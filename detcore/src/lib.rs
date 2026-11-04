@@ -1383,6 +1383,21 @@ impl<T: RecordOrReplay> Detcore<T> {
             physical_ids,
         )
         .await;
+        // The run's record of its tasks names the child from here, ending
+        // the clone the backend began counting at its native entry
+        // (`ThreadState::begin_native_clone`); a clone it did not announce
+        // there leaves the record unknown (`LiveTasks::end_reported_clone`).
+        let child_process = if flags.contains(CloneFlags::CLONE_THREAD) {
+            guest.thread_state().detpid.expect("detpid unset")
+        } else {
+            child_dettid
+        };
+        guest
+            .thread_state()
+            .live_tasks
+            .lock()
+            .expect("live tasks mutex poisoned")
+            .end_reported_clone(parent_dettid, child_dettid, child_process);
         guest.thread_state_mut().clone_flags = None;
     }
     async fn passthrough<G: Guest<Self>>(
@@ -5275,6 +5290,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 }
                 let guest_clock = Arc::clone(&pts.1.guest_clock);
                 let unix_connections = Arc::clone(&pts.1.unix_connections);
+                // Every task of the run shares one record of its tasks
+                // (`tool_local::LiveTasks`); the creator's clone, not this,
+                // adds the child to it.
+                let live_tasks = Arc::clone(&pts.1.live_tasks);
                 // A pending unreported signal may already have changed the
                 // parent's actions unseen: the child gets no copy then.
                 let child_signal_shadow = pts
@@ -5448,6 +5467,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     guest_clock,
                     // So do the connections waiting for an accept.
                     unix_connections,
+                    live_tasks,
                     parent_process_cpu_time: if clone_flags.contains(CloneFlags::CLONE_THREAD) {
                         pts.1.parent_process_cpu_time.clone()
                     } else {
@@ -5551,6 +5571,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     next_signal_announcement: 0,
                     consecutive_continuations: 0,
                     scheduler_grants: 0,
+                    host_timed_binder_loss_recorded: false,
+                    shared_binder_loss_recorded: false,
+                    unrecorded_binder_loss_recorded: false,
 
                     end_of_timeslice: None,
                     replay_rcb_end: None,
@@ -8030,6 +8053,19 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         exit_status: ExitStatus,
     ) -> Result<(), Error> {
         let dettid = thread_state.dettid;
+        // A backend that runs a thread's exit past `mm_release` before it
+        // calls this (`BackendCapabilities::runs_exit_robust_list`) reports
+        // it complete: the kernel's writes for the thread (its robust list's
+        // futex words, its `clear_child_tid` word) are done, so an off-turn
+        // binder call waiting on them may go (`LiveTasks::unreported`). First,
+        // before anything else this hook does.
+        if self.cfg.backend.runs_exit_robust_list {
+            thread_state
+                .live_tasks
+                .lock()
+                .expect("live tasks mutex poisoned")
+                .exit_reported(dettid);
+        }
         thread_state.delivery_counters.log(dettid);
         // Its kept /proc status file reads only ESRCH from now on.
         crate::syscalls::forget_thread_status(Pid::from_raw(tid.as_raw()));

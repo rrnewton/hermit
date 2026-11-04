@@ -918,7 +918,7 @@ fn binder_fd_passing_guest() -> &'static Path {
         fs::create_dir_all(&build_root).expect("failed to create binder-fd-passing directory");
         let guest = build_root.join("binder_fd_passing");
         let output = Command::new("cc")
-            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
             .arg(repository.join("tests/c/binder_fd_passing.c"))
             .arg("-o")
             .arg(&guest)
@@ -60912,18 +60912,42 @@ fn a_preemption_replay_readmits_a_backgrounded_call_where_its_recording_did() {
         serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
     };
 
-    // The schedule as a host whose branch counter fails Reverie's validation
-    // can repeat it: which thread ran which event, in order. Such a counter
-    // (an AMD Zen host with SpecLockMap on, say) can tally a few branches
-    // more or less between two system calls, a branch count no replay can
-    // make repeat.
-    let events = |schedule: &serde_json::Value| -> Vec<(serde_json::Value, serde_json::Value)> {
-        schedule
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|event| (event["dettid"].clone(), event["op"].clone()))
-            .collect()
+    // The schedule and priority histories as a host whose branch counter
+    // fails Reverie's validation can repeat them: everything but what that
+    // counter decides. Such a counter (an AMD Zen host with SpecLockMap on,
+    // say) can tally a few branches more or less between two system calls, a
+    // count no replay can make repeat, and with it the times, instruction
+    // pointers and counts derived from it: an event's end time and
+    // instruction pointers, the count of an event that is not a system call,
+    // and the times, branch counts and chaos epochs of a thread's priority
+    // changes. Which thread ran which event, in what order, each system call
+    // and its phase, and each priority a thread took, are compared whole.
+    let without_the_counter = |record: &serde_json::Value| -> serde_json::Value {
+        let mut global = record["global"].clone();
+        for event in global.as_array_mut().unwrap() {
+            let event = event.as_object_mut().unwrap();
+            for derived in ["end_time", "start_rip", "end_rip"] {
+                event.remove(derived);
+            }
+            if event["op"].get("Syscall").is_none() {
+                event.remove("count");
+            }
+        }
+        let mut per_thread = record["per_thread"].clone();
+        for history in per_thread.as_object_mut().unwrap().values_mut() {
+            let history = history.as_object_mut().unwrap();
+            history.remove("preemption_rcbs");
+            history.remove("chaos_epochs");
+            if let Some(changes) = history.get_mut("prio_changes") {
+                *changes = changes
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|change| change[1].clone())
+                    .collect();
+            }
+        }
+        serde_json::json!({"global": global, "per_thread": per_thread})
     };
 
     let record = directory.path().join("record.json");
@@ -60931,6 +60955,63 @@ fn a_preemption_replay_readmits_a_backgrounded_call_where_its_recording_did() {
     let exact_counter = !stderr(&recorded).contains("performance counters failed");
     let recorded_order = order(&recorded);
     let recording = read(&record);
+
+    // The comparison for such a host ignores what the counter decides, and
+    // nothing a replay must repeat: a mutation of the counter's fields alone
+    // compares equal, and a mutation of any other field does not.
+    let edited = |edit: &dyn Fn(&mut serde_json::Value)| {
+        let mut copy = recording.clone();
+        edit(&mut copy);
+        without_the_counter(&copy)
+    };
+    let events = recording["global"].as_array().unwrap();
+    let syscall = events
+        .iter()
+        .position(|event| event["op"].get("Syscall").is_some())
+        .expect("a system call event");
+    let other = events
+        .iter()
+        .position(|event| event["op"].get("Syscall").is_none())
+        .expect("an event that is not a system call");
+    let original = without_the_counter(&recording);
+    assert_eq!(
+        edited(&|copy| {
+            let event = &mut copy["global"][other];
+            event["count"] = serde_json::json!(4_000_000);
+            event["end_time"] = serde_json::json!(1);
+            event["end_rip"] = serde_json::json!(1);
+            event["start_rip"] = serde_json::json!(1);
+        }),
+        original
+    );
+    for (what, edit) in [
+        (
+            "a system call's number",
+            &(|copy: &mut serde_json::Value| {
+                copy["global"][syscall]["op"]["Syscall"][0] = serde_json::json!(999);
+            }) as &dyn Fn(&mut serde_json::Value),
+        ),
+        ("an event's thread", &|copy| {
+            copy["global"][other]["dettid"] = serde_json::json!(999);
+        }),
+        ("an event's kind", &|copy| {
+            copy["global"][other]["op"] = serde_json::json!({"Syscall": [39, "Prehook"]});
+        }),
+        ("the number of events", &|copy| {
+            copy["global"].as_array_mut().unwrap().pop();
+        }),
+        ("a thread's final priority", &|copy| {
+            let (_, history) = copy["per_thread"]
+                .as_object_mut()
+                .unwrap()
+                .iter_mut()
+                .next()
+                .unwrap();
+            history["final_prio"] = serde_json::json!(7);
+        }),
+    ] {
+        assert_ne!(edited(edit), original, "{what} is not compared");
+    }
     let rejoins = &recording["rejoins"];
     assert!(
         rejoins
@@ -60965,8 +61046,8 @@ fn a_preemption_replay_readmits_a_backgrounded_call_where_its_recording_did() {
             }
         } else {
             assert_eq!(
-                events(&replay["global"]),
-                events(&recording["global"]),
+                without_the_counter(&replay),
+                without_the_counter(&recording),
                 "probe seed {probe_seed}: the replay re-recorded another schedule"
             );
         }
@@ -60975,9 +61056,9 @@ fn a_preemption_replay_readmits_a_backgrounded_call_where_its_recording_did() {
 
 /// A replay whose record names a readmission it cannot follow leaves the
 /// record with a WARN naming the event and goes on as a fresh run. A
-/// preemption replay always goes on, as it does at any other mismatch. A
-/// schedule replay under `--die-on-desync` ends there as it does at a
-/// schedule desync: the container exits 1, which Hermit reports as an
+/// preemption replay without `--die-on-desync` goes on, as it does at any
+/// other mismatch. A schedule replay under `--die-on-desync` ends there as it
+/// does at a schedule desync: the container exits 1, which Hermit reports as an
 /// unexpected container exit. Before, it went on.
 #[test]
 fn a_schedule_replay_that_leaves_its_readmissions_ends_there_under_die_on_desync() {
@@ -61053,6 +61134,189 @@ fn a_schedule_replay_that_leaves_its_readmissions_ends_there_under_die_on_desync
         stderr(&dies).contains("class=container-child-exit status=Exited(1)"),
         "{}",
         stderr(&dies)
+    );
+}
+
+/// A preemption replay whose record names a readmission it cannot follow
+/// ends there under `--die-on-desync`, as it does at a schedule desync.
+/// Without it, the replay goes on as a fresh run would, but not unmarked:
+/// the record it re-records says it departed from its source
+/// (`replay_departed_at`, written inside the incomplete-record envelope that
+/// faithful replay refuses). Before, it went on under `--die-on-desync` too,
+/// and re-recorded an ordinary record. The record is edited so that its first
+/// readmission names another call of the same thread. A copy lowered to
+/// format 3 without its background starts, as main's schedule replays
+/// re-record, keeps its readmissions: followed as recorded, it succeeds with
+/// no departure, and edited the same way it is left and ends the run.
+#[test]
+fn a_preemption_replay_that_leaves_its_readmissions_is_marked_or_ends_under_die_on_desync() {
+    let _guard = hermit_run_guard();
+    let guest = guest_discard_at_send_guest().to_str().unwrap().to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let epoch = format!("--epoch={}", detcore_model::config::CANONICAL_TEST_EPOCH);
+    let run = |extra: &[&str]| {
+        let mut args = vec!["run", "--base-env=minimal", &epoch];
+        args.extend(extra);
+        args.extend(["--", guest.as_str(), "signalfd-inread"]);
+        let output = hermit_test::hermit_output(
+            &format!("hermit {args:?}"),
+            hermit_command(&args)
+                .env_remove("HERMIT_EPOCH")
+                .env("HERMIT_RACE_PROBE", "bg_harvest_skip=0@0.5")
+                .env("HERMIT_RACE_PROBE_SEED", "13")
+                .stdin(Stdio::null()),
+        );
+        let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+        (args, output)
+    };
+    let succeeded = |(args, output): &(Vec<String>, Output)| {
+        assert_success(output, &args.iter().map(String::as_str).collect::<Vec<_>>());
+    };
+    let record = directory.path().join("record.json");
+    succeeded(&run(&[&format!(
+        "--record-preemptions-to={}",
+        record.display()
+    )]));
+    let mut recording: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
+    let call = &mut recording["rejoins"][0]["calls"][0][1];
+    assert!(call.is_u64(), "no readmission recorded: {recording}");
+    *call = serde_json::json!(999_999);
+    let edited = directory.path().join("edited.json");
+    fs::write(&edited, recording.to_string()).unwrap();
+    let replay_edited = format!("--replay-preemptions-from={}", edited.display());
+    let left = "stopped following the replayed record's readmissions";
+
+    // The record as it was is followed to the end, `--die-on-desync` or not.
+    let faithful = run(&[
+        &format!("--replay-preemptions-from={}", record.display()),
+        "--die-on-desync",
+    ]);
+    succeeded(&faithful);
+    assert!(
+        !stderr(&faithful.1).contains(left),
+        "{}",
+        stderr(&faithful.1)
+    );
+
+    // The edited one is left and marked ...
+    let rerecord = directory.path().join("rerecord.json");
+    let marked = run(&[
+        &replay_edited,
+        &format!("--record-preemptions-to={}", rerecord.display()),
+    ]);
+    succeeded(&marked);
+    assert!(stderr(&marked.1).contains(left), "{}", stderr(&marked.1));
+    let rerecorded: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&rerecord).unwrap()).unwrap();
+    assert!(
+        rerecorded["incomplete_preemption_record"]["replay_departed_at"].is_u64(),
+        "the re-record does not say it departed: {rerecorded}"
+    );
+
+    // ... or, under `--die-on-desync`, ends the run where it leaves it.
+    let (_, dies) = run(&[&replay_edited, "--die-on-desync"]);
+    assert_eq!(
+        dies.status.code(),
+        Some(HERMIT_INTERNAL_FAILURE_EXIT),
+        "{}",
+        stderr(&dies)
+    );
+    assert!(stderr(&dies).contains(left), "{}", stderr(&dies));
+    assert!(
+        stderr(&dies).contains(
+            "Replay mode desynchronized from trace, bailing out (--die-on-desync): \
+             HERMIT_REPLAY_LEFT_READMISSIONS"
+        ),
+        "{}",
+        stderr(&dies)
+    );
+
+    // The readmissions of a format-3 record are followed as a format-4
+    // record's are: main's writer stores them there.
+    let lower = |mut value: serde_json::Value, name: &str| {
+        value["format_version"] = serde_json::json!(3);
+        value.as_object_mut().unwrap().remove("background_starts");
+        let path = directory.path().join(name);
+        fs::write(&path, value.to_string()).unwrap();
+        format!("--replay-preemptions-from={}", path.display())
+    };
+    let original: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
+    let lowered = run(&[&lower(original, "lowered.json"), "--die-on-desync"]);
+    succeeded(&lowered);
+    assert!(!stderr(&lowered.1).contains(left), "{}", stderr(&lowered.1));
+    let (_, lowered_dies) = run(&[&lower(recording, "lowered-edited.json"), "--die-on-desync"]);
+    assert_eq!(
+        lowered_dies.status.code(),
+        Some(HERMIT_INTERNAL_FAILURE_EXIT),
+        "the format-3 record's readmissions were not followed: {}",
+        stderr(&lowered_dies)
+    );
+    assert!(
+        stderr(&lowered_dies).contains(left),
+        "{}",
+        stderr(&lowered_dies)
+    );
+}
+
+/// A `--strict` preemption replay that leaves its record's readmissions ends
+/// there, by name, whether or not `--die-on-desync` is given: a strict replay
+/// may not succeed after readmitting a call by host timing. The record as it
+/// was is followed to a successful end. Needs a branch counter `--strict`
+/// accepts, which many VMs lack, so it is host-limited.
+#[test]
+#[ignore = "host-limited: needs a branch counter --strict accepts; run with --run-ignored only (docs/TESTING_ENVIRONMENTS.md)"]
+fn a_strict_preemption_replay_that_leaves_its_readmissions_ends_there() {
+    let _guard = hermit_run_guard();
+    let guest = guest_discard_at_send_guest().to_str().unwrap().to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let epoch = format!("--epoch={}", detcore_model::config::CANONICAL_TEST_EPOCH);
+    let run = |extra: &[&str]| {
+        let mut args = vec!["run", "--base-env=minimal", &epoch];
+        args.extend(extra);
+        args.extend(["--", guest.as_str(), "signalfd-inread"]);
+        hermit_test::hermit_output(
+            &format!("hermit {args:?}"),
+            hermit_command(&args)
+                .env_remove("HERMIT_EPOCH")
+                .env("HERMIT_RACE_PROBE", "bg_harvest_skip=0@0.5")
+                .env("HERMIT_RACE_PROBE_SEED", "13")
+                .stdin(Stdio::null()),
+        )
+    };
+    let record = directory.path().join("record.json");
+    let recorded = run(&[&format!("--record-preemptions-to={}", record.display())]);
+    assert_success(&recorded, &["record"]);
+    let faithful = run(&[
+        "--strict",
+        &format!("--replay-preemptions-from={}", record.display()),
+    ]);
+    assert_success(&faithful, &["--strict", "faithful replay"]);
+    let mut recording: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
+    let call = &mut recording["rejoins"][0]["calls"][0][1];
+    assert!(call.is_u64(), "no readmission recorded: {recording}");
+    *call = serde_json::json!(999_999);
+    let edited = directory.path().join("edited.json");
+    fs::write(&edited, recording.to_string()).unwrap();
+    let ends = run(&[
+        "--strict",
+        &format!("--replay-preemptions-from={}", edited.display()),
+    ]);
+    assert_eq!(
+        ends.status.code(),
+        Some(HERMIT_INTERNAL_FAILURE_EXIT),
+        "{}",
+        stderr(&ends)
+    );
+    assert!(
+        stderr(&ends).contains(
+            "Replay mode desynchronized from trace, bailing out (--strict): \
+             HERMIT_REPLAY_LEFT_READMISSIONS"
+        ),
+        "{}",
+        stderr(&ends)
     );
 }
 
@@ -63958,22 +64222,38 @@ fn a_recording_whose_stream_cannot_be_written_in_full_is_refused() {
     );
 }
 
+/// Which side of the binder guest's transaction runs under Hermit.
+#[derive(Clone, Copy)]
+enum BinderSide {
+    /// Both, the guest forking its sender: two guest processes.
+    Both,
+    /// The context manager alone, the run's one task; its sender runs
+    /// outside Hermit once the manager is ready.
+    Manager,
+    /// The sender alone, the run's one task, against a context manager that
+    /// runs outside Hermit, as Android runs servicemanager.
+    Client,
+}
+
 /// Run the binder guest in `mode` on a private binderfs instance this test
-/// mounts in a user and mount namespace of its own, and return its output,
-/// or `None` where the kernel has no binder filesystem or will not mount one
-/// here. The run is bounded: the failures these tests pin are hangs.
-fn binder_guest_output(mode: &str) -> Option<Output> {
-    binder_guest_output_with(mode, &[])
+/// mounts in a user and mount namespace of its own, with `side` under Hermit
+/// and the other side, if any, outside it, and return Hermit's output, the
+/// outside side's appended to its stderr after a `--- outside Hermit ---`
+/// line; or `None` where the kernel has no binder filesystem or will not
+/// mount one here, saying which. The run is bounded: the failures these
+/// tests pin are hangs.
+fn binder_guest_output(mode: &str, side: BinderSide) -> Option<Output> {
+    binder_guest_output_with(mode, side, &[])
 }
 
 /// [`binder_guest_output`] with `hermit_args` added to `hermit run`'s own.
-fn binder_guest_output_with(mode: &str, hermit_args: &[&str]) -> Option<Output> {
+fn binder_guest_output_with(mode: &str, side: BinderSide, hermit_args: &[&str]) -> Option<Output> {
     let filesystems = fs::read_to_string("/proc/filesystems").unwrap_or_default();
     if !filesystems
         .lines()
         .any(|line| line.split_whitespace().last() == Some("binder"))
     {
-        eprintln!("skipping: this kernel has no binder filesystem (CONFIG_ANDROID_BINDERFS)");
+        eprintln!("no binder: this kernel has no binder filesystem (CONFIG_ANDROID_BINDERFS)");
         return None;
     }
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -63982,26 +64262,68 @@ fn binder_guest_output_with(mode: &str, hermit_args: &[&str]) -> Option<Output> 
     let hermit = env!("CARGO_BIN_EXE_hermit");
     let guest = binder_fd_passing_guest().display().to_string();
     let mountpoint = mountpoint.display().to_string();
+    let peer_log = directory.path().join("outside.log").display().to_string();
+    let under_hermit = |role: &str| {
+        format!(
+            "timeout --kill-after 5s 120s {hermit} run --base-env=minimal {} -- \
+             {guest} {mountpoint} {mode} {role}",
+            hermit_args.join(" ")
+        )
+    };
+    // The manager says it is ready by creating `<mount>.ready`.
+    let await_ready = format!(
+        "i=0; while [ ! -e {mountpoint}.ready ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done"
+    );
+    // The side outside Hermit is given up to 10 s to finish on its own, so
+    // its output is whole, before any cleanup kill.
+    let reap_peer = "i=0; while kill -0 $peer 2>/dev/null && [ $i -lt 100 ]; do sleep 0.1; \
+                     i=$((i+1)); done; kill $peer 2>/dev/null; wait $peer";
+    let report_peer = format!("echo '--- outside Hermit ---' >&2; cat {peer_log} >&2");
+    let run = match side {
+        BinderSide::Both => format!("exec {}", under_hermit("both")),
+        BinderSide::Manager => format!(
+            "( {await_ready}; exec timeout --kill-after 5s 60s {guest} {mountpoint} {mode} \
+             client ) >{peer_log} 2>&1 & peer=$!; {}; status=$?; {reap_peer}; \
+             {report_peer}; exit $status",
+            under_hermit("manager")
+        ),
+        BinderSide::Client => format!(
+            "timeout --kill-after 5s 60s {guest} {mountpoint} {mode} manager >{peer_log} 2>&1 & \
+             peer=$!; {await_ready}; {}; status=$?; {reap_peer}; {report_peer}; \
+             exit $status",
+            under_hermit("client")
+        ),
+    };
     // A refused mount is told apart from a failed run by a marker on stdout,
     // which neither the guest nor hermit prints.
-    let script = format!(
-        "mount -t binder binder {mountpoint} || {{ echo NO-BINDERFS; exit 0; }}; \
-         exec timeout --kill-after 5s 120s {hermit} run --base-env=minimal {} -- \
-         {guest} {mountpoint} {mode}",
-        hermit_args.join(" ")
-    );
+    let script =
+        format!("mount -t binder binder {mountpoint} || {{ echo NO-BINDERFS; exit 0; }}; {run}");
     let mut command = Command::new("unshare");
     command.args(["--user", "--map-root-user", "--mount", "sh", "-c", &script]);
     let label = format!("{command:?}");
     let output = hermit_test::hermit_output(&label, &mut command);
     if stdout(&output).contains("NO-BINDERFS") {
         eprintln!(
-            "skipping: binderfs cannot be mounted in a user namespace here: {}",
+            "no binder: binderfs cannot be mounted in a user namespace here: {}",
             String::from_utf8_lossy(&output.stderr)
         );
         return None;
     }
     Some(output)
+}
+
+/// [`binder_guest_output`] for a binder test, which is ignored as
+/// host-limited (docs/TESTING_ENVIRONMENTS.md): a run that selects it on a
+/// host without a binder filesystem a user namespace may mount fails, naming
+/// that, rather than counting as a pass that never ran.
+fn binder_guest_output_on_a_capable_host(mode: &str, side: BinderSide) -> Output {
+    binder_guest_output(mode, side).unwrap_or_else(|| {
+        panic!(
+            "this binder test needs a binder filesystem (CONFIG_ANDROID_BINDERFS) that an \
+             unprivileged user and mount namespace may mount, which this host lacks (see the \
+             line above); it is ignored as host-limited, so run it only where that holds"
+        )
+    })
 }
 
 /// A descriptor one process sends another in a binder transaction is usable
@@ -64011,15 +64333,136 @@ fn binder_guest_output_with(mode: &str, hermit_args: &[&str]) -> Option<Output> 
 /// receiver's first read through it failed with EBADF. Both processes poll
 /// and read without blocking, so every binder call returns in its turn.
 #[test]
+#[ignore = "host-limited: needs a binder filesystem (CONFIG_ANDROID_BINDERFS) mountable in a user namespace; run with --run-ignored only (docs/TESTING_ENVIRONMENTS.md)"]
 fn a_descriptor_received_in_a_binder_transaction_is_usable() {
-    let Some(output) = binder_guest_output("poll") else {
-        return;
-    };
+    let output = binder_guest_output_on_a_capable_host("poll", BinderSide::Both);
     assert_success(&output, &["binder_fd_passing"]);
     let stdout = stdout(&output);
     assert!(
         stdout.starts_with("received fd ") && stdout.trim_end().ends_with(": hello"),
         "{stdout}"
+    );
+}
+
+/// A binder read whose buffer is already full (`read_consumed ==
+/// read_size`) waits for work as any read does (`binder_thread_read`), so it
+/// runs off the turn, as a read with room does. The context manager runs
+/// alone under Hermit and makes one before its sender, which runs outside
+/// Hermit and sleeps first, has sent anything; it returns once the
+/// transaction is queued, with nothing added, and the manager then reads the
+/// transaction. The run says the call waited off the turn
+/// (`HERMIT_EXTERNAL_INPUT`). Before, Detcore classified it as returning on
+/// its own and ran it in the receiver's turn, so a sender under Hermit never
+/// ran.
+#[test]
+#[ignore = "host-limited: needs a binder filesystem (CONFIG_ANDROID_BINDERFS) mountable in a user namespace; run with --run-ignored only (docs/TESTING_ENVIRONMENTS.md)"]
+fn an_exhausted_binder_read_does_not_hold_the_guests_turn() {
+    let output = binder_guest_output_on_a_capable_host("exhausted", BinderSide::Manager);
+    assert_success(&output, &["binder_fd_passing", "exhausted"]);
+    let stdout = stdout(&output);
+    assert!(
+        stdout.starts_with("exhausted read returned\nreceived transaction from pid "),
+        "{stdout}"
+    );
+    assert_binder_ran_off_the_turn_alone(&output);
+}
+
+/// The run's stderr says a binder call went off the turn
+/// (`HERMIT_EXTERNAL_INPUT`, which only that route prints) and that none ran
+/// beside another task, and the sender outside Hermit got its reply.
+fn assert_binder_ran_off_the_turn_alone(output: &Output) {
+    let log = stderr(output);
+    assert!(
+        log.contains("HERMIT_EXTERNAL_INPUT source=binder"),
+        "no binder call ran off the turn: {log}"
+    );
+    assert!(!log.contains("HERMIT_SHARED_BINDER_CALL"), "{log}");
+    assert!(
+        log.split("--- outside Hermit ---")
+            .nth(1)
+            .is_some_and(|outside| outside.contains("client received its reply")),
+        "the sender outside Hermit got no reply: {log}"
+    );
+}
+
+/// A blocking binder read that waits for its transaction runs off the turn,
+/// on the background path, and the descriptor it delivers is recorded and
+/// usable: the context manager is the run's one task, so no other task could
+/// see the descriptor, or change what the read returned, before it resumed.
+/// Its sender runs outside Hermit and sleeps first, so the manager's read is
+/// the one that waits. Before, the run was refused once the descriptor had
+/// arrived, and before that, the receiver's first use of it failed with
+/// EBADF, an answer Linux never gives.
+#[test]
+#[ignore = "host-limited: needs a binder filesystem (CONFIG_ANDROID_BINDERFS) mountable in a user namespace; run with --run-ignored only (docs/TESTING_ENVIRONMENTS.md)"]
+fn a_descriptor_a_binder_read_delivers_off_the_turn_is_usable() {
+    let output = binder_guest_output_on_a_capable_host("block", BinderSide::Manager);
+    assert_success(&output, &["binder_fd_passing", "block"]);
+    assert_binder_ran_off_the_turn_alone(&output);
+    let stdout = stdout(&output);
+    assert!(
+        stdout.starts_with("received fd ") && stdout.ends_with(": hello\n"),
+        "{stdout}"
+    );
+    assert!(
+        !stderr(&output).contains("Bad file descriptor"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+/// A binder read that would wait off the guest's turn while the run has
+/// another task is refused by name, before it runs, naming that task: Linux
+/// installs the descriptors a read delivers in the caller's table before the
+/// call returns, and another task could use them first. The context manager
+/// here, under Hermit with its sender outside, starts an idle thread before
+/// it waits. Before, the read ran off the turn, and a descriptor it delivered
+/// was visible to that thread before Hermit could account for it.
+#[test]
+#[ignore = "host-limited: needs a binder filesystem (CONFIG_ANDROID_BINDERFS) mountable in a user namespace; run with --run-ignored only (docs/TESTING_ENVIRONMENTS.md)"]
+fn a_binder_read_that_waits_beside_another_thread_is_refused_by_name() {
+    let output = binder_guest_output_on_a_capable_host("threaded", BinderSide::Manager);
+    let log = stderr(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{log}"
+    );
+    assert!(
+        log.contains(
+            "would run off the guest's turn, which Hermit allows only while the caller is the \
+             run's one task, but the run has another task besides it (task "
+        ) && log.contains(" of process "),
+        "{log}"
+    );
+    assert!(
+        !stdout(&output).contains("received transaction"),
+        "{}",
+        stdout(&output)
+    );
+}
+
+/// A binder call that sends a transaction and waits for its reply in one
+/// `BINDER_WRITE_READ`, as libbinder's `talkWithDriver` does, would run its
+/// write half off the turn on the background path, at a moment the host
+/// chooses. A run that fails closed, the default, refuses it by name. Before,
+/// it ran with one warning, and nothing marked the run as host-timed.
+#[test]
+#[ignore = "host-limited: needs a binder filesystem (CONFIG_ANDROID_BINDERFS) mountable in a user namespace; run with --run-ignored only (docs/TESTING_ENVIRONMENTS.md)"]
+fn a_binder_write_and_read_that_waits_is_refused_by_name() {
+    let output = binder_guest_output_on_a_capable_host("writeread", BinderSide::Client);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{}",
+        stderr(&output)
+    );
+    let log = stderr(&output);
+    assert!(
+        log.contains("ioctl(BINDER_WRITE_READ) on descriptor")
+            && log.contains("both writes and waits to read")
+            && log.contains("--allow-unsupported-syscalls"),
+        "{log}"
     );
 }
 
@@ -66477,9 +66920,11 @@ fn a_fresh_strict_run_refuses_binder_and_names_the_replay_route() {
     let epoch = format!("--epoch={}", detcore_model::config::CANONICAL_TEST_EPOCH);
     // Without the preemption timer, a host whose branch counter `--strict`
     // would refuse still reaches the binder call.
-    let Some(output) =
-        binder_guest_output_with("ping", &["--strict", "--max-timeslice=disabled", &epoch])
-    else {
+    let Some(output) = binder_guest_output_with(
+        "ping",
+        BinderSide::Both,
+        &["--strict", "--max-timeslice=disabled", &epoch],
+    ) else {
         return;
     };
     let log = stderr(&output);
@@ -66504,7 +66949,9 @@ fn a_strict_replay_of_a_record_with_readmissions_may_use_binder() {
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let record = directory.path().join("binder.json");
     let record_flag = format!("--record-preemptions-to={}", record.display());
-    let Some(recorded) = binder_guest_output_with("ping", &[&epoch, &record_flag]) else {
+    let Some(recorded) =
+        binder_guest_output_with("ping", BinderSide::Both, &[&epoch, &record_flag])
+    else {
         return;
     };
     assert_success(&recorded, &["binder_fd_passing", "ping"]);
@@ -66517,8 +66964,12 @@ fn a_strict_replay_of_a_record_with_readmissions_may_use_binder() {
         "the recording stored no readmission"
     );
     let replay_flag = format!("--replay-preemptions-from={}", record.display());
-    let replayed = binder_guest_output_with("ping", &["--strict", &epoch, &replay_flag])
-        .expect("binderfs mounted for the recording");
+    let replayed = binder_guest_output_with(
+        "ping",
+        BinderSide::Both,
+        &["--strict", &epoch, &replay_flag],
+    )
+    .expect("binderfs mounted for the recording");
     // A replay follows the record's preemptions with the branch counter,
     // which `--strict` refuses on a host where it is not exact.
     if replayed.status.code() == Some(HERMIT_POLICY_REFUSAL_EXIT)
@@ -66539,17 +66990,18 @@ fn a_strict_replay_of_a_record_with_readmissions_may_use_binder() {
 }
 
 /// A binder read that waits for another process does not hold the guest's
-/// only turn. Both processes open the device blocking, so each read waits
-/// inside `ioctl(BINDER_WRITE_READ)` until the other sends it work: the way
-/// every binder thread pool works. Detcore runs such a call on the
-/// background path, so the other guest process runs and the pair completes;
-/// before, the first read held the turn and nothing else ever ran.
+/// turn. The context manager runs alone under Hermit and opens the device
+/// blocking, so its read waits inside `ioctl(BINDER_WRITE_READ)` until its
+/// sender, outside Hermit, sends it work: the way every binder thread waits.
+/// Detcore runs such a call on the background path, where it waits alone,
+/// and the pair completes; before, the read held the turn, which a sender
+/// under Hermit needed to run.
 #[test]
+#[ignore = "host-limited: needs a binder filesystem (CONFIG_ANDROID_BINDERFS) mountable in a user namespace; run with --run-ignored only (docs/TESTING_ENVIRONMENTS.md)"]
 fn a_blocking_binder_read_does_not_hold_the_guests_turn() {
-    let Some(output) = binder_guest_output("ping") else {
-        return;
-    };
+    let output = binder_guest_output_on_a_capable_host("ping", BinderSide::Manager);
     assert_success(&output, &["binder_fd_passing", "ping"]);
+    assert_binder_ran_off_the_turn_alone(&output);
     assert!(
         stdout(&output).starts_with("received transaction from pid "),
         "{}",

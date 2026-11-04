@@ -2242,6 +2242,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         // scheduler before the child exists.
         super::signal_shadow::before_clone(guest, flags.bits()).await;
 
+        // From here until it returns, the clone may have made a task the
+        // run's record does not name yet (a vfork child runs before its
+        // parent's clone returns), so it counts as one (`LiveTasks`). Noted
+        // in this turn, before the vfork parent below gives the turn up.
+        guest
+            .thread_state()
+            .live_tasks
+            .lock()
+            .expect("live tasks mutex poisoned")
+            .begin_clone(parent_dettid);
+
         trace!("[detcore, dtid {}] parent invoking clone.", parent_dettid);
 
         // A CLONE_VFORK parent cannot resume until the child execs or exits.
@@ -2312,6 +2323,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         let ts = guest.thread_state_mut();
         ts.clone_flags = None; // Unset, now that it has been read by the child.
         ts.pending_vfork = None;
+        // The clone returned, in this turn: the child it made, if any, is
+        // one of the run's tasks from here until a wait reaps its process.
+        let child = maybe_res.as_ref().ok().map(|&res| {
+            let child = DetTid::from_raw(res as i32);
+            let process = if flags.contains(CloneFlags::CLONE_THREAD) {
+                ts.detpid.expect("detpid unset")
+            } else {
+                child
+            };
+            (child, process)
+        });
+        ts.live_tasks
+            .lock()
+            .expect("live tasks mutex poisoned")
+            .end_clone(parent_dettid, child);
 
         // A backend that cannot create the child says so with a typed refusal
         // (an in-guest backend runs one thread of the guest; KVM cannot give a
@@ -3152,6 +3178,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             Permission::RW,
         );
         resource_request(guest, request).await;
+        // Granted: still one of the run's tasks until the grant is committed
+        // below (`LiveTasks`).
+        let dettid = guest.thread_state().dettid;
+        guest
+            .thread_state()
+            .live_tasks
+            .lock()
+            .expect("live tasks mutex poisoned")
+            .note_exit(dettid);
         self.run_robust_list_owner_death(guest).await;
         // A leader whose group lives on is a zombie from here until its last
         // sibling leaves, and its backend reports its exit only then: it
@@ -3190,6 +3225,24 @@ impl<T: RecordOrReplay> Detcore<T> {
         // before the native exit, as an exit_group does
         // (`Self::release_table_at_exit`).
         self.release_table_at_exit(guest, false).await;
+        // The grant is committed: the last thing this thread does in its turn
+        // before the native exit, after which, with sequentialized threads,
+        // it never runs again. Where the backend reports the exit complete
+        // afterwards (`BackendCapabilities::runs_exit_robust_list`: its exit
+        // hook comes after the kernel's `mm_release`), a thread that does not
+        // lead its process leaves the run's tasks here, its report awaited
+        // before any off-turn binder call is issued. A leader stays, a zombie,
+        // until a wait reaps its process, as does every thread elsewhere
+        // (`LiveTasks::commit_thread_exit`).
+        if self.cfg.sequentialize_threads && self.cfg.backend.runs_exit_robust_list {
+            let detpid = guest.thread_state().detpid.expect("detpid unset");
+            guest
+                .thread_state()
+                .live_tasks
+                .lock()
+                .expect("live tasks mutex poisoned")
+                .commit_thread_exit(dettid, detpid);
+        }
         // It's ok here that we skip running the posthook:
         guest.tail_inject(call).await
     }
@@ -3257,6 +3310,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             Permission::RW,
         );
         resource_request(guest, request).await;
+        // Every task of the process exited, each counted among the run's
+        // tasks until a wait reaps it (`LiveTasks`).
+        let detpid = guest.thread_state().detpid.expect("detpid unset");
+        guest
+            .thread_state()
+            .live_tasks
+            .lock()
+            .expect("live tasks mutex poisoned")
+            .note_process_exit(detpid);
         match path {
             Some(OwnerDeathPath::Barrier) => {
                 guest.thread_state().begin_exit_group_robust_walk();
