@@ -1271,7 +1271,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (dh-4a61v): 1951 - 1 = 1950.
     // And the departed shell py_hello replay (dh-9r2mg): 1950 - 1 = 1949.
     // PR 4920 (3): two model/config units: 1955 + 2 = 1957.
-    ("test.regular_crates", 1957),
+    ("test.regular_crates", 1959),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1992,7 +1992,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And rundata::tests::a_recorded_target_run_replays_a_workspace_copy_within_an_explicit_bound:
     // 1257 + 1 = 1258.
     // PR 4920 (3): the prefix-trial unit: 1258 + 1 = 1259.
-    ("test.hermit_unit", 1260),
+    ("test.hermit_unit", 1266),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3293,7 +3293,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And scheduler a_replayed_switch_wakes_its_due_target, restored from
     // https://github.com/rrnewton/hermit/pull/4889: 3492 + 2 = 3494
     // (wake unit + deferred-SIGCHLD negative arm).
-    ("test.detcore_unit", 3524),
+    ("test.detcore_unit", 3567),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5367,7 +5367,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same departed blocking-sigsuspend (dh-4a61v) and shell py_hello
     // (dh-9r2mg) named losses: 1937 - 2 = 1935.
     // PR 4920 (3): the same two units: 1941 + 2 = 1943.
-    ("test.regular_crates_on_host", 1943),
+    ("test.regular_crates_on_host", 1945),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5944,7 +5944,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same unit (same growth as test.detcore_unit, PR #4926): 3469 + 1 = 3470.
     // PR #4751: the same twelve units (same growth as test.detcore_unit): 3482.
     // And the same two replayed-switch wake units: 3492 + 2 = 3494.
-    ("test.detcore_unit_on_host", 3524),
+    ("test.detcore_unit_on_host", 3567),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -6366,7 +6366,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same trial-record stamping unit: 1250 + 1 = 1251.
     // And the same run1-preemptions test: 1251 + 1 = 1252.
     // PR 4920 (3): the same unit: 1252 + 1 = 1253.
-    ("test.hermit_unit_on_host", 1254),
+    ("test.hermit_unit_on_host", 1260),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -6608,7 +6608,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same departed blocking-sigsuspend (dh-4a61v) and shell py_hello
     // (dh-9r2mg) named losses: 1937 - 2 = 1935.
     // PR 4920 (3): the same two units: 1941 + 2 = 1943.
-    ("test.regular_crates_on_host", 1943),
+    ("test.regular_crates_on_host", 1945),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
@@ -11456,6 +11456,15 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         description: r########"Calibrates the PMU skid margin on the host, then runs the ignored bisect_rejects_a_timed_out_replay, analyze_stops_on_a_refused_trial, analyze_ends_with_a_refused_target_run, analyze_keeps_its_workspace_after_an_error, analyze_cleans_up_when_a_signal_stops_it and analyze_stops_a_run_whose_init_has_not_armed tests. The shell command checks four positive-integer settings (ANALYZE_SKID_CALIBRATION_ITERATIONS, default 64; ANALYZE_SKID_CALIBRATION_PERIOD, 1000000; ANALYZE_SKID_MINIMUM_MARGIN, 20000; ANALYZE_SKID_CALIBRATION_TIMEOUT, 30 seconds), compiles tests/util/pmu_skid.c into target/ci-pmu-skid, runs it to read "Recommended margin: N RCB", and passes the larger of N and the floor as HERMIT_ANALYZE_SKID_MARGIN. analyze_hello_race is excluded while https://github.com/rrnewton/hermit/issues/5115 tracks its pinpointing failure; this exclusion is not a passing result. The bisect timeout regression runs an endless guest with a one-second Hermit timeout and a 30-second outer bound; it requires exit 124 with the typed run-timeout marker and no successful report or causal claim. The refusal cases require a named restart_syscall refusal, exact policy-refusal exit 122 and no causal report, while distinguishing an ordinary completed guest exit 122. The workspace cases check analyze's cleanup through real trials: an analysis that ends with an error keeps its one workspace, with or without --keep-tmp, and says so; a SIGTERM to analyze two seconds into a target run that spins for ever ends that run and the analysis and leaves no workspace; and a SIGTERM while the run's container init is held before it arms its own stop handlers still reaches that init and leaves no workspace. A missing calibration line exits with an error before the tests; a lost timeout classification fails the tests. A failure is blocking for the super validation."########,
         labels: &[r########"super"########],
         // Disable only analyze_hello_race pending https://github.com/rrnewton/hermit/issues/5115.
+        // The aarch64 rewriter's code/data proof on main (F1): two detcore-model
+        // units, the unmarked files' legacy form and summary: 1957, listed.
+        // The aarch64 rewriter's code/data proof on main (F1): six hermit-run
+        // units: 1260, listed.
+        // The aarch64 rewriter's code/data proof on main (F1): forty-three
+        // detcore units: 3535, listed.
+        // The same two detcore-model units: 1943, listed.
+        // The same forty-three detcore units: 3535, listed.
+        // The same six hermit-run units: 1254, listed.
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -u
 iters=${ANALYZE_SKID_CALIBRATION_ITERATIONS:-64}
 period=${ANALYZE_SKID_CALIBRATION_PERIOD:-1000000}

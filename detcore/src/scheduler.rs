@@ -22597,6 +22597,9 @@ impl Scheduler {
                 skid_overshoots: None,
                 skid_overshoot_reports: None,
                 seed_reproducible: None,
+                // GlobalState names the files the exclusive rewrite left
+                // unchanged for want of mapping symbols (aarch64).
+                exclusive_rewrite_unmarked: Vec::new(),
             },
             info_reprio_descrip,
         ))

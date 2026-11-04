@@ -430,6 +430,13 @@ pub struct RunSummary {
     /// [`RunSummary::record_skid_overshoots`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed_reproducible: Option<bool>,
+
+    /// aarch64: the files the run's `--rewrite-exclusives` left unchanged,
+    /// wholly or in part, because no mapping symbol it accepts marks their
+    /// code: none, or one that is neither `$x` nor `$d`. Shown in the INFO view and the
+    /// full report. Absent when there were none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclusive_rewrite_unmarked: Vec<String>,
 }
 
 fn is_zero(count: &u64) -> bool {
@@ -741,6 +748,7 @@ impl RunSummary {
             skid_overshoots,
             skid_overshoot_reports,
             seed_reproducible: _,
+            exclusive_rewrite_unmarked,
         } = self;
         if let Some(bound) = run_timeout_secs {
             writeln!(
@@ -847,6 +855,17 @@ impl RunSummary {
             )?;
             for (path, reads) in counter_reads {
                 writeln!(f, "  {path}: {reads}")?;
+            }
+        }
+        if !exclusive_rewrite_unmarked.is_empty() {
+            writeln!(
+                f,
+                "--rewrite-exclusives left {} file(s) unchanged where no mapping symbol it \
+                 accepts marks their code:",
+                exclusive_rewrite_unmarked.len()
+            )?;
+            for path in exclusive_rewrite_unmarked {
+                writeln!(f, "  {path}")?;
             }
         }
         if !exclusive_rewrites.is_empty() {
@@ -1382,6 +1401,28 @@ mod tests {
     /// back; a summary without notes, or written before the field existed,
     /// omits it; a kind from a later Hermit still parses
     /// (https://github.com/rrnewton/hermit/issues/4876).
+    /// The files the rewrite left unchanged for want of mapping symbols are
+    /// in the JSON and the INFO view, and absent when there are none.
+    #[test]
+    fn the_unmarked_rewrite_files_are_stated_in_the_summary() {
+        let quiet = RunSummary::default();
+        let json = serde_json::to_string(&quiet).unwrap();
+        assert!(!json.contains("exclusive_rewrite_"), "{json}");
+        assert!(!quiet.info(None).to_string().contains("rewrite-exclusives"));
+        let stated = RunSummary {
+            exclusive_rewrite_unmarked: vec!["/lib64/libstdc++.so.6".to_owned()],
+            ..RunSummary::default()
+        };
+        let json = serde_json::to_string(&stated).unwrap();
+        let back: RunSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.exclusive_rewrite_unmarked,
+            stated.exclusive_rewrite_unmarked
+        );
+        let info = stated.info(None).to_string();
+        assert!(info.contains("\n  /lib64/libstdc++.so.6\n"), "{info}");
+    }
+
     #[test]
     fn untaken_background_start_notes_round_trip_through_summary_json() {
         use super::BackgroundStartRef;
