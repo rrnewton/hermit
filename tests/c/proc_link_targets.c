@@ -36,12 +36,42 @@
  * signalfd is closed: KVM creates no process while one is open); the exe link
  * (argv[0]'s realpath); and the working directory's link after the
  * directory is renamed, and after it is removed ("<path> (deleted)", while
- * getcwd fails with ENOENT), by seven spellings. Paths below the scratch
- * directory are printed from "<dir>". A child's failed checks fail its
- * parent. It removes what it made in DIR before it ends, so that a second
- * run in DIR (--verify) starts from the same directory.
+ * getcwd fails with ENOENT), by seven spellings. Then a "." after a link,
+ * which Linux's walk looks up in what the link leads to (link_path_walk,
+ * fs/namei.c): ENOTDIR for a file, a pipe and the image, EINVAL for a
+ * directory (searched, then no link), ENOENT for a closed descriptor, by
+ * the fd, cwd, root and exe links; and the links of descriptors open on the
+ * process's own /proc/self/status and /proc/self/maps ("/proc/<pid>/status",
+ * "/proc/<pid>/maps", printed as whether they name the caller's pid), also
+ * as a fork's child reads the inherited status descriptor (its opener's
+ * pid). Paths below the scratch directory are printed from "<dir>". A
+ * child's failed checks fail its parent. It removes what it made in DIR
+ * before it ends, so that a second run in DIR (--verify) starts from the
+ * same directory.
  *
- * usage: proc_link_targets DIR
+ * With --sibling-directories it instead reads another live thread's cwd
+ * and root links (/proc/self/task/<tid>/cwd and root): the working and root
+ * directories the threads share (CLONE_FS), "<dir>" and "/".
+ *
+ * With --directory-links it instead reads the caller's own descriptor links
+ * through a link to one of its own descriptor directories: Linux follows
+ * the descriptor link D of a descriptor open on /proc/self/fd (a link to
+ * the directory /proc/<pid>/fd, proc_fd_link) and then reads the link N in
+ * that directory, so /proc/self/fd/D/N reads descriptor N's target. It
+ * prints, for a regular file in DIR and for /dev/null, that target by the
+ * five absolute spellings of D's link (/proc/self/fd/D, /proc/<pid>/fd/D,
+ * /proc/thread-self/fd/D, /proc/<pid>/task/<tid>/fd/D, /dev/fd/D) and by
+ * readlinkat(D, "N"); then through descriptors open on /proc/thread-self/fd
+ * and on /dev/fd, through one open on /proc (/proc/self/fd/P/self/fd/N and
+ * readlinkat(P, "self/fd/N")), through D twice (/proc/self/fd/D/D/N), and
+ * relative to D and to P (readlinkat(D, "D/N"), readlinkat(P,
+ * "self/fd/D/N")); the
+ * link of D itself read through D ("/proc/<pid>/fd", printed with "<pid>"
+ * where it names the caller's pid); a closed descriptor through D
+ * (ENOENT); and the file's link through D followed by a final slash and by
+ * "/." (ENOTDIR).
+ *
+ * usage: proc_link_targets DIR [--sibling-directories | --directory-links]
  */
 
 #ifndef _GNU_SOURCE
@@ -293,6 +323,47 @@ static void check_anonymous_buffer(int fd) {
       untouched);
 }
 
+/* readlink of `path`, printed as `label` with the target or the errno. */
+static void show_path(const char *label, const char *path) {
+  char got[PATH_MAX];
+  errno = 0;
+  ssize_t n = read_link(path, got);
+  if (n >= 0) {
+    print_target(label, got);
+  } else {
+    printf("%s=-1 errno=%s\n", label, errno_name(errno));
+  }
+}
+
+/* readlink of descriptor `fd`'s link with `tail` after it ("/." and the
+ * like): a lookup in what the link leads to. */
+static void show_walked(const char *label, const char *spelling, int fd, const char *tail) {
+  char path[96];
+  char shown[160];
+  snprintf(path, sizeof(path), spelling, fd);
+  strncat(path, tail, sizeof(path) - strlen(path) - 1);
+  snprintf(shown, sizeof(shown), "walked: %s fd%s", label, tail);
+  show_path(shown, path);
+}
+
+/* Print whether descriptor `fd`, open on the caller's own /proc/self/<name>,
+ * links to "/proc/<the caller's pid>/<name>", and how many spellings agree. */
+static void show_own_proc_file(const char *label, int fd, const char *name) {
+  char path[64];
+  char target[PATH_MAX];
+  char expected[96];
+  snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+  snprintf(expected, sizeof(expected), "/proc/%d/%s", (int)getpid(), name);
+  ssize_t n = read_link(path, target);
+  if (n < 0) {
+    printf("%s=-1 errno=%s\n", label, errno_name(errno));
+    failures++;
+    return;
+  }
+  printf("%s: names /proc/<pid>/%s=%d\n", label, name, strcmp(target, expected) == 0);
+  printf("%s: spellings=6 same=%d\n", label, same_spellings(fd, target));
+}
+
 static int thread_fd;
 
 static void *thread_main(void *argument) {
@@ -377,7 +448,7 @@ static void check_exe(const char *argv0) {
   printf("exe: is argv[0]'s realpath=%d\n", n >= 0 && strcmp(real, target) == 0);
 }
 
-static void check_child(int inherited) {
+static void check_child(int inherited, int status_fd) {
   pid_t child = fork();
   CHECK(child >= 0, "fork: %s", strerror(errno));
   if (child == 0) {
@@ -388,6 +459,16 @@ static void check_child(int inherited) {
         open("/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     CHECK(proc_fd_directory >= 0, "open /proc/self/fd: %s", strerror(errno));
     show("child: the inherited file", inherited);
+    /* The inherited descriptor names its opener's file, the parent's. */
+    char status_path[64];
+    char status_target[PATH_MAX];
+    char status_expected[96];
+    snprintf(status_path, sizeof(status_path), "/proc/self/fd/%d", status_fd);
+    snprintf(status_expected, sizeof(status_expected), "/proc/%d/status", (int)getppid());
+    ssize_t status_n = read_link(status_path, status_target);
+    printf(
+        "child: the inherited status names its opener's /proc/<pid>/status=%d\n",
+        status_n >= 0 && strcmp(status_target, status_expected) == 0);
     char path[PATH_MAX];
     snprintf(path, sizeof(path), "%s/child-file", dir);
     int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
@@ -405,9 +486,180 @@ static void check_child(int inherited) {
   }
 }
 
+static int sibling_tid;
+static int sibling_ready[2];
+static int sibling_release[2];
+
+static void *sibling_main(void *argument) {
+  (void)argument;
+  sibling_tid = (int)gettid_raw();
+  char byte = 1;
+  CHECK(write(sibling_ready[1], &byte, 1) == 1, "write: %s", strerror(errno));
+  CHECK(read(sibling_release[0], &byte, 1) == 1, "read: %s", strerror(errno));
+  return NULL;
+}
+
+/* Another live thread's working and root directory links, which it shares
+ * with the caller (CLONE_FS). */
+static int check_sibling_directories(void) {
+  CHECK(pipe2(sibling_ready, O_CLOEXEC) == 0, "pipe2: %s", strerror(errno));
+  CHECK(pipe2(sibling_release, O_CLOEXEC) == 0, "pipe2: %s", strerror(errno));
+  pthread_t thread;
+  CHECK(
+      pthread_create(&thread, NULL, sibling_main, NULL) == 0,
+      "pthread_create failed");
+  char byte;
+  CHECK(read(sibling_ready[0], &byte, 1) == 1, "read: %s", strerror(errno));
+  char path[96];
+  snprintf(path, sizeof(path), "/proc/self/task/%d/cwd", sibling_tid);
+  show_path("sibling: self/task/<tid>/cwd", path);
+  snprintf(path, sizeof(path), "/proc/self/task/%d/root", sibling_tid);
+  show_path("sibling: self/task/<tid>/root", path);
+  byte = 1;
+  CHECK(write(sibling_release[1], &byte, 1) == 1, "write: %s", strerror(errno));
+  CHECK(pthread_join(thread, NULL) == 0, "pthread_join failed");
+  printf("failures=%d\n", failures);
+  return failures == 0 ? 0 : 1;
+}
+
+/* readlink of `path`, printed as `label`, with "/proc/<the caller's
+ * pid>/" printed as "/proc/<pid>/". */
+static void show_path_own_pid(const char *label, const char *path) {
+  char got[PATH_MAX];
+  char own[32];
+  errno = 0;
+  ssize_t n = read_link(path, got);
+  if (n < 0) {
+    printf("%s=-1 errno=%s\n", label, errno_name(errno));
+    return;
+  }
+  int own_len = snprintf(own, sizeof(own), "/proc/%d/", (int)getpid());
+  if (strncmp(got, own, own_len) == 0) {
+    printf("%s=/proc/<pid>/%s\n", label, got + own_len);
+  } else {
+    print_target(label, got);
+  }
+}
+
+/* readlinkat of `name` from `dirfd`, printed as `label`. */
+static void show_at(const char *label, int dirfd, const char *name) {
+  char got[PATH_MAX];
+  errno = 0;
+  ssize_t n = readlinkat(dirfd, name, got, PATH_MAX - 1);
+  if (n >= 0) {
+    got[n] = 0;
+    print_target(label, got);
+  } else {
+    printf("%s=-1 errno=%s\n", label, errno_name(errno));
+  }
+}
+
+/* Descriptor `fd`'s link read through a link to the caller's own
+ * descriptor directory, by each spelling --directory-links names. */
+static void show_through_directories(
+    const char *label,
+    int fd,
+    int self_fd,
+    int thread_fd,
+    int dev_fd,
+    int proc) {
+  char path[160];
+  char shown[160];
+  int pid = (int)getpid();
+  int tid = (int)gettid_raw();
+  const char *spellings[] = {
+      "/proc/self/fd/%d/%d",
+      "/proc/%d/fd/%d/%d",
+      "/proc/thread-self/fd/%d/%d",
+      "/proc/%d/task/%d/fd/%d/%d",
+      "/dev/fd/%d/%d",
+  };
+  const char *names[] = {
+      "self/fd/D/N", "<pid>/fd/D/N", "thread-self/fd/D/N",
+      "<pid>/task/<tid>/fd/D/N", "/dev/fd/D/N"};
+  for (int i = 0; i < 5; i++) {
+    switch (i) {
+      case 1:
+        snprintf(path, sizeof(path), spellings[i], pid, self_fd, fd);
+        break;
+      case 3:
+        snprintf(path, sizeof(path), spellings[i], pid, tid, self_fd, fd);
+        break;
+      default:
+        snprintf(path, sizeof(path), spellings[i], self_fd, fd);
+    }
+    snprintf(shown, sizeof(shown), "through: %s %s", label, names[i]);
+    show_path(shown, path);
+  }
+  char name[32];
+  snprintf(name, sizeof(name), "%d", fd);
+  snprintf(shown, sizeof(shown), "through: %s readlinkat(D, N)", label);
+  show_at(shown, self_fd, name);
+  snprintf(path, sizeof(path), "/proc/self/fd/%d/%d", thread_fd, fd);
+  snprintf(shown, sizeof(shown), "through: %s self/fd/<thread-self/fd>/N", label);
+  show_path(shown, path);
+  snprintf(path, sizeof(path), "/proc/self/fd/%d/%d", dev_fd, fd);
+  snprintf(shown, sizeof(shown), "through: %s self/fd/</dev/fd>/N", label);
+  show_path(shown, path);
+  snprintf(path, sizeof(path), "/proc/self/fd/%d/self/fd/%d", proc, fd);
+  snprintf(shown, sizeof(shown), "through: %s self/fd/</proc>/self/fd/N", label);
+  show_path(shown, path);
+  snprintf(name, sizeof(name), "self/fd/%d", fd);
+  snprintf(shown, sizeof(shown), "through: %s readlinkat(</proc>, self/fd/N)", label);
+  show_at(shown, proc, name);
+  snprintf(path, sizeof(path), "/proc/self/fd/%d/%d/%d", self_fd, self_fd, fd);
+  snprintf(shown, sizeof(shown), "through: %s self/fd/D/D/N", label);
+  show_path(shown, path);
+  snprintf(name, sizeof(name), "%d/%d", self_fd, fd);
+  snprintf(shown, sizeof(shown), "through: %s readlinkat(D, D/N)", label);
+  show_at(shown, self_fd, name);
+  snprintf(name, sizeof(name), "self/fd/%d/%d", self_fd, fd);
+  snprintf(shown, sizeof(shown), "through: %s readlinkat(</proc>, self/fd/D/N)", label);
+  show_at(shown, proc, name);
+}
+
+/* The caller's own descriptor links read through a link to one of its own
+ * descriptor directories (--directory-links). */
+static int check_directory_links(void) {
+  char path[PATH_MAX];
+  snprintf(path, sizeof(path), "%s/through", dir);
+  int file = open(path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+  CHECK(file >= 0, "open %s: %s", path, strerror(errno));
+  int null = open("/dev/null", O_RDONLY | O_CLOEXEC);
+  CHECK(null >= 0, "open /dev/null: %s", strerror(errno));
+  int self_fd = open("/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  CHECK(self_fd >= 0, "open /proc/self/fd: %s", strerror(errno));
+  int thread_fd = open("/proc/thread-self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  CHECK(thread_fd >= 0, "open /proc/thread-self/fd: %s", strerror(errno));
+  int dev_fd = open("/dev/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  CHECK(dev_fd >= 0, "open /dev/fd: %s", strerror(errno));
+  int proc = open("/proc", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  CHECK(proc >= 0, "open /proc: %s", strerror(errno));
+  show_through_directories("file", file, self_fd, thread_fd, dev_fd, proc);
+  show_through_directories("null", null, self_fd, thread_fd, dev_fd, proc);
+  snprintf(path, sizeof(path), "/proc/self/fd/%d/%d", self_fd, self_fd);
+  show_path_own_pid("through: D's own link self/fd/D/D", path);
+  snprintf(path, sizeof(path), "/proc/self/fd/%d/%d", self_fd, 999);
+  show_path("through: closed self/fd/D/999", path);
+  snprintf(path, sizeof(path), "/proc/self/fd/%d/%d/", self_fd, file);
+  show_path("through: followed file self/fd/D/N/", path);
+  snprintf(path, sizeof(path), "/proc/self/fd/%d/%d/.", self_fd, file);
+  show_path("through: walked file self/fd/D/N/.", path);
+  int fds[] = {file, null, self_fd, thread_fd, dev_fd, proc};
+  for (size_t i = 0; i < sizeof(fds) / sizeof(fds[0]); i++) {
+    CHECK(close(fds[i]) == 0, "close: %s", strerror(errno));
+  }
+  snprintf(path, sizeof(path), "%s/through", dir);
+  CHECK(unlink(path) == 0, "unlink %s: %s", path, strerror(errno));
+  printf("failures=%d\n", failures);
+  return failures == 0 ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
-  if (argc != 2) {
-    fprintf(stderr, "usage: %s DIR\n", argv[0]);
+  int sibling = argc == 3 && strcmp(argv[2], "--sibling-directories") == 0;
+  int directory_links = argc == 3 && strcmp(argv[2], "--directory-links") == 0;
+  if (argc != 2 && !sibling && !directory_links) {
+    fprintf(stderr, "usage: %s DIR [--sibling-directories | --directory-links]\n", argv[0]);
     return 2;
   }
   setvbuf(stdout, NULL, _IOLBF, 0);
@@ -421,6 +673,12 @@ int main(int argc, char **argv) {
   if (chdir(dir) != 0) {
     perror("chdir DIR");
     return 2;
+  }
+  if (sibling) {
+    return check_sibling_directories();
+  }
+  if (directory_links) {
+    return check_directory_links();
   }
   proc_fd_directory = open("/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
   CHECK(proc_fd_directory >= 0, "open /proc/self/fd: %s", strerror(errno));
@@ -526,6 +784,32 @@ int main(int argc, char **argv) {
   show_followed("removed directory", removed);
   show_followed("pipe", pipes[0]);
 
+  /* A "." after a link: a lookup in what it leads to. */
+  show_walked("file", "/proc/self/fd/%d", file, "/.");
+  show_walked("directory", "/proc/self/fd/%d", directory, "/.");
+  show_walked("directory", "/proc/self/fd/%d", directory, "/./");
+  show_walked("removed directory", "/proc/self/fd/%d", removed, "/.");
+  show_walked("pipe", "/proc/self/fd/%d", pipes[0], "/.");
+  show_walked("closed", "/proc/self/fd/%d", closed, "/.");
+  show_walked("thread-self file", "/proc/thread-self/fd/%d", file, "//.");
+  show_walked("dev/fd directory", "/dev/fd/%d", directory, "/.");
+  show_path("walked: self/cwd/.", "/proc/self/cwd/.");
+  show_path("walked: thread-self/cwd/.", "/proc/thread-self/cwd/.");
+  show_path("walked: self/root/.", "/proc/self/root/.");
+  show_path("walked: self/exe/.", "/proc/self/exe/.");
+  show_path("walked: self/exe/./", "/proc/self/exe/./");
+
+  /* The process's own procfs files, which a backend may keep itself. */
+  int status = open("/proc/self/status", O_RDONLY | O_CLOEXEC);
+  CHECK(status >= 0, "open /proc/self/status: %s", strerror(errno));
+  show_own_proc_file("status", status, "status");
+  show_followed("status", status);
+  show_walked("status", "/proc/self/fd/%d", status, "/.");
+  int maps = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+  CHECK(maps >= 0, "open /proc/self/maps: %s", strerror(errno));
+  show_own_proc_file("maps", maps, "maps");
+  CHECK(close(maps) == 0, "close maps: %s", strerror(errno));
+
   thread_fd = file;
   pthread_t thread;
   CHECK(
@@ -533,7 +817,8 @@ int main(int argc, char **argv) {
       "pthread_create failed");
   CHECK(pthread_join(thread, NULL) == 0, "pthread_join failed");
 
-  check_child(file);
+  check_child(file, status);
+  CHECK(close(status) == 0, "close status: %s", strerror(errno));
   check_exe(argv[0]);
   check_cwd();
 
