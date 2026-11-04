@@ -2107,6 +2107,42 @@ impl<T: RecordOrReplay> Detcore<T> {
         !matches!((uid, euid), (Ok(uid), Ok(euid)) if uid == euid && uid != OVERFLOW_ID)
     }
 
+    /// Make sure, once per thread, at its first clone, that Detcore's model
+    /// knows the guest-visible parent of the thread's process: where it does
+    /// not (`procfs::task_stat::TaskStatFacts::parent` is `None`), the
+    /// process's real parent is outside the guest's tree (the run's root,
+    /// and a `CLONE_PARENT` child of such a process), and the process's own
+    /// `getppid` answer, injected here, in its own turn, is recorded
+    /// (`Scheduler::record_external_parent`), as its first open of its own
+    /// rendered `stat` records it. A process it creates can then read that
+    /// parent in the process's rendered `stat` (package K item 2b slice
+    /// 2b-1): Linux reads it from `real_parent` at each read (`do_task_stat`)
+    /// and it does not change during the run. Not under record and replay,
+    /// where Detcore renders no procfs file.
+    async fn record_external_parent_at_clone<G: Guest<Self>>(&self, guest: &mut G) {
+        if self.cfg.recordreplay_modes || guest.thread_state().external_parent_checked {
+            return;
+        }
+        guest.thread_state_mut().external_parent_checked = true;
+        let Some(process) = guest.thread_state().detpid else {
+            return;
+        };
+        let facts = crate::tool_global::task_stat_facts(
+            guest,
+            crate::procfs::BoundTask {
+                process: process.as_raw(),
+                thread: None,
+            },
+        )
+        .await;
+        if facts.parent.is_some() || facts.process != Some(process.as_raw()) {
+            return;
+        }
+        if let Ok(parent) = guest.inject(syscalls::Getppid::new()).await {
+            crate::tool_global::record_external_parent(guest, process, parent as i32).await;
+        }
+    }
+
     /// Clone, clone3, fork, vfork system calls
     pub async fn handle_clone_family<G: Guest<Self>>(
         &self,
@@ -2186,6 +2222,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             && !flags.contains(CloneFlags::CLONE_THREAD)
             && !self.cfg.recordreplay_modes
             && self.user_namespace_owner_may_differ(guest).await;
+
+        // The caller's process's guest-visible parent, where its real parent
+        // is outside the guest's tree, before the clone makes a process that
+        // could read the caller's stat.
+        self.record_external_parent_at_clone(guest).await;
 
         // The child's ID, when Detcore chooses the IDs: taken here, in this
         // turn, before the vfork parent below gives the turn up.
@@ -3217,6 +3258,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                 },
             )
             .await;
+        }
+        // The exit code the zombie keeps until it is reaped, which its
+        // rendered `/proc/<pid>/stat` shows (field 52): `exit_group` passes
+        // the status shifted left by 8 to `do_group_exit` (kernel/exit.c:1113
+        // in 6.17), on every backend (`Scheduler::record_exit_code`).
+        if let Some(process) = guest.thread_state().detpid {
+            crate::tool_global::record_exit_code(guest, process, (call.status() & 0xff) << 8).await;
         }
         // On [`OwnerDeathPath::Barrier`] the walk follows the grant and wakes
         // at once, as an exit does (`Self::run_robust_list_owner_death`):
