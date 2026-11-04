@@ -87,10 +87,12 @@ mod tests {
     use super::*;
 
     /// Revisions reserved for a change that is not on this base yet, which
-    /// `GLOBAL_RPC_REVISIONS` therefore skips: none now, since SP2's 25
-    /// (reserved as 22 with its record version) landed beneath PRCTL's 26,
-    /// with its row. Remove an entry when its change lands, with its row.
-    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[];
+    /// `GLOBAL_RPC_REVISIONS` therefore skips: 29 to 37, taken by changes
+    /// the coordinator allocated them to that are not beneath package K item
+    /// 2b slice 2b-1, and 38, released and given to no change, which 2b-1's
+    /// 39 follows (allocated by the kvm lane's coordinator, 2026-11-04).
+    /// Remove an entry when its change lands, with its row.
+    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[29, 30, 31, 32, 33, 34, 35, 36, 37, 38];
 
     /// Every revision of the global RPC, oldest first, with the digest of the
     /// code of its two enums and its `Resources` payload. A change to any of
@@ -229,6 +231,12 @@ mod tests {
         // its rebase onto main's pidfd revision 27; digest measured at this
         // head).
         (28, "a23bc7a0c1215843", "f013e36743d8d9e6"),
+        // Adds `GlobalRequest::WithCpuTime`, which carries a thread's CPU
+        // accounting on its request (`CpuPublication`, defined outside the
+        // digested enums), and `GlobalRequest::RecordExitCode` and its
+        // response (package K item 2b slice 2b-1, revision 39 allocated by the
+        // kvm lane's coordinator; digest measured at this head).
+        (39, "87cc13c4d4a45073", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
