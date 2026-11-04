@@ -9997,6 +9997,7 @@ impl<T> ThreadState<T> {
         let Some(max_timeslice) = cfg.max_timeslice else {
             return;
         };
+        let max_timeslice = self.after_post_crash(max_timeslice);
         if self.end_of_timeslice.is_none() || self.end_of_timeslice != self.replay_backstop {
             return;
         }
@@ -12075,6 +12076,38 @@ mod timeslice_tests {
             state.end_of_timeslice,
             Some(state.thread_logical_time.as_nanos() + Duration::from_nanos(100_000))
         );
+    }
+
+    /// After the post-crash switch, a kept slice's restarted backstop uses
+    /// the post-crash bound, as `next_timeslice` does. Restarting from the
+    /// ordinary maximum instead ended a switched thread's slice at the old,
+    /// smaller bound, and its replay departed from the recording. A slice
+    /// end the schedule owns is still left alone.
+    #[test]
+    fn a_kept_replay_slice_restarts_its_backstop_at_the_post_crash_bound() {
+        let config = Config {
+            max_timeslice: nz(20_000),
+            post_crash_timeslice: nz(100_000),
+            replay_schedule_from: Some(std::path::PathBuf::from("schedule.json")),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(1), &config, ());
+        state.next_timeslice(&config);
+        state.post_crash_bound = nz(100_000);
+        state.thread_logical_time.add_rcbs(1000);
+        let now = state.thread_logical_time.as_nanos();
+
+        state.restart_replay_backstop(&config);
+        let restarted = Some(now + Duration::from_nanos(100_000));
+        assert_eq!(state.end_of_timeslice, restarted);
+        assert_eq!(state.max_timeslice_end, restarted);
+        assert_eq!(state.replay_backstop, restarted);
+
+        let scheduled = now + Duration::from_nanos(10);
+        state.install_schedule_deadline(scheduled, true);
+        state.restart_replay_backstop(&config);
+        assert_eq!(state.end_of_timeslice, Some(scheduled));
+        assert_eq!(state.max_timeslice_end, Some(scheduled));
     }
 
     /// A slice end the replayed schedule installs stays one even on the
