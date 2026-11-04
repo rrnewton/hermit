@@ -1,0 +1,44 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="The maximum timeslice that `hermit run --chaos --chaos-seeded-timeslice` draws from the scheduler seed."><title>hermit::chaos_timeslice - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="hermit" data-themes="" data-resource-suffix="" data-rustdoc-version="1.99.0-nightly (be8e82435 2026-07-11)" data-channel="nightly" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module chaos_timeslice</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../hermit/index.html">hermit</a><span class="version">0.5.4</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module chaos_<wbr>timeslice</a></h2><h3><a href="#constants">Module Items</a></h3><ul class="block"><li><a href="#constants" title="Constants">Constants</a></li><li><a href="#functions" title="Functions">Functions</a></li></ul></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="../index.html">In crate hermit</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">hermit</a></div><h1>Module <span>chaos_<wbr>timeslice</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/hermit/chaos_timeslice.rs.html#9-215">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>The maximum timeslice that <code>hermit run --chaos --chaos-seeded-timeslice</code>
+draws from the scheduler seed.</p>
+<p>Chaos mode ends each timeslice after a random number of retired
+conditional branches, exponentially distributed with a mean of the
+maximum timeslice and capped at it. Which mean finds a race depends on the
+race: one whose window is a few dozen branches long needs slices of about a
+hundred branches, while one whose second thread must run far into its own
+work before the conflicting access needs slices that let it get there. A
+fixed mean suits one of them. Drawing the mean once per scheduler seed
+spreads a sweep of seeds across five orders of magnitude, so it covers both
+without a guessed value.</p>
+<p>The draw is not uniform over those orders of magnitude. The races measured
+needed either the shortest slices or the longest: a 46-branch window in a
+multithreaded C++ test binary failed in 9 of 32 seeds at 1000 ns and in
+none of 32 at 1e4, 1e5, 1e6 or the default 2e8 ns (1e7 was not measured),
+while races whose other thread must first run tens of thousands of branches
+need 1000000 ns or more, and none of the races measured needed the decades
+in between. So
+<a href="constant.SEEDED_MAX_TIMESLICE_PIECES.html" title="constant hermit::chaos_timeslice::SEEDED_MAX_TIMESLICE_PIECES"><code>SEEDED_MAX_TIMESLICE_PIECES</code></a> gives two in five seeds 1000 to 2000 ns (100
+to 200 branches per slice), two in five 1000000 to 200000000 ns, and keeps
+one in five for the decades between them.</p>
+<p>The draw is a pure function of the scheduler seed (and of the one-RCB
+floor, which only a large clock multiplier or slowdown factor raises above
+the range). It seeds a generator of its own and takes nothing from the
+streams Detcore already derives from that seed (each thread’s chaos
+generator, the post-fork generator, the per-thread slowdown factors), so
+those are seeded exactly as before. Its result is an ordinary
+<code>--max-timeslice</code> value: Detcore receives the configuration of a run given
+that value explicitly.</p>
+</div></details><h2 id="constants" class="section-header">Constants<a href="#constants" class="anchor">§</a></h2><dl class="item-table"><dt><a class="constant" href="constant.DEFAULT_MAX_TIMESLICE.html" title="constant hermit::chaos_timeslice::DEFAULT_MAX_TIMESLICE">DEFAULT_<wbr>MAX_<wbr>TIMESLICE</a></dt><dd><a href="constant.SEEDED_MAX_TIMESLICE_MAX_NS.html" title="constant hermit::chaos_timeslice::SEEDED_MAX_TIMESLICE_MAX_NS"><code>SEEDED_MAX_TIMESLICE_MAX_NS</code></a> as a maximum: the default that
+<code>--chaos-seeded-timeslice</code> stands in for where it draws nothing.</dd><dt><a class="constant" href="constant.SEEDED_MAX_TIMESLICE_MAX_NS.html" title="constant hermit::chaos_timeslice::SEEDED_MAX_TIMESLICE_MAX_NS">SEEDED_<wbr>MAX_<wbr>TIMESLICE_<wbr>MAX_<wbr>NS</a></dt><dd>The largest drawn maximum, in virtual nanoseconds: the <code>--max-timeslice</code>
+default. No draw exceeds it, so a replay of a recorded chaos run, which
+keeps the default, is never bounded more tightly than the recording was.</dd><dt><a class="constant" href="constant.SEEDED_MAX_TIMESLICE_MIN_NS.html" title="constant hermit::chaos_timeslice::SEEDED_MAX_TIMESLICE_MIN_NS">SEEDED_<wbr>MAX_<wbr>TIMESLICE_<wbr>MIN_<wbr>NS</a></dt><dd>The smallest drawn maximum, in virtual nanoseconds: 100 retired
+conditional branches at the default clock multiplier.</dd><dt><a class="constant" href="constant.SEEDED_MAX_TIMESLICE_PIECES.html" title="constant hermit::chaos_timeslice::SEEDED_MAX_TIMESLICE_PIECES">SEEDED_<wbr>MAX_<wbr>TIMESLICE_<wbr>PIECES</a></dt><dd>The pieces of the drawn maximum’s distribution, in order: each is
+<code>(share, low, high)</code>, the share of seeds whose maximum falls in
+[<code>low</code>, <code>high</code>] virtual nanoseconds, log-uniformly within it. The pieces
+are contiguous, run from <a href="constant.SEEDED_MAX_TIMESLICE_MIN_NS.html" title="constant hermit::chaos_timeslice::SEEDED_MAX_TIMESLICE_MIN_NS"><code>SEEDED_MAX_TIMESLICE_MIN_NS</code></a> to
+<a href="constant.SEEDED_MAX_TIMESLICE_MAX_NS.html" title="constant hermit::chaos_timeslice::SEEDED_MAX_TIMESLICE_MAX_NS"><code>SEEDED_MAX_TIMESLICE_MAX_NS</code></a>, and their shares sum to one.</dd></dl><h2 id="functions" class="section-header">Functions<a href="#functions" class="anchor">§</a></h2><dl class="item-table"><dt><a class="fn" href="fn.seeded_max_timeslice.html" title="fn hermit::chaos_timeslice::seeded_max_timeslice">seeded_<wbr>max_<wbr>timeslice</a></dt><dd>The maximum timeslice, in virtual nanoseconds, drawn for <code>sched_seed</code>: one
+uniform number <code>u</code> from the seed’s own generator, mapped through the
+quantile function of <a href="constant.SEEDED_MAX_TIMESLICE_PIECES.html" title="constant hermit::chaos_timeslice::SEEDED_MAX_TIMESLICE_PIECES"><code>SEEDED_MAX_TIMESLICE_PIECES</code></a> (the piece whose
+cumulative share passes <code>u</code>, log-uniformly within it), rounded to a whole
+nanosecond, then raised to <code>minimum_ns</code> (one RCB at the run’s clock
+multiplier and slowdown, <a href="../struct.DetConfig.html#method.minimum_max_timeslice_nanos" title="method hermit::DetConfig::minimum_max_timeslice_nanos"><code>detcore::Config::minimum_max_timeslice_nanos</code></a>)
+if it falls below it. The mapping is monotone in <code>u</code>.</dd></dl></section></div></main></body></html>

@@ -1,0 +1,468 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `detcore/src/procfs/memory_map.rs`."><title>memory_map.rs - source</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../../" data-static-root-path="../../../static.files/" data-current-crate="detcore" data-themes="" data-resource-suffix="" data-rustdoc-version="1.99.0-nightly (be8e82435 2026-07-11)" data-channel="nightly" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../../static.files/storage-41dd4d93.js"></script><script defer src="../../../static.files/src-script-813739b1.js"></script><script defer src="../../../src-files.js"></script><script defer src="../../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../../static.files/favicon-044be391.svg"></head><body class="rustdoc src"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="sidebar"><div class="src-sidebar-title"><h2>Files</h2></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1><div class="sub-heading">detcore/procfs/</div>memory_map.rs</h1><rustdoc-toolbar></rustdoc-toolbar></div><div class="example-wrap digits-3"><pre class="rust"><code><a href=#1 id=1 data-nosnippet>1</a><span class="comment">/*
+<a href=#2 id=2 data-nosnippet>2</a> * Copyright (c) Meta Platforms, Inc. and affiliates.
+<a href=#3 id=3 data-nosnippet>3</a> * All rights reserved.
+<a href=#4 id=4 data-nosnippet>4</a> *
+<a href=#5 id=5 data-nosnippet>5</a> * This source code is licensed under the BSD-style license found in the
+<a href=#6 id=6 data-nosnippet>6</a> * LICENSE file in the root directory of this source tree.
+<a href=#7 id=7 data-nosnippet>7</a> */
+<a href=#8 id=8 data-nosnippet>8</a>
+<a href=#9 id=9 data-nosnippet>9</a></span><span class="doccomment">//! A process's `maps` rendered from the backend's memory map
+<a href=#10 id=10 data-nosnippet>10</a>//! (`reverie::Guest::memory_map`), where the backend gives one: each listed
+<a href=#11 id=11 data-nosnippet>11</a>//! mapping as one line, as Linux prints it (`show_map_vma` and
+<a href=#12 id=12 data-nosnippet>12</a>//! `show_vma_header_prefix` in `fs/proc/task_mmu.c`), in the order listed.
+<a href=#13 id=13 data-nosnippet>13</a>//!
+<a href=#14 id=14 data-nosnippet>14</a>//! The backend's list is exact for each mapping it lists, but it need not be
+<a href=#15 id=15 data-nosnippet>15</a>//! complete (`reverie::MemoryMap::complete`). On ptrace it is the kernel's own
+<a href=#16 id=16 data-nosnippet>16</a>//! text, so the rendered file is the one the kernel prints. On KVM it holds the
+<a href=#17 id=17 data-nosnippet>17</a>//! stack window's mappings only, `[stack]` and the parts a split left of it:
+<a href=#18 id=18 data-nosnippet>18</a>//! the image, the interpreter, the vDSO, the heap and every mapping `mmap(2)`
+<a href=#19 id=19 data-nosnippet>19</a>//! made are missing from the rendered file, a named difference of the KVM
+<a href=#20 id=20 data-nosnippet>20</a>//! provider (&lt;https://github.com/rrnewton/reverie/issues/1211&gt;). Nothing here
+<a href=#21 id=21 data-nosnippet>21</a>//! infers from a missing line that no mapping is there, and an incomplete list
+<a href=#22 id=22 data-nosnippet>22</a>//! that lists nothing is no answer: KVM's, once LinuxEmu has lost track of the
+<a href=#23 id=23 data-nosnippet>23</a>//! stack window (an `mprotect(2)` across a hole in it, which LinuxEmu refuses
+<a href=#24 id=24 data-nosnippet>24</a>//! whole where Linux changes the part before the hole, or a change a `vfork`
+<a href=#25 id=25 data-nosnippet>25</a>//! partner made). The file is then read as it was before this rendering.
+<a href=#26 id=26 data-nosnippet>26</a>//!
+<a href=#27 id=27 data-nosnippet>27</a>//! One line the kernel prints is left out, and only here: `[uprobes]`, the
+<a href=#28 id=28 data-nosnippet>28</a>//! page the kernel adds to a process the first time a uprobe fires in it
+<a href=#29 id=29 data-nosnippet>29</a>//! (`xol_add_vma` in `kernel/events/uprobes.c`). Whether it is there depends
+<a href=#30 id=30 data-nosnippet>30</a>//! on what other processes on the host do (a profiler installing a uprobe on a
+<a href=#31 id=31 data-nosnippet>31</a>//! file the guest runs), not on the guest, so it can be in one run of a guest
+<a href=#32 id=32 data-nosnippet>32</a>//! and not in the next one on the same host. Lines that depend on the host or
+<a href=#33 id=33 data-nosnippet>33</a>//! on the backend but stay the same from run to run on one host are kept:
+<a href=#34 id=34 data-nosnippet>34</a>//! `[vsyscall]` (the kernel's `vsyscall=` mode), `[vvar_vclock]` (the kernel's
+<a href=#35 id=35 data-nosnippet>35</a>//! version), the sizes of `[vdso]` and `[vvar]`, and the pages a backend maps
+<a href=#36 id=36 data-nosnippet>36</a>//! into the guest for itself, which only `super::private_maps` removes, for
+<a href=#37 id=37 data-nosnippet>37</a>//! the backends that report them.
+<a href=#38 id=38 data-nosnippet>38</a>//!
+<a href=#39 id=39 data-nosnippet>39</a>//! The page is left out of the file this module renders, and nowhere else: it
+<a href=#40 id=40 data-nosnippet>40</a>//! still shows in `smaps` and `numa_maps`, in another process's `maps`, and in
+<a href=#41 id=41 data-nosnippet>41</a>//! a `maps` that is read from the kernel's file (by another process that
+<a href=#42 id=42 data-nosnippet>42</a>//! inherited the descriptor, or after an `exec`). Nor is the page's effect on
+<a href=#43 id=43 data-nosnippet>43</a>//! the rest of the map hidden: the kernel asks for it one page below the top
+<a href=#44 id=44 data-nosnippet>44</a>//! of the address space, which on a host with 4-level paging is inside the
+<a href=#45 id=45 data-nosnippet>45</a>//! stack, so there it takes a page a later mapping could have had (read from
+<a href=#46 id=46 data-nosnippet>46</a>//! the source, not measured: this host has 5-level paging, where that address
+<a href=#47 id=47 data-nosnippet>47</a>//! is free). x86's `[uprobes-trampoline]` page, which the kernel maps near a
+<a href=#48 id=48 data-nosnippet>48</a>//! probed instruction it optimizes (`create_uprobe_trampoline` in
+<a href=#49 id=49 data-nosnippet>49</a>//! `arch/x86/kernel/uprobes.c`), is not left out.
+<a href=#50 id=50 data-nosnippet>50</a>
+<a href=#51 id=51 data-nosnippet>51</a></span><span class="kw">use </span>detcore_model::futex::MmId;
+<a href=#52 id=52 data-nosnippet>52</a><span class="kw">use </span>reverie::MappingBacking;
+<a href=#53 id=53 data-nosnippet>53</a><span class="kw">use </span>reverie::MappingFact;
+<a href=#54 id=54 data-nosnippet>54</a><span class="kw">use </span>reverie::MemoryMap;
+<a href=#55 id=55 data-nosnippet>55</a><span class="kw">use </span>serde::Deserialize;
+<a href=#56 id=56 data-nosnippet>56</a><span class="kw">use </span>serde::Serialize;
+<a href=#57 id=57 data-nosnippet>57</a>
+<a href=#58 id=58 data-nosnippet>58</a><span class="kw">use </span><span class="kw">super</span>::BoundTask;
+<a href=#59 id=59 data-nosnippet>59</a><span class="kw">use </span><span class="kw">super</span>::TaskIncarnation;
+<a href=#60 id=60 data-nosnippet>60</a><span class="kw">use </span><span class="kw">super</span>::listing::ProcfsTaskAnswer;
+<a href=#61 id=61 data-nosnippet>61</a>
+<a href=#62 id=62 data-nosnippet>62</a><span class="doccomment">/// The column `seq_pad` fills a header to before a name, with
+<a href=#63 id=63 data-nosnippet>63</a>/// `seq_setwidth(m, 25 + sizeof(void *) * 6 - 1)` on a 64-bit kernel.
+<a href=#64 id=64 data-nosnippet>64</a></span><span class="kw">const </span>NAME_COLUMN: usize = <span class="number">25 </span>+ <span class="number">8 </span>* <span class="number">6 </span>- <span class="number">1</span>;
+<a href=#65 id=65 data-nosnippet>65</a>
+<a href=#66 id=66 data-nosnippet>66</a><span class="doccomment">/// The name the kernel gives the page uprobes execute their copied
+<a href=#67 id=67 data-nosnippet>67</a>/// instructions from (`xol_add_vma`).
+<a href=#68 id=68 data-nosnippet>68</a></span><span class="kw">const </span>UPROBES: <span class="kw-2">&amp;</span>[u8] = <span class="string">b"[uprobes]"</span>;
+<a href=#69 id=69 data-nosnippet>69</a>
+<a href=#70 id=70 data-nosnippet>70</a><span class="doccomment">/// The bytes of a `maps` file listing `map`'s mappings, but for any
+<a href=#71 id=71 data-nosnippet>71</a>/// `[uprobes]` page. `None` where `map` is an incomplete list that lists
+<a href=#72 id=72 data-nosnippet>72</a>/// nothing once that page is left out, or where a mapping's backing is one
+<a href=#73 id=73 data-nosnippet>73</a>/// this renderer does not know, so that the caller reads the file another way
+<a href=#74 id=74 data-nosnippet>74</a>/// rather than print a file Linux would not.
+<a href=#75 id=75 data-nosnippet>75</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>render(map: <span class="kw-2">&amp;</span>MemoryMap) -&gt; <span class="prelude-ty">Option</span>&lt;Vec&lt;u8&gt;&gt; {
+<a href=#76 id=76 data-nosnippet>76</a>    <span class="kw">let </span><span class="kw-2">mut </span>out = Vec::new();
+<a href=#77 id=77 data-nosnippet>77</a>    <span class="kw">for </span>mapping <span class="kw">in </span><span class="kw-2">&amp;</span>map.mappings {
+<a href=#78 id=78 data-nosnippet>78</a>        <span class="kw">if </span><span class="macro">matches!</span>(<span class="kw-2">&amp;</span>mapping.backing, MappingBacking::Special(name) <span class="kw">if </span>name == UPROBES) {
+<a href=#79 id=79 data-nosnippet>79</a>            <span class="kw">continue</span>;
+<a href=#80 id=80 data-nosnippet>80</a>        }
+<a href=#81 id=81 data-nosnippet>81</a>        line(mapping, <span class="kw-2">&amp;mut </span>out)<span class="question-mark">?</span>;
+<a href=#82 id=82 data-nosnippet>82</a>    }
+<a href=#83 id=83 data-nosnippet>83</a>    <span class="kw">if </span>!map.complete &amp;&amp; out.is_empty() {
+<a href=#84 id=84 data-nosnippet>84</a>        <span class="kw">return </span><span class="prelude-val">None</span>;
+<a href=#85 id=85 data-nosnippet>85</a>    }
+<a href=#86 id=86 data-nosnippet>86</a>    <span class="prelude-val">Some</span>(out)
+<a href=#87 id=87 data-nosnippet>87</a>}
+<a href=#88 id=88 data-nosnippet>88</a>
+<a href=#89 id=89 data-nosnippet>89</a><span class="doccomment">/// Append `mapping`'s line, newline included.
+<a href=#90 id=90 data-nosnippet>90</a></span><span class="kw">fn </span>line(mapping: <span class="kw-2">&amp;</span>MappingFact, out: <span class="kw-2">&amp;mut </span>Vec&lt;u8&gt;) -&gt; <span class="prelude-ty">Option</span>&lt;()&gt; {
+<a href=#91 id=91 data-nosnippet>91</a>    <span class="kw">let </span>(device, inode, name): (u64, u64, <span class="prelude-ty">Option</span>&lt;Vec&lt;u8&gt;&gt;) = <span class="kw">match </span><span class="kw-2">&amp;</span>mapping.backing {
+<a href=#92 id=92 data-nosnippet>92</a>        MappingBacking::Anonymous =&gt; (<span class="number">0</span>, <span class="number">0</span>, <span class="prelude-val">None</span>),
+<a href=#93 id=93 data-nosnippet>93</a>        MappingBacking::Stack =&gt; (<span class="number">0</span>, <span class="number">0</span>, <span class="prelude-val">Some</span>(<span class="string">b"[stack]"</span>.to_vec())),
+<a href=#94 id=94 data-nosnippet>94</a>        MappingBacking::Heap =&gt; (<span class="number">0</span>, <span class="number">0</span>, <span class="prelude-val">Some</span>(<span class="string">b"[heap]"</span>.to_vec())),
+<a href=#95 id=95 data-nosnippet>95</a>        MappingBacking::Vdso =&gt; (<span class="number">0</span>, <span class="number">0</span>, <span class="prelude-val">Some</span>(<span class="string">b"[vdso]"</span>.to_vec())),
+<a href=#96 id=96 data-nosnippet>96</a>        MappingBacking::Vvar =&gt; (<span class="number">0</span>, <span class="number">0</span>, <span class="prelude-val">Some</span>(<span class="string">b"[vvar]"</span>.to_vec())),
+<a href=#97 id=97 data-nosnippet>97</a>        MappingBacking::NamedAnonymous(name) =&gt; (<span class="number">0</span>, <span class="number">0</span>, <span class="prelude-val">Some</span>([<span class="string">b"[anon:"</span>, <span class="kw-2">&amp;</span>name[..], <span class="string">b"]"</span>].concat())),
+<a href=#98 id=98 data-nosnippet>98</a>        MappingBacking::Special(name) =&gt; (<span class="number">0</span>, <span class="number">0</span>, <span class="prelude-val">Some</span>(name.clone())),
+<a href=#99 id=99 data-nosnippet>99</a>        MappingBacking::File {
+<a href=#100 id=100 data-nosnippet>100</a>            raw_device,
+<a href=#101 id=101 data-nosnippet>101</a>            raw_inode,
+<a href=#102 id=102 data-nosnippet>102</a>            path,
+<a href=#103 id=103 data-nosnippet>103</a>        } =&gt; (<span class="kw-2">*</span>raw_device, <span class="kw-2">*</span>raw_inode, <span class="prelude-val">Some</span>(path.clone())),
+<a href=#104 id=104 data-nosnippet>104</a>        MappingBacking::NamedSharedAnonymous {
+<a href=#105 id=105 data-nosnippet>105</a>            raw_device,
+<a href=#106 id=106 data-nosnippet>106</a>            raw_inode,
+<a href=#107 id=107 data-nosnippet>107</a>            name,
+<a href=#108 id=108 data-nosnippet>108</a>        } =&gt; (
+<a href=#109 id=109 data-nosnippet>109</a>            <span class="kw-2">*</span>raw_device,
+<a href=#110 id=110 data-nosnippet>110</a>            <span class="kw-2">*</span>raw_inode,
+<a href=#111 id=111 data-nosnippet>111</a>            <span class="prelude-val">Some</span>([<span class="string">b"[anon_shmem:"</span>, <span class="kw-2">&amp;</span>name[..], <span class="string">b"]"</span>].concat()),
+<a href=#112 id=112 data-nosnippet>112</a>        ),
+<a href=#113 id=113 data-nosnippet>113</a>        <span class="kw">_ </span>=&gt; <span class="kw">return </span><span class="prelude-val">None</span>,
+<a href=#114 id=114 data-nosnippet>114</a>    };
+<a href=#115 id=115 data-nosnippet>115</a>    <span class="kw">let </span>prot = |bit: libc::c_int, set: u8| {
+<a href=#116 id=116 data-nosnippet>116</a>        <span class="kw">if </span>mapping.prot &amp; bit <span class="kw">as </span>u32 != <span class="number">0 </span>{
+<a href=#117 id=117 data-nosnippet>117</a>            set
+<a href=#118 id=118 data-nosnippet>118</a>        } <span class="kw">else </span>{
+<a href=#119 id=119 data-nosnippet>119</a>            <span class="string">b'-'
+<a href=#120 id=120 data-nosnippet>120</a>        </span>}
+<a href=#121 id=121 data-nosnippet>121</a>    };
+<a href=#122 id=122 data-nosnippet>122</a>    <span class="kw">let </span>start = out.len();
+<a href=#123 id=123 data-nosnippet>123</a>    out.extend_from_slice(
+<a href=#124 id=124 data-nosnippet>124</a>        <span class="macro">format!</span>(
+<a href=#125 id=125 data-nosnippet>125</a>            <span class="string">"{:08x}-{:08x} {}{}{}{} {:08x} {:02x}:{:02x} {} "</span>,
+<a href=#126 id=126 data-nosnippet>126</a>            mapping.start,
+<a href=#127 id=127 data-nosnippet>127</a>            mapping.end,
+<a href=#128 id=128 data-nosnippet>128</a>            prot(libc::PROT_READ, <span class="string">b'r'</span>) <span class="kw">as </span>char,
+<a href=#129 id=129 data-nosnippet>129</a>            prot(libc::PROT_WRITE, <span class="string">b'w'</span>) <span class="kw">as </span>char,
+<a href=#130 id=130 data-nosnippet>130</a>            prot(libc::PROT_EXEC, <span class="string">b'x'</span>) <span class="kw">as </span>char,
+<a href=#131 id=131 data-nosnippet>131</a>            <span class="kw">if </span>mapping.shared { <span class="string">'s' </span>} <span class="kw">else </span>{ <span class="string">'p' </span>},
+<a href=#132 id=132 data-nosnippet>132</a>            mapping.offset,
+<a href=#133 id=133 data-nosnippet>133</a>            libc::major(device),
+<a href=#134 id=134 data-nosnippet>134</a>            libc::minor(device),
+<a href=#135 id=135 data-nosnippet>135</a>            inode,
+<a href=#136 id=136 data-nosnippet>136</a>        )
+<a href=#137 id=137 data-nosnippet>137</a>        .as_bytes(),
+<a href=#138 id=138 data-nosnippet>138</a>    );
+<a href=#139 id=139 data-nosnippet>139</a>    <span class="kw">if let </span><span class="prelude-val">Some</span>(name) = name {
+<a href=#140 id=140 data-nosnippet>140</a>        <span class="kw">let </span>header = out.len() - start;
+<a href=#141 id=141 data-nosnippet>141</a>        out.extend(std::iter::repeat_n(
+<a href=#142 id=142 data-nosnippet>142</a>            <span class="string">b' '</span>,
+<a href=#143 id=143 data-nosnippet>143</a>            NAME_COLUMN.saturating_sub(header) + <span class="number">1</span>,
+<a href=#144 id=144 data-nosnippet>144</a>        ));
+<a href=#145 id=145 data-nosnippet>145</a>        out.extend_from_slice(<span class="kw-2">&amp;</span>name);
+<a href=#146 id=146 data-nosnippet>146</a>    }
+<a href=#147 id=147 data-nosnippet>147</a>    out.push(<span class="string">b'\n'</span>);
+<a href=#148 id=148 data-nosnippet>148</a>    <span class="prelude-val">Some</span>(())
+<a href=#149 id=149 data-nosnippet>149</a>}
+<a href=#150 id=150 data-nosnippet>150</a>
+<a href=#151 id=151 data-nosnippet>151</a><span class="doccomment">/// What a process's `maps`, opened by a task of the process its path names,
+<a href=#152 id=152 data-nosnippet>152</a>/// is bound to where Detcore may render it (`Detcore::maps_from_memory_map`):
+<a href=#153 id=153 data-nosnippet>153</a>/// the task its path named, which of the tasks to hold that task's numbers it
+<a href=#154 id=154 data-nosnippet>154</a>/// was, and the address space it held at the open, the opener's.
+<a href=#155 id=155 data-nosnippet>155</a>///
+<a href=#156 id=156 data-nosnippet>156</a>/// Linux's open takes the task's address space (`proc_maps_open`), and each
+<a href=#157 id=157 data-nosnippet>157</a>/// read first finds the task again by the pid its inode holds (`m_start`):
+<a href=#158 id=158 data-nosnippet>158</a>/// ESRCH once that task is reaped, whichever task holds its number by then.
+<a href=#159 id=159 data-nosnippet>159</a>/// Detcore gives a reaped task's number out again
+<a href=#160 id=160 data-nosnippet>160</a>/// (`Scheduler::forget_previous_process_exit`), and an address space's
+<a href=#161 id=161 data-nosnippet>161</a>/// identity ([`MmId`]) is a task's number and an exec count that a fork
+<a href=#162 id=162 data-nosnippet>162</a>/// starts again at 0. So a task holding a reused number may hold an address
+<a href=#163 id=163 data-nosnippet>163</a>/// space with the bound one's identity, and only the number's incarnation
+<a href=#164 id=164 data-nosnippet>164</a>/// ([`TaskIncarnation`]) tells the two tasks apart.
+<a href=#165 id=165 data-nosnippet>165</a>///
+<a href=#166 id=166 data-nosnippet>166</a>/// That incarnation is the bound task's: [`Binding::held_by`] compares the
+<a href=#167 id=167 data-nosnippet>167</a>/// reader's address space by its identity alone, which a reused number can
+<a href=#168 id=168 data-nosnippet>168</a>/// repeat while the bound task lives. On ptrace, once the kernel's pid space
+<a href=#169 id=169 data-nosnippet>169</a>/// wraps, a task that shares a reaped task's address space (a `CLONE_VM`
+<a href=#170 id=170 data-nosnippet>170</a>/// child that is not a thread) can open its maps and then fork a child that
+<a href=#171 id=171 data-nosnippet>171</a>/// gets the reaped task's number: that child's address space has the bound
+<a href=#172 id=172 data-nosnippet>172</a>/// one's identity, so it reads its own map through the inherited descriptor,
+<a href=#173 id=173 data-nosnippet>173</a>/// where Linux prints the opener's. Telling the two apart needs the
+<a href=#174 id=174 data-nosnippet>174</a>/// incarnation of the address space's maker in [`MmId`], which also keys
+<a href=#175 id=175 data-nosnippet>175</a>/// futexes. LinuxEmu never reuses a task's number.
+<a href=#176 id=176 data-nosnippet>176</a></span><span class="attr">#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+<a href=#177 id=177 data-nosnippet>177</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">struct </span>Binding {
+<a href=#178 id=178 data-nosnippet>178</a>    task: BoundTask,
+<a href=#179 id=179 data-nosnippet>179</a>    incarnation: TaskIncarnation,
+<a href=#180 id=180 data-nosnippet>180</a>    mm: MmId,
+<a href=#181 id=181 data-nosnippet>181</a>}
+<a href=#182 id=182 data-nosnippet>182</a>
+<a href=#183 id=183 data-nosnippet>183</a><span class="kw">impl </span>Binding {
+<a href=#184 id=184 data-nosnippet>184</a>    <span class="doccomment">/// The binding of a `maps` whose path named `task`, a task of the
+<a href=#185 id=185 data-nosnippet>185</a>    /// opener's process, where the process table answered `answer` about that
+<a href=#186 id=186 data-nosnippet>186</a>    /// task at the open and the opener's address space is `opener`. `None`
+<a href=#187 id=187 data-nosnippet>187</a>    /// where the task holds no address space, having exited (Linux's file
+<a href=#188 id=188 data-nosnippet>188</a>    /// then reads empty, as the kernel's does), or another one.
+<a href=#189 id=189 data-nosnippet>189</a>    </span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>at_open(
+<a href=#190 id=190 data-nosnippet>190</a>        task: BoundTask,
+<a href=#191 id=191 data-nosnippet>191</a>        answer: <span class="kw-2">&amp;</span>ProcfsTaskAnswer,
+<a href=#192 id=192 data-nosnippet>192</a>        opener: MmId,
+<a href=#193 id=193 data-nosnippet>193</a>    ) -&gt; <span class="prelude-ty">Option</span>&lt;<span class="self">Self</span>&gt; {
+<a href=#194 id=194 data-nosnippet>194</a>        (answer.exists &amp;&amp; !answer.without_mm &amp;&amp; answer.mm == <span class="prelude-val">Some</span>(opener)).then_some(<span class="self">Self </span>{
+<a href=#195 id=195 data-nosnippet>195</a>            task,
+<a href=#196 id=196 data-nosnippet>196</a>            incarnation: answer.incarnation(),
+<a href=#197 id=197 data-nosnippet>197</a>            mm: opener,
+<a href=#198 id=198 data-nosnippet>198</a>        })
+<a href=#199 id=199 data-nosnippet>199</a>    }
+<a href=#200 id=200 data-nosnippet>200</a>
+<a href=#201 id=201 data-nosnippet>201</a>    <span class="doccomment">/// The task the path named, which a read asks the process table about.
+<a href=#202 id=202 data-nosnippet>202</a>    </span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>task(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; BoundTask {
+<a href=#203 id=203 data-nosnippet>203</a>        <span class="self">self</span>.task
+<a href=#204 id=204 data-nosnippet>204</a>    }
+<a href=#205 id=205 data-nosnippet>205</a>
+<a href=#206 id=206 data-nosnippet>206</a>    <span class="doccomment">/// Whether a reader whose address space is `reader` holds the bound one:
+<a href=#207 id=207 data-nosnippet>207</a>    /// not another process that inherited the descriptor, nor the opener's
+<a href=#208 id=208 data-nosnippet>208</a>    /// process after an `exec`. The reader is then one of the address space's
+<a href=#209 id=209 data-nosnippet>209</a>    /// users, so Linux's read finds it still in use.
+<a href=#210 id=210 data-nosnippet>210</a>    </span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>held_by(<span class="kw-2">&amp;</span><span class="self">self</span>, reader: MmId) -&gt; bool {
+<a href=#211 id=211 data-nosnippet>211</a>        <span class="self">self</span>.mm == reader
+<a href=#212 id=212 data-nosnippet>212</a>    }
+<a href=#213 id=213 data-nosnippet>213</a>
+<a href=#214 id=214 data-nosnippet>214</a>    <span class="doccomment">/// Whether `answer`, the process table's answer about the bound task at a
+<a href=#215 id=215 data-nosnippet>215</a>    /// read, is about that very task, which Linux's read finds: it still
+<a href=#216 id=216 data-nosnippet>216</a>    /// exists (a zombie too) and no other task has taken its numbers.
+<a href=#217 id=217 data-nosnippet>217</a>    </span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>finds_its_task(<span class="kw-2">&amp;</span><span class="self">self</span>, answer: <span class="kw-2">&amp;</span>ProcfsTaskAnswer) -&gt; bool {
+<a href=#218 id=218 data-nosnippet>218</a>        answer.still_names(<span class="self">self</span>.incarnation)
+<a href=#219 id=219 data-nosnippet>219</a>    }
+<a href=#220 id=220 data-nosnippet>220</a>}
+<a href=#221 id=221 data-nosnippet>221</a>
+<a href=#222 id=222 data-nosnippet>222</a><span class="attr">#[cfg(test)]
+<a href=#223 id=223 data-nosnippet>223</a></span><span class="kw">mod </span>tests {
+<a href=#224 id=224 data-nosnippet>224</a>    <span class="kw">use super</span>::<span class="kw-2">*</span>;
+<a href=#225 id=225 data-nosnippet>225</a>
+<a href=#226 id=226 data-nosnippet>226</a>    <span class="doccomment">/// A map as Linux prints it (`show_map_vma`), with a line of each kind:
+<a href=#227 id=227 data-nosnippet>227</a>    /// files, `[heap]`, unnamed and named anonymous memory, write-only and
+<a href=#228 id=228 data-nosnippet>228</a>    /// shared anonymous memory, named shared anonymous memory, shared memory
+<a href=#229 id=229 data-nosnippet>229</a>    /// Linux backs with `/dev/zero (deleted)`, a path that holds a newline
+<a href=#230 id=230 data-nosnippet>230</a>    /// (`\012`), a file with no path, the vDSO's pages, a device with a
+<a href=#231 id=231 data-nosnippet>231</a>    /// three-digit major and an inode past the name column, a header longer
+<a href=#232 id=232 data-nosnippet>232</a>    /// than the name column (a nine-digit offset, the widest device and
+<a href=#233 id=233 data-nosnippet>233</a>    /// inode), a stack `mprotect(2)` split, and the gate area. The padding
+<a href=#234 id=234 data-nosnippet>234</a>    /// rule it follows reproduced each of the 46 lines of a process's own
+<a href=#235 id=235 data-nosnippet>235</a>    /// map on Linux 7.1.3.
+<a href=#236 id=236 data-nosnippet>236</a>    </span><span class="kw">const </span>LINUX: <span class="kw-2">&amp;</span>[u8] = <span class="string">b"\
+<a href=#237 id=237 data-nosnippet>237</a>        00400000-00401000 r--p 00000000 00:2a 2952102844                         /tmp/a.out\n\
+<a href=#238 id=238 data-nosnippet>238</a>        00401000-00402000 r-xp 00001000 00:2a 2952102844                         /tmp/a.out\n\
+<a href=#239 id=239 data-nosnippet>239</a>        00405000-00426000 rw-p 00000000 00:00 0                                  [heap]\n\
+<a href=#240 id=240 data-nosnippet>240</a>        7ffff7c00000-7ffff7c29000 r--p 00000000 00:20 73572743                   /usr/lib64/libc.so.6\n\
+<a href=#241 id=241 data-nosnippet>241</a>        7ffff7dfe000-7ffff7e0b000 rw-p 00000000 00:00 0 \n\
+<a href=#242 id=242 data-nosnippet>242</a>        7ffff7e0b000-7ffff7e0c000 -w-p 00000000 00:00 0 \n\
+<a href=#243 id=243 data-nosnippet>243</a>        7ffff7e0c000-7ffff7e0d000 --xs 00000000 00:00 0 \n\
+<a href=#244 id=244 data-nosnippet>244</a>        7ffff7faf000-7ffff7fb2000 rw-p 00000000 00:00 0                          [anon:probe]\n\
+<a href=#245 id=245 data-nosnippet>245</a>        7ffff7fb2000-7ffff7fb3000 rw-p 00000000 00:00 0                          [anon:]\n\
+<a href=#246 id=246 data-nosnippet>246</a>        7ffff7fb3000-7ffff7fb4000 rw-s 00002000 00:01 1036                       [anon_shmem:shared]\n\
+<a href=#247 id=247 data-nosnippet>247</a>        7ffff7fb4000-7ffff7fb5000 rw-s 00000000 00:01 1037                       /dev/zero (deleted)\n\
+<a href=#248 id=248 data-nosnippet>248</a>        7ffff7fb5000-7ffff7fb6000 r--p 00000000 00:2a 17                         /tmp/new\\012line\n\
+<a href=#249 id=249 data-nosnippet>249</a>        7ffff7fb6000-7ffff7fb7000 r--s 00000000 00:0f 1057                       anon_inode:[perf_event]\n\
+<a href=#250 id=250 data-nosnippet>250</a>        7ffff7fbc000-7ffff7fc0000 r--p 00000000 00:00 0                          [vvar]\n\
+<a href=#251 id=251 data-nosnippet>251</a>        7ffff7fc0000-7ffff7fc2000 r--p 00000000 00:00 0                          [vvar_vclock]\n\
+<a href=#252 id=252 data-nosnippet>252</a>        7ffff7fc2000-7ffff7fc4000 r-xp 00000000 00:00 0                          [vdso]\n\
+<a href=#253 id=253 data-nosnippet>253</a>        7ffff7fc4000-7ffff7fc6000 r--p 00000000 103:02 1234567890123             /usr/lib64/ld-linux-x86-64.so.2\n\
+<a href=#254 id=254 data-nosnippet>254</a>        7ffff7fc6000-7ffff7fc7000 r--p 1000000000 fff:fffff 18446744073709551615  /f\n\
+<a href=#255 id=255 data-nosnippet>255</a>        7ffffffde000-7fffffff6000 rw-p 00000000 00:00 0 \n\
+<a href=#256 id=256 data-nosnippet>256</a>        7fffffff6000-7fffffff7000 r--p 00000000 00:00 0 \n\
+<a href=#257 id=257 data-nosnippet>257</a>        7fffffff7000-7ffffffff000 rw-p 00000000 00:00 0                          [stack]\n\
+<a href=#258 id=258 data-nosnippet>258</a>        ffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0                  [vsyscall]\n"</span>;
+<a href=#259 id=259 data-nosnippet>259</a>
+<a href=#260 id=260 data-nosnippet>260</a>    <span class="doccomment">/// The memory map a backend reports for Linux's text renders as that
+<a href=#261 id=261 data-nosnippet>261</a>    /// text, byte for byte.
+<a href=#262 id=262 data-nosnippet>262</a>    </span><span class="attr">#[test]
+<a href=#263 id=263 data-nosnippet>263</a>    </span><span class="kw">fn </span>a_rendered_map_is_the_text_linux_prints() {
+<a href=#264 id=264 data-nosnippet>264</a>        <span class="kw">let </span>map = MemoryMap::from_maps(LINUX).unwrap();
+<a href=#265 id=265 data-nosnippet>265</a>        <span class="macro">assert_eq!</span>(map.mappings.len(), <span class="number">22</span>);
+<a href=#266 id=266 data-nosnippet>266</a>        <span class="macro">assert_eq!</span>(
+<a href=#267 id=267 data-nosnippet>267</a>            String::from_utf8_lossy(<span class="kw-2">&amp;</span>render(<span class="kw-2">&amp;</span>map).unwrap()),
+<a href=#268 id=268 data-nosnippet>268</a>            String::from_utf8_lossy(LINUX)
+<a href=#269 id=269 data-nosnippet>269</a>        );
+<a href=#270 id=270 data-nosnippet>270</a>    }
+<a href=#271 id=271 data-nosnippet>271</a>
+<a href=#272 id=272 data-nosnippet>272</a>    <span class="doccomment">/// The map Linux prints for this test's own process renders as the same
+<a href=#273 id=273 data-nosnippet>273</a>    /// text, but for a `[uprobes]` line where the host gave the process one.
+<a href=#274 id=274 data-nosnippet>274</a>    /// Another thread of the process may change its mappings while the
+<a href=#275 id=275 data-nosnippet>275</a>    /// file is read, which can give text out of order, so a text that does
+<a href=#276 id=276 data-nosnippet>276</a>    /// not parse is read again.
+<a href=#277 id=277 data-nosnippet>277</a>    </span><span class="attr">#[test]
+<a href=#278 id=278 data-nosnippet>278</a>    </span><span class="kw">fn </span>a_rendered_map_is_the_text_linux_prints_for_this_process() {
+<a href=#279 id=279 data-nosnippet>279</a>        <span class="kw">let </span>(text, map) = (<span class="number">0</span>..<span class="number">100</span>)
+<a href=#280 id=280 data-nosnippet>280</a>            .find_map(|<span class="kw">_</span>| {
+<a href=#281 id=281 data-nosnippet>281</a>                <span class="kw">let </span>text = std::fs::read(<span class="string">"/proc/self/maps"</span>).unwrap();
+<a href=#282 id=282 data-nosnippet>282</a>                <span class="kw">let </span>map = MemoryMap::from_maps(<span class="kw-2">&amp;</span>text).ok()<span class="question-mark">?</span>;
+<a href=#283 id=283 data-nosnippet>283</a>                <span class="prelude-val">Some</span>((text, map))
+<a href=#284 id=284 data-nosnippet>284</a>            })
+<a href=#285 id=285 data-nosnippet>285</a>            .expect(<span class="string">"a map that parses"</span>);
+<a href=#286 id=286 data-nosnippet>286</a>        <span class="macro">assert!</span>(map.mappings.len() &gt; <span class="number">3</span>, <span class="string">"{map:?}"</span>);
+<a href=#287 id=287 data-nosnippet>287</a>        <span class="kw">let </span>expected: Vec&lt;u8&gt; = text
+<a href=#288 id=288 data-nosnippet>288</a>            .split_inclusive(|byte| <span class="kw-2">*</span>byte == <span class="string">b'\n'</span>)
+<a href=#289 id=289 data-nosnippet>289</a>            .filter(|line| !line.ends_with(<span class="string">b" [uprobes]\n"</span>))
+<a href=#290 id=290 data-nosnippet>290</a>            .flatten()
+<a href=#291 id=291 data-nosnippet>291</a>            .copied()
+<a href=#292 id=292 data-nosnippet>292</a>            .collect();
+<a href=#293 id=293 data-nosnippet>293</a>        <span class="macro">assert_eq!</span>(
+<a href=#294 id=294 data-nosnippet>294</a>            String::from_utf8_lossy(<span class="kw-2">&amp;</span>render(<span class="kw-2">&amp;</span>map).unwrap()),
+<a href=#295 id=295 data-nosnippet>295</a>            String::from_utf8_lossy(<span class="kw-2">&amp;</span>expected)
+<a href=#296 id=296 data-nosnippet>296</a>        );
+<a href=#297 id=297 data-nosnippet>297</a>    }
+<a href=#298 id=298 data-nosnippet>298</a>
+<a href=#299 id=299 data-nosnippet>299</a>    <span class="doccomment">/// A `[uprobes]` page is left out, and every other line is as Linux
+<a href=#300 id=300 data-nosnippet>300</a>    /// prints it. An incomplete list whose only mapping is that page lists
+<a href=#301 id=301 data-nosnippet>301</a>    /// nothing once it is left out, which is no answer; a complete one is an
+<a href=#302 id=302 data-nosnippet>302</a>    /// empty file.
+<a href=#303 id=303 data-nosnippet>303</a>    </span><span class="attr">#[test]
+<a href=#304 id=304 data-nosnippet>304</a>    </span><span class="kw">fn </span>a_rendered_map_hides_the_uprobes_page() {
+<a href=#305 id=305 data-nosnippet>305</a>        <span class="comment">// The line a process on a Linux 7.1.3 host with five-level paging
+<a href=#306 id=306 data-nosnippet>306</a>        // listed once a uprobe installed on the host fired in it: the page
+<a href=#307 id=307 data-nosnippet>307</a>        // below the top of its address space, executable only.
+<a href=#308 id=308 data-nosnippet>308</a>        </span><span class="kw">let </span>uprobes =
+<a href=#309 id=309 data-nosnippet>309</a>            <span class="string">b"ffffffffffe000-fffffffffff000 --xp 00000000 00:00 0                      [uprobes]\n"</span>;
+<a href=#310 id=310 data-nosnippet>310</a>        <span class="kw">let </span>at = LINUX.len()
+<a href=#311 id=311 data-nosnippet>311</a>            - <span class="string">b"ffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0                  [vsyscall]\n"
+<a href=#312 id=312 data-nosnippet>312</a>                </span>.len();
+<a href=#313 id=313 data-nosnippet>313</a>        <span class="kw">let </span>text = [<span class="kw-2">&amp;</span>LINUX[..at], uprobes, <span class="kw-2">&amp;</span>LINUX[at..]].concat();
+<a href=#314 id=314 data-nosnippet>314</a>        <span class="kw">let </span>map = MemoryMap::from_maps(<span class="kw-2">&amp;</span>text).unwrap();
+<a href=#315 id=315 data-nosnippet>315</a>        <span class="macro">assert_eq!</span>(map.mappings.len(), <span class="number">23</span>);
+<a href=#316 id=316 data-nosnippet>316</a>        <span class="macro">assert_eq!</span>(
+<a href=#317 id=317 data-nosnippet>317</a>            map.mappings[<span class="number">21</span>].backing,
+<a href=#318 id=318 data-nosnippet>318</a>            MappingBacking::Special(UPROBES.to_vec())
+<a href=#319 id=319 data-nosnippet>319</a>        );
+<a href=#320 id=320 data-nosnippet>320</a>        <span class="macro">assert_eq!</span>(
+<a href=#321 id=321 data-nosnippet>321</a>            String::from_utf8_lossy(<span class="kw-2">&amp;</span>render(<span class="kw-2">&amp;</span>map).unwrap()),
+<a href=#322 id=322 data-nosnippet>322</a>            String::from_utf8_lossy(LINUX)
+<a href=#323 id=323 data-nosnippet>323</a>        );
+<a href=#324 id=324 data-nosnippet>324</a>        <span class="kw">let </span>only_uprobes =
+<a href=#325 id=325 data-nosnippet>325</a>            |complete| MemoryMap::new(<span class="macro">vec!</span>[map.mappings[<span class="number">21</span>].clone()], complete).unwrap();
+<a href=#326 id=326 data-nosnippet>326</a>        <span class="macro">assert_eq!</span>(render(<span class="kw-2">&amp;</span>only_uprobes(<span class="bool-val">false</span>)), <span class="prelude-val">None</span>);
+<a href=#327 id=327 data-nosnippet>327</a>        <span class="macro">assert_eq!</span>(render(<span class="kw-2">&amp;</span>only_uprobes(<span class="bool-val">true</span>)).unwrap(), <span class="string">b""</span>);
+<a href=#328 id=328 data-nosnippet>328</a>    }
+<a href=#329 id=329 data-nosnippet>329</a>
+<a href=#330 id=330 data-nosnippet>330</a>    <span class="doccomment">/// A complete list that lists nothing, the map of a task that has no
+<a href=#331 id=331 data-nosnippet>331</a>    /// address space left, is an empty file; an incomplete list that lists
+<a href=#332 id=332 data-nosnippet>332</a>    /// nothing is no answer (KVM's, once LinuxEmu has lost track of the stack
+<a href=#333 id=333 data-nosnippet>333</a>    /// window); an incomplete list renders only what it lists, here the stack
+<a href=#334 id=334 data-nosnippet>334</a>    /// window a guard zone split.
+<a href=#335 id=335 data-nosnippet>335</a>    </span><span class="attr">#[test]
+<a href=#336 id=336 data-nosnippet>336</a>    </span><span class="kw">fn </span>a_rendered_map_lists_only_what_the_backend_lists() {
+<a href=#337 id=337 data-nosnippet>337</a>        <span class="macro">assert_eq!</span>(
+<a href=#338 id=338 data-nosnippet>338</a>            render(<span class="kw-2">&amp;</span>MemoryMap::new(Vec::new(), <span class="bool-val">true</span>).unwrap()).unwrap(),
+<a href=#339 id=339 data-nosnippet>339</a>            <span class="string">b""
+<a href=#340 id=340 data-nosnippet>340</a>        </span>);
+<a href=#341 id=341 data-nosnippet>341</a>        <span class="macro">assert_eq!</span>(render(<span class="kw-2">&amp;</span>MemoryMap::new(Vec::new(), <span class="bool-val">false</span>).unwrap()), <span class="prelude-val">None</span>);
+<a href=#342 id=342 data-nosnippet>342</a>        <span class="kw">let </span>read_write = (libc::PROT_READ | libc::PROT_WRITE) <span class="kw">as </span>u32;
+<a href=#343 id=343 data-nosnippet>343</a>        <span class="kw">let </span>window = MemoryMap::new(
+<a href=#344 id=344 data-nosnippet>344</a>            <span class="macro">vec!</span>[
+<a href=#345 id=345 data-nosnippet>345</a>                MappingFact::new(
+<a href=#346 id=346 data-nosnippet>346</a>                    <span class="number">0x7fff_ff80_0000</span>,
+<a href=#347 id=347 data-nosnippet>347</a>                    <span class="number">0x7fff_fffe_b000</span>,
+<a href=#348 id=348 data-nosnippet>348</a>                    read_write,
+<a href=#349 id=349 data-nosnippet>349</a>                    <span class="bool-val">false</span>,
+<a href=#350 id=350 data-nosnippet>350</a>                    <span class="number">0</span>,
+<a href=#351 id=351 data-nosnippet>351</a>                    MappingBacking::Anonymous,
+<a href=#352 id=352 data-nosnippet>352</a>                )
+<a href=#353 id=353 data-nosnippet>353</a>                .unwrap(),
+<a href=#354 id=354 data-nosnippet>354</a>                MappingFact::new(
+<a href=#355 id=355 data-nosnippet>355</a>                    <span class="number">0x7fff_fffe_b000</span>,
+<a href=#356 id=356 data-nosnippet>356</a>                    <span class="number">0x7fff_fffe_f000</span>,
+<a href=#357 id=357 data-nosnippet>357</a>                    <span class="number">0</span>,
+<a href=#358 id=358 data-nosnippet>358</a>                    <span class="bool-val">false</span>,
+<a href=#359 id=359 data-nosnippet>359</a>                    <span class="number">0</span>,
+<a href=#360 id=360 data-nosnippet>360</a>                    MappingBacking::Anonymous,
+<a href=#361 id=361 data-nosnippet>361</a>                )
+<a href=#362 id=362 data-nosnippet>362</a>                .unwrap(),
+<a href=#363 id=363 data-nosnippet>363</a>                MappingFact::new(
+<a href=#364 id=364 data-nosnippet>364</a>                    <span class="number">0x7fff_fffe_f000</span>,
+<a href=#365 id=365 data-nosnippet>365</a>                    <span class="number">0x7fff_ffff_f000</span>,
+<a href=#366 id=366 data-nosnippet>366</a>                    read_write,
+<a href=#367 id=367 data-nosnippet>367</a>                    <span class="bool-val">false</span>,
+<a href=#368 id=368 data-nosnippet>368</a>                    <span class="number">0</span>,
+<a href=#369 id=369 data-nosnippet>369</a>                    MappingBacking::Stack,
+<a href=#370 id=370 data-nosnippet>370</a>                )
+<a href=#371 id=371 data-nosnippet>371</a>                .unwrap(),
+<a href=#372 id=372 data-nosnippet>372</a>            ],
+<a href=#373 id=373 data-nosnippet>373</a>            <span class="bool-val">false</span>,
+<a href=#374 id=374 data-nosnippet>374</a>        )
+<a href=#375 id=375 data-nosnippet>375</a>        .unwrap();
+<a href=#376 id=376 data-nosnippet>376</a>        <span class="macro">assert_eq!</span>(
+<a href=#377 id=377 data-nosnippet>377</a>            String::from_utf8(render(<span class="kw-2">&amp;</span>window).unwrap()).unwrap(),
+<a href=#378 id=378 data-nosnippet>378</a>            <span class="string">"\
+<a href=#379 id=379 data-nosnippet>379</a>            7fffff800000-7ffffffeb000 rw-p 00000000 00:00 0 \n\
+<a href=#380 id=380 data-nosnippet>380</a>            7ffffffeb000-7ffffffef000 ---p 00000000 00:00 0 \n\
+<a href=#381 id=381 data-nosnippet>381</a>            7ffffffef000-7ffffffff000 rw-p 00000000 00:00 0                          [stack]\n"
+<a href=#382 id=382 data-nosnippet>382</a>        </span>);
+<a href=#383 id=383 data-nosnippet>383</a>    }
+<a href=#384 id=384 data-nosnippet>384</a>
+<a href=#385 id=385 data-nosnippet>385</a>    <span class="doccomment">/// The process table's answer about a task that holds the numbers
+<a href=#386 id=386 data-nosnippet>386</a>    /// `incarnation` names and the address space `mm`, or none.
+<a href=#387 id=387 data-nosnippet>387</a>    </span><span class="kw">fn </span>answer(incarnation: u32, mm: <span class="prelude-ty">Option</span>&lt;MmId&gt;) -&gt; ProcfsTaskAnswer {
+<a href=#388 id=388 data-nosnippet>388</a>        ProcfsTaskAnswer {
+<a href=#389 id=389 data-nosnippet>389</a>            exists: <span class="bool-val">true</span>,
+<a href=#390 id=390 data-nosnippet>390</a>            without_mm: mm.is_none(),
+<a href=#391 id=391 data-nosnippet>391</a>            process_incarnation: incarnation,
+<a href=#392 id=392 data-nosnippet>392</a>            thread_incarnation: <span class="prelude-val">None</span>,
+<a href=#393 id=393 data-nosnippet>393</a>            mm,
+<a href=#394 id=394 data-nosnippet>394</a>            runtime_private_memory: <span class="prelude-val">None</span>,
+<a href=#395 id=395 data-nosnippet>395</a>        }
+<a href=#396 id=396 data-nosnippet>396</a>    }
+<a href=#397 id=397 data-nosnippet>397</a>
+<a href=#398 id=398 data-nosnippet>398</a>    <span class="doccomment">/// A `maps` binds the task its path named where that task holds the
+<a href=#399 id=399 data-nosnippet>399</a>    /// opener's address space at the open, and only there; a read of it is the
+<a href=#400 id=400 data-nosnippet>400</a>    /// reader's map while the reader holds that address space and the task is
+<a href=#401 id=401 data-nosnippet>401</a>    /// still there, a zombie too.
+<a href=#402 id=402 data-nosnippet>402</a>    </span><span class="attr">#[test]
+<a href=#403 id=403 data-nosnippet>403</a>    </span><span class="kw">fn </span>a_maps_binding_takes_the_task_and_the_address_space_of_the_open() {
+<a href=#404 id=404 data-nosnippet>404</a>        <span class="kw">let </span>process = detcore_model::pid::DetTid::from_raw(<span class="number">5</span>);
+<a href=#405 id=405 data-nosnippet>405</a>        <span class="kw">let </span>task = BoundTask {
+<a href=#406 id=406 data-nosnippet>406</a>            process: <span class="number">5</span>,
+<a href=#407 id=407 data-nosnippet>407</a>            thread: <span class="prelude-val">None</span>,
+<a href=#408 id=408 data-nosnippet>408</a>        };
+<a href=#409 id=409 data-nosnippet>409</a>        <span class="kw">let </span>opener = MmId::initial(process);
+<a href=#410 id=410 data-nosnippet>410</a>        <span class="macro">assert_eq!</span>(Binding::at_open(task, <span class="kw-2">&amp;</span>answer(<span class="number">1</span>, <span class="prelude-val">None</span>), opener), <span class="prelude-val">None</span>);
+<a href=#411 id=411 data-nosnippet>411</a>        <span class="macro">assert_eq!</span>(
+<a href=#412 id=412 data-nosnippet>412</a>            Binding::at_open(task, <span class="kw-2">&amp;</span>answer(<span class="number">1</span>, <span class="prelude-val">Some</span>(opener.for_exec(process))), opener),
+<a href=#413 id=413 data-nosnippet>413</a>            <span class="prelude-val">None
+<a href=#414 id=414 data-nosnippet>414</a>        </span>);
+<a href=#415 id=415 data-nosnippet>415</a>        <span class="kw">let </span>gone = ProcfsTaskAnswer::default();
+<a href=#416 id=416 data-nosnippet>416</a>        <span class="macro">assert_eq!</span>(Binding::at_open(task, <span class="kw-2">&amp;</span>gone, opener), <span class="prelude-val">None</span>);
+<a href=#417 id=417 data-nosnippet>417</a>        <span class="comment">// Whatever address space an answer names, a task that is not there,
+<a href=#418 id=418 data-nosnippet>418</a>        // or has released its address space, binds nothing.
+<a href=#419 id=419 data-nosnippet>419</a>        </span><span class="kw">for </span>(exists, without_mm) <span class="kw">in </span>[(<span class="bool-val">false</span>, <span class="bool-val">false</span>), (<span class="bool-val">true</span>, <span class="bool-val">true</span>)] {
+<a href=#420 id=420 data-nosnippet>420</a>            <span class="kw">let </span>inconsistent = ProcfsTaskAnswer {
+<a href=#421 id=421 data-nosnippet>421</a>                exists,
+<a href=#422 id=422 data-nosnippet>422</a>                without_mm,
+<a href=#423 id=423 data-nosnippet>423</a>                ..answer(<span class="number">1</span>, <span class="prelude-val">Some</span>(opener))
+<a href=#424 id=424 data-nosnippet>424</a>            };
+<a href=#425 id=425 data-nosnippet>425</a>            <span class="macro">assert_eq!</span>(Binding::at_open(task, <span class="kw-2">&amp;</span>inconsistent, opener), <span class="prelude-val">None</span>);
+<a href=#426 id=426 data-nosnippet>426</a>        }
+<a href=#427 id=427 data-nosnippet>427</a>        <span class="kw">let </span>binding = Binding::at_open(task, <span class="kw-2">&amp;</span>answer(<span class="number">1</span>, <span class="prelude-val">Some</span>(opener)), opener).unwrap();
+<a href=#428 id=428 data-nosnippet>428</a>        <span class="macro">assert_eq!</span>(binding.task(), task);
+<a href=#429 id=429 data-nosnippet>429</a>        <span class="macro">assert!</span>(binding.held_by(opener));
+<a href=#430 id=430 data-nosnippet>430</a>        <span class="macro">assert!</span>(binding.finds_its_task(<span class="kw-2">&amp;</span>answer(<span class="number">1</span>, <span class="prelude-val">Some</span>(opener))));
+<a href=#431 id=431 data-nosnippet>431</a>        <span class="comment">// Its leader a zombie, whose address space Linux has released, while
+<a href=#432 id=432 data-nosnippet>432</a>        // another thread of the process still holds it.
+<a href=#433 id=433 data-nosnippet>433</a>        </span><span class="macro">assert!</span>(binding.finds_its_task(<span class="kw-2">&amp;</span>answer(<span class="number">1</span>, <span class="prelude-val">None</span>)));
+<a href=#434 id=434 data-nosnippet>434</a>        <span class="comment">// Reaped, with no task on its number.
+<a href=#435 id=435 data-nosnippet>435</a>        </span><span class="macro">assert!</span>(!binding.finds_its_task(<span class="kw-2">&amp;</span>gone));
+<a href=#436 id=436 data-nosnippet>436</a>        <span class="comment">// Another process that inherited the descriptor, and the process
+<a href=#437 id=437 data-nosnippet>437</a>        // after an exec.
+<a href=#438 id=438 data-nosnippet>438</a>        </span><span class="macro">assert!</span>(!binding.held_by(MmId::initial(detcore_model::pid::DetTid::from_raw(<span class="number">6</span>))));
+<a href=#439 id=439 data-nosnippet>439</a>        <span class="macro">assert!</span>(!binding.held_by(opener.for_exec(process)));
+<a href=#440 id=440 data-nosnippet>440</a>    }
+<a href=#441 id=441 data-nosnippet>441</a>
+<a href=#442 id=442 data-nosnippet>442</a>    <span class="doccomment">/// Process 5 opens its `maps`, forks process 6 and exits, and is reaped;
+<a href=#443 id=443 data-nosnippet>443</a>    /// 6 forks a child that Detcore gives the number 5 again, which inherits
+<a href=#444 id=444 data-nosnippet>444</a>    /// the descriptor. That child's address space has the identity of the
+<a href=#445 id=445 data-nosnippet>445</a>    /// opener's (a fork's exec count starts again at 0), so the address
+<a href=#446 id=446 data-nosnippet>446</a>    /// space alone would render the child's own map where Linux's read
+<a href=#447 id=447 data-nosnippet>447</a>    /// answers ESRCH for the reaped task: the number's incarnation refuses
+<a href=#448 id=448 data-nosnippet>448</a>    /// it.
+<a href=#449 id=449 data-nosnippet>449</a>    </span><span class="attr">#[test]
+<a href=#450 id=450 data-nosnippet>450</a>    </span><span class="kw">fn </span>a_maps_binding_refuses_a_task_on_a_reused_number() {
+<a href=#451 id=451 data-nosnippet>451</a>        <span class="kw">let </span>reused = detcore_model::pid::DetTid::from_raw(<span class="number">5</span>);
+<a href=#452 id=452 data-nosnippet>452</a>        <span class="kw">let </span>task = BoundTask {
+<a href=#453 id=453 data-nosnippet>453</a>            process: <span class="number">5</span>,
+<a href=#454 id=454 data-nosnippet>454</a>            thread: <span class="prelude-val">None</span>,
+<a href=#455 id=455 data-nosnippet>455</a>        };
+<a href=#456 id=456 data-nosnippet>456</a>        <span class="kw">let </span>opener = MmId::initial(reused);
+<a href=#457 id=457 data-nosnippet>457</a>        <span class="kw">let </span>binding = Binding::at_open(task, <span class="kw-2">&amp;</span>answer(<span class="number">1</span>, <span class="prelude-val">Some</span>(opener)), opener).unwrap();
+<a href=#458 id=458 data-nosnippet>458</a>        <span class="kw">let </span>child = MmId::for_clone(
+<a href=#459 id=459 data-nosnippet>459</a>            MmId::initial(detcore_model::pid::DetTid::from_raw(<span class="number">6</span>)),
+<a href=#460 id=460 data-nosnippet>460</a>            reused,
+<a href=#461 id=461 data-nosnippet>461</a>            <span class="bool-val">false</span>,
+<a href=#462 id=462 data-nosnippet>462</a>        );
+<a href=#463 id=463 data-nosnippet>463</a>        <span class="macro">assert_eq!</span>(child, opener);
+<a href=#464 id=464 data-nosnippet>464</a>        <span class="macro">assert!</span>(binding.held_by(child));
+<a href=#465 id=465 data-nosnippet>465</a>        <span class="macro">assert!</span>(!binding.finds_its_task(<span class="kw-2">&amp;</span>answer(<span class="number">2</span>, <span class="prelude-val">Some</span>(child))));
+<a href=#466 id=466 data-nosnippet>466</a>    }
+<a href=#467 id=467 data-nosnippet>467</a>}
+</code></pre></div></section></main></body></html>

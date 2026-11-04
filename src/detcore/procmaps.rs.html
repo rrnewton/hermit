@@ -1,0 +1,346 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `detcore/src/procmaps.rs`."><title>procmaps.rs - source</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="detcore" data-themes="" data-resource-suffix="" data-rustdoc-version="1.99.0-nightly (be8e82435 2026-07-11)" data-channel="nightly" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="../../static.files/src-script-813739b1.js"></script><script defer src="../../src-files.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc src"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="sidebar"><div class="src-sidebar-title"><h2>Files</h2></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1><div class="sub-heading">detcore/</div>procmaps.rs</h1><rustdoc-toolbar></rustdoc-toolbar></div><div class="example-wrap digits-3"><pre class="rust"><code><a href=#1 id=1 data-nosnippet>1</a><span class="comment">/*
+<a href=#2 id=2 data-nosnippet>2</a> * Copyright (c) Meta Platforms, Inc. and affiliates.
+<a href=#3 id=3 data-nosnippet>3</a> * All rights reserved.
+<a href=#4 id=4 data-nosnippet>4</a> *
+<a href=#5 id=5 data-nosnippet>5</a> * This source code is licensed under the BSD-style license found in the
+<a href=#6 id=6 data-nosnippet>6</a> * LICENSE file in the root directory of this source tree.
+<a href=#7 id=7 data-nosnippet>7</a> */
+<a href=#8 id=8 data-nosnippet>8</a>
+<a href=#9 id=9 data-nosnippet>9</a></span><span class="kw">pub use </span>procfs::process::MMapPath;
+<a href=#10 id=10 data-nosnippet>10</a><span class="kw">pub use </span>procfs::process::MemoryMap;
+<a href=#11 id=11 data-nosnippet>11</a><span class="kw">use </span>reverie::Guest;
+<a href=#12 id=12 data-nosnippet>12</a><span class="kw">use </span>reverie::Pid;
+<a href=#13 id=13 data-nosnippet>13</a><span class="kw">use </span>reverie::Tool;
+<a href=#14 id=14 data-nosnippet>14</a><span class="kw">use </span>reverie::syscalls::Addr;
+<a href=#15 id=15 data-nosnippet>15</a><span class="kw">use </span>reverie::syscalls::MemoryAccess;
+<a href=#16 id=16 data-nosnippet>16</a>
+<a href=#17 id=17 data-nosnippet>17</a><span class="kw">use </span><span class="kw">crate</span>::Digest;
+<a href=#18 id=18 data-nosnippet>18</a>
+<a href=#19 id=19 data-nosnippet>19</a><span class="kw">fn </span>display_pathname(p: <span class="kw-2">&amp;</span>MMapPath) -&gt; String {
+<a href=#20 id=20 data-nosnippet>20</a>    <span class="kw">match </span>p {
+<a href=#21 id=21 data-nosnippet>21</a>        MMapPath::Vdso =&gt; String::from(<span class="string">"[vsdo]"</span>),
+<a href=#22 id=22 data-nosnippet>22</a>        MMapPath::Stack =&gt; String::from(<span class="string">"[stack]"</span>),
+<a href=#23 id=23 data-nosnippet>23</a>        MMapPath::TStack(tid) =&gt; <span class="macro">format!</span>(<span class="string">"[tstack:{}]"</span>, tid),
+<a href=#24 id=24 data-nosnippet>24</a>        MMapPath::Vvar =&gt; String::from(<span class="string">"[vvar]"</span>),
+<a href=#25 id=25 data-nosnippet>25</a>        MMapPath::Vsyscall =&gt; String::from(<span class="string">"[syscalls]"</span>),
+<a href=#26 id=26 data-nosnippet>26</a>        MMapPath::Heap =&gt; String::from(<span class="string">"[heap]"</span>),
+<a href=#27 id=27 data-nosnippet>27</a>        MMapPath::Other(s) =&gt; <span class="macro">format!</span>(<span class="string">"[other: {}]"</span>, s),
+<a href=#28 id=28 data-nosnippet>28</a>        MMapPath::Anonymous =&gt; String::from(<span class="string">"[annonymous]"</span>),
+<a href=#29 id=29 data-nosnippet>29</a>        MMapPath::Path(s) =&gt; s.display().to_string(),
+<a href=#30 id=30 data-nosnippet>30</a>        MMapPath::Rollup =&gt; String::from(<span class="string">"[rollup]"</span>),
+<a href=#31 id=31 data-nosnippet>31</a>        MMapPath::Vsys(vsys) =&gt; vsys.to_string(),
+<a href=#32 id=32 data-nosnippet>32</a>    }
+<a href=#33 id=33 data-nosnippet>33</a>}
+<a href=#34 id=34 data-nosnippet>34</a>
+<a href=#35 id=35 data-nosnippet>35</a><span class="kw">pub fn </span>display(map: <span class="kw-2">&amp;</span>MemoryMap) -&gt; String {
+<a href=#36 id=36 data-nosnippet>36</a>    display_as(map, <span class="kw-2">&amp;</span>display_pathname(<span class="kw-2">&amp;</span>map.pathname))
+<a href=#37 id=37 data-nosnippet>37</a>}
+<a href=#38 id=38 data-nosnippet>38</a>
+<a href=#39 id=39 data-nosnippet>39</a><span class="doccomment">/// Render a mapping with an explicit pathname column.
+<a href=#40 id=40 data-nosnippet>40</a>///
+<a href=#41 id=41 data-nosnippet>41</a>/// Used to report a region that *is* the guest heap but which the kernel did
+<a href=#42 id=42 data-nosnippet>42</a>/// not label `[heap]`, so the record is textually comparable with the labelled
+<a href=#43 id=43 data-nosnippet>43</a>/// one another backend produces. Every other column is the mapping's real
+<a href=#44 id=44 data-nosnippet>44</a>/// procfs data.
+<a href=#45 id=45 data-nosnippet>45</a></span><span class="kw">pub fn </span>display_as(map: <span class="kw-2">&amp;</span>MemoryMap, pathname: <span class="kw-2">&amp;</span>str) -&gt; String {
+<a href=#46 id=46 data-nosnippet>46</a>    display_range_as(map, map.address.<span class="number">0</span>, map.address.<span class="number">1</span>, pathname)
+<a href=#47 id=47 data-nosnippet>47</a>}
+<a href=#48 id=48 data-nosnippet>48</a>
+<a href=#49 id=49 data-nosnippet>49</a><span class="doccomment">/// Render a mapping's real procfs columns against an EXPLICIT address range.
+<a href=#50 id=50 data-nosnippet>50</a>///
+<a href=#51 id=51 data-nosnippet>51</a>/// The two address columns come from `start`/`end`; every other column is the
+<a href=#52 id=52 data-nosnippet>52</a>/// mapping's real procfs data. Used where the region being reported is a SUBSET
+<a href=#53 id=53 data-nosnippet>53</a>/// of the mapping that contains it -- the observed program break inside its
+<a href=#54 id=54 data-nosnippet>54</a>/// enclosing anonymous mapping -- so the record's extent is the region actually
+<a href=#55 id=55 data-nosnippet>55</a>/// hashed rather than the arena that happens to hold it.
+<a href=#56 id=56 data-nosnippet>56</a></span><span class="kw">pub fn </span>display_range_as(map: <span class="kw-2">&amp;</span>MemoryMap, start: u64, end: u64, pathname: <span class="kw-2">&amp;</span>str) -&gt; String {
+<a href=#57 id=57 data-nosnippet>57</a>    <span class="macro">format!</span>(
+<a href=#58 id=58 data-nosnippet>58</a>        <span class="string">"{:#x}-{:#x} {:?} {:x} {:x}:{:x} {} {}"</span>,
+<a href=#59 id=59 data-nosnippet>59</a>        start, end, map.perms, map.offset, map.dev.<span class="number">0</span>, map.dev.<span class="number">1</span>, map.inode, pathname
+<a href=#60 id=60 data-nosnippet>60</a>    )
+<a href=#61 id=61 data-nosnippet>61</a>}
+<a href=#62 id=62 data-nosnippet>62</a>
+<a href=#63 id=63 data-nosnippet>63</a><span class="doccomment">/// Reverie ptrace's own pages in every guest process, `[start, end)`: its
+<a href=#64 id=64 data-nosnippet>64</a>/// trampoline at `0x7100_0000` and the SIGTRAP repairs' scratch page after
+<a href=#65 id=65 data-nosnippet>65</a>/// it (reverie-ptrace `cp::PRIVATE_PAGE_OFFSET`, `cp::SCRATCH_BASE` and
+<a href=#66 id=66 data-nosnippet>66</a>/// `cp::SCRATCH_SIZE`, which that crate keeps private; hermit-cli's
+<a href=#67 id=67 data-nosnippet>67</a>/// `REVERIE_PTRACE_PRIVATE_PAGE`, pinned by a cli test, names the first).
+<a href=#68 id=68 data-nosnippet>68</a>/// They are private anonymous mappings, but Reverie's state, not the guest's.
+<a href=#69 id=69 data-nosnippet>69</a></span><span class="kw">pub const </span>REVERIE_PTRACE_PAGES: (u64, u64) = (<span class="number">0x7100_0000</span>, <span class="number">0x7100_2000</span>);
+<a href=#70 id=70 data-nosnippet>70</a>
+<a href=#71 id=71 data-nosnippet>71</a><span class="doccomment">/// Whether `map` is one `--detlog-anon` hashes: anonymous (unnamed, named by
+<a href=#72 id=72 data-nosnippet>72</a>/// `PR_SET_VMA_ANON_NAME` as `[anon:&lt;name&gt;]`, or a thread stack an older
+<a href=#73 id=73 data-nosnippet>73</a>/// kernel labels `[stack:&lt;tid&gt;]`), private, readable and writable, and not
+<a href=#74 id=74 data-nosnippet>74</a>/// one of Reverie's own pages ([`REVERIE_PTRACE_PAGES`]). `[heap]` and
+<a href=#75 id=75 data-nosnippet>75</a>/// `[stack]` are `--detlog-heap`'s and `--detlog-stack`'s; a shared anonymous
+<a href=#76 id=76 data-nosnippet>76</a>/// mapping (`[anon_shmem:&lt;name&gt;]`, or `/dev/zero (deleted)`) is another
+<a href=#77 id=77 data-nosnippet>77</a>/// process's memory as much as this one's; and a mapping that cannot be read
+<a href=#78 id=78 data-nosnippet>78</a>/// (`PROT_NONE`, such as an allocator's reservation) or written holds nothing
+<a href=#79 id=79 data-nosnippet>79</a>/// the guest changed through it.
+<a href=#80 id=80 data-nosnippet>80</a></span><span class="kw">pub fn </span>is_hashed_anonymous(map: <span class="kw-2">&amp;</span>MemoryMap) -&gt; bool {
+<a href=#81 id=81 data-nosnippet>81</a>    <span class="kw">use </span>procfs::process::MMPermissions;
+<a href=#82 id=82 data-nosnippet>82</a>    <span class="kw">let </span>anonymous = <span class="kw">match </span><span class="kw-2">&amp;</span>map.pathname {
+<a href=#83 id=83 data-nosnippet>83</a>        MMapPath::Anonymous | MMapPath::TStack(<span class="kw">_</span>) =&gt; <span class="bool-val">true</span>,
+<a href=#84 id=84 data-nosnippet>84</a>        MMapPath::Other(name) =&gt; name.starts_with(<span class="string">"anon:"</span>),
+<a href=#85 id=85 data-nosnippet>85</a>        <span class="kw">_ </span>=&gt; <span class="bool-val">false</span>,
+<a href=#86 id=86 data-nosnippet>86</a>    };
+<a href=#87 id=87 data-nosnippet>87</a>    <span class="kw">let </span>reverie =
+<a href=#88 id=88 data-nosnippet>88</a>        REVERIE_PTRACE_PAGES.<span class="number">0 </span>&lt;= map.address.<span class="number">0 </span>&amp;&amp; map.address.<span class="number">1 </span>&lt;= REVERIE_PTRACE_PAGES.<span class="number">1</span>;
+<a href=#89 id=89 data-nosnippet>89</a>    anonymous
+<a href=#90 id=90 data-nosnippet>90</a>        &amp;&amp; !reverie
+<a href=#91 id=91 data-nosnippet>91</a>        &amp;&amp; map
+<a href=#92 id=92 data-nosnippet>92</a>            .perms
+<a href=#93 id=93 data-nosnippet>93</a>            .contains(MMPermissions::READ | MMPermissions::WRITE | MMPermissions::PRIVATE)
+<a href=#94 id=94 data-nosnippet>94</a>}
+<a href=#95 id=95 data-nosnippet>95</a>
+<a href=#96 id=96 data-nosnippet>96</a><span class="doccomment">/// The size of the pages `--detlog-anon=pages` digests.
+<a href=#97 id=97 data-nosnippet>97</a></span><span class="kw">const </span>DIGESTED_PAGE: usize = <span class="number">4096</span>;
+<a href=#98 id=98 data-nosnippet>98</a>
+<a href=#99 id=99 data-nosnippet>99</a><span class="doccomment">/// The largest mapping `--detlog-anon` reads. A larger one, such as a
+<a href=#100 id=100 data-nosnippet>100</a>/// sanitizer's shadow (terabytes, `MAP_NORESERVE`) or a heap a runtime
+<a href=#101 id=101 data-nosnippet>101</a>/// reserves read-write up front, is recorded by its size alone.
+<a href=#102 id=102 data-nosnippet>102</a></span><span class="kw">pub const </span>ANON_HASH_LIMIT: u64 = <span class="number">256 </span>&lt;&lt; <span class="number">20</span>;
+<a href=#103 id=103 data-nosnippet>103</a>
+<a href=#104 id=104 data-nosnippet>104</a><span class="doccomment">/// How much of a mapping `--detlog-anon` reads at a time, a whole number of
+<a href=#105 id=105 data-nosnippet>105</a>/// pages, so that page digests never straddle a read.
+<a href=#106 id=106 data-nosnippet>106</a></span><span class="kw">const </span>ANON_READ_CHUNK: usize = <span class="number">1 </span>&lt;&lt; <span class="number">20</span>;
+<a href=#107 id=107 data-nosnippet>107</a>
+<a href=#108 id=108 data-nosnippet>108</a><span class="doccomment">/// The digest of one page for `--detlog-anon=pages`: `&lt;index&gt;:&lt;the first 8
+<a href=#109 id=109 data-nosnippet>109</a>/// bytes of its SHA-256 in hex&gt;`, or `None` for an all-zero page, which an
+<a href=#110 id=110 data-nosnippet>110</a>/// untouched anonymous page reads as.
+<a href=#111 id=111 data-nosnippet>111</a></span><span class="kw">fn </span>page_digest(index: usize, page: <span class="kw-2">&amp;</span>[u8]) -&gt; <span class="prelude-ty">Option</span>&lt;String&gt; {
+<a href=#112 id=112 data-nosnippet>112</a>    page.iter()
+<a href=#113 id=113 data-nosnippet>113</a>        .any(|byte| <span class="kw-2">*</span>byte != <span class="number">0</span>)
+<a href=#114 id=114 data-nosnippet>114</a>        .then(|| <span class="macro">format!</span>(<span class="string">"{index}:{}"</span>, <span class="kw-2">&amp;</span>Digest::new(page).to_string()[..<span class="number">16</span>]))
+<a href=#115 id=115 data-nosnippet>115</a>}
+<a href=#116 id=116 data-nosnippet>116</a>
+<a href=#117 id=117 data-nosnippet>117</a><span class="doccomment">/// For `--detlog-anon=pages`: each 4 KiB page of `bytes` that is not all zero
+<a href=#118 id=118 data-nosnippet>118</a>/// ([`page_digest`]), comma-separated, computed at once: the reference
+<a href=#119 id=119 data-nosnippet>119</a>/// [`hash_in_chunks`] is checked against. A page index counts from the start
+<a href=#120 id=120 data-nosnippet>120</a>/// of the mapping, so a mapping that merges with a neighbour or moves
+<a href=#121 id=121 data-nosnippet>121</a>/// (`mremap`) renumbers its pages.
+<a href=#122 id=122 data-nosnippet>122</a></span><span class="attr">#[cfg(test)]
+<a href=#123 id=123 data-nosnippet>123</a></span><span class="kw">fn </span>page_digests(bytes: <span class="kw-2">&amp;</span>[u8]) -&gt; String {
+<a href=#124 id=124 data-nosnippet>124</a>    bytes
+<a href=#125 id=125 data-nosnippet>125</a>        .chunks(DIGESTED_PAGE)
+<a href=#126 id=126 data-nosnippet>126</a>        .enumerate()
+<a href=#127 id=127 data-nosnippet>127</a>        .filter_map(|(index, page)| page_digest(index, page))
+<a href=#128 id=128 data-nosnippet>128</a>        .collect::&lt;Vec&lt;<span class="kw">_</span>&gt;&gt;()
+<a href=#129 id=129 data-nosnippet>129</a>        .join(<span class="string">","</span>)
+<a href=#130 id=130 data-nosnippet>130</a>}
+<a href=#131 id=131 data-nosnippet>131</a>
+<a href=#132 id=132 data-nosnippet>132</a><span class="doccomment">/// What `--detlog-anon` records for one mapping.
+<a href=#133 id=133 data-nosnippet>133</a></span><span class="kw">pub enum </span>AnonHash {
+<a href=#134 id=134 data-nosnippet>134</a>    <span class="doccomment">/// Its digest and, where asked for, its page digests (`&lt;index&gt;:&lt;hex&gt;`,
+<a href=#135 id=135 data-nosnippet>135</a>    /// comma-separated; [`hash_in_chunks`]).
+<a href=#136 id=136 data-nosnippet>136</a>    </span>Hashed(Digest, <span class="prelude-ty">Option</span>&lt;String&gt;),
+<a href=#137 id=137 data-nosnippet>137</a>    <span class="doccomment">/// Larger than [`ANON_HASH_LIMIT`]: its size, unread.
+<a href=#138 id=138 data-nosnippet>138</a>    </span>TooLarge(u64),
+<a href=#139 id=139 data-nosnippet>139</a>}
+<a href=#140 id=140 data-nosnippet>140</a>
+<a href=#141 id=141 data-nosnippet>141</a><span class="doccomment">/// The digest of `size` bytes and, where `pages`, their page digests, read
+<a href=#142 id=142 data-nosnippet>142</a>/// `chunk` bytes at a time (a multiple of the page size) through `read`,
+<a href=#143 id=143 data-nosnippet>143</a>/// which fills its buffer from the given offset. Equal to hashing all the
+<a href=#144 id=144 data-nosnippet>144</a>/// bytes at once, which the unit tests check, without holding them at once.
+<a href=#145 id=145 data-nosnippet>145</a></span><span class="kw">fn </span>hash_in_chunks(
+<a href=#146 id=146 data-nosnippet>146</a>    size: u64,
+<a href=#147 id=147 data-nosnippet>147</a>    chunk: usize,
+<a href=#148 id=148 data-nosnippet>148</a>    pages: bool,
+<a href=#149 id=149 data-nosnippet>149</a>    <span class="kw-2">mut </span>read: <span class="kw">impl </span>FnMut(u64, <span class="kw-2">&amp;mut </span>[u8]) -&gt; <span class="prelude-ty">Result</span>&lt;(), reverie::Error&gt;,
+<a href=#150 id=150 data-nosnippet>150</a>) -&gt; <span class="prelude-ty">Result</span>&lt;(Digest, <span class="prelude-ty">Option</span>&lt;String&gt;), reverie::Error&gt; {
+<a href=#151 id=151 data-nosnippet>151</a>    <span class="macro">debug_assert_eq!</span>(chunk % DIGESTED_PAGE, <span class="number">0</span>);
+<a href=#152 id=152 data-nosnippet>152</a>    <span class="kw">let </span><span class="kw-2">mut </span>digest = <span class="kw">crate</span>::digest::DigestBuilder::default();
+<a href=#153 id=153 data-nosnippet>153</a>    <span class="kw">let </span><span class="kw-2">mut </span>listed = Vec::new();
+<a href=#154 id=154 data-nosnippet>154</a>    <span class="kw">let </span><span class="kw-2">mut </span>buf = <span class="macro">vec!</span>[<span class="number">0</span>; chunk.min(size <span class="kw">as </span>usize)];
+<a href=#155 id=155 data-nosnippet>155</a>    <span class="kw">let </span><span class="kw-2">mut </span>offset = <span class="number">0u64</span>;
+<a href=#156 id=156 data-nosnippet>156</a>    <span class="kw">while </span>offset &lt; size {
+<a href=#157 id=157 data-nosnippet>157</a>        <span class="kw">let </span>n = (size - offset).min(chunk <span class="kw">as </span>u64) <span class="kw">as </span>usize;
+<a href=#158 id=158 data-nosnippet>158</a>        read(offset, <span class="kw-2">&amp;mut </span>buf[..n])<span class="question-mark">?</span>;
+<a href=#159 id=159 data-nosnippet>159</a>        digest.update(<span class="kw-2">&amp;</span>buf[..n]);
+<a href=#160 id=160 data-nosnippet>160</a>        <span class="kw">if </span>pages {
+<a href=#161 id=161 data-nosnippet>161</a>            <span class="kw">let </span>first = (offset / DIGESTED_PAGE <span class="kw">as </span>u64) <span class="kw">as </span>usize;
+<a href=#162 id=162 data-nosnippet>162</a>            listed.extend(
+<a href=#163 id=163 data-nosnippet>163</a>                buf[..n]
+<a href=#164 id=164 data-nosnippet>164</a>                    .chunks(DIGESTED_PAGE)
+<a href=#165 id=165 data-nosnippet>165</a>                    .enumerate()
+<a href=#166 id=166 data-nosnippet>166</a>                    .filter_map(|(index, page)| page_digest(first + index, page)),
+<a href=#167 id=167 data-nosnippet>167</a>            );
+<a href=#168 id=168 data-nosnippet>168</a>        }
+<a href=#169 id=169 data-nosnippet>169</a>        offset += n <span class="kw">as </span>u64;
+<a href=#170 id=170 data-nosnippet>170</a>    }
+<a href=#171 id=171 data-nosnippet>171</a>    <span class="prelude-val">Ok</span>((digest.finish(), pages.then(|| listed.join(<span class="string">","</span>))))
+<a href=#172 id=172 data-nosnippet>172</a>}
+<a href=#173 id=173 data-nosnippet>173</a>
+<a href=#174 id=174 data-nosnippet>174</a><span class="doccomment">/// What `--detlog-anon` records for the guest bytes in `[start, end)`
+<a href=#175 id=175 data-nosnippet>175</a>/// ([`AnonHash`]), read in [`ANON_READ_CHUNK`]s.
+<a href=#176 id=176 data-nosnippet>176</a></span><span class="kw">pub fn </span>compute_hash_and_pages&lt;G, T: Tool&gt;(
+<a href=#177 id=177 data-nosnippet>177</a>    guest: <span class="kw-2">&amp;mut </span>G,
+<a href=#178 id=178 data-nosnippet>178</a>    start: u64,
+<a href=#179 id=179 data-nosnippet>179</a>    end: u64,
+<a href=#180 id=180 data-nosnippet>180</a>    pages: bool,
+<a href=#181 id=181 data-nosnippet>181</a>) -&gt; <span class="prelude-ty">Result</span>&lt;AnonHash, reverie::Error&gt;
+<a href=#182 id=182 data-nosnippet>182</a><span class="kw">where
+<a href=#183 id=183 data-nosnippet>183</a>    </span>G: Guest&lt;T&gt;,
+<a href=#184 id=184 data-nosnippet>184</a>{
+<a href=#185 id=185 data-nosnippet>185</a>    <span class="kw">let </span>size = end.saturating_sub(start);
+<a href=#186 id=186 data-nosnippet>186</a>    <span class="kw">if </span>size &gt; ANON_HASH_LIMIT {
+<a href=#187 id=187 data-nosnippet>187</a>        <span class="kw">return </span><span class="prelude-val">Ok</span>(AnonHash::TooLarge(size));
+<a href=#188 id=188 data-nosnippet>188</a>    }
+<a href=#189 id=189 data-nosnippet>189</a>    <span class="kw">let </span>memory = guest.memory();
+<a href=#190 id=190 data-nosnippet>190</a>    <span class="kw">let </span>(digest, listed) = hash_in_chunks(size, ANON_READ_CHUNK, pages, |offset, buf| {
+<a href=#191 id=191 data-nosnippet>191</a>        <span class="kw">let </span>address = Addr::&lt;u8&gt;::from_raw((start + offset) <span class="kw">as </span>usize).unwrap();
+<a href=#192 id=192 data-nosnippet>192</a>        memory.read_values(address, buf)<span class="question-mark">?</span>;
+<a href=#193 id=193 data-nosnippet>193</a>        <span class="prelude-val">Ok</span>(())
+<a href=#194 id=194 data-nosnippet>194</a>    })<span class="question-mark">?</span>;
+<a href=#195 id=195 data-nosnippet>195</a>    <span class="prelude-val">Ok</span>(AnonHash::Hashed(digest, listed))
+<a href=#196 id=196 data-nosnippet>196</a>}
+<a href=#197 id=197 data-nosnippet>197</a>
+<a href=#198 id=198 data-nosnippet>198</a><span class="kw">fn </span>map_error(err: procfs::ProcError) -&gt; reverie::Error {
+<a href=#199 id=199 data-nosnippet>199</a>    <span class="kw">match </span>err {
+<a href=#200 id=200 data-nosnippet>200</a>        procfs::ProcError::Io(err, <span class="kw">_</span>) =&gt; reverie::Error::Io(err),
+<a href=#201 id=201 data-nosnippet>201</a>        err =&gt; reverie::Error::Tool(<span class="macro">anyhow::anyhow!</span>(err)),
+<a href=#202 id=202 data-nosnippet>202</a>    }
+<a href=#203 id=203 data-nosnippet>203</a>}
+<a href=#204 id=204 data-nosnippet>204</a>
+<a href=#205 id=205 data-nosnippet>205</a><span class="kw">pub fn </span>from_pid&lt;F&gt;(pid: Pid, filter: F) -&gt; <span class="prelude-ty">Result</span>&lt;Vec&lt;MemoryMap&gt;, reverie::Error&gt;
+<a href=#206 id=206 data-nosnippet>206</a><span class="kw">where
+<a href=#207 id=207 data-nosnippet>207</a>    </span>F: Fn(<span class="kw-2">&amp;</span>MemoryMap) -&gt; bool,
+<a href=#208 id=208 data-nosnippet>208</a>{
+<a href=#209 id=209 data-nosnippet>209</a>    <span class="kw">match </span>procfs::process::Process::new(pid.as_raw()) {
+<a href=#210 id=210 data-nosnippet>210</a>        <span class="prelude-val">Ok</span>(process) =&gt; <span class="kw">match </span>process.maps() {
+<a href=#211 id=211 data-nosnippet>211</a>            <span class="prelude-val">Ok</span>(<span class="kw-2">mut </span>maps) =&gt; {
+<a href=#212 id=212 data-nosnippet>212</a>                maps.<span class="number">0</span>.retain(filter);
+<a href=#213 id=213 data-nosnippet>213</a>                <span class="prelude-val">Ok</span>(maps.<span class="number">0</span>)
+<a href=#214 id=214 data-nosnippet>214</a>            }
+<a href=#215 id=215 data-nosnippet>215</a>            <span class="prelude-val">Err</span>(err) =&gt; <span class="prelude-val">Err</span>(map_error(err)),
+<a href=#216 id=216 data-nosnippet>216</a>        },
+<a href=#217 id=217 data-nosnippet>217</a>        <span class="prelude-val">Err</span>(err) =&gt; <span class="prelude-val">Err</span>(map_error(err)),
+<a href=#218 id=218 data-nosnippet>218</a>    }
+<a href=#219 id=219 data-nosnippet>219</a>}
+<a href=#220 id=220 data-nosnippet>220</a>
+<a href=#221 id=221 data-nosnippet>221</a><span class="kw">pub fn </span>compute_hash&lt;G, T: Tool&gt;(guest: <span class="kw-2">&amp;mut </span>G, map: <span class="kw-2">&amp;</span>MemoryMap) -&gt; <span class="prelude-ty">Result</span>&lt;Digest, reverie::Error&gt;
+<a href=#222 id=222 data-nosnippet>222</a><span class="kw">where
+<a href=#223 id=223 data-nosnippet>223</a>    </span>G: Guest&lt;T&gt;,
+<a href=#224 id=224 data-nosnippet>224</a>{
+<a href=#225 id=225 data-nosnippet>225</a>    compute_hash_range(guest, map.address.<span class="number">0</span>, map.address.<span class="number">1</span>)
+<a href=#226 id=226 data-nosnippet>226</a>}
+<a href=#227 id=227 data-nosnippet>227</a>
+<a href=#228 id=228 data-nosnippet>228</a><span class="doccomment">/// Hash the guest bytes in the half-open guest-virtual range `[start, end)`,
+<a href=#229 id=229 data-nosnippet>229</a>/// read through `guest.memory()`. Used for backend-reported memory regions
+<a href=#230 id=230 data-nosnippet>230</a>/// ([`reverie::Guest::detlog_memory_regions`]) where the range is a guest
+<a href=#231 id=231 data-nosnippet>231</a>/// address rather than an entry parsed from a host `/proc/&lt;pid&gt;/maps`.
+<a href=#232 id=232 data-nosnippet>232</a></span><span class="kw">pub fn </span>compute_hash_range&lt;G, T: Tool&gt;(
+<a href=#233 id=233 data-nosnippet>233</a>    guest: <span class="kw-2">&amp;mut </span>G,
+<a href=#234 id=234 data-nosnippet>234</a>    start: u64,
+<a href=#235 id=235 data-nosnippet>235</a>    end: u64,
+<a href=#236 id=236 data-nosnippet>236</a>) -&gt; <span class="prelude-ty">Result</span>&lt;Digest, reverie::Error&gt;
+<a href=#237 id=237 data-nosnippet>237</a><span class="kw">where
+<a href=#238 id=238 data-nosnippet>238</a>    </span>G: Guest&lt;T&gt;,
+<a href=#239 id=239 data-nosnippet>239</a>{
+<a href=#240 id=240 data-nosnippet>240</a>    <span class="kw">let </span>size = end.saturating_sub(start) <span class="kw">as </span>usize;
+<a href=#241 id=241 data-nosnippet>241</a>    <span class="kw">let </span>memory = guest.memory();
+<a href=#242 id=242 data-nosnippet>242</a>    <span class="kw">let </span><span class="kw-2">mut </span>buf = <span class="macro">vec!</span>[<span class="number">0</span>; size];
+<a href=#243 id=243 data-nosnippet>243</a>    <span class="kw">let </span>start = Addr::&lt;u8&gt;::from_raw(start <span class="kw">as </span>usize).unwrap();
+<a href=#244 id=244 data-nosnippet>244</a>    memory.read_values(start, buf.as_mut_slice())<span class="question-mark">?</span>;
+<a href=#245 id=245 data-nosnippet>245</a>    <span class="prelude-val">Ok</span>(Digest::new(buf.as_slice()))
+<a href=#246 id=246 data-nosnippet>246</a>}
+<a href=#247 id=247 data-nosnippet>247</a>
+<a href=#248 id=248 data-nosnippet>248</a><span class="attr">#[cfg(test)]
+<a href=#249 id=249 data-nosnippet>249</a></span><span class="kw">mod </span>tests {
+<a href=#250 id=250 data-nosnippet>250</a>    <span class="kw">use </span>procfs::process::MMPermissions;
+<a href=#251 id=251 data-nosnippet>251</a>
+<a href=#252 id=252 data-nosnippet>252</a>    <span class="kw">use super</span>::<span class="kw-2">*</span>;
+<a href=#253 id=253 data-nosnippet>253</a>
+<a href=#254 id=254 data-nosnippet>254</a>    <span class="kw">fn </span>map(perms: MMPermissions, pathname: MMapPath) -&gt; MemoryMap {
+<a href=#255 id=255 data-nosnippet>255</a>        MemoryMap {
+<a href=#256 id=256 data-nosnippet>256</a>            address: (<span class="number">0x7f00_0000_0000</span>, <span class="number">0x7f00_0000_2000</span>),
+<a href=#257 id=257 data-nosnippet>257</a>            perms,
+<a href=#258 id=258 data-nosnippet>258</a>            offset: <span class="number">0</span>,
+<a href=#259 id=259 data-nosnippet>259</a>            dev: (<span class="number">0</span>, <span class="number">0</span>),
+<a href=#260 id=260 data-nosnippet>260</a>            inode: <span class="number">0</span>,
+<a href=#261 id=261 data-nosnippet>261</a>            pathname,
+<a href=#262 id=262 data-nosnippet>262</a>            extension: Default::default(),
+<a href=#263 id=263 data-nosnippet>263</a>        }
+<a href=#264 id=264 data-nosnippet>264</a>    }
+<a href=#265 id=265 data-nosnippet>265</a>
+<a href=#266 id=266 data-nosnippet>266</a>    <span class="attr">#[test]
+<a href=#267 id=267 data-nosnippet>267</a>    </span><span class="kw">fn </span>only_private_writable_anonymous_mappings_are_hashed() {
+<a href=#268 id=268 data-nosnippet>268</a>        <span class="kw">let </span>rw = MMPermissions::READ | MMPermissions::WRITE | MMPermissions::PRIVATE;
+<a href=#269 id=269 data-nosnippet>269</a>        <span class="kw">for </span>pathname <span class="kw">in </span>[
+<a href=#270 id=270 data-nosnippet>270</a>            MMapPath::Anonymous,
+<a href=#271 id=271 data-nosnippet>271</a>            MMapPath::Other(<span class="string">"anon:scudo:primary"</span>.to_owned()),
+<a href=#272 id=272 data-nosnippet>272</a>            MMapPath::TStack(<span class="number">12</span>),
+<a href=#273 id=273 data-nosnippet>273</a>        ] {
+<a href=#274 id=274 data-nosnippet>274</a>            <span class="macro">assert!</span>(
+<a href=#275 id=275 data-nosnippet>275</a>                is_hashed_anonymous(<span class="kw-2">&amp;</span>map(rw, pathname.clone())),
+<a href=#276 id=276 data-nosnippet>276</a>                <span class="string">"{pathname:?}"
+<a href=#277 id=277 data-nosnippet>277</a>            </span>);
+<a href=#278 id=278 data-nosnippet>278</a>        }
+<a href=#279 id=279 data-nosnippet>279</a>        <span class="kw">for </span>pathname <span class="kw">in </span>[
+<a href=#280 id=280 data-nosnippet>280</a>            MMapPath::Heap,
+<a href=#281 id=281 data-nosnippet>281</a>            MMapPath::Stack,
+<a href=#282 id=282 data-nosnippet>282</a>            MMapPath::Vvar,
+<a href=#283 id=283 data-nosnippet>283</a>            MMapPath::Other(<span class="string">"anon_shmem:x"</span>.to_owned()),
+<a href=#284 id=284 data-nosnippet>284</a>            MMapPath::Path(<span class="string">"/usr/lib/libc.so.6"</span>.into()),
+<a href=#285 id=285 data-nosnippet>285</a>        ] {
+<a href=#286 id=286 data-nosnippet>286</a>            <span class="macro">assert!</span>(
+<a href=#287 id=287 data-nosnippet>287</a>                !is_hashed_anonymous(<span class="kw-2">&amp;</span>map(rw, pathname.clone())),
+<a href=#288 id=288 data-nosnippet>288</a>                <span class="string">"{pathname:?}"
+<a href=#289 id=289 data-nosnippet>289</a>            </span>);
+<a href=#290 id=290 data-nosnippet>290</a>        }
+<a href=#291 id=291 data-nosnippet>291</a>        <span class="comment">// Reverie's trampoline (read-write-execute) and scratch page.
+<a href=#292 id=292 data-nosnippet>292</a>        </span><span class="kw">let </span>rwx = rw | MMPermissions::EXECUTE;
+<a href=#293 id=293 data-nosnippet>293</a>        <span class="kw">let </span><span class="kw-2">mut </span>trampoline = map(rwx, MMapPath::Anonymous);
+<a href=#294 id=294 data-nosnippet>294</a>        trampoline.address = (<span class="number">0x7100_0000</span>, <span class="number">0x7100_1000</span>);
+<a href=#295 id=295 data-nosnippet>295</a>        <span class="kw">let </span><span class="kw-2">mut </span>scratch = map(rw, MMapPath::Anonymous);
+<a href=#296 id=296 data-nosnippet>296</a>        scratch.address = (<span class="number">0x7100_1000</span>, <span class="number">0x7100_2000</span>);
+<a href=#297 id=297 data-nosnippet>297</a>        <span class="macro">assert!</span>(!is_hashed_anonymous(<span class="kw-2">&amp;</span>trampoline) &amp;&amp; !is_hashed_anonymous(<span class="kw-2">&amp;</span>scratch));
+<a href=#298 id=298 data-nosnippet>298</a>        <span class="comment">// A reservation, a read-only mapping, and a shared one.
+<a href=#299 id=299 data-nosnippet>299</a>        </span><span class="kw">for </span>perms <span class="kw">in </span>[
+<a href=#300 id=300 data-nosnippet>300</a>            MMPermissions::PRIVATE,
+<a href=#301 id=301 data-nosnippet>301</a>            MMPermissions::READ | MMPermissions::PRIVATE,
+<a href=#302 id=302 data-nosnippet>302</a>            MMPermissions::READ | MMPermissions::WRITE | MMPermissions::SHARED,
+<a href=#303 id=303 data-nosnippet>303</a>        ] {
+<a href=#304 id=304 data-nosnippet>304</a>            <span class="macro">assert!</span>(
+<a href=#305 id=305 data-nosnippet>305</a>                !is_hashed_anonymous(<span class="kw-2">&amp;</span>map(perms, MMapPath::Anonymous)),
+<a href=#306 id=306 data-nosnippet>306</a>                <span class="string">"{perms:?}"
+<a href=#307 id=307 data-nosnippet>307</a>            </span>);
+<a href=#308 id=308 data-nosnippet>308</a>        }
+<a href=#309 id=309 data-nosnippet>309</a>    }
+<a href=#310 id=310 data-nosnippet>310</a>
+<a href=#311 id=311 data-nosnippet>311</a>    <span class="attr">#[test]
+<a href=#312 id=312 data-nosnippet>312</a>    </span><span class="kw">fn </span>page_digests_list_the_pages_that_are_not_all_zero() {
+<a href=#313 id=313 data-nosnippet>313</a>        <span class="kw">let </span><span class="kw-2">mut </span>bytes = <span class="macro">vec!</span>[<span class="number">0u8</span>; <span class="number">3 </span>* <span class="number">4096</span>];
+<a href=#314 id=314 data-nosnippet>314</a>        <span class="macro">assert_eq!</span>(page_digests(<span class="kw-2">&amp;</span>bytes), <span class="string">""</span>);
+<a href=#315 id=315 data-nosnippet>315</a>        bytes[<span class="number">4096 </span>+ <span class="number">17</span>] = <span class="number">1</span>;
+<a href=#316 id=316 data-nosnippet>316</a>        <span class="kw">let </span>digests = page_digests(<span class="kw-2">&amp;</span>bytes);
+<a href=#317 id=317 data-nosnippet>317</a>        <span class="kw">let </span>expected = <span class="kw-2">&amp;</span>Digest::new(<span class="kw-2">&amp;</span>bytes[<span class="number">4096</span>..<span class="number">8192</span>]).to_string()[..<span class="number">16</span>];
+<a href=#318 id=318 data-nosnippet>318</a>        <span class="macro">assert_eq!</span>(digests, <span class="macro">format!</span>(<span class="string">"1:{expected}"</span>));
+<a href=#319 id=319 data-nosnippet>319</a>        bytes[<span class="number">2 </span>* <span class="number">4096</span>] = <span class="number">2</span>;
+<a href=#320 id=320 data-nosnippet>320</a>        <span class="macro">assert_eq!</span>(page_digests(<span class="kw-2">&amp;</span>bytes).split(<span class="string">','</span>).count(), <span class="number">2</span>);
+<a href=#321 id=321 data-nosnippet>321</a>        <span class="comment">// A short last page counts as a page.
+<a href=#322 id=322 data-nosnippet>322</a>        </span><span class="macro">assert_eq!</span>(page_digests(<span class="kw-2">&amp;</span>[<span class="number">0</span>, <span class="number">0</span>, <span class="number">3</span>]).split(<span class="string">':'</span>).next(), <span class="prelude-val">Some</span>(<span class="string">"0"</span>));
+<a href=#323 id=323 data-nosnippet>323</a>    }
+<a href=#324 id=324 data-nosnippet>324</a>
+<a href=#325 id=325 data-nosnippet>325</a>    <span class="attr">#[test]
+<a href=#326 id=326 data-nosnippet>326</a>    </span><span class="kw">fn </span>reading_in_chunks_equals_hashing_at_once() {
+<a href=#327 id=327 data-nosnippet>327</a>        <span class="comment">// Two and a half chunks of two pages each, with a page written in
+<a href=#328 id=328 data-nosnippet>328</a>        // each chunk and the last, short, chunk.
+<a href=#329 id=329 data-nosnippet>329</a>        </span><span class="kw">let </span><span class="kw-2">mut </span>bytes = <span class="macro">vec!</span>[<span class="number">0u8</span>; <span class="number">5 </span>* <span class="number">4096 </span>+ <span class="number">100</span>];
+<a href=#330 id=330 data-nosnippet>330</a>        <span class="kw">for </span>(index, byte) <span class="kw">in </span>[(<span class="number">1</span>, <span class="number">7u8</span>), (<span class="number">2 </span>* <span class="number">4096 </span>+ <span class="number">9</span>, <span class="number">8</span>), (<span class="number">5 </span>* <span class="number">4096 </span>+ <span class="number">50</span>, <span class="number">9</span>)] {
+<a href=#331 id=331 data-nosnippet>331</a>            bytes[index] = byte;
+<a href=#332 id=332 data-nosnippet>332</a>        }
+<a href=#333 id=333 data-nosnippet>333</a>        <span class="kw">let </span>(digest, pages) = hash_in_chunks(bytes.len() <span class="kw">as </span>u64, <span class="number">2 </span>* <span class="number">4096</span>, <span class="bool-val">true</span>, |offset, buf| {
+<a href=#334 id=334 data-nosnippet>334</a>            <span class="kw">let </span>offset = offset <span class="kw">as </span>usize;
+<a href=#335 id=335 data-nosnippet>335</a>            buf.copy_from_slice(<span class="kw-2">&amp;</span>bytes[offset..offset + buf.len()]);
+<a href=#336 id=336 data-nosnippet>336</a>            <span class="prelude-val">Ok</span>(())
+<a href=#337 id=337 data-nosnippet>337</a>        })
+<a href=#338 id=338 data-nosnippet>338</a>        .unwrap();
+<a href=#339 id=339 data-nosnippet>339</a>        <span class="macro">assert_eq!</span>(digest, Digest::new(<span class="kw-2">&amp;</span>bytes));
+<a href=#340 id=340 data-nosnippet>340</a>        <span class="macro">assert_eq!</span>(pages.as_deref(), <span class="prelude-val">Some</span>(page_digests(<span class="kw-2">&amp;</span>bytes).as_str()));
+<a href=#341 id=341 data-nosnippet>341</a>        <span class="macro">assert_eq!</span>(pages.unwrap().split(<span class="string">','</span>).count(), <span class="number">3</span>);
+<a href=#342 id=342 data-nosnippet>342</a>        <span class="kw">let </span>(empty, none) = hash_in_chunks(<span class="number">0</span>, <span class="number">4096</span>, <span class="bool-val">false</span>, |<span class="kw">_</span>, <span class="kw">_</span>| <span class="prelude-val">Ok</span>(())).unwrap();
+<a href=#343 id=343 data-nosnippet>343</a>        <span class="macro">assert_eq!</span>((empty, none), (Digest::new(<span class="kw-2">&amp;</span>[]), <span class="prelude-val">None</span>));
+<a href=#344 id=344 data-nosnippet>344</a>    }
+<a href=#345 id=345 data-nosnippet>345</a>}
+</code></pre></div></section></main></body></html>

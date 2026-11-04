@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["PEER_EXIT"],"enum":["ArmStatus","Kind","Mode","PeerState"],"fn":["hermit_xinuse_arm","hermit_xinuse_cpuid_cycles","hermit_xinuse_peer_loop","hermit_xinuse_save_restore_cycles","hermit_xinuse_syscall_cycles"],"struct":["ArmCtx","PeerCtx"]};
