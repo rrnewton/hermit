@@ -21095,9 +21095,10 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // 132. And SIGSHARE S2a's
         // run_kvm_the_drain_decides_a_polled_call_from_the_backends_signal_state:
         // 133. And package K item 2b slice 2b-1's
-        // run_kvm_another_processs_stat_and_comm_answer_as_linux: 134, matching
-        // the DAG pin in validation_dag_static.
-        ("privileged-only-test.cli_kvm", 134usize),
+        // run_kvm_another_processs_stat_and_comm_answer_as_linux: 134. And
+        // slice 2b-2's run_kvm_another_processs_status_answers_as_linux: 135,
+        // matching the DAG pin in validation_dag_static.
+        ("privileged-only-test.cli_kvm", 135usize),
     ] {
         let step = privileged
             .steps
