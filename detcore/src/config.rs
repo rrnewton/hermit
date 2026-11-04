@@ -87,13 +87,19 @@ mod tests {
     use super::*;
 
     /// Revisions reserved for a change that is not on this base yet, which
-    /// `GLOBAL_RPC_REVISIONS` therefore skips. Nothing is reserved at this
-    /// head: 28 is https://github.com/rrnewton/hermit/pull/4789's, 29 is
-    /// https://github.com/rrnewton/hermit/pull/4884's, 30 is this change's
-    /// (https://github.com/rrnewton/hermit/pull/4728), 31 is
-    /// https://github.com/rrnewton/hermit/pull/4867's, and 32, this
-    /// change's layout on top of 31's, is the current revision.
-    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[];
+    /// `GLOBAL_RPC_REVISIONS` therefore skips: 33 to 38, taken by changes the
+    /// coordinator allocated them to that are not beneath package K item 2b
+    /// slice 2b-1, whose 39 follows (allocated by the kvm lane's coordinator,
+    /// 2026-11-04). 28 is https://github.com/rrnewton/hermit/pull/4789's, 29
+    /// is https://github.com/rrnewton/hermit/pull/4884's, 30 and 32 are
+    /// https://github.com/rrnewton/hermit/pull/4728's, and 31 is
+    /// https://github.com/rrnewton/hermit/pull/4867's. A change that lands
+    /// below the last row removes its entry, with its row. One that lands
+    /// after a higher revision (any of 33 to 38 after 39) appends its row
+    /// above the last instead and leaves its old number here, reserved as
+    /// never landed: filling a number in below a landed row would rewrite
+    /// that row's digest.
+    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[33, 34, 35, 36, 37, 38];
 
     /// Every revision of the global RPC, oldest first, with the digest of the
     /// code of its two enums and its `Resources` payload. A change to any of
@@ -261,6 +267,12 @@ mod tests {
         // here rather than relabel 31 (revopus1's R1 on this change).
         // Digest measured at this head.
         (32, "e178ac33707f23b5", "f013e36743d8d9e6"),
+        // Adds `GlobalRequest::WithCpuTime`, which carries a thread's CPU
+        // accounting on its request (`CpuPublication`, defined outside the
+        // digested enums), and `GlobalRequest::RecordExitCode` and its
+        // response (package K item 2b slice 2b-1, revision 39 allocated by the
+        // kvm lane's coordinator; digest measured at this head).
+        (39, "e88a95a39cc9aba4", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
