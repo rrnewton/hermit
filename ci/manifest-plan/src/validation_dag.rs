@@ -6377,7 +6377,7 @@ sys.exit(37)
         refuse(OUTPUT, "the file", text);
     }
 
-    /// The PMU analyze node retains exactly the six other ignored integrations
+    /// The PMU analyze node retains exactly the ten other ignored integrations
     /// while hello-race pinpointing is excluded for its tracked failure.
     #[test]
     fn the_pmu_analyze_node_runs_the_ignored_analyze_integrations() {
@@ -6430,7 +6430,7 @@ sys.exit(37)
                 format!("{expected_filter}' -- --ignored"),
                 "{origin}"
             );
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "6", "{origin}");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "10", "{origin}");
             assert!(
                 !step.cmd.contains("test(=analyze_hello_race)"),
                 "{origin}: excluded hello-race must not run"

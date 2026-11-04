@@ -313,7 +313,12 @@ pub(super) const PMU_MEMORY_FAILURE_FAMILY_MEMBERS: &[&str] = &[
 pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Six selected cases remain after excluding analyze_hello_race for
     // https://github.com/rrnewton/hermit/issues/5115; the excluded case is not a pass.
-    ("super.pmu_analyze_hello_race_stress_calibrated_skid", 6),
+    // And PR #4752's race-finder two (analyze_checks_the_race_candidates_and_says_what_each_edit_moved,
+    // analyze_names_the_close_racing_the_reused_descriptor) and verdict two
+    // (bisect_exits_2_when_its_good_schedule_meets_the_target,
+    // analyze_reports_a_target_met_without_chaos_as_reproduced_without_the_schedule),
+    // rebased onto main b23568f7: 6 + 4 = 10.
+    ("super.pmu_analyze_hello_race_stress_calibrated_skid", 10),
     // Measured 189 - 185 embedded qualifier tests = four allocator/source-copy
     // cases. The same 185 qualifier identities now run once through the existing
     // allocator producer's script-test harness, with none dropped or ignored.
@@ -1266,7 +1271,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 1971 pin: 1971 + 2 = 1973, measured by that run.
     // Train 5 recount (measured by the ccb5080910 full validate):
     // Composed on measured main ffe313b1: 1944 + 2 = 1946 (Train 5 delta +2).
-    ("test.regular_crates", 1951),
+    // And PR #4752's detcore-model open-note unit (nextest list against
+    // main b23568f7: detcore-model 337 -> 338; manifest-plan unchanged):
+    // 1951 + 1 = 1952.
+    ("test.regular_crates", 1952),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1980,7 +1988,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR #4609 (rebased onto post-split main) adds ten hermit-run units
     // (nine in app::analyze::phases, one in app::analyze::rundata):
     // 1239 + 10 = 1249, measured by nextest list.
-    ("test.hermit_unit", 1252),
+    // And PR #4752's 40 hermit-unit additions on this base (analyze verdict,
+    // race report and output-matching units; measured by nextest list at the
+    // rebased head against main b23568f7: 1350 -> 1390): 1252 + 40 = 1292.
+    ("test.hermit_unit", 1292),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -4641,7 +4652,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // cases: 780 + 7 = 787, measured by the 216dbc929a full validate.
     // Train 5 recount (measured by the ccb5080910 full validate):
     // Composed on landed batch main: 789 + 5 = 794 (Train 5 delta +5 over 787).
-    ("test.cli", 797),
+    // And PR #4752's open-note cli case (nextest list against main
+    // b23568f7: 963 -> 964): 797 + 1 = 798.
+    ("test.cli", 798),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5300,7 +5313,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 1 recount (measured by the 216dbc929a full validate, same
     // growth as test.cli): 699 + 7 = 706.
     // Train 5 recount (same growth as test.cli), composed on landed batch main: 708 + 5 = 713.
-    ("test.cli_on_host", 716),
+    // And the same one PR #4752 cli case as test.cli: 716 + 1 = 717.
+    ("test.cli_on_host", 717),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
@@ -5311,7 +5325,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two added units as the local selection (1973 measured at
     // 85b8cec25a): 1957 + 2 = 1959 (1973 - 14).
     // Train 5 recount (same growth as test.regular_crates), composed on measured main: 1930 + 2 = 1932.
-    ("test.regular_crates_on_host", 1937),
+    // And the same one PR #4752 unit as test.regular_crates: 1937 + 1 = 1938.
+    ("test.regular_crates_on_host", 1938),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -6297,7 +6312,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // in the hosted CPUID-faulting skip set): 1327 + 2 = 1329.
     // The split retains nine additional core identities: 1329 + 9 = 1338.
     // Train 5 recount (same growth as test.hermit_unit), composed on measured main: 1206 + 1 = 1207.
-    ("test.hermit_unit_on_host", 1246),
+    // And the same 40 PR #4752 units as test.hermit_unit: 1246 + 40 = 1286.
+    ("test.hermit_unit_on_host", 1286),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -6536,7 +6552,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two added units as the local selection (1973 measured at
     // 85b8cec25a), none hosted-excluded: 1957 + 2 = 1959 (1973 - 14).
     // Train 5 recount (same growth as test.regular_crates), composed on measured main: 1930 + 2 = 1932.
-    ("test.regular_crates_on_host", 1937),
+    // And the same one PR #4752 unit as test.regular_crates: 1937 + 1 = 1938.
+    ("test.regular_crates_on_host", 1938),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
@@ -11381,7 +11398,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"super"########,
         job: r########"pmu_analyze_hello_race_stress_calibrated_skid"########,
         desc: r########"PMU analyze hello-race stress (calibrated skid)"########,
-        description: r########"Calibrates the PMU skid margin on the host, then runs the ignored bisect_rejects_a_timed_out_replay, analyze_stops_on_a_refused_trial, analyze_ends_with_a_refused_target_run, analyze_keeps_its_workspace_after_an_error, analyze_cleans_up_when_a_signal_stops_it and analyze_stops_a_run_whose_init_has_not_armed tests. The shell command checks four positive-integer settings (ANALYZE_SKID_CALIBRATION_ITERATIONS, default 64; ANALYZE_SKID_CALIBRATION_PERIOD, 1000000; ANALYZE_SKID_MINIMUM_MARGIN, 20000; ANALYZE_SKID_CALIBRATION_TIMEOUT, 30 seconds), compiles tests/util/pmu_skid.c into target/ci-pmu-skid, runs it to read "Recommended margin: N RCB", and passes the larger of N and the floor as HERMIT_ANALYZE_SKID_MARGIN. analyze_hello_race is excluded while https://github.com/rrnewton/hermit/issues/5115 tracks its pinpointing failure; this exclusion is not a passing result. The bisect timeout regression runs an endless guest with a one-second Hermit timeout and a 30-second outer bound; it requires exit 124 with the typed run-timeout marker and no successful report or causal claim. The refusal cases require a named restart_syscall refusal, exact policy-refusal exit 122 and no causal report, while distinguishing an ordinary completed guest exit 122. The workspace cases check analyze's cleanup through real trials: an analysis that ends with an error keeps its one workspace, with or without --keep-tmp, and says so; a SIGTERM to analyze two seconds into a target run that spins for ever ends that run and the analysis and leaves no workspace; and a SIGTERM while the run's container init is held before it arms its own stop handlers still reaches that init and leaves no workspace. A missing calibration line exits with an error before the tests; a lost timeout classification fails the tests. A failure is blocking for the super validation."########,
+        description: r########"Calibrates the PMU skid margin on the host, then runs the ignored bisect_rejects_a_timed_out_replay, analyze_stops_on_a_refused_trial, analyze_ends_with_a_refused_target_run, analyze_keeps_its_workspace_after_an_error, analyze_cleans_up_when_a_signal_stops_it, analyze_stops_a_run_whose_init_has_not_armed, analyze_checks_the_race_candidates_and_says_what_each_edit_moved, analyze_names_the_close_racing_the_reused_descriptor, bisect_exits_2_when_its_good_schedule_meets_the_target and analyze_reports_a_target_met_without_chaos_as_reproduced_without_the_schedule tests. The shell command checks four positive-integer settings (ANALYZE_SKID_CALIBRATION_ITERATIONS, default 64; ANALYZE_SKID_CALIBRATION_PERIOD, 1000000; ANALYZE_SKID_MINIMUM_MARGIN, 20000; ANALYZE_SKID_CALIBRATION_TIMEOUT, 30 seconds), compiles tests/util/pmu_skid.c into target/ci-pmu-skid, runs it to read "Recommended margin: N RCB", and passes the larger of N and the floor as HERMIT_ANALYZE_SKID_MARGIN. analyze_hello_race is excluded while https://github.com/rrnewton/hermit/issues/5115 tracks its pinpointing failure; this exclusion is not a passing result. The bisect timeout regression runs an endless guest with a one-second Hermit timeout and a 30-second outer bound; it requires exit 124 with the typed run-timeout marker and no successful report or causal claim. The refusal cases require a named restart_syscall refusal, exact policy-refusal exit 122 and no causal report, while distinguishing an ordinary completed guest exit 122. The workspace cases check analyze's cleanup through real trials: an analysis that ends with an error keeps its one workspace, with or without --keep-tmp, and says so; a SIGTERM to analyze two seconds into a target run that spins for ever ends that run and the analysis and leaves no workspace; and a SIGTERM while the run's container init is held before it arms its own stop handlers still reaches that init and leaves no workspace. The two race-candidate cases run `hermit analyze --prefix-search` on tests/c/rpc_shutdown_removes_client.c and tests/c/fd_reuse_close_race.c and read the report's racing_accesses: the first requires the server's change of course among the ranked candidates, checked by intervention and reported not realized with the events its edit moved, and no poller nap that decides; the second requires the found pair to be the closer's close and the writer's lseek failing with EBADF, on two threads, unordered by the edges Hermit observes, and runs without the calibrated margin (SkidMargin::Without in hermit-cli/tests/analyze.rs): its guest's writer computes between syscalls, 59 of a run's 64 timeslices end at the 400000 ns timer, and stepping each such event through a 20000-branch margin made every prefix trial take 42 to 61 s instead of 1.5 to 2.0 s on an Intel Xeon Gold 6138, so 18 trials would not fit the node's per-test wall. The bisect precondition case gives `hermit bisect` a --good schedule that meets the target and requires exit 2 with HERMIT_ANALYZE_PRECONDITION class=baseline-not-reproduced, not an internal failure. The verdict case runs a prefix search on a target the scheduler meets without chaos at every timeslice and requires exit 0, HERMIT_ANALYZE_VERDICT class=reproduced-without-schedule and a report whose verdict says so, with no event localized. A missing calibration line exits with an error before the tests; a lost timeout classification fails the tests. A failure is blocking for the super validation."########,
         labels: &[r########"super"########],
         // Disable only analyze_hello_race pending https://github.com/rrnewton/hermit/issues/5115.
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -u
@@ -11410,7 +11427,7 @@ margin=$rec
 if [ "$margin" -lt "$floor" ]; then margin=$floor; fi
 printf 'Analyze PMU skid margin: calibrated=%s RCB, conservative floor=%s RCB, using=%s RCB\n' \
     "$rec" "$floor" "$margin"
-HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit-run --features liteinst --test analyze -j 1 -E 'test(=bisect_rejects_a_timed_out_replay) | test(=analyze_stops_on_a_refused_trial) | test(=analyze_ends_with_a_refused_target_run) | test(=analyze_keeps_its_workspace_after_an_error) | test(=analyze_cleans_up_when_a_signal_stops_it) | test(=analyze_stops_a_run_whose_init_has_not_armed)' -- --ignored"########,
+HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit-run --features liteinst --test analyze -j 1 -E 'test(=bisect_rejects_a_timed_out_replay) | test(=analyze_stops_on_a_refused_trial) | test(=analyze_ends_with_a_refused_target_run) | test(=analyze_keeps_its_workspace_after_an_error) | test(=analyze_cleans_up_when_a_signal_stops_it) | test(=analyze_stops_a_run_whose_init_has_not_armed) | test(=analyze_checks_the_race_candidates_and_says_what_each_edit_moved) | test(=analyze_names_the_close_racing_the_reused_descriptor) | test(=bisect_exits_2_when_its_good_schedule_meets_the_target) | test(=analyze_reports_a_target_met_without_chaos_as_reproduced_without_the_schedule)' -- --ignored"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"analyze"########]),
