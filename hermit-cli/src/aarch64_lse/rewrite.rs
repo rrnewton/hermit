@@ -90,7 +90,9 @@ pub enum Refusal {
     /// the load-exclusive's reservation in place in the original, and a
     /// store-exclusive outside the sequence could consume that reservation.
     /// The replacement's single atomic creates no reservation, so the
-    /// outside store would silently stop storing.
+    /// outside store would silently stop storing. The outside store may be
+    /// in another executable section: a section boundary does not clear
+    /// the exclusive monitor.
     ExportsReservation,
     /// The idiom matched but its registers break an assumption the
     /// replacement needs; the string names which one.
@@ -185,6 +187,23 @@ pub fn plan_with_entries(
     external_targets: &HashSet<u64>,
     known_entries: &HashSet<u64>,
 ) -> Report {
+    plan_with_external_store(words, base, external_targets, known_entries, false)
+}
+
+/// The same, also told whether code outside this range holds a
+/// store-exclusive (or an unreadable executable section, whose contents are
+/// unknown). A section boundary does not clear the exclusive monitor, so a
+/// compare idiom whose failing exit leaves its reservation in place is
+/// refused whenever any other store-exclusive in the image could consume
+/// that reservation, in this range or any other: the replacement's single
+/// atomic creates no reservation for it to consume.
+pub fn plan_with_external_store(
+    words: &[u32],
+    base: u64,
+    external_targets: &HashSet<u64>,
+    known_entries: &HashSet<u64>,
+    external_store_exclusive: bool,
+) -> Report {
     let decoded: Vec<Insn> = words.iter().copied().map(decode).collect();
     let branches = direct_branches(&decoded, base);
     let mut targets: HashSet<u64> = branches.iter().map(|(_, target)| *target).collect();
@@ -229,13 +248,14 @@ pub fn plan_with_entries(
                         // whether that store stores.
                         let exports_reservation =
                             matches!(site.idiom, Idiom::CasCompare | Idiom::CasZero)
-                                && decoded.iter().enumerate().any(|(other, other_insn)| {
-                                    other != index
-                                        && matches!(
-                                            other_insn,
-                                            Insn::StoreExcl { .. } | Insn::ExclPair
-                                        )
-                                });
+                                && (external_store_exclusive
+                                    || decoded.iter().enumerate().any(|(other, other_insn)| {
+                                        other != index
+                                            && matches!(
+                                                other_insn,
+                                                Insn::StoreExcl { .. } | Insn::ExclPair
+                                            )
+                                    }));
                         if interior_entered {
                             report.refused.push(RefusedSite {
                                 addr: addr(index),
@@ -1066,6 +1086,28 @@ mod tests {
                 .any(|r| r.reason == Refusal::ExportsReservation),
             "{report:?}"
         );
+    }
+
+    #[test]
+    fn a_compare_exit_is_refused_when_another_section_holds_a_store() {
+        // The same CasZero loop as above, told a store-exclusive exists in
+        // another executable section: a section boundary does not clear
+        // the monitor, so the outside store could still consume the
+        // reservation the failing exit leaves.
+        let words = [0xc85f_fc40, 0xb500_0060, 0xc803_fc41, 0x35ff_ffa3];
+        let report = plan_with_external_store(&words, BASE, &HashSet::new(), &HashSet::new(), true);
+        assert_eq!(report.patched, vec![], "{report:?}");
+        assert!(
+            report
+                .refused
+                .iter()
+                .any(|r| r.reason == Refusal::ExportsReservation),
+            "{report:?}"
+        );
+        // Told there is none, the same loop is rewritten as before.
+        let report =
+            plan_with_external_store(&words, BASE, &HashSet::new(), &HashSet::new(), false);
+        assert_eq!(report.patched.len(), 1, "{report:?}");
     }
 
     #[test]

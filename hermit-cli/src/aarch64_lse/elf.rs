@@ -512,14 +512,14 @@ pub fn rewrite_bytes(
         pages.dedup();
         for page in pages {
             // `functions` is sorted by entry, so only the ones starting
-            // before the page ends can overlap it, and of those only the
-            // last few reach into it.
+            // before the page ends can overlap it. FDE ranges may nest, so
+            // every overlapping range counts: stopping at the first range
+            // that ends before the page would miss an enclosing one.
             let before = functions.partition_point(|(entry, _)| *entry < page + PAGE);
             extents.extend(
                 functions[..before]
                     .iter()
-                    .rev()
-                    .take_while(|(_, end)| *end > page)
+                    .filter(|(_, end)| *end > page)
                     .filter(|(entry, _)| unwind_only(entry))
                     .copied(),
             );
@@ -531,6 +531,32 @@ pub fn rewrite_bytes(
         // never shadow a longer one that contains a candidate.
         merge_ranges(extents)
     };
+    // Whether each section's words hold a store-exclusive, for the
+    // reservation proof: a compare rewrite in one section is refused when
+    // any other executable section holds a store that could consume the
+    // reservation its failing exit leaves, because a section boundary does
+    // not clear the exclusive monitor. An unreadable section is unknown,
+    // which counts the same way.
+    let section_has_store: Vec<bool> = sections
+        .iter()
+        .map(|section| {
+            section.words.as_ref().is_some_and(|words| {
+                words.iter().any(|word| {
+                    matches!(
+                        insn::decode(*word),
+                        insn::Insn::StoreExcl { .. } | insn::Insn::ExclPair
+                    )
+                })
+            })
+        })
+        .collect();
+    let external_store: Vec<bool> = (0..sections.len())
+        .map(|index| {
+            sections.iter().enumerate().any(|(other, section)| {
+                other != index && (section.words.is_none() || section_has_store[other])
+            })
+        })
+        .collect();
     let mut report = FileReport::default();
     if relr_unreadable {
         report
@@ -571,7 +597,13 @@ pub fn rewrite_bytes(
         // each sequence the planner finds is named as left alone for that
         // reason, whatever else it would have said of it.
         if let Some(reason) = unproven {
-            let plan = rewrite::plan_with_entries(&words, vaddr, &external_targets, &known_entries);
+            let plan = rewrite::plan_with_external_store(
+                &words,
+                vaddr,
+                &external_targets,
+                &known_entries,
+                external_store[index],
+            );
             report.exclusive_instructions += plan.exclusive_instructions;
             let mut sites: Vec<u64> = plan
                 .patched
@@ -603,7 +635,13 @@ pub fn rewrite_bytes(
             ));
             continue;
         }
-        let mut plan = rewrite::plan_with_entries(&words, vaddr, &external_targets, &known_entries);
+        let mut plan = rewrite::plan_with_external_store(
+            &words,
+            vaddr,
+            &external_targets,
+            &known_entries,
+            external_store[index],
+        );
         restrict_to_code(&mut plan, &words, vaddr, &code);
         refuse_literals(&mut plan, &literals);
         refuse_overlapping(&mut plan, &extents, Refusal::AddressedData);
@@ -873,11 +911,12 @@ fn stored_pointers(bytes: &[u8], elf: &Elf<'_>, functions: &[(u64, u64)]) -> Vec
     const R_AARCH64_RELATIVE: u32 = 1027;
     const SHT_RELR: u32 = 19;
     const STT_OBJECT: u8 = 1;
+    // FDE ranges may nest, so any containing range counts, not only the
+    // nearest one.
     let inside = |addr: u64| {
-        let after = functions.partition_point(|(entry, _)| *entry <= addr);
-        after
-            .checked_sub(1)
-            .is_some_and(|i| functions[i].0 < addr && addr < functions[i].1)
+        functions
+            .iter()
+            .any(|(entry, end)| *entry < addr && addr < *end)
     };
     let word_at = |addr: u64| -> Option<u64> {
         // The file offset of an address, through the section that holds it.
@@ -1349,6 +1388,120 @@ mod tests {
             let (at, len) = (data_at as u64, data_len as u64);
             header(&mut bytes, sections - 1, [33, 1, 2, at, at, len, 0, 0]);
         }
+        bytes
+    }
+
+    /// A minimal two-executable-section image at 0x400000: `.text.loop`
+    /// at file offset/address offset 0x100 and `.text.out` at 0x200, each
+    /// marked `$x`, in one read-and-execute `PT_LOAD`, entered at the
+    /// first section.
+    fn elf_image_two_sections(first: &[u32], second: &[u32]) -> Vec<u8> {
+        const BASE: u64 = 0x400000;
+        let offsets = [0x100usize, 0x200];
+        let names = b"\0.text.loop\0.text.out\0.shstrtab\0.symtab\0.strtab\0";
+        let strings = b"\0$x\0";
+        let mut syms = vec![0u8; 24];
+        for (i, offset) in offsets.iter().enumerate() {
+            syms.extend_from_slice(&mapping::tests::symbol(
+                1,
+                0,
+                (i + 1) as u16,
+                BASE + *offset as u64,
+            ));
+        }
+        let names_at = offsets[1] + 4 * second.len();
+        let str_at = names_at + names.len();
+        let sym_at = (str_at + strings.len()).next_multiple_of(8);
+        let shoff = (sym_at + syms.len()).next_multiple_of(8);
+        let sections = 6usize;
+        let total = shoff + sections * 64;
+        let mut bytes = vec![0u8; total];
+        let put = |bytes: &mut Vec<u8>, at: usize, value: &[u8]| {
+            bytes[at..at + value.len()].copy_from_slice(value)
+        };
+        put(&mut bytes, 0, b"\x7fELF\x02\x01\x01");
+        put(&mut bytes, 16, &2u16.to_le_bytes());
+        put(&mut bytes, 18, &183u16.to_le_bytes());
+        put(&mut bytes, 20, &1u32.to_le_bytes());
+        put(&mut bytes, 24, &(BASE + 0x100).to_le_bytes());
+        put(&mut bytes, 32, &64u64.to_le_bytes());
+        put(&mut bytes, 40, &(shoff as u64).to_le_bytes());
+        put(&mut bytes, 52, &64u16.to_le_bytes());
+        put(&mut bytes, 54, &56u16.to_le_bytes());
+        put(&mut bytes, 56, &1u16.to_le_bytes());
+        put(&mut bytes, 58, &64u16.to_le_bytes());
+        put(&mut bytes, 60, &(sections as u16).to_le_bytes());
+        put(&mut bytes, 62, &3u16.to_le_bytes());
+        put(&mut bytes, 64, &1u32.to_le_bytes());
+        put(&mut bytes, 68, &5u32.to_le_bytes());
+        put(&mut bytes, 72, &0u64.to_le_bytes());
+        put(&mut bytes, 80, &BASE.to_le_bytes());
+        put(&mut bytes, 88, &BASE.to_le_bytes());
+        put(&mut bytes, 96, &(total as u64).to_le_bytes());
+        put(&mut bytes, 104, &(total as u64).to_le_bytes());
+        put(&mut bytes, 112, &0x1000u64.to_le_bytes());
+        for (i, word) in first.iter().enumerate() {
+            put(&mut bytes, offsets[0] + 4 * i, &word.to_le_bytes());
+        }
+        for (i, word) in second.iter().enumerate() {
+            put(&mut bytes, offsets[1] + 4 * i, &word.to_le_bytes());
+        }
+        put(&mut bytes, names_at, names);
+        put(&mut bytes, str_at, strings);
+        put(&mut bytes, sym_at, &syms);
+        let header = |bytes: &mut Vec<u8>, index: usize, fields: [u64; 8]| {
+            let at = shoff + 64 * index;
+            let [name, kind, flags, addr, offset, size, link, entsize] = fields;
+            put(bytes, at, &(name as u32).to_le_bytes());
+            put(bytes, at + 4, &(kind as u32).to_le_bytes());
+            put(bytes, at + 8, &flags.to_le_bytes());
+            put(bytes, at + 16, &addr.to_le_bytes());
+            put(bytes, at + 24, &offset.to_le_bytes());
+            put(bytes, at + 32, &size.to_le_bytes());
+            put(bytes, at + 40, &(link as u32).to_le_bytes());
+            put(bytes, at + 48, &4u64.to_le_bytes());
+            put(bytes, at + 56, &entsize.to_le_bytes());
+        };
+        header(
+            &mut bytes,
+            1,
+            [1, 1, 6, BASE + 0x100, 0x100, (4 * first.len()) as u64, 0, 0],
+        );
+        header(
+            &mut bytes,
+            2,
+            [
+                12,
+                1,
+                6,
+                BASE + 0x200,
+                0x200,
+                (4 * second.len()) as u64,
+                0,
+                0,
+            ],
+        );
+        header(
+            &mut bytes,
+            3,
+            [22, 3, 0, 0, names_at as u64, names.len() as u64, 0, 0],
+        );
+        header(
+            &mut bytes,
+            4,
+            [32, 2, 0, 0, sym_at as u64, syms.len() as u64, 5, 24],
+        );
+        // Fix the symtab link/info fields the generic header writes at
+        // fixed offsets: link is the strtab index, info the first
+        // non-local symbol.
+        let symtab_at = shoff + 64 * 4;
+        bytes[symtab_at + 40..symtab_at + 44].copy_from_slice(&5u32.to_le_bytes());
+        bytes[symtab_at + 44..symtab_at + 48].copy_from_slice(&3u32.to_le_bytes());
+        header(
+            &mut bytes,
+            5,
+            [40, 3, 0, 0, str_at as u64, strings.len() as u64, 0, 0],
+        );
         bytes
     }
 
@@ -2225,6 +2378,89 @@ mod tests {
         words[19] = 0x35ff_ffa9; // cbnz w9, <ldaxr>
         words[20] = 0xd65f_03c0; // ret
         let image = elf_image_with(&words, None, Some(&[(0, 21)]));
+        let (bytes, report) = rewritten(&image);
+        assert_eq!(bytes, image, "{report:?}");
+        assert_eq!(report.patched_total(), 0, "{report:?}");
+        assert_eq!(
+            report.refused,
+            BTreeMap::from([("addressed-data-inside-the-sequence", 1)]),
+            "{report:?}"
+        );
+    }
+
+    /// A compare loop in one executable section whose failing exit
+    /// branches to a store-exclusive in another section: a section
+    /// boundary does not clear the exclusive monitor, so the compare is
+    /// refused and the image is preserved. Without the outside store the
+    /// same loop is rewritten.
+    #[test]
+    fn a_compare_whose_reservation_is_consumed_in_another_section_is_refused() {
+        // ldaxr x0,[x2]; cbnz x0, <second section>; stlxr w3,x1,[x2];
+        // cbnz w3, <ldaxr>
+        let first = [0xc85f_fc40, 0xb500_07e0, 0xc803_fc41, 0x35ff_ffa3];
+        // stlxr w4,x1,[x2]
+        let second = [0xc804_fc41];
+        let image = elf_image_two_sections(&first, &second);
+        let (bytes, report) = rewritten_with(&image, StrippedRewrite::Refuse);
+        assert_eq!(bytes, image, "{report:?}");
+        assert_eq!(report.patched_total(), 0, "{report:?}");
+        assert_eq!(
+            report.refused.get("exclusive-reservation-exported"),
+            Some(&1),
+            "{report:?}"
+        );
+        // The same loop with no store in the other section is rewritten.
+        let image = elf_image_two_sections(&first, &[0xd503_201f]);
+        let (bytes, report) = rewritten_with(&image, StrippedRewrite::Refuse);
+        assert_ne!(bytes, image, "{report:?}");
+        assert_eq!(report.patched_total(), 1, "{report:?}");
+    }
+
+    /// Nested FDEs, direct data: data addressed inside both an enclosing
+    /// and a short nested FDE runs to the enclosing end, so the loop
+    /// after the nested range but inside the enclosing one is refused.
+    #[test]
+    fn nested_fdes_do_not_shorten_a_direct_data_exclusion() {
+        let mut words = [0xd503_201fu32; 21];
+        words[0] = 0x1000_01a2; // adr x2, <word 13>
+        words[1] = 0xb940_0443; // ldr w3, [x2, #4]
+        words[16] = 0x885f_fc08; // ldaxr w8, [x0]
+        words[17] = 0x1100_0508; // add w8, w8, #1
+        words[18] = 0x8809_fc08; // stlxr w9, w8, [x0]
+        words[19] = 0x35ff_ffa9; // cbnz w9, <ldaxr>
+        words[20] = 0xd65f_03c0; // ret
+        let image = elf_image_with(&words, None, Some(&[(0, 21), (12, 14)]));
+        let (bytes, report) = rewritten(&image);
+        assert_eq!(bytes, image, "{report:?}");
+        assert_eq!(report.patched_total(), 0, "{report:?}");
+        assert_eq!(
+            report.refused,
+            BTreeMap::from([("addressed-data-inside-the-sequence", 1)]),
+            "{report:?}"
+        );
+        // Without the nested FDE the same program is likewise preserved.
+        let image = elf_image_with(&words, None, Some(&[(0, 21)]));
+        let (bytes, report) = rewritten(&image);
+        assert_eq!(bytes, image, "{report:?}");
+        assert_eq!(report.patched_total(), 0, "{report:?}");
+    }
+
+    /// Nested FDEs, unresolved ADRP page: an enclosing FDE that reaches
+    /// into the page an uncompleted ADRP names is taken for data even
+    /// when a short nested FDE ending before the page comes first in
+    /// entry order.
+    #[test]
+    fn nested_fdes_do_not_hide_an_enclosing_function_from_an_unresolved_page() {
+        let candidate = 1000usize;
+        let mut words = vec![0xd503_201fu32; candidate + 5];
+        words[0] = 0xb000_0001; // adrp x1, <page 0x1000>, never completed
+        words[candidate] = 0x885f_fc08; // ldaxr w8, [x0]
+        words[candidate + 1] = 0x1100_0508; // add w8, w8, #1
+        words[candidate + 2] = 0x8809_fc08; // stlxr w9, w8, [x0]
+        words[candidate + 3] = 0x35ff_ffa9; // cbnz w9, <ldaxr>
+        words[candidate + 4] = 0xd65f_03c0; // ret
+        let total = words.len();
+        let image = elf_image_with(&words, None, Some(&[(0, total), (64, 65)]));
         let (bytes, report) = rewritten(&image);
         assert_eq!(bytes, image, "{report:?}");
         assert_eq!(report.patched_total(), 0, "{report:?}");

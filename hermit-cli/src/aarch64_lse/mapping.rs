@@ -874,15 +874,18 @@ pub fn data_extents(
     functions: &[(u64, u64)],
     branches: &[(u64, u64)],
 ) -> Vec<(u64, u64)> {
+    // FDE ranges may nest: a short range inside a longer one does not end
+    // the data at its own end, so every containing range contributes an
+    // extent and the merge below keeps the longest.
     let mut extents: Vec<(u64, u64)> = starts
         .iter()
-        .filter_map(|start| {
-            let after = functions.partition_point(|(entry, _)| entry <= start);
+        .flat_map(|start| {
+            let start = *start;
+            let after = functions.partition_point(|(entry, _)| *entry <= start);
             functions[..after]
                 .iter()
-                .rev()
-                .find(|(entry, end)| entry < start && start < end)
-                .map(|(_, end)| (*start, *end))
+                .filter(move |(entry, end)| *entry < start && start < *end)
+                .map(move |(_, end)| (start, *end))
         })
         .collect();
     extents.sort_unstable();
@@ -1397,6 +1400,11 @@ pub(crate) mod tests {
             data_extents(&[0x140, 0x148, 0x220], &functions, &[(0x108, 0x150)]),
             vec![(0x140, 0x150), (0x220, 0x240)]
         );
+        // Nested FDEs: 0x134 is inside both the enclosing range and a
+        // short nested one. The data runs to the enclosing range's end,
+        // not the nested one's, so a candidate at 0x140 stays excluded.
+        let nested = [(0x100, 0x180), (0x130, 0x138)];
+        assert_eq!(data_extents(&[0x134], &nested, &[]), vec![(0x134, 0x180)]);
     }
 
     #[test]
