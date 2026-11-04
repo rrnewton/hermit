@@ -242,9 +242,10 @@ mod tests {
         (31, "b4bbaec490287ee5", "f013e36743d8d9e6"),
         // Adds `GlobalRequest::CpuClockProcess` and `GlobalResponse::CpuClockProcess`
         // (https://github.com/rrnewton/hermit/pull/4885; revision 20 at its base,
-        // renumbered to 32 after main's 27 at the drain rebase (29-31 allocated elsewhere, 28 landed as 4789); digests measured
+        // renumbered to 32 at the drain rebase after main's landed 29 (PR 4884)
+        // and 31 (PR 4867), skipping reserved 30 (4728); digests measured
         // at this head).
-        (32, "576cc8a315acb220", "f013e36743d8d9e6"),
+        (32, "1096e1e45f53b6bf", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
