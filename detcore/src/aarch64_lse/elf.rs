@@ -23,6 +23,15 @@
 //! began. A file with no section headers is left alone and reported, because
 //! nothing in it can be told apart from data.
 //!
+//! An executable section is not all instructions either: a literal pool or
+//! jump table inside `.text` is data whose words can decode as a canonical
+//! exclusive loop. The AArch64 mapping symbols the assembler emits (`$x`
+//! for A64 code, `$d` for data) say which ranges of a section are which, so
+//! only `$x` ranges are scanned. `$d` ranges, bytes before a section's
+//! first mapping symbol, and a section with no mapping symbols at all are
+//! left alone and reported, exactly as a headerless file is: what cannot
+//! be told from data must not be rewritten as code.
+//!
 //! A section in a segment that is both writable and executable is refused
 //! too: writable text is either a loader quirk or a runtime that rewrites
 //! itself, and rewriting it would race whatever writes it.
@@ -146,6 +155,70 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
     Ok(Some(plan.report))
 }
 
+/// Whether a symbol name is an AArch64 mapping symbol, and whether the
+/// range it opens is A64 code. `$x` (optionally suffixed, as in `$x.1`)
+/// opens code and `$d` opens data; any other `$`-symbol (`$a`, `$t`, ...)
+/// opens something that is not A64 code either, so it closes a code range
+/// just as `$d` does.
+fn mapping_symbol_code(name: &str) -> Option<bool> {
+    let suffixed = |prefix: &str| {
+        name.strip_prefix(prefix)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+    };
+    if suffixed("$x") {
+        Some(true)
+    } else if name.starts_with('$') {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// The A64 code ranges of one section, from its mapping symbols as
+/// `(address, is code)` marks in symbol-table order: each mark opens a
+/// range ending at the next mark or at the section's end, and bytes
+/// before the first mark belong to no range. `None` when the section
+/// has no mapping symbols, so nothing in it can be told from data.
+fn code_ranges(
+    section_addr: u64,
+    section_size: u64,
+    marks: &[(u64, bool)],
+) -> Option<Vec<(u64, u64)>> {
+    let section_end = section_addr.saturating_add(section_size);
+    let mut marks: Vec<(u64, bool)> = marks
+        .iter()
+        .copied()
+        .filter(|(addr, _)| (section_addr..=section_end).contains(addr))
+        .collect();
+    if marks.is_empty() {
+        return None;
+    }
+    // Stable, so where two marks name one address the later symbol wins.
+    marks.sort_by_key(|(addr, _)| *addr);
+    marks.dedup_by(|next, kept| {
+        if next.0 == kept.0 {
+            kept.1 = next.1;
+            true
+        } else {
+            false
+        }
+    });
+    let mut ranges = Vec::new();
+    for (index, (addr, code)) in marks.iter().enumerate() {
+        if !code {
+            continue;
+        }
+        let end = marks
+            .get(index + 1)
+            .map_or(section_end, |(next, _)| *next)
+            .min(section_end);
+        if addr < &end {
+            ranges.push((*addr, end));
+        }
+    }
+    Some(ranges)
+}
+
 /// Decide the rewrite of `bytes` without applying it: the report
 /// [`rewrite_bytes`] gives, and each replacement as a [`FilePatch`]. A
 /// caller that applies the replacements somewhere other than the file (a
@@ -221,43 +294,77 @@ pub fn plan_bytes(bytes: &[u8]) -> Result<Option<FilePlan>, goblin::error::Error
                 patches: Vec::new(),
             }));
         }
+        // The mapping symbols of each section, by section index, in
+        // symbol-table order. They alone say which ranges of an
+        // executable section are instructions and which are data in
+        // code's clothing (a literal pool, a jump table).
+        let mut mapping_marks: Vec<Vec<(u64, bool)>> = vec![Vec::new(); elf.section_headers.len()];
+        for sym in elf.syms.iter() {
+            let Some(code) = elf.strtab.get_at(sym.st_name).and_then(mapping_symbol_code) else {
+                continue;
+            };
+            if let Some(marks) = mapping_marks.get_mut(sym.st_shndx) {
+                marks.push((sym.st_value, code));
+            }
+        }
         elf.section_headers
             .iter()
-            .filter(|sh| {
+            .enumerate()
+            .filter(|(_, sh)| {
                 sh.sh_type == section_header::SHT_PROGBITS
                     && sh.sh_flags & u64::from(section_header::SHF_EXECINSTR) != 0
                     && sh.sh_size != 0
             })
-            .map(|sh| {
+            .map(|(index, sh)| {
                 let writable = writable_executable
                     .iter()
                     .any(|(start, end)| sh.sh_addr >= *start && sh.sh_addr < *end);
-                (sh.sh_offset, sh.sh_size, sh.sh_addr, writable)
+                let ranges = code_ranges(sh.sh_addr, sh.sh_size, &mapping_marks[index]);
+                (sh.sh_offset, sh.sh_size, sh.sh_addr, writable, ranges)
             })
             .collect::<Vec<_>>()
     };
-    // A direct branch in one executable section can target a sequence in
-    // another, so collect each section's targets before planning any. A
-    // section's OWN branches are not external to it: the planner already
-    // knows them, and its loops' own backward branches are among them.
-    let section_targets: Vec<std::collections::HashSet<u64>> = sections
+    // The instruction words of one code range, and the file offset its
+    // first word sits at. A range that starts off an instruction
+    // boundary or runs past the file is malformed, and is preserved.
+    let range_words = |offset: u64, vaddr: u64, range: (u64, u64)| -> Option<(usize, Vec<u32>)> {
+        if !range.0.is_multiple_of(4) {
+            return None;
+        }
+        let start = usize::try_from(offset.checked_add(range.0.checked_sub(vaddr)?)?).ok()?;
+        let count = usize::try_from((range.1 - range.0) / 4).ok()?;
+        if start.checked_add(4 * count)? > bytes.len() {
+            return None;
+        }
+        let words: Vec<u32> = (0..count)
+            .map(|i| {
+                let at = start + 4 * i;
+                u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+            })
+            .collect();
+        Some((start, words))
+    };
+    // A direct branch in one code range can target a sequence in another,
+    // so collect each range's targets before planning any. A range's OWN
+    // branches are not external to it: the planner already knows them, and
+    // its loops' own backward branches are among them.
+    let range_targets: Vec<Vec<std::collections::HashSet<u64>>> = sections
         .iter()
-        .map(|(offset, filesz, vaddr, _)| {
-            let start = *offset as usize;
-            let Some(end) = offset
-                .checked_add(*filesz)
-                .and_then(|end| usize::try_from(end).ok())
-                .filter(|end| *end <= bytes.len() && start.is_multiple_of(4))
-            else {
-                return std::collections::HashSet::new();
-            };
-            let words: Vec<u32> = (0..(end - start) / 4)
-                .map(|i| {
-                    let at = start + 4 * i;
-                    u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+        .map(|(offset, _, vaddr, _, ranges)| {
+            ranges
+                .as_ref()
+                .map(|ranges| {
+                    ranges
+                        .iter()
+                        .map(|range| {
+                            range_words(*offset, *vaddr, *range)
+                                .map_or_else(std::collections::HashSet::new, |(_, words)| {
+                                    rewrite::direct_branch_targets(&words, range.0)
+                                })
+                        })
+                        .collect()
                 })
-                .collect();
-            rewrite::direct_branch_targets(&words, *vaddr)
+                .unwrap_or_default()
         })
         .collect();
     let mut report = FileReport::default();
@@ -268,13 +375,8 @@ pub fn plan_bytes(bytes: &[u8]) -> Result<Option<FilePlan>, goblin::error::Error
             .push("a packed relative relocation section is truncated".into());
         return Ok(Some(FilePlan { report, patches }));
     }
-    for (section, (offset, filesz, vaddr, writable)) in sections.iter().copied().enumerate() {
-        let external_targets: std::collections::HashSet<u64> = section_targets
-            .iter()
-            .enumerate()
-            .filter(|(other, _)| *other != section)
-            .flat_map(|(_, targets)| targets.iter().copied())
-            .collect();
+    for (section, (offset, filesz, vaddr, writable, ranges)) in sections.iter().enumerate() {
+        let (offset, filesz, vaddr, writable) = (*offset, *filesz, *vaddr, *writable);
         let start = offset as usize;
         let end = start.saturating_add(filesz as usize);
         if end > bytes.len() || !start.is_multiple_of(4) || !vaddr.is_multiple_of(4) {
@@ -289,60 +391,83 @@ pub fn plan_bytes(bytes: &[u8]) -> Result<Option<FilePlan>, goblin::error::Error
             ));
             continue;
         }
-        let count = (end - start) / 4;
-        let words: Vec<u32> = (0..count)
-            .map(|i| {
-                let at = start + 4 * i;
-                u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
-            })
-            .collect();
-        let mut plan = rewrite::plan_with_external_targets(&words, vaddr, &external_targets);
-        // A relocation inside a sequence means the loader will write those
-        // bytes itself, for the instruction that used to be there.
-        if !relocated.is_empty() {
-            let (keep, relocated_sites) = plan.patched.into_iter().partition::<Vec<_>, _>(|site| {
-                let end = site.addr + 4 * site.words.len() as u64;
-                !relocated
-                    .iter()
-                    .any(|(start, stop)| *start < end && site.addr < *stop)
-            });
-            plan.patched = keep;
-            plan.refused.extend(
-                relocated_sites
-                    .into_iter()
-                    .map(|site| rewrite::RefusedSite {
-                        addr: site.addr,
-                        reason: rewrite::Refusal::Relocated,
-                    }),
-            );
-        }
-        report.exclusive_instructions += plan.exclusive_instructions;
-        for site in &plan.patched {
-            *report.patched.entry(idiom_name(site.idiom)).or_default() += 1;
-        }
-        for refused in &plan.refused {
-            *report
-                .refused
-                .entry(refusal_name(&refused.reason))
-                .or_default() += 1;
-            if report.refused_examples.len() < 16 {
-                report
-                    .refused_examples
-                    .push((refused.addr, refusal_detail(&refused.reason)));
-            }
-        }
-        // Each site replaces exactly its own words (`rewrite::apply`), so
-        // the patch is those words before and after.
-        for site in &plan.patched {
-            let index = ((site.addr - vaddr) / 4) as usize;
-            let to_bytes = |words: &[u32]| -> Vec<u8> {
-                words.iter().flat_map(|word| word.to_le_bytes()).collect()
+        let Some(ranges) = ranges else {
+            report.skipped_segments.push(format!(
+                "executable section at {vaddr:#x} has no mapping symbols \
+                 ($x/$d), so code cannot be told from data"
+            ));
+            continue;
+        };
+        for (range, range_addr) in ranges.iter().enumerate() {
+            let external_targets: std::collections::HashSet<u64> = range_targets
+                .iter()
+                .enumerate()
+                .flat_map(|(other, targets)| {
+                    targets
+                        .iter()
+                        .enumerate()
+                        .filter(move |(other_range, _)| other != section || *other_range != range)
+                        .flat_map(|(_, targets)| targets.iter().copied())
+                })
+                .collect();
+            let Some((range_start, words)) = range_words(offset, vaddr, *range_addr) else {
+                report.skipped_segments.push(format!(
+                    "code range at {:#x} is truncated or unaligned",
+                    range_addr.0
+                ));
+                continue;
             };
-            patches.push(FilePatch {
-                offset: (start + 4 * index) as u64,
-                original: to_bytes(&words[index..index + site.words.len()]),
-                rewritten: to_bytes(&site.words),
-            });
+            let vaddr = range_addr.0;
+            let start = range_start;
+            let mut plan = rewrite::plan_with_external_targets(&words, vaddr, &external_targets);
+            // A relocation inside a sequence means the loader will write those
+            // bytes itself, for the instruction that used to be there.
+            if !relocated.is_empty() {
+                let (keep, relocated_sites) =
+                    plan.patched.into_iter().partition::<Vec<_>, _>(|site| {
+                        let end = site.addr + 4 * site.words.len() as u64;
+                        !relocated
+                            .iter()
+                            .any(|(start, stop)| *start < end && site.addr < *stop)
+                    });
+                plan.patched = keep;
+                plan.refused.extend(
+                    relocated_sites
+                        .into_iter()
+                        .map(|site| rewrite::RefusedSite {
+                            addr: site.addr,
+                            reason: rewrite::Refusal::Relocated,
+                        }),
+                );
+            }
+            report.exclusive_instructions += plan.exclusive_instructions;
+            for site in &plan.patched {
+                *report.patched.entry(idiom_name(site.idiom)).or_default() += 1;
+            }
+            for refused in &plan.refused {
+                *report
+                    .refused
+                    .entry(refusal_name(&refused.reason))
+                    .or_default() += 1;
+                if report.refused_examples.len() < 16 {
+                    report
+                        .refused_examples
+                        .push((refused.addr, refusal_detail(&refused.reason)));
+                }
+            }
+            // Each site replaces exactly its own words (`rewrite::apply`), so
+            // the patch is those words before and after.
+            for site in &plan.patched {
+                let index = ((site.addr - vaddr) / 4) as usize;
+                let to_bytes = |words: &[u32]| -> Vec<u8> {
+                    words.iter().flat_map(|word| word.to_le_bytes()).collect()
+                };
+                patches.push(FilePatch {
+                    offset: (start + 4 * index) as u64,
+                    original: to_bytes(&words[index..index + site.words.len()]),
+                    rewritten: to_bytes(&site.words),
+                });
+            }
         }
     }
     Ok(Some(FilePlan { report, patches }))
@@ -383,14 +508,28 @@ mod tests {
 
     /// A minimal aarch64 ELF image: one read-and-execute `PT_LOAD` covering
     /// the file, and a `.text` section holding `words` at file offset and
-    /// address 0x100.
+    /// address 0x100. As every toolchain-emitted image does, it carries
+    /// mapping symbols: `mapping` names each word index where an A64 code
+    /// (`$x`, `true`) or data (`$d`, `false`) range starts, or `None` for an
+    /// image with no symbol table at all.
     fn elf_with_text(words: &[u32]) -> Vec<u8> {
+        elf_image(words, Some(&[(0, true)]))
+    }
+
+    fn elf_image(words: &[u32], mapping: Option<&[(usize, bool)]>) -> Vec<u8> {
         const TEXT: usize = 0x100;
         let text_len = 4 * words.len();
-        let strtab = b"\0.text\0.shstrtab\0";
-        let strtab_at = TEXT + text_len;
-        let shoff = (strtab_at + strtab.len()).next_multiple_of(8);
-        let total = shoff + 3 * 64;
+        // Symbol-name string table: "$x" at 1, "$d" at 4.
+        let sym_names = b"\0$x\0$d\0";
+        let sym_names_at = TEXT + text_len;
+        let nsyms = mapping.map_or(0, |marks| 1 + marks.len());
+        let symtab_at = (sym_names_at + sym_names.len()).next_multiple_of(8);
+        let symtab_len = 24 * nsyms;
+        let shstrtab = b"\0.text\0.symtab\0.strtab\0.shstrtab\0";
+        let shstrtab_at = symtab_at + symtab_len;
+        let shoff = (shstrtab_at + shstrtab.len()).next_multiple_of(8);
+        let shnum = if mapping.is_some() { 5 } else { 3 };
+        let total = shoff + shnum * 64;
         let mut bytes = vec![0u8; total];
         let put = |bytes: &mut Vec<u8>, at: usize, value: &[u8]| {
             bytes[at..at + value.len()].copy_from_slice(value)
@@ -406,8 +545,8 @@ mod tests {
         put(&mut bytes, 54, &56u16.to_le_bytes()); // e_phentsize
         put(&mut bytes, 56, &1u16.to_le_bytes()); // e_phnum
         put(&mut bytes, 58, &64u16.to_le_bytes()); // e_shentsize
-        put(&mut bytes, 60, &3u16.to_le_bytes()); // e_shnum
-        put(&mut bytes, 62, &2u16.to_le_bytes()); // e_shstrndx
+        put(&mut bytes, 60, &(shnum as u16).to_le_bytes()); // e_shnum
+        put(&mut bytes, 62, &((shnum - 1) as u16).to_le_bytes()); // e_shstrndx
         // PT_LOAD, PF_R | PF_X, the whole file at address 0.
         put(&mut bytes, 64, &1u32.to_le_bytes());
         put(&mut bytes, 68, &5u32.to_le_bytes());
@@ -417,8 +556,28 @@ mod tests {
         for (i, word) in words.iter().enumerate() {
             put(&mut bytes, TEXT + 4 * i, &word.to_le_bytes());
         }
-        put(&mut bytes, strtab_at, strtab);
-        // Section headers: null, .text (PROGBITS, ALLOC | EXECINSTR), .shstrtab.
+        put(&mut bytes, sym_names_at, sym_names);
+        if let Some(marks) = mapping {
+            // Symbol 0 is the null symbol; the mapping symbols follow, all
+            // local NOTYPE symbols in section 1 (.text).
+            for (n, (index, code)) in marks.iter().enumerate() {
+                let at = symtab_at + 24 * (n + 1);
+                put(
+                    &mut bytes,
+                    at,
+                    &if *code { 1u32 } else { 4u32 }.to_le_bytes(),
+                );
+                put(&mut bytes, at + 6, &1u16.to_le_bytes()); // st_shndx
+                put(
+                    &mut bytes,
+                    at + 8,
+                    &((TEXT + 4 * index) as u64).to_le_bytes(),
+                );
+            }
+        }
+        put(&mut bytes, shstrtab_at, shstrtab);
+        // Section headers: null, .text (PROGBITS, ALLOC | EXECINSTR), then
+        // with a symbol table .symtab and .strtab, and .shstrtab last.
         let text = shoff + 64;
         put(&mut bytes, text, &1u32.to_le_bytes());
         put(&mut bytes, text + 4, &1u32.to_le_bytes());
@@ -427,11 +586,42 @@ mod tests {
         put(&mut bytes, text + 24, &(TEXT as u64).to_le_bytes());
         put(&mut bytes, text + 32, &(text_len as u64).to_le_bytes());
         put(&mut bytes, text + 48, &4u64.to_le_bytes());
-        let names = shoff + 128;
-        put(&mut bytes, names, &7u32.to_le_bytes());
+        let mut next = shoff + 128;
+        if mapping.is_some() {
+            let symtab = next;
+            put(&mut bytes, symtab, &7u32.to_le_bytes());
+            put(&mut bytes, symtab + 4, &2u32.to_le_bytes()); // SHT_SYMTAB
+            put(&mut bytes, symtab + 24, &(symtab_at as u64).to_le_bytes());
+            put(&mut bytes, symtab + 32, &(symtab_len as u64).to_le_bytes());
+            put(&mut bytes, symtab + 40, &3u32.to_le_bytes()); // sh_link: .strtab
+            put(&mut bytes, symtab + 44, &(nsyms as u32).to_le_bytes());
+            put(&mut bytes, symtab + 48, &8u64.to_le_bytes());
+            put(&mut bytes, symtab + 56, &24u64.to_le_bytes());
+            let strtab = symtab + 64;
+            put(&mut bytes, strtab, &15u32.to_le_bytes());
+            put(&mut bytes, strtab + 4, &3u32.to_le_bytes()); // SHT_STRTAB
+            put(
+                &mut bytes,
+                strtab + 24,
+                &(sym_names_at as u64).to_le_bytes(),
+            );
+            put(
+                &mut bytes,
+                strtab + 32,
+                &(sym_names.len() as u64).to_le_bytes(),
+            );
+            put(&mut bytes, strtab + 48, &1u64.to_le_bytes());
+            next = strtab + 64;
+        }
+        let names = next;
+        put(&mut bytes, names, &23u32.to_le_bytes());
         put(&mut bytes, names + 4, &3u32.to_le_bytes());
-        put(&mut bytes, names + 24, &(strtab_at as u64).to_le_bytes());
-        put(&mut bytes, names + 32, &(strtab.len() as u64).to_le_bytes());
+        put(&mut bytes, names + 24, &(shstrtab_at as u64).to_le_bytes());
+        put(
+            &mut bytes,
+            names + 32,
+            &(shstrtab.len() as u64).to_le_bytes(),
+        );
         put(&mut bytes, names + 48, &1u64.to_le_bytes());
         bytes
     }
@@ -477,6 +667,74 @@ mod tests {
         let mut applied = image;
         applied[0x104..0x104 + patch.rewritten.len()].copy_from_slice(&patch.rewritten);
         assert_eq!(applied, rewritten);
+    }
+
+    /// A literal pool in `.text` holds data, not instructions, even when
+    /// its words decode as a canonical exclusive loop: the mapping
+    /// symbols say which ranges are code, and data and unmarked ranges
+    /// keep their bytes in both the file plan (`plan_bytes`, which the
+    /// in-memory rewrite also consumes) and the rewritten file. A
+    /// genuine flag-setting loop in a code range of the same section is
+    /// still rewritten.
+    #[test]
+    fn literal_pool_data_is_preserved_and_the_code_loop_beside_it_is_rewritten() {
+        // b <loop>; <pool: ldxr x4, [x3]; add x4, x4, #1; stlxr w5, x4,
+        // [x3]; cbnz w5, <pool> as data>; <loop: ldxr x9, [x8];
+        // subs x9, x9, #1; stlxr w10, x9, [x8]; cbnz w10, <loop>>;
+        // b.ne <after>; ret
+        let pool = [0xc85f_fc64, 0x9100_0484, 0xc805_fc64, 0x35ff_ffa5];
+        let loop_words = [0xc85f_7d09, 0xf100_0529, 0xc80a_fd09, 0x35ff_ffaa];
+        let mut words = vec![0x1400_0005];
+        words.extend_from_slice(&pool);
+        words.extend_from_slice(&loop_words);
+        words.extend_from_slice(&[0x5400_00a1, 0xd65f_03c0]);
+        let image = elf_image(&words, Some(&[(0, true), (1, false), (5, true)]));
+
+        let plan = plan_bytes(&image).unwrap().expect("an aarch64 ELF image");
+        assert_eq!(plan.report.patched_total(), 1, "{:?}", plan.report);
+        assert_eq!(plan.patches.len(), 1, "{:?}", plan.patches);
+        assert_eq!(
+            plan.patches[0].offset, 0x114,
+            "only the code loop is a patch"
+        );
+        assert_eq!(
+            plan.report.exclusive_instructions, 2,
+            "the pool's words are data, not exclusives: {:?}",
+            plan.report
+        );
+
+        let mut rewritten = image.clone();
+        rewrite_bytes(&mut rewritten).unwrap().unwrap();
+        assert_eq!(
+            &rewritten[0x104..0x114],
+            &image[0x104..0x114],
+            "the literal pool keeps its bytes"
+        );
+        assert_eq!(
+            &rewritten[0x114..0x124],
+            plan.patches[0].rewritten.as_slice(),
+            "the genuine loop beside it is rewritten"
+        );
+        assert_ne!(&rewritten[0x114..0x124], &image[0x114..0x124]);
+
+        // Without mapping symbols nothing in the section can be told
+        // from data either, so the section is left alone and reported.
+        let unmarked = elf_image(&words, None);
+        let plan = plan_bytes(&unmarked)
+            .unwrap()
+            .expect("an aarch64 ELF image");
+        assert_eq!(plan.patches.len(), 0, "{:?}", plan.report);
+        assert!(
+            plan.report
+                .skipped_segments
+                .iter()
+                .any(|why| why.contains("mapping symbols")),
+            "{:?}",
+            plan.report
+        );
+        let mut rewritten = unmarked.clone();
+        rewrite_bytes(&mut rewritten).unwrap().unwrap();
+        assert_eq!(rewritten, unmarked);
     }
 
     /// A relocation section's entries must be seen, including the packed
