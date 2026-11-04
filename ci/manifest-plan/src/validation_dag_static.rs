@@ -3267,7 +3267,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Rebased onto main fcd62385f: 3465 + 2 = 3467.
     // PR #4789 (rebased onto post-split main) adds two detcore units and
     // one cli test: 3467 + 2 = 3469.
-    ("test.detcore_unit", 3469),
+    // And scheduler's a_replayed_switch_wakes_its_due_target, restored from
+    // https://github.com/rrnewton/hermit/pull/4889: 3469 + 1 = 3470.
+    ("test.detcore_unit", 3470),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5879,7 +5881,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 5 recount (same growth as test.detcore_unit), composed on measured main: 3395 + 44 = 3439.
     // And the same two start-grant units: 2955, listed.
     // Rebased onto main fcd62385f: 3465 + 2 = 3467.
-    ("test.detcore_unit_on_host", 3469),
+    // And the same replayed-switch wake unit: 3469 + 1 = 3470.
+    ("test.detcore_unit_on_host", 3470),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
