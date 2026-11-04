@@ -188,9 +188,11 @@ pub struct PreemptionRecord {
     post_crash: Option<Vec<crate::post_crash::PostCrashSwitch>>,
     /// Set when the run that produced this record ended its slices without
     /// the `--max-timeslice` bound: a run that replayed a preemption record
-    /// (`--replay-preemptions-from`), whose slices end where that record
-    /// says, so they can run far longer than the bound, or a schedule replay
-    /// of a record that says so. It holds the latest logical time, in
+    /// (`--replay-preemptions-from`) some of whose own slices ran past the
+    /// bound (`Self::has_slice_past` on the record being written), or that
+    /// followed a record that was itself marked, or a schedule replay of a
+    /// record that says so. A replay whose slices all fit under the bound
+    /// writes no mark, so a capped record round-trips byte-identically. It holds the latest logical time, in
     /// nanoseconds, any of the run's recorded events reached, which no slice
     /// of the run outlasts. A schedule replay of such a record installs no
     /// `--max-timeslice` slice end while the record lasts
@@ -1093,6 +1095,26 @@ impl PreemptionRecord {
     pub fn with_uncapped_slices(mut self, uncapped: Option<u64>) -> Self {
         self.uncapped_slices = uncapped;
         self
+    }
+
+    /// Whether any recorded slice of this record ran longer than `bound`
+    /// nanoseconds: for each thread, the gap between its successive slice
+    /// ends (`global` events in order, measured on that thread's clock,
+    /// whose first slice starts at zero). The writer stamps a replay's
+    /// record `uncapped_slices` only when this holds for the record being
+    /// written (or the record it follows was already marked), so a capped
+    /// record round-trips byte-identically.
+    pub(crate) fn has_slice_past(&self, bound: u64) -> bool {
+        let mut last_end: std::collections::BTreeMap<DetTid, u64> = Default::default();
+        for event in &self.global {
+            let Some(end) = event.end_time else { continue };
+            let end = end.as_nanos();
+            let start = last_end.insert(event.dettid, end).unwrap_or(0);
+            if end.saturating_sub(start) > bound {
+                return true;
+            }
+        }
+        false
     }
 
     /// The latest logical time, in nanoseconds, any event of this record
@@ -2865,6 +2887,38 @@ mod tests {
     /// back unmarked and is written exactly as before; a marked one keeps the
     /// mark through a round trip and a copy of its preemptions.
     #[test]
+    fn has_slice_past_measures_each_threads_slices_against_the_bound() {
+        let event = |dettid: i32, end: Option<u64>| SchedEvent {
+            dettid: DetTid::from_raw(dettid),
+            op: detcore_model::schedule::Op::Branch,
+            count: 1,
+            start_rip: None,
+            end_rip: None,
+            end_time: end.map(LogicalTime::from_nanos),
+            stopless: false,
+        };
+        // No slice of either thread passes 100: thread 3 runs 40 then 40,
+        // thread 4 runs 90, however the global gaps interleave.
+        let mut capped = PreemptionWriter::new(None);
+        for e in [
+            event(3, Some(40)),
+            event(4, Some(90)),
+            event(3, None),
+            event(3, Some(80)),
+        ] {
+            capped.inner.global.push(e);
+        }
+        assert!(!capped.inner.has_slice_past(100));
+        // Thread 3's first slice runs 0 -> 250, past the bound.
+        let mut uncapped = PreemptionWriter::new(None);
+        for e in [event(3, Some(250)), event(4, Some(10)), event(3, Some(400))] {
+            uncapped.inner.global.push(e);
+        }
+        assert!(uncapped.inner.has_slice_past(100));
+        assert!(!uncapped.inner.has_slice_past(250));
+    }
+
+    #[test]
     fn the_uncapped_slices_mark_is_written_only_when_set() {
         let ordinary = PreemptionWriter::new(None).into_string();
         assert!(!ordinary.contains("uncapped_slices"), "{ordinary}");
@@ -2901,6 +2955,27 @@ mod tests {
                 .uncapped_slices(),
             Some(7)
         );
+        // With a bound, a replay whose slices all fit under it writes no
+        // mark, so its record is the unmarked one's bytes; a slice past
+        // the bound stamps.
+        let capped = PreemptionWriter::new(None)
+            .with_uncapped_slices(true)
+            .with_max_timeslice(std::num::NonZeroU64::new(10_000_000))
+            .into_string();
+        assert_eq!(capped, ordinary, "{capped}");
+        let mut past = PreemptionWriter::new(None)
+            .with_uncapped_slices(true)
+            .with_max_timeslice(std::num::NonZeroU64::new(1_000_000));
+        past.inner.global.push(SchedEvent {
+            dettid: DetTid::from_raw(3),
+            op: detcore_model::schedule::Op::Branch,
+            count: 1,
+            start_rip: None,
+            end_rip: None,
+            end_time: Some(LogicalTime::from_nanos(9_400_000)),
+            stopless: false,
+        });
+        assert!(past.into_string().contains("\"uncapped_slices\":9400000"));
     }
 
     #[test]
@@ -4069,6 +4144,10 @@ pub struct PreemptionWriter {
     /// Whether the run ends its slices without the `--max-timeslice` bound
     /// (`with_uncapped_slices`).
     uncapped: bool,
+    /// The run's `--max-timeslice` bound, when it has one
+    /// (`with_max_timeslice`): the uncapped mark is written only when a
+    /// recorded slice actually ran past it.
+    max_timeslice: Option<std::num::NonZeroU64>,
 }
 
 impl PreemptionWriter {
@@ -4085,6 +4164,7 @@ impl PreemptionWriter {
             reserved_input_qualification: Default::default(),
             boundary_records: None,
             uncapped: false,
+            max_timeslice: None,
             dest: path,
             flushed: false,
         }
@@ -4373,10 +4453,23 @@ impl PreemptionWriter {
         self
     }
 
+    /// The run's `--max-timeslice` bound, when it has one: a replay stamps
+    /// its record only when a slice it actually ran passed the bound, so a
+    /// capped record round-trips byte-identically. No bound (the default)
+    /// stamps whenever `with_uncapped_slices` says to.
+    pub fn with_max_timeslice(mut self, bound: Option<std::num::NonZeroU64>) -> Self {
+        self.max_timeslice = bound;
+        self
+    }
+
     /// Fill in the uncapped-slices mark, if the run ends its slices without
     /// the bound, from the events recorded so far.
     fn mark_uncapped_slices(&mut self) {
-        if self.uncapped {
+        if self.uncapped
+            && self
+                .max_timeslice
+                .is_none_or(|bound| self.inner.has_slice_past(bound.get()))
+        {
             self.inner.uncapped_slices = Some(self.inner.latest_event_time());
         }
     }

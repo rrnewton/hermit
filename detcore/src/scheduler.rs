@@ -5640,7 +5640,8 @@ impl Scheduler {
                 )
                 .with_uncapped_slices(
                     cfg.replay_preemptions_from.is_some() || uncapped_replay_backstop.is_some(),
-                );
+                )
+                .with_max_timeslice(cfg.max_timeslice);
             // This run's own record lists every switch it takes, possibly
             // none, so its replay can refuse an unrecorded one.
             let writer = if cfg.post_crash_timeslice_in_effect().is_some() {
