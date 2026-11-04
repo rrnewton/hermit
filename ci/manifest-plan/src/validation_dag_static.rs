@@ -1980,7 +1980,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR #4609 (rebased onto post-split main) adds ten hermit-run units
     // (nine in app::analyze::phases, one in app::analyze::rundata):
     // 1239 + 10 = 1249, measured by nextest list.
-    ("test.hermit_unit", 1252),
+    // And https://github.com/rrnewton/hermit/pull/4772's two no-namespace
+    // analyze tests: 1252 + 2 = 1254.
+    // And analyze::rundata::tests::every_record_written_for_a_trial_states_the_trials_chosen_ids:
+    // 1254 + 1 = 1255.
+    ("test.hermit_unit", 1255),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -4641,7 +4645,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // cases: 780 + 7 = 787, measured by the 216dbc929a full validate.
     // Train 5 recount (measured by the ccb5080910 full validate):
     // Composed on landed batch main: 789 + 5 = 794 (Train 5 delta +5 over 787).
-    ("test.cli", 797),
+    // And https://github.com/rrnewton/hermit/pull/4772's
+    // no_namespace_bisect_replays_the_schedules_it_writes and
+    // no_namespace_minimize_replays_its_candidate_records: 797 + 2 = 799.
+    ("test.cli", 799),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5300,7 +5307,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 1 recount (measured by the 216dbc929a full validate, same
     // growth as test.cli): 699 + 7 = 706.
     // Train 5 recount (same growth as test.cli), composed on landed batch main: 708 + 5 = 713.
-    ("test.cli_on_host", 716),
+    // And the same --no-namespace bisect and --minimize tests, not excluded:
+    // 716 + 2 = 718.
+    ("test.cli_on_host", 718),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
@@ -6297,7 +6306,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // in the hosted CPUID-faulting skip set): 1327 + 2 = 1329.
     // The split retains nine additional core identities: 1329 + 9 = 1338.
     // Train 5 recount (same growth as test.hermit_unit), composed on measured main: 1206 + 1 = 1207.
-    ("test.hermit_unit_on_host", 1246),
+    // And the same two: 1246 + 2 = 1248.
+    // And the same trial-record stamping unit: 1248 + 1 = 1249.
+    ("test.hermit_unit_on_host", 1249),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
