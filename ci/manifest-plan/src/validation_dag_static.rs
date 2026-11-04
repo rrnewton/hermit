@@ -3282,7 +3282,18 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (3470 + 12 on this base): the counted runner substitutes the compiled
     // population for it, so neither 3482 nor a derived 3497 is a measured
     // nextest count.
-    ("test.detcore_unit", 3492),
+    // Drain 4885 recount: the CPU-clock fix-forward adds six detcore
+    // units (cpu_clock's the_resolution_is_the_kernels_for_each_kind,
+    // cpu_clock::handler_tests' a_cpu_clock_sleep_that_would_wait_is_refused,
+    // timer_create_checks_the_task_a_cpu_clock_names and
+    // timer_settime_on_a_timer_whose_thread_exited_is_esrch,
+    // thread_cpu_time_tests' an_exited_leaders_clock_keeps_its_final_time
+    // and scheduler's a_cpu_clock_names_only_tasks_linux_still_has;
+    // an_absolute_cpu_timer_expiration_is_served_only_once_passed replaces
+    // an earlier unit) and the timer-incarnation reuse regression
+    // (timer_settime_after_the_timers_thread_number_is_reused_is_esrch)
+    // one more: composed on current main, 3492 + 7 = 3499.
+    ("test.detcore_unit", 3499),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5907,7 +5918,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Rebased onto main fcd62385f: 3465 + 2 = 3467.
     // And the same unit (same growth as test.detcore_unit, PR #4926): 3469 + 1 = 3470.
     // PR #4751: the same twelve units (same growth as test.detcore_unit): 3482.
-    ("test.detcore_unit_on_host", 3492),
+    // The same seven drain-4885 detcore units as test.detcore_unit:
+    // 3492 + 7 = 3499.
+    ("test.detcore_unit_on_host", 3499),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
