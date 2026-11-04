@@ -5542,12 +5542,117 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok((PathBuf::from(std::ffi::OsString::from_vec(bytes)), links))
     }
 
+    /// The absolute guest path `bytes` where it walks through one of the
+    /// caller's descriptor links to a directory Detcore serves on a
+    /// placeholder, as Linux follows each such link (`/proc/self/fd/D/N`,
+    /// with descriptor `D` open on `/proc/self/fd`, is `/proc/<pid>/fd/N`;
+    /// [`Self::readlink_walk`]), where Detcore serves the caller's own task
+    /// directories ([`Self::serves_task_directories`], package K slice K10):
+    /// there no backend directory stands behind the link for the rest of
+    /// the walk. `Ok(None)` where the path walks through none of them, or
+    /// Detcore does not serve them; `ELOOP` past the lookup's link budget.
+    pub(crate) fn through_own_descriptor_links<G: Guest<Self>>(
+        guest: &G,
+        bytes: &[u8],
+    ) -> Result<Option<Vec<u8>>, Errno> {
+        if !Self::serves_task_directories(guest) {
+            return Ok(None);
+        }
+        let (path, hops) = Self::readlink_walk(guest, bytes)?;
+        Ok((hops > 0).then_some(path))
+    }
+
+    /// The absolute guest path `bytes` of a `readlink` with each of the
+    /// caller's descriptor links to a placeholder directory it walks through
+    /// replaced by the directory's canonical spelling (`/proc/<pid>/fd`,
+    /// `/proc/<pid>/task/<tid>/fd`, `/proc`), and how many it replaced.
+    ///
+    /// `ELOOP` where the symbolic links Linux follows for the whole lookup
+    /// pass `MAXSYMLINKS` (40; `reserve_stack` and `pick_link`, fs/namei.c),
+    /// counted across every replacement: each descriptor link followed, the
+    /// selector links each is spelled through ([`selector_links`]: the
+    /// guest's own `/dev/fd` and `self` or `thread-self`, and every `self` a
+    /// replaced `/proc` exposes below it, `/proc/self/fd/P/self/fd/N`),
+    /// those of the descriptor link the walk ends at, which `readlink` does
+    /// not follow, and that link itself where a final `/` or `/.` follows it
+    /// (`lookup_last` follows it then; a `.` makes it no last component) and
+    /// the caller's table holds its descriptor
+    /// ([`Self::holds_own_descriptor`]): an absent entry is `ENOENT`, never
+    /// one link too many.
+    /// Unlike [`Self::decided_path`], which counts the selectors of the
+    /// first link only (the stat and open respelling's undercount,
+    /// <https://github.com/rrnewton/hermit/issues/5133>).
+    fn readlink_walk<G: Guest<Self>>(guest: &G, bytes: &[u8]) -> Result<(Vec<u8>, usize), Errno> {
+        let mut path = bytes.to_vec();
+        let mut links = 0;
+        let mut hops = 0;
+        while let Some((link, rest)) = through_descriptor_link(&path) {
+            let Some(directory) = Self::own_link_directory(guest, &link) else {
+                break;
+            };
+            links += selector_links(&link) + 1;
+            if links > LINK_LIMIT {
+                return Err(Errno::ELOOP);
+            }
+            hops += 1;
+            path = below(&directory.canonical(), &rest);
+        }
+        if let Some((link, end)) = descriptor_link_prefix(&path) {
+            links += selector_links(&link);
+            if links > LINK_LIMIT {
+                return Err(Errno::ELOOP);
+            }
+            let after = &path[end..];
+            let followed = !after.is_empty()
+                && after
+                    .split(|byte| *byte == b'/')
+                    .all(|name| name.is_empty() || name == b".");
+            if followed && Self::holds_own_descriptor(guest, &link) {
+                links += 1;
+                if links > LINK_LIMIT {
+                    return Err(Errno::ELOOP);
+                }
+            }
+        }
+        Ok((path, hops))
+    }
+
+    /// Whether the descriptor link `link` (`/proc/<pid>/fd/N`, spelled as
+    /// [`descriptor_link_prefix`] spells it) names a descriptor the caller's
+    /// own table holds, as Detcore keeps that table: the entry Linux's walk
+    /// finds (`proc_lookupfd_common`, fs/proc/fd.c) before it follows the
+    /// link. Linux charges `MAXSYMLINKS` only for a symbolic link that
+    /// exists and that it follows (`step_into`, then `pick_link` and
+    /// `reserve_stack`, fs/namei.c): a closed descriptor or a name that is no
+    /// number is `ENOENT`, whatever the walk has followed before. `false`
+    /// also for a table Detcore does not keep for the caller (another
+    /// task's, or the process's read by a thread that does not hold it),
+    /// whose entry it cannot establish, so it charges no follow for it.
+    fn holds_own_descriptor<G: Guest<Self>>(guest: &G, link: &Path) -> bool {
+        let Some(own) = Self::descriptor_directory_caller(guest) else {
+            return false;
+        };
+        let Some(descriptor) = crate::syscalls::namespace::own_descriptor_link(link, Some(own))
+        else {
+            return false;
+        };
+        let state = guest.thread_state();
+        if descriptor.table == crate::syscalls::namespace::DescriptorTable::Process
+            && state.dettid.as_raw() != own.0
+            && !state.holds_process_files()
+        {
+            return false;
+        }
+        state.with_detfd(descriptor.fd, |_| ()).is_ok()
+    }
+
     /// Answer a `readlink` of the absolute guest path `path` into the buffer
     /// `buf` of `buf_len` bytes if it is a descriptor link of the caller's to
     /// a placeholder directory ([`Self::own_link_directory`]): the directory's
     /// path (`/proc/<pid>/fd`, which `proc_fd_link` reads, or `/proc`),
     /// truncated to the buffer and without a NUL, as `do_readlinkat` copies
-    /// it. The placeholder's own path never reaches the guest.
+    /// it. The placeholder's own path never reaches the guest. The walk to
+    /// the link keeps the lookup's whole link budget ([`Self::readlink_walk`]).
     pub(crate) async fn answer_descriptor_directory_link<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -5558,8 +5663,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         if !self.serves_descriptor_directories(guest) {
             return None;
         }
-        let decided = match Self::decided_path(guest, path) {
-            Ok((decided, _)) => decided,
+        let decided = match Self::readlink_walk(guest, path.as_os_str().as_bytes()) {
+            Ok((decided, _)) => PathBuf::from(std::ffi::OsString::from_vec(decided)),
             Err(errno) => return Some(Err(errno.into())),
         };
         let target = Self::own_link_directory(guest, &decided)?.canonical();
