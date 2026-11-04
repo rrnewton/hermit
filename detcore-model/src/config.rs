@@ -3979,7 +3979,7 @@ mod legacy_backend_json {
     /// as well, so it is never written and reads as off.
     /// `stacktrace_at_schedule_positions` came after it too. It is never
     /// written and reads as false: the DBT runtime takes no stack traces.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 53] = [
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 52] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -5567,9 +5567,9 @@ mod tests {
         // `post_crash_timeslice`, `rewrite_exclusives_in_memory`,
         // `stacktrace_at_schedule_positions`
         // and `strict_schedule_boundaries` none: fourteen more keys and
-        // fifty-two fewer, so thirty-eight keys fewer than fields.
+        // fifty-one fewer, so thirty-seven keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 38);
+        assert_eq!(fields.len(), keys.len() + 37);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
