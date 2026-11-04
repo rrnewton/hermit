@@ -2859,6 +2859,23 @@ pub struct ThreadTree {
     /// 25, `rsslim`) whoever reads it: copied to a forked child, kept by
     /// exec, as Linux keeps `signal->rlim`.
     rss_limits: HashMap<DetPid, u64>,
+    /// Each task's own CPU time, user and system, as its thread last
+    /// published it (`Scheduler::publish_cpu_time`): with threads
+    /// sequentialized, where it last stopped, which another process's
+    /// rendered `task/<tid>/stat` shows. Like `task_comms`, entries are kept
+    /// for the run and replaced when a number is given out again.
+    published_thread_cpu: HashMap<DetTid, (LogicalTime, LogicalTime)>,
+    /// Each process's CPU time (its threads', exited ones included, as
+    /// Linux's `thread_group_cputime` counts them, and its reaped
+    /// children's) as its last publishing thread published it, which
+    /// another process's rendered `stat` shows: a zombie's are its final
+    /// totals. Kept as `published_thread_cpu` is.
+    published_process_cpu: HashMap<DetPid, crate::procfs::task_stat::TaskCpuTimes>,
+    /// Each process's exit code as Linux keeps it in the zombie's
+    /// `task_struct::exit_code` (the wait status), where its `exit_group`
+    /// recorded it (`Scheduler::record_exit_code`), which its rendered
+    /// `stat` shows until it is reaped. Kept as `published_thread_cpu` is.
+    exit_codes: HashMap<DetPid, i32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3087,7 +3104,12 @@ impl ThreadTree {
         };
         self.cpu_homes.insert(child_dettid, self.cpu_homes_given);
         self.cpu_homes_given = self.cpu_homes_given.wrapping_add(1);
+        // A new task has used no CPU time (`copy_process` zeroes its
+        // accounting); a reused number does not keep the old task's.
+        self.published_thread_cpu.remove(&child_dettid);
         if is_group_leader {
+            self.published_process_cpu.remove(&child_dettid);
+            self.exit_codes.remove(&child_dettid);
             // A new process starts with its creator's resource limits
             // (`copy_signal` copies `rlim`) and no recorded outside parent.
             let creator = self.thread_to_leader.get(&parent_dettid).copied();
@@ -13271,6 +13293,35 @@ impl Scheduler {
         }
     }
 
+    /// Record what thread `thread` of process `process` published of its CPU
+    /// accounting with a request (`tool_global::GlobalRequest::WithCpuTime`):
+    /// its own time, user and system, and its process's
+    /// (`ThreadState::process_cpu_time`), which counts every thread, exited
+    /// ones included, and the process's reaped children's. Every request
+    /// that may let another thread run carries it where it changed, so with
+    /// threads sequentialized it is the time each task had where it last
+    /// stopped, which another process's rendered `stat` shows
+    /// (`Self::task_stat_facts`).
+    pub fn publish_cpu_time(
+        &mut self,
+        process: DetPid,
+        thread: DetTid,
+        own: (LogicalTime, LogicalTime),
+        total: crate::procfs::task_stat::TaskCpuTimes,
+    ) {
+        self.thread_tree.published_thread_cpu.insert(thread, own);
+        self.thread_tree
+            .published_process_cpu
+            .insert(process, total);
+    }
+
+    /// Record `code`, the exit code Linux keeps in the zombie of `process`
+    /// (`task_struct::exit_code`: the `exit_group` status shifted left by 8,
+    /// `do_group_exit`), in the turn of its `exit_group`.
+    pub fn record_exit_code(&mut self, process: DetPid, code: i32) {
+        self.thread_tree.exit_codes.insert(process, code);
+    }
+
     /// Record `limit`, `process`'s virtual soft `RLIMIT_RSS` after a
     /// `setrlimit` or `prlimit64` changed it, in its own turn
     /// (`ThreadTree::rss_limits`).
@@ -13373,6 +13424,33 @@ impl Scheduler {
         let tree = &self.thread_tree;
         let wait = leader.and_then(|leader| tree.process_wait.get(&leader));
         let parent = leader.and_then(|leader| self.guest_visible_parent(leader));
+        // A top-level file shows the process's time, a file below `task/`
+        // the thread's own; both the process's reaped children's.
+        let process_cpu = leader
+            .and_then(|leader| tree.published_process_cpu.get(&leader).copied())
+            .unwrap_or_default();
+        let cpu = match thread {
+            None => process_cpu,
+            Some(thread) => {
+                let (user, system) = tree
+                    .published_thread_cpu
+                    .get(&thread)
+                    .copied()
+                    .unwrap_or_default();
+                crate::procfs::task_stat::TaskCpuTimes {
+                    user,
+                    system,
+                    ..process_cpu
+                }
+            }
+        };
+        let exit_code = if exited {
+            leader
+                .and_then(|leader| tree.exit_codes.get(&leader).copied())
+                .unwrap_or(0)
+        } else {
+            0
+        };
         crate::procfs::task_stat::TaskStatFacts {
             comm: tree.task_comms.get(&described).copied(),
             cpus: self.task_cpus(described),
@@ -13392,6 +13470,8 @@ impl Scheduler {
             rsslim: leader
                 .and_then(|leader| tree.rss_limits.get(&leader).copied())
                 .unwrap_or(crate::procfs::task_stat::RLIM_INFINITY),
+            cpu,
+            exit_code,
         }
     }
 
@@ -48992,6 +49072,70 @@ mod test {
         assert!(!scheduler.child_waits_wait_only_on_stuck_children());
     }
 
+    /// Another process's rendered `stat` shows the CPU time its threads last
+    /// published with their requests (package K item 2b slice 2b-1): the
+    /// process's for its top-level file, which counts every thread, and one
+    /// thread's own below `task/`, with the process's reaped children's in
+    /// both; a task that has published nothing has used nothing. A live
+    /// process shows no exit code, and a reused number starts with none of
+    /// the old task's.
+    #[test]
+    fn task_stat_facts_show_the_published_cpu_time() {
+        use crate::procfs::task_stat::TaskCpuTimes;
+        let mut scheduler = Scheduler::new(&Config::default());
+        let (leader, worker) = (DetTid::from_raw(3), DetTid::from_raw(4));
+        scheduler.thread_tree.add_child(leader, leader, true);
+        register_known_thread(&mut scheduler, leader);
+        scheduler.thread_tree.add_child(leader, worker, false);
+        register_known_thread(&mut scheduler, worker);
+        assert_eq!(
+            scheduler.task_stat_facts(leader, None).cpu,
+            TaskCpuTimes::default()
+        );
+        let ms = |ms: u64| LogicalTime::from_nanos(ms * 1_000_000);
+        let total = TaskCpuTimes {
+            user: ms(30),
+            system: ms(4),
+            children_user: ms(2),
+            children_system: ms(1),
+        };
+        scheduler.publish_cpu_time(leader, worker, (ms(20), ms(3)), total);
+        assert_eq!(scheduler.task_stat_facts(leader, None).cpu, total);
+        assert_eq!(scheduler.task_stat_facts(worker, None).cpu, total);
+        assert_eq!(
+            scheduler.task_stat_facts(leader, Some(worker)).cpu,
+            TaskCpuTimes {
+                user: ms(20),
+                system: ms(3),
+                ..total
+            }
+        );
+        assert_eq!(
+            scheduler.task_stat_facts(leader, Some(leader)).cpu,
+            TaskCpuTimes {
+                user: LogicalTime::from_nanos(0),
+                system: LogicalTime::from_nanos(0),
+                ..total
+            },
+            "the leader published nothing of its own"
+        );
+        scheduler.record_exit_code(leader, 7 << 8);
+        assert_eq!(scheduler.task_stat_facts(leader, None).exit_code, 0);
+        // A number given out again starts a task that has used nothing.
+        scheduler.thread_tree.add_child(leader, worker, true);
+        assert_eq!(
+            scheduler.task_stat_facts(worker, Some(worker)).cpu,
+            TaskCpuTimes::default()
+        );
+        assert!(!scheduler.thread_tree.exit_codes.contains_key(&worker));
+        assert!(
+            !scheduler
+                .thread_tree
+                .published_process_cpu
+                .contains_key(&worker)
+        );
+    }
+
     /// Detcore records each task's name (package K slice D4c-1): a new task
     /// takes its creator's (`dup_task_struct`), a rename replaces only the
     /// renamed task's, an exec by a thread carries the survivor's name to the
@@ -49141,7 +49285,7 @@ mod test {
         // The root before its first image: nothing to render, so the
         // kernel beneath answers (the executor's EACCES on KVM).
         let unnamed = scheduler.task_stat_facts(leader, None);
-        assert!(!renders_task_comm(&unnamed, 3, CommSource::Record));
+        assert!(!renders_task_comm(&unnamed, CommSource::Record));
         // The root's image, launched as /path/to/probe.
         scheduler.set_task_comm(leader, TaskComm::of_exec_filename(b"/path/to/probe"));
         let comm = |scheduler: &Scheduler, named: DetTid, thread: Option<DetTid>| {
@@ -49152,14 +49296,10 @@ mod test {
         assert_eq!(comm(&scheduler, leader, None), b"probe\n");
         assert_eq!(comm(&scheduler, leader, Some(leader)), b"probe\n");
         let own = scheduler.task_stat_facts(leader, None);
-        assert!(renders_task_comm(&own, 3, CommSource::Record));
+        assert!(renders_task_comm(&own, CommSource::Record));
         assert!(
-            !renders_task_comm(&own, 3, CommSource::Kernel),
+            !renders_task_comm(&own, CommSource::Kernel),
             "ptrace, DBT, SaBRe and LiteInst leave every comm to the kernel"
-        );
-        assert!(
-            !renders_task_comm(&own, 9, CommSource::Record),
-            "another process's comm is the kernel beneath's"
         );
         // PR_SET_NAME (15 bytes kept) by the leader.
         scheduler.set_task_comm(leader, TaskComm::new(b"0123456789abcdefghij"));
@@ -49178,7 +49318,6 @@ mod test {
         assert_eq!(comm(&scheduler, child, None), b"0123456789abcde\n");
         assert!(renders_task_comm(
             &scheduler.task_stat_facts(child, None),
-            5,
             CommSource::Record
         ));
         // An exec by the worker: it keeps its own name under the leader's
