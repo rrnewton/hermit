@@ -1153,6 +1153,7 @@ fn other_instructions(tid: DetTid) -> SchedEvent {
         start_rip: None,
         end_rip: None,
         end_time: None,
+        stopless: false,
     }
 }
 
