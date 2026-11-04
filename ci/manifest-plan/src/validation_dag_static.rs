@@ -3293,7 +3293,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And scheduler a_replayed_switch_wakes_its_due_target, restored from
     // https://github.com/rrnewton/hermit/pull/4889: 3492 + 2 = 3494
     // (wake unit + deferred-SIGCHLD negative arm).
-    ("test.detcore_unit", 3573),
+    ("test.detcore_unit", 3575),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5944,7 +5944,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same unit (same growth as test.detcore_unit, PR #4926): 3469 + 1 = 3470.
     // PR #4751: the same twelve units (same growth as test.detcore_unit): 3482.
     // And the same two replayed-switch wake units: 3492 + 2 = 3494.
-    ("test.detcore_unit_on_host", 3573),
+    ("test.detcore_unit_on_host", 3575),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -11469,6 +11469,8 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         // And six known-entry and overlap units: 3541, listed.
         // And the same six units: 3541, listed.
         // And the same stale trial-overlay unit: 1255, listed.
+        // And the in-memory rewrite's unproven-file units: 3543, listed.
+        // And the same two unproven-file units: 3543, listed.
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -u
 iters=${ANALYZE_SKID_CALIBRATION_ITERATIONS:-64}
 period=${ANALYZE_SKID_CALIBRATION_PERIOD:-1000000}
