@@ -2017,7 +2017,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // classification, timing-trial naming and report-schema tests in
     // app::analyze and the bin's exit-code test), measured by nextest list
     // at the rebased head against main de84048e: 1314 + 14 = 1328.
-    ("test.hermit_unit", 1329),
+    // And PR #4759's prefix-trial uncapped-mark unit: 1329 + 1 = 1330.
+    ("test.hermit_unit", 1330),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3328,7 +3329,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And exec_teardown_tests
     // a_transferred_exec_gives_the_leader_the_survivors_own_cpu_time and
     // a_pre_exec_cpu_publication_after_a_transferred_exec_is_dropped: 3579.
-    ("test.detcore_unit", 3579),
+    // And PR #4759's eight replay-backstop units: 3579 + 8 = 3587.
+    ("test.detcore_unit", 3587),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4726,7 +4728,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4796: two CLI access-trace/watch cases: 819 + 2 = 821.
     // Package K slice 2b-1's another_processs_stat_and_comm_answer_as_linux
     // (the ptrace twin of the KVM other-process stat test): 821 + 1 = 822.
-    ("test.cli", 822),
+    // And PR #4759's uncapped-slice replay case: 822 + 1 = 823.
+    ("test.cli", 823),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5418,7 +5421,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4920 (3): the same two cases: 717 + 2 = 719.
     // PR 4796: the same two cases: 738 + 2 = 740.
     // The same 2b-1 other-process stat ptrace twin: 740 + 1 = 741.
-    ("test.cli_on_host", 741),
+    // And the same PR #4759 case: 741 + 1 = 742.
+    ("test.cli_on_host", 742),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
@@ -6024,7 +6028,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two replayed-switch wake units: 3492 + 2 = 3494.
     // PR 4796: the same ten units (same growth as test.detcore_unit): 3563 + 10 = 3573.
     // The same six 2b-1 units: 3573 + 6 = 3579.
-    ("test.detcore_unit_on_host", 3579),
+    // And the same eight PR #4759 units: 3579 + 8 = 3587.
+    ("test.detcore_unit_on_host", 3587),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -6453,7 +6458,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // test.hermit_unit (dh-jqhfx, PR 5182): 1262 + 5 = 1267.
     // And the same fourteen PR #4752 verdict units as test.hermit_unit
     // (none in the hosted CPUID-faulting skip set): 1308 + 14 = 1322.
-    ("test.hermit_unit_on_host", 1323),
+    // And the same one PR #4759 unit as test.hermit_unit: 1323 + 1 = 1324.
+    ("test.hermit_unit_on_host", 1324),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
