@@ -21,11 +21,15 @@
 // With the argument "syscalls", both threads also make a getppid call every
 // 256 rounds, so slices also end at syscalls, where the virtual time a
 // syscall adds crosses a slice end, and not only at the preemption timer.
+//
+// A numeric argument overrides ROUNDS (the compute-loop count), so a test
+// can run the same race at half the cost; the paths taken do not change.
 #define _GNU_SOURCE
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/syscall.h>
 #include <time.h>
@@ -37,6 +41,7 @@ enum { NOBODY, MAIN, WORKER };
 
 static atomic_int first = NOBODY;
 static bool syscalls;
+static unsigned long rounds = ROUNDS;
 static long long start_us;
 static long long worker_done_us;
 
@@ -50,7 +55,7 @@ static long long now_us(void) {
 static unsigned long compute(void) {
   unsigned long x = 1;
   unsigned long high = 0;
-  for (unsigned long i = 0; i < ROUNDS; i++) {
+  for (unsigned long i = 0; i < rounds; i++) {
     x = x * 6364136223846793005UL + 1442695040888963407UL;
     if (x >> 63) {
       high++;
@@ -77,7 +82,13 @@ static void* worker(void* arg) {
 }
 
 int main(int argc, char** argv) {
-  syscalls = argc > 1 && strcmp(argv[1], "syscalls") == 0;
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "syscalls") == 0) {
+      syscalls = true;
+    } else {
+      rounds = strtoul(argv[i], NULL, 10);
+    }
+  }
   start_us = now_us();
   volatile unsigned long sink = compute();
   pthread_t thread;

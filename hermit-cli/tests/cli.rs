@@ -25438,19 +25438,19 @@ fn assert_chaos_schedule_replay_follows(guest_args: &[&str], replay_chaos: bool,
 /// endpoints. Seeds 1, 2 and 3, one test each.
 #[test]
 fn a_schedule_replay_under_chaos_follows_its_recording_at_seed_1() {
-    assert_chaos_schedule_replay_follows(&[], true, 1);
+    assert_chaos_schedule_replay_follows(&["100000"], true, 1);
 }
 
 /// Seed 2 of `a_schedule_replay_under_chaos_follows_its_recording_at_seed_1`.
 #[test]
 fn a_schedule_replay_under_chaos_follows_its_recording_at_seed_2() {
-    assert_chaos_schedule_replay_follows(&[], true, 2);
+    assert_chaos_schedule_replay_follows(&["100000"], true, 2);
 }
 
 /// Seed 3 of `a_schedule_replay_under_chaos_follows_its_recording_at_seed_1`.
 #[test]
 fn a_schedule_replay_under_chaos_follows_its_recording_at_seed_3() {
-    assert_chaos_schedule_replay_follows(&[], true, 3);
+    assert_chaos_schedule_replay_follows(&["100000"], true, 3);
 }
 
 /// A schedule replay ends each recorded slice once. With the guest's
