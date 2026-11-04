@@ -2585,40 +2585,64 @@ impl std::fmt::Display for SkidOvershootError {
 
 impl std::error::Error for SkidOvershootError {}
 
-fn take_skid_overshoot_error() -> Option<SkidOvershootError> {
-    let count = reverie::take_skid_overshoot_count();
-    (count > 0).then(|| SkidOvershootError::new(count))
+/// The skid overshoots one run reported.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SkidOvershoots {
+    /// The events, and the reports of them by every detection site
+    /// ([`detcore::skid_overshoots::take_skid_overshoots`]).
+    counts: detcore::skid_overshoots::SkidOvershootCounts,
+}
+
+impl SkidOvershoots {
+    /// Take the reports recorded in this process since the last take, with
+    /// the backends' details of them, so a later run starts clean.
+    fn take() -> Self {
+        let (counts, _details) = detcore::skid_overshoots::take_skid_overshoots();
+        Self { counts }
+    }
+
+    /// Refuses the `result` of the run that reported these with
+    /// [`SkidOvershootError`] (exit 122) if there are any (there are events
+    /// exactly when there are reports): a moved preemption point means the
+    /// run is not deterministic evidence. The refusal counts the reports, as
+    /// its `HERMIT_SKID_OVERSHOOT report(s)` says; a failing guest's error
+    /// keeps its chain, with the refusal as its context.
+    fn refuse<T>(self, result: Result<T, Error>) -> Result<T, Error> {
+        if self.counts.reports == 0 {
+            return result;
+        }
+        let refusal = SkidOvershootError::new(self.counts.reports);
+        match result {
+            Ok(_) => Err(Error::new(refusal)),
+            Err(error) => Err(error.context(refusal)),
+        }
+    }
 }
 
 impl SkidOvershootReport {
     fn begin(enabled: bool) -> Self {
         if enabled {
             // A previous invocation in this process must not qualify this one.
-            let _ = reverie::take_skid_overshoot_count();
+            let _ = SkidOvershoots::take();
         }
         Self { enabled }
     }
 
-    fn finish<T>(self, result: Result<T, Error>) -> Result<T, Error> {
-        if !self.enabled {
-            return result;
-        }
-
-        let Some(overshoot) = take_skid_overshoot_error() else {
-            return result;
-        };
-        match result {
-            Ok(_) => Err(Error::new(overshoot)),
-            Err(error) => Err(error.context(overshoot)),
+    fn take(self) -> SkidOvershoots {
+        if self.enabled {
+            SkidOvershoots::take()
+        } else {
+            SkidOvershoots::default()
         }
     }
 
-    fn finish_with_count<T>(self, result: Result<T, Error>) -> Result<(T, u64), Error> {
-        if !self.enabled {
-            return result.map(|value| (value, 0));
-        }
+    fn finish<T>(self, result: Result<T, Error>) -> Result<T, Error> {
+        self.take().refuse(result)
+    }
 
-        let count = reverie::take_skid_overshoot_count();
+    /// Returns the reports, as a refusal counts them.
+    fn finish_with_count<T>(self, result: Result<T, Error>) -> Result<(T, u64), Error> {
+        let count = self.take().counts.reports;
         match result {
             Ok(value) => Ok((value, count)),
             Err(error) if count > 0 => Err(error.context(SkidOvershootError::new(count))),
@@ -4134,12 +4158,26 @@ async fn dispatch_backend(
     )
     .await?;
     let stats_source = tracer.backend_stats();
-    let (exit_status, global_state) = ptrace_completion::wait(tracer, control).await?;
-    let terminal_outcome = global_state.terminal_outcome();
+    let waited = ptrace_completion::wait_outcome(tracer, control).await?;
     let dispatch_stats =
         backend_stats::report_if_collected(backend, stats_request, stats_source.as_ref());
+    let (exit_status, global_state) = match waited {
+        ptrace_completion::Waited::Finished(status, global_state) => (status, global_state),
+        ptrace_completion::Waited::TimedOut(run) => {
+            let summary_json = print_summary_to_json_file.as_deref();
+            return Err(run
+                .finish(print_summary, summary_json, dispatch_stats)
+                .await);
+        }
+    };
+    let terminal_outcome = global_state.terminal_outcome();
     let cleanup = global_state
-        .clean_up_with_dispatch_stats(print_summary, print_summary_to_json_file, dispatch_stats)
+        .clean_up_with_backend_counts(
+            print_summary,
+            print_summary_to_json_file,
+            dispatch_stats,
+            Some(detcore::skid_overshoots::skid_overshoot_counts()),
+        )
         .await;
     let completed = match terminal_outcome {
         Some(outcome) => Err(SchedulerEndedRun::new(outcome, None)),
@@ -4233,6 +4271,52 @@ pub fn run_with_output_backend_timeout(
     backend: Backend,
     timeout: Option<Duration>,
 ) -> Result<Output, Error> {
+    run_with_output_and_skid_overshoot_report(
+        command,
+        config,
+        print_summary,
+        print_summary_to_json_file,
+        backend,
+        timeout,
+        |report, result| report.finish(result),
+    )
+}
+
+/// Run with captured output and return the number of precise PMU timer
+/// overshoots alongside it instead of refusing before a caller can inspect the
+/// completed output. The `--verify` path uses this to finish and publish its
+/// comparison before it refuses the overshoot-tainted result.
+#[doc(hidden)]
+pub fn run_with_output_backend_timeout_and_skid_overshoots(
+    command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    backend: Backend,
+    timeout: Option<Duration>,
+) -> Result<(Output, u64), Error> {
+    run_with_output_and_skid_overshoot_report(
+        command,
+        config,
+        print_summary,
+        print_summary_to_json_file,
+        backend,
+        timeout,
+        SkidOvershootReport::finish_with_count,
+    )
+}
+
+/// Run with captured output, then hand the run's skid-overshoot report and
+/// result to `finish`, on the tracer thread for ptrace.
+fn run_with_output_and_skid_overshoot_report<T: Send + 'static>(
+    command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    backend: Backend,
+    timeout: Option<Duration>,
+    finish: impl FnOnce(SkidOvershootReport, Result<Output, Error>) -> Result<T, Error> + Send + 'static,
+) -> Result<T, Error> {
     if backend == Backend::Ptrace {
         let summary_path = print_summary_to_json_file.clone();
         let command = tracer_thread::SendCommand::new(command);
@@ -4250,52 +4334,7 @@ pub fn run_with_output_backend_timeout(
                 Some(control),
             ))
             .await;
-            report.finish(result)
-        });
-    }
-    let (output, skid_overshoots) = run_with_output_backend_timeout_and_skid_overshoots(
-        command,
-        config,
-        print_summary,
-        print_summary_to_json_file,
-        backend,
-        timeout,
-    )?;
-    if skid_overshoots > 0 {
-        return Err(Error::new(SkidOvershootError::new(skid_overshoots)));
-    }
-    Ok(output)
-}
-
-/// Run with captured output and return the number of precise PMU timer
-/// overshoots alongside it instead of refusing before a caller can inspect the
-/// completed output. The `--verify` path uses this to finish and publish its
-/// comparison before it refuses the overshoot-tainted result.
-#[doc(hidden)]
-pub fn run_with_output_backend_timeout_and_skid_overshoots(
-    command: Command,
-    config: DetConfig,
-    print_summary: bool,
-    print_summary_to_json_file: &Option<PathBuf>,
-    backend: Backend,
-    timeout: Option<Duration>,
-) -> Result<(Output, u64), Error> {
-    if backend == Backend::Ptrace {
-        let summary_path = print_summary_to_json_file.clone();
-        let command = tracer_thread::SendCommand::new(command);
-        return ptrace_completion::run_on_tracer_thread(timeout, move |control| async move {
-            let command = command.into_inner();
-            let report = SkidOvershootReport::begin(true);
-            let result = Box::pin(dispatch_output_backend(
-                command,
-                prepare_backend_config(config, backend),
-                print_summary,
-                &summary_path,
-                backend,
-                Some(control),
-            ))
-            .await;
-            report.finish_with_count(result)
+            finish(report, result)
         });
     }
     let skid_overshoot_report =
@@ -4315,7 +4354,7 @@ pub fn run_with_output_backend_timeout_and_skid_overshoots(
         backend,
         timeout,
     );
-    skid_overshoot_report.finish_with_count(result)
+    finish(skid_overshoot_report, result)
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -4517,12 +4556,26 @@ async fn dispatch_output_backend(
     )
     .await?;
     let stats_source = tracer.backend_stats();
-    let (output, global_state) = ptrace_completion::wait_with_output(tracer, control).await?;
-    let terminal_outcome = global_state.terminal_outcome();
+    let waited = ptrace_completion::wait_with_output_outcome(tracer, control).await?;
     let dispatch_stats =
         backend_stats::report_if_collected(backend, stats_request, stats_source.as_ref());
+    let (output, global_state) = match waited {
+        ptrace_completion::Waited::Finished(output, global_state) => (output, global_state),
+        ptrace_completion::Waited::TimedOut(run) => {
+            let summary_json = print_summary_to_json_file.as_deref();
+            return Err(run
+                .finish(print_summary, summary_json, dispatch_stats)
+                .await);
+        }
+    };
+    let terminal_outcome = global_state.terminal_outcome();
     let cleanup = global_state
-        .clean_up_with_dispatch_stats(print_summary, print_summary_to_json_file, dispatch_stats)
+        .clean_up_with_backend_counts(
+            print_summary,
+            print_summary_to_json_file,
+            dispatch_stats,
+            Some(detcore::skid_overshoots::skid_overshoot_counts()),
+        )
         .await;
     let status = output.status;
     let completed = match terminal_outcome {
@@ -7339,6 +7392,7 @@ mod tests {
             let gap = in_guest_liteinst_program_gap(&mut command);
             match launch {
                 Ok(program) => {
+                    assert!(program.is_absolute());
                     let gap = gap.unwrap().expect("the static image was not refused");
                     assert!(gap.contains("is statically linked"), "{gap}");
                     assert_eq!(Path::new(command.get_program()), program);
@@ -7375,14 +7429,19 @@ mod tests {
             command.env_clear().env("PATH", &search);
             command
         }));
-        // Without a cleared environment the command's explicit PATH still
-        // wins over the inherited one (Reverie cf745200 makes program lookup
-        // read the environment the child receives), so both find the image.
-        assert!(check(&|| {
+        // An explicit PATH overrides the inherited one without clearing the
+        // base environment. The launch and the check must select this fixture
+        // and keep the caller's argv[0] when the program is pinned.
+        let explicit_path = || {
             let mut command = Command::new(name);
-            command.env("PATH", &search);
+            command.env("PATH", &search).arg0("kept-argv0");
             command
-        }));
+        };
+        assert_eq!(
+            fs::canonicalize(explicit_path().find_program().unwrap()).unwrap(),
+            fs::canonicalize(&static_elf).unwrap()
+        );
+        assert!(check(&explicit_path));
         // A cleared environment without PATH (`--base-env=empty`) searches
         // Hermit's working directory, not the guest's and not /bin:/usr/bin.
         assert!(!check(&|| {
@@ -7405,11 +7464,14 @@ mod tests {
     #[test]
     fn skid_overshoot_error_refuses_a_successful_result() {
         let _lock = SKID_OVERSHOOT_TEST_LOCK.lock().unwrap();
-        let _ = reverie::take_skid_overshoot_count();
-        assert!(take_skid_overshoot_error().is_none());
+        let _ = SkidOvershoots::take();
+        assert_eq!(SkidOvershoots::take().refuse(Ok::<_, Error>(7)).unwrap(), 7);
 
         reverie::record_skid_overshoot();
-        let error = take_skid_overshoot_error().expect("recorded overshoot must be reported");
+        reverie::record_skid_overshoot_detail(late_delivery(41_000));
+        let error = SkidOvershoots::take()
+            .refuse(Ok::<_, Error>(7))
+            .expect_err("recorded overshoot must be reported");
         assert!(
             error
                 .to_string()
@@ -7420,7 +7482,8 @@ mod tests {
                 .to_string()
                 .contains("deterministic execution was not established")
         );
-        assert_eq!(reverie::take_skid_overshoot_count(), 0);
+        // The refusal took the details with the count.
+        assert_eq!(SkidOvershoots::take(), SkidOvershoots::default());
     }
 
     #[test]
@@ -7431,6 +7494,78 @@ mod tests {
         let report = SkidOvershootReport::begin(true);
         assert_eq!(report.finish(Ok::<_, Error>(7)).unwrap(), 7);
         assert_eq!(reverie::take_skid_overshoot_count(), 0);
+    }
+
+    fn late_delivery(rcb_actual: u64) -> reverie::SkidOvershootDetail {
+        reverie::SkidOvershootDetail {
+            tid: reverie::Tid::from_raw(42),
+            kind: reverie::SkidOvershootKind::DeliveredLate,
+            rcb_target: 33_000,
+            rcb_actual,
+            overflow_point: Some(31_000),
+            overflow_recorded: Some(true),
+            sample_age_ns: Some(3_500),
+        }
+    }
+
+    /// A run's skid overshoots are taken whole: the events and reports since
+    /// the run began, counted apart (one event two sites reported counts
+    /// once as an event), with the backends' details, so a later run in the
+    /// process starts clean. Any of them refuses the run, whether the guest
+    /// succeeded or failed, and the refusal counts the reports.
+    #[test]
+    fn a_runs_skid_overshoots_are_taken_whole_and_refuse_it_by_their_reports() {
+        let _lock = SKID_OVERSHOOT_TEST_LOCK.lock().unwrap();
+        // An earlier invocation's report does not reach this run.
+        reverie::record_skid_overshoot();
+        reverie::record_skid_overshoot_detail(late_delivery(99_000));
+
+        let report = SkidOvershootReport::begin(true);
+        for rcb_actual in [41_000, 50_000] {
+            reverie::record_skid_overshoot();
+            reverie::record_skid_overshoot_detail(late_delivery(rcb_actual));
+        }
+        // A site that counts one without classifying it, as Reverie's
+        // block-step guard does.
+        reverie::record_skid_overshoot();
+        let overshoots = report.take();
+        assert_eq!(
+            overshoots,
+            SkidOvershoots {
+                counts: detcore::skid_overshoots::SkidOvershootCounts {
+                    events: 3,
+                    reports: 3,
+                },
+            }
+        );
+        assert_eq!(SkidOvershoots::take(), SkidOvershoots::default());
+        let error = overshoots
+            .clone()
+            .refuse(Err::<(), _>(anyhow!("guest failed")))
+            .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<SkidOvershootError>()
+                .map(SkidOvershootError::count),
+            Some(3)
+        );
+        assert!(format!("{error:#}").contains("guest failed"), "{error:#}");
+
+        // One event that Reverie and Detcore's prehook both reported.
+        let twice_reported = SkidOvershoots {
+            counts: detcore::skid_overshoots::SkidOvershootCounts {
+                events: 1,
+                reports: 2,
+            },
+        };
+        let refusal = twice_reported.refuse(Ok::<_, Error>(())).unwrap_err();
+        assert_eq!(
+            refusal
+                .downcast_ref::<SkidOvershootError>()
+                .map(SkidOvershootError::count),
+            Some(2),
+            "a refusal counts the reports"
+        );
     }
 
     #[test]

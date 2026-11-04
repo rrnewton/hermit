@@ -171,6 +171,20 @@ run without `--epoch` (or `HERMIT_EPOCH`, or a replayed recording that supplies
 the epoch), or with `--seed-from=SystemRandom`, is refused before the guest
 starts instead of drawing that input from the host.
 
+A run on a backend with precise timer events (ptrace, e9patch preprocessing on
+it, or KVM) whose precise timers preempted a thread late (a skid overshoot: the
+counter's interrupt arrived past its target) is refused at the end with exit
+status 122, since the moved preemption point is not deterministic evidence.
+`--summary` and `--summary-json` record the number of skid-overshoot events
+(`skid_overshoots`, with `seed_reproducible: false`). Reverie and Detcore can
+each report one overshoot, so an event is one thread's late timer and its
+target, however many reports name it; the JSON also records the reports
+(`skid_overshoot_reports`), which the refusal counts. Both describe that
+execution, not its seed: the same seed can run clean once and overshoot the
+next time, so a seed is never classified. An absent `seed_reproducible` with
+`skid_overshoots: 0` means that no overshoot was observed in that run, not that
+the seed reproduces it.
+
 ## Choosing A Mode
 
 | Goal | Command |
@@ -983,6 +997,46 @@ Run `hermit analyze --help` before using this workflow. Search, minimization,
 and schedule replay can perform many guest executions and require a reliably
 reproducible target condition.
 
+Analyze keeps every run's schedules, logs, output and reproducer command in a
+workspace, a `hermit_analyze*` directory it creates in `--tmp-dir`, or else in
+`$TMPDIR` (`/tmp` when TMPDIR is unset); the paths it prints name that
+directory. Analyze removes the workspace when it exits after its report, and
+when SIGTERM, SIGINT or SIGHUP stops it; after an error it keeps it, since the
+error can name trial files in it (a trial that did not finish, say). A stop
+signal ends the run in progress and starts no other; analyze then removes the
+workspace and that run's own temporary directories, and dies of the signal, so
+a shell reports 128 plus its number (143 for SIGTERM). Pass `--keep-tmp` to
+keep the workspace, for example to rerun a reproducer; `--verbose` keeps it
+too, since the per-run logs it adds are written there. The report file
+(`--report-file`) and the `--tmp-dir` directory itself are never removed.
+
+While analyze runs, a bisection trial's schedules, as large as the endpoints'
+(hundreds of MB for a few million events), are removed as soon as the trial's
+outcome is read, and every run's recording with event times once analyze has
+written it without them. `--keep-tmp` keeps them as well; `--verbose` does
+not, so the reproducer it prints for each trial needs `--keep-tmp` to run
+afterwards. `hermit bisect` keeps them.
+
+Analyze cannot clean up after SIGKILL, nor after a stop signal it does not
+handle: a signal it inherits as ignored stays ignored (SIGINT in a shell's
+background job, SIGHUP under `nohup`), and an analyze that is PID 1 of its PID
+namespace, as in `docker run IMAGE hermit analyze ...` without `--init`, keeps
+the default actions, which Linux discards for a namespace's init. Analyze also
+leaves the stop signals to kill it at once, as before, when `/proc` is not its
+own PID namespace's (analyze started by another process inside `unshare -pf`
+without `--mount-proc`) or when it inherited more than 64 children, since it
+could not then find the run to stop, and where it cannot open a pidfd, send
+a signal through one or wait on one (Linux before 5.4, or a seccomp filter
+that refuses `pidfd_open`, `pidfd_send_signal` or `waitid`), since it signals
+the run only through a pidfd: a process ID it found can be reaped and given to
+another process before the signal goes out. A stop it cannot pass on to the
+run (no file descriptor left to read `/proc`, or a pidfd call that fails) is
+not lost either: analyze says which call failed and dies of the signal as it
+would without its handler, the run dies with it, and the workspace and the
+running trial's private temporary directory stay, since such a death unwinds
+nothing.
+`hermit bisect` keeps its workspace and names it when it exits.
+
 A replayed or spliced schedule can leave the guest spinning or waiting indefinitely.
 `--trial-timeout=SECONDS|auto|off` bounds runs after the initial target attempt.
 The default `auto` uses the initial completed run and completed target/baseline
@@ -1021,8 +1075,14 @@ example timeslices that end at other points, or extra iterations of a polling
 loop), no single swap may separate the outcomes. `--prefix-search` searches
 within the failing schedule instead: each trial replays its first K events and
 then schedules without chaos, and a binary search finds the event at which the
-outcome flips. The report shows the stack of the thread the failing schedule
-runs at that event and of the thread that runs there otherwise:
+outcome flips. The continuation runs at the run's own `--max-timeslice`; a race
+found only at a short timeslice often shows without chaos at that timeslice
+too, and then the search continues at 200 ms instead
+(`--continuation-timeslice`). The report shows the stack of the thread the
+failing schedule runs at that event and of the thread that runs there
+otherwise. When both continuations run the same thread there, the decision is
+how long that thread runs: the report then shows its stack, and the stacks of
+the threads that run after it with and without the event:
 
 ```bash
 hermit analyze --prefix-search --run1-seed=1 --target-stdout='FAILED' \

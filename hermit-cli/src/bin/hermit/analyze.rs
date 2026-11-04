@@ -13,9 +13,12 @@ mod memory;
 mod minimize;
 mod phases;
 mod rundata;
+mod stop;
 mod types;
+mod workspace;
 
 pub use memory::MemoryBudget;
 pub use types::AnalyzeOpts;
+pub use types::ContinuationTimeslice;
 pub use types::ExitStatusConstraint;
 pub use types::TrialTimeout;

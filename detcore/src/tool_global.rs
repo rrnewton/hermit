@@ -373,6 +373,10 @@ pub struct BackendFailureCleanup {
     pub scheduler: Result<(), tokio::task::JoinError>,
     /// The requested partial recording's write result; no destination is success.
     pub preemption_recording: Result<(), String>,
+    /// The partial summary's result for a run `--timeout` stopped
+    /// (`GlobalState::clean_up_after_run_timeout`); success for any other
+    /// failed run, which has no summary.
+    pub summary: Result<(), String>,
 }
 
 #[derive(Clone, Copy)]
@@ -1252,6 +1256,10 @@ pub struct GlobalState {
     // refused (`GlobalRequest::PolicyRefusal`); the first report is kept.
     policy_refusal: Mutex<Option<String>>,
 
+    // The first self-sentinel `pidfd_send_signal` a Tool image refused as
+    // unqualified (`GlobalRequest::PidfdSelfQualificationRefusal`).
+    pidfd_self_qualification_refusal: Mutex<Option<crate::PidfdSelfQualificationRefusal>>,
+
     // The host identity of each file the guest opened in this run, in the
     // order the opens were reported, when `Config::record_host_inputs` is set
     // (see `detcore_model::host_input`). Written to `Config::host_input_log`
@@ -1951,6 +1959,7 @@ impl GlobalState {
             host_diskstats: std::sync::OnceLock::new(),
             procfs_sequences: Mutex::new(BTreeMap::new()),
             policy_refusal: Mutex::new(None),
+            pidfd_self_qualification_refusal: Mutex::new(None),
             host_inputs: Mutex::new(Vec::new()),
             host_mutations: Mutex::new(BTreeSet::new()),
             replay_host_inputs,
@@ -2247,6 +2256,15 @@ impl GlobalState {
         self.policy_refusal.lock().unwrap().clone()
     }
 
+    /// The first self-sentinel `pidfd_send_signal` a Tool image refused
+    /// because its backend could not qualify the sentinel's physical spelling
+    /// (`GlobalRequest::PidfdSelfQualificationRefusal`), taken once.
+    pub fn take_pidfd_self_qualification_refusal(
+        &self,
+    ) -> Option<crate::PidfdSelfQualificationRefusal> {
+        self.pidfd_self_qualification_refusal.lock().unwrap().take()
+    }
+
     /// Unrecoverable fatal erorr. Bring things to a close cleanly, but as quickly as
     /// possible.
     pub fn force_shutdown_with_error(&self) {
@@ -2306,7 +2324,41 @@ impl GlobalState {
     /// A failed run has no successful run summary. Preserve the scheduler's
     /// join error and any requested partial preemption recording's write error
     /// for the caller, without allowing either to replace the backend failure.
-    pub async fn clean_up_after_backend_failure(mut self) -> BackendFailureCleanup {
+    pub async fn clean_up_after_backend_failure(self) -> BackendFailureCleanup {
+        self.clean_up_failed_run(None).await
+    }
+
+    /// [`Self::clean_up_after_backend_failure`] for a run that `--timeout`,
+    /// its wall-clock deadline of `limit_secs` seconds, stopped before the
+    /// guest exited. Once the scheduler has finished, the run is summarized
+    /// as it stood, marked partial with the bound
+    /// (`RunSummary::run_timeout_secs`), and the summary is printed or logged,
+    /// and written to `print_summary_to_json_file` with the backend's
+    /// `dispatch_stats`, as [`Self::clean_up_with_dispatch_stats`] does for a
+    /// finished run. A panicked scheduler, or a poisoned lock used by the
+    /// summary, leaves no summary. The partial recording is flushed after the
+    /// summary describes it, so a write error stays the run's recording
+    /// error.
+    pub async fn clean_up_after_run_timeout(
+        self,
+        limit_secs: u64,
+        to_stderr: bool,
+        print_summary_to_json_file: Option<&std::path::Path>,
+        dispatch_stats: Option<reverie::DispatchStats>,
+    ) -> BackendFailureCleanup {
+        self.clean_up_failed_run(Some(PartialSummary {
+            limit_secs,
+            to_stderr,
+            json: print_summary_to_json_file,
+            dispatch_stats,
+        }))
+        .await
+    }
+
+    async fn clean_up_failed_run(
+        mut self,
+        partial_summary: Option<PartialSummary<'_>>,
+    ) -> BackendFailureCleanup {
         // From here a scheduler panic is reported beside the backend's
         // failure, as its JoinError below, not by ending the process.
         crate::scheduler::note_backend_failure_cleanup();
@@ -2315,6 +2367,14 @@ impl GlobalState {
         } else {
             Ok(())
         };
+        let summary = match partial_summary {
+            Some(request) if scheduler.is_ok() => self.report_partial_summary(request),
+            Some(_) => Err("the scheduler task did not finish".to_owned()),
+            None => Ok(()),
+        };
+        if let Err(error) = &summary {
+            warn!("No summary of the run --timeout stopped: {error}");
+        }
         // A scheduler panic can poison this mutex. Its JoinError is returned
         // below; recovering only to finish output must not replace that error.
         let mut writer = self
@@ -2339,7 +2399,50 @@ impl GlobalState {
         BackendFailureCleanup {
             scheduler,
             preemption_recording,
+            summary,
         }
+    }
+
+    /// The summary of a run its deadline stopped, reported as `clean_up`
+    /// reports a finished run's.
+    fn report_partial_summary(&self, request: PartialSummary<'_>) -> Result<(), String> {
+        // A handler that panicked while holding summary state leaves no
+        // trustworthy summary, and must not panic the cleanup that flushes
+        // the recording. Every guest task and the scheduler have stopped.
+        if self.sched.is_poisoned() || self.global_time.is_poisoned() {
+            return Err("a scheduler or clock lock was poisoned".to_owned());
+        }
+        if self.syscall_observation_gaps.is_poisoned() {
+            return Err("the syscall observation-gap lock was poisoned".to_owned());
+        }
+        if self
+            .replay_host_inputs
+            .as_ref()
+            .is_some_and(|inputs| inputs.is_poisoned())
+        {
+            return Err("the replay host-input lock was poisoned".to_owned());
+        }
+        #[cfg(target_arch = "aarch64")]
+        if self.store_exclusive.is_poisoned() {
+            return Err("the store-exclusive lock was poisoned".to_owned());
+        }
+        let (mut summary, info_reprio_descrip) = self
+            .run_summary_for_log(Scheduler::generate_stopped_run_summary_for_log)
+            .map_err(|error| format!("{error:#}"))?;
+        summary.run_timeout_secs = Some(request.limit_secs);
+        summary.dispatch_stats = request.dispatch_stats;
+        if let Some(path) = request.json {
+            let json = serde_json::to_string_pretty(&summary).map_err(|error| error.to_string())?;
+            fs::write(path, json + "\n")
+                .map_err(|error| format!("writing {}: {error}", path.display()))?;
+        }
+        report_run_summary(
+            summary,
+            info_reprio_descrip.as_deref(),
+            self.cfg.record_preemptions_to.as_deref(),
+            request.to_stderr,
+        );
+        Ok(())
     }
 
     /// Shut down anything running, in particular wait on the scheduler.
@@ -2360,7 +2463,10 @@ impl GlobalState {
         to_stderr: bool,
         print_summary_to_json_file: &Option<PathBuf>,
     ) -> anyhow::Result<()> {
-        self.clean_up_with_dispatch_stats(to_stderr, print_summary_to_json_file, None)
+        // Each entry point calls the shared body directly: a guest's ptrace
+        // run awaits this on the tracer thread's stack, and every wrapper
+        // future would hold its own copy of `self`.
+        self.clean_up_with_backend_counts(to_stderr, print_summary_to_json_file, None, None)
             .await
     }
 
@@ -2368,10 +2474,31 @@ impl GlobalState {
     /// machine-readable summary. The human-readable report, including the INFO
     /// view `--verify` compares, never shows it.
     pub async fn clean_up_with_dispatch_stats(
+        self,
+        to_stderr: bool,
+        print_summary_to_json_file: &Option<PathBuf>,
+        dispatch_stats: Option<reverie::DispatchStats>,
+    ) -> anyhow::Result<()> {
+        self.clean_up_with_backend_counts(
+            to_stderr,
+            print_summary_to_json_file,
+            dispatch_stats,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::clean_up_with_dispatch_stats`], also recording in the summary
+    /// the skid overshoots of the backend's precise PMU timers, events and
+    /// reports ([`RunSummary::record_skid_overshoots`],
+    /// [`crate::skid_overshoots::skid_overshoot_counts`]). Only a backend with
+    /// such timers passes `Some`.
+    pub async fn clean_up_with_backend_counts(
         mut self,
         to_stderr: bool,
         print_summary_to_json_file: &Option<PathBuf>,
         dispatch_stats: Option<reverie::DispatchStats>,
+        skid_overshoots: Option<crate::skid_overshoots::SkidOvershootCounts>,
     ) -> anyhow::Result<()> {
         if let Some(handle) = self.sched_handle.take() {
             debug!("Global state cleanup, confirming scheduler has shut down...");
@@ -2391,8 +2518,6 @@ impl GlobalState {
         };
         let network_refusal = self.finish_network_trace();
         self.finish_access_trace();
-        let banner =
-            "  ------------------------------ hermit run report ------------------------------";
         let recording_destination = self.cfg.record_preemptions_to.clone();
         // The run is over: write what it opened for --verify.
         if let Some(log) = &self.cfg.host_input_log {
@@ -2413,6 +2538,9 @@ impl GlobalState {
             .finalize_run_summary()
             .and_then(|(mut summary, description)| {
                 summary.dispatch_stats = dispatch_stats;
+                if let Some(counts) = skid_overshoots {
+                    summary.record_skid_overshoots(counts.events, counts.reports);
+                }
                 // No summary is published unless terminal validation and recording
                 // output both succeeded. Output errors retain their ordinary class.
                 if let Some(path) = print_summary_to_json_file {
@@ -2423,7 +2551,7 @@ impl GlobalState {
             });
         // A saved network refusal is an additional observed cause on this new
         // error path. The existing network-only report/exit path stays below.
-        let (mut summary, info_reprio_descrip) = match summary_result {
+        let (summary, info_reprio_descrip) = match summary_result {
             Ok(summary) => summary,
             Err(error) => {
                 return crate::combine_finalization(
@@ -2435,32 +2563,12 @@ impl GlobalState {
                 );
             }
         };
-        // Print human-readable summary:
-        if to_stderr {
-            // In this case, print summary irrespective of logging level.
-            // TODO: output summary in machine-readable, JSON form.
-            //
-            // NOT `eprint!`: a guest that set O_NONBLOCK on the inherited fd 2
-            // makes `write_all` fail with EAGAIN here, which panics the print
-            // macro and loses both the summary and the panic message. See
-            // `crate::util::RetryingStderr`.
-            {
-                use std::io::Write;
-                let _ = write!(crate::util::RetryingStderr, "{}\n{}", banner, summary);
-            }
-        } else {
-            // Separate out the nondeterministic bits and print them at debug level:
-            let rt = summary.realtime_elapsed.take();
-            log_run_summary(
-                banner,
-                &summary,
-                info_reprio_descrip.as_deref(),
-                recording_destination.as_deref(),
-            );
-            if let Some(x) = rt {
-                debug!("Nondeterministic realtime elapsed: {:?}", x);
-            }
-        }
+        report_run_summary(
+            summary,
+            info_reprio_descrip.as_deref(),
+            recording_destination.as_deref(),
+            to_stderr,
+        );
         // After the report, so a refused replay still describes the run.
         if let Some(refusal) = network_refusal {
             {
@@ -2481,7 +2589,7 @@ impl GlobalState {
     // In particular, strict finish can fail before the summary takes it. A
     // consumed failed write is absent and must never be retried by Drop.
     fn finalize_run_summary(&self) -> anyhow::Result<(RunSummary, Option<String>)> {
-        let summary = self.run_summary_for_log();
+        let summary = self.run_summary_for_log(Scheduler::generate_partial_run_summary_for_log);
         let writer = self.sched.lock().unwrap().preemption_writer.take();
         // Do not hold the scheduler mutex while doing output I/O.
         let flushed = if self.cfg.record_preemptions_to.is_some() {
@@ -2610,7 +2718,15 @@ impl GlobalState {
         }
     }
 
-    fn run_summary_for_log(&self) -> anyhow::Result<(RunSummary, Option<String>)> {
+    /// The run's summary, whose scheduler half `scheduler_half` builds
+    /// (`Scheduler::generate_partial_run_summary_for_log` for a finished run).
+    fn run_summary_for_log(
+        &self,
+        scheduler_half: impl FnOnce(
+            &mut Scheduler,
+            Option<&PathBuf>,
+        ) -> anyhow::Result<(RunSummary, Option<String>)>,
+    ) -> anyhow::Result<(RunSummary, Option<String>)> {
         // The host files the guest opened go into the recorded schedule,
         // which the scheduler flushes below, and into the summary.
         let host_inputs = self.host_input_set();
@@ -2637,7 +2753,7 @@ impl GlobalState {
                         .failures_for_recording(),
                 );
             }
-            sched.generate_partial_run_summary_for_log(self.cfg.record_preemptions_to.as_ref())?
+            scheduler_half(&mut sched, self.cfg.record_preemptions_to.as_ref())?
         };
         #[cfg(target_arch = "aarch64")]
         self.store_exclusive
@@ -2694,6 +2810,55 @@ impl GlobalState {
         }
 
         Ok((summary, info_reprio_descrip))
+    }
+}
+
+/// What [`GlobalState::clean_up_after_run_timeout`] reports of a run its
+/// deadline stopped.
+struct PartialSummary<'a> {
+    limit_secs: u64,
+    to_stderr: bool,
+    json: Option<&'a std::path::Path>,
+    dispatch_stats: Option<reverie::DispatchStats>,
+}
+
+const RUN_REPORT_BANNER: &str =
+    "  ------------------------------ hermit run report ------------------------------";
+
+/// Print the human-readable summary to stderr, or log its INFO view, with the
+/// nondeterministic realtime at debug level.
+fn report_run_summary(
+    mut summary: RunSummary,
+    info_reprio_descrip: Option<&str>,
+    recording_destination: Option<&std::path::Path>,
+    to_stderr: bool,
+) {
+    if to_stderr {
+        // In this case, print summary irrespective of logging level.
+        //
+        // NOT `eprint!`: a guest that set O_NONBLOCK on the inherited fd 2
+        // makes `write_all` fail with EAGAIN here, which panics the print
+        // macro and loses both the summary and the panic message. See
+        // `crate::util::RetryingStderr`.
+        use std::io::Write;
+        let _ = write!(
+            crate::util::RetryingStderr,
+            "{}\n{}",
+            RUN_REPORT_BANNER,
+            summary
+        );
+    } else {
+        // Separate out the nondeterministic bits and print them at debug level:
+        let rt = summary.realtime_elapsed.take();
+        log_run_summary(
+            RUN_REPORT_BANNER,
+            &summary,
+            info_reprio_descrip,
+            recording_destination,
+        );
+        if let Some(x) = rt {
+            debug!("Nondeterministic realtime elapsed: {:?}", x);
+        }
     }
 }
 
@@ -3959,6 +4124,7 @@ impl GlobalState {
                 GlobalRequest::ParkedProtocolFailure(_)
                     | GlobalRequest::UnrecoverableShutdown
                     | GlobalRequest::PolicyRefusal(_)
+                    | GlobalRequest::PidfdSelfQualificationRefusal(_)
                     | GlobalRequest::StoppingRefusal(_)
             );
 
@@ -4290,6 +4456,17 @@ impl GlobalState {
             }
             GlobalRequest::PolicyRefusal(reason) => {
                 self.policy_refusal.lock().unwrap().get_or_insert(reason);
+                R::PolicyRefusal(())
+            }
+            GlobalRequest::PidfdSelfQualificationRefusal(refusal) => {
+                self.policy_refusal
+                    .lock()
+                    .unwrap()
+                    .get_or_insert_with(|| refusal.to_string());
+                self.pidfd_self_qualification_refusal
+                    .lock()
+                    .unwrap()
+                    .get_or_insert(refusal);
                 R::PolicyRefusal(())
             }
             // Acted on even from a committed SIGKILL victim (it is in the
@@ -4751,7 +4928,7 @@ impl GlobalState {
                     )
                     .await
                 {
-                    SchedulerRpcResult::Continue(history) => {
+                    SchedulerRpcResult::Continue((history, first_slice)) => {
                         let mut sched = self.lock_rpc_scheduler(false).await;
                         // A callback-annotated history replays from its
                         // first row only at the thread's birth.
@@ -4775,7 +4952,7 @@ impl GlobalState {
                                 .cloned()
                                 .unwrap_or_default(),
                         };
-                        let response = R::StartNewThread(history);
+                        let response = R::StartNewThread(history, first_slice);
                         if sched.callback_history_active {
                             R::WithCallbackHistory(startup, Box::new(response))
                         } else {
@@ -6670,7 +6847,7 @@ impl GlobalState {
         request_mm: MmId,
         physical_ids: Option<(i32, i32)>,
         signal_identity: Option<reverie::SignalTaskIdentity>,
-    ) -> SchedulerRpcResult<Option<ThreadHistory>> {
+    ) -> SchedulerRpcResult<(Option<ThreadHistory>, Option<LogicalTime>)> {
         #[cfg(feature = "physical-mm-test-support")]
         self.initial_mm_checkpoint(initial_mm_probe::Point::ThreadStartup, dettid, request_mm)
             .await;
@@ -6833,6 +7010,17 @@ impl GlobalState {
             "[detcore, dtid {}] New thread given go-ahead to proceed via {}",
             &dettid, &response_ivar
         );
+        // The grant carries a timeslice length exactly as a resource grant
+        // does (`recv_grant_resources`): in a schedule replay, the one the
+        // replayer stored for this thread when it switched to it, which is
+        // the thread's first recorded slice.
+        let first_slice = match answer {
+            SchedResponse::Go(Some(SchedValue::Value(length)))
+            | SchedResponse::GoAlone(Some(SchedValue::Value(length))) => {
+                Some(LogicalTime::from_nanos(length))
+            }
+            _ => None,
+        };
         if let Some(pr) = &self.preemptions_to_replay {
             let (history, old_prio) = {
                 let mut sched = self.lock_rpc_scheduler(false).await;
@@ -6856,9 +7044,9 @@ impl GlobalState {
                 history.initial_priority(),
                 old_prio,
             );
-            SchedulerRpcResult::Continue(Some(history))
+            SchedulerRpcResult::Continue((Some(history), first_slice))
         } else {
-            SchedulerRpcResult::Continue(None)
+            SchedulerRpcResult::Continue((None, first_slice))
         }
     }
 
@@ -7764,8 +7952,9 @@ pub enum SignalScope {
 /// coordinator. The in-guest runtimes, the only peers built apart, never
 /// register a placeholder (`Detcore::serves_placeholders`).
 // 26 follows SP2's 25, whose variants come before this revision's
-// `ChildSubreaper` pair.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 26;
+// `ChildSubreaper` pair. 28 retypes `StartNewThread` (PR #4789, renumbered
+// after pidfd's 27).
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 28;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
@@ -8735,6 +8924,13 @@ pub enum GlobalRequest {
     /// where Detcore names (`places_orphans`) and holds no flag of its own.
     /// Appended last.
     ChildSubreaper(DetPid),
+    /// The Tool image is refusing a self-sentinel `pidfd_send_signal` whose
+    /// physical spelling its backend could not qualify. Recorded as a policy
+    /// refusal, as `PolicyRefusal` is, and kept as this type
+    /// (`GlobalState::take_pidfd_self_qualification_refusal`) for a launcher
+    /// that learns of the refusal only from the coordinator (DBT). Answered
+    /// with `PolicyRefusal`. Appended last.
+    PidfdSelfQualificationRefusal(crate::PidfdSelfQualificationRefusal),
 }
 
 /// Responses from the global object
@@ -8775,8 +8971,10 @@ pub enum GlobalResponse {
     RetireExec(bool),
     MarkPastFirstExecve(Box<ExecFdState>),
     CreateChildThread(Option<MmId>),
-    /// Includes optional preemption points for the new thread.
-    StartNewThread(Option<ThreadHistory>),
+    /// Includes optional preemption points for the new thread, and the
+    /// length of its first timeslice when its start grant names one (a
+    /// schedule replay's recorded first slice; see `thread_start_request`).
+    StartNewThread(Option<ThreadHistory>, Option<LogicalTime>),
     DeregisterThread(()),
     SetChildTidAddress(()),
     SetSavedGuestSigmask(()),
@@ -9639,6 +9837,27 @@ where
     );
 }
 
+/// Files a self-sentinel `pidfd_send_signal` refusal with the coordinator
+/// before the Tool error that ends this image is returned
+/// (`GlobalRequest::PidfdSelfQualificationRefusal`).
+pub(crate) async fn report_pidfd_self_qualification_refusal<G, T>(
+    guest: &mut G,
+    refusal: crate::PidfdSelfQualificationRefusal,
+) where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let (_, response) =
+        send_and_update_time(guest, GlobalRequest::PidfdSelfQualificationRefusal(refusal)).await;
+    assert!(
+        matches!(
+            response,
+            GlobalResponse::PolicyRefusal(()) | GlobalResponse::ThreadExited
+        ),
+        "unexpected response to PidfdSelfQualificationRefusal: {response:?}"
+    );
+}
+
 /// Tells the coordinator why the fail-closed policy is ending the run, before
 /// this Tool image exits (`GlobalRequest::PolicyRefusal`).
 pub(crate) async fn report_policy_refusal<G, T>(guest: &mut G, reason: String)
@@ -10090,7 +10309,7 @@ where
             .thread_state_mut()
             .callback_history
             .install(checkpoints);
-    } else if matches!(resp.1, GlobalResponse::StartNewThread(_)) {
+    } else if matches!(resp.1, GlobalResponse::StartNewThread(..)) {
         assert!(
             !guest.thread_state().callback_history.is_active(),
             "preserved callback activation matches coordinator startup"
@@ -10549,12 +10768,13 @@ where
 /// Blocking: future returns only when the thread execution is truly ready to proceed.
 ///
 /// Returns: a history of the thread preemptions, for it to play back when --replay-preemptions-from
-/// is used.
+/// is used, and the length of the thread's first timeslice when its start grant names one: a
+/// schedule replay's recorded first slice, which `finish_thread_start` installs.
 pub async fn thread_start_request<G, T>(
     cfg: &Config,
     guest: &mut G,
     detpid: DetPid,
-) -> Option<ThreadHistory>
+) -> (Option<ThreadHistory>, Option<LogicalTime>)
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -10574,7 +10794,7 @@ where
         )
         .await;
         match resp.1 {
-            GlobalResponse::StartNewThread(preempts) => {
+            GlobalResponse::StartNewThread(preempts, first_slice) => {
                 // Publish only after the deterministic start grant. Before
                 // it, parent registration and this RPC can race in host time.
                 publish_runtime_private_memory(guest).await;
@@ -10583,20 +10803,31 @@ where
                     reverie::reserved_input::InputGrantKind::Ordinary,
                 );
                 trace!("[detcore, dtid {}] new thread UNBLOCKED (post-rpc)", dettid);
-                preempts
+                (preempts, first_slice)
             }
             _ => unreachable!(),
         }
     } else {
-        None
+        (None, None)
     }
 }
 
 /// Complete the existing startup reset after its grant. In particular, a
 /// boundary budget arrives before this reset and is installed only after it;
 /// the legacy preemption-history and deadline-cap ordering is unchanged.
-pub(crate) fn finish_thread_start<G, T>(cfg: &Config, guest: &mut G, history: Option<ThreadHistory>)
-where
+///
+/// A schedule replay's recorded first slice (`first_slice`) is installed after
+/// the reset and its deadline cap, exactly as `trace_schedevent` installs the
+/// replayer's slice after any other event: the reset alone would give the
+/// thread a full `--max-timeslice`, so a first slice the recording ended
+/// sooner, at a timer before the thread's first syscall, would run past its
+/// recorded end.
+pub(crate) fn finish_thread_start<G, T>(
+    cfg: &Config,
+    guest: &mut G,
+    history: Option<ThreadHistory>,
+    first_slice: Option<LogicalTime>,
+) where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
@@ -10608,6 +10839,9 @@ where
     };
     let deadline = guest.thread_state_mut().last_grant_deadline.take();
     cap_timeslice_at_deadline(guest, deadline);
+    if let Some(length) = first_slice {
+        install_replayed_timeslice(guest, length);
+    }
     crate::slice_boundary::grant::finish_start(guest.thread_state_mut(), reset)
         .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error));
 }
@@ -11578,26 +11812,46 @@ pub async fn trace_schedevent_with_access<G, T>(
                 write_backtrace(guest, m_path.as_ref());
             }
 
-            if let Some(timeslice) = timeslice
-                && guest.thread_state().past_global_first_execve
-            {
-                let end_of_timeslice =
-                    guest.thread_state().thread_logical_time.as_nanos() + timeslice;
-                trace!(
-                    "[detcore][dettid {}] setting end_of_timeslice to {:?} as instructed by replayer",
-                    guest.thread_state().dettid,
-                    end_of_timeslice
-                );
-                let max_timeslice = guest.config().max_timeslice.is_some();
-                guest
-                    .thread_state_mut()
-                    .install_schedule_deadline(end_of_timeslice, max_timeslice);
+            if let Some(timeslice) = timeslice {
+                install_replayed_timeslice(guest, timeslice);
             }
         }
         _ => {
             unreachable!()
         }
     }
+}
+
+/// End the thread's current timeslice `length` from now, as the schedule
+/// replayer instructs (`ReplayAction::Continue` / `ContextSwitch`): after a
+/// traced event (`trace_schedevent`), or for a thread's first slice at its
+/// start (`finish_thread_start`).
+fn install_replayed_timeslice<G, T>(guest: &mut G, length: LogicalTime)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if !guest.thread_state().past_global_first_execve {
+        // Before the first execve no slice is replayed: the recording starts
+        // there. A fresh post-exec runtime that starts as a new thread comes
+        // here too, and its first slice keeps the reset's length.
+        trace!(
+            "[detcore][dettid {}] not installing the replayer's slice of {:?} before the first execve",
+            guest.thread_state().dettid,
+            length
+        );
+        return;
+    }
+    let end_of_timeslice = guest.thread_state().thread_logical_time.as_nanos() + length;
+    trace!(
+        "[detcore][dettid {}] setting end_of_timeslice to {:?} as instructed by replayer",
+        guest.thread_state().dettid,
+        end_of_timeslice
+    );
+    let max_timeslice = guest.config().max_timeslice.is_some();
+    guest
+        .thread_state_mut()
+        .install_schedule_deadline(end_of_timeslice, max_timeslice);
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -14520,6 +14774,255 @@ mod tests {
         assert_eq!(serde_json::to_vec(&summary).unwrap(), json);
     }
 
+    /// A run `--timeout` stopped is summarized as it stood, marked partial
+    /// with the bound, before its partial recording is flushed: the summary
+    /// describes the recording and the file it goes to, and the recording is
+    /// then written once. The summary does not flush it: a recording that
+    /// cannot be written stays the failed run's recording error, as before,
+    /// and the summary is still reported.
+    #[tokio::test]
+    async fn a_run_the_timeout_stopped_is_summarized_before_its_recording_is_flushed() {
+        let directory = tempfile::tempdir().unwrap();
+        let recording = directory.path().join("recording");
+        let summary_json = directory.path().join("summary.json");
+        let (_config, state, tid, _) = cancellation_test_state_with_config(Config {
+            sequentialize_threads: true,
+            record_preemptions_to: Some(recording.clone()),
+            ..Config::default()
+        });
+        let mut writer = crate::preemptions::PreemptionWriter::new(Some(recording.clone()));
+        writer.register_thread(tid, DEFAULT_PRIORITY);
+        writer.insert_reprioritization(tid, LogicalTime::from_nanos(100), 10, DEFAULT_PRIORITY, 20);
+        state.sched.lock().unwrap().preemption_writer = Some(writer);
+
+        let cleanup = state
+            .clean_up_after_run_timeout(2, false, Some(&summary_json), None)
+            .await;
+        assert!(cleanup.scheduler.is_ok());
+        assert_eq!(cleanup.preemption_recording, Ok(()));
+        assert_eq!(cleanup.summary, Ok(()));
+        let summary: detcore_model::summary::RunSummary =
+            serde_json::from_slice(&std::fs::read(&summary_json).unwrap()).unwrap();
+        assert_eq!(summary.run_timeout_secs, Some(2));
+        assert_eq!(
+            summary.reprio_descrip.as_deref(),
+            Some(
+                format!(
+                    "Record of 1 preemption and reprioritization events:\n  (Writing to file {recording:?})\n"
+                )
+                .as_str()
+            )
+        );
+        let recorded: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&recording).unwrap()).unwrap();
+        assert_eq!(
+            recorded["per_thread"][tid.to_string()]["prio_changes"],
+            serde_json::json!([[100, DEFAULT_PRIORITY]])
+        );
+
+        let unwritable = summary_json.join("recording");
+        let (_config, state, tid, _) = cancellation_test_state_with_config(Config {
+            sequentialize_threads: true,
+            record_preemptions_to: Some(unwritable.clone()),
+            ..Config::default()
+        });
+        let mut writer = crate::preemptions::PreemptionWriter::new(Some(unwritable));
+        writer.register_thread(tid, DEFAULT_PRIORITY);
+        state.sched.lock().unwrap().preemption_writer = Some(writer);
+        let second_summary = directory.path().join("second.json");
+        let cleanup = state
+            .clean_up_after_run_timeout(2, false, Some(&second_summary), None)
+            .await;
+        assert!(cleanup.preemption_recording.is_err());
+        assert_eq!(cleanup.summary, Ok(()));
+        assert!(second_summary.exists());
+    }
+
+    /// Refusing a partial summary whose inputs were poisoned must still
+    /// consume and flush the recording, including returning a write error.
+    /// Each lock is poisoned independently; the healthy row still reports.
+    #[tokio::test]
+    async fn a_poisoned_summary_lock_does_not_prevent_timeout_recording_cleanup() {
+        #[derive(Clone, Copy, Debug)]
+        enum SummaryLock {
+            Healthy,
+            SyscallObservationGaps,
+            ReplayHostInputs,
+            #[cfg(target_arch = "aarch64")]
+            StoreExclusive,
+        }
+
+        fn poison<T>(lock: &Mutex<T>) {
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = lock.lock().unwrap();
+                panic!("poison a partial-summary input");
+            }));
+            assert!(panic.is_err());
+            assert!(lock.is_poisoned());
+        }
+
+        for (which, expected_error) in [
+            (SummaryLock::Healthy, None),
+            (
+                SummaryLock::SyscallObservationGaps,
+                Some("the syscall observation-gap lock was poisoned"),
+            ),
+            (
+                SummaryLock::ReplayHostInputs,
+                Some("the replay host-input lock was poisoned"),
+            ),
+            #[cfg(target_arch = "aarch64")]
+            (
+                SummaryLock::StoreExclusive,
+                Some("the store-exclusive lock was poisoned"),
+            ),
+        ] {
+            for writable in [true, false] {
+                let directory = tempfile::tempdir().unwrap();
+                let blocker = directory.path().join("not-a-directory");
+                std::fs::write(&blocker, b"keep this file").unwrap();
+                let recording = if writable {
+                    directory.path().join("recording.json")
+                } else {
+                    blocker.join("recording.json")
+                };
+                let summary_json = directory.path().join("summary.json");
+                let (_config, mut state, tid, _) = cancellation_test_state_with_config(Config {
+                    sequentialize_threads: true,
+                    record_preemptions_to: Some(recording.clone()),
+                    record_host_inputs: true,
+                    ..Config::default()
+                });
+                state.replay_host_inputs = Some(Mutex::new(
+                    crate::host_inputs::ReplayHostInputs::new(Default::default()),
+                ));
+                let mut writer = crate::preemptions::PreemptionWriter::new(Some(recording.clone()));
+                writer.register_thread(tid, DEFAULT_PRIORITY);
+                writer.insert_reprioritization(
+                    tid,
+                    LogicalTime::from_nanos(100),
+                    10,
+                    DEFAULT_PRIORITY,
+                    20,
+                );
+                state.sched.lock().unwrap().preemption_writer = Some(writer);
+                assert!(!recording.exists());
+                match which {
+                    SummaryLock::Healthy => {}
+                    SummaryLock::SyscallObservationGaps => poison(&state.syscall_observation_gaps),
+                    SummaryLock::ReplayHostInputs => {
+                        poison(state.replay_host_inputs.as_ref().unwrap());
+                    }
+                    #[cfg(target_arch = "aarch64")]
+                    SummaryLock::StoreExclusive => poison(&state.store_exclusive),
+                }
+
+                let cleanup = state
+                    .clean_up_after_run_timeout(2, false, Some(&summary_json), None)
+                    .await;
+                assert!(cleanup.scheduler.is_ok(), "{which:?}, writable={writable}");
+                assert_eq!(
+                    cleanup.summary,
+                    expected_error.map_or(Ok(()), |error| Err(error.to_owned())),
+                    "{which:?}, writable={writable}"
+                );
+                if expected_error.is_some() {
+                    assert!(!summary_json.exists(), "{which:?}");
+                } else {
+                    let summary: detcore_model::summary::RunSummary =
+                        serde_json::from_slice(&std::fs::read(&summary_json).unwrap()).unwrap();
+                    assert_eq!(summary.run_timeout_secs, Some(2));
+                    assert!(summary.syscall_histogram.is_some());
+                }
+                if writable {
+                    assert_eq!(cleanup.preemption_recording, Ok(()), "{which:?}");
+                    let recorded: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(&recording).unwrap()).unwrap();
+                    assert_eq!(
+                        recorded["per_thread"][tid.to_string()]["prio_changes"],
+                        serde_json::json!([[100, DEFAULT_PRIORITY]]),
+                        "{which:?}"
+                    );
+                    assert_eq!(recorded["host_inputs"]["files"], serde_json::json!([]));
+                } else {
+                    let error = cleanup.preemption_recording.unwrap_err();
+                    assert!(error.contains(&recording.display().to_string()), "{error}");
+                    assert!(!recording.exists());
+                    assert_eq!(std::fs::read(&blocker).unwrap(), b"keep this file");
+                }
+            }
+        }
+    }
+
+    /// Exercise the timeout cleanup route with an admitted annotated record:
+    /// its unconsumed checkpoint must not suppress the requested JSON report.
+    /// The same state still refuses a claim that replay finished.
+    #[tokio::test]
+    async fn a_timed_out_annotated_priority_replay_writes_its_partial_summary() {
+        use crate::preemptions::callback_history::Origin;
+        use crate::preemptions::callback_history::Site;
+        use crate::slice_boundary::callbacks::Callback;
+
+        let directory = tempfile::tempdir().unwrap();
+        let recording = directory.path().join("annotated.json");
+        let summary_json = directory.path().join("summary.json");
+        let tid = DetTid::from_raw(17);
+        let mut writer = crate::preemptions::PreemptionWriter::new(Some(recording.clone()));
+        writer.register_thread(tid, DEFAULT_PRIORITY);
+        writer.insert_schedevent(SchedEvent::branches(tid, 10));
+        writer.insert_reprioritization(tid, LogicalTime::from_nanos(100), 10, DEFAULT_PRIORITY, 20);
+        writer.insert_callback_checkpoint(
+            tid,
+            Origin {
+                callback: Callback::PmuTimer,
+                site: Site::Prehook,
+                progress: 10,
+                last_op: Some(crate::types::Op::Branch),
+                time: LogicalTime::from_nanos(100),
+                rcbs: 10,
+            },
+        );
+        writer.flush().unwrap();
+
+        let (config, state, _, _) = cancellation_test_state_with_config(Config {
+            annotated_priority_replay: true,
+            replay_preemptions_from: Some(recording),
+            sequentialize_threads: true,
+            backend: reverie::BackendCapabilities::PTRACE,
+            ..Config::default()
+        });
+        assert_eq!(config.annotated_priority_replay_unqualified(), None);
+        let refusal = {
+            let mut scheduler = state.sched.lock().unwrap();
+            let refusal = scheduler.priority_history_incomplete().unwrap();
+            assert!(refusal.contains("dtid 17: 1 unconsumed from row 0"));
+            let error = scheduler.generate_partial_run_summary(None).unwrap_err();
+            assert!(error.is::<crate::PriorityHistoryRefusal>(), "{error:#}");
+            assert_eq!(
+                error.to_string(),
+                format!("terminal replay refusal: {refusal}")
+            );
+            refusal
+        };
+
+        let cleanup = state
+            .clean_up_after_run_timeout(2, false, Some(&summary_json), None)
+            .await;
+        assert!(cleanup.scheduler.is_ok());
+        assert_eq!(cleanup.preemption_recording, Ok(()));
+        assert_eq!(cleanup.summary, Ok(()));
+        let summary: detcore_model::summary::RunSummary =
+            serde_json::from_slice(&std::fs::read(&summary_json).unwrap()).unwrap();
+        assert_eq!(summary.run_timeout_secs, Some(2));
+        assert_eq!(
+            summary.desync_descrip.as_deref(),
+            Some(format!("{refusal}\n").as_str())
+        );
+        assert_eq!(summary.schedevent_desynced, 0);
+        assert!(summary.to_string().starts_with("PARTIAL: --timeout=2"));
+        assert!(summary.to_string().contains(&refusal));
+    }
+
     #[test]
     fn run_summary_records_the_effective_shared_preemption_configuration() {
         // Config::default() is unprepared: launch installs the timer capability.
@@ -16770,7 +17273,7 @@ mod tests {
                 }
                 1 => assert_eq!(
                     super::thread_start_request(&config, &mut guest, process).await,
-                    None
+                    (None, None)
                 ),
                 2 => {
                     let response =
@@ -16814,7 +17317,7 @@ mod tests {
             // pending here, not armed and then erased by next_timeslice.
             assert_eq!(guest.thread.replay_rcb_end, None);
             assert_eq!(guest.thread.stats.timeslice_count, original_slices);
-            super::finish_thread_start(&config, &mut guest, None);
+            super::finish_thread_start(&config, &mut guest, None, None);
         }
         assert_eq!(guest.thread.replay_rcb_end, with_budget.then_some(91));
         assert_eq!(
@@ -18940,7 +19443,7 @@ mod tests {
         if child_first {
             assert_eq!(
                 startup.as_mut().await,
-                (None, granted(GlobalResponse::StartNewThread(None)))
+                (None, granted(GlobalResponse::StartNewThread(None, None)))
             );
         } else {
             assert_eq!(
@@ -18994,7 +19497,7 @@ mod tests {
         } else {
             assert_eq!(
                 startup.await,
-                (None, granted(GlobalResponse::StartNewThread(None)))
+                (None, granted(GlobalResponse::StartNewThread(None, None)))
             );
         }
         let mut scheduler = state.sched.lock().unwrap();
@@ -19096,6 +19599,289 @@ mod tests {
         assert_eq!(state.sched.lock().unwrap().turn, turn, "no turn committed");
     }
 
+    /// A schedule replay that switches to a thread before the thread starts
+    /// stores the thread's first recorded slice for its grant
+    /// (`ReplayAction::ContextSwitch`). The start grant hands that length to
+    /// the thread (`GlobalResponse::StartNewThread`), which installs it after
+    /// its startup reset (`finish_thread_start`). Before, the length was
+    /// dropped, and the thread ran a full `--max-timeslice` before its first
+    /// stop, past a recorded first slice that a timer ended sooner.
+    #[tokio::test]
+    async fn a_start_grant_carries_the_threads_replayed_first_slice() {
+        let config = Config {
+            sequentialize_threads: true,
+            runs_post_fork: RunsPostFork::Child,
+            ..Config::default()
+        };
+        let state = GlobalState::initialize(&config, false);
+        let parent = DetTid::from_raw(17);
+        let parent_pid = parent;
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .thread_tree
+            .add_child(parent, parent, true);
+        let child = DetTid::from_raw(parent.as_raw() + 1);
+        let parent_mm = MmId::initial(parent_pid);
+        let child_mm = MmId::for_clone(parent_mm, child, false);
+        install_test_registration(&state, parent, Ivar::new());
+        let parent_clock = DetTime::new(&config);
+        let child_clock = parent_clock.clone_for_child();
+        let mut registration = Box::pin(state.receive_rpc(
+            Tid::from_raw(parent.as_raw()),
+            (
+                parent_clock.clone(),
+                parent_mm,
+                GlobalRequest::CreateChildThread(
+                    child,
+                    parent_pid,
+                    0,
+                    Some(CloneFlags::empty()),
+                    libc::SIGCHLD,
+                    None,
+                    Some(DEFAULT_PRIORITY),
+                ),
+            ),
+        ));
+        assert!(futures::poll!(&mut registration).is_pending());
+        let first_slice = LogicalTime::from_rcbs(83);
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .timeslices
+            .insert(child, Some(first_slice));
+        let mut startup = Box::pin(state.receive_rpc(
+            Tid::from_raw(child.as_raw()),
+            (
+                child_clock,
+                child_mm,
+                GlobalRequest::StartNewThread(child, child, None, None),
+            ),
+        ));
+        assert!(futures::poll!(&mut startup).is_pending());
+        assert!(futures::poll!(&mut startup).is_pending());
+        let first = crate::scheduler::do_a_turn_blocking(
+            state.sched.clone(),
+            state.global_time.clone(),
+            &Err(crate::scheduler::SkipTurn),
+        )
+        .await
+        .expect("the child's start turn must commit");
+        assert_eq!(first.tid, child);
+        assert_eq!(
+            startup.await,
+            (
+                None,
+                granted(GlobalResponse::StartNewThread(None, Some(first_slice)))
+            )
+        );
+        assert!(!state.sched.lock().unwrap().timeslices.contains_key(&child));
+    }
+
+    /// The thread's side of a replayed first slice (`finish_thread_start`):
+    /// after the startup reset, the start grant's length ends the thread's
+    /// first slice that far from its clock, PMU maximum included. A schedule
+    /// replay does not cap that slice at the grant's deadline hint
+    /// (`cap_timeslice_at_deadline`), so a hint does not move it. Without a
+    /// length, or before the first execve (as `trace_schedevent` has it), the
+    /// reset's slice stands.
+    #[test]
+    fn finish_thread_start_installs_a_replayed_first_slice() {
+        let trace_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            trace_file.path(),
+            PreemptionRecord::from_sched_events(vec![]).to_string(),
+        )
+        .unwrap();
+        let (config, state, tid, process) = cancellation_test_state_with_config(
+            Config {
+                sequentialize_threads: true,
+                replay_schedule_from: Some(trace_file.path().to_path_buf()),
+                ..Config::default()
+            }
+            .with_backend(|backend| backend.needs_killed_thread_rpc_cancellation = true),
+        );
+        assert!(config.max_timeslice.is_some());
+        let length = LogicalTime::from_rcbs(83);
+        let start = |first_slice: Option<LogicalTime>, past_global_first_execve: bool| {
+            let mut thread = crate::ThreadState::new(tid, &config, ());
+            thread.detpid = Some(process);
+            thread.past_global_first_execve = past_global_first_execve;
+            thread.last_grant_deadline = Some(Duration::from_nanos(1));
+            let mut guest = ExternalRegistrationGuest {
+                global: &state,
+                config: &config,
+                thread,
+                requests: Mutex::new(Vec::new()),
+                post_exec: false,
+                ppid: None,
+                private_memory: None,
+            };
+            super::finish_thread_start(&config, &mut guest, None, first_slice);
+            guest.thread
+        };
+
+        let replayed = start(Some(length), true);
+        let end = replayed.thread_logical_time.as_nanos() + length;
+        assert_eq!(replayed.end_of_timeslice, Some(end));
+        assert_eq!(replayed.max_timeslice_end, Some(end));
+        assert_eq!(replayed.last_grant_deadline, None, "the hint was consumed");
+
+        // The reset alone ends the slice at the configured maximum.
+        let reset_only = start(None, true);
+        let reset_slice = (reset_only.end_of_timeslice, reset_only.max_timeslice_end);
+        assert_eq!(reset_slice.0, reset_slice.1);
+        assert!(reset_slice.0.is_some_and(|reset_end| reset_end > end));
+
+        let before_exec = start(Some(length), false);
+        assert_eq!(
+            (before_exec.end_of_timeslice, before_exec.max_timeslice_end),
+            reset_slice
+        );
+    }
+
+    /// A first recorded slice can end on the startup backstop's exact
+    /// nanosecond. Installing it must transfer ownership to the schedule,
+    /// so a later kept callback cannot move that end as a provisional one.
+    #[test]
+    fn finish_thread_start_keeps_a_recorded_deadline_equal_to_its_backstop() {
+        let trace_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            trace_file.path(),
+            PreemptionRecord::from_sched_events(vec![]).to_string(),
+        )
+        .unwrap();
+        let mut config = Config {
+            sequentialize_threads: true,
+            chaos: true,
+            max_timeslice: std::num::NonZeroU64::new(1_000),
+            target_timeslice: None,
+            replay_schedule_from: Some(trace_file.path().to_path_buf()),
+            ..Config::default()
+        }
+        .with_backend(|backend| backend.needs_killed_thread_rpc_cancellation = true);
+        config.validate();
+        assert!(config.use_rcb_time());
+        let (config, state, tid, process) = cancellation_test_state_with_config(config);
+        let length = LogicalTime::from_nanos(1_000);
+        for first_slice in [Some(length), None] {
+            let mut thread = crate::ThreadState::new(tid, &config, ());
+            thread.detpid = Some(process);
+            thread.past_global_first_execve = true;
+            thread.last_grant_deadline = Some(Duration::from_nanos(1));
+            let initial_time = thread.thread_logical_time.as_nanos();
+            let generator = thread.chaos_prng.clone();
+            let mut guest = ExternalRegistrationGuest {
+                global: &state,
+                config: &config,
+                thread,
+                requests: Mutex::new(Vec::new()),
+                post_exec: false,
+                ppid: None,
+                private_memory: None,
+            };
+            super::finish_thread_start(&config, &mut guest, None, first_slice);
+            let thread = &mut guest.thread;
+            let initial_end = initial_time + length;
+            assert_eq!(thread.thread_logical_time.as_nanos(), initial_time);
+            assert_eq!(thread.end_of_timeslice, Some(initial_end));
+            assert_eq!(thread.max_timeslice_end, Some(initial_end));
+            assert_eq!(thread.last_grant_deadline, None);
+            assert_eq!(thread.chaos_prng, generator);
+            let stats = serde_json::to_value(&thread.stats).unwrap();
+
+            thread.thread_logical_time.add_rcbs(91);
+            let advanced = thread.thread_logical_time.as_nanos();
+            assert!(advanced > initial_time);
+            assert!(advanced < initial_end);
+            thread.restart_replay_backstop(&config);
+            let expected_end = if first_slice.is_some() {
+                initial_end
+            } else {
+                advanced + length
+            };
+            assert_eq!(thread.end_of_timeslice, Some(expected_end));
+            assert_eq!(thread.max_timeslice_end, Some(expected_end));
+            assert_eq!(
+                thread.replay_backstop,
+                first_slice.is_none().then_some(expected_end)
+            );
+            assert_eq!(thread.thread_logical_time.as_nanos(), advanced);
+            assert_eq!(serde_json::to_value(&thread.stats).unwrap(), stats);
+            assert_eq!(thread.chaos_prng, generator);
+            assert!(guest.requests.lock().unwrap().is_empty());
+        }
+    }
+
+    /// The actual startup reset also admits a cooperative target without a
+    /// PMU maximum. A recorded first slice supplies only its logical end;
+    /// absent or pre-exec first slices retain the reset's provisional end.
+    #[test]
+    fn finish_thread_start_installs_a_target_only_replayed_first_slice() {
+        let trace_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            trace_file.path(),
+            PreemptionRecord::from_sched_events(vec![]).to_string(),
+        )
+        .unwrap();
+        let mut config = Config {
+            sequentialize_threads: true,
+            chaos: true,
+            no_rcb_time: true,
+            max_timeslice: None,
+            target_timeslice: std::num::NonZeroU64::new(100_000),
+            replay_schedule_from: Some(trace_file.path().to_path_buf()),
+            ..Config::default()
+        }
+        .with_backend(|backend| backend.needs_killed_thread_rpc_cancellation = true);
+        config.validate();
+        assert!(!config.use_rcb_time());
+        assert_eq!(config.max_timeslice, None);
+        assert_eq!(config.target_timeslice, std::num::NonZeroU64::new(100_000));
+        let (config, state, tid, process) = cancellation_test_state_with_config(config);
+        let length = LogicalTime::from_nanos(830);
+        for (first_slice, past_global_first_execve) in
+            [(Some(length), true), (None, true), (Some(length), false)]
+        {
+            let mut thread = crate::ThreadState::new(tid, &config, ());
+            thread.detpid = Some(process);
+            thread.past_global_first_execve = past_global_first_execve;
+            thread.last_grant_deadline = Some(Duration::from_nanos(1));
+            let initial_time = thread.thread_logical_time.as_nanos();
+            let generator = thread.chaos_prng.clone();
+            let initial_slices = thread.stats.timeslice_count;
+            let mut guest = ExternalRegistrationGuest {
+                global: &state,
+                config: &config,
+                thread,
+                requests: Mutex::new(Vec::new()),
+                post_exec: false,
+                ppid: None,
+                private_memory: None,
+            };
+            super::finish_thread_start(&config, &mut guest, None, first_slice);
+            let recorded = first_slice.is_some() && past_global_first_execve;
+            let expected_end = if recorded {
+                initial_time + length
+            } else {
+                LogicalTime::MAX
+            };
+            assert_eq!(guest.thread.end_of_timeslice, Some(expected_end));
+            assert_eq!(guest.thread.max_timeslice_end, None);
+            assert_eq!(
+                guest.thread.replay_backstop,
+                (!recorded).then_some(LogicalTime::MAX)
+            );
+            assert_eq!(guest.thread.thread_logical_time.as_nanos(), initial_time);
+            assert_eq!(guest.thread.stats.timeslice_count, initial_slices + 1);
+            assert_eq!(guest.thread.last_grant_deadline, None);
+            assert_eq!(guest.thread.chaos_prng, generator);
+            assert!(guest.requests.lock().unwrap().is_empty());
+        }
+    }
+
     #[tokio::test]
     async fn child_start_clock_is_independent_of_first_rpc_arrival() {
         for child_first in [true, false] {
@@ -19193,7 +19979,7 @@ mod tests {
         assert_eq!(first.tid, child);
         assert_eq!(
             startup.await,
-            (None, granted(GlobalResponse::StartNewThread(None)))
+            (None, granted(GlobalResponse::StartNewThread(None, None)))
         );
         assert_eq!(state.global_time.lock().unwrap().as_nanos(), before_child);
     }
@@ -19307,7 +20093,7 @@ mod tests {
         assert_eq!(first.tid, child);
         assert_eq!(
             startup.await,
-            (None, granted(GlobalResponse::StartNewThread(None)))
+            (None, granted(GlobalResponse::StartNewThread(None, None)))
         );
     }
 
@@ -19368,7 +20154,7 @@ mod tests {
         assert_eq!(first.tid, child);
         assert_eq!(
             startup.await,
-            (None, granted(GlobalResponse::StartNewThread(None)))
+            (None, granted(GlobalResponse::StartNewThread(None, None)))
         );
     }
 
@@ -19419,7 +20205,7 @@ mod tests {
         assert_eq!(first.tid, child);
         assert_eq!(
             startup.await,
-            (None, granted(GlobalResponse::StartNewThread(None)))
+            (None, granted(GlobalResponse::StartNewThread(None, None)))
         );
     }
 
@@ -19471,7 +20257,7 @@ mod tests {
         assert_eq!(first_turn.tid, child);
         assert_eq!(
             first_start.await,
-            (None, granted(GlobalResponse::StartNewThread(None)))
+            (None, granted(GlobalResponse::StartNewThread(None, None)))
         );
         first_holder.advance_to(first_holder.as_nanos() + LogicalTime::from_nanos(500));
         let deregistered = state
@@ -19548,7 +20334,7 @@ mod tests {
         assert_eq!(second_turn.tid, child);
         assert_eq!(
             startup.await,
-            (None, granted(GlobalResponse::StartNewThread(None)))
+            (None, granted(GlobalResponse::StartNewThread(None, None)))
         );
     }
 
@@ -19803,7 +20589,7 @@ mod tests {
         assert_eq!(first.tid, leader);
         assert_eq!(
             startup.await,
-            (None, granted(GlobalResponse::StartNewThread(None)))
+            (None, granted(GlobalResponse::StartNewThread(None, None)))
         );
         assert_eq!(state.global_time.lock().unwrap().as_nanos(), total);
 
@@ -19972,7 +20758,10 @@ mod tests {
             .await;
         assert_eq!(
             start_response,
-            (Some(thread_before), GlobalResponse::StartNewThread(None))
+            (
+                Some(thread_before),
+                GlobalResponse::StartNewThread(None, None)
+            )
         );
 
         let scheduler = state.sched.lock().unwrap();
@@ -20443,7 +21232,7 @@ mod tests {
             start_response,
             (
                 Some(worker_clock.as_nanos()),
-                granted(GlobalResponse::StartNewThread(None))
+                granted(GlobalResponse::StartNewThread(None, None))
             )
         );
         {

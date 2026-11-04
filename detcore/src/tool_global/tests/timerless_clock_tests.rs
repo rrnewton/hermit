@@ -16,6 +16,7 @@ use std::sync::Mutex;
 use clap::Parser;
 use detcore_model::schedule::Op;
 use detcore_model::schedule::SchedEvent;
+use detcore_model::schedule::SyscallPhase;
 use reverie::Errno;
 use reverie::GlobalRPC;
 use reverie::GlobalTool;
@@ -676,6 +677,140 @@ async fn replay_continue_installs_a_logical_deadline_without_requiring_a_timer()
         assert_eq!(replayer.cursor.peek(), Some(&branch));
         assert_eq!(sched.turn, 0);
     }
+}
+
+/// A schedule replay that switches threads at a syscall prehook, to a thread
+/// whose next recorded slice ends at a timer preemption (a nonempty recorded
+/// duration), hands that duration to the switching thread as its new slice
+/// end (and maximum), measured from its clock at the prehook, and stages it
+/// for the destination (`Scheduler::timeslices`); the rest of the switching
+/// thread's state, its clock included, is unchanged. The prehook is traced
+/// through the actual `trace_schedevent`, `receive_rpc` and replayer path,
+/// and the reply is applied by the same code a guest thread runs; the
+/// switching thread runs on into its call, so no grant is waited for, and
+/// nothing desynchronizes.
+///
+/// The switching thread's earlier slice end is not kept: in the recording its
+/// yield ended that slice, and keeping it ended slices the recording did not
+/// have, which moved the clock of a static guest's yielding thread
+/// (`a_schedule_replay_keeps_the_clock_of_a_thread_that_yields_beside_a_computing_one`
+/// in hermit-cli's tests).
+#[tokio::test]
+async fn a_prehook_switch_hands_the_switching_thread_the_recorded_slice() {
+    const NEXT: DetTid = DetTid::from_raw(18);
+    let sample_time =
+        crate::types::DetTime::new(&Config::default()).as_nanos() + LogicalTime::from_nanos(70);
+    let prehook = SchedEvent {
+        dettid: TID,
+        op: Op::Syscall(reverie::syscalls::Sysno::sched_yield, SyscallPhase::Prehook),
+        count: 1,
+        start_rip: None,
+        end_rip: std::num::NonZeroUsize::new(RIP as usize),
+        end_time: Some(sample_time),
+    };
+    // The next thread's slice, ended by a timer preemption as recordings
+    // write it: branches with no OtherInstructions after them, then another
+    // thread's event.
+    let branches = SchedEvent {
+        dettid: NEXT,
+        op: Op::Branch,
+        count: 123,
+        start_rip: None,
+        end_rip: None,
+        end_time: Some(sample_time + LogicalTime::from_rcbs(123)),
+    };
+    let after = SchedEvent {
+        dettid: DetTid::from_raw(19),
+        op: Op::Syscall(reverie::syscalls::Sysno::getpid, SyscallPhase::Prehook),
+        count: 1,
+        start_rip: None,
+        end_rip: std::num::NonZeroUsize::new(RIP as usize),
+        end_time: Some(sample_time + LogicalTime::from_rcbs(123)),
+    };
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        file.path(),
+        crate::preemptions::PreemptionRecord::from_sched_events(vec![
+            prehook.clone(),
+            branches,
+            after,
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    let config = Config {
+        sequentialize_threads: true,
+        replay_schedule_from: Some(file.path().to_path_buf()),
+        ..Config::default()
+    };
+    let state = GlobalState::initialize(&config, false);
+    state
+        .past_first_execve
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    state
+        .sched
+        .lock()
+        .unwrap()
+        .thread_tree
+        .add_child(TID, TID, true);
+    super::install_test_registration(&state, TID, crate::ivar::Ivar::new());
+    let tool: Detcore = Detcore::new(Tid::from_raw(TID.as_raw()), &config);
+    let mut thread = tool.init_thread_state(Tid::from_raw(TID.as_raw()), None);
+    thread.detpid = Some(TID);
+    thread.past_global_first_execve = true;
+    thread.thread_logical_time.add_rcbs(7);
+    thread.committed_clock_value = 7;
+    thread.account_process_cpu_time();
+    assert_eq!(thread.thread_logical_time.as_nanos(), sample_time);
+    // The switching thread's slice end from before its yield.
+    let earlier_end = sample_time + LogicalTime::from_rcbs(4_000);
+    thread.end_of_timeslice = Some(earlier_end);
+    thread.max_timeslice_end = Some(earlier_end);
+    let handed_end = sample_time + LogicalTime::from_rcbs(123);
+    let expected = {
+        let mut expected = thread.clone();
+        expected.end_of_timeslice = Some(handed_end);
+        if config.max_timeslice.is_some() {
+            expected.max_timeslice_end = Some(handed_end);
+        }
+        bincode::serde::encode_to_vec(&expected, bincode::config::legacy()).unwrap()
+    };
+    let mut guest = ClockGuest {
+        config,
+        thread,
+        raw: 7,
+        reads: 0,
+        records: Mutex::new(Vec::new()),
+        precise_timers: Vec::new(),
+        imprecise_timers: Vec::new(),
+        rpc_state: Some(state),
+    };
+    super::super::trace_schedevent(&mut guest, prehook.clone(), false).await;
+    assert_eq!(*guest.records.lock().unwrap(), vec![prehook]);
+    assert_eq!(guest.thread.end_of_timeslice, Some(handed_end));
+    assert_eq!(
+        bincode::serde::encode_to_vec(&guest.thread, bincode::config::legacy()).unwrap(),
+        expected,
+        "only the switching thread's slice end changes"
+    );
+    let sched = guest.rpc_state.as_ref().unwrap().sched.lock().unwrap();
+    assert_eq!(
+        sched.timeslices.get(&NEXT),
+        Some(&Some(LogicalTime::from_rcbs(123))),
+        "the recorded duration is staged for the next thread"
+    );
+    let replayer = sched.replayer.as_ref().unwrap();
+    assert_eq!(replayer.traced_event_count, 1);
+    assert_eq!(replayer.events_popped, 1);
+    assert!(
+        replayer
+            .desync_counts
+            .values()
+            .all(|counts| counts.soft == 0 && counts.hard == 0),
+        "{:?}",
+        replayer.desync_counts
+    );
+    assert_eq!(replayer.cursor.peek().map(|event| event.dettid), Some(NEXT));
 }
 
 /// Actual shared pre/post hooks and the CPUID Tool callback, with typed

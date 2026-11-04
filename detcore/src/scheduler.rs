@@ -1323,6 +1323,15 @@ enum TimeSkipMode {
     Legacy,
 }
 
+/// How the run a summary describes ended (`Scheduler::summarize_run`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunEnd {
+    /// The guest exited, or the scheduler ended the run.
+    Finished,
+    /// `--timeout`, the run's wall-clock deadline, stopped it first.
+    Stopped,
+}
+
 /// The state for the deterministic scheduler.
 #[derive(Debug)]
 pub struct Scheduler {
@@ -6816,6 +6825,23 @@ impl Scheduler {
                             // immediate_fatal_exit();
                         }
                     }
+                    // The recorded slice length is the next thread's, handed to
+                    // it with its grant (`timeslices`). The thread that
+                    // switches takes it too. At a prehook it runs on into its
+                    // call, and in the recording its yield there ended its
+                    // slice, so it resumed with a fresh one; the replay sets
+                    // its next timer-ended deadline just before that segment
+                    // (`Continue`), so until then it needs a deadline that
+                    // does not end the segment early. Its earlier deadline,
+                    // set before the yield, can: a static guest's yielding
+                    // thread then ended slices its recording did not have,
+                    // and its clock moved (`a_schedule_replay_keeps_the_clock_of_a_thread_that_yields_beside_a_computing_one`).
+                    // In a recording without `--chaos` a timer-ended slice is
+                    // the full `--max-timeslice`, the same length as the fresh
+                    // slice the switching thread resumed with. Under `--chaos`
+                    // the two lengths differ; replays of such recordings leave
+                    // them for other reasons too, and which deadline is right
+                    // there is not established.
                     self.timeslices.insert(new_tid, timeslice_remaining);
                     return ConsumeResult {
                         keep_running: !is_now,
@@ -21633,7 +21659,29 @@ impl Scheduler {
         &mut self,
         preemptions_to: Option<&PathBuf>,
     ) -> anyhow::Result<(RunSummary, Option<String>)> {
-        if let Some(replayer) = &self.boundary_replayer {
+        self.summarize_run(preemptions_to, RunEnd::Finished)
+    }
+
+    /// [`Self::generate_partial_run_summary_for_log`] for a run `--timeout`
+    /// stopped before the guest exited, summarized as it stands. Its replay
+    /// need not have reached the recording's end, and a recording bound for a
+    /// file is described but left in place, for the failed run's own flush
+    /// (`GlobalState::clean_up_after_run_timeout`).
+    pub(crate) fn generate_stopped_run_summary_for_log(
+        &mut self,
+        preemptions_to: Option<&PathBuf>,
+    ) -> anyhow::Result<(RunSummary, Option<String>)> {
+        self.summarize_run(preemptions_to, RunEnd::Stopped)
+    }
+
+    fn summarize_run(
+        &mut self,
+        preemptions_to: Option<&PathBuf>,
+        end: RunEnd,
+    ) -> anyhow::Result<(RunSummary, Option<String>)> {
+        if end == RunEnd::Finished
+            && let Some(replayer) = &self.boundary_replayer
+        {
             replayer.finish().map_err(crate::TerminalReplayRefusal)?;
         }
         self.report_stacktrace_events_the_run_did_not_reach();
@@ -21787,16 +21835,19 @@ impl Scheduler {
         }
         // Legacy EOF policy does not make an unconsumed suffix fatal. Name
         // incomplete callback metadata separately; do not invent guest events.
-        for (tid, points) in &self.callback_checkpoints {
-            if !points.is_empty() {
-                let message = format!(
-                    "DESYNC incomplete callback history for {tid}: {} unconsumed checkpoints",
-                    points.len()
-                );
-                tracing::warn!("{}", message);
-                desync_descrip
-                    .get_or_insert_with(String::new)
-                    .push_str(&format!("{message}\n"));
+        // A stopped run's replay is unfinished by definition.
+        if end == RunEnd::Finished {
+            for (tid, points) in &self.callback_checkpoints {
+                if !points.is_empty() {
+                    let message = format!(
+                        "DESYNC incomplete callback history for {tid}: {} unconsumed checkpoints",
+                        points.len()
+                    );
+                    tracing::warn!("{}", message);
+                    desync_descrip
+                        .get_or_insert_with(String::new)
+                        .push_str(&format!("{message}\n"));
+                }
             }
         }
         for message in &self.callback_checkpoint_desyncs {
@@ -21824,8 +21875,16 @@ impl Scheduler {
                 .push_str(&format!("{message}\n"));
         }
 
-        let (reprio_descrip, info_reprio_descrip) = if let Some(pw) = self.preemption_writer.take()
+        let (reprio_descrip, info_reprio_descrip) = if end == RunEnd::Stopped
+            && let (Some(pw), Some(path)) = (&self.preemption_writer, preemptions_to)
         {
+            let info_description = format!(
+                "Record of {} preemption and reprioritization events:\n",
+                pw.len()
+            );
+            let description = format!("{info_description}  (Writing to file {path:?})\n");
+            (Some(description), Some(info_description))
+        } else if let Some(pw) = self.preemption_writer.take() {
             let mut buf = String::new();
             writeln!(
                 buf,
@@ -21879,10 +21938,17 @@ impl Scheduler {
             TerminalOutcome::to_fields(self.terminal_outcome);
 
         // After the record is flushed and each thread's DESYNC line is
-        // logged above: the re-recorded history survives as evidence, and the
-        // run still ends as a refusal, not a summary.
+        // logged above, a finished run must still refuse an incomplete
+        // annotated replay. A deadline-stopped run may have an unconsumed
+        // suffix: retain its diagnostic in the partial report instead of
+        // withholding that report or claiming replay completed.
         if let Some(refusal) = self.priority_history_incomplete() {
-            return Err(crate::PriorityHistoryRefusal(refusal).into());
+            if end == RunEnd::Finished {
+                return Err(crate::PriorityHistoryRefusal(refusal).into());
+            }
+            desync_descrip
+                .get_or_insert_with(String::new)
+                .push_str(&format!("{refusal}\n"));
         }
 
         Ok((
@@ -21929,6 +21995,12 @@ impl Scheduler {
                 virtual_timeout_ns,
                 // GlobalState counts binder calls (`syscalls::binder`).
                 binder_external_calls: None,
+                // GlobalState marks a run its deadline stopped.
+                run_timeout_secs: None,
+                // The backend's precise timers count these.
+                skid_overshoots: None,
+                skid_overshoot_reports: None,
+                seed_reproducible: None,
             },
             info_reprio_descrip,
         ))
@@ -26997,6 +27069,37 @@ mod test {
             SyscallPhase::Prehook,
         ));
         (Replayer::new(events), prehook)
+    }
+
+    /// A schedule replay's context switch at a prehook stages the next
+    /// thread's recorded slice length for that thread (`timeslices`) and
+    /// hands the same length to the switching thread, which runs on into its
+    /// call with a deadline past it. Keeping the switching thread's earlier
+    /// deadline instead ended slices its recording did not have
+    /// (`a_schedule_replay_keeps_the_clock_of_a_thread_that_yields_beside_a_computing_one`).
+    #[test]
+    fn a_prehook_context_switch_hands_the_switching_thread_the_recorded_slice() {
+        let mut sched = Scheduler::new(&Config::default());
+        let (caller, next, following) = (
+            DetTid::from_raw(3),
+            DetTid::from_raw(7),
+            DetTid::from_raw(9),
+        );
+        for tid in [caller, next, following] {
+            register_known_thread(&mut sched, tid);
+        }
+        let (replayer, prehook) = exec_replay(caller, next, following, Some(123));
+        sched.replayer = Some(replayer);
+        let consumed = sched.consume_schedevent(&prehook);
+        assert!(consumed.keep_running);
+        assert_eq!(
+            consumed.timeslice_remaining,
+            Some(LogicalTime::from_rcbs(123))
+        );
+        assert_eq!(
+            sched.timeslices.get(&next),
+            Some(&Some(LogicalTime::from_rcbs(123)))
+        );
     }
 
     #[tokio::test]

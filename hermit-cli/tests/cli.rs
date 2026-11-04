@@ -12,6 +12,9 @@ mod exec_posix_timers;
 #[path = "common/fault_sites.rs"]
 mod fault_sites;
 
+#[path = "common/pidfd_forwarding.rs"]
+mod pidfd_forwarding;
+
 #[path = "common/timerfd_virtual_time.rs"]
 mod timerfd_virtual_time;
 
@@ -142,6 +145,7 @@ use hermit::canonical_verdict::Verdict;
 use hermit::canonical_verdict::VerificationReport;
 
 static PIPE_READER_REPLAY_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static FIRST_SLICE_REPLAY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_MMAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static ANON_MAPPING_WRITE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_EXEC_FAILURE_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -285,6 +289,7 @@ static SCM_RIGHTS_OVERLAPPING_RECEIPT_GUEST: OnceLock<PathBuf> = OnceLock::new()
 static CPUINFO_MATCHES_CPUID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLOCK_ID_VALIDATION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPU_TIME_CLOCKS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static YIELD_BESIDE_COMPUTE_NOLIBC_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PROC_CPU_TIMES_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUID_TABLE_DUMP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DATAGRAM_READ_SHUTDOWN_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -955,6 +960,32 @@ fn pipe_reader_replay_guest() -> &'static Path {
     })
 }
 
+fn first_slice_replay_guest() -> &'static Path {
+    FIRST_SLICE_REPLAY_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("first-slice-replay");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create first-slice-replay guest directory");
+        let guest = build_root.join("first_slice_replay");
+        let output = Command::new("cc")
+            .args(["-O2", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/first_slice_replay.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile first-slice-replay guest");
+        assert!(
+            output.status.success(),
+            "first-slice-replay guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
 fn fifo_peer_guest() -> &'static Path {
     FIFO_PEER_GUEST.get_or_init(|| {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1362,6 +1393,43 @@ fn futex_c_guest(cell: &'static OnceLock<PathBuf>, name: &str) -> &'static Path 
         assert!(
             output.status.success(),
             "{name} guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+/// tests/c/yield_beside_compute_nolibc.c, built static with no libc, so a run
+/// of it has no dynamic loader.
+fn yield_beside_compute_nolibc_guest() -> &'static Path {
+    YIELD_BESIDE_COMPUTE_NOLIBC_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("yield-beside-compute-nolibc");
+        fs::create_dir_all(&build_root).expect("failed to create the static guest directory");
+        let guest = build_root.join("yield_beside_compute_nolibc");
+        let output = Command::new("cc")
+            .args([
+                "-O1",
+                "-static",
+                "-nostdlib",
+                "-fno-stack-protector",
+                "-fno-pie",
+                "-no-pie",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+            ])
+            .arg(repository.join("tests/c/yield_beside_compute_nolibc.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the static guest");
+        assert!(
+            output.status.success(),
+            "yield_beside_compute_nolibc guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -27772,6 +27840,166 @@ fn a_schedule_replay_of_a_pipe_reader_whose_writers_exited_is_no_deadlock() {
     }
 }
 
+/// A schedule replay keeps the clock of a thread that yields beside a
+/// computing one. The static guest, with no libc and no dynamic loader, has
+/// its main task call sched_yield, compute briefly and read CLOCK_MONOTONIC,
+/// 40 times, while a second task made by a raw clone computes for 1,500,000
+/// iterations, long enough to outlast every yield at both slice lengths; it
+/// prints a digest of the main task's clock reads. Each recording, at an
+/// explicit --max-timeslice of 100 us and of 400 us and without --chaos, has
+/// the main task's prehook switch to the computing task carry that task's
+/// timer-ended slice length, and must replay with no desync and the same
+/// output. Giving the switching thread no slice there, so that it keeps the
+/// deadline it had before its yield, ended slices its recording did not
+/// have: the main task's last clock read came 3.5 ms late at 100 us and
+/// 1.0 ms late at 400 us, with 17 and 19 events desynchronized. The four
+/// runs take about 4.8 s of wall time (4.4 s of CPU) on an Intel Xeon Gold
+/// 6138. Needs the PMU, so it runs in privileged-test.pmu_cli_cases, and
+/// test.cli and test.cli_on_host skip it.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn a_schedule_replay_keeps_the_clock_of_a_thread_that_yields_beside_a_computing_one() {
+    let program = yield_beside_compute_nolibc_guest()
+        .to_str()
+        .expect("static guest path should be UTF-8");
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    for max_timeslice in ["100000", "400000"] {
+        let record = dir.path().join(format!("{max_timeslice}.json"));
+        let summary = dir.path().join(format!("{max_timeslice}.summary.json"));
+        let bound = format!("--max-timeslice={max_timeslice}");
+        let record_arg = format!("--record-preemptions-to={}", record.display());
+        let replay_arg = format!("--replay-schedule-from={}", record.display());
+        let summary_arg = format!("--summary-json={}", summary.display());
+        let run = |extra: &[&str]| {
+            let mut args = vec![
+                "run",
+                "--strict",
+                "--base-env=minimal",
+                "--epoch=2026-01-01T00:00:00Z",
+                "--seed=1",
+                bound.as_str(),
+            ];
+            args.extend_from_slice(extra);
+            args.extend(["--", program, "40", "300", "1500000"]);
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            stdout(&output)
+        };
+        let recorded = run(&[record_arg.as_str()]);
+        assert!(
+            recorded.starts_with("second=")
+                && recorded.contains("\nmain=")
+                && recorded.contains("\nlast_ns="),
+            "{max_timeslice}: {recorded}"
+        );
+        assert_eq!(
+            run(&[replay_arg.as_str(), summary_arg.as_str()]),
+            recorded,
+            "--max-timeslice={max_timeslice}: the replay moved the yielding task's clock"
+        );
+        let summary: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&summary).unwrap()).unwrap();
+        assert_eq!(
+            summary["schedevent_desynced"], 0,
+            "--max-timeslice={max_timeslice}: {summary}"
+        );
+    }
+}
+
+/// A schedule replay ends a new thread's first timeslice where the recording
+/// ended it. The guest's new thread computes about 3000 branches before its
+/// first syscall, so under `--chaos --max-timeslice=1000` the recording ends
+/// that thread's first slice at a timer, and for these seeds at least one
+/// such slice is shorter than the longest slice the record holds: the
+/// thread first enters Detcore at that timer stop, through its start grant,
+/// not at a syscall. Each replay must print the recording's line and report
+/// no desync. A replay that gave the starting thread the full slice instead
+/// of its recorded one (the start grant's length dropped, as before this
+/// change) ran past the recorded end and desynchronized 56 to 74 later
+/// events of each seed whose first slice was shorter than the maximum.
+/// Seeds 3, 8 and 9 also record a short first slice but are left out: their
+/// schedule replays desynchronize on main too (61, 1004 and 75 events), and
+/// with this change still 4, 4 and 2, all on the main thread and none on the
+/// new one, at main's schedule-replay departures under `--chaos` at short
+/// slices (<https://github.com/rrnewton/hermit/issues/5104>). They return
+/// when that issue is fixed.
+#[test]
+fn a_schedule_replay_ends_a_new_threads_first_slice_where_the_recording_did() {
+    let program = first_slice_replay_guest()
+        .to_str()
+        .expect("first-slice-replay guest path should be UTF-8");
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let mut shorter_first_slices = 0;
+    for seed in [1, 7, 10] {
+        let record = dir.path().join(format!("seed-{seed}.json"));
+        let summary = dir.path().join(format!("seed-{seed}.summary.json"));
+        let seed_arg = format!("--seed={seed}");
+        let record_arg = format!("--record-preemptions-to={}", record.display());
+        let replay_arg = format!("--replay-schedule-from={}", record.display());
+        let summary_arg = format!("--summary-json={}", summary.display());
+        let run = |extra: &[&str]| {
+            let mut args = vec![
+                "run",
+                "--strict",
+                "--epoch=2026-01-01T00:00:00Z",
+                "--max-timeslice=1000",
+            ];
+            args.extend_from_slice(extra);
+            args.extend(["--", program]);
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            stdout(&output)
+        };
+        let recorded = run(&["--chaos", seed_arg.as_str(), record_arg.as_str()]);
+
+        // The new thread, the second one the record names, first appears
+        // as the branches up to a timer stop, before any syscall.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
+        let events = parsed["global"].as_array().expect("the record's events");
+        assert!(
+            !events.is_empty(),
+            "seed {seed}: the record holds no events"
+        );
+        let mut threads = Vec::new();
+        for event in events {
+            if !threads.contains(&event["dettid"]) {
+                threads.push(event["dettid"].clone());
+            }
+        }
+        let child = threads
+            .get(1)
+            .unwrap_or_else(|| panic!("seed {seed}: no second thread in {threads:?}"));
+        let first = events
+            .iter()
+            .find(|event| &event["dettid"] == child)
+            .expect("the new thread's first event");
+        assert_eq!(first["op"], "Branch", "seed {seed}: {first}");
+        let longest = events
+            .iter()
+            .filter(|event| event["op"] == "Branch")
+            .filter_map(|event| event["count"].as_u64())
+            .max()
+            .expect("the record's longest slice");
+        if first["count"].as_u64().is_some_and(|count| count < longest) {
+            shorter_first_slices += 1;
+        }
+
+        assert_eq!(
+            run(&[replay_arg.as_str(), summary_arg.as_str()]),
+            recorded,
+            "seed {seed}"
+        );
+        let summary: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&summary).unwrap()).unwrap();
+        assert_eq!(summary["schedevent_desynced"], 0, "seed {seed}: {summary}");
+    }
+    assert!(
+        shorter_first_slices > 0,
+        "no seed's recording ended the new thread's first slice before the maximum"
+    );
+}
+
 /// A gate whose BEFORE anchor can never fire, on the only thread left, is a
 /// deadlock to report (https://github.com/rrnewton/hermit/issues/3149). A held
 /// thread is in neither the run queue nor a blocked pool, so the scheduler loop
@@ -36875,6 +37103,95 @@ fn skid_overshoot_and_guest_failure_have_different_exit_codes() {
     );
 }
 
+/// A run without `--strict` whose PMU timers overshoot is refused as a
+/// strict one is (exit 122, `HERMIT_POLICY_REFUSAL`), not finished with a
+/// warning, and its summary records the events, one per thread and timer
+/// target named in the timer warnings and prehook errors, with
+/// `seed_reproducible: false`. The overshoot is induced with Reverie's own
+/// fault injector, as in
+/// `skid_overshoot_and_guest_failure_have_different_exit_codes`, whose
+/// `--strict --verify` run is refused too. The guest's own status, 3, is one
+/// no refusal or Hermit failure uses, and must not pass through.
+#[test]
+fn a_skid_overshoot_without_strict_is_refused_and_counted_in_the_summary() {
+    let _guard = hermit_run_guard();
+
+    let busy = "awk 'BEGIN{s=0;for(i=0;i<300000;i++)s+=i;print s}'; exit 3";
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("create skid-overshoot summary directory");
+    let summary = directory.path().join("summary.json");
+    let summary_arg = format!("--summary-json={}", summary.display());
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command.args(["run", summary_arg.as_str()]);
+    append_hermit_args(&mut command, &["--", "/bin/sh", "-c", busy]);
+    let output = command
+        .env("REVERIE_SKID_MARGIN_OVERRIDE", "0")
+        .output()
+        .expect("failed to run hermit under the skid injector");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("HERMIT_SKID_OVERSHOOT"),
+        "the skid injector did not induce an overshoot; this test is measuring nothing:\n{stderr}"
+    );
+    // EXIT-CLASS: hermit
+    assert_eq!(
+        output.status.code(),
+        Some(122),
+        "a skid overshoot must refuse the run, not pass the guest's status through:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("HERMIT_POLICY_REFUSAL") && stderr.contains("skid-overshoot"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr
+            .lines()
+            .any(|line| line.starts_with("hermit: WARNING: ") && line.contains("skid-overshoot")),
+        "{stderr}"
+    );
+
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&summary).expect("the summary was not written"))
+            .expect("the summary is not JSON");
+    assert!(
+        report["skid_overshoots"]
+            .as_u64()
+            .is_some_and(|events| events > 0),
+        "{report}"
+    );
+    assert_eq!(report["seed_reproducible"], serde_json::json!(false));
+    // The summary counts events: the distinct thread and target pairs that
+    // Reverie's timer warnings and Detcore's prehook errors name, however
+    // many of those lines name each.
+    let field = |line: &str, name: &str| -> Option<u64> {
+        let start = line.find(&format!("{name}="))? + name.len() + 1;
+        let digits: String = line[start..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        digits.parse().ok()
+    };
+    let reported: Vec<(u64, u64)> = stderr
+        .lines()
+        .filter(|line| {
+            line.contains("reverie_ptrace::timer") || line.contains("HERMIT_SKID_OVERSHOOT prehook")
+        })
+        .filter_map(|line| Some((field(line, "tid")?, field(line, "rcb_target")?)))
+        .collect();
+    let events: std::collections::BTreeSet<_> = reported.iter().copied().collect();
+    assert_eq!(
+        report["skid_overshoots"].as_u64(),
+        Some(events.len() as u64),
+        "{report}\n{stderr}"
+    );
+    let reports = report["skid_overshoot_reports"].as_u64();
+    assert!(
+        reports.is_some_and(|reports| reports >= reported.len() as u64),
+        "{report}\n{stderr}"
+    );
+}
+
 /// Retained entries of a verify-log directory whose names start with `prefix`.
 fn retained_captures(log_dir: &Path, prefix: &str) -> Vec<PathBuf> {
     let mut captures = fs::read_dir(log_dir)
@@ -39826,6 +40143,71 @@ fn run_timeout_leaves_a_guest_that_finishes_in_time_alone() {
         !String::from_utf8_lossy(&output.stderr).contains("class=run-timeout"),
         "an unexpired bound must say nothing at all"
     );
+}
+
+/// `--summary` of a run `--timeout` stopped: the summary still prints, before
+/// the deadline's class line, marked partial and naming the bound, and
+/// `--summary-json` records the bound beside the scheduler's turns and the
+/// virtual time the run had reached. A guest that finishes inside its bound
+/// gets a summary with no bound. Before, a timed-out run printed and wrote no
+/// summary at all.
+#[test]
+fn run_timeout_prints_a_partial_summary_naming_the_deadline() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let summary_run = |name: &str, secs: u64, argv: &[&str]| {
+        let path = directory.path().join(name);
+        let json = format!("--summary-json={}", path.display());
+        let secs = secs.to_string();
+        let mut args = vec!["run", "--summary", &json, "--timeout", &secs, "--"];
+        args.extend_from_slice(argv);
+        let output = hermit_command(&args)
+            .stdin(Stdio::null())
+            .output()
+            .expect("failed to run hermit run --summary --timeout");
+        let summary = fs::read(&path).ok().map(|bytes| {
+            serde_json::from_slice::<serde_json::Value>(&bytes)
+                .unwrap_or_else(|error| panic!("{name}: unreadable summary JSON: {error}"))
+        });
+        (output, summary)
+    };
+
+    let (output, summary) = summary_run("stopped.json", RUN_TIMEOUT_SECS, RUN_TIMEOUT_SPINNER);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(output.status.code(), Some(124), "stderr:\n{stderr}");
+    let report = stderr
+        .find("hermit run report")
+        .unwrap_or_else(|| panic!("a timed-out run printed no summary. stderr:\n{stderr}"));
+    let partial = format!(
+        "PARTIAL: --timeout={RUN_TIMEOUT_SECS} (seconds of wall-clock time) stopped the run \
+         before the guest exited"
+    );
+    let marked = stderr[report..]
+        .find(&partial)
+        .unwrap_or_else(|| panic!("the summary is not marked partial. stderr:\n{stderr}"));
+    let class = stderr
+        .find("HERMIT_RUN_TIMEOUT class=run-timeout")
+        .unwrap_or_else(|| panic!("the deadline lost its class line. stderr:\n{stderr}"));
+    assert!(report + marked < class, "stderr:\n{stderr}");
+    let summary = summary.expect("a timed-out run wrote no --summary-json");
+    assert_eq!(summary["run_timeout_secs"], RUN_TIMEOUT_SECS, "{summary}");
+    // `syscalls` comes from the exit reports of the threads the deadline
+    // killed: the shell is the run's only thread.
+    for field in ["sched_turns", "virttime_elapsed", "syscalls"] {
+        assert!(
+            summary[field].as_u64().is_some_and(|value| value > 0),
+            "{field}: {summary}"
+        );
+    }
+
+    let (output, summary) = summary_run("finished.json", 30, &["/bin/echo", "finished"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr:\n{stderr}");
+    assert!(stderr.contains("hermit run report"), "stderr:\n{stderr}");
+    assert!(!stderr.contains("PARTIAL"), "stderr:\n{stderr}");
+    let summary = summary.expect("a finished run wrote no --summary-json");
+    assert!(summary.get("run_timeout_secs").is_none(), "{summary}");
 }
 
 /// The SIGALRM fallback fires, is named, and reports the deadline code.
@@ -48218,6 +48600,96 @@ fn pidfd_send_signal_flags_and_proc_descriptors_answer_as_linux_does_at_bitwise_
         serde_json::from_slice(&fs::read(&verdict).expect("failed to read the verdict"))
             .expect("the verdict must be JSON");
     assert_eq!(report["bitwise_parity"], true, "{report}");
+}
+
+/// A library embedder whose process carries a seccomp filter Hermit did not
+/// install gets the typed refusal for the guest's first self-sentinel
+/// `pidfd_send_signal` as an `Err` from the launch, and goes on to launch
+/// another guest. Under a foreign filter the ptrace backend cannot qualify how
+/// the kernel spells the sentinel (the filter could fabricate its probe's
+/// success), so it refuses rather than guess. The filter cannot be removed, so
+/// it is installed in a child process; the same launch from this unfiltered
+/// process succeeds.
+#[test]
+fn a_filtered_library_embedder_gets_the_typed_pidfd_self_refusal_and_lives() {
+    const CHILD: &str = "HERMIT_PIDFD_SELF_LIBRARY_CHILD";
+    const NAME: &str = "a_filtered_library_embedder_gets_the_typed_pidfd_self_refusal_and_lives";
+    const ALIVE: &str = "embedder alive after the refusal";
+    let guest = futex_c_guest(&PIDFD_SEND_SIGNAL_FLAGS_GUEST, "pidfd_send_signal_flags");
+    // The exit code, or whether the error is a policy refusal, and its text.
+    let launch = |program: &Path| {
+        let program = program.to_owned();
+        std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(move || {
+                let config = hermit::DetConfig {
+                    max_timeslice: None,
+                    ..Default::default()
+                };
+                match hermit::run_with_output(
+                    reverie::process::Command::new(&program),
+                    config,
+                    false,
+                    &None,
+                ) {
+                    Ok(output) => Ok(output.status.code()),
+                    Err(error) => {
+                        let text = format!("{error:#}");
+                        let kind = hermit::SerializableError::from(error).kind();
+                        Err((kind == hermit::FailureKind::PolicyRefusal, text))
+                    }
+                }
+            })
+            .unwrap()
+            .join()
+            .expect("the launching thread failed")
+    };
+    if std::env::var_os(CHILD).is_some() {
+        let allow = [libc::sock_filter {
+            code: (libc::BPF_RET | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ALLOW,
+        }];
+        let program = libc::sock_fprog {
+            len: 1,
+            filter: allow.as_ptr().cast_mut(),
+        };
+        // SAFETY: an allow-everything filter, installed after no_new_privs.
+        unsafe {
+            assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0);
+            assert_eq!(
+                libc::prctl(
+                    libc::PR_SET_SECCOMP,
+                    libc::SECCOMP_MODE_FILTER,
+                    &program as *const libc::sock_fprog,
+                ),
+                0
+            );
+        }
+        let (refused, text) = launch(guest).expect_err("a filtered embedder's launch succeeded");
+        assert!(refused, "not a policy refusal: {text}");
+        assert!(
+            text.contains("pidfd_send_signal through the self sentinel -10000 is refused"),
+            "{text}"
+        );
+        assert_eq!(launch(Path::new("/bin/true")), Ok(Some(0)));
+        println!("{ALIVE}");
+        return;
+    }
+    assert_eq!(launch(guest), Ok(Some(0)));
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains(ALIVE),
+        "{}\nstdout:\n{stdout}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// A `/proc/<pid>` descriptor for Hermit's own process, PID 1 of the guest's

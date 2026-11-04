@@ -649,6 +649,12 @@
       "why": "tests/c/file_timestamp_identity.c is owned by target/debug/test-harness via tests/e2e/manifests/system-utils.yaml: creates files and directories, prints their stat and statx metadata including atime/mtime/ctime/btime and the mtime ORDERING between them, and exercises utimensat fixed and UTIME_NOW, so verify's double run asserts guest-created file timestamps are reproducible without freezing them"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/first_slice_replay.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/first_slice_replay.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test records this guest, whose new thread computes before its first syscall, under --chaos --max-timeslice=1000 for several seeds and replays each schedule with --replay-schedule-from, asserting that the new thread's first recorded slice ends at a timer, that each replay prints the recording's line and that it reports no desync; it remains a guest fixture because a generic manifest cannot compare a recording with its replay."
+    },
+    {
       "disposition": "suite-helper",
       "path": "tests/c/fixture_cpuset_shim.c",
       "runner": "tests/c/fixture_mutation.py",
@@ -3605,6 +3611,12 @@
       "path": "tests/c/writev_determinism.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/writev_determinism.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/yield_beside_compute_nolibc.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/yield_beside_compute_nolibc.c is owned by hermit-cli/tests/cli.rs: a_schedule_replay_keeps_the_clock_of_a_thread_that_yields_beside_a_computing_one builds it static with no libc and no dynamic loader, records its schedule at an explicit --max-timeslice of 100 us and of 400 us, and requires the replay to have no desync and the same stdout, which carries a digest of the yielding task's clock reads (review of https://github.com/rrnewton/hermit/pull/4747); it remains a guest fixture because a generic manifest cannot compare a schedule replay's output with its recording's."
     },
     {
       "disposition": "guest-fixture",
