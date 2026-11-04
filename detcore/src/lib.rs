@@ -5579,6 +5579,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     crash_armed: None,
                     last_grant_deadline: None,
                     published_runtime_private_memory: None,
+                    published_cpu: None,
+                    external_parent_checked: false,
                     last_rcb_timer: None,
                     last_rcb_timer_is_max: false,
                     lone_grant: false,
