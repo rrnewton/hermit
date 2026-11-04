@@ -3502,7 +3502,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                     // Recording began a slice here, including its slowdown
                     // epoch. The cursor's future deadline is not this boundary.
                     // With no logical slice, recording skipped that refresh too.
-                    if self.cfg.target_timeslice.or(self.cfg.max_timeslice).is_some() {
+                    if self
+                        .cfg
+                        .target_timeslice
+                        .or(self.cfg.max_timeslice)
+                        .is_some()
+                    {
                         thread.refresh_chaos_epoch(&self.cfg, end_time);
                     }
                     thread.restart_replay_backstop(&self.cfg);
