@@ -7943,7 +7943,7 @@ pub enum SignalScope {
 /// appends a revision (`config::tests::the_global_rpc_revision_matches_its_definitions`
 /// fails until it does). That test digests the two enums' bodies,
 /// `Resources`, the StoreExclusive payload's types, and the nested payload
-/// types it lists (from revision 29, `TraceSchedEventResponse`), and refuses
+/// types it lists (from revision 37, `TraceSchedEventResponse`), and refuses
 /// a revision whose digests did not change, so no revision can be appended
 /// by hand. A change to another payload type defined
 /// elsewhere (`CommittedSendWindow`, `PlaceholderDirectory`, ...) changes what
@@ -7960,9 +7960,10 @@ pub enum SignalScope {
 /// register a placeholder (`Detcore::serves_placeholders`).
 // 26 follows SP2's 25, whose variants come before this revision's
 // `ChildSubreaper` pair. 28 retypes `StartNewThread` (PR #4789, renumbered
-// after pidfd's 27). 29 adds `TraceSchedEventResponse::backstop`
-// (PR #4759, allocated 25 on its own base, renumbered after 28).
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 29;
+// after pidfd's 27). 37 adds `TraceSchedEventResponse::backstop`
+// (PR #4759, allocated 25 on its own base, assigned 37 after 28,
+// skipping 29 to 36 reserved for pending changes).
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 37;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a

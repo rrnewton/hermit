@@ -87,10 +87,12 @@ mod tests {
     use super::*;
 
     /// Revisions reserved for a change that is not on this base yet, which
-    /// `GLOBAL_RPC_REVISIONS` therefore skips: none now, since SP2's 25
-    /// (reserved as 22 with its record version) landed beneath PRCTL's 26,
-    /// with its row. Remove an entry when its change lands, with its row.
-    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[];
+    /// `GLOBAL_RPC_REVISIONS` therefore skips: 29 to 36, assigned to changes
+    /// pending elsewhere
+    /// (`ignored/drain-20261103/rpc-revisions.tsv` in the dev-hermit
+    /// parent), which 4759's 37 skips. Remove an entry when its change
+    /// lands, with its row.
+    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[29, 30, 31, 32, 33, 34, 35, 36];
 
     /// Every revision of the global RPC, oldest first, with the digest of the
     /// code of its two enums and its `Resources` payload. A change to any of
@@ -235,9 +237,10 @@ mod tests {
         // carries; from this revision the definition digest also covers
         // `TraceSchedEventResponse` (`NESTED_PAYLOADS`)
         // (https://github.com/rrnewton/hermit/pull/4759, allocated revision
-        // 25 on its own base after main's 24, renumbered to 29 at its rebase
-        // onto main's 28; digest measured at this head).
-        (29, "9116f166c618cf5a", "f013e36743d8d9e6"),
+        // 25 on its own base after main's 24, assigned 37 at its rebase onto
+        // main's 28, skipping 29 to 36 reserved for pending changes (29 is
+        // PR #4884's); digest measured at this head).
+        (37, "9116f166c618cf5a", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
@@ -287,7 +290,7 @@ mod tests {
     /// `GlobalRequest` or `GlobalResponse` carries and whose own fields the
     /// definition digest covers, by the line that declares each. Positional
     /// bincode encodes their fields in place, so a field added to one changes
-    /// the wire as a field added to a variant does. Revision 29 added the
+    /// the wire as a field added to a variant does. Revision 37 added the
     /// first, `TraceSchedEventResponse` (`GlobalResponse::TraceSchedEvent`);
     /// earlier digests do not cover them. They are digested in domain 6, apart
     /// from main's StoreExclusive payload types in domain 3
