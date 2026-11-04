@@ -3901,10 +3901,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 1 (https://github.com/rrnewton/hermit/pull/5057) adds two
     // record/replay units: 229 + 2 = 231, measured by the 216dbc929a full
     // validate.
+    // The 19 shared-mapping record/replay tests of
+    // https://github.com/rrnewton/hermit/pull/5120: 231 + 19 = 250.
     // The MAP_FIXED_NOREPLACE fix for https://github.com/rrnewton/hermit/pull/5120
     // adds five placement tests: 250 + 5 = 255.
     // The /dev/zero sharing fix adds four record/replay tests: 255 + 4 = 259.
-    ("test.record_replay", 259),
+    // The occupied-range placement test for MAP_SHARED_VALIDATE: 259 + 1 = 260.
+    ("test.record_replay", 260),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
