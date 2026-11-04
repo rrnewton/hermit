@@ -4683,7 +4683,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And analyze_replays_a_recorded_target_instead_of_panicking: 797 + 1 = 798.
     // PR 4920 (3): prefix-stack and fatal-time-skip cases: 798 + 2 = 800.
     // drain/4709: main + this change's CLI tests (+16): 800 + 16 = 816.
-    ("test.cli", 816),
+    // drain/4709: main + this change's CLI tests (+16): 816 + 16 = 817.
+    // And replay_only_ignores_an_unused_requested_cpu_profile (revcodex fix): 816 + 1 = 817.
+    ("test.cli", 817),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5369,7 +5371,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same recorded-target regression test: 716 + 1 = 717.
     // PR 4920 (3): the same two cases: 717 + 2 = 719.
     // drain/4709: main + this change's CLI tests (+16, same growth as test.cli): 719 + 16 = 735.
-    ("test.cli_on_host", 735),
+    // drain/4709: main + this change's CLI tests (+16, same growth as test.cli): 735 + 16 = 736.
+    // And the same replay-only case: 735 + 1 = 736.
+    ("test.cli_on_host", 736),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
