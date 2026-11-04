@@ -1270,7 +1270,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // blocking-sigsuspend replay, deselected by name as a named loss
     // (dh-4a61v): 1951 - 1 = 1950.
     // And the departed shell py_hello replay (dh-9r2mg): 1950 - 1 = 1949.
-    ("test.regular_crates", 1955),
+    // PR 4920 (3): two model/config units: 1955 + 2 = 1957.
+    ("test.regular_crates", 1957),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1988,7 +1989,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // analyze tests: 1254 + 2 = 1256.
     // And analyze::rundata::tests::every_record_written_for_a_trial_states_the_trials_chosen_ids:
     // 1256 + 1 = 1257.
-    ("test.hermit_unit", 1257),
+    // PR 4920 (3): the prefix-trial unit: 1257 + 1 = 1258.
+    ("test.hermit_unit", 1258),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3286,7 +3288,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (3470 + 12 on this base): the counted runner substitutes the compiled
     // population for it, so neither 3482 nor a derived 3497 is a measured
     // nextest count.
-    ("test.detcore_unit", 3492),
+    // PR 4920 (3): four position units plus the unreached-position unit: 3492 + 5 = 3497.
+    ("test.detcore_unit", 3497),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4665,7 +4668,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And https://github.com/rrnewton/hermit/pull/4772's
     // no_namespace_bisect_replays_the_schedules_it_writes and
     // no_namespace_minimize_replays_its_candidate_records: 795 + 2 = 797.
-    ("test.cli", 797),
+    // PR 4920 (3): the loopback prefix-stack case: 797 + 1 = 798.
+    ("test.cli", 798),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5333,7 +5337,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR #4751: the same host-limited binder gate: 715 - 1 = 714.
     // And the same --no-namespace bisect and --minimize tests, not excluded:
     // 714 + 2 = 716.
-    ("test.cli_on_host", 716),
+    // PR 4920 (3): the same case: 716 + 1 = 717.
+    ("test.cli_on_host", 717),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
@@ -5346,7 +5351,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 5 recount (same growth as test.regular_crates), composed on measured main: 1930 + 2 = 1932.
     // The same departed blocking-sigsuspend (dh-4a61v) and shell py_hello
     // (dh-9r2mg) named losses: 1937 - 2 = 1935.
-    ("test.regular_crates_on_host", 1941),
+    // PR 4920 (3): the same two units: 1941 + 2 = 1943.
+    ("test.regular_crates_on_host", 1943),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5916,7 +5922,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Rebased onto main fcd62385f: 3465 + 2 = 3467.
     // And the same unit (same growth as test.detcore_unit, PR #4926): 3469 + 1 = 3470.
     // PR #4751: the same twelve units (same growth as test.detcore_unit): 3482.
-    ("test.detcore_unit_on_host", 3492),
+    // PR 4920 (3): the same five units: 3492 + 5 = 3497.
+    ("test.detcore_unit_on_host", 3497),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -6336,7 +6343,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 5 recount (same growth as test.hermit_unit), composed on measured main: 1206 + 1 = 1207.
     // And the same two: 1248 + 2 = 1250.
     // And the same trial-record stamping unit: 1250 + 1 = 1251.
-    ("test.hermit_unit_on_host", 1251),
+    // PR 4920 (3): the same unit: 1251 + 1 = 1252.
+    ("test.hermit_unit_on_host", 1252),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -6577,7 +6585,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 5 recount (same growth as test.regular_crates), composed on measured main: 1930 + 2 = 1932.
     // The same departed blocking-sigsuspend (dh-4a61v) and shell py_hello
     // (dh-9r2mg) named losses: 1937 - 2 = 1935.
-    ("test.regular_crates_on_host", 1941),
+    // PR 4920 (3): the same two units: 1941 + 2 = 1943.
+    ("test.regular_crates_on_host", 1943),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
