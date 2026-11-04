@@ -1992,7 +1992,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And rundata::tests::a_recorded_target_run_replays_a_workspace_copy_within_an_explicit_bound:
     // 1257 + 1 = 1258.
     // PR 4920 (3): the prefix-trial unit: 1258 + 1 = 1259.
-    ("test.hermit_unit", 1260),
+    ("test.hermit_unit", 1261),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3302,7 +3302,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And exec_teardown_tests
     // a_transferred_exec_gives_the_leader_the_survivors_own_cpu_time and
     // a_pre_exec_cpu_publication_after_a_transferred_exec_is_dropped: 3530.
-    ("test.detcore_unit", 3530),
+    ("test.detcore_unit", 3537),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4685,7 +4685,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4920 (3): prefix-stack and fatal-time-skip cases: 798 + 2 = 800.
     // Package K slice 2b-1's another_processs_stat_and_comm_answer_as_linux
     // (the ptrace twin of the KVM other-process stat test): 800 + 1 = 801.
-    ("test.cli", 801),
+    ("test.cli", 802),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5367,7 +5367,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same recorded-target regression test: 716 + 1 = 717.
     // PR 4920 (3): the same two cases: 717 + 2 = 719.
     // The same 2b-1 other-process stat ptrace twin: 719 + 1 = 720.
-    ("test.cli_on_host", 720),
+    ("test.cli_on_host", 721),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
@@ -5963,7 +5963,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR #4751: the same twelve units (same growth as test.detcore_unit): 3482.
     // And the same two replayed-switch wake units: 3492 + 2 = 3494.
     // The same six 2b-1 units: 3524 + 6 = 3530.
-    ("test.detcore_unit_on_host", 3530),
+    ("test.detcore_unit_on_host", 3537),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -6385,7 +6385,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same trial-record stamping unit: 1250 + 1 = 1251.
     // And the same run1-preemptions test: 1251 + 1 = 1252.
     // PR 4920 (3): the same unit: 1252 + 1 = 1253.
-    ("test.hermit_unit_on_host", 1254),
+    ("test.hermit_unit_on_host", 1255),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
