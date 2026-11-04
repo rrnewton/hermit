@@ -60,7 +60,7 @@ mod skid_overshoot;
 
 /// Attempts at one case when its Hermit runs are refused for PMU skid
 /// overshoot, as hermit-cli's tests allow (`hermit_test::hermit_output`).
-const SKID_ATTEMPTS: u32 = 5;
+const SKID_ATTEMPTS: u32 = detcore_model::SKID_RETRY_MAX_ATTEMPTS;
 
 /// Wall bound for one hermit-verify run, which runs Hermit twice.
 const VERIFY_TIMEOUT: &str = "240s";

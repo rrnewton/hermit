@@ -881,6 +881,12 @@ export HERMIT_SKID_RETRY_RECORD=$skid_retry_record
 # One RetryRecordV1 JSON line per retried test (ledger retry_rollup schema).
 export HERMIT_RETRY_RECORD_FILE="$cpu_measurement_dir/retry-records.jsonl"
 : >"$HERMIT_RETRY_RECORD_FILE" || exit $?
+# A test whose whole skid budget ended in typed skid-overshoot refusals
+# appends one HERMIT-SKID-INFRA line here; the result writer classifies that
+# test's terminal attempt as an infrastructure error (verdict SKID-INFRA,
+# not a test failure) and this count keeps it visible in the log.
+export HERMIT_SKID_INFRA_FILE="$cpu_measurement_dir/skid-infra.log"
+: >"$HERMIT_SKID_INFRA_FILE" || exit $?
 nextest_status=0
 run_nextest "$events_log" "$(configured_wall_timeout_multiplier)" "$cpu_wrapper" \
     "$cpu_attempt_records" "$cpu_binary_map" "$cpu_inventory" "$cpu_report" "$@" \
@@ -896,5 +902,10 @@ if ((retry_records > 0)); then
 fi
 if ((skid_retries > 0)); then
     sed 's/^/run-nextest-counted: skid-overshoot retry: /' "$skid_retry_record" >&2
+fi
+skid_infra=$(wc -l <"$HERMIT_SKID_INFRA_FILE") || exit $?
+printf 'run-nextest-counted: SKID-INFRA count %d\n' "$skid_infra" >&2
+if ((skid_infra > 0)); then
+    sed 's/^HERMIT-SKID-INFRA: /run-nextest-counted: SKID-INFRA: /' "$HERMIT_SKID_INFRA_FILE" >&2
 fi
 exit "$nextest_status"

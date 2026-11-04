@@ -82,12 +82,15 @@ pub fn bucket_dir(root: &Path, lane: &str, category: &str) -> PathBuf {
 
 /// The decisions an executed run makes for itself, applied to imported rows.
 pub struct ImportPolicy<'a> {
-    /// Whether this run would retry after `row`, by the rule an executed run
-    /// applies to its own attempt: its retry setting, the cell's
-    /// `no_retry_reason`, and for an ERROR the skid-overshoot and host-input
-    /// rules, which re-decide the attempt from its retained report bytes. It
-    /// is consulted for every FAIL and ERROR row; a PASS ends the history.
-    pub earns_retry: &'a dyn Fn(&SelectedCell, &CellResult) -> bool,
+    /// Whether this run would retry after the last row of `history` (the
+    /// cell's attempts up to and including that row), by the rule an
+    /// executed run applies to its own history: its retry setting, the
+    /// cell's `no_retry_reason`, for an ERROR the skid-overshoot and
+    /// host-input rules, which re-decide the attempt from its retained
+    /// report bytes, and the history's attempt cap (the skid budget only
+    /// while every attempt is skid-only). It is consulted for every FAIL
+    /// and ERROR row; a PASS ends the history.
+    pub earns_retry: &'a dyn Fn(&SelectedCell, &[CellResult]) -> bool,
     /// Why this machine cannot run the cell, if it cannot.
     pub host_inapplicable: &'a dyn Fn(&SelectedCell) -> Option<String>,
 }
@@ -460,7 +463,11 @@ pub fn load(
                         // the report bytes the row retains.
                         let kept = found
                             .iter()
-                            .position(|row| row.outcome == "PASS" || !(policy.earns_retry)(cell, row))
+                            .enumerate()
+                            .position(|(position, row)| {
+                                row.outcome == "PASS"
+                                    || !(policy.earns_retry)(cell, &found[..=position])
+                            })
                             .map_or(found.len(), |terminal| terminal + 1);
                         dropped_retries += found.len() - kept;
                         found.truncate(kept);

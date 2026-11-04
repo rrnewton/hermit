@@ -43,9 +43,11 @@ pub struct RetryRecordV1 {
 #[serde(deny_unknown_fields)]
 pub struct RetryRollupV1 {
     pub schema: u32,
-    /// The one e2e bound, from `MAX_ATTEMPTS_PER_CELL`. (The nextest skid
-    /// helper's separate bound of 5 attempts predates this schema and is
-    /// recorded per record, not by this field.)
+    /// The generic e2e bound, from `MAX_ATTEMPTS_PER_CELL`. A skid-only
+    /// history may run to the separate skid budget
+    /// (`MAX_SKID_ATTEMPTS_PER_CELL`, the shared
+    /// `detcore_model::SKID_RETRY_MAX_ATTEMPTS`); such a record's own
+    /// attempt count says so, not this field.
     pub max_attempts_per_test: u64,
     pub total_retries: u64,
     pub retried_tests: u64,
@@ -158,6 +160,19 @@ impl RetryRollupV1 {
     /// Attempts beyond the first are retries; a retried test whose final
     /// outcome is PASS is a flaky pass.
     pub fn from_framework_retries(retries: &FrameworkRetriesV1) -> Self {
+        // The census retains first and final outcomes. A history past the
+        // generic bound of 2 attempts is skid-only by construction, so
+        // every intermediate attempt repeats the first attempt's outcome,
+        // class, signature and error kind; the final attempt carries the
+        // selected outcome (and no class/signature/kind when it passed).
+        fn expand<T: Clone>(attempts: u64, first: T, final_value: T) -> Vec<T> {
+            if attempts <= 1 {
+                return vec![first];
+            }
+            let mut values = vec![first.clone(); (attempts - 1) as usize];
+            values.push(final_value);
+            values
+        }
         let tests = retries
             .cells
             .iter()
@@ -167,49 +182,38 @@ impl RetryRollupV1 {
                 backend: Some(cell.cell.backend.clone()),
                 attempts: cell.attempts,
                 retries: cell.attempts.saturating_sub(1),
-                // The census retains first and final outcomes; with the
-                // harness bound of 2 attempts that is the whole history.
-                attempt_outcomes: if cell.attempts > 1 {
-                    vec![cell.first_outcome.clone(), cell.final_outcome.clone()]
-                } else {
-                    vec![cell.first_outcome.clone()]
-                },
-                attempt_classes: if cell.attempts > 1 {
-                    vec![
-                        cell.first_failure_class.clone(),
-                        if cell.final_outcome == "PASS" {
-                            None
-                        } else {
-                            cell.first_failure_class.clone()
-                        },
-                    ]
-                } else {
-                    vec![cell.first_failure_class.clone()]
-                },
-                attempt_signatures: if cell.attempts > 1 {
-                    vec![
-                        cell.first_signature.clone(),
-                        if cell.final_outcome == "PASS" {
-                            None
-                        } else {
-                            cell.first_signature.clone()
-                        },
-                    ]
-                } else {
-                    vec![cell.first_signature.clone()]
-                },
-                attempt_error_kinds: if cell.attempts > 1 {
-                    vec![
-                        cell.first_error_kind.clone(),
-                        if cell.final_outcome == "PASS" {
-                            None
-                        } else {
-                            cell.first_error_kind.clone()
-                        },
-                    ]
-                } else {
-                    vec![cell.first_error_kind.clone()]
-                },
+                attempt_outcomes: expand(
+                    cell.attempts,
+                    cell.first_outcome.clone(),
+                    cell.final_outcome.clone(),
+                ),
+                attempt_classes: expand(
+                    cell.attempts,
+                    cell.first_failure_class.clone(),
+                    if cell.final_outcome == "PASS" {
+                        None
+                    } else {
+                        cell.first_failure_class.clone()
+                    },
+                ),
+                attempt_signatures: expand(
+                    cell.attempts,
+                    cell.first_signature.clone(),
+                    if cell.final_outcome == "PASS" {
+                        None
+                    } else {
+                        cell.first_signature.clone()
+                    },
+                ),
+                attempt_error_kinds: expand(
+                    cell.attempts,
+                    cell.first_error_kind.clone(),
+                    if cell.final_outcome == "PASS" {
+                        None
+                    } else {
+                        cell.first_error_kind.clone()
+                    },
+                ),
                 final_outcome: cell.final_outcome.clone(),
                 flaky_pass: cell.final_outcome == "PASS",
             })

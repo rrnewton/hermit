@@ -4073,7 +4073,29 @@ impl RunContext {
 }
 
 /// One initial execution plus one retry, scoped to one selected cell.
+/// This is the generic per-cell retry bound (product, timeout and
+/// host-input causes); a typed skid-overshoot-only history has its own
+/// separate budget ([`MAX_SKID_ATTEMPTS_PER_CELL`]).
 pub const MAX_ATTEMPTS_PER_CELL: u64 = 2;
+
+/// Attempts a cell whose every attempt is a typed PMU skid overshoot and
+/// nothing else ([`skid_overshoot_only_reports`]) gets in all: the one
+/// shared skid budget ([`detcore_model::SKID_RETRY_MAX_ATTEMPTS`]),
+/// separate from the generic [`MAX_ATTEMPTS_PER_CELL`] bound. A history
+/// may run past the generic bound only while every attempt so far is
+/// skid-only; the first non-skid attempt returns the cell to the generic
+/// bound. Exhausting this budget selects the [`SKID_INFRA_VERDICT`]
+/// verdict, not a test failure.
+pub const MAX_SKID_ATTEMPTS_PER_CELL: u64 = detcore_model::SKID_RETRY_MAX_ATTEMPTS as u64;
+
+/// The selected verdict of a cell whose attempts were all typed PMU skid
+/// overshoots and nothing else: the host's interrupt latency refused
+/// every measurement, so the cell produced no product result. The one
+/// shared spelling ([`detcore_model::SKID_INFRA_VERDICT`]). Per-attempt
+/// rows keep their `ERROR` infrastructure classification (every raw-row
+/// reader accepts an `infrastructure_error` report only on that
+/// classification); this names what the whole history selected.
+pub const SKID_INFRA_VERDICT: &str = detcore_model::SKID_INFRA_VERDICT;
 
 /// Select the outcome that the framework reports for one cell's complete
 /// attempt history.
@@ -4093,9 +4115,16 @@ pub fn outcome_after_retries<'a>(
     let mut saw_host_inapplicable = false;
 
     for (attempt, outcome) in attempts {
-        if attempt > MAX_ATTEMPTS_PER_CELL {
+        // The hard ceiling is the skid budget: a history past the generic
+        // [`MAX_ATTEMPTS_PER_CELL`] bound is produced only by skid-only
+        // retries (the harness and the import policy enforce that from
+        // each row's retained evidence). Selection itself is unchanged —
+        // a product failure anywhere in a long history still selects
+        // FAIL — so admitting the longer failing history turns nothing
+        // green.
+        if attempt > MAX_SKID_ATTEMPTS_PER_CELL {
             return Err(format!(
-                "cell result attempt {attempt} exceeds the shared maximum of {MAX_ATTEMPTS_PER_CELL}"
+                "cell result attempt {attempt} exceeds the shared maximum of {MAX_SKID_ATTEMPTS_PER_CELL}"
             ));
         }
         if attempt != expected_attempt {
@@ -4461,6 +4490,22 @@ pub fn skid_overshoot_only_reports(result: &CellResult) -> Option<u64> {
         reports.checked_add(attempt_skid_overshoot_reports(
             attempt, declared, accepted, backend, comparator,
         )?)
+    })
+}
+
+/// The total number of `HERMIT_SKID_OVERSHOOT` reports behind a cell's
+/// complete attempt history, when, and only when, every attempt in the
+/// history is skid-only ([`skid_overshoot_only_reports`]): the cell's
+/// selected verdict is [`SKID_INFRA_VERDICT`]. Any other history — a
+/// pass, a product failure, an ordinary infrastructure error, a mixed
+/// history — returns `None`, so a real failure beside a skid can never
+/// be reported as skid infrastructure.
+pub fn skid_infra_reports(results: &[CellResult]) -> Option<u64> {
+    if results.is_empty() {
+        return None;
+    }
+    results.iter().try_fold(0u64, |reports, result| {
+        reports.checked_add(skid_overshoot_only_reports(result)?)
     })
 }
 
@@ -11716,6 +11761,24 @@ mod tests {
             outcome_after_retries([(1, "HOST-INAPPLICABLE")]).unwrap(),
             "HOST-INAPPLICABLE"
         );
+        // A skid-budget history runs past the generic bound: selection is
+        // unchanged, so a late pass recovers and a product failure
+        // anywhere still wins over later infrastructure errors.
+        assert_eq!(
+            outcome_after_retries([
+                (1, "ERROR"),
+                (2, "ERROR"),
+                (3, "ERROR"),
+                (4, "ERROR"),
+                (5, "PASS")
+            ])
+            .unwrap(),
+            "PASS"
+        );
+        assert_eq!(
+            outcome_after_retries([(1, "ERROR"), (2, "ERROR"), (3, "FAIL"), (4, "ERROR")]).unwrap(),
+            "FAIL"
+        );
     }
 
     #[test]
@@ -11733,8 +11796,15 @@ mod tests {
             ),
             (vec![(1, "UNKNOWN")], "unknown outcome \"UNKNOWN\""),
             (
-                vec![(1, "FAIL"), (2, "ERROR"), (3, "PASS")],
-                "exceeds the shared maximum of 2",
+                vec![
+                    (1, "FAIL"),
+                    (2, "ERROR"),
+                    (3, "ERROR"),
+                    (4, "ERROR"),
+                    (5, "ERROR"),
+                    (6, "PASS"),
+                ],
+                "exceeds the shared maximum of 5",
             ),
         ] {
             let error = outcome_after_retries(attempts).unwrap_err();

@@ -27,10 +27,12 @@ use hermit_manifest_plan::runner::CellId;
 use hermit_manifest_plan::runner::CellResult;
 use hermit_manifest_plan::runner::FailureClass;
 use hermit_manifest_plan::runner::MAX_ATTEMPTS_PER_CELL;
+use hermit_manifest_plan::runner::MAX_SKID_ATTEMPTS_PER_CELL;
 use hermit_manifest_plan::runner::ManifestSet;
 use hermit_manifest_plan::runner::Population;
 use hermit_manifest_plan::runner::RELAXED_LEVEL_ARGS;
 use hermit_manifest_plan::runner::RunContext;
+use hermit_manifest_plan::runner::SKID_INFRA_VERDICT;
 use hermit_manifest_plan::runner::STRICTNESS_LEVEL_ENV;
 use hermit_manifest_plan::runner::ScheduledWorkerCapacity;
 use hermit_manifest_plan::runner::SelectedCell;
@@ -53,6 +55,7 @@ use hermit_manifest_plan::runner::refused_on_an_inexact_branch_counter;
 use hermit_manifest_plan::runner::requires_capability;
 use hermit_manifest_plan::runner::row_records_cell_relaxations;
 use hermit_manifest_plan::runner::run_cell;
+use hermit_manifest_plan::runner::skid_infra_reports;
 use hermit_manifest_plan::runner::skid_overshoot_only_reports;
 use hermit_manifest_plan::runner::validate_source_snapshot;
 use hermit_manifest_plan::runner::write_junit;
@@ -2926,17 +2929,18 @@ fn for_each_parallel<T: Send>(
 
 fn run_with_retry<T>(
     first_attempt: u64,
+    max_attempts: u64,
     mut execute: impl FnMut(u64) -> T,
     mut retryable: impl FnMut(&T) -> bool,
     mut emit: impl FnMut(T, bool) -> bool,
 ) {
     assert!(
-        (1..=MAX_ATTEMPTS_PER_CELL).contains(&first_attempt),
+        (1..=max_attempts).contains(&first_attempt),
         "first cell attempt must be within the shared attempt cap"
     );
-    for attempt in first_attempt..=MAX_ATTEMPTS_PER_CELL {
+    for attempt in first_attempt..=max_attempts {
         let result = execute(attempt);
-        let will_retry = retryable(&result) && attempt < MAX_ATTEMPTS_PER_CELL;
+        let will_retry = retryable(&result) && attempt < max_attempts;
         if !emit(result, will_retry) || !will_retry {
             break;
         }
@@ -3000,8 +3004,10 @@ enum RetryCause {
 ///
 /// Retries apply to every failing attempt in a run that has not turned
 /// them off (`--no-retry` keeps exactly one attempt for flake measurement).
-/// The shared [`MAX_ATTEMPTS_PER_CELL`] caps all causes together;
-/// classification only labels the retry (owner policy, 2026-10-30).
+/// The generic [`MAX_ATTEMPTS_PER_CELL`] caps product, timeout and
+/// host-input causes; a skid-only history has its own separate budget
+/// ([`MAX_SKID_ATTEMPTS_PER_CELL`], see [`history_earns_retry`]).
+/// Classification only labels the retry (owner policy, 2026-10-30).
 fn attempt_retry_cause(
     retries: Retries,
     cell: &SelectedCell,
@@ -3049,6 +3055,41 @@ fn attempt_retry_cause(
 /// [`attempt_retry_cause`].
 fn attempt_earns_retry(retries: Retries, cell: &SelectedCell, result: &CellResult) -> bool {
     attempt_retry_cause(retries, cell, result).is_some()
+}
+
+/// The attempt cap for a history ending in its last row: the skid budget
+/// ([`MAX_SKID_ATTEMPTS_PER_CELL`]) while every attempt's retry cause is
+/// a typed skid overshoot, the generic [`MAX_ATTEMPTS_PER_CELL`] as soon
+/// as any attempt has another cause (or none). A skid refusal measures
+/// the host, not the guest, so skid retries do not consume the generic
+/// budget; a product failure anywhere in the history returns the cell
+/// to the generic bound, so the skid budget can never widen a product
+/// retry.
+fn attempt_cap_for_history(retries: Retries, cell: &SelectedCell, history: &[CellResult]) -> u64 {
+    if !history.is_empty()
+        && history.iter().all(|row| {
+            matches!(
+                attempt_retry_cause(retries, cell, row),
+                Some(RetryCause::SkidOvershoot { .. })
+            )
+        })
+    {
+        MAX_SKID_ATTEMPTS_PER_CELL
+    } else {
+        MAX_ATTEMPTS_PER_CELL
+    }
+}
+
+/// Whether the last attempt of `history` earns one more attempt: its
+/// retry cause exists and its attempt number is below the history's cap
+/// ([`attempt_cap_for_history`]). This is the one rule both an executed
+/// run and the import policy apply.
+fn history_earns_retry(retries: Retries, cell: &SelectedCell, history: &[CellResult]) -> bool {
+    let Some(last) = history.last() else {
+        return false;
+    };
+    attempt_earns_retry(retries, cell, last)
+        && last.attempt < attempt_cap_for_history(retries, cell, history)
 }
 
 /// One SKID-RETRY of a cell's history: the retried attempt, its overshoot
@@ -3203,17 +3244,24 @@ fn unretried_skid_line(
         Err(error) => format!("ERROR (the history is inconsistent: {error})"),
     };
     let backend = backend.unwrap_or("native");
-    if attempt >= MAX_ATTEMPTS_PER_CELL {
+    // The cap this history was under: the skid budget only while every
+    // attempt is skid-only, as `skid_infra_reports` re-decides.
+    let cap = if skid_infra_reports(history).is_some() {
+        MAX_SKID_ATTEMPTS_PER_CELL
+    } else {
+        MAX_ATTEMPTS_PER_CELL
+    };
+    if attempt >= cap {
         format!(
-            "SKID-RETRY LIMIT {test} ({mode}/{backend}): attempt {attempt} of at most {MAX_ATTEMPTS_PER_CELL} is a typed HERMIT_SKID_OVERSHOOT infrastructure error ({reports} report(s)); the attempt cap is reached, no further retry is made, and the cell's selected outcome is {selected}"
+            "SKID-RETRY LIMIT {test} ({mode}/{backend}): attempt {attempt} of at most {cap} is a typed HERMIT_SKID_OVERSHOOT infrastructure error ({reports} report(s)); the attempt cap is reached, no further retry is made, and the cell's selected outcome is {selected}"
         )
     } else if imported {
         format!(
-            "SKID-RETRY NOT MADE {test} ({mode}/{backend}): attempt {attempt} of at most {MAX_ATTEMPTS_PER_CELL} is a typed HERMIT_SKID_OVERSHOOT infrastructure error ({reports} report(s)), but it is an imported attempt and its producer recorded no later attempt of the cell; the cell's selected outcome is {selected}"
+            "SKID-RETRY NOT MADE {test} ({mode}/{backend}): attempt {attempt} of at most {cap} is a typed HERMIT_SKID_OVERSHOOT infrastructure error ({reports} report(s)), but it is an imported attempt and its producer recorded no later attempt of the cell; the cell's selected outcome is {selected}"
         )
     } else {
         format!(
-            "SKID-RETRY NOT MADE {test} ({mode}/{backend}): attempt {attempt} of at most {MAX_ATTEMPTS_PER_CELL} is a typed HERMIT_SKID_OVERSHOOT infrastructure error ({reports} report(s)), but this run has no later attempt of the cell; the cell's selected outcome is {selected}"
+            "SKID-RETRY NOT MADE {test} ({mode}/{backend}): attempt {attempt} of at most {cap} is a typed HERMIT_SKID_OVERSHOOT infrastructure error ({reports} report(s)), but this run has no later attempt of the cell; the cell's selected outcome is {selected}"
         )
     }
 }
@@ -3340,8 +3388,8 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     });
     mark_parity_running(&parity_scope.cells, &context, &results_path);
     let imported = import_root.as_deref().map(|import_root| {
-        let earns_retry = |cell: &SelectedCell, row: &CellResult| {
-            attempt_earns_retry(args.retries, cell, row)
+        let earns_retry = |cell: &SelectedCell, history: &[CellResult]| {
+            history_earns_retry(args.retries, cell, history)
         };
         let host_inapplicable = |cell: &SelectedCell| {
             cell_host_inapplicable_reason(
@@ -3400,8 +3448,14 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                 return;
             }
 
+            // The loop bound is the skid budget; the retryable closure
+            // tracks the causes seen so far and stops at the generic
+            // bound as soon as any attempt is not skid-only
+            // (`attempt_cap_for_history`, applied incrementally).
+            let mut causes: Vec<Option<RetryCause>> = Vec::new();
             run_with_retry(
                 context.attempt,
+                MAX_SKID_ATTEMPTS_PER_CELL,
                 |attempt| {
                     let attempt_context = context.with_attempt(attempt);
                     match run_cell(&attempt_context, cell) {
@@ -3409,7 +3463,19 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                         Err(error) => error.into_result(&attempt_context, cell),
                     }
                 },
-                |result| attempt_earns_retry(args.retries, cell, result),
+                |result| {
+                    let cause = attempt_retry_cause(args.retries, cell, result);
+                    causes.push(cause);
+                    let cap = if causes
+                        .iter()
+                        .all(|cause| matches!(cause, Some(RetryCause::SkidOvershoot { .. })))
+                    {
+                        MAX_SKID_ATTEMPTS_PER_CELL
+                    } else {
+                        MAX_ATTEMPTS_PER_CELL
+                    };
+                    cause.is_some() && result.attempt < cap
+                },
                 emit,
             );
         },
@@ -3482,7 +3548,7 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
             let retry_note = match (effective_will_retry, retry_cause) {
                 (true, Some(RetryCause::SkidOvershoot { reports })) => format!(
                     " [SKID-RETRY: attempt {} of at most {} is a typed HERMIT_SKID_OVERSHOOT infrastructure error ({reports} report(s)) and nothing else; retrying this cell only]",
-                    result.attempt, MAX_ATTEMPTS_PER_CELL
+                    result.attempt, MAX_SKID_ATTEMPTS_PER_CELL
                 ),
                 (true, Some(RetryCause::HostInputChanged)) => format!(
                     " [HOST-INPUT-RETRY: attempt {} of at most {} diverged because a host file changed during a run, which is not a product failure; retrying this cell once, and a second divergence stays a failure]",
@@ -3631,6 +3697,40 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
             retry.final_outcome
         );
     }
+    // A cell whose every attempt was skid-only produced no product
+    // result: its selected verdict is SKID-INFRA, not a test failure.
+    // `skid_infra_reports` re-decides each row from its retained
+    // evidence, so a mixed history (any pass, product failure or other
+    // error) is never listed here.
+    let skid_infra_cells = attempt_results
+        .iter()
+        .filter_map(|history| {
+            let reports = skid_infra_reports(history)?;
+            let last = history.last()?;
+            Some(serde_json::json!({
+                "test": last.test,
+                "mode": last.mode,
+                "backend": last.backend,
+                "attempts": history.len(),
+                "overshoot_reports": reports,
+                "verdict": SKID_INFRA_VERDICT,
+            }))
+        })
+        .collect::<Vec<_>>();
+    if expected > 0 {
+        println!("test-harness: SKID-INFRA count {}", skid_infra_cells.len());
+    }
+    for cell in &skid_infra_cells {
+        println!(
+            "test-harness: SKID-INFRA {} ({}/{}): all {} attempt(s) were typed HERMIT_SKID_OVERSHOOT infrastructure errors ({} report(s)); verdict {} (not a test failure)",
+            cell["test"].as_str().unwrap_or(""),
+            cell["mode"].as_str().unwrap_or(""),
+            cell["backend"].as_str().unwrap_or("native"),
+            cell["attempts"],
+            cell["overshoot_reports"],
+            SKID_INFRA_VERDICT
+        );
+    }
     // The other retries are counted the same way: a PRODUCT-RETRY follows a
     // measured product failure, including a verify divergence without an
     // overshoot marker, and a final PASS selected after one is a failure the
@@ -3712,6 +3812,11 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         // not fail the run. Counted and named separately so they stay visible.
         "diagnostic_failures": diagnostic_cells.len(),
         "diagnostic_failure_cells": diagnostic_cells,
+        // Cells whose every attempt was skid-only: selected verdict
+        // SKID-INFRA, no product result, not a test failure. A subset of
+        // `errors` by row classification, named separately here.
+        "skid_infra": skid_infra_cells.len(),
+        "skid_infra_cells": skid_infra_cells,
         // Retries of a verify attempt whose only failure was Hermit's typed
         // precise-timer overshoot (https://github.com/rrnewton/hermit/issues/1845).
         "skid_retries": skid_retried.len(),
@@ -4516,6 +4621,7 @@ mod tests {
 
     use hermit_manifest_plan::parity;
     use hermit_manifest_plan::runner::FailureClass;
+    use hermit_manifest_plan::runner::MAX_ATTEMPTS_PER_CELL;
     use hermit_manifest_plan::runner::ManifestSet;
     use hermit_manifest_plan::runner::ScheduledWorkerCapacity;
 
@@ -4838,9 +4944,11 @@ rundir.mkdir()
     }
 
     /// A verify attempt whose only failure is Hermit's typed precise-timer
-    /// overshoot earns one SKID-RETRY, which is counted on the summary line,
-    /// named in summary.json and kept as a row; a second overshoot fails the
-    /// cell loudly (<https://github.com/rrnewton/hermit/issues/1845>). An
+    /// overshoot earns SKID-RETRYs up to the separate skid budget of five
+    /// attempts, counted on the summary line, named in summary.json and
+    /// kept as rows; a fifth overshoot selects the SKID-INFRA verdict
+    /// loudly, not a test failure
+    /// (<https://github.com/rrnewton/hermit/issues/1845>). An
     /// overshoot report without its stderr markers, a run with `--no-retry`,
     /// a divergence that merely prints the markers, and an overshoot beside a
     /// rejected guest disposition (run 1 exited 1 so Hermit wrote its skid
@@ -5002,7 +5110,7 @@ rundir.mkdir()
             ("skid-then-match", true, 2, 1, 0),
             ("skid-then-match-sabre", true, 2, 1, 0),
             ("skid-then-match-relaxed-producer", true, 2, 1, 0),
-            ("skid-twice", false, 2, 1, 0),
+            ("skid-twice", false, 5, 4, 0),
             ("skid-no-retry", false, 1, 0, 0),
             ("unmarked-skid", false, 2, 0, 1),
             ("diverged-marked", false, 2, 0, 1),
@@ -5112,7 +5220,7 @@ n=len(calls.read_text().splitlines()) if calls.exists() else 0
 with calls.open('a') as f:f.write(json.dumps(a)+'\n')
 plan={'skid-then-match':['skid','matched'],'skid-then-match-sabre':['skid','matched'],
  'skid-then-match-relaxed-producer':['skid','matched'],
- 'skid-twice':['skid','skid'],
+ 'skid-twice':['skid','skid','skid','skid','skid'],
  'skid-no-retry':['skid'],'unmarked-skid':['unmarked'],'diverged-marked':['diverged','diverged'],
  'diverged-then-skid':['diverged','skid'],'rejected-guest-skid':['rejected'],
  'crashed-operand-skid':['crashed'],'skid-wrong-stdout':['skid','matched'],
@@ -5225,9 +5333,8 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
             match scenario {
                 "skid-then-match"
                 | "skid-then-match-sabre"
-                | "skid-then-match-relaxed-producer"
-                | "skid-twice" => {
-                    let final_outcome = if succeeds { "PASS" } else { "ERROR" };
+                | "skid-then-match-relaxed-producer" => {
+                    let final_outcome = "PASS";
                     assert_eq!(first.outcome, "ERROR", "{scenario}");
                     assert_eq!(rows[1].outcome, final_outcome, "{scenario}");
                     assert_eq!(
@@ -5240,7 +5347,7 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
                     );
                     assert!(
                         stdout.contains(&format!(
-                            "ERROR parity/skid (verify/{backend}) [SKID-RETRY: attempt 1 of at most 2 is a typed HERMIT_SKID_OVERSHOOT infrastructure error (2 report(s)) and nothing else; retrying this cell only]"
+                            "ERROR parity/skid (verify/{backend}) [SKID-RETRY: attempt 1 of at most 5 is a typed HERMIT_SKID_OVERSHOOT infrastructure error (2 report(s)) and nothing else; retrying this cell only]"
                         )),
                         "{scenario}: {stdout}"
                     );
@@ -5250,22 +5357,17 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
                         )),
                         "{scenario}: {stdout}"
                     );
-                    assert_eq!(
-                        stdout.contains(&format!(
-                            "SKID-RETRY LIMIT parity/skid (verify/{backend}): attempt 2 of at most 2 is a typed HERMIT_SKID_OVERSHOOT infrastructure error (2 report(s)); the attempt cap is reached, no further retry is made, and the cell's selected outcome is ERROR (attempt 2)\n"
-                        )),
-                        !succeeds,
+                    assert!(
+                        !stdout.contains("SKID-RETRY LIMIT"),
                         "{scenario}: the cap must be loud exactly when it is reached: {stdout}"
                     );
                     assert!(
                         !stdout.contains("SKID-RETRY NOT MADE"),
                         "{scenario}: {stdout}"
                     );
-                    assert_eq!(
-                        summary["errors"],
-                        json!(usize::from(!succeeds)),
-                        "{scenario}"
-                    );
+                    assert_eq!(summary["errors"], json!(0), "{scenario}");
+                    assert_eq!(summary["skid_infra"], json!(0), "{scenario}");
+                    assert_eq!(summary["skid_infra_cells"], json!([]), "{scenario}");
                     // A history that ends at a skid attempt below the cap
                     // names the missing retry, and why, without claiming the
                     // cap was reached.
@@ -5280,7 +5382,7 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
                             false
                         ),
                         format!(
-                            "SKID-RETRY NOT MADE parity/skid (verify/{backend}): attempt 1 of at most 2 is a typed HERMIT_SKID_OVERSHOOT infrastructure error (2 report(s)), but this run has no later attempt of the cell; the cell's selected outcome is ERROR (attempt 1)"
+                            "SKID-RETRY NOT MADE parity/skid (verify/{backend}): attempt 1 of at most 5 is a typed HERMIT_SKID_OVERSHOOT infrastructure error (2 report(s)), but this run has no later attempt of the cell; the cell's selected outcome is ERROR (attempt 1)"
                         ),
                         "{scenario}"
                     );
@@ -5295,10 +5397,67 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
                             true
                         ),
                         format!(
-                            "SKID-RETRY NOT MADE parity/skid (verify/{backend}): attempt 1 of at most 2 is a typed HERMIT_SKID_OVERSHOOT infrastructure error (2 report(s)), but it is an imported attempt and its producer recorded no later attempt of the cell; the cell's selected outcome is ERROR (attempt 1)"
+                            "SKID-RETRY NOT MADE parity/skid (verify/{backend}): attempt 1 of at most 5 is a typed HERMIT_SKID_OVERSHOOT infrastructure error (2 report(s)), but it is an imported attempt and its producer recorded no later attempt of the cell; the cell's selected outcome is ERROR (attempt 1)"
                         ),
                         "{scenario}"
                     );
+                }
+                "skid-twice" => {
+                    // The skid budget runs to five attempts (the scenario
+                    // name predates it): four counted SKID-RETRYs, a loud
+                    // LIMIT at attempt 5, and the SKID-INFRA verdict — the
+                    // cell produced no product result, so it is not a
+                    // test failure, and summary.json names it.
+                    assert!(
+                        rows.iter().all(|row| row.outcome == "ERROR"),
+                        "{scenario}: {rows:#?}"
+                    );
+                    assert_eq!(
+                        summary["skid_retry_cells"],
+                        json!((1..=4)
+                            .map(|attempt| json!({
+                                "test": "parity/skid", "mode": "verify", "backend": backend,
+                                "attempt": attempt, "overshoot_reports": 2, "final_outcome": "ERROR",
+                            }))
+                            .collect::<Vec<_>>()),
+                        "{scenario}"
+                    );
+                    assert!(
+                        stdout.contains(&format!(
+                            "ERROR parity/skid (verify/{backend}) [SKID-RETRY: attempt 1 of at most 5 is a typed HERMIT_SKID_OVERSHOOT infrastructure error (2 report(s)) and nothing else; retrying this cell only]"
+                        )),
+                        "{scenario}: {stdout}"
+                    );
+                    assert!(
+                        stdout.contains(&format!(
+                            "SKID-RETRY LIMIT parity/skid (verify/{backend}): attempt 5 of at most 5 is a typed HERMIT_SKID_OVERSHOOT infrastructure error (2 report(s)); the attempt cap is reached, no further retry is made, and the cell's selected outcome is ERROR (attempt 5)\n"
+                        )),
+                        "{scenario}: {stdout}"
+                    );
+                    assert_eq!(summary["errors"], json!(1), "{scenario}");
+                    assert_eq!(summary["skid_infra"], json!(1), "{scenario}");
+                    assert_eq!(
+                        summary["skid_infra_cells"],
+                        json!([{
+                            "test": "parity/skid", "mode": "verify", "backend": backend,
+                            "attempts": 5, "overshoot_reports": 10, "verdict": "SKID-INFRA",
+                        }]),
+                        "{scenario}"
+                    );
+                    assert!(
+                        stdout.contains("test-harness: SKID-INFRA count 1\n"),
+                        "{scenario}: {stdout}"
+                    );
+                    assert!(
+                        stdout.contains(&format!(
+                            "test-harness: SKID-INFRA parity/skid (verify/{backend}): all 5 attempt(s) were typed HERMIT_SKID_OVERSHOOT infrastructure errors (10 report(s)); verdict SKID-INFRA (not a test failure)"
+                        )),
+                        "{scenario}: {stdout}"
+                    );
+                    assert_eq!(super::skid_infra_reports(&rows), Some(10), "{scenario}");
+                    // The one-row prefix is the same verdict at that
+                    // point: every attempt so far skid-only.
+                    assert_eq!(super::skid_infra_reports(&rows[..1]), Some(2), "{scenario}");
                 }
                 "diverged-then-skid" => {
                     // The retry was earned by the product failure, so it is
@@ -5320,6 +5479,15 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
                     );
                     assert!(
                         !stdout.contains("test-harness: SKID-RETRY "),
+                        "{scenario}: {stdout}"
+                    );
+                    // A product failure before the skid keeps the cell a
+                    // product failure: never SKID-INFRA.
+                    assert_eq!(summary["skid_infra"], json!(0), "{scenario}");
+                    assert_eq!(summary["skid_infra_cells"], json!([]), "{scenario}");
+                    assert_eq!(super::skid_infra_reports(&rows), None, "{scenario}");
+                    assert!(
+                        stdout.contains("test-harness: SKID-INFRA count 0\n"),
                         "{scenario}: {stdout}"
                     );
                 }
@@ -5967,10 +6135,10 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
                         "{context}"
                     );
                     let skid_line = format!(
-                        "ERROR parity/skid (verify/{backend}) [SKID-RETRY: attempt 1 of at most 2 is a typed HERMIT_SKID_OVERSHOOT infrastructure error (2 report(s)) and nothing else; retrying this cell only]"
+                        "ERROR parity/skid (verify/{backend}) [SKID-RETRY: attempt 1 of at most 5 is a typed HERMIT_SKID_OVERSHOOT infrastructure error (2 report(s)) and nothing else; retrying this cell only]"
                     );
                     let not_made = format!(
-                        "SKID-RETRY NOT MADE parity/skid (verify/{backend}): attempt 1 of at most 2 is a typed HERMIT_SKID_OVERSHOOT infrastructure error (2 report(s)), but it is an imported attempt and its producer recorded no later attempt of the cell; the cell's selected outcome is ERROR (attempt 1)\n"
+                        "SKID-RETRY NOT MADE parity/skid (verify/{backend}): attempt 1 of at most 5 is a typed HERMIT_SKID_OVERSHOOT infrastructure error (2 report(s)), but it is an imported attempt and its producer recorded no later attempt of the cell; the cell's selected outcome is ERROR (attempt 1)\n"
                     );
                     assert_eq!(
                         stdout.contains("SKID-RETRY NOT MADE"),
@@ -6858,7 +7026,7 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
         .unwrap();
 
         // This machine runs every cell.
-        let earns_retry = |_: &SelectedCell, _: &CellResult| true;
+        let earns_retry = |_: &SelectedCell, _: &[CellResult]| true;
         let host_inapplicable = |_: &SelectedCell| None;
         let policy = imported_results::ImportPolicy {
             earns_retry: &earns_retry,
@@ -6971,7 +7139,7 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
         .unwrap();
 
         // This machine lacks KVM for verify@kvm only.
-        let earns_retry = |_: &SelectedCell, _: &CellResult| true;
+        let earns_retry = |_: &SelectedCell, _: &[CellResult]| true;
         let host_inapplicable = |cell: &SelectedCell| {
             (cell.id.mode == "verify" && cell.id.backend.as_deref() == Some("kvm"))
                 .then(|| "this machine lacks kvm".to_string())
@@ -7075,7 +7243,7 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
             serde_json::to_vec(&json!({"evidence_complete_executions": evidence})).unwrap(),
         )
         .unwrap();
-        let earns_retry = |_: &SelectedCell, _: &CellResult| false;
+        let earns_retry = |_: &SelectedCell, _: &[CellResult]| false;
         let host_inapplicable = |_: &SelectedCell| None::<String>;
         let policy = imported_results::ImportPolicy {
             earns_retry: &earns_retry,
@@ -10247,6 +10415,7 @@ sys.exit(1 if failed else 0)
             |_, emit| {
                 run_with_retry(
                     1,
+                    MAX_ATTEMPTS_PER_CELL,
                     |attempt| {
                         if attempt == 2 {
                             assert_eq!(published.load(Ordering::SeqCst), 1);
@@ -10313,6 +10482,7 @@ sys.exit(1 if failed else 0)
             |index, emit| {
                 run_with_retry(
                     1,
+                    MAX_ATTEMPTS_PER_CELL,
                     |attempt| {
                         executions[index].fetch_add(1, Ordering::SeqCst);
                         if index < NO_RESULT_CELLS {
@@ -10351,6 +10521,7 @@ sys.exit(1 if failed else 0)
         let mut rows = Vec::new();
         run_with_retry(
             1,
+            MAX_ATTEMPTS_PER_CELL,
             |attempt| {
                 executions.fetch_add(1, Ordering::SeqCst);
                 if attempt == 1 {
@@ -10859,6 +11030,7 @@ sys.exit(1 if failed else 0)
         let mut rows = Vec::new();
         run_with_retry(
             1,
+            MAX_ATTEMPTS_PER_CELL,
             |attempt| {
                 executions.fetch_add(1, Ordering::SeqCst);
                 attempt
@@ -11562,6 +11734,7 @@ sys.exit(1 if failed else 0)
         let mut rows = Vec::new();
         run_with_retry(
             2,
+            MAX_ATTEMPTS_PER_CELL,
             |attempt| attempt,
             |_| true,
             |attempt, will_retry| {
@@ -11582,6 +11755,7 @@ sys.exit(1 if failed else 0)
             |index, emit| {
                 run_with_retry(
                     1,
+                    MAX_ATTEMPTS_PER_CELL,
                     |attempt| {
                         executions[index].fetch_add(1, Ordering::SeqCst);
                         (index, attempt)
@@ -11613,6 +11787,7 @@ sys.exit(1 if failed else 0)
             |_, emit| {
                 run_with_retry(
                     1,
+                    MAX_ATTEMPTS_PER_CELL,
                     |attempt| {
                         executions.fetch_add(1, Ordering::SeqCst);
                         attempt

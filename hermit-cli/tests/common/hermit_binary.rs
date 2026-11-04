@@ -21,11 +21,12 @@ use std::sync::OnceLock;
 pub mod skid_overshoot;
 
 /// Attempts a Hermit run gets when Hermit refuses it for a late PMU interrupt
-/// (exit 122, `cause=skid-overshoot`). A refusal measures the host's
-/// interrupt latency under load, not the guest
+/// (exit 122, `cause=skid-overshoot`): the one shared skid budget
+/// ([`detcore_model::SKID_RETRY_MAX_ATTEMPTS`]). A refusal measures the
+/// host's interrupt latency under load, not the guest
 /// (https://github.com/rrnewton/hermit/issues/1845).
 #[allow(dead_code)]
-pub const SKID_ATTEMPTS: u32 = 5;
+pub const SKID_ATTEMPTS: u32 = detcore_model::SKID_RETRY_MAX_ATTEMPTS;
 
 /// Run `command` (a direct or timeout-wrapped Hermit command), and run it
 /// again, up to [`SKID_ATTEMPTS`] in all, only after an attempt whose output

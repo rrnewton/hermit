@@ -21,7 +21,7 @@ static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 // (exit 122, cause=skid-overshoot). That measures the host, not the guest, so
 // such an attempt runs again; nothing else does
 // (https://github.com/rrnewton/hermit/issues/1845).
-const SKID_ATTEMPTS: u32 = 5;
+const SKID_ATTEMPTS: u32 = detcore_model::SKID_RETRY_MAX_ATTEMPTS;
 
 #[test]
 fn compression_tools_are_deterministic_under_strict_hermit() {
