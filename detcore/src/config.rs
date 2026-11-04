@@ -87,7 +87,7 @@ mod tests {
     use super::*;
 
     /// Revisions reserved for a change that is not on this base yet, which
-    /// `GLOBAL_RPC_REVISIONS` therefore skips: 33 to 36 and 38 to 39 are reserved for
+    /// `GLOBAL_RPC_REVISIONS` therefore skips: 33 to 39 are reserved for
     /// pending changes in the coordinator's allocation table (39 for kvm
     /// 2b-1). At this head 28 is https://github.com/rrnewton/hermit/pull/4789's,
     /// 29 is https://github.com/rrnewton/hermit/pull/4884's, 30 is
@@ -98,7 +98,7 @@ mod tests {
     /// `TraceSchedEventResponse::backstop` renumbered from its allocated
     /// 37 at its rebase after 40 landed, is the current revision. Remove
     /// an entry when its change lands, with its row.
-    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[33, 34, 35, 36, 38, 39];
+    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[33, 34, 35, 36, 37, 38, 39];
 
     /// Every revision of the global RPC, oldest first, with the digest of the
     /// code of its two enums and its `Resources` payload. A change to any of
@@ -280,7 +280,7 @@ mod tests {
         // (https://github.com/rrnewton/hermit/pull/4759, allocated revision
         // 25 on its own base after main's 24, renumbered to 41 at its rebase
         // after landed 40; digest measured at this head).
-        (41, "0000000000000000", "f013e36743d8d9e6"),
+        (41, "652615e080d1cb3c", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
