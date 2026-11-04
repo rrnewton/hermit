@@ -14996,7 +14996,14 @@ mod tests {
         });
         let mut writer = crate::preemptions::PreemptionWriter::new(Some(recording.clone()));
         writer.register_thread(tid, DEFAULT_PRIORITY);
-        writer.insert_reprioritization(tid, LogicalTime::from_nanos(100), 10, DEFAULT_PRIORITY, 20);
+        writer.insert_reprioritization(
+            tid,
+            LogicalTime::from_nanos(100),
+            10,
+            DEFAULT_PRIORITY,
+            20,
+            None,
+        );
         state.sched.lock().unwrap().preemption_writer = Some(writer);
 
         let cleanup = state
@@ -15108,6 +15115,7 @@ mod tests {
                     10,
                     DEFAULT_PRIORITY,
                     20,
+                    None,
                 );
                 state.sched.lock().unwrap().preemption_writer = Some(writer);
                 assert!(!recording.exists());
@@ -15174,7 +15182,14 @@ mod tests {
         let mut writer = crate::preemptions::PreemptionWriter::new(Some(recording.clone()));
         writer.register_thread(tid, DEFAULT_PRIORITY);
         writer.insert_schedevent(SchedEvent::branches(tid, 10));
-        writer.insert_reprioritization(tid, LogicalTime::from_nanos(100), 10, DEFAULT_PRIORITY, 20);
+        writer.insert_reprioritization(
+            tid,
+            LogicalTime::from_nanos(100),
+            10,
+            DEFAULT_PRIORITY,
+            20,
+            None,
+        );
         writer.insert_callback_checkpoint(
             tid,
             Origin {
