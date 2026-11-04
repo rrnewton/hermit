@@ -3953,7 +3953,7 @@ mod legacy_backend_json {
     /// is never written and reads as false.
     /// `post_crash_timeslice` came after it too, and the scheduler acts on it
     /// as well, so it is never written and reads as off.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 52] = [
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 51] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -5536,9 +5536,9 @@ mod tests {
         // `standard_stream_aliases`, `sleep_registration`, `strict_binder`,
         // `post_crash_timeslice`, `rewrite_exclusives_in_memory`
         // and `strict_schedule_boundaries` none: fourteen more keys and
-        // fifty-one fewer, so thirty-seven keys fewer than fields.
+        // fifty fewer, so thirty-six keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 37);
+        assert_eq!(fields.len(), keys.len() + 36);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
