@@ -1271,7 +1271,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (dh-4a61v): 1951 - 1 = 1950.
     // And the departed shell py_hello replay (dh-9r2mg): 1950 - 1 = 1949.
     // PR 4920 (3): two model/config units: 1955 + 2 = 1957.
-    ("test.regular_crates", 1957),
+    // PR 4750: six standard-descriptor units: 1957 + 6 = 1963.
+    ("test.regular_crates", 1963),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -4674,7 +4675,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // no_namespace_minimize_replays_its_candidate_records: 795 + 2 = 797.
     // And analyze_replays_a_recorded_target_instead_of_panicking: 797 + 1 = 798.
     // PR 4920 (3): prefix-stack and fatal-time-skip cases: 798 + 2 = 800.
-    ("test.cli", 800),
+    // PR 4750: four stdio CLI cases: 800 + 4 = 804.
+    ("test.cli", 804),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5353,7 +5355,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 714 + 2 = 716.
     // And the same recorded-target regression test: 716 + 1 = 717.
     // PR 4920 (3): the same two cases: 717 + 2 = 719.
-    ("test.cli_on_host", 719),
+    // PR 4750: the same four stdio CLI cases: 719 + 4 = 723.
+    ("test.cli_on_host", 723),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
@@ -5367,7 +5370,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same departed blocking-sigsuspend (dh-4a61v) and shell py_hello
     // (dh-9r2mg) named losses: 1937 - 2 = 1935.
     // PR 4920 (3): the same two units: 1941 + 2 = 1943.
-    ("test.regular_crates_on_host", 1943),
+    // PR 4750: the same six standard-descriptor units: 1943 + 6 = 1949.
+    ("test.regular_crates_on_host", 1949),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -6608,7 +6612,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same departed blocking-sigsuspend (dh-4a61v) and shell py_hello
     // (dh-9r2mg) named losses: 1937 - 2 = 1935.
     // PR 4920 (3): the same two units: 1941 + 2 = 1943.
-    ("test.regular_crates_on_host", 1943),
+    // PR 4750: the same six standard-descriptor units, none hosted-excluded:
+    // 1943 + 6 = 1949.
+    ("test.regular_crates_on_host", 1949),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
