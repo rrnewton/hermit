@@ -1282,7 +1282,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // adds six hermit-record units: 1985 + 6 = 1991.
     // Its privileged map_files unit is now #[ignore]d instead of passing
     // without running where the capability is missing: 1991 - 1 = 1990.
-    ("test.regular_crates", 1990),
+    // The privileged map_files unit is replaced by an unprivileged one that
+    // classifies a real mapping's object: 1990 + 1 = 1991.
+    ("test.regular_crates", 1991),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -3912,7 +3914,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // adds five placement tests: 250 + 5 = 255.
     // The /dev/zero sharing fix adds four record/replay tests: 255 + 4 = 259.
     // The occupied-range placement test for MAP_SHARED_VALIDATE: 259 + 1 = 260.
-    ("test.record_replay", 260),
+    // The map_files test for a dev-zero object: 260 + 1 = 261.
+    ("test.record_replay", 261),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -5397,7 +5400,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The two hermit-replay unit tests of the MAP_FIXED_NOREPLACE fix: 1969 + 2 = 1971.
     // The same six hermit-record units of the /dev/zero sharing fix: 1971 + 6 = 1977.
     // The same privileged map_files unit, now #[ignore]d: 1977 - 1 = 1976.
-    ("test.regular_crates_on_host", 1976),
+    // The same unprivileged replacement unit: 1976 + 1 = 1977.
+    ("test.regular_crates_on_host", 1977),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -6645,7 +6649,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The two hermit-replay unit tests of the MAP_FIXED_NOREPLACE fix: 1969 + 2 = 1971.
     // The same six hermit-record units of the /dev/zero sharing fix: 1971 + 6 = 1977.
     // The same privileged map_files unit, now #[ignore]d: 1977 - 1 = 1976.
-    ("test.regular_crates_on_host", 1976),
+    // The same unprivileged replacement unit: 1976 + 1 = 1977.
+    ("test.regular_crates_on_host", 1977),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
