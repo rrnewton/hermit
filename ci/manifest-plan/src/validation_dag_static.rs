@@ -4659,7 +4659,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And a_preemption_replay_that_leaves_its_readmissions_is_marked_or_ends_under_die_on_desync:
     // 792 + 1 = 793.
     // On #4742's head on main 77be1fd09: 794 + 1 = 795.
-    ("test.cli", 795),
+    // The two --strict binder CLI tests ignored as host-limited: 795 - 2 = 793.
+    ("test.cli", 793),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5320,7 +5321,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Rebased onto main 77be1fd09: 715 - 2 = 713.
     // And the same departed-readmissions test: 712.
     // On #4742's head on main 77be1fd09: 713 + 1 = 714.
-    ("test.cli_on_host", 714),
+    // The same two strict binder tests ignored: 714 - 2 = 712.
+    ("test.cli_on_host", 712),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
