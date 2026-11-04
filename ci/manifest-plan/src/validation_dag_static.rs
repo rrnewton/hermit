@@ -3342,7 +3342,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // an_offset_free_record_is_written_exactly_as_before_the_offsets:
     // 3573 + 16 = 3589.
     // The UDF #imm16 exemption's two units: 3655, listed.
-    ("test.detcore_unit", 3655),
+    // And the SVE encodings' unit: 3656, listed.
+    ("test.detcore_unit", 3656),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -6043,7 +6044,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same sixteen --chaos-instruction-offset units:
     // 3573 + 16 = 3589.
     // The same two UDF units: 3655, listed.
-    ("test.detcore_unit_on_host", 3655),
+    // And the same SVE unit: 3656, listed.
+    ("test.detcore_unit_on_host", 3656),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
