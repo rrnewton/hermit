@@ -1983,7 +1983,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (nine in app::analyze::phases, one in app::analyze::rundata):
     // 1239 + 10 = 1249, measured by nextest list.
     // drain/4709: main + this change's library tests (+1, incl. the script-chain case): 1252 + 1 = 1253.
-    ("test.hermit_unit", 1253),
+    // And mapped_launch_path_preserves_an_exact_file_bind (revcodex fix): 1253 + 1 = 1254.
+    ("test.hermit_unit", 1254),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -4646,7 +4647,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 5 recount (measured by the ccb5080910 full validate):
     // Composed on landed batch main: 789 + 5 = 794 (Train 5 delta +5 over 787).
     // drain/4709: main + this change's CLI tests (+16): 797 + 16 = 813.
-    ("test.cli", 813),
+    // And replay_only_ignores_an_unused_requested_cpu_profile (revcodex fix): 813 + 1 = 814.
+    ("test.cli", 814),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5306,7 +5308,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // growth as test.cli): 699 + 7 = 706.
     // Train 5 recount (same growth as test.cli), composed on landed batch main: 708 + 5 = 713.
     // drain/4709: main + this change's CLI tests (+16, same growth as test.cli): 716 + 16 = 732.
-    ("test.cli_on_host", 732),
+    // And the same replay-only case: 732 + 1 = 733.
+    ("test.cli_on_host", 733),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
@@ -6306,7 +6309,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The split retains nine additional core identities: 1329 + 9 = 1338.
     // Train 5 recount (same growth as test.hermit_unit), composed on measured main: 1206 + 1 = 1207.
     // drain/4709: main + this change's library tests (+1, same growth as test.hermit_unit): 1246 + 1 = 1247.
-    ("test.hermit_unit_on_host", 1247),
+    // And the same exact-file-bind unit: 1247 + 1 = 1248.
+    ("test.hermit_unit_on_host", 1248),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
