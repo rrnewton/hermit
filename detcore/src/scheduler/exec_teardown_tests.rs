@@ -564,3 +564,36 @@ fn reused_vfork_tid_requires_exact_pending_grant_and_consumes_its_authority() {
         }
     }
 }
+
+/// A transferred exec gives the survivor the leader's tid (`de_thread`): the
+/// leader's `task/<pid>/stat` then shows the survivor's own CPU time, not the
+/// old leader's larger one, also once the survivor publishes a smaller time
+/// under its new tid, and the old leader's exit record (a raw `exit` while its
+/// threads ran on) is gone (revopus1 on hermit 5139). The process total, which
+/// counts every thread, is kept.
+#[test]
+fn a_transferred_exec_gives_the_leader_the_survivors_own_cpu_time() {
+    use crate::procfs::task_stat::TaskCpuTimes;
+    let (mut sched, process, mm) = group();
+    let leader = DetTid::from_raw(process.as_raw());
+    let survivor = DetTid::from_raw(18);
+    let ms = |ms: u64| LogicalTime::from_nanos(ms * 1_000_000);
+    let total = TaskCpuTimes {
+        user: ms(80),
+        system: ms(10),
+        ..TaskCpuTimes::default()
+    };
+    sched.publish_cpu_time(process, leader, (ms(50), ms(9)), total);
+    sched.publish_cpu_time(process, survivor, (ms(5), ms(1)), total);
+    sched.record_exit_code(process, 3 << 8);
+    reconnect(&mut sched, survivor, process, mm);
+    let own = |sched: &Scheduler| {
+        let cpu = sched.task_stat_facts(process, Some(leader)).cpu;
+        (cpu.user, cpu.system)
+    };
+    assert_eq!(own(&sched), (ms(5), ms(1)));
+    sched.publish_cpu_time(process, leader, (ms(6), ms(1)), total);
+    assert_eq!(own(&sched), (ms(6), ms(1)));
+    assert_eq!(sched.task_stat_facts(process, None).cpu, total);
+    assert!(!sched.thread_tree.exit_codes.contains_key(&process));
+}
