@@ -3282,7 +3282,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // nextest count.
     // PR #4761: refusing a binder descriptor under --strict where it arrives
     // adds twelve units, the KVM admission check's five included: 3493.
-    ("test.detcore_unit", 3493),
+    // And two binder receipt units where the run fails closed (PR #4761): 3495.
+    ("test.detcore_unit", 3495),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5900,7 +5901,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Rebased onto main fcd62385f: 3465 + 2 = 3467.
     // PR #4751: the same twelve units (same growth as test.detcore_unit).
     // PR #4761: the same twelve strict binder descriptor units: 3493.
-    ("test.detcore_unit_on_host", 3493),
+    // And the same two binder receipt units: 3495.
+    ("test.detcore_unit_on_host", 3495),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
