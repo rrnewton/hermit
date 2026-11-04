@@ -5,7 +5,7 @@
 //! A fourth record belongs only to the mixed ON-CLI/OFF-runtime control.
 //! ```cargo
 //! [dependencies]
-//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "9a55aa7d2d92435a382622de8ec2823ab0481645" }
+//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "f79789533dc03fe529a6a1211921bade81ae0680" }
 //! libc = "0.2"
 //! serde_json = "1"
 //! sha2 = "=0.10.9"
@@ -48,7 +48,7 @@ use sha2::Sha256;
 
 type Result<T> = std::result::Result<T, String>;
 const FEATURES: &str = "in-guest-trap,exec-stop-launcher,native-exec";
-const MANIFEST_TEST_COUNT: usize = 303;
+const MANIFEST_TEST_COUNT: usize = 315;
 const ISOLATION_TEST_COUNT: usize = 150;
 const MIXED_RUNTIME_CASE: &str =
     "liteinst_cli_refuses_an_off_runtime_unless_patching_is_explicitly_disabled";
@@ -162,9 +162,11 @@ const PORTABLE_SKIPS: &[&str] = &[
     "run_ptrace_nonleader_exec_displaces_runnable_leader",
     "run_ptrace_nonleader_exec_refuses_preemption_artifacts",
     "run_chaos_preemption_replay_reuses_the_recorded_epoch",
+    "run_schedule_replay_ends_check_in_slices_where_the_record_did",
     "max_log_bytes_preemption_stacktrace_exits_promptly_when_stderr_is_a_full_pipe",
     "poll_timeout_returns_on_time_while_another_thread_spins",
     "a_guests_sigchld_to_a_futex_waiting_sibling_beside_a_cpu_bound_one_ends_its_wait",
+    "a_schedule_replay_keeps_the_clock_of_a_thread_that_yields_beside_a_computing_one",
     "a_readied_pipe_poller_runs_once_the_actors_branch_counted_time_is_the_latency_later",
     "happens_before_relative_anchor_holds_the_first_call_after_its_base",
     "happens_before_relative_anchor_state_is_not_inherited_by_a_new_thread",
@@ -178,6 +180,11 @@ const PORTABLE_SKIPS: &[&str] = &[
     "cpu_profile_v3_lazy_binding_xsave_is_identical_on_the_hashed_stack",
     "cpu_profile_v3_replay_refuses_a_recording_from_a_different_cpu",
     "cpu_profile_v3_cpuinfo_matches_cpuid",
+    "proc_cpu_times_agree_with_every_cpu_time_view",
+    "a_chaos_timeslice_range_draws_slices_from_the_seed_and_replays",
+    "a_run_draw_picks_the_timeslice_and_a_replay_runs_under_it",
+    "a_draw_without_a_range_draws_from_the_recommended_range",
+    "a_fair_continuation_does_not_hand_a_spinner_a_timeslice_per_write",
 ];
 
 fn require(ok: bool, message: &str) -> Result<()> {
@@ -795,7 +802,7 @@ impl SharedDeadline {
 }
 
 const HOST_COMPAT_COUNT: usize = 62;
-const PINNED_MANIFEST_COUNT: usize = 241;
+const PINNED_MANIFEST_COUNT: usize = 253;
 const BRIDGE_SCHEMA: &str = "hermit-off-host-pinned/v1";
 const SOURCE_INPUTS: &[&str] = &[
     "Cargo.toml",
@@ -994,7 +1001,7 @@ fn manifest_partition(rows: &[Value]) -> Result<(BTreeSet<String>, Vec<Value>, V
     }
     require(
         host.len() == HOST_COMPAT_COUNT && pinned.len() == PINNED_MANIFEST_COUNT,
-        "required manifest HOST62/pinned241 partition changed",
+        "required manifest HOST62/pinned253 partition changed",
     )?;
     let host_ids = partition_plan_ids(&host)?;
     let pinned_ids = partition_plan_ids(&pinned)?;
@@ -1005,7 +1012,7 @@ fn manifest_partition(rows: &[Value]) -> Result<(BTreeSet<String>, Vec<Value>, V
                 .cloned()
                 .collect::<BTreeSet<_>>()
                 == full,
-        "manifest partition is not the exact disjoint 303-cell union",
+        "manifest partition is not the exact disjoint 315-cell union",
     )?;
     Ok((full, pinned, host))
 }
@@ -3328,9 +3335,9 @@ mod tests {
     fn host_and_pinned_manifest_partitions_preserve_the_complete_required_census() {
         let rows = required_manifest_rows();
         let (full, pinned, host) = manifest_partition(&rows).unwrap();
-        assert_eq!(full.len(), 303);
+        assert_eq!(full.len(), 315);
         assert_eq!(host.len(), 62);
-        assert_eq!(pinned.len(), 241);
+        assert_eq!(pinned.len(), 253);
         assert!(host.iter().all(|row| row["category"] == "compat"));
         assert!(pinned.iter().all(|row| row["category"] != "compat"));
         let host_ids = check_partition_plan(&host, &host).unwrap();
