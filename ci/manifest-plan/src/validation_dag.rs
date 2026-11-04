@@ -6407,7 +6407,8 @@ sys.exit(37)
     }
 
     /// The PMU analyze node retains exactly the six other ignored integrations
-    /// while hello-race pinpointing is excluded for its tracked failure.
+    /// plus the race finder's two, while hello-race pinpointing is excluded
+    /// for its tracked failure.
     #[test]
     fn the_pmu_analyze_node_runs_the_ignored_analyze_integrations() {
         let source = include_str!("../../../hermit-cli/tests/analyze.rs");
@@ -6456,7 +6457,7 @@ sys.exit(37)
                 format!("{expected_filter}' -- --ignored"),
                 "{origin}"
             );
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "6", "{origin}");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "8", "{origin}");
             assert!(
                 !step.cmd.contains("test(=analyze_hello_race)"),
                 "{origin}: excluded hello-race must not run"
