@@ -6,14 +6,18 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::ops::Range;
 
 use anyhow::bail;
 use colored::Colorize;
+use detcore::edit_distance::BubbleSortIter;
 use detcore::edit_distance::NeedlemanWunsch;
 use detcore::edit_distance::NeedlemanWunschError;
 use detcore::edit_distance::generate_permutation;
-use detcore::edit_distance::iterable_bubble_sort;
+use detcore::edit_distance::iterable_bubble_sort_from_perm;
+use detcore::types::DetTid;
 use detcore::types::Op;
 use detcore::types::SchedEvent;
 
@@ -141,11 +145,7 @@ pub struct CriticalSchedule {
 /// return -2 otherwise
 pub fn scoring_function(first: SchedEvent, second: SchedEvent) -> i32 {
     let mut score = -2;
-    if (first.dettid == second.dettid)
-        && (first.op == second.op)
-        && (first.start_rip == second.start_rip)
-        && (first.end_rip == second.end_rip)
-    {
+    if first.same_kind(&second) {
         score += 1;
     } else {
         return score;
@@ -217,7 +217,11 @@ where
             .bold()
     );
     let critical_event_index = {
-        let (common_prefix, _) = get_common_pre_and_postfix(&passing_schedule, &failing_schedule);
+        let (common_prefix, _) = get_common_pre_and_postfix(
+            &passing_schedule,
+            &failing_schedule,
+            SchedEvent::same_operations,
+        );
         common_prefix.len() + 1
     };
     eprintln!("Critical event index {}", critical_event_index);
@@ -228,31 +232,122 @@ where
     })
 }
 
+/// Each Branch event of `schedule` with its thread's total branch count at
+/// its end: the point in the thread's own execution the event ends at, the
+/// same in every run of the same thread.
+fn branch_totals(schedule: &[SchedEvent]) -> Vec<u64> {
+    let mut branches = HashMap::new();
+    schedule
+        .iter()
+        .map(|event| {
+            if event.op != Op::Branch {
+                return 0;
+            }
+            let thread_total: &mut u64 = branches.entry(event.dettid).or_default();
+            *thread_total += u64::from(event.count);
+            *thread_total
+        })
+        .collect()
+}
+
+/// The points (thread, branch total) at which a Branch event of either
+/// schedule ends a timeslice taken without a stop (`SchedEvent::stopless`):
+/// there that run read no `end_rip`, so no RIP can be compared.
+fn stopless_points(schedules: [&[SchedEvent]; 2]) -> HashSet<(DetTid, u64)> {
+    schedules
+        .into_iter()
+        .flat_map(|schedule| {
+            schedule
+                .iter()
+                .zip(branch_totals(schedule))
+                // A record that marks an end it holds a RIP for is refused
+                // where records are read (`SchedEvent::stopless_mark_refusal`);
+                // should one reach here, its known RIP is still compared.
+                .filter(|(event, _)| event.stopless && event.end_rip.is_none())
+                .map(|(event, total)| (event.dettid, total))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// A schedule's alignment keys: each event with its thread's branch total
+/// at its end (`alignment_keys`).
+type AlignmentKeys = Vec<(SchedEvent, u64)>;
+
+/// What two runs' schedules are aligned on (`generate_permutation`): each
+/// event as recorded, except that a Branch event stands for the branches it
+/// covers, as its thread's total branch count at its end, rather than for how
+/// the run took the timeslice end there. A stop reads an `end_rip` that an
+/// end taken without one (`SchedEvent::stopless`) does not have, and two runs
+/// differ in which ends their thread ran alone at: at a point in `unknown`,
+/// where either run took the end without a stop, the RIP is left out. Two
+/// known RIPs at the same point are compared, so ends at different
+/// instructions stay apart. The total also keeps apart batches of the same
+/// size that the RIP told apart.
+fn alignment_keys(schedule: &[SchedEvent], unknown: &HashSet<(DetTid, u64)>) -> AlignmentKeys {
+    schedule
+        .iter()
+        .zip(branch_totals(schedule))
+        .map(|(event, total)| {
+            let mut key = event.clone();
+            key.stopless = false;
+            if event.op == Op::Branch && unknown.contains(&(event.dettid, total)) {
+                key.end_rip = None;
+            }
+            (key, total)
+        })
+        .collect()
+}
+
+/// The `alignment_keys` of `source` and `target`, each with the RIPs left out
+/// where either took a slice end without a stop.
+fn aligned_keys(source: &[SchedEvent], target: &[SchedEvent]) -> (AlignmentKeys, AlignmentKeys) {
+    let unknown = stopless_points([source, target]);
+    (
+        alignment_keys(source, &unknown),
+        alignment_keys(target, &unknown),
+    )
+}
+
+/// Bubble sort `source` into `target`'s order, matching events by
+/// `aligned_keys`.
+fn align<'a>(source: &'a [SchedEvent], target: &[SchedEvent]) -> BubbleSortIter<'a, SchedEvent> {
+    let (source_keys, target_keys) = aligned_keys(source, target);
+    let permutation = generate_permutation(&source_keys, &target_keys);
+    iterable_bubble_sort_from_perm(source, permutation)
+}
+
 // Return edit distance and swap distance.
 fn just_distance(sched1: &[SchedEvent], sched2: &[SchedEvent]) -> (usize, usize) {
-    let bubbles = iterable_bubble_sort(sched1, sched2);
+    let bubbles = align(sched1, sched2);
     (bubbles.edit_distance(), bubbles.swap_distance())
 }
 
 /// `schedule` without the events `other` has no counterpart for, matched as
 /// multisets from the left, if what is left differs from `other` by exactly one
-/// adjacent swap.
+/// adjacent swap. Counterparts are matched by the alignment policy
+/// (`aligned_keys`), as `align` matches them: a slice end one schedule took
+/// without a stop and the other took with one are the same event, so the
+/// shared events are the ones alignment would pair, with `schedule`'s own
+/// events retained.
 fn events_shared_with(schedule: &[SchedEvent], other: &[SchedEvent]) -> Option<Vec<SchedEvent>> {
+    let (schedule_keys, other_keys) = aligned_keys(schedule, other);
     let mut available: std::collections::HashMap<&SchedEvent, usize> =
         std::collections::HashMap::new();
-    for event in other {
-        *available.entry(event).or_default() += 1;
+    for (key, _) in &other_keys {
+        *available.entry(key).or_default() += 1;
     }
     let shared: Vec<SchedEvent> = schedule
         .iter()
-        .filter(|event| match available.get_mut(event) {
+        .zip(&schedule_keys)
+        .filter(|(_, (key, _))| match available.get_mut(key) {
             Some(count) if *count > 0 => {
                 *count -= 1;
                 true
             }
             _ => false,
         })
-        .cloned()
+        .map(|(event, _)| event.clone())
         .collect();
     (shared.len() == other.len() && just_distance(&shared, other) == (1, 1)).then_some(shared)
 }
@@ -513,7 +608,8 @@ fn print_unmatched_events(
     failing_schedule: &[SchedEvent],
     max_to_print: usize,
 ) {
-    let perm = generate_permutation(passing_schedule, failing_schedule);
+    let (passing_keys, failing_keys) = aligned_keys(passing_schedule, failing_schedule);
+    let perm = generate_permutation(&passing_keys, &failing_keys);
     for ix in perm.unmatched_source_indices.iter().take(max_to_print) {
         eprintln!(
             " :: unmatched source evt #{}: {}",
@@ -561,7 +657,7 @@ where
 
     for pass_number in 0..cfg.max_event_level_search_passes {
         let (swap_dist, edit_dist, requested_midpoint_schedule) = {
-            let mut bubbles = iterable_bubble_sort(&passing_schedule, &failing_schedule);
+            let mut bubbles = align(&passing_schedule, &failing_schedule);
             (
                 bubbles.swap_distance(),
                 bubbles.edit_distance(),
@@ -683,15 +779,16 @@ where
     );
 }
 
-/// Returns `(prefix, postfix)` respectively.
-fn get_common_pre_and_postfix<'a, T>(sched_1: &'a [T], sched_2: &[T]) -> (&'a [T], &'a [T])
-where
-    T: Eq,
-{
+/// Returns `(prefix, postfix)` respectively, of events that are `same`.
+fn get_common_pre_and_postfix<'a, T>(
+    sched_1: &'a [T],
+    sched_2: &[T],
+    same: impl Fn(&T, &T) -> bool,
+) -> (&'a [T], &'a [T]) {
     let common_prefix_len = sched_1
         .iter()
         .zip(sched_2.iter())
-        .take_while(|(e1, e2)| e1 == e2)
+        .take_while(|(e1, e2)| same(e1, e2))
         .count();
 
     let common_postfix_len = if sched_1.len() == sched_2.len() && sched_1.len() == common_prefix_len
@@ -702,7 +799,7 @@ where
             .iter()
             .rev()
             .zip(sched_2.iter().rev())
-            .take_while(|(e1, e2)| e1 == e2)
+            .take_while(|(e1, e2)| same(e1, e2))
             .count()
     };
 
@@ -744,7 +841,11 @@ fn sub_event_search<F>(
 where
     F: FnMut(&[SchedEvent]) -> TrialOutcome,
 {
-    let (prefix, postfix) = get_common_pre_and_postfix(&passing_schedule, &failing_schedule);
+    let (prefix, postfix) = get_common_pre_and_postfix(
+        &passing_schedule,
+        &failing_schedule,
+        SchedEvent::same_operations,
+    );
     if passing_schedule.len() != failing_schedule.len()
         || prefix.len() + postfix.len() + 2 != passing_schedule.len()
     {
@@ -904,11 +1005,10 @@ where
 }
 
 fn same_event_except_count(first: &SchedEvent, second: &SchedEvent) -> bool {
-    let mut first = first.clone();
-    let mut second = second.clone();
-    first.count = 0;
-    second.count = 0;
-    first == second
+    first.same_operations(&SchedEvent {
+        count: first.count,
+        ..*second
+    })
 }
 
 fn can_split_event(event: &SchedEvent) -> bool {
@@ -920,7 +1020,12 @@ where
     F: FnMut(&[SchedEvent]) -> TrialOutcome,
 {
     let (passes, actual) = tester(requested)?;
-    if actual != requested {
+    let realized = actual.len() == requested.len()
+        && actual
+            .iter()
+            .zip(requested)
+            .all(|(actual, requested)| actual.same_operations(requested));
+    if !realized {
         eprintln!(
             ":: Skipping sub-event refinement: replay did not realize a requested branch boundary exactly (requested {} events, realized {})",
             requested.len(),
@@ -979,6 +1084,9 @@ fn sched_event_fragment(
         count,
         start_rip: keeps_start.then_some(original.start_rip).flatten(),
         end_rip: keeps_end.then_some(original.end_rip).flatten(),
+        // Only the fragment that ends where the original did ends at its
+        // slice end.
+        stopless: keeps_end && original.stopless,
         ..*original
     }
 }
@@ -1025,7 +1133,6 @@ fn create_schedule_with_critical_pair(
 mod tests {
 
     use detcore::preemptions::PreemptionRecord;
-    use detcore::types::DetTid;
     use detcore::types::LogicalTime;
     use detcore::types::Op;
     use detcore::types::SyscallPhase;
@@ -1033,10 +1140,103 @@ mod tests {
 
     use super::*;
 
+    /// Two runs that differ only in which slice ends they took without a
+    /// stop align event for event, and batches of the same size stay apart:
+    /// each stands for its thread's branches up to its end.
+    #[test]
+    fn schedules_align_however_their_slice_ends_were_taken() {
+        let a = DetTid::from_raw(3);
+        let b = DetTid::from_raw(4);
+        let stop = |tid, count, rip| {
+            SchedEvent::branches(tid, count)
+                .with_end_rip(detcore::types::InstructionPointer::new(rip).unwrap())
+        };
+        let stopped = vec![
+            stop(a, 100, 0x10),
+            stop(a, 100, 0x20),
+            SchedEvent::syscall(a, Sysno::write, SyscallPhase::Prehook),
+            stop(b, 100, 0x30),
+        ];
+        let mut taken_alone = stopped.clone();
+        taken_alone[0] = SchedEvent::branches(a, 100).taken_without_stop();
+        taken_alone[1] = SchedEvent::branches(a, 100).taken_without_stop();
+        assert_eq!(just_distance(&stopped, &taken_alone), (0, 0));
+        assert_eq!(
+            get_common_pre_and_postfix(&stopped, &taken_alone, SchedEvent::same_operations)
+                .0
+                .len(),
+            stopped.len()
+        );
+        let swapped = vec![
+            stopped[0].clone(),
+            stopped[3].clone(),
+            stopped[1].clone(),
+            stopped[2].clone(),
+        ];
+        assert_ne!(just_distance(&stopped, &swapped), (0, 0));
+        assert_eq!(
+            just_distance(&taken_alone, &swapped),
+            just_distance(&stopped, &swapped)
+        );
+    }
+
+    /// Two Branch events at the same point of their thread with known but
+    /// different end RIPs are different events: their distance is not zero,
+    /// so a zero-jitter search does not accept a replay that ended a slice at
+    /// another instruction as the requested schedule without checking that
+    /// replays of it agree. Only a RIP the run did not read (a slice end taken
+    /// without a stop) is left out of the comparison.
+    #[test]
+    fn known_end_rips_that_differ_are_not_aligned_as_equal() {
+        let a = DetTid::from_raw(3);
+        let stop = |rip| {
+            SchedEvent::branches(a, 100)
+                .with_end_rip(detcore::types::InstructionPointer::new(rip).unwrap())
+        };
+        let requested = vec![stop(0x401000)];
+        let elsewhere = vec![stop(0x402000)];
+        assert_ne!(just_distance(&requested, &elsewhere), (0, 0));
+        assert_eq!(just_distance(&requested, &requested.clone()), (0, 0));
+        // Either run's stopless end at the same point matches.
+        let taken_alone = vec![SchedEvent::branches(a, 100).taken_without_stop()];
+        assert_eq!(just_distance(&requested, &taken_alone), (0, 0));
+        assert_eq!(just_distance(&taken_alone, &elsewhere), (0, 0));
+        // A mark on an end with a known RIP, which no record reader admits,
+        // does not hide that RIP either.
+        let marked = |events: &[SchedEvent]| {
+            events
+                .iter()
+                .map(|event| SchedEvent {
+                    stopless: true,
+                    ..event.clone()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_ne!(
+            just_distance(&marked(&requested), &marked(&elsewhere)),
+            (0, 0)
+        );
+
+        // Zero jitter allowed: the replay that ended elsewhere is replayed
+        // again before it classifies the schedule.
+        let mut calls = 0;
+        let mut tester = |_: &[SchedEvent]| -> TrialOutcome {
+            calls += 1;
+            Ok((true, elsewhere.clone()))
+        };
+        let cfg = Config::default();
+        assert_eq!((cfg.max_jitter_editdist, cfg.max_jitter_swapdist), (0, 0));
+        test_and_select_stable_point(&mut tester, &requested, &cfg).unwrap();
+        assert_eq!(
+            calls, 2,
+            "a replay that differs at a known RIP is checked again"
+        );
+    }
+
     #[test]
     fn test_common_pre_and_postfix() {
         assert_eq!(
-            get_common_pre_and_postfix(b"abABcde", b"abBAcde"),
+            get_common_pre_and_postfix(b"abABcde", b"abBAcde", |a, b| a == b),
             (b"ab".as_slice(), b"cde".as_slice())
         );
     }
@@ -1168,6 +1368,30 @@ mod tests {
             events_shared_with(&passing, &passing),
             None,
             "identical schedules are not one swap apart"
+        );
+    }
+
+    /// The shared-events trim matches counterparts by the alignment
+    /// policy, not by raw equality: a slice end the passing run took
+    /// without a stop and the failing run took with one (a known RIP)
+    /// is the same event. With raw matching that end would be dropped
+    /// as unshared, the trim would come up short, and the one-swap
+    /// reduction would report no single swap for a pair it can localize.
+    #[test]
+    fn a_shared_end_taken_with_and_without_a_stop_survives_the_trim() {
+        let a = DetTid::from_raw(3);
+        let stopped_end = SchedEvent::branches(a, 100)
+            .with_end_rip(detcore::types::InstructionPointer::new(0x401000).unwrap());
+        let stopless_end = SchedEvent::branches(a, 100).taken_without_stop();
+        let x = SchedEvent::syscall(DetTid::from_raw(5), Sysno::write, SyscallPhase::Prehook);
+        let y = SchedEvent::syscall(DetTid::from_raw(7), Sysno::read, SyscallPhase::Prehook);
+        let extra = SchedEvent::syscall(DetTid::from_raw(9), Sysno::getpid, SyscallPhase::Prehook);
+        let passing = vec![stopless_end, x.clone(), y.clone()];
+        let failing = vec![stopped_end.clone(), y.clone(), x.clone(), extra];
+        assert_eq!(
+            events_shared_with(&failing, &passing),
+            Some(vec![stopped_end, y, x]),
+            "the trim keeps the failing run's own stopped end and drops only its extra event"
         );
     }
 
