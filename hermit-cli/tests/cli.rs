@@ -66223,7 +66223,7 @@ fn run_kvm_the_callers_own_proc_directories_answer_as_linux() {
 static PROC_LINK_TARGETS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 
 /// How many lines the link-targets guest prints.
-const PROC_LINK_TARGET_LINES: usize = 57;
+const PROC_LINK_TARGET_LINES: usize = 77;
 
 /// `tests/c/proc_link_targets.c`'s guest.
 fn proc_link_targets_guest() -> &'static Path {
@@ -66259,6 +66259,20 @@ fn proc_link_targets_native() -> String {
         "followed: removed directory fd/=-1 errno=EINVAL",
         "removed: cwd=<dir>/moved (deleted)",
         "removed: cwd spellings=7 same=7",
+        "walked: file fd/.=-1 errno=ENOTDIR",
+        "walked: directory fd/.=-1 errno=EINVAL",
+        "walked: removed directory fd/.=-1 errno=EINVAL",
+        "walked: pipe fd/.=-1 errno=ENOTDIR",
+        "walked: closed fd/.=-1 errno=ENOENT",
+        "walked: self/cwd/.=-1 errno=EINVAL",
+        "walked: self/root/.=-1 errno=EINVAL",
+        "walked: self/exe/.=-1 errno=ENOTDIR",
+        "status: names /proc/<pid>/status=1",
+        "status: spellings=6 same=6",
+        "followed: status fd/=-1 errno=ENOTDIR",
+        "walked: status fd/.=-1 errno=ENOTDIR",
+        "maps: names /proc/<pid>/maps=1",
+        "child: the inherited status names its opener's /proc/<pid>/status=1",
         "failures=0",
     ] {
         assert!(
@@ -66273,6 +66287,12 @@ fn proc_link_targets_native() -> String {
 /// runs at bitwise parity under `--verify-strict`, with the same nonzero
 /// number of INFO records compared.
 fn proc_link_targets_at_l2(backend: &str) -> String {
+    proc_link_targets_at_l2_with(backend, &[])
+}
+
+/// [`proc_link_targets_at_l2`] with the guest's arguments `extra` after its
+/// directory.
+fn proc_link_targets_at_l2_with(backend: &str, extra: &[&str]) -> String {
     let guest = proc_link_targets_guest();
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let report = directory.path().join(format!("{backend}.json"));
@@ -66294,6 +66314,7 @@ fn proc_link_targets_at_l2(backend: &str) -> String {
         guest.to_str().expect("guest path is UTF-8"),
         work.to_str().expect("directory path is UTF-8"),
     ];
+    let args = args.iter().chain(extra).copied().collect::<Vec<_>>();
     let output = hermit(&args);
     assert_success(&output, &args);
     let verdict: serde_json::Value =
@@ -66316,8 +66337,13 @@ fn proc_link_targets_at_l2(backend: &str) -> String {
 /// eventfd, an epoll instance, a timerfd, a signalfd, a memfd), by six
 /// spellings; a closed descriptor, short, empty and unwritable buffers, and
 /// links followed by a final slash; a second thread's and a fork child's
-/// reads; the `exe` link; and the working directory's link after it is
-/// renamed and removed, by seven spellings. Package K slice F2-h leaves
+/// reads; the `exe` link; the working directory's link after it is
+/// renamed and removed, by seven spellings; a `.` after the fd, cwd, root
+/// and exe links (`ENOTDIR` for a file, a pipe and the image, `EINVAL` for a
+/// directory, `ENOENT` for a closed descriptor); and the links of
+/// descriptors open on the process's own `/proc/self/status` and
+/// `/proc/self/maps` (`/proc/<pid>/status`, `/proc/<pid>/maps`), also read
+/// by a fork's child through the inherited one. Package K slice F2-h leaves
 /// ptrace as it was, so one line keeps the answer it had: KNOWN DIFFERENCE,
 /// NOT COMPLETION: a named FIFO's link, which Linux names by the FIFO's path,
 /// reads `pipe:[<n>]`, because Detcore's canonicalization of a descriptor
@@ -66358,7 +66384,14 @@ fn the_callers_own_link_targets_answer_as_linux() {
 /// a link followed by a final slash failed with `ELOOP` (Linux: `ENOTDIR`
 /// for a file or a pipe, `EINVAL` for a directory), and the working
 /// directory's link after it was renamed and removed kept the path the last
-/// `chdir` set, without " (deleted)".
+/// `chdir` set, without " (deleted)". Package K slice F2-d0 adds the
+/// spellings with a `.` after a link, which the executor's walk of its own
+/// `/proc` refused with `ELOOP` and which Detcore now looks up from the
+/// link's target itself (`readlinkat(fd, ".")`, or from the working
+/// directory or the root), and the links of the executor's own `status` and
+/// `maps` descriptors, which the fact does not name and which Detcore names
+/// from its record of the open (followed by a final slash or a `.`, they
+/// failed with `ELOOP` before).
 #[test]
 fn run_kvm_the_callers_own_link_targets_answer_as_linux() {
     let test = "run_kvm_the_callers_own_link_targets_answer_as_linux";
@@ -66367,4 +66400,237 @@ fn run_kvm_the_callers_own_link_targets_answer_as_linux() {
     }
     let native = proc_link_targets_native();
     assert_eq!(proc_link_targets_at_l2("kvm"), native, "kvm");
+}
+
+/// The link-targets guest's `--directory-links` transcript, line by line:
+/// the caller's own descriptor links read through a link to one of its own
+/// descriptor directories, as Linux answers them (it follows the link to
+/// the directory, `proc_fd_link`, and reads the link named below it).
+const DIRECTORY_LINK_LINES: &[&str] = &[
+    "through: file self/fd/D/N=<dir>/through",
+    "through: file <pid>/fd/D/N=<dir>/through",
+    "through: file thread-self/fd/D/N=<dir>/through",
+    "through: file <pid>/task/<tid>/fd/D/N=<dir>/through",
+    "through: file /dev/fd/D/N=<dir>/through",
+    "through: file readlinkat(D, N)=<dir>/through",
+    "through: file self/fd/<thread-self/fd>/N=<dir>/through",
+    "through: file self/fd/</dev/fd>/N=<dir>/through",
+    "through: file self/fd/</proc>/self/fd/N=<dir>/through",
+    "through: file readlinkat(</proc>, self/fd/N)=<dir>/through",
+    "through: file self/fd/D/D/N=<dir>/through",
+    "through: file readlinkat(D, D/N)=<dir>/through",
+    "through: file readlinkat(</proc>, self/fd/D/N)=<dir>/through",
+    "through: null self/fd/D/N=/dev/null",
+    "through: null <pid>/fd/D/N=/dev/null",
+    "through: null thread-self/fd/D/N=/dev/null",
+    "through: null <pid>/task/<tid>/fd/D/N=/dev/null",
+    "through: null /dev/fd/D/N=/dev/null",
+    "through: null readlinkat(D, N)=/dev/null",
+    "through: null self/fd/<thread-self/fd>/N=/dev/null",
+    "through: null self/fd/</dev/fd>/N=/dev/null",
+    "through: null self/fd/</proc>/self/fd/N=/dev/null",
+    "through: null readlinkat(</proc>, self/fd/N)=/dev/null",
+    "through: null self/fd/D/D/N=/dev/null",
+    "through: null readlinkat(D, D/N)=/dev/null",
+    "through: null readlinkat(</proc>, self/fd/D/N)=/dev/null",
+    "through: D's own link self/fd/D/D=/proc/<pid>/fd",
+    "through: closed self/fd/D/999=-1 errno=ENOENT",
+    "through: followed file self/fd/D/N/=-1 errno=ENOTDIR",
+    "through: walked file self/fd/D/N/.=-1 errno=ENOTDIR",
+    "through: climbed file self/fd/D/../fd/N=<dir>/through",
+    "through: climbed file self/fd/D/../../self/fd/N=<dir>/through",
+    "budget: 19 P segments N=/dev/null",
+    "budget: 20 P segments N=-1 errno=ELOOP",
+    "budget: 19 P segments N/=-1 errno=ENOTDIR",
+    "budget: 39 D segments N=/dev/null",
+    "budget: 40 D segments N=-1 errno=ELOOP",
+    "budget: 38 D segments N/=-1 errno=ENOTDIR",
+    "budget: 39 D segments N/=-1 errno=ELOOP",
+    "budget: 38 D segments N/.=-1 errno=ENOTDIR",
+    "budget: 39 D segments N/.=-1 errno=ELOOP",
+    "budget: 19 P segments D=/proc/<pid>/fd",
+    "budget: 20 P segments D=-1 errno=ELOOP",
+    "budget: 39 D segments closed/=-1 errno=ENOENT",
+    "budget: 39 D segments closed/.=-1 errno=ENOENT",
+    "budget: 39 D segments absent/.=-1 errno=ENOENT",
+    "budget: 39 D segments ../fd/N=/dev/null",
+    "failures=0",
+];
+
+/// The link-targets guest's `--directory-links` transcript, run natively,
+/// checked against [`DIRECTORY_LINK_LINES`], so a host that answers
+/// otherwise fails here rather than in the comparison.
+fn directory_links_native() -> String {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let output = Command::new(proc_link_targets_guest())
+        .arg(directory.path())
+        .arg("--directory-links")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the link-targets guest natively");
+    assert!(output.status.success(), "native: {output:?}");
+    let native = stdout(&output);
+    assert_eq!(native.lines().collect::<Vec<_>>(), DIRECTORY_LINK_LINES);
+    native
+}
+
+/// The caller's own descriptor links read through a link to one of its own
+/// descriptor directories (`tests/c/proc_link_targets.c --directory-links`)
+/// on ptrace, where the kernel answers them, at L2, as natively: a file's
+/// and `/dev/null`'s link by `/proc/self/fd/D/N` and the other four absolute
+/// spellings of `D`'s link, by `readlinkat(D, "N")`, through descriptors on
+/// `/proc/thread-self/fd`, `/dev/fd` and `/proc`, through `D` twice, and
+/// relative to `D` and to the `/proc` descriptor; `D`'s own link through
+/// itself; a closed descriptor (`ENOENT`); the file's link through `D`
+/// followed by a final slash and by `/.` (`ENOTDIR`); the file's link
+/// through `D` and a `..` that climbs out of the directory `D` leads to
+/// (`D/../fd/N`, `D/../../self/fd/N`); and each side of Linux's 40-link
+/// budget (`MAXSYMLINKS`): 19 and 20 segments through a descriptor on
+/// `/proc` (`P/self/fd/`, two links each), and 19 then `N/` (exactly 40,
+/// `ENOTDIR`), 39 and 40 through
+/// `D` to a plain `N`, and 38 and 39 through `D` to `N/` and `N/.`, which
+/// follow `N`'s link too (`ENOTDIR` within the budget, `ELOOP` past it),
+/// 19 and 20 `/proc` segments to `D`'s own link (`/proc/<pid>/fd`, then
+/// `ELOOP`), and, after 39 `D` segments (40 links), a closed descriptor
+/// followed by `/` and by `/.` and a name that is no number followed by
+/// `/.` (`ENOENT`: Linux charges a link only where one exists to follow),
+/// and `../fd/N` (a `..` follows no link). The KVM twin is
+/// [`run_kvm_descriptor_links_through_a_descriptor_directory_answer_as_linux`].
+#[test]
+fn descriptor_links_through_a_descriptor_directory_answer_as_linux() {
+    let native = directory_links_native();
+    assert_eq!(
+        proc_link_targets_at_l2_with("ptrace", &["--directory-links"]),
+        native,
+        "ptrace"
+    );
+}
+
+/// The caller's own descriptor links read through a link to one of its own
+/// descriptor directories
+/// ([`descriptor_links_through_a_descriptor_directory_answer_as_linux`]) on
+/// KVM, at L2, exactly as natively. Detcore serves the directory on a
+/// placeholder, so the walk goes on from the directory's own spelling
+/// (`/proc/self/fd/D/N` is `/proc/<pid>/fd/N`) and the link it ends at is
+/// answered from the backend's `link_path` fact (package K slice F2-d0).
+/// Before, the walk went to the KVM executor, whose descriptor links Reverie
+/// F2-d deleted: every absolute spelling through `D` answered `EACCES`
+/// (`/proc/self/fd/D/N` in `c-programs/proc-fd-directory` among them), and
+/// one followed by a final slash or by `/.` answered `ELOOP`. The walk counts
+/// every link Linux follows across the substitutions (each `self` a `/proc`
+/// descriptor exposes, and `N`'s own link where `/` or `/.` follows it), so
+/// the budget lines answer as natively; before that count, 20 `/proc`
+/// segments read the target (`N`'s and `D`'s alike) and 39 `D` segments
+/// before `N/` or `N/.` answered `ENOTDIR`, where Linux answers `ELOOP`.
+/// The final link is charged only where the caller's table holds its
+/// descriptor: charged by its spelling alone, a closed descriptor or a name
+/// that is no number after 39 `D` segments answered `ELOOP` on both
+/// backends, where Linux answers `ENOENT`. A `..` right after `D` climbs out
+/// of the directory's own spelling (`/proc/<pid>/fd/..` is `/proc/<pid>`);
+/// kept in the respelled path, it sent `D/../fd/N` and `D/../../self/fd/N`
+/// on to the KVM executor, whose descriptor links Reverie F2-d deleted:
+/// `EACCES`.
+#[test]
+fn run_kvm_descriptor_links_through_a_descriptor_directory_answer_as_linux() {
+    let test = "run_kvm_descriptor_links_through_a_descriptor_directory_answer_as_linux";
+    if kvm_unavailable(test) {
+        return;
+    }
+    let native = directory_links_native();
+    assert_eq!(
+        proc_link_targets_at_l2_with("kvm", &["--directory-links"]),
+        native,
+        "kvm"
+    );
+}
+
+/// The link-targets guest's `--sibling-directories` transcript, run
+/// natively: another live thread's `cwd` and `root` links, which it shares
+/// with the caller (`CLONE_FS`).
+fn sibling_directory_links_native() -> String {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let output = Command::new(proc_link_targets_guest())
+        .arg(directory.path())
+        .arg("--sibling-directories")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the link-targets guest natively");
+    assert!(output.status.success(), "native: {output:?}");
+    let native = stdout(&output);
+    assert_eq!(
+        native,
+        "sibling: self/task/<tid>/cwd=<dir>\nsibling: self/task/<tid>/root=/\nfailures=0\n"
+    );
+    native
+}
+
+/// Another live thread's `cwd` and `root` links
+/// (`/proc/self/task/<tid>/{cwd,root}`, `tests/c/proc_link_targets.c
+/// --sibling-directories`) on ptrace, where the kernel answers them, at L2,
+/// as natively: the directories the threads share. The KVM twin is
+/// [`run_kvm_another_threads_directory_links_are_refused_by_name`].
+#[test]
+fn another_threads_directory_links_answer_as_linux() {
+    let native = sibling_directory_links_native();
+    assert_eq!(
+        proc_link_targets_at_l2_with("ptrace", &["--sibling-directories"]),
+        native,
+        "ptrace"
+    );
+}
+
+/// Another live thread's `cwd` and `root` links
+/// ([`another_threads_directory_links_answer_as_linux`]) on KVM: refused by
+/// name, through the unsupported-operation policy (exit
+/// `HERMIT_POLICY_REFUSAL_EXIT`), before the guest prints them. Detcore reads
+/// the working directory from the backend's `link_path` fact, which names the
+/// calling thread's alone, and nothing Detcore keeps says whether the other
+/// thread shares the caller's (package K slice F2-d0; the KVM executor keeps a
+/// working directory per thread, https://github.com/rrnewton/hermit/issues/4698).
+/// Before, the call reached the executor's walk of the supervisor's own
+/// `/proc/self/task/<tid>`, which answered `EACCES`, the host's answer for a
+/// number of the supervisor's own.
+#[test]
+fn run_kvm_another_threads_directory_links_are_refused_by_name() {
+    let test = "run_kvm_another_threads_directory_links_are_refused_by_name";
+    if kvm_unavailable(test) {
+        return;
+    }
+    sibling_directory_links_native();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let guest = proc_link_targets_guest();
+    let args = [
+        "--backend",
+        "kvm",
+        "run",
+        "--strict",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--base-env=minimal",
+        "--",
+        guest.to_str().expect("guest path is UTF-8"),
+        directory.path().to_str().expect("directory path is UTF-8"),
+        "--sibling-directories",
+    ];
+    let output = hermit(&args);
+    let stderr = stderr(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{args:?}: {stderr}"
+    );
+    assert!(
+        stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("readlink refused: /proc/self/task/")
+            && stderr.contains(
+                "/cwd cannot be served: on this backend Detcore reads the working and root \
+                 directories of the calling thread alone, from the backend's link_path fact, and \
+                 does not know whether another thread shares them \
+                 (https://github.com/rrnewton/hermit/issues/4698)"
+            ),
+        "{stderr}"
+    );
+    assert_eq!(stdout(&output), "", "the guest printed past the refusal");
 }
