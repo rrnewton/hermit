@@ -4667,7 +4667,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And https://github.com/rrnewton/hermit/pull/4772's
     // no_namespace_bisect_replays_the_schedules_it_writes and
     // no_namespace_minimize_replays_its_candidate_records: 795 + 2 = 797.
-    ("test.cli", 797),
+    // PR #4761 renames and host-limits two previously executed strict
+    // binder cases (a_fresh_strict_run_refuses_binder and
+    // a_strict_replay_refuses_binder), so two fewer execute: 797 - 2 = 795.
+    ("test.cli", 795),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5335,7 +5338,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR #4751: the same host-limited binder gate: 715 - 1 = 714.
     // And the same --no-namespace bisect and --minimize tests, not excluded:
     // 714 + 2 = 716.
-    ("test.cli_on_host", 716),
+    // PR #4761: the same two strict binder tests ignored: 716 - 2 = 714.
+    ("test.cli_on_host", 714),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
