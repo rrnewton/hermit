@@ -1473,6 +1473,7 @@ mod tests {
         (
             "rewrite-exclusives-mode",
             &["--rewrite-exclusives", "--rewrite-exclusives-mode=memory"],
+        ),
         (
             "watch",
             &[
