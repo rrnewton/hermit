@@ -1992,7 +1992,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And rundata::tests::a_recorded_target_run_replays_a_workspace_copy_within_an_explicit_bound:
     // 1257 + 1 = 1258.
     // PR 4920 (3): the prefix-trial unit: 1258 + 1 = 1259.
-    ("test.hermit_unit", 1260),
+    // And PR #4759's prefix-trial uncapped-mark unit (nextest list against
+    // main f76f9b8c: 1362 -> 1363): 1260 + 1 = 1261.
+    ("test.hermit_unit", 1261),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3293,7 +3295,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And scheduler a_replayed_switch_wakes_its_due_target, restored from
     // https://github.com/rrnewton/hermit/pull/4889: 3492 + 2 = 3494
     // (wake unit + deferred-SIGCHLD negative arm).
-    ("test.detcore_unit", 3521),
+    // And PR #4759's eight detcore units (seven uncapped-slices units and
+    // the slice-evidence unit; nextest list against main f76f9b8c:
+    // 3715 -> 3723): 3521 + 8 = 3529.
+    ("test.detcore_unit", 3529),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4674,7 +4679,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // no_namespace_minimize_replays_its_candidate_records: 795 + 2 = 797.
     // And analyze_replays_a_recorded_target_instead_of_panicking: 797 + 1 = 798.
     // PR 4920 (3): prefix-stack and fatal-time-skip cases: 798 + 2 = 800.
-    ("test.cli", 798),
+    // And PR #4759's uncapped-slice replay case (nextest list against
+    // main f76f9b8c: 977 -> 978): 798 + 1 = 799.
+    ("test.cli", 799),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5344,7 +5351,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 714 + 2 = 716.
     // And the same recorded-target regression test: 716 + 1 = 717.
     // PR 4920 (3): the same two cases: 717 + 2 = 719.
-    ("test.cli_on_host", 717),
+    // And the same one PR #4759 cli case as test.cli: 717 + 1 = 718.
+    ("test.cli_on_host", 718),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
@@ -5929,7 +5937,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same unit (same growth as test.detcore_unit, PR #4926): 3469 + 1 = 3470.
     // PR #4751: the same twelve units (same growth as test.detcore_unit): 3482.
     // And the same two replayed-switch wake units: 3492 + 2 = 3494.
-    ("test.detcore_unit_on_host", 3521),
+    // And the same eight PR #4759 units as test.detcore_unit: 3521 + 8 = 3529.
+    ("test.detcore_unit_on_host", 3529),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -6351,7 +6360,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same trial-record stamping unit: 1250 + 1 = 1251.
     // And the same run1-preemptions test: 1251 + 1 = 1252.
     // PR 4920 (3): the same unit: 1252 + 1 = 1253.
-    ("test.hermit_unit_on_host", 1254),
+    // And the same one PR #4759 unit as test.hermit_unit: 1254 + 1 = 1255.
+    ("test.hermit_unit_on_host", 1255),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
