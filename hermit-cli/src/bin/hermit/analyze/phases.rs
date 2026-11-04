@@ -1486,11 +1486,8 @@ impl AnalyzeOpts {
             &PreemptionRecord,
             usize,
             Option<(&'static str, u64)>,
-        ) -> anyhow::Result<(
-            CompletedScheduleTrial,
-            PathBuf,
-            Option<TracedReplay>,
-        )>,
+        )
+            -> anyhow::Result<(CompletedScheduleTrial, PathBuf, Option<TracedReplay>)>,
     {
         let PrefixDecision {
             schedule,
