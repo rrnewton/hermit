@@ -297,7 +297,7 @@ mod tests {
         // 25 on its own base after main's 24, assigned 42 at its rebase
         // onto 41, skipping 33 to 39 reserved for pending changes; digest
         // measured at this head).
-        (42, "0000000000000000", "f013e36743d8d9e6"),
+        (42, "aa178017abfd366e", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
