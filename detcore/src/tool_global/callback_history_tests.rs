@@ -882,8 +882,25 @@ async fn drive_callback_hook<F: std::future::Future>(
 }
 
 async fn legacy_callback_expired_deadline_trial(annotated: bool, owner_switch: bool) -> (LogicalTime, LogicalTime) {
+    legacy_callback_expired_deadline_trial_at(
+        crate::preemptions::callback_history::Site::Prehook,
+        annotated,
+        owner_switch,
+        false,
+    )
+    .await
+}
+
+// As above, with the recorded checkpoint at `site` of the timer callback, and
+// the replay run with `--chaos` when `chaos`.
+async fn legacy_callback_expired_deadline_trial_at(
+    site: crate::preemptions::callback_history::Site,
+    annotated: bool,
+    owner_switch: bool,
+    chaos: bool,
+) -> (LogicalTime, LogicalTime) {
     use reverie::Tool;
-    use crate::preemptions::callback_history::{Origin, Site, Startup};
+    use crate::preemptions::callback_history::{Origin, Startup};
     use crate::slice_boundary::callbacks::Callback;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("expired-deadline.json");
@@ -891,6 +908,7 @@ async fn legacy_callback_expired_deadline_trial(annotated: bool, owner_switch: b
     let peer = DetTid::from_raw(18);
     let mut config = Config {
         sequentialize_threads: true,
+        chaos,
         replay_schedule_from: Some(path.clone()),
         max_timeslice: std::num::NonZeroU64::new(5_000_000),
         target_timeslice: std::num::NonZeroU64::new(1_000_000),
@@ -911,7 +929,7 @@ async fn legacy_callback_expired_deadline_trial(annotated: bool, owner_switch: b
     writer.insert_schedevent(SchedEvent { dettid: tid, op: Op::OtherInstructions, count: 1, start_rip: None, end_rip: None, end_time: None });
     writer.insert_schedevent(SchedEvent::syscall(tid, Sysno::close, detcore_model::schedule::SyscallPhase::Prehook));
     writer.insert_reprioritization(tid, at, 11, DEFAULT_PRIORITY, DEFAULT_PRIORITY);
-    if annotated { writer.insert_callback_checkpoint(tid, Origin { callback: Callback::PmuTimer, site: Site::Prehook, progress: 11, last_op: Some(Op::Branch), time: at, rcbs: 11 }); }
+    if annotated { writer.insert_callback_checkpoint(tid, Origin { callback: Callback::PmuTimer, site, progress: 11, last_op: Some(Op::Branch), time: at, rcbs: 11 }); }
     std::fs::write(&path, writer.into_string()).unwrap();
     let (config, state, tid, process) = cancellation_test_state_with_config(config);
     install_test_registration(&state, tid, Ivar::new());
@@ -988,4 +1006,608 @@ async fn legacy_callback_checkpoint_subsumes_expired_tracereplay_deadline_once()
         let baseline = legacy_callback_expired_deadline_trial(false, true).await;
         assert_eq!(legacy_callback_expired_deadline_trial(true, true).await, baseline);
     }).await.expect("bounded expired TraceReplay Go(None) callback");
+}
+
+// The record ended the timer's slice at its post-hook, within one RCB of the
+// PMU maximum, while the replay reaches the replayed branch deadline already
+// at the pre-hook. The slice ends once, at the checkpoint, as in the record:
+// before, the pre-hook ended it too, one commit more than recorded.
+#[tokio::test]
+async fn legacy_callback_checkpoint_at_the_pmu_epsilon_ends_an_expired_deadline_once() {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let baseline = legacy_callback_expired_deadline_trial(false, false).await;
+        let at_epsilon = legacy_callback_expired_deadline_trial_at(
+            crate::preemptions::callback_history::Site::PosthookPmuEpsilon,
+            true,
+            false,
+            false,
+        )
+        .await;
+        assert_eq!(at_epsilon, baseline);
+    })
+    .await
+    .expect("bounded expired Continue(None) callback with a PMU-epsilon checkpoint");
+}
+
+// Under `--chaos` the same replay ends the slice as it does without: no random
+// priority change point at the expired deadline (the trial counts it as a
+// skipped turn) and no drawn slice end after it (the trial checks the next
+// slice end is the backstop), so the commits and the clocks agree.
+#[tokio::test]
+async fn legacy_chaos_replay_ends_an_expired_deadline_as_without_chaos() {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let baseline = legacy_callback_expired_deadline_trial(false, false).await;
+        let chaos = legacy_callback_expired_deadline_trial_at(
+            crate::preemptions::callback_history::Site::Prehook,
+            false,
+            false,
+            true,
+        )
+        .await;
+        assert_eq!(chaos, baseline);
+    })
+    .await
+    .expect("bounded expired Continue(None) callback under --chaos");
+}
+
+/// A guest of `state`'s schedule replay for the slice-end tests below, its
+/// clock at `reported_rcbs`.
+fn schedule_replay_guest<'a>(
+    state: &'a GlobalState,
+    config: &'a Config,
+    thread: crate::ThreadState<()>,
+    reported_rcbs: u64,
+) -> LegacyDeadlineGuest<'a> {
+    LegacyDeadlineGuest {
+        inner: ExternalRegistrationGuest {
+            global: state,
+            config,
+            thread,
+            requests: Mutex::new(Vec::new()),
+            post_exec: false,
+            ppid: None,
+            private_memory: None,
+        },
+        clock_reads: 0,
+        reported_rcbs,
+        timers: Vec::new(),
+        responses: Mutex::new(Vec::new()),
+    }
+}
+
+/// Writes `events` for thread 17 as a schedule-replay record at `path`, with
+/// whatever `more` adds to it, and returns the replay's state and the thread,
+/// past its first exec, in its first slice: under a schedule replay
+/// `next_timeslice` installs the `--max-timeslice` backstop
+/// (`replay_backstop`).
+fn schedule_replay_thread(
+    path: &std::path::Path,
+    config: Config,
+    events: &[SchedEvent],
+    more: impl FnOnce(&mut crate::preemptions::PreemptionWriter),
+) -> (Config, GlobalState, crate::ThreadState<()>) {
+    let mut writer = crate::preemptions::PreemptionWriter::new(None);
+    let tid = DetTid::from_raw(17);
+    writer.register_thread(tid, DEFAULT_PRIORITY);
+    for event in events {
+        writer.insert_schedevent(event.clone());
+    }
+    more(&mut writer);
+    std::fs::write(path, writer.into_string()).unwrap();
+    let (config, state, tid, process) = cancellation_test_state_with_config(config);
+    install_test_registration(&state, tid, Ivar::new());
+    state
+        .past_first_execve
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut thread = crate::ThreadState::new(tid, &config, ());
+    thread.detpid = Some(process);
+    thread.past_global_first_execve = true;
+    thread.next_timeslice(&config);
+    assert!(thread.replay_backstop.is_some(), "a schedule replay's backstop");
+    (config, state, thread)
+}
+
+fn other_instructions(tid: DetTid) -> SchedEvent {
+    SchedEvent {
+        dettid: tid,
+        op: Op::OtherInstructions,
+        count: 1,
+        start_rip: None,
+        end_rip: None,
+        end_time: None,
+    }
+}
+
+// The replayer's deadline for a thread's next recorded event, which
+// `trace_schedevent` installs, is the schedule's slice end: it bounds the
+// PMU maximum and is no backstop, so it clears the backstop the slice kept.
+// A recorded slice end can fall on the backstop's nanosecond, and a callback
+// checkpoint's restart (`restart_replay_backstop`) took it for the backstop
+// and moved it a whole --max-timeslice later.
+//
+// The replayer gives such a deadline only for a timer preemption, which a
+// recording writes as branches carrying the RIP the PMU stopped at
+// (`Replayer::resolve_time_to_run`). Branches without it that the thread's
+// OtherInstructions follows reached a check-in, which the thread reaches on
+// its own: no deadline is installed, and the slice keeps its end and its
+// backstop.
+#[tokio::test]
+async fn a_replayed_event_deadline_is_the_schedules_and_no_backstop() {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let tid = DetTid::from_raw(17);
+        let call = SchedEvent::syscall(
+            tid,
+            Sysno::close,
+            detcore_model::schedule::SyscallPhase::Prehook,
+        );
+        let timer_stop = SchedEvent {
+            end_rip: detcore_model::schedule::InstructionPointer::new(0x4000),
+            ..SchedEvent::branches(tid, 90)
+        };
+        for (name, branches, stops) in [
+            ("a timer preemption", timer_stop, true),
+            (
+                "branches before a check-in",
+                SchedEvent::branches(tid, 90),
+                false,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("event-deadline.json");
+            let mut config = Config {
+                sequentialize_threads: true,
+                replay_schedule_from: Some(path.clone()),
+                max_timeslice: std::num::NonZeroU64::new(5_000_000),
+                ..Config::default()
+            };
+            config.validate();
+            let (config, state, thread) = schedule_replay_thread(
+                &path,
+                config,
+                &[
+                    call.clone(),
+                    branches,
+                    other_instructions(tid),
+                    SchedEvent::branches(tid, 5),
+                ],
+                |_| {},
+            );
+            let mut guest = schedule_replay_guest(&state, &config, thread, 0);
+            let now = guest.thread.thread_logical_time.as_nanos();
+            let kept = (
+                guest.thread.end_of_timeslice,
+                guest.thread.max_timeslice_end,
+                guest.thread.replay_backstop,
+            );
+            let mut event = call.clone();
+            event.end_time = Some(now);
+            super::trace_schedevent(&mut guest, event, false).await;
+            let after = (
+                guest.thread.end_of_timeslice,
+                guest.thread.max_timeslice_end,
+                guest.thread.replay_backstop,
+            );
+            if stops {
+                // The next recorded event is a timer stop after 90 branches.
+                let deadline = Some(now + LogicalTime::from_rcbs(90));
+                assert_eq!(after, (deadline, deadline, None), "{name}");
+            } else {
+                assert!(kept.2.is_some(), "{name}: the slice's backstop");
+                assert_eq!(after, kept, "{name}");
+            }
+        }
+    })
+    .await
+    .expect("bounded replayed event deadline");
+}
+
+// Without RCB time, a schedule replay whose PMU maximum stops the thread
+// installs the slice end the schedule still holds, or the fallback past the
+// maximum (`handle_timer_event`). That slice end is the schedule's too: it
+// clears the backstop the slice kept, as `trace_schedevent`'s does.
+#[tokio::test]
+async fn a_replayed_slice_end_past_the_maximum_is_the_schedules_and_no_backstop() {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        use reverie::Tool;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("past-maximum.json");
+        let tid = DetTid::from_raw(17);
+        let mut config = Config {
+            sequentialize_threads: true,
+            no_rcb_time: true,
+            replay_schedule_from: Some(path.clone()),
+            max_timeslice: std::num::NonZeroU64::new(1_000),
+            ..Config::default()
+        }
+        .with_backend(|backend| backend.delivers_preemption_timer_events = true);
+        config.validate();
+        let (config, state, mut thread) = schedule_replay_thread(
+            &path,
+            config,
+            &[other_instructions(tid), SchedEvent::branches(tid, 5)],
+            |_| {},
+        );
+        let maximum = thread.max_timeslice_end.expect("a PMU maximum");
+        assert_eq!(thread.replay_backstop, Some(maximum));
+        thread.last_rcb_timer_is_max = true;
+        let mut guest = schedule_replay_guest(&state, &config, thread, 0);
+        let tool: Detcore = Detcore::new(Tid::from_raw(tid.as_raw()), &config);
+        let mut previous = Err(crate::scheduler::SkipTurn);
+        drive_callback_hook(&state, tid, tool.handle_timer_event(&mut guest), &mut previous).await;
+        // The schedule's slice end was the maximum itself, so the fallback,
+        // one --max-timeslice past it, is installed.
+        let fallback = maximum + Duration::from_nanos(1_000);
+        assert_eq!(guest.thread.thread_logical_time.as_nanos(), maximum);
+        assert_eq!(guest.thread.end_of_timeslice, Some(fallback));
+        assert_eq!(guest.thread.max_timeslice_end, Some(fallback));
+        assert_eq!(guest.thread.replay_backstop, None);
+    })
+    .await
+    .expect("bounded replayed maximum without RCB time");
+}
+
+// A callback checkpoint that a schedule replay applies as an administrative
+// turn keeps the slice, and restarts the `--max-timeslice` backstop the slice
+// kept from now (`restart_replay_backstop`), as the recorded run began a new
+// slice there. Counted from the kept slice's start, the backstop would end
+// the next replayed slice early, at a point the record does not have.
+#[tokio::test]
+async fn a_replayed_checkpoint_that_keeps_the_slice_restarts_its_backstop() {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        use reverie::Tool;
+        use crate::preemptions::callback_history::{Origin, Site, Startup};
+        use crate::slice_boundary::callbacks::Callback;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kept-slice.json");
+        let tid = DetTid::from_raw(17);
+        let max_timeslice = 5_000_000;
+        let mut config = Config {
+            sequentialize_threads: true,
+            replay_schedule_from: Some(path.clone()),
+            max_timeslice: std::num::NonZeroU64::new(max_timeslice),
+            target_timeslice: std::num::NonZeroU64::new(1_000_000),
+            ..Config::default()
+        }
+        .with_backend(|backend| backend.delivers_preemption_timer_events = true);
+        config.validate();
+        let start = crate::ThreadState::new(tid, &config, ()).thread_logical_time.as_nanos();
+        let at = start + Duration::from_nanos(110);
+        let call = SchedEvent::syscall(
+            tid,
+            Sysno::close,
+            detcore_model::schedule::SyscallPhase::Prehook,
+        );
+        let (config, state, mut thread) = schedule_replay_thread(
+            &path,
+            config,
+            &[
+                SchedEvent::branches(tid, 1),
+                SchedEvent::branches(tid, 10),
+                other_instructions(tid),
+                call,
+                SchedEvent::branches(tid, 90),
+            ],
+            // The recorded run began a new slice at the call, after 11
+            // branches, and kept running.
+            |writer| {
+                writer.insert_reprioritization(tid, at, 11, DEFAULT_PRIORITY, DEFAULT_PRIORITY);
+                writer.insert_callback_checkpoint(
+                    tid,
+                    Origin {
+                        callback: Callback::Syscall(Sysno::close),
+                        site: Site::Prehook,
+                        progress: 12,
+                        last_op: Some(Op::OtherInstructions),
+                        time: at,
+                        rcbs: 11,
+                    },
+                );
+            },
+        );
+        let backstop = thread.replay_backstop.expect("the kept slice's backstop");
+        assert_eq!(thread.end_of_timeslice, Some(backstop));
+        thread.callback_history.install(Startup {
+            checkpoints: state
+                .sched
+                .lock()
+                .unwrap()
+                .callback_checkpoints
+                .get(&tid)
+                .map(|points| points.iter().cloned().collect())
+                .unwrap_or_default(),
+            ..Startup::default()
+        });
+        let mut guest = schedule_replay_guest(&state, &config, thread, 1);
+        let tool: Detcore = Detcore::new(Tid::from_raw(tid.as_raw()), &config);
+        let mut previous = Err(crate::scheduler::SkipTurn);
+        for rcbs in [1, 11] {
+            guest.reported_rcbs = rcbs;
+            let pre = tool.pre_handler_hook_observed(
+                &mut guest,
+                true,
+                crate::CheckIn::Event,
+                Some(Callback::PmuTimer),
+            );
+            let (token, _, _) = drive_callback_hook(&state, tid, pre, &mut previous).await;
+            drive_callback_hook(
+                &state,
+                tid,
+                tool.post_handler_hook_observed(&mut guest, crate::CheckIn::Event, token),
+                &mut previous,
+            )
+            .await;
+        }
+        assert_eq!(guest.thread.thread_logical_time.as_nanos(), at);
+        assert_eq!(guest.thread.end_of_timeslice, Some(backstop));
+
+        let call = tool.pre_handler_hook_observed(
+            &mut guest,
+            false,
+            crate::CheckIn::Event,
+            Some(Callback::Syscall(Sysno::close)),
+        );
+        drive_callback_hook(&state, tid, call, &mut previous).await;
+        let restarted = at + Duration::from_nanos(max_timeslice);
+        assert!(restarted > backstop);
+        assert_eq!(guest.thread.end_of_timeslice, Some(restarted));
+        assert_eq!(guest.thread.max_timeslice_end, Some(restarted));
+        assert_eq!(guest.thread.replay_backstop, Some(restarted));
+        let scheduler = state.sched.lock().unwrap();
+        assert!(scheduler.callback_checkpoints.values().all(|points| points.is_empty()));
+        assert!(
+            scheduler
+                .replayer
+                .as_ref()
+                .unwrap()
+                .desync_counts
+                .values()
+                .all(|stats| stats.soft == 0 && stats.hard == 0)
+        );
+    })
+    .await
+    .expect("bounded kept slice at a replayed checkpoint");
+}
+
+/// The recorded callback ended a slice even when the event cursor already
+/// installed a later deadline. Refresh its slowdown at this callback's time,
+/// while retaining that deadline, its ownership, statistics and one turn.
+#[tokio::test]
+async fn a_replayed_callback_slice_end_refreshes_its_slowdown_epoch_without_replacing_its_deadline() {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        use reverie::Tool;
+
+        use crate::preemptions::callback_history::{Origin, Site, Startup};
+        use crate::slice_boundary::callbacks::Callback;
+        use crate::tool_local::chaos_per_thread_slowdown_factor;
+        use detcore_model::time::RcbTimeMultiplier;
+
+        for (slowdown, epoch_length, logical_slice) in [
+            (true, 1_000, true),
+            (true, 0, true),
+            (false, 1_000, true),
+            (true, 1_000, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("callback-slowdown.json");
+            let tid = DetTid::from_raw(17);
+            let mut config = Config {
+                sequentialize_threads: true,
+                chaos: true,
+                seed: 3,
+                chaos_per_thread_slowdown: slowdown,
+                chaos_epoch_length_ns: epoch_length,
+                chaos_slowdown_max_factor: 4.0,
+                replay_schedule_from: Some(path.clone()),
+                max_timeslice: logical_slice.then(|| std::num::NonZeroU64::new(5_000_000).unwrap()),
+                target_timeslice: logical_slice.then(|| std::num::NonZeroU64::new(1_000).unwrap()),
+                ..Config::default()
+            }
+            .with_backend(|backend| backend.delivers_preemption_timer_events = true);
+            config.validate();
+            let active = slowdown && logical_slice;
+            let initial_factor = if active {
+                chaos_per_thread_slowdown_factor(config.sched_seed(), tid, 0, 4.0)
+            } else {
+                RcbTimeMultiplier::ONE
+            };
+            let mut clock = crate::ThreadState::new(tid, &config, ()).thread_logical_time;
+            let rcbs = if logical_slice { 1_100 } else { 0 };
+            if logical_slice {
+                clock.add_rcbs_with_multiplier(rcbs, initial_factor);
+            } else {
+                // No maximum also means no RCB clock. A prior syscall has
+                // nevertheless advanced time beyond epoch zero.
+                clock.add_syscall();
+            }
+            let at = clock.as_nanos();
+            let elapsed = clock.without_starting().as_nanos();
+            let expected_epoch = elapsed.checked_div(epoch_length).unwrap_or(0);
+            let expected_factor = if active {
+                chaos_per_thread_slowdown_factor(config.sched_seed(), tid, expected_epoch, 4.0)
+            } else {
+                RcbTimeMultiplier::ONE
+            };
+            if active && epoch_length != 0 {
+                assert!(expected_epoch > 0);
+                assert_ne!(expected_factor, initial_factor);
+            }
+            let callback = if logical_slice {
+                Callback::PmuTimer
+            } else {
+                Callback::Syscall(Sysno::close)
+            };
+            let mut writer = crate::preemptions::PreemptionWriter::new(None);
+            writer.register_thread(tid, DEFAULT_PRIORITY);
+            if logical_slice {
+                writer.insert_schedevent(SchedEvent::branches(tid, u32::try_from(rcbs).unwrap()));
+            }
+            writer.insert_schedevent(other_instructions(tid));
+            writer.insert_schedevent(SchedEvent::syscall(
+                tid,
+                Sysno::close,
+                detcore_model::schedule::SyscallPhase::Prehook,
+            ));
+            writer.insert_reprioritization(tid, at, rcbs, DEFAULT_PRIORITY, DEFAULT_PRIORITY);
+            writer.insert_callback_checkpoint(
+                tid,
+                Origin {
+                    callback,
+                    site: Site::Prehook,
+                    progress: rcbs,
+                    last_op: logical_slice.then_some(Op::Branch),
+                    time: at,
+                    rcbs,
+                },
+            );
+            std::fs::write(&path, writer.into_string()).unwrap();
+            let (config, state, registered, process) = cancellation_test_state_with_config(config);
+            assert_eq!(registered, tid);
+            install_test_registration(&state, tid, Ivar::new());
+            state
+                .past_first_execve
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let mut thread = crate::ThreadState::new(tid, &config, ());
+            thread.detpid = Some(process);
+            thread.past_global_first_execve = true;
+            thread.next_timeslice(&config);
+            if !logical_slice {
+                assert_eq!((config.target_timeslice, config.max_timeslice), (None, None));
+                assert!(!thread.chaos_slowdown_active);
+                assert_eq!(thread.end_of_timeslice, None);
+                thread.thread_logical_time.add_syscall();
+            }
+            thread.callback_history.install(Startup {
+                checkpoints: state.sched.lock().unwrap().callback_checkpoints[&tid]
+                    .iter()
+                    .cloned()
+                    .collect(),
+                ..Startup::default()
+            });
+            // A previous replay reply may have installed this future end.
+            // It is beyond another epoch, so using it as this boundary would
+            // install the wrong factor even if the old factor were refreshed.
+            let future = at + Duration::from_nanos(9_000_000);
+            thread.install_schedule_deadline(future, logical_slice);
+            if let Some(future_epoch) = (elapsed + 9_000_000).checked_div(epoch_length) {
+                assert_ne!(future_epoch, expected_epoch);
+            }
+            thread.take_pending_chaos_epochs();
+            let stats = serde_json::to_value(&thread.stats).unwrap();
+            let generator = thread.chaos_prng.clone();
+            let mut guest = schedule_replay_guest(&state, &config, thread, rcbs);
+            let tool: Detcore = Detcore::new(Tid::from_raw(tid.as_raw()), &config);
+            let mut previous = Err(crate::scheduler::SkipTurn);
+            let (_, commits, skips) = drive_callback_hook(
+                &state,
+                tid,
+                tool.pre_handler_hook_observed(
+                    &mut guest,
+                    logical_slice,
+                    crate::CheckIn::Event,
+                    Some(callback),
+                ),
+                &mut previous,
+            )
+            .await;
+            assert_eq!((commits, skips), (1, 1));
+            assert_eq!(guest.thread.thread_logical_time.as_nanos(), at);
+            assert_eq!(guest.thread.end_of_timeslice, Some(future));
+            assert_eq!(guest.thread.max_timeslice_end, logical_slice.then_some(future));
+            assert_eq!(guest.thread.replay_backstop, None);
+            assert_eq!(serde_json::to_value(&guest.thread.stats).unwrap(), stats);
+            assert_eq!(guest.thread.chaos_prng, generator);
+            assert_eq!(guest.thread.rcb_time_multiplier(), expected_factor);
+            assert_eq!(guest.thread.chaos_slowdown_active, active);
+            if active {
+                assert_eq!(guest.thread.chaos_epoch, expected_epoch);
+            }
+            // The actual priority request transfers the pending transitions
+            // before this hook returns. Observe that captured RPC payload,
+            // not the local buffer it has already drained.
+            let changes: Vec<_> = {
+                let requests = guest.requests.lock().unwrap();
+                requests
+                    .iter()
+                    .filter_map(|request| {
+                        let mut request = request;
+                        while let GlobalRequest::WithForwardedCount(_, inner) = request {
+                            request = inner;
+                        }
+                        match request {
+                            GlobalRequest::RequestResources(resources, _) => Some(resources),
+                            _ => None,
+                        }
+                    })
+                    .flat_map(|request| {
+                        request
+                            .resources
+                            .keys()
+                            .filter_map(move |resource| match resource {
+                                ResourceID::PriorityChangePoint(_, time, rcbs, epochs) => {
+                                    assert_eq!(request.resources.len(), 1);
+                                    Some((
+                                        *time,
+                                        *rcbs,
+                                        epochs.clone(),
+                                        request.callback_checkpoint.clone(),
+                                    ))
+                                }
+                                _ => None,
+                            })
+                    })
+                    .collect()
+            };
+            assert_eq!(changes.len(), 1);
+            let (change_time, change_rcbs, transitions, origin) = &changes[0];
+            assert_eq!(*change_time, at);
+            assert_eq!(*change_rcbs, rcbs);
+            assert_eq!(
+                origin.as_deref(),
+                Some(&Origin {
+                    callback,
+                    site: Site::Prehook,
+                    progress: rcbs,
+                    last_op: logical_slice.then_some(Op::Branch),
+                    time: at,
+                    rcbs,
+                })
+            );
+            assert!(guest.thread.take_pending_chaos_epochs().is_empty());
+            if active && epoch_length != 0 {
+                assert_eq!(transitions.len(), 1);
+                assert_eq!(transitions[0].logical_time, at);
+                assert_eq!(transitions[0].epoch, expected_epoch);
+                assert_eq!(transitions[0].factor, expected_factor);
+            } else {
+                assert!(transitions.is_empty());
+            }
+            if logical_slice {
+                // Use the real clock-update route, not only the factor field:
+                // these next RCBs must receive the newly installed Q32 weight.
+                let mut expected_clock = guest.thread.thread_logical_time.clone();
+                expected_clock.add_rcbs_with_multiplier(7, expected_factor);
+                guest.reported_rcbs += 7;
+                let events = tool.update_logical_time_rcbs(&mut guest, true).await.unwrap();
+                assert_eq!(events.len(), 1);
+                assert_eq!((events[0].op, events[0].count), (Op::Branch, 7));
+                assert_eq!(guest.thread.committed_clock_value, 1_107);
+                assert_eq!(
+                    guest.thread.thread_logical_time.as_nanos(),
+                    expected_clock.as_nanos()
+                );
+            } else {
+                assert_eq!(guest.clock_reads, 0);
+            }
+            let scheduler = state.sched.lock().unwrap();
+            assert!(
+                scheduler.callback_checkpoints.values().all(|points| points.is_empty())
+            );
+            assert!(
+                scheduler.replayer.as_ref().unwrap().desync_counts.values()
+                    .all(|counts| counts.soft == 0 && counts.hard == 0)
+            );
+        }
+    })
+    .await
+    .expect("bounded replayed callback slowdown transition");
 }
