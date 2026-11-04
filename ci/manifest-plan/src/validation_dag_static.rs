@@ -1273,6 +1273,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4920 (3): two model/config units: 1955 + 2 = 1957.
     // The shared-mapping tests of https://github.com/rrnewton/hermit/pull/5120
     // on this main: 1957 + 26 = 1983.
+    // The two hermit-replay unit tests of the MAP_FIXED_NOREPLACE fix: 1983 + 2 = 1985.
     ("test.regular_crates", 1983),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
@@ -3895,7 +3896,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 1 (https://github.com/rrnewton/hermit/pull/5057) adds two
     // record/replay units: 229 + 2 = 231, measured by the 216dbc929a full
     // validate.
-    ("test.record_replay", 250),
+    // The MAP_FIXED_NOREPLACE fix for https://github.com/rrnewton/hermit/pull/5120
+    // adds five placement tests: 250 + 5 = 255.
+    ("test.record_replay", 255),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -5362,6 +5365,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4920 (3): the same two units: 1941 + 2 = 1943.
     // The shared-mapping tests of https://github.com/rrnewton/hermit/pull/5120
     // on this main: 1943 + 26 = 1969.
+    // The two hermit-replay unit tests of the MAP_FIXED_NOREPLACE fix: 1969 + 2 = 1971.
     ("test.regular_crates_on_host", 1969),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
@@ -6599,6 +6603,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4920 (3): the same two units: 1941 + 2 = 1943.
     // The shared-mapping tests of https://github.com/rrnewton/hermit/pull/5120
     // on this main: 1943 + 26 = 1969.
+    // The two hermit-replay unit tests of the MAP_FIXED_NOREPLACE fix: 1969 + 2 = 1971.
     ("test.regular_crates_on_host", 1969),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
