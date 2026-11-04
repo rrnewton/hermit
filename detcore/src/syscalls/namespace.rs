@@ -13,7 +13,6 @@
 mod own_getters_tests;
 #[path = "namespace/own_links.rs"]
 mod own_links;
-
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Component;
@@ -21,6 +20,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+pub(crate) use own_links::procfs_file_link_name;
 use reverie::Errno;
 use reverie::Error;
 use reverie::Guest;
@@ -1907,6 +1907,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     async fn readlink_decided_link<G: Guest<Self>>(
         &self,
         guest: &mut G,
+        sysno: reverie::syscalls::Sysno,
         path: &Path,
         (spelled, link): (&Path, (i32, Option<PathPtr<'_>>)),
         buffer: Option<AddrMut<'_, libc::c_char>>,
@@ -1934,10 +1935,25 @@ impl<T: RecordOrReplay> Detcore<T> {
         let unprefixed = serves
             .then(|| procfs_leading_components_dropped(bytes))
             .flatten();
+        // A walk through one of the caller's descriptor links to a directory
+        // Detcore serves there (`/proc/self/fd/D/N`, `/dev/fd/D/N`, and
+        // `/proc/self/fd/P/self/fd/N` through a descriptor on `/proc`) goes
+        // on from the directory's own spelling, as Linux follows the link,
+        // so the link it ends at is decided as that spelling is: the
+        // backend's executor, which answered such a walk before Reverie
+        // F2-d, has no `/proc` of the guest's to walk.
         let resolved = if serves {
             let follows_last = bytes.ends_with(b"/") || bytes.ends_with(b"/.");
-            match Self::own_tree_resolved(guest, bytes, follows_last).await {
-                Ok(resolved) => resolved,
+            let through = match Self::through_own_descriptor_links(guest, bytes) {
+                Ok(through) => through,
+                Err(errno) => {
+                    readlink_size(buffer_len)?;
+                    return Err(errno.into());
+                }
+            };
+            let walked = through.as_deref().unwrap_or(bytes);
+            match Self::own_tree_resolved(guest, walked, follows_last).await {
+                Ok(resolved) => resolved.or(through),
                 Err(errno) => {
                     // Linux refuses a size that is not positive before it
                     // looks up the path.
@@ -1956,7 +1972,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Detcore reads it from the backend's fact (KVM, package K slice
         // F2-h).
         if let Some(result) = self
-            .readlink_own_descriptor_fact(guest, (spelling, bytes), link, buffer, buffer_len)
+            .readlink_own_descriptor_fact(guest, sysno, (spelling, bytes), link, buffer, buffer_len)
             .await?
         {
             return Ok(Some(result));
@@ -2214,6 +2230,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         if let Some(result) = self
             .readlink_decided_link(
                 guest,
+                reverie::syscalls::Sysno::readlink,
                 &path,
                 (&path, (libc::AT_FDCWD, call.path())),
                 call.buf(),
@@ -2426,6 +2443,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             && let Some(result) = self
                 .readlink_decided_link(
                     guest,
+                    reverie::syscalls::Sysno::readlinkat,
                     &observed_path,
                     (&path, (call.dirfd(), call.path())),
                     call.buf(),

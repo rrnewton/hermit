@@ -5542,6 +5542,28 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok((PathBuf::from(std::ffi::OsString::from_vec(bytes)), links))
     }
 
+    /// The absolute guest path `bytes` where it walks through one of the
+    /// caller's descriptor links to a directory Detcore serves on a
+    /// placeholder ([`Self::decided_path`]), as Linux follows each such link
+    /// (`/proc/self/fd/D/N`, with descriptor `D` open on `/proc/self/fd`, is
+    /// `/proc/<pid>/fd/N`), where Detcore serves the caller's own task
+    /// directories ([`Self::serves_task_directories`], package K slice K10):
+    /// there no backend directory stands behind the link for the rest of
+    /// the walk. `Ok(None)` where the path walks through none of them, or
+    /// Detcore does not serve them; `ELOOP` where the links Linux follows on
+    /// the way pass `MAXSYMLINKS`.
+    pub(crate) fn through_own_descriptor_links<G: Guest<Self>>(
+        guest: &G,
+        bytes: &[u8],
+    ) -> Result<Option<Vec<u8>>, Errno> {
+        if !Self::serves_task_directories(guest) {
+            return Ok(None);
+        }
+        let path = Path::new(std::ffi::OsStr::from_bytes(bytes));
+        let (decided, links) = Self::decided_path(guest, path)?;
+        Ok((links > 0).then(|| decided.into_os_string().into_vec()))
+    }
+
     /// Answer a `readlink` of the absolute guest path `path` into the buffer
     /// `buf` of `buf_len` bytes if it is a descriptor link of the caller's to
     /// a placeholder directory ([`Self::own_link_directory`]): the directory's
