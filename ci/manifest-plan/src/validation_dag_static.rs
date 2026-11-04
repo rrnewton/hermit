@@ -1274,7 +1274,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The shared-mapping tests of https://github.com/rrnewton/hermit/pull/5120
     // on this main: 1957 + 26 = 1983.
     // The two hermit-replay unit tests of the MAP_FIXED_NOREPLACE fix: 1983 + 2 = 1985.
-    ("test.regular_crates", 1983),
+    // The /dev/zero sharing fix for https://github.com/rrnewton/hermit/pull/5120
+    // adds six hermit-record units: 1985 + 6 = 1991.
+    ("test.regular_crates", 1991),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -3898,7 +3900,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // validate.
     // The MAP_FIXED_NOREPLACE fix for https://github.com/rrnewton/hermit/pull/5120
     // adds five placement tests: 250 + 5 = 255.
-    ("test.record_replay", 255),
+    // The /dev/zero sharing fix adds four record/replay tests: 255 + 4 = 259.
+    ("test.record_replay", 259),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -5366,7 +5369,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The shared-mapping tests of https://github.com/rrnewton/hermit/pull/5120
     // on this main: 1943 + 26 = 1969.
     // The two hermit-replay unit tests of the MAP_FIXED_NOREPLACE fix: 1969 + 2 = 1971.
-    ("test.regular_crates_on_host", 1969),
+    // The same six hermit-record units of the /dev/zero sharing fix: 1971 + 6 = 1977.
+    ("test.regular_crates_on_host", 1977),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -6604,7 +6608,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The shared-mapping tests of https://github.com/rrnewton/hermit/pull/5120
     // on this main: 1943 + 26 = 1969.
     // The two hermit-replay unit tests of the MAP_FIXED_NOREPLACE fix: 1969 + 2 = 1971.
-    ("test.regular_crates_on_host", 1969),
+    // The same six hermit-record units of the /dev/zero sharing fix: 1971 + 6 = 1977.
+    ("test.regular_crates_on_host", 1977),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
