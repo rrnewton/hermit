@@ -3907,7 +3907,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // adds five placement tests: 250 + 5 = 255.
     // The /dev/zero sharing fix adds four record/replay tests: 255 + 4 = 259.
     // The occupied-range placement test for MAP_SHARED_VALIDATE: 259 + 1 = 260.
-    ("test.record_replay", 260),
+    // The map_files test for a dev-zero object: 260 + 1 = 261.
+    ("test.record_replay", 261),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
