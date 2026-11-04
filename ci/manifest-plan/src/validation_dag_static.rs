@@ -3269,8 +3269,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // one cli test: 3467 + 2 = 3469.
     // And scheduler::test::the_chaos_bounds_apply_past_the_end_of_a_replayed_schedule
     // (bounds past a replayed schedule's end, PR #4926): 3469 + 1 = 3470, listed.
-    // And this change's nine: 3470 + 9 = 3479.
-    ("test.detcore_unit", 3479),
+    // And this change's ten (the ninth-plus-one is the F1 lowering test):
+    // 3470 + 10 = 3480.
+    ("test.detcore_unit", 3480),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5889,8 +5890,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two start-grant units: 2955, listed.
     // Rebased onto main fcd62385f: 3465 + 2 = 3467.
     // And the same unit (same growth as test.detcore_unit, PR #4926): 3469 + 1 = 3470.
-    // And this change's nine: 3470 + 9 = 3479.
-    ("test.detcore_unit_on_host", 3479),
+    // And this change's ten: 3470 + 10 = 3480.
+    ("test.detcore_unit_on_host", 3480),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
