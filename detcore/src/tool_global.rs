@@ -3261,6 +3261,34 @@ impl GlobalTool for GlobalState {
     }
 
     async fn receive_rpc(&self, from: Tid, gr: Self::Request) -> Self::Response {
+        // A thread's CPU accounting rides on its request where it changed:
+        // record it, then answer the request it carries as if it came alone.
+        let gr = match gr {
+            (time, mm, GlobalRequest::WithCpuTime(publication, request)) => {
+                let CpuPublication {
+                    process,
+                    own,
+                    total,
+                } = *publication;
+                // As every ordinary mutation, none after a backend failure
+                // (`Self::lock_rpc_scheduler`). The publication is dropped
+                // rather than waited behind, so that a request the failure
+                // still answers (a refusal, a consuming cleanup) is answered.
+                // `publish_cpu_time` likewise drops one from a replaced exec
+                // incarnation (`Scheduler::rpc_incarnation_matches`). Either
+                // way only the publication is dropped: the wrapped request
+                // is still answered below exactly as if it came alone, so
+                // whatever its own path decides for a stale incarnation is
+                // unchanged by the publication riding on it.
+                let mut sched = self.sched.lock().unwrap();
+                if !sched.backend_failed() {
+                    let thread = DetTid::from_raw(from.as_raw());
+                    sched.publish_cpu_time(process, thread, mm, own, total);
+                }
+                (time, mm, *request)
+            }
+            gr => gr,
+        };
         if replay_departure::is_report(&gr.2) {
             return self.accept_replay_departure(from, gr);
         }
@@ -4325,6 +4353,9 @@ impl GlobalState {
             }
             GlobalRequest::WithForwardedCount(..) => {
                 unreachable!("a counted request is unwrapped on arrival")
+            }
+            GlobalRequest::WithCpuTime(..) => {
+                unreachable!("a CPU publication is taken off on arrival")
             }
             GlobalRequest::ReplayDeparture { .. } => {
                 unreachable!("replay findings use the authenticated neutral path")
@@ -5901,6 +5932,12 @@ impl GlobalState {
                     .record_external_parent(process, parent);
                 R::RecordExternalParent(())
             }
+            GlobalRequest::RecordExitCode(process, code) => {
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .record_exit_code(process, code);
+                R::RecordExitCode(())
+            }
             GlobalRequest::SetRssLimit(process, limit) => {
                 self.lock_rpc_scheduler(false)
                     .await
@@ -7179,6 +7216,7 @@ impl GlobalState {
             chaos_epochs,
             killed_by_group_signal,
             passed_descriptors_out,
+            wait_status,
         } = deregistration;
         if !sched.rpc_incarnation_matches(dettid, mm) {
             debug!(
@@ -7224,6 +7262,17 @@ impl GlobalState {
         // The process as the scheduler registered the thread, as the retire
         // path reads it (`logically_kill_thread`), not the backend's report.
         let process = sched.registered_process(dettid).unwrap_or(detpid);
+        // A death by a signal that ends the group, reported on the ordinary
+        // path (a fault, an abort, a host's kill), is the group's exit: its
+        // wait status, the signal with `0x80` where the death dumped core as
+        // the backend reports it, is the code the zombie keeps
+        // (`group_exit_code`, fs/proc/array.c:529-530 in 6.17). Recorded
+        // before the thread is retired, so no reader sees the process exited
+        // without it. A SIGKILL a guest sent was recorded at its kill turn,
+        // and its victims' receipts returned above.
+        if killed_by_group_signal {
+            sched.record_exit_code(process, wait_status);
+        }
         // A leader retired at its own exit (`retire_exited_leader`) reports
         // here a death already accounted: whatever killed its group, a guest's
         // SIGKILL above all, is accounted where it happened, not at this
@@ -7901,6 +7950,13 @@ pub struct ThreadDeregistration {
     /// A descriptor may have escaped before cancellation prevented its
     /// owner's next request from publishing the fact.
     pub(crate) passed_descriptors_out: bool,
+    /// The thread's exit status in wait(2) encoding
+    /// (`reverie::ExitStatus::into_raw`): the signal, with `0x80` where the
+    /// death dumped core, or the exit code shifted left by 8. Where the
+    /// death ends the group by a signal and its deregistration takes the
+    /// ordinary path, it is the zombie's exit code
+    /// (`Scheduler::record_exit_code`).
+    pub(crate) wait_status: i32,
 }
 
 /// A question about, or a record in, the scheduler's ledger of guest-handled
@@ -8019,9 +8075,10 @@ pub enum SignalScope {
 /// and `ReplayedSliceEnd` are revision 30, reserved for this change by the
 /// D2 seal; the combined layout on top of 31 appends revision 32.
 /// 40 appends the `CpuClockProcess` pair (drain of PR 4885, allocated
-/// revision 40) after 32, skipping reserved 33 to 39, and is the current
-/// revision.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 40;
+/// revision 40) after 32, skipping reserved 33 to 39. 41 adds `WithCpuTime`
+/// and `RecordExitCode` (package K item 2b slice 2b-1, allocated 39 and
+/// renumbered 41 at its rebase onto 40) and is the current revision.
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 41;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
@@ -9006,6 +9063,29 @@ pub enum GlobalRequest {
     /// live thread or an existing process (`Scheduler::cpu_clock_process`).
     /// Appended last.
     CpuClockProcess(DetPid),
+    /// Request `.1`, sent with what the calling thread publishes of its CPU
+    /// accounting (`CpuPublication`, `Scheduler::publish_cpu_time`), where it
+    /// changed since its last publication. Added by `send_and_update_time`
+    /// around every request that may let another thread run, and taken off
+    /// by `receive_rpc` before anything else reads the request, so no other
+    /// part of the global state sees it. Appended last.
+    WithCpuTime(Box<CpuPublication>, Box<GlobalRequest>),
+    /// Record `.1` as the exit code of process `.0`, in wait(2) encoding, in
+    /// the turn that ends it (`Scheduler::record_exit_code`). Appended last.
+    RecordExitCode(DetPid, i32),
+}
+
+/// What a guest thread publishes of its CPU accounting with a request
+/// (`GlobalRequest::WithCpuTime`): its process, its own time, user and
+/// system (`ThreadState::thread_cpu_time`), and its process's
+/// (`ThreadState::process_cpu_time`), which counts every thread, exited ones
+/// included, and the process's reaped children's. Another process's rendered
+/// `stat` shows it (`Scheduler::publish_cpu_time`).
+#[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize)]
+pub struct CpuPublication {
+    pub process: DetPid,
+    pub own: (LogicalTime, LogicalTime),
+    pub total: crate::procfs::task_stat::TaskCpuTimes,
 }
 
 /// Responses from the global object
@@ -9410,6 +9490,8 @@ pub enum GlobalResponse {
     /// (`InodePool::incarnation`), so a CPU timer can bind to the task it
     /// was created for and not to a later task reusing its number. Appended last.
     CpuClockProcess(Option<(DetPid, u32)>),
+    /// The answer to `GlobalRequest::RecordExitCode`. Appended last.
+    RecordExitCode(()),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -10332,6 +10414,75 @@ where
     }
 }
 
+/// `request` with what the calling thread publishes of its CPU accounting
+/// (`GlobalRequest::WithCpuTime`), where it changed since the thread last
+/// published it: its own time and its process's as of its last accounting
+/// (`ThreadState::accounted_cpu_times`), which its syscall's entry made.
+/// Every request that may let another thread run goes through
+/// `send_and_update_time`, so with threads sequentialized another process
+/// reads each task's time as of where it last stopped
+/// (`Scheduler::publish_cpu_time`). A thread whose process is not yet known
+/// publishes nothing, and neither does one that has published nothing yet
+/// while its times are all zero: that is what global state answers for a
+/// task with no publication.
+fn with_cpu_publication<G, T>(guest: &mut G, request: GlobalRequest) -> GlobalRequest
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let state = guest.thread_state_mut();
+    let Some(process) = state.detpid else {
+        return request;
+    };
+    let (own, total) = state.accounted_cpu_times();
+    let publication = CpuPublication {
+        process,
+        own,
+        total: crate::procfs::task_stat::TaskCpuTimes {
+            user: total.user,
+            system: total.system,
+            children_user: total.children_user,
+            children_system: total.children_system,
+        },
+    };
+    let unchanged = match &state.published_cpu {
+        Some(published) => *published == publication,
+        None => {
+            publication.own == (LogicalTime::ZERO, LogicalTime::ZERO)
+                && publication.total == crate::procfs::task_stat::TaskCpuTimes::default()
+        }
+    };
+    if unchanged {
+        return request;
+    }
+    state.published_cpu = Some(publication.clone());
+    GlobalRequest::WithCpuTime(Box::new(publication), Box::new(request))
+}
+
+/// `request` without the CPU publication [`send_and_update_time`] may wrap it
+/// in (`GlobalRequest::WithCpuTime`): the request a test's scripted
+/// coordinator answers or records.
+#[cfg(test)]
+pub(crate) fn without_cpu_publication(request: GlobalRequest) -> GlobalRequest {
+    match request {
+        GlobalRequest::WithCpuTime(_, request) => *request,
+        request => request,
+    }
+}
+
+/// Record `code`, the exit code of the calling thread's process as Linux
+/// keeps it in the zombie (`Scheduler::record_exit_code`).
+pub(crate) async fn record_exit_code<G, T>(guest: &mut G, process: DetPid, code: i32)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::RecordExitCode(process, code))
+        .await
+        .1;
+    assert_eq!(response, GlobalResponse::RecordExitCode(()));
+}
+
 pub async fn send_and_update_time<G, T>(
     guest: &mut G,
     request: GlobalRequest,
@@ -10361,7 +10512,8 @@ where
     let mm = guest.thread_state().mm_id;
     let continues_sigreturn = request_continues_sigreturn(&request);
     let starts_thread = matches!(request, GlobalRequest::StartNewThread(..));
-    let mut resp = guest.send_rpc((mytime, mm, counted_request(request))).await;
+    let request = with_cpu_publication(guest, counted_request(request));
+    let mut resp = guest.send_rpc((mytime, mm, request)).await;
     let lone_grant = if let GlobalResponse::WithLoneGrant(response) = resp.1 {
         resp.1 = *response;
         true
@@ -15870,6 +16022,7 @@ mod tests {
                     chaos_epochs: Vec::new(),
                     killed_by_group_signal: false,
                     passed_descriptors_out: false,
+                    wait_status: 0,
                 },
             );
             assert_eq!(
@@ -18645,6 +18798,7 @@ mod tests {
                     chaos_epochs: Vec::new(),
                     killed_by_group_signal: false,
                     passed_descriptors_out: false,
+                    wait_status: 0,
                 };
                 for _ in 0..2 {
                     let (_, done) = state
@@ -18774,6 +18928,7 @@ mod tests {
                             chaos_epochs: Vec::new(),
                             killed_by_group_signal: false,
                             passed_descriptors_out: false,
+                            wait_status: 0,
                         }),
                     ),
                 )
@@ -20317,6 +20472,7 @@ mod tests {
                         syscall_histogram: Default::default(),
                         chaos_epochs: Vec::new(),
                         passed_descriptors_out: false,
+                        wait_status: 0,
                         killed_by_group_signal: false,
                     }),
                 ),
@@ -21030,6 +21186,7 @@ mod tests {
                     chaos_epochs: Vec::new(),
                     killed_by_group_signal: false,
                     passed_descriptors_out: false,
+                    wait_status: 0,
                 },
             )
             .await;
@@ -21194,6 +21351,7 @@ mod tests {
                         chaos_epochs: Vec::new(),
                         killed_by_group_signal: false,
                         passed_descriptors_out: false,
+                        wait_status: 0,
                     }),
                 ),
             )
@@ -22612,6 +22770,7 @@ mod tests {
                     chaos_epochs: Vec::new(),
                     killed_by_group_signal: false,
                     passed_descriptors_out: false,
+                    wait_status: 0,
                 },
             )
             .await;
@@ -22642,6 +22801,7 @@ mod tests {
                     chaos_epochs: Vec::new(),
                     killed_by_group_signal: false,
                     passed_descriptors_out: false,
+                    wait_status: 0,
                 },
             )
             .await;
@@ -22969,6 +23129,7 @@ mod tests {
                         chaos_epochs: Vec::new(),
                         killed_by_group_signal: false,
                         passed_descriptors_out: false,
+                        wait_status: 0,
                     }),
                 ),
             )
@@ -23007,6 +23168,7 @@ mod tests {
                         chaos_epochs: Vec::new(),
                         killed_by_group_signal: false,
                         passed_descriptors_out: false,
+                        wait_status: 0,
                     }),
                 ),
             )
