@@ -25617,6 +25617,15 @@ fn a_chaos_instruction_offset_run_verifies_and_replays_at_its_offsets() {
             .is_some_and(|k| (1..=8).contains(&k))),
         "{offsets:?}"
     );
+    // Rows holding an offset state the offset-row format exactly, fencing
+    // this record out of older readers; an offset-free record states the
+    // format below it instead (`chosen_json_provenance_follows_real_target_
+    // setup_and_both_replay_loaders`).
+    assert_eq!(
+        json["format_version"],
+        detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT,
+        "{json}"
+    );
 
     let guest = branch_free_race_guest().to_str().unwrap();
     let replay_arg = format!("--replay-preemptions-from={}", recorded.display());
@@ -65248,9 +65257,18 @@ fn chosen_json_provenance_follows_real_target_setup_and_both_replay_loaders() {
         })
     );
     assert_eq!(original["guest_ids"]["Chosen"]["base"], 5000);
+    // The producer took no instruction-offset decision, so its record states
+    // the newest format below the offset-row format (the writer's
+    // `format_without_instruction_offsets` rule): format 6 fences out older
+    // readers only for a record whose rows actually hold an offset. The
+    // offsets counterpart states 6 exactly (`a_chaos_instruction_offset_run_
+    // verifies_and_replays_at_its_offsets`).
+    let producer_format = detcore::preemptions::format_without_instruction_offsets(Some(
+        detcore::preemptions::PREEMPTION_RECORD_FORMAT,
+    ));
     assert_eq!(
         original["format_version"],
-        detcore::preemptions::PREEMPTION_RECORD_FORMAT
+        serde_json::json!(producer_format)
     );
     let event_count = original["global"].as_array().unwrap().len();
     assert!(event_count > 0, "{original}");
@@ -65285,10 +65303,11 @@ fn chosen_json_provenance_follows_real_target_setup_and_both_replay_loaders() {
     // A schedule replay notes no background starts, so its re-record states
     // the format below the background-starts format, with the same timing
     // rules; a priority replay notes them and keeps the recording's format.
-    let schedule_format =
-        serde_json::json!(detcore::preemptions::format_without_background_starts(
-            Some(detcore::preemptions::PREEMPTION_RECORD_FORMAT)
-        ));
+    // Lower from the producer's stated format, not the newest constant: the
+    // two agree today only because both sit in the background-starts range.
+    let schedule_format = serde_json::json!(
+        detcore::preemptions::format_without_background_starts(producer_format)
+    );
     let schedule_flag = format!("--replay-schedule-from={}", recording.display());
     let priority_flag = format!("--replay-preemptions-from={}", recording.display());
     for route in ["schedule", "priority", "both"] {
