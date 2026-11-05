@@ -370,15 +370,8 @@ pub(crate) async fn arm_selected(
     };
     match super::until_backend_failure(&scheduler, selected.transaction.arm()).await {
         Ok(Ok(ChildExitCaptureArm::Unsupported)) => {
-            tracing::error!(
-                "[child-exit-capture] required capture unsupported reservation={} parent={} child={}",
-                request.reservation,
-                request.parent,
-                request.child
-            );
-            // Selection already committed to capture. GrantGuard must latch
-            // backend failure and abort the hold, not grant an uncaptured Exit.
-            return Err(());
+            guard.complete();
+            return Ok(None);
         }
         Ok(Ok(ChildExitCaptureArm::Armed)) => {}
         Ok(Err(error)) => {

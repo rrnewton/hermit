@@ -285,7 +285,6 @@ impl Scheduler {
         if !self.backend.provides_process_signal_control
             || self.backend.process_exits_complete_asynchronously
             || self.parked.control.is_some()
-            || self.native_child_capture_installed()
             || !self.next_turns.is_empty()
             || self.turn != 0
             || self.started_up.try_read().is_some()
