@@ -45,6 +45,7 @@ use std::process::Output;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::OnceLock;
+use std::time::Instant;
 
 /// `hermit record` writes to shared per-run state; serialize the record/replay
 /// cases the same way `record_replay.rs` does.
@@ -77,6 +78,7 @@ fn guest() -> &'static Path {
         fs::create_dir_all(&build_root).expect("failed to create the flock guest build directory");
         let binary = build_root.join("flock_exclusion");
         let source = repository().join("tests/c/flock_exclusion.c");
+        let measurement_started = Instant::now();
         let compile = Command::new("cc")
             .args(["-O1", "-std=c11", "-Wall", "-Wextra", "-Werror"])
             .arg(&source)
@@ -84,6 +86,10 @@ fn guest() -> &'static Path {
             .arg(&binary)
             .output()
             .unwrap_or_else(|error| panic!("failed to start cc for {}: {error}", source.display()));
+        eprintln!(
+            "P0_TIMING compile label=flock elapsed_seconds={:.9} status={}",
+            measurement_started.elapsed().as_secs_f64(), compile.status
+        );
         assert!(
             compile.status.success(),
             "failed to compile {}:\n{}",
@@ -146,10 +152,14 @@ fn hermit_run_backend_timeout(
     // In the pinned validate root this adds the hermetic `--workdir=/test`,
     // without which the DBT backend refuses the run.
     hermit_test::configure_guest_execution(&mut command);
-    finish(hermit_test::hermit_output(
-        &format!("{command:?}"),
-        &mut command,
-    ))
+    eprintln!("P0_START flock scenario={scenario:?} argv={command:?}");
+    let measurement_started = Instant::now();
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
+    eprintln!(
+        "P0_TIMING flock scenario={scenario:?} elapsed_seconds={:.9} status={}",
+        measurement_started.elapsed().as_secs_f64(), output.status
+    );
+    finish(output)
 }
 
 /// Mutual exclusion, the property the pre-#2373 no-op removed outright: under

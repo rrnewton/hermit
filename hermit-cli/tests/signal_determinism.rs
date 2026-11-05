@@ -41,7 +41,13 @@ static SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 fn command_output(mut command: Command, label: &str) -> Output {
     hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
+    eprintln!("P0_START command label={label:?} argv={rendered}");
+    let measurement_started = Instant::now();
     let output = hermit_test::hermit_output(&rendered, &mut command);
+    eprintln!(
+        "P0_TIMING command label={label:?} elapsed_seconds={:.9} status={}",
+        measurement_started.elapsed().as_secs_f64(), output.status
+    );
     assert!(
         output.status.success(),
         "{label} failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
@@ -103,6 +109,7 @@ fn bounded_command_output_once(command: &mut Command, label: &str) -> (Output, b
             panic!("failed to clone {label} stderr capture: {error}")
         })));
     let rendered = format!("{command:?}");
+    eprintln!("P0_START bounded label={label:?} argv={rendered}");
     let started = Instant::now();
     let mut child = command
         .spawn()
@@ -122,6 +129,7 @@ fn bounded_command_output_once(command: &mut Command, label: &str) -> (Output, b
             }
         }
     };
+    let measurement_process_elapsed = started.elapsed();
     stdout
         .seek(SeekFrom::Start(0))
         .unwrap_or_else(|error| panic!("failed to rewind {label} stdout capture: {error}"));
@@ -137,6 +145,10 @@ fn bounded_command_output_once(command: &mut Command, label: &str) -> (Output, b
         .read_to_end(&mut stderr_bytes)
         .unwrap_or_else(|error| panic!("failed to read {label} stderr capture: {error}"));
     let elapsed = started.elapsed();
+    eprintln!(
+        "P0_TIMING bounded label={label:?} elapsed_seconds={:.9} process_seconds={:.9} process_timed_out={} status={}",
+        elapsed.as_secs_f64(), measurement_process_elapsed.as_secs_f64(), process_timed_out, status
+    );
     (
         Output {
             status,
