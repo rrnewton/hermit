@@ -61,6 +61,11 @@ pub struct ExtensionNode {
 /// The first post-split bucket is gvisor; see module docs.
 pub const POST_SPLIT_CORE_NODES: &[ExtensionNode] = &[
     ExtensionNode {
+        tag: "check.gvisor_vendoring",
+        labels: &["full", "hosted-portable", "portable"],
+        deps: &[],
+    },
+    ExtensionNode {
         tag: "e2e.manifest_gvisor",
         labels: &["full", "portable"],
         deps: &[
