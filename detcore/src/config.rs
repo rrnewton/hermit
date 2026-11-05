@@ -297,7 +297,7 @@ mod tests {
         // 25 on its own base after main's 24, assigned 42 at its rebase
         // onto 41, skipping 33 to 39 reserved for pending changes; digest
         // measured at this head).
-        (42, "0000000000000000", "f013e36743d8d9e6"),
+        (42, "3ac5fc0756fc3ccd", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
@@ -663,13 +663,13 @@ mod tests {
         );
         assert_ne!(nested_added, source);
         assert_ne!(
-            definition_digest(&nested_added, payload, schedule, replayer),
+            definition_digest(&nested_added, payload, schedule, replayer, task_stat),
             digest
         );
         let nested_removed = source.replacen("    backstop: Option<LogicalTime>,\n", "", 1);
         assert_ne!(nested_removed, source);
         assert_ne!(
-            definition_digest(&nested_removed, payload, schedule, replayer),
+            definition_digest(&nested_removed, payload, schedule, replayer, task_stat),
             digest
         );
 
