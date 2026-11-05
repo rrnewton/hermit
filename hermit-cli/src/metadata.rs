@@ -1312,6 +1312,7 @@ fn record_or_replay_config_with_timer_support(
         cpu_profile_host: None,
         // `hermit record` keeps the files it replays; nothing is rewritten.
         rewrite_exclusives_in_memory: false,
+        rewrite_exclusives_overlay: false,
         count_store_exclusives: false,
         cpu_profile_source: None,
         // Record and replay run under the ptrace backend.

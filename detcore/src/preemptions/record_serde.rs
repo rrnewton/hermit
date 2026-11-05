@@ -88,6 +88,8 @@ struct RawRecord {
     background_starts: Vec<BackgroundStart>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     rewrite_exclusives_in_memory: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rewrite_exclusives: Option<super::RewriteExclusives>,
 }
 
 struct LegacyFields<'a>(&'a PreemptionRecord);
@@ -804,6 +806,26 @@ mod tests {
         assert!(marked.contains(ENVELOPE), "{marked}");
         let back: PreemptionRecord = serde_json::from_str(&marked).unwrap();
         assert!(back.rewrite_exclusives_in_memory());
+        assert_eq!(
+            back.rewrite_exclusives(),
+            Some(crate::preemptions::RewriteExclusives::current(
+                crate::preemptions::RewriteExclusivesMode::Memory
+            )),
+            "{marked}"
+        );
         assert_eq!(back.replay_departed_at(), Some(7));
+        // A stated overlay provenance round-trips byte for byte, as the
+        // last field of the raw form.
+        let overlay = r#"{"per_thread":{},"global":[],"rewrite_exclusives":{"mode":"overlay","format_version":6}}"#;
+        let record: PreemptionRecord = serde_json::from_str(overlay).unwrap();
+        assert_eq!(
+            record.rewrite_exclusives(),
+            Some(crate::preemptions::RewriteExclusives {
+                mode: crate::preemptions::RewriteExclusivesMode::Overlay,
+                format_version: 6,
+            })
+        );
+        assert!(!record.rewrite_exclusives_in_memory());
+        assert_eq!(serde_json::to_string(&record).unwrap(), overlay);
     }
 }
