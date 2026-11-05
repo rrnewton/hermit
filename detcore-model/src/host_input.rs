@@ -205,6 +205,11 @@ pub fn host_input_changed(recorded: &HostInput, now: &HostInput) -> bool {
 pub struct HostInputSet {
     pub digest: String,
     pub files: Vec<HostInput>,
+    /// The kinds of file behind the guest's standard descriptors when the
+    /// run began ([`StdioKinds`]). Not part of [`Self::digest`], which follows
+    /// the files alone. Absent where the run did not look.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdio: Option<StdioKinds>,
 }
 
 impl HostInputSet {
@@ -246,6 +251,290 @@ impl std::fmt::Display for HostInputChange {
             f,
             "host input {} changed since the recording ({} then, {} now); the run may diverge where the guest reads it",
             self.path, self.recorded, self.now
+        )
+    }
+}
+
+/// The kind of file behind one of the guest's standard descriptors. A guest
+/// can tell them apart (`fstat`, `isatty`, and calls whose result depends on
+/// the kind: `fsync` fails with `EINVAL` on a pipe and succeeds on a file, and
+/// `lseek` fails with `ESPIPE` on a pipe), so a replay whose stdio kinds
+/// differ from its recording's may run differently where the guest checks.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StdioKind {
+    /// A regular file.
+    File,
+    /// A pipe or FIFO.
+    Pipe,
+    /// A socket.
+    Socket,
+    /// A terminal.
+    Tty,
+    /// A character device that is not a terminal, such as `/dev/null`.
+    CharDevice,
+    /// A block device.
+    BlockDevice,
+    /// A directory.
+    Directory,
+    /// No open descriptor.
+    Closed,
+    /// A file Hermit inspected and found to be of none of the kinds above:
+    /// an anonymous inode, a namespace, or a symbolic link an `O_PATH`
+    /// descriptor names.
+    Other,
+    /// Not read: Hermit could not tell the kind without an operation on the
+    /// file's filesystem that it does not make (a file on a mount outside
+    /// [`LOCAL_KERNEL_FILESYSTEMS`], such as FUSE, NFS or overlay), or the
+    /// facts it reads were unavailable. Never compared: a descriptor whose
+    /// kind is unknown in either run is not named as changed
+    /// ([`StdioKinds::changes`]).
+    Unknown,
+}
+
+/// The filesystems on which Detcore reads the type of a file behind one of
+/// the guest's standard descriptors ([`StdioKind::of_guest_descriptor`]):
+/// local, in-kernel filesystems whose `getattr` answers from the host
+/// itself, so the read waits on no server and makes no request another
+/// process could see. Network filesystems (NFS, CIFS, 9p, Ceph), FUSE,
+/// whose server may be a guest process, and overlay, whose `getattr` goes to
+/// its layers, are left out, and so is every type not listed here.
+pub const LOCAL_KERNEL_FILESYSTEMS: [&str; 11] = [
+    "ext2", "ext3", "ext4", "xfs", "btrfs", "tmpfs", "ramfs", "devtmpfs", "devpts", "proc", "sysfs",
+];
+
+/// The mount ID and filesystem type of each row of `mountinfo`, the text of
+/// a process's `/proc/<pid>/mountinfo`. Mount IDs are unique across mount
+/// namespaces while the mounts exist, so rows read from several namespaces
+/// can be searched together.
+pub fn mount_types(mountinfo: &str) -> Vec<(u64, String)> {
+    mountinfo
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let id = fields.next()?.parse::<u64>().ok()?;
+            // The filesystem type follows the `-` that ends the optional
+            // fields.
+            let fstype = fields.skip_while(|field| *field != "-").nth(1)?;
+            Some((id, fstype.to_owned()))
+        })
+        .collect()
+}
+
+/// The mounts of the namespace hermit-cli was launched in, read before it
+/// creates its container ([`mount_types`]): a descriptor the guest inherits
+/// from outside the container names one of these mounts in its `fdinfo`,
+/// which the container's own mountinfo, whose copies have new IDs, does not
+/// list (`crate::config::Config::launch_namespace_mounts`). Only its size
+/// shows in `Debug`, because a run logs its configuration at its start, and
+/// mount IDs differ from run to run.
+#[derive(Clone, Default, Eq, PartialEq)]
+pub struct LaunchNamespaceMounts(pub Vec<(u64, String)>);
+
+impl std::fmt::Debug for LaunchNamespaceMounts {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LaunchNamespaceMounts")
+            .field("mounts", &self.0.len())
+            .finish()
+    }
+}
+
+/// Whether `maps`, the text of a process's `/proc/<pid>/maps`, maps the file
+/// `exe` (the target of its `/proc/<pid>/exe` link) with inode number `ino`.
+/// Detcore knows a process as the root it expects when its image is the
+/// file the root's exec ran, and both texts come from procfs, which names
+/// the file and its inode without asking the file's filesystem. Inode 0 is
+/// an anonymous mapping's, never a file's.
+pub fn maps_name_image(maps: &str, exe: &[u8], ino: u64) -> bool {
+    ino != 0
+        && maps.lines().any(|line| {
+            // address, perms, offset, dev, inode, then the pathname, which may
+            // hold spaces.
+            let mut rest = line;
+            let mut fields = Vec::with_capacity(5);
+            for _ in 0..5 {
+                rest = rest.trim_start();
+                let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+                fields.push(&rest[..end]);
+                rest = &rest[end..];
+            }
+            fields[4].parse::<u64>().is_ok_and(|inode| inode == ino)
+                && rest.trim_start().as_bytes() == exe
+        })
+}
+
+impl StdioKind {
+    /// The kind of an open descriptor whose `st_mode` is `mode`, with
+    /// `terminal` whether it is a terminal (`isatty`).
+    pub fn from_mode(mode: libc::mode_t, terminal: bool) -> Self {
+        match mode & libc::S_IFMT {
+            libc::S_IFREG => Self::File,
+            libc::S_IFIFO => Self::Pipe,
+            libc::S_IFSOCK => Self::Socket,
+            libc::S_IFCHR if terminal => Self::Tty,
+            libc::S_IFCHR => Self::CharDevice,
+            libc::S_IFBLK => Self::BlockDevice,
+            libc::S_IFDIR => Self::Directory,
+            _ => Self::Other,
+        }
+    }
+
+    /// Whether the character device numbered `rdev` belongs to a terminal
+    /// driver, by `drivers`, the kernel's list of them (the text of
+    /// `/proc/tty/drivers`: one driver per line, ending with its major
+    /// number, its minor number or range, and its type). Detcore classifies
+    /// a guest's descriptor without opening it ([`Self::of_guest_descriptor`]),
+    /// so it cannot ask `isatty`.
+    pub fn is_terminal_device(rdev: u64, drivers: &str) -> bool {
+        // glibc's `gnu_dev_major` and `gnu_dev_minor`.
+        let major = ((rdev >> 8) & 0xfff) | ((rdev >> 32) & !0xfff);
+        let minor = (rdev & 0xff) | ((rdev >> 12) & !0xff);
+        drivers.lines().any(|line| {
+            let mut fields = line.split_whitespace().rev();
+            let (Some(_kind), Some(minors), Some(driver_major)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                return false;
+            };
+            let (first, last) = minors.split_once('-').unwrap_or((minors, minors));
+            driver_major.parse() == Ok(major)
+                && first.parse().is_ok_and(|first: u64| first <= minor)
+                && last.parse().is_ok_and(|last: u64| minor <= last)
+        })
+    }
+
+    /// The kind of one of a guest's descriptors, from what Detcore can read
+    /// about it without opening it and without an operation on its file's
+    /// filesystem that could wait on a server. `link` is the target of its
+    /// `/proc/<pid>/fd/<n>` link: a name that is no path is one only the
+    /// kernel gives, to a pipe (`pipe:[ino]`), a socket (`socket:[ino]`) or
+    /// another pseudo-filesystem object (`anon_inode:...`, `<type>:[ino]`),
+    /// and tells the kind alone. A path never does, since the guest's own
+    /// mounts decide what is at it (a regular file bound over `/dev/null` has
+    /// the same link): `fdinfo` (the text of `/proc/<pid>/fdinfo/<n>`) names
+    /// the file's mount, and `mounts` (mount IDs and filesystem types,
+    /// [`mount_types`], of the guest's namespace, the coordinator's, and the
+    /// one Hermit was launched in) its type. On one of
+    /// [`LOCAL_KERNEL_FILESYSTEMS`], `stat` reads the file's own type through
+    /// the link (`st_mode` and `st_rdev`), and that decides: a character
+    /// device is a terminal when a driver in `drivers` (the text of
+    /// `/proc/tty/drivers`) owns its device number. Anything else is
+    /// [`Self::Unknown`], unread: a mount outside that list, no mount ID, a
+    /// mount in neither namespace, a failed `stat`, or a character device
+    /// without the driver list.
+    pub fn of_guest_descriptor(
+        link: &[u8],
+        fdinfo: Option<&str>,
+        mounts: &[(u64, String)],
+        drivers: Option<&str>,
+        stat: impl FnOnce() -> Option<(libc::mode_t, u64)>,
+    ) -> Self {
+        if !link.starts_with(b"/") {
+            return if link.starts_with(b"pipe:[") {
+                Self::Pipe
+            } else if link.starts_with(b"socket:[") {
+                Self::Socket
+            } else {
+                Self::Other
+            };
+        }
+        let local = fdinfo.is_some_and(|fdinfo| {
+            let Some(mount) = fdinfo
+                .lines()
+                .find_map(|line| line.strip_prefix("mnt_id:"))
+                .and_then(|id| id.trim().parse::<u64>().ok())
+            else {
+                return false;
+            };
+            mounts.iter().any(|(id, fstype)| {
+                *id == mount && LOCAL_KERNEL_FILESYSTEMS.contains(&fstype.as_str())
+            })
+        });
+        if !local {
+            return Self::Unknown;
+        }
+        let Some((mode, rdev)) = stat() else {
+            return Self::Unknown;
+        };
+        if mode & libc::S_IFMT == libc::S_IFCHR {
+            return match drivers {
+                Some(drivers) => Self::from_mode(mode, Self::is_terminal_device(rdev, drivers)),
+                None => Self::Unknown,
+            };
+        }
+        Self::from_mode(mode, false)
+    }
+
+    fn describe(self) -> &'static str {
+        match self {
+            Self::File => "a regular file",
+            Self::Pipe => "a pipe",
+            Self::Socket => "a socket",
+            Self::Tty => "a terminal",
+            Self::CharDevice => "a character device",
+            Self::BlockDevice => "a block device",
+            Self::Directory => "a directory",
+            Self::Closed => "closed",
+            Self::Other => "a file of another kind (such as an anonymous inode)",
+            Self::Unknown => "of a kind not read",
+        }
+    }
+}
+
+/// The kinds of file behind the guest's stdin, stdout and stderr when a run
+/// began.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StdioKinds {
+    pub stdin: StdioKind,
+    pub stdout: StdioKind,
+    pub stderr: StdioKind,
+}
+
+impl StdioKinds {
+    /// The descriptors whose kind differs between `recorded` and `now`, in
+    /// descriptor order. A descriptor whose kind either run did not read
+    /// ([`StdioKind::Unknown`]) is never named: nothing says it changed.
+    pub fn changes(recorded: &Self, now: &Self) -> Vec<StdioChange> {
+        [
+            (0, recorded.stdin, now.stdin),
+            (1, recorded.stdout, now.stdout),
+            (2, recorded.stderr, now.stderr),
+        ]
+        .into_iter()
+        .filter(|(_, recorded, now)| {
+            recorded != now && *recorded != StdioKind::Unknown && *now != StdioKind::Unknown
+        })
+        .map(|(fd, recorded, now)| StdioChange { fd, recorded, now })
+        .collect()
+    }
+}
+
+/// A standard descriptor whose kind differs between a recorded run and the
+/// run that reproduces it ([`StdioKinds::changes`]).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StdioChange {
+    /// 0, 1 or 2.
+    pub fd: u8,
+    pub recorded: StdioKind,
+    pub now: StdioKind,
+}
+
+impl std::fmt::Display for StdioChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self.fd {
+            0 => "stdin",
+            1 => "stdout",
+            _ => "stderr",
+        };
+        write!(
+            f,
+            "{name} (fd {}) was {} in the recording and is {} now; the run may diverge where the guest checks it (fstat, isatty, fsync, lseek)",
+            self.fd,
+            self.recorded.describe(),
+            self.now.describe()
         )
     }
 }
@@ -298,6 +587,7 @@ mod tests {
 
     fn set(files: &[(&str, HostFileIdentity)]) -> HostInputSet {
         HostInputSet {
+            stdio: None,
             digest: String::new(),
             files: files
                 .iter()
@@ -308,6 +598,300 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    /// A descriptor's kind follows its mode, and a character device is a
+    /// terminal only when it says so. A replay names each descriptor whose
+    /// kind changed, in descriptor order. A set without stdio kinds is
+    /// written as before, and one with them round-trips.
+    /// A guest descriptor's kind comes from its link's name only where that
+    /// is no path, with no `stat`. A path is stat'ed only when its mount is
+    /// one of the local, in-kernel filesystems (here by injected mountinfo
+    /// texts), and the file's own type decides, whatever the path says: a
+    /// regular file bound over `/dev/null` or `/dev/pts/3` is `file`, the
+    /// real devices are `char_device` and `tty`. A file on NFS, CIFS, 9p,
+    /// Ceph, FUSE, overlay or a type not listed, a `/dev/null` on overlay
+    /// among them, is `unknown`, unstat'ed; so are a mount in neither
+    /// namespace, a missing mount ID, a failed `stat`, and a character device
+    /// without the driver list.
+    #[test]
+    fn a_guest_descriptor_is_statted_only_on_a_local_kernel_filesystem() {
+        let guest_mounts = "\
+22 1 0:21 / /proc rw,nosuid shared:5 - proc proc rw
+23 29 0:5 / /dev rw,nosuid shared:2 - devtmpfs devtmpfs rw,size=4096k
+24 23 0:22 / /dev/pts rw,nosuid,noexec shared:3 - devpts devpts rw,gid=5,mode=620
+40 29 0:45 / /mnt/remote rw,nosuid,nodev shared:30 - fuse.sshfs host:/ rw,user_id=0
+41 29 0:46 / /mnt/plain rw - fuse fuse rw
+42 29 8:1 / /mnt/disk rw - fuseblk /dev/sda1 rw
+43 29 0:47 / /mnt/nfs rw shared:31 - nfs4 server:/export rw,vers=4.2
+44 29 0:48 / /mnt/smb rw - cifs //server/share rw
+45 29 0:49 / /mnt/9p rw - 9p hostshare rw,trans=virtio
+46 29 0:50 / / rw - overlay overlay rw,lowerdir=/l,upperdir=/u,workdir=/w
+47 29 0:51 / /mnt/ceph rw - ceph mon:/ rw
+48 29 0:52 / /sys/fs/fuse/connections rw - fusectl fusectl rw
+49 29 0:53 / /dev/shm rw - tmpfs tmpfs rw
+";
+        let host_mounts = "29 1 8:2 / / rw,relatime shared:1 - ext4 /dev/sda2 rw\n";
+        let mut mounts = mount_types(guest_mounts);
+        mounts.extend(mount_types(host_mounts));
+        assert_eq!(mounts.len(), 14);
+        assert!(mounts.contains(&(46, "overlay".to_owned())));
+        let fdinfo = |id: u64| format!("pos:\t0\nflags:\t0100002\nmnt_id:\t{id}\nino:\t5\n");
+        let no_stat =
+            || -> Option<(libc::mode_t, u64)> { panic!("stat'ed a file it must not reach") };
+        let classify = |link: &str, fdinfo: Option<&str>| {
+            StdioKind::of_guest_descriptor(link.as_bytes(), fdinfo, &mounts, None, no_stat)
+        };
+        for (link, kind) in [
+            ("pipe:[1234]", StdioKind::Pipe),
+            ("socket:[99]", StdioKind::Socket),
+            ("anon_inode:[eventfd]", StdioKind::Other),
+            ("net:[4026531840]", StdioKind::Other),
+        ] {
+            assert_eq!(classify(link, None), kind, "{link}");
+        }
+        // Not stat'ed: a mount outside the list, whatever the path, a
+        // container's /dev on overlay among them.
+        for (link, mount) in [
+            ("/dev/null", 46),
+            ("/dev/pts/3", 46),
+            ("/dev/console", 46),
+            ("/mnt/remote/out.log", 40),
+        ] {
+            assert_eq!(
+                classify(link, Some(&fdinfo(mount))),
+                StdioKind::Unknown,
+                "{link}"
+            );
+        }
+        for id in 40..=48 {
+            assert_eq!(
+                classify("/mnt/remote/out.log", Some(&fdinfo(id))),
+                StdioKind::Unknown,
+                "mount {id}"
+            );
+        }
+        // On a local, in-kernel filesystem, one stat decides.
+        let pty = (136 << 8) | 3;
+        let null = (1 << 8) | 3;
+        let drivers = "pty_slave            /dev/pts      136 0-1048575 pty:slave\n";
+        let stat_once =
+            |link: &str, mount: u64, mode: libc::mode_t, rdev: u64, drivers: Option<&str>| {
+                let mut stats = 0;
+                let kind = StdioKind::of_guest_descriptor(
+                    link.as_bytes(),
+                    Some(&fdinfo(mount)),
+                    &mounts,
+                    drivers,
+                    || {
+                        stats += 1;
+                        Some((mode, rdev))
+                    },
+                );
+                assert_eq!(stats, 1, "{link}");
+                kind
+            };
+        let file = libc::S_IFREG | 0o644;
+        let chr = libc::S_IFCHR | 0o666;
+        for (link, mount, mode, rdev, kind) in [
+            ("/home/user/out.log", 29, file, 0, StdioKind::File),
+            ("/dev/shm/out", 49, file, 0, StdioKind::File),
+            ("/home/user/fifo", 29, libc::S_IFIFO, 0, StdioKind::Pipe),
+            // The real devices.
+            ("/dev/null", 23, chr, null, StdioKind::CharDevice),
+            ("/dev/pts/3", 24, chr, pty, StdioKind::Tty),
+            // Regular files bound over device paths, on ext4 and tmpfs.
+            ("/dev/null", 29, file, 0, StdioKind::File),
+            ("/dev/pts/3", 49, file, 0, StdioKind::File),
+            // A device node at another path is what it is.
+            ("/home/user/tty", 29, chr, pty, StdioKind::Tty),
+        ] {
+            assert_eq!(
+                stat_once(link, mount, mode, rdev, Some(drivers)),
+                kind,
+                "{link} on {mount}"
+            );
+        }
+        assert_eq!(
+            stat_once("/dev/pts/3", 24, chr, pty, None),
+            StdioKind::Unknown
+        );
+        assert_eq!(
+            stat_once("/dev/null", 23, chr, null, None),
+            StdioKind::Unknown
+        );
+        // No mount ID, a mount neither namespace lists, or a failed stat.
+        assert_eq!(classify("/home/user/out.log", None), StdioKind::Unknown);
+        assert_eq!(
+            classify("/memfd:input (deleted)", Some(&fdinfo(7))),
+            StdioKind::Unknown
+        );
+        assert_eq!(
+            StdioKind::of_guest_descriptor(b"/x", Some(&fdinfo(29)), &mounts, None, || None),
+            StdioKind::Unknown
+        );
+    }
+
+    /// A descriptor whose kind either run did not read is never named as
+    /// changed, whichever run it is, while two kinds both read still are,
+    /// `other` among them; `unknown` keeps its name on the wire.
+    #[test]
+    fn an_unknown_stdio_kind_is_never_compared() {
+        let read = StdioKinds {
+            stdin: StdioKind::CharDevice,
+            stdout: StdioKind::File,
+            stderr: StdioKind::Other,
+        };
+        let unread = StdioKinds {
+            stdin: StdioKind::Unknown,
+            stdout: StdioKind::Unknown,
+            stderr: StdioKind::Unknown,
+        };
+        assert!(StdioKinds::changes(&read, &unread).is_empty());
+        assert!(StdioKinds::changes(&unread, &read).is_empty());
+        assert!(StdioKinds::changes(&unread, &unread).is_empty());
+        let now = StdioKinds {
+            stdin: StdioKind::Unknown,
+            stdout: StdioKind::Pipe,
+            stderr: StdioKind::File,
+        };
+        assert_eq!(
+            StdioKinds::changes(&read, &now),
+            vec![
+                StdioChange {
+                    fd: 1,
+                    recorded: StdioKind::File,
+                    now: StdioKind::Pipe,
+                },
+                StdioChange {
+                    fd: 2,
+                    recorded: StdioKind::Other,
+                    now: StdioKind::File,
+                },
+            ]
+        );
+        assert_eq!(
+            serde_json::to_string(&StdioKind::Unknown).unwrap(),
+            "\"unknown\""
+        );
+        assert_eq!(
+            serde_json::from_str::<StdioKind>("\"other\"").unwrap(),
+            StdioKind::Other
+        );
+    }
+
+    /// A process is the expected root when its maps map the file its `exe`
+    /// link names with the inode the root's exec ran, whatever spaces the
+    /// path holds; another inode, another path, or no mapping is not it.
+    #[test]
+    fn the_root_is_known_by_its_mapped_image() {
+        let maps = "\
+55d0c8a00000-55d0c8a02000 r--p 00000000 00:2a 100483                     /usr/bin/echo
+55d0c8a02000-55d0c8a06000 r-xp 00002000 00:2a 100483                     /usr/bin/echo
+7f1e2c000000-7f1e2c022000 r--p 00000000 00:2a 160034633                  /usr/lib64/ld-linux-x86-64.so.2
+7ffc1a000000-7ffc1a021000 rw-p 00000000 00:00 0                          [stack]
+7f1e2d000000-7f1e2d001000 r-xp 00000000 00:2a 77                         /opt/my tools/run me (deleted)
+";
+        assert!(maps_name_image(maps, b"/usr/bin/echo", 100483));
+        assert!(!maps_name_image(maps, b"/usr/bin/echo", 100484));
+        assert!(!maps_name_image(maps, b"/usr/bin/true", 100483));
+        assert!(maps_name_image(maps, b"/opt/my tools/run me (deleted)", 77));
+        assert!(!maps_name_image(maps, b"[stack]", 0));
+        assert!(!maps_name_image("", b"/usr/bin/echo", 100483));
+    }
+
+    /// A character device is a terminal when a terminal driver in the
+    /// kernel's list owns its major number and its minor number: a pty slave,
+    /// a serial port and the console are; /dev/null and a minor number past
+    /// a driver's range are not.
+    #[test]
+    fn terminal_devices_follow_the_kernels_driver_list() {
+        let drivers = "\
+/dev/tty             /dev/tty        5       0 system:/dev/tty
+/dev/console         /dev/console    5       1 system:console
+/dev/vc/0            /dev/vc/0       4       0 system:vtmaster
+serial               /dev/ttyS       4 64-95 serial
+pty_slave            /dev/pts      136 0-1048575 pty:slave
+";
+        let device = |major: u64, minor: u64| {
+            ((major & 0xfff) << 8)
+                | ((major & !0xfff) << 32)
+                | (minor & 0xff)
+                | ((minor & !0xff) << 12)
+        };
+        for (major, minor, terminal) in [
+            (136, 3, true),
+            (136, 1_000_000, true),
+            (4, 64, true),
+            (4, 95, true),
+            (4, 96, false),
+            (5, 1, true),
+            (1, 3, false),
+        ] {
+            assert_eq!(
+                StdioKind::is_terminal_device(device(major, minor), drivers),
+                terminal,
+                "{major}:{minor}"
+            );
+        }
+        assert!(!StdioKind::is_terminal_device(device(136, 3), ""));
+        // A symbolic link an `O_PATH` descriptor names is no regular file.
+        assert_eq!(StdioKind::from_mode(libc::S_IFLNK, false), StdioKind::Other);
+    }
+
+    #[test]
+    fn stdio_kinds_name_each_changed_descriptor() {
+        assert_eq!(
+            StdioKind::from_mode(libc::S_IFREG | 0o644, false),
+            StdioKind::File
+        );
+        assert_eq!(StdioKind::from_mode(libc::S_IFIFO, false), StdioKind::Pipe);
+        assert_eq!(StdioKind::from_mode(libc::S_IFCHR, true), StdioKind::Tty);
+        assert_eq!(
+            StdioKind::from_mode(libc::S_IFCHR, false),
+            StdioKind::CharDevice
+        );
+        let recorded = StdioKinds {
+            stdin: StdioKind::CharDevice,
+            stdout: StdioKind::Pipe,
+            stderr: StdioKind::File,
+        };
+        let now = StdioKinds {
+            stdin: StdioKind::Closed,
+            stderr: StdioKind::Pipe,
+            ..recorded
+        };
+        assert!(StdioKinds::changes(&recorded, &recorded).is_empty());
+        let changes = StdioKinds::changes(&recorded, &now);
+        assert_eq!(
+            changes,
+            vec![
+                StdioChange {
+                    fd: 0,
+                    recorded: StdioKind::CharDevice,
+                    now: StdioKind::Closed,
+                },
+                StdioChange {
+                    fd: 2,
+                    recorded: StdioKind::File,
+                    now: StdioKind::Pipe,
+                },
+            ]
+        );
+        assert_eq!(
+            changes[1].to_string(),
+            "stderr (fd 2) was a regular file in the recording and is a pipe now; the run may \
+             diverge where the guest checks it (fstat, isatty, fsync, lseek)"
+        );
+        let without = set(&[]);
+        assert!(!serde_json::to_string(&without).unwrap().contains("stdio"));
+        let with = HostInputSet {
+            stdio: Some(now),
+            ..set(&[])
+        };
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(json.contains(r#""stderr":"pipe""#), "{json}");
+        assert_eq!(serde_json::from_str::<HostInputSet>(&json).unwrap(), with);
     }
 
     #[test]

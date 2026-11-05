@@ -6412,6 +6412,14 @@ impl Scheduler {
         }
     }
 
+    /// The kernel's process ID of the host thread `dettid` registered as
+    /// ([`Self::register_physical_thread`]), if it registered one.
+    pub(crate) fn physical_process_id(&self, dettid: DetTid) -> Option<i32> {
+        self.physical_thread_pidfds
+            .get(&dettid)
+            .map(|(_, pid, _, _)| *pid)
+    }
+
     #[cfg(test)]
     pub(crate) fn physical_thread_identity(&self, dettid: DetTid) -> Option<(MmId, i32, i32)> {
         self.physical_thread_pidfds
@@ -23025,6 +23033,7 @@ impl Scheduler {
                 // GlobalState names the files the exclusive rewrite left
                 // unchanged for want of mapping symbols (aarch64).
                 exclusive_rewrite_unmarked: Vec::new(),
+                stdio_changed: Vec::new(),
             },
             info_reprio_descrip,
         ))

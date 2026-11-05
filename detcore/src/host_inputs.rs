@@ -130,6 +130,7 @@ pub(crate) fn input_set(records: &[HostInputRecord], mutated: &BTreeSet<String>)
     HostInputSet {
         digest: hex(&hasher.finalize()),
         files,
+        stdio: None,
     }
 }
 
