@@ -18,7 +18,14 @@ sanitized_feature = selects.apply(
 
 rust_library(
     name = "detcore",
-    srcs = glob(["src/**/*.rs"]),
+    srcs = glob([
+        "src/**/*.rs",
+        "src/**/*.txt",
+        "src/**/*.json",
+    ]),
+    mapped_srcs = {
+        "//hermetic_infra/hermit/detcore-model:src/schedule.rs": "../detcore-model/src/schedule.rs",
+    },
     autocargo = {
         "cargo_toml_config": {
             "package": {
