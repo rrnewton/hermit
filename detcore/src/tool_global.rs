@@ -8394,13 +8394,15 @@ pub enum SignalScope {
 /// `TraceSchedEventResponse::backstop` (PR #4759, allocated 25 on its
 /// own base, assigned 42 at its rebase onto 41, renumbered 43 at
 /// integration). 44 adds the `PublishInstructionOffset`
-/// pair (PR #4769, renumbered from 41 at integration). The current
-/// revision 45 is the `HostFileIdentity::content` layout (PR #4791,
-/// renumbered from 41 at integration). The current revision 46 retypes
-/// `GlobalRequest::TraceSchedEvent` and adds
+/// pair (PR #4769, renumbered from 41 at integration). 45 is the
+/// `HostFileIdentity::content` layout (PR #4791, renumbered from 41 at
+/// integration). 46 retypes `GlobalRequest::TraceSchedEvent` and adds
 /// `GlobalResponse::WithWatchOrder` (PR #4796, renumbered from 45 at
-/// integration).
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 46;
+/// integration). 47 adds the `RecordExecStrings`/`ProcessExecStrings`
+/// pair (package K item 2b slice 2b-3, renumbered from 42 at
+/// integration). The current revision 48 records the combined
+/// integration tree's definitions as measured at regeneration.
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 48;
 
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
