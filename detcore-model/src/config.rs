@@ -5377,6 +5377,17 @@ mod tests {
                 "publishable_parent_death_signals" => serde_json::Value::from(
                     BackendCapabilities::KVM.publishable_parent_death_signals,
                 ),
+                // An `Option` contract, not a bool: move between its two
+                // states (absent reads as `None` by serde default).
+                "rcb_clock_contract" => {
+                    if value.is_null() {
+                        serde_json::Value::String(
+                            "PerfCounterOnTargetThreadUserOnly".to_owned(),
+                        )
+                    } else {
+                        serde_json::Value::Null
+                    }
+                }
                 _ => serde_json::Value::Bool(!value.as_bool().unwrap()),
             };
             let backend = serde_json::from_value(edited).unwrap();
@@ -5404,10 +5415,15 @@ mod tests {
         for (name, value) in envelope["backend"].as_object().unwrap() {
             let mut missing = envelope.clone();
             missing["backend"].as_object_mut().unwrap().remove(name);
-            assert!(
-                decode_backend_config_json(&missing.to_string()).is_err(),
-                "missing {name}"
-            );
+            // `rcb_clock_contract` is `#[serde(default)]` by design: an
+            // older serialized value without it reads as `None`, so its
+            // absence is not an error. Every other capability is required.
+            if name != "rcb_clock_contract" {
+                assert!(
+                    decode_backend_config_json(&missing.to_string()).is_err(),
+                    "missing {name}"
+                );
+            }
             let backend = serde_json::to_string(&sent.backend).unwrap();
             let duplicate = backend.replacen('{', &format!("{{\"{name}\":{value},"), 1);
             let duplicate = encoded.replace(&backend, &duplicate);
