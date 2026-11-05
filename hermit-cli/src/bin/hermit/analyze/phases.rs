@@ -3536,6 +3536,9 @@ impl AnalyzeOpts {
     pub fn main(&mut self, global: &GlobalOpts) -> anyhow::Result<ExitStatus> {
         // The budget counts from here, before anything that takes time.
         self.budget = Budget::new(self.time_budget, self.trial_budget);
+        // Every trial reads the one property snapshot this invocation takes
+        // (`RunOpts::take_property_snapshot`); it goes when analyze ends.
+        let _remove_property_snapshot = crate::app::property_snapshot::RemoveOnExit;
         self.prepare(global)?;
         let _watchdog = self.max_memory.enforce("hermit analyze")?;
         // From here SIGTERM, SIGINT and SIGHUP end the run in progress and

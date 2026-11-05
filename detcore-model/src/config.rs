@@ -220,6 +220,80 @@ pub enum DetlogAnon {
     Pages,
 }
 
+/// A frozen copy of a directory whose files the guest maps read-only while
+/// another process rewrites them in place. On Android that is the system
+/// property area, `/dev/__properties__`: init writes every property change into
+/// those shared files, and bionic (the dynamic linker's private copy as well as
+/// libc's) rereads its cached values whenever their serial moves, so property
+/// writes made outside the run during it change which code the guest runs.
+///
+/// An open of `guest_dir/<name>` for reading, by any guest thread from its
+/// first system call, opens `copy_dir/<name>` instead when that copy exists. A
+/// write open, or a name with no copy, is left as it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PropertySnapshot {
+    /// The directory the guest names: `/dev/__properties__`.
+    pub guest_dir: PathBuf,
+    /// The directory holding the copies, one per file of `guest_dir` Hermit
+    /// could read, made before the guest's first exec.
+    pub copy_dir: PathBuf,
+    /// Each live file copied: its host device and inode, by which an open
+    /// that reaches it by any spelling (a symbolic link, a bind mount, a
+    /// descriptor link) is recognized, and its name in `copy_dir`.
+    #[serde(default)]
+    pub live_files: Vec<PropertyFile>,
+    /// Each live file the capture saw but could not copy, because it stopped
+    /// being readable mid-capture. It has no copy, so an open that reaches it
+    /// by any spelling reads the live area, which is refused under the
+    /// default fail-closed policy.
+    #[serde(default)]
+    pub uncopied_files: Vec<PropertyFile>,
+    /// Whether the copies are one consistent cut: `properties_serial` read
+    /// the same before and after they were taken. Otherwise (properties kept
+    /// changing, or the serial could not be read) each file is coherent on
+    /// its own, but two files may come from different moments. Shown in the
+    /// run summary; not stored in preemption or schedule recordings.
+    #[serde(default)]
+    pub consistent_cut: bool,
+}
+
+impl PropertySnapshot {
+    /// The live file the snapshot copied with host device `dev` and inode
+    /// `ino`, if any.
+    pub fn live_file(&self, dev: u64, ino: u64) -> Option<&PropertyFile> {
+        self.live_files
+            .iter()
+            .find(|file| (file.dev, file.ino) == (dev, ino))
+    }
+
+    /// The live property file with host device `dev` and inode `ino` the
+    /// capture saw, copied or not: reading it reads the live area. Matching
+    /// is by identity alone, here and in [`Self::live_file`]: if a captured
+    /// file is deleted during the run and its inode reused by an unrelated
+    /// file, a pure read of that file is falsely redirected to the copy (a
+    /// copied identity) or treated as the live area and refused in a
+    /// fail-closed run (an uncopied one). Either way no live property read
+    /// is let through.
+    pub fn known_live_file(&self, dev: u64, ino: u64) -> Option<&PropertyFile> {
+        self.live_file(dev, ino).or_else(|| {
+            self.uncopied_files
+                .iter()
+                .find(|file| (file.dev, file.ino) == (dev, ino))
+        })
+    }
+}
+
+/// One live property file a [`PropertySnapshot`] copied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PropertyFile {
+    /// The live file's host `st_dev`.
+    pub dev: u64,
+    /// The live file's host `st_ino`.
+    pub ino: u64,
+    /// Its name, in the guest directory and in the copy directory.
+    pub name: String,
+}
+
 /// Configuration options for detcore.
 #[derive(Debug, Serialize, Deserialize, Clone, Parser)]
 pub struct Config {
@@ -1707,6 +1781,17 @@ pub struct Config {
     #[serde(skip)]
     #[clap(skip)]
     pub host_input_snapshots: Vec<crate::host_input::HostInputSnapshot>,
+
+    /// The frozen copy of the Android system property area that the guest
+    /// reads in place of the live one ([`PropertySnapshot`]). hermit-cli makes
+    /// the copy and sets this before the guest's first exec on a host that has
+    /// `/dev/__properties__`; never a CLI flag. Serialized, because Detcore's
+    /// open handler reads it in each guest process's tool, which receives this
+    /// `Config` encoded; it came after the legacy form froze, so it never
+    /// enters that form and reads as unset there.
+    #[serde(default)]
+    #[clap(skip)]
+    pub property_snapshot: Option<PropertySnapshot>,
 
     /// A guest address range, `[start, end)`, holding code whose syscalls
     /// the backend lets through without Detcore seeing them, which the guest
@@ -4093,7 +4178,10 @@ mod legacy_backend_json {
     /// `chaos_instruction_offset` came after it as well: the ptrace backend's
     /// precise timer takes its single steps, and `hermit run` refuses it on
     /// every other backend, so it is never written and reads as 0.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 55] = [
+    /// `property_snapshot` came after it too, and only hermit-cli sets it, on
+    /// Android, where DBT does not run; it is never written and reads as
+    /// unset.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 56] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -4149,6 +4237,7 @@ mod legacy_backend_json {
         "stacktrace_at_schedule_positions",
         "untrap_passthrough_syscalls",
         "chaos_instruction_offset",
+        "property_snapshot",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -4337,7 +4426,8 @@ mod legacy_backend_json {
                     | "access_trace_max_records"
                     | "access_trace_max_bytes"
                     | "standard_stream_aliases"
-                    | "post_crash_timeslice",
+                    | "post_crash_timeslice"
+                    | "property_snapshot",
                 ) => seed
                     .deserialize(serde_json::Value::Null)
                     .map(Some)
@@ -4670,6 +4760,7 @@ mod legacy_backend_json {
                 | "stacktrace_at_schedule_positions"
                 | "untrap_passthrough_syscalls"
                 | "chaos_instruction_offset" => Ok(()),
+                | "property_snapshot" => Ok(()),
                 "replay_continue_fairly" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
@@ -5678,6 +5769,7 @@ mod tests {
                 | "stacktrace_at_schedule_positions"
                 | "untrap_passthrough_syscalls"
                 | "chaos_instruction_offset" => {}
+                | "property_snapshot" => {}
                 "replay_continue_fairly" => {}
                 other => expected.push(other.to_owned()),
             }
@@ -5717,11 +5809,12 @@ mod tests {
         // `standard_stream_aliases`, `sleep_registration`, `strict_binder`,
         // `post_crash_timeslice`, `rewrite_exclusives_in_memory`,
         // `stacktrace_at_schedule_positions`, `rewrite_exclusives_unmarked`,
-        // `untrap_passthrough_syscalls`, `chaos_instruction_offset` and
-        // `strict_schedule_boundaries` none: fourteen more keys and
-        // fifty-four fewer, so forty keys fewer than fields.
+        // `untrap_passthrough_syscalls`, `chaos_instruction_offset`,
+        // `property_snapshot` and `strict_schedule_boundaries` none:
+        // fourteen more keys and fifty-five fewer, so forty-one keys
+        // fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 40);
+        assert_eq!(fields.len(), keys.len() + 41);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:

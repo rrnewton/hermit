@@ -1136,6 +1136,238 @@ const DETERMINISTIC_NETNS_COOKIE: u64 = 1;
 // Above Linux's PID range and below the high-bit IDs used by kernel autobind.
 const DETERMINISTIC_NETLINK_PORT_ID_BASE: u32 = 0x4000_0000;
 
+/// The name of the file `path` names directly in `guest_dir`: one normal
+/// component after it, so no `..` and no subdirectory.
+fn property_area_name<'a>(guest_dir: &Path, path: &'a Path) -> Option<&'a std::ffi::OsStr> {
+    let name = path.strip_prefix(guest_dir).ok()?;
+    let mut components = name.components();
+    let (Some(std::path::Component::Normal(file)), None) = (components.next(), components.next())
+    else {
+        return None;
+    };
+    Some(file)
+}
+
+/// The area name of a kernel-resolved path (`/proc/<pid>/fd/<fd>` of an
+/// opened descriptor): the kernel has already walked `..`, symlinks and
+/// dirfds, so a lexical check on *this* path is a check on the object
+/// itself, not on the guest's spelling. `guest_dir` itself may be named
+/// through a symlink, so its canonical form is tried too.
+fn resolved_property_area_name(
+    snapshot: &detcore_model::config::PropertySnapshot,
+    resolved: &Path,
+) -> Option<String> {
+    let resolved = resolved
+        .to_string_lossy()
+        .strip_suffix(" (deleted)")
+        .map_or_else(|| resolved.to_path_buf(), PathBuf::from);
+    if let Some(name) = property_area_name(&snapshot.guest_dir, &resolved) {
+        return Some(name.to_string_lossy().into_owned());
+    }
+    let canonical = crate::util::canonicalize(&snapshot.guest_dir).ok()?;
+    if canonical == snapshot.guest_dir {
+        return None;
+    }
+    property_area_name(&canonical, &resolved).map(|name| name.to_string_lossy().into_owned())
+}
+
+/// The area name of the live object `(dev, ino)`, found by listing the
+/// live area itself: a fallback where the tool cannot name a guest
+/// descriptor. Only an object on the area's own filesystem can be in it.
+fn live_area_name_by_identity(
+    snapshot: &detcore_model::config::PropertySnapshot,
+    dev: u64,
+    ino: u64,
+) -> Option<String> {
+    let area = crate::util::raw_stat(&snapshot.guest_dir).ok()?;
+    if area.st_dev != dev {
+        return None;
+    }
+    crate::util::find_in_directory(&snapshot.guest_dir, |name| {
+        let meta = crate::util::raw_stat(&snapshot.guest_dir.join(name)).ok()?;
+        ((meta.st_dev, meta.st_ino) == (dev, ino)).then(|| name.to_string_lossy().into_owned())
+    })
+    .ok()
+    .flatten()
+}
+
+/// Whether the live object `(dev, ino)` a descriptor reached, whose
+/// kernel-resolved path is `resolved` where the tool can name it, is a
+/// file of the live area the snapshot does not catalogue (neither copied
+/// nor known-uncopied): its area name, if so.
+fn uncatalogued_area_name(
+    snapshot: &detcore_model::config::PropertySnapshot,
+    resolved: Option<&Path>,
+    dev: u64,
+    ino: u64,
+) -> Option<String> {
+    if snapshot.known_live_file(dev, ino).is_some() {
+        return None;
+    }
+    resolved
+        .and_then(|path| resolved_property_area_name(snapshot, path))
+        .or_else(|| live_area_name_by_identity(snapshot, dev, ino))
+}
+
+/// The area name a not-yet-existing file at `path` would have: its parent,
+/// kernel-resolved on the host (symlinks and `..` walked, as
+/// `resolved_property_area_name` relies on), is the live area itself. This
+/// decides an `O_CREAT` open before it can create anything.
+fn area_parent_name(
+    snapshot: &detcore_model::config::PropertySnapshot,
+    path: &Path,
+) -> Option<String> {
+    let parent = path.parent()?;
+    let name = path.file_name()?;
+    let canonical_parent = crate::util::canonicalize(parent).ok()?;
+    let canonical_area = crate::util::canonicalize(&snapshot.guest_dir).ok()?;
+    (canonical_parent == canonical_area).then(|| name.to_string_lossy().into_owned())
+}
+
+/// Whether an open with `flags` only reads: `O_RDONLY` without `O_CREAT` or
+/// `O_TRUNC`, or `O_PATH`, for which Linux ignores every flag but
+/// `O_CLOEXEC`, `O_DIRECTORY` and `O_NOFOLLOW` (fs/open.c `build_open_flags`).
+fn is_pure_read(flags: OFlag) -> bool {
+    flags.contains(OFlag::O_PATH)
+        || (flags.bits() & libc::O_ACCMODE == libc::O_RDONLY
+            && !flags.intersects(OFlag::O_CREAT | OFlag::O_TRUNC))
+}
+
+/// Whether an open with `flags` gives a descriptor its holder can read:
+/// access mode `O_RDONLY` or `O_RDWR`, whatever the creation and truncation
+/// flags (`O_RDONLY` with `O_CREAT` or `O_TRUNC` reads too; open(2)). The
+/// reserved access mode 3 does not: Linux checks read and write permission
+/// for it (`ACC_MODE`, include/linux/fs.h:3889 at v6.16, read by
+/// `build_open_flags`, fs/open.c:1243) but gives the file neither
+/// `FMODE_READ` nor `FMODE_WRITE` (`OPEN_FMODE`, include/linux/fs.h:3890,
+/// set in fs/file_table.c:175), so its descriptor can be neither read nor
+/// written. An `O_PATH` descriptor reads nothing either.
+fn opens_readable(flags: OFlag) -> bool {
+    !flags.contains(OFlag::O_PATH)
+        && matches!(
+            flags.bits() & libc::O_ACCMODE,
+            libc::O_RDONLY | libc::O_RDWR
+        )
+}
+
+/// Whether an open with `flags` can change the file it names: access mode
+/// `O_WRONLY` or `O_RDWR`, or `O_CREAT` or `O_TRUNC`. A bare access mode 3
+/// open reads and writes nothing ([`opens_readable`]).
+fn opens_to_change(flags: OFlag) -> bool {
+    !flags.contains(OFlag::O_PATH)
+        && (matches!(
+            flags.bits() & libc::O_ACCMODE,
+            libc::O_WRONLY | libc::O_RDWR
+        ) || flags.intersects(OFlag::O_CREAT | OFlag::O_TRUNC))
+}
+
+/// What `property_reached_live` found about a descriptor.
+enum LiveCheck {
+    /// A live property file the snapshot copied, with why.
+    Live(String),
+    /// Its identity could not be read, with why.
+    Unchecked(String),
+    /// Not a live property file.
+    NotLive,
+}
+
+/// Whether a creation's parent directory, resolved as the pending
+/// open resolves it, is the live property area (`resolved_parent_area`).
+enum ParentArea {
+    /// The resolved parent is the live area itself, proven by identity.
+    Area,
+    /// The resolved parent is some other directory, proven by a
+    /// successful resolution whose identity differs from the area's.
+    /// A resolution that fails is never `Outside`.
+    Outside,
+    /// The resolved parent could not be determined, or could not be
+    /// proven outside (its spelling does not fit the staged probe,
+    /// its resolution failed, or it resolves only in the guest's own
+    /// context), so the creation fails closed by name.
+    Unknown,
+}
+
+/// What an open under a property snapshot does (`property_decision`).
+enum PropertyOpen {
+    /// Read the copy at this path instead.
+    Copy(PathBuf),
+    /// The copy should serve this open but cannot, for this reason.
+    Live(String),
+    /// A name in the property area the snapshot does not hold.
+    Unknown(String),
+}
+
+#[cfg(test)]
+mod property_copy_tests {
+    use super::*;
+
+    /// Only a file directly in the area has an area name: not a `..`
+    /// spelling, a subdirectory path, the area itself or a path outside it.
+    #[test]
+    fn only_a_file_directly_in_the_area_has_an_area_name() {
+        let area = Path::new("/dev/__properties__");
+        let name =
+            |path: &str| property_area_name(area, Path::new(path)).map(|name| name.to_owned());
+        assert_eq!(
+            name("/dev/__properties__/properties_serial"),
+            Some("properties_serial".into())
+        );
+        assert_eq!(name("/dev/__properties__/../properties_serial"), None);
+        assert_eq!(name("/dev/__properties__/a/properties_serial"), None);
+        assert_eq!(name("/dev/__properties__"), None);
+        assert_eq!(name("/dev/properties_serial"), None);
+    }
+
+    /// A copy is identified by its contents: the same bytes give the same
+    /// identity wherever and whenever they were copied, and other bytes do
+    /// not.
+    #[test]
+    fn a_property_copy_is_identified_by_its_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b, c) = (
+            dir.path().join("a"),
+            dir.path().join("b"),
+            dir.path().join("c"),
+        );
+        std::fs::write(&a, [1; 64]).unwrap();
+        std::fs::write(&b, [1; 64]).unwrap();
+        std::fs::write(&c, [2; 64]).unwrap();
+        let identity = |path: &Path| property_copy_identity(path).unwrap();
+        assert_eq!(identity(&a), identity(&b));
+        assert_ne!(identity(&a), identity(&c));
+        assert_eq!(identity(&a).size, 64);
+        assert!(identity(&a).content.is_some());
+    }
+}
+
+/// The host-input identity of a property snapshot copy: its size and a hash
+/// of its contents (`HostFileIdentity::of_snapshot`), or `None` if it cannot
+/// be read.
+fn property_copy_identity(copy: &Path) -> Option<detcore_model::host_input::HostFileIdentity> {
+    // A copy never changes (hermit-cli makes it read-only and nothing writes
+    // it), so each is hashed once per tool process.
+    type Known = std::collections::HashMap<PathBuf, detcore_model::host_input::HostFileIdentity>;
+    static KNOWN: std::sync::LazyLock<std::sync::Mutex<Known>> =
+        std::sync::LazyLock::new(Default::default);
+    if let Some(known) = KNOWN.lock().ok()?.get(copy) {
+        return Some(*known);
+    }
+    let identity = hash_property_copy(copy)?;
+    KNOWN.lock().ok()?.insert(copy.to_owned(), identity);
+    Some(identity)
+}
+
+fn hash_property_copy(copy: &Path) -> Option<detcore_model::host_input::HostFileIdentity> {
+    use sha2::Digest;
+    let contents = std::fs::read(copy).ok()?;
+    let digest = sha2::Sha256::digest(&contents);
+    let content = u64::from_be_bytes(digest[..8].try_into().ok()?);
+    Some(detcore_model::host_input::HostFileIdentity::of_snapshot(
+        contents.len() as i64,
+        content,
+    ))
+}
+
 /// Does the new guest descriptor `fd` reopen an anonymous pipe that the same
 /// process already holds as a scheduler-managed pipe (`managed_pipe_fds`)?
 ///
@@ -5593,6 +5825,588 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(result?)
     }
 
+    /// What the open `call`, of `path`, does under `Config::property_snapshot`.
+    /// Only a pure read ([`is_pure_read`]) is served from the snapshot; the
+    /// copy is never opened to write. A write-only open is the guest's own
+    /// change to the host filesystem, which Hermit does not make
+    /// deterministic: it runs as it is, and one that names the area is said
+    /// once ([`Self::note_property_write`]). An open that writes, creates or
+    /// truncates and also reads ([`opens_readable`]: `O_RDWR`, or `O_RDONLY`
+    /// with `O_CREAT` or `O_TRUNC`) would read the live file through its
+    /// descriptor, which the read-only copy cannot serve: it is decided as a
+    /// pure read is, and an object the snapshot copied is then
+    /// [`PropertyOpen::Live`], which a fail-closed run refuses before the open
+    /// runs. A pure read, or such an open, is decided before it runs by the
+    /// object it names (a `newfstatat` of its path, which follows a last
+    /// symbolic link unless the open does not) and by its name:
+    /// - an object the snapshot copied: its copy, for a pure read;
+    /// - a name directly in the area whose object the snapshot does not hold,
+    ///   or could not be classified ([`PropertyOpen::Unknown`]);
+    /// - anything else: `None`, the open as it is. Its descriptor is then
+    ///   checked against the snapshot (`property_reached_live`), which also
+    ///   catches an object swapped in between the `newfstatat` and the open.
+    async fn property_decision<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Openat,
+        path: &Path,
+    ) -> Option<PropertyOpen> {
+        let snapshot = self.cfg.property_snapshot.as_ref()?;
+        let in_area = property_area_name(&snapshot.guest_dir, path);
+        let pure_read = is_pure_read(call.flags());
+        if !pure_read && in_area.is_some() && opens_to_change(call.flags()) {
+            self.note_property_write(path);
+        }
+        let follow = if call.flags().contains(OFlag::O_NOFOLLOW) {
+            AtFlags::AT_SYMLINK_NOFOLLOW
+        } else {
+            AtFlags::empty()
+        };
+        let object = match call.path() {
+            Some(spelled) => {
+                Self::inject_statat(guest, call.dirfd(), spelled, [Some(spelled), None], follow)
+                    .await
+                    .ok()
+            }
+            None => None,
+        };
+        let copied = object.and_then(|stat| snapshot.live_file(stat.st_dev, stat.st_ino));
+        // No object: a mutating `O_CREAT` open would create in the
+        // directory the kernel resolves, which need not be the spelled
+        // parent (a dangling final symlink creates in its target's
+        // directory; a retained dirfd creates in the directory object it
+        // holds). Refuse before the real open can create anything there.
+        if copied.is_none()
+            && object.is_none()
+            && call.flags().contains(OFlag::O_CREAT)
+            && opens_to_change(call.flags())
+        {
+            let reason = match area_parent_name(snapshot, path) {
+                Some(name) => Some(format!(
+                    "{name} is in the property area but not in its snapshot"
+                )),
+                None => {
+                    self.creation_in_live_area(guest, call, path, snapshot)
+                        .await
+                }
+            };
+            if let Some(reason) = reason {
+                return Some(PropertyOpen::Live(reason));
+            }
+        }
+        if !pure_read && !opens_readable(call.flags()) {
+            return None;
+        }
+        // A nonreading open (`O_PATH`, or the reserved access mode) of an
+        // uncopied file reads no live bytes, so it keeps its native
+        // behaviour; only a readable open is refused for having no copy.
+        // A later readable reopen is decided as its own open.
+        if copied.is_none()
+            && opens_readable(call.flags())
+            && let Some(file) =
+                object.and_then(|stat| snapshot.known_live_file(stat.st_dev, stat.st_ino))
+        {
+            return Some(PropertyOpen::Live(format!(
+                "the live property file {} stopped being readable while the snapshot was \
+                 taken, so it has no copy",
+                file.name
+            )));
+        }
+        // A readable open of an uncatalogued live-area object (by any
+        // spelling: the stat above follows symlinks and dirfds, and the
+        // identity search lists the area itself) is refused here, before
+        // the live open can truncate or create anything. `O_PATH` is not
+        // readable (`opens_readable`), so it keeps its native success
+        // below; a later readable reopen is decided on its own.
+        if opens_readable(call.flags())
+            && let Some(stat) = object
+            && let Some(name) = uncatalogued_area_name(snapshot, None, stat.st_dev, stat.st_ino)
+        {
+            return Some(PropertyOpen::Live(format!(
+                "{name} is in the property area but not in its snapshot"
+            )));
+        }
+        match (copied, in_area) {
+            (Some(file), _) if !pure_read => Some(PropertyOpen::Live(format!(
+                "it opens the property file {} to read and also to write, create or truncate \
+                 it (open flags {:#o}), which its frozen, read-only copy cannot serve",
+                file.name,
+                call.flags().bits()
+            ))),
+            (Some(file), _) => Some(if snapshot.copy_dir.is_dir() {
+                PropertyOpen::Copy(snapshot.copy_dir.join(&file.name))
+            } else {
+                PropertyOpen::Live(format!(
+                    "its snapshot directory {} is gone or not visible to Hermit",
+                    snapshot.copy_dir.display()
+                ))
+            }),
+            (None, Some(name)) if opens_readable(call.flags()) => {
+                Some(PropertyOpen::Live(format!(
+                    "{name} is in the property area but not in its snapshot",
+                    name = name.to_string_lossy()
+                )))
+            }
+            (None, Some(name)) => Some(PropertyOpen::Unknown(name.to_string_lossy().into_owned())),
+            (None, None) => None,
+        }
+    }
+
+    /// Whether the directory the guest kernel resolves for
+    /// `parent` (a pathname resolved from `dirfd`, exactly as the
+    /// pending open will resolve it) is the live property area: an
+    /// injected `O_PATH` open of the parent, compared by
+    /// `(st_dev, st_ino)` with the area itself. The probe takes no
+    /// `O_NOFOLLOW`: for the pending open the parent is an
+    /// *intermediate* component, which the kernel always follows
+    /// (`O_NOFOLLOW` on the guest's call affects only its final
+    /// component), so a final parent component that is a symlink to
+    /// the area must be followed here too, or the probe stats the
+    /// link itself and misses the directory the open will create in.
+    /// This binds the decision to the directory object the open will
+    /// use, not to any spelling of it, so a retained dirfd whose
+    /// spelling was replaced and a parent reached through symlinks
+    /// are both decided correctly. A probe the kernel refuses while
+    /// resolving the parent (a missing or non-directory component, a
+    /// symlink loop, a permission failure) is `Unknown`, never
+    /// `Outside`: only a resolved directory whose identity differs
+    /// from the area's proves the parent outside, and a failed
+    /// resolution is no proof at all, so the creation fails closed
+    /// by name instead of being allowed as a proven outside parent.
+    async fn resolved_parent_area<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        dirfd: RawFd,
+        parent: &[u8],
+        snapshot: &detcore_model::config::PropertySnapshot,
+    ) -> ParentArea {
+        // A parent spelling that does not fit the staged probe cannot
+        // be shown to be outside the area in the guest.
+        const PATH_MAX: usize = 512;
+        if parent.is_empty() || parent.len() >= PATH_MAX {
+            return ParentArea::Unknown;
+        }
+        let mut spelled = [0_u8; PATH_MAX];
+        spelled[..parent.len()].copy_from_slice(parent);
+        let flags = OFlag::O_PATH | OFlag::O_CLOEXEC;
+        let opened = crate::syscalls::scratch::inject_with_scratch(guest, spelled, |base| {
+            syscalls::Openat::new()
+                .with_dirfd(dirfd)
+                .with_path(PathPtr::from_ptr(base.as_raw() as *const libc::c_char))
+                .with_flags(flags)
+                .with_mode(None)
+                .into()
+        })
+        .await;
+        let (opened, _) = match opened {
+            Ok(opened) => opened,
+            // A failed resolution is not proof of outside.
+            Err(_) => return ParentArea::Unknown,
+        };
+        let Ok(fd) = RawFd::try_from(opened) else {
+            return ParentArea::Unknown;
+        };
+        if fd < 0 {
+            return ParentArea::Unknown;
+        }
+        let dir = self.inject_fstat(guest, fd).await;
+        let _ = guest.inject(syscalls::Close::new().with_fd(fd)).await;
+        // `Outside` only on a successful identity mismatch; every
+        // other outcome stays `Unknown`.
+        match (dir, crate::util::raw_stat(&snapshot.guest_dir)) {
+            (Ok(dir), Ok(area)) if (dir.st_dev, dir.st_ino) == (area.st_dev, area.st_ino) => {
+                ParentArea::Area
+            }
+            (Ok(_), Ok(_)) => ParentArea::Outside,
+            _ => ParentArea::Unknown,
+        }
+    }
+
+    /// Why an `O_CREAT` open with no existing object is refused
+    /// before it creates, where the spelled parent
+    /// (`area_parent_name` on the observed spelling) is not the live
+    /// area, or `None` where the creation runs as it is. The
+    /// creating directory is the one the kernel resolves for the
+    /// open, decided in the guest (`resolved_parent_area`, from the
+    /// same dirfd the open uses, following a symlinked final
+    /// parent). An open that follows its final component
+    /// (`O_NOFOLLOW` unset, and not `O_CREAT|O_EXCL`, which fails
+    /// `EEXIST` on any link) creates in its final link's target
+    /// directory instead; the link chain is walked in the guest, one
+    /// `readlinkat` per link up to the kernel's own nested-link
+    /// limit, and the last target's parent is decided the same way.
+    /// A creating directory that cannot be shown to be outside the
+    /// area (a spelling or a link target that does not fit the
+    /// staged resolution) refuses the creation by name, rather than
+    /// letting the real open create live first.
+    async fn creation_in_live_area<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Openat,
+        _observed: &Path,
+        snapshot: &detcore_model::config::PropertySnapshot,
+    ) -> Option<String> {
+        use std::os::unix::ffi::OsStrExt as _;
+        fn split(path: &[u8]) -> (&[u8], &[u8]) {
+            match path.iter().rposition(|byte| *byte == b'/') {
+                Some(0) => (b"/".as_slice(), &path[1..]),
+                Some(index) => (&path[..index], &path[index + 1..]),
+                None => (b".".as_slice(), path),
+            }
+        }
+        fn area_reason(name: &[u8]) -> String {
+            format!(
+                "{} is in the property area but not in its snapshot",
+                String::from_utf8_lossy(name)
+            )
+        }
+        fn unknown_reason(name: &[u8]) -> String {
+            format!(
+                "creating {} could not be shown to be outside the property area",
+                String::from_utf8_lossy(name)
+            )
+        }
+        let spelled_ptr = call.path()?;
+        let spelled: PathBuf = spelled_ptr.read(&guest.memory()).ok()?;
+        let bytes = spelled.as_os_str().as_bytes();
+        let (parent, name) = split(bytes);
+        // Only the guest-side probe may decide a spelled parent:
+        // host resolution is never consulted, on success or on
+        // failure, because in the tracer's context the same bytes
+        // can name different objects (its own descriptors and task
+        // identity, symlink aliases, a different root). A parent
+        // the probe cannot prove outside — including any spelling
+        // too long for the staged probe — stays `Unknown` and is
+        // refused by name below. That refuses some overlong outside
+        // creations too; it is the accepted bound at this layer,
+        // where no guest-resolution primitive can decide a spelling
+        // beyond the staged probe.
+        let parent_area = self
+            .resolved_parent_area(guest, call.dirfd(), parent, snapshot)
+            .await;
+        match parent_area {
+            ParentArea::Area => return Some(area_reason(name)),
+            ParentArea::Unknown => return Some(unknown_reason(name)),
+            ParentArea::Outside => {}
+        }
+        let flags = call.flags();
+        if flags.contains(OFlag::O_NOFOLLOW)
+            || (flags.contains(OFlag::O_CREAT) && flags.contains(OFlag::O_EXCL))
+        {
+            return None;
+        }
+        // Final-component probe: the link itself, not its target.
+        let link =
+            Self::inject_lstatat(guest, call.dirfd(), spelled_ptr, [Some(spelled_ptr), None])
+                .await
+                .ok()?;
+        if link.st_mode & libc::S_IFMT != libc::S_IFLNK {
+            return None;
+        }
+        const PATH_PART: usize = 256;
+        const TARGET_PART: usize = 512;
+        // Linux's nested-link limit (`MAXSYMLINKS`, fs/namei.c): a
+        // chain longer than this fails `ELOOP` in the real open.
+        // The walk therefore needs one readlink attempt past the
+        // limit: the parent of a dangling target is decided in the
+        // Err arm of the attempt *after* the readlink that reached
+        // it, so a chain of exactly `MAX_LINKS` links (which Linux
+        // still creates through) is decided by attempt 41, and a
+        // target that is still a link after 41 readlinks means the
+        // real open needs a further traversal and fails `ELOOP`.
+        const MAX_LINKS: usize = 40;
+        let dirfd = call.dirfd();
+        let mut current = bytes.to_vec();
+        for depth in 0..=MAX_LINKS {
+            // The final component of `current` is a link (the spelled
+            // one by the `lstat` above, a later one by the readlink
+            // that produced it), or the walk ends below.
+            if current.len() >= PATH_PART {
+                return Some(unknown_reason(split(&current).1));
+            }
+            let mut buffer = [0_u8; PATH_PART + TARGET_PART];
+            buffer[..current.len()].copy_from_slice(&current);
+            let linked = crate::syscalls::scratch::inject_with_scratch(guest, buffer, |base| {
+                // SAFETY: the buffer holds a path half and a target half.
+                let target = unsafe { base.add(PATH_PART) };
+                syscalls::Readlinkat::new()
+                    .with_dirfd(dirfd)
+                    .with_path(PathPtr::from_ptr(base.as_raw() as *const libc::c_char))
+                    .with_buf(Some(target.cast::<libc::c_char>()))
+                    .with_buf_len(TARGET_PART)
+                    .into()
+            })
+            .await;
+            let target: Vec<u8> = match linked {
+                Ok((length, buffer)) => {
+                    let Ok(length) = usize::try_from(length) else {
+                        return Some(unknown_reason(split(&current).1));
+                    };
+                    // A target that fills its buffer may be cut off.
+                    if length == 0 || length >= TARGET_PART {
+                        return Some(unknown_reason(split(&current).1));
+                    }
+                    buffer[PATH_PART..PATH_PART + length].to_vec()
+                }
+                // The spelled final component is a link (above), so a
+                // refused readlink leaves its target directory unknown.
+                Err(_) if depth == 0 => return Some(unknown_reason(name)),
+                // A later target that is no link (absent, or an object
+                // the earlier stat did not see): its own parent is
+                // the creating directory.
+                Err(_) => {
+                    let (target_parent, target_name) = split(&current);
+                    let target_parent = target_parent.to_vec();
+                    let target_name = target_name.to_vec();
+                    return match self
+                        .resolved_parent_area(guest, dirfd, &target_parent, snapshot)
+                        .await
+                    {
+                        ParentArea::Area => Some(area_reason(&target_name)),
+                        ParentArea::Unknown => Some(unknown_reason(&target_name)),
+                        ParentArea::Outside => None,
+                    };
+                }
+            };
+            // A relative target is named from the link's own directory.
+            current = if target.first() == Some(&b'/') {
+                target
+            } else {
+                let (link_parent, _) = split(&current);
+                if link_parent == b"." {
+                    target
+                } else {
+                    let mut joined = link_parent.to_vec();
+                    if !joined.ends_with(b"/") {
+                        joined.push(b'/');
+                    }
+                    joined.extend_from_slice(&target);
+                    joined
+                }
+            };
+        }
+        // A chain past the kernel's limit: the real open fails
+        // `ELOOP` natively and creates nothing.
+        None
+    }
+
+    /// Say once that the guest opens a file of the property area to write,
+    /// create or truncate it: the open runs on the live file, as natively,
+    /// while the guest's own reads keep coming from the snapshot.
+    fn note_property_write(&self, path: &Path) {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            let _ = std::io::Write::write_fmt(
+                &mut crate::util::RetryingStderr,
+                format_args!(
+                    "WARNING: HERMIT_PROPERTY_SET_NOT_VISIBLE: the guest opens {} to write, \
+                     create or truncate it; that changes the live property area, and its later \
+                     pure-read opens keep reading the frozen copy\n",
+                    path.display()
+                ),
+            );
+        }
+    }
+
+    /// Whether the descriptor `fd` an open returned is a live property file
+    /// the snapshot copied: by `host_stat` where metadata virtualization took
+    /// it, otherwise by an `fstat`.
+    async fn property_reached_live<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        host_stat: Option<&libc::stat>,
+    ) -> LiveCheck {
+        let Some(snapshot) = self.cfg.property_snapshot.as_ref() else {
+            return LiveCheck::NotLive;
+        };
+        let (dev, ino) = match host_stat {
+            Some(stat) => (stat.st_dev, stat.st_ino),
+            None => match self.inject_fstat(guest, fd).await {
+                Ok(stat) => (stat.st_dev, stat.st_ino),
+                Err(errno) => {
+                    return LiveCheck::Unchecked(format!(
+                        "descriptor {fd} could not be checked against the snapshot ({errno})"
+                    ));
+                }
+            },
+        };
+        if let Some(file) = snapshot.known_live_file(dev, ino) {
+            return LiveCheck::Live(format!(
+                "an open reached the live property file {}",
+                file.name
+            ));
+        }
+        // An object the capture never catalogued (a file the area gained
+        // afterwards) is still in the live area if the object the kernel
+        // resolved this descriptor to is: by its resolved path, or by its
+        // identity among the area's current entries.
+        let resolved = resolved_open_path(&self.cfg.backend, guest.pid().as_raw(), fd);
+        match uncatalogued_area_name(snapshot, resolved.as_deref(), dev, ino) {
+            Some(name) => LiveCheck::Live(format!(
+                "{name} is in the property area but not in its snapshot"
+            )),
+            None => LiveCheck::NotLive,
+        }
+    }
+
+    /// Whether descriptor `fd`, about to be mapped, is a live property file
+    /// the snapshot copied (by its `fstat`): if it is, the guest would read
+    /// the live area, which `live_property_area_allowed` decides.
+    async fn check_mapped_property_file<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Result<(), Error> {
+        let Some(snapshot) = self.cfg.property_snapshot.as_ref() else {
+            return Ok(());
+        };
+        let stat = match self.inject_fstat(guest, fd).await {
+            Ok(stat) => stat,
+            // Not a descriptor: the mapping fails natively.
+            Err(Errno::EBADF) => return Ok(()),
+            Err(errno) => {
+                let reason = format!(
+                    "descriptor {fd}, about to be mapped, could not be checked against the \
+                     snapshot ({errno})"
+                );
+                return self.live_property_area_allowed(guest, &reason).await;
+            }
+        };
+        if let Some(file) = snapshot.known_live_file(stat.st_dev, stat.st_ino) {
+            let reason = format!(
+                "descriptor {fd}, which Hermit did not open from its snapshot, maps the live \
+                 property file {}",
+                file.name
+            );
+            self.live_property_area_allowed(guest, &reason).await?;
+            return Ok(());
+        }
+        let resolved = resolved_open_path(&self.cfg.backend, guest.pid().as_raw(), fd);
+        if let Some(name) =
+            uncatalogued_area_name(snapshot, resolved.as_deref(), stat.st_dev, stat.st_ino)
+        {
+            let reason = format!(
+                "descriptor {fd}, which Hermit did not open from its snapshot, maps {name}, \
+                 which is in the property area but not in its snapshot"
+            );
+            self.live_property_area_allowed(guest, &reason).await?;
+        }
+        Ok(())
+    }
+
+    /// Open `copy` for the guest in place of the property file `call` names:
+    /// the same call with the copy's path, written to the guest's stack, as
+    /// `open_launched_exe` does for an image. Returns the open's result and
+    /// the copy, if the open read it.
+    async fn open_property_copy<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Openat,
+        copy: PathBuf,
+    ) -> (Result<i64, Error>, Option<PathBuf>) {
+        // Room for the copy's path, NUL included: hermit-cli refuses a
+        // snapshot whose copy paths are longer, and a smaller buffer fits
+        // more guest stacks than `PATH_MAX` would.
+        const CAPACITY: usize = 512;
+        // hermit-cli publishes an absolute copy root; a relative one left
+        // in a configuration is bound here, against this tool's working
+        // directory, so the guest's dirfd/cwd below cannot move it.
+        let copy = if copy.is_absolute() {
+            copy
+        } else {
+            std::path::absolute(&copy).unwrap_or(copy)
+        };
+        let bytes = std::os::unix::ffi::OsStrExt::as_bytes(copy.as_os_str());
+        let mut stack = guest.stack().await;
+        if bytes.len() >= CAPACITY || stack.capacity() < CAPACITY {
+            drop(stack);
+            let reason = format!(
+                "the path of its copy {} does not fit this thread's scratch stack",
+                copy.display()
+            );
+            return (
+                self.open_live_property_area(guest, call, &reason).await,
+                None,
+            );
+        }
+        let mut buffer = [0_u8; CAPACITY];
+        buffer[..bytes.len()].copy_from_slice(bytes);
+        let address = stack.push(buffer).cast::<libc::c_char>();
+        let stack_guard = match stack.commit() {
+            Ok(guard) => guard,
+            Err(error) => return (Err(error.into()), None),
+        };
+        // The copy is opened by its absolute path with `AT_FDCWD`: the
+        // guest's dirfd (which may name the property area itself) and its
+        // current directory must not resolve the copy's path. A copy path
+        // that is still relative is made absolute against this tool's own
+        // working directory, never the guest's.
+        let call = call
+            .with_dirfd(libc::AT_FDCWD)
+            .with_path(PathPtr::from_ptr(address.as_raw() as *const libc::c_char));
+        let result = self.record_or_replay(guest, Syscall::Openat(call)).await;
+        drop(stack_guard);
+        (result.map_err(Error::from), Some(copy))
+    }
+
+    /// Open the live property file `call` names, where the snapshot should
+    /// have served it but cannot, for `reason`, if the run allows it
+    /// (`Self::live_property_area_allowed`).
+    async fn open_live_property_area<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Openat,
+        reason: &str,
+    ) -> Result<i64, Error> {
+        self.live_property_area_allowed(guest, reason).await?;
+        Ok(self.record_or_replay(guest, Syscall::Openat(call)).await?)
+    }
+
+    /// Whether the guest may read the live property area where the snapshot
+    /// should have served it, for `reason`: never. This operation cannot
+    /// be served from the snapshot, so it goes through the named
+    /// refusal/errno policy in both modes (`docs/ARCHITECTURE.md`
+    /// principle 6): a fail-closed run (the default, and `--strict`) stops,
+    /// and a run with `--allow-unsupported-syscalls` prints the same named
+    /// refusal and returns `EOPNOTSUPP` to the guest. No live read or map
+    /// is issued on this path. Operations that do not read property data
+    /// never reach here and keep their native behaviour.
+    async fn live_property_area_allowed<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        reason: &str,
+    ) -> Result<(), Error> {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let message = format!(
+            "HERMIT_PROPERTY_AREA_LIVE: the guest opens the live system property area, \
+             which processes outside the run rewrite while it runs, because {reason}"
+        );
+        if self.cfg.panic_on_unsupported_syscalls {
+            let _ = std::io::Write::write_fmt(
+                &mut crate::util::RetryingStderr,
+                format_args!("hermit: {message}\n"),
+            );
+        } else if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            let _ = std::io::Write::write_fmt(
+                &mut crate::util::RetryingStderr,
+                format_args!("WARNING: {message}\n"),
+            );
+        }
+        match self
+            .refuse_unserviceable_operation_because(
+                guest,
+                Sysno::openat,
+                Errno::EOPNOTSUPP,
+                &message,
+            )
+            .await
+        {
+            Ok(_) => Err(Errno::EOPNOTSUPP.into()),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Whether guest descriptor `fd` is open on the launcher a launched run
     /// declared (`Detcore::launched_exe`), read where the tool shares the
     /// guest's descriptor table, as a launcher's tool does. Asked only for an
@@ -5849,14 +6663,42 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             None
         };
+        // A file of the Android property area the guest reads from Hermit's
+        // frozen copy (`Config::property_snapshot`).
+        let property_open =
+            if fifo.is_none() && launched_exe.is_none() && self.cfg.property_snapshot.is_some() {
+                Box::pin(self.property_decision(guest, call, &observed_path)).await
+            } else {
+                None
+            };
+        // The copy this open read, if it read one.
+        let mut property_copy: Option<PathBuf> = None;
+        // A name in the property area the snapshot does not hold.
+        let mut property_unknown: Option<String> = None;
         let res: Result<i64, Error> = match fifo {
             Some((fifo, fifo_path)) => {
                 self.open_fifo_once_a_guest_holds_its_peer(guest, call, fifo, &fifo_path)
                     .await
             }
-            None => match launched_exe {
-                Some(exe) => self.open_launched_exe(guest, call, exe.as_deref()).await,
-                None => self
+            None => match (launched_exe, property_open) {
+                (Some(exe), _) => self.open_launched_exe(guest, call, exe.as_deref()).await,
+                (None, Some(PropertyOpen::Copy(copy))) => {
+                    // Boxed, like the other rare paths, so that they do not
+                    // grow every open's future.
+                    let (result, read) = Box::pin(self.open_property_copy(guest, call, copy)).await;
+                    property_copy = read;
+                    result
+                }
+                (None, Some(PropertyOpen::Live(reason))) => {
+                    Box::pin(self.open_live_property_area(guest, call, &reason)).await
+                }
+                (None, Some(PropertyOpen::Unknown(name))) => {
+                    property_unknown = Some(name);
+                    self.record_or_replay(guest, Syscall::Openat(call))
+                        .await
+                        .map_err(Error::from)
+                }
+                (None, None) => self
                     .record_or_replay(guest, Syscall::Openat(call))
                     .await
                     .map_err(Error::from),
@@ -5960,6 +6802,59 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let host_stat = self
                     .add_fd_with_stat(guest, fd, call.flags(), fd_type)
                     .await?;
+                // A file in the property area the snapshot does not hold,
+                // which this open reached live: one made after the snapshot.
+                let live_read = match property_unknown.take() {
+                    // Only a readable descriptor is refused: an `O_PATH`
+                    // descriptor reads nothing (its `read` is `EBADF`
+                    // natively), so it stays usable, as native Linux
+                    // leaves it. A later readable reopen is a new open
+                    // and is decided there.
+                    Some(name) if opens_readable(call.flags()) => Some(format!(
+                        "{name} is in the property area but not in its snapshot"
+                    )),
+                    Some(_) => None,
+                    None if property_copy.is_none()
+                        && self.cfg.property_snapshot.is_some()
+                        && opens_readable(call.flags()) =>
+                    {
+                        // A readable open that may have reached the live
+                        // area, or could not be checked, is refused
+                        // fail-closed. `O_PATH` is excluded here too:
+                        // `opens_readable` is false for it.
+                        match Box::pin(self.property_reached_live(guest, fd, host_stat.as_ref()))
+                            .await
+                        {
+                            LiveCheck::Live(reason) | LiveCheck::Unchecked(reason) => Some(reason),
+                            LiveCheck::NotLive => None,
+                        }
+                    }
+                    None if self.cfg.property_snapshot.is_some()
+                        && opens_to_change(call.flags()) =>
+                    {
+                        // A write-only open of a live property file by any
+                        // name runs as it is; say so once.
+                        if let LiveCheck::Live(_) =
+                            Box::pin(self.property_reached_live(guest, fd, host_stat.as_ref()))
+                                .await
+                        {
+                            self.note_property_write(&observed_path);
+                        }
+                        None
+                    }
+                    None => None,
+                };
+                if let Some(reason) = live_read {
+                    // The live descriptor is never handed to the guest:
+                    // close it and drop its Detcore state in both modes,
+                    // then the named refusal/errno policy decides.
+                    guest.thread_state().remove_fd(fd);
+                    let _ = guest.inject(syscalls::Close::new().with_fd(fd)).await;
+                    resource_release_all(guest).await;
+                    return Box::pin(self.live_property_area_allowed(guest, &reason))
+                        .await
+                        .and_then(|()| Err(Errno::EOPNOTSUPP.into()));
+                }
                 // Linux names a random device by its device number, whatever
                 // path reached it (a literal or relative name, `.` or `..`, a
                 // symbolic link, `/proc/self/fd/N`, a bind mount, a copy of
@@ -6131,7 +7026,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                     }
                 }
                 if let (true, Some(stat)) = (guest.config().record_host_inputs, &host_stat) {
-                    let identity = detcore_model::host_input::HostFileIdentity::from_stat(stat);
+                    // A snapshot copy is new in every run, so its contents,
+                    // not its inode, identify it, and the run's end has
+                    // nothing more to read of it.
+                    let copy_identity = property_copy.as_deref().and_then(property_copy_identity);
+                    let identity = copy_identity.unwrap_or_else(|| {
+                        detcore_model::host_input::HostFileIdentity::from_stat(stat)
+                    });
                     let file_type = stat.st_mode & libc::S_IFMT;
                     // Where the tool can name the guest's descriptor, the
                     // kernel's path for it (a readlink, which raises no
@@ -6168,7 +7069,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     });
                     let source = target
                         .filter(|_| {
-                            !kernel_object && matches!(file_type, libc::S_IFREG | libc::S_IFDIR)
+                            copy_identity.is_none()
+                                && !kernel_object
+                                && matches!(file_type, libc::S_IFREG | libc::S_IFDIR)
                         })
                         .and_then(|target| target.to_str().map(str::to_owned));
                     crate::tool_global::record_host_input(
@@ -11830,6 +12733,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             None
         };
+        // A live property file mapped through a descriptor Hermit did not
+        // redirect (one the guest inherited or received) reads the live area.
+        if call.fd() >= 0
+            && !call.flags().contains(MapFlags::MAP_ANONYMOUS)
+            && self.cfg.property_snapshot.is_some()
+        {
+            Box::pin(self.check_mapped_property_file(guest, call.fd())).await?;
+        }
         let len = call.len();
         let result = self.record_or_replay(guest, call).await?;
         let start = usize::try_from(result).expect("a successful mmap must return an address");

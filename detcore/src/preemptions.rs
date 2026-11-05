@@ -4895,6 +4895,7 @@ mod tests {
                     size: 4,
                     mtime_sec: 5,
                     mtime_nsec: 6,
+                    content: None,
                 },
                 content: Some("cd".repeat(32)),
             }],

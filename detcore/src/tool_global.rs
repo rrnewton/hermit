@@ -2922,6 +2922,14 @@ impl GlobalState {
             .unwrap_or_else(PoisonError::into_inner)
             .1
             .clone();
+        summary.property_snapshot = self.cfg.property_snapshot.as_ref().map(|snapshot| {
+            detcore_model::summary::PropertySnapshotSummary {
+                copied_files: snapshot.live_files.len() as u64,
+                uncopied_files: snapshot.uncopied_files.len() as u64,
+                consistent_cut: snapshot.consistent_cut,
+            }
+        });
+
         //
         // Real time report:
         // N.B.: We don't have a job-level exit hook atm (T76248597), so we use the
@@ -8223,10 +8231,12 @@ pub enum SignalScope {
 /// before either decodes the other's messages. A change to either enum
 /// appends a revision (`config::tests::the_global_rpc_revision_matches_its_definitions`
 /// fails until it does). That test digests the two enums' bodies,
-/// `Resources`, the StoreExclusive payload's types, and the nested payload
-/// types it lists (from revision 37, `TraceSchedEventResponse`), and refuses
-/// a revision whose digests did not change, so no revision can be appended
-/// by hand. A change to another payload type defined
+/// `Resources`, the StoreExclusive payload's types, the scheduled event
+/// and trace reply `TraceSchedEvent` carries, the nested payload types
+/// it lists (from revision 37, `TraceSchedEventResponse`), and the
+/// nested `HostFileIdentity`, and refuses a revision whose digests did
+/// not change, so no revision can be appended by hand. A change to
+/// another payload type defined
 /// elsewhere (`CommittedSendWindow`, `PlaceholderDirectory`, ...) changes what
 /// is on the wire without changing the digest, so it must either keep every
 /// encoding a peer built before it can send or receive (an enum variant
@@ -8254,10 +8264,12 @@ pub enum SignalScope {
 /// rebase onto 40, then 42 at integration). 43 adds
 /// `TraceSchedEventResponse::backstop` (PR #4759, allocated 25 on its
 /// own base, assigned 42 at its rebase onto 41, renumbered 43 at
-/// integration). The current revision 44 adds the
-/// `PublishInstructionOffset` pair (PR #4769, renumbered from 41 at
-/// integration).
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 44;
+/// integration). 44 adds the `PublishInstructionOffset`
+/// pair (PR #4769, renumbered from 41 at integration). The current
+/// revision 45 is the `HostFileIdentity::content` layout (PR #4791,
+/// renumbered from 41 at integration).
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 45;
+
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
@@ -24921,6 +24933,7 @@ mod tests {
             size,
             mtime_sec: 1_700_000_000,
             mtime_nsec: 5,
+            content: None,
         };
         let open = |path: &str, ino: u64, size: i64| HostInputRecord {
             path: path.to_owned(),
@@ -25338,6 +25351,7 @@ mod tests {
             size: 100,
             mtime_sec: 1_700_000_000,
             mtime_nsec: 5,
+            content: None,
         };
         let mut sender_time = DetTime::new(&config);
         sender_time.add_syscall();
