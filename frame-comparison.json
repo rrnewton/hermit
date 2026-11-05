@@ -1,0 +1,87 @@
+{
+  "before_elf_sha256": "b75f91a8d8291bd97dafd1ce75d7be07be0e70f66411b185611ca7b76b52230e",
+  "after_elf_sha256": "cd7c0411ff161efd0be3b6292ccfe4a76523a1351031af4f1b0a7beec67d3008",
+  "qualification": "Individual static x86 prologue allocations, not simultaneous stack sum. After disassembly retained for direct verification.",
+  "frames": [
+    {
+      "symbol": "procfs_determinism::chroot_mountinfo_subset_keeps_fdinfo_identity_consistent",
+      "before_address": "0xe67560",
+      "before_stack_bytes": 8456,
+      "after_address": "0xe67650",
+      "after_stack_bytes": 8456,
+      "delta_bytes": 0
+    },
+    {
+      "symbol": "hermit::dispatch_output_backend",
+      "before_address": "0x173cb50",
+      "before_stack_bytes": 88,
+      "after_address": "0x173cbe0",
+      "after_stack_bytes": 88,
+      "delta_bytes": 0
+    },
+    {
+      "symbol": "hermit::run_with_output_backend_inner",
+      "before_address": "0x1741440",
+      "before_stack_bytes": 105272,
+      "after_address": "0x17414d0",
+      "after_stack_bytes": 4584,
+      "delta_bytes": -100688
+    },
+    {
+      "symbol": "hermit::run_with_output_backend_timeout",
+      "before_address": "0x1741980",
+      "before_stack_bytes": 2936,
+      "after_address": "0x1741a00",
+      "after_stack_bytes": 2936,
+      "delta_bytes": 0
+    },
+    {
+      "symbol": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+      "before_address": "0x183a160",
+      "before_stack_bytes": 73352,
+      "after_address": "0x183a2f0",
+      "after_stack_bytes": 6232,
+      "delta_bytes": -67120
+    },
+    {
+      "symbol": "<detcore::tool_local::Detcore as reverie::tool::Tool>::handle_syscall_event::<reverie_ptrace::task::TracedTask<detcore::tool_local::Detcore>>::{closure#0}",
+      "before_address": "0x1ac0b30",
+      "before_stack_bytes": 565672,
+      "after_address": "0x1ac0c60",
+      "after_stack_bytes": 565672,
+      "delta_bytes": 0
+    },
+    {
+      "symbol": "hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}",
+      "before_address": "0x1c6dcb0",
+      "before_stack_bytes": 69512,
+      "after_address": "0x1c6dde0",
+      "after_stack_bytes": 36008,
+      "delta_bytes": -33504
+    },
+    {
+      "symbol": "hermit::dispatch_output_backend::{closure#0}",
+      "before_address": "0x1c715b0",
+      "before_stack_bytes": 254472,
+      "after_address": "0x1c71800",
+      "after_stack_bytes": 254472,
+      "delta_bytes": 0
+    },
+    {
+      "symbol": "hermit::run_with_output_backend_inner::{closure#0}",
+      "before_address": "0x1c76690",
+      "before_stack_bytes": 171000,
+      "after_address": "0x1c768e0",
+      "after_stack_bytes": 35592,
+      "delta_bytes": -135408
+    },
+    {
+      "symbol": "hermit::run_with_output_backend_timeout::{closure#0}",
+      "before_address": "0x1c770c0",
+      "before_stack_bytes": 40,
+      "after_address": "0x1c772a0",
+      "after_stack_bytes": 40,
+      "delta_bytes": 0
+    }
+  ]
+}

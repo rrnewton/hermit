@@ -1,0 +1,37 @@
+{
+  "report_sha256": "72993575944fba44de54655c0c96ab0e0baea408e607b9050b0742a304071adc",
+  "evidence_index_sha256": "a5adcb1bd6f3beac8aa9ee5459a7e672fbcd39e6ff503a7679e6e606bab3c2d4",
+  "indexed_files_verified": 70,
+  "mismatches": [],
+  "production_linkage_files_verified": [
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit/validate/hermit",
+      "size_equal": true,
+      "hash_equal": true
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit/validate/deps/libdetcore_dbt.so",
+      "size_equal": true,
+      "hash_equal": true
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit/validate/deps/detcore-dbt-native-16ffab7-fa74aeba96025320/libreverie_dbt_client.so",
+      "size_equal": true,
+      "hash_equal": true
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit/validate/deps/detcore-dbt-native-16ffab7-fa74aeba96025320/CMakeCache.txt",
+      "size_equal": true,
+      "hash_equal": true
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit/validate/deps/detcore-dbt-native-16ffab7-fa74aeba96025320/CMakeFiles/reverie_dbt_client.dir/link.txt",
+      "size_equal": true,
+      "hash_equal": true
+    }
+  ],
+  "head": "6611e75333eba5682a21aa9b5e54444eb32747dc",
+  "pin": "16ffab7c558c47c78c43aa8e0e4242eb2deeeb3d",
+  "original_report_sha256": "e6d8ac97352cb6cbd6cf1263522c9fe0822700d40206bbd31ae8a5607eac1aae",
+  "report_correction": "Terminal explicit debug/strict/minimal-env/fixed-epoch flags; separate default-log canonical EOF assurance. No result/source change."
+}

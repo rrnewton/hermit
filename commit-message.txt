@@ -1,0 +1,23 @@
+Box output dispatch futures before retaining them
+
+[hermit2, dbt, gpt-6-astra, devbig014, role=impl]
+
+Plain Language Summary and Project Impact
+
+Keep large backend output futures on the heap before the retained operation or deadline wrapper captures them. Ptrace library runs from ordinary test threads otherwise overflow their stack after shared Detcore state grows; the two existing chroot/procfs regressions now complete with their original stack settings and assertions.
+
+Task: D3 ptrace output stack overflow
+
+Determinism
+
+This changes the location of the Rust future state only. Ptrace constructs the backend future after its existing admission point, then polls and drops it on the original thread. Skid reporting, result order, deadline handling and owned cleanup remain unchanged; no scheduler or provenance policy changes.
+
+Linux Semantics
+
+Guest syscalls, descriptor identity and access flags are unchanged. The existing procfs/fdinfo and read-only proc-mount assertions remain intact. There is no thread-stack increase, extra runtime thread or backend exception.
+
+Validation
+
+On devbig014, the unchanged default-profile Cargo command below failed both selected tests at base 00591c8a43e5d25bc50547ad568184eceb41f417 and passed both with this exact source diff; 49 tests were filtered, none ignored. The two tests exercise ptrace through the library, at the fixture's default log level and without new relaxations. Retained before/after ELFs support the frame-layout comparison. This is focused regression evidence, not a canonical-parity or full-validation claim.
+
+cargo test --offline --locked -p hermit --features third-party-backends,kvm-execution-tests --test procfs_determinism chroot_mountinfo_subset_keeps_fdinfo_identity_consistent -- --nocapture

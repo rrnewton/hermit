@@ -1,0 +1,13 @@
+{
+  "base": "00591c8a43e5d25bc50547ad568184eceb41f417",
+  "reverie_pin": "16ffab7c558c47c78c43aa8e0e4242eb2deeeb3d",
+  "paths": [
+    "hermit-cli/src/lib.rs"
+  ],
+  "diff_sha256": "dbd8b0efa1c7188715901a3b1c8bf2298e5f04aa203e56a56fc44db85be182e9",
+  "before_lib_sha256": "c3458b7593db042955bfde77a588d777b138895de9ef98af79fbb7b99eed084e",
+  "after_lib_sha256": "6fcdf988e3e8ddbb18ea3abb7786d32bdab03d037be3d2cae25739f1fe9a6b1e",
+  "status": " M hermit-cli/src/lib.rs\n",
+  "committed": false,
+  "scope": "Only three common output-dispatch heap boundaries; original tests and stack settings unchanged."
+}

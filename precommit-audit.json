@@ -1,0 +1,11 @@
+{
+  "base": "00591c8a43e5d25bc50547ad568184eceb41f417",
+  "paths": [
+    "hermit-cli/src/lib.rs"
+  ],
+  "numstat": "22\t30\thermit-cli/src/lib.rs\n",
+  "file_bytes": 328859,
+  "diff_sha256": "dbd8b0efa1c7188715901a3b1c8bf2298e5f04aa203e56a56fc44db85be182e9",
+  "right_repo_product_source": true,
+  "no_binary_or_generated_or_nested_repo_or_experiment_path": true
+}

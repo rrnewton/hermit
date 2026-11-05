@@ -1,0 +1,34 @@
+
+/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/d3-procfs-stack-v1/validation-plain-main00591/artifacts/procfs_determinism-3a0f05b3fbc3b749:     file format elf64-x86-64
+
+
+Disassembly of section .text:
+
+0000000001ac0b30 <<detcore::tool_local::Detcore as reverie::tool::Tool>::handle_syscall_event::<reverie_ptrace::task::TracedTask<detcore::tool_local::Detcore>>::{closure#0}>:
+ 1ac0b30:	mov    %rsp,%r11
+ 1ac0b33:	sub    $0x8a000,%r11
+ 1ac0b3a:	sub    $0x1000,%rsp
+ 1ac0b41:	movq   $0x0,(%rsp)
+ 1ac0b49:	cmp    %r11,%rsp
+ 1ac0b4c:	jne    1ac0b3a <<detcore::tool_local::Detcore as reverie::tool::Tool>::handle_syscall_event::<reverie_ptrace::task::TracedTask<detcore::tool_local::Detcore>>::{closure#0}+0xa>
+ 1ac0b4e:	sub    $0x1a8,%rsp
+ 1ac0b55:	mov    %rsi,0xea8(%rsp)
+ 1ac0b5d:	mov    %rdi,0xeb0(%rsp)
+ 1ac0b65:	mov    %rdi,0xeb8(%rsp)
+ 1ac0b6d:	mov    %rsi,0x87828(%rsp)
+ 1ac0b75:	mov    %rdx,0x87830(%rsp)
+ 1ac0b7d:	mov    %rdx,0x87820(%rsp)
+ 1ac0b85:	mov    %rsi,0x87848(%rsp)
+ 1ac0b8d:	movzbl 0x158(%rsi),%eax
+ 1ac0b94:	mov    %rax,0xec0(%rsp)
+ 1ac0b9c:	mov    0xec0(%rsp),%rcx
+ 1ac0ba4:	lea    -0x165a60f(%rip),%rax        # 46659c <reverie_liteinst_allocator_backing_v1+0xd59c>
+ 1ac0bab:	movslq (%rax,%rcx,4),%rcx
+ 1ac0baf:	add    %rcx,%rax
+ 1ac0bb2:	jmp    *%rax
+ 1ac0bb4:	ud2    
+ 1ac0bb6:	mov    0xea8(%rsp),%rax
+ 1ac0bbe:	movb   $0x0,0x8780f(%rsp)
+ 1ac0bc6:	movb   $0x0,0x8780b(%rsp)
+ 1ac0bce:	.byte 0xc6
+ 1ac0bcf:	.byte 0x84

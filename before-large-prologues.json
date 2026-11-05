@@ -1,0 +1,240 @@
+[
+  {
+    "address": "0x1aa4540",
+    "symbol_size": 116198,
+    "stack_prologue_bytes": 567720,
+    "symbol": "<detcore::tool_local::Detcore as reverie::tool::Tool>::handle_syscall_event::<reverie_kvm::runtime::KvmGuest<detcore::tool_local::Detcore>>::{closure#0}",
+    "first_64_bytes": "4989e34981eb00a008004881ec0010000048c70424000000004c39dc75ec4881eca80900004889b424a80e00004889bc24b00e00004889bc24b80e00004889b4"
+  },
+  {
+    "address": "0x1ac0b30",
+    "symbol_size": 116198,
+    "stack_prologue_bytes": 565672,
+    "symbol": "<detcore::tool_local::Detcore as reverie::tool::Tool>::handle_syscall_event::<reverie_ptrace::task::TracedTask<detcore::tool_local::Detcore>>::{closure#0}",
+    "first_64_bytes": "4989e34981eb00a008004881ec0010000048c70424000000004c39dc75ec4881eca80100004889b424a80e00004889bc24b00e00004889bc24b80e00004889b4"
+  },
+  {
+    "address": "0x2e579a0",
+    "symbol_size": 53909,
+    "stack_prologue_bytes": 509528,
+    "symbol": "<detcore_model::config::Config as clap_builder::derive::Args>::augment_args",
+    "first_64_bytes": "4989e34981eb00c007004881ec0010000048c70424000000004c39dc75ec4881ec580600004889bc24880400004889bc2490040000c684247292060000c68424"
+  },
+  {
+    "address": "0x1c715b0",
+    "symbol_size": 16124,
+    "stack_prologue_bytes": 254472,
+    "symbol": "hermit::dispatch_output_backend::{closure#0}",
+    "first_64_bytes": "4989e34981eb00e003004881ec0010000048c70424000000004c39dc75ec4881ec080200004889b424200300004889bc24280300004889bc24300300004889b4"
+  },
+  {
+    "address": "0x10755c0",
+    "symbol_size": 26213,
+    "stack_prologue_bytes": 198600,
+    "symbol": "<reverie_kvm::vm::KvmBackend>::run_process_action_with_tool_inner::<detcore::tool_local::Detcore>::{closure#0}",
+    "first_64_bytes": "554157415641554154534989e34981eb000003004881ec0010000048c70424000000004c39dc75ec4881ecc80700004889b424580500004889bc246005000048"
+  },
+  {
+    "address": "0x192d1f0",
+    "symbol_size": 90423,
+    "stack_prologue_bytes": 180696,
+    "symbol": "<reverie_kvm::vm::KvmBackend>::run_static_elf_process_with_tool::<detcore::tool_local::Detcore>::{closure#0}::{closure#0}",
+    "first_64_bytes": "554157415641554154534989e34981eb00c002004881ec0010000048c70424000000004c39dc75ec4881ecd80100004889b424600e00004889bc24680e000048"
+  },
+  {
+    "address": "0x1c76690",
+    "symbol_size": 2066,
+    "stack_prologue_bytes": 171000,
+    "symbol": "hermit::run_with_output_backend_inner::{closure#0}",
+    "first_64_bytes": "4989e34981eb009002004881ec0010000048c70424000000004c39dc75ec4881ecf80b000048897424784889bc24800000004889bc24880000004889b424b09b"
+  },
+  {
+    "address": "0x1c782e0",
+    "symbol_size": 14249,
+    "stack_prologue_bytes": 139800,
+    "symbol": "hermit::run_dbt::{closure#0}",
+    "first_64_bytes": "4989e34981eb002002004881ec0010000048c70424000000004c39dc75ec4881ec180200004889b424100300004889bc24180300004889bc24200300004889b4"
+  },
+  {
+    "address": "0x1741440",
+    "symbol_size": 681,
+    "stack_prologue_bytes": 105272,
+    "symbol": "hermit::run_with_output_backend_inner",
+    "first_64_bytes": "4989e34981eb009001004881ec0010000048c70424000000004c39dc75ec4881ec380b00004c8944243048895424284889f848894424184488ca4088cf488944"
+  },
+  {
+    "address": "0x159d090",
+    "symbol_size": 1980,
+    "stack_prologue_bytes": 99624,
+    "symbol": "<reverie_ptrace::tracer::Tracer<detcore::tool_global::GlobalState>>::completion::<reverie_process::child::Output>",
+    "first_64_bytes": "4989e34981eb008001004881ec0010000048c70424000000004c39dc75ec4881ec2805000048898c24880000004889b424900000004889bc249800000088d088"
+  },
+  {
+    "address": "0x25e2740",
+    "symbol_size": 527,
+    "stack_prologue_bytes": 98872,
+    "symbol": "<ruzstd::encoding::frame_compressor::FrameCompressor<&[u8], &mut alloc::vec::Vec<u8>, ruzstd::encoding::match_generator::MatchGeneratorDriver>>::new",
+    "first_64_bytes": "4989e34981eb008001004881ec0010000048c70424000000004c39dc75ec4881ec3802000048897c24084088f08844241748897c241888842427820100b80004"
+  },
+  {
+    "address": "0x21192c0",
+    "symbol_size": 19003,
+    "stack_prologue_bytes": 95528,
+    "symbol": "<reverie_kvm::vm::KvmBackend>::run_process_action_inner::{closure#0}",
+    "first_64_bytes": "554157415641554154534989e34981eb007001004881ec0010000048c70424000000004c39dc75ec4881ec280500004889b424b00300004889bc24b803000048"
+  },
+  {
+    "address": "0x155d640",
+    "symbol_size": 22215,
+    "stack_prologue_bytes": 95400,
+    "symbol": "<reverie_ptrace::task::TracedTask<detcore::tool_local::Detcore>>::run_ordinary_owned::{closure#0}",
+    "first_64_bytes": "4989e34981eb007001004881ec0010000048c70424000000004c39dc75ec4881eca80400004889b424980600004889bc24a00600004889bc24a80600004889b4"
+  },
+  {
+    "address": "0x1c7ba90",
+    "symbol_size": 15143,
+    "stack_prologue_bytes": 90288,
+    "symbol": "hermit::run_kvm::{closure#0}",
+    "first_64_bytes": "41574156534989e34981eb006001004881ec0010000048c70424000000004c39dc75ec4881ecb00000004889b424580500004889bc24600500004889bc246805"
+  },
+  {
+    "address": "0x1886b90",
+    "symbol_size": 20676,
+    "stack_prologue_bytes": 82960,
+    "symbol": "<reverie_kvm::vm::KvmBackend>::run_admitted_static_elf_with_tool::<detcore::tool_local::Detcore>::{closure#0}",
+    "first_64_bytes": "534989e34981eb004001004881ec0010000048c70424000000004c39dc75ec4881ec100400004889b424100200004889bc24180200004889bc24200200004889"
+  },
+  {
+    "address": "0x1552010",
+    "symbol_size": 5833,
+    "stack_prologue_bytes": 82408,
+    "symbol": "<reverie_ptrace::task::TracedTask<detcore::tool_local::Detcore>>::inner_tail_inject::{closure#0}",
+    "first_64_bytes": "4989e34981eb004001004881ec0010000048c70424000000004c39dc75ec4881ece80100004889b424c00000004889bc24c80000004889bc24d00000004889b4"
+  },
+  {
+    "address": "0x11efb70",
+    "symbol_size": 15974,
+    "stack_prologue_bytes": 81920,
+    "symbol": "<detcore::tool_local::Detcore>::handle_network_trace_syscall::<reverie_kvm::runtime::KvmGuest<detcore::tool_local::Detcore>>::{closure#0}",
+    "first_64_bytes": "4989e34981eb004001004881ec0010000048c70424000000004c39dc75ec4883ec584889b424900300004889bc24980300004889bc24a00300004889b424b03c"
+  },
+  {
+    "address": "0x11f39e0",
+    "symbol_size": 15977,
+    "stack_prologue_bytes": 81848,
+    "symbol": "<detcore::tool_local::Detcore>::handle_network_trace_syscall::<reverie_ptrace::task::TracedTask<detcore::tool_local::Detcore>>::{closure#0}",
+    "first_64_bytes": "4989e34981eb003001004881ec0010000048c70424000000004c39dc75ec4881ecb80f00004889b424900300004889bc24980300004889bc24a00300004889b4"
+  },
+  {
+    "address": "0x1885620",
+    "symbol_size": 5478,
+    "stack_prologue_bytes": 81736,
+    "symbol": "<reverie_kvm::vm::KvmBackend>::run_static_elf_process_with_tool::<detcore::tool_local::Detcore>::{closure#0}",
+    "first_64_bytes": "554157415641554154534989e34981eb003001004881ec0010000048c70424000000004c39dc75ec4881ec480f00004889b424200100004889bc242801000048"
+  },
+  {
+    "address": "0x152b750",
+    "symbol_size": 6243,
+    "stack_prologue_bytes": 80456,
+    "symbol": "<reverie_ptrace::task::TracedTask<detcore::tool_local::Detcore>>::inner_inject::{closure#0}",
+    "first_64_bytes": "4989e34981eb003001004881ec0010000048c70424000000004c39dc75ec4881ec480a00004889b424d00000004889bc24d80000004889bc24e00000004889b4"
+  },
+  {
+    "address": "0x2a324b0",
+    "symbol_size": 3155,
+    "stack_prologue_bytes": 74440,
+    "symbol": "ruzstd::encoding::blocks::compressed::compress_block::<ruzstd::encoding::match_generator::MatchGeneratorDriver>",
+    "first_64_bytes": "4989e34981eb002001004881ec0010000048c70424000000004c39dc75ec4881ecc80200004889bc24980100004889b424a00100004889bc24902201004889b4"
+  },
+  {
+    "address": "0x15506c0",
+    "symbol_size": 6476,
+    "stack_prologue_bytes": 73496,
+    "symbol": "<reverie_ptrace::task::TracedTask<detcore::tool_local::Detcore>>::handle_stop_event::{closure#0}",
+    "first_64_bytes": "4989e34981eb001001004881ec0010000048c70424000000004c39dc75ec4881ec180f00004889b424b00000004889bc24b80000004889bc24c00000004889b4"
+  },
+  {
+    "address": "0x183a160",
+    "symbol_size": 4183,
+    "stack_prologue_bytes": 73352,
+    "symbol": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "first_64_bytes": "4989e34981eb001001004881ec0010000048c70424000000004c39dc75ec4881ec880e000048898c24a8000000899424b40000004889b424b80000004889bc24"
+  },
+  {
+    "address": "0x183b1c0",
+    "symbol_size": 4183,
+    "stack_prologue_bytes": 73352,
+    "symbol": "hermit::ptrace_completion::run::<(reverie_process::child::Output, u64), hermit::run_with_output_backend_timeout_and_skid_overshoots::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout_and_skid_overshoots::{closure#0}>",
+    "first_64_bytes": "4989e34981eb001001004881ec0010000048c70424000000004c39dc75ec4881ec880e000048898c24a8000000899424b40000004889b424b80000004889bc24"
+  },
+  {
+    "address": "0xee93a0",
+    "symbol_size": 479,
+    "stack_prologue_bytes": 69992,
+    "symbol": "<tokio::runtime::runtime::Runtime>::block_on_inner::<hermit::run_with_output_backend_inner::{closure#0}>",
+    "first_64_bytes": "4989e34981eb001001004881ec0010000048c70424000000004c39dc75ec4881ec6801000048894c24304889542438488974244048897c244848897c24504889"
+  },
+  {
+    "address": "0xee9ba0",
+    "symbol_size": 726,
+    "stack_prologue_bytes": 69992,
+    "symbol": "<tokio::runtime::runtime::Runtime>::block_on::<hermit::run_with_output_backend_inner::{closure#0}>",
+    "first_64_bytes": "4989e34981eb001001004881ec0010000048c70424000000004c39dc75ec4881ec6801000048894c24304889542438488974244048897c244848897c24504889"
+  },
+  {
+    "address": "0x1c6e240",
+    "symbol_size": 1223,
+    "stack_prologue_bytes": 69528,
+    "symbol": "hermit::run_with_output_backend_timeout_and_skid_overshoots::{closure#0}::{closure#0}",
+    "first_64_bytes": "4989e34981eb000001004881ec0010000048c70424000000004c39dc75ec4881ec980f0000488974243048897c243848897c24404889b424280f010048899424"
+  },
+  {
+    "address": "0x1c6dcb0",
+    "symbol_size": 1227,
+    "stack_prologue_bytes": 69512,
+    "symbol": "hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}",
+    "first_64_bytes": "4989e34981eb000001004881ec0010000048c70424000000004c39dc75ec4881ec880f0000488974243048897c243848897c24404889b424180f010048899424"
+  },
+  {
+    "address": "0x2124780",
+    "symbol_size": 7147,
+    "stack_prologue_bytes": 67800,
+    "symbol": "<reverie_kvm::vm::KvmBackend>::prepare_forked_process_admitted::{closure#0}",
+    "first_64_bytes": "4989e34981eb000001004881ec0010000048c70424000000004c39dc75ec4881ecd80800004889b424000100004889bc24080100004889bc24100100004889b4"
+  },
+  {
+    "address": "0x1c6d040",
+    "symbol_size": 2957,
+    "stack_prologue_bytes": 67784,
+    "symbol": "hermit::dispatch_output_backend::{closure#0}::{closure#1}",
+    "first_64_bytes": "4989e34981eb000001004881ec0010000048c70424000000004c39dc75ec4881ecc80800004889b424b00000004889bc24b80000004889bc24c00000004889b4"
+  },
+  {
+    "address": "0xf99830",
+    "symbol_size": 725,
+    "stack_prologue_bytes": 67560,
+    "symbol": "tokio::time::timeout::timeout::<hermit::dispatch_output_backend::{closure#0}>",
+    "first_64_bytes": "4989e34981eb000001004881ec0010000048c70424000000004c39dc75ec4881ece80700004c8944244048894c24288954243448897424384889f8488b7c2440"
+  },
+  {
+    "address": "0x14f5c10",
+    "symbol_size": 3836,
+    "stack_prologue_bytes": 67336,
+    "symbol": "<hermit::sabre_bootstrap::DiskSnapshot>::new",
+    "first_64_bytes": "4989e34981eb000001004881ec0010000048c70424000000004c39dc75ec4881ec0807000048899424780100004889b424800100004889bc24880100004889bc"
+  },
+  {
+    "address": "0x14dff50",
+    "symbol_size": 1092,
+    "stack_prologue_bytes": 67256,
+    "symbol": "<hermit::sabre_bootstrap::OriginalBytes>::matches_file",
+    "first_64_bytes": "4989e34981eb000001004881ec0010000048c70424000000004c39dc75ec4881ecb806000048895424284889f0488b742428488944243048897c243848897c24"
+  },
+  {
+    "address": "0x21ad220",
+    "symbol_size": 739,
+    "stack_prologue_bytes": 65768,
+    "symbol": "reverie_kvm::elf::read_file_image",
+    "first_64_bytes": "4989e34981eb000001004881ec0010000048c70424000000004c39dc75ec4881ece8000000488974244848897c245048897c24584889b424b8000100c68424b7"
+  }
+]

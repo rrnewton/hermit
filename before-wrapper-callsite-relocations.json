@@ -1,0 +1,1955 @@
+[
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183a21a:\tcall   *%rax",
+    "got": "0x372c0a0",
+    "target": "0x10f9510",
+    "callee": "hermit::ptrace_completion::reject_nested_runtime"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183a25e:\tcall   *%rax",
+    "got": "0x372c098",
+    "target": "0x1a449b0",
+    "callee": "<core::result::Result<(), hermit::ptrace_completion::RecoveryRefusal> as core::ops::try_trait::Try>::branch"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183a2bc:\tcall   *%rax",
+    "got": "0x3754850",
+    "target": "0x1a49010",
+    "callee": "<core::result::Result<reverie_process::child::Output, anyhow::Error> as core::ops::try_trait::FromResidual<core::result::Result<core::convert::Infallible, hermit::ptrace_completion::RecoveryRefusal>>>::from_residual"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183a2e9:\tcall   *%rax",
+    "got": "0x372bf90",
+    "target": "0x1a43eb0",
+    "callee": "<core::result::Result<(hermit::ptrace_completion::OriginNumbers, std::fs::File), hermit::ptrace_completion::RecoveryRefusal> as core::ops::try_trait::Try>::branch"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183a347:\tcall   *%rax",
+    "got": "0x3754850",
+    "target": "0x1a49010",
+    "callee": "<core::result::Result<reverie_process::child::Output, anyhow::Error> as core::ops::try_trait::FromResidual<core::result::Result<core::convert::Infallible, hermit::ptrace_completion::RecoveryRefusal>>>::from_residual"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183a40a:\tcall   *%rax",
+    "got": "0x3754800",
+    "target": "0x1a3e770",
+    "callee": "<core::result::Result<hermit::ptrace_completion::OriginalProcess, hermit::ptrace_completion::RecoveryRefusal> as core::ops::try_trait::Try>::branch"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183a468:\tcall   *%rax",
+    "got": "0x3754850",
+    "target": "0x1a49010",
+    "callee": "<core::result::Result<reverie_process::child::Output, anyhow::Error> as core::ops::try_trait::FromResidual<core::result::Result<core::convert::Infallible, hermit::ptrace_completion::RecoveryRefusal>>>::from_residual"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183a49e:\tcall   *%rax",
+    "got": "0x3754860",
+    "target": "0x1961f70",
+    "callee": "<core::sync::atomic::Atomic<u64>>::try_update::<hermit::ptrace_completion::run<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>::{closure#0}>"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183a4fa:\tcall   *%rax",
+    "got": "0x3754868",
+    "target": "0x1a2f440",
+    "callee": "<core::result::Result<u64, u64>>::map_err::<hermit::ptrace_completion::RecoveryRefusal, hermit::ptrace_completion::run<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>::{closure#1}>"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183a515:\tcall   *%rax",
+    "got": "0x3754808",
+    "target": "0x1a44cd0",
+    "callee": "<core::result::Result<u64, hermit::ptrace_completion::RecoveryRefusal> as core::ops::try_trait::Try>::branch"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183a573:\tcall   *%rax",
+    "got": "0x3754850",
+    "target": "0x1a49010",
+    "callee": "<core::result::Result<reverie_process::child::Output, anyhow::Error> as core::ops::try_trait::FromResidual<core::result::Result<core::convert::Infallible, hermit::ptrace_completion::RecoveryRefusal>>>::from_residual"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183a5bf:\tcall   *%rax",
+    "got": "0x3754810",
+    "target": "0x19bc800",
+    "callee": "<alloc::rc::Rc<hermit::ptrace_completion::Control>>::new"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183a5f2:\tcall   *%rax",
+    "got": "0x370b410",
+    "target": "0x32868d0",
+    "callee": "<tokio::runtime::builder::Builder>::new_current_thread"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183a62e:\tcall   *%rax",
+    "got": "0x370b418",
+    "target": "0x32868a0",
+    "callee": "<tokio::runtime::builder::Builder>::enable_all"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183a649:\tcall   *%rax",
+    "got": "0x370b420",
+    "target": "0x32dc830",
+    "callee": "core::ptr::drop_glue::<tokio::runtime::builder::Builder>"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183a67a:\tcall   *%rax",
+    "got": "0x370b428",
+    "target": "0x32878c0",
+    "callee": "<tokio::runtime::builder::Builder>::build"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183a695:\tcall   *%rax",
+    "got": "0x3754818",
+    "target": "0x1a3f5c0",
+    "callee": "<core::result::Result<tokio::runtime::runtime::Runtime, core::io::error::Error> as core::ops::try_trait::Try>::branch"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183a6db:\tcall   *%rax",
+    "got": "0x37274b0",
+    "target": "0x1a49060",
+    "callee": "<core::result::Result<reverie_process::child::Output, anyhow::Error> as core::ops::try_trait::FromResidual<core::result::Result<core::convert::Infallible, core::io::error::Error>>>::from_residual"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183a799:\tcall   *%rax",
+    "got": "0x370b420",
+    "target": "0x32dc830",
+    "callee": "core::ptr::drop_glue::<tokio::runtime::builder::Builder>"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183a7dc:\tcall   *%rax",
+    "got": "0x3754820",
+    "target": "0x2411bd0",
+    "callee": "<std::sync::poison::mutex::Mutex<usize>>::lock"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183a7f7:\tcall   *%rax",
+    "got": "0x3754870",
+    "target": "0x1a15380",
+    "callee": "<core::result::Result<std::sync::poison::mutex::MutexGuard<usize>, std::sync::poison::PoisonError<std::sync::poison::mutex::MutexGuard<usize>>>>::map_err::<hermit::ptrace_completion::RecoveryRefusal, hermit::ptrace_completion::run<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>::{closure#2}>"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183a812:\tcall   *%rax",
+    "got": "0x3754828",
+    "target": "0x1a3af40",
+    "callee": "<core::result::Result<std::sync::poison::mutex::MutexGuard<usize>, hermit::ptrace_completion::RecoveryRefusal> as core::ops::try_trait::Try>::branch"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183a862:\tcall   *%rax",
+    "got": "0x3754850",
+    "target": "0x1a49010",
+    "callee": "<core::result::Result<reverie_process::child::Output, anyhow::Error> as core::ops::try_trait::FromResidual<core::result::Result<core::convert::Infallible, hermit::ptrace_completion::RecoveryRefusal>>>::from_residual"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183a8ad:\tcall   *%rax",
+    "got": "0x3754830",
+    "target": "0x2412e60",
+    "callee": "<std::sync::poison::mutex::MutexGuard<usize> as core::ops::deref::Deref>::deref"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183a937:\tcall   *%rax",
+    "got": "0x3734270",
+    "target": "0x12099d0",
+    "callee": "core::mem::drop::<std::sync::poison::mutex::MutexGuard<usize>>"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183a95b:\tcall   *%rax",
+    "got": "0x3754838",
+    "target": "0x1843440",
+    "callee": "<hermit::ptrace_completion::RecoveryRefusal as core::convert::Into<anyhow::Error>>::into"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183a9a4:\tcall   *%rax",
+    "got": "0x3754840",
+    "target": "0x19be340",
+    "callee": "<alloc::rc::Rc<hermit::ptrace_completion::Control> as core::clone::Clone>::clone"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183aa5e:\tcall   *%rax",
+    "got": "0x37500e8",
+    "target": "0x17ef190",
+    "callee": "core::ptr::drop_glue::<hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}>"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183aafd:\tcall   *%rax",
+    "got": "0x37504c8",
+    "target": "0x17571a0",
+    "callee": "core::ptr::drop_glue::<hermit::ptrace_completion::EraseResult<hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}>>"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183aba3:\tcall   *%rax",
+    "got": "0x3723c38",
+    "target": "0x1068c10",
+    "callee": "<core::any::TypeId>::of::<reverie_process::child::Output>"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183abb6:\tcall   *%rax",
+    "got": "0x3753638",
+    "target": "0x1808a60",
+    "callee": "core::ptr::drop_glue::<hermit::ptrace_completion::OriginalProcess>"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183acb8:\tcall   *%rax",
+    "got": "0x370ded0",
+    "target": "0xf9a2f0",
+    "callee": "<core::cell::RefCell<core::mem::manually_drop::ManuallyDrop<hermit::ptrace_completion::Driver>>>::new"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183acc5:\tcall   *%rax",
+    "got": "0x372c070",
+    "target": "0x331e440",
+    "callee": "<core::cell::Cell<bool>>::new"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183acd6:\tcall   *%rax",
+    "got": "0x372c070",
+    "target": "0x331e440",
+    "callee": "<core::cell::Cell<bool>>::new"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183ace7:\tcall   *%rax",
+    "got": "0x372c070",
+    "target": "0x331e440",
+    "callee": "<core::cell::Cell<bool>>::new"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183adeb:\tcall   *%rax",
+    "got": "0x3754848",
+    "target": "0x19bc720",
+    "callee": "<alloc::rc::Rc<hermit::ptrace_completion::Entry>>::new"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183ae50:\tcall   *%rax",
+    "got": "0x3749310",
+    "target": "0x16ed310",
+    "callee": "<std::thread::local::LocalKey<core::cell::RefCell<core::mem::manually_drop::ManuallyDrop<alloc::collections::btree::map::BTreeMap<u64, alloc::rc::Rc<hermit::ptrace_completion::Entry>>>>>>::try_with::<hermit::ptrace_completion::run<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>::{closure#3}, ()>"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183ae97:\tcall   *%rax",
+    "got": "0x3754878",
+    "target": "0x1a25820",
+    "callee": "<core::result::Result<(), std::thread::local::AccessError>>::map_err::<hermit::ptrace_completion::RecoveryRefusal, hermit::ptrace_completion::run<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>::{closure#4}>"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183aeb2:\tcall   *%rax",
+    "got": "0x372c098",
+    "target": "0x1a449b0",
+    "callee": "<core::result::Result<(), hermit::ptrace_completion::RecoveryRefusal> as core::ops::try_trait::Try>::branch"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183af10:\tcall   *%rax",
+    "got": "0x3754850",
+    "target": "0x1a49010",
+    "callee": "<core::result::Result<reverie_process::child::Output, anyhow::Error> as core::ops::try_trait::FromResidual<core::result::Result<core::convert::Infallible, hermit::ptrace_completion::RecoveryRefusal>>>::from_residual"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183af35:\tcall   *%rax",
+    "got": "0x3754858",
+    "target": "0x183c220",
+    "callee": "hermit::ptrace_completion::drive::<reverie_process::child::Output>"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183af90:\tcall   *%rax",
+    "got": "0x37304c0",
+    "target": "0x174f230",
+    "callee": "core::ptr::drop_glue::<alloc::rc::Rc<hermit::ptrace_completion::Entry>>"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183afc3:\tcall   *%rax",
+    "got": "0x37304c0",
+    "target": "0x174f230",
+    "callee": "core::ptr::drop_glue::<alloc::rc::Rc<hermit::ptrace_completion::Entry>>"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183afdf:\tcall   *%rax",
+    "got": "0x370f518",
+    "target": "0x357b2b0",
+    "callee": "core::ptr::drop_glue::<std::fs::File>"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183aff5:\tcall   *%rax",
+    "got": "0x374e140",
+    "target": "0x1748ff0",
+    "callee": "core::ptr::drop_glue::<core::pin::Pin<alloc::boxed::Box<dyn core::future::future::Future<Output = core::result::Result<alloc::boxed::Box<dyn core::any::Any>, anyhow::Error>>>>>"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183b00b:\tcall   *%rax",
+    "got": "0x3753250",
+    "target": "0x17f1960",
+    "callee": "core::ptr::drop_glue::<hermit::run_with_output_backend_timeout::{closure#0}>"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183b052:\tcall   *%rax",
+    "got": "0x3734278",
+    "target": "0x2416ae0",
+    "callee": "core::ptr::drop_glue::<std::sync::poison::mutex::MutexGuard<usize>>"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183b065:\tcall   *%rax",
+    "got": "0x3734278",
+    "target": "0x2416ae0",
+    "callee": "core::ptr::drop_glue::<std::sync::poison::mutex::MutexGuard<usize>>"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183b091:\tcall   *%rax",
+    "got": "0x370b440",
+    "target": "0x32dca80",
+    "callee": "core::ptr::drop_glue::<tokio::runtime::runtime::Runtime>"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183b0a4:\tcall   *%rax",
+    "got": "0x370b440",
+    "target": "0x32dca80",
+    "callee": "core::ptr::drop_glue::<tokio::runtime::runtime::Runtime>"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183b0ba:\tcall   *%rax",
+    "got": "0x370b420",
+    "target": "0x32dc830",
+    "callee": "core::ptr::drop_glue::<tokio::runtime::builder::Builder>"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183b0d7:\tcall   *%rax",
+    "got": "0x374e900",
+    "target": "0x174f240",
+    "callee": "core::ptr::drop_glue::<alloc::rc::Rc<hermit::ptrace_completion::Control>>"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183b0f6:\tcall   *%rax",
+    "got": "0x374e900",
+    "target": "0x174f240",
+    "callee": "core::ptr::drop_glue::<alloc::rc::Rc<hermit::ptrace_completion::Control>>"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183b122:\tcall   *%rax",
+    "got": "0x3753638",
+    "target": "0x1808a60",
+    "callee": "core::ptr::drop_glue::<hermit::ptrace_completion::OriginalProcess>"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183b135:\tcall   *%rax",
+    "got": "0x3753638",
+    "target": "0x1808a60",
+    "callee": "core::ptr::drop_glue::<hermit::ptrace_completion::OriginalProcess>"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183b157:\tcall   *%rax",
+    "got": "0x370f518",
+    "target": "0x357b2b0",
+    "callee": "core::ptr::drop_glue::<std::fs::File>"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183b179:\tcall   *%rax",
+    "got": "0x370f518",
+    "target": "0x357b2b0",
+    "callee": "core::ptr::drop_glue::<std::fs::File>"
+  },
+  {
+    "caller": "hermit::ptrace_completion::run::<reverie_process::child::Output, hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}, hermit::run_with_output_backend_timeout::{closure#0}>",
+    "instruction": "183b1b3:\tcall   *%rax",
+    "got": "0x3753250",
+    "target": "0x17f1960",
+    "callee": "core::ptr::drop_glue::<hermit::run_with_output_backend_timeout::{closure#0}>"
+  },
+  {
+    "caller": "hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}",
+    "instruction": "1c6dd6d:\tcall   *%rax",
+    "got": "0x374d840",
+    "target": "0x1745a00",
+    "callee": "<hermit::SkidOvershootReport>::begin"
+  },
+  {
+    "caller": "hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}",
+    "instruction": "1c6de4e:\tcall   *%rax",
+    "got": "0x374d788",
+    "target": "0x173c0f0",
+    "callee": "hermit::prepare_backend_config"
+  },
+  {
+    "caller": "hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}",
+    "instruction": "1c6de61:\tcall   *%rax",
+    "got": "0x370b3d0",
+    "target": "0x32161f0",
+    "callee": "core::ptr::drop_glue::<reverie_process::Command>"
+  },
+  {
+    "caller": "hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}",
+    "instruction": "1c6dee3:\tcall   *%rax",
+    "got": "0x37193c0",
+    "target": "0x1c84830",
+    "callee": "<hermit::dispatch_output_backend::{closure#0} as core::future::into_future::IntoFuture>::into_future"
+  },
+  {
+    "caller": "hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}",
+    "instruction": "1c6df4f:\tcall   *%rax",
+    "got": "0x37193c8",
+    "target": "0x17f0d70",
+    "callee": "core::ptr::drop_glue::<hermit::dispatch_output_backend::{closure#0}>"
+  },
+  {
+    "caller": "hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}",
+    "instruction": "1c6df88:\tcall   *%rax",
+    "got": "0x3719448",
+    "target": "0x1c715b0",
+    "callee": "hermit::dispatch_output_backend::{closure#0}"
+  },
+  {
+    "caller": "hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}",
+    "instruction": "1c6e020:\tcall   *%rax",
+    "got": "0x37193c8",
+    "target": "0x17f0d70",
+    "callee": "core::ptr::drop_glue::<hermit::dispatch_output_backend::{closure#0}>"
+  },
+  {
+    "caller": "hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}",
+    "instruction": "1c6e087:\tcall   *%rax",
+    "got": "0x3761c38",
+    "target": "0x1c6b2c0",
+    "callee": "<hermit::SkidOvershootReport>::finish::<reverie_process::child::Output>"
+  },
+  {
+    "caller": "hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}",
+    "instruction": "1c6e09e:\tcall   *%rax",
+    "got": "0x370b280",
+    "target": "0x23955f0",
+    "callee": "core::ptr::drop_glue::<core::option::Option<std::path::PathBuf>>"
+  },
+  {
+    "caller": "hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}",
+    "instruction": "1c6e11d:\tcall   *%rax",
+    "got": "0x370b3d0",
+    "target": "0x32161f0",
+    "callee": "core::ptr::drop_glue::<reverie_process::Command>"
+  },
+  {
+    "caller": "hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}",
+    "instruction": "1c6e134:\tcall   *%rax",
+    "got": "0x370b280",
+    "target": "0x23955f0",
+    "callee": "core::ptr::drop_glue::<core::option::Option<std::path::PathBuf>>"
+  },
+  {
+    "caller": "hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}",
+    "instruction": "1c6e14b:\tcall   *%rax",
+    "got": "0x370b3d8",
+    "target": "0x2eeda40",
+    "callee": "core::ptr::drop_glue::<detcore_model::config::Config>"
+  },
+  {
+    "caller": "hermit::run_with_output_backend_timeout::{closure#0}::{closure#0}",
+    "instruction": "1c6e174:\tcall   *%rax",
+    "got": "0x374e900",
+    "target": "0x174f240",
+    "callee": "core::ptr::drop_glue::<alloc::rc::Rc<hermit::ptrace_completion::Control>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c7194b:\tcall   *%rax",
+    "got": "0x374dce0",
+    "target": "0x1745540",
+    "callee": "hermit::run_kvm"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c71a2b:\tcall   *%rax",
+    "got": "0x374dcd8",
+    "target": "0x17454b0",
+    "callee": "hermit::run_dbt"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c71a54:\tcall   *%rax",
+    "got": "0x374db20",
+    "target": "0x1745850",
+    "callee": "<hermit::Backend>::is_in_guest_liteinst"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c71a84:\tcall   *%rax",
+    "got": "0x374d708",
+    "target": "0x173b820",
+    "callee": "hermit::output_backend_stdin"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c71aad:\tcall   *%rax",
+    "got": "0x374d818",
+    "target": "0x173cf70",
+    "callee": "hermit::ensure_backend_dispatch"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c71ade:\tcall   *%rax",
+    "got": "0x374d708",
+    "target": "0x173b820",
+    "callee": "hermit::output_backend_stdin"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c71af4:\tcall   *%rax",
+    "got": "0x37273e8",
+    "target": "0x280d3f0",
+    "callee": "<core::result::Result<(), anyhow::Error> as core::ops::try_trait::Try>::branch"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c71b55:\tcall   *%rax",
+    "got": "0x3727498",
+    "target": "0x1a48f50",
+    "callee": "<core::result::Result<reverie_process::child::Output, anyhow::Error> as core::ops::try_trait::FromResidual<core::result::Result<core::convert::Infallible, anyhow::Error>>>::from_residual"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c71b80:\tcall   *%rax",
+    "got": "0x372a8c8",
+    "target": "0x10d75b0",
+    "callee": "hermit::backend_stats::request"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c71bc4:\tcall   *%rax",
+    "got": "0x374d708",
+    "target": "0x173b820",
+    "callee": "hermit::output_backend_stdin"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c71bdf:\tcall   *%rax",
+    "got": "0x375b298",
+    "target": "0x1a3b720",
+    "callee": "<core::result::Result<reverie_process::stdio::Stdio, anyhow::Error> as core::ops::try_trait::Try>::branch"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c71c18:\tcall   *%rax",
+    "got": "0x3727498",
+    "target": "0x1a48f50",
+    "callee": "<core::result::Result<reverie_process::child::Output, anyhow::Error> as core::ops::try_trait::FromResidual<core::result::Result<core::convert::Infallible, anyhow::Error>>>::from_residual"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c71c4a:\tcall   *%rax",
+    "got": "0x37274d0",
+    "target": "0x227c1b0",
+    "callee": "<reverie_process::Command>::stdin::<reverie_process::stdio::Stdio>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c71c6b:\tcall   *%rax",
+    "got": "0x370b8b8",
+    "target": "0x323c5b0",
+    "callee": "<reverie_process::stdio::Stdio>::piped"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c71c9a:\tcall   *%rax",
+    "got": "0x370b8c0",
+    "target": "0x227c210",
+    "callee": "<reverie_process::Command>::stdout::<reverie_process::stdio::Stdio>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c71cbb:\tcall   *%rax",
+    "got": "0x370b8b8",
+    "target": "0x323c5b0",
+    "callee": "<reverie_process::stdio::Stdio>::piped"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c71cea:\tcall   *%rax",
+    "got": "0x370b8c8",
+    "target": "0x227c1e0",
+    "callee": "<reverie_process::Command>::stderr::<reverie_process::stdio::Stdio>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c71d39:\tcall   *%rax",
+    "got": "0x3744560",
+    "target": "0x15b6dc0",
+    "callee": "<reverie_ptrace::tracer::TracerBuilder<detcore::tool_local::Detcore>>::new"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c71dd3:\tcall   *%rax",
+    "got": "0x3744570",
+    "target": "0x15b6ee0",
+    "callee": "<reverie_ptrace::tracer::TracerBuilder<detcore::tool_local::Detcore>>::config"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c71e14:\tcall   *%rax",
+    "got": "0x37614f0",
+    "target": "0x1c21140",
+    "callee": "<core::option::Option<alloc::rc::Rc<hermit::ptrace_completion::Control>>>::ok_or_else::<anyhow::Error, hermit::dispatch_output_backend::{closure#0}::{closure#3}>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c71e85:\tcall   *%rax",
+    "got": "0x3743e08",
+    "target": "0x159d850",
+    "callee": "<reverie_ptrace::tracer::TracerBuilder<detcore::tool_local::Detcore>>::gdbserver::<u16>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c71f43:\tcall   *%rax",
+    "got": "0x3744558",
+    "target": "0x15b6da0",
+    "callee": "<reverie_ptrace::tracer::TracerBuilder<detcore::tool_local::Detcore>>::sequentialized_guest"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c71fb6:\tcall   *%rax",
+    "got": "0x375b248",
+    "target": "0x1a39900",
+    "callee": "<core::result::Result<alloc::rc::Rc<hermit::ptrace_completion::Control>, anyhow::Error> as core::ops::try_trait::Try>::branch"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c7201e:\tcall   *%rax",
+    "got": "0x3727498",
+    "target": "0x1a48f50",
+    "callee": "<core::result::Result<reverie_process::child::Output, anyhow::Error> as core::ops::try_trait::FromResidual<core::result::Result<core::convert::Infallible, anyhow::Error>>>::from_residual"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c7209e:\tcall   *%rax",
+    "got": "0x3744550",
+    "target": "0x15b6d60",
+    "callee": "<reverie_ptrace::tracer::TracerBuilder<detcore::tool_local::Detcore>>::backend_stats"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c720f0:\tcall   *%rax",
+    "got": "0x3744568",
+    "target": "0x15b6ea0",
+    "callee": "<reverie_ptrace::tracer::TracerBuilder<detcore::tool_local::Detcore>>::spawn"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c7210b:\tcall   *%rax",
+    "got": "0x3744588",
+    "target": "0x15b70c0",
+    "callee": "<<reverie_ptrace::tracer::TracerBuilder<detcore::tool_local::Detcore>>::spawn::{closure#0} as core::future::into_future::IntoFuture>::into_future"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c72185:\tcall   *%rax",
+    "got": "0x3743e10",
+    "target": "0x1757e30",
+    "callee": "core::ptr::drop_glue::<reverie_ptrace::tracer::TracerBuilder<detcore::tool_local::Detcore>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c721db:\tcall   *%rax",
+    "got": "0x375b298",
+    "target": "0x1a3b720",
+    "callee": "<core::result::Result<reverie_process::stdio::Stdio, anyhow::Error> as core::ops::try_trait::Try>::branch"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c72214:\tcall   *%rax",
+    "got": "0x3727498",
+    "target": "0x1a48f50",
+    "callee": "<core::result::Result<reverie_process::child::Output, anyhow::Error> as core::ops::try_trait::FromResidual<core::result::Result<core::convert::Infallible, anyhow::Error>>>::from_residual"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c72246:\tcall   *%rax",
+    "got": "0x37274d0",
+    "target": "0x227c1b0",
+    "callee": "<reverie_process::Command>::stdin::<reverie_process::stdio::Stdio>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c72278:\tcall   *%rax",
+    "got": "0x374d780",
+    "target": "0x173c0a0",
+    "callee": "hermit::in_guest_stats_request"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c722c0:\tcall   *%rax",
+    "got": "0x374d980",
+    "target": "0x173f4b0",
+    "callee": "hermit::refuse_in_guest_liteinst_run"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c722db:\tcall   *%rax",
+    "got": "0x37273e8",
+    "target": "0x280d3f0",
+    "callee": "<core::result::Result<(), anyhow::Error> as core::ops::try_trait::Try>::branch"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c7233c:\tcall   *%rax",
+    "got": "0x3727498",
+    "target": "0x1a48f50",
+    "callee": "<core::result::Result<reverie_process::child::Output, anyhow::Error> as core::ops::try_trait::FromResidual<core::result::Result<core::convert::Infallible, anyhow::Error>>>::from_residual"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c72359:\tcall   *%rax",
+    "got": "0x374dc20",
+    "target": "0x1743c70",
+    "callee": "hermit::announce_liteinst_config_fingerprint"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c72382:\tcall   *%rax",
+    "got": "0x374da88",
+    "target": "0x1741750",
+    "callee": "hermit::in_guest_detlog_forward_policy"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c723a5:\tcall   *%rax",
+    "got": "0x374dbb8",
+    "target": "0x17438c0",
+    "callee": "hermit::request_liteinst_detlog_forwarding"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c723b8:\tcall   *%rax",
+    "got": "0x3753278",
+    "target": "0x2828c30",
+    "callee": "core::ptr::drop_glue::<detcore::detlog::ForwardPolicy>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c723ec:\tcall   *%rax",
+    "got": "0x374dbd0",
+    "target": "0x1a37e30",
+    "callee": "<core::result::Result<core::option::Option<std::os::fd::owned::OwnedFd>, anyhow::Error> as core::ops::try_trait::Try>::branch"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c72425:\tcall   *%rax",
+    "got": "0x3727498",
+    "target": "0x1a48f50",
+    "callee": "<core::result::Result<reverie_process::child::Output, anyhow::Error> as core::ops::try_trait::FromResidual<core::result::Result<core::convert::Infallible, anyhow::Error>>>::from_residual"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c72457:\tcall   *%rax",
+    "got": "0x3753278",
+    "target": "0x2828c30",
+    "callee": "core::ptr::drop_glue::<detcore::detlog::ForwardPolicy>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c72471:\tcall   *%rax",
+    "got": "0x3727670",
+    "target": "0x32155a0",
+    "callee": "core::ptr::drop_glue::<core::option::Option<std::os::fd::owned::OwnedFd>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c724e0:\tcall   *%rax",
+    "got": "0x3761d10",
+    "target": "0x2580080",
+    "callee": "<core::option::Option<std::os::fd::owned::OwnedFd>>::is_some"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c72537:\tcall   *%rax",
+    "got": "0x373dca8",
+    "target": "0x1496e00",
+    "callee": "<bool>::then::<alloc::string::String, hermit::dispatch_output_backend::{closure#0}::{closure#0}>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c72551:\tcall   *%rax",
+    "got": "0x370ba20",
+    "target": "0x2f93a00",
+    "callee": "core::ptr::drop_glue::<core::option::Option<alloc::string::String>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c725e6:\tcall   *%rax",
+    "got": "0x374d900",
+    "target": "0x173e740",
+    "callee": "hermit::in_guest_site_patching_off"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c72618:\tcall   *%rax",
+    "got": "0x374db98",
+    "target": "0x1742f60",
+    "callee": "hermit::liteinst_tool_runtime_library_path"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c7265d:\tcall   *%rax",
+    "got": "0x370c088",
+    "target": "0x3239120",
+    "callee": "<core::result::Result<std::path::PathBuf, core::io::error::Error> as core::ops::try_trait::Try>::branch"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c726a3:\tcall   *%rax",
+    "got": "0x37274b0",
+    "target": "0x1a49060",
+    "callee": "<core::result::Result<reverie_process::child::Output, anyhow::Error> as core::ops::try_trait::FromResidual<core::result::Result<core::convert::Infallible, core::io::error::Error>>>::from_residual"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c72708:\tcall   *%rax",
+    "got": "0x372a2b8",
+    "target": "0x10d3a90",
+    "callee": "<hermit::in_guest_exits::InGuestExitAdmission as core::default::Default>::default"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c72761:\tcall   *%rax",
+    "got": "0x37263b0",
+    "target": "0x1096e00",
+    "callee": "<alloc::sync::Arc<hermit::in_guest_exits::InGuestExitAdmission>>::new"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c72796:\tcall   *%rax",
+    "got": "0x3726af8",
+    "target": "0x109b9d0",
+    "callee": "<alloc::sync::Arc<hermit::in_guest_exits::InGuestExitAdmission> as core::clone::Clone>::clone"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c727b8:\tcall   *%rax",
+    "got": "0x374f4a0",
+    "target": "0x1750000",
+    "callee": "core::ptr::drop_glue::<alloc::sync::Arc<hermit::in_guest_exits::InGuestExitAdmission>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c728cd:\tcall   *%rax",
+    "got": "0x371f240",
+    "target": "0xfdcc40",
+    "callee": "<reverie_inguest::launcher::PreloadBackend>::with_connection_admission::<hermit::dispatch_output_backend::{closure#0}::{closure#1}>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c728e8:\tcall   *%rax",
+    "got": "0x371f8a8",
+    "target": "0xfeb820",
+    "callee": "<<reverie_inguest::launcher::PreloadBackend>::with_connection_admission<hermit::dispatch_output_backend::{closure#0}::{closure#1}>::{closure#0} as core::future::into_future::IntoFuture>::into_future"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c72962:\tcall   *%rax",
+    "got": "0x3753278",
+    "target": "0x2828c30",
+    "callee": "core::ptr::drop_glue::<detcore::detlog::ForwardPolicy>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c7298a:\tcall   *%rax",
+    "got": "0x375b298",
+    "target": "0x1a3b720",
+    "callee": "<core::result::Result<reverie_process::stdio::Stdio, anyhow::Error> as core::ops::try_trait::Try>::branch"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c729c3:\tcall   *%rax",
+    "got": "0x3727498",
+    "target": "0x1a48f50",
+    "callee": "<core::result::Result<reverie_process::child::Output, anyhow::Error> as core::ops::try_trait::FromResidual<core::result::Result<core::convert::Infallible, anyhow::Error>>>::from_residual"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c729f5:\tcall   *%rax",
+    "got": "0x37274d0",
+    "target": "0x227c1b0",
+    "callee": "<reverie_process::Command>::stdin::<reverie_process::stdio::Stdio>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c72a16:\tcall   *%rax",
+    "got": "0x370b8b8",
+    "target": "0x323c5b0",
+    "callee": "<reverie_process::stdio::Stdio>::piped"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c72a45:\tcall   *%rax",
+    "got": "0x370b8c0",
+    "target": "0x227c210",
+    "callee": "<reverie_process::Command>::stdout::<reverie_process::stdio::Stdio>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c72a66:\tcall   *%rax",
+    "got": "0x370b8b8",
+    "target": "0x323c5b0",
+    "callee": "<reverie_process::stdio::Stdio>::piped"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c72a95:\tcall   *%rax",
+    "got": "0x370b8c8",
+    "target": "0x227c1e0",
+    "callee": "<reverie_process::Command>::stderr::<reverie_process::stdio::Stdio>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c72b45:\tcall   *%rax",
+    "got": "0x374dce8",
+    "target": "0x17455e0",
+    "callee": "hermit::run_sabre"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c72b60:\tcall   *%rax",
+    "got": "0x3761d18",
+    "target": "0x1c848b0",
+    "callee": "<hermit::run_sabre::{closure#0} as core::future::into_future::IntoFuture>::into_future"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c72bc4:\tcall   *%rax",
+    "got": "0x3761d20",
+    "target": "0x1c84870",
+    "callee": "<hermit::run_dbt::{closure#0} as core::future::into_future::IntoFuture>::into_future"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c72c23:\tcall   *%rax",
+    "got": "0x3761d28",
+    "target": "0x1c84890",
+    "callee": "<hermit::run_kvm::{closure#0} as core::future::into_future::IntoFuture>::into_future"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c72c98:\tcall   *%rax",
+    "got": "0x3753210",
+    "target": "0x17f2180",
+    "callee": "core::ptr::drop_glue::<hermit::run_kvm::{closure#0}>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c72cd4:\tcall   *%rax",
+    "got": "0x3761d30",
+    "target": "0x1c7ba90",
+    "callee": "hermit::run_kvm::{closure#0}"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c72db8:\tcall   *%rax",
+    "got": "0x3753210",
+    "target": "0x17f2180",
+    "callee": "core::ptr::drop_glue::<hermit::run_kvm::{closure#0}>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c72dd5:\tcall   *%rax",
+    "got": "0x3753218",
+    "target": "0x17f1ac0",
+    "callee": "core::ptr::drop_glue::<hermit::run_dbt::{closure#0}>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c72e11:\tcall   *%rax",
+    "got": "0x3761d38",
+    "target": "0x1c782e0",
+    "callee": "hermit::run_dbt::{closure#0}"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c72ef5:\tcall   *%rax",
+    "got": "0x3753218",
+    "target": "0x17f1ac0",
+    "callee": "core::ptr::drop_glue::<hermit::run_dbt::{closure#0}>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c72f12:\tcall   *%rax",
+    "got": "0x3753220",
+    "target": "0x17f2570",
+    "callee": "core::ptr::drop_glue::<hermit::run_sabre::{closure#0}>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c72f4e:\tcall   *%rax",
+    "got": "0x3761d40",
+    "target": "0x1c7f5c0",
+    "callee": "hermit::run_sabre::{closure#0}"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c73032:\tcall   *%rax",
+    "got": "0x3753220",
+    "target": "0x17f2570",
+    "callee": "core::ptr::drop_glue::<hermit::run_sabre::{closure#0}>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c7304f:\tcall   *%rax",
+    "got": "0x37514a8",
+    "target": "0x17608e0",
+    "callee": "core::ptr::drop_glue::<<reverie_inguest::launcher::PreloadBackend>::with_connection_admission<hermit::dispatch_output_backend::{closure#0}::{closure#1}>::{closure#0}>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c7308b:\tcall   *%rax",
+    "got": "0x371f2b8",
+    "target": "0xfdd430",
+    "callee": "<reverie_inguest::launcher::PreloadBackend>::with_connection_admission::<hermit::dispatch_output_backend::{closure#0}::{closure#1}>::{closure#0}"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c7310d:\tcall   *%rax",
+    "got": "0x37514a8",
+    "target": "0x17608e0",
+    "callee": "core::ptr::drop_glue::<<reverie_inguest::launcher::PreloadBackend>::with_connection_admission<hermit::dispatch_output_backend::{closure#0}::{closure#1}>::{closure#0}>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c7316c:\tcall   *%rax",
+    "got": "0x375aee8",
+    "target": "0x1a1e610",
+    "callee": "<core::result::Result<(std::process::Output, detcore::tool_global::GlobalState, core::option::Option<reverie::dispatch_stats::DispatchStats>, u64), reverie::error::Error>>::inspect_err::<hermit::dispatch_output_backend::{closure#0}::{closure#2}>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c73187:\tcall   *%rax",
+    "got": "0x375b550",
+    "target": "0x1a43d10",
+    "callee": "<core::result::Result<(std::process::Output, detcore::tool_global::GlobalState, core::option::Option<reverie::dispatch_stats::DispatchStats>, u64), reverie::error::Error> as core::ops::try_trait::Try>::branch"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c731e5:\tcall   *%rax",
+    "got": "0x375b8a8",
+    "target": "0x1a48fc0",
+    "callee": "<core::result::Result<reverie_process::child::Output, anyhow::Error> as core::ops::try_trait::FromResidual<core::result::Result<core::convert::Infallible, reverie::error::Error>>>::from_residual"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c73302:\tcall   *%rax",
+    "got": "0x372a808",
+    "target": "0x1c51d70",
+    "callee": "<core::option::Option<reverie::dispatch_stats::DispatchStats>>::as_ref"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c73375:\tcall   *%rax",
+    "got": "0x374da98",
+    "target": "0x1741810",
+    "callee": "hermit::in_guest_trap_patching_evidence"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c73396:\tcall   *%rax",
+    "got": "0x3726bf8",
+    "target": "0x109c1a0",
+    "callee": "<alloc::sync::Arc<hermit::in_guest_exits::InGuestExitAdmission> as core::ops::deref::Deref>::deref"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c733ff:\tcall   *%rax",
+    "got": "0x374d778",
+    "target": "0x173c020",
+    "callee": "hermit::settle_in_guest_exits"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c7341a:\tcall   *%rax",
+    "got": "0x3761d48",
+    "target": "0x1c84810",
+    "callee": "<hermit::settle_in_guest_exits::{closure#0} as core::future::into_future::IntoFuture>::into_future"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c73477:\tcall   *%rax",
+    "got": "0x374f4a0",
+    "target": "0x1750000",
+    "callee": "core::ptr::drop_glue::<alloc::sync::Arc<hermit::in_guest_exits::InGuestExitAdmission>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c73494:\tcall   *%rax",
+    "got": "0x3753228",
+    "target": "0x17f0d00",
+    "callee": "core::ptr::drop_glue::<hermit::settle_in_guest_exits::{closure#0}>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c734c8:\tcall   *%rax",
+    "got": "0x3761d50",
+    "target": "0x1c70cb0",
+    "callee": "hermit::settle_in_guest_exits::{closure#0}"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c7356c:\tcall   *%rax",
+    "got": "0x3753228",
+    "target": "0x17f0d00",
+    "callee": "core::ptr::drop_glue::<hermit::settle_in_guest_exits::{closure#0}>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c7358c:\tcall   *%rax",
+    "got": "0x3712110",
+    "target": "0xef8d80",
+    "callee": "<std::process::ExitStatus as core::convert::Into<reverie_process::exit_status::ExitStatus>>::into"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c736bd:\tcall   *%rax",
+    "got": "0x375b160",
+    "target": "0x1a32410",
+    "callee": "<core::result::Result<(), anyhow::Error>>::is_err"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c736de:\tcall   *%rax",
+    "got": "0x370b348",
+    "target": "0x18077c0",
+    "callee": "core::ptr::drop_glue::<reverie_process::child::Output>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c7373e:\tcall   *%rax",
+    "got": "0x374db50",
+    "target": "0x1742a20",
+    "callee": "hermit::liteinst_requires_forced_shutdown"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c7375f:\tcall   *%rax",
+    "got": "0x3761d58",
+    "target": "0x266be30",
+    "callee": "<detcore::tool_global::GlobalState>::force_shutdown_with_error"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c7382f:\tcall   *%rax",
+    "got": "0x3721188",
+    "target": "0x266c580",
+    "callee": "<detcore::tool_global::GlobalState>::clean_up_with_dispatch_stats"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c73854:\tcall   *%rax",
+    "got": "0x3761d60",
+    "target": "0x266be10",
+    "callee": "<detcore::tool_global::GlobalState>::cancel_internal_scheduler"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c7386f:\tcall   *%rax",
+    "got": "0x371d1c8",
+    "target": "0x10405c0",
+    "callee": "<<detcore::tool_global::GlobalState>::cancel_internal_scheduler::{closure#0} as core::future::into_future::IntoFuture>::into_future"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c738ed:\tcall   *%rax",
+    "got": "0x3753230",
+    "target": "0x17f6eb0",
+    "callee": "core::ptr::drop_glue::<<detcore::tool_global::GlobalState>::cancel_internal_scheduler::{closure#0}>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c73921:\tcall   *%rax",
+    "got": "0x371cd20",
+    "target": "0x103c630",
+    "callee": "<detcore::tool_global::GlobalState>::cancel_internal_scheduler::{closure#0}"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c73994:\tcall   *%rax",
+    "got": "0x3753230",
+    "target": "0x17f6eb0",
+    "callee": "core::ptr::drop_glue::<<detcore::tool_global::GlobalState>::cancel_internal_scheduler::{closure#0}>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c739b2:\tcall   *%rax",
+    "got": "0x371cd40",
+    "target": "0x10405f0",
+    "callee": "<<detcore::tool_global::GlobalState>::clean_up_with_dispatch_stats::{closure#0} as core::future::into_future::IntoFuture>::into_future"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c73a0d:\tcall   *%rax",
+    "got": "0x3721190",
+    "target": "0x17f6f40",
+    "callee": "core::ptr::drop_glue::<<detcore::tool_global::GlobalState>::clean_up_with_dispatch_stats::{closure#0}>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c73a41:\tcall   *%rax",
+    "got": "0x371cd28",
+    "target": "0x103caa0",
+    "callee": "<detcore::tool_global::GlobalState>::clean_up_with_dispatch_stats::{closure#0}"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c73ab4:\tcall   *%rax",
+    "got": "0x3721190",
+    "target": "0x17f6f40",
+    "callee": "core::ptr::drop_glue::<<detcore::tool_global::GlobalState>::clean_up_with_dispatch_stats::{closure#0}>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c73ad5:\tcall   *%rax",
+    "got": "0x37273e8",
+    "target": "0x280d3f0",
+    "callee": "<core::result::Result<(), anyhow::Error> as core::ops::try_trait::Try>::branch"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c73b36:\tcall   *%rax",
+    "got": "0x3727498",
+    "target": "0x1a48f50",
+    "callee": "<core::result::Result<reverie_process::child::Output, anyhow::Error> as core::ops::try_trait::FromResidual<core::result::Result<core::convert::Infallible, anyhow::Error>>>::from_residual"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c73b7f:\tcall   *%rax",
+    "got": "0x374da50",
+    "target": "0x17412f0",
+    "callee": "hermit::refuse_in_guest_trap_patching"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c73b9a:\tcall   *%rax",
+    "got": "0x37273e8",
+    "target": "0x280d3f0",
+    "callee": "<core::result::Result<(), anyhow::Error> as core::ops::try_trait::Try>::branch"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c73bfb:\tcall   *%rax",
+    "got": "0x3727498",
+    "target": "0x1a48f50",
+    "callee": "<core::result::Result<reverie_process::child::Output, anyhow::Error> as core::ops::try_trait::FromResidual<core::result::Result<core::convert::Infallible, anyhow::Error>>>::from_residual"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c73d4b:\tcall   *%rax",
+    "got": "0x370ab48",
+    "target": "0x3530290",
+    "callee": "core::ptr::drop_glue::<alloc::vec::Vec<u8>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c73dbd:\tcall   *%rax",
+    "got": "0x370ab48",
+    "target": "0x3530290",
+    "callee": "core::ptr::drop_glue::<alloc::vec::Vec<u8>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c73e07:\tcall   *%rax",
+    "got": "0x370ba20",
+    "target": "0x2f93a00",
+    "callee": "core::ptr::drop_glue::<core::option::Option<alloc::string::String>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c73e34:\tcall   *%rax",
+    "got": "0x370ba20",
+    "target": "0x2f93a00",
+    "callee": "core::ptr::drop_glue::<core::option::Option<alloc::string::String>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c73e8e:\tcall   *%rax",
+    "got": "0x3710b38",
+    "target": "0x2eeb960",
+    "callee": "core::ptr::drop_glue::<alloc::vec::Vec<detcore_model::config::MountInfoRootRewrite>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c73ee8:\tcall   *%rax",
+    "got": "0x370acc8",
+    "target": "0x20d50a0",
+    "callee": "core::ptr::drop_glue::<alloc::vec::Vec<(u64, u64)>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c73f42:\tcall   *%rax",
+    "got": "0x370acd0",
+    "target": "0x2f93ba0",
+    "callee": "core::ptr::drop_glue::<alloc::vec::Vec<u64>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c73f9c:\tcall   *%rax",
+    "got": "0x370acd0",
+    "target": "0x2f93ba0",
+    "callee": "core::ptr::drop_glue::<alloc::vec::Vec<u64>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c73ff6:\tcall   *%rax",
+    "got": "0x370b280",
+    "target": "0x23955f0",
+    "callee": "core::ptr::drop_glue::<core::option::Option<std::path::PathBuf>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c74050:\tcall   *%rax",
+    "got": "0x370b280",
+    "target": "0x23955f0",
+    "callee": "core::ptr::drop_glue::<core::option::Option<std::path::PathBuf>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c740aa:\tcall   *%rax",
+    "got": "0x370b280",
+    "target": "0x23955f0",
+    "callee": "core::ptr::drop_glue::<core::option::Option<std::path::PathBuf>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c74104:\tcall   *%rax",
+    "got": "0x3710b60",
+    "target": "0x2eebc00",
+    "callee": "core::ptr::drop_glue::<alloc::vec::Vec<(u64, core::option::Option<std::path::PathBuf>)>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c7415e:\tcall   *%rax",
+    "got": "0x370b280",
+    "target": "0x23955f0",
+    "callee": "core::ptr::drop_glue::<core::option::Option<std::path::PathBuf>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c741b8:\tcall   *%rax",
+    "got": "0x370b280",
+    "target": "0x23955f0",
+    "callee": "core::ptr::drop_glue::<core::option::Option<std::path::PathBuf>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c74212:\tcall   *%rax",
+    "got": "0x3710b78",
+    "target": "0x2eed3c0",
+    "callee": "core::ptr::drop_glue::<detcore_model::network_trace::NetworkTraceConfig>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c7426c:\tcall   *%rax",
+    "got": "0x3710b90",
+    "target": "0x2eebae0",
+    "callee": "core::ptr::drop_glue::<alloc::vec::Vec<(detcore_model::pid::DetPid, u64)>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c742c6:\tcall   *%rax",
+    "got": "0x3710b98",
+    "target": "0x2eeb0c0",
+    "callee": "core::ptr::drop_glue::<core::option::Option<detcore_model::happens_before::HappensBeforeProgram>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c74320:\tcall   *%rax",
+    "got": "0x370b280",
+    "target": "0x23955f0",
+    "callee": "core::ptr::drop_glue::<core::option::Option<std::path::PathBuf>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c7437c:\tcall   *%rax",
+    "got": "0x3727670",
+    "target": "0x32155a0",
+    "callee": "core::ptr::drop_glue::<core::option::Option<std::os::fd::owned::OwnedFd>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c74399:\tcall   *%rax",
+    "got": "0x37274f0",
+    "target": "0x2eeb140",
+    "callee": "core::ptr::drop_glue::<core::option::Option<detcore_model::config::FatalCoreCapture>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c743e4:\tcall   *%rax",
+    "got": "0x3710b38",
+    "target": "0x2eeb960",
+    "callee": "core::ptr::drop_glue::<alloc::vec::Vec<detcore_model::config::MountInfoRootRewrite>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c74401:\tcall   *%rax",
+    "got": "0x370acc8",
+    "target": "0x20d50a0",
+    "callee": "core::ptr::drop_glue::<alloc::vec::Vec<(u64, u64)>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c7441e:\tcall   *%rax",
+    "got": "0x370acd0",
+    "target": "0x2f93ba0",
+    "callee": "core::ptr::drop_glue::<alloc::vec::Vec<u64>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c7443b:\tcall   *%rax",
+    "got": "0x370acd0",
+    "target": "0x2f93ba0",
+    "callee": "core::ptr::drop_glue::<alloc::vec::Vec<u64>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c74458:\tcall   *%rax",
+    "got": "0x370b280",
+    "target": "0x23955f0",
+    "callee": "core::ptr::drop_glue::<core::option::Option<std::path::PathBuf>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c74475:\tcall   *%rax",
+    "got": "0x370b280",
+    "target": "0x23955f0",
+    "callee": "core::ptr::drop_glue::<core::option::Option<std::path::PathBuf>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c74492:\tcall   *%rax",
+    "got": "0x370b280",
+    "target": "0x23955f0",
+    "callee": "core::ptr::drop_glue::<core::option::Option<std::path::PathBuf>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c744af:\tcall   *%rax",
+    "got": "0x3710b60",
+    "target": "0x2eebc00",
+    "callee": "core::ptr::drop_glue::<alloc::vec::Vec<(u64, core::option::Option<std::path::PathBuf>)>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c744cc:\tcall   *%rax",
+    "got": "0x370b280",
+    "target": "0x23955f0",
+    "callee": "core::ptr::drop_glue::<core::option::Option<std::path::PathBuf>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c744e9:\tcall   *%rax",
+    "got": "0x370b280",
+    "target": "0x23955f0",
+    "callee": "core::ptr::drop_glue::<core::option::Option<std::path::PathBuf>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c74506:\tcall   *%rax",
+    "got": "0x3710b78",
+    "target": "0x2eed3c0",
+    "callee": "core::ptr::drop_glue::<detcore_model::network_trace::NetworkTraceConfig>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c74523:\tcall   *%rax",
+    "got": "0x3710b90",
+    "target": "0x2eebae0",
+    "callee": "core::ptr::drop_glue::<alloc::vec::Vec<(detcore_model::pid::DetPid, u64)>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c74540:\tcall   *%rax",
+    "got": "0x3710b98",
+    "target": "0x2eeb0c0",
+    "callee": "core::ptr::drop_glue::<core::option::Option<detcore_model::happens_before::HappensBeforeProgram>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c7455d:\tcall   *%rax",
+    "got": "0x370b280",
+    "target": "0x23955f0",
+    "callee": "core::ptr::drop_glue::<core::option::Option<std::path::PathBuf>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c7457a:\tcall   *%rax",
+    "got": "0x37274f0",
+    "target": "0x2eeb140",
+    "callee": "core::ptr::drop_glue::<core::option::Option<detcore_model::config::FatalCoreCapture>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c74597:\tcall   *%rax",
+    "got": "0x370ab48",
+    "target": "0x3530290",
+    "callee": "core::ptr::drop_glue::<alloc::vec::Vec<u8>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c745b4:\tcall   *%rax",
+    "got": "0x374ed50",
+    "target": "0x174d070",
+    "callee": "core::ptr::drop_glue::<core::result::Result<(), anyhow::Error>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c745d1:\tcall   *%rax",
+    "got": "0x370ba20",
+    "target": "0x2f93a00",
+    "callee": "core::ptr::drop_glue::<core::option::Option<alloc::string::String>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c74608:\tcall   *%rax",
+    "got": "0x37210e8",
+    "target": "0x28169b0",
+    "callee": "core::ptr::drop_glue::<core::option::Option<reverie::dispatch_stats::DispatchStats>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c7463c:\tcall   *%rax",
+    "got": "0x371f308",
+    "target": "0x2827bd0",
+    "callee": "core::ptr::drop_glue::<detcore::tool_global::GlobalState>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c74669:\tcall   *%rax",
+    "got": "0x370ab48",
+    "target": "0x3530290",
+    "callee": "core::ptr::drop_glue::<alloc::vec::Vec<u8>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c7469e:\tcall   *%rax",
+    "got": "0x370ab48",
+    "target": "0x3530290",
+    "callee": "core::ptr::drop_glue::<alloc::vec::Vec<u8>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c746b1:\tcall   *%rax",
+    "got": "0x370ac18",
+    "target": "0x3598160",
+    "callee": "core::ptr::drop_glue::<std::path::PathBuf>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c746e1:\tcall   *%rax",
+    "got": "0x370ba20",
+    "target": "0x2f93a00",
+    "callee": "core::ptr::drop_glue::<core::option::Option<alloc::string::String>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c7470e:\tcall   *%rax",
+    "got": "0x3710b38",
+    "target": "0x2eeb960",
+    "callee": "core::ptr::drop_glue::<alloc::vec::Vec<detcore_model::config::MountInfoRootRewrite>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c7473b:\tcall   *%rax",
+    "got": "0x370acc8",
+    "target": "0x20d50a0",
+    "callee": "core::ptr::drop_glue::<alloc::vec::Vec<(u64, u64)>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c74768:\tcall   *%rax",
+    "got": "0x370acd0",
+    "target": "0x2f93ba0",
+    "callee": "core::ptr::drop_glue::<alloc::vec::Vec<u64>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c74795:\tcall   *%rax",
+    "got": "0x370acd0",
+    "target": "0x2f93ba0",
+    "callee": "core::ptr::drop_glue::<alloc::vec::Vec<u64>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c747c2:\tcall   *%rax",
+    "got": "0x370b280",
+    "target": "0x23955f0",
+    "callee": "core::ptr::drop_glue::<core::option::Option<std::path::PathBuf>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c747ef:\tcall   *%rax",
+    "got": "0x370b280",
+    "target": "0x23955f0",
+    "callee": "core::ptr::drop_glue::<core::option::Option<std::path::PathBuf>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c7481c:\tcall   *%rax",
+    "got": "0x370b280",
+    "target": "0x23955f0",
+    "callee": "core::ptr::drop_glue::<core::option::Option<std::path::PathBuf>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c74849:\tcall   *%rax",
+    "got": "0x3710b60",
+    "target": "0x2eebc00",
+    "callee": "core::ptr::drop_glue::<alloc::vec::Vec<(u64, core::option::Option<std::path::PathBuf>)>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c74876:\tcall   *%rax",
+    "got": "0x370b280",
+    "target": "0x23955f0",
+    "callee": "core::ptr::drop_glue::<core::option::Option<std::path::PathBuf>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c748a3:\tcall   *%rax",
+    "got": "0x370b280",
+    "target": "0x23955f0",
+    "callee": "core::ptr::drop_glue::<core::option::Option<std::path::PathBuf>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c748d0:\tcall   *%rax",
+    "got": "0x3710b78",
+    "target": "0x2eed3c0",
+    "callee": "core::ptr::drop_glue::<detcore_model::network_trace::NetworkTraceConfig>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c748fd:\tcall   *%rax",
+    "got": "0x3710b90",
+    "target": "0x2eebae0",
+    "callee": "core::ptr::drop_glue::<alloc::vec::Vec<(detcore_model::pid::DetPid, u64)>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c7492a:\tcall   *%rax",
+    "got": "0x3710b98",
+    "target": "0x2eeb0c0",
+    "callee": "core::ptr::drop_glue::<core::option::Option<detcore_model::happens_before::HappensBeforeProgram>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c7495a:\tcall   *%rax",
+    "got": "0x370b280",
+    "target": "0x23955f0",
+    "callee": "core::ptr::drop_glue::<core::option::Option<std::path::PathBuf>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c74974:\tcall   *%rax",
+    "got": "0x37274f0",
+    "target": "0x2eeb140",
+    "callee": "core::ptr::drop_glue::<core::option::Option<detcore_model::config::FatalCoreCapture>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c74991:\tcall   *%rax",
+    "got": "0x3753238",
+    "target": "0x1804d20",
+    "callee": "core::ptr::drop_glue::<<reverie_ptrace::tracer::TracerBuilder<detcore::tool_local::Detcore>>::spawn::{closure#0}>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c749cd:\tcall   *%rax",
+    "got": "0x37443d0",
+    "target": "0x15af390",
+    "callee": "<reverie_ptrace::tracer::TracerBuilder<detcore::tool_local::Detcore>>::spawn::{closure#0}"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c74a4f:\tcall   *%rax",
+    "got": "0x3753238",
+    "target": "0x1804d20",
+    "callee": "core::ptr::drop_glue::<<reverie_ptrace::tracer::TracerBuilder<detcore::tool_local::Detcore>>::spawn::{closure#0}>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c74a90:\tcall   *%rax",
+    "got": "0x37274e0",
+    "target": "0x1a3a630",
+    "callee": "<core::result::Result<reverie_ptrace::tracer::Tracer<detcore::tool_global::GlobalState>, reverie::error::Error> as core::ops::try_trait::Try>::branch"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c74aee:\tcall   *%rax",
+    "got": "0x375b8a8",
+    "target": "0x1a48fc0",
+    "callee": "<core::result::Result<reverie_process::child::Output, anyhow::Error> as core::ops::try_trait::FromResidual<core::result::Result<core::convert::Infallible, reverie::error::Error>>>::from_residual"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c74b7c:\tcall   *%rax",
+    "got": "0x3744538",
+    "target": "0x15b6ce0",
+    "callee": "<reverie_ptrace::tracer::Tracer<detcore::tool_global::GlobalState>>::backend_stats"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c74c26:\tcall   *%rax",
+    "got": "0x3727470",
+    "target": "0x10f94c0",
+    "callee": "hermit::ptrace_completion::wait_with_output"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c74c40:\tcall   *%rax",
+    "got": "0x37437f0",
+    "target": "0x174b990",
+    "callee": "core::ptr::drop_glue::<core::option::Option<reverie_ptrace::stats::PtraceBackendStatsSource>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c74c74:\tcall   *%rax",
+    "got": "0x3727478",
+    "target": "0x1843420",
+    "callee": "<hermit::ptrace_completion::wait_with_output::{closure#0} as core::future::into_future::IntoFuture>::into_future"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c74cef:\tcall   *%rax",
+    "got": "0x3727480",
+    "target": "0x18058d0",
+    "callee": "core::ptr::drop_glue::<hermit::ptrace_completion::wait_with_output::{closure#0}>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c74d28:\tcall   *%rax",
+    "got": "0x3727488",
+    "target": "0x1842d10",
+    "callee": "hermit::ptrace_completion::wait_with_output::{closure#0}"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c74daa:\tcall   *%rax",
+    "got": "0x3727480",
+    "target": "0x18058d0",
+    "callee": "core::ptr::drop_glue::<hermit::ptrace_completion::wait_with_output::{closure#0}>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c74de5:\tcall   *%rax",
+    "got": "0x3727490",
+    "target": "0x1a434f0",
+    "callee": "<core::result::Result<(reverie_process::child::Output, detcore::tool_global::GlobalState), anyhow::Error> as core::ops::try_trait::Try>::branch"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c74e2b:\tcall   *%rax",
+    "got": "0x3727498",
+    "target": "0x1a48f50",
+    "callee": "<core::result::Result<reverie_process::child::Output, anyhow::Error> as core::ops::try_trait::FromResidual<core::result::Result<core::convert::Infallible, anyhow::Error>>>::from_residual"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c74ee6:\tcall   *%rax",
+    "got": "0x3761a08",
+    "target": "0x1c52560",
+    "callee": "<core::option::Option<reverie_ptrace::stats::PtraceBackendStatsSource>>::as_ref"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c74f44:\tcall   *%rax",
+    "got": "0x372a720",
+    "target": "0x10d52b0",
+    "callee": "hermit::backend_stats::report_if_collected::<reverie_ptrace::stats::PtraceBackendStatsSource>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c74fe1:\tcall   *%rax",
+    "got": "0x3721188",
+    "target": "0x266c580",
+    "callee": "<detcore::tool_global::GlobalState>::clean_up_with_dispatch_stats"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c74ffc:\tcall   *%rax",
+    "got": "0x371cd40",
+    "target": "0x10405f0",
+    "callee": "<<detcore::tool_global::GlobalState>::clean_up_with_dispatch_stats::{closure#0} as core::future::into_future::IntoFuture>::into_future"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c75057:\tcall   *%rax",
+    "got": "0x37437f0",
+    "target": "0x174b990",
+    "callee": "core::ptr::drop_glue::<core::option::Option<reverie_ptrace::stats::PtraceBackendStatsSource>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c75074:\tcall   *%rax",
+    "got": "0x374e900",
+    "target": "0x174f240",
+    "callee": "core::ptr::drop_glue::<alloc::rc::Rc<hermit::ptrace_completion::Control>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c7509e:\tcall   *%rax",
+    "got": "0x3743e10",
+    "target": "0x1757e30",
+    "callee": "core::ptr::drop_glue::<reverie_ptrace::tracer::TracerBuilder<detcore::tool_local::Detcore>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c750eb:\tcall   *%rax",
+    "got": "0x374e8f8",
+    "target": "0x174a3d0",
+    "callee": "core::ptr::drop_glue::<core::option::Option<alloc::rc::Rc<hermit::ptrace_completion::Control>>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c75153:\tcall   *%rax",
+    "got": "0x370b3d8",
+    "target": "0x2eeda40",
+    "callee": "core::ptr::drop_glue::<detcore_model::config::Config>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c751b2:\tcall   *%rax",
+    "got": "0x370b3d0",
+    "target": "0x32161f0",
+    "callee": "core::ptr::drop_glue::<reverie_process::Command>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c7523e:\tcall   *%rax",
+    "got": "0x3721190",
+    "target": "0x17f6f40",
+    "callee": "core::ptr::drop_glue::<<detcore::tool_global::GlobalState>::clean_up_with_dispatch_stats::{closure#0}>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c7526f:\tcall   *%rax",
+    "got": "0x371cd28",
+    "target": "0x103caa0",
+    "callee": "<detcore::tool_global::GlobalState>::clean_up_with_dispatch_stats::{closure#0}"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c752dc:\tcall   *%rax",
+    "got": "0x3721190",
+    "target": "0x17f6f40",
+    "callee": "core::ptr::drop_glue::<<detcore::tool_global::GlobalState>::clean_up_with_dispatch_stats::{closure#0}>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c75379:\tcall   *%rax",
+    "got": "0x37437f0",
+    "target": "0x174b990",
+    "callee": "core::ptr::drop_glue::<core::option::Option<reverie_ptrace::stats::PtraceBackendStatsSource>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c753af:\tcall   *%rax",
+    "got": "0x370b3d8",
+    "target": "0x2eeda40",
+    "callee": "core::ptr::drop_glue::<detcore_model::config::Config>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c753eb:\tcall   *%rax",
+    "got": "0x370b348",
+    "target": "0x18077c0",
+    "callee": "core::ptr::drop_glue::<reverie_process::child::Output>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c75401:\tcall   *%rax",
+    "got": "0x371f308",
+    "target": "0x2827bd0",
+    "callee": "core::ptr::drop_glue::<detcore::tool_global::GlobalState>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c7541b:\tcall   *%rax",
+    "got": "0x37274e8",
+    "target": "0x1758190",
+    "callee": "core::ptr::drop_glue::<reverie_ptrace::tracer::Tracer<detcore::tool_global::GlobalState>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c75438:\tcall   *%rax",
+    "got": "0x374e900",
+    "target": "0x174f240",
+    "callee": "core::ptr::drop_glue::<alloc::rc::Rc<hermit::ptrace_completion::Control>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c7544e:\tcall   *%rax",
+    "got": "0x3743e10",
+    "target": "0x1757e30",
+    "callee": "core::ptr::drop_glue::<reverie_ptrace::tracer::TracerBuilder<detcore::tool_local::Detcore>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c7546b:\tcall   *%rax",
+    "got": "0x374e8f8",
+    "target": "0x174a3d0",
+    "callee": "core::ptr::drop_glue::<core::option::Option<alloc::rc::Rc<hermit::ptrace_completion::Control>>>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c75488:\tcall   *%rax",
+    "got": "0x370b3d8",
+    "target": "0x2eeda40",
+    "callee": "core::ptr::drop_glue::<detcore_model::config::Config>"
+  },
+  {
+    "caller": "hermit::dispatch_output_backend::{closure#0}",
+    "instruction": "1c754a5:\tcall   *%rax",
+    "got": "0x370b3d0",
+    "target": "0x32161f0",
+    "callee": "core::ptr::drop_glue::<reverie_process::Command>"
+  }
+]
