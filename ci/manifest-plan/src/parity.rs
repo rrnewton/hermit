@@ -6315,8 +6315,9 @@ mod tests {
         // c-programs/shared-file-threads (shared file views beside live
         // threads, https://github.com/rrnewton/reverie/issues/1108) adds one row
         // per candidate backend: 3120. rr/simple (first upstream rr guest,
-        // pressure tier) adds one row per candidate backend: 3125.
-        assert_eq!(parsed.cells.len(), 3125);
+        // pressure tier) adds one row per candidate backend: 3125. Batch 1's
+        // 31 further rr guests add one row per candidate backend each: 3280.
+        assert_eq!(parsed.cells.len(), 3280);
         assert_eq!(parsed.schema, PARITY_CELLS_SCHEMA);
         // The repository's limit for a text file is 2 MiB. This bound was
         // 1 MiB until fold 5 of https://github.com/rrnewton/hermit/issues/3448
