@@ -328,7 +328,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // analyze_reports_a_target_met_without_chaos_as_reproduced_without_the_schedule):
     // 8 + 2 = 10.
     // And the resume change's a_budget_ends_analyze_with_a_partial_report_that_resume_finishes: 10 + 1 = 11.
-    ("super.pmu_analyze_hello_race_stress_calibrated_skid", 11),
+    // And the resume change's a_budget_ends_analyze_with_a_partial_report_that_resume_finishes:
+    // 11 + 1 = 12.
+    ("super.pmu_analyze_hello_race_stress_calibrated_skid", 12),
     // Measured 189 - 185 embedded qualifier tests = four allocator/source-copy
     // cases. The same 185 qualifier identities now run once through the existing
     // allocator producer's script-test harness, with none dropped or ignored.
@@ -2029,7 +2031,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and rundata's
     // a_prefix_trial_of_offset_rows_keeps_its_timing_at_every_length
     // (--chaos-instruction-offset): 1329 + 4 = 1333.
-    ("test.hermit_unit", 1333),
+    // PR #4746's 37 added hermit-run lib units (budget, checkpoint, journal,
+    // resume and their refusals; nextest-list delta): 1333 + 37 = 1370.
+    ("test.hermit_unit", 1370),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6470,7 +6474,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (none in the hosted CPUID-faulting skip set): 1308 + 14 = 1322.
     // And the same four --chaos-instruction-offset units:
     // 1323 + 4 = 1327.
-    ("test.hermit_unit_on_host", 1327),
+    // PR #4746: the same 37 hermit-run units: 1327 + 37 = 1364.
+    ("test.hermit_unit_on_host", 1364),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
