@@ -18,7 +18,6 @@ use anyhow::Context as _;
 use anyhow::bail;
 use colored::Colorize;
 use detcore::clock_identity::combined_identity;
-use detcore::preemptions::HistoryIdentity;
 use detcore::preemptions::PreemptionReader;
 use detcore::preemptions::PreemptionRecord;
 use detcore::types::DetTid;
@@ -2052,6 +2051,13 @@ impl AnalyzeOpts {
             let path = newrun.sched_path_out().to_path_buf();
             let record = PreemptionReader::try_new(&path)?.into_inner();
             RunData::require_complete_record(&record, &path)?;
+            // A trial whose recording states another identity than its
+            // endpoints ends the search: its coordinates count differently.
+            combined_identity(
+                ("the bisection endpoints", target.identity()),
+                (&newrun.sched_out_file_name(), record.identity()),
+            )
+            .map_err(anyhow::Error::msg)?;
             // Only a completed trial contributes its realized schedule and jumps.
             self.time_skip_sources.lock().unwrap().remember(&record);
             let completed = CompletedScheduleTrial {
@@ -2083,11 +2089,6 @@ impl AnalyzeOpts {
                 eprintln!(" => Baseline condition (usually absence of crash)");
             }
 
-            combined_identity(
-                ("the bisection endpoints", target.identity()),
-                (&newrun.sched_out_file_name(), completed.schedule.identity()),
-            )
-            .map_err(anyhow::Error::msg)?;
             Ok((!completed.target_met, completed.schedule))
         };
 
@@ -2119,7 +2120,7 @@ impl AnalyzeOpts {
             bad.schedevents().len(),
         );
 
-        let critical = self.phase5_bisect_traces(&bad, &good, identity.as_ref())?;
+        let critical = self.phase5_bisect_traces(&bad, &good)?;
         let index = critical.critical_event_index;
         if index == 0 || index >= critical.failing_schedule.len() {
             bail!("schedule search returned an invalid critical event index {index}");
@@ -6376,7 +6377,10 @@ mod tests {
         assert_eq!(written(&options), [Some(0); 3]);
         assert_eq!(
             options
-                .stamp_trial_record(PreemptionRecord::from_vecs_with_identity(&Default::default(), None))
+                .stamp_trial_record(PreemptionRecord::from_vecs_with_identity(
+                    &Default::default(),
+                    None
+                ))
                 .pipe_wake_latency(),
             Some(0)
         );

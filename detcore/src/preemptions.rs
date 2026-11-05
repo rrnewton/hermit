@@ -296,7 +296,6 @@ pub struct PreemptionRecord {
     /// The identity of this record's RCB coordinates, carried by the
     /// `rcb_history` envelope around the record rather than inside it.
     /// `None` for a legacy file, and for a record built without one.
-    #[serde(skip)]
     identity: Option<HistoryIdentity>,
 }
 
@@ -474,6 +473,9 @@ impl PreemptionRecord {
         Self::from_sched_events_with_identity(events, None)
     }
 
+    /// `identity` is that of the events' RCB coordinates: the admitted
+    /// source's for events taken from another history, `None` where it is
+    /// unknown.
     pub fn from_sched_events_with_identity(
         events: Vec<SchedEvent>,
         identity: Option<HistoryIdentity>,
@@ -963,8 +965,6 @@ impl PreemptionRecord {
         self.identity = identity;
         self
     }
-        self
-    }
 
     /// The same record, stating the `--pipe-wake-latency` of the trials it
     /// came from. Every record analyze, minimize or bisect writes from trials
@@ -1236,6 +1236,7 @@ impl PreemptionRecord {
         Self::from_vecs_with_identity(bt, None)
     }
 
+    /// [`Self::from_vecs`], stating `identity` for the histories' coordinates.
     pub fn from_vecs_with_identity(
         bt: &BTreeMap<DetTid, Vec<(LogicalTime, Priority)>>,
         identity: Option<HistoryIdentity>,
@@ -2573,7 +2574,7 @@ mod tests {
             assert_eq!(back.pipe_wake_latency(), latency);
             assert_eq!(record.clone_preemptions_only().pipe_wake_latency(), latency);
             let minimized =
-                PreemptionRecord::from_vecs(&BTreeMap::new(), None).with_pipe_wake_latency(latency);
+                PreemptionRecord::from_vecs(&BTreeMap::new()).with_pipe_wake_latency(latency);
             assert_eq!(minimized.pipe_wake_latency(), latency);
             let path = dir.path().join("record.json");
             std::fs::write(&path, &json).unwrap();
@@ -3208,7 +3209,7 @@ mod tests {
 [946684799001171285,8408],[946684799001171295,4493],[946684799001192845,3481]]}},"global":[]}"#;
         let pr: PreemptionRecord = serde_json::from_str(str).unwrap();
         let vecs = pr.as_vecs();
-        let pr2 = PreemptionRecord::from_vecs(&vecs, None);
+        let pr2 = PreemptionRecord::from_vecs(&vecs);
         assert_eq!(pr, pr2);
     }
 
@@ -3855,8 +3856,10 @@ mod tests {
 
         use crate::slice_boundary::callbacks::Callback;
         let tid = DetTid::from_raw(3);
-        let mut record =
-            PreemptionRecord::from_sched_events_with_identity(vec![SchedEvent::branches(tid, 10)], None);
+        let mut record = PreemptionRecord::from_sched_events_with_identity(
+            vec![SchedEvent::branches(tid, 10)],
+            None,
+        );
         let time = LogicalTime::from_nanos(100);
         let mut history = ThreadHistory::new();
         history.prio_changes.push((time, 1000));

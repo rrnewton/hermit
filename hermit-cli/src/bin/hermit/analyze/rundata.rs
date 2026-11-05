@@ -24,7 +24,6 @@ use clap::CommandFactory;
 use clap::FromArgMatches;
 use clap::parser::ValueSource;
 use colored::Colorize;
-use detcore::preemptions::HistoryIdentity;
 use detcore::preemptions::PreemptionReader;
 use detcore::preemptions::PreemptionRecord;
 use detcore::types::SchedEvent;
@@ -1637,7 +1636,6 @@ impl AnalyzeOpts {
     /// record without that field states as `each`, and for the in-memory
     /// exclusive-loop rewrite, which a record without that field was made
     /// without.
-
     pub fn refuse_recordings_under_another_pipe_wake_latency(
         &self,
         recordings: &[(&str, &Path)],

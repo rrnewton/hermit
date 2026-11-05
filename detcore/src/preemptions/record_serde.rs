@@ -88,6 +88,9 @@ struct RawRecord {
     background_starts: Vec<BackgroundStart>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     rewrite_exclusives_in_memory: bool,
+    // Carried by the `rcb_history` envelope around the record, never inside it.
+    #[serde(skip)]
+    identity: Option<super::HistoryIdentity>,
 }
 
 struct LegacyFields<'a>(&'a PreemptionRecord);

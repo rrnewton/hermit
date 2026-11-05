@@ -247,9 +247,12 @@ impl AnalyzeOpts {
                         })?;
                     // A subset of the input's own coordinates keeps its identity.
                     self.stamp_trial_record(
-                        PreemptionRecord::from_vecs_with_identity(&btmap, init_schedule.identity().cloned())
-                            .with_guest_ids(init_schedule.guest_ids().unwrap_or_default())
-                            .with_reserved_input(init_schedule.reserved_input().clone()),
+                        PreemptionRecord::from_vecs_with_identity(
+                            &btmap,
+                            init_schedule.identity().cloned(),
+                        )
+                        .with_guest_ids(init_schedule.guest_ids().unwrap_or_default())
+                        .with_reserved_input(init_schedule.reserved_input().clone()),
                     )
                 };
                 if let Err(e) = pr_new.validate() {
@@ -351,9 +354,12 @@ mod tests {
         let history: Vec<(LogicalTime, Priority)> = (1..=8)
             .map(|k| (LogicalTime::from_nanos(k * 1000), FIRST_PRIORITY + k))
             .collect();
-        PreemptionRecord::from_vecs_with_identity(&BTreeMap::from([(DetTid::from_raw(3), history)]), None)
-            .write_to_disk(&preempts_path)
-            .unwrap();
+        PreemptionRecord::from_vecs_with_identity(
+            &BTreeMap::from([(DetTid::from_raw(3), history)]),
+            None,
+        )
+        .write_to_disk(&preempts_path)
+        .unwrap();
         let options =
             AnalyzeOpts::try_parse_from(["analyze", "--analyze-seed=7", "--", "/bin/true"])
                 .unwrap();
@@ -408,9 +414,12 @@ mod tests {
         let history: Vec<(LogicalTime, Priority)> = (1..=8)
             .map(|k| (LogicalTime::from_nanos(k * 1000), FIRST_PRIORITY + k))
             .collect();
-        PreemptionRecord::from_vecs_with_identity(&BTreeMap::from([(DetTid::from_raw(3), history)]), None)
-            .write_to_disk(&preempts_path)
-            .unwrap();
+        PreemptionRecord::from_vecs_with_identity(
+            &BTreeMap::from([(DetTid::from_raw(3), history)]),
+            None,
+        )
+        .write_to_disk(&preempts_path)
+        .unwrap();
         let options =
             AnalyzeOpts::try_parse_from(["analyze", "--analyze-seed=7", "--", "/bin/true"])
                 .unwrap();
@@ -490,6 +499,8 @@ mod tests {
                 .unwrap();
             assert_eq!(trials, 3);
             assert_eq!(minimized.identity(), identity.as_ref());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -505,7 +516,10 @@ mod replay_departure_tests {
         let history = (1..=8)
             .map(|i| (LogicalTime::from_nanos(i * 1000), FIRST_PRIORITY + i))
             .collect();
-        let record = PreemptionRecord::from_vecs_with_identity(&BTreeMap::from([(DetTid::from_raw(3), history)]), None);
+        let record = PreemptionRecord::from_vecs_with_identity(
+            &BTreeMap::from([(DetTid::from_raw(3), history)]),
+            None,
+        );
         let options =
             AnalyzeOpts::try_parse_from(["analyze", "--analyze-seed=7", "--", "/bin/true"])
                 .unwrap();

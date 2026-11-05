@@ -1838,29 +1838,13 @@ impl GlobalState {
             prepared.schedule,
             &prepared.clock,
         )));
-        // The admitted priority history keeps its replay-input validation:
-        // the same checks `HistoryReader::read_for_replay` makes, on the
-        // admitted object rather than a second read.
+        // The admitted priority history was read and validated for this
+        // numbering by preparation (`HistoryReader::read_for_replay`).
         if let Some(history) = &prepared.history {
             let path = cfg
                 .replay_preemptions_from
                 .as_ref()
                 .expect("admitted history names its input");
-            history
-                .recording()
-                .validate_replay_inputs(
-                    &format!("--replay-preemptions-from {}", path.display()),
-                    cfg.guest_ids,
-                )
-                .unwrap_or_else(|error| {
-                    if error
-                        .chain()
-                        .any(|cause| cause.is::<crate::preemptions::RecordAdmissionRefusal>())
-                    {
-                        crate::scheduler::exit_on_scheduler_refusal(&format!("{error:#}"));
-                    }
-                    panic!("{error:?}")
-                });
             history
                 .require_replay_mode(cfg.replay_edited_preemptions)
                 .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error));
@@ -1874,7 +1858,8 @@ impl GlobalState {
                 tracing::warn!(
                     "HERMIT_INCOMPLETE_REPLAY_RECORD: explicit edited history exploration of {} \
                      retains replay_departed_at={}; it does not certify faithful replay",
-                    path.display(), event,
+                    path.display(),
+                    event,
                 );
                 if let Some(writer) = &mut sched.lock().unwrap().preemption_writer {
                     writer.mark_replay_departed(event);
@@ -17187,7 +17172,7 @@ mod tests {
         use crate::preemptions::boundary_recording::Recording;
         let directory = tempfile::tempdir().unwrap();
         let input = directory.path().join("legacy.json");
-        Recording::Legacy(PreemptionRecord::from_sched_events(
+        Recording::Legacy(PreemptionRecord::from_sched_events_with_identity(
             vec![],
             Some(crate::clock_identity::test_sources::known()),
         ))
@@ -17240,7 +17225,7 @@ mod tests {
         let path = input.path().join("bad.json");
         Recording::Boundaries(
             BoundaryRecording::new(
-                PreemptionRecord::from_sched_events(
+                PreemptionRecord::from_sched_events_with_identity(
                     vec![],
                     Some(crate::clock_identity::test_sources::known()),
                 ),
@@ -17359,7 +17344,7 @@ mod tests {
             let budget = crate::slice_boundary::grant::tests::budget(tid, MmId::initial(tid), 91);
             let recording = Recording::Boundaries(
                 BoundaryRecording::new(
-                    PreemptionRecord::from_sched_events(
+                    PreemptionRecord::from_sched_events_with_identity(
                         vec![],
                         Some(crate::clock_identity::test_sources::known()),
                     ),
@@ -21462,7 +21447,7 @@ mod tests {
                 let input = temp.path().join("input");
                 Recording::Boundaries(
                     BoundaryRecording::new(
-                        PreemptionRecord::from_sched_events(
+                        PreemptionRecord::from_sched_events_with_identity(
                             vec![],
                             Some(crate::clock_identity::test_sources::known()),
                         ),
@@ -23202,7 +23187,7 @@ mod tests {
         let trace_file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(
             trace_file.path(),
-            PreemptionRecord::from_sched_events(
+            PreemptionRecord::from_sched_events_with_identity(
                 vec![event.clone(), next_event],
                 Some(crate::clock_identity::test_sources::known()),
             )

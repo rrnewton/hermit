@@ -298,7 +298,16 @@ pub(crate) fn prepare_run_with(
     let history = match &cfg.replay_preemptions_from {
         None => None,
         Some(path) => {
-            let history = HistoryReader::read(path).map_err(PrepareError::Unreadable)?;
+            let history = HistoryReader::read_for_replay(path, cfg.guest_ids).map_err(|error| {
+                if error
+                    .chain()
+                    .any(|cause| cause.is::<crate::preemptions::RecordAdmissionRefusal>())
+                {
+                    PrepareError::Refused(format!("{error:#}"))
+                } else {
+                    PrepareError::Unreadable(error)
+                }
+            })?;
             history
                 .require_legacy_mode()
                 .map_err(|error| PrepareError::Refused(error.to_string()))?;
@@ -808,9 +817,10 @@ mod tests {
     }
 
     /// A legacy schedule's `--stacktrace-event` indices are resolved before
-    /// the pin too: an index outside its events still panics, as indexing
-    /// them always has, now with nothing pinned; a valid one reaches
-    /// construction with its event.
+    /// the pin too. On current main an index at or past the end names the
+    /// events the run makes after the schedule runs out, so it resolves
+    /// without a recorded event instead of panicking; a valid one reaches
+    /// construction resolved the same way.
     #[test]
     fn legacy_stack_indices_are_resolved_before_the_pin() {
         use detcore_model::schedule::SchedEvent;
@@ -821,28 +831,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("legacy.json");
         let event = SchedEvent::branches(DetTid::from_raw(1), 4);
-        write_events(&path, vec![event.clone()]);
+        write_events(&path, vec![event]);
         let config = |indices| {
             let mut cfg = prepared(&amd());
             cfg.replay_schedule_from = Some(path.clone());
             cfg.stacktrace_event = indices;
             cfg
         };
-        let state = PmuState::new();
-        let outside = config(vec![(1, None)]);
-        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            prepare_run_with(&outside, &on(&amd(), &state))
-        }));
-        assert!(panicked.is_err(), "an index outside the events must panic");
-        assert_eq!(state.pinned(), None);
         let stack = Some(dir.path().join("stack"));
         let state = PmuState::new();
         let prepared =
-            prepare_run_with(&config(vec![(0, stack.clone())]), &on(&amd(), &state)).unwrap();
+            prepare_run_with(&config(vec![(1, stack.clone())]), &on(&amd(), &state)).unwrap();
         assert_eq!(state.pinned(), Some(amd().key()));
         assert_eq!(
             prepared.schedule.unwrap().stacks,
-            ReplayStacks::Legacy(vec![(0, Some(event), stack)])
+            ReplayStacks::Legacy(vec![(1, None, stack)])
         );
     }
 

@@ -355,16 +355,14 @@ impl InterpolateOpts {
     /// The `--pipe-wake-latency` both schedules were recorded under, which
     /// the interpolated schedule carries; schedules recorded under different
     /// values are refused (<https://github.com/rrnewton/hermit/issues/4380>).
-    /// Each input is a path and the bytes read from it.
     fn common_pipe_wake_latency(
-        (file_a, bytes_a): (&std::path::Path, &[u8]),
-        (file_b, bytes_b): (&std::path::Path, &[u8]),
+        file_a: &std::path::Path,
+        file_b: &std::path::Path,
     ) -> anyhow::Result<Option<u64>> {
-        let read = |path: &std::path::Path, bytes: &[u8]| {
-            detcore::preemptions::recorded_pipe_wake_latency_in(path, bytes)
-                .map_err(anyhow::Error::msg)
+        let read = |path: &std::path::Path| {
+            detcore::preemptions::read_recorded_pipe_wake_latency(path).map_err(anyhow::Error::msg)
         };
-        let (a, b) = (read(file_a, bytes_a)?, read(file_b, bytes_b)?);
+        let (a, b) = (read(file_a)?, read(file_b)?);
         if a != b {
             anyhow::bail!(
                 "{} and {} were recorded under different --pipe-wake-latency values ({:?} and \
@@ -434,6 +432,8 @@ impl InterpolateOpts {
             );
         }
         Ok(a)
+    }
+
     /// The RCB coordinate identity both schedules state, which the
     /// interpolated schedule carries unchanged; schedules stating different
     /// identities are refused. Each input is a path and its decoded recording.
@@ -450,17 +450,15 @@ impl InterpolateOpts {
 
     /// The signal-state copy setting the interpolated schedule carries: the
     /// one the schedules state, where they agree or only one states it.
-    /// Schedules recorded under different settings are refused. Each input
-    /// is a path and the bytes read from it.
+    /// Schedules recorded under different settings are refused.
     fn common_signal_state_copy(
-        (file_a, bytes_a): (&std::path::Path, &[u8]),
-        (file_b, bytes_b): (&std::path::Path, &[u8]),
+        file_a: &std::path::Path,
+        file_b: &std::path::Path,
     ) -> anyhow::Result<Option<bool>> {
-        let read = |path: &std::path::Path, bytes: &[u8]| {
-            detcore::preemptions::recorded_signal_state_copy_in(path, bytes)
-                .map_err(anyhow::Error::msg)
+        let read = |path: &std::path::Path| {
+            detcore::preemptions::read_recorded_signal_state_copy(path).map_err(anyhow::Error::msg)
         };
-        match (read(file_a, bytes_a)?, read(file_b, bytes_b)?) {
+        match (read(file_a)?, read(file_b)?) {
             (Some(a), Some(b)) if a != b => anyhow::bail!(
                 "{} and {} were recorded with the signal-state copy {} and {}; no \
                  interpolation of them can be replayed",
@@ -554,9 +552,10 @@ mod tests {
         // Nondefault current-main metadata must survive together with the new
         // format/jump fields. Deserialize the public record representation,
         // as the command does, rather than constructing private fields.
-        let mut value =
-            serde_json::to_value(PreemptionRecord::from_sched_events_with_identity(events, None).with_current_format())
-                .unwrap();
+        let mut value = serde_json::to_value(
+            PreemptionRecord::from_sched_events_with_identity(events, None).with_current_format(),
+        )
+        .unwrap();
         value["epoch"] = serde_json::json!("2026-01-01T00:00:00Z");
         value["cap_preemption_charge"] = serde_json::json!(true);
         value["chaos_timeslice"] = serde_json::json!(123_456);
@@ -715,8 +714,11 @@ mod tests {
             SchedEvent::branches(DetTid::from_raw(5000), 3),
             SchedEvent::branches(DetTid::from_raw(5001), 2),
         ];
-        let mut input =
-            serde_json::to_value(PreemptionRecord::from_sched_events_with_identity(events.clone(), None)).unwrap();
+        let mut input = serde_json::to_value(PreemptionRecord::from_sched_events_with_identity(
+            events.clone(),
+            None,
+        ))
+        .unwrap();
         input["guest_ids"] = serde_json::to_value(ids).unwrap();
         let unmarked = input.clone();
         let unmarked_path = directory.path().join("unmarked.json");
@@ -811,9 +813,10 @@ mod tests {
             .enumerate()
             .map(|(index, ids)| {
                 let path = directory.path().join(format!("{index}.json"));
-                let mut record =
-                    serde_json::to_value(PreemptionRecord::from_sched_events_with_identity(events.clone(), None))
-                        .unwrap();
+                let mut record = serde_json::to_value(
+                    PreemptionRecord::from_sched_events_with_identity(events.clone(), None),
+                )
+                .unwrap();
                 if let Some(ids) = ids {
                     record["guest_ids"] = ids.clone();
                     if matches!(
@@ -929,8 +932,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("recording.json");
         let recording = Recording::Boundaries(
-            BoundaryRecording::new(PreemptionRecord::from_sched_events_with_identity(vec![], None), schedule)
-                .unwrap(),
+            BoundaryRecording::new(
+                PreemptionRecord::from_sched_events_with_identity(vec![], None),
+                schedule,
+            )
+            .unwrap(),
         );
         recording.write(&path).unwrap();
         let before = std::fs::read(&path).unwrap();
@@ -970,8 +976,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let write = |name: &str, copy: Option<bool>| {
             let path = dir.path().join(name);
-            let record =
-                PreemptionRecord::from_sched_events_with_identity(Vec::new(), None).with_signal_state_copy(copy);
+            let record = PreemptionRecord::from_sched_events_with_identity(Vec::new(), None)
+                .with_signal_state_copy(copy);
             std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
             path
         };
@@ -979,11 +985,7 @@ mod tests {
         let on = write("on.json", Some(true));
         let off = write("off.json", Some(false));
         let common = |a: &PathBuf, b: &PathBuf| {
-            let (bytes_a, bytes_b) = (std::fs::read(a).unwrap(), std::fs::read(b).unwrap());
-            InterpolateOpts::common_signal_state_copy(
-                (a.as_path(), bytes_a.as_slice()),
-                (b.as_path(), bytes_b.as_slice()),
-            )
+            InterpolateOpts::common_signal_state_copy(a.as_path(), b.as_path())
         };
         assert_eq!(common(&unsaid, &unsaid).unwrap(), None);
         assert_eq!(common(&on, &on).unwrap(), Some(true));
@@ -1053,8 +1055,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let write = |name: &str, on: bool| {
             let path = dir.path().join(name);
-            let record =
-                PreemptionRecord::from_sched_events_with_identity(Vec::new(), None).with_cap_preemption_charge(on);
+            let record = PreemptionRecord::from_sched_events_with_identity(Vec::new(), None)
+                .with_cap_preemption_charge(on);
             std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
             path
         };
@@ -1159,7 +1161,7 @@ mod tests {
         for (capped, once) in [(true, true), (true, false), (false, true), (false, false)] {
             let write = |name: &str, tid: i32| {
                 let path = dir.path().join(format!("{name}-{capped}-{once}.json"));
-                PreemptionRecord::from_sched_events(events(tid), None)
+                PreemptionRecord::from_sched_events(events(tid))
                     .with_cap_preemption_charge(capped)
                     .with_expired_wait_runs_charged_once(once)
                     .write_to_disk(&path)
@@ -1242,14 +1244,12 @@ mod tests {
         );
         let error = options
             .interpolated_record()
-            .err()
-            .expect("different identities are refused");
+            .expect_err("different identities are refused");
         assert!(
             error.to_string().contains("hermit refused to combine"),
             "{error}"
         );
     }
-
 }
 
 #[cfg(test)]

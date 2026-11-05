@@ -1150,7 +1150,10 @@ mod identity_tests {
     #[test]
     fn a_legacy_file_states_no_identity() {
         for recording in [
-            Recording::Legacy(PreemptionRecord::from_sched_events_with_identity(vec![], None)),
+            Recording::Legacy(PreemptionRecord::from_sched_events_with_identity(
+                vec![],
+                None,
+            )),
             sample(true),
         ] {
             let decoded = Recording::decode(&recording.encode().unwrap()).unwrap();
@@ -1187,7 +1190,8 @@ mod identity_tests {
                 String::from_utf8_lossy(&bytes)
             );
         }
-        let text = PreemptionRecord::from_sched_events_with_identity(vec![], Some(known())).to_string();
+        let text =
+            PreemptionRecord::from_sched_events_with_identity(vec![], Some(known())).to_string();
         let duplicated = text.replacen("\"format\":2,", "\"format\":2,\"format\":2,", 1);
         assert_ne!(duplicated, text);
         assert!(Recording::decode(duplicated.as_bytes()).is_err());

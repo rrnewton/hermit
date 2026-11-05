@@ -61,6 +61,8 @@ pub const DEFAULT_BACKEND_CAPABILITIES: BackendCapabilities = {
     backend.delivers_preemption_timer_events = false;
     backend.runs_guest_code_between_injections = false;
     backend.reports_sigreturns = false;
+    // Nor does it know which counter the run's RCB clock is.
+    backend.rcb_clock_contract = None;
     backend
 };
 
@@ -5136,6 +5138,48 @@ mod tests {
             let received = decode_backend_config_json(&encoded).unwrap();
             assert_eq!(received.backend, backend, "{name}");
         }
+    }
+
+    /// Every backend constant states a listed RCB clock contract (Reverie's
+    /// enum is non-exhaustive, so a match cannot catch a new variant), and a
+    /// contract no Reverie names is refused, not read as none. Ported from
+    /// the pinned guard's capability adaptation; the envelope missing and
+    /// duplicate cases are covered by the next test.
+    #[test]
+    fn every_backend_constant_states_a_listed_rcb_clock_contract() {
+        use reverie::RcbClockContract;
+
+        const RCB_CLOCK_CONTRACTS: [Option<RcbClockContract>; 2] = [
+            None,
+            Some(RcbClockContract::PerfCounterOnTargetThreadUserOnly),
+        ];
+        for backend in [
+            BackendCapabilities::PTRACE,
+            BackendCapabilities::E9PATCH,
+            BackendCapabilities::LITEINST_IN_GUEST,
+            BackendCapabilities::SABRE,
+            BackendCapabilities::DBT,
+            BackendCapabilities::KVM,
+        ] {
+            assert!(
+                RCB_CLOCK_CONTRACTS.contains(&backend.rcb_clock_contract),
+                "{backend:?}"
+            );
+        }
+        assert_eq!(
+            BackendCapabilities::PTRACE.rcb_clock_contract,
+            Some(RcbClockContract::PerfCounterOnTargetThreadUserOnly)
+        );
+        let sent = Config {
+            backend: BackendCapabilities::LITEINST_IN_GUEST,
+            ..Config::default()
+        };
+        let encoded =
+            encode_backend_config_json(to_legacy_backend_json(&sent).unwrap(), sent.backend)
+                .unwrap();
+        let mut unnamed: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        unnamed["backend"]["rcb_clock_contract"] = "PerfCounterOnSomeOtherThread".into();
+        assert!(decode_backend_config_json(&unnamed.to_string()).is_err());
     }
 
     #[test]

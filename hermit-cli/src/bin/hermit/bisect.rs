@@ -16,6 +16,7 @@ use anyhow::Context;
 use anyhow::bail;
 use clap::Parser;
 use detcore::clock_identity::combined_identity;
+#[cfg(test)]
 use detcore::preemptions::HistoryIdentity;
 use detcore::preemptions::PreemptionRecord;
 use hermit::Error;
@@ -108,10 +109,7 @@ impl BisectOpts {
 
     /// Everything `main` does before the first replay: the refusals, the two
     /// schedules, and the trial configuration they imply.
-    fn prepare(
-        &self,
-        global: &GlobalOpts,
-    ) -> Result<Prepared, Error> {
+    fn prepare(&self, global: &GlobalOpts) -> Result<Prepared, Error> {
         let mut analyzer = AnalyzeOpts {
             target_stdout: self.target_stdout.clone(),
             target_stderr: self.target_stderr.clone(),
@@ -203,7 +201,9 @@ impl BisectOpts {
             (&format!("--good {}", self.good.display()), good.identity()),
             (&format!("--bad {}", self.bad.display()), bad.identity()),
         )
-        .map_err(|refusal| anyhow::Error::new(crate::container::PolicyRefusal).context(refusal))?;
+        .map_err(|refusal| {
+            anyhow::Error::new(crate::app::container::PolicyRefusal).context(refusal)
+        })?;
         // A trial spliced from either schedule's prefix makes the jumps of
         // global time that prefix contains (`crate::app::time_skip_carry`).
         {
@@ -864,7 +864,7 @@ mod tests {
         let crate::app::Subcommand::Bisect(options) = args.command else {
             panic!("{argv:?} is not bisect")
         };
-        let (mut analyzer, _, _, _) = options.prepare(&args.global)?;
+        let (mut analyzer, _, _) = options.prepare(&args.global)?;
         analyzer.tmp_dir = Some(dir.to_path_buf());
         Ok(analyzer)
     }
@@ -1221,8 +1221,8 @@ mod tests {
                 "--",
                 "/bin/true",
             ];
-            let args = crate::Args::try_parse_from(argv).unwrap();
-            let crate::Subcommand::Bisect(options) = args.command else {
+            let args = crate::app::Args::try_parse_from(argv).unwrap();
+            let crate::app::Subcommand::Bisect(options) = args.command else {
                 panic!("{argv:?} is not bisect")
             };
             let error = options.prepare(&args.global).map(|_| ()).unwrap_err();

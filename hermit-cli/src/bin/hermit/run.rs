@@ -6038,7 +6038,7 @@ fn replay_refuses_another_pipe_wake_latency() {
     let dir = tempfile::tempdir().unwrap();
     let record = |name: &str, latency: Option<u64>| {
         let path = dir.path().join(name);
-        let record = detcore::preemptions::PreemptionRecord::from_sched_events(Vec::new(), None)
+        let record = detcore::preemptions::PreemptionRecord::from_sched_events(Vec::new())
             .with_pipe_wake_latency(latency);
         std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
         path
@@ -6090,9 +6090,12 @@ fn replay_refuses_a_history_it_cannot_execute_before_launch() {
     let dir = tempfile::tempdir().unwrap();
     let write = |name: &str, identity| {
         let path = dir.path().join(name);
-        detcore::preemptions::PreemptionRecord::from_sched_events(Vec::new(), identity)
-            .write_to_disk(&path)
-            .unwrap();
+        detcore::preemptions::PreemptionRecord::from_sched_events_with_identity(
+            Vec::new(),
+            identity,
+        )
+        .write_to_disk(&path)
+        .unwrap();
         path
     };
     let legacy = write("legacy.json", None);

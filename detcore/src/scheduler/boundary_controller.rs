@@ -351,7 +351,7 @@ mod tests {
         let path = directory.path().join("recording.json");
         Recording::Boundaries(
             BoundaryRecording::new(
-                PreemptionRecord::from_sched_events(
+                PreemptionRecord::from_sched_events_with_identity(
                     vec![],
                     Some(crate::clock_identity::test_sources::known()),
                 ),
@@ -412,7 +412,7 @@ mod tests {
         assert_eq!(scheduler.boundary_budget_for_live_owner(tid).unwrap(), None);
         // Old format retains its exact old replayer and producer rather than
         // trying to synthesize absent callback identities.
-        Recording::Legacy(PreemptionRecord::from_sched_events(
+        Recording::Legacy(PreemptionRecord::from_sched_events_with_identity(
             vec![SchedEvent::branches(tid, 1)],
             Some(crate::clock_identity::test_sources::known()),
         ))
