@@ -409,7 +409,7 @@ mod tests {
     fn the_global_rpc_revision_matches_its_definitions() {
         let source = include_str!("tool_global.rs");
         let payload = include_str!("store_exclusive.rs");
-        let schedule = include_str!("../../detcore-model/src/schedule.rs");
+        let schedule = detcore_model::SCHEDULE_RS_SOURCE;
         let replayer = include_str!("scheduler/replayer.rs");
         let digest = definition_digest(source, payload, schedule, replayer);
         let resources = include_str!("resources.rs");
