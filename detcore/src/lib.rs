@@ -6066,6 +6066,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         if !self.cfg.recordreplay_modes {
             Box::pin(self.record_process_auxv(guest)).await;
         }
+        // The working directory the new image starts in, for its filesystem
+        // group, where Detcore renders another process's `cwd` link (package
+        // K item 2b slice 2b-4): the first record of the run's first process,
+        // and a fresh one at each exec. Boxed, as above.
+        Box::pin(self.record_working_directory(guest)).await;
         // The new image's program-break model, checked against the kernel's
         // once its exec record is in place.
         self.check_brk_model(guest).await;
@@ -7877,6 +7882,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
             if res.is_ok() && !removed_inodes.is_empty() {
                 self.retire_removed_inodes(guest, removed_inodes).await;
+            }
+            // A successful change of the working directory, for another
+            // process's `cwd` link where Detcore renders it (package K item 2b
+            // slice 2b-4, `Detcore::record_working_directory`). Boxed: rare,
+            // and kept out of every syscall's future.
+            if res.is_ok() && matches!(call.number(), Sysno::chdir | Sysno::fchdir) {
+                Box::pin(self.record_working_directory(guest)).await;
             }
             if res.is_ok() {
                 for fifo in removed_guest_fifos {

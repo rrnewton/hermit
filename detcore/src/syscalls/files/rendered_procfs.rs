@@ -1340,6 +1340,9 @@ enum CapabilityRefusal {
     /// Another process's `/proc/<pid>/environ`, at its open (package K item
     /// 2b slice 2b-3).
     Environ,
+    /// Another process's `exe`, `cwd` and `root` links, at a readlink
+    /// (package K item 2b slice 2b-4).
+    Links,
 }
 
 /// Whether the run has warned that the reader's own capabilities refused
@@ -1352,6 +1355,8 @@ static CAPABILITY_REFUSAL_WARNED_AUXV: std::sync::atomic::AtomicBool =
 static CAPABILITY_REFUSAL_WARNED_IO: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static CAPABILITY_REFUSAL_WARNED_ENVIRON: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static CAPABILITY_REFUSAL_WARNED_LINKS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Whether the run has warned that another process's `cmdline` or `environ`
@@ -2941,6 +2946,20 @@ impl<T: RecordOrReplay> Detcore<T> {
         Self::ptrace_read_allowed_for(guest, task, CapabilityRefusal::Auxv).await
     }
 
+    /// Linux's `proc_fd_access_allowed` for the caller and `task`, the task
+    /// a `/proc/<pid>/{exe,cwd,root}` path names, in another thread group,
+    /// which `proc_pid_readlink` and `proc_pid_get_link` ask before they
+    /// read the link (fs/proc/base.c:708-722, 1809-1810 and 1853-1854 in
+    /// 6.17): `ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS)`, the check
+    /// an `auxv` open makes, so decided as [`Self::ptrace_read_allowed`]
+    /// decides it (package K item 2b slice 2b-4).
+    pub(crate) async fn link_read_allowed<G: Guest<Self>>(
+        guest: &mut G,
+        task: crate::procfs::BoundTask,
+    ) -> Result<Result<(), Errno>, Error> {
+        Self::ptrace_read_allowed_for(guest, task, CapabilityRefusal::Links).await
+    }
+
     /// [`Self::ptrace_read_allowed`] for the open of another process's
     /// `refusal` file: `auxv`, or `environ`, whose open makes the same check
     /// on a file of the same owner and mode (`environ_open` and `auxv_open`
@@ -3395,6 +3414,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                 "environ",
                 reverie::syscalls::Sysno::openat,
                 &CAPABILITY_REFUSAL_WARNED_ENVIRON,
+            ),
+            CapabilityRefusal::Links => (
+                "{exe,cwd,root}",
+                reverie::syscalls::Sysno::readlinkat,
+                &CAPABILITY_REFUSAL_WARNED_LINKS,
             ),
         };
         match Self::inject_capget(guest, CapabilitySet::Effective).await? {

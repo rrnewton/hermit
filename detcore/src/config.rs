@@ -95,8 +95,9 @@ mod tests {
     /// https://github.com/rrnewton/hermit/pull/4728's, 31 is
     /// https://github.com/rrnewton/hermit/pull/4867's, 32 is the stopless
     /// layout on top of 31's, 40 is the `CpuClockProcess` pair allocated
-    /// to https://github.com/rrnewton/hermit/pull/4885, and 41, package K
-    /// item 2b slice 2b-1's, is the current revision. A change that lands
+    /// to https://github.com/rrnewton/hermit/pull/4885, 41 is package K
+    /// item 2b slice 2b-1's, 42 slice 2b-3's, and 43, slice 2b-4's, is the
+    /// current revision. A change that lands
     /// below the last row removes its entry, with its row. One that lands
     /// after a higher revision (any of 33 to 38 after 41) appends its row
     /// above the last instead and leaves its old number here, reserved as
@@ -293,6 +294,13 @@ mod tests {
         // in `ProcessExecStrings`'s, the image's number. The digest covers
         // that payload type too (domain 7). Digest measured at this head.
         (42, "05097a2f4152ff09", "f013e36743d8d9e6"),
+        // Adds `GlobalRequest::RecordWorkingDirectory` and
+        // `GlobalRequest::TaskWorkingDirectory` and their responses, which
+        // carry a task's working directory as Detcore recorded it
+        // (`DirectoryRecord`, package K item 2b slice 2b-4, the next
+        // revision after 2b-3's). The digest covers that payload type too
+        // (domain 8, from exec_record.rs). Digest measured at this head.
+        (43, "02d24f3a79e7a7f3", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
@@ -368,6 +376,11 @@ mod tests {
     /// tool_global.rs.
     const EXEC_STRINGS_WIRE: [&str; 1] = ["pub struct ExecStrings {"];
 
+    /// The payload type package K item 2b slice 2b-4 added, which
+    /// `RecordWorkingDirectory` and `TaskWorkingDirectory`'s response carry,
+    /// in exec_record.rs.
+    const DIRECTORY_RECORD_WIRE: [&str; 1] = ["pub struct DirectoryRecord {"];
+
     /// The lines of code of the item `source` declares, unindented, on the
     /// line `header`: the attributes just above it (its derives and serde
     /// attributes decide its encoding), the header, and its body through
@@ -411,7 +424,8 @@ mod tests {
     /// `source`, of the StoreExclusive payload's types in `payload`, of the
     /// scheduled event's wire items in `schedule`, and of the trace reply's
     /// wire items in `source` and `replayer`, of 2b-1's payload types in
-    /// `source` and `task_stat`, and of 2b-3's in `source`: their variants, fields, payload types, order
+    /// `source` and `task_stat`, of 2b-3's in `source`, and of 2b-4's in
+    /// exec_record.rs: their variants, fields, payload types, order
     /// and attributes, not their documentation.
     fn definition_digest(
         source: &str,
@@ -419,6 +433,26 @@ mod tests {
         schedule: &str,
         replayer: &str,
         task_stat: &str,
+    ) -> String {
+        definition_digest_with(
+            source,
+            payload,
+            schedule,
+            replayer,
+            task_stat,
+            include_str!("exec_record.rs"),
+        )
+    }
+
+    /// [`definition_digest`], with 2b-4's payload type read from
+    /// `exec_record`.
+    fn definition_digest_with(
+        source: &str,
+        payload: &str,
+        schedule: &str,
+        replayer: &str,
+        task_stat: &str,
+        exec_record: &str,
     ) -> String {
         let request = definition(source, "pub enum GlobalRequest {").join("\n");
         let response = definition(source, "pub enum GlobalResponse {").join("\n");
@@ -439,6 +473,7 @@ mod tests {
         ]
         .join("\n");
         let exec_strings = wire_items(source, &EXEC_STRINGS_WIRE);
+        let directory_record = wire_items(exec_record, &DIRECTORY_RECORD_WIRE);
         fnv_domains(&[
             (0, request.as_bytes()),
             (1, response.as_bytes()),
@@ -447,6 +482,7 @@ mod tests {
             (5, reply.as_bytes()),
             (6, procfs.as_bytes()),
             (7, exec_strings.as_bytes()),
+            (8, directory_record.as_bytes()),
         ])
     }
 
@@ -679,6 +715,29 @@ mod tests {
         assert_ne!(documented, source);
         assert_eq!(
             definition_digest(&documented, payload, schedule, replayer, task_stat),
+            digest
+        );
+        // And 2b-4's: a field added to `DirectoryRecord` changes the digest;
+        // a doc line does not.
+        let exec_record = include_str!("exec_record.rs");
+        let grown = exec_record.replacen(
+            "pub struct DirectoryRecord {\n",
+            "pub struct DirectoryRecord {\n    pub added: u32,\n",
+            1,
+        );
+        assert_ne!(grown, exec_record);
+        assert_ne!(
+            definition_digest_with(source, payload, schedule, replayer, task_stat, &grown),
+            digest
+        );
+        let documented = exec_record.replacen(
+            "pub struct DirectoryRecord {\n",
+            "pub struct DirectoryRecord {\n    /// Documentation only.\n",
+            1,
+        );
+        assert_ne!(documented, exec_record);
+        assert_eq!(
+            definition_digest_with(source, payload, schedule, replayer, task_stat, &documented),
             digest
         );
 
