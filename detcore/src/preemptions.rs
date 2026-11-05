@@ -3097,6 +3097,7 @@ mod tests {
                 rcbs,
                 DEFAULT_PRIORITY,
                 20,
+                None,
             );
             writer.record_store_exclusive_failures(store_exclusive_failures);
             writer.summary().unwrap()
@@ -3117,6 +3118,7 @@ mod tests {
                 10,
                 DEFAULT_PRIORITY,
                 20,
+                None,
             );
             writer.record_store_exclusive_failures(store_exclusive_failures);
             writer.summary().unwrap()
