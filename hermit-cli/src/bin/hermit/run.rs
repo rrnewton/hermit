@@ -645,8 +645,9 @@ pub(crate) fn branch_counter_verdict() -> hermit::canonical_verdict::BranchCount
 
 /// Why a run on `backend`, with `--passthru-opt` when `passthru_opt` is set,
 /// can run guest code or syscalls that Hermit does not observe, or `None` when
-/// Hermit sees every syscall of every guest process from its first
-/// instruction after exec. In such a run a host file change found before the
+/// Hermit sees every syscall of every guest process that can change a file,
+/// from its first instruction after exec. `--untrap-passthrough-syscalls`
+/// leaves untrapped only calls that change no file. In such a run a host file change found before the
 /// first divergence is not evidence that the guest did not make the change
 /// itself (see `hermit::host_input_change`).
 fn unobserved_guest_execution(backend: Backend, passthru_opt: bool) -> Option<&'static str> {
@@ -5326,6 +5327,224 @@ fn the_ptrace_runtime_guards_reverie_private_page() {
     );
     ro.set_backend(Some(Backend::Kvm));
     assert_eq!(ro.effective_det_config().untraced_code_range, None);
+}
+
+#[test]
+fn untrap_passthrough_syscalls_is_an_opt_in_refused_where_its_calls_are_counted() {
+    let mut opts = RunOpts::parse_from(["fakehermit", "--untrap-passthrough-syscalls", "fakeprog"]);
+    opts.validate_args_with_perf_support(true).unwrap();
+    assert!(opts.det_opts.det_config.untrap_passthrough_syscalls);
+    assert_eq!(
+        format!("{}", opts),
+        " --untrap-passthrough-syscalls --epoch=2026-01-01T00:00:00+00:00 -- fakeprog"
+    );
+    let mut default = RunOpts::parse_from(["fakehermit", "fakeprog"]);
+    default.validate_args_with_perf_support(true).unwrap();
+    assert!(!default.det_opts.det_config.untrap_passthrough_syscalls);
+
+    // Validation reads a replayed record before this refusal, so the replay
+    // case names a readable one; this one states nothing.
+    let directory = tempfile::tempdir().unwrap();
+    let record = directory.path().join("preemptions.json");
+    detcore::preemptions::PreemptionRecord::from_sched_events(Vec::new())
+        .write_to_disk(&record)
+        .unwrap();
+    let replay = format!("--replay-schedule-from={}", record.display());
+    for (argument, backend, refused_with) in [
+        (Some("--strict"), None, "--strict"),
+        // KVM refuses the default preemption timer before this check.
+        (
+            Some("--max-timeslice=disabled"),
+            Some(Backend::Kvm),
+            "backend other than ptrace",
+        ),
+        (
+            Some("--max-timeslice=disabled"),
+            Some(Backend::Liteinst),
+            "backend other than ptrace",
+        ),
+        (
+            Some("--record-preemptions-to=/tmp/p"),
+            None,
+            "preemption record",
+        ),
+        (Some(replay.as_str()), None, "preemption record"),
+        (Some("--happens-before=/tmp/hb"), None, "--happens-before"),
+        (Some("--verify-run=/tmp/v"), None, "--verify-run"),
+        (Some("--namespace-only"), None, "backend other than ptrace"),
+        (Some("--max-timeslice=disabled"), None, "RCB time"),
+        (Some("--no-rcb-time"), None, "RCB time"),
+    ] {
+        let mut opts = RunOpts::parse_from(
+            ["fakehermit", "--untrap-passthrough-syscalls"]
+                .into_iter()
+                .chain(argument)
+                .chain(["fakeprog"]),
+        );
+        opts.set_backend(backend);
+        let error = opts
+            .validate_args_with_perf_support(true)
+            .expect_err("refused");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("--untrap-passthrough-syscalls") && message.contains(refused_with),
+            "{argument:?} {backend:?}: {message}"
+        );
+    }
+    // Nor on a host without usable performance counters, where validation
+    // turns the timer off.
+    let mut opts = RunOpts::parse_from(["fakehermit", "--untrap-passthrough-syscalls", "fakeprog"]);
+    let message = format!(
+        "{:#}",
+        opts.validate_args_with_timer_support(Err(TimerUnavailable::NoPerfEvents))
+            .expect_err("refused without a timer")
+    );
+    assert!(message.contains("RCB time"), "{message}");
+
+    // Nor on an executable-selected backend: its built-in enum still reads
+    // as the ptrace default, so the backend comparison above cannot see it.
+    // The inherited positive maximum is retained (no --max-timeslice), so
+    // preemption admission alone would accept the run; the refusal is the
+    // executable-selected qualification check (revcodex2 on PR 4764).
+    let application = run_opts_for(&[
+        "hermit",
+        "--backend=dbt",
+        "run",
+        "--untrap-passthrough-syscalls",
+        "--",
+        "fakeprog",
+    ]);
+    assert_eq!(application.application_backend, Some("dbt"));
+    assert_eq!(
+        application.adapter_capabilities,
+        Some(reverie::BackendCapabilities::DBT)
+    );
+    assert_eq!(application.selected_backend(), Backend::Ptrace);
+    assert!(application.det_opts.det_config.max_timeslice.is_some());
+    let error = application
+        .refuse_unqualified_application_options(
+            <super::core_adapter::CoreApplicationAdapter as super::backend_hook::BackendAdapter>::NONDEFAULT_CPU_PROFILE_REFUSAL,
+        )
+        .expect_err("refused on an executable-selected backend");
+    assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+    assert_eq!(
+        error.to_string(),
+        "--untrap-passthrough-syscalls is not qualified for executable-selected backend `dbt`"
+    );
+}
+
+/// A preemption record holds a callback for each trapped call the recorded run
+/// made, `getppid` among them, with its charge and its preemption point. With
+/// `--untrap-passthrough-syscalls` those calls never reach Detcore, so a replay
+/// of the record would place its checkpoints and priority changes at other
+/// guest progress. Validation refuses such a replay, and recording one, before
+/// the guest runs, whether the options come from the command line, a
+/// `--config` file or a `--from` manifest. Without the flag each route accepts
+/// the same record, so the refusal is the flag's.
+#[test]
+fn untrap_passthrough_syscalls_refuses_preemption_records_by_every_route() {
+    use clap::CommandFactory as _;
+    use detcore::types::DetTid;
+    use detcore::types::SchedEvent;
+    use detcore::types::SyscallPhase;
+    use reverie::syscalls::Sysno;
+
+    let directory = tempfile::tempdir().unwrap();
+    let record = directory.path().join("preemptions.json");
+    let thread = DetTid::from_raw(3);
+    detcore::preemptions::PreemptionRecord::from_sched_events(vec![
+        SchedEvent::syscall(thread, Sysno::getppid, SyscallPhase::Prehook),
+        SchedEvent::syscall(thread, Sysno::getppid, SyscallPhase::Posthook),
+    ])
+    .write_to_disk(&record)
+    .unwrap();
+    let record = record.to_str().expect("record path is UTF-8").to_owned();
+
+    // Validates `hermit run ARGS -- /bin/true`, expanded as `main` expands a
+    // `--config` or `--from` before parsing.
+    let validate = |run: &[&str]| -> Result<(), Error> {
+        let argv: Vec<std::ffi::OsString> = ["hermit", "run"]
+            .iter()
+            .chain(run)
+            .chain(&["--", "/bin/true"])
+            .map(std::ffi::OsString::from)
+            .collect();
+        let argv = crate::app::run_config::expand_argv(&crate::app::Args::command(), &argv)?
+            .unwrap_or(argv);
+        let matches = crate::app::Args::command().try_get_matches_from(&argv)?;
+        let mut args = crate::app::args_from_matches_with_clock(&matches, || {
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_767_225_600)
+        })?;
+        let crate::app::Subcommand::Run(run) = &mut args.command else {
+            panic!("{argv:?} is not a `run` command");
+        };
+        run.validate_args_with_perf_support(true)
+    };
+    let refused = |run: &[&str], route: &str| {
+        let message = format!("{:#}", validate(run).expect_err(route));
+        assert!(
+            message.contains("--untrap-passthrough-syscalls")
+                && message.contains("preemption record"),
+            "{route}: {message}"
+        );
+    };
+
+    let replay = format!("--replay-preemptions-from={record}");
+    validate(&[replay.as_str()]).expect("the record replays without the flag");
+    refused(
+        &["--untrap-passthrough-syscalls", replay.as_str()],
+        "command line, --replay-preemptions-from",
+    );
+    validate(&["--record-preemptions"]).expect("a run records preemptions without the flag");
+    refused(
+        &["--untrap-passthrough-syscalls", "--record-preemptions"],
+        "command line, --record-preemptions",
+    );
+
+    let config = |untrap: bool| {
+        let path = directory.path().join(format!("run-{untrap}.yaml"));
+        std::fs::write(
+            &path,
+            format!(
+                "schema: {}\nrun:\n  replay-preemptions-from: {record}\n  \
+                 untrap-passthrough-syscalls: {untrap}\n",
+                crate::app::run_config::SCHEMA
+            ),
+        )
+        .unwrap();
+        path.to_str().expect("config path is UTF-8").to_owned()
+    };
+    let (with, without) = (config(true), config(false));
+    validate(&["--config", without.as_str()]).expect("the config replays without the flag");
+    refused(&["--config", with.as_str()], "--config");
+
+    let manifest = |config: &str, name: &str| {
+        let loaded = crate::app::run_config::read(Path::new(config)).unwrap();
+        let (global, run) = crate::app::run_config::to_manifest_parts(&loaded).unwrap();
+        let manifest = crate::app::manifest::Manifest::new(
+            hermit::Id::unique(),
+            crate::app::manifest::Kind::InputsOnly,
+            crate::app::manifest::Command {
+                program: Some("/bin/true".to_owned()),
+                args: Vec::new(),
+                cwd: None,
+            },
+            crate::app::manifest::Inputs {
+                global,
+                run,
+                host_drawn: Default::default(),
+            },
+        );
+        let at = directory
+            .path()
+            .join(name)
+            .join(crate::app::manifest::MANIFEST_NAME);
+        crate::app::manifest::write(&at, &manifest).unwrap();
+        at.parent().unwrap().to_str().unwrap().to_owned()
+    };
+    let (with, without) = (manifest(&with, "untrapped"), manifest(&without, "trapped"));
+    validate(&["--from", without.as_str()]).expect("the manifest replays without the flag");
+    refused(&["--from", with.as_str()], "--from");
 }
 
 #[test]
@@ -10481,6 +10700,10 @@ impl RunOpts {
             (self.happens_before.is_some(), "--happens-before"),
             (config.futex_wake_yields, "--futex-wake-yields"),
             (config.cap_preemption_charge, "--cap-preemption-charge"),
+            (
+                config.untrap_passthrough_syscalls,
+                "--untrap-passthrough-syscalls",
+            ),
             (config.signal_at.is_some(), "--signal-at"),
             (config.pipe_wake_latency.is_some(), "--pipe-wake-latency"),
             (config.work_span_report.is_some(), "--work-span-report"),
@@ -12397,6 +12620,37 @@ impl RunOpts {
             );
         }
         config.shutdown_on_unsupported_syscall = config.panic_on_unsupported_syscalls;
+        if config.untrap_passthrough_syscalls {
+            // The untrapped calls never reach Detcore, so nothing that counts,
+            // logs or compares Detcore's events sees them.
+            let conflict = if self.strict {
+                Some("--strict, which promises that Detcore observes every syscall")
+            } else if self.namespace_only || backend != Backend::Ptrace {
+                Some(
+                    "a backend other than ptrace, whose syscall interception it has not been \
+                     checked against",
+                )
+            } else if let Err(refusal @ detcore::UntrapPassthroughRefusal::PreemptionRecord) =
+                detcore::untrap_passthrough_admission(config)
+            {
+                // Recording one, or replaying one: a record made without the
+                // flag holds the untrapped calls' callbacks, their charges and
+                // their preemption points, which a replay with it never
+                // reaches, so its checkpoints and priority changes would land
+                // at different guest progress. The rule and its message are
+                // Detcore's, which every launch checks again.
+                return Err(Error::new(refusal));
+            } else if self.happens_before.is_some() {
+                Some("--happens-before, whose syscall anchors count the calls it untraps")
+            } else if self.verify_run.is_some() {
+                Some("--verify-run, whose record does not say the calls were untrapped")
+            } else {
+                None
+            };
+            if let Some(conflict) = conflict {
+                anyhow::bail!("--untrap-passthrough-syscalls cannot be combined with {conflict}");
+            }
+        }
 
         // virtualize_metadata implies virtualize_time
         if config.virtualize_metadata && !config.virtualize_time {
@@ -12516,6 +12770,15 @@ impl RunOpts {
             config.max_timeslice = None;
             self.timer_downgrade = Some(unavailable.clone());
         }
+        // Without RCB time, which needs the preemption timer, syscall charges
+        // are the only progress of virtual time and trapped syscalls the only
+        // points where a thread yields, so a loop on the calls this untraps
+        // would never yield or let virtual time advance. Checked once a host
+        // without usable performance counters has turned the timer off. The
+        // rule and its message are Detcore's
+        // (`detcore::untrap_passthrough_admission`), which every launch,
+        // the library's included, checks again in `facility_admission`.
+        detcore::untrap_passthrough_admission(config).map_err(Error::new)?;
 
         // `--chaos-timeslice-draw=run` draws from the effective scheduler seed,
         // which `--seed-from` has just settled, unless a replayed record gave

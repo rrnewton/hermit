@@ -177,6 +177,66 @@ pub use finalization::FinalizationFailure;
 pub use finalization::PriorityHistoryRefusal;
 pub use finalization::ReplayDepartureError;
 pub use finalization::TerminalReplayRefusal;
+
+/// Why a run cannot leave the pass-through syscalls untrapped
+/// (`Config::untrap_passthrough_syscalls`, `--untrap-passthrough-syscalls`),
+/// whatever launched it ([`untrap_passthrough_admission`]): a policy refusal
+/// made before the guest starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UntrapPassthroughRefusal {
+    /// The run records or replays a preemption record, whose callback
+    /// history counts the calls the mode untraps.
+    PreemptionRecord,
+    /// The run has no RCB time (`Config::use_rcb_time`): no preemption
+    /// timer, or `no_rcb_time`. Syscall charges are then the only progress
+    /// of virtual time and trapped syscalls the only points where a thread
+    /// yields, so a loop on the untrapped calls would never yield or let
+    /// virtual time advance.
+    NoRcbTime,
+}
+
+impl std::fmt::Display for UntrapPassthroughRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::PreemptionRecord => {
+                "--untrap-passthrough-syscalls cannot be combined with a preemption record, \
+                 whose callback history counts the calls it untraps"
+            }
+            Self::NoRcbTime => {
+                "--untrap-passthrough-syscalls needs the preemption timer and RCB time (not \
+                 --max-timeslice=disabled, --no-rcb-time, or a host without usable \
+                 performance counters): without them a loop on the calls it untraps would \
+                 never yield or let virtual time advance"
+            }
+        })
+    }
+}
+
+impl std::error::Error for UntrapPassthroughRefusal {}
+
+/// The prerequisites of `Config::untrap_passthrough_syscalls` that the
+/// configuration itself decides: no preemption record, recorded or
+/// replayed, and RCB time. Every launch reaches it through Detcore's
+/// `facility_admission`, the library entry points (`hermit::run`,
+/// `hermit::run_with_output` and the rest) as well as `hermit run`, whose
+/// validation asks it too so that its options are refused by name before
+/// any launch. A configuration without the mode is always admitted.
+pub fn untrap_passthrough_admission(config: &Config) -> Result<(), UntrapPassthroughRefusal> {
+    if !config.untrap_passthrough_syscalls {
+        return Ok(());
+    }
+    if config.record_preemptions
+        || config.record_preemptions_to.is_some()
+        || config.replay_preemptions_from.is_some()
+        || config.replay_schedule_from.is_some()
+    {
+        return Err(UntrapPassthroughRefusal::PreemptionRecord);
+    }
+    if !config.use_rcb_time() {
+        return Err(UntrapPassthroughRefusal::NoRcbTime);
+    }
+    Ok(())
+}
 pub use finalization::combine_finalization;
 pub use pidfd_self::PidfdSelfQualificationRefusal;
 #[cfg(test)]
@@ -4265,6 +4325,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // This is an operational pre-start hook. subscriptions and the
         // capability queries remain pure, including when called by another
         // Tool to decide whether its own guarantees hold.
+        //
+        // `subscriptions` leaves the untrapped calls out whenever the mode is
+        // on, so its prerequisites are checked here, where every launch
+        // passes, and not only by `hermit run`'s validation.
+        untrap_passthrough_admission(config)
+            .map_err(|refusal| reverie::Error::Tool(anyhow::Error::new(refusal)))?;
         if let Err(refusal) =
             crate::record_or_replay::require_chosen_input_stream(config, T::stream_role())
         {
@@ -4452,6 +4518,16 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             subscription.rdtsc();
             if config.virtualize_cpuid {
                 subscription.cpuid();
+            }
+            // Explicit performance opt-in: these calls run without a stop, so
+            // Detcore neither charges them virtual time nor logs or counts
+            // them.
+            if config.untrap_passthrough_syscalls {
+                subscription.disable_syscalls(
+                    crate::syscall_classification::UNTRAPPED_PASSTHROUGH
+                        .iter()
+                        .copied(),
+                );
             }
             subscription
         } else {
@@ -8540,6 +8616,148 @@ mod subscription_tests {
                     .iter_syscalls()
                     .any(|subscribed| subscribed == syscall),
                 "passthru_opt allowed {syscall} to bypass Detcore's thread-exit state"
+            );
+        }
+    }
+
+    /// The mode's configuration prerequisites are checked where every launch
+    /// passes (`facility_admission`): without RCB time, or with a preemption
+    /// record recorded or replayed, it is refused before the guest starts;
+    /// with RCB time and no record it is admitted, as is any configuration
+    /// without the mode.
+    #[test]
+    fn facility_admission_refuses_untrapping_without_its_prerequisites() {
+        let qualified = Config {
+            untrap_passthrough_syscalls: true,
+            sequentialize_threads: true,
+            max_timeslice: std::num::NonZeroU64::new(10_000),
+            ..Config::default()
+        };
+        assert!(qualified.use_rcb_time());
+        assert_eq!(untrap_passthrough_admission(&qualified), Ok(()));
+        <Detcore as Tool>::facility_admission(&qualified).unwrap();
+        let refused = |config: Config, refusal: UntrapPassthroughRefusal| {
+            assert_eq!(untrap_passthrough_admission(&config), Err(refusal));
+            match <Detcore as Tool>::facility_admission(&config) {
+                Err(reverie::Error::Tool(error)) => assert_eq!(
+                    error.downcast_ref::<UntrapPassthroughRefusal>(),
+                    Some(&refusal)
+                ),
+                other => panic!("{config:?}: {other:?}"),
+            }
+            let without = Config {
+                untrap_passthrough_syscalls: false,
+                ..config
+            };
+            assert_eq!(untrap_passthrough_admission(&without), Ok(()));
+        };
+        refused(
+            Config {
+                max_timeslice: None,
+                ..qualified.clone()
+            },
+            UntrapPassthroughRefusal::NoRcbTime,
+        );
+        refused(
+            Config {
+                no_rcb_time: true,
+                ..qualified.clone()
+            },
+            UntrapPassthroughRefusal::NoRcbTime,
+        );
+        refused(
+            Config {
+                record_preemptions: true,
+                ..qualified.clone()
+            },
+            UntrapPassthroughRefusal::PreemptionRecord,
+        );
+        refused(
+            Config {
+                replay_schedule_from: Some(std::path::PathBuf::from("/nonexistent")),
+                ..qualified
+            },
+            UntrapPassthroughRefusal::PreemptionRecord,
+        );
+    }
+
+    /// `--untrap-passthrough-syscalls` unsubscribes exactly its list, and a
+    /// run without it still subscribes every syscall it did.
+    #[test]
+    fn untrap_passthrough_syscalls_unsubscribes_exactly_its_list() {
+        use std::collections::BTreeSet;
+
+        let subscribed = |untrap| {
+            let config = Config {
+                untrap_passthrough_syscalls: untrap,
+                ..strict_config(false)
+            };
+            let subscriptions = <Detcore as Tool>::subscriptions(&config);
+            (
+                subscriptions.iter_syscalls().collect::<BTreeSet<_>>(),
+                subscriptions.has_rdtsc(),
+                subscriptions.has_cpuid(),
+            )
+        };
+        let (trapped, rdtsc, cpuid) = subscribed(false);
+        let (untrapped, untrapped_rdtsc, untrapped_cpuid) = subscribed(true);
+        assert_eq!(
+            trapped,
+            <Detcore as Tool>::subscriptions(&strict_config(false))
+                .iter_syscalls()
+                .collect::<BTreeSet<_>>()
+        );
+        assert!(untrapped.is_subset(&trapped));
+        assert_eq!(
+            trapped
+                .difference(&untrapped)
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            syscall_classification::UNTRAPPED_PASSTHROUGH
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+        );
+        assert_eq!((untrapped_rdtsc, untrapped_cpuid), (rdtsc, cpuid));
+        // Every syscall whose output buffer `--detlog-io-buffers` hashes is
+        // still trapped.
+        for sysno in crate::io_buffers::HASHED_SYSCALLS {
+            assert!(untrapped.contains(sysno), "{sysno}");
+        }
+    }
+
+    /// Each untrapped syscall is one whose Detcore handler passes it through
+    /// unchanged: classified PassThrough, outside the PassThrough calls that
+    /// Detcore handles itself or observes, and none that names a file or a
+    /// descriptor, reads virtual time, maps memory, or has an output buffer
+    /// that `--detlog-io-buffers` hashes.
+    #[test]
+    fn untrapped_passthrough_syscalls_are_plain_passthroughs() {
+        let handled = [
+            Sysno::chroot,
+            Sysno::brk,
+            Sysno::set_tid_address,
+            Sysno::set_robust_list,
+            Sysno::rt_sigreturn,
+            Sysno::mprotect,
+            Sysno::pkey_mprotect,
+        ];
+        for &sysno in syscall_classification::UNTRAPPED_PASSTHROUGH {
+            assert_eq!(
+                syscall_classification::classify_syscall(sysno),
+                syscall_classification::SyscallClassification::PassThrough,
+                "{sysno}"
+            );
+            assert!(!handled.contains(&sysno), "{sysno}");
+            assert!(
+                !crate::syscalls::may_name_file_or_descriptor(sysno),
+                "{sysno}"
+            );
+            assert!(!syscall_time::observes_virtual_time(sysno), "{sysno}");
+            // `--detlog-io-buffers` hashes these calls' output buffers.
+            assert!(
+                !crate::io_buffers::HASHED_SYSCALLS.contains(&sysno),
+                "{sysno}"
             );
         }
     }
