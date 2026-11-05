@@ -132,6 +132,12 @@ struct Config {
     /// `origin/main`: the base a PR would land on. A caller with no such ref
     /// (a fresh clone, an isolated fixture) simply gets no floor asserted.
     base_ref: String,
+    /// Integration-branch bypass (owner directive 2026-11-05): a Reverie
+    /// branch name whose history may contain the pin instead of main's.
+    /// Set by --allow-ref or HERMIT_REVERIE_PIN_ALLOW_REF. A bypassed run
+    /// is signal, never landing evidence: it prints the bypass loudly and
+    /// the merge queue never sets it.
+    allow_ref: Option<String>,
 }
 
 impl Default for Config {
@@ -147,6 +153,7 @@ impl Default for Config {
             staged_advisory: false,
             no_base: false,
             base_ref: DEFAULT_BASE_REF.to_string(),
+            allow_ref: None,
         }
     }
 }
@@ -172,6 +179,9 @@ fn usage() -> &'static str {
        --update-to-latest                  Advance every derived Cargo pin site to the main tip\n\
        --no-verify-build                   Skip the post-bump compile check (UNSAFE)\n\
        --base-ref REF                      Monotonicity floor (default: origin/main)\n\
+       --allow-ref BRANCH                  Accept a pin reachable from this Reverie branch\n\
+                                           instead of main (or HERMIT_REVERIE_PIN_ALLOW_REF);\n\
+                                           loud bypass, never landing evidence\n\
        --offline                           Local consistency only; no networked policy checks\n\
        --no-base                           Declare there is no monotonicity base (skip it)\n\
        --staged-pin-advisory               Pre-commit advisory on a STAGED pin edit\n\
@@ -199,6 +209,9 @@ fn parse_args() -> Result<Config, String> {
             "--repo" => config.repo = Some(PathBuf::from(take_value(&args, &mut i, "--repo")?)),
             "--print-pin" => config.print_pin = true,
             "--base-ref" => config.base_ref = take_value(&args, &mut i, "--base-ref")?,
+            "--allow-ref" => {
+                config.allow_ref = Some(take_value(&args, &mut i, "--allow-ref")?)
+            }
             "--offline" => config.offline = true,
             "--no-base" => config.no_base = true,
             "--staged-pin-advisory" => config.staged_advisory = true,
@@ -218,7 +231,37 @@ fn parse_args() -> Result<Config, String> {
     if config.skip_verify_build && !config.update_to_latest {
         return Err("--no-verify-build requires --update-to-latest".to_string());
     }
+    if config.allow_ref.is_none() {
+        if let Ok(value) = env::var(ALLOW_REF_ENV) {
+            let value = value.trim().to_string();
+            if !value.is_empty() {
+                config.allow_ref = Some(value);
+            }
+        }
+    }
+    if let Some(allow) = &config.allow_ref {
+        allow_ref_full(allow)?;
+    }
     Ok(config)
+}
+
+const ALLOW_REF_ENV: &str = "HERMIT_REVERIE_PIN_ALLOW_REF";
+
+/// The full ref for an allow-ref branch name, refusing anything that is
+/// not a plain branch name (no option injection, no refspec syntax).
+fn allow_ref_full(name: &str) -> Result<String, String> {
+    let branch = name.strip_prefix("refs/heads/").unwrap_or(name);
+    let invalid = branch.is_empty()
+        || branch.starts_with('-')
+        || branch.starts_with('/')
+        || branch.ends_with('/')
+        || branch.ends_with(".lock")
+        || branch.contains("..")
+        || branch.contains(['~', '^', ':', '?', '*', '[', '\\', ' ', '\t', '\n']);
+    if invalid {
+        return Err(format!("invalid --allow-ref branch name {name:?}"));
+    }
+    Ok(format!("refs/heads/{branch}"))
 }
 
 fn is_full_sha(value: &str) -> bool {
@@ -908,6 +951,33 @@ fn staged_pin_advisory(root: &Path, remote: &str) -> Result<i32, String> {
     eprintln!("Or acknowledge:      {ACK_ENV}=1 git commit ...");
     eprintln!("  (The environment variable keeps its historical name for compatibility.)");
     Ok(1)
+}
+
+/// The tip of an allow-ref branch, asked of the same proven authority
+/// as main. Only used by the integration bypass.
+fn query_branch_tip(remote: &str, full_ref: &str) -> Result<String, String> {
+    under_git_env(|| refuse_redirected_authority(remote, authority_git_command()?))?;
+    let output = under_git_env(|| {
+        authority_git_command()?
+            .args(["ls-remote", "--exit-code", remote, full_ref])
+            .output()
+            .map_err(|error| format!("could not run git ls-remote: {error}"))
+    })?;
+    if !output.status.success() {
+        return Err(format!(
+            "git ls-remote {remote} {full_ref} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let sha = String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    if !is_full_sha(&sha) {
+        return Err(format!("remote returned invalid allow-ref SHA {sha:?}"));
+    }
+    Ok(sha)
 }
 
 fn query_main(remote: &str) -> Result<String, String> {
@@ -2668,7 +2738,45 @@ fn run_with_config(config: Config) -> Result<i32, String> {
     // (1) ANCESTRY: the pin must be on Reverie's main history. This refuses a
     // dead, abandoned, or rewritten commit -- the case a tip-equality check
     // never even asked about.
+    //
+    // INTEGRATION BYPASS (owner directive 2026-11-05): with --allow-ref (or
+    // HERMIT_REVERIE_PIN_ALLOW_REF), a pin reachable from that named Reverie
+    // branch is accepted instead, loudly. This exists so a combined
+    // integration branch can be validated before its Reverie side lands.
+    // A bypassed run is signal, never landing evidence: the merge queue
+    // never sets it, and monotonicity below still applies unchanged.
+    let mut bypass: Option<(String, String)> = None;
     if !is_ancestor(&graph, pin, &main)? {
+        if let Some(allow_name) = &config.allow_ref {
+            let full = allow_ref_full(allow_name)?;
+            let tip = query_branch_tip(remote, &full)?;
+            let fetch = graph.run(&[
+                "fetch",
+                "--no-tags",
+                "--quiet",
+                "--force",
+                remote,
+                &format!("+{full}:refs/heads/allow-ref"),
+            ])?;
+            if !fetch.status.success() {
+                return Err(format!(
+                    "could not fetch allow-ref {full} from {remote}: {}",
+                    String::from_utf8_lossy(&fetch.stderr).trim()
+                ));
+            }
+            if is_ancestor(&graph, pin, &tip)? {
+                loud_header("REVERIE PIN BYPASS - NOT LANDING EVIDENCE");
+                eprintln!(
+                    "REVERIE PIN BYPASS: pin {pin} reachable from {full} (tip {tip}), not main"
+                );
+                println!(
+                    "REVERIE PIN BYPASS: pin {pin} reachable from {full} (tip {tip}), not main"
+                );
+                bypass = Some((full, tip));
+            }
+        }
+    }
+    if !is_ancestor(&graph, pin, &main)? && bypass.is_none() {
         loud_header("REVERIE PIN IS NOT ON reverie/main HISTORY - BLOCKED");
         eprintln!("Hermit pin:  {pin}");
         eprintln!("Reverie main: {main}");
@@ -2748,7 +2856,13 @@ fn run_with_config(config: Config) -> Result<i32, String> {
 
     let behind = graph.run(&["rev-list", "--count", &format!("{pin}..{main}")])?;
     let lag = String::from_utf8_lossy(&behind.stdout).trim().to_string();
-    if pin == main {
+    if let Some((full, tip)) = &bypass {
+        println!(
+            "REVERIE PIN BYPASS: pin {pin} reachable from {full} (tip {tip}), not main \
+             ({lag} commit(s) of main not in the pin; {entries} revision entries across \
+             {pin_files} tracked Cargo metadata files) - signal only, never landing evidence"
+        );
+    } else if pin == main {
         println!(
             "Reverie pin equals the main tip: {pin} ({entries} revision entries across {pin_files} tracked Cargo metadata files)"
         );
@@ -4489,6 +4603,40 @@ mod tests {
             "a pin not reachable from reverie/main must be REFUSED even though it is a real commit"
         );
         fs::remove_dir_all(root).expect("remove Hermit fixture repository");
+    }
+
+    #[test]
+    fn pin_allow_ref_accepts_named_branch_only() {
+        // The integration bypass: the same off-history pin is refused
+        // without an allow-ref (previous test), accepted when the named
+        // branch contains it, and still refused when the named branch
+        // does not. Monotonicity is unchanged (base `old` is an ancestor
+        // of the abandoned-branch pin).
+        let (remote, old, _latest, offhistory) = shared_reverie();
+        let run = |allow: Option<&str>| {
+            let root = hermit_fixture("allowref-hermit", &old, &offhistory);
+            let code = run_with_config(Config {
+                repo: Some(root.clone()),
+                remote: Some(remote.to_string_lossy().into_owned()),
+                base_ref: "basefixture".to_string(),
+                allow_ref: allow.map(str::to_string),
+                ..Config::default()
+            })
+            .expect("allow-ref pin should be classified");
+            fs::remove_dir_all(root).expect("remove Hermit fixture repository");
+            code
+        };
+        assert_eq!(run(None), 1, "no allow-ref: off-main pin refused");
+        assert_eq!(
+            run(Some("abandoned")),
+            0,
+            "allow-ref naming the containing branch accepts"
+        );
+        assert_eq!(
+            run(Some("main")),
+            1,
+            "allow-ref naming a branch without the pin still refuses"
+        );
     }
 
     /// Drive the pre-commit advisory: HEAD pins `head_pin`, the worktree stages
