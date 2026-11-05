@@ -4101,6 +4101,41 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/madvise-guard-fault",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/madvise-guard-fault",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/madvise-guard-regions",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/madvise-guard-regions",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/madvise-guard-regions",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/map-shadow-stack-enosys",
           "mode": "replay",
           "backend": "ptrace"
@@ -28498,6 +28533,20 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/madvise-guard-fault",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/madvise-guard-regions",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/map-shadow-stack-enosys",
           "mode": "verify",
           "backend": "ptrace"
@@ -34356,6 +34405,34 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/madvise-determinism",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/madvise-guard-fault",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/madvise-guard-fault",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/madvise-guard-regions",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/madvise-guard-regions",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -47284,6 +47361,41 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/madvise-determinism",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/madvise-guard-fault",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/madvise-guard-fault",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/madvise-guard-regions",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/madvise-guard-regions",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/madvise-guard-regions",
           "mode": "verify",
           "backend": "ptrace"
         },
