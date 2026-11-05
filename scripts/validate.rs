@@ -950,6 +950,10 @@ struct Args {
     e2e_runner: &'static str,
     /// The internal buck2 a Buck E2E runner uses. Never committed.
     buck2: Option<PathBuf>,
+    /// Integration-branch Reverie pin bypass (owner directive 2026-11-05):
+    /// forwarded to the pin gate as HERMIT_REVERIE_PIN_ALLOW_REF. Signal
+    /// only, never landing evidence; the queue never passes it.
+    pin_allow_ref: Option<String>,
 }
 
 const SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_OPTION: &str =
@@ -1335,6 +1339,10 @@ fn usage() -> &'static str {
      \x20 --label-pr       Publish a receipt and label the PR after a full green (default).\n\
      \x20 --no-label-pr    Disable the non-fatal receipt publication and label update.\n\
      \x20 --ignore-cache   Force a real run even on a tree-keyed cache hit.\n\
+     \x20 --pin-allow-ref BRANCH\n\
+     \x20                  Integration bypass: accept a Reverie pin reachable from\n\
+     \x20                  this rrnewton/reverie branch instead of main. Loud in\n\
+     \x20                  the output and never landing evidence.\n\
      \x20 --buck-release DOTSLASH\n\
      \x20                  Build release Hermit with Buck2 through the named absolute\n\
      \x20                  public DotSlash launcher. Cargo remains the default. Buck\n\
@@ -1492,6 +1500,7 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
         buck_release_dotslash: None,
         e2e_runner: E2E_RUNNER_CARGO,
         buck2: None,
+        pin_allow_ref: None,
     };
     let mut e2e_runner_explicit = false;
     let mut label_pr_explicit = false;
@@ -1633,6 +1642,22 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
                 args.skip_inner_dirty_working_tree_and_rebase_freshness_checks = true
             }
             "--ignore-cache" => args.ignore_cache = true,
+            "--pin-allow-ref" => {
+                i += 1;
+                match argv.get(i) {
+                    Some(v) if !v.is_empty() && args.pin_allow_ref.is_none() => {
+                        args.pin_allow_ref = Some(v.clone());
+                    }
+                    Some(_) if args.pin_allow_ref.is_some() => {
+                        eprintln!("validate: --pin-allow-ref may be supplied only once");
+                        return Err(2);
+                    }
+                    _ => {
+                        eprintln!("validate: --pin-allow-ref needs a BRANCH");
+                        return Err(2);
+                    }
+                }
+            }
             "--buck-release" => {
                 i += 1;
                 match argv.get(i) {
@@ -29200,6 +29225,7 @@ fn run(
     std::env::remove_var(E2E_BUCK2_ENV);
     let args = match parse_args() {
         Ok(a) => a,
+
         // `parse_args` returns 0 only for `--help`, whose usage text is the
         // output; anything else is a genuine CLI refusal and gets a summary.
         Err(0) => return RunSummary::new(Verdict::Help, 0, "help", vec![]),
@@ -29212,6 +29238,22 @@ fn run(
             );
         }
     };
+
+    // Integration pin bypass (owner directive 2026-11-05): forward the
+    // explicit driver argument to DAG children as the checker's env var.
+    // Driver-owned: set only from argv here, never inherited ambiently
+    // (ambient copies are removed with the other driver-owned modes
+    // above by virtue of never being read). The pin gate prints the
+    // bypass loudly; a run with it is signal, never landing evidence.
+    if let Some(allow_ref) = &args.pin_allow_ref {
+        std::env::set_var("HERMIT_REVERIE_PIN_ALLOW_REF", allow_ref);
+        eprintln!(
+            "validate: REVERIE PIN BYPASS armed: --pin-allow-ref {allow_ref} \
+             (signal only, never landing evidence)"
+        );
+    } else {
+        std::env::remove_var("HERMIT_REVERIE_PIN_ALLOW_REF");
+    }
 
     if args.self_test && std::env::var_os(SUMMARY_EPILOGUE_SELF_TEST_ENV).is_some() {
         return RunSummary::refused(
