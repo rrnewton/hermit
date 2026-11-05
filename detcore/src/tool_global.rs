@@ -1467,6 +1467,21 @@ pub(crate) struct ProcessAuxvTable {
     /// one entry per live process whose image's initial stack Detcore read,
     /// inherited at fork and forgotten at exit, as the vectors are.
     cmdline_areas: BTreeMap<DetPid, crate::procfs::CmdlineArea>,
+    /// Each live process's current image's argument and environment
+    /// strings as its `execve` passed them (`ExecStrings`), which another
+    /// process's rendered `/proc/<pid>/cmdline` and `environ` show where the
+    /// tool cannot read that process's memory (package K item 2b slice
+    /// 2b-3): recorded at the image's first stop, before its first
+    /// instruction, inherited at fork, replaced at exec and forgotten at
+    /// exit. Each record carries the number of the image it was recorded
+    /// for (`recorded_images`), which an `environ` descriptor pins at its open,
+    /// as Linux's open pins the memory map (`__mem_open`).
+    exec_strings: BTreeMap<DetPid, (u64, Arc<ExecStrings>)>,
+    /// How many images have recorded their strings
+    /// ([`ProcessAuxvTable::record_exec_strings`]): the next image's number.
+    /// A fork's copy keeps its creator's record and number, as the record
+    /// names the creator's image until the child execs.
+    recorded_images: u64,
     /// Each task's filesystem group, and the groups whose root changed.
     roots: FsRoots,
     /// Whether this run has warned that a backend reports no initial stack
@@ -1560,6 +1575,24 @@ pub struct ProcessAuxv {
     pub bytes: Vec<u8>,
 }
 
+/// A process image's argument and environment strings as its `execve`
+/// passed them (package K item 2b slice 2b-3): the bytes of its argument area
+/// (`arg_start..arg_end`) and environment area (`env_start..env_end`), each
+/// string with its NUL, read from the new image's own memory at its first
+/// stop, before its first instruction, which is what Linux's
+/// `/proc/<pid>/cmdline` and `environ` read until the process changes that
+/// memory ([`ProcessAuxvTable::exec_strings`]). Kept only where the tool
+/// cannot read another process's memory (KVM): the named interim fallback
+/// for that read, which does not show a rewrite after the exec (minibeads
+/// dh-ngy9z).
+#[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize)]
+pub struct ExecStrings {
+    /// The argument area's bytes.
+    pub argv: Vec<u8>,
+    /// The environment area's bytes.
+    pub envp: Vec<u8>,
+}
+
 /// Why an image's `/proc/<pid>/auxv` is left to the kernel beneath
 /// ([`ProcessAuxvTable::first_kernel_file`]).
 #[derive(PartialEq, Debug, Eq, Clone, Copy, Serialize, Deserialize)]
@@ -1597,6 +1630,10 @@ impl ProcessAuxvTable {
             Some(area) => self.cmdline_areas.insert(child, area),
             None => self.cmdline_areas.remove(&child),
         };
+        match self.exec_strings.get(&parent).cloned() {
+            Some(strings) => self.exec_strings.insert(child, strings),
+            None => self.exec_strings.remove(&child),
+        };
     }
 
     /// Record `area`, the argument and environment areas of `process`'s new
@@ -1613,6 +1650,26 @@ impl ProcessAuxvTable {
             Some(area) => self.cmdline_areas.insert(process, area),
             None => self.cmdline_areas.remove(&process),
         };
+        // A new image: its creator's or earlier image's strings are stale
+        // until the image records its own (`Self::record_exec_strings`).
+        self.exec_strings.remove(&process);
+    }
+
+    /// Record `strings`, the argument and environment strings `process`'s
+    /// new image found in its memory before its first instruction, as its
+    /// current ones (package K item 2b slice 2b-3), under a number no other
+    /// image's record has had in this run.
+    pub(crate) fn record_exec_strings(&mut self, process: DetPid, strings: ExecStrings) {
+        let image = self.recorded_images;
+        self.recorded_images += 1;
+        self.exec_strings
+            .insert(process, (image, Arc::new(strings)));
+    }
+
+    /// `process`'s current image's number and argument and environment
+    /// strings, if Detcore recorded them.
+    pub(crate) fn current_exec_strings(&self, process: DetPid) -> Option<(u64, Arc<ExecStrings>)> {
+        self.exec_strings.get(&process).cloned()
     }
 
     /// `process`'s current image's argument and environment areas, if
@@ -1661,6 +1718,7 @@ impl ProcessAuxvTable {
     pub(crate) fn forget_process(&mut self, process: DetPid) {
         self.processes.remove(&process);
         self.cmdline_areas.remove(&process);
+        self.exec_strings.remove(&process);
         self.roots.forget(process);
     }
 
@@ -6151,6 +6209,30 @@ impl GlobalState {
                     .record_exit_code(process, code);
                 R::RecordExitCode(())
             }
+            GlobalRequest::RecordExecStrings(strings) => {
+                let sched = self.lock_rpc_scheduler(false).await;
+                let process = sched.registered_process(dtid).unwrap_or(dtid);
+                self.process_auxv
+                    .lock()
+                    .unwrap()
+                    .record_exec_strings(process, *strings);
+                R::RecordExecStrings(())
+            }
+            GlobalRequest::ProcessExecStrings(process) => {
+                let sched = self.lock_rpc_scheduler(false).await;
+                // `/proc/<tid>/cmdline` and `environ` are a thread's
+                // process's.
+                let process = sched
+                    .registered_process(DetTid::from_raw(process.as_raw()))
+                    .unwrap_or(process);
+                let strings = self
+                    .process_auxv
+                    .lock()
+                    .unwrap()
+                    .current_exec_strings(process)
+                    .map(|(image, strings)| (image, Box::new((*strings).clone())));
+                R::ProcessExecStrings(process, strings)
+            }
             GlobalRequest::SetRssLimit(process, limit) => {
                 self.lock_rpc_scheduler(false)
                     .await
@@ -9320,6 +9402,16 @@ pub enum GlobalRequest {
     /// (`Scheduler::publish_instruction_offset`). Answered before any clock or
     /// scheduler accounting. Appended last.
     PublishInstructionOffset(crate::resources::InstructionOffset),
+    /// Record the argument and environment strings the sender's process's
+    /// new image found in its memory before its first instruction
+    /// (`ProcessAuxvTable::record_exec_strings`, package K item 2b slice
+    /// 2b-3). Appended last.
+    RecordExecStrings(Box<ExecStrings>),
+    /// The process `/proc/<.0>/cmdline` and `environ` name (a thread's number
+    /// names its process), and its current image's recorded argument and
+    /// environment strings (`ProcessAuxvTable::current_exec_strings`).
+    /// Appended last.
+    ProcessExecStrings(DetPid),
 }
 
 /// What a guest thread publishes of its CPU accounting with a request
@@ -9746,6 +9838,12 @@ pub enum GlobalResponse {
     /// Whether the scheduler took the offset (it takes nothing from a thread
     /// it does not know, one killed, or a retired incarnation). Appended last.
     PublishInstructionOffset(bool),
+    /// The answer to `GlobalRequest::RecordExecStrings`. Appended last.
+    RecordExecStrings(()),
+    /// The answer to `GlobalRequest::ProcessExecStrings`: the process the
+    /// number names and its image's number and recorded strings, if any.
+    /// Appended last.
+    ProcessExecStrings(DetPid, Option<(u64, Box<ExecStrings>)>),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -10804,6 +10902,41 @@ where
         .await
         .1;
     assert_eq!(response, GlobalResponse::RecordExitCode(()));
+}
+
+/// Record `strings`, the argument and environment strings the calling
+/// process's new image found in its memory before its first instruction
+/// (`ProcessAuxvTable::record_exec_strings`, package K item 2b slice 2b-3).
+pub(crate) async fn record_exec_strings<G, T>(guest: &mut G, strings: ExecStrings)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::RecordExecStrings(Box::new(strings)))
+        .await
+        .1;
+    assert_eq!(response, GlobalResponse::RecordExecStrings(()));
+}
+
+/// The process `/proc/<process>/cmdline` and `environ` name (a thread's
+/// number names its process), and its current image's number and recorded
+/// argument and environment strings, if Detcore recorded them
+/// (`ProcessAuxvTable::current_exec_strings`).
+pub(crate) async fn process_exec_strings<G, T>(
+    guest: &mut G,
+    process: DetPid,
+) -> (DetPid, Option<(u64, Box<ExecStrings>)>)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match send_and_update_time(guest, GlobalRequest::ProcessExecStrings(process))
+        .await
+        .1
+    {
+        GlobalResponse::ProcessExecStrings(process, strings) => (process, strings),
+        _ => unreachable!(),
+    }
 }
 
 pub async fn send_and_update_time<G, T>(
@@ -15042,6 +15175,64 @@ mod tests {
         assert_eq!(table.current_cmdline(child), None);
     }
 
+    /// A process's recorded argument and environment strings follow its
+    /// images (package K item 2b slice 2b-3): recorded after the image's
+    /// areas, copied to a fork child, which runs its creator's image,
+    /// dropped by the next exec until that image records its own (whether or
+    /// not Detcore read its areas), and forgotten at exit. Each record names
+    /// its image by a number no earlier record had, even where the strings
+    /// are the same, which a fork child's copy keeps until it execs.
+    #[test]
+    fn process_exec_strings_follow_exec_fork_and_exit() {
+        use super::ExecStrings;
+        use super::ProcessAuxvTable;
+        use crate::procfs::CmdlineArea;
+        use crate::types::DetPid;
+        let (parent, child) = (DetPid::from_raw(3), DetPid::from_raw(4));
+        let strings = |argv: &[u8]| ExecStrings {
+            argv: argv.to_vec(),
+            envp: b"A=1\0".to_vec(),
+        };
+        let area = Some(CmdlineArea::default());
+        let current = |table: &ProcessAuxvTable, process| {
+            table
+                .current_exec_strings(process)
+                .map(|(_, s)| (*s).clone())
+        };
+        let image = |table: &ProcessAuxvTable, process| {
+            table.current_exec_strings(process).map(|(image, _)| image)
+        };
+        let mut table = ProcessAuxvTable::default();
+        assert_eq!(current(&table, parent), None);
+        table.record_cmdline(parent, area);
+        table.record_exec_strings(parent, strings(b"parent\0"));
+        assert_eq!(current(&table, parent), Some(strings(b"parent\0")));
+        let parents = image(&table, parent);
+        table.inherit(parent, child);
+        assert_eq!(current(&table, child), Some(strings(b"parent\0")));
+        assert_eq!(image(&table, child), parents);
+        // The child's exec: its creator's strings go, then its own come,
+        // under a new image's number, even for the same strings.
+        table.record_cmdline(child, area);
+        assert_eq!(current(&table, child), None);
+        table.record_exec_strings(child, strings(b"parent\0"));
+        assert_eq!(current(&table, child), Some(strings(b"parent\0")));
+        assert_ne!(image(&table, child), parents);
+        table.record_exec_strings(child, strings(b"child\0"));
+        assert_eq!(current(&table, child), Some(strings(b"child\0")));
+        assert_eq!(current(&table, parent), Some(strings(b"parent\0")));
+        assert_eq!(image(&table, parent), parents);
+        // An exec Detcore read no areas for drops them too.
+        table.record_cmdline(child, None);
+        assert_eq!(current(&table, child), None);
+        // Exit forgets them; a creator with none gives its child none.
+        table.forget_process(parent);
+        assert_eq!(current(&table, parent), None);
+        table.record_exec_strings(child, strings(b"again\0"));
+        table.inherit(parent, child);
+        assert_eq!(current(&table, child), None);
+    }
+
     /// Hermit's tasks are exactly its own thread group, named from its own PID
     /// namespace (<https://github.com/rrnewton/hermit/issues/4066>). The test
     /// process stands in for Hermit.
@@ -17059,6 +17250,18 @@ mod tests {
         .await
         .1;
         assert_eq!(response, GlobalResponse::RecordProcessAuxv(()));
+        let strings = super::ExecStrings {
+            argv: b"root\0".to_vec(),
+            envp: b"A=1\0".to_vec(),
+        };
+        let response = rpc(
+            root,
+            root_mm,
+            GlobalRequest::RecordExecStrings(Box::new(strings.clone())),
+        )
+        .await
+        .1;
+        assert_eq!(response, GlobalResponse::RecordExecStrings(()));
         for (task, flags) in [
             (forked, CloneFlags::empty()),
             (shared, CloneFlags::CLONE_VM),
@@ -17098,6 +17301,25 @@ mod tests {
             assert_eq!(entry.bytes, vec![7; 32], "{task}");
         }
         assert_eq!(state.process_auxv.lock().unwrap().len(), 3);
+        let exec_strings = |task: DetTid| {
+            rpc(
+                root,
+                root_mm,
+                GlobalRequest::ProcessExecStrings(DetPid::from_raw(task.as_raw())),
+            )
+        };
+        // The root's image is the run's first to record its strings; its
+        // children's copies name the same image.
+        for task in [root, forked, shared] {
+            assert_eq!(
+                exec_strings(task).await.1,
+                GlobalResponse::ProcessExecStrings(
+                    DetPid::from_raw(task.as_raw()),
+                    Some((0, Box::new(strings.clone())))
+                ),
+                "{task}"
+            );
+        }
         // The forked child's exec finds no plausible vector: its creator's is
         // stale and goes; only the first such exec of the run warns.
         let forked_mm = MmId::initial(forked);
@@ -17113,11 +17335,17 @@ mod tests {
         }
         assert_eq!(current(forked).await.1, GlobalResponse::ProcessAuxv(None));
         assert_eq!(state.process_auxv.lock().unwrap().len(), 2);
+        // ... and its creator's strings with it.
+        assert_eq!(
+            exec_strings(forked).await.1,
+            GlobalResponse::ProcessExecStrings(DetPid::from_raw(forked.as_raw()), None)
+        );
         // The exits as a ptrace backend reports them.
         for task in [forked, shared, root] {
             state.on_backend_process_exited(task.as_raw());
         }
         assert_eq!(state.process_auxv.lock().unwrap().len(), 0);
+        assert!(state.process_auxv.lock().unwrap().exec_strings.is_empty());
     }
 
     #[tokio::test]

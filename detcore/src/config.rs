@@ -111,7 +111,7 @@ mod tests {
     /// of https://github.com/rrnewton/hermit/pull/4796's row 45, is the
     /// current revision. A change that lands below the last row removes
     /// its entry, with its row. One that lands after a higher revision
-    /// (any of 33 to 39 after 46) appends its row above the last instead
+    /// (any of 33 to 39 after 47) appends its row above the last instead
     /// and leaves its old number here, reserved as never landed: filling
     /// a number in below a landed row would rewrite that row's digest.
     const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[33, 34, 35, 36, 37, 38, 39];
@@ -345,6 +345,16 @@ mod tests {
         // 41-44; renumbered 46 at integration behind rows 41 to 45;
         // digest re-measured on the combined tree at regeneration.
         (46, "b434f4f465fdbb8d", "f013e36743d8d9e6"),
+        // Adds `GlobalRequest::RecordExecStrings` and
+        // `GlobalRequest::ProcessExecStrings` and their responses, which
+        // carry an image's argument and environment strings (`ExecStrings`,
+        // package K item 2b slice 2b-3, the next revision after 2b-1's) and,
+        // in `ProcessExecStrings`'s, the image's number. The digest covers
+        // that payload type too (domain 8 at integration, behind the
+        // host-input domain 7; renumbered 47 from its row 42 behind rows
+        // 41 to 46; digest re-measured on the combined tree at
+        // regeneration).
+        (47, "05097a2f4152ff09", "f013e36743d8d9e6"),
 
     ];
 
@@ -468,7 +478,8 @@ mod tests {
     /// scheduled event's wire items in `schedule`, and of the trace reply's
     /// wire items in `source` and `replayer`, and of 2b-1's payload types in
     /// `source` and `task_stat`, and of the nested wire types in
-    /// `host_input` (`HOST_INPUT_WIRE`): their variants, fields, payload types, order
+    /// `host_input` (`HOST_INPUT_WIRE`), and of 2b-3's `ExecStrings`
+    /// in `source`: their variants, fields, payload types, order
     /// and attributes, not their documentation.
     fn definition_digest(
         source: &str,
@@ -497,6 +508,7 @@ mod tests {
         ]
         .join("\n");
         let nested = wire_items(host_input, &HOST_INPUT_WIRE);
+        let exec_strings = wire_items(source, &EXEC_STRINGS_WIRE);
         fnv_domains(&[
             (0, request.as_bytes()),
             (1, response.as_bytes()),
@@ -505,6 +517,7 @@ mod tests {
             (5, reply.as_bytes()),
             (6, procfs.as_bytes()),
             (7, nested.as_bytes()),
+            (8, exec_strings.as_bytes()),
         ])
     }
 
@@ -773,6 +786,34 @@ mod tests {
         assert_ne!(rederived, host_input);
         assert_ne!(
             definition_digest(source, payload, schedule, replayer, task_stat, &rederived),
+            digest
+        );
+        // And 2b-3's: a field added to `ExecStrings` or one retyped changes
+        // the digest; a doc line does not.
+        let grown = source.replacen(
+            "pub struct ExecStrings {\n",
+            "pub struct ExecStrings {\n    pub added: u32,\n",
+            1,
+        );
+        assert_ne!(grown, source);
+        assert_ne!(
+            definition_digest(&grown, payload, schedule, replayer, task_stat),
+            digest
+        );
+        let retyped = source.replacen("    pub envp: Vec<u8>,\n", "    pub envp: String,\n", 1);
+        assert_ne!(retyped, source);
+        assert_ne!(
+            definition_digest(&retyped, payload, schedule, replayer, task_stat),
+            digest
+        );
+        let documented = source.replacen(
+            "pub struct ExecStrings {\n",
+            "pub struct ExecStrings {\n    /// Documentation only.\n",
+            1,
+        );
+        assert_ne!(documented, source);
+        assert_eq!(
+            definition_digest(&documented, payload, schedule, replayer, task_stat),
             digest
         );
 
