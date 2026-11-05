@@ -58,8 +58,45 @@ pub struct ExtensionNode {
 }
 
 /// The ONE registry for validation-DAG nodes created after the split.
-/// Empty until the first post-split bucket lands; see module docs.
-pub const POST_SPLIT_CORE_NODES: &[ExtensionNode] = &[];
+/// The first post-split bucket is gvisor; see module docs.
+pub const POST_SPLIT_CORE_NODES: &[ExtensionNode] = &[
+    ExtensionNode {
+        tag: "e2e.manifest_gvisor",
+        labels: &["full", "portable"],
+        deps: &[
+            "build.e2e_artifact_in_pinned_root",
+            "build.manifest_guests_in_pinned_root",
+            "build.rust_scripts_in_pinned_root",
+            "gate.manifest",
+            "pre.reverie_pin",
+            "setup.manifest_plan",
+            "setup.manifest_plan_in_pinned_root",
+            "setup.pinned_root_fetch",
+        ],
+    },
+    ExtensionNode {
+        tag: "e2e.manifest_gvisor_on_host",
+        labels: &["hosted-portable"],
+        deps: &[
+            "build.e2e_artifact_on_host",
+            "build.manifest_guests",
+            "gate.manifest",
+            "pre.reverie_pin",
+            "setup.manifest_plan",
+        ],
+    },
+    ExtensionNode {
+        tag: "e2e.manifest_gvisor_buck",
+        labels: &["full-buck-e2e"],
+        deps: &[
+            "build.rust_scripts",
+            "e2e.buck_cells",
+            "gate.manifest",
+            "pre.reverie_pin",
+            "setup.manifest_plan",
+        ],
+    },
+];
 
 /// Tags admitted by `extension`, after validating it against `source`.
 fn validate_extension_registry(
