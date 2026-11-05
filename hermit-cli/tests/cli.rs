@@ -69105,6 +69105,181 @@ fn run_kvm_another_processs_cmdline_and_environ_answer_as_linux() {
     );
 }
 
+static PROC_OTHER_PROCESS_LINKS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+
+/// `tests/c/proc_other_process_links.c`'s guest.
+fn proc_other_process_links_guest() -> &'static Path {
+    compiled_c_guest(&PROC_OTHER_PROCESS_LINKS_GUEST, "proc_other_process_links")
+}
+
+/// The other-process links guest's transcript, as Linux answers it: another
+/// process's `exe`, `cwd` and `root` (fs/proc/base.c proc_pid_readlink,
+/// proc_exe_link, proc_cwd_link, proc_root_link and d_path), with the work
+/// directory as `<dir>`, the guest's own image as `<exe>` and its working
+/// directory as `<cwd>`. A non-dumpable child's links are refused to a reader
+/// without effective capabilities (proc_fd_access_allowed), and a zombie has
+/// none.
+const PROC_OTHER_PROCESS_LINKS_LINES: &[&str] = &[
+    "forked exe=<exe>",
+    "forked cwd=<dir>/sub",
+    "forked root=/",
+    "forked task/<pid>/exe=<exe>",
+    "forked task/<pid>/cwd=<dir>/sub",
+    "forked task/<pid>/root=/",
+    "forked task/<parent>/cwd: ENOENT",
+    "forked readlinkat(<pid>, cwd)=<dir>/sub",
+    "forked cwd in 5 bytes: length=5 prefix=1 untouched=1",
+    "forked cwd/: EINVAL",
+    "forked root/: EINVAL",
+    "forked exe/: ENOTDIR",
+    "forked root/.: EINVAL",
+    "forked exe/.: ENOTDIR",
+    "forked after fchdir cwd=<dir>/fsub",
+    "inherited cwd=<cwd>",
+    "inherited root=/",
+    "exec'd exe=<dir>/copy",
+    "exec'd cwd=<dir>/sub2",
+    "exec'd root=/",
+    "exec'd after rename exe=<dir>/moved",
+    "exec'd after unlink exe=<dir>/moved (deleted)",
+    "thread task/<tid>/cwd=<dir>/sub",
+    "thread task/<tid>/exe=<exe>",
+    "thread task/<tid>/root=/",
+    "thread <tid>/cwd=<dir>/sub",
+    "zombie exe: ENOENT",
+    "zombie cwd: ENOENT",
+    "zombie root: ENOENT",
+    "non-dumpable child: exe=EACCES cwd=EACCES root=EACCES",
+    "failures=0",
+];
+
+/// The other-process links guest's transcript run natively in a fresh work
+/// directory, checked line by line first ([`PROC_OTHER_PROCESS_LINKS_LINES`]),
+/// so a host that answers otherwise fails here rather than in the comparison.
+fn proc_other_process_links_native() -> String {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let output = Command::new(proc_other_process_links_guest())
+        .arg(directory.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the other-process links guest natively");
+    assert!(output.status.success(), "native: {output:?}");
+    let native = stdout(&output);
+    assert_eq!(
+        native.lines().collect::<Vec<_>>(),
+        PROC_OTHER_PROCESS_LINKS_LINES,
+        "native"
+    );
+    native
+}
+
+/// The other-process links guest's transcript on `backend`, at L2, in a
+/// fresh work directory that both verified runs share (the guest removes
+/// what it made before it exits).
+fn proc_other_process_links_at_l2(backend: &str) -> String {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let work = directory.path().to_str().expect("work directory is UTF-8");
+    guest_transcript_at_l2(backend, proc_other_process_links_guest(), &[work])
+}
+
+/// Another process's `/proc/<pid>/exe`, `cwd` and `root`
+/// (`tests/c/proc_other_process_links.c`) on ptrace, at L2, exactly as
+/// natively, every line: a forked child's, by number, below its task
+/// directory, relative to a descriptor of its directory, cut short by a small
+/// buffer, followed by a slash or `/.`, and after its `fchdir`; a child that
+/// stayed in the parent's directory; an exec'd copy of the guest, whose image
+/// the parent renames and then unlinks (`exe` follows, then reads
+/// " (deleted)") while its working directory survives the exec; a second
+/// thread sharing its process's filesystem information; a zombie (no link);
+/// and a non-dumpable child read without effective capabilities (EACCES).
+/// ptrace keeps the kernel's links (package K item 2b slice 2b-4 changes
+/// nothing there).
+#[test]
+fn another_processs_exe_cwd_and_root_links_answer_as_linux() {
+    let native = proc_other_process_links_native();
+    assert_eq!(proc_other_process_links_at_l2("ptrace"), native, "ptrace");
+}
+
+/// [`another_processs_exe_cwd_and_root_links_answer_as_linux`] on KVM, at L2,
+/// exactly as natively, every line. Before package K item 2b slice 2b-4
+/// every `exe` was the executor's ENOENT and every `cwd` and `root` the KVM
+/// provider's EACCES; Detcore now renders them from its exec records, the
+/// backend's `link_path` fact for another process's image, the working
+/// directory it records for each filesystem group and its root records,
+/// with Linux's access check and zombie rule.
+#[test]
+fn run_kvm_another_processs_exe_cwd_and_root_links_answer_as_linux() {
+    let test = "run_kvm_another_processs_exe_cwd_and_root_links_answer_as_linux";
+    if kvm_unavailable(test) {
+        return;
+    }
+    let native = proc_other_process_links_native();
+    assert_eq!(proc_other_process_links_at_l2("kvm"), native, "kvm");
+}
+
+/// Another process's working directory that was renamed after the process
+/// entered it (`tests/c/proc_other_process_links.c --renamed-cwd`): Linux's
+/// link names the new path (natively, `renamed cwd=<dir>/renamed`), which
+/// nothing Detcore records on KVM can give, so a strict KVM run refuses the
+/// read by name (exit 122) rather than show the old path.
+#[test]
+fn run_kvm_a_renamed_working_directory_of_another_process_is_refused_by_name() {
+    let test = "run_kvm_a_renamed_working_directory_of_another_process_is_refused_by_name";
+    if kvm_unavailable(test) {
+        return;
+    }
+    let guest = proc_other_process_links_guest()
+        .to_str()
+        .expect("guest path is UTF-8");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let work = directory.path().to_str().expect("work directory is UTF-8");
+    let native = Command::new(guest)
+        .args(["--renamed-cwd", work])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the guest natively");
+    assert!(native.status.success(), "native: {native:?}");
+    assert_eq!(
+        stdout(&native),
+        "renamed cwd=<dir>/renamed\nfailures=0\n",
+        "native"
+    );
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let work = directory.path().to_str().expect("work directory is UTF-8");
+    let args = [
+        "--backend",
+        "kvm",
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--",
+        guest,
+        "--renamed-cwd",
+        work,
+    ];
+    let output = hermit(&args);
+    let refused_stderr = stderr(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "the read must end the strict run as a policy refusal\nstdout:\n{}\nstderr:\n{refused_stderr}",
+        stdout(&output)
+    );
+    assert!(
+        refused_stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal")
+            && refused_stderr.contains(
+                "another process's cwd link: Detcore recorded no working directory for it, or \
+                 the one it recorded has been renamed or removed since"
+            ),
+        "the run did not name the refusal on stderr\nstderr:\n{refused_stderr}"
+    );
+    assert!(
+        !stdout(&output).contains("renamed cwd="),
+        "the guest printed a link the run should have refused: {}",
+        stdout(&output)
+    );
+}
+
 /// The link-targets guest's `--directory-links` transcript, line by line:
 /// the caller's own descriptor links read through a link to one of its own
 /// descriptor directories, as Linux answers them (it follows the link to

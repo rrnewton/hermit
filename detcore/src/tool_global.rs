@@ -1475,17 +1475,25 @@ pub(crate) struct ProcessAuxvTable {
 }
 
 /// Each task's filesystem group: the tasks that share one Linux `fs_struct`,
-/// and so one root. A task is in its creator's group when it was created with
-/// `CLONE_FS`, and in a new group, starting from a copy of its creator's
-/// root, otherwise. `unshare(CLONE_FS)` would detach a task too, but Detcore
-/// refuses every `unshare` (EPERM), so no guest task does. A task Detcore has
-/// not seen created (none in practice) has an unchanged root.
+/// and so one root and one working directory. A task is in its creator's
+/// group when it was created with `CLONE_FS`, and in a new group, starting
+/// from a copy of its creator's root and working directory, otherwise, as
+/// Linux's `copy_fs` copies the `fs_struct`. `unshare(CLONE_FS)` would detach
+/// a task too, but Detcore refuses every `unshare` (EPERM), so no guest task
+/// does. A task Detcore has not seen created (none in practice) has an
+/// unchanged root and no recorded working directory.
 #[derive(Debug, Default)]
 struct FsRoots {
     /// Each task's group, by its thread number.
     groups: BTreeMap<DetPid, u64>,
     /// The groups whose root changed.
     changed: BTreeSet<u64>,
+    /// Each group's working directory, where Detcore records it
+    /// (`Detcore::record_working_directory`, package K item 2b slice 2b-4:
+    /// where it renders another process's `cwd` link, KVM), as the group's
+    /// last successful `chdir` or `fchdir`, or its image's first stop, left
+    /// it. A group without an entry has none Detcore could record.
+    working_directories: BTreeMap<u64, crate::exec_record::DirectoryRecord>,
     /// The next group's number.
     next: u64,
 }
@@ -1506,6 +1514,13 @@ impl FsRoots {
             parent_group => {
                 let changed = parent_group.is_some_and(|group| self.changed.contains(&group));
                 let group = self.new_group(changed);
+                // The copy starts in its creator's working directory.
+                if let Some(directory) = parent_group
+                    .and_then(|parent_group| self.working_directories.get(&parent_group))
+                    .cloned()
+                {
+                    self.working_directories.insert(group, directory);
+                }
                 if shares_fs {
                     // A creator Detcore had not seen created shares the new
                     // group from now on.
@@ -1517,16 +1532,37 @@ impl FsRoots {
         self.groups.insert(child, group);
     }
 
-    fn mark_changed(&mut self, task: DetPid) {
-        let group = match self.groups.get(&task).copied() {
+    /// `task`'s group, a new one of its own where Detcore has seen none.
+    fn group_of(&mut self, task: DetPid) -> u64 {
+        match self.groups.get(&task).copied() {
             Some(group) => group,
             None => {
                 let group = self.new_group(false);
                 self.groups.insert(task, group);
                 group
             }
-        };
+        }
+    }
+
+    fn mark_changed(&mut self, task: DetPid) {
+        let group = self.group_of(task);
         self.changed.insert(group);
+    }
+
+    fn set_working_directory(
+        &mut self,
+        task: DetPid,
+        directory: Option<crate::exec_record::DirectoryRecord>,
+    ) {
+        let group = self.group_of(task);
+        match directory {
+            Some(directory) => self.working_directories.insert(group, directory),
+            None => self.working_directories.remove(&group),
+        };
+    }
+
+    fn working_directory(&self, task: DetPid) -> Option<&crate::exec_record::DirectoryRecord> {
+        self.working_directories.get(self.groups.get(&task)?)
     }
 
     fn changed(&self, task: DetPid) -> bool {
@@ -1546,6 +1582,7 @@ impl FsRoots {
             && !self.groups.values().any(|other| *other == group)
         {
             self.changed.remove(&group);
+            self.working_directories.remove(&group);
         }
     }
 }
@@ -1678,6 +1715,26 @@ impl ProcessAuxvTable {
     /// Whether `task`'s root has changed.
     pub(crate) fn root_changed(&self, task: DetPid) -> bool {
         self.roots.changed(task)
+    }
+
+    /// `task` changed its working directory (a successful `chdir` or
+    /// `fchdir`), or its new image started there: `directory` is what
+    /// Detcore recorded of it, `None` where it could record nothing, for
+    /// every task in its filesystem group (package K item 2b slice 2b-4).
+    pub(crate) fn record_working_directory(
+        &mut self,
+        task: DetPid,
+        directory: Option<crate::exec_record::DirectoryRecord>,
+    ) {
+        self.roots.set_working_directory(task, directory);
+    }
+
+    /// What Detcore recorded of `task`'s working directory, if anything.
+    pub(crate) fn working_directory(
+        &self,
+        task: DetPid,
+    ) -> Option<crate::exec_record::DirectoryRecord> {
+        self.roots.working_directory(task).cloned()
     }
 
     /// A successful exec by the non-leader thread `former` gave it its
@@ -6020,6 +6077,29 @@ impl GlobalState {
                     .map(|(image, strings)| (image, Box::new((*strings).clone())));
                 R::ProcessExecStrings(process, strings)
             }
+            GlobalRequest::RecordWorkingDirectory(directory) => {
+                // The sending task's own filesystem group: a thread created
+                // without CLONE_FS has its own working directory.
+                let _sched = self.lock_rpc_scheduler(false).await;
+                self.process_auxv
+                    .lock()
+                    .unwrap()
+                    .record_working_directory(dtid, directory.map(|directory| *directory));
+                R::RecordWorkingDirectory(())
+            }
+            GlobalRequest::TaskWorkingDirectory(task) => {
+                // The task the path names: a process's number names its
+                // leader thread, whose working directory Linux's
+                // `/proc/<pid>/cwd` shows.
+                let _sched = self.lock_rpc_scheduler(false).await;
+                R::TaskWorkingDirectory(
+                    self.process_auxv
+                        .lock()
+                        .unwrap()
+                        .working_directory(task)
+                        .map(Box::new),
+                )
+            }
             GlobalRequest::SetRssLimit(process, limit) => {
                 self.lock_rpc_scheduler(false)
                     .await
@@ -8166,9 +8246,11 @@ pub enum SignalScope {
 /// and `RecordExitCode` (package K item 2b slice 2b-1, allocated 39 and
 /// renumbered 41 at its rebase onto 40). The next revision after 2b-1's adds
 /// `RecordExecStrings` and `ProcessExecStrings` (package K item 2b slice
-/// 2b-3). The next revision after that appends `SuspendHoldsDiscarded`
-/// (SIGSHARE S2b) and is the current revision.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 43;
+/// 2b-3). 43, the next after 2b-3's, appends `SuspendHoldsDiscarded`
+/// (SIGSHARE S2b). 44, the next after that, adds `RecordWorkingDirectory` and
+/// `TaskWorkingDirectory` (package K item 2b slice 2b-4) and is the current
+/// revision.
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 44;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
@@ -9178,6 +9260,16 @@ pub enum GlobalRequest {
     /// (`Scheduler::suspend_holds_discarded`), asked by a call that would stop
     /// ignoring it (SIGSHARE S2b). Appended last.
     SuspendHoldsDiscarded(DetPid, i32),
+    /// Record what the sender recorded of its working directory after a
+    /// successful `chdir` or `fchdir`, or at its image's first stop, for its
+    /// filesystem group, or that it could record nothing (`None`)
+    /// (`ProcessAuxvTable::record_working_directory`, package K item 2b
+    /// slice 2b-4). Appended last.
+    RecordWorkingDirectory(Option<Box<crate::exec_record::DirectoryRecord>>),
+    /// What Detcore recorded of task `.0`'s working directory, which its
+    /// `/proc/<pid>/cwd` link names (`ProcessAuxvTable::working_directory`).
+    /// Appended last.
+    TaskWorkingDirectory(DetPid),
 }
 
 /// What a guest thread publishes of its CPU accounting with a request
@@ -9605,6 +9697,11 @@ pub enum GlobalResponse {
     ProcessExecStrings(DetPid, Option<(u64, Box<ExecStrings>)>),
     /// The answer to `GlobalRequest::SuspendHoldsDiscarded`. Appended last.
     SuspendHoldsDiscarded(bool),
+    /// The answer to `GlobalRequest::RecordWorkingDirectory`. Appended last.
+    RecordWorkingDirectory(()),
+    /// The answer to `GlobalRequest::TaskWorkingDirectory`: what Detcore
+    /// recorded of the task's working directory, if anything. Appended last.
+    TaskWorkingDirectory(Option<Box<crate::exec_record::DirectoryRecord>>),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -13581,6 +13678,46 @@ where
     assert_eq!(response, GlobalResponse::MarkChangedRoot(()));
 }
 
+/// Record `directory`, what the calling task recorded of its working
+/// directory after a successful `chdir` or `fchdir` or at its image's first
+/// stop (`None`: nothing it could record), for its filesystem group
+/// (`ProcessAuxvTable::record_working_directory`, package K item 2b slice
+/// 2b-4).
+pub(crate) async fn record_working_directory<G, T>(
+    guest: &mut G,
+    directory: Option<crate::exec_record::DirectoryRecord>,
+) where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(
+        guest,
+        GlobalRequest::RecordWorkingDirectory(directory.map(Box::new)),
+    )
+    .await
+    .1;
+    assert_eq!(response, GlobalResponse::RecordWorkingDirectory(()));
+}
+
+/// What Detcore recorded of task `task`'s working directory, if anything
+/// (`ProcessAuxvTable::working_directory`).
+pub(crate) async fn task_working_directory<G, T>(
+    guest: &mut G,
+    task: DetPid,
+) -> Option<crate::exec_record::DirectoryRecord>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match send_and_update_time(guest, GlobalRequest::TaskWorkingDirectory(task))
+        .await
+        .1
+    {
+        GlobalResponse::TaskWorkingDirectory(directory) => directory.map(|directory| *directory),
+        _ => unreachable!(),
+    }
+}
+
 /// Whether the process `task` names has changed its root
 /// (`ProcessAuxvTable::root_changed`).
 pub(crate) async fn root_changed<G, T>(guest: &mut G, task: DetPid) -> bool
@@ -14773,6 +14910,63 @@ mod tests {
         // The group outlives a member that exits.
         table.forget_process(pid(4));
         assert!(table.root_changed(pid(3)));
+    }
+
+    /// A working directory belongs to a filesystem group, as Linux's
+    /// `fs_struct` holds it (package K item 2b slice 2b-4): a task created
+    /// with CLONE_FS shares its creator's, one created without it starts in a
+    /// copy of it, a record of nothing clears the group's, a non-leader
+    /// thread's exec takes the group to the process's number, and the group's
+    /// record goes when its last member does.
+    #[test]
+    fn a_working_directory_is_kept_per_filesystem_group() {
+        use super::ProcessAuxvTable;
+        use crate::exec_record::DirectoryRecord;
+        use crate::types::DetPid;
+        let pid = DetPid::from_raw;
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::util::canonicalize(directory.path()).unwrap();
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        let record = |path: &str| DirectoryRecord::at(&root, std::path::Path::new(path)).unwrap();
+        let named = |table: &ProcessAuxvTable, task| {
+            table
+                .working_directory(task)
+                .map(|record| record.path.to_str().unwrap().to_owned())
+        };
+        let mut table = ProcessAuxvTable::default();
+        table.clone_root(pid(1), pid(3), false);
+        assert_eq!(named(&table, pid(3)), None, "nothing recorded yet");
+        table.record_working_directory(pid(3), Some(record("/a")));
+        // A thread sharing the group, and a fork with a copy.
+        table.clone_root(pid(3), pid(4), true);
+        table.clone_root(pid(3), pid(5), false);
+        assert_eq!(named(&table, pid(4)).as_deref(), Some("/a"));
+        assert_eq!(named(&table, pid(5)).as_deref(), Some("/a"));
+        table.record_working_directory(pid(4), Some(record("/a/b")));
+        assert_eq!(
+            named(&table, pid(3)).as_deref(),
+            Some("/a/b"),
+            "a thread's chdir is its group's"
+        );
+        assert_eq!(
+            named(&table, pid(5)).as_deref(),
+            Some("/a"),
+            "a copy stays where it was"
+        );
+        table.record_working_directory(pid(5), None);
+        assert_eq!(named(&table, pid(5)), None);
+        assert_eq!(named(&table, pid(3)).as_deref(), Some("/a/b"));
+        // A thread without CLONE_FS, whose exec gives it its process's number.
+        table.clone_root(pid(3), pid(6), false);
+        table.record_working_directory(pid(6), Some(record("/")));
+        table.transfer_root(pid(6), pid(3));
+        assert_eq!(named(&table, pid(3)).as_deref(), Some("/"));
+        // The group outlives a member that exits, not its last.
+        table.forget_process(pid(3));
+        assert_eq!(named(&table, pid(4)).as_deref(), Some("/a/b"));
+        table.forget_process(pid(4));
+        table.clone_root(pid(1), pid(4), true);
+        assert_eq!(named(&table, pid(4)), None, "a reused number starts afresh");
     }
 
     #[test]
