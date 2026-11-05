@@ -67495,7 +67495,7 @@ fn chosen_json_provenance_follows_real_target_setup_and_both_replay_loaders() {
     assert_eq!(original["guest_ids"]["Chosen"]["base"], 5000);
     assert_eq!(
         original["format_version"],
-        detcore::preemptions::PREEMPTION_RECORD_FORMAT
+        detcore::preemptions::PREEMPTION_RECORD_FORMAT_WITHOUT_OFFSETS
     );
     let event_count = original["global"].as_array().unwrap().len();
     assert!(event_count > 0, "{original}");
@@ -67532,7 +67532,7 @@ fn chosen_json_provenance_follows_real_target_setup_and_both_replay_loaders() {
     // rules; a priority replay notes them and keeps the recording's format.
     let schedule_format =
         serde_json::json!(detcore::preemptions::format_without_background_starts(
-            Some(detcore::preemptions::PREEMPTION_RECORD_FORMAT)
+            Some(detcore::preemptions::PREEMPTION_RECORD_FORMAT_WITHOUT_OFFSETS)
         ));
     let schedule_flag = format!("--replay-schedule-from={}", recording.display());
     let priority_flag = format!("--replay-preemptions-from={}", recording.display());
@@ -67728,7 +67728,7 @@ fn namespace_record_format_refusals_are_policy_before_guest_startup() {
     fs::remove_file(&marker).unwrap();
 
     // The first format past the newest this Hermit reads.
-    let newest = detcore::preemptions::PREEMPTION_RECORD_FORMAT;
+    let newest = detcore::preemptions::PREEMPTION_RECORD_FORMAT_MAX;
     let future = newest + 1;
     for (name, value, reason) in [
         (
