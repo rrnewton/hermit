@@ -1276,7 +1276,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the departed shell py_hello replay (dh-9r2mg): 1950 - 1 = 1949.
     // PR 4920 (3): two model/config units: 1955 + 2 = 1957.
     // drain/4709: main + this change's detcore-model cpu_profile test (+1).
-    ("test.regular_crates", 1992),
+    ("test.regular_crates", 1998),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -4692,7 +4692,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // drain/4709: main + this change's CLI tests (+16): 800 + 16 = 816.
     // drain/4709: main + this change's CLI tests (+16): 816 + 16 = 817.
     // And replay_only_ignores_an_unused_requested_cpu_profile (revcodex fix): 816 + 1 = 817.
-    ("test.cli", 820),
+    ("test.cli", 824),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5386,7 +5386,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // drain/4709: main + this change's CLI tests (+16, same growth as test.cli): 719 + 16 = 735.
     // drain/4709: main + this change's CLI tests (+16, same growth as test.cli): 735 + 16 = 736.
     // And the same replay-only case: 735 + 1 = 736.
-    ("test.cli_on_host", 739),
+    ("test.cli_on_host", 743),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
@@ -5401,7 +5401,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (dh-9r2mg) named losses: 1937 - 2 = 1935.
     // PR 4920 (3): the same two units: 1941 + 2 = 1943.
     // drain/4709: main + this change's detcore-model cpu_profile test (+1).
-    ("test.regular_crates_on_host", 1978),
+    ("test.regular_crates_on_host", 1984),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -6658,7 +6658,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (dh-9r2mg) named losses: 1937 - 2 = 1935.
     // PR 4920 (3): the same two units: 1941 + 2 = 1943.
     // drain/4709: main + this change's detcore-model cpu_profile test (+1).
-    ("test.regular_crates_on_host", 1978),
+    ("test.regular_crates_on_host", 1984),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
