@@ -1,0 +1,1040 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+//! Blocking guest client for synchronous in-process instrumentation callbacks.
+
+use std::io;
+use std::io::Read;
+use std::io::Write;
+use std::marker::PhantomData;
+use std::os::fd::AsRawFd;
+use std::os::fd::RawFd;
+use std::os::unix::net::UnixStream;
+use std::path::Path;
+use std::sync::Mutex;
+
+use async_trait::async_trait;
+use reverie::GlobalRPC;
+use reverie::GlobalTool;
+use reverie::Tid;
+
+use crate::codec::DEFAULT_MAX_FRAME_LEN;
+use crate::codec::decode;
+#[cfg(test)]
+use crate::codec::encode;
+use crate::envelope::RequestEnvelope;
+use crate::error::RpcError;
+
+/// A per-thread blocking connection to a coordinator serving `G`.
+///
+/// Some in-guest instrumentation runtimes, including SaBRe, invoke the tool
+/// through a synchronous callback and poll its async handler exactly once.
+/// Tokio socket operations normally return `Pending` on that first poll. This
+/// client deliberately performs the request/response exchange synchronously
+/// inside `GlobalRPC::send_rpc`, so the enclosing tool future remains
+/// immediately ready after the coordinator responds.
+///
+/// Keep one client per guest thread. A Detcore scheduler response can be
+/// delayed until another thread releases resources, so sharing one connection
+/// across threads could otherwise deadlock behind the single in-flight request.
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-128): Review the blocking transport used by synchronous in-guest backends.
+pub struct BlockingRpcClient<G: GlobalTool, S = UnixStream> {
+    tid: Tid,
+    config: G::Config,
+    stream: Mutex<S>,
+    _phantom: PhantomData<fn() -> G>,
+}
+
+/// A callback-scoped client borrowing an already configured connection.
+///
+/// The owner keeps the socket and configuration across callbacks. The borrowed
+/// stream may bind I/O to the current instrumentation callback; neither that
+/// context nor ownership of the descriptor escapes through this client. A
+/// fresh mutex protects this borrow, never an inherited client lock.
+pub struct BorrowedBlockingRpcClient<'a, G: GlobalTool, S> {
+    tid: Tid,
+    config: &'a G::Config,
+    stream: Mutex<&'a mut S>,
+}
+
+// Small control exchanges retain all request/response storage on the caller's
+// stack. Large messages keep the same wire and maximum-frame semantics.
+const INLINE_FRAME_LEN: usize = 512;
+
+// Boxing the inline arm would reintroduce the allocation this storage avoids.
+#[allow(clippy::large_enum_variant)]
+enum FrameBytes {
+    Inline {
+        len: usize,
+        bytes: [u8; INLINE_FRAME_LEN],
+    },
+    Heap(Vec<u8>),
+}
+
+impl FrameBytes {
+    fn empty() -> Self {
+        Self::Inline {
+            len: 0,
+            bytes: [0; INLINE_FRAME_LEN],
+        }
+    }
+
+    fn for_read(&mut self, length: usize) -> &mut [u8] {
+        if length > INLINE_FRAME_LEN {
+            *self = Self::Heap(vec![0; length]);
+        }
+        match self {
+            Self::Inline { len, bytes } => {
+                *len = length;
+                &mut bytes[..length]
+            }
+            Self::Heap(bytes) => {
+                bytes.resize(length, 0);
+                bytes
+            }
+        }
+    }
+
+    fn into_vec(self) -> Vec<u8> {
+        match self {
+            Self::Inline { len, bytes } => bytes[..len].to_vec(),
+            Self::Heap(bytes) => bytes,
+        }
+    }
+}
+
+impl std::ops::Deref for FrameBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Inline { len, bytes } => &bytes[..*len],
+            Self::Heap(bytes) => bytes,
+        }
+    }
+}
+
+impl bincode::enc::write::Writer for FrameBytes {
+    fn write(&mut self, input: &[u8]) -> Result<(), bincode::error::EncodeError> {
+        match self {
+            Self::Inline { len, bytes } => {
+                let end =
+                    len.checked_add(input.len())
+                        .ok_or(bincode::error::EncodeError::Other(
+                            "RPC request length overflow",
+                        ))?;
+                if end <= INLINE_FRAME_LEN {
+                    bytes[*len..end].copy_from_slice(input);
+                    *len = end;
+                } else {
+                    let mut heap = Vec::with_capacity(end);
+                    heap.extend_from_slice(&bytes[..*len]);
+                    heap.extend_from_slice(input);
+                    *self = Self::Heap(heap);
+                }
+            }
+            Self::Heap(bytes) => bytes.extend_from_slice(input),
+        }
+        Ok(())
+    }
+}
+
+/// A shared-codec request prepared before entering an adapter's I/O lease.
+///
+/// Preparation runs the request's `Serialize` implementation. The owned bytes
+/// include the originating TID and convey no connection or admission authority.
+pub struct RpcRequest<G: GlobalTool> {
+    bytes: FrameBytes,
+    _phantom: PhantomData<fn() -> G>,
+}
+
+impl<G: GlobalTool> RpcRequest<G> {
+    /// Serialize the same request envelope used by the owned blocking client.
+    pub fn new(from: Tid, request: G::Request) -> Result<Self, RpcError> {
+        let mut bytes = FrameBytes::empty();
+        // Serialize once: falling back to a Vec must not rerun a stateful
+        // user Serialize implementation.
+        bincode::serde::encode_into_writer(
+            &RequestEnvelope { from, request },
+            &mut bytes,
+            bincode::config::legacy(),
+        )?;
+        Ok(Self {
+            bytes,
+            _phantom: PhantomData,
+        })
+    }
+}
+
+/// A complete reply whose decoding may run after a callback releases its I/O owner.
+///
+/// This contains only owned wire bytes: no stream, lock, configuration or callback
+/// borrow. Receiving it has already completed the request/response exchange.
+pub struct RpcResponse<G: GlobalTool> {
+    bytes: FrameBytes,
+    _phantom: PhantomData<fn() -> G>,
+}
+
+impl<G: GlobalTool> RpcResponse<G> {
+    /// Decode using the shared legacy RPC codec, consuming the complete reply.
+    pub fn decode(self) -> Result<G::Response, RpcError> {
+        decode(&self.bytes)
+    }
+}
+
+/// An owned client that completed the explicit InitialImage transport exchange.
+///
+/// Private fields prevent constructing this from an ordinary RPC client. This
+/// records the acknowledgement and raw Config digest checks on its owned
+/// stream; it does not prove the launcher's authorization policy is sound.
+/// Fork/exec successors cannot inherit this as a new launch authorization.
+pub struct InitialImageClient<G: GlobalTool, S = UnixStream> {
+    client: BlockingRpcClient<G, S>,
+}
+
+/// Owned explicit successor exchange, preserving the same RPC connection.
+///
+/// Construction requires the acknowledged expected digests and exact raw
+/// Config/state frames. This does not attest the admission hook's policy.
+pub struct SuccessorClient<G: GlobalTool, S = UnixStream> {
+    client: BlockingRpcClient<G, S>,
+    state: crate::successor::VerifiedSuccessorState,
+}
+
+impl<G: GlobalTool, S> SuccessorClient<G, S> {
+    /// Config decoded only after both raw frame digests have matched.
+    pub fn config(&self) -> &G::Config {
+        &self.client.config
+    }
+
+    /// The checked opaque state; its typed consumer must decode exactly.
+    pub fn state(&self) -> &crate::successor::VerifiedSuccessorState {
+        &self.state
+    }
+
+    /// Transfer the same live stream and checked state without reconnecting.
+    pub fn into_parts(
+        self,
+    ) -> (
+        BlockingRpcClient<G, S>,
+        crate::successor::VerifiedSuccessorState,
+    ) {
+        (self.client, self.state)
+    }
+}
+
+impl<G: GlobalTool, S: AsRawFd> AsRawFd for SuccessorClient<G, S> {
+    fn as_raw_fd(&self) -> RawFd {
+        self.client.as_raw_fd()
+    }
+}
+
+impl<G: GlobalTool, S> InitialImageClient<G, S> {
+    /// Configuration decoded only after the independently expected hash matched.
+    pub fn config(&self) -> &G::Config {
+        &self.client.config
+    }
+
+    /// Transfer the same live connection into the normal RPC owner.
+    /// This consumes the InitialImage handle without reconnecting or duplicating.
+    pub fn into_client(self) -> BlockingRpcClient<G, S> {
+        self.client
+    }
+}
+
+impl<G: GlobalTool, S: AsRawFd> AsRawFd for InitialImageClient<G, S> {
+    fn as_raw_fd(&self) -> RawFd {
+        self.client.as_raw_fd()
+    }
+}
+
+// TODO-HUMAN-REVIEW(PR-212): Review raw descriptor exposure for in-guest
+// runtimes that must hide coordinator transport descriptors from the guest.
+impl<G: GlobalTool, S: AsRawFd> AsRawFd for BlockingRpcClient<G, S> {
+    fn as_raw_fd(&self) -> RawFd {
+        self.stream
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_raw_fd()
+    }
+}
+
+impl<G: GlobalTool, S> BlockingRpcClient<G, S> {
+    /// Consume the client and return its stored TID, config and stream.
+    ///
+    /// This transfers ownership without acquiring the stream mutex, performing
+    /// I/O, cloning the config, or dropping either returned value. Poison does
+    /// not prevent extracting the owned stream; a live poisoned client's RPC
+    /// requests continue to fail normally.
+    ///
+    /// The caller controls when the returned values are used or destroyed.
+    /// Extraction does not make their callbacks or destructors safe after fork
+    /// or repair any separate synchronization in an enclosing runtime.
+    pub fn into_parts(self) -> (Tid, G::Config, S) {
+        let Self {
+            tid,
+            config,
+            stream,
+            _phantom: _,
+        } = self;
+        let stream = stream
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (tid, config, stream)
+    }
+}
+
+impl<G> BlockingRpcClient<G>
+where
+    G: GlobalTool,
+{
+    /// Borrow a connection whose initial Config frame was already consumed.
+    ///
+    /// This does not connect, read a handshake, clone configuration, or take
+    /// ownership of the stream. The caller must retain exclusive use of the
+    /// connection for the whole borrow and provide its current request TID.
+    /// This ordinary RPC view conveys no InitialImage admission authority.
+    pub fn from_borrowed_stream<'a, S: Read + Write + Send>(
+        stream: &'a mut S,
+        tid: Tid,
+        config: &'a G::Config,
+    ) -> BorrowedBlockingRpcClient<'a, G, S> {
+        BorrowedBlockingRpcClient {
+            tid,
+            config,
+            stream: Mutex::new(stream),
+        }
+    }
+
+    /// Redeem an explicit one-use successor ticket on the configured native
+    /// image endpoint. Expected digests must come from the protected admitted
+    /// input, independently of this connection's response. There is no
+    /// InitialImage or ordinary-connect fallback.
+    pub fn connect_successor(
+        path: impl AsRef<Path>,
+        tid: Tid,
+        request: crate::successor::SuccessorRequest<'_>,
+    ) -> Result<SuccessorClient<G>, RpcError> {
+        // Preserve validation before the ordinary connection side effect.
+        let request_bytes = crate::successor::encode_redemption(request)?;
+        Self::successor_from_encoded_request(
+            UnixStream::connect(path)?,
+            tid,
+            request,
+            request_bytes,
+        )
+    }
+
+    /// Connect and synchronously receive the coordinator's config handshake.
+    pub fn connect(path: impl AsRef<Path>, tid: Tid) -> Result<Self, RpcError> {
+        Self::from_connected_stream(UnixStream::connect(path)?, tid)
+    }
+
+    /// Redeem InitialImage authorization and receive Config on the same socket.
+    ///
+    /// `expected_config_digest` must come independently from the authenticated
+    /// launch inputs. Neither the server's acknowledgement nor the subsequent
+    /// Config supplies authority for this value. Raw Config bytes are checked
+    /// before deserialization. Ordinary connect and fork reconnect do not use
+    /// or inherit this exchange.
+    pub fn connect_initial_image(
+        path: impl AsRef<Path>,
+        tid: Tid,
+        redemption: &[u8],
+        expected_config_digest: crate::initial_image::ConfigDigest,
+    ) -> Result<InitialImageClient<G>, RpcError> {
+        // Preserve validation before the ordinary connection side effect.
+        let request = crate::initial_image::encode_redemption(redemption)?;
+        Self::initial_image_from_encoded_request(
+            UnixStream::connect(path)?,
+            tid,
+            request,
+            expected_config_digest,
+        )
+    }
+}
+
+impl<G, S> BlockingRpcClient<G, S>
+where
+    G: GlobalTool,
+    S: Read + Write + Send,
+{
+    /// Redeem InitialImage authorization on the supplied owned connection.
+    ///
+    /// This runs the same framing, exact acknowledgement and independently
+    /// expected Config digest checks as `connect_initial_image`. The stream is
+    /// retained through installation; supplying it grants no admission authority.
+    pub fn initial_image_from_connected_stream(
+        stream: S,
+        tid: Tid,
+        redemption: &[u8],
+        expected_config_digest: crate::initial_image::ConfigDigest,
+    ) -> Result<InitialImageClient<G, S>, RpcError> {
+        let request = crate::initial_image::encode_redemption(redemption)?;
+        Self::initial_image_from_encoded_request(stream, tid, request, expected_config_digest)
+    }
+
+    fn initial_image_from_encoded_request(
+        mut stream: S,
+        tid: Tid,
+        request: Vec<u8>,
+        expected_config_digest: crate::initial_image::ConfigDigest,
+    ) -> Result<InitialImageClient<G, S>, RpcError> {
+        write_message(&mut stream, &request)?;
+        let acknowledgement = read_message(&mut stream, crate::initial_image::MAX_FRAME_LEN)?;
+        crate::initial_image::check_ack(&acknowledgement, expected_config_digest)?;
+        let config_bytes = read_message(&mut stream, DEFAULT_MAX_FRAME_LEN)?;
+        if crate::initial_image::config_digest(&config_bytes) != expected_config_digest {
+            return Err(crate::initial_image::invalid(
+                "InitialImage raw config digest mismatch",
+            ));
+        }
+        let config = decode(&config_bytes)?;
+        Ok(InitialImageClient {
+            client: Self {
+                tid,
+                config,
+                stream: Mutex::new(stream),
+                _phantom: PhantomData,
+            },
+        })
+    }
+
+    /// Redeem a successor ticket on the supplied owned connection.
+    ///
+    /// The exact acknowledgement, raw Config digest and bounded verified
+    /// successor state use the existing shared exchange. There is no ordinary
+    /// or InitialImage fallback, reconnect or independently constructed client.
+    pub fn successor_from_connected_stream(
+        stream: S,
+        tid: Tid,
+        request: crate::successor::SuccessorRequest<'_>,
+    ) -> Result<SuccessorClient<G, S>, RpcError> {
+        let request_bytes = crate::successor::encode_redemption(request)?;
+        Self::successor_from_encoded_request(stream, tid, request, request_bytes)
+    }
+
+    fn successor_from_encoded_request(
+        mut stream: S,
+        tid: Tid,
+        request: crate::successor::SuccessorRequest<'_>,
+        request_bytes: Vec<u8>,
+    ) -> Result<SuccessorClient<G, S>, RpcError> {
+        write_message(&mut stream, &request_bytes)?;
+        let acknowledgement = read_message(&mut stream, crate::successor::MAX_CONTROL_LEN)?;
+        crate::successor::check_ack(&acknowledgement, request)?;
+        let config_bytes = read_message(&mut stream, DEFAULT_MAX_FRAME_LEN)?;
+        if crate::initial_image::config_digest(&config_bytes) != request.expected.config {
+            return Err(crate::successor::invalid(
+                "successor raw Config digest differs",
+            ));
+        }
+        let state_bytes = read_message(&mut stream, crate::successor::MAX_STATE_LEN)?;
+        let state =
+            crate::successor::VerifiedSuccessorState::from_checked_frame(request, state_bytes)?;
+        let config =
+            crate::codec::decode_exact_bounded::<G::Config, DEFAULT_MAX_FRAME_LEN>(&config_bytes)?;
+        Ok(SuccessorClient {
+            client: Self {
+                tid,
+                config,
+                stream: Mutex::new(stream),
+                _phantom: PhantomData,
+            },
+            state,
+        })
+    }
+
+    /// Receive the config handshake from an already connected byte stream.
+    ///
+    /// Deserialization happens synchronously on the caller. Keep a separate
+    /// stream/client for every thread that can have an independent pending RPC.
+    pub fn from_connected_stream(mut stream: S, tid: Tid) -> Result<Self, RpcError> {
+        let config_bytes = read_config_frame(&mut stream)?;
+        let config = decode(&config_bytes)?;
+        Ok(Self {
+            tid,
+            config,
+            stream: Mutex::new(stream),
+            _phantom: PhantomData,
+        })
+    }
+
+    /// The tid attached to requests on this connection.
+    pub fn tid(&self) -> Tid {
+        self.tid
+    }
+
+    /// Send one request and block until the coordinator returns its response.
+    pub fn try_send_rpc(&self, message: G::Request) -> Result<G::Response, RpcError> {
+        let request = RpcRequest::<G>::new(self.tid, message)?;
+        let mut stream = self.stream.lock().map_err(|_| {
+            RpcError::Io(io::Error::other(
+                "reverie-rpc-transport: blocking client mutex poisoned",
+            ))
+        })?;
+        decode(&exchange(&mut *stream, &request.bytes)?)
+    }
+}
+
+impl<G, S> BorrowedBlockingRpcClient<'_, G, S>
+where
+    G: GlobalTool,
+    S: Read + Write + Send,
+{
+    /// Send one request through the same framing and codec as an owned client.
+    pub fn try_send_rpc(&self, message: G::Request) -> Result<G::Response, RpcError> {
+        self.receive_response(RpcRequest::new(self.tid, message)?)?
+            .decode()
+    }
+
+    /// Complete the exchange without running the response's `Deserialize` code.
+    ///
+    /// Callback adapters can release their connection lease or close a temporary
+    /// socket before decoding. Errors and panics in user deserialization then
+    /// cannot retain those adapter-owned resources.
+    pub fn receive_response(&self, request: RpcRequest<G>) -> Result<RpcResponse<G>, RpcError> {
+        let mut response = RpcResponse {
+            bytes: FrameBytes::empty(),
+            _phantom: PhantomData,
+        };
+        let mut stream = self.stream.lock().map_err(|_| {
+            RpcError::Io(io::Error::other(
+                "reverie-rpc-transport: blocking client mutex poisoned",
+            ))
+        })?;
+        exchange_into(&mut **stream, &request.bytes, &mut response.bytes)?;
+        Ok(response)
+    }
+}
+
+#[async_trait]
+impl<G, S> GlobalRPC<G> for BorrowedBlockingRpcClient<'_, G, S>
+where
+    G: GlobalTool,
+    S: Read + Write + Send,
+{
+    async fn send_rpc(&self, message: G::Request) -> G::Response {
+        self.try_send_rpc(message)
+            .expect("reverie-rpc-transport: blocking RPC to coordinator failed")
+    }
+
+    fn config(&self) -> &G::Config {
+        self.config
+    }
+}
+
+impl<G: GlobalTool> BlockingRpcClient<G> {
+    /// Send a request, entering a caller-owned scope only around stream I/O.
+    ///
+    /// In-process backends use this to permit access to a private coordinator
+    /// descriptor. Request serialization and response deserialization run
+    /// outside the scope. Each read or write drops its scope before returning,
+    /// including on an I/O error; framing and error handling are unchanged.
+    pub fn try_send_rpc_with_io_scope<Scope>(
+        &self,
+        message: G::Request,
+        mut enter: impl FnMut(RawFd) -> Scope,
+    ) -> Result<G::Response, RpcError> {
+        let request = RpcRequest::<G>::new(self.tid, message)?;
+        let mut stream = self.stream.lock().map_err(|_| {
+            RpcError::Io(io::Error::other(
+                "reverie-rpc-transport: blocking client mutex poisoned",
+            ))
+        })?;
+        let response_bytes = {
+            let mut io = ScopedIo {
+                stream: &mut stream,
+                enter: &mut enter,
+            };
+            exchange(&mut io, &request.bytes)?
+        };
+        decode(&response_bytes)
+    }
+}
+
+/// Consume the coordinator's single initial configuration frame.
+///
+/// Some instrumentation engines obtain authoritative configuration separately
+/// and keep only connection ownership between callbacks. They still consume
+/// this frame using the same limits, partial-I/O and EOF handling as the owned
+/// blocking client. Strict consumers can apply [`crate::codec::decode_exact`].
+pub fn read_config_frame(stream: &mut impl Read) -> Result<Vec<u8>, RpcError> {
+    read_message(stream, DEFAULT_MAX_FRAME_LEN)
+}
+
+fn exchange(
+    stream: &mut (impl Read + Write),
+    request_bytes: &[u8],
+) -> Result<FrameBytes, RpcError> {
+    let mut response = FrameBytes::empty();
+    exchange_into(stream, request_bytes, &mut response)?;
+    Ok(response)
+}
+
+fn exchange_into(
+    stream: &mut (impl Read + Write),
+    request_bytes: &[u8],
+    response: &mut FrameBytes,
+) -> Result<(), RpcError> {
+    // Materialize/touch the inline storage before the remote snapshot can
+    // occur. The fixed small response never allocates after this write.
+    std::hint::black_box(&mut *response);
+    write_message(stream, request_bytes)?;
+    read_message_into(stream, DEFAULT_MAX_FRAME_LEN, response)
+}
+
+#[async_trait]
+impl<G, S> GlobalRPC<G> for BlockingRpcClient<G, S>
+where
+    G: GlobalTool,
+    S: Read + Write + Send,
+{
+    async fn send_rpc(&self, message: G::Request) -> G::Response {
+        self.try_send_rpc(message)
+            .expect("reverie-rpc-transport: blocking RPC to coordinator failed")
+    }
+
+    fn config(&self) -> &G::Config {
+        &self.config
+    }
+}
+
+struct ScopedIo<'a, Enter> {
+    stream: &'a mut UnixStream,
+    enter: &'a mut Enter,
+}
+
+impl<Scope, Enter: FnMut(RawFd) -> Scope> Read for ScopedIo<'_, Enter> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let _scope = (self.enter)(self.stream.as_raw_fd());
+        self.stream.read(buffer)
+    }
+}
+
+impl<Scope, Enter: FnMut(RawFd) -> Scope> Write for ScopedIo<'_, Enter> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let _scope = (self.enter)(self.stream.as_raw_fd());
+        self.stream.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        // UnixStream::flush performs no I/O and needs no descriptor exception.
+        self.stream.flush()
+    }
+}
+
+fn write_message(stream: &mut impl Write, payload: &[u8]) -> Result<(), RpcError> {
+    let len = u32::try_from(payload.len()).map_err(|_| RpcError::FrameTooLarge {
+        len: payload.len(),
+        max: u32::MAX as usize,
+    })?;
+    stream.write_all(&len.to_be_bytes())?;
+    stream.write_all(payload)?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn read_message(stream: &mut impl Read, max_len: usize) -> Result<Vec<u8>, RpcError> {
+    let mut payload = FrameBytes::empty();
+    read_message_into(stream, max_len, &mut payload)?;
+    Ok(payload.into_vec())
+}
+
+fn read_message_into(
+    stream: &mut impl Read,
+    max_len: usize,
+    payload: &mut FrameBytes,
+) -> Result<(), RpcError> {
+    // Read the 4-byte length prefix in one `read` on the common path. The loop
+    // only re-enters the kernel on a short read or `EINTR`, collapsing the
+    // former 1-byte probe + 3-byte remainder into a single syscall per hop.
+    let mut header = [0u8; 4];
+    let mut filled = 0;
+    while filled < header.len() {
+        match stream.read(&mut header[filled..]) {
+            // A clean EOF exactly at a frame boundary is a graceful close;
+            // preserve the previous 1-byte-probe semantics.
+            Ok(0) if filled == 0 => return Err(RpcError::Closed),
+            // EOF partway through the header is a truncated frame.
+            Ok(0) => return Err(RpcError::Io(io::Error::from(io::ErrorKind::UnexpectedEof))),
+            Ok(n) => filled += n,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(RpcError::Io(error)),
+        }
+    }
+
+    let len = u32::from_be_bytes(header) as usize;
+    if len > max_len {
+        return Err(RpcError::FrameTooLarge { len, max: max_len });
+    }
+
+    stream.read_exact(payload.for_read(len))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod connected_image_tests;
+
+#[cfg(test)]
+mod io_scope_tests;
+
+#[cfg(test)]
+mod borrowed_tests;
+
+#[cfg(test)]
+mod inline_frame_tests {
+    use std::io::Cursor;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    use serde::Deserialize;
+    use serde::Serialize;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct Fixed;
+
+    #[async_trait]
+    impl GlobalTool for Fixed {
+        type Request = (u64, bool);
+        type Response = (u64, bool);
+        type Config = ();
+
+        async fn receive_rpc(&self, _: Tid, request: Self::Request) -> Self::Response {
+            request
+        }
+    }
+
+    struct Stream {
+        input: Cursor<Vec<u8>>,
+        output: Vec<u8>,
+    }
+
+    impl Read for Stream {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            self.input.read(bytes)
+        }
+    }
+
+    impl Write for Stream {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.output.write(bytes)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn fixed_request_and_response_stay_inline_with_the_existing_wire() {
+        let from = Tid::from_raw(37);
+        let value = (0x1234_5678, true);
+        let request = RpcRequest::<Fixed>::new(from, value).unwrap();
+        assert!(matches!(&request.bytes, FrameBytes::Inline { .. }));
+        let expected = encode(&RequestEnvelope {
+            from,
+            request: value,
+        })
+        .unwrap();
+        assert_eq!(&*request.bytes, expected);
+        let mut input = Vec::new();
+        write_message(&mut input, &encode(&value).unwrap()).unwrap();
+        let mut stream = Stream {
+            input: Cursor::new(input),
+            output: Vec::with_capacity(expected.len() + 4),
+        };
+        let response = BlockingRpcClient::<Fixed>::from_borrowed_stream(&mut stream, from, &())
+            .receive_response(request)
+            .unwrap();
+        assert!(matches!(&response.bytes, FrameBytes::Inline { .. }));
+        assert_eq!(response.decode().unwrap(), value);
+        let mut expected_frame = Vec::new();
+        write_message(&mut expected_frame, &expected).unwrap();
+        assert_eq!(stream.output, expected_frame);
+    }
+
+    #[derive(Deserialize)]
+    struct Counted {
+        bytes: Vec<u8>,
+        #[serde(skip)]
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Serialize for Counted {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.bytes.serialize(serializer)
+        }
+    }
+
+    #[derive(Default)]
+    struct Large;
+
+    #[async_trait]
+    impl GlobalTool for Large {
+        type Request = Counted;
+        type Response = Vec<u8>;
+        type Config = ();
+
+        async fn receive_rpc(&self, _: Tid, request: Counted) -> Vec<u8> {
+            request.bytes
+        }
+    }
+
+    #[test]
+    fn large_frames_spill_without_repeating_serialization_or_changing_bytes() {
+        let from = Tid::from_raw(41);
+        let bytes: Vec<u8> = (0..INLINE_FRAME_LEN * 3).map(|i| i as u8).collect();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let request = RpcRequest::<Large>::new(
+            from,
+            Counted {
+                bytes: bytes.clone(),
+                calls: calls.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(&request.bytes, FrameBytes::Heap(_)));
+        assert_eq!(
+            &*request.bytes,
+            encode(&RequestEnvelope {
+                from,
+                request: &bytes
+            })
+            .unwrap()
+        );
+        let mut input = Vec::new();
+        write_message(&mut input, &encode(&bytes).unwrap()).unwrap();
+        let mut stream = Stream {
+            input: Cursor::new(input),
+            output: Vec::new(),
+        };
+        let response = BlockingRpcClient::<Large>::from_borrowed_stream(&mut stream, from, &())
+            .receive_response(request)
+            .unwrap();
+        assert!(matches!(&response.bytes, FrameBytes::Heap(_)));
+        assert_eq!(response.decode().unwrap(), bytes);
+    }
+
+    #[test]
+    fn inline_framing_keeps_closed_truncated_and_oversize_errors() {
+        let mut output = FrameBytes::empty();
+        assert!(matches!(
+            read_message_into(&mut Cursor::new([]), 16, &mut output),
+            Err(RpcError::Closed)
+        ));
+        for bytes in [&[0, 0][..], &[0, 0, 0, 2, 1][..]] {
+            assert!(
+                matches!(read_message_into(&mut Cursor::new(bytes), 16, &mut output), Err(RpcError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof)
+            );
+        }
+        assert!(matches!(
+            read_message_into(&mut Cursor::new(17_u32.to_be_bytes()), 16, &mut output),
+            Err(RpcError::FrameTooLarge { len: 17, max: 16 })
+        ));
+        assert!(matches!(output, FrameBytes::Inline { .. }));
+    }
+
+    #[test]
+    fn optional_sync_default_returns_the_original_request_without_io() {
+        let mut stream = Stream {
+            input: Cursor::new(Vec::new()),
+            output: Vec::new(),
+        };
+        let client =
+            BlockingRpcClient::<Large>::from_borrowed_stream(&mut stream, Tid::from_raw(43), &());
+        let bytes = vec![1, 2, 3];
+        let pointer = bytes.as_ptr();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let request = Counted {
+            bytes,
+            calls: calls.clone(),
+        };
+        let returned = match client.try_send_rpc_sync(request) {
+            Err(original) => original,
+            Ok(_) => panic!("default synchronous method performed an exchange"),
+        };
+        assert_eq!(returned.bytes.as_ptr(), pointer);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(stream.output.is_empty());
+        assert_eq!(stream.input.position(), 0);
+    }
+}
+
+#[cfg(test)]
+mod into_parts_tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    use std::time::Instant;
+
+    use serde::Deserialize;
+    use serde::Serialize;
+
+    use super::*;
+
+    #[derive(Debug, Default)]
+    struct Counts {
+        clones: AtomicUsize,
+        config_drops: AtomicUsize,
+    }
+
+    #[derive(Debug, Default, Serialize, Deserialize)]
+    struct Config {
+        identity: u64,
+        #[serde(skip)]
+        counts: Arc<Counts>,
+    }
+    impl Clone for Config {
+        fn clone(&self) -> Self {
+            self.counts.clones.fetch_add(1, Ordering::SeqCst);
+            Self {
+                identity: self.identity,
+                counts: self.counts.clone(),
+            }
+        }
+    }
+    impl Drop for Config {
+        fn drop(&mut self) {
+            self.counts.config_drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    #[derive(Default)]
+    struct Global;
+    #[async_trait]
+    impl GlobalTool for Global {
+        type Request = u8;
+        type Response = u8;
+        type Config = Config;
+        async fn receive_rpc(&self, _: Tid, request: u8) -> u8 {
+            request
+        }
+    }
+    // Deliberately neither Send nor Read/Write: extraction only moves ownership.
+    struct Stream(Rc<Cell<usize>>);
+    impl Drop for Stream {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+    fn client() -> (
+        BlockingRpcClient<Global, Stream>,
+        Arc<Counts>,
+        Rc<Cell<usize>>,
+    ) {
+        let counts = Arc::new(Counts::default());
+        let drops = Rc::new(Cell::new(0));
+        (
+            BlockingRpcClient {
+                tid: Tid::from_raw(173),
+                config: Config {
+                    identity: 0x9182_7364,
+                    counts: counts.clone(),
+                },
+                stream: Mutex::new(Stream(drops.clone())),
+                _phantom: PhantomData,
+            },
+            counts,
+            drops,
+        )
+    }
+    fn assert_parts(
+        client: BlockingRpcClient<Global, Stream>,
+        counts: Arc<Counts>,
+        drops: Rc<Cell<usize>>,
+    ) {
+        let (tid, config, stream) = client.into_parts();
+        assert_eq!(tid, Tid::from_raw(173));
+        assert_eq!(config.identity, 0x9182_7364);
+        assert!(Arc::ptr_eq(&config.counts, &counts));
+        assert!(Rc::ptr_eq(&stream.0, &drops));
+        assert_eq!(counts.clones.load(Ordering::SeqCst), 0, "config was cloned");
+        assert_eq!(
+            counts.config_drops.load(Ordering::SeqCst),
+            0,
+            "config was dropped before transfer"
+        );
+        assert_eq!(drops.get(), 0, "stream was dropped before transfer");
+        drop(config);
+        assert_eq!(counts.config_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.get(), 0);
+        drop(stream);
+        assert_eq!(drops.get(), 1);
+    }
+    #[test]
+    fn exact_owners_move_without_callbacks_or_stream_bounds() {
+        let (client, counts, drops) = client();
+        assert_parts(client, counts, drops);
+    }
+    #[test]
+    fn poisoned_owned_stream_is_recovered_without_changing_live_poison_rules() {
+        let (client, counts, drops) = client();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = client.stream.lock().unwrap();
+            panic!("intentional owned mutex poison");
+        }));
+        assert!(panic.is_err());
+        assert!(client.stream.is_poisoned());
+        assert_parts(client, counts, drops);
+    }
+    #[test]
+    fn abandoned_lock_child() {
+        if std::env::var_os("RPC_INTO_PARTS_ABANDONED_LOCK_CHILD").is_none() {
+            return;
+        }
+        let (client, counts, drops) = client();
+        std::mem::forget(client.stream.lock().unwrap());
+        assert_parts(client, counts, drops);
+    }
+    #[test]
+    fn abandoned_lock_is_not_acquired_during_owned_extraction() {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "blocking_client::into_parts_tests::abandoned_lock_child",
+                "--nocapture",
+            ])
+            .env("RPC_INTO_PARTS_ABANDONED_LOCK_CHILD", "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut exceeded = false;
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                exceeded = true;
+                child.kill().unwrap();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            !exceeded,
+            "owned extraction tried to acquire the abandoned mutex; child reaped with {:?}",
+            output.status
+        );
+        assert!(
+            output.status.success(),
+            "owned extraction child failed: {:?}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}

@@ -1,0 +1,408 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+#[path = "common/prepared_redis.rs"]
+mod prepared_redis;
+
+use std::ffi::OsString;
+use std::fs;
+use std::net::TcpListener;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::Command;
+use std::process::Output;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
+use std::thread;
+use std::time::Duration;
+
+// Separately run Hermit processes are compared, so they share one epoch: a
+// host-drawn one differs per run, and Hermit then reports the recording it
+// saved on stderr (https://github.com/rrnewton/hermit/issues/4321).
+const EPOCH: &str = "--epoch=2026-01-01T00:00:00Z";
+
+static HERMIT_REDIS_LOCK: Mutex<()> = Mutex::new(());
+
+struct RedisServerGuard {
+    redis_cli: PathBuf,
+    port: u16,
+}
+
+impl Drop for RedisServerGuard {
+    fn drop(&mut self) {
+        let _ = Command::new(&self.redis_cli)
+            .args([
+                "-h",
+                "127.0.0.1",
+                "-p",
+                &self.port.to_string(),
+                "SHUTDOWN",
+                "NOSAVE",
+            ])
+            .output();
+    }
+}
+
+fn hermit_redis_lock() -> MutexGuard<'static, ()> {
+    HERMIT_REDIS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn executable(candidates: &[&str]) -> Option<PathBuf> {
+    candidates.iter().find_map(|candidate| {
+        let path = PathBuf::from(candidate);
+        let metadata = fs::metadata(&path).ok()?;
+        (metadata.is_file() && metadata.permissions().mode() & 0o111 != 0).then_some(path)
+    })
+}
+
+fn command_output(mut command: Command, label: &str) -> Output {
+    let rendered = format!("{command:?}");
+    let output = hermit_test::hermit_output(&rendered, &mut command);
+    assert!(
+        output.status.success(),
+        "{label} failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    output
+}
+
+fn repository() -> &'static Path {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository")
+}
+
+fn unused_loopback_port() -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .expect("failed to reserve a unique loopback port for Redis");
+    listener
+        .local_addr()
+        .expect("failed to read reserved Redis address")
+        .port()
+}
+
+fn system_redis() -> (PathBuf, PathBuf) {
+    if let Some(redis) = prepared_redis::prepared_redis() {
+        return (redis.server, redis.cli);
+    }
+    // The pinned root has redis at /bin only.
+    let redis_server = executable(&[
+        "/usr/bin/redis-server",
+        "/usr/local/bin/redis-server",
+        "/bin/redis-server",
+    ])
+    .expect("redis-server is required; the portable CI job installs it");
+    let redis_cli = executable(&[
+        "/usr/bin/redis-cli",
+        "/usr/local/bin/redis-cli",
+        "/bin/redis-cli",
+    ])
+    .expect("redis-cli is required; the portable CI job installs it");
+    (redis_server, redis_cli)
+}
+
+fn redis_cli_output(redis_cli: &Path, port: u16, args: &[&str]) -> Output {
+    Command::new(redis_cli)
+        .args(["--raw", "-h", "127.0.0.1", "-p", &port.to_string()])
+        .args(args)
+        .output()
+        .expect("failed to start redis-cli")
+}
+
+fn run_deterministic_workload(
+    redis_server: &Path,
+    redis_cli: &Path,
+    mode: &str,
+    iteration: usize,
+) -> Output {
+    let workload = repository().join("hermit-cli/tests/fixtures/redis-strict/workload.sh");
+    let instance = format!("cargo-{}-{iteration}", std::process::id());
+    let port = unused_loopback_port();
+    // Compatibility workloads keep deterministic defaults while normal mode reports any
+    // unsupported syscalls; strict fail-closed behavior is covered by dedicated tests.
+    let mut command = Command::new("timeout");
+    command
+        .arg("90")
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log", "off", "run", EPOCH, "--", "/bin/sh"])
+        .arg(workload)
+        .arg(redis_server)
+        .arg(redis_cli)
+        .arg(mode)
+        .arg(instance)
+        .arg(port.to_string());
+    command_output(
+        command,
+        &format!("Redis deterministic {mode} workload, iteration {iteration}"),
+    )
+}
+
+#[test]
+fn redis_small_subset_is_deterministic_under_hermit() {
+    let _guard = hermit_redis_lock();
+    let (redis_server, redis_cli) = system_redis();
+
+    let first = run_deterministic_workload(&redis_server, &redis_cli, "small", 1);
+    let second = run_deterministic_workload(&redis_server, &redis_cli, "small", 2);
+    assert_eq!(
+        first.stdout, second.stdout,
+        "Redis stdout changed between runs"
+    );
+    assert_eq!(
+        first.stderr, second.stderr,
+        "Redis stderr changed between runs"
+    );
+
+    let stdout = String::from_utf8_lossy(&first.stdout);
+    for marker in [
+        "ping=PONG\n",
+        "string=hermit\n",
+        "counter=2\n",
+        "list=alpha,beta,gamma\n",
+        "redis-strict-small-ok\n",
+    ] {
+        assert!(
+            stdout.contains(marker),
+            "Redis output omitted {marker:?}:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn redis_persistence_restart_is_deterministic_under_hermit() {
+    let _guard = hermit_redis_lock();
+    let (redis_server, redis_cli) = system_redis();
+
+    let first = run_deterministic_workload(&redis_server, &redis_cli, "extended", 1);
+    let second = run_deterministic_workload(&redis_server, &redis_cli, "extended", 2);
+    assert_eq!(
+        first.stdout, second.stdout,
+        "Redis persistence stdout changed between runs"
+    );
+    assert_eq!(
+        first.stderr, second.stderr,
+        "Redis persistence stderr changed between runs"
+    );
+
+    let stdout = String::from_utf8_lossy(&first.stdout);
+    for marker in [
+        "pid-turnover=ok\n",
+        "persistence=ok\n",
+        "redis-strict-extended-ok\n",
+    ] {
+        assert!(
+            stdout.contains(marker),
+            "Redis persistence output omitted {marker:?}:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn redis_workload_refuses_to_control_a_preexisting_server() {
+    let _guard = hermit_redis_lock();
+    let (redis_server, redis_cli) = system_redis();
+    let port = unused_loopback_port();
+    let root = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create unrelated Redis directory");
+    let pidfile = root.path().join("redis.pid");
+    let logfile = root.path().join("redis.log");
+
+    let mut start = Command::new(&redis_server);
+    start
+        .args([
+            "--daemonize",
+            "yes",
+            "--bind",
+            "127.0.0.1",
+            "--protected-mode",
+            "no",
+            "--port",
+            &port.to_string(),
+            "--save",
+            "",
+            "--appendonly",
+            "no",
+            "--pidfile",
+        ])
+        .arg(&pidfile)
+        .arg("--logfile")
+        .arg(&logfile)
+        .arg("--dir")
+        .arg(root.path());
+    command_output(start, "unrelated Redis server");
+    let _server_guard = RedisServerGuard {
+        redis_cli: redis_cli.clone(),
+        port,
+    };
+
+    let mut ready = false;
+    for _ in 0..100 {
+        let output = redis_cli_output(&redis_cli, port, &["PING"]);
+        if output.status.success() && output.stdout == b"PONG\n" {
+            ready = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(ready, "unrelated Redis server did not become ready");
+    let expected_pid = fs::read_to_string(&pidfile)
+        .expect("unrelated Redis server omitted its pidfile")
+        .trim()
+        .to_owned();
+
+    let workload = repository().join("hermit-cli/tests/fixtures/redis-strict/workload.sh");
+    let output = Command::new("/bin/sh")
+        .arg(workload)
+        .arg(&redis_server)
+        .arg(&redis_cli)
+        .arg("small")
+        .arg(format!("collision-{}", std::process::id()))
+        .arg(port.to_string())
+        .output()
+        .expect("failed to run Redis collision probe");
+    assert!(
+        !output.status.success(),
+        "workload unexpectedly attached to a preexisting Redis server"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("already serving before launch"),
+        "workload did not report its occupied endpoint:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let info = redis_cli_output(&redis_cli, port, &["INFO", "server"]);
+    assert!(
+        info.status.success(),
+        "preexisting Redis server was stopped"
+    );
+    let info_stdout = String::from_utf8_lossy(&info.stdout);
+    let observed_pid = info_stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("process_id:"))
+        .map(str::trim)
+        .expect("Redis INFO omitted process_id");
+    assert_eq!(
+        observed_pid, expected_pid,
+        "workload replaced or stopped the preexisting Redis server"
+    );
+}
+
+#[test]
+#[ignore = "downloads and builds pinned Redis, then runs the extended strict suite"]
+fn redis_source_build_and_extended_suite_under_strict_hermit() {
+    let _guard = hermit_redis_lock();
+    let runner = repository().join("hermit-cli/tests/fixtures/redis-strict/run.sh");
+    let mut command = Command::new("timeout");
+    command
+        .arg("900")
+        .arg(runner)
+        .env("HERMIT_BIN", env!("CARGO_BIN_EXE_hermit"));
+    let output = command_output(command, "pinned Redis source-build strict suite");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("redis-source-build-strict-ok\n"),
+        "source-build runner omitted its success marker:\n{stdout}"
+    );
+}
+
+/// Writes an empty file `name` in `directory` with `mode`.
+fn file_with_mode(directory: &Path, name: &str, mode: u32) -> PathBuf {
+    fs::create_dir_all(directory).expect("failed to create a fixture directory");
+    let path = directory.join(name);
+    fs::write(&path, b"").expect("failed to write a fixture file");
+    fs::set_permissions(&path, fs::Permissions::from_mode(mode)).expect("failed to set a mode");
+    path
+}
+
+/// The HERMIT_PREPARED_REDIS text that declares `server` and `cli`.
+fn redis_declaration(server: &Path, cli: &Path) -> OsString {
+    serde_json::json!({"redis-cli": cli, "redis-server": server})
+        .to_string()
+        .into()
+}
+
+#[test]
+fn a_declared_redis_pair_is_used_only_when_declared() {
+    assert_eq!(prepared_redis::parse_prepared_redis(None), Ok(None));
+    let root = tempfile::tempdir().expect("failed to create a fixture directory");
+    let server = file_with_mode(root.path(), "redis-server", 0o755);
+    let cli = file_with_mode(root.path(), "redis-cli", 0o755);
+    let declared = redis_declaration(&server, &cli);
+    let expected = prepared_redis::PreparedRedis { server, cli };
+    assert_eq!(
+        prepared_redis::parse_prepared_redis(Some(declared)),
+        Ok(Some(expected))
+    );
+}
+
+#[test]
+fn a_bad_redis_declaration_is_refused_rather_than_replaced() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let root = tempfile::tempdir().expect("failed to create a fixture directory");
+    let server = file_with_mode(root.path(), "redis-server", 0o755);
+    let cli = file_with_mode(root.path(), "redis-cli", 0o755);
+    let renamed = file_with_mode(root.path(), "redis-sentinel", 0o755);
+    let plain_server = file_with_mode(&root.path().join("plain"), "redis-server", 0o644);
+    let plain_cli = file_with_mode(&root.path().join("plain"), "redis-cli", 0o644);
+    let directory = root.path().join("directory/redis-server");
+    fs::create_dir_all(&directory).expect("failed to create a fixture directory");
+    let missing = root.path().join("missing/redis-cli");
+    let only_server = serde_json::json!({"redis-server": &server}).to_string();
+    let extra = serde_json::json!({"redis-cli": &cli, "redis-server": &server, "x": &cli});
+    let cases: [(OsString, &str); 11] = [
+        (OsString::from_vec(vec![0xff]), "is not UTF-8"),
+        ("not json".into(), "is not a JSON object of paths"),
+        (
+            r#"{"redis-cli": 1, "redis-server": 2}"#.into(),
+            "is not a JSON object of paths",
+        ),
+        (
+            only_server.into(),
+            "must name exactly redis-cli and redis-server",
+        ),
+        (
+            extra.to_string().into(),
+            "must name exactly redis-cli and redis-server",
+        ),
+        (
+            redis_declaration(Path::new("redis-server"), &cli),
+            "which is not absolute",
+        ),
+        (
+            redis_declaration(&renamed, &cli),
+            "does not keep the file name redis-server",
+        ),
+        (
+            redis_declaration(&directory, &cli),
+            "which is not an executable file",
+        ),
+        (
+            redis_declaration(&plain_server, &cli),
+            "which is not an executable file",
+        ),
+        (redis_declaration(&server, &plain_cli), "names redis-cli"),
+        (
+            redis_declaration(&server, &missing),
+            "No such file or directory",
+        ),
+    ];
+    for (declared, problem) in cases {
+        let shown = format!("{declared:?}");
+        let refused = prepared_redis::parse_prepared_redis(Some(declared));
+        let refused = refused.expect_err(&format!("accepted {shown}"));
+        assert!(refused.contains(problem), "{shown}: {refused}");
+    }
+}

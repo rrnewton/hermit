@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+set -euo pipefail
+
+case ${1:-} in
+    --prepare)
+        test -x /usr/bin/python3
+        test -x /usr/bin/tr
+        ;;
+    --run)
+        # Name the interpreter by its path, matching the --prepare gate, so the
+        # cell runs the same system interpreter whatever the host puts first on
+        # PATH. A host whose /usr/local/bin/python3 is a launcher would otherwise
+        # be measured instead (https://github.com/rrnewton/hermit/issues/4598).
+        #
+        # Python's subprocess closes every descriptor above 2 in the child. An interpreter
+        # without close_range(2) lists /proc/self/fd for them, and where that
+        # open is refused (the KVM backend refuses /proc files with EACCES) it
+        # calls close() on each number up to RLIMIT_NOFILE, a host setting
+        # (one million calls at a limit of 1048576). Pin the soft limit so the
+        # cell's work does not depend on the host's file limit.
+        ulimit -Sn 1024
+        exec /usr/bin/python3 - <<'PYTHON'
+import hashlib
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import time
+
+root = Path(os.environ.get("E2E_TMPDIR", "/tmp")) / "hermit-python-interpreter-batch"
+shutil.rmtree(root, ignore_errors=True)
+root.mkdir(parents=True)
+
+payload = "alpha\nbeta\ngamma\n"
+input_path = root / "input.txt"
+output_path = root / "output.txt"
+input_path.write_text(payload, encoding="utf-8")
+
+child = subprocess.run(
+    ["/usr/bin/tr", "a-z", "A-Z"],
+    input=input_path.read_text(encoding="utf-8"),
+    text=True,
+    capture_output=True,
+    check=True,
+)
+output_path.write_text(child.stdout, encoding="utf-8")
+observed = output_path.read_bytes()
+
+print(
+    "PYTHON "
+    f"version={sys.version.split()[0]} "
+    f"bytes={len(observed)} "
+    f"sha256={hashlib.sha256(observed).hexdigest()} "
+    f"child={child.returncode} "
+    f"wall_ns={time.time_ns()} "
+    f"monotonic_ns={time.monotonic_ns()}"
+)
+PYTHON
+        ;;
+    *)
+        echo "usage: $0 --prepare|--run" >&2
+        exit 2
+        ;;
+esac

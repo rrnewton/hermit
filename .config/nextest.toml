@@ -1,0 +1,61 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+nextest-version = "0.9.100"
+
+[profile.default]
+fail-fast = false
+test-threads = "num-cpus"
+status-level = "pass"
+final-status-level = "slow"
+failure-output = "immediate-final"
+success-output = "never"
+# Individual test processes use the owner-approved wall backstop derived from
+# the completing data-handling/dd-partial-transfers observation:
+# ceil(4 * 14.019s) = 57s. This remains alongside the manifest runner's CPU
+# budget because a wedged process can consume no CPU. Machine-specific wall
+# scaling from HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER and the per-execution CPU
+# budget/measurement wrapper are added to a temporary copy of this canonical file by
+# ci/run-nextest-counted.sh.
+slow-timeout = { period = "57s", terminate-after = 1, grace-period = "2s" }
+global-timeout = "60m"
+
+[profile.ci]
+status-level = "slow"
+final-status-level = "slow"
+
+[profile.ci.junit]
+path = "junit.xml"
+
+# No group serializes the hermit integration binaries any more. Nextest runs
+# every test in its own process, and the process-local HERMIT_RUN_LOCK mutexes
+# some binaries keep never serialized two tests under it. What two tests
+# running at once could share was the files they write under
+# CARGO_TARGET_TMPDIR, so every such file now goes in a path named for the test
+# process: process_build_root in cli and rr_suite, and a `<name>-<pid>` suffix
+# on the fixed guest paths of the binaries test.hermit_integration selects.
+# record_replay records into tempdirs and runs prepared, read-only workloads.
+# Each DAG node sets its own width: test.cli, test.rr_suite_contract,
+# test.record_replay, privileged-test.cli_kvm and the test.hermit_integration
+# shards run several tests at once (measured on 2026-10-06 and 2026-10-15; see
+# their descriptions), and every other node, the PMU-timing ones among them,
+# passes -j 1. Until 2026-10-15 a hermit-serialized group (max-threads 1) held
+# every hermit integration binary but cli, rr_suite and record_replay.
+
+# Stopgap for https://github.com/rrnewton/hermit/issues/3827. `hermit record
+# start --verify-with-gdbex` binds its replay gdbserver to host port
+# 16384 + tid % 1024 (record_start.rs), so two such replays running at once can
+# pick the same port. These two cli tests are the only ones that reach that
+# replay stage; the other --verify-with-gdbex cases fault during recording,
+# before the port is chosen. The group keeps the two from overlapping each
+# other. The general fix is a design item on that issue.
+# ci/nextest-timeout-config.rs accepts exactly this filter.
+[test-groups.cli-gdbserver-port]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = "package(=hermit-run) & binary(=cli) & (test(=record_classifies_a_gdbserver_replay_stage_container_child_failure) | test(=every_record_container_site_classifies_a_child_fault_by_name))"
+test-group = "cli-gdbserver-port"

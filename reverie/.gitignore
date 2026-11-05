@@ -1,0 +1,9 @@
+target/
+# Cargo.lock is tracked: the workspace builds binaries (reverie-examples'
+# recorder and reverie-e2e-compare) that Hermit's validation builds with
+# --locked --offline from the pinned checkout (reverie-examples/e2e/).
+
+# Local backup and Python cache files.
+*.orig
+**/__pycache__/
+**/.mypy_cache/

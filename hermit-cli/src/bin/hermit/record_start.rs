@@ -1,0 +1,1586 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+use std::cell::RefCell;
+#[cfg(test)]
+use std::ffi::OsStr;
+use std::fs;
+use std::num::NonZeroU64;
+use std::path::Path;
+use std::path::PathBuf;
+use std::ptr;
+use std::rc::Rc;
+use std::sync::atomic::AtomicPtr;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+
+use clap::Args;
+use colored::Colorize;
+use hermit::Backend;
+use hermit::Context;
+use hermit::Error;
+use hermit::HermitData;
+use hermit::Shebang;
+use nix::sys::signal::SaFlags;
+use nix::sys::signal::SigAction;
+use nix::sys::signal::SigHandler;
+use nix::sys::signal::SigSet;
+use nix::sys::signal::Signal;
+use nix::sys::signal::sigaction;
+use reverie::process::Command;
+use reverie::process::Container;
+use reverie::process::ExitStatus;
+use reverie::process::Mount;
+use reverie::process::MountFlags;
+
+use super::container::IdentityGuard;
+use super::container::PlannedMount;
+use super::container::container_proc_mount;
+use super::container::identity_hardening_mounts;
+use super::container::namespace_container;
+use super::gdb_client::CLIENT_EXITED_BEFORE_CONNECTING;
+use super::gdb_client::GdbClientWatch;
+use super::global_opts::GlobalOpts;
+use super::record_envelope::RecordEnvelope;
+use super::run::BaseEnv;
+use super::run::NetworkingMode;
+use super::run::apply_base_environment;
+use super::run::is_elf_file;
+use super::run::parse_assignment;
+use super::run::path_resolution_visits_prefix;
+use super::verify::ComparedRun;
+use super::verify::ComparisonOptions;
+use super::verify::LogCompareStrictness;
+use super::verify::SecondRun;
+use super::verify::announce_verification_outcome;
+use super::verify::compare_two_runs;
+use super::verify::emit_compared_guest_output;
+use super::verify::setup_double_run;
+use super::verify::validate_log_level;
+use super::verify::write_pending_verification_json;
+use super::verify::write_verification_json;
+
+#[derive(Debug)]
+struct E9patchRecordOverlay {
+    source: PathBuf,
+    target: PathBuf,
+}
+
+static TIMEOUT_MESSAGE: AtomicPtr<u8> = AtomicPtr::new(ptr::null_mut());
+static TIMEOUT_MESSAGE_LEN: AtomicUsize = AtomicUsize::new(0);
+
+extern "C" fn recording_timeout_handler(_signal: libc::c_int) {
+    let len = TIMEOUT_MESSAGE_LEN.load(Ordering::Acquire);
+    let message = TIMEOUT_MESSAGE.load(Ordering::Acquire);
+    if !message.is_null() && len != 0 {
+        // SAFETY: `message` is leaked before the timer is armed, and fcntl(2),
+        // write(2), and _exit(2) are all async-signal-safe.
+        unsafe {
+            // Make stderr non-blocking before writing. If stderr is a pipe or
+            // socket whose buffer is full, a blocking write(2) would wedge the
+            // handler and never reach _exit, defeating the deadline. A dropped
+            // diagnostic is acceptable; a hung timeout is not.
+            let flags = libc::fcntl(libc::STDERR_FILENO, libc::F_GETFL);
+            if flags != -1 {
+                libc::fcntl(libc::STDERR_FILENO, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+            libc::write(libc::STDERR_FILENO, message.cast(), len);
+        }
+    }
+
+    // Exiting PID 1 tears down the isolated recording namespace and its tracees.
+    // SAFETY: _exit(2) is async-signal-safe and does not run Rust destructors.
+    unsafe { libc::_exit(124) }
+}
+
+struct RecordingDeadline {
+    previous_handler: SigAction,
+    // Whether SIGALRM was blocked in the inherited mask and must be re-blocked
+    // when the deadline is disarmed.
+    reblock_sigalrm: bool,
+}
+
+fn sigalrm_set() -> SigSet {
+    let mut set = SigSet::empty();
+    set.add(Signal::SIGALRM);
+    set
+}
+
+impl RecordingDeadline {
+    fn arm(timeout: Duration) -> Result<Self, Error> {
+        let seconds: libc::c_uint = timeout
+            .as_secs()
+            .try_into()
+            .map_err(|_| Error::msg("record timeout exceeds the platform alarm limit"))?;
+        let message = Box::leak(
+            format!(
+                "Error: Recording timed out after {} seconds; the recording container was terminated\n",
+                timeout.as_secs()
+            )
+            .into_boxed_str(),
+        );
+        TIMEOUT_MESSAGE.store(message.as_mut_ptr(), Ordering::Release);
+        TIMEOUT_MESSAGE_LEN.store(message.len(), Ordering::Release);
+
+        let action = SigAction::new(
+            SigHandler::Handler(recording_timeout_handler),
+            SaFlags::SA_RESETHAND,
+            SigSet::empty(),
+        );
+        // SAFETY: the handler uses only async-signal-safe operations and remains
+        // installed until this guard disarms the alarm.
+        let previous_handler = unsafe { sigaction(Signal::SIGALRM, &action) }?;
+
+        // A signal mask inherited from our parent may have SIGALRM blocked. If
+        // it is, the alarm signal stays perpetually pending and the handler
+        // never runs, silently disabling the deadline. Unblock SIGALRM so the
+        // alarm is deliverable, and remember to restore the original state.
+        let reblock_sigalrm = SigSet::thread_get_mask()
+            .map(|mask| mask.contains(Signal::SIGALRM))
+            .unwrap_or(false);
+        if reblock_sigalrm {
+            let _ = sigalrm_set().thread_unblock();
+        }
+
+        // SAFETY: the timeout is nonzero and fits c_uint.
+        unsafe { libc::alarm(seconds) };
+
+        Ok(Self {
+            previous_handler,
+            reblock_sigalrm,
+        })
+    }
+}
+
+impl Drop for RecordingDeadline {
+    fn drop(&mut self) {
+        // SAFETY: disarm the process-local alarm before restoring its handler.
+        unsafe {
+            libc::alarm(0);
+            let _ = sigaction(Signal::SIGALRM, &self.previous_handler);
+        }
+        // Restore SIGALRM to its inherited blocked state without disturbing the
+        // rest of the mask.
+        if self.reblock_sigalrm {
+            let _ = sigalrm_set().thread_block();
+        }
+        TIMEOUT_MESSAGE_LEN.store(0, Ordering::Release);
+        TIMEOUT_MESSAGE.store(ptr::null_mut(), Ordering::Release);
+    }
+}
+
+fn with_recording_deadline<T>(
+    timeout: Duration,
+    record: impl FnOnce() -> Result<T, Error>,
+) -> Result<T, Error> {
+    let _deadline = RecordingDeadline::arm(timeout)?;
+    record()
+}
+
+#[derive(Debug, Args, Clone)]
+#[clap(group(clap::ArgGroup::new("verification").args(["verify", "verify_run"])))]
+pub struct StartOpts {
+    /// Program to run.
+    #[clap(value_name = "PROGRAM", required = true)]
+    program: Option<PathBuf>,
+
+    /// The CPU the recorded guest sees: x86-64-v2 (the default) or x86-64-v3,
+    /// offered only on qualified ptrace hosts. The long help states what the
+    /// qualification leaves uncovered.
+    #[clap(long, value_enum, default_value_t, long_help = detcore_model::cpu_profile::CPU_PROFILE_LONG_HELP)]
+    cpu_profile: detcore_model::cpu_profile::CpuProfile,
+
+    /// Refuse to record (exit 122) on a host whose retired-conditional-branch counter
+    /// fails Reverie's performance-counter validation, as `hermit run --strict` does: the
+    /// ptrace record runtime reads its virtual clock and preemption points from that
+    /// counter, so a replay could diverge from its recording for a hardware reason
+    /// (https://github.com/rrnewton/hermit/issues/3810). That refusal is the flag's only
+    /// effect. Recording does NOT run under `run --strict`'s configuration: see
+    /// `hermit_cli::metadata::record_or_replay_config`, which deliberately sets
+    /// `virtualize_time: false`, `deterministic_io: false`, `passthru_opt: true` and
+    /// `panic_on_unsupported_syscalls: true`. A recorded guest therefore reads the REAL
+    /// host clock, and two independent recordings of the same program observe different
+    /// times. What `--verify` establishes is that a recording REPLAYS faithfully, not that
+    /// two independent recordings agree.
+    #[clap(long = "strict")]
+    strict: bool,
+
+    /// Arguments for the program.
+    #[clap(value_name = "ARGS")]
+    args: Vec<String>,
+
+    /// Additionally append one or more environment variables to the recorded
+    /// guest environment. If a name is provided without a value, pass that
+    /// variable through from the host.
+    #[clap(short = 'e', long, value_parser = parse_assignment, value_name = "name[=val]")]
+    env: Vec<(String, Option<String>)>,
+
+    /// The base environment presented to the recorded guest. This uses the
+    /// same contract as `hermit run`; record and replay must not diverge merely
+    /// because the manifest selected a different front door.
+    #[clap(long, default_value = "host", value_name = "str")]
+    base_env: BaseEnv,
+
+    /// Mount a file, directory, or fresh filesystem for recording and an immediate verify replay.
+    #[clap(long)]
+    mount: Vec<Mount>,
+
+    /// Select guest networking, with the same contract as `hermit run --network`. `local`
+    /// (the default) gives the recording and its verify replay an isolated loopback
+    /// interface; `host` exposes the host network to the recording. The choice is
+    /// stored in the recording, and `hermit replay --autopilot` replays in the same
+    /// network. `--verify-with-gdbex` defaults to, and requires, `host`: its replay's
+    /// gdbserver must be reachable from the gdb client outside the container.
+    #[clap(long, alias = "net", value_name = "local|host")]
+    network: Option<NetworkingMode>,
+
+    /// How much of `/proc` the recorded guest sees, as for `hermit run --proc`
+    /// (`minimal`, the default, or `standard`). The level is stored in the
+    /// recording, and its replay runs at it.
+    #[clap(
+        long = "proc",
+        default_value = "minimal",
+        value_name = "minimal|standard"
+    )]
+    proc: detcore_model::config::ProcLevel,
+
+    /// Set the working directory for both recording and replay after mounts apply.
+    #[clap(long, value_name = "path")]
+    workdir: Option<String>,
+
+    /// Directory where recorded syscall data is stored.
+    #[clap(long, value_name = "DIR", env = "HERMIT_DATA_DIR")]
+    data_dir: Option<PathBuf>,
+
+    /// Kill the recording if the guest does not finish within this many seconds.
+    #[clap(long, value_name = "SECONDS")]
+    record_timeout: Option<NonZeroU64>,
+
+    /// After recording, immediately replays the command to verify that it works.
+    /// This is useful for testing purposes where we often want to verify that
+    /// recording was successful.
+    ///
+    /// The recording is deleted if the replay was successful.
+    #[clap(long)]
+    verify: bool,
+
+    /// With --verify, write the verification verdict as a single JSON line to
+    /// this path: `{"verified":bool,"bitwise_parity":bool,
+    /// "verdict":"matched"|"diverged","comparison":{"strictness":
+    /// "stripped"|"canonical","display_name":str,"compare_logs":bool,
+    /// "compare_io_buffers":bool,
+    /// "log_scope":
+    /// "deterministic"|"info"|"full_trace","record_envelope":
+    /// "all_records_v1","strip_lines":bool,
+    /// "canonicalize_addresses":bool,"full_trace":bool,"exact_remainder":bool,
+    /// "stripped_prefixes":[str],"canonicalizations":[str],"ignore_lines":bool,
+    /// "skip_commit":bool,"skip_detlog":bool},"dbt_counted_branches":
+    /// {"left":int,"right":int},"guest_exit_code":int|null,
+    /// "guest_signal":int|null,"first_divergent_scheduler_turn":int|null,
+    /// "first_divergent_virtual_nanoseconds":int|null,
+    /// "first_divergent_record":int|null,"first_divergent_syscall":int|null}`.
+    /// `dbt_counted_branches` is present only when DBT completed a typed
+    /// whole-process comparison; it is omitted for other backends and no-result.
+    /// ALL FOUR divergence coordinates are emitted, and they are four
+    /// DIFFERENT KEYSPACES that must never be compared across axes: one real
+    /// divergence was record 7495, syscall 1074, scheduler turn 196 -- three
+    /// numbers for one event. A consumer that reads a subset silently drops
+    /// located evidence. This is the
+    /// exit-code-independent verdict
+    /// channel: `verified` reflects whether the record and replay runs matched,
+    /// regardless of what the guest exited with, so a caller need not (and must
+    /// not) infer the verdict from the process exit code. A record/replay parity
+    /// ratchet must key on `bitwise_parity`, NOT `verified`: `bitwise_parity` is
+    /// true only under the `canonical` (`BitwiseInfoV1`) policy — a full-INFO
+    /// comparison inside a named canonical record envelope that strips only the
+    /// real wall-clock prefix, canonicalizes host addresses to first-appearance
+    /// ordinals, includes syscall output-buffer hashes, and compares everything
+    /// else exactly (see --verify-strict) — rather than a stripped, content-blind,
+    /// or opaque filtered match.
+    #[clap(long, requires = "verify", value_name = "PATH")]
+    verify_json: Option<PathBuf>,
+
+    /// With --verify, compare the record and replay logs under the CANONICAL
+    /// parity policy: strip only the real wall-clock timestamp prefix, canonicalize
+    /// host memory addresses to first-appearance ordinals (tolerating an ASLR
+    /// shift while still diverging on allocation-order or aliasing changes), and
+    /// compare every INFO message's remaining bytes — virtual-time timestamps,
+    /// raw syscall argument/result values, counts, sizes, flags — exactly. An
+    /// explicit DEBUG/TRACE level remains captured for diagnostics but does not
+    /// change the INFO verdict. Without this the
+    /// default `--verify` normalizes away numbers, addresses, tmp paths, and
+    /// timestamps before comparing, so a "verified" result asserts only stripped
+    /// parity, not bitwise identity. A record/replay determinism ratchet keying on
+    /// the verdict should set this so it cannot be silently weakened to a stripped
+    /// comparison.
+    #[clap(long, requires = "verification")]
+    verify_strict: bool,
+
+    /// One half of `--verify`, written to NEW_DIR, which must not exist: the
+    /// recording, kept in NEW_DIR/recording, with its verification log, the
+    /// guest's output and a verify-run.json record of how it ended. With
+    /// `--verify-replay-of FIRST`, the replay of FIRST's recording instead.
+    /// `hermit log-diff --verify-json REPORT FIRST NEW_DIR` compares the two
+    /// as `--verify` compares its recording and replay, and writes the report
+    /// `--verify --verify-json` writes. Give both halves the same options.
+    #[clap(
+        long,
+        value_name = "NEW_DIR",
+        conflicts_with_all = ["verify", "gdbex"]
+    )]
+    verify_run: Option<PathBuf>,
+
+    /// With `--verify-run`, replay the recording in this `--verify-run`
+    /// directory, instead of recording.
+    #[clap(long, value_name = "FIRST", requires = "verify_run")]
+    verify_replay_of: Option<PathBuf>,
+
+    /// After recording, immediately replays the command to verify that it works
+    /// With provided gdb command (passed by `-ex`).
+    /// This is useful for testing purposes where we often want to verify that
+    /// recording was successful with gdbserver enabled.
+    ///
+    /// The recording is deleted if the replay was successful.
+    #[clap(long = "verify-with-gdbex", value_delimiter = ';')]
+    gdbex: Vec<String>,
+
+    /// Why this host's retired-branch counter is inexact, if it is. Only the
+    /// `--strict` refusal consults it; tests replace it to reach that refusal
+    /// on a host whose counters pass.
+    #[clap(skip = crate::host_capabilities::host_inexact_branch_counter as fn() -> Option<String>)]
+    inexact_branch_counter: fn() -> Option<String>,
+}
+
+impl StartOpts {
+    fn program(&self) -> &PathBuf {
+        self.program
+            .as_ref()
+            .expect("Clap requires PROGRAM unless a record management subcommand is selected")
+    }
+
+    fn record_timeout(&self) -> Option<Duration> {
+        self.record_timeout
+            .map(|seconds| Duration::from_secs(seconds.get()))
+    }
+
+    fn guest_command(&self) -> Result<Command, Error> {
+        let mut command = Command::new(self.program());
+        command.args(&self.args);
+        if let Some(workdir) = &self.workdir {
+            command.current_dir(workdir);
+        }
+        apply_base_environment(&mut command, &self.base_env, &self.env)?;
+        Ok(command)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-696): Review /proc magic-link rejection for record overlays.
+    fn resolve_e9patch_record_target(&self) -> Result<PathBuf, Error> {
+        let command = Command::new(self.program());
+        let resolved = command.find_program().with_context(|| {
+            format!(
+                "Could not resolve program {:?} in PATH for e9patch preprocessing",
+                self.program()
+            )
+        })?;
+        if path_resolution_visits_prefix(&resolved, Path::new("/proc"))? {
+            anyhow::bail!(
+                "e9patch cannot safely overlay executable {} because its path resolves through \
+                 /proc; use the executable's stable filesystem path",
+                self.program().display()
+            );
+        }
+        fs::canonicalize(&resolved).with_context(|| {
+            format!(
+                "failed to resolve e9patch executable {}",
+                resolved.display()
+            )
+        })
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-696): Review e9patch record preparation and executable overlaying.
+    fn prepare_e9patch_overlay(
+        &self,
+        global: &GlobalOpts,
+    ) -> Result<Option<E9patchRecordOverlay>, Error> {
+        if global.backend != Some(Backend::E9patch) {
+            return Ok(None);
+        }
+
+        #[cfg(not(feature = "e9patch"))]
+        Backend::E9patch.ensure_available()?;
+        Backend::Ptrace.ensure_available()?;
+        let target = self.resolve_e9patch_record_target()?;
+        if !is_elf_file(&target)? {
+            eprintln!(
+                ":: Backend: e9patch preprocessing + ptrace record runtime; mapped_sites=0; \
+                 main_executable=non-ELF; preprocessing=not-applicable"
+            );
+            return Ok(None);
+        }
+        if let Some(reason) = hermit::e9patch::unavailable_reason() {
+            anyhow::bail!("backend `e9patch` is unavailable: {reason}");
+        }
+
+        let prepared = hermit::e9patch::prepare(&target)?;
+        let rewrite_cache = if prepared.patched_sites == 0 {
+            "not-applicable"
+        } else if prepared.rewrite_cache_hit {
+            "hit"
+        } else {
+            "miss"
+        };
+        eprintln!(
+            ":: Backend: e9patch preprocessing + ptrace record runtime; candidate_sites={}; \
+             mapped_sites={}; b0_sites={}; instruction_map_cache={:?}; rewrite_cache={}; \
+             artifact_sha256={}",
+            prepared.candidate_sites,
+            prepared.patched_sites,
+            prepared.b0_sites,
+            prepared.instruction_map_cache_status,
+            rewrite_cache,
+            prepared.artifact_sha256.as_deref().unwrap_or("none"),
+        );
+
+        Ok(
+            (prepared.patched_sites != 0).then_some(E9patchRecordOverlay {
+                source: prepared.binary,
+                target,
+            }),
+        )
+    }
+
+    /// Whether this invocation replays its recording under a gdbserver.
+    fn replays_under_gdb(&self) -> bool {
+        !self.verify && !self.gdbex.is_empty()
+    }
+
+    /// The network the recording (and an immediate replay of it) runs in.
+    fn network(&self) -> NetworkingMode {
+        self.network.unwrap_or(if self.replays_under_gdb() {
+            NetworkingMode::Host
+        } else {
+            NetworkingMode::Local
+        })
+    }
+
+    /// A replay served to gdb runs on the host network, where the gdb client
+    /// can reach its gdbserver port, so the recording it checks must too.
+    fn check_gdb_replay_network(&self) -> Result<(), Error> {
+        if self.replays_under_gdb() && self.network() == NetworkingMode::Local {
+            anyhow::bail!(
+                "--verify-with-gdbex replays under a gdbserver that the gdb client reaches \
+                 on the host network, so the recording must use the same network; \
+                 --network local is not supported with it"
+            );
+        }
+        Ok(())
+    }
+
+    fn configured_container(
+        &self,
+        network: NetworkingMode,
+    ) -> Result<(Container, IdentityGuard), Error> {
+        let mut container = namespace_container(true);
+        network.configure(&mut container, false);
+        let (mut identity_mounts, mut identity_guard) = identity_hardening_mounts()?;
+        for mount in &self.mount {
+            let user_target = mount.get_target();
+            identity_guard.discard_mounts_shadowed_by(&mut identity_mounts, user_target);
+            if mount.get_source().is_some() && super::container::is_bind_mount(mount) {
+                identity_guard.add_user_bind(user_target, None);
+            }
+        }
+        // The mount plan, `/proc` first, installed by the container's setup
+        // and recorded in its init (`IdentityGuard::record_plan`).
+        let mut plan = vec![PlannedMount::hermit(container_proc_mount())];
+        plan.extend(identity_mounts.into_iter().map(PlannedMount::hermit));
+        plan.extend(self.mount.iter().cloned().map(PlannedMount::hermit));
+        identity_guard.set_plan(&mut container, plan)?;
+        if let Some(workdir) = &self.workdir {
+            container.current_dir(workdir);
+        }
+        Ok((container, identity_guard))
+    }
+
+    fn recording_container(
+        &self,
+        global: &GlobalOpts,
+    ) -> Result<(Container, IdentityGuard), Error> {
+        let overlay = self.prepare_e9patch_overlay(global)?;
+        let (mut container, mut identity_guard) = self.configured_container(self.network())?;
+        if let Some(overlay) = overlay {
+            // The rewritten program over its original path: e9patch's own
+            // mounts, which the guest's mount table leaves out.
+            identity_guard.add_backend_mounts(
+                &mut container,
+                [
+                    Mount::bind(&overlay.source, &overlay.target).readonly(),
+                    Mount::new(overlay.target).flags(
+                        MountFlags::MS_BIND | MountFlags::MS_REMOUNT | MountFlags::MS_RDONLY,
+                    ),
+                ],
+            )?;
+        }
+        Ok((container, identity_guard))
+    }
+
+    /// The `--verify-json` path this invocation will publish a verdict to, if
+    /// any. See `RunOpts::verify_json_path`: the stamp must precede the
+    /// top-level preflight, not merely `record_verify`'s first statement.
+    pub(crate) fn verify_json_path(&self) -> Option<&Path> {
+        self.verify.then_some(self.verify_json.as_deref()).flatten()
+    }
+
+    /// `--strict` on a host whose retired-branch counter is inexact: refused,
+    /// with `hermit run --strict`'s message. Every recording runs on the ptrace
+    /// record runtime, with or without e9patch preprocessing, and both read the
+    /// virtual clock from that counter, so unlike `run` there is no backend to
+    /// exempt.
+    fn refuse_strict_with_inexact_branch_counter(&self, global: &GlobalOpts) -> Result<(), Error> {
+        if !self.strict {
+            return Ok(());
+        }
+        crate::run::refuse_an_inexact_branch_counter(
+            global.backend.unwrap_or_default(),
+            self.inexact_branch_counter,
+        )
+    }
+
+    pub fn main(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+        hermit::cpu_profile_admission::check_record_or_replay(self.cpu_profile).map_err(
+            |refusal| Error::new(crate::container::PolicyRefusal).context(refusal.to_string()),
+        )?;
+        if self.cpu_profile == detcore_model::cpu_profile::CpuProfile::X86_64V3 {
+            super::verify::CPU_PROFILE_V3_RAN.store(true, std::sync::atomic::Ordering::SeqCst);
+            // Qualify here, before any container: a refusal ends the command at
+            // once, and the recorder and replayer reuse the result.
+            let request = hermit::cpu_profile_admission::record_or_replay_request(false);
+            hermit::cpu_profile_admission::admit(&request).map_err(|refusal| {
+                Error::new(crate::container::PolicyRefusal)
+                    .context(format!("--cpu-profile x86-64-v3 refused: {refusal}"))
+            })?;
+        }
+        if self.verify {
+            validate_log_level(global)?;
+            self.record_verify(global)
+        } else if let Some(directory) = &self.verify_run {
+            validate_log_level(global)?;
+            self.record_verify_run(directory, global)
+        } else if !self.gdbex.is_empty() {
+            self.refuse_strict_with_inexact_branch_counter(global)?;
+            self.record_verify_debug(global)
+        } else {
+            self.refuse_strict_with_inexact_branch_counter(global)?;
+            let hermit = HermitData::from(self.data_dir.as_ref());
+            let record_timeout = self.record_timeout();
+            let local_networking = self.network() == NetworkingMode::Local;
+            let proc_level = self.proc;
+
+            let (mut container, identity_guard) = self.recording_container(global)?;
+
+            // Parent-owned for BOTH deadline and unbounded spellings. No
+            // metadata/last-id commit occurs before real successful completion.
+            let data = hermit.create_recording_dir()?;
+            let resources = format!("recording {} and identity mounts", data.path().display());
+            let options = self.clone();
+            let global = global.clone();
+            let (exit_status, (data, _identity)) = super::owned_container::run(
+                &mut container,
+                (data, identity_guard),
+                resources,
+                true,
+                if record_timeout.is_some() {
+                    "record.main.deadline"
+                } else {
+                    "record.main"
+                },
+                None,
+                move |(data, identity)| {
+                    let _guard = global.init_tracing();
+                    identity.record_plan()?;
+                    let command = options.guest_command()?;
+                    let mountinfo = identity.mount_provenance()?;
+                    match record_timeout {
+                        Some(timeout) => with_recording_deadline(timeout, || {
+                            hermit::record_to_with_mountinfo(
+                                command,
+                                data.path(),
+                                mountinfo,
+                                local_networking,
+                                proc_level,
+                                options.cpu_profile,
+                            )
+                        }),
+                        None => hermit::record_to_with_mountinfo(
+                            command,
+                            data.path(),
+                            mountinfo,
+                            local_networking,
+                            proc_level,
+                            options.cpu_profile,
+                        ),
+                    }
+                },
+            )?;
+            let recording = hermit.commit_recording(data, exit_status)?;
+            // The recording also gets a manifest, the one format every kind of
+            // recording shares (https://github.com/rrnewton/hermit/issues/4271).
+            // `hermit replay` still reads metadata.json, which stays beside it.
+            if let Err(error) =
+                write_full_record_manifest(&hermit, recording.id, recording.exit_status)
+            {
+                eprintln!(
+                    "hermit record: WARNING: the recording's manifest was not written: {error:#}"
+                );
+            }
+
+            eprintln!("\n{}\n", "RECORDING COMPLETE!".yellow().bold());
+            // A v3 recording replays only to the end: a GDB- or DAP-served
+            // replay runs a gdbserver, which v3 refuses.
+            let autopilot_only =
+                self.cpu_profile == detcore_model::cpu_profile::CpuProfile::X86_64V3;
+            for (label, command) in
+                replay_hint_commands(&recording.id.to_string(), self.data_dir.as_deref())
+                    .into_iter()
+                    .take(if autopilot_only { 1 } else { 3 })
+            {
+                eprintln!(
+                    "{}:\n\n    {}\n",
+                    label.yellow().bold(),
+                    command.blue().bold()
+                );
+            }
+
+            Ok(recording.exit_status)
+        }
+    }
+
+    /// This is called when `--verify` is passed to the command line.
+    fn record_verify(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+        // `record start` runs on the ptrace record runtime, whose virtual clock
+        // is the retired-branch counter, and installs no PMU configuration of
+        // its own, so Reverie's validation can run here.
+        if self.verify_json.is_some() {
+            crate::verify::record_exact_branch_counter(crate::run::branch_counter_verdict());
+        }
+        // Stamp an explicit no-result BEFORE any fallible work: the record and
+        // replay steps below can fail long before a verdict exists, and a reused
+        // --verify-json path must never keep showing a previous invocation's
+        // green as though it described this one.
+        if let Some(path) = &self.verify_json {
+            write_pending_verification_json(path)?;
+        }
+        // After the pending report carries the counter verdict, so that a
+        // refused recording still says which counter it would have read.
+        self.refuse_strict_with_inexact_branch_counter(global)?;
+        let strictness = self.verification_strictness();
+        let ((global1, log1), (global2, log2)) =
+            setup_double_run(global, "record", "replay", strictness)
+                .context("Failed to create verification log files")?;
+
+        let (mut recording_container, record_identity_guard) = self.recording_container(global)?;
+
+        eprintln!(":: {}", "Recording...".yellow().bold());
+
+        let temp_data_dir = tempfile::tempdir()?;
+        let resources = format!(
+            "verification recording {}, identity mounts and both logs",
+            temp_data_dir.path().display()
+        );
+        let record_timeout = self.record_timeout();
+        let local_networking = self.network() == NetworkingMode::Local;
+        let proc_level = self.proc;
+        let options = self.clone();
+        let record_global = global1.clone();
+        let (recording, (temp_data_dir, _record_identity, log1, log2)) =
+            super::owned_container::run(
+                &mut recording_container,
+                (temp_data_dir, record_identity_guard, log1, log2),
+                resources.clone(),
+                true,
+                "record_verify.record",
+                None,
+                move |(data, identity, _, _)| {
+                    let _guard = record_global.init_tracing();
+                    identity.record_plan()?;
+                    let command = options.guest_command()?;
+                    let mountinfo = identity.mount_provenance()?;
+                    match record_timeout {
+                        Some(timeout) => with_recording_deadline(timeout, || {
+                            hermit::record_with_output_with_mountinfo(
+                                command,
+                                data.path(),
+                                mountinfo,
+                                local_networking,
+                                proc_level,
+                                options.cpu_profile,
+                            )
+                        }),
+                        None => hermit::record_with_output_with_mountinfo(
+                            command,
+                            data.path(),
+                            mountinfo,
+                            local_networking,
+                            proc_level,
+                            options.cpu_profile,
+                        ),
+                    }
+                },
+            )?;
+        eprintln!(":: {}", "Replaying...".yellow().bold());
+        let (mut replay_container, replay_identity) = self.configured_container(self.network())?;
+        let mounts = self.mount.clone();
+        let replay_global = global2.clone();
+        let (replay, (_data, _identity, log1, log2)) = super::owned_container::run(
+            &mut replay_container,
+            (temp_data_dir, replay_identity, log1, log2),
+            resources,
+            true,
+            "record_verify.replay",
+            None,
+            move |(data, _, _, _)| {
+                let _guard = replay_global.init_tracing();
+                hermit::replay_with_output_and_mounts(data.path(), &mounts)
+            },
+        )?;
+
+        conclude_record_replay(
+            [&recording, &replay],
+            [log1.into_temp_path(), log2.into_temp_path()],
+            strictness,
+            self.verify_json.as_deref(),
+            false,
+        )
+    }
+
+    fn verification_strictness(&self) -> LogCompareStrictness {
+        if self.verify_strict {
+            LogCompareStrictness::Canonical
+        } else {
+            LogCompareStrictness::Stripped
+        }
+    }
+
+    /// `record start --verify-run DIR`: one half of `--verify`, the recording
+    /// or (`--verify-replay-of`) its replay, run as `record_verify` runs it,
+    /// with what its comparison reads written to DIR (`verify_run`).
+    fn record_verify_run(
+        &self,
+        directory: &Path,
+        global: &GlobalOpts,
+    ) -> Result<ExitStatus, Error> {
+        use super::verify_run;
+
+        let strictness = self.verification_strictness();
+        let first = self
+            .verify_replay_of
+            .as_deref()
+            .map(verify_run::VerifyRunDirectory::read)
+            .transpose()?;
+        if let Some(first) = &first {
+            first.recording()?;
+        }
+        let writer = verify_run::VerifyRunWriter::create(directory)?;
+        let log_path = writer.path(verify_run::LOG);
+        fs::File::create_new(&log_path)
+            .with_context(|| format!("creating the verification log {}", log_path.display()))?;
+        let mut run_global = global.clone();
+        run_global.log_file = Some(log_path);
+        run_global.log = Some(super::verify::verification_log_level(
+            global.log, strictness, false,
+        ));
+        let exact_branch_counter = crate::run::branch_counter_verdict();
+        let result = match &first {
+            None => self
+                .refuse_strict_with_inexact_branch_counter(global)
+                .and_then(|()| self.record_into(&writer.path(verify_run::RECORDING), &run_global)),
+            Some(first) => {
+                self.replay_from(&first.directory().join(verify_run::RECORDING), &run_global)
+            }
+        };
+        let (outcome, result) = match result {
+            Ok(output) => {
+                writer.write(verify_run::STDOUT, &output.stdout)?;
+                writer.write(verify_run::STDERR, &output.stderr)?;
+                (
+                    verify_run::VerifyRunOutcome::Completed {
+                        status: verify_run::recorded_status(output.status),
+                        skid_overshoots: 0,
+                        forwarded_syscalls: None,
+                    },
+                    Ok(output.status),
+                )
+            }
+            Err(error) => (crate::run::verify_run_outcome_of(&error), Err(error)),
+        };
+        writer.commit(&verify_run::VerifyRunRecord {
+            schema: verify_run::SCHEMA,
+            backend: global.backend.unwrap_or_default().as_str().to_string(),
+            comparison: verify_run::RecordedComparison {
+                strictness,
+                diagnostic_full_trace: false,
+                compare_io_buffers: hermit::RECORD_REPLAY_HASHES_IO_BUFFERS,
+                virtualize_time: hermit::RECORD_REPLAY_VIRTUALIZES_TIME,
+            },
+            passthru_opt: false,
+            epoch: verify_run::RECORDING_EPOCH.into(),
+            exact_branch_counter: Some(exact_branch_counter),
+            dbt: None,
+            role: if first.is_some() {
+                verify_run::RunRole::Replay
+            } else {
+                verify_run::RunRole::Record
+            },
+            outcome,
+        })?;
+        result
+    }
+
+    /// Record the guest into `data`, as `record_verify` records it.
+    fn record_into(
+        &self,
+        data: &Path,
+        global: &GlobalOpts,
+    ) -> Result<reverie::process::Output, Error> {
+        fs::create_dir(data).with_context(|| format!("creating {}", data.display()))?;
+        let (mut container, identity_guard) = self.recording_container(global)?;
+        eprintln!(":: {}", "Recording...".yellow().bold());
+        let record_timeout = self.record_timeout();
+        let local_networking = self.network() == NetworkingMode::Local;
+        let proc_level = self.proc;
+        let options = self.clone();
+        let record_global = global.clone();
+        let data = data.to_owned();
+        let resources = format!(
+            "verification recording {} and identity mounts",
+            data.display()
+        );
+        let (recording, _identity) = super::owned_container::run(
+            &mut container,
+            identity_guard,
+            resources,
+            true,
+            "record_verify_run.record",
+            None,
+            move |identity| {
+                let _guard = record_global.init_tracing();
+                identity.record_plan()?;
+                let command = options.guest_command()?;
+                let mountinfo = identity.mount_provenance()?;
+                match record_timeout {
+                    Some(timeout) => with_recording_deadline(timeout, || {
+                        hermit::record_with_output_with_mountinfo(
+                            command,
+                            &data,
+                            mountinfo,
+                            local_networking,
+                            proc_level,
+                            options.cpu_profile,
+                        )
+                    }),
+                    None => hermit::record_with_output_with_mountinfo(
+                        command,
+                        &data,
+                        mountinfo,
+                        local_networking,
+                        proc_level,
+                        options.cpu_profile,
+                    ),
+                }
+            },
+        )?;
+        Ok(recording)
+    }
+
+    /// Replay the recording in `data`, as `record_verify` replays it.
+    fn replay_from(
+        &self,
+        data: &Path,
+        global: &GlobalOpts,
+    ) -> Result<reverie::process::Output, Error> {
+        eprintln!(":: {}", "Replaying...".yellow().bold());
+        let (mut container, identity) = self.configured_container(self.network())?;
+        let mounts = self.mount.clone();
+        let replay_global = global.clone();
+        let data = data.to_owned();
+        let resources = format!("verification replay {} and identity mounts", data.display());
+        let (replay, _identity) = super::owned_container::run(
+            &mut container,
+            identity,
+            resources,
+            true,
+            "record_verify_run.replay",
+            None,
+            move |_| {
+                let _guard = replay_global.init_tracing();
+                hermit::replay_with_output_and_mounts(&data, &mounts)
+            },
+        )?;
+        Ok(replay)
+    }
+
+    /// This is called when `--verify-with-gdbex` is passed to the command line.
+    fn record_verify_debug(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+        self.check_gdb_replay_network()?;
+        let (mut container, identity_guard) = self.recording_container(global)?;
+
+        eprintln!(":: {}", "Recording...".yellow().bold());
+
+        let temp_data_dir = tempfile::tempdir()?;
+        let record_timeout = self.record_timeout();
+        let local_networking = self.network() == NetworkingMode::Local;
+        let proc_level = self.proc;
+        let options = self.clone();
+        let record_global = global.clone();
+        let resources = format!(
+            "debug recording {}, identity mounts and GDB watcher",
+            temp_data_dir.path().display()
+        );
+        let (_, (temp_data_dir, _identity)) = super::owned_container::run(
+            &mut container,
+            (temp_data_dir, identity_guard),
+            resources.clone(),
+            true,
+            "record_verify_debug.record",
+            None,
+            move |(data, identity)| {
+                let _guard = record_global.init_tracing();
+                identity.record_plan()?;
+                let command = options.guest_command()?;
+                let mountinfo = identity.mount_provenance()?;
+                match record_timeout {
+                    Some(timeout) => with_recording_deadline(timeout, || {
+                        hermit::record_to_with_mountinfo(
+                            command,
+                            data.path(),
+                            mountinfo,
+                            local_networking,
+                            proc_level,
+                            options.cpu_profile,
+                        )
+                    }),
+                    None => hermit::record_to_with_mountinfo(
+                        command,
+                        data.path(),
+                        mountinfo,
+                        local_networking,
+                        proc_level,
+                        options.cpu_profile,
+                    ),
+                }
+            },
+        )?;
+        let data_dir = temp_data_dir.path();
+
+        eprintln!(":: {}", "Replaying...".yellow().bold());
+
+        // Find the path to the executable so that GDB can use it to resolve
+        // symbols.
+        let exe = data_dir.join("exe");
+        let real_exe = Shebang::new(&exe).map_or(exe, |s| s.interpreter().into());
+
+        // Not using fixed port (such as 1234) here because this is mainly
+        // intended for tests, which could be running in parallel. This could
+        // be flakey when port is already in use.
+        let gdbserver_port = 16384 + nix::unistd::gettid().as_raw() as u16 % 1024;
+
+        // Run the gdb client outside of the PID namespace. This cannot be done
+        // inside of the PID namespace because it would perturb the
+        // deterministic PID allocation that is needed for the replay.
+        let mut gdb_command = std::process::Command::new("gdb");
+        gdb_command
+            .arg(real_exe)
+            .arg("-quiet")
+            .arg("-iex")
+            // don't prompt (dialog) when breakpoint symbol doesn't exist.
+            .arg("set breakpoint pending on")
+            .arg("-ex")
+            .arg(format!("target remote :{}", gdbserver_port));
+        for ex in &self.gdbex {
+            gdb_command.arg("-ex").arg(ex);
+        }
+        // Make sure gdb always exit.
+        gdb_command.arg("-batch");
+        gdb_command.arg("--return-child-result");
+
+        // TODO: For replay, we ought to construct the container from
+        // `metadata.json`. That logic belongs in `hermit::replay`, but we have
+        // to initialize logging inside the container because it may spawn a
+        // thread. If we can guarantee that tracing won't spawn a thread, then
+        // that restriction be lifted.
+        // ⚠️ HAND THE CLIENT OVER BEFORE THE CONTAINER STARTS. The gdbserver
+        // inside the container waits for this process with an UNBOUNDED accept,
+        // so if it has already died the container blocks forever -- and the
+        // `gdb_client.wait()` that would have noticed used to sit BELOW the `?`
+        // on that container result, unreachable in exactly the case that needed
+        // it. The watch owns the reap and releases the accept.
+        let gdb_watch = GdbClientWatch::spawn(gdb_command, gdbserver_port)?;
+        // The gdb client runs outside the container, so the replay's gdbserver
+        // port must live in the host network namespace, which `network()`
+        // guarantees the recording also used.
+        let (mut container, identity) = self.configured_container(self.network())?;
+        let guards = Rc::new(RefCell::new((temp_data_dir, identity, gdb_watch)));
+        let replay_global = global.clone();
+        let mounts = self.mount.clone();
+        let result = super::owned_container::run(
+            &mut container,
+            Rc::clone(&guards),
+            resources,
+            true,
+            "record_verify_debug.replay",
+            None,
+            move |guards| {
+                let _guard = replay_global.init_tracing();
+                hermit::replay_with_gdbserver_and_mounts(
+                    guards.borrow().0.path(),
+                    gdbserver_port,
+                    &mounts,
+                )
+            },
+        );
+        if result.as_ref().is_err_and(|e| {
+            e.downcast_ref::<super::owned_container::ParentCleanupUnconfirmed>()
+                .is_some()
+        }) {
+            return result.map(|(status, _)| status);
+        }
+        let finished = guards.borrow_mut().2.finish();
+        match (result, finished) {
+            (Ok((status, _)), Ok(_)) => Ok(status),
+            (Ok(_), Err(watcher)) => Err(watcher),
+            (Err(primary), Err(watcher)) => {
+                Err(primary.context(format!("GDB watcher also failed: {watcher:#}")))
+            }
+            (Err(primary), Ok(true)) => Err(primary.context(CLIENT_EXITED_BEFORE_CONNECTING)),
+            (Err(primary), Ok(false)) => Err(primary),
+        }
+    }
+}
+
+/// The replay commands offered after a successful `hermit record start`, as
+/// `(label, command)` pairs in the order they are printed.
+///
+/// Plain playback comes first because a bare `hermit replay` starts an
+/// interactive GDB session (see `ReplayOpts::main`), which is a debugging
+/// tool, not the way to watch a recording run again. `--autopilot` replays to
+/// the end without a debugger. `--dap-listen` serves the replay to an editor
+/// or another Debug Adapter Protocol client, with stepBack (DEBUGGING.md). A
+/// recording made with `--data-dir` (or `HERMIT_DATA_DIR`) is only found by a
+/// replay given the same directory, so the directory is repeated in every
+/// command.
+/// Writes `DATA/<id>/manifest.json` for the syscall recording `id`, from its
+/// metadata: the guest command, the recording's `RECORD_VERSION`, and how the
+/// guest ended. A syscall recording draws no input from the host that it
+/// does not record, so its `inputs` are empty.
+fn write_full_record_manifest(
+    hermit: &HermitData,
+    id: hermit::Id,
+    exit_status: ExitStatus,
+) -> Result<(), Error> {
+    use super::manifest;
+    let metadata = hermit.recording_metadata(id)?;
+    let mut document = manifest::Manifest::new(
+        id,
+        manifest::Kind::FullSyscall,
+        manifest::Command {
+            program: Some(metadata.program.clone()),
+            args: metadata.args.clone(),
+            cwd: metadata.current_dir.to_str().map(str::to_owned),
+        },
+        manifest::Inputs {
+            global: Default::default(),
+            run: Default::default(),
+            host_drawn: Default::default(),
+        },
+    );
+    document.exit = Some(manifest::Exit::from_status(exit_status));
+    document.artifacts = Some(manifest::Artifacts {
+        network_trace: None,
+        syscall_recording: Some(manifest::SyscallRecording {
+            record_version: serde_json::to_value(metadata.version)?,
+            metadata: hermit::RECORDING_METADATA_NAME.to_owned(),
+        }),
+    });
+    manifest::write(
+        &hermit
+            .data_dir()
+            .join(id.to_string())
+            .join(manifest::MANIFEST_NAME),
+        &document,
+    )
+}
+
+/// Compare a recording with its replay, publish the report to `verify_json`,
+/// announce the verdict and return the status `record start --verify` exits
+/// with. `record start --verify` reaches it after its replay, and `hermit
+/// log-diff --verify-json` after reading the two `--verify-run` directories,
+/// whose logs it owns (`caller_owns_logs`).
+pub(super) fn conclude_record_replay(
+    [recording, replay]: [&reverie::process::Output; 2],
+    [log1, log2]: [tempfile::TempPath; 2],
+    strictness: LogCompareStrictness,
+    verify_json: Option<&Path>,
+    caller_owns_logs: bool,
+) -> Result<ExitStatus, Error> {
+    let outcome = compare_two_runs(
+        ComparedRun {
+            output: recording,
+            log: log1,
+            label: "the recording",
+        },
+        ComparedRun {
+            output: replay,
+            log: log2,
+            label: "the replay",
+        },
+        ComparisonOptions {
+            verbose: false,
+            strictness,
+            compare_logs: true,
+            diagnostic_full_trace: false,
+            // Recording DOES enable the syscall output-buffer hash, so a
+            // replay verdict here is a content-parity claim. It was not
+            // before: this line and the recorder's own setting were two
+            // independent hard-coded `false`s, and they are now one
+            // constant precisely so they cannot drift apart again. See its
+            // doc on `RECORD_REPLAY_HASHES_IO_BUFFERS`.
+            compare_io_buffers: hermit::RECORD_REPLAY_HASHES_IO_BUFFERS,
+            // Disclose the time policy this path actually runs under. It is
+            // the SAME constant `record_or_replay_config` uses, so the report
+            // cannot describe a policy the run did not use.
+            virtualize_time: hermit::RECORD_REPLAY_VIRTUALIZES_TIME,
+            keep_logs: false,
+            match_overridden: false,
+            failed_log_retention: (!caller_owns_logs)
+                .then(super::verify::default_failed_verify_log_retention),
+            record_envelope: RecordEnvelope::all_records_v1(),
+            caller_owns_logs,
+        },
+    )?;
+
+    // Emit the machine-readable verdict (if requested) before collapsing the
+    // outcome to the historical exit-code convention, so the verdict is
+    // recorded whether or not the runs matched and independent of the guest's
+    // own exit status.
+    if let Some(path) = verify_json {
+        write_verification_json(path, &outcome)?;
+    }
+    announce_verification_outcome(
+        &outcome,
+        SecondRun::Replay,
+        "Success: replay matched recording.",
+        "Recording output did not match replay output!",
+    );
+    emit_compared_guest_output(outcome.verified(), recording, replay)?;
+
+    outcome.into_exit_status()
+}
+
+fn replay_hint_commands(id: &str, data_dir: Option<&Path>) -> [(&'static str, String); 3] {
+    let data_dir = data_dir.map_or_else(String::new, |dir| {
+        format!(" --data-dir={}", shell_words::quote(&dir.to_string_lossy()))
+    });
+    [
+        (
+            "To replay it to the end",
+            format!("hermit replay --autopilot{data_dir} {id}"),
+        ),
+        (
+            "To replay it under GDB for debugging",
+            format!("hermit replay{data_dir} {id}"),
+        ),
+        (
+            "To debug it from an editor or another DAP client, with stepBack",
+            format!("hermit replay --dap-listen=4711{data_dir} {id}"),
+        ),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completion_hint_offers_plain_playback_before_the_gdb_session() {
+        let id = "0123456789abcdef0123456789abcdef";
+        let [(plain_label, plain), (gdb_label, gdb), (dap_label, dap)] =
+            replay_hint_commands(id, None);
+        assert_eq!(plain, format!("hermit replay --autopilot {id}"));
+        assert_eq!(plain_label, "To replay it to the end");
+        assert_eq!(gdb, format!("hermit replay {id}"));
+        assert!(gdb_label.contains("GDB"), "{gdb_label}");
+        assert_eq!(dap, format!("hermit replay --dap-listen=4711 {id}"));
+        assert!(dap_label.contains("DAP"), "{dap_label}");
+
+        let [(_, plain), (_, gdb), (_, dap)] =
+            replay_hint_commands(id, Some(Path::new("/data/my recordings")));
+        assert_eq!(
+            plain,
+            format!("hermit replay --autopilot --data-dir='/data/my recordings' {id}")
+        );
+        assert_eq!(
+            gdb,
+            format!("hermit replay --data-dir='/data/my recordings' {id}")
+        );
+
+        // Every offered command must parse as a real `hermit replay`
+        // invocation, and only the plain one may select autopilot (no GDB).
+        use clap::CommandFactory;
+        for (command, autopilot) in [(&plain, true), (&gdb, false), (&dap, false)] {
+            let matches = crate::Args::command()
+                .try_get_matches_from(shell_words::split(command).unwrap())
+                .unwrap_or_else(|e| panic!("{command}: {e}"));
+            let replay = matches.subcommand_matches("replay").expect(command);
+            assert_eq!(replay.get_flag("autopilot"), autopilot, "{command}");
+            assert_eq!(
+                replay.get_one::<PathBuf>("data_dir"),
+                Some(&PathBuf::from("/data/my recordings")),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn replay_report_is_published_before_success_is_announced() {
+        let source = include_str!("record_start.rs");
+        let verification = source
+            .split_once("let outcome = compare_two_runs(")
+            .expect("record/replay comparison")
+            .1;
+        let publish = verification
+            .find("write_verification_json(path, &outcome)")
+            .expect("verification report publication");
+        let announce = verification
+            .find("announce_verification_outcome(")
+            .expect("verification announcement");
+        assert!(publish < announce);
+        // The second half of record-mode verification is a replay, so its match
+        // line must use the replay wording for the time note.
+        let call = &verification[announce..];
+        let call = &call[..call.find(");").expect("end of announcement call")];
+        assert!(call.contains("SecondRun::Replay"), "{call}");
+    }
+
+    fn start_options(env: Vec<(String, Option<String>)>) -> StartOpts {
+        StartOpts {
+            program: Some(PathBuf::from("/bin/true")),
+            cpu_profile: Default::default(),
+            strict: false,
+            args: Vec::new(),
+            env,
+            base_env: BaseEnv::Host,
+            mount: Vec::new(),
+            network: None,
+            proc: Default::default(),
+            workdir: None,
+            data_dir: None,
+            record_timeout: None,
+            verify: false,
+            verify_json: None,
+            verify_strict: false,
+            verify_run: None,
+            verify_replay_of: None,
+            gdbex: Vec::new(),
+            inexact_branch_counter: || None,
+        }
+    }
+
+    /// `record start --strict` refuses an inexact retired-branch counter
+    /// before it records anything, on each of `main`'s three recording paths
+    /// (https://github.com/rrnewton/hermit/issues/3810). The recordings would
+    /// go to a fresh data directory, which must stay empty.
+    #[test]
+    fn strict_record_refuses_an_inexact_branch_counter_before_it_records() {
+        let global = <GlobalOpts as clap::Parser>::parse_from(["hermit"]);
+        let data_dir = tempfile::tempdir().unwrap();
+        for path in ["record", "verify", "verify-with-gdbex"] {
+            let mut options = start_options(Vec::new());
+            options.strict = true;
+            options.data_dir = Some(data_dir.path().to_path_buf());
+            match path {
+                "verify" => options.verify = true,
+                "verify-with-gdbex" => options.gdbex = vec!["continue".to_string()],
+                _ => {}
+            }
+            options.inexact_branch_counter = || Some("SpecLockMap is enabled".to_string());
+            let error = options.main(&global).expect_err(path);
+            assert!(
+                error
+                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .is_some(),
+                "{path}: {error:#}"
+            );
+            let message = error.to_string();
+            for expected in [
+                "--strict",
+                "`ptrace` backend",
+                "SpecLockMap is enabled",
+                "CPU ",
+                "issues/3794",
+            ] {
+                assert!(
+                    message.contains(expected),
+                    "{path}: {expected:?}: {message}"
+                );
+            }
+        }
+        assert_eq!(
+            fs::read_dir(data_dir.path()).unwrap().count(),
+            0,
+            "a refused recording leaves nothing behind"
+        );
+    }
+
+    /// The refusal needs `--strict` and an inexact counter, and covers e9patch
+    /// preprocessing, which records on the same ptrace runtime and counter.
+    #[test]
+    fn record_refusal_needs_strict_and_an_inexact_counter() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[clap(flatten)]
+            start: StartOpts,
+        }
+        let parse = |args: &[&str]| <Cli as clap::Parser>::try_parse_from(args).unwrap().start;
+        let ptrace = <GlobalOpts as clap::Parser>::parse_from(["hermit"]);
+        let unreachable = || -> Option<String> { panic!("the counter is not consulted") };
+
+        let mut options = parse(&["start", "/bin/true"]);
+        assert!(!options.strict);
+        options.inexact_branch_counter = unreachable;
+        options
+            .refuse_strict_with_inexact_branch_counter(&ptrace)
+            .unwrap();
+
+        let mut options = parse(&["start", "--strict", "/bin/true"]);
+        assert!(options.strict);
+        options.inexact_branch_counter = || None;
+        options
+            .refuse_strict_with_inexact_branch_counter(&ptrace)
+            .unwrap();
+
+        let e9patch = <GlobalOpts as clap::Parser>::parse_from(["hermit", "--backend=e9patch"]);
+        options.inexact_branch_counter = || Some("SpecLockMap is enabled".to_string());
+        let error = options
+            .refuse_strict_with_inexact_branch_counter(&e9patch)
+            .unwrap_err();
+        assert!(error.to_string().contains("`e9patch` backend"), "{error:#}");
+    }
+
+    /// `record start` takes `run`'s networking contract, local by default,
+    /// except that a gdb-served replay needs the host network.
+    #[test]
+    fn record_networking_defaults_to_local_like_run() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[clap(flatten)]
+            start: StartOpts,
+        }
+        let parse = |args: &[&str]| {
+            <Cli as clap::Parser>::try_parse_from(args)
+                .unwrap()
+                .start
+                .network()
+        };
+        assert_eq!(parse(&["start", "/bin/true"]), NetworkingMode::Local);
+        assert_eq!(
+            parse(&["start", "--network", "host", "/bin/true"]),
+            NetworkingMode::Host
+        );
+        assert_eq!(
+            parse(&["start", "--verify-with-gdbex", "continue", "/bin/true"]),
+            NetworkingMode::Host
+        );
+        assert_eq!(
+            parse(&[
+                "start",
+                "--verify",
+                "--verify-with-gdbex",
+                "continue",
+                "/bin/true"
+            ]),
+            NetworkingMode::Local
+        );
+        assert_eq!(
+            parse(&[
+                "start",
+                "--network",
+                "local",
+                "--verify-with-gdbex",
+                "continue",
+                "/bin/true"
+            ]),
+            NetworkingMode::Local
+        );
+    }
+
+    #[test]
+    fn a_gdb_checked_recording_refuses_local_networking() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[clap(flatten)]
+            start: StartOpts,
+        }
+        let check = |args: &[&str]| {
+            <Cli as clap::Parser>::try_parse_from(args)
+                .unwrap()
+                .start
+                .check_gdb_replay_network()
+        };
+        let refused = check(&[
+            "start",
+            "--network",
+            "local",
+            "--verify-with-gdbex",
+            "continue",
+            "/bin/true",
+        ])
+        .unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("--network local is not supported"),
+            "{refused:#}"
+        );
+        check(&["start", "--verify-with-gdbex", "continue", "/bin/true"]).unwrap();
+        check(&[
+            "start",
+            "--network",
+            "host",
+            "--verify-with-gdbex",
+            "continue",
+            "/bin/true",
+        ])
+        .unwrap();
+        check(&["start", "--network", "local", "/bin/true"]).unwrap();
+    }
+
+    #[test]
+    fn record_guest_command_applies_explicit_environment() {
+        let options = start_options(vec![("RECORD_ENV_FIXTURE".into(), Some("value".into()))]);
+        let command = options.guest_command().unwrap();
+        assert!(
+            command
+                .get_captured_envs()
+                .iter()
+                .any(|(name, value)| name == "RECORD_ENV_FIXTURE" && value == "value")
+        );
+    }
+
+    #[test]
+    fn record_guest_command_can_use_the_run_minimal_environment_and_workdir() {
+        let mut options = start_options(Vec::new());
+        options.base_env = BaseEnv::Minimal;
+        options.workdir = Some("/test".into());
+        let command = options.guest_command().unwrap();
+        let env = command.get_captured_envs();
+        assert_eq!(command.get_current_dir(), Some(Path::new("/test")));
+        assert_eq!(
+            env.get(OsStr::new("HOME")).and_then(|value| value.to_str()),
+            Some("/root")
+        );
+        assert_eq!(
+            env.get(OsStr::new("HOSTNAME"))
+                .and_then(|value| value.to_str()),
+            Some("hermetic-container.local")
+        );
+        assert_eq!(
+            env.get(OsStr::new("ASAN_OPTIONS"))
+                .and_then(|value| value.to_str()),
+            Some("detect_leaks=0")
+        );
+        assert!(!env.contains_key(OsStr::new("PWD")));
+        assert!(!env.contains_key(OsStr::new("OLDPWD")));
+    }
+
+    #[test]
+    fn record_guest_command_refuses_missing_passthrough_environment() {
+        let name = "HERMIT_RECORD_MISSING_ENV_FIXTURE_5E7D2C";
+        assert!(std::env::var_os(name).is_none());
+        let error = match start_options(vec![(name.into(), None)]).guest_command() {
+            Ok(_) => panic!("missing pass-through environment was accepted"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("not set in the host environment")
+        );
+    }
+
+    // A blocked SIGALRM (e.g. inherited from the parent) would leave the alarm
+    // perpetually pending and silently disable the deadline. Arming must unblock
+    // SIGALRM, and dropping must restore the prior blocked state without
+    // spuriously blocking a signal that started unblocked. A long timeout keeps
+    // the process-wide alarm from firing during the test; the guard's Drop
+    // cancels it.
+    #[test]
+    fn recording_deadline_manages_sigalrm_mask() {
+        let sigalrm = sigalrm_set();
+
+        // Case 1: SIGALRM starts blocked. Arm unblocks it; drop re-blocks it.
+        sigalrm.thread_block().unwrap();
+        assert!(SigSet::thread_get_mask().unwrap().contains(Signal::SIGALRM));
+        {
+            let _deadline = RecordingDeadline::arm(Duration::from_secs(3600)).unwrap();
+            assert!(
+                !SigSet::thread_get_mask().unwrap().contains(Signal::SIGALRM),
+                "arming the deadline must unblock SIGALRM so the alarm is deliverable"
+            );
+        }
+        assert!(
+            SigSet::thread_get_mask().unwrap().contains(Signal::SIGALRM),
+            "dropping the deadline must restore the inherited blocked state"
+        );
+
+        // Case 2: SIGALRM starts unblocked. Arm leaves it unblocked; drop must
+        // not spuriously block it.
+        sigalrm.thread_unblock().unwrap();
+        assert!(!SigSet::thread_get_mask().unwrap().contains(Signal::SIGALRM));
+        {
+            let _deadline = RecordingDeadline::arm(Duration::from_secs(3600)).unwrap();
+            assert!(!SigSet::thread_get_mask().unwrap().contains(Signal::SIGALRM));
+        }
+        assert!(
+            !SigSet::thread_get_mask().unwrap().contains(Signal::SIGALRM),
+            "dropping must not block SIGALRM when it started unblocked"
+        );
+    }
+
+    #[test]
+    fn e9patch_record_target_rejects_proc_magic_links() {
+        let options = StartOpts {
+            program: Some(PathBuf::from("/proc/self/exe")),
+            cpu_profile: Default::default(),
+            strict: false,
+            args: Vec::new(),
+            env: Vec::new(),
+            base_env: BaseEnv::Host,
+            mount: Vec::new(),
+            network: None,
+            proc: Default::default(),
+            workdir: None,
+            data_dir: None,
+            record_timeout: None,
+            verify: false,
+            verify_json: None,
+            verify_strict: false,
+            verify_run: None,
+            verify_replay_of: None,
+            gdbex: Vec::new(),
+            inexact_branch_counter: || None,
+        };
+        let error = options.resolve_e9patch_record_target().unwrap_err();
+        assert!(
+            error.to_string().contains("resolves through /proc"),
+            "unexpected error: {error}"
+        );
+    }
+}

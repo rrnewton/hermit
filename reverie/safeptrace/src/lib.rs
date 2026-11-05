@@ -1,0 +1,4005 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+#![deny(missing_docs)]
+#![deny(rustdoc::broken_intra_doc_links)]
+#![cfg(target_os = "linux")]
+
+//! A safe ptrace API. This API forces correct usage of ptrace in that it is
+//! not possible to call ptrace on a process not in a stopped state.
+//!
+//! With `notifier`, generic wait and exit futures retain their Send contract
+//! and require native thread pidfds (Linux 6.9 or newer). A native
+//! `PIDFD_THREAD` acquisition refusal with `EINVAL` reports this requirement
+//! to stderr on a best-effort basis and returns the same typed errno.
+//! Select the named `_on_ptracer_thread`
+//! constructors and waits to permit a retained legacy fallback. Their local
+//! wrappers are !Send and !Sync on every kernel; their Send manual drivers
+//! do not implement Future. Borrow and retain the same driver through refusal
+//! and cancellation, and progress it only on its original ptracer OS thread.
+//! The explicit mode requires procfs aligned with the caller's PID namespace;
+//! mismatched inherited mounts are refused with EXDEV. Descriptor SIGKILL
+//! remains available; exact thread SIGSTOP requires a native thread pidfd.
+#[cfg(feature = "memory")]
+mod memory;
+#[cfg(feature = "notifier")]
+mod notifier;
+mod regs;
+mod syscall_info;
+mod waitid;
+
+use core::mem::MaybeUninit;
+use std::fmt;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+
+use nix::sys::ptrace;
+// Re-exports so that nothing else needs to depend on `nix`.
+pub use nix::sys::ptrace::Options;
+pub use nix::sys::signal::Signal;
+use nix::sys::wait::WaitPidFlag;
+use nix::sys::wait::WaitStatus;
+pub use reverie_process::ExitStatus;
+pub use reverie_process::Pid;
+pub use syscalls::Errno;
+use syscalls::Sysno;
+use thiserror::Error;
+
+#[cfg(feature = "notifier")]
+pub use crate::notifier::ExitFuture;
+#[cfg(feature = "notifier")]
+pub use crate::notifier::GuardedPendingStatusReservation;
+#[cfg(feature = "notifier")]
+pub use crate::notifier::PendingStatusReservation;
+#[cfg(feature = "notifier")]
+pub use crate::notifier::ProcStatError;
+#[cfg(feature = "notifier")]
+pub use crate::notifier::PtracerCleanupDriver;
+#[cfg(feature = "notifier")]
+pub use crate::notifier::PtracerExitDriver;
+#[cfg(feature = "notifier")]
+pub use crate::notifier::PtracerExitFuture;
+#[cfg(feature = "notifier")]
+pub use crate::notifier::PtracerOwnedWaitFuture;
+#[cfg(feature = "notifier")]
+pub use crate::notifier::PtracerPendingStatusReservation;
+#[cfg(feature = "notifier")]
+pub use crate::notifier::PtracerSyncDriver;
+#[cfg(feature = "notifier")]
+pub use crate::notifier::PtracerSyncWait;
+#[cfg(feature = "notifier")]
+pub use crate::notifier::PtracerTerminalCleanup;
+#[cfg(feature = "notifier")]
+pub use crate::notifier::PtracerThreadGuard;
+#[cfg(feature = "notifier")]
+pub use crate::notifier::PtracerWaitDriver;
+#[cfg(feature = "notifier")]
+pub use crate::notifier::PtracerWaitFuture;
+#[cfg(feature = "notifier")]
+pub use crate::notifier::StopObservationError;
+#[cfg(feature = "notifier")]
+pub use crate::notifier::StopObservationSample;
+#[cfg(feature = "notifier")]
+pub use crate::notifier::StopSiginfo;
+#[cfg(feature = "notifier")]
+pub use crate::notifier::StoppedObservation;
+#[cfg(feature = "notifier")]
+pub use crate::notifier::SupersededStopRefusal;
+#[cfg(feature = "notifier")]
+pub use crate::notifier::TerminalCleanup;
+pub use crate::regs::*;
+pub use crate::syscall_info::SyscallInfo;
+pub use crate::syscall_info::SyscallInfoError;
+pub use crate::syscall_info::SyscallInfoOp;
+use crate::waitid::IdType;
+use crate::waitid::wait_status;
+
+/// Immutable generation token carried through every typed tracee state.
+#[derive(Clone, Debug)]
+struct TraceeToken {
+    #[cfg(feature = "notifier")]
+    event: notifier::EventHandle,
+    #[cfg(feature = "notifier")]
+    policy: notifier::WaitPolicy,
+    #[cfg(feature = "notifier")]
+    ptracer_owner: Option<std::sync::Arc<notifier::LegacyWaitOwner>>,
+    #[cfg(feature = "notifier")]
+    // Host selection alone does not authorize a wait for this generation.
+    // Retain an actual attachment/real-parent proof through later retirement.
+    ptracer_wait_role: bool,
+}
+
+impl PartialEq for TraceeToken {
+    fn eq(&self, other: &Self) -> bool {
+        #[cfg(feature = "notifier")]
+        return self.event == other.event;
+        #[cfg(not(feature = "notifier"))]
+        {
+            let _ = other;
+            true
+        }
+    }
+}
+impl Eq for TraceeToken {}
+impl std::hash::Hash for TraceeToken {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        #[cfg(feature = "notifier")]
+        {
+            std::hash::Hash::hash(&self.event, state);
+        }
+        #[cfg(not(feature = "notifier"))]
+        let _ = state;
+    }
+}
+
+impl TraceeToken {
+    fn new() -> Self {
+        Self {
+            #[cfg(feature = "notifier")]
+            event: notifier::EventHandle::new(),
+            #[cfg(feature = "notifier")]
+            policy: notifier::WaitPolicy::Native,
+            #[cfg(feature = "notifier")]
+            ptracer_owner: None,
+            #[cfg(feature = "notifier")]
+            ptracer_wait_role: false,
+        }
+    }
+
+    fn current_or_new(pid: Pid) -> Result<Self, Errno> {
+        #[cfg(not(feature = "notifier"))]
+        let _ = pid;
+        Ok(Self {
+            #[cfg(feature = "notifier")]
+            event: notifier::EventHandle::current_or_new(pid)?,
+            #[cfg(feature = "notifier")]
+            policy: notifier::WaitPolicy::Native,
+            #[cfg(feature = "notifier")]
+            ptracer_owner: None,
+            #[cfg(feature = "notifier")]
+            ptracer_wait_role: false,
+        })
+    }
+
+    /// The generation that `pid` names now, shared with every other
+    /// capability for it as `current_or_new` shares it, or a fresh token if
+    /// the task's identity cannot be captured. A fresh token is bound to no
+    /// generation, so its requests are not held off by the TID gate that the
+    /// task's reaper marks.
+    fn current_or_fresh(pid: Pid) -> Self {
+        Self::current_or_new(pid).unwrap_or_else(|_| Self::new())
+    }
+
+    fn current_or_error(pid: Pid) -> Self {
+        #[cfg(not(feature = "notifier"))]
+        let _ = pid;
+        Self {
+            #[cfg(feature = "notifier")]
+            event: notifier::EventHandle::current_or_error(pid),
+            #[cfg(feature = "notifier")]
+            policy: notifier::WaitPolicy::Native,
+            #[cfg(feature = "notifier")]
+            ptracer_owner: None,
+            #[cfg(feature = "notifier")]
+            ptracer_wait_role: false,
+        }
+    }
+
+    #[cfg(feature = "notifier")]
+    fn from_event(event: notifier::EventHandle) -> Self {
+        Self::from_event_for_policy(event, notifier::WaitPolicy::Native)
+    }
+
+    #[cfg(feature = "notifier")]
+    fn from_event_for_policy(event: notifier::EventHandle, policy: notifier::WaitPolicy) -> Self {
+        let ptracer_owner = (policy == notifier::WaitPolicy::PtracerThread)
+            .then(|| event.capture_current_ptracer_owner().ok())
+            .flatten();
+        let ptracer_wait_role = ptracer_owner.is_some();
+        Self {
+            event,
+            policy,
+            ptracer_owner,
+            ptracer_wait_role,
+        }
+    }
+
+    #[cfg(feature = "notifier")]
+    fn current_on_ptracer_thread(pid: Pid) -> Result<Self, Errno> {
+        let mut token = Self::from_event_for_policy(
+            notifier::EventHandle::current_or_new_on_ptracer_thread(pid)?,
+            notifier::WaitPolicy::PtracerThread,
+        );
+        if token.ptracer_owner.is_none() && token.event().current_tracer_pid()?.as_raw() == 0 {
+            token.ptracer_owner = Some(token.event().capture_current_constructor_owner()?);
+            // Selecting an untraced nonchild remains available for a later
+            // attachment. It grants no wait role. A positive direct-parent
+            // proof can be retained now, before the target later disappears;
+            // any refusal is rechecked by the first named wait operation.
+            token.ptracer_wait_role = token
+                .event()
+                .authenticates_wait_role(token.ptracer_owner.as_ref().unwrap())
+                .unwrap_or(false);
+        }
+        Ok(token)
+    }
+
+    fn capture_child(&self, pid: Pid) -> Result<Running, Errno> {
+        #[cfg(feature = "notifier")]
+        if self.policy == notifier::WaitPolicy::PtracerThread {
+            return Running::new_on_ptracer_thread(pid);
+        }
+        Running::from_current_or_new(pid)
+    }
+
+    #[cfg(feature = "notifier")]
+    fn event(&self) -> &notifier::EventHandle {
+        &self.event
+    }
+
+    /// Runs one numeric request on this generation's TID.
+    ///
+    /// Under the notifier, a fatal signal can end the stop that a capability
+    /// names, and the generation's reaper can then release the TID for reuse
+    /// while the capability is still held. Once that reap has marked this
+    /// generation's gate, the request fails with `ESRCH` without reaching the
+    /// kernel, so it does not name a replacement task. A reap that marks no
+    /// gate lets the request through while nothing else has marked it: a
+    /// reap while the generation is unbound, a bulk wait, or an order in
+    /// <https://github.com/rrnewton/reverie/issues/860>. Without the notifier
+    /// the request always runs.
+    fn on_held_tid<T>(&self, request: impl FnOnce() -> Result<T, Errno>) -> Result<T, Errno> {
+        #[cfg(feature = "notifier")]
+        if let Some(error) = self.event.initial_capture_error() {
+            return Err(error);
+        }
+        #[cfg(feature = "notifier")]
+        let Some(_held) = self.event.hold_tid() else {
+            return Err(Errno::ESRCH);
+        };
+        #[cfg(feature = "notifier")]
+        if self.policy == notifier::WaitPolicy::PtracerThread {
+            // A retained task generation cannot make a copied numeric PID
+            // meaningful in another host task or PID namespace. Use this
+            // token's original owner; never recapture one from the number.
+            let owner = self.ptracer_owner.as_ref().ok_or(Errno::EPERM)?;
+            if !owner.is_current()? {
+                return Err(Errno::EPERM);
+            }
+            // Nonleader exec can release its former TID before an
+            // unregistered Event has any reaper to close the gate. Refuse
+            // an already-retired retained target before a numeric request
+            // can address its replacement. This is a lifetime precheck,
+            // not an atomic descriptor-valued ptrace operation.
+            self.event.check_numeric_target_lifetime(owner)?;
+        }
+        request()
+    }
+}
+
+fn nix_errno(err: nix::Error) -> Errno {
+    Errno::new(err as i32)
+}
+
+#[cfg(target_arch = "x86_64")]
+const NT_X86_XSTATE: i32 = 0x202;
+
+/// An error that occurred during tracing.
+#[derive(Error, Debug, Eq, PartialEq)]
+pub enum Error {
+    /// A low-level errno.
+    #[error(transparent)]
+    Errno(#[from] Errno),
+
+    /// The tracee died unexpectedly. This should be handled gracefully by
+    /// reaping the zombie.
+    #[error("tracee {0} is a zombie")]
+    Died(Zombie),
+}
+
+impl From<nix::errno::Errno> for Error {
+    fn from(err: nix::errno::Errno) -> Self {
+        Self::Errno(Errno::new(err as i32))
+    }
+}
+
+#[cfg(feature = "notifier")]
+pub use notifier::OwnedWaitError;
+#[cfg(feature = "notifier")]
+pub use notifier::OwnedWaitFuture;
+
+/// Represents an invalid state. Useful for errors.
+#[derive(Debug, Eq, PartialEq)]
+struct InvalidState(pub TryWait);
+
+impl From<InvalidState> for TryWait {
+    fn from(error: InvalidState) -> TryWait {
+        error.0
+    }
+}
+
+impl fmt::Display for InvalidState {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "got unexpected status {}", self.0)
+    }
+}
+
+impl std::error::Error for InvalidState {}
+
+/// Indicates how a child was created (i.e., via `fork`, `vfork`, or `clone`).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ChildOp {
+    /// Stop before return from `fork(2)` or `clone(2)` with the exit signal set
+    /// to `SIGCHLD`.
+    Fork,
+
+    /// Stop before return from `vfork(2)` or `clone(2)` with the `CLONE_VFORK`
+    /// flag. When the tracee is continued after this stop, it will wait for
+    /// child to exit/exec before continuing its execution (in other words, the
+    /// usual behavior on `vfork(2)`).
+    Vfork,
+
+    /// Stop before return from `clone(2)`.
+    Clone,
+}
+
+/// A signal number, including one `nix`'s [`Signal`] cannot name: Linux's
+/// signals run from 1 to 64, and `nix` names only 1 to 31. Realtime signals
+/// (32 to 64; glibc reserves 32 and 33, so `SIGRTMIN()` is 34) are real and
+/// deliverable. It compares equal to the `nix` signal with the same number
+/// (<https://github.com/rrnewton/reverie/issues/207>).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AnySignal(i32);
+
+impl AnySignal {
+    /// The signal numbered `raw`, if Linux has one (1 to 64).
+    pub fn new(raw: i32) -> Option<Self> {
+        (1..=64).contains(&raw).then_some(Self(raw))
+    }
+
+    /// The raw signal number.
+    pub fn raw(self) -> i32 {
+        self.0
+    }
+
+    /// The `nix` signal, `None` for one it cannot name.
+    pub fn as_nix(self) -> Option<Signal> {
+        Signal::try_from(self.0).ok()
+    }
+}
+
+impl From<Signal> for AnySignal {
+    fn from(signal: Signal) -> Self {
+        Self(signal as i32)
+    }
+}
+
+impl PartialEq<Signal> for AnySignal {
+    fn eq(&self, other: &Signal) -> bool {
+        self.0 == *other as i32
+    }
+}
+
+impl PartialEq<AnySignal> for Signal {
+    fn eq(&self, other: &AnySignal) -> bool {
+        *self as i32 == other.0
+    }
+}
+
+impl std::fmt::Debug for AnySignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.as_nix() {
+            Some(signal) => write!(f, "{signal:?}"),
+            None => write!(f, "SIG{}", self.0),
+        }
+    }
+}
+
+impl std::fmt::Display for AnySignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.as_nix() {
+            Some(signal) => write!(f, "{signal}"),
+            None => write!(f, "SIG{}", self.0),
+        }
+    }
+}
+
+/// A stop event. Documentation is from `ptrace(2)`.
+#[derive(Debug, Eq, PartialEq)]
+pub enum Event {
+    /// Stop event after a new child has been created (i.e., via `fork`, `vfork`,
+    /// or `clone`).
+    NewChild(ChildOp, Running),
+
+    /// Stop before return from `execve(2)`. Since Linux 3.0,
+    /// `PTRACE_GETEVENTMSG` returns the former thread ID.
+    Exec(Pid),
+
+    /// Stop before return from `vfork(2)` or `clone(2)` with the `CLONE_VFORK`
+    /// flag, but after the child unblocked this tracee by exiting or execing.
+    VforkDone,
+
+    /// Stop before exit (including death from `exit_group(2)`), signal death, or
+    /// exit caused by `execve(2)` in a multithreaded process.
+    /// `PTRACE_GETEVENTMSG` returns the exit status. Registers can be examined
+    /// (unlike when "real" exit happens). The tracee is still alive; it needs to
+    /// be `PTRACE_CONT`ed or `PTRACE_DETACH`ed to finish exiting.
+    Exit,
+
+    /// Stop triggered by a `seccomp(2)` rule on tracee syscall entry when
+    /// `PTRACE_O_TRACESECCOMP` has been set by the tracer. The seccomp event
+    /// message data (from the `SECCOMP_RET_DATA` portion of the seccomp filter
+    /// rule) can be retrieved with `PTRACE_GETEVENTMSG`. The semantics of this
+    /// stop are described in detail in a separate section below.
+    Seccomp,
+
+    /// Stop induced by PTRACE_INTERRUPT command, or group-stop, or initial
+    /// ptrace-stop when a new child is attached (only if attached using
+    /// PTRACE_SEIZE).
+    Stop,
+
+    /// The tracee was stopped by execution of a system call.
+    Syscall,
+
+    /// The tracee was stopped by delivery of a signal.
+    Signal(Signal),
+
+    /// The tracee was stopped by delivery of a signal that `nix`'s `Signal`
+    /// cannot name: a realtime signal, 32 to 64 (glibc reserves 32 and 33,
+    /// so `SIGRTMIN()` is 34). It is the raw signal number, always 32 to 64.
+    /// Resume with [`Stopped::resume_raw`] or [`Stopped::syscall_raw`] to
+    /// deliver it. Before, such a stop failed to decode with EINVAL, or, on
+    /// the wait paths without the `notifier` feature, was reported as a
+    /// SIGSTOP (<https://github.com/rrnewton/reverie/issues/207>).
+    RawSignal(i32),
+}
+
+impl Event {
+    /// The signal of a signal-delivery stop ([`Event::Signal`] or
+    /// [`Event::RawSignal`]), or `None` for any other stop.
+    pub fn signal(&self) -> Option<AnySignal> {
+        match *self {
+            Event::Signal(sig) => Some(sig.into()),
+            Event::RawSignal(raw) => AnySignal::new(raw),
+            _ => None,
+        }
+    }
+
+    /// The signal-delivery stop event for `sig`: [`Event::Signal`] when nix
+    /// names it, else [`Event::RawSignal`].
+    pub fn from_signal(sig: AnySignal) -> Self {
+        match sig.as_nix() {
+            Some(sig) => Event::Signal(sig),
+            None => Event::RawSignal(sig.raw()),
+        }
+    }
+
+    /// Converts a raw i32 to a ptrace event and gets any associated data.
+    fn from_ptrace_event(task: &Stopped, event: i32) -> Result<Self, Error> {
+        // Note that there is no danger in calling ptrace here because the
+        // process is guaranteed to be in a ptrace-stop state when this function
+        // is called.
+        match event {
+            libc::PTRACE_EVENT_FORK => {
+                // Get the pid of the child immediately since we almost always
+                // want that.
+                let child_pid = Pid::from_raw(task.getevent()? as i32);
+                #[cfg(all(test, feature = "notifier"))]
+                notifier::register_new_child_for_test_cleanup(task.1.event(), child_pid)?;
+                Ok(Self::NewChild(
+                    ChildOp::Fork,
+                    task.1.capture_child(child_pid)?,
+                ))
+            }
+            libc::PTRACE_EVENT_VFORK => {
+                // Get the pid of the child immediately since we almost always
+                // want that.
+                let child_pid = Pid::from_raw(task.getevent()? as i32);
+                #[cfg(all(test, feature = "notifier"))]
+                notifier::register_new_child_for_test_cleanup(task.1.event(), child_pid)?;
+                Ok(Self::NewChild(
+                    ChildOp::Vfork,
+                    task.1.capture_child(child_pid)?,
+                ))
+            }
+            libc::PTRACE_EVENT_CLONE => {
+                // Get the pid of the child immediately since we almost always
+                // want that.
+                let child_pid = Pid::from_raw(task.getevent()? as i32);
+                #[cfg(all(test, feature = "notifier"))]
+                notifier::register_new_child_for_test_cleanup(task.1.event(), child_pid)?;
+                Ok(Self::NewChild(
+                    ChildOp::Clone,
+                    task.1.capture_child(child_pid)?,
+                ))
+            }
+            libc::PTRACE_EVENT_EXEC => {
+                // The event arrives under the current leader TID. GETEVENTMSG
+                // identifies the executing thread's former TID; it is not a
+                // newly allocated PID or a terminal status for that thread.
+                let former_tid = Pid::from_raw(task.getevent()? as i32);
+                // Only a task in its exec stop reports that message. A fatal
+                // signal takes a tracee out of any stop without a tracer
+                // request, into its exit stop, whose message is the exit
+                // code. PTRACE_GETSIGINFO after GETEVENTMSG confirms the task
+                // was still in its exec stop when the message was read: the
+                // task never returns to an exec stop once it has left it, so
+                // an exec-stop si_code here proves the message above is the
+                // former TID. Any other si_code, or ESRCH, is a death under
+                // ptrace: this status names a stop the tracee has left.
+                let siginfo = task.getsiginfo()?;
+                if siginfo.si_code != libc::SIGTRAP | (libc::PTRACE_EVENT_EXEC << 8) {
+                    return Err(Error::Died(Zombie::from_token(task.0, task.1.clone())));
+                }
+                Ok(Self::Exec(former_tid))
+            }
+            libc::PTRACE_EVENT_VFORK_DONE => Ok(Self::VforkDone),
+            libc::PTRACE_EVENT_EXIT => {
+                // Note that we can get the exit status here using `getevent`,
+                // but that's almost never what we want to do. It is better to
+                // get that during the final exit event.
+                Ok(Self::Exit)
+            }
+            libc::PTRACE_EVENT_SECCOMP => Ok(Self::Seccomp),
+            libc::PTRACE_EVENT_STOP => Ok(Self::Stop),
+            _ => unreachable!("unknown ptrace event {:#x}", event),
+        }
+    }
+}
+
+/// `ptrace(request, pid, 0, sig)` for a resuming request, with the signal as a
+/// raw number so that one `nix` cannot name can be delivered.
+/// `PTRACE_SINGLEBLOCK` (arch/x86/include/uapi/asm/ptrace-abi.h), which the
+/// libc crate does not define. Linux accepts it on every x86-64 processor
+/// (`arch_has_block_step`).
+#[cfg(target_arch = "x86_64")]
+const PTRACE_SINGLEBLOCK: libc::c_uint = 33;
+
+fn ptrace_resume_raw(request: libc::c_uint, pid: Pid, sig: i32) -> Result<(), Errno> {
+    Errno::result(unsafe {
+        libc::ptrace(
+            request,
+            pid.as_raw(),
+            std::ptr::null_mut::<libc::c_void>(),
+            sig as libc::c_long as *mut libc::c_void,
+        )
+    })
+    .map(drop)
+}
+
+/// Helper function for waiting on one or more processes: the PID that
+/// changed state and its raw wait status, which `Wait::from_wait_helper`
+/// decodes.
+/// Returns `None` if `WaitPidFlag::WNOHANG` was specified and the process is
+/// still running.
+///
+/// A raw status keeps a realtime signal's number, which `nix`'s `WaitStatus`
+/// cannot hold (<https://github.com/rrnewton/reverie/issues/207>). A stop
+/// whose signal is 0 is reported as a SIGSTOP, as through `WaitStatus`: the
+/// status can sometimes be 0 when using PTRACE_SEIZE.
+fn wait(id: IdType, flags: WaitPidFlag) -> Result<Option<(Pid, i32)>, Errno> {
+    loop {
+        let result = wait_status(id, flags).map(|changed| {
+            changed.map(|(pid, status)| {
+                if libc::WIFSTOPPED(status) && libc::WSTOPSIG(status) == 0 {
+                    (pid.into(), status | (libc::SIGSTOP << 8))
+                } else {
+                    (pid.into(), status)
+                }
+            })
+        });
+
+        if result == Err(Errno::EINTR) {
+            continue;
+        }
+
+        return result;
+    }
+}
+
+/// The result of a non-blocking wait. A process can be in one of three main
+/// states: running, ptrace-stopped, or exited.
+///
+/// Both `Clone` and `Copy` are intentionally not implemented. This is to enforce
+/// type safety.
+#[derive(Debug, Eq, PartialEq)]
+pub enum TryWait {
+    /// The process is in either a stopped state or an exited state.
+    Wait(Wait),
+
+    /// The process is in a running state and thus can only be waited on.
+    ///
+    /// When the process is successfully waited on, it transitions to a waited
+    /// state.
+    Running(Running),
+}
+
+impl TryWait {
+    /// Returns the PID for this attempted wait.
+    pub fn pid(&self) -> Pid {
+        match self {
+            Self::Wait(wait) => wait.pid(),
+            Self::Running(running) => running.pid(),
+        }
+    }
+
+    /// Returns true if we're in a running state. Note that this may not reflect
+    /// the real *current* state that we may not yet have observed.
+    pub fn is_running(&self) -> bool {
+        matches!(self, Self::Running(_))
+    }
+
+    /// Returns true if we're in a stopped state. Note that this may not reflect
+    /// the real *current* state that we may not yet have observed.
+    pub fn is_stopped(&self) -> bool {
+        matches!(self, Self::Wait(Wait::Stopped(_, _)))
+    }
+
+    /// Assumes the process is in a stopped state. Panics if it isn't.
+    pub fn assume_stopped(self) -> (Stopped, Event) {
+        match self {
+            Self::Wait(Wait::Stopped(stopped, event)) => (stopped, event),
+            status => panic!("{:?}", InvalidState(status)),
+        }
+    }
+
+    /// Assumes the process is in a running state. Panics if it isn't.
+    pub fn assume_running(self) -> Running {
+        match self {
+            Self::Running(running) => running,
+            status => panic!("{:?}", InvalidState(status)),
+        }
+    }
+
+    /// Assumes the process is in an exited state. Panics if it isn't.
+    pub fn assume_exited(self) -> (Pid, ExitStatus) {
+        match self {
+            Self::Wait(Wait::Exited(pid, exit_status)) => (pid, exit_status),
+            status => panic!("{:?}", InvalidState(status)),
+        }
+    }
+}
+
+impl fmt::Display for TryWait {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::Wait(wait) => write!(f, "{}", wait),
+            Self::Running(running) => write!(f, "pid {} is running", running.pid()),
+        }
+    }
+}
+
+impl From<Running> for TryWait {
+    fn from(status: Running) -> Self {
+        Self::Running(status)
+    }
+}
+
+impl From<Wait> for TryWait {
+    fn from(wait: Wait) -> Self {
+        Self::Wait(wait)
+    }
+}
+
+/// The result of a blocking wait. A process in this state is guaranteed to not
+/// be in a running state.
+///
+/// Both `Clone` and `Copy` are intentionally not implemented. This is to enforce
+/// type safety.
+#[derive(Debug, Eq, PartialEq)]
+pub enum Wait {
+    /// The process is in a stopped state and thus only operations that can be
+    /// done during a stopped state are allowed (i.e., ptrace operations).
+    ///
+    /// When the process is resumed, it transitions to a running state.
+    Stopped(Stopped, Event),
+
+    /// The process has exited with an exit status.
+    Exited(Pid, ExitStatus),
+}
+
+impl Wait {
+    /// Returns the PID for this state.
+    pub fn pid(&self) -> Pid {
+        match self {
+            Self::Stopped(stopped, _) => stopped.pid(),
+            Self::Exited(pid, _exit_status) => *pid,
+        }
+    }
+
+    /// Assumes the process is in a stopped state. Panics if it isn't.
+    pub fn assume_stopped(self) -> (Stopped, Event) {
+        match self {
+            Self::Stopped(stopped, event) => (stopped, event),
+            state => panic!("{:?}", InvalidState(state.into())),
+        }
+    }
+
+    /// Assumes the process is in an exited state. Panics if it isn't.
+    pub fn assume_exited(self) -> (Pid, ExitStatus) {
+        match self {
+            Self::Exited(pid, exit_status) => (pid, exit_status),
+            state => panic!("{:?}", InvalidState(state.into())),
+        }
+    }
+
+    /// Converts a raw `i32` status to this type.
+    ///
+    /// Preconditions:
+    /// The process must not be in a running state.
+    pub fn from_raw(pid: Pid, status: i32) -> Result<Self, Error> {
+        let token = if libc::WIFSTOPPED(status) {
+            TraceeToken::current_or_fresh(pid)
+        } else {
+            TraceeToken::new()
+        };
+        Self::from_raw_with_token(pid, status, token)
+    }
+
+    fn from_raw_with_token(pid: Pid, status: i32, token: TraceeToken) -> Result<Self, Error> {
+        #[cfg(feature = "notifier")]
+        token.event().invalidate_numeric_auth();
+        let wait = Self::decode_raw(pid, status, token)?;
+        #[cfg(all(test, feature = "notifier"))]
+        if let Wait::Stopped(task, Event::NewChild(..)) = &wait {
+            notifier::pause_sync_new_child_decode(task.1.event());
+        }
+        Ok(wait)
+    }
+
+    /// Decodes a status that one of the plain wait helpers (`wait_all`,
+    /// `wait_group`, `peek_all` and the like) returned. It is decoded as
+    /// [`Wait::from_raw`] decodes it, but without the notifier's bookkeeping
+    /// on the tracee's event handle, which these helpers never did.
+    fn from_wait_helper(pid: Pid, status: i32) -> Result<Self, Error> {
+        let token = if libc::WIFSTOPPED(status) {
+            TraceeToken::current_or_fresh(pid)
+        } else {
+            TraceeToken::new()
+        };
+        Self::decode_raw(pid, status, token)
+    }
+
+    /// Decodes a raw wait status, keeping a realtime stop signal's number
+    /// (`Event::RawSignal`).
+    fn decode_raw(pid: Pid, status: i32, token: TraceeToken) -> Result<Self, Error> {
+        Ok(if libc::WIFEXITED(status) {
+            Wait::Exited(pid, ExitStatus::Exited(libc::WEXITSTATUS(status)))
+        } else if libc::WIFSIGNALED(status) {
+            // A realtime signal is `ExitStatus::SignaledRaw`
+            // (<https://github.com/rrnewton/reverie/issues/997>).
+            Wait::Exited(
+                pid,
+                ExitStatus::signaled(libc::WTERMSIG(status), libc::WCOREDUMP(status)),
+            )
+        } else if libc::WIFSTOPPED(status) {
+            let task = Stopped::from_token(pid, token);
+
+            let event = if libc::WSTOPSIG(status) == libc::SIGTRAP | 0x80 {
+                Event::Syscall
+            } else if (status >> 16) == 0 {
+                let raw = libc::WSTOPSIG(status);
+                match (Signal::try_from(raw), AnySignal::new(raw)) {
+                    (Ok(sig), _) => Event::Signal(sig),
+                    (Err(_), Some(_)) => Event::RawSignal(raw),
+                    (Err(_), None) => return Err(Errno::EINVAL.into()),
+                }
+            } else {
+                let event = status >> 16;
+
+                // PTRACE_EVENT_STOP is not guaranteed to return the correct
+                // signal, so we ignore it here. Compare raw numbers: the signal
+                // of a PTRACE_EVENT_STOP can be one nix cannot name.
+                debug_assert!(
+                    event == libc::PTRACE_EVENT_STOP || libc::WSTOPSIG(status) == libc::SIGTRAP
+                );
+
+                Event::from_ptrace_event(&task, event)?
+            };
+
+            Wait::Stopped(task, event)
+        } else if libc::WIFCONTINUED(status) {
+            // TODO: Handle continued status.
+            unimplemented!("Continued status not yet handled")
+        } else {
+            panic!("PID {} got unexpected status: {:#x}", pid, status)
+        })
+    }
+}
+
+impl TryFrom<WaitStatus> for Wait {
+    type Error = Error;
+
+    /// Converts a `WaitStatus` to this type.
+    ///
+    /// Preconditions:
+    /// The process must not be in a `StillAlive` state.
+    fn try_from(wait_status: WaitStatus) -> Result<Self, Error> {
+        let token = match wait_status {
+            WaitStatus::Stopped(pid, _)
+            | WaitStatus::PtraceEvent(pid, ..)
+            | WaitStatus::PtraceSyscall(pid) => TraceeToken::current_or_fresh(pid.into()),
+            _ => TraceeToken::new(),
+        };
+        Self::from_wait_status_with_token(wait_status, token)
+    }
+}
+
+impl Wait {
+    fn from_wait_status_with_token(
+        wait_status: WaitStatus,
+        token: TraceeToken,
+    ) -> Result<Self, Error> {
+        Ok(match wait_status {
+            WaitStatus::Exited(pid, code) => Self::Exited(pid.into(), ExitStatus::Exited(code)),
+            WaitStatus::Signaled(pid, sig, coredump) => {
+                Self::Exited(pid.into(), ExitStatus::Signaled(sig, coredump))
+            }
+            WaitStatus::Stopped(pid, sig) => {
+                let event = Event::Signal(sig);
+                Self::Stopped(Stopped::from_token(pid.into(), token), event)
+            }
+            WaitStatus::PtraceEvent(pid, sig, event) => {
+                // PTRACE_EVENT_STOP is not guaranteed to return the correct
+                // signal, so we ignore it here.
+                debug_assert!(event == libc::PTRACE_EVENT_STOP || sig == Signal::SIGTRAP);
+                let task = Stopped::from_token(pid.into(), token);
+                let event = Event::from_ptrace_event(&task, event)?;
+                Self::Stopped(task, event)
+            }
+            WaitStatus::PtraceSyscall(pid) => {
+                let event = Event::Syscall;
+                Self::Stopped(Stopped::from_token(pid.into(), token), event)
+            }
+            WaitStatus::Continued(_pid) => {
+                // Not possible because we aren't using WaitPidFlag::WCONTINUED
+                // anywhere.
+                unreachable!("unexpected WaitStatus::Continued");
+            }
+            WaitStatus::StillAlive => {
+                // The precondition of this function forbids this.
+                unreachable!("precondition violated with WaitStatus::StillAlive");
+            }
+        })
+    }
+}
+
+impl fmt::Display for Wait {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::Stopped(stopped, event) => {
+                write!(f, "pid {} stopped ({:?})", stopped.pid(), event)
+            }
+            Self::Exited(pid, exit_status) => write!(f, "pid {} exited ({:?})", pid, exit_status),
+        }
+    }
+}
+
+// libc crate doesn't provide this struct
+#[repr(C)]
+struct ptrace_peeksiginfo_args {
+    off: u64,
+    flags: u32,
+    nr: u32,
+}
+
+bitflags::bitflags! {
+    /// Flags for ptrace peeksiginfo
+    #[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Clone, Copy)]
+    pub struct PeekSigInfoFlags: u32 {
+        /// dumping signals from the process-wide signal queue. signals are
+        /// read from the per-thread queue of the specified thread if this
+        /// flag is not set.
+        const SHARED = 1;
+    }
+}
+
+/// The tracee generation a [`Stopped`] capability is bound to. It grants no
+/// ptrace operation by itself.
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+pub struct TraceeGeneration(Pid, TraceeToken);
+
+impl TraceeGeneration {
+    /// Returns the process ID of the tracee.
+    pub fn pid(&self) -> Pid {
+        self.0
+    }
+
+    /// Retains a passive descriptor/observation facade for this generation.
+    /// This does not register a worker, recapture the numeric PID, or grant a
+    /// stopped capability. Registration starts on a later explicit request.
+    #[cfg(feature = "notifier")]
+    pub fn terminal_cleanup(&self) -> TerminalCleanup {
+        TerminalCleanup::new_unregistered(self.0, &self.1)
+    }
+
+    /// Retains this token's host anchor, or binds the current controller host
+    /// through the generation's original proc mount when none was captured.
+    /// This selects only a host thread; it grants no attachment or wait role.
+    /// Bind before callbacks or suspension, then keep that same guard rather
+    /// than capturing another after a foreign poll, error or cancellation.
+    #[cfg(feature = "notifier")]
+    pub fn ptracer_thread_guard(&self) -> Result<PtracerThreadGuard, Errno> {
+        if let Some(error) = self.1.event().initial_capture_error() {
+            return Err(error);
+        }
+        match &self.1.ptracer_owner {
+            Some(owner) => Ok(PtracerThreadGuard::from_owner(owner.clone())),
+            None => self.1.event().capture_host_thread_guard(),
+        }
+    }
+
+    /// Returns an existing host anchor only when this token already retains
+    /// a positive wait-role witness for its original generation.
+    ///
+    /// This passive accessor captures nothing and does not check the current
+    /// attachment or upgrade a constructor-only role. Authenticate a returned
+    /// guard with [`PtracerThreadGuard::check_current`] before controller use.
+    /// It remains the same host anchor after genuine target retirement.
+    #[cfg(feature = "notifier")]
+    pub fn retained_ptracer_thread_guard(&self) -> Result<Option<PtracerThreadGuard>, Errno> {
+        if let Some(error) = self.1.event().initial_capture_error() {
+            return Err(error);
+        }
+        Ok(self
+            .1
+            .ptracer_wait_role
+            .then(|| self.1.ptracer_owner.clone())
+            .flatten()
+            .map(PtracerThreadGuard::from_owner))
+    }
+
+    /// Binds a controller host only after proving its current wait role for
+    /// this original live generation. The proof requires the actual ptracer
+    /// TID, or the real parent TGID for an untraced descriptor waiter.
+    ///
+    /// Use this fallible cold binder before callbacks or suspension when no
+    /// previously bound controller guard is available. Retain the same guard
+    /// thereafter, including for children and terminal results. A refusal
+    /// registers no worker and leaves this generation available for its real
+    /// owner; a retired task cannot supply a missing controller anchor.
+    #[cfg(feature = "notifier")]
+    pub fn ptracer_thread_guard_for_wait(&self) -> Result<PtracerThreadGuard, Errno> {
+        let guard = self.ptracer_thread_guard()?;
+        guard.check_wait_role(self.1.event())?;
+        Ok(guard)
+    }
+
+    /// Creates a stopped state for this generation. Like
+    /// [`Stopped::new_unchecked`], the caller must independently know that the
+    /// tracee is stopped. Unlike it, with the `notifier` feature and once this
+    /// generation's identity has been captured, requests through the result
+    /// are refused once the notifier or [`Running::wait`] reaps this
+    /// generation, even if another task has reused the TID. Without that
+    /// feature, or while the generation is unbound because its identity could
+    /// not be captured, requests go to the numeric TID unchecked. A reap
+    /// through [`wait_all`], [`try_wait_all`] or [`wait_group`], and the
+    /// registration orders in <https://github.com/rrnewton/reverie/issues/860>,
+    /// do not refuse them yet.
+    pub fn assume_stopped(&self) -> Stopped {
+        Stopped::from_token(self.0, self.1.clone())
+    }
+}
+
+/// A process that is in a stopped state and allows ptrace operations to be
+/// performed.
+#[derive(Hash, Eq, PartialEq)]
+pub struct Stopped(Pid, TraceeToken, ExitStopMark);
+
+/// How [`Stopped::transition_unless_left_for_exit_with`] probes whether the
+/// tracee has left the stop a capability names for its exit stop.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExitProbe {
+    /// For any held stop: stat flags first (`PF_SIGNALED`), then
+    /// `PTRACE_GETSIGINFO` last. Correct even when someone wrote the stop's
+    /// siginfo. Five system calls.
+    Full,
+    /// For a stop whose siginfo nobody has written since the kernel reported
+    /// it, such as a single step's trap: `PTRACE_GETSIGINFO`, then the flags
+    /// only to confirm an exit signature. One system call in the common case.
+    ReportedSiginfo,
+}
+
+/// A resuming request for [`Stopped::transition_unless_left_for_exit`]. Each
+/// signal is a raw number, so that one nix cannot name can be delivered; 0
+/// delivers none.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Transition {
+    /// `PTRACE_CONT`.
+    Cont(i32),
+    /// `PTRACE_SYSCALL`.
+    Syscall(i32),
+    /// `PTRACE_SINGLESTEP`.
+    Step(i32),
+    /// `PTRACE_SINGLEBLOCK`, delivering no signal.
+    #[cfg(target_arch = "x86_64")]
+    BlockStep,
+}
+
+impl fmt::Debug for Stopped {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Stopped")
+            .field(&self.0)
+            .field(&self.1)
+            .finish()
+    }
+}
+
+/// Marks the one [`Stopped`] minted by an exit future for a published
+/// `PTRACE_EVENT_EXIT` stop, with the exit epoch that publication belongs to.
+/// It is not part of the value's identity: equality and hashing ignore it.
+#[derive(Clone, Copy, Default)]
+#[cfg_attr(not(feature = "notifier"), allow(dead_code))]
+struct ExitStopMark(Option<usize>);
+
+impl PartialEq for ExitStopMark {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for ExitStopMark {}
+
+impl std::hash::Hash for ExitStopMark {
+    fn hash<H: std::hash::Hasher>(&self, _: &mut H) {}
+}
+
+impl Stopped {
+    /// Helper for converting from the Errno type.
+    ///
+    /// # Why is this needed?
+    ///
+    /// According to ptrace(2), any ptrace operation may return ESRCH
+    /// ("No such process") for one of three reasons:
+    ///  1. The process was observed to be in a stopped state and died
+    ///     unexpectedly.
+    ///  2. The process is not currently being traced by the caller.
+    ///  3. The process is not in a stopped state.
+    ///
+    /// Since we know that reasons (2) and (3) only occur due to
+    /// programmer errors that this API is designed to prevent, we can
+    /// safely assume that this ESRCH means the tracee has died
+    /// unexpectedly while in a stopped state.
+    ///
+    /// For more information, please see the "Death under ptrace" section
+    /// in `man 2 ptrace`.
+    ///
+    /// On the capability for a published exit stop, ESRCH also retires the
+    /// statuses queued before that exit stop (see
+    /// [`Stopped::retire_statuses_before_exit_stop`]). That relies on the
+    /// same assumption as the mapping to `Died` above: every ptrace request
+    /// for this tracee comes from its one tracer thread, so reason (2), which
+    /// the kernel also reports to a thread that is not the tracer, does not
+    /// apply. The kernel also returns ESRCH when it cannot freeze the stop
+    /// because a fatal signal is pending; the tracee is then being killed out
+    /// of the exit stop, so the queued stops ahead of it are still dead.
+    fn map_err(&self, err: Errno) -> Error {
+        if err == Errno::ESRCH {
+            self.retire_statuses_before_exit_stop();
+            Error::Died(Zombie::from_token(self.0, self.1.clone()))
+        } else {
+            Error::Errno(err)
+        }
+    }
+
+    /// Returns a future that is notified when the next exit stop occurs. This
+    /// is received asynchronously regardless of what the process was doing at
+    /// the time. This is useful for canceling futures when a process enters a
+    /// `PTRACE_EVENT_EXIT` (such as when one thread calls `exit_group` and
+    /// causes all other threads to suddenly exit).
+    ///
+    /// Exactly one future for this immutable tracee generation can claim the
+    /// exit stop and return a [`Stopped`] capability. Duplicate or re-polled
+    /// futures return [`Errno::EALREADY`]. An unclaimed capability also expires
+    /// before terminal publication or cancellation cleanup advances the
+    /// tracee.
+    #[cfg(feature = "notifier")]
+    pub fn exit_event(&self) -> notifier::ExitFuture {
+        notifier::ExitFuture::new(self.0, &self.1)
+    }
+
+    /// Observes this exact exit epoch using the explicit ptracer-thread mode.
+    /// The new interface is !Send and !Sync, including on native kernels.
+    #[cfg(feature = "notifier")]
+    pub fn exit_event_on_ptracer_thread(&self) -> PtracerExitFuture {
+        PtracerExitFuture::new(self.0, &self.1)
+    }
+
+    /// Returns a generation-bound terminal cleanup acknowledgment.
+    ///
+    /// This is primarily useful with [`Stopped::new_unchecked`] during
+    /// cancellation after the caller has independently validated that the TID
+    /// still names the expected ptrace generation.
+    #[cfg(feature = "notifier")]
+    pub fn terminal_cleanup(&self) -> TerminalCleanup {
+        TerminalCleanup::new(self.0, &self.1)
+    }
+
+    /// Retains explicit ptracer-thread progress for this same stopped state.
+    /// Its separate shared facade performs only descriptor signaling and
+    /// observation; construction never recaptures this numeric identity.
+    #[cfg(feature = "notifier")]
+    pub fn terminal_cleanup_on_ptracer_thread(&self) -> PtracerTerminalCleanup {
+        PtracerTerminalCleanup::new(self.0, &self.1)
+    }
+
+    /// Retain a read-only observer for this actual token and its current exec epoch.
+    /// It cannot resume, wait, or mint another owning capability, and makes no
+    /// new PID/proc capture. Use it only while the original current stop remains
+    /// under this caller's execution-control ownership.
+    #[cfg(feature = "notifier")]
+    pub fn observation(&self) -> StoppedObservation {
+        StoppedObservation::new(self.0, &self.1)
+    }
+
+    /// Creates a new stopped state. This is useful when we know the process is
+    /// in a stopped state already.
+    ///
+    /// Using this method is unsound because there is no check to verify that the
+    /// pid really is in a stopped state. It is better to arrive at a stopped
+    /// state via other methods such as `Running::wait`.
+    pub fn new_unchecked(pid: Pid) -> Self {
+        Self::from_token(pid, TraceeToken::current_or_error(pid))
+    }
+
+    /// Creates an unchecked stopped state joined to the currently registered
+    /// proc generation for `pid`.
+    ///
+    /// Like [`Stopped::new_unchecked`], the caller must independently prove
+    /// that the exact TID is stopped. Unlike that constructor, generation
+    /// capture/read failures are returned rather than creating an unbound
+    /// notifier state.
+    #[cfg(feature = "notifier")]
+    pub fn try_new_current_unchecked(pid: Pid) -> Result<Self, Errno> {
+        Ok(Self::from_token(pid, TraceeToken::current_or_new(pid)?))
+    }
+
+    /// Captures the original identity for explicit ptracer-thread waits.
+    /// Like [`Self::new_unchecked`], the caller must prove this exact task is
+    /// physically stopped. Capture failures return without an unbound token.
+    #[cfg(feature = "notifier")]
+    pub fn new_unchecked_on_ptracer_thread(pid: Pid) -> Result<Self, Errno> {
+        Ok(Self::from_token(
+            pid,
+            TraceeToken::current_on_ptracer_thread(pid)?,
+        ))
+    }
+
+    fn from_token(pid: Pid, token: TraceeToken) -> Self {
+        Self(pid, token, ExitStopMark(None))
+    }
+
+    /// The capability for the `PTRACE_EVENT_EXIT` stop published in exit
+    /// `epoch`. See [`Stopped::retire_statuses_before_exit_stop`] for when the
+    /// statuses queued before that exit stop are retired.
+    #[cfg(feature = "notifier")]
+    fn from_exit_token(pid: Pid, token: TraceeToken, epoch: usize) -> Self {
+        Self(pid, token, ExitStopMark(Some(epoch)))
+    }
+
+    /// On the capability for a published exit stop, retires the statuses the
+    /// notifier queued before that exit stop. The tracee had already left
+    /// each of those stops when it entered the exit stop, so none of them
+    /// names a stop it can still be in.
+    ///
+    /// This runs on every terminal disposition of the capability: a ptrace
+    /// request that moves the tracee out of the exit stop, and an ESRCH from
+    /// any request on it (resume, step, GETEVENTMSG, ...), which means the
+    /// tracee is no longer in the exit stop. Statuses queued after the exit
+    /// stop, such as the Exec or the terminal wait status, are never removed.
+    /// A mark from an earlier exit epoch retires nothing, so a stale
+    /// capability cannot remove the prefix of a later exit stop. Does nothing
+    /// on any other capability.
+    fn retire_statuses_before_exit_stop(&self) {
+        #[cfg(feature = "notifier")]
+        if let Some(epoch) = self.2.0 {
+            self.1.event().retire_statuses_before_exit_stop(epoch);
+        }
+    }
+
+    /// On the capability for a published exit stop, refuses the stop when a
+    /// fork, vfork or clone stop was queued before it.
+    ///
+    /// Such a stop names a live child only through its event message. The
+    /// tracee left it for the exit stop, whose message (the exit status) has
+    /// replaced the child's PID: decoding it now would read the exit status
+    /// as a PID, and once this exit stop is resumed the read fails with
+    /// ESRCH and the child is never captured. The refusal names the queued
+    /// status instead. This makes no ptrace request and changes no queue; a
+    /// prefix holding such a stop is also never retired (see
+    /// `Stopped::retire_statuses_before_exit_stop`). Always succeeds on any
+    /// other capability.
+    #[cfg(feature = "notifier")]
+    pub fn superseded_new_child(&self) -> Result<(), SupersededStopRefusal> {
+        match self.2.0 {
+            Some(epoch) => self.1.event().superseded_new_child(epoch),
+            None => Ok(()),
+        }
+    }
+
+    /// Converts this capability into the running state after a successful
+    /// ptrace request moved the tracee out of its stop.
+    fn into_running(self) -> Running {
+        #[cfg(feature = "notifier")]
+        self.1.event().invalidate_numeric_auth();
+        self.retire_statuses_before_exit_stop();
+        Running::from_token(self.0, self.1)
+    }
+
+    /// Returns the generation this capability is bound to, so a caller that
+    /// later rebuilds an unchecked capability for this tracee keeps the
+    /// generation's TID gate instead of joining whatever task holds the TID
+    /// by then.
+    pub fn generation(&self) -> TraceeGeneration {
+        TraceeGeneration(self.0, self.1.clone())
+    }
+
+    /// Returns the process ID of the tracee.
+    pub fn pid(&self) -> Pid {
+        self.0
+    }
+
+    /// Sets the ptracer options.
+    pub fn setoptions(&self, options: ptrace::Options) -> Result<(), Error> {
+        self.1
+            .on_held_tid(|| ptrace::setoptions(self.0.into(), options).map_err(nix_errno))
+            .map_err(|err| self.map_err(err))
+    }
+
+    /// Gets a set of registers.
+    ///
+    /// `which` corresponds to one of:
+    ///  * `libc::NT_PRSTATUS` for the general registers.
+    ///  * `libc::NT_PRFPREG` for the floating point registers.
+    ///
+    /// There are others, but we don't use them.
+    fn getregset<T>(&self, which: i32) -> Result<T, Error> {
+        let mut regs = MaybeUninit::<T>::uninit();
+
+        let mut iov = libc::iovec {
+            iov_base: regs.as_mut_ptr() as *mut libc::c_void,
+            iov_len: core::mem::size_of_val(&regs),
+        };
+
+        self.1
+            .on_held_tid(|| unsafe {
+                syscalls::syscall!(
+                    Sysno::ptrace,
+                    // PTRACE_GETREGS isn't available on aarch64, so we must use
+                    // PTRACE_GETREGSET instead.
+                    libc::PTRACE_GETREGSET,
+                    self.0.as_raw(),
+                    which,
+                    &mut iov as *mut _
+                )
+            })
+            .map_err(|err| self.map_err(err))?;
+
+        // GETREGSET selects the target's ABI, which may differ from the
+        // tracer's (for example, a compat PRSTATUS reply is shorter). Require
+        // the entire typed layout in every build before assuming initialization.
+        // Zero-filling the tail would not make a short reply a valid native ABI.
+        if iov.iov_len != core::mem::size_of_val(&regs) {
+            return Err(Error::Errno(Errno::EPROTO));
+        }
+
+        Ok(unsafe { regs.assume_init() })
+    }
+
+    fn setregset<T>(&self, which: i32, regs: &T) -> Result<(), Error> {
+        let iov = libc::iovec {
+            iov_base: regs as *const _ as *mut _,
+            iov_len: core::mem::size_of::<T>(),
+        };
+
+        self.1
+            .on_held_tid(|| unsafe {
+                syscalls::syscall!(
+                    Sysno::ptrace,
+                    // PTRACE_SETREGS isn't available on aarch64, so we must use
+                    // PTRACE_SETREGSET instead.
+                    libc::PTRACE_SETREGSET,
+                    self.0.as_raw(),
+                    which,
+                    &iov as *const _
+                )
+            })
+            .map_err(|err| self.map_err(err))?;
+
+        Ok(())
+    }
+
+    /// Gets the current state of the general purpose registers.
+    pub fn getregs(&self) -> Result<Regs, Error> {
+        self.getregset(libc::NT_PRSTATUS)
+    }
+
+    /// Sets the general purpose registers.
+    pub fn setregs(&self, regs: &Regs) -> Result<(), Error> {
+        self.setregset(libc::NT_PRSTATUS, regs)
+    }
+
+    /// Gets the floating point registers.
+    pub fn getfpregs(&self) -> Result<FpRegs, Error> {
+        self.getregset(libc::NT_PRFPREG)
+    }
+
+    /// Sets the floating point registers. Fails with `EPERM` once
+    /// [`forbid_fpu_register_writes`] has been called.
+    pub fn setfpregs(&self, regs: &FpRegs) -> Result<(), Error> {
+        check_fpu_register_write()?;
+        self.setregset(libc::NT_PRFPREG, regs)
+    }
+
+    /// Gets the complete variable-length x86 XSAVE state for the tracee.
+    // TODO-HUMAN-REVIEW(PR-270): Review complete ptrace XSTATE preservation API.
+    #[cfg(target_arch = "x86_64")]
+    pub fn getxstate(&self) -> Result<XState, Error> {
+        // CPUID.(EAX=0xD,ECX=0):ECX reports the maximum XSAVE area for all
+        // processor-supported user components. The kernel returns the exact
+        // active regset length through iov_len.
+        let maximum = core::arch::x86_64::__cpuid_count(0x0d, 0).ecx as usize;
+        let mut bytes = vec![0_u8; maximum.max(4096)];
+        let mut iov = libc::iovec {
+            iov_base: bytes.as_mut_ptr().cast(),
+            iov_len: bytes.len(),
+        };
+        self.1
+            .on_held_tid(|| unsafe {
+                syscalls::syscall!(
+                    Sysno::ptrace,
+                    libc::PTRACE_GETREGSET,
+                    self.0.as_raw(),
+                    NT_X86_XSTATE,
+                    &mut iov as *mut _
+                )
+            })
+            .map_err(|err| self.map_err(err))?;
+        if iov.iov_len > bytes.len() {
+            return Err(Error::Errno(Errno::EOVERFLOW));
+        }
+        bytes.truncate(iov.iov_len);
+        Ok(XState(bytes))
+    }
+
+    /// Restores a complete x86 XSAVE state previously returned by
+    /// [`Stopped::getxstate`]. Fails with `EPERM` once
+    /// [`forbid_fpu_register_writes`] has been called.
+    // TODO-HUMAN-REVIEW(PR-270): Review complete ptrace XSTATE preservation API.
+    #[cfg(target_arch = "x86_64")]
+    pub fn setxstate(&self, state: &XState) -> Result<(), Error> {
+        check_fpu_register_write()?;
+        let iov = libc::iovec {
+            iov_base: state.0.as_ptr() as *mut libc::c_void,
+            iov_len: state.0.len(),
+        };
+        self.1
+            .on_held_tid(|| unsafe {
+                syscalls::syscall!(
+                    Sysno::ptrace,
+                    libc::PTRACE_SETREGSET,
+                    self.0.as_raw(),
+                    NT_X86_XSTATE,
+                    &iov as *const _
+                )
+            })
+            .map_err(|err| self.map_err(err))?;
+        Ok(())
+    }
+
+    /// Resumes the process and transitions it back to a running state.
+    pub fn resume<T: Into<Option<Signal>>>(self, sig: T) -> Result<Running, Error> {
+        self.1
+            .on_held_tid(|| ptrace::cont(self.0.into(), sig).map_err(nix_errno))
+            .map_err(|err| self.map_err(err))?;
+        Ok(self.into_running())
+    }
+
+    /// Attempts to resume while retaining the original capability on error.
+    ///
+    /// The error arm returns the same generation-bound value, not a new value
+    /// constructed from its numeric PID. This retains ownership; it does not
+    /// guarantee that the kernel state is unchanged after every ptrace error.
+    /// The refusal is a non-owning errno, including ESRCH: no second Zombie
+    /// capability escapes beside the retained Stopped. An errno alone does not
+    /// acknowledge terminal status or guarantee the same physical kernel stop.
+    /// Callers must use their original event owner before another transition.
+    pub fn resume_retaining<T: Into<Option<Signal>>>(
+        self,
+        sig: T,
+    ) -> Result<Running, (Self, Errno)> {
+        let result = self
+            .1
+            .on_held_tid(|| ptrace::cont(self.0.into(), sig).map_err(nix_errno));
+        self.finish_retained_resume(result)
+    }
+
+    /// Resume to a syscall stop, retaining the same stopped capability on error.
+    ///
+    /// The error contract is the same as [`Self::resume_retaining`]: the errno
+    /// does not establish unchanged kernel state or terminal acknowledgement.
+    /// The original event owner must retain and settle the returned capability.
+    pub fn syscall_retaining<T: Into<Option<Signal>>>(
+        self,
+        sig: T,
+    ) -> Result<Running, (Self, Errno)> {
+        let result = self
+            .1
+            .on_held_tid(|| ptrace::syscall(self.0.into(), sig).map_err(nix_errno));
+        self.finish_retained_resume(result)
+    }
+
+    /// Like [`Self::syscall_retaining`], delivering a raw signal number.
+    ///
+    /// This permits genuine realtime signals without converting them to an
+    /// absent signal. Invalid numbers are refused by the original kernel
+    /// request, with the same generation-bound capability returned on error.
+    pub fn syscall_raw_retaining(self, sig: i32) -> Result<Running, (Self, Errno)> {
+        let result = self
+            .1
+            .on_held_tid(|| ptrace_resume_raw(libc::PTRACE_SYSCALL, self.0, sig));
+        self.finish_retained_resume(result)
+    }
+
+    /// Transfers the original capability into a retained notifier wait.
+    ///
+    /// This performs no resume and constructs no replacement running or stopped
+    /// value. Use it when an external lifecycle transition may have superseded
+    /// this stop, such as an actual ESRCH from [`Stopped::resume_retaining`].
+    /// The error is not an exit acknowledgement: only this same generation's
+    /// actual next event settles the wait. If the task remains stopped, this
+    /// future can remain pending; the caller must retain its ownership and
+    /// arrange any necessary termination through its existing supervisor.
+    /// Registration/decoding refusals obey [`Running::wait_owned`]'s retry
+    /// contract and never return a second owning capability.
+    #[cfg(feature = "notifier")]
+    pub fn wait_owned(self) -> notifier::OwnedWaitFuture {
+        notifier::OwnedWaitFuture::from_stopped(self)
+    }
+
+    /// Transfers this same stopped state into an explicit ptracer-thread wait.
+    /// Non-owning refusals retain the original state for retry or return to
+    /// its ptracer through [`PtracerOwnedWaitFuture::into_driver`].
+    #[cfg(feature = "notifier")]
+    pub fn wait_owned_on_ptracer_thread(self) -> PtracerOwnedWaitFuture {
+        PtracerOwnedWaitFuture::from_stopped(self)
+    }
+
+    pub(crate) fn finish_retained_resume(
+        self,
+        result: Result<(), Errno>,
+    ) -> Result<Running, (Self, Errno)> {
+        match result {
+            Ok(()) => Ok(self.into_running()),
+            Err(error) => {
+                if error == Errno::ESRCH {
+                    // The retained value keeps its ownership role, but the
+                    // tracee has left the exit stop this capability names.
+                    self.retire_statuses_before_exit_stop();
+                }
+                Err((self, error))
+            }
+        }
+    }
+
+    /// Resumes the process, delivering the raw signal `sig`, which may be one
+    /// `nix`'s `Signal` cannot name (a realtime signal; see
+    /// [`Event::RawSignal`]). `0` delivers nothing.
+    pub fn resume_raw(self, sig: i32) -> Result<Running, Error> {
+        self.1
+            .on_held_tid(|| ptrace_resume_raw(libc::PTRACE_CONT, self.0, sig))
+            .map_err(|err| self.map_err(err))?;
+        Ok(self.into_running())
+    }
+
+    /// Like [`Stopped::syscall`], delivering the raw signal `sig` (see
+    /// [`Stopped::resume_raw`]).
+    pub fn syscall_raw(self, sig: i32) -> Result<Running, Error> {
+        self.1
+            .on_held_tid(|| ptrace_resume_raw(libc::PTRACE_SYSCALL, self.0, sig))
+            .map_err(|err| self.map_err(err))?;
+        Ok(self.into_running())
+    }
+
+    /// Like [`Stopped::step`], delivering the raw signal `sig` (see
+    /// [`Stopped::resume_raw`]).
+    pub fn step_raw(self, sig: i32) -> Result<Running, Error> {
+        self.1
+            .on_held_tid(|| ptrace_resume_raw(libc::PTRACE_SINGLESTEP, self.0, sig))
+            .map_err(|err| self.map_err(err))?;
+        Ok(self.into_running())
+    }
+
+    /// Runs the process until it next takes a branch, with
+    /// `PTRACE_SINGLEBLOCK`, delivering no signal.
+    ///
+    /// x86 traps after each taken branch (jump, call, return, or conditional
+    /// branch that is taken) when the trap flag is set with DEBUGCTL.BTF, and
+    /// Linux reports the stop as a single step's: SIGTRAP with TRAP_TRACE.
+    /// The step can end earlier, at any stop a single step would also meet
+    /// (a signal, a syscall or seccomp stop, a fault), but never later than
+    /// just past the first taken branch. Conditional branches that are not
+    /// taken do not end it. A processor or hypervisor that ignores BTF steps
+    /// a single instruction instead, which is earlier still.
+    #[cfg(target_arch = "x86_64")]
+    pub fn block_step(self) -> Result<Running, Error> {
+        self.1
+            .on_held_tid(|| ptrace_resume_raw(PTRACE_SINGLEBLOCK, self.0, 0))
+            .map_err(|err| self.map_err(err))?;
+        Ok(self.into_running())
+    }
+
+    /// Advances the execution of the process by a single step optionally
+    /// delivering a signal specified by `sig`.
+    pub fn step<T: Into<Option<Signal>>>(self, sig: T) -> Result<Running, Error> {
+        self.1
+            .on_held_tid(|| ptrace::step(self.0.into(), sig).map_err(nix_errno))
+            .map_err(|err| self.map_err(err))?;
+        Ok(self.into_running())
+    }
+
+    /// Like `step`, but arranges for the tracee to be stopped at the next
+    /// entry to or exit from a system call.
+    pub fn syscall<T: Into<Option<Signal>>>(self, sig: T) -> Result<Running, Error> {
+        self.1
+            .on_held_tid(|| ptrace::syscall(self.0.into(), sig).map_err(nix_errno))
+            .map_err(|err| self.map_err(err))?;
+        Ok(self.into_running())
+    }
+
+    /// Sets the syscall to be executed. Only available on `aarch64`.
+    ///
+    /// Normally, on x86_64, the register `orig_rax` should be set instead to
+    /// modify the syscall number, which typically involves 3 ptrace calls:
+    ///  1. getregs to get the current registers.
+    ///  2. setregs to change `orig_rax` to set the syscall number.
+    ///  3. setregs again to restore the original registers after the syscall
+    ///     has been executed.
+    ///
+    /// `set_syscall` on `aarch64` has the advantage of only requiring a single
+    /// ptrace call.
+    #[cfg(target_arch = "aarch64")]
+    pub fn set_syscall(&self, nr: i32) -> Result<(), Error> {
+        const NT_ARM_SYSTEM_CALL: i32 = 0x404;
+        self.setregset(NT_ARM_SYSTEM_CALL, &nr)
+    }
+
+    /// Gets info about the signal that caused the process to be stopped.
+    pub fn getsiginfo(&self) -> Result<libc::siginfo_t, Error> {
+        self.1
+            .on_held_tid(|| ptrace::getsiginfo(self.0.into()).map_err(nix_errno))
+            .map_err(|err| self.map_err(err))
+    }
+
+    /// Returns [`Error::Died`] if this tracee has left the stop this
+    /// capability names and is now in its `PTRACE_EVENT_EXIT` stop, or if
+    /// the probe itself reports its death. Returns `None` otherwise.
+    ///
+    /// A fatal signal takes a tracee out of any ptrace stop without a tracer
+    /// request. A request made while the tracee is on its way to its exit
+    /// stop fails with `ESRCH`, because the tracee is not in a stop. Once it
+    /// is in its exit stop, requests succeed again, so an ordinary probe made
+    /// after that `ESRCH` sees a stopped, apparently live tracee.
+    /// `PTRACE_GETSIGINFO` tells the two apart: in the exit stop, `si_code`
+    /// is `SIGTRAP | (PTRACE_EVENT_EXIT << 8)`.
+    ///
+    /// Call this only on the capability for a stop other than the exit stop,
+    /// after a request on it failed with `ESRCH`. Holding such a stop, the
+    /// tracer has not resumed the tracee, so a tracee found in its exit stop
+    /// was taken there by a fatal signal and the held stop is dead. Before a
+    /// resume, use [`Self::died_into_exit_stop_before_resume`].
+    pub fn died_into_exit_stop(&self) -> Option<Error> {
+        match self.getsiginfo() {
+            Ok(siginfo)
+                if siginfo.si_signo == libc::SIGTRAP
+                    && siginfo.si_code == libc::SIGTRAP | (libc::PTRACE_EVENT_EXIT << 8) =>
+            {
+                Some(self.map_err(Errno::ESRCH))
+            }
+            Err(died @ Error::Died(_)) => Some(died),
+            _ => None,
+        }
+    }
+
+    /// [`Self::died_into_exit_stop`] for a probe made before resuming the stop
+    /// this capability names, so that the resume does not land on the exit
+    /// stop and consume it (a resume is addressed by PID, not by stop). To
+    /// resume, prefer [`Self::transition_unless_left_for_exit`], which makes
+    /// the same probe immediately before its request.
+    ///
+    /// Siginfo contents alone prove nothing here: at a SIGTRAP delivery stop
+    /// a thread may queue itself the exit signature (`si_code` 0x605), and
+    /// `PTRACE_SETSIGINFO` can overwrite the real exit stop's siginfo (a
+    /// replayed signal does) while `PTRACE_GETEVENTMSG` still holds the exit
+    /// status. So the probe rests on two other facts:
+    /// - `PF_SIGNALED` (0x400) in the thread's stat flags, read through the
+    ///   generation's retained proc directory: a task that took a fatal
+    ///   signal can only be stopped in its exit stop, and the flag is set
+    ///   before that stop is reported. A gone task (`ESRCH`/`ENOENT`) has
+    ///   left too.
+    /// - `PTRACE_GETSIGINFO` failing with `ESRCH`: the tracee is no longer in
+    ///   a stop. Holding one, the tracer has not resumed it, so a fatal signal
+    ///   woke it (Linux clears `JOBCTL_TRACED` at once).
+    ///
+    /// The flags come first and `PTRACE_GETSIGINFO` last, so that in the
+    /// common case no system call separates the final check from the
+    /// request that follows: each return from a system call is a point where
+    /// a loaded scheduler can preempt the tracer while the tracee moves on.
+    /// An exit signature seen by that last check, after flags without
+    /// `PF_SIGNALED`, re-reads the flags to tell a real exit stop entered in
+    /// between from a forged one.
+    #[cfg(feature = "notifier")]
+    pub fn died_into_exit_stop_before_resume(&self) -> Option<Error> {
+        self.died_into_exit_stop_before_resume_with(ExitProbe::Full)
+    }
+
+    /// [`Self::died_into_exit_stop_before_resume`] with the given probe.
+    /// `Some` refuses the resume: [`Error::Died`] when the tracee left the
+    /// stop, or the probe's own error when it could not observe that (then
+    /// nothing may resume the stop on its account).
+    #[cfg(feature = "notifier")]
+    pub fn died_into_exit_stop_before_resume_with(&self, probe: ExitProbe) -> Option<Error> {
+        match self.1.on_held_tid(|| self.left_for_exit_stop(probe)) {
+            Ok(true) | Err(Errno::ESRCH) => Some(self.map_err(Errno::ESRCH)),
+            Ok(false) => None,
+            Err(error) => Some(Error::Errno(error)),
+        }
+    }
+
+    /// Makes `transition` unless the tracee has left the stop this capability
+    /// names for its exit stop; then it returns the same [`Error::Died`] as a
+    /// request that met `ESRCH`, without issuing the request. The probe (see
+    /// [`Self::died_into_exit_stop_before_resume`]) runs inside the same held
+    /// TID section, immediately before the request. Nothing makes the two
+    /// atomic: a fatal signal arriving between them still takes the tracee
+    /// into its exit stop, and the request then resumes it.
+    ///
+    /// Use it only on the capability for a stop other than the exit stop.
+    #[cfg(feature = "notifier")]
+    pub fn transition_unless_left_for_exit(self, transition: Transition) -> Result<Running, Error> {
+        self.transition_unless_left_for_exit_with(transition, ExitProbe::Full)
+    }
+
+    /// [`Self::transition_unless_left_for_exit`] with the given probe.
+    #[cfg(feature = "notifier")]
+    pub fn transition_unless_left_for_exit_with(
+        self,
+        transition: Transition,
+        probe: ExitProbe,
+    ) -> Result<Running, Error> {
+        let (request, signal) = match transition {
+            Transition::Cont(signal) => (libc::PTRACE_CONT, signal),
+            Transition::Syscall(signal) => (libc::PTRACE_SYSCALL, signal),
+            Transition::Step(signal) => (libc::PTRACE_SINGLESTEP, signal),
+            #[cfg(target_arch = "x86_64")]
+            Transition::BlockStep => (PTRACE_SINGLEBLOCK, 0),
+        };
+        self.1
+            .on_held_tid(|| {
+                // A probe that cannot observe refuses with its own error: no
+                // resume on an unknown verdict.
+                if self.left_for_exit_stop(probe)? {
+                    return Err(Errno::ESRCH);
+                }
+                ptrace_resume_raw(request, self.0, signal)
+            })
+            .map_err(|err| self.map_err(err))?;
+        Ok(self.into_running())
+    }
+
+    /// The probe shared by [`Self::died_into_exit_stop_before_resume_with`]
+    /// and [`Self::transition_unless_left_for_exit_with`], for use inside a
+    /// held TID section. `Ok(true)`: the tracee has left the stop for its
+    /// exit stop (or is gone). `Ok(false)`: it is still in a stop that is not
+    /// its exit stop. `Err`: the observation failed, and no verdict exists.
+    ///
+    /// Procfs errors are not lifecycle evidence. A failed stat read (for
+    /// example `EMFILE`) is an error, not "no `PF_SIGNALED`". `ENOENT` or
+    /// `ESRCH` from it can be a permission-shaped denial (procfs `hidepid`
+    /// reports `ENOENT`) rather than death, so it counts as gone only when the
+    /// retained pidfd also reports the task dead; a live pidfd makes it an
+    /// error. Without a captured identity bound to this PID the flags cannot
+    /// be read; an exit signature in the siginfo then counts as an exit stop,
+    /// which can refuse a forged SIGTRAP but never consumes a real exit stop
+    /// the siginfo still shows.
+    #[cfg(feature = "notifier")]
+    fn left_for_exit_stop(&self, probe: ExitProbe) -> Result<bool, Errno> {
+        const PF_SIGNALED: u32 = 0x400;
+        let event = self.1.event();
+        // Ok(Some(true)) when PF_SIGNALED or the task is proven gone,
+        // Ok(Some(false)) when neither, Ok(None) without a bound identity.
+        let signaled = || -> Result<Option<bool>, Errno> {
+            match event.bound_stat_flags(self.0) {
+                None => Ok(None),
+                Some(Ok(flags)) => Ok(Some(flags & PF_SIGNALED != 0)),
+                Some(Err(notifier::ProcStatError::Io(Errno::ENOENT | Errno::ESRCH))) => {
+                    match event.bound_pidfd_live(self.0) {
+                        Some(Ok(false)) => Ok(Some(true)),
+                        Some(Ok(true)) | None => Err(Errno::ENOENT),
+                        Some(Err(error)) => Err(error),
+                    }
+                }
+                Some(Err(notifier::ProcStatError::Io(error))) => Err(error),
+                Some(Err(_)) => Err(Errno::EIO),
+            }
+        };
+        if probe == ExitProbe::Full && signaled()? == Some(true) {
+            return Ok(true);
+        }
+        match ptrace::getsiginfo(self.0.into()) {
+            Err(nix::Error::ESRCH) => Ok(true),
+            // EINVAL: the stop has no siginfo, which only a group-stop of a
+            // tracee attached without PTRACE_SEIZE reports (Linux v6.17
+            // kernel/ptrace.c:683, kernel/signal.c:2682). The exit stop always
+            // has one (ptrace_do_notify, kernel/signal.c:2500), so the tracee
+            // is still in a stop that is not its exit stop.
+            Err(nix::Error::EINVAL) => Ok(false),
+            Err(error) => Err(nix_errno(error)),
+            Ok(info)
+                if info.si_signo == libc::SIGTRAP
+                    && info.si_code == libc::SIGTRAP | (libc::PTRACE_EVENT_EXIT << 8) =>
+            {
+                Ok(signaled()?.unwrap_or(true))
+            }
+            Ok(_) => Ok(false),
+        }
+    }
+
+    /// Sets info about the singal that caused the process to be stopped.
+    pub fn setsiginfo(&self, siginfo: &libc::siginfo_t) -> Result<(), Error> {
+        self.1
+            .on_held_tid(|| ptrace::setsiginfo(self.0.into(), siginfo).map_err(nix_errno))
+            .map_err(|err| self.map_err(err))
+    }
+
+    /// The bytes of the siginfo of the signal that stopped the tracee
+    /// (`PTRACE_GETSIGINFO`), exactly as the kernel wrote them, into storage
+    /// that is initialized before the request. Unlike [`Stopped::getsiginfo`],
+    /// whose `siginfo_t` a typed move may leave with undefined padding (64-bit
+    /// musl's has four bytes after `si_code`), every byte is defined.
+    pub fn getsiginfo_bytes(&self) -> Result<[u8; SIGINFO_BYTES], Error> {
+        let mut bytes = [0u8; SIGINFO_BYTES];
+        self.1
+            .on_held_tid(|| {
+                Errno::result(unsafe {
+                    libc::ptrace(
+                        libc::PTRACE_GETSIGINFO,
+                        self.0.as_raw(),
+                        0,
+                        bytes.as_mut_ptr(),
+                    )
+                })
+            })
+            .map_err(|err| self.map_err(err))?;
+        Ok(bytes)
+    }
+
+    /// Sets the siginfo of the signal that stopped the tracee
+    /// (`PTRACE_SETSIGINFO`) from `bytes`, the kernel's layout, without
+    /// building a `siginfo_t`.
+    pub fn setsiginfo_bytes(&self, bytes: &[u8; SIGINFO_BYTES]) -> Result<(), Error> {
+        self.1
+            .on_held_tid(|| {
+                Errno::result(unsafe {
+                    libc::ptrace(libc::PTRACE_SETSIGINFO, self.0.as_raw(), 0, bytes.as_ptr())
+                })
+            })
+            .map_err(|err| self.map_err(err))
+            .map(drop)
+    }
+
+    /// Gets the tracee's blocked signal mask (`PTRACE_GETSIGMASK`). Bit `n - 1`
+    /// is set when signal `n` is blocked.
+    pub fn getsigmask(&self) -> Result<u64, Error> {
+        let mut mask: u64 = 0;
+        self.1
+            .on_held_tid(|| {
+                Errno::result(unsafe {
+                    libc::ptrace(
+                        libc::PTRACE_GETSIGMASK,
+                        self.0.as_raw(),
+                        core::mem::size_of::<u64>(),
+                        &mut mask as *mut u64,
+                    )
+                })
+            })
+            .map_err(|err| self.map_err(err))?;
+        Ok(mask)
+    }
+
+    /// Sets the tracee's blocked signal mask (`PTRACE_SETSIGMASK`). The kernel
+    /// ignores the `SIGKILL` and `SIGSTOP` bits. Like any ptrace mask write, it
+    /// also clears the tracee's pending restore of a mask saved by a
+    /// mask-swapping syscall such as `ppoll` or `rt_sigsuspend`.
+    pub fn setsigmask(&self, mask: u64) -> Result<(), Error> {
+        self.1
+            .on_held_tid(|| {
+                Errno::result(unsafe {
+                    libc::ptrace(
+                        libc::PTRACE_SETSIGMASK,
+                        self.0.as_raw(),
+                        core::mem::size_of::<u64>(),
+                        &mask as *const u64,
+                    )
+                })
+            })
+            .map_err(|err| self.map_err(err))?;
+        Ok(())
+    }
+
+    /// Like `getsiginfo`, but do not remove the signal info from an internal
+    /// queue.
+    pub fn peeksiginfo<T: Into<Option<PeekSigInfoFlags>>>(
+        &self,
+        flags: T,
+    ) -> Result<Vec<libc::siginfo_t>, Error> {
+        const SIGNAL_MAX: usize = 8 * core::mem::size_of::<u64>();
+        let mut data = MaybeUninit::<[libc::siginfo_t; SIGNAL_MAX]>::zeroed();
+        let mut siginfo_args = ptrace_peeksiginfo_args {
+            off: 0,
+            flags: flags.into().map_or(0, |x| x.bits()),
+            nr: SIGNAL_MAX as u32,
+        };
+        let count = self
+            .1
+            .on_held_tid(|| {
+                Errno::result(unsafe {
+                    libc::ptrace(
+                        libc::PTRACE_PEEKSIGINFO,
+                        self.0.as_raw(),
+                        &mut siginfo_args as *mut _,
+                        data.as_mut_ptr() as *const _ as *const libc::c_void,
+                    )
+                })
+            })
+            .map_err(|err| self.map_err(err))?;
+        Ok(unsafe { data.assume_init() }[0..count as usize].to_vec())
+    }
+
+    /// Like `peeksiginfo`, but returns the whole queue rather than at most its
+    /// first 64 entries.
+    ///
+    /// The kernel copies at least one entry per call if one exists at the
+    /// offset, may stop early when the tracer has a signal pending, and
+    /// returns 0 only past the end of the queue, so this reads until it gets 0.
+    /// Real-time signals queue one entry each, so a queue can exceed 64 entries.
+    pub fn peeksiginfo_all<T: Into<Option<PeekSigInfoFlags>>>(
+        &self,
+        flags: T,
+    ) -> Result<Vec<libc::siginfo_t>, Error> {
+        const CHUNK: usize = 64;
+        let flags = flags.into().map_or(0, |x| x.bits());
+        let mut data = MaybeUninit::<[libc::siginfo_t; CHUNK]>::zeroed();
+        let mut all = Vec::new();
+        loop {
+            let mut siginfo_args = ptrace_peeksiginfo_args {
+                off: all.len() as u64,
+                flags,
+                nr: CHUNK as u32,
+            };
+            let count = self
+                .1
+                .on_held_tid(|| {
+                    Errno::result(unsafe {
+                        libc::ptrace(
+                            libc::PTRACE_PEEKSIGINFO,
+                            self.0.as_raw(),
+                            &mut siginfo_args as *mut _,
+                            data.as_mut_ptr() as *const _ as *const libc::c_void,
+                        )
+                    })
+                })
+                .map_err(|err| self.map_err(err))? as usize;
+            if count == 0 {
+                return Ok(all);
+            }
+            // SAFETY: zero-initialized, and the kernel wrote the first `count`.
+            all.extend_from_slice(&unsafe { data.assume_init_ref() }[..count]);
+        }
+    }
+
+    /// Whether any queued signal matches `matches`, read like
+    /// `peeksiginfo_all` but 64 entries at a time with no more kept, and
+    /// stopping at the first match.
+    pub fn peeksiginfo_any<T, F>(&self, flags: T, mut matches: F) -> Result<bool, Error>
+    where
+        T: Into<Option<PeekSigInfoFlags>>,
+        F: FnMut(&libc::siginfo_t) -> bool,
+    {
+        const CHUNK: usize = 64;
+        let flags = flags.into().map_or(0, |x| x.bits());
+        let mut data = MaybeUninit::<[libc::siginfo_t; CHUNK]>::zeroed();
+        let mut off = 0u64;
+        loop {
+            let mut siginfo_args = ptrace_peeksiginfo_args {
+                off,
+                flags,
+                nr: CHUNK as u32,
+            };
+            let count = self
+                .1
+                .on_held_tid(|| {
+                    Errno::result(unsafe {
+                        libc::ptrace(
+                            libc::PTRACE_PEEKSIGINFO,
+                            self.0.as_raw(),
+                            &mut siginfo_args as *mut _,
+                            data.as_mut_ptr() as *const _ as *const libc::c_void,
+                        )
+                    })
+                })
+                .map_err(|err| self.map_err(err))? as usize;
+            if count == 0 {
+                return Ok(false);
+            }
+            // SAFETY: zero-initialized, and the kernel wrote the first `count`.
+            if unsafe { data.assume_init_ref() }[..count]
+                .iter()
+                .any(&mut matches)
+            {
+                return Ok(true);
+            }
+            off += count as u64;
+        }
+    }
+
+    /// Retrieve a message about the ptrace event that just happened.
+    ///
+    /// It shouldn't be necessary to call this in most cases because `Event`
+    /// provides the necessary context for certain ptrace events.
+    pub fn getevent(&self) -> Result<i64, Error> {
+        self.1
+            .on_held_tid(|| ptrace::getevent(self.0.into()).map_err(nix_errno))
+            .map_err(|err| self.map_err(err))
+    }
+
+    /// Detach while retaining the original generation-bound stop on error.
+    /// An errno does not establish unchanged kernel state or terminal status;
+    /// the original owner must retain and settle that uncertainty.
+    pub fn detach_retaining<T: Into<Option<Signal>>>(
+        self,
+        sig: T,
+    ) -> Result<Running, (Self, Errno)> {
+        let result = self
+            .1
+            .on_held_tid(|| ptrace::detach(self.0.into(), sig).map_err(nix_errno));
+        self.finish_retained_resume(result)
+    }
+
+    /// Detaches from and then resumes the stopped tracee.
+    pub fn detach<T: Into<Option<Signal>>>(self, sig: T) -> Result<Running, Error> {
+        self.1
+            .on_held_tid(|| ptrace::detach(self.0.into(), sig).map_err(nix_errno))
+            .map_err(|err| self.map_err(err))?;
+        Ok(self.into_running())
+    }
+}
+
+/// Waits for any child processes to change state, blocking until the next event.
+/// This is equivalent to `waitpid(-1)`.
+///
+/// Reaping a child here does not close its capabilities' TID gates, so a
+/// gate that nothing else closed lets them reach a task that reuses its TID
+/// (<https://github.com/rrnewton/reverie/issues/860>).
+pub fn wait_all() -> Result<Option<Wait>, Error> {
+    let result = wait(IdType::All, WaitPidFlag::WEXITED | WaitPidFlag::WSTOPPED)
+        .map_err(Error::from)
+        .and_then(|status| {
+            // Unwrap is OK because the process cannot be left in a running
+            // state without WNOHANG.
+            let (pid, status) = status.unwrap();
+            Wait::from_wait_helper(pid, status)
+        });
+
+    match result {
+        Ok(state) => Ok(Some(state)),
+        Err(Error::Errno(Errno::ECHILD)) => {
+            // waitpid(-1) only returns ECHILD when there are no more children
+            // to wait for. Returning `None` here makes it easy to write a while
+            // loop that terminates when there are no more children left.
+            Ok(None)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Like `wait_all`, but immediately returns `Ok(None)` if no state transition
+/// will occur.
+///
+/// This is the non-blocking version of `wait_all`.
+pub fn try_wait_all() -> Result<Option<Wait>, Error> {
+    wait(
+        IdType::All,
+        WaitPidFlag::WEXITED | WaitPidFlag::WSTOPPED | WaitPidFlag::WNOHANG,
+    )?
+    .map(|(pid, status)| Wait::from_wait_helper(pid, status))
+    .transpose()
+}
+
+/// Waits for any child in a process group to change state, blocking until the
+/// next event.
+///
+/// Reaping a child here does not close its capabilities' TID gates, so a
+/// gate that nothing else closed lets them reach a task that reuses its TID
+/// (<https://github.com/rrnewton/reverie/issues/860>).
+pub fn wait_group(pid: Pid) -> Result<Option<Wait>, Error> {
+    let result = wait(
+        IdType::Pgid(pid.into()),
+        WaitPidFlag::WEXITED | WaitPidFlag::WSTOPPED,
+    )
+    .map_err(Error::from)
+    .and_then(|status| {
+        // Unwrap is OK because the process cannot be left in a running
+        // state without WNOHANG.
+        let (pid, status) = status.unwrap();
+        Wait::from_wait_helper(pid, status)
+    });
+
+    match result {
+        Ok(state) => Ok(Some(state)),
+        Err(Error::Errno(Errno::ECHILD)) => {
+            // This only returns ECHILD when there are no more children to wait
+            // for. Returning `None` here makes it easy to write a while loop
+            // that terminates when there are no more children left.
+            Ok(None)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Blocks until a state change is ready to consume, but does not consume it.
+/// Returns the pid that has the pending state change. Returns `Ok(None)` if
+/// there are no child processes to wait on.
+///
+/// This is useful for deciding which processes to consume events for.
+///
+/// # Examples
+///
+/// ```ignore
+/// while let Some(process) = peek_all()? {
+///     match process.wait()? {
+///         Wait::Stopped(tracee, _event) => {
+///             tracee.resume(None)?;
+///         }
+///         Wait::Exited(pid, exit_status) => {
+///             println!("pid {} exited ({})", pid, exit_status);
+///         }
+///     }
+/// }
+/// ```
+pub fn peek_all() -> Result<Option<Running>, Errno> {
+    let result = wait(
+        IdType::All,
+        WaitPidFlag::WEXITED | WaitPidFlag::WSTOPPED | WaitPidFlag::WNOWAIT,
+    )
+    .map(|state| {
+        // Unwrap is OK because the process cannot be in a running state without
+        // WNOHANG.
+        state.unwrap()
+    });
+
+    match result {
+        Ok((pid, _)) => Ok(Some(Running::new(pid))),
+        Err(Errno::ECHILD) => {
+            // waitpid(-1) only returns ECHILD when there are no more children
+            // to wait for. Returning `None` here makes it easy to write a while
+            // loop that terminates when there are no more children left.
+            Ok(None)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Returns a process that is ready to change state. If there are no child
+/// processes ready to change, returns immediately.
+///
+/// This is the non-blocking version of `peek_all`.
+pub fn try_peek_all() -> Result<Option<Running>, Errno> {
+    let next = wait(
+        IdType::All,
+        WaitPidFlag::WEXITED | WaitPidFlag::WSTOPPED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+    )?;
+
+    Ok(next.map(|(pid, _)| Running::new(pid)))
+}
+
+/// A running child.
+#[derive(Debug, Hash, Eq, PartialEq)]
+pub struct Running(Pid, TraceeToken);
+
+impl Running {
+    /// Creates a new running process. This is generally the entry point for a
+    /// new process as soon as it is created.
+    ///
+    /// The state shares the generation that other states for the same live
+    /// task already carry. With the `notifier` feature, once that
+    /// generation's identity has been captured, a numeric request through any
+    /// of them stops reaching the TID once the notifier or [`Running::wait`]
+    /// reaps that task, except in the orders listed in
+    /// <https://github.com/rrnewton/reverie/issues/860>. If the identity
+    /// cannot be captured, the state gets a fresh, unbound generation, which
+    /// no reap gates until a later registration binds it.
+    pub fn new(pid: Pid) -> Self {
+        Self::from_token(pid, TraceeToken::current_or_fresh(pid))
+    }
+
+    /// Captures a running generation using the generic native thread-pidfd
+    /// interface and returns its exact acquisition error. This preserves the
+    /// same sibling-pollable contract as [`Self::new`] and enables no legacy
+    /// fallback.
+    #[cfg(feature = "notifier")]
+    pub fn try_new(pid: Pid) -> Result<Self, Errno> {
+        Self::from_current_or_new(pid)
+    }
+
+    /// Captures this original generation for explicit ptracer-thread waits.
+    /// Only this named mode enables the retained legacy fallback when
+    /// PIDFD_THREAD is unavailable. A failed capture returns no unbound state.
+    #[cfg(feature = "notifier")]
+    pub fn new_on_ptracer_thread(pid: Pid) -> Result<Self, Errno> {
+        Ok(Self::from_token(
+            pid,
+            TraceeToken::current_on_ptracer_thread(pid)?,
+        ))
+    }
+
+    fn from_token(pid: Pid, token: TraceeToken) -> Self {
+        Self(pid, token)
+    }
+
+    fn from_current_or_new(pid: Pid) -> Result<Self, Errno> {
+        Ok(Self::from_token(pid, TraceeToken::current_or_new(pid)?))
+    }
+
+    fn newly_attached(pid: Pid) -> Self {
+        let running = Self::new(pid);
+        #[cfg(feature = "notifier")]
+        return Self::from_token(
+            pid,
+            TraceeToken::from_event(running.1.event().reconnect_attachment(pid)),
+        );
+        #[cfg(not(feature = "notifier"))]
+        running
+    }
+
+    /// Attaches to a running process. The process becomes a tracee and a SIGSTOP
+    /// is sent to it. By the time this function ends, the tracee may not yet
+    /// have actually stopped. Thus, the tracee is still considered to be in a
+    /// running state and needs to be waited upon to observe the SIGSTOP.
+    pub fn attach(pid: Pid) -> Result<Self, Errno> {
+        ptrace::attach(pid.into()).map_err(|err| Errno::new(err as i32))?;
+        Ok(Self::newly_attached(pid))
+    }
+
+    /// Similar to attach, but does not stop the process. This also affects the
+    /// events that are later delivered. Upon clone, fork, or vfork, an
+    /// `Event::Stop` is delivered instead of `Event::Signal(Signal::SIGSTOP)`.
+    ///
+    /// Unlike other modes, a seized process can also accept interrupts.
+    pub fn seize(pid: Pid, options: Options) -> Result<Self, Errno> {
+        ptrace::seize(pid.into(), options).map_err(|err| Errno::new(err as i32))?;
+        Ok(Self::newly_attached(pid))
+    }
+
+    /// Attaches, then captures the task that the atomic ptrace request owns.
+    /// If that first exact capture is refused, the successful attachment is
+    /// retained in the returned state with its original errno. Local waits
+    /// refuse that unbound state without capturing a replacement generation.
+    #[cfg(feature = "notifier")]
+    pub fn attach_on_ptracer_thread(pid: Pid) -> Result<Self, Errno> {
+        let owner = notifier::EventHandle::capture_current_host_owner()?;
+        let original = notifier::AttachmentAnchor::capture(pid)?;
+        ptrace::attach(pid.into()).map_err(nix_errno)?;
+        #[cfg(test)]
+        notifier::after_initial_attachment_for_test(pid, &original);
+        let mut token = TraceeToken::from_event_for_policy(
+            notifier::EventHandle::attachment_on_ptracer_thread(pid, &original),
+            notifier::WaitPolicy::PtracerThread,
+        );
+        token.ptracer_owner = Some(owner);
+        // attachment_on_ptracer_thread validated the same retained original
+        // generation after the successful atomic request. A later transient
+        // host lookup cannot erase that established attachment role.
+        token.ptracer_wait_role = token.event().initial_capture_error().is_none();
+        Ok(Self::from_token(pid, token))
+    }
+
+    /// Seizes, then captures the task actually owned by that ptrace request.
+    /// Capture refusals retain the successful attached state as described by
+    /// [`Self::attach_on_ptracer_thread`]; no later local recapture is allowed.
+    #[cfg(feature = "notifier")]
+    pub fn seize_on_ptracer_thread(pid: Pid, options: Options) -> Result<Self, Errno> {
+        let owner = notifier::EventHandle::capture_current_host_owner()?;
+        let original = notifier::AttachmentAnchor::capture(pid)?;
+        ptrace::seize(pid.into(), options).map_err(nix_errno)?;
+        #[cfg(test)]
+        notifier::after_initial_attachment_for_test(pid, &original);
+        let mut token = TraceeToken::from_event_for_policy(
+            notifier::EventHandle::attachment_on_ptracer_thread(pid, &original),
+            notifier::WaitPolicy::PtracerThread,
+        );
+        token.ptracer_owner = Some(owner);
+        token.ptracer_wait_role = token.event().initial_capture_error().is_none();
+        Ok(Self::from_token(pid, token))
+    }
+
+    /// Interrupts the running process, even if it is in the middle of a syscall.
+    /// The next time the process is waited on, the process transitions to a
+    /// stopped state and `Event::Stop` is returned.
+    ///
+    /// # Limitations
+    ///
+    /// This only works for processes being traced via `Running::seize`.
+    /// The request addresses a numeric TID. A concurrent nonleader exec can
+    /// release that TID and allow a same-ptracer replacement to receive the
+    /// request, including after an explicit interface's lifetime precheck.
+    /// Native thread pidfds do not make this ptrace request atomic. See
+    /// <https://github.com/rrnewton/reverie/issues/860>.
+    pub fn interrupt(&self) -> Result<(), Errno> {
+        // nix doesn't provide `ptrace::interrupt` yet, so we need to roll our
+        // own.
+        self.1.on_held_tid(|| {
+            Errno::result(unsafe {
+                libc::ptrace(
+                    libc::PTRACE_INTERRUPT,
+                    self.0.as_raw(),
+                    std::ptr::null_mut::<libc::c_void>(),
+                    std::ptr::null_mut::<libc::c_void>(),
+                )
+            })
+            .map(drop)
+        })
+    }
+
+    /// Returns the pid of the running process.
+    pub fn pid(&self) -> Pid {
+        self.0
+    }
+
+    /// Retains this exact task generation without granting a ptrace request.
+    /// The caller must independently establish a real stop before using
+    /// [`TraceeGeneration::assume_stopped`].
+    pub fn generation(&self) -> TraceeGeneration {
+        TraceeGeneration(self.0, self.1.clone())
+    }
+
+    /// Blocks until a state change occurs. This may transition the process to
+    /// either a stopped state or exited state, but never a running state.
+    pub fn wait(self) -> Result<Wait, Error> {
+        let pid = self.0;
+        let token = self.1;
+        #[cfg(feature = "notifier")]
+        {
+            notifier::wait_sync(pid, token)
+        }
+        #[cfg(not(feature = "notifier"))]
+        {
+            wait(
+                IdType::Pid(pid.into()),
+                WaitPidFlag::WEXITED | WaitPidFlag::WSTOPPED,
+            )
+            .map_err(Error::from)
+            .and_then(|status| {
+                // Unwrap is OK because the process cannot be in a running state without
+                // WNOHANG.
+                let (_, status) = status.unwrap();
+                Wait::decode_raw(pid, status, token)
+            })
+        }
+    }
+
+    /// Creates a retaining synchronous wait for this exact ptracer thread.
+    /// Its explicit wait operation permits the legacy descriptor mode and
+    /// keeps the same original input on a foreign-thread or backend refusal.
+    #[cfg(feature = "notifier")]
+    pub fn wait_sync_on_ptracer_thread(self) -> PtracerSyncWait {
+        PtracerSyncWait::new(self)
+    }
+
+    /// Like `wait`, but filters out events we don't care about by resuming the
+    /// tracee when encountering them. This is useful for skipping past spurious
+    /// events until a point we know the tracee must stop.
+    #[cfg(feature = "notifier")]
+    pub async fn wait_until<F>(mut self, mut pred: F) -> Result<Wait, Error>
+    where
+        F: FnMut(&Event) -> bool,
+    {
+        loop {
+            match self.next_state().await? {
+                Wait::Stopped(stopped, event) => {
+                    if pred(&event) {
+                        break Ok(Wait::Stopped(stopped, event));
+                    }
+                    // Forward a signal, named or not
+                    // (<https://github.com/rrnewton/reverie/issues/207>): a
+                    // resume without one would suppress it.
+                    self = match event {
+                        Event::Signal(sig) => stopped.resume(Some(sig))?,
+                        Event::RawSignal(raw) => stopped.resume_raw(raw)?,
+                        _ => stopped.resume(None)?,
+                    };
+                }
+                task => break Ok(task),
+            }
+        }
+    }
+
+    /// Waits until we receive a specific stop signal. Useful for skipping past
+    /// spurious signals.
+    #[cfg(feature = "notifier")]
+    pub async fn wait_for_signal(self, sig: Signal) -> Result<Wait, Error> {
+        self.wait_until(|event| event == &Event::Signal(sig)).await
+    }
+
+    /// Waits for the next exit stop to occur. This is received asynchronously
+    /// regardless of what the process was doing at the time. This is useful for
+    /// canceling futures when a process enters a `PTRACE_EVENT_EXIT` (such as
+    /// when one thread calls `exit_group` and causes all other threads to
+    /// suddenly exit).
+    ///
+    /// Exactly one future for this immutable tracee generation can claim the
+    /// exit stop and return a [`Stopped`] capability. Duplicate or re-polled
+    /// futures return [`Errno::EALREADY`]. An unclaimed capability also expires
+    /// before terminal publication or cancellation cleanup advances the
+    /// tracee.
+    #[cfg(feature = "notifier")]
+    pub fn exit_event(&self) -> notifier::ExitFuture {
+        notifier::ExitFuture::new(self.0, &self.1)
+    }
+
+    /// Waits for this same exit epoch in the explicit ptracer-thread mode.
+    /// The returned future is !Send and !Sync on every supported kernel.
+    #[cfg(feature = "notifier")]
+    pub fn exit_event_on_ptracer_thread(&self) -> PtracerExitFuture {
+        PtracerExitFuture::new(self.0, &self.1)
+    }
+
+    /// Registers this process with the async notifier and returns a bounded
+    /// synchronous acknowledgment handle for terminal cleanup.
+    #[cfg(feature = "notifier")]
+    pub fn terminal_cleanup(&self) -> TerminalCleanup {
+        TerminalCleanup::new(self.0, &self.1)
+    }
+
+    /// Retains explicit ptracer-thread cleanup for this original generation.
+    /// The returned progressing facade is !Send and !Sync on every kernel.
+    #[cfg(feature = "notifier")]
+    pub fn terminal_cleanup_on_ptracer_thread(&self) -> PtracerTerminalCleanup {
+        PtracerTerminalCleanup::new(self.0, &self.1)
+    }
+
+    /// Transfers this generation into an owned notifier wait.
+    ///
+    /// Unlike the convenience async wrapper, this future retains its original
+    /// generation after a returned error. It may be polled again after the
+    /// caller has handled a registration or status-decoding refusal. An error
+    /// does not prove exit. Its [`OwnedWaitError`] contains no second owning
+    /// Zombie. After a successful state return this future releases its old
+    /// owner and every subsequent poll returns `OwnedWaitError::Completed`.
+    #[cfg(feature = "notifier")]
+    pub fn wait_owned(self) -> notifier::OwnedWaitFuture {
+        notifier::OwnedWaitFuture::new(self)
+    }
+
+    /// Transfers this original generation into an explicit owner-thread wait.
+    /// Every refusal preserves that same state; no numeric recapture occurs.
+    #[cfg(feature = "notifier")]
+    pub fn wait_owned_on_ptracer_thread(self) -> PtracerOwnedWaitFuture {
+        PtracerOwnedWaitFuture::new(self)
+    }
+
+    /// Waits through the explicitly selected ptracer-thread interface.
+    /// This has the retained, non-owning error contract of
+    /// [`Self::wait_owned_on_ptracer_thread`], rather than a sibling-pollable
+    /// generic future. Use the explicit constructor before first capture.
+    #[cfg(feature = "notifier")]
+    pub fn next_state_on_ptracer_thread(self) -> PtracerWaitFuture {
+        self.wait_owned_on_ptracer_thread()
+    }
+
+    /// Like `wait`, but wait asynchronously for the next state change.
+    ///
+    /// NOTE: This call should not be mixed with [`Running::wait`]!! Once
+    /// [`Running::next_state`] is called once, [`Running::wait`] should never
+    /// be called again for that PID. This is because a notifier thread takes
+    /// over and calls `wait` in a continuous loop.
+    #[cfg(feature = "notifier")]
+    pub async fn next_state(self) -> Result<Wait, Error> {
+        notifier::WaitFuture::new(self).await
+    }
+}
+
+/// A process that is no longer running, but hasn't yet fully exited. The only
+/// thing zombie can do is exit.
+#[derive(Debug, Hash, Eq, PartialEq)]
+pub struct Zombie(Running);
+
+impl Zombie {
+    /// Creates a new instance.
+    fn from_token(pid: Pid, token: TraceeToken) -> Self {
+        Zombie(Running::from_token(pid, token))
+    }
+
+    /// Returns the PID of the zombie.
+    pub fn pid(&self) -> Pid {
+        self.0.pid()
+    }
+
+    /// Retains this zombie's original generation without capturing a target
+    /// or registering another wait owner.
+    pub fn generation(&self) -> TraceeGeneration {
+        self.0.generation()
+    }
+
+    /// Transfers the original generation into a retained notifier wait.
+    ///
+    /// The same retry contract as [`Running::wait_owned`] applies. A subsequent
+    /// stop still requires its actual stopped capability to be continued; this
+    /// method does not manufacture or acknowledge terminal status.
+    #[cfg(feature = "notifier")]
+    pub fn wait_owned(self) -> notifier::OwnedWaitFuture {
+        self.0.wait_owned()
+    }
+
+    /// Retains this same zombie generation in an explicit ptracer-thread wait.
+    #[cfg(feature = "notifier")]
+    pub fn wait_owned_on_ptracer_thread(self) -> PtracerOwnedWaitFuture {
+        self.0.wait_owned_on_ptracer_thread()
+    }
+
+    /// Reaps the zombie by waiting for it to fully exit.
+    #[cfg(feature = "notifier")]
+    pub async fn reap(self) -> Result<ExitStatus, Error> {
+        // The tracee may not be fully dead yet. It is still possible for it to
+        // still enter an `Event::Exit` state by waiting on it. For more info,
+        // see the "BUGS" section in `man 2 ptrace`.
+        let mut next_state = self.0.next_state().await;
+
+        loop {
+            match next_state {
+                Ok(wait) => match wait {
+                    Wait::Stopped(stopped, event) => {
+                        if let Event::Exit = event {
+                            next_state = match stopped.resume(None) {
+                                Ok(task) => task.next_state().await,
+                                Err(err) => Err(err),
+                            };
+                        } else {
+                            panic!("Task {:?} unexpected stop event {:?}", stopped, event)
+                        }
+                    }
+                    Wait::Exited(_pid, exit_status) => break Ok(exit_status),
+                },
+                Err(Error::Died(zombie)) => next_state = zombie.0.next_state().await,
+                Err(error) => break Err(error),
+            }
+        }
+    }
+}
+
+impl fmt::Display for Zombie {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.pid())
+    }
+}
+
+/// Sets up this process to be traced by its parent and raises a SIGSTOP.
+pub fn traceme_and_stop() -> Result<(), Errno> {
+    ptrace::traceme()
+        .and_then(|()| nix::sys::signal::raise(Signal::SIGSTOP))
+        .map_err(|e| Errno::new(e as i32))?;
+    Ok(())
+}
+
+/// The size of Linux's `siginfo_t`, the unit of [`Stopped::getsiginfo_bytes`]
+/// and [`Stopped::setsiginfo_bytes`].
+pub const SIGINFO_BYTES: usize = 128;
+
+static FPU_REGISTER_WRITES_FORBIDDEN: AtomicBool = AtomicBool::new(false);
+
+/// Makes every later [`Stopped::setfpregs`] and [`Stopped::setxstate`] in this
+/// process fail with `EPERM`. It cannot be undone.
+///
+/// A tool calls this when a write to a tracee's floating-point or extended
+/// state would void a guarantee it gives. Hermit's x86-64-v3 CPU profile
+/// qualifies a host on the in-use bits a guest's own XSAVE reads, and the
+/// kernel's regset write forces some of those bits
+/// (<https://github.com/rrnewton/hermit/issues/4243>). The check sits at this
+/// layer, where every such write passes, so a caller added later cannot bypass
+/// it.
+///
+/// A caller that writes several register sets can be left part way: the
+/// gdbstub's `G` packet writes the general registers before the FP registers,
+/// so after this call such a packet is partly applied before it fails with
+/// EPERM. Hermit refuses `--gdbserver` under that profile, so it never reaches
+/// this.
+pub fn forbid_fpu_register_writes() {
+    FPU_REGISTER_WRITES_FORBIDDEN.store(true, Ordering::SeqCst);
+}
+
+/// Whether [`forbid_fpu_register_writes`] has been called in this process.
+pub fn fpu_register_writes_forbidden() -> bool {
+    FPU_REGISTER_WRITES_FORBIDDEN.load(Ordering::SeqCst)
+}
+
+fn check_fpu_register_write() -> Result<(), Error> {
+    if fpu_register_writes_forbidden() {
+        Err(Error::Errno(Errno::EPERM))
+    } else {
+        Ok(())
+    }
+}
+
+/// These tests are meant to test this API but also to show how ptrace works.
+#[cfg(test)]
+mod test {
+    use std::io;
+    use std::os::fd::BorrowedFd;
+    use std::thread;
+
+    use nix::sys::signal;
+    use nix::sys::signal::Signal;
+    use nix::unistd::ForkResult;
+    use nix::unistd::fork;
+    // Make sure tokio is referenced in all configurations.
+    use tokio as _;
+
+    use super::*;
+
+    // Traces a closure in a forked process. The forked process starts in a
+    // stopped state so that ptrace options may be set.
+    fn trace<F>(f: F, options: Options) -> Result<(Pid, Stopped), Error>
+    where
+        F: FnOnce() -> i32,
+    {
+        match unsafe { fork() }? {
+            ForkResult::Parent { child, .. } => {
+                let mut running = Running::seize(child.into(), options)?;
+
+                // Keep consuming events until we reach a SIGSTOP or group stop.
+                let stopped = loop {
+                    match running.wait()? {
+                        Wait::Stopped(stopped, event) => {
+                            if event == Event::Signal(Signal::SIGSTOP) || event == Event::Stop {
+                                break stopped;
+                            } else if let Event::Signal(sig) = event {
+                                running = stopped.resume(Some(sig))?;
+                            } else if let Event::RawSignal(raw) = event {
+                                running = stopped.resume_raw(raw)?;
+                            } else {
+                                running = stopped.resume(None)?;
+                            }
+                        }
+                        task => panic!("Got unexpected exit: {:?}", task),
+                    }
+                };
+
+                Ok((stopped.pid(), stopped))
+            }
+            ForkResult::Child => {
+                // Create a new process group so we can wait on this process and
+                // every child more efficiently.
+                let _ = unsafe { libc::setpgid(0, 0) };
+
+                // Suppress core dumps for testing purposes.
+                let limit = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                let _ = unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) };
+
+                // PTRACE_SEIZE is inherently racey, so we stop the child
+                // process here.
+                signal::raise(Signal::SIGSTOP).unwrap();
+
+                // Run the child when the process is resumed.
+                let exit_code = f();
+
+                // Note: We can't use the normal exit function here because we
+                // don't want to call atexit handlers since `execve` was never
+                // called. `_exit` diverges (`-> !`), so there is nothing to bind.
+                unsafe { ::libc::_exit(exit_code) };
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn exercise_retained_syscall_stops(raw: bool) -> Result<(), Box<dyn std::error::Error>> {
+        let (pid, mut stopped) = trace(
+            || {
+                // No Rust work is required between this actual syscall and
+                // the test helper's ordinary _exit.
+                unsafe {
+                    libc::syscall(libc::SYS_getpid);
+                }
+                23
+            },
+            Options::PTRACE_O_EXITKILL | Options::PTRACE_O_TRACESYSGOOD,
+        )?;
+        let generation = stopped.generation();
+        let mut found = false;
+        // libc raise's return may first expose its syscall exit or mask repair.
+        // Discover the actual GET_SYSCALL_INFO ENTRY, never alternate a phase bit.
+        for _ in 0..8 {
+            let running = if raw {
+                stopped.syscall_raw_retaining(0)
+            } else {
+                stopped.syscall_retaining(None)
+            }
+            .map_err(|(_, error)| error)?;
+            let (next, event) = running.wait()?.assume_stopped();
+            stopped = next;
+            assert_eq!(event, Event::Syscall);
+            assert_eq!(stopped.generation(), generation);
+            let info = stopped.getsyscallinfo()?;
+            assert_eq!(info.architecture, 0xc000_003e);
+            if matches!(info.operation, SyscallInfoOp::Entry { number, .. } if number == libc::SYS_getpid as u64)
+            {
+                found = true;
+                break;
+            }
+        }
+        assert!(
+            found,
+            "did not observe the actual getpid entry within the fixture bound"
+        );
+        let entry = stopped.getsyscallinfo()?;
+        let running = if raw {
+            stopped.syscall_raw_retaining(0)
+        } else {
+            stopped.syscall_retaining(None)
+        }
+        .map_err(|(_, error)| error)?;
+        let (stopped, event) = running.wait()?.assume_stopped();
+        assert_eq!(event, Event::Syscall);
+        assert_eq!(stopped.generation(), generation);
+        let exit = stopped.getsyscallinfo()?;
+        assert_eq!(exit.architecture, entry.architecture);
+        assert_eq!(exit.instruction_pointer, entry.instruction_pointer);
+        assert_eq!(exit.stack_pointer, entry.stack_pointer);
+        assert_eq!(
+            exit.operation,
+            SyscallInfoOp::Exit {
+                return_value: i64::from(pid.as_raw()),
+                is_error: false,
+            }
+        );
+        assert_eq!(
+            stopped
+                .resume_retaining(None)
+                .map_err(|(_, error)| error)?
+                .wait()?,
+            Wait::Exited(pid, ExitStatus::Exited(23)),
+        );
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn syscall_retaining_reaches_actual_entry_and_exit() -> Result<(), Box<dyn std::error::Error>> {
+        exercise_retained_syscall_stops(false)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn syscall_raw_retaining_reaches_actual_entry_and_exit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        exercise_retained_syscall_stops(true)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn syscall_raw_retaining_kernel_refusal_keeps_original_stop()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (pid, stopped) = trace(|| 23, Options::PTRACE_O_EXITKILL)?;
+        let generation = stopped.generation();
+        let before = stopped.getregs()?;
+        let mask = stopped.getsigmask()?;
+        // Linux ptrace_resume rejects an invalid signal with EIO before resume.
+        // This is a real failed kernel request, not an injected mock errno.
+        let (stopped, error) = stopped.syscall_raw_retaining(i32::MAX).unwrap_err();
+        let after = stopped.getregs()?;
+        let after_mask = stopped.getsigmask()?;
+        let same_generation = stopped.generation() == generation;
+        // Confirm progress and terminal reap BEFORE assertions on the refusal.
+        let terminal = stopped
+            .resume_retaining(None)
+            .map_err(|(_, error)| error)?
+            .wait()?;
+        assert_eq!(terminal, Wait::Exited(pid, ExitStatus::Exited(23)));
+        assert_eq!(error, Errno::EIO);
+        assert!(same_generation);
+        assert_eq!(after, before);
+        assert_eq!(after_mask, mask);
+        Ok(())
+    }
+
+    #[test]
+    fn fpu_register_writes_fail_once_forbidden() -> Result<(), Box<dyn std::error::Error + 'static>>
+    {
+        // No other test in this binary writes FP registers, so forbidding them
+        // process-wide here does not disturb one.
+        let (pid, tracee) = trace(|| 0, Options::PTRACE_O_EXITKILL)?;
+        let fpregs = tracee.getfpregs()?;
+        tracee.setfpregs(&fpregs)?;
+        #[cfg(target_arch = "x86_64")]
+        let xstate = tracee.getxstate()?;
+        #[cfg(target_arch = "x86_64")]
+        tracee.setxstate(&xstate)?;
+        forbid_fpu_register_writes();
+        assert!(fpu_register_writes_forbidden());
+        assert!(matches!(
+            tracee.setfpregs(&fpregs),
+            Err(Error::Errno(Errno::EPERM))
+        ));
+        #[cfg(target_arch = "x86_64")]
+        assert!(matches!(
+            tracee.setxstate(&xstate),
+            Err(Error::Errno(Errno::EPERM))
+        ));
+        // Reads are unaffected.
+        tracee.getfpregs()?;
+        assert_eq!(
+            tracee.resume(None)?.wait()?,
+            Wait::Exited(pid, ExitStatus::Exited(0))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn basic() -> Result<(), Box<dyn std::error::Error + 'static>> {
+        // Do nothing but exit.
+        let (pid, tracee) = trace(|| 42, Options::empty())?;
+        assert_eq!(
+            tracee.resume(None)?.wait()?,
+            Wait::Exited(pid, ExitStatus::Exited(42))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn stop_on_exit() -> Result<(), Box<dyn std::error::Error + 'static>> {
+        let (pid, tracee) = trace(
+            || 42,
+            Options::PTRACE_O_EXITKILL | Options::PTRACE_O_TRACEEXIT,
+        )?;
+
+        let running = tracee.resume(None)?;
+        let (stopped, event) = running.wait()?.assume_stopped();
+
+        // The tracee has stopped just before exiting. Resuming or detaching now
+        // will let the process exit.
+        assert_eq!(event, Event::Exit);
+
+        assert_eq!(
+            stopped.resume(None)?.wait()?,
+            Wait::Exited(pid, ExitStatus::Exited(42))
+        );
+
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    const PRSTATUS_BYTES: usize = core::mem::size_of::<libc::user_regs_struct>();
+    #[cfg(target_arch = "x86_64")]
+    const PRSTATUS_CS: usize = core::mem::offset_of!(libc::user_regs_struct, cs);
+
+    // Independent raw observation: this deliberately does not call
+    // Stopped::getregs or any decoder that assumes a native reply size.
+    #[cfg(target_arch = "x86_64")]
+    fn raw_prstatus(tid: i32) -> Result<([u8; PRSTATUS_BYTES], usize), Errno> {
+        let mut bytes = [0xa5u8; PRSTATUS_BYTES];
+        let mut iov = libc::iovec {
+            iov_base: bytes.as_mut_ptr().cast(),
+            iov_len: bytes.len(),
+        };
+        Errno::result(unsafe {
+            libc::ptrace(
+                libc::PTRACE_GETREGSET,
+                tid,
+                libc::NT_PRSTATUS as usize as *mut libc::c_void,
+                &mut iov as *mut libc::iovec,
+            )
+        })?;
+        Ok((bytes, iov.iov_len))
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn set_native_prstatus(tid: i32, bytes: &[u8; PRSTATUS_BYTES]) -> Result<(), Errno> {
+        // On x86-64, PTRACE_SETREGS uses the native tracer layout even when the
+        // stopped target's current CS selects compat GETREGSET. This permits
+        // exact restoration without executing a single instruction in compat
+        // mode.
+        Errno::result(unsafe {
+            libc::ptrace(
+                libc::PTRACE_SETREGS,
+                tid,
+                std::ptr::null_mut::<libc::c_void>(),
+                bytes.as_ptr(),
+            )
+        })
+        .map(|_| ())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn generic_getregs_refuses_actual_compat_and_restores()
+    -> Result<(), Box<dyn std::error::Error + 'static>> {
+        let (pid, tracee) = trace(|| 42, Options::PTRACE_O_EXITKILL)?;
+        let tid = pid.as_raw();
+        let (original, length) = raw_prstatus(tid)?;
+        assert_eq!(length, PRSTATUS_BYTES);
+        assert_eq!(tracee.getregs()?.cs, 0x33);
+        let mut compat = original;
+        compat[PRSTATUS_CS..PRSTATUS_CS + 8].copy_from_slice(&0x23u64.to_ne_bytes());
+        set_native_prstatus(tid, &compat)?;
+        let (reply, length) = raw_prstatus(tid)?;
+        assert_eq!(length, 68, "actual short kernel PRSTATUS, never a mock");
+        assert_eq!(u16::from_ne_bytes(reply[52..54].try_into().unwrap()), 0x23);
+        assert!(reply[length..].iter().all(|byte| *byte == 0xa5));
+
+        // The fixed generic API must refuse before constructing Regs. Restore
+        // the native registers before asserting, so the child can exit
+        // normally. (Before the fix, debug builds panicked on the length
+        // assertion and release builds constructed Regs from 148
+        // uninitialized bytes.)
+        let result = tracee.getregs();
+        set_native_prstatus(tid, &original)?;
+        let (restored, length) = raw_prstatus(tid)?;
+        assert_eq!(length, PRSTATUS_BYTES);
+        assert_eq!(restored, original);
+        assert!(
+            matches!(result, Err(Error::Errno(Errno::EPROTO))),
+            "{result:?}"
+        );
+        assert_eq!(tracee.getregs()?.cs, 0x33);
+        assert_eq!(
+            tracee.resume(None)?.wait()?,
+            Wait::Exited(pid, ExitStatus::Exited(42))
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(not(sanitized))]
+    fn serialized_threads() -> Result<(), Box<dyn std::error::Error + 'static>> {
+        const THREAD_COUNT: usize = 8;
+
+        let (pid, tracee) = trace(
+            move || {
+                // Create a handful of threads that do nothing but exit. They
+                // are raw pthreads: see `spawn_tracee_thread`.
+                extern "C" fn exit_at_once(_: *mut libc::c_void) -> *mut libc::c_void {
+                    std::ptr::null_mut()
+                }
+                let threads = (0..THREAD_COUNT)
+                    .map(|_| spawn_tracee_thread(exit_at_once, std::ptr::null_mut()))
+                    .collect::<Vec<_>>();
+
+                for t in threads {
+                    assert_eq!(unsafe { libc::pthread_join(t, std::ptr::null_mut()) }, 0);
+                }
+
+                42
+            },
+            Options::PTRACE_O_EXITKILL
+                | Options::PTRACE_O_TRACEEXIT
+                | ptrace::Options::PTRACE_O_TRACECLONE,
+        )?;
+
+        let mut parent = tracee.resume(None)?;
+
+        // We should observe threads getting created.
+        for _ in 0..THREAD_COUNT {
+            let (stopped, event) = parent.wait()?.assume_stopped();
+
+            let child = match event {
+                Event::NewChild(ChildOp::Clone, child) => child,
+                e => panic!("Expected clone event, got {:?}", e),
+            };
+
+            // Should be at a group stop.
+            let (child, event) = child.wait()?.assume_stopped();
+            assert_eq!(event, Event::Stop);
+
+            // Resume the child.
+            let child = child.resume(None)?;
+
+            // Wait for it to exit.
+            let (child, event) = child.wait()?.assume_stopped();
+            assert_eq!(event, Event::Exit);
+
+            // Resume one last time to let it fully exit.
+            let (_child_pid, exit_status) = child.resume(None)?.wait()?.assume_exited();
+            assert_eq!(exit_status, ExitStatus::Exited(0));
+
+            // Resume the parent.
+            parent = stopped.resume(None)?;
+        }
+
+        // ptrace stop just before fully exiting.
+        let (parent, event) = parent.wait()?.assume_stopped();
+        assert_eq!(event, Event::Exit);
+
+        // Fully exited.
+        let parent = parent.resume(None)?;
+        assert_eq!(parent.wait()?, Wait::Exited(pid, ExitStatus::Exited(42)));
+
+        Ok(())
+    }
+
+    /// Starts a thread in a tracee forked by [`trace`] with a raw
+    /// `pthread_create`.
+    ///
+    /// The test harness is multithreaded, and `fork` copies only the calling
+    /// thread. A lock another harness thread held at the fork stays held in
+    /// the child forever. `std::thread::spawn` takes such a lock (the thread
+    /// info lock of std's stack overflow handler), so a tracee that uses it
+    /// can block before its first clone. `pthread_create` needs no lock that
+    /// glibc does not reset in the child of a fork.
+    #[cfg(not(sanitized))]
+    fn spawn_tracee_thread(
+        start: extern "C" fn(*mut libc::c_void) -> *mut libc::c_void,
+        arg: *mut libc::c_void,
+    ) -> libc::pthread_t {
+        let mut thread = std::mem::MaybeUninit::<libc::pthread_t>::uninit();
+        let rc = unsafe { libc::pthread_create(thread.as_mut_ptr(), std::ptr::null(), start, arg) };
+        assert_eq!(rc, 0, "pthread_create in a tracee failed");
+        unsafe { thread.assume_init() }
+    }
+
+    #[cfg(not(sanitized))]
+    fn group_exit(thread_count: usize) -> Result<(), Box<dyn std::error::Error + 'static>> {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let (parent_pid, tracee) = trace(
+            move || {
+                let counter = Arc::new(AtomicUsize::new(0));
+
+                // Create a handful of threads that sleep forever. They are
+                // raw pthreads: see `spawn_tracee_thread`.
+                extern "C" fn count_and_sleep(counter: *mut libc::c_void) -> *mut libc::c_void {
+                    // SAFETY: `counter` comes from `Arc::into_raw` below and
+                    // owns one strong count, which this thread never drops:
+                    // it sleeps until exit_group ends the process.
+                    let counter = unsafe { &*(counter as *const AtomicUsize) };
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    unsafe { libc::sleep(Duration::from_mins(1).as_secs() as libc::c_uint) };
+                    std::ptr::null_mut()
+                }
+                let _threads = (0..thread_count)
+                    .map(|_i| {
+                        let counter = Arc::into_raw(counter.clone()) as *mut libc::c_void;
+                        spawn_tracee_thread(count_and_sleep, counter)
+                    })
+                    .collect::<Vec<_>>();
+
+                // Wait for each of the threads to actually get initialized.
+                while counter.load(Ordering::Relaxed) != thread_count {
+                    thread::yield_now();
+                }
+
+                // All threads should be alive at this point. SYS_exit_group
+                // should force all threads to exit.
+                let _ = unsafe { libc::syscall(libc::SYS_exit_group, 42) };
+
+                unreachable!()
+            },
+            Options::PTRACE_O_EXITKILL
+                | Options::PTRACE_O_TRACEEXIT
+                | ptrace::Options::PTRACE_O_TRACECLONE,
+        )?;
+
+        tracee.resume(None)?;
+
+        let mut exited = Vec::new();
+
+        // Keep consuming events until everything has exited.
+        while let Some(wait) = wait_group(parent_pid)? {
+            match wait {
+                Wait::Stopped(tracee, _event) => {
+                    tracee.resume(None)?;
+                }
+                Wait::Exited(pid, exit_status) => {
+                    exited.push((pid, exit_status));
+                }
+            }
+        }
+
+        // The parent should have exited last.
+        assert_eq!(exited.pop(), Some((parent_pid, ExitStatus::Exited(42))));
+
+        // The only things left should be the threads that were spawned.
+        assert_eq!(exited.len(), thread_count);
+
+        // All others should have exited with the same exit status.
+        for (_pid, exit_status) in exited {
+            assert_eq!(exit_status, ExitStatus::Exited(42));
+        }
+
+        Ok(())
+    }
+
+    /// Tests that we receive an exit for all threads in the right order even
+    /// when the main thread calls `exit_group`.
+    #[test]
+    #[cfg(not(sanitized))]
+    fn group_exit_stress() {
+        // Test a variety of thread counts. Super-high thread counts makes
+        // ptrace very slow, so we keep this to a relatively low number.
+        for i in 0..100 {
+            group_exit(i / 2).unwrap();
+        }
+    }
+
+    /// Tests that trying to trace from another thread does not work.
+    #[test]
+    fn trace_from_another_thread() -> Result<(), Box<dyn std::error::Error + 'static>> {
+        let (pid, tracee) = trace(|| 42, Options::empty()).unwrap();
+
+        // Try resuming from another thread, which should fail. The process
+        // didn't actually die; this is just how ESRCH is interpreted.
+        let error = thread::spawn(move || tracee.resume(None))
+            .join()
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(error, Error::Died(zombie) if zombie.pid() == pid));
+
+        assert_eq!(
+            Stopped::new_unchecked(pid).resume(None)?.wait()?,
+            Wait::Exited(pid, ExitStatus::Exited(42))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn trace_killed_by_signal() -> Result<(), Box<dyn std::error::Error + 'static>> {
+        let (pid, tracee) = trace(
+            || {
+                signal::raise(Signal::SIGILL).unwrap();
+                unreachable!()
+            },
+            Options::PTRACE_O_EXITKILL,
+        )?;
+
+        let running = tracee.resume(None)?;
+
+        let (stopped, event) = running.wait()?.assume_stopped();
+
+        // The tracee has stopped just before exiting. Resuming or detaching now
+        // will let the process exit.
+        assert_eq!(event, Event::Signal(Signal::SIGILL));
+
+        assert_eq!(
+            stopped.resume(Some(Signal::SIGILL))?.wait()?,
+            Wait::Exited(pid, ExitStatus::Signaled(Signal::SIGILL, true))
+        );
+
+        Ok(())
+    }
+
+    #[cfg(feature = "notifier")]
+    #[cfg(not(sanitized))]
+    #[tokio::test]
+    async fn notifier_basic() -> Result<(), Box<dyn std::error::Error + 'static>> {
+        let (pid, tracee) = trace(|| 42, Options::empty())?;
+        assert_eq!(
+            tracee.resume(None)?.next_state().await?,
+            Wait::Exited(pid, ExitStatus::Exited(42))
+        );
+
+        Ok(())
+    }
+
+    #[cfg(feature = "notifier")]
+    #[cfg(not(sanitized))]
+    #[tokio::test]
+    async fn notifier_generation_preserves_exit_and_signal_status()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (pid, tracee) = trace(|| 42, Options::empty())?;
+        let token = tracee.1.clone();
+        let stale_running = Running::from_token(pid, token.clone());
+        let stale_zombie = Zombie::from_token(pid, token);
+        let expected = ExitStatus::Exited(42);
+
+        assert_eq!(
+            tracee.resume(None)?.next_state().await?,
+            Wait::Exited(pid, expected)
+        );
+        assert_eq!(
+            stale_running.next_state().await?,
+            Wait::Exited(pid, expected),
+            "old Running rebound after terminal registry removal"
+        );
+        assert_eq!(stale_zombie.reap().await?, expected);
+        assert_eq!(
+            Running::new(pid).next_state().await,
+            Err(Error::Errno(Errno::ECHILD)),
+            "fresh generation inherited stale terminal status"
+        );
+
+        let (pid, tracee) = trace(
+            || {
+                signal::raise(Signal::SIGILL).unwrap();
+                unreachable!()
+            },
+            Options::PTRACE_O_EXITKILL,
+        )?;
+        let token = tracee.1.clone();
+        let stale_running = Running::from_token(pid, token.clone());
+        let stale_zombie = Zombie::from_token(pid, token);
+        let expected = ExitStatus::Signaled(Signal::SIGILL, true);
+        let (stopped, event) = tracee.resume(None)?.next_state().await?.assume_stopped();
+        assert_eq!(event, Event::Signal(Signal::SIGILL));
+
+        assert_eq!(
+            stopped.resume(Some(Signal::SIGILL))?.next_state().await?,
+            Wait::Exited(pid, expected)
+        );
+        assert_eq!(
+            stale_running.next_state().await?,
+            Wait::Exited(pid, expected),
+            "old Running lost the terminating signal"
+        );
+        assert_eq!(stale_zombie.reap().await?, expected);
+        assert_eq!(
+            Running::new(pid).next_state().await,
+            Err(Error::Errno(Errno::ECHILD))
+        );
+
+        Ok(())
+    }
+
+    #[cfg(feature = "notifier")]
+    #[cfg(not(sanitized))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn owned_wait_clone_parent_decode_refusal_retains_same_owner()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        for injected in [Errno::EMFILE, Errno::EIO] {
+            let (pid, tracee) = trace(
+                || {
+                    let flags = libc::CLONE_PARENT | libc::SIGCHLD;
+                    let result = unsafe {
+                        libc::syscall(libc::SYS_clone, flags, 0usize, 0usize, 0usize, 0usize)
+                    };
+                    if result == 0 {
+                        unsafe { libc::_exit(0) };
+                    }
+                    i32::from(result == -1)
+                },
+                Options::PTRACE_O_EXITKILL | Options::PTRACE_O_TRACEFORK,
+            )?;
+            let running = tracee.resume_retaining(None).map_err(|(_, error)| error)?;
+            let cleanup = running.terminal_cleanup();
+            let mut owner = running.wait_owned();
+
+            notifier::inject_capture_error_for_current_thread(injected);
+            assert_eq!(
+                tokio::time::timeout(
+                    deadline.saturating_duration_since(std::time::Instant::now()),
+                    &mut owner
+                )
+                .await?,
+                Err(OwnedWaitError::Errno(injected)),
+                "first CLONE_PARENT decode did not surface the injected capture error"
+            );
+
+            let (parent, event) = tokio::time::timeout(
+                deadline.saturating_duration_since(std::time::Instant::now()),
+                &mut owner,
+            )
+            .await??
+            .assume_stopped();
+            assert_eq!(parent.pid(), pid);
+            assert!(parent.terminal_cleanup().same_generation(&cleanup));
+            assert!(matches!((&mut owner).await, Err(OwnedWaitError::Completed)));
+            let child = match event {
+                Event::NewChild(ChildOp::Fork, child) => child,
+                event => panic!("retry lost the CLONE_PARENT event: {event:?}"),
+            };
+            let (child, event) = tokio::time::timeout(
+                deadline.saturating_duration_since(std::time::Instant::now()),
+                child.wait_owned(),
+            )
+            .await??
+            .assume_stopped();
+            assert!(matches!(
+                event,
+                Event::Stop | Event::Signal(Signal::SIGSTOP)
+            ));
+            assert_eq!(
+                tokio::time::timeout(
+                    deadline.saturating_duration_since(std::time::Instant::now()),
+                    child.resume(None)?.wait_owned()
+                )
+                .await??
+                .assume_exited()
+                .1,
+                ExitStatus::Exited(0)
+            );
+            assert_eq!(
+                tokio::time::timeout(
+                    deadline.saturating_duration_since(std::time::Instant::now()),
+                    parent.resume(None)?.wait_owned()
+                )
+                .await??
+                .assume_exited()
+                .1,
+                ExitStatus::Exited(0)
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "notifier")]
+    #[cfg(not(sanitized))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn notifier_clone_parent_decode_error_preserves_fifo_front()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for injected in [Errno::EMFILE, Errno::EIO] {
+            let (pid, tracee) = trace(
+                || {
+                    let flags = libc::CLONE_PARENT | libc::SIGCHLD;
+                    let result = unsafe {
+                        libc::syscall(libc::SYS_clone, flags, 0usize, 0usize, 0usize, 0usize)
+                    };
+                    if result == 0 {
+                        unsafe { libc::_exit(0) };
+                    }
+                    i32::from(result == -1)
+                },
+                Options::PTRACE_O_EXITKILL | Options::PTRACE_O_TRACEFORK,
+            )?;
+            let token = tracee.1.clone();
+            let running = tracee.resume(None)?;
+            let retry = Running::from_token(pid, token);
+            let _cleanup = running.terminal_cleanup();
+
+            notifier::inject_capture_error_for_current_thread(injected);
+            assert_eq!(
+                running.next_state().await,
+                Err(Error::Errno(injected)),
+                "first CLONE_PARENT decode did not surface the injected capture error"
+            );
+
+            let (parent, event) = retry.next_state().await?.assume_stopped();
+            let child = match event {
+                Event::NewChild(ChildOp::Fork, child) => child,
+                event => panic!("retry lost the CLONE_PARENT event: {event:?}"),
+            };
+            let (child, event) = child.next_state().await?.assume_stopped();
+            assert!(matches!(
+                event,
+                Event::Stop | Event::Signal(Signal::SIGSTOP)
+            ));
+            assert_eq!(
+                child.resume(None)?.next_state().await?.assume_exited().1,
+                ExitStatus::Exited(0)
+            );
+            assert_eq!(
+                parent.resume(None)?.next_state().await?.assume_exited().1,
+                ExitStatus::Exited(0)
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "notifier")]
+    #[cfg(not(sanitized))]
+    #[test]
+    fn synchronous_clone_parent_decode_error_preserves_fifo_front()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for injected in [Errno::EMFILE, Errno::EIO] {
+            let (pid, tracee) = trace(
+                || {
+                    let flags = libc::CLONE_PARENT | libc::SIGCHLD;
+                    let result = unsafe {
+                        libc::syscall(libc::SYS_clone, flags, 0usize, 0usize, 0usize, 0usize)
+                    };
+                    if result == 0 {
+                        unsafe { libc::_exit(0) };
+                    }
+                    i32::from(result == -1)
+                },
+                Options::PTRACE_O_EXITKILL | Options::PTRACE_O_TRACEFORK,
+            )?;
+            let token = tracee.1.clone();
+            let running = tracee.resume(None)?;
+            let retry = Running::from_token(pid, token);
+
+            notifier::inject_sync_decode_capture_error(pid, injected);
+            assert_eq!(
+                running.wait(),
+                Err(Error::Errno(injected)),
+                "first synchronous CLONE_PARENT decode did not surface the injected error"
+            );
+
+            let (parent, event) = retry.wait()?.assume_stopped();
+            let child = match event {
+                Event::NewChild(ChildOp::Fork, child) => child,
+                event => panic!("synchronous retry lost the CLONE_PARENT event: {event:?}"),
+            };
+            let (child, event) = child.wait()?.assume_stopped();
+            assert!(matches!(
+                event,
+                Event::Stop | Event::Signal(Signal::SIGSTOP)
+            ));
+            assert_eq!(
+                child.resume(None)?.wait()?.assume_exited().1,
+                ExitStatus::Exited(0)
+            );
+            assert_eq!(
+                parent.resume(None)?.wait()?.assume_exited().1,
+                ExitStatus::Exited(0)
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "notifier")]
+    #[cfg(not(sanitized))]
+    #[tokio::test]
+    async fn late_waits_after_terminal_reap_return_echild() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (pid, tracee) = trace(|| 42, Options::empty())?;
+        assert_eq!(
+            tracee.resume(None)?.next_state().await?,
+            Wait::Exited(pid, ExitStatus::Exited(42))
+        );
+
+        assert_eq!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                Running::new(pid).next_state(),
+            )
+            .await
+            .expect("late next_state hung after terminal reap"),
+            Err(Error::Errno(Errno::ECHILD))
+        );
+        assert_eq!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                Running::new(pid).exit_event(),
+            )
+            .await
+            .expect("late exit_event hung after terminal reap"),
+            Err(Error::Errno(Errno::ECHILD))
+        );
+
+        Ok(())
+    }
+
+    // kernel_sigset_t used by naked syscall
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    struct KernelSigset(u64);
+
+    impl From<&[Signal]> for KernelSigset {
+        fn from(signals: &[Signal]) -> Self {
+            let mut set: u64 = 0;
+            for &sig in signals {
+                set |= 1u64 << (sig as usize - 1);
+            }
+            KernelSigset(set)
+        }
+    }
+
+    #[unsafe(no_mangle)]
+    extern "C" fn sigalrm_handler(
+        _sig: i32,
+        _siginfo: *mut libc::siginfo_t,
+        _ucontext: *const libc::c_void,
+    ) {
+        nix::unistd::write(unsafe { BorrowedFd::borrow_raw(2) }, b"caught SIGALRM!").unwrap();
+    }
+
+    #[allow(dead_code)]
+    unsafe fn install_sigalrm_handler() -> i32 {
+        unsafe {
+            let mut sa: libc::sigaction = MaybeUninit::zeroed().assume_init();
+            sa.sa_flags = libc::SA_RESTART | libc::SA_SIGINFO | libc::SA_NODEFER;
+            sa.sa_sigaction = sigalrm_handler as *const () as _;
+
+            libc::sigaction(libc::SIGALRM, &sa as *const _, std::ptr::null_mut())
+        }
+    }
+
+    #[allow(dead_code)]
+    // unblock signal(s) and set its handler to SIG_DFL
+    unsafe fn unblock_signals(signals: &[Signal]) -> io::Result<KernelSigset> {
+        unsafe {
+            let set = KernelSigset::from(signals);
+            let mut oldset = MaybeUninit::<u64>::uninit();
+
+            if libc::syscall(
+                libc::SYS_rt_sigprocmask,
+                libc::SIG_UNBLOCK,
+                &set as *const _,
+                oldset.as_mut_ptr(),
+                8,
+            ) != 0
+            {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(KernelSigset(oldset.assume_init()))
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    unsafe fn block_signals(signals: &[Signal]) -> io::Result<KernelSigset> {
+        unsafe {
+            let set = KernelSigset::from(signals);
+            let mut oldset = MaybeUninit::<u64>::uninit();
+
+            if libc::syscall(
+                libc::SYS_rt_sigprocmask,
+                libc::SIG_BLOCK,
+                &set as *const _,
+                oldset.as_mut_ptr(),
+                8,
+            ) != 0
+            {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(KernelSigset(oldset.assume_init()))
+            }
+        }
+    }
+
+    /// The calling thread's blocked-signal mask, as the kernel reports it.
+    fn own_sigmask() -> u64 {
+        let mut mask = 0u64;
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_rt_sigprocmask,
+                libc::SIG_BLOCK,
+                std::ptr::null::<u64>(),
+                &mut mask as *mut u64,
+                8,
+            )
+        };
+        assert_eq!(ret, 0);
+        mask
+    }
+
+    /// Stops the calling thread with a raw `tgkill(getpid(), gettid(),
+    /// SIGSTOP)`, so no userspace mask save and restore wraps the stop. libc
+    /// `raise()` in glibc 2.26 to 2.33, and in musl, blocks signals around its
+    /// tgkill and restores the saved mask afterwards; that restore would run
+    /// after the tracer's PTRACE_SETSIGMASK at this stop and overwrite it.
+    fn stop_self_with_raw_tgkill() {
+        let ret = unsafe {
+            let pid = libc::syscall(libc::SYS_getpid);
+            let tid = libc::syscall(libc::SYS_gettid);
+            libc::syscall(libc::SYS_tgkill, pid, tid, libc::SIGSTOP)
+        };
+        assert_eq!(ret, 0);
+    }
+
+    /// Waits for the tracee's next stop, which must be a signal-delivery stop
+    /// for `signal`.
+    fn expect_signal_stop(running: Running, signal: Signal) -> Stopped {
+        match running.wait().unwrap() {
+            Wait::Stopped(stopped, Event::Signal(got)) if got == signal => stopped,
+            other => panic!("expected a {signal:?} delivery stop, got {other:?}"),
+        }
+    }
+
+    /// PTRACE_GETSIGMASK reads the mask the tracee set itself, and
+    /// PTRACE_SETSIGMASK replaces it (minus SIGKILL and SIGSTOP, which the
+    /// kernel never blocks) as the tracee then observes.
+    #[cfg(not(sanitized))]
+    #[test]
+    fn getsigmask_and_setsigmask_read_and_replace_the_tracee_mask()
+    -> Result<(), Box<dyn std::error::Error + 'static>> {
+        let replacement = KernelSigset::from(&[Signal::SIGUSR1, Signal::SIGALRM][..]).0;
+        let unblockable = KernelSigset::from(&[Signal::SIGKILL, Signal::SIGSTOP][..]).0;
+        let (pid, tracee) = trace(
+            move || {
+                unsafe { block_signals(&[Signal::SIGUSR1, Signal::SIGUSR2]) }.unwrap();
+                stop_self_with_raw_tgkill();
+                if own_sigmask() == replacement { 0 } else { 1 }
+            },
+            Options::PTRACE_O_EXITKILL,
+        )?;
+        let stopped = expect_signal_stop(tracee.resume(None)?, Signal::SIGSTOP);
+        let blocked = KernelSigset::from(&[Signal::SIGUSR1, Signal::SIGUSR2][..]).0;
+        let mask = stopped.getsigmask()?;
+        assert_eq!(mask & blocked, blocked, "mask {mask:#x}");
+        stopped.setsigmask(replacement | unblockable)?;
+        assert_eq!(stopped.getsigmask()?, replacement);
+        // Suppress the SIGSTOP; the tracee checks its own mask and exits.
+        assert_eq!(
+            stopped.resume(None)?.wait()?,
+            Wait::Exited(pid, ExitStatus::Exited(0))
+        );
+        Ok(())
+    }
+
+    static SIGUSR1_HANDLED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    extern "C" fn note_sigusr1(_signal: libc::c_int) {
+        SIGUSR1_HANDLED.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// A mask set by the tracer holds a signal sent meanwhile pending (no
+    /// delivery stop, no handler), and restoring the saved mask releases it
+    /// to an ordinary delivery stop and the handler.
+    #[cfg(not(sanitized))]
+    #[test]
+    fn setsigmask_holds_a_signal_pending_until_the_mask_is_restored()
+    -> Result<(), Box<dyn std::error::Error + 'static>> {
+        let (pid, tracee) = trace(
+            || {
+                let mut action: libc::sigaction = unsafe { MaybeUninit::zeroed().assume_init() };
+                action.sa_sigaction = note_sigusr1 as *const () as usize;
+                assert_eq!(
+                    unsafe { libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut()) },
+                    0
+                );
+                unsafe { unblock_signals(&[Signal::SIGUSR1]) }.unwrap();
+                stop_self_with_raw_tgkill();
+                // The tracer blocked everything and sent SIGUSR1.
+                let mut pending = 0u64;
+                unsafe { libc::syscall(libc::SYS_rt_sigpending, &mut pending as *mut u64, 8) };
+                let usr1 = KernelSigset::from(&[Signal::SIGUSR1][..]).0;
+                if pending & usr1 == 0 {
+                    return 2;
+                }
+                if SIGUSR1_HANDLED.load(std::sync::atomic::Ordering::SeqCst) {
+                    return 3;
+                }
+                stop_self_with_raw_tgkill();
+                // The tracer restored the mask: SIGUSR1 has been handled.
+                if SIGUSR1_HANDLED.load(std::sync::atomic::Ordering::SeqCst) {
+                    0
+                } else {
+                    4
+                }
+            },
+            Options::PTRACE_O_EXITKILL,
+        )?;
+        let stopped = expect_signal_stop(tracee.resume(None)?, Signal::SIGSTOP);
+        let saved = stopped.getsigmask()?;
+        stopped.setsigmask(!0)?;
+        signal::kill(pid.into(), Signal::SIGUSR1)?;
+        // SIGUSR1 is blocked: the next stop is the second SIGSTOP.
+        let stopped = expect_signal_stop(stopped.resume(None)?, Signal::SIGSTOP);
+        stopped.setsigmask(saved)?;
+        assert_eq!(stopped.getsigmask()?, saved);
+        let stopped = expect_signal_stop(stopped.resume(None)?, Signal::SIGUSR1);
+        assert_eq!(
+            stopped.resume(Some(Signal::SIGUSR1))?.wait()?,
+            Wait::Exited(pid, ExitStatus::Exited(0))
+        );
+        Ok(())
+    }
+
+    #[cfg(not(sanitized))]
+    #[test]
+    fn peeksiginfo_returns_pending_siginfo() -> Result<(), Box<dyn std::error::Error + 'static>> {
+        let (parent_pid, tracee) = trace(
+            move || {
+                let _ = unsafe {
+                    block_signals(&[Signal::SIGALRM, Signal::SIGVTALRM, Signal::SIGPROF])
+                };
+                assert!(signal::raise(Signal::SIGALRM).is_ok());
+                assert!(signal::raise(Signal::SIGVTALRM).is_ok());
+                assert!(signal::raise(Signal::SIGPROF).is_ok());
+
+                // All threads should be alive at this point. SYS_exit_group
+                // should force all threads to exit.
+                let _ = unsafe { libc::syscall(libc::SYS_exit_group, 0) };
+
+                unreachable!()
+            },
+            Options::PTRACE_O_EXITKILL
+                | Options::PTRACE_O_TRACEEXIT
+                | ptrace::Options::PTRACE_O_TRACECLONE,
+        )?;
+
+        tracee.resume(None)?;
+
+        let mut exited = Vec::new();
+
+        // Keep consuming events until everything has exited.
+        while let Some(wait) = wait_group(parent_pid)? {
+            match wait {
+                Wait::Stopped(tracee, Event::Exit) => {
+                    let pending: Vec<_> = tracee
+                        .peeksiginfo(None)?
+                        .iter()
+                        .map(|&si| Signal::try_from(si.si_signo).unwrap())
+                        .collect();
+                    assert_eq!(
+                        pending,
+                        [Signal::SIGALRM, Signal::SIGVTALRM, Signal::SIGPROF]
+                    );
+                    // do a second peek here to demostrate peek doesn't
+                    // *pop* pending signals.
+                    let pending: Vec<_> = tracee
+                        .peeksiginfo(None)?
+                        .iter()
+                        .map(|&si| Signal::try_from(si.si_signo).unwrap())
+                        .collect();
+                    assert_eq!(
+                        pending,
+                        [Signal::SIGALRM, Signal::SIGVTALRM, Signal::SIGPROF]
+                    );
+                    tracee.resume(None)?;
+                }
+                Wait::Stopped(tracee, _event) => {
+                    tracee.resume(None)?;
+                }
+                Wait::Exited(pid, exit_status) => {
+                    exited.push((pid, exit_status));
+                }
+            }
+        }
+
+        // The parent should have exited last
+        assert_eq!(exited.pop(), Some((parent_pid, ExitStatus::Exited(0))));
+
+        Ok(())
+    }
+
+    #[cfg(not(sanitized))]
+    #[test]
+    fn peeksiginfo_all_returns_the_whole_queue() -> Result<(), Box<dyn std::error::Error + 'static>>
+    {
+        // Real-time signals queue one entry each, so this exceeds one 64-entry
+        // read twice over.
+        const QUEUED: usize = 150;
+        let (parent_pid, tracee) = trace(
+            move || {
+                let rt = libc::SIGRTMIN();
+                unsafe {
+                    let mut set: libc::sigset_t = core::mem::zeroed();
+                    libc::sigemptyset(&mut set);
+                    libc::sigaddset(&mut set, rt);
+                    libc::sigaddset(&mut set, libc::SIGALRM);
+                    assert_eq!(
+                        libc::sigprocmask(libc::SIG_BLOCK, &set, core::ptr::null_mut()),
+                        0
+                    );
+                    for _ in 0..QUEUED {
+                        assert_eq!(
+                            libc::syscall(libc::SYS_tgkill, libc::getpid(), libc::gettid(), rt),
+                            0
+                        );
+                    }
+                    assert_eq!(
+                        libc::syscall(
+                            libc::SYS_tgkill,
+                            libc::getpid(),
+                            libc::gettid(),
+                            libc::SIGALRM
+                        ),
+                        0
+                    );
+                    libc::syscall(libc::SYS_exit_group, 0);
+                }
+                unreachable!()
+            },
+            Options::PTRACE_O_EXITKILL | Options::PTRACE_O_TRACEEXIT,
+        )?;
+
+        tracee.resume(None)?;
+
+        let mut peeked = false;
+        while let Some(wait) = wait_group(parent_pid)? {
+            match wait {
+                Wait::Stopped(tracee, Event::Exit) => {
+                    let signos = |v: Vec<libc::siginfo_t>| -> Vec<i32> {
+                        v.iter().map(|si| si.si_signo).collect()
+                    };
+                    let mut expected = vec![libc::SIGRTMIN(); QUEUED];
+                    expected.push(libc::SIGALRM);
+                    assert_eq!(signos(tracee.peeksiginfo(None)?), expected[..64]);
+                    assert_eq!(signos(tracee.peeksiginfo_all(None)?), expected);
+                    peeked = true;
+                    tracee.resume(None)?;
+                }
+                Wait::Stopped(tracee, _event) => {
+                    tracee.resume(None)?;
+                }
+                Wait::Exited(_, exit_status) => {
+                    assert_eq!(exit_status, ExitStatus::Exited(0));
+                }
+            }
+        }
+        assert!(peeked, "the tracee never reached its exit stop");
+
+        Ok(())
+    }
+
+    #[cfg(not(sanitized))]
+    #[test]
+    fn getsiginfo_should_success() -> Result<(), Box<dyn std::error::Error + 'static>> {
+        let (parent_pid, tracee) = trace(
+            move || {
+                let _ = unsafe { unblock_signals(&[Signal::SIGALRM]) };
+                let _ = unsafe { block_signals(&[Signal::SIGVTALRM, Signal::SIGPROF]) };
+                assert_eq!(unsafe { install_sigalrm_handler() }, 0);
+                assert!(signal::raise(Signal::SIGALRM).is_ok());
+
+                // All threads should be alive at this point. SYS_exit_group
+                // should force all threads to exit.
+                let _ = unsafe { libc::syscall(libc::SYS_exit_group, 0) };
+
+                unreachable!()
+            },
+            Options::PTRACE_O_EXITKILL
+                | Options::PTRACE_O_TRACEEXIT
+                | ptrace::Options::PTRACE_O_TRACECLONE,
+        )?;
+
+        tracee.resume(None)?;
+
+        let mut exited = Vec::new();
+
+        // Keep consuming events until everything has exited.
+        while let Some(wait) = wait_group(parent_pid)? {
+            match wait {
+                Wait::Stopped(tracee, Event::Signal(Signal::SIGALRM)) => {
+                    let siginfo = tracee.getsiginfo()?;
+                    assert_eq!(siginfo.si_signo, Signal::SIGALRM as i32);
+                    tracee.resume(Signal::SIGALRM)?;
+                }
+                Wait::Stopped(tracee, Event::Signal(other_signal)) => {
+                    tracee.resume(other_signal)?;
+                }
+                Wait::Stopped(tracee, _event) => {
+                    tracee.resume(None)?;
+                }
+                Wait::Exited(pid, exit_status) => {
+                    exited.push((pid, exit_status));
+                }
+            }
+        }
+
+        // The parent should have exited last
+        assert_eq!(exited.pop(), Some((parent_pid, ExitStatus::Exited(0))));
+
+        Ok(())
+    }
+
+    static RT_HANDLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    extern "C" fn note_realtime(signal: libc::c_int) {
+        RT_HANDLED.fetch_or(1 << (signal - 1), std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// A realtime signal-delivery stop decodes as `Event::RawSignal` with its
+    /// number, 32 and 33 included, and `resume_raw` delivers it to the
+    /// tracee's handler or, with 0, suppresses it
+    /// (<https://github.com/rrnewton/reverie/issues/207>). Standard signals
+    /// still decode as `Event::Signal`.
+    #[cfg(not(sanitized))]
+    #[test]
+    fn realtime_signal_stops_decode_raw_and_resume_raw_delivers_them()
+    -> Result<(), Box<dyn std::error::Error + 'static>> {
+        let delivered = [34, 50, 64];
+        let (pid, tracee) = trace(
+            move || {
+                for signal in delivered {
+                    let mut action: libc::sigaction =
+                        unsafe { MaybeUninit::zeroed().assume_init() };
+                    action.sa_sigaction = note_realtime as *const () as usize;
+                    assert_eq!(
+                        unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) },
+                        0
+                    );
+                }
+                for signal in [32, 33, 34, 50, 64] {
+                    let ret = unsafe {
+                        let pid = libc::syscall(libc::SYS_getpid);
+                        let tid = libc::syscall(libc::SYS_gettid);
+                        libc::syscall(libc::SYS_tgkill, pid, tid, signal)
+                    };
+                    assert_eq!(ret, 0);
+                }
+                stop_self_with_raw_tgkill();
+                let want = delivered.iter().fold(0, |bits, s| bits | 1 << (s - 1));
+                if RT_HANDLED.load(std::sync::atomic::Ordering::SeqCst) == want {
+                    0
+                } else {
+                    1
+                }
+            },
+            Options::PTRACE_O_EXITKILL,
+        )?;
+        let mut running = tracee.resume(None)?;
+        for signal in [32, 33, 34, 50, 64] {
+            let stopped = match running.wait()? {
+                Wait::Stopped(stopped, Event::RawSignal(got)) if got == signal => stopped,
+                other => panic!("expected a raw {signal} delivery stop, got {other:?}"),
+            };
+            let any = AnySignal::new(signal).unwrap();
+            assert_eq!(Event::RawSignal(signal).signal(), Some(any));
+            assert_eq!(Event::from_signal(any), Event::RawSignal(signal));
+            assert_eq!(any.as_nix(), None);
+            assert_eq!(format!("{any}"), format!("SIG{signal}"));
+            // 32 and 33 are suppressed: their default action would end the
+            // tracee. The others reach the handler.
+            let deliver = if signal < 34 { 0 } else { signal };
+            running = stopped.resume_raw(deliver)?;
+        }
+        let stopped = expect_signal_stop(running, Signal::SIGSTOP);
+        assert_eq!(
+            Event::Signal(Signal::SIGSTOP).signal(),
+            Some(AnySignal::from(Signal::SIGSTOP))
+        );
+        assert_eq!(
+            stopped.resume(None)?.wait()?,
+            Wait::Exited(pid, ExitStatus::Exited(0))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn any_signal_names_only_1_to_64() {
+        assert_eq!(AnySignal::new(0), None);
+        assert_eq!(AnySignal::new(65), None);
+        assert_eq!(AnySignal::new(-1), None);
+        assert_eq!(AnySignal::new(31).unwrap().as_nix(), Some(Signal::SIGSYS));
+        assert_eq!(AnySignal::new(32).unwrap().as_nix(), None);
+        assert_eq!(AnySignal::new(64).unwrap().raw(), 64);
+        assert_eq!(AnySignal::from(Signal::SIGUSR1), Signal::SIGUSR1);
+        assert_eq!(Event::Seccomp.signal(), None);
+        assert_eq!(
+            Event::from_signal(Signal::SIGUSR1.into()),
+            Event::Signal(Signal::SIGUSR1)
+        );
+    }
+
+    /// The plain wait helpers decode a realtime stop as `Event::RawSignal`
+    /// too, with and without the `notifier` feature. Before, they reported
+    /// it as a SIGSTOP (<https://github.com/rrnewton/reverie/issues/207>).
+    /// `wait_all` and `try_wait_all` decode as `wait_group` does
+    /// (`Wait::from_wait_helper`); the peeks return only the PID. Waiting
+    /// by process group keeps this test to its own tracee.
+    #[cfg(not(sanitized))]
+    #[test]
+    fn wait_group_decodes_a_realtime_stop() -> Result<(), Box<dyn std::error::Error + 'static>> {
+        let (pid, tracee) = trace(
+            || {
+                let mut action: libc::sigaction = unsafe { MaybeUninit::zeroed().assume_init() };
+                action.sa_sigaction = libc::SIG_IGN;
+                assert_eq!(
+                    unsafe { libc::sigaction(40, &action, std::ptr::null_mut()) },
+                    0
+                );
+                let ret = unsafe {
+                    let pid = libc::syscall(libc::SYS_getpid);
+                    let tid = libc::syscall(libc::SYS_gettid);
+                    libc::syscall(libc::SYS_tgkill, pid, tid, 40)
+                };
+                if ret == 0 { 0 } else { 1 }
+            },
+            Options::PTRACE_O_EXITKILL,
+        )?;
+        let _running = tracee.resume(None)?;
+        let stopped = match wait_group(pid)? {
+            Some(Wait::Stopped(stopped, Event::RawSignal(40))) => stopped,
+            other => panic!("expected a raw 40 delivery stop, got {other:?}"),
+        };
+        let _running = stopped.resume_raw(40)?;
+        assert_eq!(
+            wait_group(pid)?,
+            Some(Wait::Exited(pid, ExitStatus::Exited(0)))
+        );
+        Ok(())
+    }
+
+    #[cfg(all(feature = "notifier", not(sanitized)))]
+    static FIRST_SIGNAL_DELIVERIES: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    #[cfg(all(feature = "notifier", not(sanitized)))]
+    extern "C" fn count_first_signal(_signal: libc::c_int) {
+        FIRST_SIGNAL_DELIVERIES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(all(feature = "notifier", not(sanitized)))]
+    extern "C" fn ignore_target_signal(_signal: libc::c_int) {}
+
+    /// `wait_for_signal` forwards a signal it passes over, named or realtime,
+    /// rather than suppress it (from the Codex review of
+    /// <https://github.com/rrnewton/reverie/pull/995>). The tracee sends
+    /// itself a caught `first` signal, then SIGUSR1; the wait selects
+    /// SIGUSR1, and the tracee exits 0 only if `first`'s handler ran once.
+    /// Before, a realtime `first` was resumed with no signal and dropped
+    /// (exit 42); SIGUSR2 is the named control.
+    #[cfg(all(feature = "notifier", not(sanitized)))]
+    #[test]
+    fn wait_for_signal_forwards_an_intervening_signal_named_or_realtime()
+    -> Result<(), Box<dyn std::error::Error + 'static>> {
+        for first in [libc::SIGUSR2, 40] {
+            let (pid, tracee) = trace(
+                move || {
+                    for (signal, handler) in [
+                        (first, count_first_signal as *const () as usize),
+                        (libc::SIGUSR1, ignore_target_signal as *const () as usize),
+                    ] {
+                        let mut action: libc::sigaction =
+                            unsafe { MaybeUninit::zeroed().assume_init() };
+                        action.sa_sigaction = handler;
+                        assert_eq!(
+                            unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) },
+                            0
+                        );
+                    }
+                    for signal in [first, libc::SIGUSR1] {
+                        let ret = unsafe {
+                            let pid = libc::syscall(libc::SYS_getpid);
+                            let tid = libc::syscall(libc::SYS_gettid);
+                            libc::syscall(libc::SYS_tgkill, pid, tid, signal)
+                        };
+                        assert_eq!(ret, 0);
+                    }
+                    let calls = FIRST_SIGNAL_DELIVERIES.load(std::sync::atomic::Ordering::SeqCst);
+                    if calls == 1 { 0 } else { 42 }
+                },
+                Options::PTRACE_O_EXITKILL,
+            )?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let status = runtime.block_on(async {
+                let selected = tracee
+                    .resume(None)?
+                    .wait_for_signal(Signal::SIGUSR1)
+                    .await?;
+                let stopped = match selected {
+                    Wait::Stopped(stopped, Event::Signal(Signal::SIGUSR1)) => stopped,
+                    other => panic!("expected the SIGUSR1 stop, got {other:?}"),
+                };
+                stopped.resume(Some(Signal::SIGUSR1))?.next_state().await
+            })?;
+            assert_eq!(
+                status,
+                Wait::Exited(pid, ExitStatus::Exited(0)),
+                "first signal {first}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A tracee that a realtime signal kills decodes as
+    /// `ExitStatus::SignaledRaw` with its number; it failed with EINVAL
+    /// (<https://github.com/rrnewton/reverie/issues/997>).
+    #[cfg(not(sanitized))]
+    #[test]
+    fn a_tracee_killed_by_a_realtime_signal_exits_signaled_raw()
+    -> Result<(), Box<dyn std::error::Error + 'static>> {
+        let (pid, tracee) = trace(
+            || {
+                unsafe { libc::raise(40) };
+                0
+            },
+            Options::PTRACE_O_EXITKILL,
+        )?;
+        let stopped = match tracee.resume(None)?.wait()? {
+            Wait::Stopped(stopped, Event::RawSignal(40)) => stopped,
+            other => panic!("expected a raw 40 delivery stop, got {other:?}"),
+        };
+        assert_eq!(
+            stopped.resume_raw(40)?.wait()?,
+            Wait::Exited(pid, ExitStatus::SignaledRaw(40, false))
+        );
+        Ok(())
+    }
+}

@@ -1,0 +1,1660 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+//! System calls for dealing with threads and concurrency.
+use std::time::Duration;
+
+use nix::sys::signal::Signal;
+use reverie::Error;
+use reverie::Guest;
+use reverie::Stack;
+use reverie::syscalls;
+use reverie::syscalls::AddrMut;
+use reverie::syscalls::ClockId;
+use reverie::syscalls::Errno;
+use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::Syscall;
+use reverie::syscalls::Sysno;
+use reverie::syscalls::Timespec;
+use reverie::syscalls::Timeval;
+use reverie::syscalls::family::NanosleepFamily;
+use tracing::error;
+use tracing::info;
+use tracing::trace;
+
+use super::signal::SleepCheck;
+use super::signal::SleepSignal;
+use crate::detlog;
+use crate::record_or_replay::RecordOrReplay;
+use crate::resources::Permission;
+use crate::resources::ResourceID;
+use crate::resources::Resources;
+use crate::scheduler::Priority;
+use crate::scheduler::entropy_to_priority;
+use crate::tool_global::PosixTimerNotification;
+use crate::tool_global::ResumeStatus;
+use crate::tool_global::SigalrmControl;
+use crate::tool_global::posix_timer_thread;
+use crate::tool_global::refuse_sigalrm;
+use crate::tool_global::register_posix_timer;
+use crate::tool_global::thread_observe_time;
+use crate::tool_local::Detcore;
+use crate::types::LogicalTime;
+use crate::types::PosixTimerThread;
+use crate::types::SigWrapper;
+
+/// Whether Linux accepts `clockid` in clock_gettime and clock_getres, as far as
+/// the id alone decides: the fixed clocks 0 to 9 and CLOCK_TAI (11). Linux
+/// answers EINVAL for 10 (CLOCK_SGI_CYCLE, gone since Linux 4.x) and for
+/// every id from 12 up. A negative id names a process's or thread's CPU
+/// clock, or a clock descriptor; whether it is valid depends on the process
+/// or descriptor it names, so it is accepted here as before.
+fn clock_id_is_known(clockid: ClockId) -> bool {
+    use reverie::syscalls::FromToRaw;
+    match clockid.into_raw() as i32 {
+        0..=9 | 11 => true,
+        id => id < 0,
+    }
+}
+
+/// Linux's answer to `timer_create` for `clockid` alone, which it gives
+/// before it reads the notification (`do_timer_create`,
+/// kernel/time/posix-timers.c:448-455 at v6.12): EINVAL for an id with no
+/// clock (`clockid_to_kclock` and the `posix_clocks` table at :1529-1556: 10,
+/// and 12 up), EOPNOTSUPP for a clock with no timers (CLOCK_MONOTONIC_RAW,
+/// CLOCK_REALTIME_COARSE, CLOCK_MONOTONIC_COARSE, and a clock descriptor: a
+/// negative id with `(id & CLOCKFD_MASK) == CLOCKFD`, which names
+/// `clock_posix_dynamic`, kernel/time/posix-clock.c:334-339, whatever
+/// descriptor it encodes; include/linux/posix-timers_types.h:24-32), and
+/// EINVAL for a negative id whose clock bits name no CPU clock (`(id & 7) ==
+/// 7`: per-thread with CPUCLOCK_WHICH 3, which is CPUCLOCK_MAX, so
+/// `pid_for_clock` refuses it from the bits alone,
+/// kernel/time/posix-cpu-timers.c:63-64, and `posix_cpu_timer_create`
+/// answers EINVAL, :392-395). `None` for the clocks with timers, for the
+/// alarm clocks (whose answer depends on the host) and for the other
+/// negative ids, CPU clocks, whose answer depends on the process or thread
+/// the id names: a CPU-clock id naming a task that does not exist therefore
+/// gets the reserved-signal EPERM where Linux answers EINVAL. Only a
+/// `timer_create` whose sigevent names a reserved signal reads it, right
+/// after the copy and before the notification is checked, as Linux orders
+/// them, so that neither the refusal nor Detcore's notification checks come
+/// before Linux's clock answer. Detcore's virtual timers do not otherwise
+/// check the clock, which https://github.com/rrnewton/hermit/issues/4556
+/// tracks together with the CPU-clock case above.
+fn timer_create_clock_refusal(clockid: ClockId) -> Option<Errno> {
+    use reverie::syscalls::FromToRaw;
+    const CLOCKFD: i32 = 3;
+    const CLOCKFD_MASK: i32 = 4 | 3;
+    if !clock_id_is_known(clockid) {
+        return Some(Errno::EINVAL);
+    }
+    match clockid.into_raw() as i32 {
+        libc::CLOCK_MONOTONIC_RAW | libc::CLOCK_REALTIME_COARSE | libc::CLOCK_MONOTONIC_COARSE => {
+            Some(Errno::EOPNOTSUPP)
+        }
+        id if id < 0 && id & CLOCKFD_MASK == CLOCKFD => Some(Errno::EOPNOTSUPP),
+        // CPUCLOCK_PERTHREAD_MASK | CPUCLOCK_MAX: no CPU clock.
+        id if id < 0 && id & CLOCKFD_MASK == CLOCKFD_MASK => Some(Errno::EINVAL),
+        _ => None,
+    }
+}
+
+fn time_from_resources(rsrcs: &Resources) -> Option<LogicalTime> {
+    if rsrcs.resources.len() > 1 {
+        panic!(
+            "time_from_resources: multiple resource ids in resource request: {:?}",
+            rsrcs
+        );
+    }
+    for rs in rsrcs.resources.iter() {
+        if let (ResourceID::SleepUntil(tm), _) = rs {
+            return Some(*tm);
+        }
+    }
+    None
+}
+
+/// Flatten a `timespec` to nanoseconds. Negative fields are not valid for the
+/// timer syscalls we handle; treat them as zero rather than panicking.
+fn timespec_to_ns(ts: libc::timespec) -> u64 {
+    let secs = ts.tv_sec.max(0) as u64;
+    let nsec = ts.tv_nsec.max(0) as u64;
+    secs.saturating_mul(1_000_000_000).saturating_add(nsec)
+}
+
+/// Inverse of [`timespec_to_ns`].
+fn ns_to_timespec(ns: u64) -> libc::timespec {
+    libc::timespec {
+        tv_sec: (ns / 1_000_000_000) as libc::time_t,
+        tv_nsec: (ns % 1_000_000_000) as libc::c_long,
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-857): Query-only timex mode boundary.
+fn timex_mode_is_query(modes: libc::c_uint) -> bool {
+    modes == 0 || modes == libc::ADJ_OFFSET_SS_READ
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-857): Host-independent NTP discipline snapshot.
+fn deterministic_timex(now: Timespec) -> libc::timex {
+    // SAFETY: `libc::timex` contains only integer fields and padding; zero is a
+    // valid baseline for the fields not modeled by Hermit.
+    let mut tx: libc::timex = unsafe { std::mem::zeroed() };
+    tx.status = libc::STA_UNSYNC;
+    tx.tick = 10_000;
+    tx.time = libc::timeval {
+        tv_sec: now.tv_sec,
+        tv_usec: now.tv_nsec / 1_000,
+    };
+    tx
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-845): Review SaBRe thread-local guest clock reads.
+pub(crate) async fn guest_clock_time<G, T>(guest: &mut G) -> LogicalTime
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let raw = thread_observe_time(guest).await;
+    guest.thread_state().observe_guest_clock(raw)
+}
+
+/// Replacing host time in the `tv` of a `gettimeofday` that failed with EFAULT
+/// could not finish. `tv` may still hold host wall-clock time, so this is a
+/// failed run, not a guest errno.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TvRepairFailure {
+    /// The word being stored: `tv_sec` or `tv_usec`.
+    field: &'static str,
+    kind: TvRepairFailureKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TvRepairFailureKind {
+    /// The backend could not execute the `time(2)` probe. EFAULT is not a
+    /// failure: it means Linux stopped before storing this word.
+    ProbeFailed(Errno),
+    /// After a store probe returned EFAULT, `time(NULL)`, which Linux cannot
+    /// fail, failed too. Something other than the store, such as a seccomp
+    /// filter, produced the EFAULT, so it says nothing about `tv`.
+    ControlProbeFailed(Errno),
+    /// A word at or after the one whose store probe returned EFAULT no longer
+    /// reads as it did before the call, so the original call stored it and the
+    /// EFAULT did not come from the store.
+    StoppedWordChanged,
+    /// A word at or after the one whose store probe returned EFAULT could not
+    /// be read before or after the call, although every byte of it is mapped.
+    /// The read failure may not be a fault: a seccomp filter can deny the
+    /// read while the store went through, so nothing shows the word unstored.
+    StoppedWordUnreadable,
+    /// The guest's memory map, needed to tell an unmapped word from an
+    /// unreadable one, could not be read or was empty.
+    MapsUnavailable,
+    /// The exact overwrite after a successful probe failed. The probe just
+    /// stored host seconds, so the run cannot safely continue.
+    OverwriteFailed(Errno),
+    /// The one-shot overwrite reported a count other than the whole word.
+    OverwriteCount { expected: usize, reported: usize },
+    /// Adding the field offset to the guest's `timeval` address overflowed.
+    AddressOverflow,
+    /// A recorded EFAULT does not prove that this replay execution performed
+    /// the original stores, so live probing would mix replayed and host state.
+    ReplayMode,
+}
+
+impl std::fmt::Display for TvRepairFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "replacing host time in the {} of a failed gettimeofday: ",
+            self.field
+        )?;
+        match self.kind {
+            TvRepairFailureKind::ProbeFailed(errno) => {
+                write!(f, "time(2) store probe failed: {errno}")
+            }
+            TvRepairFailureKind::ControlProbeFailed(errno) => write!(
+                f,
+                "time(NULL) control probe failed: {errno}, so the store probe's EFAULT was not a store fault"
+            ),
+            TvRepairFailureKind::StoppedWordChanged => f.write_str(
+                "the word changed during the call although its store probe returned EFAULT",
+            ),
+            TvRepairFailureKind::StoppedWordUnreadable => f.write_str(
+                "the word is mapped but could not be read, so its store probe's EFAULT is unconfirmed",
+            ),
+            TvRepairFailureKind::MapsUnavailable => {
+                f.write_str("the guest's memory map could not be read")
+            }
+            TvRepairFailureKind::OverwriteFailed(errno) => {
+                write!(f, "virtual-time overwrite failed: {errno}")
+            }
+            TvRepairFailureKind::OverwriteCount { expected, reported } => write!(
+                f,
+                "virtual-time overwrite reported {reported} of {expected} bytes"
+            ),
+            TvRepairFailureKind::AddressOverflow => f.write_str("field address overflowed"),
+            TvRepairFailureKind::ReplayMode => {
+                f.write_str("cannot probe a recorded or replayed EFAULT")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TvRepairFailure {}
+
+fn tv_repair_error(field: &'static str, kind: TvRepairFailureKind) -> Error {
+    Error::Tool(anyhow::Error::new(TvRepairFailure { field, kind }))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeStoreProbe {
+    Stored,
+    Stopped,
+}
+
+fn classify_time_store_probe(
+    field: &'static str,
+    result: Result<i64, Errno>,
+) -> Result<TimeStoreProbe, Error> {
+    match result {
+        Ok(_) => Ok(TimeStoreProbe::Stored),
+        Err(Errno::EFAULT) => Ok(TimeStoreProbe::Stopped),
+        Err(errno) => Err(tv_repair_error(
+            field,
+            TvRepairFailureKind::ProbeFailed(errno),
+        )),
+    }
+}
+
+/// `time(NULL)` stores nothing and cannot fail on Linux, so any error means
+/// the injected `time(2)` never reached the native call.
+fn require_native_time_control_probe(
+    field: &'static str,
+    result: Result<i64, Errno>,
+) -> Result<(), Error> {
+    match result {
+        Ok(_) => Ok(()),
+        Err(errno) => Err(tv_repair_error(
+            field,
+            TvRepairFailureKind::ControlProbeFailed(errno),
+        )),
+    }
+}
+
+/// How a word that Linux did not store reads after the call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoppedWord {
+    /// Readable, with the value it held before the call.
+    Unchanged,
+    /// Unreadable both before and after the call. This proves nothing by
+    /// itself; see [`require_unmapped_unreadable_word`].
+    Unreadable,
+}
+
+/// A word Linux did not store keeps both its contents and its readability.
+fn require_unchanged_stopped_word(
+    field: &'static str,
+    before: Result<libc::time_t, Errno>,
+    after: Result<libc::time_t, Errno>,
+) -> Result<StoppedWord, Error> {
+    match (before, after) {
+        (Ok(before), Ok(after)) if before == after => Ok(StoppedWord::Unchanged),
+        (Err(_), Err(_)) => Ok(StoppedWord::Unreadable),
+        _ => Err(tv_repair_error(
+            field,
+            TvRepairFailureKind::StoppedWordChanged,
+        )),
+    }
+}
+
+/// Whether every byte of the `time_t` at `word` lies in one of `ranges`, the
+/// half-open address ranges of the guest's mappings.
+fn time_word_is_fully_mapped(mut ranges: Vec<(u64, u64)>, word: u64) -> bool {
+    let Some(end) = word.checked_add(std::mem::size_of::<libc::time_t>() as u64) else {
+        return false;
+    };
+    ranges.sort_unstable();
+    let mut covered = word;
+    for (start, stop) in ranges {
+        if start <= covered && covered < stop {
+            covered = stop;
+            if covered >= end {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// An unreadable word is accepted as unstored only when part of it is
+/// unmapped: Linux's eight-byte `put_user` faults there before storing any
+/// byte. A failed read of a fully mapped word is not evidence of a fault: a
+/// seccomp filter can deny the read while the store succeeds. Ptrace reads use
+/// `FOLL_FORCE`, which bypasses page permissions, but some listed mappings
+/// still refuse the read: file pages beyond end of file, hardware-poisoned
+/// pages, `MADV_GUARD_INSTALL` guard regions, `VM_PFNMAP` mappings without an
+/// `access` operation, missing pages of a userfaultfd region in SIGBUS mode,
+/// and `[vsyscall]` in xonly mode. Backends
+/// that read with `process_vm_readv` also cannot read `PROT_NONE` pages. A
+/// `gettimeofday` whose store faults on any of these ends the run rather than
+/// returning EFAULT. An empty map is refused because a filter that fakes a
+/// successful zero-byte read would otherwise make every word look unmapped.
+fn require_unmapped_unreadable_word(
+    field: &'static str,
+    maps: Result<Vec<(u64, u64)>, Error>,
+    word: u64,
+) -> Result<(), Error> {
+    let ranges = match maps {
+        Ok(ranges) if !ranges.is_empty() => ranges,
+        Ok(_) => {
+            error!("gettimeofday tv repair: the guest's memory map is empty");
+            return Err(tv_repair_error(field, TvRepairFailureKind::MapsUnavailable));
+        }
+        Err(err) => {
+            error!("gettimeofday tv repair: reading the guest's memory map: {err}");
+            return Err(tv_repair_error(field, TvRepairFailureKind::MapsUnavailable));
+        }
+    };
+    if time_word_is_fully_mapped(ranges, word) {
+        Err(tv_repair_error(
+            field,
+            TvRepairFailureKind::StoppedWordUnreadable,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// What Detcore's memory reader returned for `tv_sec` and `tv_usec` before a
+/// `gettimeofday`, with the read error where it failed. Under ptrace the read
+/// ignores page protection and protection keys; backends that read with
+/// `process_vm_readv` respect `VM_READ`.
+type TimevalWordSnapshot = [Result<libc::time_t, Errno>; 2];
+
+const TIMEVAL_WORDS: [(&str, usize); 2] = [
+    ("tv_sec", std::mem::offset_of!(Timeval, tv_sec)),
+    ("tv_usec", std::mem::offset_of!(Timeval, tv_usec)),
+];
+
+fn snapshot_timeval_words<'a, G, T>(
+    guest: &mut G,
+    tv_addr: AddrMut<'a, Timeval>,
+) -> TimevalWordSnapshot
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    TIMEVAL_WORDS.map(|(field, offset)| {
+        let addr = timeval_word_addr(field, tv_addr, offset).map_err(|_| Errno::EFAULT)?;
+        guest.memory().read_value(addr)
+    })
+}
+
+fn timeval_word_addr<'a>(
+    field: &'static str,
+    tv_addr: AddrMut<'a, Timeval>,
+    offset: usize,
+) -> Result<AddrMut<'a, libc::time_t>, Error> {
+    tv_addr
+        .as_raw()
+        .checked_add(offset)
+        .and_then(AddrMut::<libc::time_t>::from_raw)
+        .ok_or_else(|| tv_repair_error(field, TvRepairFailureKind::AddressOverflow))
+}
+
+/// The address of `tv`'s word at `offset` for checking that a stopped
+/// `gettimeofday` left it alone, or `None` when the address is past the end of
+/// the address space. No store can reach such a word, so it needs no check.
+/// (A probe needs a real address, so `timeval_word_addr` fails closed instead.)
+fn stopped_timeval_word_addr<'a>(
+    tv_addr: AddrMut<'a, Timeval>,
+    offset: usize,
+) -> Option<AddrMut<'a, libc::time_t>> {
+    tv_addr
+        .as_raw()
+        .checked_add(offset)
+        .and_then(AddrMut::<libc::time_t>::from_raw)
+}
+
+fn require_complete_time_word_overwrite(
+    field: &'static str,
+    expected: usize,
+    result: Result<usize, Errno>,
+) -> Result<(), Error> {
+    match result {
+        Ok(reported) if reported == expected => Ok(()),
+        Ok(reported) => Err(tv_repair_error(
+            field,
+            TvRepairFailureKind::OverwriteCount { expected, reported },
+        )),
+        Err(errno) => Err(tv_repair_error(
+            field,
+            TvRepairFailureKind::OverwriteFailed(errno),
+        )),
+    }
+}
+
+fn require_live_time_store_probe(replay_data_is_some: bool) -> Result<(), Error> {
+    if replay_data_is_some {
+        Err(tv_repair_error("tv", TvRepairFailureKind::ReplayMode))
+    } else {
+        Ok(())
+    }
+}
+
+/// Replaces the host wall-clock time that a `gettimeofday` failing with EFAULT
+/// may have stored in `tv` with virtual time, in exactly the words Linux
+/// stored.
+///
+/// Linux stores `tv_sec`, then `tv_usec`, each with one eight-byte `put_user`,
+/// and only then copies `tz`; the first fault ends the call with EFAULT. A
+/// store that faults on either page it touches commits nothing, so each word
+/// is stored whole or not at all, and nothing after an unstored word is
+/// attempted. `time(2)` uses the same eight-byte `put_user` store for its
+/// `tloc`, so the repair injects it at each word in kernel order. EFAULT means
+/// the original call stopped at that word too. Success means the probe itself
+/// just stored host seconds in those exact bytes; only then does Hermit replace
+/// the word with its virtual value. Other probe errors and overwrite failures
+/// fail closed because host time may remain.
+///
+/// An EFAULT from the probe is only evidence about `tv` if it came from the
+/// store. A seccomp filter can return EFAULT for `time(2)` without running it,
+/// and would otherwise end the repair while host time remains in a writable
+/// `tv`. Two checks therefore confirm every EFAULT before it is trusted.
+/// First, `time(NULL)` is injected: it stores nothing and cannot fail on
+/// Linux, so any error means the probes are not reaching the native call.
+/// Second, every word from the stopped one onward must still read exactly as
+/// it did before the original call: readable with the same value, or
+/// unreadable both times and not fully mapped, so that the store could only
+/// have faulted. A changed word was stored by that call, and an unreadable
+/// word that is fully mapped may have been, because a failed read is not
+/// itself a fault. Each of these failures ends the run, including for the
+/// mapped but unreadable pages listed at `require_unmapped_unreadable_word`.
+///
+/// These checks are observations Detcore makes with its own syscalls, so they
+/// trust those syscalls' results, as every Detcore handler that reads back a
+/// result does. They catch a filter that makes a syscall fail, whether it is
+/// the guest's probe or Detcore's own read. A seccomp filter installed on
+/// Hermit itself can also make one of Detcore's own syscalls report success
+/// without running it, and that is outside this guarantee. A guest cannot
+/// install a filter: Detcore refuses `seccomp(2)` and `PR_SET_SECCOMP`.
+///
+/// The repair never writes a word the kernel could not store, and it does not
+/// test writability by rewriting a word, because a remote write ignores
+/// protection keys that deny the guest's own stores. The pre-call snapshot is
+/// a read only. The host seconds written by a successful
+/// probe exist transiently until the overwrite. Default thread
+/// sequentialization prevents another guest thread from observing that
+/// interval, but another process sharing the page can observe it; such
+/// external shared state is outside Hermit's determinism guarantee.
+/// Standard record/replay disables time virtualization, so this handler is not
+/// used there. A custom configuration that combines replay data with virtual
+/// time fails closed before probing: a recorded EFAULT does not establish that
+/// this execution performed any stores for a live `time(2)` to reproduce.
+///
+/// Every backend runs this repair. The memory map comes from
+/// `Guest::storable_memory_ranges`, which lists `/proc/<pid>/maps` of the
+/// guest by default and the guest's own page record on a backend whose
+/// `pid()` is not the guest (KVM). A backend that executes `gettimeofday` and
+/// `time(2)` itself, as KVM does, stores them as Linux does: each word with an
+/// all-or-nothing store to a writable page, in kernel order.
+async fn overwrite_failed_gettimeofday_tv<'a, G, T>(
+    guest: &mut G,
+    tv_addr: AddrMut<'a, Timeval>,
+    tv: &Timeval,
+    before: &TimevalWordSnapshot,
+) -> Result<(), Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let values = [tv.tv_sec as libc::time_t, tv.tv_usec as libc::time_t];
+    for (index, (field, offset)) in TIMEVAL_WORDS.into_iter().enumerate() {
+        let addr = timeval_word_addr(field, tv_addr, offset)?;
+        let probe = syscalls::Time::new().with_tloc(Some(addr));
+        match classify_time_store_probe(field, guest.inject(probe).await)? {
+            TimeStoreProbe::Stored => {
+                let bytes = values[index].to_ne_bytes();
+                let overwrite = guest
+                    .memory()
+                    .write_with_user_access(addr.cast::<u8>(), &bytes);
+                require_complete_time_word_overwrite(field, bytes.len(), overwrite)?;
+            }
+            TimeStoreProbe::Stopped => {
+                let control = syscalls::Time::new().with_tloc(None);
+                require_native_time_control_probe(field, guest.inject(control).await)?;
+                for (stopped, (field, offset)) in TIMEVAL_WORDS.into_iter().enumerate().skip(index)
+                {
+                    let Some(addr) = stopped_timeval_word_addr(tv_addr, offset) else {
+                        continue;
+                    };
+                    let after = guest.memory().read_value(addr);
+                    match require_unchanged_stopped_word(field, before[stopped], after)? {
+                        StoppedWord::Unchanged => {}
+                        StoppedWord::Unreadable => {
+                            let maps = guest.storable_memory_ranges();
+                            require_unmapped_unreadable_word(field, maps, addr.as_raw() as u64)?;
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remaining_sleep_duration(target: LogicalTime, now: LogicalTime) -> Duration {
+    if target > now {
+        target.duration_since(now)
+    } else {
+        Duration::ZERO
+    }
+}
+
+impl<T: RecordOrReplay> Detcore<T> {
+    /// Convenience function for constructing a sleep request with a nanosecond offset from "now".
+    pub async fn sleep_request<G: Guest<Self>>(guest: &mut G, ns_delta: Duration) -> Resources {
+        let base_time = thread_observe_time(guest).await;
+        let target_time = base_time + ns_delta;
+        let resource = ResourceID::SleepUntil(target_time);
+        guest.thread_state().mk_request(resource, Permission::W)
+    }
+
+    /// Convenience function for constructing a sleep request with a absolute nanosecond value from the realtime clock.
+    pub async fn sleep_request_abs<G: Guest<Self>>(guest: &mut G, time: LogicalTime) -> Resources {
+        // TODO T124594597 Record-replay case requires better handling of time
+        let resource = ResourceID::SleepUntil(time);
+        guest.thread_state().mk_request(resource, Permission::W)
+    }
+
+    /// Convenience function for constructing a thread yield request.
+    /// Implemented as a sleep ending at the epoch (in the past).
+    pub fn yield_request<G: Guest<Self>>(guest: &mut G) -> Resources {
+        let resource = ResourceID::SleepUntil(LogicalTime::from_nanos(0));
+        guest.thread_state().mk_request(resource, Permission::W)
+    }
+
+    /// Construct a request for a strong, one-turn scheduler yield.
+    pub fn sched_yield_request<G: Guest<Self>>(guest: &mut G) -> Resources {
+        guest
+            .thread_state()
+            .mk_request(ResourceID::SchedYield, Permission::W)
+    }
+
+    /// Construct a random PriorityChangePoint request using the local PRNG.
+    pub fn random_priority_changepoint_request<G: Guest<Self>>(
+        guest: &mut G,
+        change_time: LogicalTime,
+    ) -> Resources {
+        let entropy = guest.thread_state_mut().chaos_prng_next_u64("priority");
+        let new_priority = entropy_to_priority(entropy);
+        Self::priority_changepoint_request(guest, change_time, new_priority)
+    }
+
+    /// Construct a PriorityChangePoint request using the supplied time and priority.
+    pub fn priority_changepoint_request<G: Guest<Self>>(
+        guest: &mut G,
+        change_time: LogicalTime,
+        new_priority: Priority,
+    ) -> Resources {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-1151)
+        let epochs = guest.thread_state_mut().take_pending_chaos_epochs();
+        let rcbs = guest.thread_state().committed_clock_value;
+        let resource = ResourceID::PriorityChangePoint(new_priority, change_time, rcbs, epochs);
+        guest.thread_state().mk_request(resource, Permission::W)
+    }
+
+    /// gettimeofday
+    pub async fn handle_gettimeofday<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Gettimeofday,
+    ) -> Result<i64, Error> {
+        let time_ns = guest_clock_time(guest).await;
+
+        // What Detcore could read in `tv` before the call; the repair uses it
+        // to confirm which words a failing call left alone.
+        let before = call.tv().map(|tp| snapshot_timeval_words(guest, tp.into()));
+
+        // A call failing with EFAULT may still have stored host wall-clock time
+        // in `tv`, so keep its result until `tv` holds virtual time.
+        let result = self
+            .record_or_replay_preserving_tool_errors(guest, call)
+            .await;
+
+        let tv: Timeval = time_ns.into();
+
+        if let Some(tp) = call.tv() {
+            match (&result, &before) {
+                (Ok(_), _) => guest.memory().write_value(tp, &tv)?,
+                // Linux's gettimeofday fails only with EFAULT, which is taken
+                // to be its own even when a seccomp filter returned it without
+                // running the call. Any other error came from the backend, the
+                // tool, a seccomp filter or a replayed log, and says nothing
+                // about what reached `tv`, so memory is left alone.
+                (Err(Error::Errno(Errno::EFAULT)), Some(before)) => {
+                    require_live_time_store_probe(self.cfg.replay_data.is_some())?;
+                    overwrite_failed_gettimeofday_tv(guest, tp.into(), &tv, before).await?
+                }
+                (Err(_), _) => {}
+            }
+        }
+
+        result
+    }
+
+    /// time
+    pub async fn handle_time<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Time,
+    ) -> Result<i64, Error> {
+        let time_ns = guest_clock_time(guest).await;
+        let secs = time_ns.as_secs() as i64;
+
+        if let Some(tloc) = call.tloc() {
+            let mut memory = guest.memory();
+            memory.write_value(tloc, &secs)?;
+        }
+
+        Ok(secs)
+    }
+
+    /// clock_gettime
+    pub async fn handle_clock_gettime<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::ClockGettime,
+    ) -> Result<i64, Error> {
+        if !clock_id_is_known(call.clockid()) {
+            return Err(Errno::EINVAL.into());
+        }
+        let time_ns = guest_clock_time(guest).await;
+        trace!("Converting nanoseconds into clock_gettime: {}", time_ns);
+
+        let tp = call.tp().ok_or(Errno::EFAULT)?;
+
+        let t: Timespec = time_ns.into();
+
+        guest.memory().write_value(tp, &t)?;
+
+        Ok(0)
+    }
+
+    /// clock_getres
+    pub async fn handle_clock_getres<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::ClockGetres,
+    ) -> Result<i64, Error> {
+        if !clock_id_is_known(call.clockid()) {
+            return Err(Errno::EINVAL.into());
+        }
+        // A NULL `res` pointer is valid for clock_getres: the kernel validates
+        // the clockid and returns 0 without storing the resolution. GHC's RTS
+        // probes the per-thread CPU clock exactly this way
+        // (clock_getres(clockid, NULL)) in getCurrentThreadCPUTime, so
+        // returning EFAULT here spuriously aborts the guest. Only write the
+        // resolution when the caller supplied a destination.
+        if let Some(res) = call.res() {
+            // For now we report a constant clock res of 10ms:
+            let clock_res = 10;
+
+            let t = Timespec {
+                tv_sec: 0,
+                tv_nsec: 1000 * clock_res as i64,
+            };
+
+            guest.memory().write_value(res, &t)?;
+        }
+
+        Ok(0)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-857): Deterministic adjtimex query/refusal policy.
+    /// Report Hermit's virtual clock with a fixed unsynchronized discipline.
+    /// Adjustment modes are capability-gated host mutations and receive EPERM.
+    pub async fn handle_adjtimex<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Adjtimex,
+    ) -> Result<i64, Error> {
+        self.write_deterministic_timex(guest, call.buf()).await
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-857): Deterministic clock_adjtime query/refusal policy.
+    /// Apply the adjtimex policy to CLOCK_REALTIME. Linux does not permit NTP
+    /// adjustment of the other fixed clock IDs, so reject them with EOPNOTSUPP.
+    pub async fn handle_clock_adjtime<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::ClockAdjtime,
+    ) -> Result<i64, Error> {
+        if call.clockid() != ClockId::CLOCK_REALTIME {
+            return Err(Errno::EOPNOTSUPP.into());
+        }
+        self.write_deterministic_timex(guest, call.buf()).await
+    }
+
+    async fn write_deterministic_timex<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        buf: Option<reverie::syscalls::AddrMut<'_, libc::timex>>,
+    ) -> Result<i64, Error> {
+        let buf = buf.ok_or(Errno::EFAULT)?;
+        let request: libc::timex = guest.memory().read_value(buf)?;
+        if !timex_mode_is_query(request.modes) {
+            return Err(Errno::EPERM.into());
+        }
+
+        let now: Timespec = thread_observe_time(guest).await.into();
+        guest.memory().write_value(buf, &deterministic_timex(now))?;
+        Ok(libc::TIME_ERROR as i64)
+    }
+
+    /// Helper function to wait a given period, which may either succeed or be interrupted by a signal.
+    /// Return 0 or EINTR respectively.
+    async fn wait_and_return<R: Guest<Self>>(
+        &self,
+        guest: &mut R,
+        mut request: Resources,
+        call: NanosleepFamily,
+    ) -> Result<i64, Error> {
+        let target_time = time_from_resources(&request).expect("a sleepuntil resource request");
+        // Lets the scheduler end the sleep for a cross-task signal that
+        // interrupts it (`scheduler::sleep_signal`).
+        request.fyi(crate::resources::NANOSLEEP_FYI);
+        let mut claimed = false;
+        loop {
+            // A signal already pending ends the sleep before it parks, and one
+            // still pending after a wake ends it; a wake whose signal was taken
+            // back parks it again with its original absolute deadline
+            // (`super::signal::sleep_signal`).
+            if super::signal::sleep_signal(guest, SleepCheck::BeforePark, false).await?
+                == SleepSignal::Pending
+            {
+                break;
+            }
+            request.in_guest_sleep_sigalrm = self.in_guest_sleep_sigalrm_snapshot(guest).await;
+            match crate::tool_global::parked_wait_request(
+                guest,
+                request.clone(),
+                crate::scheduler::parked::ParkedWaitPolicy::NanosleepNoHandlerRestart {
+                    absolute_deadline: target_time,
+                },
+            )
+            .await
+            {
+                ResumeStatus::InGuestFatalAlarm => {
+                    // The default action terminates the guest. In particular,
+                    // do not observe time or write `rem` after this fatal wake.
+                    self.stage_in_guest_fatal_alarm(guest).await;
+                    return Err(Errno::EINTR.into());
+                }
+                // A sleep never asks for `NothingElseCanRun`.
+                ResumeStatus::Normal | ResumeStatus::NothingElseCanRun => return Ok(0),
+                ResumeStatus::Signaled(signals) => {
+                    match super::signal::sleep_signal(guest, SleepCheck::AfterWake(signals), false)
+                        .await?
+                    {
+                        SleepSignal::Pending | SleepSignal::Held => break,
+                        SleepSignal::Claimed => {
+                            claimed = true;
+                            break;
+                        }
+                        SleepSignal::None => trace!(
+                            "nanosleep woken for a signal no longer pending for it; sleeping again until {}",
+                            target_time
+                        ),
+                    }
+                }
+            }
+        }
+        let now = thread_observe_time(guest).await;
+        let delta = remaining_sleep_duration(target_time, now);
+        // Linux never touches remain for TIMER_ABSTIME, even when
+        // a caught signal interrupts the absolute sleep.
+        let addr2 = if call.flags() & libc::TIMER_ABSTIME == 0 {
+            call.rem()
+        } else {
+            None
+        };
+        if let Some(addr2) = addr2 {
+            info!(
+                "[interrupted] sleep till (until {}), woke up {:?} early, writing into nanosleep rem argument.",
+                target_time, delta
+            );
+            let t = Timespec {
+                tv_sec: delta.as_secs() as i64,
+                tv_nsec: delta.subsec_nanos() as i64,
+            };
+            guest.memory().write_value(addr2, &t)?;
+        } else {
+            info!("[interrupted] nanosleep rem argument is null, not writing it.")
+        }
+        if claimed {
+            // A claimed `SIGCHLD` is held for delivery as the thread resumes
+            // (`SleepSignal::Claimed`): `EINTR` if a handler runs, else the
+            // kernel's restart. As Linux's own `nanosleep`, a relative sleep
+            // returns `ERESTART_RESTARTBLOCK` and keeps its deadline for the
+            // `restart_syscall` the kernel runs only when no handler ran
+            // (`helpers::RestartBlock`, `resume_nanosleep`), so a new call,
+            // from a handler or a retry, cannot take it. An absolute one
+            // returns `ERESTARTNOHAND`: re-executed, it reads the same target.
+            if call.flags() & libc::TIMER_ABSTIME != 0 {
+                return Err(reverie::Error::Errno(Errno::ERESTARTNOHAND));
+            }
+            let result = Err(reverie::Error::Errno(Errno::ERESTART_RESTARTBLOCK));
+            crate::syscalls::helpers::keep_restart_block(
+                guest,
+                &result,
+                crate::syscalls::helpers::RestartCall::Nanosleep(call),
+                Some(target_time),
+            )
+            .await;
+            return result;
+        }
+        Err(reverie::Error::Errno(Errno::EINTR))
+    }
+
+    /// The kernel's `restart_syscall` of a relative `nanosleep` that ended for
+    /// a claimed `SIGCHLD` no handler ran for (`helpers::RestartCall::Nanosleep`).
+    /// Like Linux's restart block, it keeps the deadline it already has and
+    /// does not read the request again, which another thread may have changed.
+    pub(crate) async fn resume_nanosleep<R: Guest<Self>>(
+        &self,
+        guest: &mut R,
+        call: NanosleepFamily,
+        deadline: LogicalTime,
+    ) -> Result<i64, Error> {
+        let request = Self::sleep_request_abs(guest, deadline).await;
+        self.wait_and_return(guest, request, call).await
+    }
+
+    /// clock_nanosleep and nanosleep
+    pub async fn handle_nanosleep_family<R: Guest<Self>>(
+        &self,
+        guest: &mut R,
+        call: NanosleepFamily,
+    ) -> Result<i64, Error> {
+        if call.flags() > libc::TIMER_ABSTIME {
+            trace!("Unhandled clock_nanosleep flags, letting syscall through...");
+            return Ok(guest.inject(Syscall::from(call)).await?);
+        }
+
+        let addr = call.req().ok_or(Errno::EFAULT)?;
+        let t: Timespec = guest.memory().read_value(addr)?;
+
+        // Linux validates the requested interval BEFORE sleeping: nanosleep(2)
+        // and clock_nanosleep(2) both fail EINVAL when tv_nsec is outside
+        // [0, 999999999] or tv_sec is negative.
+        //
+        // Detcore skipped that check and fed the raw fields through `as u64`.
+        // `Timespec` stores both as i64, so `tv_sec = -1` wrapped to
+        // u64::MAX (~1.8e19 seconds) and became `SleepUntil(INDEFINITE)`: the
+        // only guest thread parked with no deadline, the run queue emptied, and
+        // `step2d_handle_empty_queue` deliberately never jumps the clock for an
+        // indefinite waiter (doing so would also wake a `pause(2)`). The
+        // container then died -- exit 1, "Sandbox container exited
+        // unexpectedly" -- where Linux returns an errno and keeps running.
+        //
+        // A past *absolute* deadline is NOT an error and must still return 0,
+        // so this rejects only malformed fields, never an early deadline.
+        if t.tv_sec < 0 || t.tv_nsec < 0 || t.tv_nsec > 999_999_999 {
+            return Err(Errno::EINVAL.into());
+        }
+
+        match call.flags() {
+            0 => {
+                if self.cfg.sequentialize_threads {
+                    let time = Duration::from_secs(t.tv_sec as u64)
+                        + Duration::from_nanos(t.tv_nsec as u64);
+                    let request = Self::sleep_request(guest, time).await;
+                    trace!(
+                        "nanosleep adding delta {:?} to yield request {:?}",
+                        time, &request
+                    );
+                    self.wait_and_return(guest, request, call).await
+                } else {
+                    trace!("Not sequentializing threads, letting nanosleep through...");
+                    Ok(guest.inject(Syscall::from(call)).await?)
+                }
+            }
+            libc::TIMER_ABSTIME => {
+                let target_time = LogicalTime::from_secs(t.tv_sec as u64)
+                    + LogicalTime::from_nanos(t.tv_nsec as u64);
+                if self.cfg.sequentialize_threads {
+                    if self.cfg.virtualize_time {
+                        let request = Self::sleep_request_abs(guest, target_time).await;
+                        trace!(
+                            "nanosleep setting absolute time {:?} to yield request {:?}",
+                            target_time, &request
+                        );
+                        self.wait_and_return(guest, request, call).await
+                    } else {
+                        // TODO T124594597: Record-replay case here, need better ideas to enable proper handling of this case.
+                        error!(
+                            "Sequentializing but not virtualizing, so can't rely on passed abs time, especially when replaying a recording, just yelding"
+                        );
+                        let request = Self::yield_request(guest);
+                        self.wait_and_return(guest, request, call).await
+                    }
+                } else if self.cfg.virtualize_time {
+                    trace!(
+                        "Not sequentializing, but virtualizing so calculating relative time and invoking nanosleep..."
+                    );
+                    let relative_ts = Self::relative_time_from_abs_target(guest, target_time).await;
+                    let mut stack = guest.stack().await;
+                    let req = stack.push(relative_ts);
+                    stack.commit()?;
+                    let modified_call = syscalls::Nanosleep::new().with_req(Some(req));
+                    Ok(guest.inject(modified_call).await?)
+                } else {
+                    trace!(
+                        "Not sequentializing threads not virtualizing, letting nanosleep through..."
+                    );
+                    Ok(guest.inject(Syscall::from(call)).await?)
+                }
+            }
+            _ => unreachable!("Unexpected, unhandled flag value"),
+        }
+    }
+
+    async fn relative_time_from_abs_target<G: Guest<Self>>(
+        guest: &mut G,
+        target_time: LogicalTime,
+    ) -> Timespec {
+        let base_time = thread_observe_time(guest).await;
+
+        // An absolute deadline already in the past is NOT an error on Linux --
+        // clock_nanosleep(TIMER_ABSTIME) simply returns 0 without sleeping.
+        // `LogicalTime`'s `Sub` is a plain subtraction (unlike its `Add` impls,
+        // which saturate deliberately), so `target_time - base_time` underflows
+        // for a past deadline: a debug build panics with "attempt to subtract
+        // with overflow", and a release build wraps to an enormous interval --
+        // the same effectively-indefinite sleep this handler exists to avoid.
+        //
+        // Clamped here rather than by making the shared operator saturate,
+        // because this is the only subtraction of two `LogicalTime`s in the
+        // tree and a silently-saturating operator could hide a real underflow
+        // in some future caller.
+        let relative_logical = if target_time <= base_time {
+            LogicalTime::from_nanos(0)
+        } else {
+            target_time - base_time
+        };
+
+        Timespec {
+            tv_sec: relative_logical.as_secs() as i64,
+            tv_nsec: relative_logical.subsec_nanos() as i64,
+        }
+    }
+
+    /// Whether a POSIX timer notifying with `signo` registers its expirations
+    /// with the scheduler. A standard signal always does. A real-time signal
+    /// (32 to 64; glibc's SIGEV_THREAD timers use one through SIGEV_THREAD_ID)
+    /// cannot be delivered by Detcore, whose signal model carries nix's `Signal`
+    /// (https://github.com/rrnewton/hermit/issues/3893). Creating, arming, reading
+    /// and deleting such a timer still behave as on Linux; only an expiration is
+    /// unserviceable. A fail-closed run registers it anyway, and the scheduler
+    /// refuses the run by name if it ever comes due; a permissive run
+    /// (`--allow-unsupported-syscalls`) leaves it unregistered, so it never fires.
+    fn posix_timer_expiry_is_registered(&self, signo: i32) -> bool {
+        Signal::try_from(signo).is_ok() || self.cfg.panic_on_unsupported_syscalls
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#869)
+    /// timer_create: allocate a per-process POSIX timer and hand back a
+    /// deterministic id, retaining any scheduler-deliverable signal and, for
+    /// `SIGEV_THREAD_ID`, the thread it notifies. The notification is checked
+    /// as Linux's `good_sigevent` does: `SIGEV_SIGNAL` and `SIGEV_THREAD` (which
+    /// the kernel treats alike; libc implements the thread itself) need a
+    /// signal from 1 to 64; `SIGEV_THREAD_ID` needs, first, a thread of the
+    /// caller's own process (<https://github.com/rrnewton/hermit/issues/4164>);
+    /// any other value is EINVAL.
+    pub async fn handle_timer_create<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::TimerCreate,
+    ) -> Result<i64, Error> {
+        // The kernel writes the new timer id here; a null pointer is EFAULT.
+        let timerid_ptr = call.timerid().ok_or(Errno::EFAULT)?;
+        let clockid = call.clockid();
+        let (signo, thread, value) = if let Some(event_ptr) = call.sevp() {
+            // Only the plain fields: `sigevent` holds a pointer, which must not
+            // be kept across the query below. The value is kept as the 64 bits
+            // Linux copies into `si_value`.
+            let (notify, signo, named, value) = {
+                let event: libc::sigevent = guest.memory().read_value(event_ptr)?;
+                (
+                    event.sigev_notify,
+                    event.sigev_signo,
+                    event.sigev_notify_thread_id,
+                    event.sigev_value.sival_ptr as usize as u64,
+                )
+            };
+            // A reserved in-guest signal: Linux answers for the clock right
+            // after copying the sigevent, before it looks at the notification
+            // (`do_timer_create`), so an unsupported clock is that answer even
+            // when the notification is invalid too
+            // (`timer_create_clock_refusal`).
+            if guest.config().reserves_in_guest_signal(signo.into())
+                && let Some(errno) = timer_create_clock_refusal(clockid)
+            {
+                return Err(errno.into());
+            }
+            let thread = match notify {
+                libc::SIGEV_NONE => None,
+                libc::SIGEV_SIGNAL | libc::SIGEV_THREAD => None,
+                reverie::syscalls::linux_abi::SIGEV_THREAD_ID => {
+                    match posix_timer_thread(guest, named).await {
+                        PosixTimerThread::Thread(thread) => Some(thread),
+                        PosixTimerThread::NotInGroup => return Err(Errno::EINVAL.into()),
+                        PosixTimerThread::NestedNamespace => {
+                            tracing::error!(
+                                "[detcore, dtid {}] timer_create with SIGEV_THREAD_ID is not supported in a nested PID namespace: the thread id is a pid of that namespace, which Detcore does not translate (https://github.com/rrnewton/hermit/issues/4155)",
+                                guest.thread_state().dettid,
+                            );
+                            return self
+                                .refuse_unserviceable_operation(
+                                    guest,
+                                    Sysno::timer_create,
+                                    Errno::ENOSYS,
+                                )
+                                .await;
+                        }
+                    }
+                }
+                _ => return Err(Errno::EINVAL.into()),
+            };
+            if notify == libc::SIGEV_NONE {
+                (None, None, Some(value))
+            } else if !(1..=64).contains(&signo) {
+                return Err(Errno::EINVAL.into());
+            } else {
+                (Some(signo), thread, Some(value))
+            }
+        } else {
+            (Some(libc::SIGALRM), None, None)
+        };
+        // A reserved in-guest signal as the timer's notification signal, for
+        // each notification that delivers one (`SIGEV_SIGNAL`, `SIGEV_THREAD`,
+        // `SIGEV_THREAD_ID`), after Linux's answers for the clock and the
+        // sigevent above. With no `sigevent` the signal is SIGALRM, which is
+        // never reserved.
+        if let Some(signo) = signo
+            && guest.config().reserves_in_guest_signal(signo.into())
+        {
+            Self::refuse_reserved_signal_arming(
+                guest,
+                crate::refused_signal_controls::ReservedArming::TimerCreate,
+                signo.into(),
+            )?;
+        }
+        // `None` for a real-time signal (32 to 64): see `handle_timer_settime`.
+        let signal = signo.and_then(|signo| Signal::try_from(signo).ok());
+        if signal == Some(Signal::SIGALRM) {
+            refuse_sigalrm(guest, SigalrmControl::ArmProducer).await?;
+        }
+        let id = {
+            let mut timers = guest.thread_state().posix_timers.lock().unwrap();
+            timers.create(signo, thread, value)
+        };
+        guest
+            .memory()
+            .write_value(timerid_ptr, &(id as libc::c_int))?;
+        // The process has a POSIX timer on this signal from its creation, armed
+        // or not, which decides how a kept send standing on another sender's
+        // record is classified (https://github.com/rrnewton/hermit/issues/4262).
+        if crate::scheduler::discarded_at_send::records(guest.config())
+            && let Some(signo) = signo
+            && (1..32).contains(&signo)
+        {
+            crate::tool_global::discarded_signal(
+                guest,
+                crate::scheduler::discarded_at_send::DiscardedSignalControl::TimerCreated {
+                    signal: signo,
+                },
+            )
+            .await;
+        }
+        detlog!(
+            "[dtid {}] timer_create(clockid={:?}) => deterministic timer id {}, signal {:?}, thread {:?}",
+            guest.thread_state().dettid,
+            clockid,
+            id,
+            signal,
+            thread,
+        );
+        Ok(0)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#869)
+    /// timer_settime: arm or disarm a timer against the deterministic virtual
+    /// clock. The old arming is reported through `old_value` when requested.
+    pub async fn handle_timer_settime<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::TimerSettime,
+    ) -> Result<i64, Error> {
+        let id = call.timerid();
+        let new_ptr = call.new_value().ok_or(Errno::EINVAL)?;
+        let new: libc::itimerspec = guest.memory().read_value(new_ptr)?;
+        let interval_ns = timespec_to_ns(new.it_interval);
+        let value_ns = timespec_to_ns(new.it_value);
+
+        let now = thread_observe_time(guest).await;
+        let deadline = if value_ns == 0 {
+            None
+        } else if call.flags() & libc::TIMER_ABSTIME != 0 {
+            // Absolute expiration is interpreted against the same virtual clock.
+            Some(LogicalTime::from_nanos(value_ns))
+        } else {
+            Some(now + Duration::from_nanos(value_ns))
+        };
+
+        let (old, signal_number, thread, value) = {
+            let mut timers = guest.thread_state().posix_timers.lock().unwrap();
+            let old = timers.settime(id, interval_ns, deadline, now);
+            let signal = timers.signal(id);
+            (
+                old,
+                signal,
+                timers.thread(id),
+                timers.value(id).unwrap_or(0),
+            )
+        };
+        let (mut old_remaining_ns, old_interval_ns) = old.ok_or(Errno::EINVAL)?;
+        let signal_number = signal_number.ok_or(Errno::EINVAL)?;
+        // The old value is the timer's remaining time as `timer_gettime`
+        // reads it now, from the scheduler where it keeps the timer's phase
+        // (4262 design §5).
+        if let Some((Some(remaining), _)) = posix_timer_readout(guest, id, now).await {
+            old_remaining_ns = remaining.as_nanos();
+        }
+
+        // Linux changes the timer, its generation and its overrun before it
+        // copies the old value out (`do_timer_settime`), and an EFAULT there
+        // undoes none of it, so the scheduler is told first (the Codex review
+        // of https://github.com/rrnewton/hermit/pull/4491, P2-2).
+        if let Some(signo) = signal_number {
+            if self.posix_timer_expiry_is_registered(signo) {
+                register_posix_timer(
+                    guest,
+                    id,
+                    deadline,
+                    LogicalTime::from_nanos(interval_ns),
+                    PosixTimerNotification {
+                        sig: SigWrapper(signo),
+                        thread,
+                        value,
+                        deleted: false,
+                    },
+                )
+                .await;
+            } else if deadline.is_some() {
+                tracing::error!(
+                    "[detcore, dtid {}] POSIX timer {} notifies with real-time signal {}, which Detcore does not deliver from a timer; it is armed but will never fire",
+                    guest.thread_state().dettid,
+                    id,
+                    signo,
+                );
+            }
+        }
+
+        if let Some(old_ptr) = call.old_value() {
+            let old_spec = libc::itimerspec {
+                it_interval: ns_to_timespec(old_interval_ns),
+                it_value: ns_to_timespec(old_remaining_ns),
+            };
+            guest.memory().write_value(old_ptr, &old_spec)?;
+        }
+
+        detlog!(
+            "[dtid {}] timer_settime(id={}, interval_ns={}, value_ns={}) armed against virtual clock",
+            guest.thread_state().dettid,
+            id,
+            interval_ns,
+            value_ns,
+        );
+        Ok(0)
+    }
+
+    /// timer_gettime: report the time remaining until the next expiration and
+    /// the reload interval, both computed from the virtual clock.
+    pub async fn handle_timer_gettime<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::TimerGettime,
+    ) -> Result<i64, Error> {
+        let id = call.timerid();
+        let value_ptr = call.value().ok_or(Errno::EFAULT)?;
+        let now = thread_observe_time(guest).await;
+        let cur = {
+            let timers = guest.thread_state().posix_timers.lock().unwrap();
+            timers.gettime(id, now)
+        };
+        let (mut remaining_ns, interval_ns) = cur.ok_or(Errno::EINVAL)?;
+        // Where the scheduler coalesces timers, it knows whether this one
+        // waits for the dequeue of its signal (4262 design §5).
+        if let Some((Some(remaining), _)) = posix_timer_readout(guest, id, now).await {
+            remaining_ns = remaining.as_nanos();
+        }
+        let spec = libc::itimerspec {
+            it_interval: ns_to_timespec(interval_ns),
+            it_value: ns_to_timespec(remaining_ns),
+        };
+        guest.memory().write_value(value_ptr, &spec)?;
+        Ok(0)
+    }
+
+    /// timer_getoverrun: the expirations the timer's last delivered signal
+    /// missed (`it_overrun_last`), where the scheduler coalesces timers
+    /// (<https://github.com/rrnewton/hermit/issues/4262>); 0 elsewhere.
+    pub async fn handle_timer_getoverrun<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::TimerGetoverrun,
+    ) -> Result<i64, Error> {
+        let id = call.timerid();
+        let exists = guest
+            .thread_state()
+            .posix_timers
+            .lock()
+            .unwrap()
+            .contains(id);
+        if !exists {
+            return Err(Errno::EINVAL.into());
+        }
+        // The overrun is the scheduler's record alone, not a function of the
+        // caller's time, which is not observed here.
+        Ok(posix_timer_readout(guest, id, LogicalTime::ZERO)
+            .await
+            .map_or(0, |(_, overrun)| overrun as i64))
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#869)
+    /// timer_delete: destroy a timer created by `timer_create`.
+    pub async fn handle_timer_delete<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::TimerDelete,
+    ) -> Result<i64, Error> {
+        let id = call.timerid();
+        let signal_number = guest
+            .thread_state()
+            .posix_timers
+            .lock()
+            .unwrap()
+            .signal(id)
+            .ok_or(Errno::EINVAL)?;
+        let existed = {
+            let mut timers = guest.thread_state().posix_timers.lock().unwrap();
+            timers.remove(id)
+        };
+        if existed {
+            if let Some(signo) = signal_number
+                && self.posix_timer_expiry_is_registered(signo)
+            {
+                register_posix_timer(
+                    guest,
+                    id,
+                    None,
+                    LogicalTime::ZERO,
+                    PosixTimerNotification {
+                        sig: SigWrapper(signo),
+                        thread: None,
+                        value: 0,
+                        deleted: true,
+                    },
+                )
+                .await;
+            }
+            detlog!(
+                "[dtid {}] timer_delete(id={})",
+                guest.thread_state().dettid,
+                id,
+            );
+            Ok(0)
+        } else {
+            Err(Errno::EINVAL.into())
+        }
+    }
+}
+
+/// The scheduler's remaining time (`None`: the caller's own answer stands)
+/// and overrun of the calling process's POSIX timer `id` at `now`, where it
+/// keeps them (`DiscardedSignalControl::TimerReadout`); `None` elsewhere.
+async fn posix_timer_readout<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+    guest: &mut G,
+    id: i32,
+    now: LogicalTime,
+) -> Option<(Option<LogicalTime>, i32)> {
+    use crate::scheduler::discarded_at_send::DiscardedSignalAnswer;
+    use crate::scheduler::discarded_at_send::DiscardedSignalControl;
+    if !crate::scheduler::discarded_at_send::records(guest.config()) {
+        return None;
+    }
+    match crate::tool_global::discarded_signal(
+        guest,
+        DiscardedSignalControl::TimerReadout { timer: id, now },
+    )
+    .await
+    {
+        DiscardedSignalAnswer::TimerReadout { remaining, overrun } => Some((remaining, overrun)),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Linux's clock answer to `timer_create`, which a reserved-signal refusal
+    /// must not come before: EINVAL for an id with no clock, EOPNOTSUPP for a
+    /// clock without timers, nothing for the clocks with timers and for the
+    /// ids whose answer depends on the host or the process they name.
+    #[test]
+    fn timer_create_clock_refusal_matches_linuxs_clock_table() {
+        use reverie::syscalls::FromToRaw;
+        let refusal = |id: i32| timer_create_clock_refusal(ClockId::from_raw(id as _));
+        for id in [
+            libc::CLOCK_REALTIME,
+            libc::CLOCK_MONOTONIC,
+            libc::CLOCK_PROCESS_CPUTIME_ID,
+            libc::CLOCK_THREAD_CPUTIME_ID,
+            libc::CLOCK_BOOTTIME,
+            libc::CLOCK_REALTIME_ALARM,
+            libc::CLOCK_BOOTTIME_ALARM,
+            libc::CLOCK_TAI,
+            -2,
+        ] {
+            assert_eq!(refusal(id), None, "{id}");
+        }
+        // FD_TO_CLOCKID(fd), ((~fd) << 3) | CLOCKFD, for descriptors 3 and 0:
+        // clock descriptors, which have no timers.
+        let clock_descriptor = |fd: i32| (!fd << 3) | 3;
+        for id in [
+            libc::CLOCK_MONOTONIC_RAW,
+            libc::CLOCK_REALTIME_COARSE,
+            libc::CLOCK_MONOTONIC_COARSE,
+            clock_descriptor(3),
+            clock_descriptor(0),
+        ] {
+            assert_eq!(refusal(id), Some(Errno::EOPNOTSUPP), "{id}");
+        }
+        // CPU clocks of a process (pid 1, CPUCLOCK_SCHED) and of a thread
+        // (perthread bit) keep `None`: their answer depends on the task.
+        for id in [(!1 << 3) | 2, (!1 << 3) | 4 | 2] {
+            assert_eq!(refusal(id), None, "{id}");
+        }
+        // Per-thread CPU-clock bits with CPUCLOCK_WHICH 3: no such clock.
+        for id in [10, 12, 99, (!1 << 3) | 7, (!0 << 3) | 7] {
+            assert_eq!(refusal(id), Some(Errno::EINVAL), "{id}");
+        }
+    }
+
+    #[test]
+    fn timex_policy_distinguishes_queries_from_mutations() {
+        assert!(timex_mode_is_query(0));
+        assert!(timex_mode_is_query(libc::ADJ_OFFSET_SS_READ));
+        assert!(!timex_mode_is_query(libc::ADJ_OFFSET));
+        assert!(!timex_mode_is_query(libc::ADJ_FREQUENCY));
+    }
+
+    #[test]
+    fn timex_snapshot_is_unsynchronized_and_uses_virtual_time() {
+        let tx = deterministic_timex(Timespec {
+            tv_sec: 123,
+            tv_nsec: 456_789_000,
+        });
+        assert_eq!(tx.status, libc::STA_UNSYNC);
+        assert_eq!(tx.tick, 10_000);
+        assert_eq!(tx.time.tv_sec, 123);
+        assert_eq!(tx.time.tv_usec, 456_789);
+    }
+
+    #[test]
+    fn interrupted_sleep_remaining_time_floors_at_zero() {
+        let target = LogicalTime::from_nanos(1_000);
+
+        assert_eq!(
+            remaining_sleep_duration(target, LogicalTime::from_nanos(750)),
+            Duration::from_nanos(250)
+        );
+        assert_eq!(remaining_sleep_duration(target, target), Duration::ZERO);
+        assert_eq!(
+            remaining_sleep_duration(target, LogicalTime::from_nanos(1_250)),
+            Duration::ZERO
+        );
+    }
+
+    mod failed_gettimeofday_tv {
+        use super::*;
+
+        fn failure(error: Error) -> TvRepairFailure {
+            match error {
+                Error::Tool(error) => *error
+                    .downcast_ref::<TvRepairFailure>()
+                    .expect("a typed repair failure"),
+                other => panic!("expected a Tool error, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn successful_time_store_probe_requires_an_overwrite() {
+            assert_eq!(
+                classify_time_store_probe("tv_sec", Ok(1)).unwrap(),
+                TimeStoreProbe::Stored
+            );
+        }
+
+        #[test]
+        fn efault_time_store_probe_stops_without_an_overwrite() {
+            assert_eq!(
+                classify_time_store_probe("tv_usec", Err(Errno::EFAULT)).unwrap(),
+                TimeStoreProbe::Stopped
+            );
+        }
+
+        #[test]
+        fn any_control_probe_error_means_the_efault_was_not_a_store_fault() {
+            require_native_time_control_probe("tv_sec", Ok(1_767_225_600)).unwrap();
+            for errno in [Errno::EFAULT, Errno::EPERM, Errno::ENOSYS] {
+                let error = require_native_time_control_probe("tv_usec", Err(errno))
+                    .expect_err("time(NULL) cannot fail natively");
+                assert_eq!(
+                    failure(error),
+                    TvRepairFailure {
+                        field: "tv_usec",
+                        kind: TvRepairFailureKind::ControlProbeFailed(errno),
+                    }
+                );
+            }
+        }
+
+        #[test]
+        fn a_stopped_word_must_keep_its_contents_and_readability() {
+            assert_eq!(
+                require_unchanged_stopped_word("tv_sec", Ok(7), Ok(7)).unwrap(),
+                StoppedWord::Unchanged
+            );
+            for (before, after) in [(Errno::EFAULT, Errno::EFAULT), (Errno::EIO, Errno::EPERM)] {
+                assert_eq!(
+                    require_unchanged_stopped_word("tv_sec", Err(before), Err(after)).unwrap(),
+                    StoppedWord::Unreadable
+                );
+            }
+            for (before, after) in [
+                (Ok(7), Ok(1_791_041_091)),
+                (Ok(7), Err(Errno::EFAULT)),
+                (Err(Errno::EFAULT), Ok(7)),
+            ] {
+                let error = require_unchanged_stopped_word("tv_usec", before, after)
+                    .expect_err("a changed stopped word means the call stored it");
+                assert_eq!(
+                    failure(error),
+                    TvRepairFailure {
+                        field: "tv_usec",
+                        kind: TvRepairFailureKind::StoppedWordChanged,
+                    }
+                );
+            }
+        }
+
+        #[test]
+        fn an_unreadable_word_is_unstored_only_if_part_of_it_is_unmapped() {
+            const PAGE: u64 = 0x1000;
+            let two_pages = || Ok(vec![(3 * PAGE, 4 * PAGE), (2 * PAGE, 3 * PAGE)]);
+            // Outside every mapping, and straddling either end of the mapped pages.
+            for word in [1, 2 * PAGE - 4, 4 * PAGE - 4, 5 * PAGE, u64::MAX - 3] {
+                require_unmapped_unreadable_word("tv_sec", two_pages(), word).unwrap();
+            }
+            // Inside one page, and across the boundary of two adjacent mappings.
+            for word in [2 * PAGE, 3 * PAGE - 4, 4 * PAGE - 8] {
+                let error = require_unmapped_unreadable_word("tv_usec", two_pages(), word)
+                    .expect_err("a failed read of a mapped word is not a fault");
+                assert_eq!(
+                    failure(error),
+                    TvRepairFailure {
+                        field: "tv_usec",
+                        kind: TvRepairFailureKind::StoppedWordUnreadable,
+                    }
+                );
+            }
+        }
+
+        #[test]
+        fn an_unreadable_word_needs_a_readable_nonempty_map() {
+            let unreadable = Err(Error::Errno(Errno::EPERM));
+            for maps in [Ok(Vec::new()), unreadable] {
+                let error = require_unmapped_unreadable_word("tv_sec", maps, 1)
+                    .expect_err("without a map an unreadable word proves nothing");
+                assert_eq!(
+                    failure(error),
+                    TvRepairFailure {
+                        field: "tv_sec",
+                        kind: TvRepairFailureKind::MapsUnavailable,
+                    }
+                );
+            }
+        }
+
+        #[test]
+        fn other_time_store_probe_errors_fail_closed() {
+            for errno in [Errno::ENOSYS, Errno::EPERM, Errno::EIO] {
+                let error = classify_time_store_probe("tv_sec", Err(errno))
+                    .expect_err("a non-EFAULT probe error must fail the repair");
+                assert_eq!(
+                    failure(error),
+                    TvRepairFailure {
+                        field: "tv_sec",
+                        kind: TvRepairFailureKind::ProbeFailed(errno),
+                    }
+                );
+            }
+        }
+
+        #[test]
+        fn overwrite_errors_and_nonexact_counts_fail_closed() {
+            assert_eq!(
+                failure(
+                    require_complete_time_word_overwrite("tv_usec", 8, Err(Errno::EFAULT),)
+                        .unwrap_err()
+                ),
+                TvRepairFailure {
+                    field: "tv_usec",
+                    kind: TvRepairFailureKind::OverwriteFailed(Errno::EFAULT),
+                }
+            );
+            for reported in [0, 3, 7, 9] {
+                assert_eq!(
+                    failure(
+                        require_complete_time_word_overwrite("tv_sec", 8, Ok(reported))
+                            .unwrap_err()
+                    ),
+                    TvRepairFailure {
+                        field: "tv_sec",
+                        kind: TvRepairFailureKind::OverwriteCount {
+                            expected: 8,
+                            reported,
+                        },
+                    }
+                );
+            }
+            require_complete_time_word_overwrite("tv_sec", 8, Ok(8)).unwrap();
+
+            require_live_time_store_probe(false).unwrap();
+            assert_eq!(
+                failure(require_live_time_store_probe(true).unwrap_err()),
+                TvRepairFailure {
+                    field: "tv",
+                    kind: TvRepairFailureKind::ReplayMode,
+                }
+            );
+        }
+
+        #[test]
+        fn timeval_word_addresses_follow_kernel_order_and_overflow_fails_closed_only_for_probes() {
+            assert_eq!(TIMEVAL_WORDS, [("tv_sec", 0), ("tv_usec", 8)]);
+            let tv_addr = AddrMut::<Timeval>::from_raw(0x10_0000).unwrap();
+            assert_eq!(
+                timeval_word_addr("tv_sec", tv_addr, std::mem::offset_of!(Timeval, tv_sec))
+                    .unwrap()
+                    .as_raw(),
+                tv_addr.as_raw()
+            );
+            assert_eq!(
+                timeval_word_addr("tv_usec", tv_addr, std::mem::offset_of!(Timeval, tv_usec))
+                    .unwrap()
+                    .as_raw(),
+                tv_addr.as_raw() + 8
+            );
+
+            let overflowing = AddrMut::<Timeval>::from_raw(usize::MAX - 3).unwrap();
+            let error = timeval_word_addr("tv_usec", overflowing, 8)
+                .expect_err("overflowing field address must fail the repair");
+            assert_eq!(
+                failure(error),
+                TvRepairFailure {
+                    field: "tv_usec",
+                    kind: TvRepairFailureKind::AddressOverflow,
+                }
+            );
+
+            // Checking a stopped word needs no probe, so a word past the end of
+            // the address space is simply one no store reached.
+            for (_, offset) in TIMEVAL_WORDS {
+                assert_eq!(
+                    stopped_timeval_word_addr(tv_addr, offset).map(|addr| addr.as_raw()),
+                    Some(tv_addr.as_raw() + offset)
+                );
+            }
+            // `gettimeofday((void *)-1, NULL)`: `tv_sec` is the last byte of
+            // the address space and `tv_usec` has no address at all.
+            let last = AddrMut::<Timeval>::from_raw(usize::MAX).unwrap();
+            assert_eq!(
+                stopped_timeval_word_addr(last, 0).map(|addr| addr.as_raw()),
+                Some(usize::MAX)
+            );
+            assert!(stopped_timeval_word_addr(last, 8).is_none());
+            assert!(stopped_timeval_word_addr(overflowing, 8).is_none());
+        }
+    }
+}
