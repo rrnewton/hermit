@@ -4042,6 +4042,12 @@ impl Scheduler {
             self.reparent_orphans(registered);
         }
         if !live_process_thread {
+            // The process, not merely its leader thread, is now terminal.
+            // Exec reconnect retains a live caller; it cannot cancel pending
+            // capture obligations by passing through sibling retirement.
+            if !self.exec_teardowns.contains_key(detpid) {
+                self.retire_native_capture_parent(*detpid, mm);
+            }
             let _ = self.begin_physical_process_exit(*detpid);
             self.reparent_orphans(*detpid);
             self.logically_exited_processes.insert(*detpid);

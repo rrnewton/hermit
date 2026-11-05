@@ -1137,7 +1137,7 @@ async fn retired_exec_former_rpc_cannot_recreate_clock_or_account_twice() {
         payload.syscall_count = 999;
         for request in [
             GlobalRequest::GlobalTimeLowerBound,
-            GlobalRequest::RequestResources(Resources::new(WORKER), LEADER),
+            GlobalRequest::RequestResources(Resources::new(WORKER), LEADER, None),
             GlobalRequest::DeregisterThread(payload),
         ] {
             let expected = if matches!(&request, GlobalRequest::DeregisterThread(_)) {
@@ -1506,7 +1506,7 @@ async fn reused_exec_worker_vfork_registration_requires_creation_mode(
         (
             parent.thread.thread_logical_time.clone(),
             parent_mm,
-            GlobalRequest::RequestResources(resources, LEADER),
+            GlobalRequest::RequestResources(resources, LEADER, None),
         ),
     ));
     assert!(futures::poll!(&mut blocking).is_pending());

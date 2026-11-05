@@ -1131,7 +1131,7 @@ mod event_tests {
             message: <GlobalState as GlobalTool>::Request,
         ) -> <GlobalState as GlobalTool>::Response {
             let response = match message.2 {
-                GlobalRequest::RequestResources(request, _)
+                GlobalRequest::RequestResources(request, _, _)
                     if request.resources.keys().any(|resource| {
                         matches!(
                             resource,
@@ -1146,7 +1146,7 @@ mod event_tests {
                         .extend(request.resources.keys().cloned());
                     GlobalResponse::RequestResources(ResumeStatus::Normal)
                 }
-                GlobalRequest::RequestResources(request, _) => {
+                GlobalRequest::RequestResources(request, _, _) => {
                     assert_eq!(request.resources.len(), 1);
                     assert_eq!(
                         request.resources.get(&ResourceID::InternalIOPolling),
