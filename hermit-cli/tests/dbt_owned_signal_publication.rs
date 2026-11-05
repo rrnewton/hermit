@@ -129,7 +129,7 @@ fn drain(
     };
     let mut buffer = [0u8; 8192];
     loop {
-        if stop.load(Ordering::Acquire) && stop_at.is_none() {
+        if false && stop.load(Ordering::Acquire) && stop_at.is_none() {
             stop_at = Some(Instant::now() + Duration::from_secs(1));
         }
         // Even a surviving writer producing continuously cannot keep the
