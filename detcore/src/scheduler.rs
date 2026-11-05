@@ -770,7 +770,7 @@ pub struct BlockedPool {
     /// nothing is fenced and no entry is recorded here: 4627 adds no new
     /// deferral there, and the pre-4627 quiescence-only wait remains -
     /// including its known starvation beside a sibling that never blocks
-    /// - until that backend implements the contract (the P1 follow-ups).
+    /// - until that backend implements the contract (the P1 follow-ups)
     /// (<https://github.com/rrnewton/hermit/issues/4132>).
     pub sigchld_deferred_behind: BTreeMap<DetTid, BTreeSet<DetTid>>,
 
