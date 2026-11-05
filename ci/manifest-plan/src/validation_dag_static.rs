@@ -3295,9 +3295,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (wake unit + deferred-SIGCHLD negative arm).
     // And SIGSHARE S2a's scheduler::signal_state_reader_tests (4 reader units
     // and 11 drain-decision rows): 3524 + 15 = 3539, listed.
-    // And SIGSHARE S2b's scheduler::backend_signal_waits_tests (13 rows):
-    // 3539 + 13 = 3552, listed.
-    ("test.detcore_unit", 3552),
+    // And SIGSHARE S2b's scheduler::backend_signal_waits_tests (14 rows) and
+    // syscalls::signal::suspend_decline_tests (1): 3539 + 15 = 3554, listed.
+    ("test.detcore_unit", 3554),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5960,8 +5960,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR #4751: the same twelve units (same growth as test.detcore_unit): 3482.
     // And the same two replayed-switch wake units: 3492 + 2 = 3494.
     // And the same fifteen SIGSHARE S2a units: 3524 + 15 = 3539, listed.
-    // And the same thirteen SIGSHARE S2b units: 3539 + 13 = 3552, listed.
-    ("test.detcore_unit_on_host", 3552),
+    // And the same fifteen SIGSHARE S2b units: 3539 + 15 = 3554, listed.
+    ("test.detcore_unit_on_host", 3554),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
