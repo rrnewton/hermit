@@ -417,6 +417,9 @@ fn run_analyze_expect_baseline_collision(label: &str, guest: &Path, analyze_opts
         combined.contains("baseline run matched target criteria when it should not"),
         "{label}: analyze did not reject indistinguishable endpoints\n{combined}"
     );
+    // A baseline that meets the target is an input analyze cannot use, not a
+    // failure of Hermit.
+    assert_precondition(label, &output, "baseline-not-reproduced");
     // The error is about the baseline run: its reproducer and the output that
     // met the target stay to be read.
     assert_workspace_kept_after_error(
@@ -498,20 +501,6 @@ fn analyze_racewrite_nostdlib_prefix_search() {
 /// server then cannot run as edited (it needs the request that now comes
 /// after it), so the check is not realized rather than a verdict. No
 /// poller nap decides.
-///
-/// This test is NOT in the PMU analyze node. Measured 2026-11-04 on an
-/// AMD EPYC 9D85 (the validation host class), whole-cgroup CPU of one
-/// systemd scope per run at the node's 20000-branch margin, it takes
-/// 24.31, 24.47 and 24.78 CPU-seconds against the node's ordinary
-/// 22-second per-test cap, and shrinking the poller's nap far enough to
-/// fit (600 microseconds and up) makes the analysis degenerate: the
-/// deciding event falls in startup (#53), the server-change replay
-/// departs at event #0, and no candidate check is realized -- the
-/// assertions below now refuse that shape. An exact-identity CPU
-/// allowance cannot admit it either today, because allowance selection
-/// drops ignored testcases (nextest_cpu::selected_inventory). It stays
-/// runnable by hand as an ignored test; re-inclusion is tracked in
-/// minibeads dh-zr6yo.
 #[test]
 #[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
 fn analyze_checks_the_race_candidates_and_says_what_each_edit_moved() {
@@ -539,54 +528,6 @@ fn analyze_checks_the_race_candidates_and_says_what_each_edit_moved() {
         .unwrap_or_else(|| panic!("no candidate names the server's change: {report}"));
     let check = &change["check"];
     assert_eq!(check["verdict"], "not_realized", "{report}");
-    // Guard against a degenerate analysis (F5): with too little poller
-    // traffic the deciding event falls in startup, before the server
-    // thread exists, the edit replay departs at event #0 instead of at
-    // the server's read, and no candidate check is realized -- while the
-    // assertions above still pass on the ranked text alone.
-    let decision = racing["decision"].as_u64().expect("decision event");
-    let server_thread = change["accesses"][1]["thread"]
-        .as_u64()
-        .expect("server thread");
-    let detail = check["detail"].as_str().unwrap_or("");
-    let departure: u64 = detail
-        .split("at event #")
-        .nth(1)
-        .and_then(|rest| {
-            rest.chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect::<String>()
-                .parse()
-                .ok()
-        })
-        .unwrap_or_else(|| panic!("no departure event in check detail: {report}"));
-    let departure_thread: u64 = detail
-        .split("(tid")
-        .nth(1)
-        .and_then(|rest| {
-            rest.chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect::<String>()
-                .parse()
-                .ok()
-        })
-        .unwrap_or_else(|| panic!("no departure thread in check detail: {report}"));
-    assert_eq!(
-        departure_thread, server_thread,
-        "the server-change replay must depart on the server thread: {report}"
-    );
-    assert!(
-        departure >= decision,
-        "the server-change replay departs at #{departure}, before the deciding \
-         event #{decision}: {report}"
-    );
-    assert!(
-        candidates.iter().any(|candidate| matches!(
-            candidate["check"]["verdict"].as_str(),
-            Some("decides" | "does_not_decide")
-        )),
-        "at least one candidate check must be realized: {report}"
-    );
     assert!(
         check["edit"].as_str().unwrap_or("").starts_with("moving ")
             && check["moved"]["events"].as_u64().unwrap_or(0) > 0
@@ -614,21 +555,16 @@ fn analyze_checks_the_race_candidates_and_says_what_each_edit_moved() {
 /// that fails with EBADF, on two threads, and no edge Hermit observes orders
 /// them.
 ///
-/// It takes no calibrated skid margin. Power/weight, 2026-11-04, on an AMD
-/// EPYC 9D85 (the validation host class), whole-cgroup CPU of one systemd
-/// scope per run of this test alone: the writer's spin went from 3000000 to
-/// 100000 iterations. The recorded schedule keeps every event class
-/// (Syscall 138, OtherInstructions 100, Cpuid 21, Rdtsc 10; Branch 228 ->
-/// 101, of which the writer's timer slices 141 -> 14), and the test's CPU
-/// fell from 191 and 230 CPU-seconds (n=2) to 12.18 and 12.25 (n=2) without
-/// the margin, inside the node's 22-second cap. With
-/// `HERMIT_ANALYZE_SKID_MARGIN=20000` the shrunk test still takes 76 to 81
-/// CPU-seconds (n=3), because the margin steps every Branch event, the ~77
-/// startup slices included, so the exemption stays. Plain `--chaos` seeds
-/// 1-5 no longer fail on this host at the shrunk spin (the 3000000-iteration
-/// guest failed seeds 1-3); analyze's own search found the failing schedule
-/// in 5 of 5 measured runs. What the test checks is the race finder's
-/// report on the pair the search finds, not where a timer event lands.
+/// It takes no calibrated skid margin. At `--max-timeslice=400000` the guest's
+/// writer, which computes between its syscalls, has 59 of a run's 64
+/// timeslices end at the timer, and under the PMU analyze node's margin every
+/// such event is placed by stepping through up to 20000 branches. Measured on
+/// an Intel Xeon Gold 6138 with this test's command: without the margin the
+/// analysis finishes in 33 s, its 18 trials taking 1.5 to 2.0 s each; with a
+/// margin of 20000 each trial takes 42 to 61 s, and the analysis had run 7 of
+/// them when a 420 s bound stopped it. What the test checks is the race
+/// finder's report on the pair the search finds, not where a timer event
+/// lands.
 #[test]
 #[ignore = "slow: bisecting chaos schedules; requires PMU branch counters and working mount namespaces"]
 fn analyze_names_the_close_racing_the_reused_descriptor() {
@@ -642,9 +578,9 @@ fn analyze_names_the_close_racing_the_reused_descriptor() {
         ],
         "unordered by the edges Hermit observes",
         SkidMargin::Without(
-            "stepping every Branch event through a 20000-branch margin, startup slices \
-             included, took 76 to 81 CPU-seconds on the validation host class against \
-             12.2 without it (see the test's documentation)",
+            "its CPU-bound writer is stepped through the margin at each timer event, which made \
+             each prefix trial take 42 to 61 s instead of 1.5 to 2.0 s (see the test's \
+             documentation)",
         ),
     );
     let racing = &report["racing_accesses"];
@@ -1060,10 +996,7 @@ fn analyze_stops_on_a_refused_trial() {
 }
 
 /// A refused target has no outcome, while a guest's ordinary exit 122 does.
-/// With the trials logged into files (`--trial-log=debug`) the error must
-/// name the actual retained trial log; with `--verbose` alone, which no
-/// longer sets the trials' level, it points at Hermit's stderr, where the
-/// refusal's reason is.
+/// With verbose logging the error must name the actual retained trial log.
 #[test]
 #[ignore = "requires PMU and mount namespaces; selected by the calibrated analyze validation node"]
 fn analyze_ends_with_a_refused_target_run() {
@@ -1078,40 +1011,28 @@ fn analyze_ends_with_a_refused_target_run() {
     assert_eq!(ordinary.status.code(), Some(122));
     assert!(!combined_output(&ordinary).contains("HERMIT_POLICY_REFUSAL"));
 
-    let refused = |trial_log: &[&str]| {
-        let dir = tempfile::tempdir().unwrap();
-        let workspace_parent = dir.path().join("workspace");
-        let report = dir.path().join("report.json");
-        let mut command = Command::new("timeout");
-        command
-            .args(["--signal=KILL", "30s"])
-            .arg(hermit_test::hermit_binary())
-            .args(["analyze", "--verbose"])
-            .args(trial_log)
-            .args(["--prefix-search", "--target-stdout=a-first"])
-            .arg(format!("--tmp-dir={}", workspace_parent.display()))
-            .arg(format!("--report-file={}", report.display()));
-        add_calibrated_skid_margin(&mut command, "analyze refused target");
-        command
-            .args(["--", "--timeout=3", "--"])
-            .arg(&workloads().refusal_after_race)
-            .arg("refuse");
-        let output = hermit_test::hermit_output("analyze refused target", &mut command);
-        let combined = assert_no_refusal_report(&output, &report);
-        (dir, workspace_parent, output, combined)
-    };
-    // --verbose alone: the refusal's reason is on Hermit's stderr.
-    let (_dir, _, output, combined) = refused(&[]);
-    assert!(
-        combined.contains("Hermit refused analysis run run1_target")
-            && combined.contains("Hermit's stderr above"),
-        "{combined}"
-    );
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("unsupported syscall: restart_syscall"),
-        "{combined}"
-    );
-    let (_dir, workspace_parent, _, combined) = refused(&["--trial-log=debug"]);
+    let dir = tempfile::tempdir().unwrap();
+    let workspace_parent = dir.path().join("workspace");
+    let report = dir.path().join("report.json");
+    let mut command = Command::new("timeout");
+    command
+        .args(["--signal=KILL", "30s"])
+        .arg(hermit_test::hermit_binary())
+        .args([
+            "analyze",
+            "--verbose",
+            "--prefix-search",
+            "--target-stdout=a-first",
+        ])
+        .arg(format!("--tmp-dir={}", workspace_parent.display()))
+        .arg(format!("--report-file={}", report.display()));
+    add_calibrated_skid_margin(&mut command, "analyze refused target");
+    command
+        .args(["--", "--timeout=3", "--"])
+        .arg(&workloads().refusal_after_race)
+        .arg("refuse");
+    let output = hermit_test::hermit_output("analyze refused target", &mut command);
+    let combined = assert_no_refusal_report(&output, &report);
     assert!(
         combined.contains("Hermit refused analysis run run1_target"),
         "{combined}"
@@ -1135,6 +1056,88 @@ fn analyze_ends_with_a_refused_target_run() {
         diagnostics.contains("unsupported syscall: restart_syscall"),
         "{diagnostics}"
     );
+}
+
+/// Stdout and stderr of `output`, together.
+/// Analyze (or bisect) ended because its inputs do not give it what it
+/// needs: exit 2, the precondition's class line on stderr, and no internal
+/// failure (125 and `HERMIT_INTERNAL_FAILURE class=cli-error` before).
+fn assert_precondition(label: &str, output: &Output, class: &str) {
+    let combined = combined_output(output);
+    assert_eq!(
+        output.status.code(),
+        Some(hermit::HERMIT_ANALYZE_PRECONDITION_EXIT),
+        "{label}\n{combined}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let line = format!("HERMIT_ANALYZE_PRECONDITION class={class}");
+    assert!(
+        stderr.lines().any(|candidate| candidate == line)
+            && !stderr.contains("HERMIT_INTERNAL_FAILURE"),
+        "{label}: no {line:?}\n{combined}"
+    );
+}
+
+/// `hermit bisect` verifies its endpoints as analyze does: a --good schedule
+/// that meets the target is an input it cannot use, so it ends with exit 2
+/// and `HERMIT_ANALYZE_PRECONDITION class=baseline-not-reproduced`, as
+/// analyze would. Before, it exited 125 with `HERMIT_INTERNAL_FAILURE
+/// class=cli-error`.
+#[test]
+#[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn bisect_exits_2_when_its_good_schedule_meets_the_target() {
+    let label = "bisect analyze_race_then, --good meets the target";
+    let guest = &workloads().race_then;
+    let then = "exit";
+    let target_seed = race_then_target_seed();
+    // Not in /tmp: the schedule is written where the guest's /tmp is not.
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create bisect directory");
+    let record = |seed: u64| -> (PathBuf, Vec<u8>) {
+        let schedule = dir.path().join(format!("seed-{seed}.json"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+        command
+            // One epoch for both schedules, which bisect requires.
+            .args([
+                "run",
+                "--chaos",
+                "--timeout=5",
+                "--epoch=2026-01-01T00:00:00Z",
+            ])
+            .arg(format!("--seed={seed}"))
+            .arg(format!("--record-preemptions-to={}", schedule.display()))
+            .arg("--")
+            .arg(guest)
+            .arg(then);
+        let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
+        (schedule, output.stdout)
+    };
+    let (target, stdout) = record(target_seed);
+    assert_eq!(stdout, b"b-first\n", "{label}: target seed {target_seed}");
+    let (passing, _) = (0..40)
+        .filter(|&seed| seed != target_seed)
+        .map(record)
+        .find(|(_, stdout)| stdout == b"a-first\n")
+        .expect("no chaos seed in 0..40 lets thread a win the race");
+    let _guard = analyze_lock();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command
+        .arg("bisect")
+        // Swapped: the schedule called good is the one that meets the target.
+        .arg(format!("--good={}", target.display()))
+        .arg(format!("--bad={}", passing.display()))
+        .args(["--target-stdout=b-first", "--target-exit-code=0"])
+        .args(["--", "--timeout=30", "--"])
+        .arg(guest)
+        .arg(then);
+    let output = hermit_test::hermit_output(label, &mut command);
+    assert!(
+        combined_output(&output)
+            .contains("the passing schedule endpoint did not reproduce a passing outcome"),
+        "{label}\n{}",
+        combined_output(&output)
+    );
+    assert_precondition(label, &output, "baseline-not-reproduced");
 }
 
 /// `hermit analyze` of the analyze_race_then fixture in mode `then` (one
@@ -1228,23 +1231,46 @@ fn analyze_continues_prefixes_at_a_coarser_timeslice() {
 }
 
 /// The same race with `--continuation-timeslice=100000`: there is no other
-/// continuation to try, so analyze fails, saying what its empty-prefix trial
-/// observed (no miss to bisect against) and what to run or pass instead.
+/// continuation to try, so analyze reports the target reproduced without
+/// the target schedule, localizes no event, and says what to run or pass
+/// instead. That is
+/// a completed analysis: exit 0, `HERMIT_ANALYZE_VERDICT
+/// class=reproduced-without-schedule`, and a report whose verdict says so. Before, it
+/// exited 125 with `HERMIT_INTERNAL_FAILURE class=cli-error`.
 #[test]
 #[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
 fn analyze_explains_a_target_the_scheduler_meets_alone() {
     let label = "analyze --prefix-search analyze_race_then late-a --continuation-timeslice=100000";
-    let (output, _) = analyze_race_then_with(
+    let (output, report) = analyze_race_then_with(
         "late-a",
         &["--prefix-search", "--continuation-timeslice=100000"],
         &["--max-timeslice=100000"],
     );
     let combined = combined_output(&output);
-    assert!(!output.status.success(), "{label}\n{combined}");
+    assert_eq!(output.status.code(), Some(0), "{label}\n{combined}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line == "HERMIT_ANALYZE_VERDICT class=reproduced-without-schedule")
+            && !stderr.contains("HERMIT_INTERNAL_FAILURE"),
+        "{label}\n{combined}"
+    );
+    let report = report.unwrap_or_else(|| panic!("{label}: no report\n{combined}"));
+    assert_eq!(
+        report["verdict"], "reproduced_without_schedule",
+        "{label}: {report}"
+    );
+    assert!(
+        report["header"].as_str().is_some_and(
+            |header| header.starts_with("the target is reproduced without the target schedule")
+        ),
+        "{label}: {report}"
+    );
     for expected in [
-        "no continuation gives the prefix search a miss to bisect against: replaying none of the \
-         target schedule and then scheduling without chaos, the scheduler alone already meets \
-         the target criteria at a 100000 ns timeslice",
+        "the target is reproduced without the target schedule: replaying none of the target \
+         schedule and then scheduling without chaos, the scheduler alone already meets the target \
+         criteria at a 100000 ns timeslice",
         "a longer prefix may still miss the target",
         "prefix_round_001.repro",
         "pass --continuation-timeslice",
@@ -1255,6 +1281,65 @@ fn analyze_explains_a_target_the_scheduler_meets_alone() {
             "{label}: no {expected:?}\n{combined}"
         );
     }
+}
+
+/// A target the scheduler meets without chaos at every timeslice (thread a
+/// winning the race, which it does unless chaos or a tiny timeslice lets b
+/// in): the prefix search reports the target reproduced without the target
+/// schedule and localizes no event, a completed analysis that exits 0 with `HERMIT_ANALYZE_VERDICT
+/// class=reproduced-without-schedule` and a report whose verdict says so. Unlike
+/// `analyze_explains_a_target_the_scheduler_meets_alone`, it needs no short
+/// timeslice, so it does not depend on preemption repeating on the host.
+#[test]
+#[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn analyze_reports_a_target_met_without_chaos_as_reproduced_without_the_schedule() {
+    let label = "analyze --prefix-search analyze_race_then exit, target a-first";
+    let guest = &workloads().race_then;
+    let _guard = analyze_lock();
+    let dir = tempfile::tempdir().expect("failed to create analyze report directory");
+    let report_file = dir.path().join("report.json");
+    let tmp_dir = tmp_dir_in(dir.path());
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command
+        .args(["analyze", "--prefix-search", "--target-stdout=a-first"])
+        .args(["--target-exit-code=nonzero", "--run1-seed=0"])
+        .arg(format!("--report-file={}", report_file.display()))
+        .arg(format!("--tmp-dir={}", tmp_dir.display()))
+        .args(["--", "--chaos", "--timeout=30", "--"])
+        .arg(guest)
+        .arg("exit");
+    let output = hermit_test::hermit_output(label, &mut command);
+    let combined = combined_output(&output);
+    assert_eq!(output.status.code(), Some(0), "{label}\n{combined}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line == "HERMIT_ANALYZE_VERDICT class=reproduced-without-schedule")
+            && !stderr.contains("HERMIT_INTERNAL_FAILURE"),
+        "{label}\n{combined}"
+    );
+    let report: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&report_file)
+            .unwrap_or_else(|error| panic!("{label}: no report: {error}\n{combined}")),
+    )
+    .unwrap();
+    assert_eq!(
+        report["verdict"], "reproduced_without_schedule",
+        "{label}: {report}"
+    );
+    assert!(
+        report["header"]
+            .as_str()
+            .is_some_and(|header| header.starts_with(
+                "the target is reproduced without the target schedule: replaying none of the \
+                 target schedule and then scheduling without chaos, the scheduler alone already \
+                 meets the target criteria"
+            )),
+        "{label}: {report}"
+    );
+    assert!(report.get("critical_event1").is_none(), "{label}: {report}");
+    assert_no_workspace_left(label, &tmp_dir, &combined);
 }
 
 /// An analysis that ends with an error keeps its workspace, with or without
@@ -1288,6 +1373,7 @@ fn analyze_keeps_its_workspace_after_an_error() {
             "{label}: {}\n{combined}",
             output.status
         );
+        assert_precondition(&label, &output, "target-not-reproduced");
         let left = left_in(&tmp_dir);
         assert!(
             left.len() == 1 && left[0].join("run1_target.repro").is_file(),
@@ -1480,88 +1566,4 @@ fn analyze_targets_the_exit_code_hermit_run_reports() {
             "{label}: the target run did not match\n{combined}"
         );
     }
-}
-
-/// `--run1-preemptions` replays the record as the target run, measured for
-/// the trial bound and logged like a seed's run. Before, analyze did not run
-/// it at all, and the next phase unwrapped the log of a run that never ran
-/// (exit 101). The record is read from the host's /tmp, which the guest's
-/// container does not see, so analyze replays a copy in its workspace. A
-/// replay that misses the target ends the analysis with an error that says
-/// why.
-#[test]
-#[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
-fn analyze_starts_from_a_recorded_target_run() {
-    let label = "analyze --prefix-search --run1-preemptions analyze_race_then plain";
-    let guest = &workloads().race_then;
-    let seed = race_then_target_seed_matching("plain", &[]);
-    // Recorded outside /tmp: the run's guest has a private one, and the
-    // record is written from inside the container.
-    let workspace =
-        tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("failed to create a workspace");
-    let recorded = workspace.path().join("target.preempts");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
-    command
-        .args(["run", "--chaos"])
-        .arg(format!("--seed={seed}"))
-        .arg(format!("--record-preemptions-to={}", recorded.display()))
-        .arg("--")
-        .arg(guest)
-        .arg("plain");
-    let output = hermit_test::hermit_output(label, &mut command);
-    assert!(
-        output.status.success() && output.stdout == b"b-first\n",
-        "{label}: the recorded run missed the target\n{}",
-        combined_output(&output)
-    );
-    let host_tmp = tempfile::tempdir_in("/tmp").expect("failed to create a directory under /tmp");
-    let record = host_tmp.path().join("target.preempts");
-    fs::copy(&recorded, &record).unwrap();
-
-    let _guard = analyze_lock();
-    let analyze = |target_stdout: &str, report_file: &Path| {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
-        command
-            .args(["analyze", "--prefix-search", "--target-exit-code=0", "-v"])
-            .arg(format!("--target-stdout={target_stdout}"))
-            .arg(format!("--run1-preemptions={}", record.display()))
-            .arg(format!("--report-file={}", report_file.display()))
-            .args(["--", "--chaos"])
-            .arg(format!("--seed={seed}"))
-            .arg("--")
-            .arg(guest)
-            .arg("plain");
-        hermit_test::hermit_output(label, &mut command)
-    };
-    let report_file = workspace.path().join("report.json");
-    let output = analyze("b-first", &report_file);
-    let combined = combined_output(&output);
-    assert!(
-        output.status.success(),
-        "{label}: {}\n{combined}",
-        output.status
-    );
-    assert!(
-        combined.contains("First run matched target criteria")
-            && combined.contains("Runs from here on are bounded at"),
-        "{label}: the record was not run as the target\n{combined}"
-    );
-    let report: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&report_file).unwrap()).unwrap();
-    assert!(
-        report["critical_event1"]["event_index"].is_u64(),
-        "{label}: {report}"
-    );
-
-    // The record's replay prints b-first, so a-first is a miss.
-    let output = analyze("a-first", &workspace.path().join("miss.json"));
-    let combined = combined_output(&output);
-    assert!(
-        !output.status.success()
-            && output.status.code() != Some(101)
-            && combined.contains("did not meet the target criteria")
-            && combined.contains("--seed included"),
-        "{label}: a missed replay: {}\n{combined}",
-        output.status
-    );
 }

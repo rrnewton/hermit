@@ -624,7 +624,6 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     "privileged-test.pmu_buck_chaos_cases",
     "privileged-test.pmu_ptrace_completion_cases",
     "privileged-test.pmu_cli_cases",
-    "privileged-test.binder_cli_cases",
     "privileged-test.pmu_detcore_time_cases",
     "privileged-cpuid.cpu_profile_v3",
     "test.pmu_integration_cases",
@@ -788,11 +787,9 @@ const PROFILES: [Profile; 11] = [
         selected_steps: 53,
     },
     Profile {
-        // 12/20 since privileged-test.binder_cli_cases joined the
-        // privileged lane (PR 4742): 11/19 before.
         label: "privileged",
-        direct_steps: 12,
-        selected_steps: 20,
+        direct_steps: 11,
+        selected_steps: 19,
     },
     Profile {
         label: HOSTED_PORTABLE_LABEL,
@@ -2811,77 +2808,6 @@ fn materialize_quick_super_budgets(cfg: &mut DagConfig) {
     }
 }
 
-/// DAG label marking a super-labelled node as pressure-tier: measured
-/// nightly by the pressure sweep, excluded from the alerting super
-/// selection until it has hermetic-image pass evidence (owner model
-/// 2026-11-04: super is expected-pass; pressure owns the negative
-/// space). Selected directly with `dagrun run --labels pressure`.
-pub const PRESSURE_LABEL: &str = "pressure";
-
-/// Super-labelled nodes with no hermetic-image pass evidence. Each is
-/// a diagnostic/stress node by construction (nonblocking unmeasured
-/// probes, the host-sensitive mem_race family, weekly ignored/chaos
-/// cases, determinism diagnostics) or a producer only those nodes
-/// consume. A node leaves this list only with retained pass evidence
-/// in the pinned root, recorded in its promotion change.
-const PRESSURE_NODES: &[&str] = &[
-    "super-compatprep.fixtures",
-    "super.chaos_hello_race_verification_diagnostic",
-    "super.full_leveldb_strict_determinism",
-    "super.ipc_determinism_diagnostic",
-    "super.managed_jvm_strict_verify_diagnostics",
-    "super.network_syscall_determinism_diagnostic",
-    "super.pmu_analyze_hello_race_stress_calibrated_skid",
-    "super.pmu_buck_chaos_cases",
-    "super.post_fork_scheduling_diagnostics",
-    "super.pselect_signal_interruption_diagnostic",
-    "super.random_source_determinism_diagnostic",
-    "super.record_replay_matrix_diagnostic",
-    "super.relaxed_hermit_flag_matrix",
-    "super.sqlite_veryquick_strict_determinism",
-    "super.threaded_integration_matrix_diagnostic",
-    "super.weekly_ignored_portable_chaos_cases",
-    "super.weekly_pmu_parallel_memory_diagnostic_mem_race_bottom_detcore",
-    "super.weekly_pmu_parallel_memory_diagnostic_mem_race_default_detcore",
-    "super.weekly_pmu_parallel_memory_diagnostic_mem_race_middle_detcore",
-    "super.weekly_pmu_parallel_memory_diagnostic_mem_race_top_detcore",
-    "super.weekly_portable_chaos_cases",
-    "super.weekly_relaxed_default_mode_cases",
-    "supercompat.manifest_compat",
-    "superstress.kvm_available",
-    "superstress.kvm_verify",
-    "superstress.ptrace_pipeline",
-    "superstress.ptrace_record_replay",
-    "superstress.ptrace_strict_verify",
-];
-
-fn materialize_pressure_labels(cfg: &mut DagConfig) -> Result<(), String> {
-    let mut marked = 0usize;
-    for step in &mut cfg.steps {
-        if PRESSURE_NODES.contains(&step.tag().as_str()) {
-            if !step.labels.iter().any(|label| label == "super") {
-                return Err(format!(
-                    "pressure node {} does not carry the super label it re-tiers from",
-                    step.tag()
-                ));
-            }
-            if !step.labels.iter().any(|label| label == PRESSURE_LABEL) {
-                step.labels.push(PRESSURE_LABEL.to_string());
-                step.labels.sort();
-            }
-            marked += 1;
-        }
-    }
-    if marked != PRESSURE_NODES.len() {
-        return Err(format!(
-            "pressure re-tier marked {marked} of {} named nodes; a renamed or \
-             retired node must update PRESSURE_NODES with its evidence",
-            PRESSURE_NODES.len()
-        ));
-    }
-    Ok(())
-}
-
 /// Keep direct preflight dependencies on host commands and tests so focused
 /// selection cannot drop their source/gate ordering. Pinned preparation retains
 /// its original pin/fetch prerequisites and can overlap the manifest audit.
@@ -3267,11 +3193,9 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // outside the per-commit smoke pair (2026-10-26).
     // 147 with privileged-test.deadline_slice_cap_kvm, the KVM gap-ledger
     // producer (2026-10-30).
-    // 148 with privileged-test.binder_cli_cases, the Binderfs-capable
-    // privileged node for PR 4742's two host-limited Binder CLI cases.
-    if expected.len() != 148 {
+    if expected.len() != 147 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 148",
+            "structured result producer registry has {} entries, expected 147",
             expected.len()
         ));
     }
@@ -3306,10 +3230,9 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // sabrecompat.sabre_examples, the archived SaBRe suite outside the smoke
     // pair, adds one.
     // privileged-test.deadline_slice_cap_kvm's required KVM tests add one.
-    // privileged-test.binder_cli_cases' two Binder cases add one (PR 4742).
-    if expected_counts.len() != 54 {
+    if expected_counts.len() != 53 {
         return Err(format!(
-            "Nextest expected-count registry has {} entries, expected 54",
+            "Nextest expected-count registry has {} entries, expected 53",
             expected_counts.len()
         ));
     }
@@ -5041,17 +4964,15 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
         ));
     }
     // A bucket node that selects a run type by label carries exactly that
-    // run type's DAG label (plus the pressure re-tier marker when the
-    // node is pressure-tier) and passes exactly that `--label`; every
-    // other bucket node selects the default run type and passes none.
+    // run type's DAG label and passes exactly that `--label`; every other
+    // bucket node selects the default run type and passes none.
     for step in cfg.steps.iter().filter(|step| step.manifest.is_some()) {
         let tag = step.tag();
         match crate::validation_dag_static::manifest_run_type(&tag) {
             Some(label) => {
                 let manifest = step.manifest.as_ref().expect("filtered on manifest");
                 let flag = format!(" --category {} --label {label} ", manifest.category);
-                let tiered = [PRESSURE_LABEL.to_string(), label.to_string()];
-                if (step.labels != [label] && step.labels != tiered) || !step.cmd.contains(&flag) {
+                if step.labels != [label] || !step.cmd.contains(&flag) {
                     return Err(format!(
                         "{tag} selects run type {label}: it must carry only that DAG label and pass `{}`",
                         flag.trim()
@@ -5420,7 +5341,6 @@ pub fn generate(root: &Path) -> Result<DagConfig, String> {
     materialize_pinned_root(&mut refreshed)?;
     materialize_focused_preflight(&mut refreshed)?;
     materialize_quick_super_budgets(&mut refreshed);
-    materialize_pressure_labels(&mut refreshed)?;
     materialize_runtime_policy(&mut refreshed);
     materialize_regular_calibration_launch(&mut refreshed)?;
     crate::dag_source_ownership::select_core(&mut refreshed)?;
@@ -6035,35 +5955,6 @@ sys.exit(37)
             );
         }
         assert!(channels.contains("HERMIT_ISOLATION_JOBS"), "{channels:?}");
-        // The lone-slice allowance is node-scoped, not a global ptrace policy.
-        // Both authored and sharded commands retain the literal marker, while
-        // the KVM node and every other node retain their existing environment.
-        const SCOPE: &str = "HERMIT_NEXTEST_BUDGET_SCOPE";
-        for step in &steps {
-            assert_eq!(
-                step.env.get(SCOPE).map(String::as_str),
-                (step.tag() == PMU_INTEGRATION_TAG).then_some("pmu-integration"),
-                "{}",
-                step.tag()
-            );
-            if step.tag() == PMU_INTEGRATION_TAG {
-                assert!(pinned_root_command(step).contains(&format!(" --env {SCOPE} ")));
-            }
-        }
-        let mut sharded = crate::validation_dag_static::config();
-        materialize_node_shards(&mut sharded, PMU_INTEGRATION_TAG, PMU_INTEGRATION_SHARDS).unwrap();
-        let tags = pmu_integration_shard_tags();
-        for step in &sharded.steps {
-            assert_eq!(
-                step.env.get(SCOPE).map(String::as_str),
-                tags.contains(&step.tag()).then_some("pmu-integration"),
-                "{}",
-                step.tag()
-            );
-            if tags.contains(&step.tag()) {
-                assert!(pinned_root_command(step).contains(&format!(" --env {SCOPE} ")));
-            }
-        }
     }
 
     #[test]
@@ -6194,48 +6085,6 @@ sys.exit(37)
         ));
         retire_host_fixtures_when_twin_present(&mut cfg);
         assert!(cfg.steps[0].labels.is_empty(), "{:?}", cfg.steps[0].labels);
-    }
-
-    #[test]
-    fn pressure_labels_mark_exactly_the_named_super_nodes() {
-        // Synthetic: every named node present and super-labelled is
-        // marked once; a missing or unlabelled node refuses.
-        let steps: Vec<String> = PRESSURE_NODES
-            .iter()
-            .map(|tag| {
-                let (group, job) = tag.split_once('.').unwrap();
-                format!(
-                    r#"{{"group":"{group}","job":"{job}","cmd":"true","labels":["super"],"timeout":1,"cpu_timeout":1,"hint":{{"rss_baseline_bytes":1,"hard_mem_max_bytes":1}}}}"#
-                )
-            })
-            .collect();
-        let text = format!(r#"{{"description":"","steps":[{}]}}"#, steps.join(","));
-        let mut cfg = dag_from_json(&text).unwrap();
-        materialize_pressure_labels(&mut cfg).unwrap();
-        assert!(
-            cfg.steps
-                .iter()
-                .all(|step| step.labels == [PRESSURE_LABEL.to_string(), "super".to_string()])
-        );
-        // Idempotent: marking twice changes nothing.
-        materialize_pressure_labels(&mut cfg).unwrap();
-        assert!(cfg.steps.iter().all(|step| step.labels.len() == 2));
-        cfg.steps.remove(0);
-        assert!(materialize_pressure_labels(&mut cfg).is_err());
-
-        // Committed: the generated DAG carries exactly the named set.
-        let committed = generated_dag();
-        let marked: Vec<String> = committed
-            .steps
-            .iter()
-            .filter(|step| step.labels.iter().any(|l| l == PRESSURE_LABEL))
-            .map(|step| step.tag())
-            .collect();
-        let mut want: Vec<String> = PRESSURE_NODES.iter().map(|tag| tag.to_string()).collect();
-        want.sort();
-        let mut got = marked.clone();
-        got.sort();
-        assert_eq!(got, want);
     }
 
     fn owner(result_manifests: Vec<DagManifest>) -> Step {
@@ -6528,11 +6377,8 @@ sys.exit(37)
         refuse(OUTPUT, "the file", text);
     }
 
-    /// The PMU analyze node retains exactly the eight other ignored
-    /// integrations (the six refusal/workspace/timeout cases, the
-    /// racewrite selfcheck regression and the race finder's fd_reuse
-    /// case) while hello-race pinpointing and the race-candidates case
-    /// are excluded for their tracked reasons.
+    /// The PMU analyze node retains exactly the ten other ignored integrations
+    /// while hello-race pinpointing is excluded for its tracked failure.
     #[test]
     fn the_pmu_analyze_node_runs_the_ignored_analyze_integrations() {
         let source = include_str!("../../../hermit-cli/tests/analyze.rs");
@@ -6543,9 +6389,12 @@ sys.exit(37)
             "analyze_keeps_its_workspace_after_an_error",
             "analyze_cleans_up_when_a_signal_stops_it",
             "analyze_stops_a_run_whose_init_has_not_armed",
-            "analyze_racewrite_nostdlib",
             // The race finder's.
+            "analyze_checks_the_race_candidates_and_says_what_each_edit_moved",
             "analyze_names_the_close_racing_the_reused_descriptor",
+            // The verdict change's.
+            "bisect_exits_2_when_its_good_schedule_meets_the_target",
+            "analyze_reports_a_target_met_without_chaos_as_reproduced_without_the_schedule",
         ];
         for case in cases {
             assert!(
@@ -6554,13 +6403,6 @@ sys.exit(37)
             );
         }
         assert!(source.contains("fn analyze_hello_race()"));
-        // The excluded race-candidates case stays in the source as a
-        // hand-runnable ignored test (dh-zr6yo tracks its re-inclusion).
-        assert!(
-            source
-                .contains("fn analyze_checks_the_race_candidates_and_says_what_each_edit_moved()"),
-            "excluded rpc case must remain in hermit-cli/tests/analyze.rs"
-        );
         let expected_filter = cases
             .iter()
             .map(|case| format!("test(={case})"))
@@ -6588,24 +6430,10 @@ sys.exit(37)
                 format!("{expected_filter}' -- --ignored"),
                 "{origin}"
             );
-            assert_eq!(
-                step.env["NEXTEST_EXPECTED_EXECUTED"],
-                cases.len().to_string().as_str(),
-                "{origin}"
-            );
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "10", "{origin}");
             assert!(
                 !step.cmd.contains("test(=analyze_hello_race)"),
                 "{origin}: excluded hello-race must not run"
-            );
-            assert!(
-                !step.cmd.contains(
-                    "test(=analyze_checks_the_race_candidates_and_says_what_each_edit_moved)"
-                ),
-                "{origin}: excluded race-candidates case must not run"
-            );
-            assert!(
-                step.description.contains("dh-zr6yo"),
-                "{origin}: missing race-candidates exclusion tracking"
             );
             assert!(
                 step.description

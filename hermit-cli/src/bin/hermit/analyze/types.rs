@@ -22,6 +22,8 @@ use serde::Serialize;
 use tracing::metadata::LevelFilter;
 
 use crate::app::analyze::races::RacingAccesses;
+use crate::app::analyze::verdict::Verdict;
+use crate::app::analyze::verdict::VerdictReason;
 
 /// Repeat a run multiple times in a controlled search to find concurrency bugs.
 ///
@@ -64,16 +66,9 @@ pub struct AnalyzeOpts {
     #[clap(long, default_value = "nonzero", value_name = "NUM|nonzero|any")]
     pub target_exit_code: ExitStatusConstraint,
 
-    /// The trials' log level, as --trial-log sets it, which wins when both are given. This
-    /// also accepts `error` and `trace`; a level above warn writes each trial's log into its
-    /// own file in the workspace. Errors are kept at `off` too, as with --trial-log=off.
+    /// What level of logging to enable for the guest runs.
     #[clap(short, long, value_name = "LEVEL", env = "HERMIT_LOG")]
     pub guest_log: Option<LevelFilter>,
-
-    /// Whether `guest_log` came from its environment variable, HERMIT_LOG, which the
-    /// workspace's retention names.
-    #[clap(skip)]
-    pub guest_log_from_env: bool,
 
     /// Insist on perfect determinism before proceeding with the analysis.
     #[clap(long)]
@@ -113,9 +108,7 @@ pub struct AnalyzeOpts {
     /// replaying all of it the target outcome; a binary search finds the K at which the
     /// outcome flips. Event #K is the scheduling decision that commits the run to the target:
     /// the report shows the stack of the thread the target schedule runs there and of the
-    /// thread the scheduler would run instead. Each stack is taken where the trial's replay
-    /// consumes the recorded event at position K, however many polling retries the trial
-    /// made before it.
+    /// thread the scheduler would run instead.
     ///
     /// Unlike the default search, it needs no baseline schedule, so events that only one of
     /// two unrelated runs executed (timeslices that end at other points, iterations of a
@@ -166,9 +159,6 @@ pub struct AnalyzeOpts {
     pub run1_seed: Option<u64>,
 
     /// Load target execution from hermit run --record-preemptions-to.
-    ///
-    /// Analyze replays the record as the target run. It is an error if that replay does not meet
-    /// the indicated target criteria.
     #[clap(
         long,
         conflicts_with = "run1_seed",
@@ -249,30 +239,12 @@ pub struct AnalyzeOpts {
     #[clap(long)]
     pub analyze_seed: Option<u64>,
 
-    /// Print quite a bit of extra information so that you can see exactly what is happening:
-    /// every run's reproducer command, the guest's output and the search's steps.
+    /// Print quite a bit of extra information so that you can see exactly what is happening.
     ///
-    /// Analyze keeps the workspace when it exits, as --keep-tmp does, so that the files the
-    /// reproducers name can be read. It does not raise the trials' log level: --trial-log
-    /// does.
+    /// Each run then writes its log into the workspace (see --tmp-dir), and analyze keeps the
+    /// workspace when it exits, as --keep-tmp does, so that the logs can be read.
     #[clap(long, short)]
     pub verbose: bool,
-
-    /// How much each run analyze starts logs, and where: `warn` (the default), `off`, `info`
-    /// or `debug`.
-    ///
-    /// At `warn` a run's warnings and errors go to analyze's stderr, as those of `hermit run`
-    /// do, and `off` drops the warnings: errors still go there, since the reason Hermit gives
-    /// when it refuses a trial is one. At `info` or `debug` each run writes its log, at that level,
-    /// into a file of its own in the workspace (`<run>.log`, see --tmp-dir), and analyze keeps
-    /// the workspace when it exits, as --keep-tmp does, so that the logs can be read. A debug
-    /// log can grow to gigabytes per run and make the run several times slower, so a trial a
-    /// bound stops then gets through less of the program. --selfcheck logs the runs whose logs
-    /// it compares (the target run, the --search run that becomes it, the runs of --minimize
-    /// and the target's replay) at debug or above, into their files, whatever this says.
-    /// When this option is not given, --guest-log gives the level, if given.
-    #[clap(long, value_name = "LEVEL", value_enum)]
-    pub trial_log: Option<TrialLog>,
 
     /// The maximum amount of schedule jitter (deviation) to tolerater while performing the bisection search.
     #[clap(long)]
@@ -288,19 +260,17 @@ pub struct AnalyzeOpts {
     ///
     /// By default the workspace is created in the system's temporary directory: $TMPDIR, or
     /// /tmp when TMPDIR is unset. Analyze removes the workspace when it exits, unless
-    /// --keep-tmp, --verbose, or --trial-log above warn, or an error ended it; this directory
-    /// itself stays.
+    /// --keep-tmp or --verbose or an error ended it; this directory itself stays.
     #[clap(long, value_name = "PATH")]
     pub tmp_dir: Option<PathBuf>,
 
-    /// Wall-clock bound on each run after the initial target attempt (and, when explicit, on the
-    /// replay of a `--run1-preemptions` record): a positive number of seconds, `auto` (the
-    /// default), or `off`.
+    /// Wall-clock bound on each run after the initial target attempt: a positive number of
+    /// seconds, `auto` (the default), or `off`.
     ///
     /// With `auto`, the initial run and completed target/baseline endpoint runs are measured.
     /// Later runs are bounded at max(60 s, 10 times the slowest measured run), rounded up to
-    /// whole seconds. With `--run1-preemptions`, the initial run is a replay of the record: it
-    /// is measured like a seed's, and an explicit number bounds it too.
+    /// whole seconds. With `--run1-preemptions`, no initial run is made: automatic bounds wait
+    /// for a measured replay, so use an explicit number to bound trials immediately.
     /// A trial that reaches its bound stops analysis with exit 124: it establishes no outcome
     /// and cannot support a successful report. Retry with a larger bound if the guest can
     /// finish. A `--timeout` in the run arguments also bounds the initial run and wins wherever
@@ -308,9 +278,8 @@ pub struct AnalyzeOpts {
     ///
     /// The bound needs a backend on which `hermit run --timeout` is qualified; elsewhere `auto`
     /// gives no bound and an explicit number is refused. Use an outer timeout there.
-    /// While trials are bounded, the log files they write under `--trial-log` above warn or
-    /// `--selfcheck` are capped at max(64 MiB, 10 times the largest measured endpoint log),
-    /// within HERMIT_LOG_MAX_BYTES.
+    /// While trials are bounded, their `--verbose`/`--selfcheck` log files are capped at
+    /// max(64 MiB, 10 times the largest measured endpoint log), within HERMIT_LOG_MAX_BYTES.
     /// HERMIT_LOG_MAX_BYTES=0 lifts both file caps; `off` lifts analyze's file cap.
     #[clap(long, value_name = "SECONDS|auto|off", default_value = "auto")]
     pub trial_timeout: TrialTimeout,
@@ -333,10 +302,10 @@ pub struct AnalyzeOpts {
     /// report, and when SIGTERM, SIGINT or SIGHUP stops it; after an error it keeps it, since
     /// the error can name trial files in it. A stop signal ends the run in progress and starts
     /// no other; analyze then removes the workspace and dies of that signal (a shell reports
-    /// 128 plus its number, 143 for SIGTERM). --verbose, and --trial-log above warn, keep the
-    /// workspace too. The report file (--report-file) is never removed. Without --keep-tmp, even
-    /// with --verbose, a bisection trial's schedules are removed as soon as its outcome is read,
-    /// and every run's recording with event times once analyze has written it without them.
+    /// 128 plus its number, 143 for SIGTERM). --verbose keeps the workspace too. The report file
+    /// (--report-file) is never removed. Without --keep-tmp, even with --verbose, a bisection
+    /// trial's schedules are removed as soon as its outcome is read, and every run's recording
+    /// with event times once analyze has written it without them.
     ///
     /// Analyze cannot clean up after SIGKILL, nor after a stop signal it does not handle: one it
     /// inherits as ignored stays ignored, and an analyze that is PID 1 of its PID namespace
@@ -353,8 +322,10 @@ pub struct AnalyzeOpts {
     pub keep_tmp: bool,
 
     /// Specify that analyze itself should return a non-zero exit code on success.
-    /// This is needed under esoteric invocation scenarios.
-    #[clap(long, value_name = "INT32")]
+    /// This is needed under esoteric invocation scenarios. It is an exit status, 0 to 255, and
+    /// 2 and 120 to 127 are refused: analyze exits 2 when its inputs do not give it what it
+    /// needs, and Hermit reserves 120 to 127 for its own statuses.
+    #[clap(long, value_name = "STATUS", value_parser = parse_success_exit_code)]
     pub success_exit_code: Option<i32>,
 
     /// Additional arguments to pass through unmodified to the hermit run subcommand.  While
@@ -433,36 +404,6 @@ impl FromStr for ContinuationTimeslice {
                  got {s:?}",
                 detcore_model::time::NANOS_PER_RCB
             )),
-        }
-    }
-}
-
-/// The least a run analyze starts logs: errors, among them the reason Hermit
-/// gives when it refuses the run at an operation it does not support, which
-/// the refusal's warning points at.
-pub const TRIAL_LOG_LEAST: LevelFilter = LevelFilter::ERROR;
-
-/// `--trial-log`: how much each run analyze starts logs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum TrialLog {
-    /// Errors only, to analyze's stderr: the reason Hermit refuses a trial is one.
-    Off,
-    /// Warnings and errors, to analyze's stderr.
-    Warn,
-    /// Info and above, into the run's own log file.
-    Info,
-    /// Debug and above, into the run's own log file.
-    Debug,
-}
-
-impl TrialLog {
-    /// The level a run logs at. `off` keeps errors ([`TRIAL_LOG_LEAST`]).
-    pub fn level(self) -> LevelFilter {
-        match self {
-            TrialLog::Off => TRIAL_LOG_LEAST,
-            TrialLog::Warn => LevelFilter::WARN,
-            TrialLog::Info => LevelFilter::INFO,
-            TrialLog::Debug => LevelFilter::DEBUG,
         }
     }
 }
@@ -587,23 +528,74 @@ impl FromStr for ExitStatusConstraint {
     }
 }
 
+/// `--success-exit-code`: an exit status, 0 to 255, but those that already
+/// mean something else for analyze (see the exit-code allocation table in
+/// `hermit::lib`). A process exits with the low 8 bits of the value it
+/// passes (`exit`, `exit_group`: `(error_code & 0xff) << 8`,
+/// <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/exit.c?h=v6.9#n992>),
+/// so a value outside that range is refused before the reserved ones are
+/// checked: 258 would exit 2 and 378 or -134 would exit 122.
+fn parse_success_exit_code(text: &str) -> Result<i32, String> {
+    let code: i32 = text
+        .parse()
+        .map_err(|error| format!("{text:?} is not a 32-bit integer: {error}"))?;
+    if !(0..=255).contains(&code) {
+        return Err(format!(
+            "{code} is not an exit status: a process exits with the low 8 bits of the value it \
+             passes, 0 to 255, so a process exiting with {code} exits {}",
+            code & 0xff
+        ));
+    }
+    match code {
+        hermit::HERMIT_ANALYZE_PRECONDITION_EXIT => Err(format!(
+            "{code} is the status analyze exits with when its inputs do not give it what it \
+             needs (HERMIT_ANALYZE_PRECONDITION), so a success could not be told apart from it"
+        )),
+        120..=127 => Err(format!(
+            "{code} is in 120 to 127, which Hermit reserves for its own statuses (122 a refusal, \
+             123 the log cap, 124 a deadline, 125 an internal failure, 126 and 127 a program \
+             that cannot run), so a success could not be told apart from them"
+        )),
+        _ => Ok(code),
+    }
+}
+
 /// The final report that comes out of the analyze process.
 #[derive(PartialEq, Debug, Eq, Clone, Hash, Serialize, Deserialize)]
 pub struct Report {
+    /// What the analysis concluded; read it first. `critical_events` names
+    /// the critical events below. `reproduced_without_schedule` names none: the header
+    /// says why, and the event fields are absent. A report without the field,
+    /// from before it, names the critical events.
+    #[serde(default)]
+    pub verdict: Verdict,
+
+    /// Why the verdict names no event: `{"cause": "scheduler_alone"}`, or,
+    /// when the scheduler alone meets the target under timing settings the
+    /// recording carries and every trial keeps, `{"cause":
+    /// "timing_semantics", "options": [...]}` with those settings. Absent
+    /// when the verdict names the critical events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict_reason: Option<VerdictReason>,
+
     /// A header containing some contextual information, to go at the beginning of the report.
     pub header: String,
 
     /// Some additional context about where in the execution the issue occured. (Basically used as a footer.)
+    #[serde(default)]
     pub additional_context: String,
 
     /// Is it a baseline run (e.g. passing run) vs a target run (e.g. failing/crashing).
+    #[serde(default)]
     pub baseline_run: bool,
 
     /// The runtime context for one critical event, which is racing with, and does not commute with
-    /// the other.
-    pub critical_event1: ReportCriticalEvent,
+    /// the other. Absent when the verdict names no event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub critical_event1: Option<ReportCriticalEvent>,
     /// The runtime context for the other identified critical event.
-    pub critical_event2: ReportCriticalEvent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub critical_event2: Option<ReportCriticalEvent>,
 
     /// The warning line, without its newline, that `hermit analyze` or `hermit bisect` printed
     /// before its first trial because those trials read a retired-branch counter that failed

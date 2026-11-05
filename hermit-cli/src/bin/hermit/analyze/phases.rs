@@ -46,6 +46,14 @@ use crate::app::analyze::types::ContinuationTimeslice;
 use crate::app::analyze::types::ExitStatusConstraint;
 use crate::app::analyze::types::Report;
 use crate::app::analyze::types::ReportCriticalEvent;
+use crate::app::analyze::types::TrialTimeout;
+use crate::app::analyze::verdict::AlternativeTiming;
+use crate::app::analyze::verdict::AnalyzeFailure;
+use crate::app::analyze::verdict::AnalyzePrecondition;
+use crate::app::analyze::verdict::AnalyzeVerdict;
+use crate::app::analyze::verdict::PreconditionClass;
+use crate::app::analyze::verdict::TimingSetting;
+use crate::app::analyze::verdict::Verdict;
 use crate::app::analyze::workspace::Retention;
 use crate::app::analyze::workspace::Workspace;
 use crate::app::analyze::workspace::note;
@@ -322,24 +330,31 @@ fn choose_continuation(
         .collect();
     // Only the empty prefix ran at each of these continuations, and prefix
     // outcomes need not be monotone: a longer prefix can still miss the
-    // target. So the error states what those trials observed, not that no
+    // target. So the verdict states what those trials observed, not that no
     // event or chaos decision matters.
-    if alone.len() == outcomes.len() {
-        bail!(
-            "no continuation gives the prefix search a miss to bisect against: replaying none of \
-             the target schedule and then scheduling without chaos, the scheduler alone already \
-             meets the target criteria {}. Only that empty prefix was tried; a longer prefix may \
-             still miss the target. Each such trial reproduces the target outcome while \
-             replaying nothing: the reproducer of the first one (prefix_round_001.repro in the \
-             workspace) reruns it. To bisect against a run that misses the target instead, pass \
-             --continuation-timeslice with a timeslice at which the scheduler alone misses it, \
-             or use the default search with a passing --run2-seed.",
-            alone.join(" and ")
-        );
+    if let (true, Some(&(first, _))) = (alone.len() == outcomes.len(), outcomes.first()) {
+        // A completed analysis, not a failure (`AnalyzeVerdict`).
+        return Err(AnalyzeVerdict::reproduced_without_schedule(
+            format!(
+                "the target is reproduced without the target schedule: replaying none of the \
+                 target schedule and then scheduling without chaos, the scheduler alone already \
+                 meets the target criteria {}. So no continuation gives the prefix search a miss \
+                 to bisect against, and it localizes no event here. Only that empty prefix was \
+                 tried; a longer prefix may still miss the target. Each such trial reproduces \
+                 the target outcome while replaying nothing: the reproducer of the first one \
+                 (prefix_round_001.repro in the workspace) reruns it. To bisect against a run \
+                 that misses the target instead, pass --continuation-timeslice with a timeslice \
+                 at which the scheduler alone misses it, or use the default search with a \
+                 passing --run2-seed.",
+                alone.join(" and ")
+            ),
+            first,
+        )
+        .into());
     }
     let remedy = "Schedule replay does not reproduce this run where replaying the whole target \
                   schedule misses the target; check that the target run replays (--selfcheck).";
-    bail!(
+    Err(AnalyzePrecondition::no_prefix_continuation(format!(
         "no continuation allows a prefix search: {}. {remedy} The default search with a \
          passing --run2-seed needs no continuation.",
         outcomes
@@ -351,11 +366,119 @@ fn choose_continuation(
             ))
             .collect::<Vec<_>>()
             .join("; ")
-    )
+    ))
+    .into())
+}
+
+/// Whether the bisection's `error` says that it has not established an exact
+/// one-swap pair of schedules with opposite outcomes ([`NoSingleSwap`]): a
+/// prefix search, which needs no baseline, then searches for a decision
+/// within the failing schedule.
+fn no_swap_separates(error: &Error) -> bool {
+    error.downcast_ref::<NoSingleSwap>().is_some()
+}
+
+/// `error` from bisecting analyze's own endpoints, pointing an endpoint that
+/// did not reproduce its outcome at replay: analyze recorded both endpoints
+/// itself, so Hermit's replay, or the host's branch counter, did not
+/// reproduce the run.
+fn point_endpoint_misses_at_replay(error: Error) -> Error {
+    match error.downcast::<AnalyzePrecondition>() {
+        Ok(precondition)
+            if matches!(
+                precondition.class,
+                PreconditionClass::TargetNotReproduced | PreconditionClass::BaselineNotReproduced
+            ) =>
+        {
+            precondition
+                .with_hint(
+                    "Analyze recorded this endpoint itself, so its replay did not reproduce \
+                     the run: --selfcheck checks that the target run replays, and `hermit \
+                     host-capabilities` whether this host's branch counter is exact.",
+                )
+                .into()
+        }
+        Ok(precondition) => precondition.into(),
+        Err(error) => error,
+    }
+}
+
+/// How analyze goes on after bisecting its own endpoints
+/// ([`own_bisection_end`]).
+enum OwnBisectionEnd {
+    /// The critical pair, to report.
+    Critical(CriticalSchedule),
+    /// The bisection has not established an exact one-swap pair of schedules
+    /// with opposite outcomes (the error says why): a prefix search, which
+    /// needs no baseline, searches for a decision within the failing schedule.
+    SearchPrefixes(Error),
+}
+
+/// What the bisection of analyze's own endpoints, `bisected`, leads to. An
+/// endpoint that did not reproduce is pointed at replay
+/// ([`point_endpoint_misses_at_replay`]); any other error ends the analysis.
+fn own_bisection_end(
+    bisected: anyhow::Result<CriticalSchedule>,
+) -> anyhow::Result<OwnBisectionEnd> {
+    match bisected {
+        Ok(critical) => Ok(OwnBisectionEnd::Critical(critical)),
+        Err(error) if no_swap_separates(&error) => Ok(OwnBisectionEnd::SearchPrefixes(error)),
+        Err(error) => Err(point_endpoint_misses_at_replay(error)),
+    }
+}
+
+/// --selfcheck's conclusion from its rerun of the target: whether it met the
+/// target, whether its log matched, and (checked last) whether it recorded
+/// the preemptions it replayed. Any difference is replay not reproducing,
+/// Hermit's or the host's, and a failure (`AnalyzeFailure`), not an input
+/// analyze cannot use.
+fn selfcheck_conclusion(
+    rerun_matched: bool,
+    logs_agree: bool,
+    fixed_point: impl FnOnce() -> Result<(), String>,
+) -> anyhow::Result<()> {
+    const HOST: &str = "`hermit host-capabilities` reports whether this host's branch counter \
+                        is exact.";
+    let difference = if !rerun_matched {
+        "First run matched criteria but second run did not.".to_string()
+    } else if !logs_agree {
+        "Log differences found, aborting because --selfcheck requires perfect reproducibility \
+         of the target run!"
+            .to_string()
+    } else if let Err(difference) = fixed_point() {
+        difference
+    } else {
+        return Ok(());
+    };
+    Err(AnalyzeFailure::ReplayNotReproducible(format!("{difference} {HOST}")).into())
+}
+
+/// `args` without the option `name`, as `name=VALUE` or as `name` and its
+/// value, before any `--` that starts the guest command, whose arguments are
+/// kept as they are.
+fn without_option(args: &[String], name: &str) -> Vec<String> {
+    let mut kept = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--" {
+            kept.push(arg.clone());
+            kept.extend(iter.cloned());
+            break;
+        }
+        if arg == name {
+            iter.next();
+        } else if !arg
+            .strip_prefix(name)
+            .is_some_and(|rest| rest.starts_with('='))
+        {
+            kept.push(arg.clone());
+        }
+    }
+    kept
 }
 
 /// "at a 200000000 ns timeslice", or "without PMU timeslices".
-fn describe_continuation(timeslice: MaybeTimeslice) -> String {
+pub(super) fn describe_continuation(timeslice: MaybeTimeslice) -> String {
     match timeslice {
         Some(nanos) => format!("at a {nanos} ns timeslice"),
         None => "without PMU timeslices".to_owned(),
@@ -712,13 +835,12 @@ fn require_repeated_outcomes(replays: &[(&str, bool, bool)], inspect: &str) -> a
 }
 
 /// Whether `ran` is the event `expected`, as the scheduler compares them when
-/// it takes a stack: the count and the time aside, and only instruction
-/// pointers present in the recorded event constrain the observed ones.
+/// it takes a stack: the count and the time aside.
 fn same_event(expected: &SchedEvent, ran: &SchedEvent) -> bool {
     expected.dettid == ran.dettid
         && expected.op == ran.op
-        && (expected.start_rip.is_none() || expected.start_rip == ran.start_rip)
-        && (expected.end_rip.is_none() || expected.end_rip == ran.end_rip)
+        && expected.start_rip == ran.start_rip
+        && expected.end_rip == ran.end_rip
 }
 
 /// The first of the first `until` events of `requested` at which `realized`
@@ -913,21 +1035,6 @@ impl AnalyzeOpts {
         }
     }
 
-    /// The chaos run of `--search` round `round`, with schedule seed
-    /// `sched_seed`. The one that matches becomes the target, whose log
-    /// `--selfcheck` compares.
-    pub(super) fn search_run(&self, round: u64, sched_seed: u64) -> anyhow::Result<RunData> {
-        let runname = format!("search_round_{:0wide$}", round, wide = 3);
-        let mut rundat = RunData::new_baseline(self, runname)?
-            .with_preemption_recording()
-            .compared_by_selfcheck();
-        rundat.runopts.det_opts.det_config.sched_seed = Some(sched_seed);
-        if self.imprecise_search {
-            rundat.runopts.det_opts.det_config.imprecise_timers = true; // TODO: enable this by default when bugs are fixed.
-        }
-        Ok(rundat)
-    }
-
     /// Launch a chaos run searching for a target (e.g. failing) schudule.
     /// Returns Some if a target schedule is found.
     fn launch_search(&self, round: u64, sched_seed: u64) -> Result<Option<RunData>, Error> {
@@ -935,7 +1042,12 @@ impl AnalyzeOpts {
             "Searching (round {}) for a target execution, chaos --sched-seed={} ",
             round, sched_seed
         ));
-        let mut rundat = self.search_run(round, sched_seed)?;
+        let runname = format!("search_round_{:0wide$}", round, wide = 3);
+        let mut rundat = RunData::new_baseline(self, runname)?.with_preemption_recording();
+        rundat.runopts.det_opts.det_config.sched_seed = Some(sched_seed);
+        if self.imprecise_search {
+            rundat.runopts.det_opts.det_config.imprecise_timers = true; // TODO: enable this by default when bugs are fixed.
+        }
         rundat.launch()?;
         if rundat.is_a_match() {
             eprintln!(
@@ -963,31 +1075,20 @@ impl AnalyzeOpts {
         }
     }
 
-    /// The run that replays the preemptions in `preempts_path`, as a
-    /// `--minimize` round does.
-    pub(super) fn preempts_replay_run(
-        &self,
-        runname: &str,
-        preempts_path: &Path,
-    ) -> anyhow::Result<RunData> {
-        Ok(RunData::new_baseline(self, runname.to_string())?
-            .with_edited_preempts_path_in(preempts_path.to_path_buf())
-            .compared_by_selfcheck())
-    }
-
     // TODO: REMOVE. Only used by minimize atm.
     //
-    /// Launch a run with preempts provided (to replay). Return true if it matches the
+    /// Launch a run with preempts provided (to replay). No logging. Return true if it matches the
     /// criteria. If provided, additionally record full schedule events from the run to
-    /// `record_sched_path`. The last of these runs to match is the minimized target, whose log
-    /// --selfcheck compares.
+    /// `record_sched_path`.
     pub(super) fn launch_from_preempts_to_sched(
         &self,
         runname: &str,
         preempts_path: &Path,
         record_sched_path: Option<&Path>,
     ) -> anyhow::Result<(bool, RunOpts)> {
-        let mut run = self.preempts_replay_run(runname, preempts_path)?;
+        let mut run = RunData::new_baseline(self, runname.to_string())?
+            .with_edited_preempts_path_in(preempts_path.to_path_buf());
+
         if let Some(path) = record_sched_path {
             run = run.with_schedule_recording_to(path.to_path_buf());
         }
@@ -1201,13 +1302,6 @@ impl AnalyzeOpts {
     /// return whether it met the target with the stack at schedule position
     /// `position`: a replayed event, or, at `len`, the first event the
     /// scheduler ran after the prefix.
-    ///
-    /// The stack is requested by schedule position
-    /// (`--stacktrace-at-schedule-positions`), not by traced index: the trial
-    /// can observe events its schedule does not hold before `position`, such
-    /// as a polling retry the recording did not make, and a traced index
-    /// would then name a neighbouring event
-    /// (https://github.com/rrnewton/hermit/issues/4917).
     fn prefix_stack(
         &self,
         runname: &str,
@@ -1233,9 +1327,11 @@ impl AnalyzeOpts {
         continuation: MaybeTimeslice,
         trace_from: Option<u64>,
     ) -> anyhow::Result<(bool, Option<PrettyBacktrace>, Option<TracedReplay>)> {
-        let (run, stack_path) =
-            self.prefix_stack_trial(runname, schedule, len, position, continuation)?;
+        let run = self.prefix_trial(runname, schedule, len, continuation)?;
         let (mut run, request) = self.request_trace(run, "target", trace_from);
+        let stack_path = run.root_path().with_extension("stack");
+        run.runopts.det_opts.det_config.stacktrace_event =
+            vec![(position as u64, Some(stack_path.clone()))];
         let is_match = self.launch_prefix_trial(&mut run, RunData::launch)?;
         eprintln!(
             ":: {}\n{}",
@@ -1253,24 +1349,6 @@ impl AnalyzeOpts {
             request.ran(schedule.schedevents(), &realized, len)
         });
         Ok((is_match, stack, traced))
-    }
-
-    /// The prefix trial `prefix_stack` launches, and the file its stack goes
-    /// to: the stack at schedule `position`, requested by position.
-    fn prefix_stack_trial(
-        &self,
-        runname: &str,
-        schedule: &PreemptionRecord,
-        len: usize,
-        position: usize,
-        continuation: MaybeTimeslice,
-    ) -> anyhow::Result<(RunData, PathBuf)> {
-        let mut run = self.prefix_trial(runname, schedule, len, continuation)?;
-        let stack_path = run.root_path().with_extension("stack");
-        let config = &mut run.runopts.det_opts.det_config;
-        config.stacktrace_event = vec![(position as u64, Some(stack_path.clone()))];
-        config.stacktrace_at_schedule_positions = true;
-        Ok((run, stack_path))
     }
 
     /// The completed outcome and schedule of a prefix trial: the replayed
@@ -1432,8 +1510,8 @@ impl AnalyzeOpts {
             );
         }
         // The thread the scheduler runs at event #decision once the prefix
-        // ends. A stack is requested by a position of the replayed schedule,
-        // so the prefix trial without event #decision runs first with its
+        // ends. `--stacktrace-event` names a position of the replayed schedule
+        // only, so the prefix trial without event #decision runs first with its
         // schedule recorded, and the stack is taken from a replay of that
         // schedule's first decision + 1 events.
         let (completed, continued_path, mut baseline_trace) = continuation(
@@ -1506,8 +1584,20 @@ impl AnalyzeOpts {
         );
         println!("{}", prefix_report_banner(&report));
         println!("{}", report.header);
-        Self::print_stack("stack1", &report.critical_event1.stack);
-        Self::print_stack("stack2", &report.critical_event2.stack);
+        Self::print_stack(
+            "stack1",
+            report
+                .critical_event1
+                .as_ref()
+                .map_or(&None, |event| &event.stack),
+        );
+        Self::print_stack(
+            "stack2",
+            report
+                .critical_event2
+                .as_ref()
+                .map_or(&None, |event| &event.stack),
+        );
         Self::print_racing_accesses(&report.racing_accesses);
         println!("\n{}", report.additional_context);
         Ok(report)
@@ -1541,17 +1631,19 @@ impl AnalyzeOpts {
         let context = Self::generate_context(schedule, decision.max(1), self.execution_context);
 
         Report {
+            verdict: Verdict::CriticalEvents,
+            verdict_reason: None,
             header,
             additional_context: context,
             baseline_run: false,
-            critical_event1: ReportCriticalEvent {
+            critical_event1: Some(ReportCriticalEvent {
                 event_index: decision,
                 stack: chosen,
-            },
-            critical_event2: ReportCriticalEvent {
+            }),
+            critical_event2: Some(ReportCriticalEvent {
                 event_index: decision,
                 stack: instead,
-            },
+            }),
             branch_counter_warning: self.branch_counter_warning.clone(),
             deciding_event: None,
             racing_accesses,
@@ -1603,7 +1695,7 @@ impl AnalyzeOpts {
     /// continuation of a record's first `len` events and `stack` each
     /// stack-trace replay (its name, record, length and the event to take
     /// the stack at), both giving completed outcomes or ending the analysis.
-    fn report_timing_decision_with<CT, S>(
+    fn report_timing_decision_with<ContinueTarget, Stack>(
         &self,
         schedule: &PreemptionRecord,
         decision: usize,
@@ -1614,15 +1706,16 @@ impl AnalyzeOpts {
             &Path,
             &mut Option<TracedReplay>,
         ),
-        (continue_target, stack): (CT, S),
+        (continue_target, stack): (ContinueTarget, Stack),
     ) -> anyhow::Result<Option<Report>>
     where
-        CT: FnOnce(
-            &PreemptionRecord,
-            usize,
-        )
-            -> anyhow::Result<(CompletedScheduleTrial, PathBuf, Option<TracedReplay>)>,
-        S: Fn(
+        ContinueTarget:
+            FnOnce(
+                &PreemptionRecord,
+                usize,
+            )
+                -> anyhow::Result<(CompletedScheduleTrial, PathBuf, Option<TracedReplay>)>,
+        Stack: Fn(
             &str,
             &PreemptionRecord,
             usize,
@@ -1712,14 +1805,16 @@ impl AnalyzeOpts {
                             end: usize,
                             expected: bool|
              -> anyhow::Result<Option<PrettyBacktrace>> {
-                // Even a one-event slice has this continuation's endpoint:
-                // its operation batch can differ from the target event's,
-                // including after a soft count mismatch in the target
-                // continuation itself. Capture it from its own record and
-                // check the outcome even when no stack was captured.
-                let (observed, captured) = stack(runname, variant, end + 1, end)?;
-                require_repeated_outcomes(&[(runname, expected, observed)], runname)?;
-                Ok(captured)
+                if end == decision {
+                    // A slice of one event ends where it starts. Reuse the
+                    // captured deciding stack; no new replay has an outcome
+                    // to compare with the search.
+                    Ok(deciding.clone())
+                } else {
+                    let (observed, captured) = stack(runname, variant, end + 1, end)?;
+                    require_repeated_outcomes(&[(runname, expected, observed)], runname)?;
+                    Ok(captured)
+                }
             };
             let with_end = stack_at(
                 "final_target_slice_end_for_stacktraces",
@@ -1810,17 +1905,19 @@ impl AnalyzeOpts {
         println!("\n{}", context);
 
         Ok(Some(Report {
+            verdict: Verdict::CriticalEvents,
+            verdict_reason: None,
             header,
             additional_context: context,
             baseline_run: false,
-            critical_event1: ReportCriticalEvent {
+            critical_event1: Some(ReportCriticalEvent {
                 event_index: event1,
                 stack: stack1,
-            },
-            critical_event2: ReportCriticalEvent {
+            }),
+            critical_event2: Some(ReportCriticalEvent {
                 event_index: event2,
                 stack: stack2,
-            },
+            }),
             branch_counter_warning: self.branch_counter_warning.clone(),
             deciding_event: Some(ReportCriticalEvent {
                 event_index: decision,
@@ -1845,26 +1942,21 @@ impl AnalyzeOpts {
     }
 
     /// Write analyze's final on-target and baseline schedules, stamped
-    /// ([`Self::stamp_trial_record`]) and with the callback checkpoints of
-    /// the part each shares with one of `sources`, the search's endpoint
-    /// records ([`trial_record_from`](crate::analyze::rundata::trial_record_from)), and say where.
+    /// ([`Self::stamp_trial_record`]), and say where.
     pub fn write_final_schedules(
         &self,
         failing: Vec<SchedEvent>,
         failing_path: &Path,
         passing: Vec<SchedEvent>,
         passing_path: &Path,
-        sources: &[&PreemptionRecord],
     ) {
-        self.write_trial_schedule_from(failing, sources, failing_path)
-            .unwrap();
+        self.write_trial_schedule(failing, failing_path).unwrap();
         eprintln!(
             "Wrote final on-target ({}) schedule to {}",
             self.display_criteria(),
             failing_path.display()
         );
-        self.write_trial_schedule_from(passing, sources, passing_path)
-            .unwrap();
+        self.write_trial_schedule(passing, passing_path).unwrap();
         eprintln!(
             "Wrote final baseline (off-target) schedule to {}",
             passing_path.display()
@@ -1917,10 +2009,9 @@ impl AnalyzeOpts {
         Ok(workspace)
     }
 
-    /// What becomes of analyze's workspace: kept with `--keep-tmp`, with
-    /// `--verbose`, whose reproducers name its files, and with `--trial-log`
-    /// (or `--guest-log`) above warn, whose per-run logs are in it for the
-    /// user to read; removed otherwise.
+    /// What becomes of analyze's workspace: kept with `--keep-tmp`, and with
+    /// `--verbose`, whose per-run logs are in it for the user to read;
+    /// removed otherwise.
     fn workspace_retention(&self) -> Retention {
         if self.keep_tmp {
             Retention::Keep {
@@ -1930,10 +2021,6 @@ impl AnalyzeOpts {
             Retention::Keep {
                 because: Some("--verbose"),
             }
-        } else if let Some(option) = self.trial_log_files_option() {
-            Retention::Keep {
-                because: Some(option),
-            }
         } else {
             Retention::Remove
         }
@@ -1942,7 +2029,7 @@ impl AnalyzeOpts {
     /// Create our workspace and verify the input run matches the criteria, or find one that does.
     /// Returns the results of the target run.
     fn phase1_establish_target_run(&mut self) -> Result<RunData, Error> {
-        let run1data = RunData::new_run1_target(self, "run1_target".to_string())?;
+        let mut run1data = RunData::new_run1_target(self, "run1_target".to_string())?;
         eprintln!(
             // `to_repro` is already a complete `hermit ... run ...` command.
             ":: {} {}",
@@ -1950,39 +2037,30 @@ impl AnalyzeOpts {
             run1data.to_repro()
         );
 
-        // Run the target, from its seed or by replaying --run1-preemptions, and
-        // record the preemptions and schedule the search works from. A replay
-        // of the record is the target run like a seed's: it is measured for the
-        // trial bound, and --selfcheck compares its log.
+        if let Some(p) = &self.run1_preemptions {
+            let preempts_path = run1data.preempts_path_out();
+            // Copy preempts to the output location as though they were recorded by this run:
+            std::fs::copy(p, preempts_path).expect("copy file to succeed");
+            if self.trial_timeout == TrialTimeout::Auto {
+                eprintln!(
+                    ":: --run1-preemptions runs no target run to measure, so runs are not \
+                     bounded until analyze replays the record to verify it (not every search \
+                     does); pass --trial-timeout=SECONDS to bound every trial."
+                );
+            }
+            // Careful, returning a NON-launched RunData just to contain the output path.
+            return Ok(run1data);
+        }
+
+        // Translate the seed into a set of preemptions we can work from.
         let mut run1data = run1data.with_preemption_recording();
         run1data.launch()?;
         self.record_endpoint(&run1data);
 
         if !run1data.is_a_match() {
-            if let Some(record) = &self.run1_preemptions {
-                bail!(
-                    "the replay of --run1-preemptions {} did not meet the target criteria ({}). \
-                     A record replays the same only under the run arguments it was recorded \
-                     with (after `--`), --seed included: it sets the guest's random and fuzz \
-                     seeds and is not stored in the record. --search does not apply to a record; \
-                     to search, pass --run1-seed.",
-                    record.display(),
-                    self.display_criteria()
-                );
-            }
-            if self.search {
-                eprintln!(
-                    ":: {}",
-                    "First run did not match target criteria; now searching for a matching run..."
-                        .red()
-                        .bold()
-                );
-                let target = self.do_search()?;
-                self.record_endpoint(&target);
-                Ok(target)
-            } else {
-                bail!("FAILED. The run did not match the target criteria. Try --search.");
-            }
+            let target = self.after_a_first_run_that_missed(|| self.do_search())?;
+            self.record_endpoint(&target);
+            Ok(target)
         } else if self.has_filters() {
             eprintln!(
                 ":: {}",
@@ -2090,22 +2168,20 @@ impl AnalyzeOpts {
             let run1b_log_path = run1b.log_path().unwrap();
             let status = self.log_diff_preemption_replay(global, min_log_path, run1b_log_path);
 
-            if !run1b.is_a_match() {
-                bail!("First run matched criteria but second run did not.");
-            }
-            if !status.success() {
-                bail!(
-                    "Log differences found, aborting because --selfcheck requires perfect reproducibility of the target run!"
-                )
-            }
+            let matched = run1b.is_a_match();
             let run1b_preempts_path = run1b.preempts_path_out();
-            if !preempt_files_equal(&min_preempts_path, run1b_preempts_path) {
-                bail!(
-                    "The preemptions recorded by the additional run did not match the preemptions replayed (no fixed point): {} vs {}",
-                    min_preempts_path.display(),
-                    run1b_preempts_path.display(),
-                );
-            }
+            selfcheck_conclusion(matched, status.success(), || {
+                preempt_files_equal(&min_preempts_path, run1b_preempts_path)
+                    .then_some(())
+                    .ok_or_else(|| {
+                        format!(
+                            "The preemptions recorded by the additional run did not match the \
+                             preemptions replayed (no fixed point): {} vs {}",
+                            min_preempts_path.display(),
+                            run1b_preempts_path.display(),
+                        )
+                    })
+            })?;
 
             eprintln!(
                 ":: {}",
@@ -2185,9 +2261,11 @@ impl AnalyzeOpts {
                     .to_string_lossy(),
             );
             if newrun.is_a_match() {
-                bail!(
-                    "Expectations not met... baseline run matched target criteria when it should not."
+                Err(AnalyzePrecondition::baseline_not_reproduced(
+                    "Expectations not met... baseline run matched target criteria when it should \
+                     not.",
                 )
+                .into())
             } else {
                 eprintln!("Good: baseline run does not match criteria (e.g. pass not fail).");
                 Ok(newrun)
@@ -2196,29 +2274,18 @@ impl AnalyzeOpts {
     }
 
     /// Perform the binary search through schedule-space, identifying critical events.
-    ///
-    /// Each trial replays its schedule with the callback checkpoints of the
-    /// part it shares with the `target` or `baseline` record
-    /// ([`trial_record_from`](crate::analyze::rundata::trial_record_from)):
-    /// an endpoint replayed whole keeps all of them, and a spliced schedule
-    /// keeps those its unchanged prefix reaches, so its slices end where the
-    /// recording's did up to the first edit.
     pub fn phase5_bisect_traces(
         &self,
-        target: &PreemptionRecord,
-        baseline: &PreemptionRecord,
+        target: &[SchedEvent],
+        baseline: &[SchedEvent],
     ) -> anyhow::Result<CriticalSchedule> {
-        self.phase5_bisect_traces_with(target.schedevents(), baseline.schedevents(), |i, sched| {
+        self.phase5_bisect_traces_with(target, baseline, |i, sched| {
             let runname = format!("bisect_round_{:0wide$}", i, wide = 3);
             let mut newrun = RunData::new_baseline(self, runname)?
                 .with_schedule_replay() // Default input path
                 .with_schedule_recording(); // Default output path
             // Prepare the next synthetic schedule on disk:
-            self.write_trial_schedule_from(
-                sched.to_owned(),
-                &[target, baseline],
-                newrun.sched_path_in(),
-            )?;
+            self.write_trial_schedule(sched.to_owned(), newrun.sched_path_in())?;
 
             if self.verbose {
                 eprintln!(
@@ -2292,15 +2359,15 @@ impl AnalyzeOpts {
     /// Bisect a known passing/failing schedule pair and report the critical event ordering.
     pub fn bisect_schedule_pair(
         &mut self,
-        good: PreemptionRecord,
-        bad: PreemptionRecord,
+        good: Vec<SchedEvent>,
+        bad: Vec<SchedEvent>,
     ) -> anyhow::Result<ExitStatus> {
         // Bisect keeps its workspace, and says where when it exits.
         let _workspace = self.phase0_initialize(Retention::Keep { because: None })?;
         eprintln!(
             ":: Beginning schedule bisection using good/bad endpoints ({} / {} events)",
-            good.schedevents().len(),
-            bad.schedevents().len(),
+            good.len(),
+            bad.len(),
         );
 
         let critical = self.phase5_bisect_traces(&bad, &good)?;
@@ -2320,7 +2387,7 @@ impl AnalyzeOpts {
             "  critical event  #{index}: {}",
             critical.failing_schedule[index]
         );
-        let report = self.phase6_record_outputs(critical, &[&bad, &good], None)?;
+        let report = self.phase6_record_outputs(critical, None)?;
         println!("Swapping these adjacent events reproduces the good outcome.");
         if let Some(path) = &self.report_file {
             let text = serde_json::to_string_pretty(&report)?;
@@ -2363,10 +2430,9 @@ impl AnalyzeOpts {
     pub fn phase6_record_outputs(
         &self,
         crit: CriticalSchedule,
-        sources: &[&PreemptionRecord],
         target_run: Option<&Path>,
     ) -> Result<Report, Error> {
-        self.phase6_record_outputs_with(crit, sources, target_run, RunData::launch)
+        self.phase6_record_outputs_with(crit, target_run, RunData::launch)
     }
 
     /// [`Self::phase6_record_outputs`], with `launch` running each
@@ -2374,7 +2440,6 @@ impl AnalyzeOpts {
     fn phase6_record_outputs_with(
         &self,
         crit: CriticalSchedule,
-        sources: &[&PreemptionRecord],
         target_run: Option<&Path>,
         launch: impl Fn(&mut RunData) -> anyhow::Result<()>,
     ) -> Result<Report, Error> {
@@ -2406,7 +2471,6 @@ impl AnalyzeOpts {
             &final_failing_path,
             passing_schedule.clone(),
             &final_passing_path,
-            sources,
         );
 
         let mut header = String::new();
@@ -2568,17 +2632,19 @@ impl AnalyzeOpts {
         }
 
         Ok(Report {
+            verdict: Verdict::CriticalEvents,
+            verdict_reason: None,
             header,
             additional_context: passing_context,
             baseline_run: true,
-            critical_event1: ReportCriticalEvent {
+            critical_event1: Some(ReportCriticalEvent {
                 event_index: critical_event_index - 1,
                 stack: stack1,
-            },
-            critical_event2: ReportCriticalEvent {
+            }),
+            critical_event2: Some(ReportCriticalEvent {
                 event_index: critical_event_index,
                 stack: stack2,
-            },
+            }),
             branch_counter_warning: self.branch_counter_warning.clone(),
             deciding_event: None,
             racing_accesses,
@@ -2647,7 +2713,6 @@ impl AnalyzeOpts {
         .into_iter()
         .filter_map(|(option, path)| Some((option, path?)))
         .collect();
-        Self::refuse_recordings_numbered_apart(&recordings)?;
         self.adopt_recorded_epoch(&recordings)?;
         // Every trial charges expired timed waits as the target did.
         self.adopt_expired_wait_charge(run1.as_deref())?;
@@ -2656,8 +2721,7 @@ impl AnalyzeOpts {
         // Every trial runs under the timeslice its recordings drew.
         self.adopt_recorded_timeslice(&recordings)?;
         self.refuse_unsound_continuation_timeslice()?;
-        self.refuse_recordings_under_another_pipe_wake_latency(&recordings)?;
-        self.prepare_trial_guest_ids(&recordings)
+        self.refuse_recordings_under_another_pipe_wake_latency(&recordings)
     }
 
     /// Take the settings `analyze` inherits from the global options: every
@@ -2726,8 +2790,7 @@ impl AnalyzeOpts {
         // baseline knocks a preemption out of, is the record that met the
         // target: a normalized copy renumbers its priorities across the
         // scheduler's fixed ones (the default priority, among others), and
-        // can run another schedule. Normalization is written for reading
-        // only; analyze keeps using the observed record.
+        // can run another schedule.
         let (normalized_path, normalized) = min_run.write_normalized_preempts();
         eprintln!(
             ":: {}\n {}",
@@ -2764,25 +2827,20 @@ impl AnalyzeOpts {
 
         let baseline_sched_name = baseline_endpoint_run.sched_out_file_name();
         let target_sched_name = target_endpoint_run.sched_out_file_name();
-        target_endpoint_run.require_complete_output()?;
-        baseline_endpoint_run.require_complete_output()?;
-        let target = target_endpoint_run.preempts_out().clone();
-        let baseline = baseline_endpoint_run.preempts_out().clone();
+        let target = target_endpoint_run.sched_out()?;
+        let baseline = baseline_endpoint_run.sched_out()?;
 
         eprintln!(
             ":: {} (event lengths {} / {}): {} {}",
             "Beginning bisection using endpoints".yellow().bold(),
-            baseline.schedevents().len(),
-            target.schedevents().len(),
+            baseline.len(),
+            target.len(),
             baseline_sched_name,
             target_sched_name,
         );
-        let crit_sched = match self.phase5_bisect_traces(&target, &baseline) {
-            Ok(crit_sched) => crit_sched,
-            // The two endpoints differ in events only one run executed: the
-            // decision is still within the failing schedule, and a prefix
-            // search needs no baseline to find it.
-            Err(error) if error.downcast_ref::<NoSingleSwap>().is_some() => {
+        let crit_sched = match own_bisection_end(self.phase5_bisect_traces(target, baseline))? {
+            OwnBisectionEnd::Critical(crit_sched) => crit_sched,
+            OwnBisectionEnd::SearchPrefixes(error) => {
                 eprintln!(
                     ":: {} {error:#}\n:: Searching within the failing schedule instead \
                      (--prefix-search).",
@@ -2790,12 +2848,10 @@ impl AnalyzeOpts {
                 );
                 return self.prefix_search_and_report(&mut target_endpoint_run);
             }
-            Err(error) => return Err(error),
         };
 
         let target_run = target_endpoint_run.root_path();
-        let report =
-            self.phase6_record_outputs(crit_sched, &[&target, &baseline], Some(&target_run))?;
+        let report = self.phase6_record_outputs(crit_sched, Some(&target_run))?;
         self.write_report_and_exit(report)
     }
 
@@ -2813,16 +2869,207 @@ impl AnalyzeOpts {
             target.schedevents().len(),
             target_endpoint_run.sched_out_file_name(),
         );
-        let decision = self.phase5_prefix_search(&target)?;
+        let searched = self.phase5_prefix_search(&target);
+        self.finish_prefix_search(searched)
+    }
+
+    /// Report what the prefix search `searched` found: the deciding event, or
+    /// a verdict that names none, which completes the analysis too. Any other
+    /// error ends it.
+    pub(super) fn finish_prefix_search(
+        &self,
+        searched: anyhow::Result<PrefixDecision>,
+    ) -> anyhow::Result<ExitStatus> {
+        let decision = match searched {
+            Ok(decision) => decision,
+            Err(error) => {
+                let verdict = error.downcast::<AnalyzeVerdict>()?;
+                let verdict = self.with_timing_tried(verdict, |timing, continuation| {
+                    self.try_alternative_timing(timing, continuation)
+                });
+                return self.write_verdict_and_exit(&verdict);
+            }
+        };
         let report = self.phase6_record_prefix_outputs(decision)?;
         self.write_report_and_exit(report)
+    }
+
+    /// `verdict`, reached by trials that all kept the recording's timing
+    /// settings ([`Self::continuation_timing`]), with what one more trial
+    /// shows about them: `try_alternative` runs the empty prefix under their
+    /// alternatives. A recording given with `--run1-preemptions` fixes the
+    /// trials' settings, so that trial is not run and the verdict says a new
+    /// failing run can tell.
+    pub(super) fn with_timing_tried(
+        &self,
+        verdict: AnalyzeVerdict,
+        try_alternative: impl FnOnce(&[TimingSetting], MaybeTimeslice) -> AlternativeTiming,
+    ) -> AnalyzeVerdict {
+        let timing = self.continuation_timing();
+        if timing.is_empty() {
+            return verdict;
+        }
+        let tried = if self.run1_preemptions.is_some() {
+            AlternativeTiming::Untried {
+                why: "the failing run is a recording (--run1-preemptions), which every trial \
+                      replays under the run arguments it was made with, so analyze runs no trial \
+                      under others (a record stamped with one --pipe-wake-latency is refused \
+                      under another)"
+                    .to_owned(),
+            }
+        } else {
+            try_alternative(&timing, verdict.continuation())
+        };
+        verdict.with_timing(&timing, tried)
+    }
+
+    /// Run the empty prefix, continued without chaos at `continuation` as
+    /// the search's trials were, with the alternatives of `timing` in place
+    /// of the settings: one deterministic trial, outside the search, that
+    /// shows whether those settings make the scheduler alone meet the
+    /// target.
+    fn try_alternative_timing(
+        &self,
+        timing: &[TimingSetting],
+        continuation: MaybeTimeslice,
+    ) -> AlternativeTiming {
+        self.try_alternative_timing_with(timing, |alternative, runname| {
+            let empty = PreemptionRecord::from_sched_events(Vec::new());
+            alternative
+                .prefix_trial(runname, &empty, 0, continuation)
+                .and_then(|mut run| run.launch().map(|()| run.is_a_match()))
+        })
+    }
+
+    /// [`Self::try_alternative_timing`], with `launch` running the trial
+    /// (`runname`) on the options it is given, these options under the
+    /// alternatives, and saying whether it met the target: how it ended
+    /// decides the cause. A trial that missed shows the settings cause the
+    /// outcome; one that met the target shows they do not; one that did not
+    /// finish (a bound or a refusal: its launch's error) or could not run
+    /// shows nothing, and the verdict says it was not tried and why: the
+    /// error and the class `hermit run` reports for it.
+    fn try_alternative_timing_with(
+        &self,
+        timing: &[TimingSetting],
+        launch: impl FnOnce(&AnalyzeOpts, &str) -> anyhow::Result<bool>,
+    ) -> AlternativeTiming {
+        let runname = "prefix_alternative_timing";
+        let trial = format!("{runname}.repro");
+        let mut alternative = self.clone();
+        for setting in timing {
+            alternative.run_arg = without_option(&alternative.run_arg, setting.drops);
+            alternative.run_args = without_option(&alternative.run_args, setting.drops);
+            alternative.run_arg.extend(setting.adds.clone());
+        }
+        eprintln!(
+            ":: Trying the empty prefix with {} instead of {}",
+            timing
+                .iter()
+                .map(|t| t.alternative.as_str())
+                .collect::<Vec<_>>()
+                .join(" and "),
+            timing
+                .iter()
+                .map(|t| t.option.as_str())
+                .collect::<Vec<_>>()
+                .join(" and ")
+        );
+        match launch(&alternative, runname) {
+            Ok(false) => AlternativeTiming::Missed { trial },
+            Ok(true) => AlternativeTiming::Met { trial },
+            // A trial that did not complete has no outcome. The verdict says
+            // why it was not tried, with the trial's error and the class
+            // `hermit run` reports for it, and takes nothing else from it.
+            Err(error) => {
+                let ended = if error.downcast_ref::<RunTimeoutMarker>().is_some()
+                    || error
+                        .downcast_ref::<crate::app::container::LogCapExceeded>()
+                        .is_some()
+                {
+                    "was stopped by its bound"
+                } else if error
+                    .downcast_ref::<crate::app::container::PolicyRefusal>()
+                    .is_some()
+                {
+                    "was refused by Hermit"
+                } else {
+                    "failed"
+                };
+                AlternativeTiming::Untried {
+                    why: format!(
+                        "the trial with them ({trial} in the workspace) {ended}: {error:#} ({})",
+                        crate::app::classify_failure(&error)
+                    ),
+                }
+            }
+        }
+    }
+
+    /// What follows a first run that missed the target: `--search` (`search`),
+    /// or the end of the analysis, its input not giving it a target run.
+    pub(super) fn after_a_first_run_that_missed(
+        &self,
+        search: impl FnOnce() -> anyhow::Result<RunData>,
+    ) -> anyhow::Result<RunData> {
+        if self.search {
+            eprintln!(
+                ":: {}",
+                "First run did not match target criteria; now searching for a matching run..."
+                    .red()
+                    .bold()
+            );
+            search()
+        } else {
+            Err(AnalyzePrecondition::target_not_reproduced(
+                "FAILED. The run did not match the target criteria. Try --search.",
+            )
+            .into())
+        }
+    }
+
+    /// Report `verdict`, a completed analysis that names no event: print it
+    /// as analyze prints any report, write it to `--report-file`, if given,
+    /// and return the exit status of a successful analysis, with the class
+    /// line on stderr.
+    pub(super) fn write_verdict_and_exit(
+        &self,
+        verdict: &AnalyzeVerdict,
+    ) -> anyhow::Result<ExitStatus> {
+        println!(
+            "\n------------------------------ hermit analyze report ------------------------------"
+        );
+        if let Some(warning) = &self.branch_counter_warning {
+            println!("{warning}");
+        }
+        println!("{verdict}");
+        self.write_report_file(&Report {
+            verdict: verdict.verdict(),
+            verdict_reason: Some(verdict.reason().clone()),
+            header: verdict.to_string(),
+            additional_context: String::new(),
+            baseline_run: false,
+            critical_event1: None,
+            critical_event2: None,
+            branch_counter_warning: self.branch_counter_warning.clone(),
+            deciding_event: None,
+            racing_accesses: None,
+        });
+        eprintln!("{}", verdict.class_line());
+        self.success_status()
     }
 
     /// Write `report` to `--report-file`, if given, and return the exit status
     /// of a successful analysis.
     fn write_report_and_exit(&self, report: Report) -> anyhow::Result<ExitStatus> {
+        self.write_report_file(&report);
+        self.success_status()
+    }
+
+    /// Write `report` to `--report-file`, if given.
+    fn write_report_file(&self, report: &Report) {
         if let Some(path) = &self.report_file {
-            let txt = serde_json::to_string(&report).unwrap();
+            let txt = serde_json::to_string(report).unwrap();
             std::fs::write(path, txt).expect("Unable to write report file");
             eprintln!(
                 ":: {}\n {}",
@@ -2830,6 +3077,10 @@ impl AnalyzeOpts {
                 path.display()
             );
         }
+    }
+
+    /// The exit status of a successful analysis: 0, or `--success-exit-code`.
+    fn success_status(&self) -> anyhow::Result<ExitStatus> {
         self.success_exit_code
             .map_or(Ok(ExitStatus::SUCCESS), |exit_code| {
                 Ok(ExitStatus::Exited(exit_code))
@@ -2867,7 +3118,10 @@ impl AnalyzeOpts {
             self.record_endpoint(&newrun);
             eprintln!("    {}", newrun.to_repro());
             if !newrun.is_a_match() {
-                bail!("Final preemption record still does not match target criteria");
+                return Err(AnalyzePrecondition::target_not_reproduced(
+                    "Final preemption record still does not match target criteria",
+                )
+                .into());
             }
             Ok(newrun)
         }
@@ -3152,7 +3406,7 @@ mod tests {
             let mut options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
             options.tmp_dir = Some(dir.path().to_path_buf());
             let error = options
-                .phase6_record_outputs_with(critical(&[1, 2, 1, 2], 2), &[], None, |run| {
+                .phase6_record_outputs_with(critical(&[1, 2, 1, 2], 2), None, |run| {
                     let met = if run.name() == "final_target_for_stacktraces" {
                         target_met
                     } else {
@@ -3366,29 +3620,41 @@ mod tests {
                         .expect("a repeated pair certifies the decision");
                     assert_eq!(calls.borrow().len(), 4);
                     if captured {
-                        assert_eq!(report.critical_event1.event_index, 3);
-                        assert_eq!(report.critical_event2.event_index, 2);
+                        assert_eq!(report.critical_event1.as_ref().unwrap().event_index, 3);
+                        assert_eq!(report.critical_event2.as_ref().unwrap().event_index, 2);
                         assert!(same_frames(
-                            report.critical_event1.stack.as_ref().unwrap(),
+                            report
+                                .critical_event1
+                                .as_ref()
+                                .unwrap()
+                                .stack
+                                .as_ref()
+                                .unwrap(),
                             &timing_report_stack(3, 0x30)
                         ));
                         assert!(same_frames(
-                            report.critical_event2.stack.as_ref().unwrap(),
+                            report
+                                .critical_event2
+                                .as_ref()
+                                .unwrap()
+                                .stack
+                                .as_ref()
+                                .unwrap(),
                             &timing_report_stack(3, 0x40)
                         ));
                     } else {
-                        assert_eq!(report.critical_event1.event_index, 4);
-                        assert_eq!(report.critical_event2.event_index, 3);
+                        assert_eq!(report.critical_event1.as_ref().unwrap().event_index, 4);
+                        assert_eq!(report.critical_event2.as_ref().unwrap().event_index, 3);
                     }
                 }
             }
         }
     }
 
-    /// A one-event slice still belongs to its own continuation. Capture both
-    /// endpoints and retain the separately labelled original deciding stack.
+    /// A one-event slice reuses the already-captured deciding stack. There
+    /// is no new slice-end replay whose outcome could be true or false.
     #[test]
-    fn timing_reports_capture_single_event_slices_from_their_own_records() {
+    fn timing_reports_reuse_single_event_stacks_without_inventing_an_outcome() {
         let options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
         for target_is_short in [false, true] {
             let (with, without, ends) = if target_is_short {
@@ -3411,9 +3677,7 @@ mod tests {
                         &mut None,
                     ),
                     (
-                        |seen, len| {
-                            assert_eq!(seen, &record);
-                            assert_eq!(len, 2);
+                        |_, _| {
                             Ok((
                                 CompletedScheduleTrial {
                                     target_met: true,
@@ -3423,266 +3687,57 @@ mod tests {
                                 None,
                             ))
                         },
-                        |runname, variant, len, position| {
+                        |runname, _, len, position| {
                             calls.borrow_mut().push(runname.to_owned());
-                            let (expected, end, met, stack) = match runname {
+                            match runname {
                                 "final_target_next_for_stacktraces" => {
-                                    (&with, ends[0] + 1, true, timing_report_stack(7, 0x10))
+                                    assert_eq!((len, position), (ends[0] + 2, ends[0] + 1));
+                                    Ok((true, Some(timing_report_stack(7, 0x10))))
                                 }
                                 "final_baseline_next_for_stacktraces" => {
-                                    (&without, ends[1] + 1, false, timing_report_stack(5, 0x10))
+                                    assert_eq!((len, position), (ends[1] + 2, ends[1] + 1));
+                                    Ok((false, Some(timing_report_stack(5, 0x10))))
                                 }
-                                "final_target_slice_end_for_stacktraces" => (
-                                    &with,
-                                    ends[0],
-                                    true,
-                                    timing_report_stack(
-                                        3,
-                                        if target_is_short { 0x20 } else { 0x30 },
-                                    ),
-                                ),
+                                "final_target_slice_end_for_stacktraces" => {
+                                    assert!(!target_is_short, "the target stack is reused");
+                                    assert_eq!((len, position), (4, 3));
+                                    Ok((true, Some(timing_report_stack(3, 0x30))))
+                                }
                                 "final_baseline_slice_end_for_stacktraces" => {
-                                    (&without, ends[1], false, timing_report_stack(3, 0x40))
+                                    assert!(target_is_short, "the baseline stack is reused");
+                                    assert_eq!((len, position), (3, 2));
+                                    Ok((false, Some(timing_report_stack(3, 0x40))))
                                 }
                                 other => panic!("unexpected replay {other}"),
-                            };
-                            assert_eq!(variant.schedevents(), expected);
-                            assert_eq!((len, position), (end + 1, end));
-                            Ok((met, Some(stack)))
+                            }
                         },
                     ),
                 )
                 .unwrap()
-                .expect("each continuation certifies its own endpoint");
+                .expect("reusing a stack must not fabricate a contradictory replay");
             assert_eq!(
-                *calls.borrow(),
-                [
-                    "final_target_next_for_stacktraces",
-                    "final_baseline_next_for_stacktraces",
-                    "final_target_slice_end_for_stacktraces",
-                    "final_baseline_slice_end_for_stacktraces",
-                ],
-                "two next-thread and two slice-end replays"
-            );
-            assert_eq!(report.critical_event1.event_index, ends[0]);
-            assert_eq!(report.critical_event2.event_index, ends[1]);
-            assert_eq!(
-                report.critical_event1.stack,
-                Some(timing_report_stack(
-                    3,
-                    if target_is_short { 0x20 } else { 0x30 }
-                ))
+                calls.borrow().len(),
+                3,
+                "two next-thread and one slice-end replay"
             );
             assert_eq!(
-                report.critical_event2.stack,
-                Some(timing_report_stack(3, 0x40))
+                report.critical_event1.as_ref().unwrap().event_index,
+                ends[0]
             );
-            assert_eq!(report.deciding_event.unwrap().stack, deciding);
+            assert_eq!(
+                report.critical_event2.as_ref().unwrap().event_index,
+                ends[1]
+            );
+            let reused = if target_is_short {
+                &report.critical_event1.as_ref().unwrap().stack
+            } else {
+                &report.critical_event2.as_ref().unwrap().stack
+            };
+            assert!(same_frames(
+                reused.as_ref().unwrap(),
+                deciding.as_ref().unwrap()
+            ));
         }
-    }
-
-    /// Completed, admitted checkpoint-free records can have one-event slices
-    /// at the same index but different operation batches. The target can also
-    /// realize a different count than the original deciding event. Model the
-    /// completed producer through the real file reader, not a native guest.
-    fn single_event_timing_report_for_test(
-        target_count: u32,
-        target_met: bool,
-        baseline_met: bool,
-        captured: bool,
-    ) -> (anyhow::Result<Option<Report>>, Vec<String>) {
-        let dir = tempfile::tempdir().unwrap();
-        let mut options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
-        options.tmp_dir = Some(dir.path().to_path_buf());
-        let source =
-            PreemptionRecord::from_sched_events(branch_events(&[(5, 1), (3, 100), (7, 1), (5, 1)]));
-        source.validate().unwrap();
-        let with = branch_events(&[(5, 1), (3, target_count), (7, 1), (5, 1)]);
-        let without = branch_events(&[(5, 1), (3, 1), (7, 1), (5, 1)]);
-        let (baseline, baseline_path) = recorded_continuation_for_test(
-            &options,
-            "single_event_baseline",
-            &source,
-            1,
-            false,
-            &without,
-        );
-        assert!(!baseline.target_met);
-        let calls = std::cell::RefCell::new(Vec::new());
-        let deciding = Some(timing_report_stack(3, 0x20));
-        let result = options.report_timing_decision_with(
-            &source,
-            1,
-            None,
-            (true, &deciding),
-            (&baseline.schedule, &baseline_path, &mut None),
-            (
-                |seen, len| {
-                    assert_eq!(seen, &source);
-                    assert_eq!(len, 2);
-                    let (completed, path) = recorded_continuation_for_test(
-                        &options,
-                        "single_event_target",
-                        seen,
-                        len,
-                        true,
-                        &with,
-                    );
-                    Ok((completed, path, None))
-                },
-                |runname, variant, len, position| {
-                    calls.borrow_mut().push(runname.to_owned());
-                    let (expected, prefix_len, end, met, stack) = match runname {
-                        "final_target_next_for_stacktraces" => {
-                            (&with, 2, 2, true, Some(timing_report_stack(7, 0x10)))
-                        }
-                        "final_baseline_next_for_stacktraces" => {
-                            (&without, 1, 2, false, Some(timing_report_stack(7, 0x10)))
-                        }
-                        "final_target_slice_end_for_stacktraces" => (
-                            &with,
-                            2,
-                            1,
-                            target_met,
-                            captured.then(|| {
-                                timing_report_stack(
-                                    3,
-                                    if target_count == 100 { 0x20 } else { 0x30 },
-                                )
-                            }),
-                        ),
-                        "final_baseline_slice_end_for_stacktraces" => (
-                            &without,
-                            1,
-                            1,
-                            baseline_met,
-                            captured.then(|| timing_report_stack(3, 0x40)),
-                        ),
-                        other => panic!("unexpected replay {other}"),
-                    };
-                    variant.validate().unwrap();
-                    assert_eq!(variant.schedevents(), expected);
-                    assert_prefix_metadata(variant, &source, prefix_len);
-                    assert_eq!((len, position), (end + 1, end));
-                    Ok((met, stack))
-                },
-            ),
-        );
-        let retained = PreemptionReader::try_new(&baseline_path)
-            .unwrap()
-            .into_inner();
-        assert_eq!(retained.schedevents(), &without);
-        (result, calls.into_inner())
-    }
-
-    #[test]
-    fn one_event_timing_slices_report_their_own_dynamic_endpoints() {
-        for target_count in [100, 101] {
-            let (result, calls) =
-                single_event_timing_report_for_test(target_count, true, false, true);
-            let report = result
-                .unwrap()
-                .expect("opposite completed outcomes certify the report");
-            assert_eq!(
-                report.critical_event2.stack,
-                Some(timing_report_stack(3, 0x40)),
-                "the one-branch baseline endpoint must not use the target deciding stack"
-            );
-            assert_eq!(
-                report.critical_event1.stack,
-                Some(timing_report_stack(
-                    3,
-                    if target_count == 100 { 0x20 } else { 0x30 }
-                )),
-                "the realized target endpoint must come from its own continued record"
-            );
-            assert_eq!(
-                (
-                    report.critical_event1.event_index,
-                    report.critical_event2.event_index
-                ),
-                (1, 1)
-            );
-            let deciding = report.deciding_event.unwrap();
-            assert_eq!(deciding.event_index, 1);
-            assert_eq!(deciding.stack, Some(timing_report_stack(3, 0x20)));
-            assert!(
-                report.header.contains(&format!(
-                    "runs 1 events ({target_count} retired conditional branches)"
-                )),
-                "{}",
-                report.header
-            );
-            assert!(
-                report
-                    .header
-                    .contains("runs 1 events (1 retired conditional branches)"),
-                "{}",
-                report.header
-            );
-            assert!(
-                !report.header.contains("same stack at both events"),
-                "{}",
-                report.header
-            );
-            assert_eq!(
-                calls,
-                [
-                    "final_target_next_for_stacktraces",
-                    "final_baseline_next_for_stacktraces",
-                    "final_target_slice_end_for_stacktraces",
-                    "final_baseline_slice_end_for_stacktraces",
-                ]
-            );
-        }
-    }
-
-    #[test]
-    fn one_event_timing_slice_replays_must_repeat_their_own_outcomes() {
-        for (target_met, baseline_met, contradicted, expected_calls) in [
-            (true, true, "final_baseline_slice_end_for_stacktraces", 4),
-            (false, false, "final_target_slice_end_for_stacktraces", 3),
-        ] {
-            for captured in [true, false] {
-                let (result, calls) =
-                    single_event_timing_report_for_test(100, target_met, baseline_met, captured);
-                let error = result
-                    .expect_err(
-                        "a contradictory one-event slice replay cannot certify the decision",
-                    )
-                    .to_string();
-                assert!(
-                    error.contains(&format!("{contradicted} observed the opposite")),
-                    "{error}"
-                );
-                assert!(
-                    error.contains("no opposite-outcome pair was established"),
-                    "{error}"
-                );
-                assert_eq!(calls.len(), expected_calls);
-                assert_eq!(calls.last().unwrap(), contradicted);
-            }
-        }
-        let (result, calls) = single_event_timing_report_for_test(100, true, false, false);
-        let report = result
-            .unwrap()
-            .expect("missing stacks do not invent a contradictory outcome");
-        assert_eq!(calls.len(), 4);
-        assert_eq!(
-            (
-                report.critical_event1.event_index,
-                report.critical_event2.event_index
-            ),
-            (2, 2)
-        );
-        assert_eq!(
-            report.critical_event1.stack,
-            Some(timing_report_stack(7, 0x10))
-        );
-        assert_eq!(
-            report.critical_event2.stack,
-            Some(timing_report_stack(7, 0x10))
-        );
     }
 
     /// The timing report creates another prefix continuation after the
@@ -4225,8 +4280,9 @@ mod tests {
             } else {
                 let report = result.unwrap();
                 assert!(report.header.contains("decides the outcome"));
-                assert!(report.critical_event1.stack.is_none());
-                assert!(report.critical_event2.stack.is_none());
+                for event in [&report.critical_event1, &report.critical_event2] {
+                    assert!(event.as_ref().is_some_and(|event| event.stack.is_none()));
+                }
             }
             assert_eq!(stacks, expected_stacks);
             assert_eq!(continuations, usize::from(target == Some(true)));
@@ -4668,41 +4724,6 @@ mod tests {
         }
     }
 
-    /// A prefix stack trial asks for its stack by schedule position
-    /// (`--stacktrace-at-schedule-positions`), not by traced index: a trial
-    /// that makes a polling retry its recording did not make would otherwise
-    /// print a neighbouring event's stack
-    /// (https://github.com/rrnewton/hermit/issues/4917). The request names the
-    /// position, its stack file, and the replayed prefix, and the trial's
-    /// repro command carries the option.
-    #[test]
-    fn a_prefix_stack_trial_requests_its_stack_by_schedule_position() {
-        let parent = tempfile::tempdir().unwrap();
-        let tmp_dir = format!("--tmp-dir={}", parent.path().display());
-        let mut options =
-            AnalyzeOpts::try_parse_from(["analyze", tmp_dir.as_str(), "--", "/bin/true"]).unwrap();
-        let _workspace = options.phase0_initialize(Retention::Remove).unwrap();
-        let tid = detcore::types::DetTid::from_raw(3);
-        let target = PreemptionRecord::from_sched_events(vec![
-            SchedEvent::branches(tid, 10),
-            SchedEvent::branches(tid, 4),
-            SchedEvent::branches(tid, 5),
-        ]);
-        let (run, stack_path) = options
-            .prefix_stack_trial("final_target_for_stacktraces", &target, 3, 2, None)
-            .unwrap();
-        let config = &run.runopts.det_opts.det_config;
-        assert!(config.stacktrace_at_schedule_positions);
-        assert_eq!(config.stacktrace_event, vec![(2, Some(stack_path))]);
-        assert!(config.replay_schedule_from.is_some());
-        assert!(
-            run.to_repro()
-                .contains(" --stacktrace-at-schedule-positions"),
-            "{}",
-            run.to_repro()
-        );
-    }
-
     /// A candidate's check keeps the callback checkpoints of the unchanged
     /// events it replays, and refuses an edit they do not fit instead of
     /// replaying a bare schedule.
@@ -4871,156 +4892,18 @@ mod tests {
         }
     }
 
-    /// A bisection trial replays its schedule with the callback checkpoints,
-    /// per-thread histories and epoch of the endpoint record it shares the
-    /// longest prefix with (on a tie, one it replays whole, then the first),
-    /// as far as that prefix reaches: an endpoint replayed whole keeps all of
-    /// its checkpoints, and one that shares nothing is written as events
-    /// alone. A schedule edited right after its first event keeps none of the
-    /// target's checkpoints, though it takes the target's histories and
-    /// epoch: the one at that event's progress ended its slice, which decides
-    /// the edited event, so the scheduler decides it, as in a prefix trial
-    /// (`PreemptionRecord::schedule_prefix`).
-    #[test]
-    fn a_bisection_trial_keeps_the_checkpoints_of_the_part_it_shares_with_an_endpoint() {
-        let parent = tempfile::tempdir().unwrap();
-        let tmp_dir = format!("--tmp-dir={}", parent.path().display());
-        let mut options =
-            AnalyzeOpts::try_parse_from(["analyze", tmp_dir.as_str(), "--", "/bin/true"]).unwrap();
-        let retention = options.workspace_retention();
-        let _workspace = options.phase0_initialize(retention).unwrap();
-        let branches = |tid: u64, count: u32| {
-            serde_json::json!({
-                "dettid": tid, "op": "Branch", "count": count,
-                "start_rip": null, "end_rip": null, "end_time": null
-            })
-        };
-        let checkpoint = |row: usize, progress: u64, time: u64| {
-            serde_json::json!({
-                "history_index": row,
-                "origin": {
-                    "callback": "PmuTimer", "site": "Prehook", "progress": progress,
-                    "last_op": "Branch", "time": time, "rcbs": progress
-                }
-            })
-        };
-        let target: PreemptionRecord = serde_json::from_value(serde_json::json!({
-            "per_thread": {"3": {
-                "final_prio": 1000,
-                "prio_changes": [[100, 1000], [200, 1000]],
-                "preemption_rcbs": [10, 15]
-            }},
-            "global": [branches(3, 10), branches(3, 5)],
-            "epoch": "2026-01-01T00:00:00Z",
-            "callback_checkpoints": {"3": [checkpoint(0, 10, 100), checkpoint(1, 15, 200)]}
-        }))
-        .unwrap();
-        target.validate().unwrap();
-        let events = |list: Vec<serde_json::Value>| -> Vec<SchedEvent> {
-            serde_json::from_value(serde_json::Value::Array(list)).unwrap()
-        };
-        // The baseline has the same events and no checkpoints: on the tie the
-        // target, listed first, is the source.
-        let baseline = PreemptionRecord::from_sched_events(target.schedevents().clone());
-        let path = parent.path().join("trial.preempts");
-        // A second endpoint whose schedule only starts with the target's
-        // first event, and keeps no checkpoints.
-        let short = PreemptionRecord::from_sched_events(events(vec![branches(3, 10)]));
-        // (sources, schedule, checkpoints kept, whether the target's histories
-        // and epoch come with them)
-        for (sources, schedule, kept, from_target) in [
-            (
-                [&target, &baseline],
-                events(vec![branches(3, 10), branches(3, 5)]),
-                2,
-                true,
-            ),
-            (
-                [&target, &baseline],
-                events(vec![branches(3, 10), branches(5, 5), branches(3, 5)]),
-                0,
-                true,
-            ),
-            (
-                [&target, &baseline],
-                events(vec![branches(5, 5), branches(3, 10)]),
-                0,
-                false,
-            ),
-            // The longer shared prefix wins, whichever source is listed first.
-            (
-                [&short, &target],
-                events(vec![branches(3, 10), branches(3, 5)]),
-                2,
-                true,
-            ),
-            // A source that ends where the schedule goes on keeps its last
-            // slice end: no event of its own follows it.
-            (
-                [&target, &short],
-                events(vec![branches(3, 10), branches(3, 5), branches(5, 1)]),
-                2,
-                true,
-            ),
-            // On a tie, the source replayed whole wins.
-            ([&target, &short], events(vec![branches(3, 10)]), 0, false),
-        ] {
-            options
-                .write_trial_schedule_from(schedule.clone(), &sources, &path)
-                .unwrap();
-            let written = PreemptionReader::new(&path).load_all();
-            written.validate().unwrap();
-            assert_eq!(written.schedevents(), &schedule);
-            let points = serde_json::to_value(&written).unwrap()["callback_checkpoints"]["3"]
-                .as_array()
-                .map_or(0, |points| points.len());
-            assert_eq!(points, kept, "{schedule:?}");
-            assert_eq!(written.epoch().is_some(), from_target, "{schedule:?}");
-            assert_eq!(
-                serde_json::to_value(&written).unwrap()["per_thread"]
-                    .as_object()
-                    .map_or(0, |rows| rows.len()),
-                usize::from(from_target),
-                "{schedule:?}"
-            );
-        }
-    }
-
-    /// A workspace kept for the level `--guest-log` gave names the option, and
-    /// HERMIT_LOG too when the level came from that variable.
-    #[test]
-    fn a_workspace_kept_for_the_guest_log_level_names_its_source() {
-        let mut options =
-            AnalyzeOpts::try_parse_from(["analyze", "-g", "debug", "--", "/bin/true"]).unwrap();
-        assert_eq!(
-            options.workspace_retention(),
-            Retention::Keep {
-                because: Some("--guest-log")
-            }
-        );
-        options.guest_log_from_env = true;
-        assert_eq!(
-            options.workspace_retention(),
-            Retention::Keep {
-                because: Some("--guest-log (HERMIT_LOG)")
-            }
-        );
-    }
-
     /// `--tmp-dir` names the directory the workspace is created in, and is
     /// created if it is missing. The workspace goes when analyze is done
-    /// with it, unless `--keep-tmp`, `--verbose`, or `--trial-log` above warn
-    /// keeps it (not `--selfcheck`, though it writes run logs there too);
-    /// the `--tmp-dir` stays.
+    /// with it, unless `--keep-tmp` or `--verbose` keeps it (not
+    /// `--selfcheck`, though it writes run logs there too); the `--tmp-dir`
+    /// stays.
     #[test]
     fn the_workspace_is_created_in_the_tmp_dir() {
         for (option, kept) in [
-            (None, None),
-            (Some("--keep-tmp"), Some("--keep-tmp")),
-            (Some("--verbose"), Some("--verbose")),
-            (Some("--selfcheck"), None),
-            (Some("--trial-log=debug"), Some("--trial-log")),
-            (Some("--trial-log=warn"), None),
+            (None, false),
+            (Some("--keep-tmp"), true),
+            (Some("--verbose"), true),
+            (Some("--selfcheck"), false),
         ] {
             let parent = tempfile::tempdir().unwrap();
             let requested = parent.path().join("not-yet-created");
@@ -5031,11 +4914,10 @@ mod tests {
             let retention = options.workspace_retention();
             assert_eq!(
                 retention,
-                match kept {
-                    Some(because) => Retention::Keep {
-                        because: Some(because),
-                    },
-                    None => Retention::Remove,
+                if kept {
+                    Retention::Keep { because: option }
+                } else {
+                    Retention::Remove
                 },
                 "{option:?}"
             );
@@ -5049,7 +4931,7 @@ mod tests {
             drop(guard);
             assert_eq!(
                 workspace.exists(),
-                kept.is_some(),
+                kept,
                 "{option:?}: {}",
                 workspace.display()
             );
@@ -5092,6 +4974,58 @@ mod tests {
             options.bisect_config().max_branch_count_jitter,
             Some(INEXACT_COUNTER_BRANCH_JITTER)
         );
+    }
+
+    /// Prefix outcomes need not be monotone: here replaying none of the
+    /// schedule meets the target (Met(0)), an interior prefix misses it
+    /// (Missed(4)) and the whole schedule meets it again (Met(10)). The
+    /// endpoint check tries only the empty prefix, so the verdict reports
+    /// what that trial observed and nothing more: the target reproduced
+    /// without the schedule and no event localized, never that no event
+    /// decides the outcome or that it does not depend on a chaos decision.
+    /// With the empty prefix missing instead, the same check finds the
+    /// endpoints a search can use.
+    #[test]
+    fn a_target_met_without_the_schedule_is_reported_as_only_that() {
+        let continuation = [Some(NonZeroU64::new(1000).unwrap())];
+        let mut tried = Vec::new();
+        let error = choose_continuation(&continuation, 10, |prefix, _| {
+            tried.push(prefix);
+            Ok(prefix != 4)
+        })
+        .unwrap_err();
+        assert_eq!(tried, [0], "only the empty prefix is tried");
+        let verdict = error
+            .downcast_ref::<AnalyzeVerdict>()
+            .unwrap_or_else(|| panic!("not a verdict: {error:#}"));
+        assert_eq!(verdict.verdict(), Verdict::ReproducedWithoutSchedule);
+        assert_eq!(
+            verdict.class_line(),
+            "HERMIT_ANALYZE_VERDICT class=reproduced-without-schedule"
+        );
+        let header = verdict.to_string();
+        for expected in [
+            "the target is reproduced without the target schedule: replaying none of the target \
+             schedule and then scheduling without chaos, the scheduler alone already meets the \
+             target criteria at a 1000 ns timeslice",
+            "and it localizes no event here",
+            "Only that empty prefix was tried; a longer prefix may still miss the target",
+        ] {
+            assert!(header.contains(expected), "no {expected:?} in {header}");
+        }
+        for overclaim in [
+            "no event of the target schedule decides",
+            "does not depend on a chaos decision",
+        ] {
+            assert!(!header.contains(overclaim), "{overclaim:?} in {header}");
+        }
+        tried.clear();
+        let usable = choose_continuation(&continuation, 10, |prefix, _| {
+            tried.push(prefix);
+            Ok(prefix != 0 && prefix != 4)
+        })
+        .unwrap();
+        assert_eq!((usable, tried), (continuation[0], vec![0, 10]));
     }
 
     /// The prefix search finds the event at which the outcome flips, wherever
@@ -5378,6 +5312,14 @@ mod tests {
         );
 
         let alone = choose_continuation(&candidates, 50, |_, _| Ok(true)).unwrap_err();
+        // A completed analysis that names no event, not a failure.
+        assert!(
+            matches!(
+                alone.downcast_ref::<AnalyzeVerdict>(),
+                Some(AnalyzeVerdict::ReproducedWithoutSchedule { .. })
+            ),
+            "{alone:#}"
+        );
         let message = alone.to_string();
         assert!(
             message.contains("the scheduler alone already meets the target criteria at a 1000 ns timeslice and at a 200000000 ns timeslice"),
@@ -5395,6 +5337,486 @@ mod tests {
             "{replay}"
         );
         assert!(replay.to_string().contains("--selfcheck"), "{replay}");
+        assert_eq!(
+            replay
+                .downcast_ref::<AnalyzePrecondition>()
+                .map(|precondition| precondition.class.name()),
+            Some("no-prefix-continuation"),
+            "{replay:#}"
+        );
+        assert_eq!(crate::app::failure_exit_code(&replay), 2);
+        assert_eq!(
+            crate::app::classify_failure(&replay),
+            "HERMIT_ANALYZE_PRECONDITION class=no-prefix-continuation"
+        );
+    }
+
+    /// A verdict that names no event is reported as a completed analysis:
+    /// its report carries `"verdict": "reproduced_without_schedule"`, its reason and the
+    /// explanation, and analyze exits as it does after naming an event (0, or
+    /// `--success-exit-code`). `main.rs` never sees it as an error. Without
+    /// timing settings in force no other trial runs. With them, a recording
+    /// given with `--run1-preemptions` leaves them untried; otherwise the
+    /// trial under their alternatives decides the cause, shown here with
+    /// stand-ins for that trial.
+    /// A trial under another timing setting drops the option, as
+    /// `name=VALUE` or as `name VALUE`, from analyze's arguments and the run
+    /// arguments before the guest command, and keeps the guest's own.
+    #[test]
+    fn a_trial_under_another_setting_drops_the_option() {
+        let args = |list: &[&str]| -> Vec<String> { list.iter().map(|a| a.to_string()).collect() };
+        assert_eq!(
+            without_option(
+                &args(&[
+                    "--pipe-wake-latency=50000",
+                    "--strict",
+                    "--pipe-wake-latency",
+                    "7",
+                    "--pipe-wake-latency-extra=1",
+                    "--",
+                    "/bin/guest",
+                    "--pipe-wake-latency=3",
+                ]),
+                "--pipe-wake-latency"
+            ),
+            args(&[
+                "--strict",
+                "--pipe-wake-latency-extra=1",
+                "--",
+                "/bin/guest",
+                "--pipe-wake-latency=3",
+            ])
+        );
+    }
+
+    #[test]
+    fn a_verdict_is_reported_and_ends_analyze_successfully() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = dir.path().join("report.json");
+        let verdict = AnalyzeVerdict::reproduced_without_schedule("reproduced without it.", None);
+        let written = |status: anyhow::Result<ExitStatus>, expected: ExitStatus| {
+            assert_eq!(status.unwrap(), expected);
+            let text = std::fs::read_to_string(&report).unwrap();
+            std::fs::remove_file(&report).unwrap();
+            // One schema reads both kinds of report.
+            let parsed: Report = serde_json::from_str(&text).unwrap();
+            assert_eq!(parsed.verdict, Verdict::ReproducedWithoutSchedule);
+            assert_eq!(parsed.critical_event1, None);
+            serde_json::from_str::<serde_json::Value>(&text).unwrap()
+        };
+        let parse = |extra: &[&str], run_args: &[&str]| {
+            let mut argv = vec![
+                "analyze".to_string(),
+                format!("--report-file={}", report.display()),
+            ];
+            argv.extend(extra.iter().map(|flag| flag.to_string()));
+            argv.push("--".to_string());
+            argv.extend(run_args.iter().map(|flag| flag.to_string()));
+            argv.push("/bin/true".to_string());
+            AnalyzeOpts::try_parse_from(argv).unwrap()
+        };
+        for (extra, status) in [
+            (&[][..], ExitStatus::SUCCESS),
+            (&["--success-exit-code=3"][..], ExitStatus::Exited(3)),
+        ] {
+            // Through the prefix search's end, as analyze reaches it.
+            let options = parse(extra, &[]);
+            let searched = Err(Error::new(verdict.clone()));
+            assert_eq!(
+                written(options.finish_prefix_search(searched), status),
+                serde_json::json!({
+                    "verdict": "reproduced_without_schedule",
+                    "verdict_reason": {"cause": "scheduler_alone"},
+                    "header": "reproduced without it.",
+                    "additional_context": "",
+                    "baseline_run": false,
+                })
+            );
+        }
+
+        // A recording fixes the settings, so no trial tries others.
+        let recorded = parse(
+            &["--run1-preemptions=/nonexistent.preempts"],
+            &["--pipe-wake-latency=50000"],
+        );
+        let searched = Err(Error::new(verdict.clone()));
+        let json = written(recorded.finish_prefix_search(searched), ExitStatus::SUCCESS);
+        assert_eq!(
+            json["verdict_reason"],
+            serde_json::json!({
+                "cause": "scheduler_alone",
+                "timing_in_force": ["--pipe-wake-latency=50000"],
+            })
+        );
+        let header = json["header"].as_str().unwrap();
+        assert!(
+            header.contains("was not tried: the failing run is a recording (--run1-preemptions)")
+                && header.contains("A new failing run with no --pipe-wake-latency"),
+            "{header}"
+        );
+
+        // Otherwise the trial without the setting decides the cause.
+        let options = parse(&[], &["--pipe-wake-latency=50000"]);
+        let trial = || "prefix_alternative_timing.repro".to_owned();
+        let shown = options.with_timing_tried(verdict.clone(), |timing, continuation| {
+            assert_eq!(timing.len(), 1);
+            assert_eq!(timing[0].drops, "--pipe-wake-latency");
+            assert_eq!(continuation, None);
+            AlternativeTiming::Missed { trial: trial() }
+        });
+        let json = written(options.write_verdict_and_exit(&shown), ExitStatus::SUCCESS);
+        assert_eq!(
+            json["verdict_reason"],
+            serde_json::json!({
+                "cause": "timing_semantics",
+                "options": ["--pipe-wake-latency=50000"],
+                "alternatives": ["no --pipe-wake-latency"],
+                "trial": "prefix_alternative_timing.repro",
+            })
+        );
+        assert!(
+            json["header"]
+                .as_str()
+                .unwrap()
+                .contains("meets the target because of --pipe-wake-latency=50000"),
+            "{json}"
+        );
+        let met = options.with_timing_tried(verdict.clone(), |_, _| AlternativeTiming::Met {
+            trial: trial(),
+        });
+        assert_eq!(
+            serde_json::to_value(met.reason()).unwrap(),
+            serde_json::json!({
+                "cause": "scheduler_alone",
+                "timing_in_force": ["--pipe-wake-latency=50000"],
+            })
+        );
+
+        // A trial that did not complete supplies no outcome: the verdict
+        // keeps the cause the search established, makes no claim about the
+        // settings and says why the trial was not tried, with its error and
+        // the class `hermit run` reports for it.
+        let stopped = options.with_timing_tried(verdict.clone(), |timing, _| {
+            options.try_alternative_timing_with(timing, |_, _| Err(Error::new(RunTimeoutMarker)))
+        });
+        let json = written(
+            options.write_verdict_and_exit(&stopped),
+            ExitStatus::SUCCESS,
+        );
+        assert_eq!(
+            json["verdict_reason"],
+            serde_json::json!({
+                "cause": "scheduler_alone",
+                "timing_in_force": ["--pipe-wake-latency=50000"],
+            })
+        );
+        let header = json["header"].as_str().unwrap();
+        assert!(
+            header.contains(
+                "was not tried: the trial with them (prefix_alternative_timing.repro in the \
+                 workspace) was stopped by its bound: "
+            ) && header.contains("(HERMIT_RUN_TIMEOUT class=run-timeout)")
+                && !header.contains("because of"),
+            "{header}"
+        );
+
+        // Any other end of the search ends the analysis, writing no report.
+        let options = AnalyzeOpts::try_parse_from([
+            "analyze".to_string(),
+            format!("--report-file={}", report.display()),
+            "--".to_string(),
+            "/bin/true".to_string(),
+        ])
+        .unwrap();
+        let other = options
+            .finish_prefix_search(Err(
+                AnalyzePrecondition::no_prefix_continuation("none").into()
+            ))
+            .unwrap_err();
+        assert!(
+            other.downcast_ref::<AnalyzePrecondition>().is_some(),
+            "{other:#}"
+        );
+        assert!(!report.exists());
+        assert_eq!(
+            verdict.class_line(),
+            "HERMIT_ANALYZE_VERDICT class=reproduced-without-schedule"
+        );
+    }
+
+    /// The trial under the alternative timing runs without the settings it
+    /// drops, and its end decides the cause: missed shows the settings cause
+    /// the outcome, met shows they do not, and an unfinished (bound or
+    /// refused) or failed trial shows nothing; the verdict then names its
+    /// error and class.
+    #[test]
+    fn the_alternative_timing_trial_decides_the_cause_by_how_it_ends() {
+        let options = AnalyzeOpts::try_parse_from([
+            "analyze",
+            "--run-arg=--scheduler-turn-cost=10000",
+            "--",
+            "--pipe-wake-latency=50000",
+            "/bin/true",
+        ])
+        .unwrap();
+        let timing = options.continuation_timing();
+        assert_eq!(
+            timing.iter().map(|t| t.option.as_str()).collect::<Vec<_>>(),
+            ["--pipe-wake-latency=50000", "--scheduler-turn-cost=10000"]
+        );
+        // How the trial ends, and what the cause must then be.
+        type Case = (anyhow::Result<bool>, fn(&AlternativeTiming) -> bool);
+        let cases: [Case; 6] = [
+            (
+                Ok(false),
+                |t| matches!(t, AlternativeTiming::Missed { trial } if trial == "prefix_alternative_timing.repro"),
+            ),
+            (Ok(true), |t| matches!(t, AlternativeTiming::Met { .. })),
+            // A trial that did not complete is not tried, and the verdict
+            // names its stop or failure: the error and its class.
+            (
+                Err(anyhow::Error::new(RunTimeoutMarker)),
+                |t| matches!(t, AlternativeTiming::Untried { why } if why.starts_with("the trial with them (prefix_alternative_timing.repro in the workspace) was stopped by its bound: ") && why.ends_with("(HERMIT_RUN_TIMEOUT class=run-timeout)")),
+            ),
+            (
+                Err(anyhow::Error::new(LogCapExceeded)),
+                |t| matches!(t, AlternativeTiming::Untried { why } if why.contains("was stopped by its bound: ") && why.ends_with("(HERMIT_LOG_CAP class=log-cap)")),
+            ),
+            (
+                Err(anyhow::Error::new(PolicyRefusal)),
+                |t| matches!(t, AlternativeTiming::Untried { why } if why.contains("was refused by Hermit: ") && why.ends_with("(HERMIT_POLICY_REFUSAL class=policy-refusal)")),
+            ),
+            (
+                Err(anyhow::anyhow!("no such binary")),
+                |t| matches!(t, AlternativeTiming::Untried { why } if why.contains("failed: no such binary (HERMIT_INTERNAL_FAILURE class=cli-error)")),
+            ),
+        ];
+        // An explicit turn cost equal to the default charge is no setting.
+        let default_cost = AnalyzeOpts::try_parse_from([
+            "analyze",
+            "--run-arg=--scheduler-turn-cost=500000",
+            "--",
+            "/bin/true",
+        ])
+        .unwrap();
+        assert_eq!(default_cost.continuation_timing(), Vec::new());
+        for (end, expected) in cases {
+            let tried = options.try_alternative_timing_with(&timing, |alternative, runname| {
+                assert_eq!(runname, "prefix_alternative_timing");
+                let args: Vec<&String> = alternative
+                    .run_arg
+                    .iter()
+                    .chain(&alternative.run_args)
+                    .collect();
+                assert!(
+                    args.iter()
+                        .all(|arg| !arg.starts_with("--pipe-wake-latency")
+                            && !arg.starts_with("--scheduler-turn-cost")),
+                    "{args:?}"
+                );
+                assert_eq!(alternative.continuation_timing(), Vec::new());
+                end
+            });
+            assert!(expected(&tried), "{tried:?}");
+        }
+    }
+
+    /// A first run that misses the target ends the analysis without --search,
+    /// an input that gives it no target run (exit 2, `target-not-reproduced`),
+    /// and searches with it.
+    #[test]
+    fn a_first_run_that_misses_ends_the_analysis_or_searches() {
+        let options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
+        let mut searched = false;
+        let error = options
+            .after_a_first_run_that_missed(|| {
+                searched = true;
+                bail!("searched")
+            })
+            .err()
+            .unwrap();
+        assert!(!searched);
+        assert_eq!(crate::app::failure_exit_code(&error), 2, "{error:#}");
+        assert_eq!(
+            crate::app::classify_failure(&error),
+            "HERMIT_ANALYZE_PRECONDITION class=target-not-reproduced"
+        );
+        assert!(error.to_string().contains("Try --search"), "{error}");
+
+        let options =
+            AnalyzeOpts::try_parse_from(["analyze", "--search", "--", "/bin/true"]).unwrap();
+        let error = options
+            .after_a_first_run_that_missed(|| bail!("searched"))
+            .err()
+            .unwrap();
+        assert_eq!(error.to_string(), "searched");
+    }
+
+    /// Both of the bisection's ends that establish no exact one-swap pair of
+    /// schedules with opposite outcomes send analyze to attempt a prefix
+    /// search; other ends do not. An
+    /// endpoint of analyze's own that did not reproduce is pointed at replay.
+    #[test]
+    fn bisection_ends_are_answered_by_their_kind() {
+        for swaps_left in [0, 1] {
+            assert!(no_swap_separates(&Error::new(NoSingleSwap {
+                unshared_events: 2,
+                swaps_left,
+                trimmed_failing_passed: false,
+            })));
+        }
+        assert!(!no_swap_separates(&Error::new(
+            AnalyzePrecondition::target_not_reproduced("no")
+        )));
+
+        for precondition in [
+            AnalyzePrecondition::target_not_reproduced("the failing endpoint did not."),
+            AnalyzePrecondition::baseline_not_reproduced("the passing endpoint did not."),
+        ] {
+            let class = precondition.class;
+            let pointed = point_endpoint_misses_at_replay(precondition.into());
+            let pointed_precondition = pointed.downcast_ref::<AnalyzePrecondition>().unwrap();
+            assert_eq!(pointed_precondition.class, class);
+            let message = pointed.to_string();
+            assert!(
+                message.contains("--selfcheck") && message.contains("hermit host-capabilities"),
+                "{message}"
+            );
+        }
+        let other = point_endpoint_misses_at_replay(anyhow::anyhow!("other"));
+        assert_eq!(other.to_string(), "other");
+    }
+
+    /// Analyze's own bisection goes on to a prefix search when no swap
+    /// separates its endpoints, and an endpoint that did not reproduce ends it
+    /// pointed at replay: --selfcheck and `hermit host-capabilities`, with the
+    /// class kept (exit 2). Other errors pass through unchanged.
+    #[test]
+    fn analyze_own_bisection_points_endpoint_misses_at_replay() {
+        let separable = own_bisection_end(Err(Error::new(NoSingleSwap {
+            unshared_events: 1,
+            swaps_left: 0,
+            trimmed_failing_passed: false,
+        })));
+        assert!(matches!(separable, Ok(OwnBisectionEnd::SearchPrefixes(_))));
+        for (precondition, class) in [
+            (
+                AnalyzePrecondition::target_not_reproduced(
+                    "the failing schedule endpoint did not reproduce the target failure",
+                ),
+                "target-not-reproduced",
+            ),
+            (
+                AnalyzePrecondition::baseline_not_reproduced(
+                    "the passing schedule endpoint did not reproduce a passing outcome",
+                ),
+                "baseline-not-reproduced",
+            ),
+        ] {
+            let Err(error) = own_bisection_end(Err(precondition.into())) else {
+                panic!("an endpoint miss ended no analysis")
+            };
+            let message = error.to_string();
+            assert!(
+                message.contains("--selfcheck") && message.contains("`hermit host-capabilities`"),
+                "{message}"
+            );
+            assert_eq!(crate::app::failure_exit_code(&error), 2);
+            assert_eq!(
+                crate::app::classify_failure(&error),
+                format!("HERMIT_ANALYZE_PRECONDITION class={class}")
+            );
+        }
+        let Err(other) = own_bisection_end(Err(anyhow::anyhow!("other"))) else {
+            panic!("an error ended no analysis")
+        };
+        assert_eq!(other.to_string(), "other");
+    }
+
+    /// --selfcheck's differences are replay not reproducing, Hermit's or the
+    /// host's: exit 125 with `class=replay-not-reproducible`, never an input
+    /// analyze cannot use. The first difference found is reported.
+    #[test]
+    fn a_selfcheck_difference_is_replay_not_reproducing() {
+        assert!(selfcheck_conclusion(true, true, || Ok(())).is_ok());
+        for (matched, logs, fixed_point, expected) in [
+            (false, true, true, "second run did not"),
+            (true, false, true, "Log differences found"),
+            (true, true, false, "no fixed point"),
+        ] {
+            let error = selfcheck_conclusion(matched, logs, || {
+                if fixed_point {
+                    Ok(())
+                } else {
+                    Err("no fixed point".to_string())
+                }
+            })
+            .unwrap_err();
+            assert!(
+                error.to_string().contains(expected)
+                    && error.to_string().contains("hermit host-capabilities"),
+                "{error}"
+            );
+            assert_eq!(crate::app::failure_exit_code(&error), 125);
+            assert_eq!(
+                crate::app::classify_failure(&error),
+                "HERMIT_INTERNAL_FAILURE class=replay-not-reproducible"
+            );
+        }
+    }
+
+    /// `--success-exit-code` refuses the statuses that already mean something
+    /// for analyze, and values that are not exit statuses, naming why.
+    #[test]
+    fn a_success_exit_code_that_means_something_else_is_refused() {
+        for code in ["2", "120", "122", "125", "127"] {
+            let error = AnalyzeOpts::try_parse_from([
+                "analyze",
+                "--success-exit-code",
+                code,
+                "--",
+                "/bin/true",
+            ])
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains(&format!("{code} is")) && error.contains("could not be told apart"),
+                "{code}: {error}"
+            );
+        }
+        // Linux keeps the low 8 bits: these would exit 2, 122, 2, 122, 0 and
+        // 255, so they are refused as not being exit statuses at all.
+        for (code, exits) in [
+            ("258", 2),
+            ("378", 122),
+            ("-254", 2),
+            ("-134", 122),
+            ("256", 0),
+            ("-1", 255),
+        ] {
+            let flag = format!("--success-exit-code={code}");
+            let error = AnalyzeOpts::try_parse_from(["analyze", flag.as_str(), "--", "/bin/true"])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(&format!(
+                    "{code} is not an exit status: a process exits with the low 8 bits of the \
+                     value it passes, 0 to 255, so a process exiting with {code} exits {exits}"
+                )),
+                "{code}: {error}"
+            );
+        }
+        for code in ["0", "1", "3", "119", "128", "255"] {
+            let options = AnalyzeOpts::try_parse_from([
+                "analyze",
+                "--success-exit-code",
+                code,
+                "--",
+                "/bin/true",
+            ])
+            .unwrap();
+            assert_eq!(options.success_exit_code, Some(code.parse().unwrap()));
+        }
     }
 
     /// Prefix outcomes need not be monotone. A guest whose thread B stores 2
@@ -5529,109 +5951,6 @@ mod tests {
             departure(&requested, &events(&[3, 5]), 5),
             Some(Departure::Ended { events: 2 })
         );
-    }
-
-    /// An unrecorded RIP is a wildcard, not a departure. This classification
-    /// determines which replay supplies the report's stack, not just wording.
-    #[test]
-    fn recorded_rip_wildcards_preserve_the_replays_stack_source() {
-        let tid = DetTid::from_raw;
-        for (start, end, observed_start, observed_end) in [
-            (None, None, Some(0x1000), None),
-            (None, None, None, Some(0x2000)),
-            (None, None, Some(0x1000), Some(0x2000)),
-            (Some(0x1000), None, Some(0x1000), Some(0x2000)),
-            (None, Some(0x2000), Some(0x1000), Some(0x2000)),
-        ] {
-            let mut requested = events(&[3, 5]);
-            requested[0].start_rip = start.and_then(std::num::NonZeroUsize::new);
-            requested[0].end_rip = end.and_then(std::num::NonZeroUsize::new);
-            let mut observed = requested.clone();
-            observed[0].start_rip = observed_start.and_then(std::num::NonZeroUsize::new);
-            observed[0].end_rip = observed_end.and_then(std::num::NonZeroUsize::new);
-            observed[0].count = 99;
-            let left_schedule = departure(&requested, &observed, 2);
-            assert_eq!(
-                left_schedule, None,
-                "extra unrecorded RIP information is not a departure"
-            );
-            let baseline = StackReplay {
-                met_target: false,
-                stacks: [
-                    Some(timing_report_stack(3, 0x31)),
-                    Some(timing_report_stack(5, 0x51)),
-                ],
-                left_schedule,
-                ran: [Some(tid(3)), Some(tid(5))],
-                traced: None,
-            };
-            let target = StackReplay {
-                met_target: true,
-                stacks: [
-                    Some(timing_report_stack(5, 0x52)),
-                    Some(timing_report_stack(3, 0x32)),
-                ],
-                left_schedule: None,
-                ran: [Some(tid(5)), Some(tid(3))],
-                traced: None,
-            };
-            assert_eq!(
-                merge_stacks(&baseline, &target, 1, [tid(3), tid(5)]),
-                [
-                    Some((
-                        timing_report_stack(3, 0x31),
-                        "the baseline replay".to_owned()
-                    )),
-                    Some((
-                        timing_report_stack(5, 0x51),
-                        "the baseline replay".to_owned()
-                    )),
-                ]
-            );
-        }
-        let mut requested = events(&[3, 5]);
-        requested[0].start_rip = std::num::NonZeroUsize::new(0x1000);
-        requested[0].end_rip = std::num::NonZeroUsize::new(0x2000);
-        assert_eq!(departure(&requested, &requested, 2), None);
-        for (start, end) in [
-            (None, Some(0x2000)),
-            (Some(0x1001), Some(0x2000)),
-            (Some(0x1000), None),
-            (Some(0x1000), Some(0x2001)),
-        ] {
-            let mut observed = requested.clone();
-            observed[0].start_rip = start.and_then(std::num::NonZeroUsize::new);
-            observed[0].end_rip = end.and_then(std::num::NonZeroUsize::new);
-            assert_eq!(
-                departure(&requested, &observed, 2),
-                Some(Departure::OtherEvent {
-                    index: 0,
-                    expected: requested[0].clone(),
-                    ran: observed[0].clone(),
-                }),
-                "a specified RIP must still be present and equal"
-            );
-        }
-        for other in [
-            SchedEvent::branches(tid(7), 10),
-            SchedEvent::syscall(
-                tid(3),
-                reverie::syscalls::Sysno::write,
-                detcore_model::schedule::SyscallPhase::Posthook,
-            ),
-        ] {
-            let requested = events(&[3, 5]);
-            let observed = vec![other.clone(), requested[1].clone()];
-            assert_eq!(
-                departure(&requested, &observed, 2),
-                Some(Departure::OtherEvent {
-                    index: 0,
-                    expected: requested[0].clone(),
-                    ran: other,
-                }),
-                "wildcard RIPs do not excuse a changed thread or operation"
-            );
-        }
     }
 
     /// A stack either replay captured is reported, in the passing order, with
@@ -6022,14 +6341,26 @@ mod tests {
                     let report = result
                         .unwrap()
                         .expect("a repeated pair produces a timing report");
-                    assert_eq!(report.critical_event1.event_index, 3);
-                    assert_eq!(report.critical_event2.event_index, 2);
+                    assert_eq!(report.critical_event1.as_ref().unwrap().event_index, 3);
+                    assert_eq!(report.critical_event2.as_ref().unwrap().event_index, 2);
                     assert!(same_frames(
-                        report.critical_event1.stack.as_ref().unwrap(),
+                        report
+                            .critical_event1
+                            .as_ref()
+                            .unwrap()
+                            .stack
+                            .as_ref()
+                            .unwrap(),
                         &timing_report_stack(3, 0x30)
                     ));
                     assert!(same_frames(
-                        report.critical_event2.stack.as_ref().unwrap(),
+                        report
+                            .critical_event2
+                            .as_ref()
+                            .unwrap()
+                            .stack
+                            .as_ref()
+                            .unwrap(),
                         &timing_report_stack(3, 0x40)
                     ));
                 }
@@ -6093,6 +6424,13 @@ mod tests {
             !serde_json::to_string(&report)
                 .unwrap()
                 .contains("deciding_event")
+        );
+        // Nor had it a verdict: it named the critical events, and says so now.
+        assert_eq!(report.verdict, Verdict::CriticalEvents);
+        assert!(
+            serde_json::to_string(&report)
+                .unwrap()
+                .starts_with(r#"{"verdict":"critical_events","#)
         );
     }
 
@@ -6201,6 +6539,15 @@ mod tests {
             None
         );
     }
+
+    /// Prefix outcomes need not be monotone. A guest whose thread B stores 2
+    /// twice and whose thread A stores 1 once, printing the final value, can
+    /// meet a target of "2" with none and all of the schedule replayed, yet
+    /// miss it at a cut between B's stores. The endpoint trials of such a
+    /// schedule try only the empty prefix, so when it meets the target at
+    /// every continuation the error states that observation (there is no miss
+    /// to bisect against) and claims nothing about the prefixes no trial ran.
+    /// Where the endpoints differ, interior flips do not matter: the search
 
     #[test]
     fn a_same_thread_critical_pair_is_flagged_and_a_cross_thread_one_is_not() {
@@ -6467,10 +6814,8 @@ mod tests {
                 dir.path().join("final-passing.json"),
                 dir.path().join("trial.json"),
             );
-            options.write_final_schedules(Vec::new(), &failing, Vec::new(), &passing, &[]);
-            options
-                .write_trial_schedule_from(Vec::new(), &[], &trial)
-                .unwrap();
+            options.write_final_schedules(Vec::new(), &failing, Vec::new(), &passing);
+            options.write_trial_schedule(Vec::new(), &trial).unwrap();
             [failing, passing, trial].map(|path| {
                 detcore::preemptions::read_recorded_expired_wait_runs_charged_once(&path).unwrap()
             })
@@ -6568,10 +6913,8 @@ mod tests {
                 dir.path().join("final-passing.json"),
                 dir.path().join("trial.json"),
             );
-            options.write_final_schedules(Vec::new(), &failing, Vec::new(), &passing, &[]);
-            options
-                .write_trial_schedule_from(Vec::new(), &[], &trial)
-                .unwrap();
+            options.write_final_schedules(Vec::new(), &failing, Vec::new(), &passing);
+            options.write_trial_schedule(Vec::new(), &trial).unwrap();
             [failing, passing, trial].map(|path| {
                 detcore::preemptions::read_recorded_queued_sleeps_registered_at_first_pass(&path)
                     .unwrap()
@@ -6677,10 +7020,8 @@ mod tests {
                 dir.path().join("final-passing.json"),
                 dir.path().join("trial.json"),
             );
-            options.write_final_schedules(Vec::new(), &failing, Vec::new(), &passing, &[]);
-            options
-                .write_trial_schedule_from(Vec::new(), &[], &trial)
-                .unwrap();
+            options.write_final_schedules(Vec::new(), &failing, Vec::new(), &passing);
+            options.write_trial_schedule(Vec::new(), &trial).unwrap();
             [failing, passing, trial]
                 .map(|path| detcore::preemptions::read_recorded_pipe_wake_latency(&path).unwrap())
         };
@@ -6758,9 +7099,7 @@ mod tests {
         let off = record("off", Some(false));
         let written = |options: &AnalyzeOpts| {
             let trial = dir.path().join("copy-trial.json");
-            options
-                .write_trial_schedule_from(Vec::new(), &[], &trial)
-                .unwrap();
+            options.write_trial_schedule(Vec::new(), &trial).unwrap();
             detcore::preemptions::read_recorded_signal_state_copy(&trial).unwrap()
         };
         let default = prepare(&on, &[]).unwrap();
@@ -7046,9 +7385,7 @@ mod replay_departure_tests {
                 &GlobalOpts::try_parse_from(["hermit"]).unwrap(),
                 &mut run,
             );
-            let projected = run
-                .require_complete_output()
-                .map(|()| run.preempts_out().schedevents().clone());
+            let projected = run.sched_out().cloned();
             let promoted = options.clone().save_final_target_sched_events(make_run());
             if marker.is_some() {
                 for error in [

@@ -549,30 +549,13 @@ way: a signal sent from outside (which can also wake a thread asleep in
 turn, which may come later than a stop would have; and a thread killed from
 outside with `SIGKILL` never has its skipped ends processed.
 Slice ends while two threads can run still stop the guest. This applies to the
-ptrace backend's precise timer, and not where the run uses `--target-timeslice`,
-`--chaos-per-thread-slowdown`, `--imprecise-timers`, strict schedule boundaries,
-turn-numbered triggers (`--stop-after-turn`, `--stop-after-iter`,
-`--signal-at`), stack traces at preemptions or events, manual interrupt points,
-a happens-before program or `--gdbserver` (a debugger stopping the thread
-between skipped ends would see Hermit's slice bookkeeping behind its program
-counter).
-
-Recording and replaying keep these savings. A recorded schedule
-(`--record-preemptions-to`) holds each slice end taken without a stop as the
-branches up to it, as for any slice end, but with no instruction pointer (the
-guest was not stopped there) and marked `"stopless": true`. A schedule replay
-(`--replay-schedule-from`) takes such an end without a stop too when the thread
-again runs alone, and stops at every other end, where it checks the instruction
-pointer the recording read. A thread that the replay switches to takes its
-first end with a stop. A preemption replay (`--replay-preemptions-from`) takes
-any recorded end at a retired-branch count without a stop when the thread runs
-alone, except in a record with per-thread chaos rates. A record made before
-this mark existed replays as before. A record that holds the mark is preemption
-record format 5, which an older Hermit, reading formats 1 to 4, refuses as a
-format it does not know before the guest starts. A record that keeps no
-background starts, and so states format 3 (a schedule replay's re-record, a
-prefix or edit of a schedule, an analyze or bisect trial), keeps no marks
-either: its replay stops at those ends, which replays the run as faithfully.
+ptrace backend's precise timer, and not where the run records or replays
+preemptions or schedules, or uses `--target-timeslice`,
+`--chaos-per-thread-slowdown`, `--imprecise-timers`, turn-numbered triggers
+(`--stop-after-turn`, `--stop-after-iter`, `--signal-at`), stack traces at
+preemptions or events, manual interrupt points, a happens-before program or
+`--gdbserver` (a debugger stopping the thread between skipped ends would see
+Hermit's slice bookkeeping behind its program counter).
 
 Which slice length exposes a race depends on the race: some need a preemption
 in a short window (fine slices), others a long uninterrupted run of one thread
@@ -1024,22 +1007,8 @@ signal ends the run in progress and starts no other; analyze then removes the
 workspace and that run's own temporary directories, and dies of the signal, so
 a shell reports 128 plus its number (143 for SIGTERM). Pass `--keep-tmp` to
 keep the workspace, for example to rerun a reproducer; `--verbose` keeps it
-too, since the reproducers it prints name its files, and so does
-`--trial-log` above `warn`. The report file (`--report-file`) and the
-`--tmp-dir` directory itself are never removed.
-
-Every run analyze starts logs at the `warn` level to analyze's stderr, as
-`hermit run` does. `--trial-log=info` or `--trial-log=debug` writes each run's
-log at that level into a file of its own in the workspace (`<run>.log`), and
-`--trial-log=off` drops the runs' warnings but keeps their errors, among them
-the reason Hermit gives when it refuses a trial; `--verbose` prints analyze's
-own detail and leaves the runs' level alone. Without `--trial-log`,
-`--guest-log` (or HERMIT_LOG) gives the level. A debug log can grow to
-gigabytes per run and make the run several times slower, so a trial that a
-bound stops gets through less of the program. `--selfcheck` compares the
-target run's log with its replay's, so the runs whose logs it may compare (the
-target run, the `--search` run that becomes it, the `--minimize` runs and the
-replay) log at `debug` or above into their files, whatever `--trial-log` says.
+too, since the per-run logs it adds are written there. The report file
+(`--report-file`) and the `--tmp-dir` directory itself are never removed.
 
 While analyze runs, a bisection trial's schedules, as large as the endpoints'
 (hundreds of MB for a few million events), are removed as soon as the trial's
@@ -1074,8 +1043,8 @@ The default `auto` uses the initial completed run and completed target/baseline
 endpoints: max(60 seconds, 10 times the slowest measured run), rounded up to
 whole seconds. Analyze prints the bound when it changes. A shorter `--timeout`
 in the run arguments still wins and also bounds the initial run. With
-`--run1-preemptions` the initial run is a replay of the record, measured like
-a seed's, which an explicit `--trial-timeout=SECONDS` bounds too. On a
+`--run1-preemptions`, no initial run is measured, so pass an explicit
+`--trial-timeout` to bound trials before a completed replay is measured. On a
 backend that does not enforce `--timeout`, `auto` gives no bound and an explicit
 number is refused; bound the whole analysis from outside there.
 
@@ -1086,10 +1055,9 @@ completed runs may already have been printed. This also applies when the
 default non-chaos baseline times out; analyze
 does not replace it with a prefix search. Retry with a larger trial bound if the
 guest can finish. `--trial-timeout=off` removes analyze's time and log bounds,
-while leaving a user-supplied `--timeout` in force. The log files bounded
-trials write under `--trial-log` above warn or `--selfcheck` are capped at
-max(64 MiB, 10 times the largest measured endpoint log), within
-`HERMIT_LOG_MAX_BYTES`; setting that variable to `0`
+while leaving a user-supplied `--timeout` in force. Bounded trials' verbose or
+self-check log files are capped at max(64 MiB, 10 times the largest measured
+endpoint log), within `HERMIT_LOG_MAX_BYTES`; setting that variable to `0`
 lifts both file caps. These host resource limits may stop a trial on a slow
 machine; they never change a stopped trial into a completed outcome.
 
@@ -1121,12 +1089,52 @@ hermit analyze --prefix-search --run1-seed=1 --target-stdout='FAILED' \
   --target-exit-code=any --report-file=analysis.json -- --chaos -- PROGRAM
 ```
 
-Analyze runs every trial under the `--expired-wait-charge` rule of the
-recording it starts from, or `each` for a chaos target it records itself. A
-baseline schedule recorded by a plain `hermit run --record-preemptions-to=...`
-stores `once`, so analyze refuses it beside a chaos target. Re-record it with
-`--expired-wait-charge=each`, or, if it is the target, pass
-`--expired-wait-charge=once` in the run arguments.
+Analyze's exit status says what it concluded. A conclusion is never reported
+as a failure of Hermit; only a failure to conclude exits 125, under a class
+line that says which. The class line is the first line on stderr:
+
+| Exit | Line on stderr | Meaning |
+| --- | --- | --- |
+| 0 (or `--success-exit-code`) | none | The report names the critical events (`"verdict": "critical_events"`). |
+| 0 (or `--success-exit-code`) | `HERMIT_ANALYZE_VERDICT class=reproduced-without-schedule` | The target is reproduced without the target schedule: without chaos the scheduler alone meets the target, so the prefix search localizes no event (which does not show that no event decides the outcome); debug that run directly. The report says why (`"verdict": "reproduced_without_schedule"`) and names no event. |
+| 2 | `HERMIT_ANALYZE_PRECONDITION class=target-not-reproduced` | The target run, the failing endpoint of a bisection, or `--minimize`'s last record does not meet the target criteria. |
+| 2 | `HERMIT_ANALYZE_PRECONDITION class=baseline-not-reproduced` | The baseline meets the target too, or the baseline the user chose does not finish. |
+| 2 | `HERMIT_ANALYZE_PRECONDITION class=no-prefix-continuation` | No continuation timeslice allows a prefix search. |
+| 2 | `HERMIT_ANALYZE_PRECONDITION class=endpoints-not-separable` | `hermit bisect` only: its search established no exact one-swap pair of schedules with opposite outcomes between `--good` and `--bad`. Analyze attempts a prefix search within the target schedule instead. |
+| 2 | `HERMIT_ANALYZE_PRECONDITION class=endpoints-identical` | `hermit bisect` only: `--good` and `--bad` contain identical event traces. |
+| 2 | none | clap's usage error: the command line did not parse. |
+| 122 | `HERMIT_POLICY_REFUSAL class=policy-refusal` | Hermit refused the target run, or analyze or bisect refused its options or schedules. |
+| 123 | `HERMIT_LOG_CAP class=log-cap` | `--max-log-bytes` ended the analysis. |
+| 125 | `HERMIT_INTERNAL_FAILURE class=replay-not-reproducible` | `--selfcheck` found a difference, or a jittered schedule never replayed the same way twice: replay, Hermit's or this host's (`hermit host-capabilities` says whether its branch counter is exact), did not reproduce a run. |
+| 125 | `HERMIT_INTERNAL_FAILURE class=search-did-not-converge` | The event-level search did not converge within its passes. |
+| 125 | another `HERMIT_INTERNAL_FAILURE class=...` | Hermit failed. |
+| 128 + N | none | Signal N (SIGTERM, SIGINT or SIGHUP) stopped the analysis. |
+
+Exit 2 means that the inputs do not give analyze what it needs, as `diff` and
+`grep` exit 2 when they cannot do what was asked; the message says what to
+change. `--success-exit-code` refuses 2 and 120 to 127 for that reason. `hermit
+bisect` checks that its `--good` schedule misses the target and its `--bad`
+schedule meets it, and exits 2 with the same lines when one does not.
+
+A report file (`--report-file`) has one schema for every verdict: read its
+`verdict` first. `critical_events` fills `critical_event1` and
+`critical_event2` (and `deciding_event` for a timing decision);
+`reproduced_without_schedule` leaves them out, and the racing accesses
+(`racing_accesses`) too, and `header` says why. Its
+`verdict_reason` says what the scheduler alone shows. When the trials keep
+timing settings from the run arguments (`--pipe-wake-latency`,
+`--scheduler-turn-cost` other than the default charge), analyze runs one more
+trial, the empty prefix without them at the first continuation it tried: if it
+misses the target, the
+reason is `{"cause": "timing_semantics", "options": [...], "alternatives":
+[...], "trial": "..."}`, the settings cause the outcome, a two-seed search
+can end the same way, and a new failing run under the alternatives may have
+an event that decides it. Otherwise (it meets the target too, or it is not
+run because a `--run1-preemptions` recording fixes the settings) the reason
+is `{"cause": "scheduler_alone", "timing_in_force": [...]}`, and without
+such settings `{"cause": "scheduler_alone"}`. A cause a later build adds
+reads as `unknown`. A report from before the field names the critical
+events.
 
 #### Racing accesses
 
@@ -1215,31 +1223,10 @@ that their order decides the failure.
 | `--max-timeslice=N` | Sets the maximum virtual time slice (minimum one scaled RCB) and requires PMU support. |
 | `--max-timeslice=disabled` | Disables PMU timer preemption. |
 | `--preemption-timeout=N` | Deprecated alias for `--max-timeslice=N`. |
-| `--expired-wait-charge=each\|once` | How a run of consecutive turns that each end an expired timed wait is charged while another thread is queued: `once`, one scheduler turn for the run (the default outside race search), or `each`, a turn per wait (the default under `--chaos` or a heuristic that does not select by priority). |
 | `--cap-preemption-charge` | Charges a turn that ends an expired timeslice at most the time its thread ran since its previous turn. |
 | `--chaos-timeslice-range=MIN..MAX` | With `--chaos`, draws each slice's mean log-uniformly from MIN..MAX virtual nanoseconds and caps slices at MAX (the run's `--max-timeslice`). Not with `--chaos-seeded-timeslice`, which draws the maximum instead. |
 | `--chaos-timeslice-draw=run` | Discovery mode: draws the run's `--max-timeslice` once from the range (without one, the recommended 1000..200000000), from the scheduler seed. Fine draws make runs much slower. |
 | `--chaos-timeslice-draw=slice` | The default draw: each slice's mean from `--chaos-timeslice-range`, which it needs; what a range alone does. |
-
-A thread that polls with timed waits shorter than a scheduler turn's charge
-(`--scheduler-turn-cost`) would otherwise burn a full charge of virtual time
-per poll while other threads wait. Under `--expired-wait-charge=once` a run of
-turns that each end an expired wait, by one thread or several, is charged
-once, so time moves as it would while those threads slept. Only a futex wait
-answered `ETIMEDOUT` and a sleep already due count as expired waits; a
-`ppoll`, `epoll_pwait2` or `pselect6` timeout is still charged each time. The
-rule changes the guest-visible clock of such runs, so a recorded schedule
-stores it, a replay that leaves the option out takes the record's, and a
-replay under the other rule is refused. A record that stores no rule replays
-under `each`; that includes schedules written by Hermit builds from the
-middle of the rule's landing (commits `027e47703` to `90bccf201`), which
-charged runs once without storing it. Two changes that came with the rule
-apply to every `--replay-schedule-from` replay, whatever rule it uses: a
-switch the schedule makes to a thread whose timed wait has already passed
-wakes that thread for the switch, and a replay's own switch turns no longer
-count as the previous turn when Hermit decides whether a signal to the
-running thread costs a turn. Both bring a replay closer to its recording, but
-a replay of an older schedule can differ from what an earlier Hermit did.
 
 `--no-sequentialize-threads` is useful for compatibility experiments and
 workloads such as virtual machines that need real host parallelism. It removes
@@ -1264,36 +1251,6 @@ standard library's reader/writer-lock preference policy. PMU preemption bounds a
 time slice; with `--max-timeslice=disabled`, a thread that never reaches an
 intercepted event can starve its peers. No separate fairness flag is needed for
 the default equal-priority policy.
-
-### Exclusive-Loop Rewrite (aarch64)
-
-On aarch64, a load/store-exclusive retry loop (`LDXR`, then `STXR`, then a
-branch back on failure) retries whenever an exception clears the exclusive
-monitor between the two, so the same work can retire a different number of
-branches. `--rewrite-exclusives` rewrites canonical loops in the guest
-executable into single LSE atomic instructions before the run, which cannot
-retry. It is preprocessing for the ptrace backend, not a backend.
-
-| Option | Effect |
-| --- | --- |
-| `--rewrite-exclusives` | Rewrites the loops it can show are code. |
-| `--rewrite-exclusives-also=FILE` | Also rewrites FILE, a shared library the guest loads. Repeatable. |
-
-Only mapping symbols prove where code is: the AArch64 ELF ABI has the
-assembler mark every switch between code (`$x`) and data (`$d`), so the
-rewrite takes only what they mark as code. A file, or an executable section,
-with no mapping symbols, such as every stripped file, is left unchanged and
-named: the run's diagnostics and its summary (`exclusive_rewrite_unmarked`)
-list it, and `hermit rewrite-exclusives --list-refusals FILE` lists each of
-its loops as `no-mapping-symbols`. A section that holds a mapping symbol of
-another kind (AArch32's `$a` or `$t`, or a `$` name Hermit does not know) is
-not proved by them and is left unchanged, its loops listed as
-`unsupported-mapping-symbol` with the symbol's name.
-
-An unwind table (`.eh_frame`) does not prove code either: it covers whole
-functions, including any table a function branches over or keeps after a call
-that does not return, so a stripped file is left unchanged whatever its unwind
-table covers.
 
 ### Virtual Inputs
 
@@ -1941,75 +1898,6 @@ This option intentionally panics and is a diagnostic, not a production mode.
 Compare with `--strace-only` to determine whether interception or Hermit's
 deterministic model causes the failure. Reduce the command to a small reproducer
 before reporting an issue.
-
-### Android Binder
-
-A binder call that waits for another process (a blocking
-`ioctl(BINDER_WRITE_READ)` read) cannot hold the guest's
-turn, so Hermit runs it off the turn, and the call then finishes when the host's
-kernel delivers its work. A waiting `BINDER_FREEZE` is host-timed, so it is
-refused by name instead (the same refusal returns `EOPNOTSUPP` under
-`--allow-unsupported-syscalls`); it never runs off the turn. Hermit does that only while the calling task is the
-run's one task: no other thread or process of the guest is live, exited but not
-yet reaped, or being created, and no debugger is attached (`--gdbserver`,
-`--dap-listen`). Then no other task can change what the call reads and writes,
-use a descriptor it delivers before Hermit records it, or take the work it waits
-for. A single-threaded binder client or service, whose peer runs outside Hermit,
-works this way. A thread that ends by its own `exit` without leading its
-process stops counting when Hermit commits that exit in the thread's turn, after
-which it never runs again, so a program that joined its helper threads and runs
-on alone is alone again (on the ptrace backend; elsewhere, or with
-`--no-sequentialize-threads`, it counts until its process is reaped). Every
-other ended task counts until a wait reaps its process: a process that exited, a
-thread-group leader that exited while its threads ran on, and a thread that an
-exec, an `exit_group` or a signal ended. A child reaped without a wait (its
-parent ignores `SIGCHLD` or set `SA_NOCLDWAIT`), and an orphan reaped by a
-process outside the guest, are never removed. Once such a task exists, the run
-is never alone again, so a fail-closed run refuses its waiting binder calls.
-
-Beside any other task, such a call is refused by name, naming the other tasks,
-and the run ends with the policy-refusal status (122). With
-`--allow-unsupported-syscalls` the same named refusal returns `EOPNOTSUPP` to
-the guest instead of ending the run (`HERMIT_SHARED_BINDER_CALL`); the call is
-not issued either way: a libbinder thread pool, or a client and service that
-both run under Hermit and wait for each other, cannot be served this way. A
-call that sends and waits in one `BINDER_WRITE_READ` (as libbinder's
-`talkWithDriver` does) is refused the same way, recorded as
-`HERMIT_HOST_TIMED_BINDER`. Calls that do not wait, such as every read on a
-descriptor opened `O_NONBLOCK`, run in the caller's turn as usual.
-
-A `--strict` run never holds a binder descriptor, in a fresh run and in a
-replay alike: binder reply payloads are not recorded, so no run can repeat
-what a binder call returns (https://github.com/rrnewton/hermit/issues/5124).
-The run ends by name, with the policy-refusal status (122), where a binder
-descriptor would reach the guest: an open of a binder device, a descriptor
-received through `SCM_RIGHTS` or `pidfd_getfd`, or one the run starts with,
-such as a binder device passed as standard input. Hermit tells a binder
-device by the open file (a character device on binderfs, or the misc device
-binder registers without binderfs), never by its path, and through the
-calling thread's own descriptor table. A descriptor whose identity Hermit
-cannot read is refused the same way. That includes a misc device with a
-dynamically assigned minor on a kernel where no binder driver's `devices`
-parameter can be read (`binder` or `binder_linux`), such as
-`/dev/userfaultfd` on a kernel without binder. Other character devices, such
-as `/dev/null`, `/dev/urandom`, terminals, `/dev/fuse` or `/dev/net/tun`, are
-not binder devices. As a backstop, a binder `ioctl` request on a descriptor
-Hermit cannot tell is not a binder device is refused too, before Hermit waits
-for anything or reads the call's argument. Under the KVM backend, guest
-descriptors are not host descriptors Hermit can inspect
-(https://github.com/rrnewton/hermit/issues/5129). So, as a temporary
-conservative policy, a `--strict` run is refused before it starts on a host
-that offers binder in any form, whether or not the guest would use it. That
-means binderfs listed in `/proc/filesystems`, a misc device in `/proc/misc`
-whose name contains "binder" or that the binder driver's `devices` parameter
-names, or a binder descriptor among those Hermit's guest inherits. It is
-refused, too, when any of that, or that parameter, cannot be read, when
-`/sys/module` is not visible as sysfs, where a missing parameter would not
-show that there is no binder driver, or when `/sys/module` lists the binder
-module without its `devices` parameter. The check trusts these host files as
-the kernel presents them; a host that deliberately mounts a substitute over
-them is outside `--strict`'s threat model. Run a guest that uses binder
-without `--strict`.
 
 ### The Guest Hangs
 
