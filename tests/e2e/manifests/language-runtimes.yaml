@@ -1,1475 +1,1708 @@
 schema: 3
 bucket: language-runtimes
 test:
-  - id: language-runtimes/bash-loop-pipe-time
-    description: Bash file I/O, loops, pipelines, hashing, and time repeat under Hermit
-    lane: portable
-    requires:
-      - linux
-      - x86_64
-      - userns
+- id: language-runtimes/bash-loop-pipe-time
+  description: Bash file I/O, loops, pipelines, hashing, and time repeat under Hermit
+  lane: portable
+  requires:
+  - linux
+  - x86_64
+  - userns
+  - ptrace
+  - bash
+  occasional: false
+  program: tests/e2e/language-runtimes/bash-loop-pipe-time.sh
+  observation:
+    status: true
+    stdout: true
+    stderr: false
+    artifacts: []
+  modes:
+    naked:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        native: This regression establishes Hermit verification, not native nondeterminism
+    verify:
+      ci: true
+      backends_enabled:
       - ptrace
-      - bash
-    occasional: false
-    program: tests/e2e/language-runtimes/bash-loop-pipe-time.sh
-    observation:
-      status: true
-      stdout: true
-      stderr: false
-      artifacts: []
-    modes:
-      naked:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          native: This regression establishes Hermit verification, not native nondeterminism
-      verify:
-        ci: true
-        backends_enabled:
-          - ptrace
-          - dbt
-          - kvm
-        backends_disabled:
-          sabre: SaBRe requires its external runtime
-          liteinst: LiteInst Bash qualification is tracked by backend compatibility
-          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
-      replay:
-        ci: true
-        backends_enabled: [ptrace]
-        backends_disabled:
-          dbt: Record/replay is unsupported by DBT
-          kvm: Record/replay is unsupported by KVM
-          sabre: Record/replay is unsupported by SaBRe
-          liteinst: Record/replay is unsupported by LiteInst
-          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      chaos:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: The Bash workload has no schedule-diversity oracle
-          dbt: Chaos scheduling is unsupported by DBT
-          kvm: Chaos scheduling is unsupported by KVM
-          sabre: Chaos scheduling is unsupported by SaBRe
-          liteinst: Chaos scheduling is unsupported by LiteInst
-          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      custom:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: No edge-case Hermit arguments are required
-          dbt: No edge-case Hermit arguments are required
-          kvm: No edge-case Hermit arguments are required
-          sabre: No edge-case Hermit arguments are required
-          liteinst: No edge-case Hermit arguments are required
-          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
-  - id: language-runtimes/bash-random
-    description: Bash $RANDOM varies natively and repeats under Hermit
-    lane: portable
-    requires:
-      - linux
-      - x86_64
-      - userns
+      - dbt
+      - kvm
+      backends_disabled:
+        sabre: SaBRe requires its external runtime
+        liteinst: LiteInst Bash qualification is tracked by backend compatibility
+        in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst
+          with syscall site patching off) is scored as its own column, apart from
+          liteinst, and its verify cells return only through their own track, as liteinst's
+          do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+    replay:
+      ci: true
+      backends_enabled:
       - ptrace
-      - bash
-    occasional: false
-    program: tests/e2e/language-runtimes/bash-random.sh
-    observation:
-      status: true
-      stdout: true
-      stderr: false
-      artifacts: []
-    modes:
-      naked:
-        ci: false
-        runs: 3
-        assert:
-          min_distinct: 2
-        backends_enabled:
-          - native
-        backends_disabled: {}
-        ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
-      verify:
-        ci: true
-        backends_enabled:
-          - ptrace
-          - dbt
-          - kvm
-        backends_disabled:
-          sabre: SaBRe requires its external runtime
-          liteinst: LiteInst Bash qualification is tracked by backend compatibility
-          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
-      replay:
-        ci: true
-        backends_enabled: [ptrace]
-        backends_disabled:
-          dbt: Record/replay is unsupported by DBT
-          kvm: Record/replay is unsupported by KVM
-          sabre: Record/replay is unsupported by SaBRe
-          liteinst: Record/replay is unsupported by LiteInst
-          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      chaos:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: The Bash workload is single-threaded
-          dbt: Chaos scheduling is unsupported by DBT
-          kvm: Chaos scheduling is unsupported by KVM
-          sabre: Chaos scheduling is unsupported by SaBRe
-          liteinst: Chaos scheduling is unsupported by LiteInst
-          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      custom:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: No edge-case Hermit arguments are required
-          dbt: No edge-case Hermit arguments are required
-          kvm: No edge-case Hermit arguments are required
-          sabre: No edge-case Hermit arguments are required
-          liteinst: No edge-case Hermit arguments are required
-          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
-  - id: language-runtimes/cpp-stl-determinism
-    description: C++17 STL containers over std::random_device entropy, file I/O, and std::chrono repeat under Hermit
-    lane: portable
-    requires:
-      - linux
-      - x86_64
-      - userns
+      backends_disabled:
+        dbt: Record/replay is unsupported by DBT
+        kvm: Record/replay is unsupported by KVM
+        sabre: Record/replay is unsupported by SaBRe
+        liteinst: Record/replay is unsupported by LiteInst
+        in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap
+          runs with syscall site patching off
+    chaos:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        ptrace: The Bash workload has no schedule-diversity oracle
+        dbt: Chaos scheduling is unsupported by DBT
+        kvm: Chaos scheduling is unsupported by KVM
+        sabre: Chaos scheduling is unsupported by SaBRe
+        liteinst: Chaos scheduling is unsupported by LiteInst
+        in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which
+          in-guest-trap runs with syscall site patching off
+    custom:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        ptrace: No edge-case Hermit arguments are required
+        dbt: No edge-case Hermit arguments are required
+        kvm: No edge-case Hermit arguments are required
+        sabre: No edge-case Hermit arguments are required
+        liteinst: No edge-case Hermit arguments are required
+        in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+- id: language-runtimes/bash-random
+  description: Bash $RANDOM varies natively and repeats under Hermit
+  lane: portable
+  requires:
+  - linux
+  - x86_64
+  - userns
+  - ptrace
+  - bash
+  occasional: false
+  program: tests/e2e/language-runtimes/bash-random.sh
+  observation:
+    status: true
+    stdout: true
+    stderr: false
+    artifacts: []
+  modes:
+    naked:
+      ci: false
+      runs: 3
+      assert:
+        min_distinct: 2
+      backends_enabled:
+      - native
+      backends_disabled: {}
+      ci_disabled_reason: This native control is not selected by ordinary validation;
+        add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared
+        outcome oracle.
+    verify:
+      ci: true
+      backends_enabled:
       - ptrace
-      - cxx
-    occasional: false
-    program: tests/e2e/language-runtimes/cpp-stl-determinism.sh
-    observation:
-      status: true
-      stdout: true
-      stderr: false
-      artifacts: []
-    modes:
-      naked:
-        ci: false
-        runs: 3
-        assert:
-          min_distinct: 2
-        backends_enabled:
-          - native
-        backends_disabled: {}
-        ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
-      verify:
-        ci: true
-        backends_enabled:
-          - ptrace
-          - dbt
-          - kvm
-        backends_disabled:
-          sabre: SaBRe requires its external runtime
-          liteinst: LiteInst C++ qualification is tracked by backend compatibility
-          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
-      replay:
-        ci: true
-        backends_enabled: [ptrace]
-        backends_disabled:
-          dbt: Record/replay is unsupported by DBT
-          kvm: Record/replay is unsupported by KVM
-          sabre: Record/replay is unsupported by SaBRe
-          liteinst: Record/replay is unsupported by LiteInst
-          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      chaos:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: The C++ workload is single-threaded
-          dbt: Chaos scheduling is unsupported by DBT
-          kvm: Chaos scheduling is unsupported by KVM
-          sabre: Chaos scheduling is unsupported by SaBRe
-          liteinst: Chaos scheduling is unsupported by LiteInst
-          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      custom:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: No edge-case Hermit arguments are required
-          dbt: No edge-case Hermit arguments are required
-          kvm: No edge-case Hermit arguments are required
-          sabre: No edge-case Hermit arguments are required
-          liteinst: No edge-case Hermit arguments are required
-          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
-  - id: language-runtimes/example-python-random
-    description: The user-facing Python random example repeats deterministically under each applicable backend
-    lane: portable
-    requires:
-      - linux
-      - x86_64
-      - userns
+      - dbt
+      - kvm
+      backends_disabled:
+        sabre: SaBRe requires its external runtime
+        liteinst: LiteInst Bash qualification is tracked by backend compatibility
+        in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst
+          with syscall site patching off) is scored as its own column, apart from
+          liteinst, and its verify cells return only through their own track, as liteinst's
+          do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+    replay:
+      ci: true
+      backends_enabled:
       - ptrace
-      - python3
-    occasional: false
-    direct:
-      - ./examples/rand.py
-    observation:
-      status: true
-      stdout: true
-      stderr: false
-      artifacts: []
-    modes:
-      naked:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          native: The existing python-random test owns the native-variation assertion
-      verify:
-        timeout_seconds:
-          dbt: 95
-        cpu_timeout_seconds:
-          dbt: 33
-        slow_reason:
-          dbt: "DBT (DynamoRIO) costs this Python start far more than the other backends (about 1 second on each of them), and more again in coordinator-launched full validations on the development host (named in docs/TESTING_ENVIRONMENTS.md, Named measurement hosts), where the host's BPF file-open hook takes a slow path. Across its 249 passing coordinator runs from 2026-10-11 to 2026-10-25, nearest-rank p90 was 17.275 CPU and 23.556 wall seconds (max 21.308 CPU, 53.146 wall); ceil(1.5x CPU)=26 and ceil(4x wall)=95. The default 22-second CPU bound stopped the validation of f8adb23a at 22.0 CPU seconds, and the 57-second wall bound stopped two runs at about 57 seconds with 7 CPU seconds used. The CPU bound is 33, ceil(1.5 x 22.0), above the required 26; the wall bound is the required 95."
-        ci:
-          ptrace: true
-          # DBT Python-random: 20/20 strict canonical pairs at c0216c84; unchanged example.
-          dbt: true
-          kvm: true
-          sabre: true
-          liteinst: true
-          in-guest-trap: true
-        backends_enabled:
-          - ptrace
-          - dbt
-          - kvm
-          - sabre
-          - liteinst
-          - in-guest-trap
-        backends_disabled: {}
-        hermit_args:
-          liteinst:
-            - --max-timeslice=disabled
-          in-guest-trap:
-            - --max-timeslice=disabled
-        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
-      replay:
-        ci: true
-        backends_enabled: [ptrace]
-        backends_disabled:
-          dbt: Record/replay is unsupported by DBT
-          kvm: Record/replay is unsupported by KVM
-          sabre: Record/replay is unsupported by SaBRe
-          liteinst: Record/replay is unsupported by LiteInst
-          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      chaos:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: The example is single-threaded
-          dbt: Chaos scheduling is unsupported by DBT
-          kvm: Chaos scheduling is unsupported by KVM
-          sabre: Chaos scheduling is unsupported by SaBRe
-          liteinst: Chaos scheduling is unsupported by LiteInst
-          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      custom:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: No edge-case Hermit arguments are required
-          dbt: No edge-case Hermit arguments are required
-          kvm: No edge-case Hermit arguments are required
-          sabre: No edge-case Hermit arguments are required
-          liteinst: No edge-case Hermit arguments are required
-          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
-  - id: language-runtimes/gawk-random
-    description: GNU awk rand() output varies natively and repeats under Hermit
-    lane: portable
-    requires:
-      - linux
-      - x86_64
-      - userns
+      backends_disabled:
+        dbt: Record/replay is unsupported by DBT
+        kvm: Record/replay is unsupported by KVM
+        sabre: Record/replay is unsupported by SaBRe
+        liteinst: Record/replay is unsupported by LiteInst
+        in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap
+          runs with syscall site patching off
+    chaos:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        ptrace: The Bash workload is single-threaded
+        dbt: Chaos scheduling is unsupported by DBT
+        kvm: Chaos scheduling is unsupported by KVM
+        sabre: Chaos scheduling is unsupported by SaBRe
+        liteinst: Chaos scheduling is unsupported by LiteInst
+        in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which
+          in-guest-trap runs with syscall site patching off
+    custom:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        ptrace: No edge-case Hermit arguments are required
+        dbt: No edge-case Hermit arguments are required
+        kvm: No edge-case Hermit arguments are required
+        sabre: No edge-case Hermit arguments are required
+        liteinst: No edge-case Hermit arguments are required
+        in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+- id: language-runtimes/cpp-stl-determinism
+  description: C++17 STL containers over std::random_device entropy, file I/O, and
+    std::chrono repeat under Hermit
+  lane: portable
+  requires:
+  - linux
+  - x86_64
+  - userns
+  - ptrace
+  - cxx
+  occasional: false
+  program: tests/e2e/language-runtimes/cpp-stl-determinism.sh
+  observation:
+    status: true
+    stdout: true
+    stderr: false
+    artifacts: []
+  modes:
+    naked:
+      ci: false
+      runs: 3
+      assert:
+        min_distinct: 2
+      backends_enabled:
+      - native
+      backends_disabled: {}
+      ci_disabled_reason: This native control is not selected by ordinary validation;
+        add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared
+        outcome oracle.
+    verify:
+      ci: true
+      backends_enabled:
       - ptrace
-      - gawk
-    occasional: false
-    program: tests/e2e/language-runtimes/gawk-random.sh
-    observation:
-      status: true
-      stdout: true
-      stderr: false
-      artifacts: []
-    modes:
-      naked:
-        ci: false
-        runs: 3
-        assert:
-          min_distinct: 2
-        backends_enabled:
-          - native
-        backends_disabled: {}
-        ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
-      verify:
-        ci: true
-        backends_enabled:
-          - ptrace
-          - dbt
-          - kvm
-        backends_disabled:
-          sabre: SaBRe requires its external runtime
-          liteinst: LiteInst awk support is tracked by backend compatibility
-          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
-      replay:
-        ci: true
-        backends_enabled: [ptrace]
-        backends_disabled:
-          dbt: Record/replay is unsupported by DBT
-          kvm: Record/replay is unsupported by KVM
-          sabre: Record/replay is unsupported by SaBRe
-          liteinst: Record/replay is unsupported by LiteInst
-          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      chaos:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: The awk workload is single-threaded
-          dbt: Chaos scheduling is unsupported by DBT
-          kvm: Chaos scheduling is unsupported by KVM
-          sabre: Chaos scheduling is unsupported by SaBRe
-          liteinst: Chaos scheduling is unsupported by LiteInst
-          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      custom:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: No edge-case Hermit arguments are required
-          dbt: No edge-case Hermit arguments are required
-          kvm: No edge-case Hermit arguments are required
-          sabre: No edge-case Hermit arguments are required
-          liteinst: No edge-case Hermit arguments are required
-          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
-  - id: language-runtimes/m4-macro-mkstemp
-    description: m4 mkstemp temp-name varies natively and repeats under Hermit
-    lane: portable
-    requires:
-      - linux
-      - x86_64
-      - userns
+      - dbt
+      - kvm
+      backends_disabled:
+        sabre: SaBRe requires its external runtime
+        liteinst: LiteInst C++ qualification is tracked by backend compatibility
+        in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst
+          with syscall site patching off) is scored as its own column, apart from
+          liteinst, and its verify cells return only through their own track, as liteinst's
+          do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+    replay:
+      ci: true
+      backends_enabled:
       - ptrace
-      - m4
-    occasional: false
-    program: tests/e2e/language-runtimes/m4-macro-mkstemp.sh
-    observation:
-      status: true
-      stdout: true
-      stderr: false
-      artifacts: []
-    modes:
-      naked:
-        ci: false
-        runs: 3
-        assert:
-          min_distinct: 2
-        backends_enabled:
-          - native
-        backends_disabled: {}
-        ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
-      verify:
-        ci:
-          ptrace: true
-          dbt: true
-          kvm: true
-        backends_enabled:
-          - ptrace
-          - dbt
-          - kvm
-        backends_disabled:
-          sabre: SaBRe requires its external runtime
-          liteinst: LiteInst m4 qualification is tracked by backend compatibility
-          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
-      replay:
-        ci: true
-        backends_enabled: [ptrace]
-        backends_disabled:
-          dbt: Record/replay is unsupported by DBT
-          kvm: Record/replay is unsupported by KVM
-          sabre: Record/replay is unsupported by SaBRe
-          liteinst: Record/replay is unsupported by LiteInst
-          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      chaos:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: The m4 workload is single-threaded
-          dbt: Chaos scheduling is unsupported by DBT
-          kvm: Chaos scheduling is unsupported by KVM
-          sabre: Chaos scheduling is unsupported by SaBRe
-          liteinst: Chaos scheduling is unsupported by LiteInst
-          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      custom:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: No edge-case Hermit arguments are required
-          dbt: No edge-case Hermit arguments are required
-          kvm: No edge-case Hermit arguments are required
-          sabre: No edge-case Hermit arguments are required
-          liteinst: No edge-case Hermit arguments are required
-          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
-  - id: language-runtimes/perl-io-subprocess-time
-    description: Perl file I/O, subprocess pipes, hashing, and time repeat under Hermit
-    lane: portable
-    requires:
-      - linux
-      - x86_64
-      - userns
+      backends_disabled:
+        dbt: Record/replay is unsupported by DBT
+        kvm: Record/replay is unsupported by KVM
+        sabre: Record/replay is unsupported by SaBRe
+        liteinst: Record/replay is unsupported by LiteInst
+        in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap
+          runs with syscall site patching off
+    chaos:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        ptrace: The C++ workload is single-threaded
+        dbt: Chaos scheduling is unsupported by DBT
+        kvm: Chaos scheduling is unsupported by KVM
+        sabre: Chaos scheduling is unsupported by SaBRe
+        liteinst: Chaos scheduling is unsupported by LiteInst
+        in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which
+          in-guest-trap runs with syscall site patching off
+    custom:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        ptrace: No edge-case Hermit arguments are required
+        dbt: No edge-case Hermit arguments are required
+        kvm: No edge-case Hermit arguments are required
+        sabre: No edge-case Hermit arguments are required
+        liteinst: No edge-case Hermit arguments are required
+        in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+- id: language-runtimes/example-python-random
+  description: The user-facing Python random example repeats deterministically under
+    each applicable backend
+  lane: portable
+  requires:
+  - linux
+  - x86_64
+  - userns
+  - ptrace
+  - python3
+  occasional: false
+  direct:
+  - ./examples/rand.py
+  observation:
+    status: true
+    stdout: true
+    stderr: false
+    artifacts: []
+  modes:
+    naked:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        native: The existing python-random test owns the native-variation assertion
+    verify:
+      timeout_seconds:
+        dbt: 95
+      cpu_timeout_seconds:
+        dbt: 33
+      slow_reason:
+        dbt: DBT (DynamoRIO) costs this Python start far more than the other backends
+          (about 1 second on each of them), and more again in coordinator-launched
+          full validations on the development host (named in docs/TESTING_ENVIRONMENTS.md,
+          Named measurement hosts), where the host's BPF file-open hook takes a slow
+          path. Across its 249 passing coordinator runs from 2026-10-11 to 2026-10-25,
+          nearest-rank p90 was 17.275 CPU and 23.556 wall seconds (max 21.308 CPU,
+          53.146 wall); ceil(1.5x CPU)=26 and ceil(4x wall)=95. The default 22-second
+          CPU bound stopped the validation of f8adb23a at 22.0 CPU seconds, and the
+          57-second wall bound stopped two runs at about 57 seconds with 7 CPU seconds
+          used. The CPU bound is 33, ceil(1.5 x 22.0), above the required 26; the
+          wall bound is the required 95.
+      ci:
+        ptrace: true
+        dbt: true
+        kvm: true
+        sabre: true
+        liteinst: true
+        in-guest-trap: true
+      backends_enabled:
       - ptrace
-      - perl
-    occasional: false
-    program: tests/e2e/language-runtimes/perl-io-subprocess-time.sh
-    observation:
-      status: true
-      stdout: true
-      stderr: false
-      artifacts: []
-    modes:
-      naked:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          native: This regression establishes Hermit verification, not native nondeterminism
-      verify:
-        ci:
-          ptrace: true
-          dbt: true
-          kvm: true
-        backends_enabled:
-          - ptrace
-          - dbt
-          - kvm
-        backends_disabled:
-          sabre: SaBRe path ineligible - the measured verify pair recorded 132 trusted shared-object sites (33 libc/ld-linux syscall instructions x Perl and tr x two runs; clock_gettime, getrandom, file I/O, memory mapping, and signal operations); forcing the first through the SaBRe marker caused SIGILL, so qualification requires zero trusted or fallback sites
-          liteinst: LiteInst Perl qualification is tracked by backend compatibility
-          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
-      replay:
-        ci: true
-        backends_enabled: [ptrace]
-        backends_disabled:
-          dbt: Record/replay is unsupported by DBT
-          kvm: Record/replay is unsupported by KVM
-          sabre: Record/replay is unsupported by SaBRe
-          liteinst: Record/replay is unsupported by LiteInst
-          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      chaos:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: The Perl workload is single-threaded
-          dbt: Chaos scheduling is unsupported by DBT
-          kvm: Chaos scheduling is unsupported by KVM
-          sabre: Chaos scheduling is unsupported by SaBRe
-          liteinst: Chaos scheduling is unsupported by LiteInst
-          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      custom:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: No edge-case Hermit arguments are required
-          dbt: No edge-case Hermit arguments are required
-          kvm: No edge-case Hermit arguments are required
-          sabre: No edge-case Hermit arguments are required
-          liteinst: No edge-case Hermit arguments are required
-          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
-  - id: language-runtimes/perl-random
-    description: Perl rand output varies natively and repeats under Hermit
-    lane: portable
-    requires:
-      - linux
-      - x86_64
-      - userns
+      - dbt
+      - kvm
+      - sabre
+      - liteinst
+      - in-guest-trap
+      backends_disabled: {}
+      hermit_args:
+        liteinst:
+        - --max-timeslice=disabled
+        in-guest-trap:
+        - --max-timeslice=disabled
+      hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a
+        preemption timer, so these cells run with the maximum timeslice disabled;
+        each passed 10 of 10 verify runs that way in a local survey on 2026-10-08
+        (https://github.com/rrnewton/hermit/issues/3745)
+    replay:
+      ci: true
+      backends_enabled:
       - ptrace
-      - perl
-    occasional: false
-    program: tests/e2e/language-runtimes/perl-random.sh
-    observation:
-      status: true
-      stdout: true
-      stderr: false
-      artifacts: []
-    modes:
-      naked:
-        ci: false
-        runs: 3
-        assert:
-          min_distinct: 2
-        backends_enabled:
-          - native
-        backends_disabled: {}
-        ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
-      verify:
-        ci: true
-        backends_enabled:
-          - ptrace
-          - dbt
-          - kvm
-        backends_disabled:
-          sabre: SaBRe requires its external runtime
-          liteinst: LiteInst Perl support is tracked by backend compatibility
-          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
-      replay:
-        ci: true
-        backends_enabled: [ptrace]
-        backends_disabled:
-          dbt: Record/replay is unsupported by DBT
-          kvm: Record/replay is unsupported by KVM
-          sabre: Record/replay is unsupported by SaBRe
-          liteinst: Record/replay is unsupported by LiteInst
-          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      chaos:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: The Perl PRNG probe is single-threaded
-          dbt: Chaos scheduling is unsupported by DBT
-          kvm: Chaos scheduling is unsupported by KVM
-          sabre: Chaos scheduling is unsupported by SaBRe
-          liteinst: Chaos scheduling is unsupported by LiteInst
-          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      custom:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: No edge-case Hermit arguments are required
-          dbt: No edge-case Hermit arguments are required
-          kvm: No edge-case Hermit arguments are required
-          sabre: No edge-case Hermit arguments are required
-          liteinst: No edge-case Hermit arguments are required
-          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
-  - id: language-runtimes/python-hash-determinism
-    description: Python hash-seed order varies natively and repeats under Hermit
-    lane: portable
-    requires:
-      - linux
-      - x86_64
-      - userns
+      backends_disabled:
+        dbt: Record/replay is unsupported by DBT
+        kvm: Record/replay is unsupported by KVM
+        sabre: Record/replay is unsupported by SaBRe
+        liteinst: Record/replay is unsupported by LiteInst
+        in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap
+          runs with syscall site patching off
+    chaos:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        ptrace: The example is single-threaded
+        dbt: Chaos scheduling is unsupported by DBT
+        kvm: Chaos scheduling is unsupported by KVM
+        sabre: Chaos scheduling is unsupported by SaBRe
+        liteinst: Chaos scheduling is unsupported by LiteInst
+        in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which
+          in-guest-trap runs with syscall site patching off
+    custom:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        ptrace: No edge-case Hermit arguments are required
+        dbt: No edge-case Hermit arguments are required
+        kvm: No edge-case Hermit arguments are required
+        sabre: No edge-case Hermit arguments are required
+        liteinst: No edge-case Hermit arguments are required
+        in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+- id: language-runtimes/gawk-random
+  description: GNU awk rand() output varies natively and repeats under Hermit
+  lane: portable
+  requires:
+  - linux
+  - x86_64
+  - userns
+  - ptrace
+  - gawk
+  occasional: false
+  program: tests/e2e/language-runtimes/gawk-random.sh
+  observation:
+    status: true
+    stdout: true
+    stderr: false
+    artifacts: []
+  modes:
+    naked:
+      ci: false
+      runs: 3
+      assert:
+        min_distinct: 2
+      backends_enabled:
+      - native
+      backends_disabled: {}
+      ci_disabled_reason: This native control is not selected by ordinary validation;
+        add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared
+        outcome oracle.
+    verify:
+      ci: true
+      backends_enabled:
       - ptrace
-      - python3
-    occasional: false
-    program: tests/e2e/language-runtimes/python-hash-determinism.sh
-    observation:
-      status: true
-      stdout: true
-      stderr: false
-      artifacts: []
-    modes:
-      naked:
-        ci: false
-        runs: 3
-        assert:
-          min_distinct: 2
-        backends_enabled:
-          - native
-        backends_disabled: {}
-        ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
-      verify:
-        ci: true
-        backends_enabled:
-          - ptrace
-          - dbt
-          - kvm
-        backends_disabled:
-          sabre: SaBRe and ptrace each reach L2, but consume different deterministic entropy positions at Python exec and produce different hash seeds and stdout
-          liteinst: LiteInst Python support is tracked by backend compatibility
-          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
-      replay:
-        ci: true
-        backends_enabled: [ptrace]
-        backends_disabled:
-          dbt: Record/replay is unsupported by DBT
-          kvm: Record/replay is unsupported by KVM
-          sabre: Record/replay is unsupported by SaBRe
-          liteinst: Record/replay is unsupported by LiteInst
-          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      chaos:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: The Python example is single-threaded
-          dbt: Chaos scheduling is unsupported by DBT
-          kvm: Chaos scheduling is unsupported by KVM
-          sabre: Chaos scheduling is unsupported by SaBRe
-          liteinst: Chaos scheduling is unsupported by LiteInst
-          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      custom:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: No edge-case Hermit arguments are required
-          dbt: No edge-case Hermit arguments are required
-          kvm: No edge-case Hermit arguments are required
-          sabre: No edge-case Hermit arguments are required
-          liteinst: No edge-case Hermit arguments are required
-          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
-  - id: language-runtimes/python-io-subprocess-time
-    description: Python file I/O, subprocess capture, hashing, and time repeat under Hermit
-    lane: portable
-    requires:
-      - linux
-      - x86_64
-      - userns
+      - dbt
+      - kvm
+      backends_disabled:
+        sabre: SaBRe requires its external runtime
+        liteinst: LiteInst awk support is tracked by backend compatibility
+        in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst
+          with syscall site patching off) is scored as its own column, apart from
+          liteinst, and its verify cells return only through their own track, as liteinst's
+          do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+    replay:
+      ci: true
+      backends_enabled:
       - ptrace
-      - python3
-    occasional: false
-    program: tests/e2e/language-runtimes/python-io-subprocess-time.sh
-    observation:
-      status: true
-      stdout: true
-      stderr: false
-      artifacts: []
-    modes:
-      naked:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          native: This regression establishes Hermit verification, not native nondeterminism
-      verify:
-        ci:
-          ptrace: true
-          kvm: true
-        backends_enabled:
-          - ptrace
-          - kvm
-        backends_disabled:
-          dbt: Deselected from the blocking validate on 2026-10-31 (owner deselect-and-fix-forward rule); solo runs complete at 18-19 CPU seconds, but inside full validates the cell burns 2-2.6x that CPU time even at load average 46-72 on 316 CPUs and was stopped at 22, 33/34 and 50 CPU-second bounds across the validations of 2026-10-31 (root cause https://github.com/rrnewton/hermit/issues/4996). The cell stays in the nightly sweep, where it is CLEAN; this is a recorded loss, not a pass.
-          sabre: SaBRe requires its external runtime
-          liteinst: LiteInst Python qualification is tracked by backend compatibility
-          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
-      replay:
-        ci: true
-        backends_enabled: [ptrace]
-        backends_disabled:
-          dbt: Record/replay is unsupported by DBT
-          kvm: Record/replay is unsupported by KVM
-          sabre: Record/replay is unsupported by SaBRe
-          liteinst: Record/replay is unsupported by LiteInst
-          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      chaos:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: The Python workload is single-threaded
-          dbt: Chaos scheduling is unsupported by DBT
-          kvm: Chaos scheduling is unsupported by KVM
-          sabre: Chaos scheduling is unsupported by SaBRe
-          liteinst: Chaos scheduling is unsupported by LiteInst
-          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      custom:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: No edge-case Hermit arguments are required
-          dbt: No edge-case Hermit arguments are required
-          kvm: No edge-case Hermit arguments are required
-          sabre: No edge-case Hermit arguments are required
-          liteinst: No edge-case Hermit arguments are required
-          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
-  - id: language-runtimes/python-random
-    description: Python random output varies natively and repeats under Hermit
-    lane: portable
-    requires:
-      - linux
-      - x86_64
-      - userns
+      backends_disabled:
+        dbt: Record/replay is unsupported by DBT
+        kvm: Record/replay is unsupported by KVM
+        sabre: Record/replay is unsupported by SaBRe
+        liteinst: Record/replay is unsupported by LiteInst
+        in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap
+          runs with syscall site patching off
+    chaos:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        ptrace: The awk workload is single-threaded
+        dbt: Chaos scheduling is unsupported by DBT
+        kvm: Chaos scheduling is unsupported by KVM
+        sabre: Chaos scheduling is unsupported by SaBRe
+        liteinst: Chaos scheduling is unsupported by LiteInst
+        in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which
+          in-guest-trap runs with syscall site patching off
+    custom:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        ptrace: No edge-case Hermit arguments are required
+        dbt: No edge-case Hermit arguments are required
+        kvm: No edge-case Hermit arguments are required
+        sabre: No edge-case Hermit arguments are required
+        liteinst: No edge-case Hermit arguments are required
+        in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+- id: language-runtimes/m4-macro-mkstemp
+  description: m4 mkstemp temp-name varies natively and repeats under Hermit
+  lane: portable
+  requires:
+  - linux
+  - x86_64
+  - userns
+  - ptrace
+  - m4
+  occasional: false
+  program: tests/e2e/language-runtimes/m4-macro-mkstemp.sh
+  observation:
+    status: true
+    stdout: true
+    stderr: false
+    artifacts: []
+  modes:
+    naked:
+      ci: false
+      runs: 3
+      assert:
+        min_distinct: 2
+      backends_enabled:
+      - native
+      backends_disabled: {}
+      ci_disabled_reason: This native control is not selected by ordinary validation;
+        add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared
+        outcome oracle.
+    verify:
+      ci:
+        ptrace: true
+        dbt: true
+        kvm: true
+      backends_enabled:
       - ptrace
-      - python3
-    occasional: false
-    program: tests/e2e/language-runtimes/python-random.sh
-    observation:
-      status: true
-      stdout: true
-      stderr: false
-      artifacts: []
-    modes:
-      naked:
-        ci: false
-        runs: 3
-        assert:
-          min_distinct: 2
-        backends_enabled:
-          - native
-        backends_disabled: {}
-        ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
-      verify:
-        ci: true
-        backends_enabled:
-          - ptrace
-          - dbt
-          - kvm
-        assert:
-          bitwise_parity: true
-        backends_disabled:
-          sabre: SaBRe requires its external runtime
-          liteinst: LiteInst Python support is tracked by backend compatibility
-          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
-      replay:
-        ci: true
-        backends_enabled: [ptrace]
-        backends_disabled:
-          dbt: Record/replay is unsupported by DBT
-          kvm: Record/replay is unsupported by KVM
-          sabre: Record/replay is unsupported by SaBRe
-          liteinst: Record/replay is unsupported by LiteInst
-          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      chaos:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: The Python example is single-threaded
-          dbt: Chaos scheduling is unsupported by DBT
-          kvm: Chaos scheduling is unsupported by KVM
-          sabre: Chaos scheduling is unsupported by SaBRe
-          liteinst: Chaos scheduling is unsupported by LiteInst
-          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      custom:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: No edge-case Hermit arguments are required
-          dbt: No edge-case Hermit arguments are required
-          kvm: No edge-case Hermit arguments are required
-          sabre: No edge-case Hermit arguments are required
-          liteinst: No edge-case Hermit arguments are required
-          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
-  - id: language-runtimes/rust-hashmap-iteration
-    description: Rust HashMap/HashSet iteration order varies natively and repeats under Hermit
-    lane: portable
-    requires:
-      - linux
-      - x86_64
-      - userns
+      - dbt
+      - kvm
+      backends_disabled:
+        sabre: SaBRe requires its external runtime
+        liteinst: LiteInst m4 qualification is tracked by backend compatibility
+        in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst
+          with syscall site patching off) is scored as its own column, apart from
+          liteinst, and its verify cells return only through their own track, as liteinst's
+          do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+    replay:
+      ci: true
+      backends_enabled:
       - ptrace
-      - rustc
-    occasional: false
-    program: tests/e2e/language-runtimes/rust-hashmap-iteration.rs
-    observation:
-      status: true
-      stdout: true
-      stderr: false
-      artifacts: []
-    modes:
-      naked:
-        ci: false
-        runs: 3
-        assert:
-          min_distinct: 2
-        backends_enabled:
-          - native
-        backends_disabled: {}
-        ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
-      verify:
-        ci: true
-        backends_enabled:
-          - ptrace
-          - sabre
-          - kvm
-          - dbt
-          - liteinst
-          - in-guest-trap
-        backends_disabled: {}
-        hermit_args:
-          liteinst:
-            - --max-timeslice=disabled
-          in-guest-trap:
-            - --max-timeslice=disabled
-        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
-      replay:
-        ci: true
-        backends_enabled: [ptrace]
-        backends_disabled:
-          dbt: Record/replay is unsupported by DBT
-          kvm: Record/replay is unsupported by KVM
-          sabre: Record/replay is unsupported by SaBRe
-          liteinst: Record/replay is unsupported by LiteInst
-          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      chaos:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: The Rust workload is single-threaded
-          dbt: Chaos scheduling is unsupported by DBT
-          kvm: Chaos scheduling is unsupported by KVM
-          sabre: Chaos scheduling is unsupported by SaBRe
-          liteinst: Chaos scheduling is unsupported by LiteInst
-          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      custom:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: No edge-case Hermit arguments are required
-          dbt: No edge-case Hermit arguments are required
-          kvm: No edge-case Hermit arguments are required
-          sabre: No edge-case Hermit arguments are required
-          liteinst: No edge-case Hermit arguments are required
-          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
-  - id: language-runtimes/rustc-hello
-    description: Compile a small Rust program with rustc and run it; rustc starts its linker through the standard library's fork path, whose exec-error channel is a SOCK_SEQPACKET socketpair, and links with its bundled rust-lld, which maps its output MAP_SHARED | MAP_NORESERVE while its worker threads run
-    lane: portable
-    requires:
-      - linux
-      - x86_64
-      - userns
+      backends_disabled:
+        dbt: Record/replay is unsupported by DBT
+        kvm: Record/replay is unsupported by KVM
+        sabre: Record/replay is unsupported by SaBRe
+        liteinst: Record/replay is unsupported by LiteInst
+        in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap
+          runs with syscall site patching off
+    chaos:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        ptrace: The m4 workload is single-threaded
+        dbt: Chaos scheduling is unsupported by DBT
+        kvm: Chaos scheduling is unsupported by KVM
+        sabre: Chaos scheduling is unsupported by SaBRe
+        liteinst: Chaos scheduling is unsupported by LiteInst
+        in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which
+          in-guest-trap runs with syscall site patching off
+    custom:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        ptrace: No edge-case Hermit arguments are required
+        dbt: No edge-case Hermit arguments are required
+        kvm: No edge-case Hermit arguments are required
+        sabre: No edge-case Hermit arguments are required
+        liteinst: No edge-case Hermit arguments are required
+        in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+- id: language-runtimes/perl-io-subprocess-time
+  description: Perl file I/O, subprocess pipes, hashing, and time repeat under Hermit
+  lane: portable
+  requires:
+  - linux
+  - x86_64
+  - userns
+  - ptrace
+  - perl
+  occasional: false
+  program: tests/e2e/language-runtimes/perl-io-subprocess-time.sh
+  observation:
+    status: true
+    stdout: true
+    stderr: false
+    artifacts: []
+  modes:
+    naked:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        native: This regression establishes Hermit verification, not native nondeterminism
+    verify:
+      ci:
+        ptrace: true
+        dbt: true
+        kvm: true
+      backends_enabled:
       - ptrace
-      - rustc
-      - cc
-    occasional: false
-    program: tests/e2e/language-runtimes/rustc-hello.sh
-    observation:
-      status: true
-      stdout: true
-      stderr: false
-      artifacts: []
-    modes:
-      naked:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: this cell asserts strict verification and a fixed output; it asserts nothing about native nondeterminism, so there is no naked oracle to run.'
-        backends_enabled: []
-        backends_disabled:
-          native: The fixed source and compiler flags make the compile-and-run transaction deterministic by construction
-      verify:
-        ci: true
-        backends_enabled:
-          - ptrace
-          - kvm
-        backends_disabled:
-          dbt: Not measured; the SOCK_SEQPACKET socketpair slice qualified ptrace and KVM
-          sabre: SaBRe multi-exec toolchain qualification must ratchet after the ptrace reference path
-          liteinst: LiteInst multi-exec toolchain qualification must ratchet after the ptrace reference path
-          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
-        expected_stdout:
-          ptrace: "hello from rustc\n"
-          kvm: "hello from rustc\n"
-      replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: record/replay qualification is a separate exercise from this strict-verification cell and has not been run for it.'
-        backends_enabled: []
-        backends_disabled:
-          ptrace: Record/replay qualification is separate from this strict-verification cell
-          dbt: Record/replay is unsupported by DBT
-          kvm: Record/replay is unsupported by KVM
-          sabre: Record/replay is unsupported by SaBRe
-          liteinst: Record/replay is unsupported by LiteInst
-          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      chaos:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: the compile-and-run transaction has no schedule-diversity oracle to run.'
-        backends_enabled: []
-        backends_disabled:
-          ptrace: The compile-and-run transaction has no schedule-diversity oracle
-          dbt: Chaos scheduling is unsupported by DBT
-          kvm: Chaos scheduling is unsupported by KVM
-          sabre: Chaos scheduling is unsupported by SaBRe
-          liteinst: Chaos scheduling is unsupported by LiteInst
-          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      custom:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case Hermit arguments have been calibrated for this cell.'
-        backends_enabled: []
-        backends_disabled:
-          ptrace: No edge-case Hermit arguments are required
-          dbt: No edge-case Hermit arguments are required
-          kvm: No edge-case Hermit arguments are required
-          sabre: No edge-case Hermit arguments are required
-          liteinst: No edge-case Hermit arguments are required
-          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
-  - id: language-runtimes/ruby-random
-    description: Ruby random output varies natively and repeats under Hermit
-    lane: portable
-    requires:
-      - linux
-      - x86_64
-      - userns
+      - dbt
+      - kvm
+      backends_disabled:
+        sabre: SaBRe path ineligible - the measured verify pair recorded 132 trusted
+          shared-object sites (33 libc/ld-linux syscall instructions x Perl and tr
+          x two runs; clock_gettime, getrandom, file I/O, memory mapping, and signal
+          operations); forcing the first through the SaBRe marker caused SIGILL, so
+          qualification requires zero trusted or fallback sites
+        liteinst: LiteInst Perl qualification is tracked by backend compatibility
+        in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst
+          with syscall site patching off) is scored as its own column, apart from
+          liteinst, and its verify cells return only through their own track, as liteinst's
+          do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+    replay:
+      ci: true
+      backends_enabled:
       - ptrace
-      - ruby
-    occasional: false
-    program: tests/e2e/language-runtimes/ruby-random.sh
-    observation:
-      status: true
-      stdout: true
-      stderr: false
-      artifacts: []
-    modes:
-      naked:
-        ci: false
-        runs: 3
-        assert:
-          min_distinct: 2
-        backends_enabled:
-          - native
-        backends_disabled: {}
-        ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
-      verify:
-        ci:
-          ptrace: true
-          dbt: true
-          kvm: true
-        backends_enabled:
-          - ptrace
-          - dbt
-          - kvm
-        backends_disabled:
-          sabre: SaBRe requires its external runtime
-          liteinst: LiteInst Ruby support is tracked by backend compatibility
-          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
-      replay:
-        ci: true
-        backends_enabled: [ptrace]
-        backends_disabled:
-          dbt: Record/replay is unsupported by DBT
-          kvm: Record/replay is unsupported by KVM
-          sabre: Record/replay is unsupported by SaBRe
-          liteinst: Record/replay is unsupported by LiteInst
-          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      chaos:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: The Ruby example is single-threaded
-          dbt: Chaos scheduling is unsupported by DBT
-          kvm: Chaos scheduling is unsupported by KVM
-          sabre: Chaos scheduling is unsupported by SaBRe
-          liteinst: Chaos scheduling is unsupported by LiteInst
-          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      custom:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: No edge-case Hermit arguments are required
-          dbt: No edge-case Hermit arguments are required
-          kvm: No edge-case Hermit arguments are required
-          sabre: No edge-case Hermit arguments are required
-          liteinst: No edge-case Hermit arguments are required
-          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
-  - id: language-runtimes/perl-hash-order
-    description: Perl hash key iteration order varies natively and repeats under Hermit
-    lane: portable
-    requires:
-      - linux
-      - x86_64
-      - userns
+      backends_disabled:
+        dbt: Record/replay is unsupported by DBT
+        kvm: Record/replay is unsupported by KVM
+        sabre: Record/replay is unsupported by SaBRe
+        liteinst: Record/replay is unsupported by LiteInst
+        in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap
+          runs with syscall site patching off
+    chaos:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        ptrace: The Perl workload is single-threaded
+        dbt: Chaos scheduling is unsupported by DBT
+        kvm: Chaos scheduling is unsupported by KVM
+        sabre: Chaos scheduling is unsupported by SaBRe
+        liteinst: Chaos scheduling is unsupported by LiteInst
+        in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which
+          in-guest-trap runs with syscall site patching off
+    custom:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        ptrace: No edge-case Hermit arguments are required
+        dbt: No edge-case Hermit arguments are required
+        kvm: No edge-case Hermit arguments are required
+        sabre: No edge-case Hermit arguments are required
+        liteinst: No edge-case Hermit arguments are required
+        in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+- id: language-runtimes/perl-random
+  description: Perl rand output varies natively and repeats under Hermit
+  lane: portable
+  requires:
+  - linux
+  - x86_64
+  - userns
+  - ptrace
+  - perl
+  occasional: false
+  program: tests/e2e/language-runtimes/perl-random.sh
+  observation:
+    status: true
+    stdout: true
+    stderr: false
+    artifacts: []
+  modes:
+    naked:
+      ci: false
+      runs: 3
+      assert:
+        min_distinct: 2
+      backends_enabled:
+      - native
+      backends_disabled: {}
+      ci_disabled_reason: This native control is not selected by ordinary validation;
+        add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared
+        outcome oracle.
+    verify:
+      ci: true
+      backends_enabled:
       - ptrace
-      - perl
-    occasional: false
-    program: tests/e2e/language-runtimes/perl-hash-order.sh
-    observation:
-      status: true
-      stdout: true
-      stderr: false
-      artifacts: []
-    modes:
-      naked:
-        ci: false
-        runs: 3
-        assert:
-          min_distinct: 2
-        backends_enabled:
-          - native
-        backends_disabled: {}
-        ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
-      verify:
-        ci: true
-        backends_enabled:
-          - ptrace
-          - dbt
-          - kvm
-        backends_disabled:
-          sabre: SaBRe requires its external runtime
-          liteinst: LiteInst perl support is tracked by backend compatibility
-          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
-      replay:
-        ci: true
-        backends_enabled: [ptrace]
-        backends_disabled:
-          dbt: Record/replay is unsupported by DBT
-          kvm: Record/replay is unsupported by KVM
-          sabre: Record/replay is unsupported by SaBRe
-          liteinst: Record/replay is unsupported by LiteInst
-          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      chaos:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: The perl workload is single-threaded
-          dbt: Chaos scheduling is unsupported by DBT
-          kvm: Chaos scheduling is unsupported by KVM
-          sabre: Chaos scheduling is unsupported by SaBRe
-          liteinst: Chaos scheduling is unsupported by LiteInst
-          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      custom:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: No edge-case Hermit arguments are required
-          dbt: No edge-case Hermit arguments are required
-          kvm: No edge-case Hermit arguments are required
-          sabre: No edge-case Hermit arguments are required
-          liteinst: No edge-case Hermit arguments are required
-          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
-  - id: language-runtimes/lua-random
-    description: Lua 5.4 math.random varies natively and repeats under Hermit
-    lane: portable
-    requires:
-      - linux
-      - x86_64
-      - userns
+      - dbt
+      - kvm
+      backends_disabled:
+        sabre: SaBRe requires its external runtime
+        liteinst: LiteInst Perl support is tracked by backend compatibility
+        in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst
+          with syscall site patching off) is scored as its own column, apart from
+          liteinst, and its verify cells return only through their own track, as liteinst's
+          do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+    replay:
+      ci: true
+      backends_enabled:
       - ptrace
-      - lua5.4
-    occasional: false
-    program: tests/e2e/language-runtimes/lua-random.sh
-    observation:
-      status: true
-      stdout: true
-      stderr: false
-      artifacts: []
-    modes:
-      naked:
-        ci: false
-        runs: 3
-        assert:
-          min_distinct: 2
-        backends_enabled:
-          - native
-        backends_disabled: {}
-        ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
-      verify:
-        ci: true
-        backends_enabled:
-          - ptrace
-          - dbt
-          - kvm
-        backends_disabled:
-          sabre: SaBRe requires its external runtime
-          liteinst: LiteInst Lua qualification is tracked by backend compatibility
-          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
-      replay:
-        ci: true
-        backends_enabled: [ptrace]
-        backends_disabled:
-          dbt: Record/replay is unsupported by DBT
-          kvm: Record/replay is unsupported by KVM
-          sabre: Record/replay is unsupported by SaBRe
-          liteinst: Record/replay is unsupported by LiteInst
-          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      chaos:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: The Lua workload is single-threaded
-          dbt: Chaos scheduling is unsupported by DBT
-          kvm: Chaos scheduling is unsupported by KVM
-          sabre: Chaos scheduling is unsupported by SaBRe
-          liteinst: Chaos scheduling is unsupported by LiteInst
-          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      custom:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: No edge-case Hermit arguments are required
-          dbt: No edge-case Hermit arguments are required
-          kvm: No edge-case Hermit arguments are required
-          sabre: No edge-case Hermit arguments are required
-          liteinst: No edge-case Hermit arguments are required
-          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
-  - id: language-runtimes/python-hashseed
-    description: Python string hash and set iteration order vary natively and repeat under Hermit
-    lane: portable
-    requires:
-      - linux
-      - x86_64
-      - userns
+      backends_disabled:
+        dbt: Record/replay is unsupported by DBT
+        kvm: Record/replay is unsupported by KVM
+        sabre: Record/replay is unsupported by SaBRe
+        liteinst: Record/replay is unsupported by LiteInst
+        in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap
+          runs with syscall site patching off
+    chaos:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        ptrace: The Perl PRNG probe is single-threaded
+        dbt: Chaos scheduling is unsupported by DBT
+        kvm: Chaos scheduling is unsupported by KVM
+        sabre: Chaos scheduling is unsupported by SaBRe
+        liteinst: Chaos scheduling is unsupported by LiteInst
+        in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which
+          in-guest-trap runs with syscall site patching off
+    custom:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        ptrace: No edge-case Hermit arguments are required
+        dbt: No edge-case Hermit arguments are required
+        kvm: No edge-case Hermit arguments are required
+        sabre: No edge-case Hermit arguments are required
+        liteinst: No edge-case Hermit arguments are required
+        in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+- id: language-runtimes/python-hash-determinism
+  description: Python hash-seed order varies natively and repeats under Hermit
+  lane: portable
+  requires:
+  - linux
+  - x86_64
+  - userns
+  - ptrace
+  - python3
+  occasional: false
+  program: tests/e2e/language-runtimes/python-hash-determinism.sh
+  observation:
+    status: true
+    stdout: true
+    stderr: false
+    artifacts: []
+  modes:
+    naked:
+      ci: false
+      runs: 3
+      assert:
+        min_distinct: 2
+      backends_enabled:
+      - native
+      backends_disabled: {}
+      ci_disabled_reason: This native control is not selected by ordinary validation;
+        add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared
+        outcome oracle.
+    verify:
+      ci: true
+      backends_enabled:
       - ptrace
-      - python3
-    occasional: false
-    program: tests/e2e/language-runtimes/python-hashseed.sh
-    observation:
-      status: true
-      stdout: true
-      stderr: false
-      artifacts: []
-    modes:
-      naked:
-        ci: false
-        runs: 3
-        assert:
-          min_distinct: 2
-        backends_enabled:
-          - native
-        backends_disabled: {}
-        ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
-      verify:
-        ci:
-          ptrace: true
-          dbt: true
-          kvm: true
-        backends_enabled:
-          - ptrace
-          - dbt
-          - kvm
-        backends_disabled:
-          sabre: SaBRe requires its external runtime
-          liteinst: LiteInst Python support is tracked by backend compatibility
-          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
-      replay:
-        ci: true
-        backends_enabled: [ptrace]
-        backends_disabled:
-          dbt: Record/replay is unsupported by DBT
-          kvm: Record/replay is unsupported by KVM
-          sabre: Record/replay is unsupported by SaBRe
-          liteinst: Record/replay is unsupported by LiteInst
-          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      chaos:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: The probe's output (string hash and set order) does not depend on scheduling, so a chaos sweep has no race to expose. It runs /usr/bin/python3 by path as one guest process, not a PATH launcher that clones a child (https://github.com/rrnewton/hermit/issues/4598)
-          dbt: Chaos scheduling is unsupported by DBT
-          kvm: Chaos scheduling is unsupported by KVM
-          sabre: Chaos scheduling is unsupported by SaBRe
-          liteinst: Chaos scheduling is unsupported by LiteInst
-          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      custom:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: No edge-case Hermit arguments are required
-          dbt: No edge-case Hermit arguments are required
-          kvm: No edge-case Hermit arguments are required
-          sabre: No edge-case Hermit arguments are required
-          liteinst: No edge-case Hermit arguments are required
-          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
-  - id: language-runtimes/python-dict-hash-iteration
-    description: Python string-hash randomization (set/dict iteration order, hash(str)) plus file I/O and subprocess repeat under Hermit
-    lane: portable
-    requires:
-      - linux
-      - x86_64
-      - userns
+      - dbt
+      - kvm
+      backends_disabled:
+        sabre: SaBRe and ptrace each reach L2, but consume different deterministic
+          entropy positions at Python exec and produce different hash seeds and stdout
+        liteinst: LiteInst Python support is tracked by backend compatibility
+        in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst
+          with syscall site patching off) is scored as its own column, apart from
+          liteinst, and its verify cells return only through their own track, as liteinst's
+          do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+    replay:
+      ci: true
+      backends_enabled:
       - ptrace
-      - python3
-    occasional: false
-    program: tests/e2e/language-runtimes/python-dict-hash-iteration.sh
-    observation:
-      status: true
-      stdout: true
-      stderr: false
-      artifacts: []
-    modes:
-      naked:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          native: Native hash-seed variation is host/PYTHONHASHSEED sensitive; this regression establishes Hermit verification, not native nondeterminism
-      verify:
-        ci:
-          ptrace: true
-          kvm: true
-        backends_enabled:
-          - ptrace
-          - kvm
-        backends_disabled:
-          dbt: Deselected from the blocking validate on 2026-10-31 (owner deselect-and-fix-forward rule); solo runs complete at 18-19 CPU seconds, but inside full validates the cell burns 2-2.6x that CPU time even at load average 46-72 on 316 CPUs and was stopped at 22, 33/34 and 50 CPU-second bounds across the validations of 2026-10-31 (root cause https://github.com/rrnewton/hermit/issues/4996). The cell stays in the nightly sweep, where it is CLEAN; this is a recorded loss, not a pass.
-          sabre: SaBRe requires its external runtime
-          liteinst: LiteInst Python qualification is tracked by backend compatibility
-          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
-      replay:
-        ci: true
-        backends_enabled: [ptrace]
-        backends_disabled:
-          dbt: Record/replay is unsupported by DBT
-          kvm: Record/replay is unsupported by KVM
-          sabre: Record/replay is unsupported by SaBRe
-          liteinst: Record/replay is unsupported by LiteInst
-          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      chaos:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: The Python workload is single-threaded
-          dbt: Chaos scheduling is unsupported by DBT
-          kvm: Chaos scheduling is unsupported by KVM
-          sabre: Chaos scheduling is unsupported by SaBRe
-          liteinst: Chaos scheduling is unsupported by LiteInst
-          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      custom:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: No edge-case Hermit arguments are required
-          dbt: No edge-case Hermit arguments are required
-          kvm: No edge-case Hermit arguments are required
-          sabre: No edge-case Hermit arguments are required
-          liteinst: No edge-case Hermit arguments are required
-          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
-  - id: language-runtimes/tcl-rand-clock
-    description: Tcl rand()/clock output varies natively and repeats under Hermit
-    lane: portable
-    requires:
-      - linux
-      - x86_64
-      - userns
+      backends_disabled:
+        dbt: Record/replay is unsupported by DBT
+        kvm: Record/replay is unsupported by KVM
+        sabre: Record/replay is unsupported by SaBRe
+        liteinst: Record/replay is unsupported by LiteInst
+        in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap
+          runs with syscall site patching off
+    chaos:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        ptrace: The Python example is single-threaded
+        dbt: Chaos scheduling is unsupported by DBT
+        kvm: Chaos scheduling is unsupported by KVM
+        sabre: Chaos scheduling is unsupported by SaBRe
+        liteinst: Chaos scheduling is unsupported by LiteInst
+        in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which
+          in-guest-trap runs with syscall site patching off
+    custom:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        ptrace: No edge-case Hermit arguments are required
+        dbt: No edge-case Hermit arguments are required
+        kvm: No edge-case Hermit arguments are required
+        sabre: No edge-case Hermit arguments are required
+        liteinst: No edge-case Hermit arguments are required
+        in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+- id: language-runtimes/python-io-subprocess-time
+  description: Python file I/O, subprocess capture, hashing, and time repeat under
+    Hermit
+  lane: portable
+  requires:
+  - linux
+  - x86_64
+  - userns
+  - ptrace
+  - python3
+  occasional: false
+  program: tests/e2e/language-runtimes/python-io-subprocess-time.sh
+  observation:
+    status: true
+    stdout: true
+    stderr: false
+    artifacts: []
+  modes:
+    naked:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        native: This regression establishes Hermit verification, not native nondeterminism
+    verify:
+      ci:
+        ptrace: true
+        kvm: true
+      backends_enabled:
       - ptrace
-      - tclsh
-    occasional: false
-    program: tests/e2e/language-runtimes/tcl-rand-clock.sh
-    observation:
-      status: true
-      stdout: true
-      stderr: false
-      artifacts: []
-    modes:
-      naked:
-        ci: false
-        runs: 3
-        assert:
-          min_distinct: 2
-        backends_enabled:
-          - native
-        backends_disabled: {}
-        ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
-      verify:
-        ci:
-          ptrace: true
-          kvm: true
-          dbt: true
-        backends_enabled:
-          - ptrace
-          - kvm
-          - dbt
-        backends_disabled:
-          sabre: SaBRe requires its external runtime
-          liteinst: LiteInst Tcl qualification is tracked by backend compatibility
-          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
-      replay:
-        ci: true
-        backends_enabled: [ptrace]
-        backends_disabled:
-          dbt: Record/replay is unsupported by DBT
-          kvm: Record/replay is unsupported by KVM
-          sabre: Record/replay is unsupported by SaBRe
-          liteinst: Record/replay is unsupported by LiteInst
-          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      chaos:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: The Tcl workload is single-threaded
-          dbt: Chaos scheduling is unsupported by DBT
-          kvm: Chaos scheduling is unsupported by KVM
-          sabre: Chaos scheduling is unsupported by SaBRe
-          liteinst: Chaos scheduling is unsupported by LiteInst
-          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      custom:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: No edge-case Hermit arguments are required
-          dbt: No edge-case Hermit arguments are required
-          kvm: No edge-case Hermit arguments are required
-          sabre: No edge-case Hermit arguments are required
-          liteinst: No edge-case Hermit arguments are required
-          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
-  - id: language-runtimes/node-v8-jit
-    description: Node.js V8 JIT-compiles a hot loop and Math.random varies natively; both repeat under Hermit
-    lane: portable
-    requires:
-      - linux
-      - x86_64
-      - userns
+      - kvm
+      backends_disabled:
+        dbt: Deselected from the blocking validate on 2026-10-31 (owner deselect-and-fix-forward
+          rule); solo runs complete at 18-19 CPU seconds, but inside full validates
+          the cell burns 2-2.6x that CPU time even at load average 46-72 on 316 CPUs
+          and was stopped at 22, 33/34 and 50 CPU-second bounds across the validations
+          of 2026-10-31 (root cause https://github.com/rrnewton/hermit/issues/4996).
+          The cell stays in the nightly sweep, where it is CLEAN; this is a recorded
+          loss, not a pass.
+        sabre: SaBRe requires its external runtime
+        liteinst: LiteInst Python qualification is tracked by backend compatibility
+        in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst
+          with syscall site patching off) is scored as its own column, apart from
+          liteinst, and its verify cells return only through their own track, as liteinst's
+          do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+    replay:
+      ci: true
+      backends_enabled:
       - ptrace
-      - node
-    occasional: false
-    program: tests/e2e/language-runtimes/node-v8-jit.sh
-    observation:
-      status: true
-      stdout: true
-      stderr: false
-      artifacts: []
-    modes:
-      naked:
-        ci: false
-        runs: 3
-        assert:
-          min_distinct: 2
-        backends_enabled:
-          - native
-        backends_disabled: {}
-        ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
-      verify:
-        timeout_seconds:
-          dbt: 57
-        cpu_timeout_seconds:
-          dbt: 33
-        slow_reason:
-          dbt: "The full validation of 77635530182d stopped this DBT cell at the default 22 CPU s. A local single sample on the host named in docs/TESTING_ENVIRONMENTS.md under Named measurement hosts, at the flip head (2026-10-27) measured 20.173 CPU s and 31.470 wall s; the configured CPU bound is ceil(1.5 x 22.0) = 33, the rule of DBT_2026_10_25_TIMEOUT_CALIBRATIONS. Wall stays at the 57 s default."
-        ci: true
-        backends_enabled:
-          - ptrace
-          - dbt
-          - kvm
-        backends_disabled:
-          sabre: SaBRe requires its external runtime
-          liteinst: LiteInst patches the code stream, so JIT-generated code needs separate qualification
-          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
-      replay:
-        ci: true
-        backends_enabled: [ptrace]
-        backends_disabled:
-          dbt: Record/replay is unsupported by DBI
-          kvm: Record/replay is unsupported by KVM
-          sabre: Record/replay is unsupported by SaBRe
-          liteinst: Record/replay is unsupported by LiteInst
-          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      chaos:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: V8's background compiler and GC threads are not guest-visible concurrency the chaos scheduler can steer
-          dbt: Chaos scheduling is unsupported by DBI
-          kvm: Chaos scheduling is unsupported by KVM
-          sabre: Chaos scheduling is unsupported by SaBRe
-          liteinst: Chaos scheduling is unsupported by LiteInst
-          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      custom:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: No edge-case Hermit arguments are required
-          dbt: No edge-case Hermit arguments are required
-          kvm: No edge-case Hermit arguments are required
-          sabre: No edge-case Hermit arguments are required
-          liteinst: No edge-case Hermit arguments are required
-          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
-  - id: language-runtimes/python-subprocess-capture
-    description: Python subprocess.run with captured output from four threads at once; every child's pipes reach EOF
-    lane: portable
-    requires:
-      - linux
-      - x86_64
-      - userns
+      backends_disabled:
+        dbt: Record/replay is unsupported by DBT
+        kvm: Record/replay is unsupported by KVM
+        sabre: Record/replay is unsupported by SaBRe
+        liteinst: Record/replay is unsupported by LiteInst
+        in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap
+          runs with syscall site patching off
+    chaos:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        ptrace: The Python workload is single-threaded
+        dbt: Chaos scheduling is unsupported by DBT
+        kvm: Chaos scheduling is unsupported by KVM
+        sabre: Chaos scheduling is unsupported by SaBRe
+        liteinst: Chaos scheduling is unsupported by LiteInst
+        in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which
+          in-guest-trap runs with syscall site patching off
+    custom:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        ptrace: No edge-case Hermit arguments are required
+        dbt: No edge-case Hermit arguments are required
+        kvm: No edge-case Hermit arguments are required
+        sabre: No edge-case Hermit arguments are required
+        liteinst: No edge-case Hermit arguments are required
+        in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+- id: language-runtimes/python-random
+  description: Python random output varies natively and repeats under Hermit
+  lane: portable
+  requires:
+  - linux
+  - x86_64
+  - userns
+  - ptrace
+  - python3
+  occasional: false
+  program: tests/e2e/language-runtimes/python-random.sh
+  observation:
+    status: true
+    stdout: true
+    stderr: false
+    artifacts: []
+  modes:
+    naked:
+      ci: false
+      runs: 3
+      assert:
+        min_distinct: 2
+      backends_enabled:
+      - native
+      backends_disabled: {}
+      ci_disabled_reason: This native control is not selected by ordinary validation;
+        add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared
+        outcome oracle.
+    verify:
+      ci: true
+      backends_enabled:
       - ptrace
-      - python3
-    occasional: false
-    program: tests/e2e/language-runtimes/python-subprocess-capture.sh
-    observation:
-      status: true
-      stdout: true
-      stderr: false
-      artifacts: []
-    modes:
-      verify:
-        ci:
-          ptrace: true
-          kvm: true
-        backends_enabled:
-          - ptrace
-          - kvm
-        backends_disabled:
-          dbt: New coverage of a KVM descriptor-table defect is established on KVM and the ptrace reference first; DBT ratchets against it separately
-          sabre: New coverage of a KVM descriptor-table defect is established on KVM and the ptrace reference first; SaBRe ratchets against it separately
-          liteinst: The in-guest runtime runs one thread of the guest and refuses execve; this guest spawns children from several threads
-          in-guest-trap: The in-guest runtime runs one thread of the guest and refuses execve; this guest spawns children from several threads
-      naked:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: this regression establishes Hermit verification, not native nondeterminism'
-        backends_enabled: []
-        backends_disabled:
-          native: This regression establishes Hermit verification, not native nondeterminism
-      replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: this cell guards strict verification of concurrent spawns; their record/replay is a separate qualification'
-        backends_enabled: []
-        backends_disabled:
-          ptrace: This cell guards strict verification of concurrent spawns; their record/replay is a separate qualification
-          dbt: Record/replay is unsupported by DBT
-          kvm: Record/replay is unsupported by KVM
-          sabre: Record/replay is unsupported by SaBRe
-          liteinst: Record/replay is unsupported by LiteInst
-          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      chaos:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: this cell guards a descriptor-table defect, not schedule diversity'
-        backends_enabled: []
-        backends_disabled:
-          ptrace: This cell guards a descriptor-table defect, not schedule diversity
-          dbt: Chaos scheduling is unsupported by DBT
-          kvm: Chaos scheduling is unsupported by KVM
-          sabre: Chaos scheduling is unsupported by SaBRe
-          liteinst: Chaos scheduling is unsupported by LiteInst
-          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      custom:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case arguments have been calibrated for this Python workload.'
-        backends_enabled: []
-        backends_disabled:
-          ptrace: No custom edge-case arguments have been calibrated for this Python workload
-          dbt: No custom edge-case arguments have been calibrated for this Python workload
-          kvm: No custom edge-case arguments have been calibrated for this Python workload
-          sabre: No custom edge-case arguments have been calibrated for this Python workload
-          liteinst: No custom edge-case arguments have been calibrated for this Python workload
-          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
-  - id: language-runtimes/go-os-exec-output
-    description: Go os/exec Cmd.Output from four goroutines at once; every child's pipes reach EOF
-    lane: portable
-    requires:
-      - linux
-      - x86_64
-      - userns
+      - dbt
+      - kvm
+      assert:
+        bitwise_parity: true
+      backends_disabled:
+        sabre: SaBRe requires its external runtime
+        liteinst: LiteInst Python support is tracked by backend compatibility
+        in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst
+          with syscall site patching off) is scored as its own column, apart from
+          liteinst, and its verify cells return only through their own track, as liteinst's
+          do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+    replay:
+      ci: true
+      backends_enabled:
       - ptrace
-    occasional: false
-    program: tests/e2e/language-runtimes/go-os-exec-output.sh
-    observation:
-      status: true
-      stdout: true
-      stderr: false
-      artifacts: []
-    modes:
-      verify:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: the pinned validation root (ci/hermetic) has no Go toolchain, so --prepare cannot build the program there; it passes 21 of 21 at L2 on KVM and ptrace on a host with go 1.26.1, and joins validation once the root carries go.'
-        backends_enabled:
-          - ptrace
-          - kvm
-        backends_disabled:
-          dbt: New coverage of a KVM descriptor-table defect is established on KVM and the ptrace reference first; DBT ratchets against it separately
-          sabre: New coverage of a KVM descriptor-table defect is established on KVM and the ptrace reference first; SaBRe ratchets against it separately
-          liteinst: The in-guest runtime runs one thread of the guest and refuses execve; this guest spawns children from several threads
-          in-guest-trap: The in-guest runtime runs one thread of the guest and refuses execve; this guest spawns children from several threads
-      naked:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: this regression establishes Hermit verification, not native nondeterminism'
-        backends_enabled: []
-        backends_disabled:
-          native: This regression establishes Hermit verification, not native nondeterminism
-      replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: this cell guards strict verification of concurrent spawns; their record/replay is a separate qualification'
-        backends_enabled: []
-        backends_disabled:
-          ptrace: This cell guards strict verification of concurrent spawns; their record/replay is a separate qualification
-          dbt: Record/replay is unsupported by DBT
-          kvm: Record/replay is unsupported by KVM
-          sabre: Record/replay is unsupported by SaBRe
-          liteinst: Record/replay is unsupported by LiteInst
-          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      chaos:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: this cell guards a descriptor-table defect, not schedule diversity'
-        backends_enabled: []
-        backends_disabled:
-          ptrace: This cell guards a descriptor-table defect, not schedule diversity
-          dbt: Chaos scheduling is unsupported by DBT
-          kvm: Chaos scheduling is unsupported by KVM
-          sabre: Chaos scheduling is unsupported by SaBRe
-          liteinst: Chaos scheduling is unsupported by LiteInst
-          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      custom:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case arguments have been calibrated for this Go workload.'
-        backends_enabled: []
-        backends_disabled:
-          ptrace: No custom edge-case arguments have been calibrated for this Go workload
-          dbt: No custom edge-case arguments have been calibrated for this Go workload
-          kvm: No custom edge-case arguments have been calibrated for this Go workload
-          sabre: No custom edge-case arguments have been calibrated for this Go workload
-          liteinst: No custom edge-case arguments have been calibrated for this Go workload
-          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+      backends_disabled:
+        dbt: Record/replay is unsupported by DBT
+        kvm: Record/replay is unsupported by KVM
+        sabre: Record/replay is unsupported by SaBRe
+        liteinst: Record/replay is unsupported by LiteInst
+        in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap
+          runs with syscall site patching off
+    chaos:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        ptrace: The Python example is single-threaded
+        dbt: Chaos scheduling is unsupported by DBT
+        kvm: Chaos scheduling is unsupported by KVM
+        sabre: Chaos scheduling is unsupported by SaBRe
+        liteinst: Chaos scheduling is unsupported by LiteInst
+        in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which
+          in-guest-trap runs with syscall site patching off
+    custom:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        ptrace: No edge-case Hermit arguments are required
+        dbt: No edge-case Hermit arguments are required
+        kvm: No edge-case Hermit arguments are required
+        sabre: No edge-case Hermit arguments are required
+        liteinst: No edge-case Hermit arguments are required
+        in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+- id: language-runtimes/rust-hashmap-iteration
+  description: Rust HashMap/HashSet iteration order varies natively and repeats under
+    Hermit
+  lane: portable
+  requires:
+  - linux
+  - x86_64
+  - userns
+  - ptrace
+  - rustc
+  occasional: false
+  program: tests/e2e/language-runtimes/rust-hashmap-iteration.rs
+  observation:
+    status: true
+    stdout: true
+    stderr: false
+    artifacts: []
+  modes:
+    naked:
+      ci: false
+      runs: 3
+      assert:
+        min_distinct: 2
+      backends_enabled:
+      - native
+      backends_disabled: {}
+      ci_disabled_reason: This native control is not selected by ordinary validation;
+        add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared
+        outcome oracle.
+    verify:
+      ci: true
+      backends_enabled:
+      - ptrace
+      - sabre
+      - kvm
+      - dbt
+      - liteinst
+      - in-guest-trap
+      backends_disabled: {}
+      hermit_args:
+        liteinst:
+        - --max-timeslice=disabled
+        in-guest-trap:
+        - --max-timeslice=disabled
+      hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a
+        preemption timer, so these cells run with the maximum timeslice disabled;
+        each passed 10 of 10 verify runs that way in a local survey on 2026-10-08
+        (https://github.com/rrnewton/hermit/issues/3745)
+    replay:
+      ci: true
+      backends_enabled:
+      - ptrace
+      backends_disabled:
+        dbt: Record/replay is unsupported by DBT
+        kvm: Record/replay is unsupported by KVM
+        sabre: Record/replay is unsupported by SaBRe
+        liteinst: Record/replay is unsupported by LiteInst
+        in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap
+          runs with syscall site patching off
+    chaos:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        ptrace: The Rust workload is single-threaded
+        dbt: Chaos scheduling is unsupported by DBT
+        kvm: Chaos scheduling is unsupported by KVM
+        sabre: Chaos scheduling is unsupported by SaBRe
+        liteinst: Chaos scheduling is unsupported by LiteInst
+        in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which
+          in-guest-trap runs with syscall site patching off
+    custom:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        ptrace: No edge-case Hermit arguments are required
+        dbt: No edge-case Hermit arguments are required
+        kvm: No edge-case Hermit arguments are required
+        sabre: No edge-case Hermit arguments are required
+        liteinst: No edge-case Hermit arguments are required
+        in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+- id: language-runtimes/rustc-hello
+  description: Compile a small Rust program with rustc and run it; rustc starts its
+    linker through the standard library's fork path, whose exec-error channel is a
+    SOCK_SEQPACKET socketpair, and links with its bundled rust-lld, which maps its
+    output MAP_SHARED | MAP_NORESERVE while its worker threads run
+  lane: portable
+  requires:
+  - linux
+  - x86_64
+  - userns
+  - ptrace
+  - rustc
+  - cc
+  occasional: false
+  program: tests/e2e/language-runtimes/rustc-hello.sh
+  observation:
+    status: true
+    stdout: true
+    stderr: false
+    artifacts: []
+  modes:
+    naked:
+      ci: false
+      ci_disabled_reason: 'NOT-EXERCISED: this cell asserts strict verification and
+        a fixed output; it asserts nothing about native nondeterminism, so there is
+        no naked oracle to run.'
+      backends_enabled: []
+      backends_disabled:
+        native: The fixed source and compiler flags make the compile-and-run transaction
+          deterministic by construction
+    verify:
+      ci: true
+      backends_enabled:
+      - ptrace
+      - kvm
+      backends_disabled:
+        dbt: Not measured; the SOCK_SEQPACKET socketpair slice qualified ptrace and
+          KVM
+        sabre: SaBRe multi-exec toolchain qualification must ratchet after the ptrace
+          reference path
+        liteinst: LiteInst multi-exec toolchain qualification must ratchet after the
+          ptrace reference path
+        in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst
+          with syscall site patching off) is scored as its own column, apart from
+          liteinst, and its verify cells return only through their own track, as liteinst's
+          do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+      expected_stdout:
+        ptrace: 'hello from rustc
+
+          '
+        kvm: 'hello from rustc
+
+          '
+    replay:
+      ci: false
+      ci_disabled_reason: 'NOT-EXERCISED: record/replay qualification is a separate
+        exercise from this strict-verification cell and has not been run for it.'
+      backends_enabled: []
+      backends_disabled:
+        ptrace: Record/replay qualification is separate from this strict-verification
+          cell
+        dbt: Record/replay is unsupported by DBT
+        kvm: Record/replay is unsupported by KVM
+        sabre: Record/replay is unsupported by SaBRe
+        liteinst: Record/replay is unsupported by LiteInst
+        in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap
+          runs with syscall site patching off
+    chaos:
+      ci: false
+      ci_disabled_reason: 'NOT-EXERCISED: the compile-and-run transaction has no schedule-diversity
+        oracle to run.'
+      backends_enabled: []
+      backends_disabled:
+        ptrace: The compile-and-run transaction has no schedule-diversity oracle
+        dbt: Chaos scheduling is unsupported by DBT
+        kvm: Chaos scheduling is unsupported by KVM
+        sabre: Chaos scheduling is unsupported by SaBRe
+        liteinst: Chaos scheduling is unsupported by LiteInst
+        in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which
+          in-guest-trap runs with syscall site patching off
+    custom:
+      ci: false
+      ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case Hermit arguments have
+        been calibrated for this cell.'
+      backends_enabled: []
+      backends_disabled:
+        ptrace: No edge-case Hermit arguments are required
+        dbt: No edge-case Hermit arguments are required
+        kvm: No edge-case Hermit arguments are required
+        sabre: No edge-case Hermit arguments are required
+        liteinst: No edge-case Hermit arguments are required
+        in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+- id: language-runtimes/ruby-random
+  description: Ruby random output varies natively and repeats under Hermit
+  lane: portable
+  requires:
+  - linux
+  - x86_64
+  - userns
+  - ptrace
+  - ruby
+  occasional: false
+  program: tests/e2e/language-runtimes/ruby-random.sh
+  observation:
+    status: true
+    stdout: true
+    stderr: false
+    artifacts: []
+  modes:
+    naked:
+      ci: false
+      runs: 3
+      assert:
+        min_distinct: 2
+      backends_enabled:
+      - native
+      backends_disabled: {}
+      ci_disabled_reason: This native control is not selected by ordinary validation;
+        add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared
+        outcome oracle.
+    verify:
+      ci:
+        ptrace: true
+        dbt: true
+        kvm: true
+      backends_enabled:
+      - ptrace
+      - dbt
+      - kvm
+      backends_disabled:
+        sabre: SaBRe requires its external runtime
+        liteinst: LiteInst Ruby support is tracked by backend compatibility
+        in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst
+          with syscall site patching off) is scored as its own column, apart from
+          liteinst, and its verify cells return only through their own track, as liteinst's
+          do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+    replay:
+      ci: true
+      backends_enabled:
+      - ptrace
+      backends_disabled:
+        dbt: Record/replay is unsupported by DBT
+        kvm: Record/replay is unsupported by KVM
+        sabre: Record/replay is unsupported by SaBRe
+        liteinst: Record/replay is unsupported by LiteInst
+        in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap
+          runs with syscall site patching off
+    chaos:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        ptrace: The Ruby example is single-threaded
+        dbt: Chaos scheduling is unsupported by DBT
+        kvm: Chaos scheduling is unsupported by KVM
+        sabre: Chaos scheduling is unsupported by SaBRe
+        liteinst: Chaos scheduling is unsupported by LiteInst
+        in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which
+          in-guest-trap runs with syscall site patching off
+    custom:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        ptrace: No edge-case Hermit arguments are required
+        dbt: No edge-case Hermit arguments are required
+        kvm: No edge-case Hermit arguments are required
+        sabre: No edge-case Hermit arguments are required
+        liteinst: No edge-case Hermit arguments are required
+        in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+- id: language-runtimes/perl-hash-order
+  description: Perl hash key iteration order varies natively and repeats under Hermit
+  lane: portable
+  requires:
+  - linux
+  - x86_64
+  - userns
+  - ptrace
+  - perl
+  occasional: false
+  program: tests/e2e/language-runtimes/perl-hash-order.sh
+  observation:
+    status: true
+    stdout: true
+    stderr: false
+    artifacts: []
+  modes:
+    naked:
+      ci: false
+      runs: 3
+      assert:
+        min_distinct: 2
+      backends_enabled:
+      - native
+      backends_disabled: {}
+      ci_disabled_reason: This native control is not selected by ordinary validation;
+        add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared
+        outcome oracle.
+    verify:
+      ci: true
+      backends_enabled:
+      - ptrace
+      - dbt
+      - kvm
+      backends_disabled:
+        sabre: SaBRe requires its external runtime
+        liteinst: LiteInst perl support is tracked by backend compatibility
+        in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst
+          with syscall site patching off) is scored as its own column, apart from
+          liteinst, and its verify cells return only through their own track, as liteinst's
+          do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+    replay:
+      ci: true
+      backends_enabled:
+      - ptrace
+      backends_disabled:
+        dbt: Record/replay is unsupported by DBT
+        kvm: Record/replay is unsupported by KVM
+        sabre: Record/replay is unsupported by SaBRe
+        liteinst: Record/replay is unsupported by LiteInst
+        in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap
+          runs with syscall site patching off
+    chaos:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        ptrace: The perl workload is single-threaded
+        dbt: Chaos scheduling is unsupported by DBT
+        kvm: Chaos scheduling is unsupported by KVM
+        sabre: Chaos scheduling is unsupported by SaBRe
+        liteinst: Chaos scheduling is unsupported by LiteInst
+        in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which
+          in-guest-trap runs with syscall site patching off
+    custom:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        ptrace: No edge-case Hermit arguments are required
+        dbt: No edge-case Hermit arguments are required
+        kvm: No edge-case Hermit arguments are required
+        sabre: No edge-case Hermit arguments are required
+        liteinst: No edge-case Hermit arguments are required
+        in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+- id: language-runtimes/lua-random
+  description: Lua 5.4 math.random varies natively and repeats under Hermit
+  lane: portable
+  requires:
+  - linux
+  - x86_64
+  - userns
+  - ptrace
+  - lua5.4
+  occasional: false
+  program: tests/e2e/language-runtimes/lua-random.sh
+  observation:
+    status: true
+    stdout: true
+    stderr: false
+    artifacts: []
+  modes:
+    naked:
+      ci: false
+      runs: 3
+      assert:
+        min_distinct: 2
+      backends_enabled:
+      - native
+      backends_disabled: {}
+      ci_disabled_reason: This native control is not selected by ordinary validation;
+        add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared
+        outcome oracle.
+    verify:
+      ci: true
+      backends_enabled:
+      - ptrace
+      - dbt
+      - kvm
+      backends_disabled:
+        sabre: SaBRe requires its external runtime
+        liteinst: LiteInst Lua qualification is tracked by backend compatibility
+        in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst
+          with syscall site patching off) is scored as its own column, apart from
+          liteinst, and its verify cells return only through their own track, as liteinst's
+          do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+    replay:
+      ci: true
+      backends_enabled:
+      - ptrace
+      backends_disabled:
+        dbt: Record/replay is unsupported by DBT
+        kvm: Record/replay is unsupported by KVM
+        sabre: Record/replay is unsupported by SaBRe
+        liteinst: Record/replay is unsupported by LiteInst
+        in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap
+          runs with syscall site patching off
+    chaos:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        ptrace: The Lua workload is single-threaded
+        dbt: Chaos scheduling is unsupported by DBT
+        kvm: Chaos scheduling is unsupported by KVM
+        sabre: Chaos scheduling is unsupported by SaBRe
+        liteinst: Chaos scheduling is unsupported by LiteInst
+        in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which
+          in-guest-trap runs with syscall site patching off
+    custom:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        ptrace: No edge-case Hermit arguments are required
+        dbt: No edge-case Hermit arguments are required
+        kvm: No edge-case Hermit arguments are required
+        sabre: No edge-case Hermit arguments are required
+        liteinst: No edge-case Hermit arguments are required
+        in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+- id: language-runtimes/python-hashseed
+  description: Python string hash and set iteration order vary natively and repeat
+    under Hermit
+  lane: portable
+  requires:
+  - linux
+  - x86_64
+  - userns
+  - ptrace
+  - python3
+  occasional: false
+  program: tests/e2e/language-runtimes/python-hashseed.sh
+  observation:
+    status: true
+    stdout: true
+    stderr: false
+    artifacts: []
+  modes:
+    naked:
+      ci: false
+      runs: 3
+      assert:
+        min_distinct: 2
+      backends_enabled:
+      - native
+      backends_disabled: {}
+      ci_disabled_reason: This native control is not selected by ordinary validation;
+        add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared
+        outcome oracle.
+    verify:
+      ci:
+        ptrace: true
+        dbt: true
+        kvm: true
+      backends_enabled:
+      - ptrace
+      - dbt
+      - kvm
+      backends_disabled:
+        sabre: SaBRe requires its external runtime
+        liteinst: LiteInst Python support is tracked by backend compatibility
+        in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst
+          with syscall site patching off) is scored as its own column, apart from
+          liteinst, and its verify cells return only through their own track, as liteinst's
+          do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+    replay:
+      ci: true
+      backends_enabled:
+      - ptrace
+      backends_disabled:
+        dbt: Record/replay is unsupported by DBT
+        kvm: Record/replay is unsupported by KVM
+        sabre: Record/replay is unsupported by SaBRe
+        liteinst: Record/replay is unsupported by LiteInst
+        in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap
+          runs with syscall site patching off
+    chaos:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        ptrace: The probe's output (string hash and set order) does not depend on
+          scheduling, so a chaos sweep has no race to expose. It runs /usr/bin/python3
+          by path as one guest process, not a PATH launcher that clones a child (https://github.com/rrnewton/hermit/issues/4598)
+        dbt: Chaos scheduling is unsupported by DBT
+        kvm: Chaos scheduling is unsupported by KVM
+        sabre: Chaos scheduling is unsupported by SaBRe
+        liteinst: Chaos scheduling is unsupported by LiteInst
+        in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which
+          in-guest-trap runs with syscall site patching off
+    custom:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        ptrace: No edge-case Hermit arguments are required
+        dbt: No edge-case Hermit arguments are required
+        kvm: No edge-case Hermit arguments are required
+        sabre: No edge-case Hermit arguments are required
+        liteinst: No edge-case Hermit arguments are required
+        in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+- id: language-runtimes/python-dict-hash-iteration
+  description: Python string-hash randomization (set/dict iteration order, hash(str))
+    plus file I/O and subprocess repeat under Hermit
+  lane: portable
+  requires:
+  - linux
+  - x86_64
+  - userns
+  - ptrace
+  - python3
+  occasional: false
+  program: tests/e2e/language-runtimes/python-dict-hash-iteration.sh
+  observation:
+    status: true
+    stdout: true
+    stderr: false
+    artifacts: []
+  modes:
+    naked:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        native: Native hash-seed variation is host/PYTHONHASHSEED sensitive; this
+          regression establishes Hermit verification, not native nondeterminism
+    verify:
+      ci:
+        ptrace: true
+        kvm: true
+      backends_enabled:
+      - ptrace
+      - kvm
+      backends_disabled:
+        dbt: Deselected from the blocking validate on 2026-10-31 (owner deselect-and-fix-forward
+          rule); solo runs complete at 18-19 CPU seconds, but inside full validates
+          the cell burns 2-2.6x that CPU time even at load average 46-72 on 316 CPUs
+          and was stopped at 22, 33/34 and 50 CPU-second bounds across the validations
+          of 2026-10-31 (root cause https://github.com/rrnewton/hermit/issues/4996).
+          The cell stays in the nightly sweep, where it is CLEAN; this is a recorded
+          loss, not a pass.
+        sabre: SaBRe requires its external runtime
+        liteinst: LiteInst Python qualification is tracked by backend compatibility
+        in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst
+          with syscall site patching off) is scored as its own column, apart from
+          liteinst, and its verify cells return only through their own track, as liteinst's
+          do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+    replay:
+      ci: true
+      backends_enabled:
+      - ptrace
+      backends_disabled:
+        dbt: Record/replay is unsupported by DBT
+        kvm: Record/replay is unsupported by KVM
+        sabre: Record/replay is unsupported by SaBRe
+        liteinst: Record/replay is unsupported by LiteInst
+        in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap
+          runs with syscall site patching off
+    chaos:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        ptrace: The Python workload is single-threaded
+        dbt: Chaos scheduling is unsupported by DBT
+        kvm: Chaos scheduling is unsupported by KVM
+        sabre: Chaos scheduling is unsupported by SaBRe
+        liteinst: Chaos scheduling is unsupported by LiteInst
+        in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which
+          in-guest-trap runs with syscall site patching off
+    custom:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        ptrace: No edge-case Hermit arguments are required
+        dbt: No edge-case Hermit arguments are required
+        kvm: No edge-case Hermit arguments are required
+        sabre: No edge-case Hermit arguments are required
+        liteinst: No edge-case Hermit arguments are required
+        in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+- id: language-runtimes/tcl-rand-clock
+  description: Tcl rand()/clock output varies natively and repeats under Hermit
+  lane: portable
+  requires:
+  - linux
+  - x86_64
+  - userns
+  - ptrace
+  - tclsh
+  occasional: false
+  program: tests/e2e/language-runtimes/tcl-rand-clock.sh
+  observation:
+    status: true
+    stdout: true
+    stderr: false
+    artifacts: []
+  modes:
+    naked:
+      ci: false
+      runs: 3
+      assert:
+        min_distinct: 2
+      backends_enabled:
+      - native
+      backends_disabled: {}
+      ci_disabled_reason: This native control is not selected by ordinary validation;
+        add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared
+        outcome oracle.
+    verify:
+      ci:
+        ptrace: true
+        kvm: true
+        dbt: true
+      backends_enabled:
+      - ptrace
+      - kvm
+      - dbt
+      backends_disabled:
+        sabre: SaBRe requires its external runtime
+        liteinst: LiteInst Tcl qualification is tracked by backend compatibility
+        in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst
+          with syscall site patching off) is scored as its own column, apart from
+          liteinst, and its verify cells return only through their own track, as liteinst's
+          do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+    replay:
+      ci: true
+      backends_enabled:
+      - ptrace
+      backends_disabled:
+        dbt: Record/replay is unsupported by DBT
+        kvm: Record/replay is unsupported by KVM
+        sabre: Record/replay is unsupported by SaBRe
+        liteinst: Record/replay is unsupported by LiteInst
+        in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap
+          runs with syscall site patching off
+    chaos:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        ptrace: The Tcl workload is single-threaded
+        dbt: Chaos scheduling is unsupported by DBT
+        kvm: Chaos scheduling is unsupported by KVM
+        sabre: Chaos scheduling is unsupported by SaBRe
+        liteinst: Chaos scheduling is unsupported by LiteInst
+        in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which
+          in-guest-trap runs with syscall site patching off
+    custom:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        ptrace: No edge-case Hermit arguments are required
+        dbt: No edge-case Hermit arguments are required
+        kvm: No edge-case Hermit arguments are required
+        sabre: No edge-case Hermit arguments are required
+        liteinst: No edge-case Hermit arguments are required
+        in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+- id: language-runtimes/node-v8-jit
+  description: Node.js V8 JIT-compiles a hot loop and Math.random varies natively;
+    both repeat under Hermit
+  lane: portable
+  requires:
+  - linux
+  - x86_64
+  - userns
+  - ptrace
+  - node
+  occasional: false
+  program: tests/e2e/language-runtimes/node-v8-jit.sh
+  observation:
+    status: true
+    stdout: true
+    stderr: false
+    artifacts: []
+  modes:
+    naked:
+      ci: false
+      runs: 3
+      assert:
+        min_distinct: 2
+      backends_enabled:
+      - native
+      backends_disabled: {}
+      ci_disabled_reason: This native control is not selected by ordinary validation;
+        add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared
+        outcome oracle.
+    verify:
+      timeout_seconds:
+        dbt: 57
+      cpu_timeout_seconds:
+        dbt: 33
+      slow_reason:
+        dbt: The full validation of 77635530182d stopped this DBT cell at the default
+          22 CPU s. A local single sample on the host named in docs/TESTING_ENVIRONMENTS.md
+          under Named measurement hosts, at the flip head (2026-10-27) measured 20.173
+          CPU s and 31.470 wall s; the configured CPU bound is ceil(1.5 x 22.0) =
+          33, the rule of DBT_2026_10_25_TIMEOUT_CALIBRATIONS. Wall stays at the 57
+          s default.
+      ci: true
+      backends_enabled:
+      - ptrace
+      - dbt
+      - kvm
+      backends_disabled:
+        sabre: SaBRe requires its external runtime
+        liteinst: LiteInst patches the code stream, so JIT-generated code needs separate
+          qualification
+        in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst
+          with syscall site patching off) is scored as its own column, apart from
+          liteinst, and its verify cells return only through their own track, as liteinst's
+          do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+    replay:
+      ci: true
+      backends_enabled:
+      - ptrace
+      backends_disabled:
+        dbt: Record/replay is unsupported by DBI
+        kvm: Record/replay is unsupported by KVM
+        sabre: Record/replay is unsupported by SaBRe
+        liteinst: Record/replay is unsupported by LiteInst
+        in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap
+          runs with syscall site patching off
+    chaos:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        ptrace: V8's background compiler and GC threads are not guest-visible concurrency
+          the chaos scheduler can steer
+        dbt: Chaos scheduling is unsupported by DBI
+        kvm: Chaos scheduling is unsupported by KVM
+        sabre: Chaos scheduling is unsupported by SaBRe
+        liteinst: Chaos scheduling is unsupported by LiteInst
+        in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which
+          in-guest-trap runs with syscall site patching off
+    custom:
+      ci: false
+      backends_enabled: []
+      backends_disabled:
+        ptrace: No edge-case Hermit arguments are required
+        dbt: No edge-case Hermit arguments are required
+        kvm: No edge-case Hermit arguments are required
+        sabre: No edge-case Hermit arguments are required
+        liteinst: No edge-case Hermit arguments are required
+        in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+- id: language-runtimes/python-subprocess-capture
+  description: Python subprocess.run with captured output from four threads at once;
+    every child's pipes reach EOF
+  lane: portable
+  requires:
+  - linux
+  - x86_64
+  - userns
+  - ptrace
+  - python3
+  occasional: false
+  program: tests/e2e/language-runtimes/python-subprocess-capture.sh
+  observation:
+    status: true
+    stdout: true
+    stderr: false
+    artifacts: []
+  modes:
+    verify:
+      ci:
+        ptrace: true
+        kvm: true
+      backends_enabled:
+      - ptrace
+      - kvm
+      backends_disabled:
+        dbt: New coverage of a KVM descriptor-table defect is established on KVM and
+          the ptrace reference first; DBT ratchets against it separately
+        sabre: New coverage of a KVM descriptor-table defect is established on KVM
+          and the ptrace reference first; SaBRe ratchets against it separately
+        liteinst: The in-guest runtime runs one thread of the guest and refuses execve;
+          this guest spawns children from several threads
+        in-guest-trap: The in-guest runtime runs one thread of the guest and refuses
+          execve; this guest spawns children from several threads
+    naked:
+      ci: false
+      ci_disabled_reason: 'NOT-EXERCISED: this regression establishes Hermit verification,
+        not native nondeterminism'
+      backends_enabled: []
+      backends_disabled:
+        native: This regression establishes Hermit verification, not native nondeterminism
+    replay:
+      ci: false
+      ci_disabled_reason: 'NOT-EXERCISED: this cell guards strict verification of
+        concurrent spawns; their record/replay is a separate qualification'
+      backends_enabled: []
+      backends_disabled:
+        ptrace: This cell guards strict verification of concurrent spawns; their record/replay
+          is a separate qualification
+        dbt: Record/replay is unsupported by DBT
+        kvm: Record/replay is unsupported by KVM
+        sabre: Record/replay is unsupported by SaBRe
+        liteinst: Record/replay is unsupported by LiteInst
+        in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap
+          runs with syscall site patching off
+    chaos:
+      ci: false
+      ci_disabled_reason: 'NOT-EXERCISED: this cell guards a descriptor-table defect,
+        not schedule diversity'
+      backends_enabled: []
+      backends_disabled:
+        ptrace: This cell guards a descriptor-table defect, not schedule diversity
+        dbt: Chaos scheduling is unsupported by DBT
+        kvm: Chaos scheduling is unsupported by KVM
+        sabre: Chaos scheduling is unsupported by SaBRe
+        liteinst: Chaos scheduling is unsupported by LiteInst
+        in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which
+          in-guest-trap runs with syscall site patching off
+    custom:
+      ci: false
+      ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case arguments have been
+        calibrated for this Python workload.'
+      backends_enabled: []
+      backends_disabled:
+        ptrace: No custom edge-case arguments have been calibrated for this Python
+          workload
+        dbt: No custom edge-case arguments have been calibrated for this Python workload
+        kvm: No custom edge-case arguments have been calibrated for this Python workload
+        sabre: No custom edge-case arguments have been calibrated for this Python
+          workload
+        liteinst: No custom edge-case arguments have been calibrated for this Python
+          workload
+        in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+- id: language-runtimes/go-os-exec-output
+  description: Go os/exec Cmd.Output from four goroutines at once; every child's pipes
+    reach EOF
+  lane: portable
+  requires:
+  - linux
+  - x86_64
+  - userns
+  - ptrace
+  occasional: false
+  program: tests/e2e/language-runtimes/go-os-exec-output.sh
+  observation:
+    status: true
+    stdout: true
+    stderr: false
+    artifacts: []
+  modes:
+    verify:
+      ci: true
+      backends_enabled:
+      - ptrace
+      - kvm
+      backends_disabled:
+        dbt: New coverage of a KVM descriptor-table defect is established on KVM and
+          the ptrace reference first; DBT ratchets against it separately
+        sabre: New coverage of a KVM descriptor-table defect is established on KVM
+          and the ptrace reference first; SaBRe ratchets against it separately
+        liteinst: The in-guest runtime runs one thread of the guest and refuses execve;
+          this guest spawns children from several threads
+        in-guest-trap: The in-guest runtime runs one thread of the guest and refuses
+          execve; this guest spawns children from several threads
+    naked:
+      ci: false
+      ci_disabled_reason: 'NOT-EXERCISED: this regression establishes Hermit verification,
+        not native nondeterminism'
+      backends_enabled: []
+      backends_disabled:
+        native: This regression establishes Hermit verification, not native nondeterminism
+    replay:
+      ci: false
+      ci_disabled_reason: 'NOT-EXERCISED: this cell guards strict verification of
+        concurrent spawns; their record/replay is a separate qualification'
+      backends_enabled: []
+      backends_disabled:
+        ptrace: This cell guards strict verification of concurrent spawns; their record/replay
+          is a separate qualification
+        dbt: Record/replay is unsupported by DBT
+        kvm: Record/replay is unsupported by KVM
+        sabre: Record/replay is unsupported by SaBRe
+        liteinst: Record/replay is unsupported by LiteInst
+        in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap
+          runs with syscall site patching off
+    chaos:
+      ci: false
+      ci_disabled_reason: 'NOT-EXERCISED: this cell guards a descriptor-table defect,
+        not schedule diversity'
+      backends_enabled: []
+      backends_disabled:
+        ptrace: This cell guards a descriptor-table defect, not schedule diversity
+        dbt: Chaos scheduling is unsupported by DBT
+        kvm: Chaos scheduling is unsupported by KVM
+        sabre: Chaos scheduling is unsupported by SaBRe
+        liteinst: Chaos scheduling is unsupported by LiteInst
+        in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which
+          in-guest-trap runs with syscall site patching off
+    custom:
+      ci: false
+      ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case arguments have been
+        calibrated for this Go workload.'
+      backends_enabled: []
+      backends_disabled:
+        ptrace: No custom edge-case arguments have been calibrated for this Go workload
+        dbt: No custom edge-case arguments have been calibrated for this Go workload
+        kvm: No custom edge-case arguments have been calibrated for this Go workload
+        sabre: No custom edge-case arguments have been calibrated for this Go workload
+        liteinst: No custom edge-case arguments have been calibrated for this Go workload
+        in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
