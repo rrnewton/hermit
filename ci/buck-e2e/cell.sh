@@ -22,6 +22,7 @@
 # stdout: Tpx HPHP-JSON (`type = "json"`): the harness's test_done for the cell, turned
 #         into a failure if its evidence is incomplete, then all_done. Always exits 0.
 set -u
+export HERMIT_DBT_NATIVE_SIGTRACE=1
 TEST=$1 MODE=$2 BACKEND=$3
 shift 3
 CELL="$TEST/$MODE@$BACKEND"
@@ -235,7 +236,7 @@ exec "$@"'
         "$wrapper" --src "$R" --out "$W/pinned" --src-rw \
         --env HERMIT_E2E_EMPTY_WORKDIR --env VALIDATE_RUN_STATE --env E2E_RESULT_ROOT \
         --env E2E_RUN_ID --env E2E_KEEP_VERIFY_LOGS --env E2E_PARITY_POST_PASS \
-        --env HERMIT_EPOCH -- \
+        --env HERMIT_EPOCH --env HERMIT_DBT_NATIVE_SIGTRACE -- \
         "${prologue[@]}" env E2E_BUILD_ROOT=/src/bundle/build \
         HERMIT_BIN=/src/bundle/hermit/hermit HERMIT_INSTALL_DIR=/src/bundle/hermit/install \
         timeout --kill-after=10 "$deadline" \
@@ -321,6 +322,16 @@ PY
 for f in result.json tpx.jsonl summary.json results.jsonl harness.stderr; do
     [[ -f $A/$f ]] && printf '{"type": {"generic_text_log": {}}, "description": "%s"}\n' "$f" >"$N/$f.annotation"
 done
+# Measurement-only retention after the original row/result/timings are complete.
+# Keep the original verdict and cleanup even when evidence copying refuses.
+study_retention_rc=0
+/usr/bin/timeout --signal=TERM --kill-after=2s 60s /usr/bin/python3 -B "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/plan-preparation/retain-failed-run.py" "$celldir" "$W" "$B" "$run_id" "$outcome" "$verdict" "$A" || study_retention_rc=$?
+printf '{"returncode":%d}\n' "$study_retention_rc" > "$A/study-retention-command.json"
+# Separate diagnostic retention after product verdict/timings; never update
+# copy_errors/evidence_complete or the original test row.
+sigtrace_retention_rc=0
+/usr/bin/timeout --signal=TERM --kill-after=2s 15s /usr/bin/python3 -B "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/sigchld-queue-diagnostic/retain-sidecars.py" "$W/results/native-signal-trace" "$A" "$run_id" || sigtrace_retention_rc=$?
+printf '{"returncode":%d}\n' "$sigtrace_retention_rc" > "$A/native-sigtrace-retention-command.json"
 rm -rf "${W:?}"
 
 python3 - "$A/tpx.jsonl" "$CELL" "$evidence_complete" "$harness_rc" "${missing[*]}" <<'PY'
