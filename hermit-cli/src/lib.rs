@@ -8412,6 +8412,14 @@ mod tests {
             // Signals 1 to 31 but SIGCHLD (17) and SIGSTOP, SIGTSTP, SIGTTIN
             // and SIGTTOU (19 to 22), as a kernel signal set.
             "publishable_parent_death_signals": if kvm { 0x7fc2_ffff_u64 } else { 0 },
+            // Ptrace's perf counter is the qualified RCB clock contract,
+            // and an e9patch run reports ptrace's capabilities; LiteInst
+            // explicitly unqualifies its own.
+            "rcb_clock_contract": if matches!(backend, CapabilityCase::Ptrace | CapabilityCase::E9patch) {
+                serde_json::json!("PerfCounterOnTargetThreadUserOnly")
+            } else {
+                serde_json::Value::Null
+            },
         })
     }
 
@@ -8546,6 +8554,9 @@ mod tests {
             // The legacy form carries no width for `hardware_watchpoints`;
             // it reads back as 0.
             config.backend.hardware_watchpoints = 0;
+            // The legacy form predates the RCB clock contract; it reads
+            // back as `None`.
+            config.backend.rcb_clock_contract = None;
             assert_eq!(
                 detcore::to_legacy_backend_json(&config).unwrap(),
                 before,
