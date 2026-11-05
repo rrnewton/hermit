@@ -732,6 +732,11 @@ fn validate_path_footprints(policy: &Value, nodes: &BTreeSet<String>) {
         let location = format!("{POLICY}: path_footprints[{index}]");
         let _ = strings(footprint, "paths", &location);
         for node in strings(footprint, "nodes", &location) {
+            // Generated group aliases (emitted below from DAG labels)
+            // resolve at selection time, not against the node set.
+            if node == "@super" || node == "@super_alerting" {
+                continue;
+            }
             if !known_selection_node(nodes, &node) {
                 die(format!("{location}: unknown portable DAG node `{node}`"));
             }
@@ -805,7 +810,37 @@ fn generated_footprints(root: &Path) -> Value {
     }
     check_reverie_backend_closure(root, &backend_rules);
     let package_paths = load_package_paths(&policy, &packages);
-    validate_path_footprints(&policy, &all_nodes);
+    // Super-labelled nodes live outside the hosted-portable universe
+    // but policy footprints name them for affected-super selection.
+    let mut super_nodes: Vec<String> = Vec::new();
+    let mut super_alerting: Vec<String> = Vec::new();
+    for step in dag["steps"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
+        let labels: Vec<&str> = step["labels"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        if labels.contains(&"super") {
+            let tag = format!(
+                "{}.{}",
+                step["group"].as_str().unwrap_or(""),
+                step["job"].as_str().unwrap_or("")
+            );
+            if !labels.contains(&hermit_manifest_plan::validation_dag::PRESSURE_LABEL) {
+                super_alerting.push(tag.clone());
+            }
+            super_nodes.push(tag);
+        }
+    }
+    super_nodes.sort();
+    super_alerting.sort();
+    let known_nodes: BTreeSet<String> = all_nodes
+        .iter()
+        .cloned()
+        .chain(super_nodes.iter().cloned())
+        .collect();
+    validate_path_footprints(&policy, &known_nodes);
 
     let mut package_footprints = Vec::new();
     let mut by_root: Vec<&Package> = packages.values().collect();
@@ -898,7 +933,10 @@ fn generated_footprints(root: &Path) -> Value {
             "only when every changed path is explicitly ci_irrelevant and no footprint matches."
         ],
         "version": 2,
-        "groups": {},
+        "groups": {
+            "super": super_nodes,
+            "super_alerting": super_alerting,
+        },
         "force_full": policy["force_full"].clone(),
         "ci_irrelevant": policy["ci_irrelevant"].clone(),
         "backend_rules": backend_rules.iter().map(backend_rule_json).collect::<Vec<_>>(),
