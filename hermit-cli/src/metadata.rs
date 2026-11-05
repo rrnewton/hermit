@@ -954,7 +954,17 @@ impl RecordVersion {
 // values, or a refusal where it recorded a completion, and another schedule.
 // It is refused here.
 // https://github.com/rrnewton/hermit/pull/4885
-// 0x19a -> 0x19c (reserved for this change in minibeads dh-gxmvo;
+// 0x19a -> 0x19b (HIGHEST_SHIPPED+1 at the rebase onto main f76f9b8c,
+// after PR 4885 took 0x19a): an Mmap event of a MAP_SHARED file mapping
+// names the mapped file
+// (device, inode, offset; for /dev/zero, the new shmem object the mapping
+// made) and the mapped descriptor's access mode. Replay
+// maps every shared mapping of one file as a view of one backing, opened
+// with that access mode, instead of making separate anonymous copies. An
+// older reader cannot decode the new field, and an older recording has no
+// identity with which to restore sharing, so it is refused here.
+// https://github.com/rrnewton/hermit/pull/5120
+// 0x19b -> 0x19c (reserved for this change in minibeads dh-gxmvo;
 // this change keeps 0x19c at its rebase onto main f76f9b8c, after
 // 0x19a shipped above; 0x19b stays reserved for the replayed-MAP_SHARED
 // fix-forward, and land-time numbering still applies): a parent's
