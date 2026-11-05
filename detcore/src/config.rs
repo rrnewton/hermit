@@ -317,11 +317,12 @@ mod tests {
         // carry an image's argument and environment strings (`ExecStrings`,
         // package K item 2b slice 2b-3, the next revision after 2b-1's: 42 on
         // its old base, renumbered mechanically to 43 at its rebase onto 2b-1's
-        // 42, and to 47 at its rebase onto 2b-1's 46). The digest covers that
+        // 42, and to 47 at its rebase onto 2b-1's 46) and, in
+        // `ProcessExecStrings`'s, the image's number. The digest covers that
         // payload type too (domain 8; domain 7 on its old base, moved to 8
         // because main's 41 took domain 6 and 2b-1's payload types moved to
         // 7). Digest measured at this head.
-        (47, "606443ea6169cef7", "f013e36743d8d9e6"),
+        (47, "9f170e528370fea8", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
