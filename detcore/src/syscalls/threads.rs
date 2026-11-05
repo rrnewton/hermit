@@ -1101,6 +1101,21 @@ impl KernelSignalState {
         Some(state)
     }
 
+    /// The signal sets a backend reports for a task (`reverie::SignalSets`:
+    /// `SigPnd`, `ShdPnd`, `SigBlk`, `SigIgn` and `SigCgt`, as Linux shows
+    /// them in the task's status file), in this type's terms, as
+    /// [`parse`](Self::parse) builds them from that file.
+    pub(crate) fn from_backend_sets(sets: &reverie::SignalSets) -> Self {
+        KernelSignalState {
+            pending: sets.pending | sets.shared_pending,
+            thread_pending: sets.pending,
+            shared_pending: sets.shared_pending,
+            blocked: sets.blocked,
+            ignored: sets.ignored,
+            caught: sets.caught,
+        }
+    }
+
     /// Signals whose delivery, while unblocked in `mask`, ends a blocking wait: a
     /// caught signal runs its handler, and a `SIG_DFL` signal terminates, dumps
     /// core, or stops the process. Ignored signals and the default-ignored
@@ -1632,6 +1647,73 @@ pub(crate) fn read_wait_signal_state(pid: Pid, tid: Pid) -> Result<KernelSignalS
             BlockedWaitSignalError::StateUnreadable { pid, tid, errno },
         ))),
     }
+}
+
+/// Whether Detcore reads a guest thread's signal state from the backend
+/// rather than from host `/proc`, on a backend with `backend`'s
+/// capabilities: exactly where the backend owns signal delivery because its
+/// guest threads are not host tasks (`provides_process_signal_control`,
+/// KVM), so `/proc/<pid>/task/<tid>` would describe an unrelated host task
+/// ([`refuses_host_signal_state_reads`]). There the backend reports the
+/// sets itself: per callback (`Guest::signal_sets`) and run-wide
+/// (`ProcessSignalControl::signal_sets`). Every other backend (ptrace,
+/// LiteInst, SaBRe, DBT) keeps its `/proc` read unchanged.
+pub(crate) fn reads_signal_state_from_backend(backend: &BackendCapabilities) -> bool {
+    backend.provides_process_signal_control
+}
+
+/// The errno for a backend's answer that names no signal sets: the errno it
+/// gave (`ESRCH` for a task that is gone, `EAGAIN` for a read an exec
+/// overlapped), or `ENOSYS` where it does not report the fact, which callers
+/// already treat as an unreadable state.
+pub(crate) fn signal_sets_errno(error: reverie::FactError) -> Errno {
+    match error {
+        reverie::FactError::Errno(errno) => errno,
+        _ => Errno::ENOSYS,
+    }
+}
+
+/// The calling thread's signal state, from the backend where Detcore reads
+/// it there ([`reads_signal_state_from_backend`]: `Guest::signal_sets`, in
+/// this thread's own callback, while it is stopped), and `None` elsewhere,
+/// where the caller keeps its `/proc` read.
+fn backend_signal_state_of_caller<G, T>(guest: &G) -> Option<Result<KernelSignalState, Errno>>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    reads_signal_state_from_backend(&guest.config().backend).then(|| {
+        guest
+            .signal_sets(guest.tid())
+            .map(|sets| KernelSignalState::from_backend_sets(&sets))
+            .map_err(signal_sets_errno)
+    })
+}
+
+/// [`read_kernel_signal_state`] of the calling thread, read from the backend
+/// where its guest threads are not host tasks
+/// ([`reads_signal_state_from_backend`]), so that no host task's `/proc`
+/// state reaches a decision there.
+pub(crate) fn read_guest_signal_state<G, T>(guest: &G) -> Result<KernelSignalState, Errno>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    backend_signal_state_of_caller(guest)
+        .unwrap_or_else(|| read_kernel_signal_state(guest.pid(), guest.tid()))
+}
+
+/// [`read_thread_signal_state`] of the calling thread, read from the backend
+/// where its guest threads are not host tasks
+/// ([`reads_signal_state_from_backend`]), so that no host task's `/proc`
+/// state reaches a decision there.
+pub(crate) fn read_guest_thread_signal_state<G, T>(guest: &G) -> Result<KernelSignalState, Errno>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    backend_signal_state_of_caller(guest)
+        .unwrap_or_else(|| read_thread_signal_state(guest.pid(), guest.tid()))
 }
 
 /// A test seam in front of the `/proc` read in [`read_kernel_signal_state`].
