@@ -321,6 +321,11 @@ PY
 for f in result.json tpx.jsonl summary.json results.jsonl harness.stderr; do
     [[ -f $A/$f ]] && printf '{"type": {"generic_text_log": {}}, "description": "%s"}\n' "$f" >"$N/$f.annotation"
 done
+# Measurement-only retention after the original row/result/timings are complete.
+# Keep the original verdict and cleanup even when evidence copying refuses.
+study_retention_rc=0
+/usr/bin/timeout --signal=TERM --kill-after=2s 60s /usr/bin/python3 -B "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/plan-preparation/retain-failed-run.py" "$celldir" "$W" "$B" "$run_id" "$outcome" "$verdict" "$A" || study_retention_rc=$?
+printf '{"returncode":%d}\n' "$study_retention_rc" > "$A/study-retention-command.json"
 rm -rf "${W:?}"
 
 python3 - "$A/tpx.jsonl" "$CELL" "$evidence_complete" "$harness_rc" "${missing[*]}" <<'PY'
