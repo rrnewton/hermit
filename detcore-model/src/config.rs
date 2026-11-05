@@ -249,6 +249,16 @@ pub struct Config {
     #[serde(default)]
     pub rewrite_exclusives_in_memory: bool,
 
+    /// aarch64: the run's exclusive loops were rewritten in overlaid
+    /// copies of its files before it ran. Set by the CLI for
+    /// `--rewrite-exclusives` in a run that has a mount namespace to
+    /// carry the rewritten files; never read from a recording. The run's
+    /// preemption record states it with the rewrite format version, so a
+    /// replay under another rewrite is refused.
+    #[clap(skip)]
+    #[serde(default)]
+    pub rewrite_exclusives_overlay: bool,
+
     /// aarch64: count the store-exclusives the guest executes and fails, as
     /// a run that records or replays preemptions does. Set by the CLI for
     /// each run of `--verify` and `--verify-run`, so that a divergence a
@@ -3969,11 +3979,14 @@ mod legacy_backend_json {
     /// rewrite of aarch64 exclusive loops is done by the ptrace backend's
     /// global state, and no backend that reads the legacy form does it, so it
     /// is never written and reads as false.
+    /// `rewrite_exclusives_overlay` came after it too: the CLI replaced the
+    /// files before the run, and only the record states it, so it is never
+    /// written and reads as false.
     /// `post_crash_timeslice` came after it too, and the scheduler acts on it
     /// as well, so it is never written and reads as off.
     /// `stacktrace_at_schedule_positions` came after it too. It is never
     /// written and reads as false: the DBT runtime takes no stack traces.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 53] = [
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 54] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -4025,6 +4038,7 @@ mod legacy_backend_json {
         "standard_stream_aliases",
         "rewrite_exclusives_unmarked",
         "rewrite_exclusives_in_memory",
+        "rewrite_exclusives_overlay",
         "count_store_exclusives",
         "stacktrace_at_schedule_positions",
     ];
@@ -4176,6 +4190,7 @@ mod legacy_backend_json {
                     | "replay_continue_fairly"
                     | "strict_binder"
                     | "rewrite_exclusives_in_memory"
+                    | "rewrite_exclusives_overlay"
                     | "count_store_exclusives"
                     | "stacktrace_at_schedule_positions",
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
@@ -4543,6 +4558,7 @@ mod legacy_backend_json {
                 | "access_trace_max_records"
                 | "access_trace_max_bytes"
                 | "rewrite_exclusives_in_memory"
+                | "rewrite_exclusives_overlay"
                 | "count_store_exclusives"
                 | "stacktrace_at_schedule_positions" => Ok(()),
                 "replay_continue_fairly" => Ok(()),
@@ -5527,6 +5543,7 @@ mod tests {
                 | "access_trace_max_records"
                 | "access_trace_max_bytes"
                 | "rewrite_exclusives_in_memory"
+                | "rewrite_exclusives_overlay"
                 | "count_store_exclusives"
                 | "stacktrace_at_schedule_positions" => {}
                 "replay_continue_fairly" => {}
@@ -5567,11 +5584,12 @@ mod tests {
         // `access_trace_max_bytes`, `replay_continue_fairly`,
         // `standard_stream_aliases`, `sleep_registration`, `strict_binder`,
         // `post_crash_timeslice`, `rewrite_exclusives_in_memory`,
+        // `rewrite_exclusives_overlay`,
         // `stacktrace_at_schedule_positions`, `rewrite_exclusives_unmarked`
         // and `strict_schedule_boundaries` none: fourteen more keys and
-        // fifty-two fewer, so thirty-eight keys fewer than fields.
+        // fifty-three fewer, so thirty-nine keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 38);
+        assert_eq!(fields.len(), keys.len() + 39);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -6173,26 +6191,23 @@ mod tests {
         };
         let on = Config {
             rewrite_exclusives_in_memory: true,
+            rewrite_exclusives_overlay: true,
             ..off.clone()
         };
         let json = to_legacy_backend_json(&on).unwrap();
         assert_eq!(json, to_legacy_backend_json(&off).unwrap());
-        assert!(!json.contains("rewrite_exclusives_in_memory"), "{json}");
-        assert!(
-            !from_legacy_backend_json(&json)
-                .unwrap()
-                .rewrite_exclusives_in_memory
-        );
+        assert!(!json.contains("rewrite_exclusives"), "{json}");
+        let back = from_legacy_backend_json(&json).unwrap();
+        assert!(!back.rewrite_exclusives_in_memory);
+        assert!(!back.rewrite_exclusives_overlay);
         let values: Vec<serde_json::Value> = ordered_entries(&json)
             .into_iter()
             .map(|(_, value)| value)
             .collect();
         let array = serde_json::to_string(&values).unwrap();
-        assert!(
-            !from_legacy_backend_json(&array)
-                .unwrap()
-                .rewrite_exclusives_in_memory
-        );
+        let back = from_legacy_backend_json(&array).unwrap();
+        assert!(!back.rewrite_exclusives_in_memory);
+        assert!(!back.rewrite_exclusives_overlay);
     }
 
     /// `count_store_exclusives` never enters the legacy form, whatever its

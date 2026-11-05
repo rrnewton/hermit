@@ -6301,6 +6301,117 @@ fn replay_refuses_another_pipe_wake_latency() {
     }
 }
 
+/// A record made under the removed stripped-file heuristic rewrite is
+/// refused under every current setting: no supported rewrite reproduces
+/// the instructions that heuristic wrote, under both replay flags. The
+/// refusal is the typed `PolicyRefusal`, as at ff9382cb before the check
+/// was lost in the recomposition onto main's rewriter.
+#[test]
+fn a_replay_under_the_other_stripped_rewrite_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let heuristic = dir.path().join("heuristic.json");
+    std::fs::write(
+        &heuristic,
+        r#"{"per_thread":{},"global":[],"rewrite_exclusives_stripped_heuristic":true}"#,
+    )
+    .unwrap();
+    for flag in ["--replay-schedule-from", "--replay-preemptions-from"] {
+        for rewrite in [
+            Vec::new(),
+            vec!["--rewrite-exclusives"],
+            vec!["--rewrite-exclusives", "--rewrite-exclusives-mode=memory"],
+            vec!["--rewrite-exclusives", "--rewrite-exclusives-mode=overlay"],
+        ] {
+            let replay = format!("{flag}={}", heuristic.display());
+            let mut argv = vec!["fakehermit".to_owned(), replay];
+            argv.extend(rewrite.iter().map(|flag| flag.to_string()));
+            argv.push("fakeprog".to_owned());
+            let ro = RunOpts::parse_from(&argv);
+            let error = ro
+                .refuse_replay_under_another_exclusive_rewrite()
+                .expect_err("a heuristic record must be refused");
+            assert!(
+                error.downcast_ref::<PolicyRefusal>().is_some(),
+                "{argv:?}: {error:#}"
+            );
+            assert!(format!("{error:#}").contains(flag), "{error:#}");
+        }
+    }
+}
+
+/// A replay is refused when its exclusive rewrite (mode and rewrite
+/// format version) is not the one its record states: the default overlay
+/// and the in-memory rewrite are different provenances, another format
+/// version under the same mode retires other instructions, and a record
+/// made before records carried the provenance cannot be shown compatible
+/// with a replay that rewrites at all.
+#[test]
+fn replay_refuses_another_exclusive_rewrite_provenance() {
+    let dir = tempfile::tempdir().unwrap();
+    let write = |name: &str, json: &str| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, json).unwrap();
+        path
+    };
+    let plain = write("plain.json", r#"{"per_thread":{},"global":[]}"#);
+    let legacy_memory = write(
+        "legacy-memory.json",
+        r#"{"per_thread":{},"global":[],"rewrite_exclusives_in_memory":true}"#,
+    );
+    let memory6 = write(
+        "memory6.json",
+        r#"{"per_thread":{},"global":[],"rewrite_exclusives_in_memory":true,"rewrite_exclusives":{"mode":"memory","format_version":6}}"#,
+    );
+    let memory5 = write(
+        "memory5.json",
+        r#"{"per_thread":{},"global":[],"rewrite_exclusives_in_memory":true,"rewrite_exclusives":{"mode":"memory","format_version":5}}"#,
+    );
+    let overlay6 = write(
+        "overlay6.json",
+        r#"{"per_thread":{},"global":[],"rewrite_exclusives":{"mode":"overlay","format_version":6}}"#,
+    );
+    let none: &[&str] = &[];
+    let overlay: &[&str] = &["--rewrite-exclusives", "--rewrite-exclusives-mode=overlay"];
+    let memory: &[&str] = &["--rewrite-exclusives", "--rewrite-exclusives-mode=memory"];
+    for flag in ["--replay-schedule-from", "--replay-preemptions-from"] {
+        for (path, rewrite, refused) in [
+            (&plain, none, false),
+            (&plain, overlay, true),
+            (&plain, memory, true),
+            (&legacy_memory, none, true),
+            // Same in-memory boolean, but the record states no format
+            // version, so its rewritten instructions are unknown.
+            (&legacy_memory, memory, true),
+            (&memory6, none, true),
+            (&memory6, overlay, true),
+            (&memory6, memory, false),
+            (&memory5, memory, true),
+            (&overlay6, none, true),
+            (&overlay6, memory, true),
+            (&overlay6, overlay, false),
+        ] {
+            let replay = format!("{flag}={}", path.display());
+            let mut argv = vec!["fakehermit".to_owned(), replay];
+            argv.extend(rewrite.iter().map(|flag| flag.to_string()));
+            argv.push("fakeprog".to_owned());
+            let ro = RunOpts::parse_from(&argv);
+            let result = ro.refuse_replay_under_another_exclusive_rewrite();
+            assert_eq!(result.is_err(), refused, "{argv:?}: {result:?}");
+            if let Err(error) = result {
+                assert!(
+                    error.downcast_ref::<PolicyRefusal>().is_some(),
+                    "{argv:?}: {error:#}"
+                );
+                let error = format!("{error:#}");
+                assert!(
+                    error.contains(flag) && error.contains("cannot reproduce the run"),
+                    "{error}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn network_trace_is_reached_through_a_descriptor_opened_before_the_container() {
     let dir = tempfile::tempdir().unwrap();
@@ -10238,10 +10349,13 @@ impl RunOpts {
         Ok(())
     }
 
-    /// Refuses a replay of a record under the other in-memory exclusive
-    /// rewrite setting, as `refuse_replay_under_another_signal_state_copy`
-    /// refuses the other copy setting: the rewrite changes the instructions
-    /// the guest retires while the files stay the same.
+    /// Refuses a replay of a record under another exclusive rewrite --
+    /// another mode, another rewrite format version, a record of the
+    /// removed stripped-file heuristic, or a record that states no
+    /// provenance when this run rewrites -- as
+    /// `refuse_replay_under_another_signal_state_copy` refuses the other
+    /// copy setting: the rewrite changes the instructions the guest
+    /// retires while the files stay the same.
     fn refuse_replay_under_another_exclusive_rewrite(&self) -> Result<(), Error> {
         if self.namespace_only {
             return Ok(());
@@ -10254,12 +10368,12 @@ impl RunOpts {
             let Some(path) = path else {
                 continue;
             };
-            let recorded = detcore::preemptions::read_recorded_rewrite_exclusives_in_memory(path)
-                .map_err(Error::msg)?;
-            if let Some(refusal) = detcore::preemptions::rewrite_exclusives_in_memory_mismatch(
+            let recorded =
+                detcore::preemptions::read_recorded_rewrite_exclusives(path).map_err(Error::msg)?;
+            if let Some(refusal) = detcore::preemptions::rewrite_exclusives_mismatch(
                 &format!("{option} {}", path.display()),
                 recorded,
-                self.rewrites_exclusives_in_memory(),
+                self.rewrite_exclusives_provenance(),
             ) {
                 return Err(Error::new(PolicyRefusal).context(refusal));
             }
@@ -17049,6 +17163,8 @@ impl RunOpts {
         // A pure function of the flags, so every trial of an analysis and
         // both runs of a `--verify` pair rewrite alike.
         config.rewrite_exclusives_in_memory = self.rewrites_exclusives_in_memory();
+        config.rewrite_exclusives_overlay =
+            self.rewrite_exclusives && !self.rewrites_exclusives_in_memory();
         config
     }
 
@@ -17061,6 +17177,23 @@ impl RunOpts {
                 RewriteExclusivesMode::Overlay => false,
                 RewriteExclusivesMode::Memory => true,
             }
+    }
+
+    /// The rewrite `--rewrite-exclusives` applies in this run, as a
+    /// preemption record states it: its mode and this Hermit's rewrite
+    /// format version; `None` when the flag is off.
+    pub(crate) fn rewrite_exclusives_provenance(
+        &self,
+    ) -> Option<detcore::preemptions::RewriteExclusives> {
+        self.rewrite_exclusives.then(|| {
+            detcore::preemptions::RewriteExclusives::current(
+                if self.rewrites_exclusives_in_memory() {
+                    detcore::preemptions::RewriteExclusivesMode::Memory
+                } else {
+                    detcore::preemptions::RewriteExclusivesMode::Overlay
+                },
+            )
+        })
     }
 
     /// Where and within what bounds the tracer keeps fatal cores, or `None`,
