@@ -10175,6 +10175,8 @@ impl<T> ThreadState<T> {
             self.max_timeslice_end = Some(deadline);
         }
         self.replay_backstop = None;
+    }
+
     /// Take what the reply to a traced event says about the replayed
     /// schedule (`Scheduler::trace_replay_reply`): whether it is over
     /// (`schedule_replay_over`), and the replay backstop
