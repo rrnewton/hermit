@@ -8,6 +8,10 @@
 
 //! System calls for dealing with the file system.
 
+#[cfg(test)]
+#[path = "files/pidfd_getfd_tests.rs"]
+mod pidfd_getfd_tests;
+
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
