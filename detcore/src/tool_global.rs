@@ -8404,7 +8404,6 @@ pub enum SignalScope {
 /// integration tree's definitions as measured at regeneration.
 pub(crate) const GLOBAL_RPC_REVISION: u32 = 48;
 
-
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
 /// fatal signal to let go of (`GlobalState::release_tables_at_death`). The

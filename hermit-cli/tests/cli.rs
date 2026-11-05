@@ -71311,4 +71311,3 @@ fn a_chaos_instruction_offset_run_verifies_and_replays_at_its_offsets() {
     assert_success(&replay, &args);
     assert_eq!(parse_branch_free_race(&stdout(&replay)), lost);
 }
-

@@ -361,7 +361,6 @@ mod tests {
         // definitions measure a new digest, recorded here as measured on
         // the combined tree at regeneration.
         (48, "f33b9b217fa438ea", "f013e36743d8d9e6"),
-
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
@@ -592,7 +591,14 @@ mod tests {
             1,
         );
         assert_eq!(
-            definition_digest(&documented, payload, schedule, replayer, task_stat, host_input),
+            definition_digest(
+                &documented,
+                payload,
+                schedule,
+                replayer,
+                task_stat,
+                host_input
+            ),
             digest
         );
         let added = source.replacen(
@@ -636,7 +642,14 @@ mod tests {
         );
         assert_ne!(documented, payload);
         assert_eq!(
-            definition_digest(source, &documented, schedule, replayer, task_stat, host_input),
+            definition_digest(
+                source,
+                &documented,
+                schedule,
+                replayer,
+                task_stat,
+                host_input
+            ),
             digest
         );
         // The event `TraceSchedEvent` carries is detcore-model's: a field
@@ -669,7 +682,14 @@ mod tests {
         );
         assert_ne!(documented, schedule);
         assert_eq!(
-            definition_digest(source, payload, &documented, replayer, task_stat, host_input),
+            definition_digest(
+                source,
+                payload,
+                &documented,
+                replayer,
+                task_stat,
+                host_input
+            ),
             digest
         );
         // So is the reply: a field added to the replayed slice end it holds,
@@ -701,7 +721,14 @@ mod tests {
         );
         assert_ne!(documented, replayer);
         assert_eq!(
-            definition_digest(source, payload, schedule, &documented, task_stat, host_input),
+            definition_digest(
+                source,
+                payload,
+                schedule,
+                &documented,
+                task_stat,
+                host_input
+            ),
             digest
         );
         // And 2b-1's payload types: a field added to `ThreadDeregistration` or
@@ -733,7 +760,14 @@ mod tests {
         );
         assert_ne!(documented, source);
         assert_eq!(
-            definition_digest(&documented, payload, schedule, replayer, task_stat, host_input),
+            definition_digest(
+                &documented,
+                payload,
+                schedule,
+                replayer,
+                task_stat,
+                host_input
+            ),
             digest
         );
 
@@ -748,13 +782,27 @@ mod tests {
         );
         assert_ne!(nested_added, source);
         assert_ne!(
-            definition_digest(&nested_added, payload, schedule, replayer, task_stat, host_input),
+            definition_digest(
+                &nested_added,
+                payload,
+                schedule,
+                replayer,
+                task_stat,
+                host_input
+            ),
             digest
         );
         let nested_removed = source.replacen("    backstop: Option<LogicalTime>,\n", "", 1);
         assert_ne!(nested_removed, source);
         assert_ne!(
-            definition_digest(&nested_removed, payload, schedule, replayer, task_stat, host_input),
+            definition_digest(
+                &nested_removed,
+                payload,
+                schedule,
+                replayer,
+                task_stat,
+                host_input
+            ),
             digest
         );
 
@@ -824,7 +872,14 @@ mod tests {
         );
         assert_ne!(documented, source);
         assert_eq!(
-            definition_digest(&documented, payload, schedule, replayer, task_stat, host_input),
+            definition_digest(
+                &documented,
+                payload,
+                schedule,
+                replayer,
+                task_stat,
+                host_input
+            ),
             digest
         );
 

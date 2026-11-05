@@ -4479,7 +4479,7 @@ mod legacy_backend_json {
                     | "rewrite_exclusives_in_memory"
                     | "count_store_exclusives"
                     | "stacktrace_at_schedule_positions"
-                    | "untrap_passthrough_syscalls"
+                    | "untrap_passthrough_syscalls",
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
                 // Empty, as its serde default is.
                 Some("rewrite_exclusives_unmarked" | "rewrite_exclusives_overlay") => seed
@@ -4858,10 +4858,9 @@ mod legacy_backend_json {
                 | "stacktrace_at_schedule_positions"
                 | "untrap_passthrough_syscalls"
                 | "chaos_instruction_offset" => Ok(()),
-                | "property_snapshot" => Ok(()),
-                | "watch"
-                | "watch_from" => Ok(()),
-                | "rewrite_exclusives_overlay" => Ok(()),
+                "property_snapshot" => Ok(()),
+                "watch" | "watch_from" => Ok(()),
+                "rewrite_exclusives_overlay" => Ok(()),
                 "replay_continue_fairly" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
@@ -5420,9 +5419,7 @@ mod tests {
                 // states (absent reads as `None` by serde default).
                 "rcb_clock_contract" => {
                     if value.is_null() {
-                        serde_json::Value::String(
-                            "PerfCounterOnTargetThreadUserOnly".to_owned(),
-                        )
+                        serde_json::Value::String("PerfCounterOnTargetThreadUserOnly".to_owned())
                     } else {
                         serde_json::Value::Null
                     }
@@ -5889,10 +5886,9 @@ mod tests {
                 | "stacktrace_at_schedule_positions"
                 | "untrap_passthrough_syscalls"
                 | "chaos_instruction_offset" => {}
-                | "property_snapshot" => {}
-                | "watch"
-                | "watch_from" => {}
-                | "rewrite_exclusives_overlay" => {}
+                "property_snapshot" => {}
+                "watch" | "watch_from" => {}
+                "rewrite_exclusives_overlay" => {}
                 "replay_continue_fairly" => {}
                 other => expected.push(other.to_owned()),
             }
