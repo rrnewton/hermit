@@ -1526,6 +1526,8 @@ impl AnalyzeOpts {
         path: &Path,
     ) -> anyhow::Result<()> {
         self.write_trial_record(trial_record_from(events, sources), path)
+    }
+
     /// Take the uncapped-slices mark of the schedule files `paths` for the
     /// trial schedules made from them: the latest time any of them states.
     pub fn adopt_uncapped_slices(&self, paths: &[&Path]) -> anyhow::Result<()> {
