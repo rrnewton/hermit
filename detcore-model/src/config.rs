@@ -4428,8 +4428,8 @@ mod legacy_backend_json {
                     | "strict_binder"
                     | "rewrite_exclusives_in_memory"
                     | "count_store_exclusives"
-                    | "stacktrace_at_schedule_positions",
-                    | "untrap_passthrough_syscalls",
+                    | "stacktrace_at_schedule_positions"
+                    | "untrap_passthrough_syscalls"
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
                 // Empty, as its serde default is.
                 Some("rewrite_exclusives_unmarked") => seed
