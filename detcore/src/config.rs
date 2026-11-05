@@ -107,9 +107,11 @@ mod tests {
     /// https://github.com/rrnewton/hermit/pull/4769's row 41, and 45,
     /// the `HostFileIdentity::content` layout of
     /// https://github.com/rrnewton/hermit/pull/4791 (renumbered from its
-    /// row 41 at integration), is the current revision. A change that lands below the last row removes
+    /// row 41 at integration), and 46, this integration's renumbering
+    /// of https://github.com/rrnewton/hermit/pull/4796's row 45, is the
+    /// current revision. A change that lands below the last row removes
     /// its entry, with its row. One that lands after a higher revision
-    /// (any of 33 to 39 after 45) appends its row above the last instead
+    /// (any of 33 to 39 after 46) appends its row above the last instead
     /// and leaves its old number here, reserved as never landed: filling
     /// a number in below a landed row would rewrite that row's digest.
     const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[33, 34, 35, 36, 37, 38, 39];
@@ -337,6 +339,12 @@ mod tests {
         // procfs payload domain; digest re-measured on the combined tree
         // at regeneration).
         (45, "aeb38079447d34fb", "f013e36743d8d9e6"),
+        // Retypes `GlobalRequest::TraceSchedEvent`; adds
+        // `GlobalResponse::WithWatchOrder` (#4796). Live-computed as 45 at
+        // its rebase onto main's 40, skipping queued/advisory claims
+        // 41-44; renumbered 46 at integration behind rows 41 to 45;
+        // digest re-measured on the combined tree at regeneration.
+        (46, "b434f4f465fdbb8d", "f013e36743d8d9e6"),
 
     ];
 

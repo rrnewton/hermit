@@ -488,6 +488,11 @@ pub struct RunSummary {
     /// full report. Absent when there were none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exclusive_rewrite_unmarked: Vec<String>,
+    /// `--watch`: which threads armed their hardware watchpoints, and the hits.
+    /// Shown in the full report, not the INFO view, so a watch leaves what
+    /// `--verify` compares as it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<WatchRunSummary>,
 }
 
 fn is_zero(count: &u64) -> bool {
@@ -678,6 +683,38 @@ pub struct DesyncNote {
     pub message: String,
 }
 
+/// The `--watch` part of a [`RunSummary`].
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+pub struct WatchRunSummary {
+    /// Threads that armed their watches in at least one image interval.
+    pub armed: u64,
+    /// Intervals that never did, by thread and why. A thread can appear
+    /// here for a post-exec interval and still count in `armed` for an
+    /// earlier one.
+    pub unarmed: Vec<(DetTid, crate::access_trace::WatchUnarmed)>,
+    /// Hits on every thread.
+    pub hits: u64,
+}
+
+impl fmt::Display for WatchRunSummary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Watch: {} thread(s) armed their watches, {} hit(s)",
+            self.armed, self.hits
+        )?;
+        if !self.unarmed.is_empty() {
+            let unarmed: Vec<String> = self
+                .unarmed
+                .iter()
+                .map(|(tid, why)| format!("thread {tid} ({why:?})"))
+                .collect();
+            write!(f, "; uncovered intervals: {}", unarmed.join(", "))?;
+        }
+        writeln!(f)
+    }
+}
+
 /// The full human-readable report, including recorded launch configuration.
 impl fmt::Display for RunSummary {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -802,6 +839,7 @@ impl RunSummary {
             seed_reproducible: _,
             exclusive_rewrite_unmarked,
             stdio_changed: _,
+            watch,
         } = self;
         if let Some(bound) = run_timeout_secs {
             writeln!(
@@ -879,6 +917,9 @@ impl RunSummary {
         }
         if include_report_metadata && let Some(post_crash) = post_crash {
             writeln!(f, "{post_crash}")?;
+        }
+        if include_report_metadata && let Some(watch) = watch {
+            write!(f, "{watch}")?;
         }
 
         if include_report_metadata {
