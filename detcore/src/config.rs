@@ -289,10 +289,10 @@ mod tests {
         // Adds `GlobalRequest::RecordExecStrings` and
         // `GlobalRequest::ProcessExecStrings` and their responses, which
         // carry an image's argument and environment strings (`ExecStrings`,
-        // package K item 2b slice 2b-3, the next revision after 2b-1's). The
-        // digest covers that payload type too (domain 7). Digest measured at
-        // this head.
-        (42, "0671347d3a6de076", "f013e36743d8d9e6"),
+        // package K item 2b slice 2b-3, the next revision after 2b-1's) and,
+        // in `ProcessExecStrings`'s, the image's number. The digest covers
+        // that payload type too (domain 7). Digest measured at this head.
+        (42, "05097a2f4152ff09", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
