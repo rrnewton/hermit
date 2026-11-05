@@ -295,16 +295,17 @@ mod tests {
         // that payload type too (domain 7). Digest measured at this head.
         (42, "05097a2f4152ff09", "f013e36743d8d9e6"),
         // Adds `GlobalRequest::SuspendHoldsDiscarded` and its response
-        // (SIGSHARE S2b, https://github.com/rrnewton/hermit/pull/5175): after(this
-        // base's last row); renumbered mechanically at each rebase.
-        (43, "33bdc9e3049122be", "f013e36743d8d9e6"),
+        // (SIGSHARE S2b, https://github.com/rrnewton/hermit/pull/5175), the
+        // next revision after 2b-3's in the KVM integration stack. Digest
+        // measured at S2b's last commit in that stack.
+        (43, "deb9c0ff4b6ec91b", "f013e36743d8d9e6"),
         // Adds `GlobalRequest::RecordWorkingDirectory` and
         // `GlobalRequest::TaskWorkingDirectory` and their responses, which
         // carry a task's working directory as Detcore recorded it
         // (`DirectoryRecord`, package K item 2b slice 2b-4, the next
         // revision after S2b's). The digest covers that payload type too
-        // (domain 8, from exec_record.rs). Digest measured at this head.
-        (44, "02d24f3a79e7a7f3", "f013e36743d8d9e6"),
+        // (domain 8, from exec_record.rs). Digest measured at the stack's head.
+        (44, "077f68d7f0b969fc", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
