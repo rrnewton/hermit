@@ -187,6 +187,35 @@ pub struct PreemptionRecord {
     /// switch on, so a replay can tell "no switch was taken" from a record
     /// derived from another, which holds none (`None`).
     post_crash: Option<Vec<crate::post_crash::PostCrashSwitch>>,
+    /// Set when the run that produced this record ended its slices without
+    /// the `--max-timeslice` bound: a run that replayed a preemption record
+    /// (`--replay-preemptions-from`) some of whose own completed slices ran
+    /// past the bound (the writer's noted longest actual slice), or that
+    /// followed a record that was itself marked, or a schedule replay of a
+    /// record that says so. A replay whose slices all fit under the bound
+    /// writes no mark, so a capped record round-trips byte-identically. It holds the latest logical time, in
+    /// nanoseconds, any of the run's recorded events reached, which no slice
+    /// of the run outlasts. A schedule replay of such a record installs no
+    /// `--max-timeslice` slice end while the record lasts
+    /// (`Scheduler::uncapped_backstop`); one that did would end a recorded
+    /// slice early and leave the record. The value survives where event
+    /// times do not (analyze writes its trial schedules without them).
+    /// `None`, which writes nothing, for every other run and for records
+    /// written before the field existed.
+    ///
+    /// Reader contract: the mark is honoured by Hermit from the change that
+    /// added it. It is an optional setting outside the format counter
+    /// (`PREEMPTION_RECORD_FORMAT`), as `pipe_wake_latency` and
+    /// `chaos_timeslice` are, because a marked record can be of any format (a
+    /// schedule replay writes the format of the record it follows, and
+    /// analyze's trials the format of the recordings they splice), so an
+    /// older Hermit ignores it, as it ignores every field it does not know.
+    /// Such a reader replays a marked record as it replayed these records
+    /// before the mark existed: its `--max-timeslice` bound ends the long
+    /// recorded slices early, and the replay counts the events that then
+    /// desynchronize in its summary, as such replays did before the mark
+    /// existed. Replay these records with a Hermit that has the mark.
+    uncapped_slices: Option<u64>,
     /// Actual callback expirations associated with existing priority-history rows.
     /// Absent in old/edited recordings; never inferred from time or branch counts.
     callback_checkpoints: BTreeMap<DetTid, Vec<callback_history::Checkpoint>>,
@@ -454,6 +483,7 @@ impl PreemptionRecord {
             reserved_input: ReservedInputMetadata::default(),
             post_crash_timeslice: None,
             post_crash: None,
+            uncapped_slices: None,
             callback_checkpoints: BTreeMap::new(),
             rng_seed: None,
             expired_wait_runs_charged_once: false,
@@ -526,6 +556,7 @@ impl PreemptionRecord {
             reserved_input,
             post_crash_timeslice,
             post_crash,
+            uncapped_slices,
             callback_checkpoints,
             rng_seed,
             expired_wait_runs_charged_once,
@@ -589,6 +620,7 @@ impl PreemptionRecord {
             // a shorter one lists none and is not checked against them, as a
             // record derived from another (`clone_preemptions_only`) is not.
             post_crash: if followed { None } else { post_crash.clone() },
+            uncapped_slices: *uncapped_slices,
             callback_checkpoints,
             rng_seed: *rng_seed,
             expired_wait_runs_charged_once: *expired_wait_runs_charged_once,
@@ -1053,6 +1085,33 @@ impl PreemptionRecord {
         self
     }
 
+    /// The latest logical time of the run this record came from, in
+    /// nanoseconds, when that run ended its slices without the
+    /// `--max-timeslice` bound (see the field).
+    pub fn uncapped_slices(&self) -> Option<u64> {
+        self.uncapped_slices
+    }
+
+    /// The same record, stating that the run (or the trials) it came from
+    /// ended their slices without the `--max-timeslice` bound, and the
+    /// latest logical time they reached. Every record analyze writes from
+    /// trials carries it, as it carries the pipe-wake latency.
+    pub fn with_uncapped_slices(mut self, uncapped: Option<u64>) -> Self {
+        self.uncapped_slices = uncapped;
+        self
+    }
+
+    /// The latest logical time, in nanoseconds, any event of this record
+    /// carries.
+    fn latest_event_time(&self) -> u64 {
+        self.global
+            .iter()
+            .filter_map(|event| event.end_time)
+            .map(|end| end.as_nanos())
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Make a copy of everything in the `PreemptionRecord` in a public format.
     pub fn extract_all(&self) -> BTreeMap<DetTid, ThreadHistory> {
         self.per_thread.clone()
@@ -1146,6 +1205,7 @@ impl PreemptionRecord {
             // A derived record (minimize, analyze trials) runs a different
             // schedule, whose switches the run computes afresh.
             post_crash: None,
+            uncapped_slices: self.uncapped_slices,
             callback_checkpoints: BTreeMap::new(),
             rng_seed: self.rng_seed,
             expired_wait_runs_charged_once: self.expired_wait_runs_charged_once,
@@ -1224,6 +1284,7 @@ impl PreemptionRecord {
             reserved_input: ReservedInputMetadata::default(),
             post_crash_timeslice: None,
             post_crash: None,
+            uncapped_slices: None,
             callback_checkpoints: BTreeMap::new(),
             rng_seed: None,
             expired_wait_runs_charged_once: false,
@@ -3026,6 +3087,87 @@ mod tests {
         assert_eq!(read_recorded_chaos_timeslice(&path), Ok(None));
     }
 
+    /// The uncapped-slices mark is written only when set, so a record from an
+    /// ordinary run, and every record written before the mark existed, reads
+    /// back unmarked and is written exactly as before; a marked one keeps the
+    /// mark through a round trip and a copy of its preemptions.
+    #[test]
+    fn the_uncapped_slices_mark_is_written_only_when_set() {
+        let ordinary = PreemptionWriter::new(None).into_string();
+        assert!(!ordinary.contains("uncapped_slices"), "{ordinary}");
+        let back: PreemptionRecord = serde_json::from_str(&ordinary).unwrap();
+        assert_eq!(back.uncapped_slices(), None);
+        let unmarked = PreemptionWriter::new(None)
+            .with_uncapped_slices(false)
+            .into_string();
+        assert_eq!(unmarked, ordinary);
+        // A marked record states the latest time its events reached.
+        let mut writer = PreemptionWriter::new(None).with_uncapped_slices(true);
+        for end in [Some(250_000), Some(9_400_000), None, Some(1_200_000)] {
+            writer.inner.global.push(SchedEvent {
+                dettid: DetTid::from_raw(3),
+                op: detcore_model::schedule::Op::Branch,
+                count: 1,
+                start_rip: None,
+                end_rip: None,
+                end_time: end.map(LogicalTime::from_nanos),
+                stopless: false,
+            });
+        }
+        let marked = writer.into_string();
+        assert!(marked.contains("\"uncapped_slices\":9400000"), "{marked}");
+        let back: PreemptionRecord = serde_json::from_str(&marked).unwrap();
+        assert_eq!(back.uncapped_slices(), Some(9_400_000));
+        assert_eq!(
+            back.clone_preemptions_only().uncapped_slices(),
+            Some(9_400_000)
+        );
+        assert_eq!(
+            PreemptionRecord::from_sched_events(Vec::new())
+                .with_uncapped_slices(Some(7))
+                .uncapped_slices(),
+            Some(7)
+        );
+        // With a bound, the mark follows the slices the run actually ran,
+        // not gaps in the traced stream. A big gap between two traced
+        // events (a wait between slices) with no completed slice past the
+        // bound writes no mark.
+        let mut waited = PreemptionWriter::new(None)
+            .with_uncapped_slices(true)
+            .with_max_timeslice(std::num::NonZeroU64::new(1_000_000));
+        for end in [Some(40), Some(9_400_000)] {
+            waited.inner.global.push(SchedEvent {
+                dettid: DetTid::from_raw(3),
+                op: detcore_model::schedule::Op::Branch,
+                count: 1,
+                start_rip: None,
+                end_rip: None,
+                end_time: end.map(LogicalTime::from_nanos),
+                stopless: false,
+            });
+        }
+        waited.note_longest_slice(40);
+        assert!(!waited.into_string().contains("uncapped_slices"));
+        // One slice dense with traced check-ins, every gap under the
+        // bound, but the slice itself ran past it: it stamps.
+        let mut past = PreemptionWriter::new(None)
+            .with_uncapped_slices(true)
+            .with_max_timeslice(std::num::NonZeroU64::new(1_000_000));
+        for end in (200_000..=9_400_000).step_by(200_000) {
+            past.inner.global.push(SchedEvent {
+                dettid: DetTid::from_raw(3),
+                op: detcore_model::schedule::Op::Branch,
+                count: 1,
+                start_rip: None,
+                end_rip: None,
+                end_time: Some(LogicalTime::from_nanos(end)),
+                stopless: false,
+            });
+        }
+        past.note_longest_slice(9_400_000);
+        assert!(past.into_string().contains("\"uncapped_slices\":9400000"));
+    }
+
     #[test]
     fn the_in_memory_exclusive_rewrite_round_trips_and_is_compared() {
         let off = PreemptionWriter::new(None).into_string();
@@ -3828,6 +3970,27 @@ mod tests {
         }
     }
 
+    /// Whether the run ended its slices without the `--max-timeslice` bound
+    /// is a setting of the whole run, as the other run settings are, and its
+    /// latest logical time still bounds every slice of a prefix: a prefix of
+    /// the schedule keeps the mark, whether it is shorter or whole.
+    #[test]
+    fn a_schedule_prefix_keeps_the_uncapped_slices_mark() {
+        let tid = DetTid::from_raw(3);
+        let record = PreemptionRecord::from_sched_events(vec![
+            SchedEvent::branches(tid, 10),
+            SchedEvent::branches(tid, 20),
+        ])
+        .with_uncapped_slices(Some(9_400_000));
+        for len in [0, 1, 2, 9] {
+            assert_eq!(
+                record.schedule_prefix(len).uncapped_slices(),
+                Some(9_400_000),
+                "prefix of {len} events"
+            );
+        }
+    }
+
     /// A replay of a schedule's first events keeps the callback checkpoints
     /// of the slices those events end, for the threads they run, and no later
     /// ones: the slice end at the prefix's own end belongs to the event after
@@ -4169,6 +4332,17 @@ pub struct PreemptionWriter {
     boundary_records: Option<Vec<detcore_model::schedule::boundary::Record>>,
     dest: Option<PathBuf>,
     flushed: bool,
+    /// Whether the run ends its slices without the `--max-timeslice` bound
+    /// (`with_uncapped_slices`).
+    uncapped: bool,
+    /// The run's `--max-timeslice` bound, when it has one
+    /// (`with_max_timeslice`): the uncapped mark is written only when a
+    /// completed slice actually ran past it.
+    max_timeslice: Option<std::num::NonZeroU64>,
+    /// Longest completed slice the scheduler has reported for this run
+    /// (`note_longest_slice`), in nanoseconds: actual slice evidence from
+    /// the threads' own slice accounting, not gaps between traced events.
+    longest_slice_ns: u64,
 }
 
 impl PreemptionWriter {
@@ -4184,6 +4358,9 @@ impl PreemptionWriter {
             },
             reserved_input_qualification: Default::default(),
             boundary_records: None,
+            uncapped: false,
+            max_timeslice: None,
+            longest_slice_ns: 0,
             dest: path,
             flushed: false,
         }
@@ -4464,6 +4641,43 @@ impl PreemptionWriter {
             .push(switch);
     }
 
+    /// Store that the run ends its slices without the `--max-timeslice`
+    /// bound (`PreemptionRecord::uncapped_slices`; `false` writes nothing).
+    /// The latest event time is filled in when the record is written.
+    pub fn with_uncapped_slices(mut self, uncapped: bool) -> Self {
+        self.uncapped = uncapped;
+        self
+    }
+
+    /// The run's `--max-timeslice` bound, when it has one: a replay stamps
+    /// its record only when a slice it actually ran passed the bound, so a
+    /// capped record round-trips byte-identically. No bound (the default)
+    /// stamps whenever `with_uncapped_slices` says to.
+    pub fn with_max_timeslice(mut self, bound: Option<std::num::NonZeroU64>) -> Self {
+        self.max_timeslice = bound;
+        self
+    }
+
+    /// Note the longest completed slice the scheduler has folded for this
+    /// run so far, in nanoseconds: the actual slice evidence the mark is
+    /// gated on. A slice dense with traced check-ins is still one slice;
+    /// a wait between slices is not one either.
+    pub fn note_longest_slice(&mut self, longest_ns: u64) {
+        self.longest_slice_ns = self.longest_slice_ns.max(longest_ns);
+    }
+
+    /// Fill in the uncapped-slices mark, if the run ends its slices without
+    /// the bound, from the events recorded so far.
+    fn mark_uncapped_slices(&mut self) {
+        if self.uncapped
+            && self
+                .max_timeslice
+                .is_none_or(|bound| self.longest_slice_ns > bound.get())
+        {
+            self.inner.uncapped_slices = Some(self.inner.latest_event_time());
+        }
+    }
+
     /// Does the record have zero entries?
     pub fn is_empty(&self) -> bool {
         self.inner.per_thread.is_empty()
@@ -4698,6 +4912,7 @@ impl PreemptionWriter {
     /// Abort writing to disk and instead gather the output thusfar into a string.
     pub fn into_string(mut self) -> String {
         self.flushed = true;
+        self.mark_uncapped_slices();
         self.serialized_string()
             .expect("invalid preemption recording")
     }
@@ -4756,6 +4971,7 @@ impl PreemptionWriter {
     }
 
     fn write_to_disk(&mut self) -> Result<(), String> {
+        self.mark_uncapped_slices();
         if self.dest.is_some() {
             if self.boundary_records.is_none() {
                 self.finalize()?;
@@ -5230,6 +5446,18 @@ pub fn sleep_registration_mismatch(
             replay.as_str(),
         )
     })
+}
+
+/// Read only the uncapped-slices mark of a preemption record file
+/// (`PreemptionRecord::uncapped_slices`), as [`read_recorded_epoch`] reads the
+/// epoch. `Ok(None)` for an unmarked record.
+pub fn read_recorded_uncapped_slices(path: &Path) -> Result<Option<u64>, String> {
+    #[derive(Deserialize)]
+    struct MarkOnly {
+        #[serde(default)]
+        uncapped_slices: Option<u64>,
+    }
+    Ok(boundary_recording::read_settings::<MarkOnly>(path)?.uncapped_slices)
 }
 
 /// The refusal of a replay whose signal-state copy setting differs from the

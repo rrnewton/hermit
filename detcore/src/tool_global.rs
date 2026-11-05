@@ -7925,16 +7925,20 @@ impl GlobalState {
             // event made meanwhile, in an earlier turn, counts too, and so does
             // the end of the schedule. On a release the scheduler drops its
             // copy of this thread's callback checkpoints here, and the thread
-            // drops its own when this reply reaches it.
-            let (schedule_released, schedule_over) = self
+            // drops its own when this reply reaches it. The replay backstop is
+            // read under the same lock, so the reply never pairs the end of the
+            // schedule with a backstop from before it
+            // (`Scheduler::trace_replay_reply`).
+            let (schedule_released, schedule_over, backstop) = self
                 .lock_rpc_scheduler(false)
                 .await
-                .schedule_replay_reply(ev.dettid);
+                .trace_replay_reply(ev.dettid);
             TraceSchedEventResponse {
                 print_stack_strace: print_stack.or(print_stack2),
                 timeslice: end_of_timeslice,
                 schedule_released,
                 schedule_over,
+                backstop,
             }
         } else {
             let print_stack_strace = {
@@ -7957,6 +7961,7 @@ impl GlobalState {
                 timeslice: None,
                 schedule_released: false,
                 schedule_over: false,
+                backstop: None,
             }
         };
 
@@ -8201,9 +8206,11 @@ pub enum SignalScope {
 /// Detcore and a coordinator built at different revisions refuse each other
 /// before either decodes the other's messages. A change to either enum
 /// appends a revision (`config::tests::the_global_rpc_revision_matches_its_definitions`
-/// fails until it does). That test digests the two enums' bodies and
-/// `Resources`, and refuses a revision whose digests did not change, so no
-/// revision can be appended by hand. A change to another payload type defined
+/// fails until it does). That test digests the two enums' bodies,
+/// `Resources`, the StoreExclusive payload's types, and the nested payload
+/// types it lists (from revision 37, `TraceSchedEventResponse`), and refuses
+/// a revision whose digests did not change, so no revision can be appended
+/// by hand. A change to another payload type defined
 /// elsewhere (`CommittedSendWindow`, `PlaceholderDirectory`, ...) changes what
 /// is on the wire without changing the digest, so it must either keep every
 /// encoding a peer built before it can send or receive (an enum variant
@@ -8226,10 +8233,13 @@ pub enum SignalScope {
 /// 40 appends the `CpuClockProcess` pair
 /// (https://github.com/rrnewton/hermit/pull/4885) after 32, skipping
 /// reserved 33 to 39. 41 adds `Rewrite::unmarked` to the
-/// `StoreExclusive` payload. The current revision 42 adds `WithCpuTime`
-/// and `RecordExitCode` (package K item 2b slice 2b-1, allocated 39,
-/// renumbered 41 at its rebase onto 40, then 42 at integration).
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 42;
+/// `StoreExclusive` payload. 42 adds `WithCpuTime` and `RecordExitCode`
+/// (package K item 2b slice 2b-1, allocated 39, renumbered 41 at its
+/// rebase onto 40, then 42 at integration). The current revision 43
+/// adds `TraceSchedEventResponse::backstop` (PR #4759, allocated 25 on
+/// its own base, assigned 42 at its rebase onto 41, renumbered 43 at
+/// integration).
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 43;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
@@ -12136,6 +12146,10 @@ pub struct TraceSchedEventResponse {
     /// Whether the replayed schedule is over: it ran out or was released
     /// (`Scheduler::schedule_replay_over`).
     schedule_over: bool,
+    /// The slice length that replaces `--max-timeslice` while the thread
+    /// replays a record whose slices ran without it
+    /// (`Scheduler::uncapped_backstop`).
+    backstop: Option<LogicalTime>,
 }
 
 struct SchedEventForLog<'a> {
@@ -12261,14 +12275,20 @@ pub async fn trace_schedevent_with_access<G, T>(
                 timeslice,
                 schedule_released,
                 schedule_over,
+                backstop,
             }),
         ) => {
             if schedule_released {
                 guest.thread_state_mut().callback_history.release();
             }
-            if schedule_over {
-                guest.thread_state_mut().schedule_replay_over = true;
-            }
+            let bound = guest.config().max_timeslice;
+            let schedule_replay = guest.config().replay_schedule_from.is_some();
+            guest.thread_state_mut().hear_schedule_replay_reply(
+                schedule_over,
+                backstop,
+                bound,
+                schedule_replay,
+            );
             if let Some(m_path) = print_stack_strace {
                 trace!("[trace_schedevent] writing stacktrace via Reverie...");
                 write_backtrace(guest, m_path.as_ref());
