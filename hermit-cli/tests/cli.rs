@@ -69280,6 +69280,274 @@ fn run_kvm_a_renamed_working_directory_of_another_process_is_refused_by_name() {
     );
 }
 
+static PROC_OTHER_PROCESS_FDS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+
+/// `tests/c/proc_other_process_fds.c`'s guest.
+fn proc_other_process_fds_guest() -> &'static Path {
+    compiled_c_guest(&PROC_OTHER_PROCESS_FDS_GUEST, "proc_other_process_fds")
+}
+
+/// The other-process descriptors guest's transcript, as Linux answers it:
+/// another process's `fd` directory and `fd/<n>` links (fs/proc/fd.c
+/// proc_readfd_common, proc_lookupfd_common, proc_fd_link and d_path, after
+/// proc_fd_access_allowed), with the work directory as `<dir>`, descriptors
+/// from 40 up, and a pipe's and a socket's object compared with the parent's
+/// own link of it. A zombie's table is gone (and its directories are root's,
+/// so a reader that is not root is refused first: either way no descriptor
+/// shows), and a non-dumpable child's links and fdinfo are refused to a
+/// reader without effective capabilities.
+const PROC_OTHER_PROCESS_FDS_LINES: &[&str] = &[
+    "listing: 40 41 50 51 52 53 54 55 56 57 58 59 60 61 70 stdio=1 dots=2",
+    "task listing: 40 41 50 51 52 53 54 55 56 57 58 59 60 61 70 stdio=1 dots=2",
+    "fd/50=<dir>/file",
+    "fd/51=<dir>/gone (deleted)",
+    "fd/52=<dir>/new",
+    "fd/53=pipe:[<n>] same as the parent's=1",
+    "fd/54=pipe:[<n>] same as the parent's=1",
+    "fd/55=socket:[<n>] same as the parent's=1",
+    "fd/56=socket:[<n>] same as the parent's=1",
+    "fd/57=anon_inode:[eventfd]",
+    "fd/58=/memfd:probe (deleted)",
+    "fd/59=/dev/null",
+    "fd/60=<dir>/file",
+    "fd/61=<dir>",
+    "fd/70=/dev/null",
+    "task fd/50=<dir>/file",
+    "readlinkat(fd, 52)=<dir>/new",
+    "fd directory: dir=1 mode=500 nlink=2",
+    "listing by descriptor: 40 41 50 51 52 53 54 55 56 57 58 59 60 61 70 stdio=1 dots=2",
+    "stat fd directory: dir=1 mode=500",
+    "fd/50 in 5 bytes: length=5 prefix=1 untouched=1",
+    "fd/99: ENOENT",
+    "fd/abc: ENOENT",
+    "fd/050: ENOENT",
+    "fdinfo/99: ENOENT",
+    "fdinfo/abc: ENOENT",
+    "bogus entry: ENOENT",
+    "fd/50/: ENOTDIR",
+    "fd/53/: ENOTDIR",
+    "fd/61/: EINVAL",
+    "after close: 40 41 50 51 52 53 54 55 56 57 58 59 61 70 stdio=1 dots=2",
+    "after close fd/60: ENOENT",
+    "zombie listing: no descriptors",
+    "zombie fd/50: no link",
+    "zombie fdinfo/50: ENOENT",
+    "reaped listing: ENOENT",
+    "reaped fd/50: ENOENT",
+    "non-dumpable child: fd/41=EACCES fdinfo/41=EACCES",
+    "failures=0",
+];
+
+/// The other-process descriptors guest run natively with `args` before a
+/// fresh work directory: its standard output.
+fn proc_other_process_fds_native(args: &[&str]) -> String {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let output = Command::new(proc_other_process_fds_guest())
+        .args(args)
+        .arg(directory.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the other-process descriptors guest natively");
+    assert!(output.status.success(), "native: {output:?}");
+    stdout(&output)
+}
+
+/// The other-process descriptors guest's transcript on `backend`, at L2, in
+/// a fresh work directory that both verified runs share (the guest removes
+/// what it made before it exits), checked against its native run, which is
+/// checked line by line first ([`PROC_OTHER_PROCESS_FDS_LINES`]), so a host
+/// that answers otherwise fails there rather than in the comparison.
+fn assert_proc_other_process_fds_at_l2(backend: &str) {
+    let native = proc_other_process_fds_native(&[]);
+    assert_eq!(
+        native.lines().collect::<Vec<_>>(),
+        PROC_OTHER_PROCESS_FDS_LINES,
+        "native"
+    );
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let work = directory.path().to_str().expect("work directory is UTF-8");
+    let transcript = guest_transcript_at_l2(backend, proc_other_process_fds_guest(), &[work]);
+    assert_eq!(transcript, native, "{backend}");
+}
+
+/// Another process's `/proc/<pid>/fd` directory and its `fd/<n>` links
+/// (`tests/c/proc_other_process_fds.c`) on ptrace, at L2, exactly as
+/// natively, every line: a forked child's listing by its process and its
+/// thread and by a descriptor of the directory, and again after it closes
+/// one; each link (a file, one unlinked, one renamed, a pipe and a socket
+/// pair shared with the parent, an eventfd, a memfd, `/dev/null`, a
+/// close-on-exec duplicate, a directory, a descriptor past the table's first
+/// 64 slots); a buffer too small; a slash after a link; numbers the child
+/// does not hold and names that are none; the directory's metadata; a
+/// zombie's and a reaped child's; and a non-dumpable child read without
+/// effective capabilities. ptrace keeps the kernel's answers (package K item
+/// 2b slice 2b-5 changes nothing there).
+#[test]
+fn another_processs_descriptor_directory_and_links_answer_as_linux() {
+    assert_proc_other_process_fds_at_l2("ptrace");
+}
+
+/// [`another_processs_descriptor_directory_and_links_answer_as_linux`] on
+/// KVM, at L2, exactly as natively, every line. Before package K item 2b
+/// slice 2b-5 the first open of the child's `fd` directory was refused by
+/// name; Detcore now lists another process's table and names its links from
+/// its own descriptor model (the table each thread holds, noted at its
+/// creator's `clone`) and the backend's `link_path` fact, with Linux's order
+/// of answers, access check and zombie rule.
+#[test]
+fn run_kvm_another_processs_descriptor_directory_and_links_answer_as_linux() {
+    let test = "run_kvm_another_processs_descriptor_directory_and_links_answer_as_linux";
+    if kvm_unavailable(test) {
+        return;
+    }
+    assert_proc_other_process_fds_at_l2("kvm");
+}
+
+/// Run the other-process descriptors guest with `args` before a fresh work
+/// directory on a strict KVM run, and check that it ends as a policy refusal
+/// whose reason names `refused` on stderr, and that the guest printed
+/// nothing for the refused read (no line starting `printed`).
+fn assert_kvm_proc_other_process_fds_refused(args: &[&str], refused: &str, printed: &str) {
+    let guest = proc_other_process_fds_guest()
+        .to_str()
+        .expect("guest path is UTF-8");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let work = directory.path().to_str().expect("work directory is UTF-8");
+    let hermit_args = [
+        "--backend",
+        "kvm",
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--",
+        guest,
+    ]
+    .into_iter()
+    .chain(args.iter().copied())
+    .chain([work])
+    .collect::<Vec<_>>();
+    let output = hermit(&hermit_args);
+    let refused_stderr = stderr(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{args:?} must end the strict run as a policy refusal\nstdout:\n{}\nstderr:\n{refused_stderr}",
+        stdout(&output)
+    );
+    assert!(
+        refused_stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal")
+            && refused_stderr.contains(refused),
+        "{args:?}: the run did not name the refusal on stderr\nstderr:\n{refused_stderr}"
+    );
+    assert!(
+        !stdout(&output)
+            .lines()
+            .any(|line| line.starts_with(printed)),
+        "{args:?}: the guest printed a read the run should have refused: {}",
+        stdout(&output)
+    );
+}
+
+/// Another process's descriptor fdinfo (`tests/c/proc_other_process_fds.c
+/// --fdinfo`): Linux shows the descriptor's position, flags and mount id
+/// (natively, its first line is `pos:\t0`), which Detcore's model does not
+/// keep for another process's open file, so a strict KVM run refuses the
+/// read by name (exit 122), after Linux's earlier answers (the access check
+/// and the descriptor's existence, which the main transcript pins).
+#[test]
+fn run_kvm_another_processs_fdinfo_is_refused_by_name() {
+    let test = "run_kvm_another_processs_fdinfo_is_refused_by_name";
+    if kvm_unavailable(test) {
+        return;
+    }
+    assert_eq!(
+        proc_other_process_fds_native(&["--fdinfo"]),
+        "fdinfo/50 pos:\t0\nfailures=0\n",
+        "native"
+    );
+    assert_kvm_proc_other_process_fds_refused(
+        &["--fdinfo"],
+        "fdinfo/50 cannot be served: Detcore does not keep that descriptor's position and \
+         mount id in its model",
+        "fdinfo/50",
+    );
+}
+
+/// How a strict KVM run answers another process's `/proc/<pid>/<name>` for a
+/// name Linux's task directory has and Detcore does not render for another
+/// process yet (ruling 2 of package K item 2b slice 2b-5): the one place the
+/// test decides it, as `unrendered_task_entry_answer` is the one place
+/// Detcore does.
+enum UnrenderedTaskEntryAnswer {
+    /// Refused by name: the run stops with the policy-refusal exit.
+    NamedRefusal,
+    /// This errno, as the guest prints it.
+    // Unused while the answer is the named refusal: the variant the one-line
+    // switch to an errno would select.
+    #[allow(dead_code)]
+    Errno(&'static str),
+}
+
+/// The answer [`UnrenderedTaskEntryAnswer`] Detcore gives today: the named
+/// refusal, since Linux has these files and no fixed errno is its answer.
+const UNRENDERED_TASK_ENTRY_ANSWER: UnrenderedTaskEntryAnswer =
+    UnrenderedTaskEntryAnswer::NamedRefusal;
+
+/// Names Linux's task directory has that Detcore does not render for another
+/// process, with the guest's native line for each: a file (`maps`) and a
+/// path below one of its directories (`ns/net`, which an open follows to the
+/// namespace file, whose read fails).
+const UNRENDERED_TASK_ENTRIES: &[(&str, &str)] = &[
+    ("maps", "entry maps: read"),
+    ("ns/net", "entry ns/net: EINVAL"),
+];
+
+/// Another process's `/proc/<pid>/<name>` for names Linux has that Detcore
+/// does not render for another process yet (`tests/c/proc_other_process_fds.c
+/// --entry NAME`, [`UNRENDERED_TASK_ENTRIES`]), on a strict KVM run: answered
+/// as [`UNRENDERED_TASK_ENTRY_ANSWER`] says, never by the backend, whose own
+/// procfs is not the guest's (before slice 2b-5 `maps` was its EACCES). A
+/// name Linux lacks is ENOENT, which the main transcript pins
+/// (`bogus entry: ENOENT`).
+#[test]
+fn run_kvm_another_processs_unrendered_task_entries_are_refused_by_name() {
+    let test = "run_kvm_another_processs_unrendered_task_entries_are_refused_by_name";
+    if kvm_unavailable(test) {
+        return;
+    }
+    for (name, native_line) in UNRENDERED_TASK_ENTRIES {
+        assert_eq!(
+            proc_other_process_fds_native(&["--entry", name]),
+            format!("{native_line}\nfailures=0\n"),
+            "native {name}"
+        );
+        let printed = format!("entry {name}:");
+        match UNRENDERED_TASK_ENTRY_ANSWER {
+            UnrenderedTaskEntryAnswer::NamedRefusal => assert_kvm_proc_other_process_fds_refused(
+                &["--entry", name],
+                &format!(
+                    "/{name} cannot be served: Detcore does not render it for another process yet"
+                ),
+                &printed,
+            ),
+            UnrenderedTaskEntryAnswer::Errno(errno) => {
+                let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+                let work = directory.path().to_str().expect("work directory is UTF-8");
+                let transcript = guest_transcript_at_l2(
+                    "kvm",
+                    proc_other_process_fds_guest(),
+                    &["--entry", name, work],
+                );
+                assert_eq!(
+                    transcript,
+                    format!("{printed} {errno}\nfailures=0\n"),
+                    "kvm {name}"
+                );
+            }
+        }
+    }
+}
+
 /// The link-targets guest's `--directory-links` transcript, line by line:
 /// the caller's own descriptor links read through a link to one of its own
 /// descriptor directories, as Linux answers them (it follows the link to

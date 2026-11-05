@@ -282,6 +282,109 @@ fn default_descriptor_capacity() -> u64 {
     64
 }
 
+/// The descriptor table each guest thread holds, by thread, in this tool
+/// process, where Detcore reads another process's table
+/// ([`reads_thread_tables`]): so that another process's `/proc/<pid>/fd`
+/// lists, and its `fd/<n>` links name, what that process's table holds now
+/// (package K item 2b slice 2b-5 of
+/// <https://github.com/rrnewton/hermit/issues/5063>).
+///
+/// A handle is noted where the thread's table is made or replaced, in the
+/// turn that makes it: a child's at its creator's `clone`
+/// (`Detcore::init_thread_state`, which the backend calls while the creator
+/// is stopped in that call, before it returns), the run's first thread's as
+/// its state is made, and an exec's new table as the exec gives it (and the
+/// old one back where the exec fails). So a reader never finds a live
+/// thread without its table, whenever the thread itself first runs. Held
+/// weakly: a table goes with its last thread state, as before, and a reader
+/// asks Detcore's process table first whether the thread is live
+/// (`procfs_task`), never this map. Thread numbers are never reissued within
+/// a run where this is kept.
+///
+/// The assumption, written down as for `tool_global::HeldTable`: one tool
+/// process serves every guest process, so a table of another process is in
+/// this one. That holds where the guest's procfs is not the kernel's (KVM,
+/// whose tool runs in Hermit's own process), the only place it is kept.
+static THREAD_TABLES: Mutex<BTreeMap<DetTid, std::sync::Weak<Mutex<FileMetadata>>>> =
+    Mutex::new(BTreeMap::new());
+
+/// Whether a run with `cfg` keeps and reads [`THREAD_TABLES`]: where the
+/// guest's procfs is not the kernel's
+/// (`procfs_inode::tool_can_name_guest_descriptors` false: KVM), so that
+/// Detcore answers another process's `/proc/<pid>/fd` itself; where the tool
+/// keeps the guest's descriptor table rather than discovering it in the
+/// guest process (`tool_shares_guest_descriptor_table` false); not under
+/// record and replay, which leave procfs to the kernel; and with
+/// sequentialized threads, so that a reader reads another table only while
+/// every other guest thread is parked. Decided by declared capabilities and
+/// configuration alone.
+pub(crate) fn reads_thread_tables(cfg: &Config) -> bool {
+    !cfg.recordreplay_modes
+        && cfg.sequentialize_threads
+        && !cfg.backend.tool_shares_guest_descriptor_table
+        && !crate::procfs_inode::tool_can_name_guest_descriptors(&cfg.backend)
+}
+
+/// Note `table` as the descriptor table thread `tid` holds
+/// ([`THREAD_TABLES`]), where the run keeps them. The entries of tables no
+/// thread state holds any more are dropped each time the map's size reaches
+/// a power of two from 1024 up, so the map stays proportional to the live
+/// threads, at a constant amortized cost.
+pub(crate) fn note_thread_table(cfg: &Config, tid: DetTid, table: &Arc<Mutex<FileMetadata>>) {
+    if reads_thread_tables(cfg) {
+        let mut tables = THREAD_TABLES.lock().expect("thread table map poisoned");
+        tables.insert(tid, Arc::downgrade(table));
+        if tables.len() >= 1024 && tables.len().is_power_of_two() {
+            tables.retain(|_, table| table.strong_count() > 0);
+        }
+    }
+}
+
+/// The descriptor table thread `tid` holds ([`THREAD_TABLES`]), if one is
+/// noted and still held by a thread state.
+pub(crate) fn thread_table(tid: DetTid) -> Option<Arc<Mutex<FileMetadata>>> {
+    THREAD_TABLES
+        .lock()
+        .expect("thread table map poisoned")
+        .get(&tid)
+        .and_then(std::sync::Weak::upgrade)
+}
+
+/// What another process's descriptor link needs of the descriptor it names,
+/// read from that process's table ([`ObservedEntry::Held`]).
+#[derive(Debug, Clone)]
+pub(crate) struct ObservedDescriptor {
+    /// The raw stat Detcore took of the descriptor's file at its open, if
+    /// any: its device and inode do not change while it is open.
+    pub(crate) stat: Option<DetStat>,
+    /// The descriptor's resource, for a container standard stream's fixed
+    /// inode number.
+    pub(crate) resource: Option<ResourceID>,
+    /// The procfs file Detcore recorded at the descriptor's open, as its
+    /// link names it (`DetFd::procfs_link_name`).
+    pub(crate) procfs_link: Option<std::path::PathBuf>,
+    /// The `/proc` directory a placeholder descriptor stands for, as its link
+    /// names it (`PlaceholderDirectory::canonical`).
+    pub(crate) placeholder_link: Option<std::path::PathBuf>,
+}
+
+/// What a descriptor table holds at one descriptor number, as another
+/// process's `/proc/<pid>/fd/<n>` reads it ([`FileMetadata::observed_descriptor`]).
+#[derive(Debug, Clone)]
+pub(crate) enum ObservedEntry {
+    /// No descriptor of that number: the table knows every descriptor it
+    /// holds.
+    Absent,
+    /// None that Detcore knows of, but a receive may have installed
+    /// descriptors it does not know ([`FileMetadata::unaccounted_receipts`]).
+    Unknown,
+    /// A descriptor Detcore keeps no description of
+    /// ([`FileMetadata::present_unmodelled`]).
+    Unmodelled,
+    /// A descriptor Detcore describes.
+    Held(Box<ObservedDescriptor>),
+}
+
 /// Deserializes a descriptor table with its aliases restored, so a table
 /// carried across fork (or any other state migration) keeps one open file
 /// description object per `OpenFileId`.
@@ -1123,6 +1226,36 @@ impl FileMetadata {
         numbers.sort_unstable();
         numbers.dedup();
         numbers
+    }
+
+    /// The descriptors open in this table that it knows of, ascending
+    /// ([`Self::descriptor_numbers`]), its capacity
+    /// ([`Self::descriptor_capacity`]), and whether a receive may have
+    /// installed descriptors Detcore does not know
+    /// ([`Self::unaccounted_receipts`]): what another process's descriptor
+    /// directory lists of it ([`THREAD_TABLES`]).
+    pub(crate) fn observed_listing(&self) -> (Vec<RawFd>, u64, bool) {
+        (
+            self.descriptor_numbers(),
+            self.descriptor_capacity,
+            self.unaccounted_receipts,
+        )
+    }
+
+    /// What this table holds at descriptor number `fd`, for another
+    /// process's link of it ([`ObservedEntry`]).
+    pub(crate) fn observed_descriptor(&self, fd: RawFd) -> ObservedEntry {
+        match self.file_handles.get(&fd) {
+            Some(detfd) => ObservedEntry::Held(Box::new(ObservedDescriptor {
+                stat: detfd.stat(),
+                resource: detfd.resource(),
+                procfs_link: detfd.procfs_link_name(),
+                placeholder_link: detfd.placeholder().map(|state| state.directory.canonical()),
+            })),
+            None if self.present_unmodelled.contains_key(&fd) => ObservedEntry::Unmodelled,
+            None if self.unaccounted_receipts => ObservedEntry::Unknown,
+            None => ObservedEntry::Absent,
+        }
     }
 
     /// The capacity a fork's copy of this table gets: `dup_fd` sizes it from
@@ -7814,6 +7947,10 @@ impl<T> ThreadState<T> {
             metadata
         };
         let process_files = Some(file_metadata.files_id);
+        let file_metadata = Arc::new(Mutex::new(file_metadata));
+        // The run's first thread's table, for another process's reads of it
+        // (`THREAD_TABLES`), as its state is made, before it runs.
+        note_thread_table(cfg, pid, &file_metadata);
         ThreadState {
             dettid: pid,
             detpid: None, // Initialized later.
@@ -7833,7 +7970,7 @@ impl<T> ThreadState<T> {
             memory_metadata: Arc::new(Mutex::new(MemoryMetadata::new())),
             pedigree: Pedigree::new(), // Root thread.
             stats: ThreadStats::new(),
-            file_metadata: Arc::new(Mutex::new(file_metadata)),
+            file_metadata,
             tool_shares_guest_descriptor_table: cfg.backend.tool_shares_guest_descriptor_table,
             timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
             default_timer_slack_ns: DEFAULT_TIMER_SLACK_NS,

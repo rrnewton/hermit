@@ -75,7 +75,22 @@
 //! descriptors Detcore cannot name (`FileMetadata::unaccounted_receipts`),
 //! and for another process's or thread's table (a descriptor a fork's child
 //! inherited), the kernel beneath the backend lists `/proc/<pid>/fd`, as
-//! before.
+//! before, where the guest's procfs is the kernel's (ptrace).
+//!
+//! Where it is not (KVM: `tool_local::reads_thread_tables`), another task's
+//! descriptor directory is Detcore's too since package K item 2b slice 2b-5
+//! (<https://github.com/rrnewton/hermit/issues/5063>): an open of
+//! `/proc/<pid>/fd` or `/proc/<pid>/task/<tid>/fd` by number binds the
+//! placeholder to that task ([`fd_directory::classify_by_number`]), a
+//! listing reads the table that task holds in Detcore's model
+//! (`tool_local::thread_table`, the leader's for a process's directory, as
+//! `proc_readfd_common` reads it), and a task that has exited lists nothing.
+//! Each thread's table is noted where it is made, in the turn that makes it
+//! (a child's in its creator's `clone`, before the call returns), and read
+//! in the caller's turn while every other guest thread is parked, so a
+//! listing is a function of the guest's calls before it, never of when a
+//! child first runs. A table a receive may have filled with descriptors
+//! Detcore cannot name is refused by name.
 //!
 //! Where Detcore runs in the guest process and discovers descriptors only as
 //! they are used (`BackendCapabilities::tool_shares_guest_descriptor_table`:
@@ -202,6 +217,11 @@ pub(super) enum OpenedDirectory {
     /// backend Detcore serves the task directories on has, so the open is
     /// refused by name ([`Detcore::open_placeholder`]).
     SelectorLink { thread: bool },
+    /// Another task's descriptor directory, by number, where Detcore reads
+    /// that task's table (`tool_local::reads_thread_tables`, package K item
+    /// 2b slice 2b-5): the table, the process and the thread
+    /// ([`fd_directory::classify_by_number`]).
+    Other(DescriptorDirectoryTable, i32, i32),
 }
 
 /// The calls whose path operands are each looked up relative to a directory
@@ -1551,6 +1571,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         if let Some(table) = fd_directory::classify(spelling, own) {
             return Some(Ok(OpenedDirectory::Own(table)));
         }
+        if let Some((table, pid, tid)) = self.other_descriptor_directory(guest, spelling).await {
+            return Some(table.map(|table| OpenedDirectory::Other(table, pid, tid)));
+        }
         if let Some(tasks) = names_procfs_root(spelling) {
             // A task the spelling names on the way that does not exist ends
             // Linux's walk there.
@@ -1643,6 +1666,85 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Some(Ok(OpenedDirectory::Own(DescriptorDirectoryTable::Process)));
         }
         None
+    }
+
+    /// Another task's descriptor directory that the procfs spelling
+    /// `spelling` names by number ([`fd_directory::classify_by_number`]),
+    /// where Detcore reads that task's table
+    /// (`tool_local::reads_thread_tables`, package K item 2b slice 2b-5): the
+    /// table, the process and the thread, and whether the task exists, as
+    /// Linux's walk finds it (`proc_pid_lookup`, `proc_task_lookup`: ENOENT
+    /// for a task Detcore's process table does not hold, or a thread that is
+    /// not of the process). Linux checks `proc_fd_permission` on the
+    /// directory (fs/proc/fd.c:331-344 at v6.17): its owner, or the same
+    /// thread group. Every guest task's files are owned by Detcore's virtual
+    /// root, which every guest task's credentials are (`getuid` answers 0 on
+    /// every backend; `task_dump_owner` gives root for a task that is not
+    /// dumpable, too), so the owner's `r-x` always grants it.
+    async fn other_descriptor_directory<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        spelling: &Path,
+    ) -> Option<(Result<DescriptorDirectoryTable, Errno>, i32, i32)> {
+        if !crate::tool_local::reads_thread_tables(&self.cfg) {
+            return None;
+        }
+        let (table, pid, tid) = fd_directory::classify_by_number(spelling)?;
+        let thread = (table == DescriptorDirectoryTable::Thread).then_some(tid);
+        let answer = crate::tool_global::procfs_task(
+            guest,
+            crate::procfs::BoundTask {
+                process: pid,
+                thread,
+            },
+        )
+        .await;
+        Some((
+            if answer.exists {
+                Ok(table)
+            } else {
+                Err(Errno::ENOENT)
+            },
+            pid,
+            tid,
+        ))
+    }
+
+    /// The binding of another task's descriptor directory (`table`, of
+    /// process `pid` and, for a thread's, thread `tid`), as an open of it
+    /// binds it (`OpenedDirectory::Other`): the opener's thread for a
+    /// process's directory, as for the caller's own.
+    async fn other_descriptor_binding<G: Guest<Self>>(
+        guest: &mut G,
+        table: DescriptorDirectoryTable,
+        (pid, tid): (i32, i32),
+        opener: i32,
+    ) -> DescriptorDirectoryBinding {
+        let thread = (table == DescriptorDirectoryTable::Thread).then_some(tid);
+        let answer = crate::tool_global::procfs_task(
+            guest,
+            crate::procfs::BoundTask {
+                process: pid,
+                thread,
+            },
+        )
+        .await;
+        DescriptorDirectoryBinding {
+            table,
+            pid,
+            tid: if table == DescriptorDirectoryTable::Thread {
+                tid
+            } else {
+                opener
+            },
+            process_incarnation: answer.process_incarnation,
+            thread_incarnation: answer.thread_incarnation,
+            device: Self::procfs_key_device(guest),
+            files: thread.and_then(|tid| {
+                crate::tool_local::thread_table(crate::types::DetTid::from_raw(tid))
+                    .map(|files| files.lock().unwrap().files_id)
+            }),
+        }
     }
 
     /// The device a `/proc` directory Detcore serves reports, the one the
@@ -2072,6 +2174,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                         .then(|| guest.thread_state().files_id()),
                 })
             }
+            OpenedDirectory::Other(table, process, thread) => PlaceholderDirectory::Descriptors(
+                Self::other_descriptor_binding(guest, table, (process, thread), tid).await,
+            ),
             OpenedDirectory::Root => PlaceholderDirectory::Root,
             OpenedDirectory::Reopened(directory) => directory,
             OpenedDirectory::Task(kind, process, thread) => PlaceholderDirectory::Task(
@@ -2843,17 +2948,20 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// the model cannot name; that, and another process's or thread's table,
     /// is listed by the kernel beneath the backend, through `object`, a
     /// placeholder descriptor on procfs's root where there is one
-    /// ([`Self::kernel_listing_base`]).
+    /// ([`Self::kernel_listing_base`]). Where the guest's procfs is not the
+    /// kernel's (KVM: `tool_local::reads_thread_tables`), another process's
+    /// or thread's table is Detcore's model of it, read from that thread's
+    /// table itself ([`Self::other_descriptor_table`]).
     async fn descriptor_directory_table<G: Guest<Self>>(
         &self,
         guest: &mut G,
         binding: &DescriptorDirectoryBinding,
         object: Option<RawFd>,
-    ) -> Result<Option<(Vec<i32>, u64)>, Errno> {
+    ) -> Result<Option<(Vec<i32>, u64)>, Error> {
         let caller = Self::caller_numbers(guest).ok_or(Errno::EACCES)?;
         let (answer, current) = Self::bound_task(guest, binding).await;
         if !current {
-            return Err(Errno::ENOENT);
+            return Err(Errno::ENOENT.into());
         }
         if binding.table == DescriptorDirectoryTable::Process && answer.without_mm {
             return Ok(None);
@@ -2886,6 +2994,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             let capacity = capacity.max(fd_directory::capacity(&listed));
             return Ok(Some((listed, capacity)));
         }
+        if crate::tool_local::reads_thread_tables(&self.cfg) {
+            return self.other_descriptor_table(guest, binding, answer).await;
+        }
         // Another table: the descriptor opened to read it is in the caller's,
         // and a descriptor of the same number in the one listed stays listed
         // (a fork's child listing the directory it inherited). (A process
@@ -2898,6 +3009,61 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await?;
         let capacity = fd_directory::capacity(&listed);
         Ok(Some((listed, capacity)))
+    }
+
+    /// The descriptors of another process's or thread's table that a
+    /// descriptor directory bound to `binding` lists now, ascending, with the
+    /// table's capacity, where Detcore reads that table itself
+    /// (`tool_local::reads_thread_tables`, package K item 2b slice 2b-5): the
+    /// table the bound task holds (`tool_local::thread_table`), the process's
+    /// leader's for a process's directory, as `proc_readfd_common` reads it
+    /// (fs/proc/fd.c:248-283 at v6.17), with the capacity Linux's table has.
+    /// `answer` is Detcore's process table's answer for the bound task, which
+    /// exists. A task that has exited (a zombie) has released its `files`
+    /// (`exit_files`): nothing to list. Where a receive may have installed
+    /// descriptors Detcore does not know in that table, it cannot be listed
+    /// from the model: refused by name (`EACCES` where the run allows
+    /// unsupported operations).
+    ///
+    /// Read in the caller's turn, with every other guest thread parked, so
+    /// the table holds what the target's own calls have made it, in the
+    /// guest's order.
+    async fn other_descriptor_table<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        binding: &DescriptorDirectoryBinding,
+        answer: crate::procfs::listing::ProcfsTaskAnswer,
+    ) -> Result<Option<(Vec<i32>, u64)>, Error> {
+        if answer.without_mm {
+            return Ok(None);
+        }
+        let holder = match binding.table {
+            DescriptorDirectoryTable::Process => binding.pid,
+            DescriptorDirectoryTable::Thread => binding.tid,
+        };
+        let listing = crate::tool_local::thread_table(crate::types::DetTid::from_raw(holder))
+            .map(|table| table.lock().unwrap().observed_listing());
+        let why = match listing {
+            Some((numbers, capacity, false)) => return Ok(Some((numbers, capacity))),
+            Some((_, _, true)) => {
+                "a receive in that task may have installed descriptors Detcore does not know"
+            }
+            None => "Detcore holds no table for that task",
+        };
+        let reason = format!(
+            "the descriptor directory {} of another guest process cannot be listed: {why}, and \
+             on this backend /proc/<pid> names no guest process \
+             (https://github.com/rrnewton/hermit/issues/5063)",
+            binding.canonical().display()
+        );
+        let sysno = Sysno::new(guest.regs().await.orig_rax as usize).unwrap_or(Sysno::getdents64);
+        match self
+            .refuse_placeholder_call(guest, sysno, Errno::EACCES, &reason)
+            .await
+        {
+            Ok(_) => Err(Errno::EACCES.into()),
+            Err(error) => Err(error),
+        }
     }
 
     /// Where the kernel beneath the backend looks up a path within procfs
@@ -3420,8 +3586,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await
         {
             Ok(table) => table.map_or(0, |(numbers, _)| numbers.len()),
-            Err(Errno::ENOENT) => return Err(Errno::ENOENT.into()),
-            Err(_) => 0,
+            Err(Error::Errno(Errno::ENOENT)) => return Err(Errno::ENOENT.into()),
+            Err(Error::Errno(_)) => 0,
+            Err(error) => return Err(error),
         };
         let owner_path = match binding.table {
             DescriptorDirectoryTable::Process => {
@@ -3773,21 +3940,27 @@ impl<T: RecordOrReplay> Detcore<T> {
                                 .then(|| guest.thread_state().files_id()),
                         })
                     }
-                    None => match names_procfs_root(&spelling) {
-                        Some(tasks) if Self::named_tasks_exist(guest, &tasks).await => {
-                            PlaceholderDirectory::Root
-                        }
-                        Some(_) => return Err(Errno::ENOENT.into()),
-                        None if follow => match Self::own_link_directory(guest, &spelling) {
-                            // Following this last link too, within the one
-                            // budget.
-                            Some(_) if links + selector_links(&spelling) + 1 > LINK_LIMIT => {
-                                return Err(Errno::ELOOP.into());
+                    None => match self.other_descriptor_directory(guest, &spelling).await {
+                        Some((table, process, thread)) => PlaceholderDirectory::Descriptors(
+                            Self::other_descriptor_binding(guest, table?, (process, thread), tid)
+                                .await,
+                        ),
+                        None => match names_procfs_root(&spelling) {
+                            Some(tasks) if Self::named_tasks_exist(guest, &tasks).await => {
+                                PlaceholderDirectory::Root
                             }
-                            Some(directory) => directory,
+                            Some(_) => return Err(Errno::ENOENT.into()),
+                            None if follow => match Self::own_link_directory(guest, &spelling) {
+                                // Following this last link too, within the one
+                                // budget.
+                                Some(_) if links + selector_links(&spelling) + 1 > LINK_LIMIT => {
+                                    return Err(Errno::ELOOP.into());
+                                }
+                                Some(directory) => directory,
+                                None => return Ok(None),
+                            },
                             None => return Ok(None),
                         },
-                        None => return Ok(None),
                     },
                 };
                 (directory, None)

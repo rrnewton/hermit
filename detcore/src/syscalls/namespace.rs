@@ -20,6 +20,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+pub(crate) use own_links::past_the_link;
 pub(crate) use own_links::procfs_file_link_name;
 use reverie::Errno;
 use reverie::Error;
