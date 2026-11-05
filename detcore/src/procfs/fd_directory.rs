@@ -286,6 +286,48 @@ pub(crate) fn classify(path: &Path, own: (i32, i32)) -> Option<DescriptorDirecto
     }
 }
 
+/// The descriptor directory the absolute guest path `path` spells by number,
+/// `/proc/<pid>/fd` (a process's table) or `/proc/<pid>/task/<tid>/fd` (a
+/// thread's), with the process and, for a thread's, the thread, each number
+/// as procfs looks it up (decimal, no leading zero). Where Detcore reads
+/// another task's table (package K item 2b slice 2b-5), this names the
+/// directories of tasks that are not the caller's own ([`classify`] names
+/// those). `None` for any other path, the `self` and `thread-self`
+/// spellings, and a spelling with `..`.
+pub(crate) fn classify_by_number(path: &Path) -> Option<(DescriptorDirectoryTable, i32, i32)> {
+    let mut components = path.components().filter(|c| *c != Component::CurDir);
+    if components.next() != Some(Component::RootDir)
+        || components.next() != Some(Component::Normal(OsStr::new("proc")))
+    {
+        return None;
+    }
+    let mut names = Vec::new();
+    for component in components {
+        match component {
+            Component::Normal(name) => names.push(name.to_str()?),
+            _ => return None,
+        }
+    }
+    let number = |name: &str| -> Option<i32> {
+        if name.starts_with('0') || name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        name.parse().ok()
+    };
+    match names.as_slice() {
+        [process, "fd"] => {
+            let pid = number(process)?;
+            Some((DescriptorDirectoryTable::Process, pid, pid))
+        }
+        [process, "task", thread, "fd"] => Some((
+            DescriptorDirectoryTable::Thread,
+            number(process)?,
+            number(thread)?,
+        )),
+        _ => None,
+    }
+}
+
 /// Which task directory a task-directory placeholder stands for: the
 /// caller's own (package K slice K10, toward
 /// <https://github.com/rrnewton/hermit/issues/5039>), or another process's in
@@ -682,6 +724,34 @@ mod tests {
             "/dev/fd",
             "proc/self/fd",
             "/proc/self/task/fd",
+        ] {
+            assert_eq!(classified(path), None, "{path}");
+        }
+    }
+
+    /// Another task's descriptor directory by number names its table, its
+    /// process and, for a thread's, its thread; every other spelling names
+    /// none (package K item 2b slice 2b-5).
+    #[test]
+    fn classifies_descriptor_directories_by_number() {
+        use DescriptorDirectoryTable::*;
+        let classified = |path: &str| classify_by_number(Path::new(path));
+        assert_eq!(classified("/proc/8/fd"), Some((Process, 8, 8)));
+        assert_eq!(classified("/proc/8/fd/"), Some((Process, 8, 8)));
+        assert_eq!(classified("/proc/./8/fd/."), Some((Process, 8, 8)));
+        assert_eq!(classified("/proc/8/task/11/fd"), Some((Thread, 8, 11)));
+        for path in [
+            "/proc/08/fd",
+            "/proc/8/task/011/fd",
+            "/proc/self/fd",
+            "/proc/thread-self/fd",
+            "/proc/8/fdinfo",
+            "/proc/8/fd/3",
+            "/proc/8/../8/fd",
+            "/proc/8",
+            "/proc/8/task/fd",
+            "/proc/-8/fd",
+            "proc/8/fd",
         ] {
             assert_eq!(classified(path), None, "{path}");
         }

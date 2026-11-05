@@ -5383,6 +5383,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     copy.hold_alone(holder);
                     Arc::new(Mutex::new(copy))
                 };
+                // The child's table, for another process's reads of it
+                // (`tool_local::THREAD_TABLES`), here, while its creator is
+                // stopped in the `clone` that makes it: before the clone
+                // returns, so whenever the child itself first runs, a reader
+                // in a later turn finds its table.
+                crate::tool_local::note_thread_table(&self.cfg, dettid, &file_metadata);
                 // A thread is of its creator's process. A new process leads a
                 // thread group of its own, whose table is the one it starts
                 // with: its creator's under CLONE_FILES, a copy otherwise.
@@ -9214,6 +9220,80 @@ mod process_files_tests {
             DetPid::from_raw(tid)
         });
         child
+    }
+
+    /// Where Detcore reads another process's descriptor table (KVM:
+    /// `tool_local::reads_thread_tables`), a child's table is noted while its
+    /// creator's `clone` makes its state, so it is readable right after the
+    /// clone, before the child's thread has started or made any call: a
+    /// forked child's copy holds its creator's descriptors at the clone, and
+    /// not what its creator opens after; a `CLONE_FILES` child's is its
+    /// creator's own table. An exec's new table replaces the old one, and the
+    /// old one is noted back where the exec fails. Nothing is noted where
+    /// the kernel's procfs answers (ptrace).
+    #[test]
+    fn a_childs_table_is_readable_from_its_creators_clone() {
+        let mut config = Config::default();
+        config.backend.provides_process_signal_control = true;
+        config.sequentialize_threads = true;
+        assert!(crate::tool_local::reads_thread_tables(&config));
+        let tool = <Detcore as Tool>::new(Pid::from_raw(1), &config);
+        let mut root = ThreadState::new(DetPid::from_raw(9301), &config, ());
+        root.detpid = Some(DetPid::from_raw(9301));
+        let listed = |tid: i32| {
+            crate::tool_local::thread_table(DetPid::from_raw(tid))
+                .map(|table| table.lock().unwrap().observed_listing().0)
+        };
+        assert_eq!(listed(9301), Some(root.descriptor_table().0));
+
+        let forked = child(&tool, &mut root, 9302, CloneFlags::empty());
+        let at_clone = root.descriptor_table().0;
+        assert_eq!(listed(9302), Some(at_clone.clone()));
+        // The creator opens a descriptor after the clone: the child's copy
+        // does not hold it, and the creator's table does.
+        root.add_fd(
+            40,
+            nix::fcntl::OFlag::empty(),
+            crate::fd::FdType::Regular,
+            None,
+        )
+        .unwrap();
+        assert_eq!(listed(9302), Some(at_clone));
+        assert!(listed(9301).unwrap().contains(&40));
+
+        let sharer = child(&tool, &mut root, 9303, CloneFlags::CLONE_FILES);
+        assert!(Arc::ptr_eq(
+            &crate::tool_local::thread_table(DetPid::from_raw(9303)).unwrap(),
+            &root.file_metadata
+        ));
+        drop(sharer);
+
+        // The table an exec gives a thread, and the old one back.
+        let mut worker = forked;
+        let old = Arc::clone(&worker.file_metadata);
+        let new = worker.file_metadata.lock().unwrap().for_exec(worker.dettid);
+        worker.file_metadata = Arc::new(Mutex::new(new));
+        crate::tool_local::note_thread_table(&config, worker.dettid, &worker.file_metadata);
+        assert!(Arc::ptr_eq(
+            &crate::tool_local::thread_table(DetPid::from_raw(9302)).unwrap(),
+            &worker.file_metadata
+        ));
+        worker.file_metadata = old;
+        crate::tool_local::note_thread_table(&config, worker.dettid, &worker.file_metadata);
+        assert!(Arc::ptr_eq(
+            &crate::tool_local::thread_table(DetPid::from_raw(9302)).unwrap(),
+            &worker.file_metadata
+        ));
+        // Gone with its last thread state.
+        drop(worker);
+        assert!(listed(9302).is_none());
+
+        // The kernel's procfs answers: nothing is noted.
+        let ptrace = Config::default();
+        assert!(!crate::tool_local::reads_thread_tables(&ptrace));
+        let other = ThreadState::new(DetPid::from_raw(9304), &ptrace, ());
+        assert!(listed(9304).is_none());
+        drop(other);
     }
 
     /// The table a thread group's leader holds, which procfs reads for the

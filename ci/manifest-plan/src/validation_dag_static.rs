@@ -3332,7 +3332,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // four exec-strings units (environ read, recorded strings, the environ
     // kind, the table's lifecycle): 3590. And slice 2b-4's directory-record
     // and per-group working-directory units: 3592.
-    ("test.detcore_unit", 3592),
+    // And slice 2b-5's thread table registry, descriptor directory by number,
+    // task entry, descriptor number and unrendered-answer units, and its
+    // other-names decision unit: 3598.
+    ("test.detcore_unit", 3598),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4734,7 +4737,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And slice 2b-3's another_processs_cmdline_and_environ_answer_as_linux:
     // 824. And slice 2b-4's
     // another_processs_exe_cwd_and_root_links_answer_as_linux: 825.
-    ("test.cli", 825),
+    // And slice 2b-5's
+    // another_processs_descriptor_directory_and_links_answer_as_linux: 826.
+    ("test.cli", 826),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5053,7 +5058,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // run_kvm_another_processs_exe_cwd_and_root_links_answer_as_linux and
     // run_kvm_a_renamed_working_directory_of_another_process_is_refused_by_name:
     // 138.
-    ("privileged-test.cli_kvm", 138),
+    // And slice 2b-5's
+    // run_kvm_another_processs_descriptor_directory_and_links_answer_as_linux,
+    // run_kvm_another_processs_fdinfo_is_refused_by_name and
+    // run_kvm_another_processs_unrendered_task_entries_are_refused_by_name:
+    // 141.
+    ("privileged-test.cli_kvm", 141),
     // The required tests of hermit-cli/tests/deadline_slice_cap.rs on KVM: the
     // suite's 42 tests less the rows of its known-gap ledger
     // (hermit-cli/tests/deadline_slice_cap.kvm-gaps.tsv), measured on Hermit
@@ -5437,7 +5447,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same 2b-2 other-process status ptrace twin: 742.
     // And the 2b-3 other-process cmdline ptrace twin: 743.
     // And the 2b-4 other-process links ptrace twin: 744.
-    ("test.cli_on_host", 744),
+    // And the 2b-5 other-process descriptors ptrace twin: 745.
+    ("test.cli_on_host", 745),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
@@ -5524,7 +5535,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // run_kvm_another_processs_cmdline_and_environ_answer_as_linux: 136.
     // And slice 2b-4's two (the links parity test and the renamed working
     // directory's named refusal): 138.
-    ("privileged-only-test.cli_kvm", 138),
+    // And slice 2b-5's three (the descriptors parity test and the fdinfo and
+    // task-entry named refusals): 141.
+    ("privileged-only-test.cli_kvm", 141),
     ("privileged-only-test.pmu_buck_chaos_cases_on_host", 6),
     // And the KVM unreadable futex word test: 56.
     // And run_kvm_a_parked_sleep_carries_the_deadline_cap: 57.
@@ -5587,7 +5600,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And slice 2b-3's
     // run_kvm_another_processs_cmdline_and_environ_answer_as_linux: 136.
     // And slice 2b-4's two other-process links tests: 138.
-    ("privileged-only-test.cli_kvm_on_host", 138),
+    // And slice 2b-5's three other-process descriptors tests: 141.
+    ("privileged-only-test.cli_kvm_on_host", 141),
     ("test.app_strict_verify_on_host", 8),
     ("test.arbitrary_binaries_on_host", 4),
     ("test.command_strict_verify_on_host", 9),
@@ -6056,7 +6070,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same six 2b-1 units: 3573 + 6 = 3579.
     // The same seven 2b-2 units: 3579 + 7 = 3586. And the four 2b-3 units:
     // 3590. And the two 2b-4 units: 3592.
-    ("test.detcore_unit_on_host", 3592),
+    // And the six 2b-5 units: 3598.
+    ("test.detcore_unit_on_host", 3598),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

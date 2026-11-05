@@ -25,6 +25,25 @@
 //! `descriptor_directory`'s task directories, `procfs::task_stat`); this
 //! module covers the files it does not serve yet.
 //!
+//! Since package K item 2b slice 2b-5, where Detcore reads another task's
+//! descriptor table (`tool_local::reads_thread_tables`: KVM), another
+//! process's `fd` directory, opened or stat'ed, is left to the descriptor
+//! directory handlers, which list that table, and `readlink` of its
+//! `fd/<N>` is answered here from it (`Detcore::readlink_other_descriptor`).
+//! Its `fdinfo/<N>` gets Linux's earlier answers (the access check, EACCES;
+//! then the descriptor's existence, ENOENT) and is refused by name after
+//! them: its position and mount id are state of another process's open file
+//! that Detcore's model does not keep (minibeads dh-rv2a8). Every other
+//! name below another process's directory is decided here too, never left to
+//! the backend's procfs ([`task_entry`]): a name Linux's task directory
+//! lacks is ENOENT; `readlink` of `exe`, `cwd` and `root` is the readlink
+//! handler's (slice 2b-4); a file Detcore renders for another process is the
+//! rendered path's where Detcore renders it now; and every other name Linux
+//! has is answered in one place, [`unrendered_task_entry_answer`], the named
+//! refusal (ruling 2 of slice 2b-5: Linux has those files, so no fixed errno
+//! is its answer). A spelling with `..` is left to a serving handler only
+//! where that handler resolves it itself.
+//!
 //! Detcore renders a process's `cmdline` for the caller's own process only (it
 //! cannot read another process's memory, which Linux reads at each read), and
 //! answers descriptor links, `fdinfo` and the directories that list them for
@@ -169,6 +188,17 @@ pub(crate) enum TaskFile {
     DescriptorInfo,
     /// The directory `fd` or `fdinfo` itself, which lists the descriptors.
     DescriptorDirectory,
+    /// A name Linux's task directory does not have, or one below `fd` or
+    /// `fdinfo` that is no descriptor number ([`task_entry`]).
+    Missing,
+    /// The `exe`, `cwd` or `root` link itself ([`task_entry`]).
+    PathLink,
+    /// A file Detcore renders for a task (`ProcfsFile::PER_PROCESS_NAMES`),
+    /// or a path below one ([`task_entry`]).
+    Rendered,
+    /// Any other name Linux's task directory has, or a path below it
+    /// ([`task_entry`]).
+    Unrendered,
 }
 
 /// The task an absolute guest path names by number, and which of its files,
@@ -221,6 +251,76 @@ pub(crate) fn named_task_file(path: &Path) -> Option<(BoundTask, TaskFile)> {
             TaskFile::DescriptorDirectory
         }
         _ => return None,
+    };
+    Some((task, file))
+}
+
+/// The task an absolute guest path below a task's directory names by number
+/// (`/proc/<pid>/<name>...` or `/proc/<pid>/task/<tid>/<name>...`, each number
+/// as [`named_task_file`] reads it), and what its first name below that
+/// directory is, for a path [`named_task_file`] does not name (ruling 2 of
+/// package K item 2b slice 2b-5, <https://github.com/rrnewton/hermit/issues/5063>):
+/// a name Linux's table for that directory lacks
+/// (`procfs::levels::process_entry_rank`) and a name below `fd` or `fdinfo`
+/// that is no descriptor number are [`TaskFile::Missing`]; `exe`, `cwd` and
+/// `root` themselves are [`TaskFile::PathLink`]; a file Detcore renders for a
+/// task, or a path below it, is [`TaskFile::Rendered`]; every other name
+/// Linux has, or a path below it, [`TaskFile::Unrendered`]. `None` for every
+/// other path: one that ends at a task directory, one in a process's `task`
+/// directory that names no thread by number, and every path
+/// [`named_task_file`] or [`past_a_task_file`] names.
+pub(crate) fn task_entry(path: &Path) -> Option<(BoundTask, TaskFile)> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(part) => parts.push(part),
+            Component::ParentDir | Component::Prefix(_) => return None,
+        }
+    }
+    let (task, rest) = match parts.as_slice() {
+        [proc, process, task, thread, rest @ ..] if *proc == "proc" && *task == "task" => (
+            BoundTask {
+                process: decimal_fd(process)?,
+                thread: Some(decimal_fd(thread)?),
+            },
+            rest,
+        ),
+        [proc, process, task, ..] if *proc == "proc" && *task == "task" => {
+            decimal_fd(process)?;
+            return None;
+        }
+        [proc, process, rest @ ..] if *proc == "proc" => (
+            BoundTask {
+                process: decimal_fd(process)?,
+                thread: None,
+            },
+            rest,
+        ),
+        _ => return None,
+    };
+    let (name, below) = rest.split_first()?;
+    let name = name.as_bytes();
+    let file = match (name, below) {
+        (b"cmdline" | b"environ", _) => return None,
+        (b"fd" | b"fdinfo", []) => return None,
+        (b"fd", [fd, ..]) | (b"fdinfo", [fd]) if decimal_fd(fd).is_some() => return None,
+        (b"fdinfo", [fd, ..]) if decimal_fd(fd).is_some() => return None,
+        (b"fd" | b"fdinfo", [_, ..]) => TaskFile::Missing,
+        _ if crate::procfs::levels::process_entry_rank(task.thread.is_some(), name).is_none() => {
+            TaskFile::Missing
+        }
+        (b"exe" | b"cwd" | b"root", []) => TaskFile::PathLink,
+        _ if crate::procfs::ProcfsFile::PER_PROCESS_NAMES
+            .iter()
+            .any(|rendered| rendered.as_bytes() == name) =>
+        {
+            TaskFile::Rendered
+        }
+        _ => TaskFile::Unrendered,
     };
     Some((task, file))
 }
@@ -355,6 +455,46 @@ fn looks_up_whole_path(sysno: Sysno, values: &[usize; 6]) -> bool {
     }
 }
 
+/// Whether `sysno` is `readlink` or `readlinkat`, which read a link
+/// without following it.
+fn is_readlink(sysno: Sysno) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if sysno == Sysno::readlink {
+        return true;
+    }
+    sysno == Sysno::readlinkat
+}
+
+/// Whether `sysno` opens or stats its path, the calls the descriptor
+/// directory handlers serve for a directory Detcore serves
+/// (`descriptor_directory`).
+fn opens_or_stats(sysno: Sysno) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if matches!(sysno, Sysno::open | Sysno::stat | Sysno::lstat) {
+        return true;
+    }
+    matches!(
+        sysno,
+        Sysno::openat | Sysno::openat2 | Sysno::newfstatat | Sysno::statx
+    )
+}
+
+/// The descriptor number of the descriptor link `named` is exactly
+/// (`/proc/<pid>[/task/<tid>]/fd/<N>`), and `None` for a path below one.
+fn descriptor_link_number(named: &Path) -> Option<i32> {
+    let mut names = named.components().rev();
+    let fd = decimal_fd(names.next()?.as_os_str())?;
+    (names.next()?.as_os_str() == "fd").then_some(fd)
+}
+
+/// The descriptor number of the descriptor fdinfo `named` is
+/// (`/proc/<pid>[/task/<tid>]/fdinfo/<N>`).
+fn descriptor_info_number(named: &Path) -> Option<i32> {
+    let mut names = named.components().rev();
+    let fd = decimal_fd(names.next()?.as_os_str())?;
+    (names.next()?.as_os_str() == "fdinfo").then_some(fd)
+}
+
 /// The reason a lookup of another guest process's `path` is refused.
 pub(crate) fn other_process_refusal_reason(path: &Path) -> String {
     format!(
@@ -376,6 +516,45 @@ pub(crate) fn init_fdinfo_refusal_reason(path: &Path) -> String {
         "{}, a descriptor's fdinfo of Hermit's own init, cannot be served: on this backend its \
          descriptors are the supervisor's, which no guest process holds, and which of them \
          exist changes with host timing (https://github.com/rrnewton/hermit/issues/4071)",
+        path.display()
+    )
+}
+
+/// The answer to a lookup of another guest process's `path`, a name Linux's
+/// task directory has that Detcore does not render for another process yet
+/// ([`TaskFile::Unrendered`], and [`TaskFile::Rendered`] where Detcore does
+/// not render that one, and `exe`, `cwd` and `root` but for `readlink`):
+/// the errno a run that allows unsupported operations gets, and the reason
+/// it is refused by name instead, if it is. The one place that decides it
+/// (ruling 2 of package K item 2b slice 2b-5,
+/// <https://github.com/rrnewton/hermit/issues/5063>): Linux has those files,
+/// so no fixed errno would be Linux's answer, and the run stops with the
+/// unsupported-operation policy's exit (the 4564 policy). Never the
+/// backend's answer, which is its own procfs's on KVM, not the guest's.
+pub(crate) fn unrendered_task_entry_answer(path: &Path) -> (Errno, Option<String>) {
+    (
+        Errno::EACCES,
+        Some(format!(
+            "another guest process's {} cannot be served: Detcore does not render it for \
+             another process yet, and on this backend /proc/<pid> names the host task with that \
+             number, if any, not the guest's process \
+             (https://github.com/rrnewton/hermit/issues/5063)",
+            path.display()
+        )),
+    )
+}
+
+/// The reason another guest process's descriptor fdinfo at `path` is refused
+/// by name, once Linux's earlier answers (the access check, the descriptor's
+/// existence) are given: its position and mount id are state of that
+/// process's open file that Detcore does not keep in its model (minibeads
+/// dh-rv2a8).
+pub(crate) fn other_fdinfo_refusal_reason(path: &Path) -> String {
+    format!(
+        "another guest process's {} cannot be served: Detcore does not keep that descriptor's \
+         position and mount id in its model, and on this backend /proc/<pid> names the host \
+         task with that number, if any, not the guest's process \
+         (https://github.com/rrnewton/hermit/issues/5063)",
         path.display()
     )
 }
@@ -793,7 +972,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Some((task, file, past)) => (task, file, Some(past)),
                 None => match named_task_file(&named) {
                     Some((task, file)) => (task, file, None),
-                    None => continue,
+                    // Every other name below another task's directory
+                    // (ruling 2 of slice 2b-5); an empty pathname names its
+                    // descriptor, which is answered as before.
+                    None => match task_entry(&named).filter(|_| !empty) {
+                        Some((task, file)) => (task, file, None),
+                        None => continue,
+                    },
                 },
             };
             if task.process == own_pid {
@@ -834,6 +1019,24 @@ impl<T: RecordOrReplay> Detcore<T> {
                                 .is_some()) =>
                     {
                         continue;
+                    }
+                    // Another guest process's other names (package K item 2b
+                    // slice 2b-5): decided from Detcore's model, or left to
+                    // the handler that serves them (`None`).
+                    Some(_) if !empty && !matches!(file, TaskFile::Cmdline | TaskFile::Environ) => {
+                        match self
+                            .other_task_entry_verdict(
+                                guest,
+                                sysno,
+                                (task, file, past),
+                                (&named, &observed),
+                            )
+                            .await
+                        {
+                            Ok(Some(verdict)) => verdict,
+                            Ok(None) => continue,
+                            Err(error) => return Some(Err(error)),
+                        }
                     }
                     // Past another process's cmdline or environ, which every
                     // task has (`past_a_task_file`).
@@ -902,11 +1105,36 @@ impl<T: RecordOrReplay> Detcore<T> {
             let (errno, refusal) = match verdict {
                 Verdict::Absent => (Errno::ENOENT, None),
                 Verdict::NotADirectory => (Errno::ENOTDIR, None),
+                Verdict::Denied => (Errno::EACCES, None),
                 Verdict::OtherProcess => {
                     (Errno::EACCES, Some(other_process_refusal_reason(&named)))
                 }
                 Verdict::InitDescriptorInfo => {
                     (Errno::EACCES, Some(init_fdinfo_refusal_reason(&named)))
+                }
+                Verdict::OtherDescriptorInfo => {
+                    (Errno::EACCES, Some(other_fdinfo_refusal_reason(&named)))
+                }
+                Verdict::Unrendered => unrendered_task_entry_answer(&named),
+                // `readlink` and `readlinkat` have one path, so this is the
+                // call's first.
+                Verdict::ReadDescriptorLink(fd) => {
+                    let (buffer, length) = match sysno {
+                        Sysno::readlinkat => (values[2], values[3]),
+                        _ => (values[1], values[2]),
+                    };
+                    let past =
+                        crate::syscalls::namespace::past_the_link(spelling.as_os_str().as_bytes());
+                    return Some(
+                        self.readlink_other_descriptor(
+                            guest,
+                            sysno,
+                            (&named, task, fd),
+                            past,
+                            (reverie::syscalls::AddrMut::from_raw(buffer), length),
+                        )
+                        .await,
+                    );
                 }
             };
             // The second path of a call with two: Linux walks the first one
@@ -933,6 +1161,94 @@ impl<T: RecordOrReplay> Detcore<T> {
             );
         }
         None
+    }
+
+    /// The verdict for a lookup by `sysno` of another guest process's `file`
+    /// of `task` at `named` (`past` it, if anything follows a regular file),
+    /// other than its `cmdline` and `environ`, which the caller decides, or
+    /// `None` where the handler that serves it answers: package K item 2b
+    /// slice 2b-5 (<https://github.com/rrnewton/hermit/issues/5063>).
+    /// `observed` is the path as the serving handlers see it, before this
+    /// module resolves its `..` into `named`: a spelling with `..` is left to
+    /// a handler only where that handler answers it itself.
+    ///
+    /// - A name Linux's task directory lacks: ENOENT ([`TaskFile::Missing`]).
+    /// - `exe`, `cwd`, `root` by `readlink` or `readlinkat`: answered by the
+    ///   readlink handler (`Detcore::readlink_other_task_link`, slice 2b-4).
+    /// - A file Detcore renders for another process where it renders it now,
+    ///   as the rendered path sees the spelling (`Detcore::rendered_procfs_at`
+    ///   of `observed`, which answers its errors too): the rendered path.
+    /// - Where Detcore reads another task's descriptor table
+    ///   (`tool_local::reads_thread_tables`, KVM): its `fd` directory, opened
+    ///   or stat'ed, is served by the descriptor directory handlers
+    ///   (`descriptor_directory`); `readlink` of its `fd/<N>` is answered
+    ///   from the table ([`Verdict::ReadDescriptorLink`]); and its
+    ///   `fdinfo/<N>` gets Linux's earlier answers, the access check
+    ///   (`proc_fdinfo_permission`, fs/proc/fd.c, EACCES) and then the
+    ///   descriptor's existence (`proc_lookupfdinfo`, ENOENT, as for a task
+    ///   that has exited), before it is refused by name.
+    /// - Every other name Linux has: [`unrendered_task_entry_answer`]; and
+    ///   every other descriptor file: refused by name, as before.
+    async fn other_task_entry_verdict<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: Sysno,
+        (task, file, past): (BoundTask, TaskFile, Option<PastFile>),
+        (named, observed): (&Path, &Path),
+    ) -> Result<Option<Verdict>, Error> {
+        let tables = crate::tool_local::reads_thread_tables(&self.cfg);
+        let plain = !observed
+            .components()
+            .any(|component| component == Component::ParentDir);
+        Ok(match file {
+            TaskFile::Missing => Some(Verdict::Absent),
+            TaskFile::PathLink => {
+                if plain && is_readlink(sysno) {
+                    None
+                } else {
+                    Some(Verdict::Unrendered)
+                }
+            }
+            TaskFile::Rendered => match self.rendered_procfs_at(guest, observed).await {
+                Ok(Some(_)) | Err(_) => None,
+                Ok(None) => Some(Verdict::Unrendered),
+            },
+            TaskFile::Unrendered => Some(Verdict::Unrendered),
+            TaskFile::DescriptorDirectory
+                if tables
+                    && plain
+                    && crate::procfs::fd_directory::classify_by_number(named).is_some()
+                    && opens_or_stats(sysno) =>
+            {
+                None
+            }
+            TaskFile::DescriptorLink if tables && is_readlink(sysno) => {
+                match descriptor_link_number(named) {
+                    Some(fd) => Some(Verdict::ReadDescriptorLink(fd)),
+                    None => Some(Verdict::OtherProcess),
+                }
+            }
+            TaskFile::DescriptorInfo if tables && past.is_none() => {
+                if Self::link_read_allowed(guest, task).await?.is_err() {
+                    return Ok(Some(Verdict::Denied));
+                }
+                let answer = crate::tool_global::procfs_task(guest, task).await;
+                let holder = task.thread.unwrap_or(task.process);
+                let entry = crate::tool_local::thread_table(crate::types::DetTid::from_raw(holder))
+                    .zip(descriptor_info_number(named))
+                    .map(|(table, fd)| table.lock().unwrap().observed_descriptor(fd));
+                Some(match entry {
+                    _ if answer.without_mm => Verdict::Absent,
+                    Some(crate::tool_local::ObservedEntry::Absent) => Verdict::Absent,
+                    _ => Verdict::OtherDescriptorInfo,
+                })
+            }
+            TaskFile::Cmdline
+            | TaskFile::Environ
+            | TaskFile::DescriptorLink
+            | TaskFile::DescriptorInfo
+            | TaskFile::DescriptorDirectory => Some(Verdict::OtherProcess),
+        })
     }
 
     /// The answer to an execveat of a descriptor (AT_EMPTY_PATH with an empty
@@ -996,6 +1312,20 @@ enum Verdict {
     /// A descriptor's fdinfo of Hermit's own init: refused by name, as no
     /// guest process holds its descriptors ([`init_fdinfo_refusal_reason`]).
     InitDescriptorInfo,
+    /// Another guest process's descriptor fdinfo or `fdinfo` entry that the
+    /// access check refuses (`proc_fdinfo_access_allowed`): EACCES, Linux's
+    /// answer.
+    Denied,
+    /// Another guest process's descriptor fdinfo that exists: refused by name
+    /// ([`other_fdinfo_refusal_reason`]).
+    OtherDescriptorInfo,
+    /// A name Linux's task directory has that Detcore does not render for
+    /// another process ([`unrendered_task_entry_answer`]).
+    Unrendered,
+    /// `readlink` of another guest process's descriptor link `fd/<N>` itself,
+    /// where Detcore reads that process's table: answered from it
+    /// (`Detcore::readlink_other_descriptor`).
+    ReadDescriptorLink(i32),
 }
 
 #[cfg(test)]
@@ -1200,6 +1530,108 @@ mod tests {
         ] {
             assert!(!looks_up_whole_path(sysno, &[0; 6]), "{sysno}");
         }
+    }
+
+    /// Every other name below another task's directory (ruling 2 of slice
+    /// 2b-5): a name Linux's table for that directory lacks, or one below
+    /// `fd` or `fdinfo` that is no descriptor number, is missing; `exe`,
+    /// `cwd` and `root` themselves are the path links; a file Detcore renders
+    /// for a task, or a path below it, is rendered; any other name Linux has,
+    /// or a path below it, is unrendered. A thread's directory has its own
+    /// table (`children`, no `task`).
+    #[test]
+    fn names_every_other_entry_of_a_task_directory() {
+        use TaskFile::*;
+        for (path, expected) in [
+            ("/proc/5/bogus", (task(5, None), Missing)),
+            ("/proc/5/bogus/x", (task(5, None), Missing)),
+            ("/proc/5/fd/abc", (task(5, None), Missing)),
+            ("/proc/5/fd/03", (task(5, None), Missing)),
+            ("/proc/5/fdinfo/abc", (task(5, None), Missing)),
+            ("/proc/5/children", (task(5, None), Missing)),
+            ("/proc/5/task/7/children", (task(5, Some(7)), Unrendered)),
+            ("/proc/5/task/7/timers", (task(5, Some(7)), Missing)),
+            ("/proc/5/exe", (task(5, None), PathLink)),
+            ("/proc/5/task/7/cwd", (task(5, Some(7)), PathLink)),
+            ("/proc/5/root", (task(5, None), PathLink)),
+            ("/proc/5/root/etc", (task(5, None), Unrendered)),
+            ("/proc/5/status", (task(5, None), Rendered)),
+            ("/proc/5/mountinfo", (task(5, None), Rendered)),
+            ("/proc/5/status/x", (task(5, None), Rendered)),
+            ("/proc/5/maps", (task(5, None), Unrendered)),
+            ("/proc/5/limits", (task(5, None), Unrendered)),
+            ("/proc/5/ns/net", (task(5, None), Unrendered)),
+            ("/proc/5/attr/current", (task(5, None), Unrendered)),
+        ] {
+            assert_eq!(task_entry(Path::new(path)), Some(expected), "{path}");
+        }
+        for path in [
+            "/proc/5",
+            "/proc/5/",
+            "/proc/5/task",
+            "/proc/5/task/7",
+            "/proc/5/task/x",
+            "/proc/5/task/x/status",
+            "/proc/5/cmdline",
+            "/proc/5/environ/x",
+            "/proc/5/fd",
+            "/proc/5/fd/3",
+            "/proc/5/fd/3/x",
+            "/proc/5/fdinfo",
+            "/proc/5/fdinfo/3",
+            "/proc/5/fdinfo/3/x",
+            "/proc/self/maps",
+            "/proc/05/maps",
+            "/proc/5/../5/maps",
+            "/proc/meminfo",
+            "proc/5/maps",
+        ] {
+            assert_eq!(task_entry(Path::new(path)), None, "{path}");
+        }
+    }
+
+    /// The descriptor number a descriptor link or fdinfo names exactly, and
+    /// none for a path below one.
+    #[test]
+    fn reads_the_number_a_descriptor_link_or_fdinfo_names() {
+        assert_eq!(descriptor_link_number(Path::new("/proc/5/fd/3")), Some(3));
+        assert_eq!(
+            descriptor_link_number(Path::new("/proc/5/task/7/fd/70")),
+            Some(70)
+        );
+        assert_eq!(descriptor_link_number(Path::new("/proc/5/fd/3/x")), None);
+        assert_eq!(descriptor_link_number(Path::new("/proc/5/fdinfo/3")), None);
+        assert_eq!(
+            descriptor_info_number(Path::new("/proc/5/fdinfo/3")),
+            Some(3)
+        );
+        assert_eq!(descriptor_info_number(Path::new("/proc/5/fd/3")), None);
+    }
+
+    /// The answer to a name Detcore does not render for another process is
+    /// decided in one place: the named refusal, whose reason names the path
+    /// and the issue, with the same text on every run.
+    #[test]
+    fn an_unrendered_task_entry_is_refused_by_name() {
+        let (errno, reason) = unrendered_task_entry_answer(Path::new("/proc/5/maps"));
+        assert_eq!(errno, Errno::EACCES);
+        let reason = reason.expect("refused by name");
+        assert!(
+            reason.starts_with(
+                "another guest process's /proc/5/maps cannot be served: Detcore does not \
+                 render it for another process yet"
+            ),
+            "{reason}"
+        );
+        assert!(
+            reason.ends_with("(https://github.com/rrnewton/hermit/issues/5063)"),
+            "{reason}"
+        );
+        let reason = other_fdinfo_refusal_reason(Path::new("/proc/5/fdinfo/3"));
+        assert!(
+            reason.starts_with("another guest process's /proc/5/fdinfo/3 cannot be served"),
+            "{reason}"
+        );
     }
 
     /// The refusals name the path (and for a second path, the call) and the
