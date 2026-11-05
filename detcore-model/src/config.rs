@@ -38,10 +38,11 @@ const fn default_backend_capabilities() -> BackendCapabilities {
 
 /// The capabilities a [`Config`] has before the host prepares it for the
 /// backend that runs it: ptrace's, the backend Detcore's own tests use, except
-/// that eight facts stay off (`supports_blocked_wait_signal_interruption` and
+/// that nine facts stay off (`supports_blocked_wait_signal_interruption` and
 /// the four split out of it, which [`set_kernel_signal_facts`] clears
 /// together, `delivers_preemption_timer_events`,
-/// `runs_guest_code_between_injections`, `reports_sigreturns`). Until
+/// `runs_guest_code_between_injections`, `reports_sigreturns`,
+/// `hardware_watchpoints`). Until
 /// `supports_blocked_wait_signal_interruption`,
 /// `delivers_preemption_timer_events` and
 /// `runs_guest_code_between_injections` became backend capabilities they were
@@ -49,7 +50,7 @@ const fn default_backend_capabilities() -> BackendCapabilities {
 /// and were false otherwise; a configuration nobody prepared keeps that
 /// behaviour, and the four readings of the first with it. A configuration
 /// nobody prepared cannot know that sigreturns are reported, so that is off
-/// too (the DBT runtime's standalone
+/// too, and it sets no hardware watchpoints (the DBT runtime's standalone
 /// fallback starts from these). `reports_kernel_child_exit_signals` keeps
 /// ptrace's value, as `reports_child_exit_publication` does: it took over the
 /// child-exit ledger's gates from that field, so such a configuration behaves
@@ -61,6 +62,7 @@ pub const DEFAULT_BACKEND_CAPABILITIES: BackendCapabilities = {
     backend.delivers_preemption_timer_events = false;
     backend.runs_guest_code_between_injections = false;
     backend.reports_sigreturns = false;
+    backend.hardware_watchpoints = 0;
     backend
 };
 
@@ -220,6 +222,80 @@ pub enum DetlogAnon {
     Pages,
 }
 
+/// A frozen copy of a directory whose files the guest maps read-only while
+/// another process rewrites them in place. On Android that is the system
+/// property area, `/dev/__properties__`: init writes every property change into
+/// those shared files, and bionic (the dynamic linker's private copy as well as
+/// libc's) rereads its cached values whenever their serial moves, so property
+/// writes made outside the run during it change which code the guest runs.
+///
+/// An open of `guest_dir/<name>` for reading, by any guest thread from its
+/// first system call, opens `copy_dir/<name>` instead when that copy exists. A
+/// write open, or a name with no copy, is left as it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PropertySnapshot {
+    /// The directory the guest names: `/dev/__properties__`.
+    pub guest_dir: PathBuf,
+    /// The directory holding the copies, one per file of `guest_dir` Hermit
+    /// could read, made before the guest's first exec.
+    pub copy_dir: PathBuf,
+    /// Each live file copied: its host device and inode, by which an open
+    /// that reaches it by any spelling (a symbolic link, a bind mount, a
+    /// descriptor link) is recognized, and its name in `copy_dir`.
+    #[serde(default)]
+    pub live_files: Vec<PropertyFile>,
+    /// Each live file the capture saw but could not copy, because it stopped
+    /// being readable mid-capture. It has no copy, so an open that reaches it
+    /// by any spelling reads the live area, which is refused under the
+    /// default fail-closed policy.
+    #[serde(default)]
+    pub uncopied_files: Vec<PropertyFile>,
+    /// Whether the copies are one consistent cut: `properties_serial` read
+    /// the same before and after they were taken. Otherwise (properties kept
+    /// changing, or the serial could not be read) each file is coherent on
+    /// its own, but two files may come from different moments. Shown in the
+    /// run summary; not stored in preemption or schedule recordings.
+    #[serde(default)]
+    pub consistent_cut: bool,
+}
+
+impl PropertySnapshot {
+    /// The live file the snapshot copied with host device `dev` and inode
+    /// `ino`, if any.
+    pub fn live_file(&self, dev: u64, ino: u64) -> Option<&PropertyFile> {
+        self.live_files
+            .iter()
+            .find(|file| (file.dev, file.ino) == (dev, ino))
+    }
+
+    /// The live property file with host device `dev` and inode `ino` the
+    /// capture saw, copied or not: reading it reads the live area. Matching
+    /// is by identity alone, here and in [`Self::live_file`]: if a captured
+    /// file is deleted during the run and its inode reused by an unrelated
+    /// file, a pure read of that file is falsely redirected to the copy (a
+    /// copied identity) or treated as the live area and refused in a
+    /// fail-closed run (an uncopied one). Either way no live property read
+    /// is let through.
+    pub fn known_live_file(&self, dev: u64, ino: u64) -> Option<&PropertyFile> {
+        self.live_file(dev, ino).or_else(|| {
+            self.uncopied_files
+                .iter()
+                .find(|file| (file.dev, file.ino) == (dev, ino))
+        })
+    }
+}
+
+/// One live property file a [`PropertySnapshot`] copied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PropertyFile {
+    /// The live file's host `st_dev`.
+    pub dev: u64,
+    /// The live file's host `st_ino`.
+    pub ino: u64,
+    /// Its name, in the guest directory and in the copy directory.
+    pub name: String,
+}
+
 /// Configuration options for detcore.
 #[derive(Debug, Serialize, Deserialize, Clone, Parser)]
 pub struct Config {
@@ -235,9 +311,15 @@ pub struct Config {
     /// features without hardware randomness. The long help states each
     /// profile's host requirements and determinism limits. Like
     /// HERMIT_EPOCH, HERMIT_CPU_PROFILE supplies the value when the flag is
-    /// absent; an explicit flag wins, unset means x86-64-v2, and a value that
-    /// names no profile is refused. Admission is the same either way.
-    #[clap(long, value_enum, default_value_t, env = "HERMIT_CPU_PROFILE", long_help = crate::cpu_profile::CPU_PROFILE_LONG_HELP)]
+    /// absent; an explicit flag wins, and a value that names no profile is
+    /// refused. Unset means auto, for the command line and
+    /// [`Config::default`] alike: `hermit run` and `hermit record start`
+    /// resolve it to a named profile before launch, and the library's launch
+    /// functions resolve it from the program they launch. A serialized
+    /// configuration or recording without the field still means x86-64-v2
+    /// (`CpuProfile`'s own default), never auto. Admission is the same either
+    /// way.
+    #[clap(long, value_enum, default_value = "auto", env = "HERMIT_CPU_PROFILE", long_help = crate::cpu_profile::CPU_PROFILE_LONG_HELP)]
     #[serde(default)]
     pub cpu_profile: crate::cpu_profile::CpuProfile,
 
@@ -257,6 +339,16 @@ pub struct Config {
     #[clap(skip)]
     #[serde(default)]
     pub count_store_exclusives: bool,
+
+    /// aarch64: the guest paths `--rewrite-exclusives` rewrote into
+    /// bind-mounted copies, or found nothing to rewrite in: the executable
+    /// and each `--rewrite-exclusives-also` file. Set by the CLI for a run
+    /// that rewrites with that overlay, empty otherwise, so that the run can
+    /// name the other mapped files whose load/store-exclusive loops it left;
+    /// never read from a recording.
+    #[clap(skip)]
+    #[serde(default)]
+    pub rewrite_exclusives_overlay: Vec<PathBuf>,
 
     /// The host facts a v3 guest's leaf 0xD and xstate answers come from, set
     /// by the CLI after the host qualifies; `None` under v2. Neither profile
@@ -432,6 +524,30 @@ pub struct Config {
     #[serde(default)]
     #[clap(skip)]
     pub launch_image: Option<LaunchImage>,
+
+    /// aarch64: the files the run's `--rewrite-exclusives` left unchanged,
+    /// wholly or in part, because no mapping symbol it accepts marks their
+    /// code: none, or one that is neither `$x` nor `$d`. The CLI sets it; the
+    /// run names them in its summary.
+    #[serde(default)]
+    #[clap(skip)]
+    pub rewrite_exclusives_unmarked: Vec<std::path::PathBuf>,
+    /// The mount IDs and filesystem types of the mount namespace hermit-cli
+    /// was launched in, read in its outer process before it creates its
+    /// container ([`crate::host_input::LaunchNamespaceMounts`]). A descriptor
+    /// the guest inherits from outside the container (the user's redirected
+    /// stdio, `/dev/null`, a `--verify` stdin snapshot) names one of these
+    /// mounts in its `fdinfo`, which the container's own mountinfo does not
+    /// list, so Detcore reads the guest's standard descriptor kinds with it
+    /// (`crate::host_input::StdioKind::of_guest_descriptor`). Empty for a
+    /// library caller, whose descriptors' mounts are in its own namespace.
+    ///
+    /// The host sets it, not a flag. In-process only, as `happens_before`
+    /// is: never serialized, so neither a recording nor DBT's legacy form
+    /// carries it, and a replay never reads another host's mount IDs.
+    #[serde(skip)]
+    #[clap(skip)]
+    pub launch_namespace_mounts: crate::host_input::LaunchNamespaceMounts,
 
     /// The seccomp state the guest inherits from the thread that starts it
     /// ([`InheritedSeccomp`]). The caller that starts the guest states it, as
@@ -638,6 +754,19 @@ pub struct Config {
     #[clap(long)]
     pub passthru_opt: bool,
 
+    /// Leave to the kernel, without a stop, the few syscalls that Detcore always passes
+    /// through unchanged and that never wait for another thread: getppid, umask, getgroups,
+    /// capget, sched_get_priority_max, sched_get_priority_min and get_robust_list. Each such
+    /// call then costs no tracer round trip, but it also charges no virtual time, logs no
+    /// DETLOG line, is not counted in the run summary, and is not a point where the thread's
+    /// timeslice can end, so the run's virtual clock, schedule and log differ from a run
+    /// without this flag, the same in every run with it. Off by default; refused under
+    /// --strict, which promises that Detcore observes every syscall, without RCB time, and
+    /// with a preemption record to write or replay, whose callback history counts these calls.
+    #[serde(default)]
+    #[clap(long)]
+    pub untrap_passthrough_syscalls: bool,
+
     /// In chaos mode, uses much cheaper approximate preemption timers.  Only makes sense
     /// when recording preemptions for later (precise) replay.
     #[clap(long)]
@@ -763,7 +892,11 @@ pub struct Config {
     /// nondeterminism points it uses `--fuzz-seed` to (a) deliver a
     /// process-directed signal to a randomly chosen thread in the group (signal
     /// timing races) and (b) randomize the requeue position of a force-unblocked
-    /// thread (lock-ordering / wakeup races). Only takes effect with `--chaos`;
+    /// thread (lock-ordering / wakeup races). With `--chaos`, outside a replay,
+    /// it also (c) starts a new thread other than a vfork child at the first or
+    /// last priority instead of a random one (fork and exec races); a vfork
+    /// child keeps its random priority. It is meant for `--chaos` runs,
+    /// but (a) and (b) apply whenever it is set, with or without `--chaos`;
     /// like the rest of chaos mode it remains reproducible under a fixed seed.
     #[clap(long)]
     pub chaos_target_races: bool,
@@ -801,6 +934,22 @@ pub struct Config {
     /// epoch transitions and factors for replay. Inert without chaos slowdown.
     #[clap(long, default_value = "0", value_name = "nanos")]
     pub chaos_epoch_length_ns: u64,
+
+    /// Let a chaos preemption land up to this many instructions past the
+    /// conditional branch its timeslice ends on. `0` (the default) is off.
+    ///
+    /// A chaos timeslice ends after a retired conditional branch, so a race
+    /// window with no conditional branch in it is never split. With this set,
+    /// each timeslice that ends on its timer is delivered `k` single steps
+    /// past that branch instead, `k` drawn uniformly from `0..=N` for each
+    /// timeslice from the seed, so a preemption can land inside straight-line
+    /// code. A preemption record keeps each `k` and its branch count, and its
+    /// replay stops at the same instruction. Each step is one ptrace stop, so
+    /// a preemption costs up to `N` more. Needs `--chaos` and the ptrace
+    /// backend's precise timers on x86_64; at most 256.
+    #[serde(default)]
+    #[clap(long, default_value = "0", value_name = "instructions")]
+    pub chaos_instruction_offset: u64,
 
     /// Record the timing of preemption events for future replay or experimentation.
     /// This is only useful in chaos modes.
@@ -958,6 +1107,27 @@ pub struct Config {
     #[serde(default)]
     #[clap(long, value_name = "bytes")]
     pub access_trace_max_bytes: Option<u64>,
+
+    /// Report each access to these guest bytes, through a hardware watchpoint, as a `watch_hit`
+    /// record in the access trace (`--record-access-trace-to`): the thread, the instruction after
+    /// the access, the event it follows and, for a thread's first 64 hits, its stack. Repeat it for
+    /// up to the backend's watchpoint count (4 on x86-64). ADDR is a guest virtual address (hex
+    /// with 0x, or decimal), LEN 1, 2, 4 or 8 bytes with ADDR aligned to it (8 by default), and w
+    /// reports writes (the default), rw reads and writes. Every thread arms its watches at its
+    /// first stop from `--watch-from` on at which it does not block SIGTRAP; the trace's
+    /// `watch_summary` lines say which threads armed, when, and how many hits each had. A hit stops
+    /// the thread in the tracer only: it adds no scheduler request and moves no virtual time, so
+    /// the schedule and the guest's results are those of the run without it. Needs the ptrace
+    /// backend's hardware watchpoints and a precise timer whose overflow records are mapped.
+    #[serde(default)]
+    #[clap(long = "watch", value_name = "addr[:len][:w|rw]")]
+    pub watch: Vec<crate::watch::WatchArg>,
+
+    /// With `--watch`, arm the watches only once the run has recorded this many schedule events
+    /// (0, the default, arms them from the start).
+    #[serde(default)]
+    #[clap(long, value_name = "event", default_value = "0")]
+    pub watch_from: u64,
 
     /// **Deprecated:** Print a stacktrace each time the program is preempted.  Only makes sense in `--chaos` mode
     /// and typically goes with preemption recording/replaying.
@@ -1645,6 +1815,17 @@ pub struct Config {
     #[clap(skip)]
     pub host_input_snapshots: Vec<crate::host_input::HostInputSnapshot>,
 
+    /// The frozen copy of the Android system property area that the guest
+    /// reads in place of the live one ([`PropertySnapshot`]). hermit-cli makes
+    /// the copy and sets this before the guest's first exec on a host that has
+    /// `/dev/__properties__`; never a CLI flag. Serialized, because Detcore's
+    /// open handler reads it in each guest process's tool, which receives this
+    /// `Config` encoded; it came after the legacy form froze, so it never
+    /// enters that form and reads as unset there.
+    #[serde(default)]
+    #[clap(skip)]
+    pub property_snapshot: Option<PropertySnapshot>,
+
     /// A guest address range, `[start, end)`, holding code whose syscalls
     /// the backend lets through without Detcore seeing them, which the guest
     /// cannot otherwise use without faulting. With
@@ -2024,15 +2205,18 @@ impl Config {
     /// precise PMU timers keyed to retired branches at one virtual-time rate,
     /// no slice-boundary protocol, no stack traces at preemptions or events,
     /// no turn-numbered triggers (`--stop-after-turn`, `--stop-after-iter`,
-    /// `--signal-at`), no happens-before program, no manual interrupt points
-    /// and no syscall-boundary deadline (`--target-timeslice`). Never with a
-    /// gdbserver either: a debugger is served at the stops, and between skipped
-    /// ends it would see Detcore's slice bookkeeping lag the guest's program
-    /// counter. A recorded schedule writes such an end without the RIP it has
-    /// no stop to read (`SchedEvent::stopless`), and a schedule replay takes
-    /// without a stop only the ends its recording took that way. Detcore's
-    /// `replay_allows_stopless_end` decides each end of a replay, including the
-    /// per-thread rates a preemption record may carry.
+    /// `--signal-at`), no happens-before program, no manual interrupt points,
+    /// no syscall-boundary deadline (`--target-timeslice`) and no instruction
+    /// offsets ([`Config::slice_ends_need_a_stop`]: an offset is stepped from a
+    /// real stop at its branch target, and processing a skipped end can draw
+    /// one). Never with a gdbserver either: a debugger is served at the stops,
+    /// and between skipped ends it would see Detcore's slice bookkeeping lag
+    /// the guest's program counter. A recorded schedule writes such an end
+    /// without the RIP it has no stop to read (`SchedEvent::stopless`), and a
+    /// schedule replay takes without a stop only the ends its recording took
+    /// that way. Detcore's `replay_allows_stopless_end` decides each end of a
+    /// replay, including the per-thread rates and the instruction offsets a
+    /// preemption record may carry.
     pub fn replays_lone_preemptions(&self) -> bool {
         !self.eager_lone_preemptions
             && self.use_preemption_timer()
@@ -2049,6 +2233,7 @@ impl Config {
             && self.signal_at.is_none()
             && self.happens_before.is_none()
             && self.interrupt_at.is_empty()
+            && !self.slice_ends_need_a_stop()
             && !self.gdbserver
     }
 
@@ -2058,6 +2243,49 @@ impl Config {
     /// setting `--max-timeslice=disabled`.
     pub fn use_rcb_time(&self) -> bool {
         self.max_timeslice.is_some() && !self.no_rcb_time
+    }
+
+    /// Whether chaos mode makes this run's scheduling decisions: `--chaos`,
+    /// unless the run replays a recorded schedule (`--replay-schedule-from`).
+    ///
+    /// Chaos draws a thread's timeslice ends and its new priority at each of
+    /// them, and lets a `sched_yield` loop open a yield epoch. A schedule
+    /// replay takes those decisions from its record instead: it ends a slice
+    /// where the record does and runs the thread the record ran. A chaos draw
+    /// there would end a slice the record does not have, and the extra
+    /// scheduler turn moves the virtual clock the guest reads, so a replay
+    /// with `--chaos` makes exactly the decisions a replay without it makes.
+    /// That holds past the end of the schedule too: the rest of the run is
+    /// scheduled as a run without `--chaos`, as a replay without it is.
+    ///
+    /// What chaos does to virtual time itself (`--chaos-per-thread-slowdown`)
+    /// is not a scheduling decision and stays on. A replay computes those
+    /// factors from its own scheduler seed and slowdown options, so it
+    /// reproduces the recorded run's virtual time only when it is given the
+    /// same ones.
+    ///
+    /// Nor does this predicate cover what `--fuzz-seed` draws: targeted chaos
+    /// (`--chaos-target-races`: the thread a process-directed signal goes to,
+    /// and whether a force-unblocked thread is requeued at the front) and
+    /// `--fuzz-futexes`. The scheduler reads those flags, not `--chaos`, so
+    /// adding `--chaos` to a schedule replay changes none of their draws. The
+    /// record does not carry them; a replay draws them again from its own
+    /// `--fuzz-seed`, so it reproduces them only when it is given the
+    /// recorded run's.
+    pub fn chaos_draws_schedule(&self) -> bool {
+        self.chaos && self.replay_schedule_from.is_none()
+    }
+
+    /// Whether every chaos timeslice end needs the guest really stopped at
+    /// its PMU branch target: `--chaos-instruction-offset` single-steps from
+    /// that stop to where the timeslice ends. Any optimization that takes a
+    /// slice end without stopping the guest there (for example a lone
+    /// runnable thread's slice end processed at its branch count, which
+    /// [`Config::replays_lone_preemptions`] turns off) must be off while this
+    /// holds, or the offset is lost and a replay of the record no longer
+    /// stops where the recorded run did.
+    pub fn slice_ends_need_a_stop(&self) -> bool {
+        self.chaos && self.chaos_instruction_offset > 0
     }
 
     /// Whether a `FUTEX_WAKE` that woke `woken` waiters makes the waker yield
@@ -2294,7 +2522,10 @@ impl fmt::Display for Config {
         if !self.virtualize_cpuid {
             write!(f, " --no-virtualize-cpuid")?;
         }
-        if !self.cpu_profile.is_default() {
+        // The command line's default is auto, so every named profile, v2
+        // included, is written out: a rerun of this line runs that profile,
+        // and never derives one again.
+        if self.cpu_profile != crate::cpu_profile::CpuProfile::Auto {
             write!(f, " --cpu-profile={}", self.cpu_profile)?;
         }
         if !self.virtualize_metadata {
@@ -2302,6 +2533,9 @@ impl fmt::Display for Config {
         }
         if self.passthru_opt {
             write!(f, " --passthru-opt")?;
+        }
+        if self.untrap_passthrough_syscalls {
+            write!(f, " --untrap-passthrough-syscalls")?;
         }
         match self.runs_post_fork {
             RunsPostFork::Child => {}
@@ -2342,6 +2576,13 @@ impl fmt::Display for Config {
             if self.chaos_epoch_length_ns > 0 {
                 write!(f, " --chaos-epoch-length-ns={}", self.chaos_epoch_length_ns)?;
             }
+        }
+        if self.chaos_instruction_offset > 0 {
+            write!(
+                f,
+                " --chaos-instruction-offset={}",
+                self.chaos_instruction_offset
+            )?;
         }
         if let Some(m) = self.clock_multiplier {
             write!(f, " --clock-multiplier={}", m)?;
@@ -2417,6 +2658,12 @@ impl fmt::Display for Config {
         }
         if self.stacktrace_at_schedule_positions {
             write!(f, " --stacktrace-at-schedule-positions")?;
+        }
+        for watch in &self.watch {
+            write!(f, " --watch={}", watch)?;
+        }
+        if self.watch_from != 0 {
+            write!(f, " --watch-from={}", self.watch_from)?;
         }
         if self.preemption_stacktrace {
             write!(f, " --preemption-stacktrace")?;
@@ -3189,6 +3436,9 @@ const CONFIG_DEFINITION_SOURCES: &[&[u8]] = &[
     include_bytes!("pid.rs"),
     include_bytes!("schedule.rs"),
     include_bytes!("time.rs"),
+    // `WatchArg`, the element of `Config::watch`. The encoded default holds
+    // no watch, so neither encoding of `Config` shows its layout.
+    include_bytes!("watch.rs"),
 ];
 
 /// A fingerprint of this build's [`Config`] payload and the configuration and
@@ -3245,16 +3495,15 @@ fn config_wire_default() -> Config {
     config.sched_seed = None;
     // `BackendCapabilities` is defined in Reverie, outside
     // `CONFIG_DEFINITION_SOURCES`, so the source domain cannot see a change to
-    // it; only its encoding can. Every field but the optional one encodes at
-    // a fixed width (a bool or the `u8` width of `hardware_watchpoints` in
-    // one byte, the `u64` signal set in eight), so any constant carries those
-    // widths (see
+    // it; only its encoding can. Every field encodes in one byte (a bool, or
+    // the `u8` width of `hardware_watchpoints`), so any constant
+    // carries every field's width (see
     // `config_fingerprint_sees_the_width_of_every_backend_capability`). KVM's
     // is kept, as it was when one field was optional and only KVM's set it.
+    config.backend = BackendCapabilities::KVM;
     // The optional `rcb_clock_contract` is set to ptrace's, the one contract
     // any backend states, because a `None` would encode as the same bare tag
     // whatever the contract's type became.
-    config.backend = BackendCapabilities::KVM;
     config.backend.rcb_clock_contract = BackendCapabilities::PTRACE.rcb_clock_contract;
     config
 }
@@ -3490,7 +3739,7 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
 /// can express, which includes every backend's own constant except for
 /// capabilities added after the legacy form froze: those never enter it, as
 /// `record_host_inputs` does not, and read back as their default. There are
-/// thirteen. `process_exits_complete_asynchronously` and
+/// fourteen. `process_exits_complete_asynchronously` and
 /// `virtualizes_guest_sigalrm` are true only for in-guest LiteInst, which
 /// never travels through this DBT-only form.
 /// `supports_blocked_wait_signal_interruption`,
@@ -3508,9 +3757,8 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
 /// `places_orphans` reads back as false and `publishable_parent_death_signals`
 /// as the empty set, DBT's values; KVM, the one backend that reports
 /// otherwise, travels through this form only inside the versioned envelope
-/// too. `rcb_clock_contract` reads back as `None`, DBT's value; ptrace, the
-/// one backend that states a contract, travels through this form only
-/// inside the versioned envelope as well.
+/// too.
+/// `hardware_watchpoints` reads back as 0, DBT's.
 ///
 /// `cpuid_virtualized_by_backend` supplies no capability either: it said the
 /// backend installed a CPUID policy of its own, which no backend does any
@@ -3853,10 +4101,11 @@ impl LegacyBackendKeys {
         // only by the versioned envelope of `encode_backend_config_json`,
         // never by these keys.
         backend.hardware_watchpoints = 0;
-        // Added after the legacy form froze (Reverie 7535309b): `None`, no
-        // qualified RCB clock, DBT's value, the form's only reader. Ptrace,
-        // the one backend that states a contract, is preserved exactly only
-        // by the versioned envelope of `encode_backend_config_json`, never by
+        // Added after the legacy form froze: the RCB clock contract is
+        // `None` for DBT, the form's only reader (its counter is not a
+        // qualified contract), so it reads back as `None`. The ptrace
+        // starting constant's `Some` is preserved exactly only by the
+        // versioned envelope of `encode_backend_config_json`, never by
         // these keys.
         backend.rcb_clock_contract = None;
         backend
@@ -3975,7 +4224,9 @@ mod legacy_backend_json {
     /// `access_trace`, `access_trace_from`, `access_trace_max_records` and
     /// `access_trace_max_bytes` came after it too; the scheduler writes the
     /// trace, and `hermit run` refuses it on DBT, so they are never written
-    /// and read as unset, 0, unset and unset.
+    /// and read as unset, 0, unset and unset. So did `watch` and `watch_from`,
+    /// which need the trace and the ptrace backend's watchpoints: never
+    /// written, read as none and 0.
     // `chaos_timeslice_range` came after it too: the scheduler draws the
     // slices, not the runtime, so it is never written and reads as unset.
     // `chaos_timeslice_draw` and `chaos_timeslice` came with it, for the same
@@ -3992,6 +4243,9 @@ mod legacy_backend_json {
     /// it is never written and reads as unset.
     /// `sleep_registration` too: the scheduler registers sleeps, not the
     /// runtime, so it is never written and reads as unset.
+    /// `rewrite_exclusives_unmarked` came after it as well: the CLI rewrites
+    /// the files before the run and the run's global state reports them, not
+    /// the runtime, so it is never written and reads as empty.
     /// `rewrite_exclusives_in_memory` came after it as well: the in-memory
     /// rewrite of aarch64 exclusive loops is done by the ptrace backend's
     /// global state, and no backend that reads the legacy form does it, so it
@@ -4000,7 +4254,21 @@ mod legacy_backend_json {
     /// as well, so it is never written and reads as off.
     /// `stacktrace_at_schedule_positions` came after it too. It is never
     /// written and reads as false: the DBT runtime takes no stack traces.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 52] = [
+    /// `untrap_passthrough_syscalls` came after it too. `hermit run` refuses it
+    /// on every backend but ptrace, so it is never written and reads as false.
+    /// `chaos_instruction_offset` came after it as well: the ptrace backend's
+    /// precise timer takes its single steps, and `hermit run` refuses it on
+    /// every other backend, so it is never written and reads as 0.
+    /// `property_snapshot` came after it too, and only hermit-cli sets it, on
+    /// Android, where DBT does not run; it is never written and reads as
+    /// unset.
+    /// `watch` and `watch_from` came after it too: hardware watchpoints are
+    /// a ptrace-backend facility, so they are never written and read as
+    /// empty and 0.
+    /// `rewrite_exclusives_overlay` likewise: the run's global state names the
+    /// files the overlay rewrite left, so it is never written and reads as
+    /// empty.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 59] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -4050,9 +4318,16 @@ mod legacy_backend_json {
         "access_trace_max_bytes",
         "replay_continue_fairly",
         "standard_stream_aliases",
+        "rewrite_exclusives_unmarked",
         "rewrite_exclusives_in_memory",
         "count_store_exclusives",
         "stacktrace_at_schedule_positions",
+        "untrap_passthrough_syscalls",
+        "chaos_instruction_offset",
+        "property_snapshot",
+        "watch",
+        "watch_from",
+        "rewrite_exclusives_overlay",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -4203,12 +4478,26 @@ mod legacy_backend_json {
                     | "strict_binder"
                     | "rewrite_exclusives_in_memory"
                     | "count_store_exclusives"
-                    | "stacktrace_at_schedule_positions",
+                    | "stacktrace_at_schedule_positions"
+                    | "untrap_passthrough_syscalls"
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
+                // Empty, as its serde default is.
+                Some("rewrite_exclusives_unmarked" | "rewrite_exclusives_overlay") => seed
+                    .deserialize(serde_json::Value::Array(Vec::new()))
+                    .map(Some)
+                    .map_err(<A::Error as de::Error>::custom),
                 // Empty, as its serde default is; and 0, the default.
-                Some("in_guest_reserved_signals" | "access_trace_from") => {
-                    seed.deserialize(U64Deserializer::new(0)).map(Some)
-                }
+                Some(
+                    "in_guest_reserved_signals"
+                    | "access_trace_from"
+                    | "chaos_instruction_offset"
+                    | "watch_from",
+                ) => seed.deserialize(U64Deserializer::new(0)).map(Some),
+                // None, as its serde default is.
+                Some("watch") => seed
+                    .deserialize(serde_json::Value::Array(Vec::new()))
+                    .map(Some)
+                    .map_err(<A::Error as de::Error>::custom),
                 // On, as its serde default is.
                 Some("signal_state_copy") => {
                     seed.deserialize(BoolDeserializer::new(true)).map(Some)
@@ -4235,7 +4524,8 @@ mod legacy_backend_json {
                     | "access_trace_max_records"
                     | "access_trace_max_bytes"
                     | "standard_stream_aliases"
-                    | "post_crash_timeslice",
+                    | "post_crash_timeslice"
+                    | "property_snapshot",
                 ) => seed
                     .deserialize(serde_json::Value::Null)
                     .map(Some)
@@ -4557,14 +4847,21 @@ mod legacy_backend_json {
                 | "chaos_timeslice"
                 | "guest_ids"
                 | "detlog_anon"
-                | "standard_stream_aliases" => Ok(()),
+                | "standard_stream_aliases"
+                | "rewrite_exclusives_unmarked" => Ok(()),
                 "access_trace"
                 | "access_trace_from"
                 | "access_trace_max_records"
                 | "access_trace_max_bytes"
                 | "rewrite_exclusives_in_memory"
                 | "count_store_exclusives"
-                | "stacktrace_at_schedule_positions" => Ok(()),
+                | "stacktrace_at_schedule_positions"
+                | "untrap_passthrough_syscalls"
+                | "chaos_instruction_offset" => Ok(()),
+                | "property_snapshot" => Ok(()),
+                | "watch"
+                | "watch_from" => Ok(()),
+                | "rewrite_exclusives_overlay" => Ok(()),
                 "replay_continue_fairly" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
@@ -4789,6 +5086,20 @@ mod tests {
         }
         let point: TimesliceRange = "4321..4321".parse().unwrap();
         assert_eq!(point.log_uniform(0.7), 4321.0);
+    }
+
+    /// `--chaos-instruction-offset` needs a real stop at every chaos slice
+    /// end; nothing else does, and the option is inert without `--chaos`.
+    #[test]
+    fn only_a_chaos_instruction_offset_needs_a_stop_at_every_slice_end() {
+        let mut config = Config::default();
+        assert!(!config.slice_ends_need_a_stop());
+        config.chaos_instruction_offset = 8;
+        assert!(!config.slice_ends_need_a_stop());
+        config.chaos = true;
+        assert!(config.slice_ends_need_a_stop());
+        config.chaos_instruction_offset = 0;
+        assert!(!config.slice_ends_need_a_stop());
     }
 
     /// The four capabilities split out of
@@ -5016,6 +5327,10 @@ mod tests {
                 let sent = Config {
                     backend,
                     sequentialize_threads,
+                    // A launch sends a resolved profile: the legacy form has
+                    // no profile field and reads back as v2, so an unresolved
+                    // auto would not round-trip.
+                    cpu_profile: crate::cpu_profile::CpuProfile::X86_64V2,
                     ..Config::default()
                 };
                 let json = to_legacy_backend_json(&sent).unwrap();
@@ -5062,6 +5377,10 @@ mod tests {
                 let sent = Config {
                     backend,
                     sequentialize_threads,
+                    // A launch sends a resolved profile: the legacy form has
+                    // no profile field and reads back as v2, so an unresolved
+                    // auto would not round-trip.
+                    cpu_profile: crate::cpu_profile::CpuProfile::X86_64V2,
                     ..Config::default()
                 };
                 let legacy = to_legacy_backend_json(&sent).unwrap();
@@ -5089,19 +5408,24 @@ mod tests {
         for (name, value) in baseline.as_object().unwrap() {
             let mut edited = baseline.clone();
             // Every capability is a bool except `hardware_watchpoints`, a
-            // `u8` width, `publishable_parent_death_signals`, a `u64` set of
-            // signal bits, and `rcb_clock_contract`, an optional contract:
-            // flip a bool, and move a number to another value (DBT's is 0
-            // for both: width 1, and KVM's set), and DBT's absent contract
-            // to ptrace's.
+            // `u8` width, and `publishable_parent_death_signals`, a `u64`
+            // set of signal bits: flip a bool, and move a number to another
+            // value (DBT's is 0 for both: width 1, and KVM's set).
             edited[name] = match name.as_str() {
                 "hardware_watchpoints" => serde_json::Value::from(1u8),
                 "publishable_parent_death_signals" => serde_json::Value::from(
                     BackendCapabilities::KVM.publishable_parent_death_signals,
                 ),
+                // An `Option` contract, not a bool: move between its two
+                // states (absent reads as `None` by serde default).
                 "rcb_clock_contract" => {
-                    assert!(value.is_null(), "DBT states no RCB clock contract");
-                    serde_json::to_value(BackendCapabilities::PTRACE.rcb_clock_contract).unwrap()
+                    if value.is_null() {
+                        serde_json::Value::String(
+                            "PerfCounterOnTargetThreadUserOnly".to_owned(),
+                        )
+                    } else {
+                        serde_json::Value::Null
+                    }
                 }
                 _ => serde_json::Value::Bool(!value.as_bool().unwrap()),
             };
@@ -5130,10 +5454,15 @@ mod tests {
         for (name, value) in envelope["backend"].as_object().unwrap() {
             let mut missing = envelope.clone();
             missing["backend"].as_object_mut().unwrap().remove(name);
-            assert!(
-                decode_backend_config_json(&missing.to_string()).is_err(),
-                "missing {name}"
-            );
+            // `rcb_clock_contract` is `#[serde(default)]` by design: an
+            // older serialized value without it reads as `None`, so its
+            // absence is not an error. Every other capability is required.
+            if name != "rcb_clock_contract" {
+                assert!(
+                    decode_backend_config_json(&missing.to_string()).is_err(),
+                    "missing {name}"
+                );
+            }
             let backend = serde_json::to_string(&sent.backend).unwrap();
             let duplicate = backend.replacen('{', &format!("{{\"{name}\":{value},"), 1);
             let duplicate = encoded.replace(&backend, &duplicate);
@@ -5549,14 +5878,21 @@ mod tests {
                 | "chaos_timeslice"
                 | "guest_ids"
                 | "detlog_anon"
-                | "standard_stream_aliases" => {}
+                | "standard_stream_aliases"
+                | "rewrite_exclusives_unmarked" => {}
                 "access_trace"
                 | "access_trace_from"
                 | "access_trace_max_records"
                 | "access_trace_max_bytes"
                 | "rewrite_exclusives_in_memory"
                 | "count_store_exclusives"
-                | "stacktrace_at_schedule_positions" => {}
+                | "stacktrace_at_schedule_positions"
+                | "untrap_passthrough_syscalls"
+                | "chaos_instruction_offset" => {}
+                | "property_snapshot" => {}
+                | "watch"
+                | "watch_from" => {}
+                | "rewrite_exclusives_overlay" => {}
                 "replay_continue_fairly" => {}
                 other => expected.push(other.to_owned()),
             }
@@ -5595,11 +5931,15 @@ mod tests {
         // `access_trace_max_bytes`, `replay_continue_fairly`,
         // `standard_stream_aliases`, `sleep_registration`, `strict_binder`,
         // `post_crash_timeslice`, `rewrite_exclusives_in_memory`,
-        // `stacktrace_at_schedule_positions`
-        // and `strict_schedule_boundaries` none: fourteen more keys and
-        // fifty-one fewer, so thirty-seven keys fewer than fields.
+        // `stacktrace_at_schedule_positions`, `rewrite_exclusives_unmarked`,
+        // `stacktrace_at_schedule_positions`, `count_store_exclusives`,
+        // `rewrite_exclusives_unmarked`, `rewrite_exclusives_overlay`,
+        // `untrap_passthrough_syscalls`, `chaos_instruction_offset`,
+        // `property_snapshot`, `watch`, `watch_from` and
+        // `strict_schedule_boundaries` none: fourteen more keys and
+        // fifty-eight fewer, so forty-four keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 37);
+        assert_eq!(fields.len(), keys.len() + 44);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -5625,6 +5965,33 @@ mod tests {
             .collect();
         let array = serde_json::to_string(&values).unwrap();
         assert!(!from_legacy_backend_json(&array).unwrap().record_host_inputs);
+    }
+
+    /// The files the exclusive rewrite left unchanged never enter the legacy
+    /// form, whatever they are: the legacy string keeps its bytes, and they
+    /// read back as empty from both the object and the array form.
+    #[test]
+    fn the_unmarked_rewrite_files_never_enter_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            rewrite_exclusives_unmarked: vec!["/lib64/libstdc++.so.6".into()],
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(!json.contains("rewrite_exclusives"), "{json}");
+        let back = from_legacy_backend_json(&json).unwrap();
+        assert!(back.rewrite_exclusives_unmarked.is_empty());
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        let back = from_legacy_backend_json(&array).unwrap();
+        assert!(back.rewrite_exclusives_unmarked.is_empty());
     }
 
     /// `process_exits_complete_asynchronously`, added after the legacy form
@@ -5667,9 +6034,8 @@ mod tests {
     /// (`supports_blocked_wait_signal_interruption` and the four split out of
     /// it, `delivers_preemption_timer_events`,
     /// `runs_guest_code_between_injections`, `reports_sigreturns`,
-    /// `kernel_never_walks_robust_lists`, `places_orphans`,
-    /// `publishable_parent_death_signals`, which reads back as the empty set,
-    /// and `rcb_clock_contract`, which reads back as `None`)
+    /// `kernel_never_walks_robust_lists`, `places_orphans`, and
+    /// `publishable_parent_death_signals`, which reads back as the empty set)
     /// never enter it, whatever their
     /// value: the legacy string keeps its bytes, and they read
     /// back as false from both the object and the array form.
@@ -5688,8 +6054,6 @@ mod tests {
         on.backend.places_orphans = true;
         on.backend.publishable_parent_death_signals =
             BackendCapabilities::KVM.publishable_parent_death_signals;
-        on.backend.rcb_clock_contract = BackendCapabilities::PTRACE.rcb_clock_contract;
-        assert!(on.backend.rcb_clock_contract.is_some());
         let json = to_legacy_backend_json(&on).unwrap();
         assert_eq!(json, to_legacy_backend_json(&off).unwrap());
         for key in [
@@ -5704,7 +6068,6 @@ mod tests {
             "kernel_never_walks_robust_lists",
             "places_orphans",
             "publishable_parent_death_signals",
-            "rcb_clock_contract",
         ] {
             assert!(!json.contains(key), "{json}");
         }
@@ -5726,7 +6089,6 @@ mod tests {
             assert!(!backend.kernel_never_walks_robust_lists);
             assert!(!backend.places_orphans);
             assert_eq!(backend.publishable_parent_death_signals, 0);
-            assert_eq!(backend.rcb_clock_contract, None);
             assert_eq!(backend, legacy_expressible(BackendCapabilities::DBT));
         }
     }
@@ -5754,6 +6116,48 @@ mod tests {
                 .unwrap()
                 .in_guest_detlog_forward_policy
                 .is_none()
+        );
+    }
+
+    /// `launch_namespace_mounts` is never serialized: neither DBT's legacy
+    /// form nor the configuration's own (which recordings keep) carries it,
+    /// both read back with an empty table, and the run-start log line shows
+    /// only its size.
+    #[test]
+    fn launch_namespace_mounts_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            launch_namespace_mounts: crate::host_input::LaunchNamespaceMounts(vec![
+                (29, "ext4".to_owned()),
+                (31, "devtmpfs".to_owned()),
+            ]),
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(!json.contains("launch_namespace_mounts"), "{json}");
+        assert!(
+            from_legacy_backend_json(&json)
+                .unwrap()
+                .launch_namespace_mounts
+                .0
+                .is_empty()
+        );
+        let full = serde_json::to_string(&on).unwrap();
+        assert!(!full.contains("launch_namespace_mounts"), "{full}");
+        assert!(
+            serde_json::from_str::<Config>(&full)
+                .unwrap()
+                .launch_namespace_mounts
+                .0
+                .is_empty()
+        );
+        assert_eq!(
+            format!("{:?}", on.launch_namespace_mounts),
+            "LaunchNamespaceMounts { mounts: 2 }"
         );
     }
 
@@ -5889,6 +6293,51 @@ mod tests {
         assert_eq!(
             from_legacy_backend_json(&array).unwrap().guest_ids,
             crate::pid::GuestIds::Namespace
+        );
+    }
+
+    /// `chaos_instruction_offset` never enters the legacy form, whatever its
+    /// value: the legacy string keeps its bytes, and it reads back as 0 from
+    /// both the object and the array form.
+    #[test]
+    fn chaos_instruction_offset_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            chaos: true,
+            chaos_instruction_offset: 16,
+            ..off.clone()
+        };
+        let chaos = Config {
+            chaos: true,
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&chaos).unwrap());
+        assert!(!json.contains("chaos_instruction_offset"), "{json}");
+        assert_eq!(
+            from_legacy_backend_json(&json)
+                .unwrap()
+                .chaos_instruction_offset,
+            0
+        );
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert_eq!(
+            from_legacy_backend_json(&array)
+                .unwrap()
+                .chaos_instruction_offset,
+            0
+        );
+        assert!(
+            !to_legacy_backend_json(&off)
+                .unwrap()
+                .contains("chaos_instruction_offset")
         );
     }
 
@@ -6198,6 +6647,74 @@ mod tests {
             !from_legacy_backend_json(&array)
                 .unwrap()
                 .rewrite_exclusives_in_memory
+        );
+    }
+
+    /// `untrap_passthrough_syscalls` never enters the legacy form, whatever its
+    /// value: the legacy string keeps its bytes, and it reads
+    /// back as false from both the object and the array form.
+    #[test]
+    fn untrap_passthrough_syscalls_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            untrap_passthrough_syscalls: true,
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(!json.contains("untrap_passthrough_syscalls"), "{json}");
+        assert!(
+            !from_legacy_backend_json(&json)
+                .unwrap()
+                .untrap_passthrough_syscalls
+        );
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert!(
+            !from_legacy_backend_json(&array)
+                .unwrap()
+                .untrap_passthrough_syscalls
+        );
+    }
+
+    /// `rewrite_exclusives_overlay` never enters the legacy form, whatever
+    /// its value: the legacy string keeps its bytes, and it reads back as
+    /// empty from both the object and the array form.
+    #[test]
+    fn rewrite_exclusives_overlay_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            rewrite_exclusives_overlay: vec!["/bin/guest".into(), "/lib/libatomic.so.1".into()],
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(!json.contains("rewrite_exclusives_overlay"), "{json}");
+        assert!(
+            from_legacy_backend_json(&json)
+                .unwrap()
+                .rewrite_exclusives_overlay
+                .is_empty()
+        );
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert!(
+            from_legacy_backend_json(&array)
+                .unwrap()
+                .rewrite_exclusives_overlay
+                .is_empty()
         );
     }
 
@@ -6716,6 +7233,8 @@ mod tests {
             access_trace_from: 7586,
             access_trace_max_records: Some(40),
             access_trace_max_bytes: Some(4096),
+            watch: vec!["0x404010:4:rw".parse().unwrap()],
+            watch_from: 12,
             ..off.clone()
         };
         let json = to_legacy_backend_json(&on).unwrap();
@@ -6725,6 +7244,7 @@ mod tests {
         assert_eq!((decoded.access_trace, decoded.access_trace_from), (None, 0));
         assert_eq!(decoded.access_trace_max_records, None);
         assert_eq!(decoded.access_trace_max_bytes, None);
+        assert_eq!((decoded.watch, decoded.watch_from), (vec![], 0));
         let values: Vec<serde_json::Value> = ordered_entries(&json)
             .into_iter()
             .map(|(_, value)| value)
@@ -6755,13 +7275,18 @@ mod tests {
                 decoded.access_trace_max_bytes,
                 config.access_trace_max_bytes
             );
+            assert_eq!(
+                (decoded.watch, decoded.watch_from),
+                (config.watch.clone(), config.watch_from)
+            );
         }
 
         let spelled = on.to_string();
         assert!(
             spelled.contains(
                 " --record-access-trace-to='/var/run 1.access' --access-trace-from=7586 \
-                 --access-trace-max-records=40 --access-trace-max-bytes=4096"
+                 --access-trace-max-records=40 --access-trace-max-bytes=4096 \
+                 --watch=0x404010:4:rw --watch-from=12"
             ),
             "{spelled}"
         );
@@ -6772,11 +7297,14 @@ mod tests {
             "--access-trace-from=7586",
             "--access-trace-max-records=40",
             "--access-trace-max-bytes=4096",
+            "--watch=0x404010:4:rw",
+            "--watch-from=12",
         ]);
         assert_eq!(reparsed.access_trace, on.access_trace);
         assert_eq!(reparsed.access_trace_from, 7586);
         assert_eq!(reparsed.access_trace_max_records, Some(40));
         assert_eq!(reparsed.access_trace_max_bytes, Some(4096));
+        assert_eq!((reparsed.watch, reparsed.watch_from), (on.watch, 12));
     }
 
     /// Anonymous-memory logging is newer than the frozen DBT configuration.
@@ -7514,9 +8042,15 @@ mod tests {
             let argv = std::iter::once("config").chain(args.lines());
             match Config::try_parse_from(argv) {
                 Ok(config) => println!(
-                    "cpu-profile={} wire={}",
+                    "cpu-profile={} wire={} default={}",
                     config.cpu_profile.name(),
-                    config_wire_default().cpu_profile.name()
+                    config_wire_default().cpu_profile.name(),
+                    // `Config::default` itself, where the environment it
+                    // reads parses (it exits on an invalid value).
+                    match Config::try_parse_from(["config"]) {
+                        Ok(_) => Config::default().cpu_profile.name(),
+                        Err(_) => "refused",
+                    }
                 ),
                 Err(error) => println!("refused: {:?}", error.kind()),
             }
@@ -7557,27 +8091,39 @@ mod tests {
                 .to_owned()
         };
 
-        assert_eq!(parse(None, &[]), "cpu-profile=x86-64-v2 wire=x86-64-v2");
+        // Unset on the command line is auto; the wire default stays v2.
+        assert_eq!(
+            parse(None, &[]),
+            "cpu-profile=auto wire=x86-64-v2 default=auto"
+        );
+        assert_eq!(
+            parse(Some("auto"), &[]),
+            "cpu-profile=auto wire=x86-64-v2 default=auto"
+        );
+        assert_eq!(
+            parse(Some("auto"), &["--cpu-profile=x86-64-v2"]),
+            "cpu-profile=x86-64-v2 wire=x86-64-v2 default=auto"
+        );
         assert_eq!(
             parse(Some("x86-64-v3"), &[]),
-            "cpu-profile=x86-64-v3 wire=x86-64-v2"
+            "cpu-profile=x86-64-v3 wire=x86-64-v2 default=x86-64-v3"
         );
         assert_eq!(
             parse(Some("host-no-rdrand"), &[]),
-            "cpu-profile=host-no-rdrand wire=x86-64-v2"
+            "cpu-profile=host-no-rdrand wire=x86-64-v2 default=host-no-rdrand"
         );
         assert_eq!(
             parse(None, &["--cpu-profile=x86-64-v3"]),
-            "cpu-profile=x86-64-v3 wire=x86-64-v2"
+            "cpu-profile=x86-64-v3 wire=x86-64-v2 default=auto"
         );
         assert_eq!(
             parse(Some("x86-64-v3"), &["--cpu-profile=x86-64-v2"]),
-            "cpu-profile=x86-64-v2 wire=x86-64-v2"
+            "cpu-profile=x86-64-v2 wire=x86-64-v2 default=x86-64-v3"
         );
         assert_eq!(parse(Some("x86-64-v4"), &[]), "refused: InvalidValue");
         assert_eq!(
             parse(Some("x86-64-v4"), &["--cpu-profile=x86-64-v2"]),
-            "cpu-profile=x86-64-v2 wire=x86-64-v2"
+            "cpu-profile=x86-64-v2 wire=x86-64-v2 default=refused"
         );
     }
 
@@ -7591,6 +8137,9 @@ mod tests {
         let sent = Config {
             backend: legacy_expressible(BackendCapabilities::DBT),
             seed: 7,
+            // A launch sends a resolved profile: the legacy form has no
+            // profile field and reads back as v2.
+            cpu_profile: crate::cpu_profile::CpuProfile::X86_64V2,
             ..Config::default()
         };
         let json = to_legacy_backend_json(&sent).unwrap();
@@ -7810,6 +8359,14 @@ mod tests {
                 },
             ),
             (
+                "--chaos --chaos-instruction-offset=8",
+                Config {
+                    chaos: true,
+                    chaos_instruction_offset: 8,
+                    ..base.clone()
+                },
+            ),
+            (
                 "--gdbserver",
                 Config {
                     gdbserver: true,
@@ -7850,6 +8407,14 @@ mod tests {
         for (option, config) in on {
             assert!(config.replays_lone_preemptions(), "{option}");
         }
+        // Chaos alone draws no offsets: its slice ends need no stop.
+        assert!(
+            Config {
+                chaos: true,
+                ..base.clone()
+            }
+            .replays_lone_preemptions()
+        );
     }
 
     #[test]
@@ -7879,6 +8444,19 @@ mod tests {
         );
         assert!(Config::try_parse_from(["detcore", "--proc=host"]).is_err());
         assert!(ProcLevel::Minimal < ProcLevel::Standard);
+    }
+
+    #[test]
+    fn untrap_passthrough_syscalls_is_opt_in_and_round_trips() {
+        assert!(!Config::default().untrap_passthrough_syscalls);
+        let config = Config::parse_from(["detcore", "--untrap-passthrough-syscalls"]);
+        assert!(config.untrap_passthrough_syscalls);
+        assert!(
+            config
+                .to_string()
+                .contains(" --untrap-passthrough-syscalls")
+        );
+        assert!(!Config::default().to_string().contains("untrap"));
     }
 
     #[test]
@@ -8246,16 +8824,13 @@ mod tests {
         // encoded default carries every field, and adding, removing or
         // widening one changes the bytes. A field that is optional would have
         // to be present in the default, or a change to its width would encode
-        // as the same bare `None`; this fails first. The one optional field,
-        // `rcb_clock_contract`, is present: `config_wire_default` sets
-        // ptrace's contract.
+        // as the same bare `None`; this fails first.
         let config = config_wire_default();
         let fields = serde_json::to_value(config.backend).unwrap();
         let fields = fields.as_object().unwrap();
         // The true widths from the capability table: every field is a bool
-        // except `hardware_watchpoints`, a `u8` count,
-        // `publishable_parent_death_signals`, a `u64` set of signal bits, and
-        // `rcb_clock_contract`, an optional unit-variant enum, present here.
+        // except `hardware_watchpoints`, a `u8` count, and
+        // `publishable_parent_death_signals`, a `u64` set of signal bits.
         for (name, value) in fields {
             match name.as_str() {
                 "hardware_watchpoints" => {
@@ -8267,10 +8842,13 @@ mod tests {
                         .as_u64()
                         .expect("a u64 signal set encodes as a number");
                 }
+                // An `Option` unit-variant contract: bare `None` in the
+                // default, or the variant's name; one byte either way.
                 "rcb_clock_contract" => {
-                    value
-                        .as_str()
-                        .expect("the default's contract is present, a unit variant's name");
+                    assert!(
+                        value.is_null() || value.is_string(),
+                        "{name}={value} is not an optional unit variant"
+                    );
                 }
                 _ => assert!(value.is_boolean(), "{name}={value} is not a bool"),
             }
@@ -8278,14 +8856,12 @@ mod tests {
         let encode = |config: &Config| {
             bincode::serde::encode_to_vec(config, bincode::config::legacy()).unwrap()
         };
-        // One byte per field (the option's tag for `rcb_clock_contract`),
-        // seven more for the `u64` signal set, and four for the contract's
-        // `u32` variant index.
+        // One byte per field, and seven more for the `u64` signal set.
         assert_eq!(
             bincode::serde::encode_to_vec(config.backend, bincode::config::legacy())
                 .unwrap()
                 .len(),
-            fields.len() + 7 + 4
+            fields.len() + 7
         );
         // The backend's values are part of the encoded default.
         let flipped = config.clone().with_backend(|backend| {
@@ -8307,11 +8883,6 @@ mod tests {
             .with_backend(|backend| backend.publishable_parent_death_signals ^= 1 << 63);
         assert_eq!(encode(&resigned).len(), encode(&config).len());
         assert_ne!(encode(&resigned), encode(&config));
-        // The contract: its absence drops the variant index.
-        let uncontracted = config
-            .clone()
-            .with_backend(|backend| backend.rcb_clock_contract = None);
-        assert_eq!(encode(&uncontracted).len() + 4, encode(&config).len());
     }
 
     #[test]
@@ -8387,6 +8958,38 @@ mod tests {
             fingerprint_of_config_material(&wire, &named_shape, &changed_sources),
             current,
             "an inode-identity layout change must invalidate the fingerprint"
+        );
+    }
+
+    /// `Config::watch` is empty in the encoded default, so neither encoding
+    /// shows the layout of its element, `WatchArg`: a plugin built before a
+    /// change to it would decode a run's watches against another layout. A
+    /// change to its definition must invalidate the fingerprint.
+    #[test]
+    fn config_fingerprint_includes_the_watch_element_layout() {
+        let config = config_wire_default();
+        assert!(config.watch.is_empty(), "the default hides the element");
+        let wire = bincode::serde::encode_to_vec(&config, bincode::config::legacy()).unwrap();
+        let named_shape = serde_json::to_string(&config).unwrap();
+        let current = config_wire_fingerprint();
+        let watch_source = include_bytes!("watch.rs").as_slice();
+        assert!(CONFIG_DEFINITION_SOURCES.contains(&watch_source));
+        let without_len = include_str!("watch.rs").replacen("    pub len: u8,\n", "", 1);
+        assert_ne!(without_len.as_bytes(), watch_source);
+        let changed_sources: Vec<_> = CONFIG_DEFINITION_SOURCES
+            .iter()
+            .map(|source| {
+                if *source == watch_source {
+                    without_len.as_bytes()
+                } else {
+                    *source
+                }
+            })
+            .collect();
+        assert_ne!(
+            fingerprint_of_config_material(&wire, &named_shape, &changed_sources),
+            current,
+            "a watch element layout change must invalidate the fingerprint"
         );
     }
 

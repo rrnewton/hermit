@@ -151,6 +151,24 @@ pub const RECORD_REPLAY_VIRTUALIZES_TIME: bool = false;
 /// one of its own accord.
 pub const HERMIT_VERIFICATION_DIVERGENCE_EXIT: i32 = 1;
 
+/// Exit status of `hermit analyze` and `hermit bisect` when their inputs do
+/// not give them what they need: **2**.
+///
+/// The target run does not meet the target criteria, the baseline does not
+/// miss it or does not finish, no continuation allows a prefix search, or
+/// bisect's endpoints are identical or its search established no exact
+/// one-swap pair of schedules with opposite outcomes between them.
+/// Analyze concluded that, and says what to change; Hermit did not fail, so
+/// it is not 125, and no fail-closed policy refused a run, so it is not 122
+/// (which analyze exits with when Hermit refuses one of its runs). It
+/// completes the convention [`HERMIT_VERIFICATION_DIVERGENCE_EXIT`] follows,
+/// that of `diff`, `cmp` and `grep`: 0 an answer, 1 a difference, 2 trouble
+/// doing what was asked. clap's usage error is 2 as well, and the class line
+/// `HERMIT_ANALYZE_PRECONDITION class=...` on stderr tells the two apart.
+///
+/// Neither command passes a guest's status through, so for them 2 is not a
+/// guest's; for `hermit run` it still is (see the allocation table below).
+pub const HERMIT_ANALYZE_PRECONDITION_EXIT: i32 = 2;
 /// Exit status for a failure of HERMIT ITSELF, as distinct from the guest's.
 ///
 /// ⚠️ EVERY CLI ERROR USED TO BE `Exited(1)`, WHICH IS THE SINGLE MOST COMMON
@@ -247,6 +265,20 @@ const _: () = assert!(
 /// Like 124, it must be read at the container boundary
 /// (`classify_container_result`) or it is rewritten to 125.
 pub const HERMIT_LOG_CAP_EXIT: i32 = 123;
+/// `hermit analyze` stopped at its own budget (`--time-budget`,
+/// `--trial-budget`) and reported its best answer so far: **120**.
+///
+/// The analysis neither failed (125) nor found the critical events (0, or
+/// `--success-exit-code`): its report says that it is partial, why, and how
+/// to continue it, after the stderr line `HERMIT_ANALYZE_PARTIAL
+/// class=time-budget|trial-budget`. It is not 124, the status of every
+/// deadline that kills what it bounds (`docs/TIMEOUT_LADDER.md`), because
+/// nothing is killed and the result is an answer, not a stopped run. Its row
+/// in the exit-code allocation table below carves it out of the guest's
+/// range. Like every hermit status it can collide with a guest's own, but
+/// analyze never exits with a guest's status: the class line is the
+/// discriminator.
+pub const HERMIT_ANALYZE_PARTIAL_EXIT: i32 = 120;
 
 /// The guest program could not be found at all: **127**.
 ///
@@ -297,9 +329,18 @@ pub const GUEST_PROGRAM_NOT_EXECUTABLE_EXIT: i32 = 126;
 //   0          success.
 //   1          HERMIT_VERIFICATION_DIVERGENCE_EXIT, matching `diff`; also a
 //              legal guest status. Read the verification JSON to distinguish.
-//   2 ..= 120  THE GUEST'S OWN STATUS, passed through untouched. (The range
-//              stops at 120 because 121 is reserved below; a guest may still
-//              CHOOSE any value, see the caveat at the end.)
+//   2 ..= 119  `hermit run`: THE GUEST'S OWN STATUS, passed through untouched.
+//              (The range stops at 119 because 120 is allocated below; a guest
+//              may still CHOOSE any value, see the caveat at the end.)
+//              `hermit analyze` and `hermit bisect` pass no guest status
+//              through; for them 2 is HERMIT_ANALYZE_PRECONDITION_EXIT (see
+//              their table below).
+//   120        HERMIT_ANALYZE_PARTIAL_EXIT -- `hermit analyze` only: a budget
+//              (`--time-budget`, `--trial-budget`) ended the analysis and it
+//              reported its best answer so far, after the stderr line
+//              `HERMIT_ANALYZE_PARTIAL class=time-budget|trial-budget`.
+//              Analyze never relays a guest's status; `hermit run` never
+//              emits 120 and passes a guest's 120 through like any other.
 //   121        HERMIT_GUEST_DEADLOCK_EXIT -- DEADLOCK UNDER HERMIT'S MODEL:
 //              Detcore's scheduler found every remaining thread blocked with
 //              no wake it models and printed its "Deadlock detected" report.
@@ -346,6 +387,37 @@ pub const GUEST_PROGRAM_NOT_EXECUTABLE_EXIT: i32 = 126;
 //   128 + N    killed by signal N (shell convention). Hermit does not emit these
 //              deliberately; a wrapper reporting a signal death must use them
 //              rather than borrow a code that already means something.
+//
+// `hermit analyze` AND `hermit bisect`, the whole of their exit statuses. The
+// class line is the first line on stderr; it, not the number, says which.
+//
+//   0          a completed analysis (or `--success-exit-code`, which refuses 2
+//              and 120 ..= 127): the report names the critical events
+//              (verdict `critical_events`; no class line), or the target is
+//              reproduced without the target schedule, which localizes no
+//              event (verdict `reproduced_without_schedule`,
+//              `HERMIT_ANALYZE_VERDICT class=reproduced-without-schedule`).
+//   2          HERMIT_ANALYZE_PRECONDITION_EXIT -- the inputs do not give
+//              analyze what it needs, `diff`'s "trouble":
+//              `HERMIT_ANALYZE_PRECONDITION class=target-not-reproduced`,
+//              `class=baseline-not-reproduced`, `class=no-prefix-continuation`,
+//              `class=endpoints-not-separable` (bisect; analyze attempts a
+//              prefix search within the target schedule instead) or `class=endpoints-identical`
+//              (bisect). clap's usage error is 2 too, with no class line.
+//   120        HERMIT_ANALYZE_PARTIAL_EXIT -- analyze only: a budget
+//              (`--time-budget`, `--trial-budget`) ended the analysis after a
+//              report headed `PARTIAL RESULT`
+//              (`HERMIT_ANALYZE_PARTIAL class=time-budget|trial-budget`).
+//   122        HERMIT_POLICY_REFUSAL_EXIT: Hermit refused the target run, or
+//              analyze or bisect refused its options or schedules
+//              (`HERMIT_POLICY_REFUSAL class=policy-refusal`).
+//   123        HERMIT_LOG_CAP_EXIT (`HERMIT_LOG_CAP class=log-cap`).
+//   125        HERMIT_INTERNAL_FAILURE_EXIT -- analyze could not conclude:
+//              `HERMIT_INTERNAL_FAILURE class=replay-not-reproducible`
+//              (--selfcheck found a difference, or a jittered schedule never
+//              replayed the same way twice), `class=search-did-not-converge`,
+//              or another `HERMIT_INTERNAL_FAILURE class=` for Hermit failing.
+//   128 + N    analyze stopped by signal N (SIGTERM, SIGINT or SIGHUP).
 //
 // ⚠️ NO CODE IS EXCLUSIVELY HERMIT'S. Every value in 0..=255 is a legal guest
 // status, so a guest may return 125 or 127 of its own accord and this table
@@ -419,6 +491,10 @@ const _: () = assert!(
     "1 is the established diff-style result for a completed comparison that diverged"
 );
 const _: () = assert!(
+    HERMIT_ANALYZE_PRECONDITION_EXIT == 2,
+    "2 is diff's trouble code, which analyze's unusable inputs follow; see the allocation table"
+);
+const _: () = assert!(
     HERMIT_INTERNAL_FAILURE_EXIT == 125,
     "125 is the GNU wrapper-failed convention; 1 is the commonest guest status and 0 is success"
 );
@@ -435,9 +511,15 @@ const _: () = assert!(
     "123 is Hermit's log-cap code, reserved for bin/safehermit's log-cap kill as well; see the allocation table"
 );
 const _: () = assert!(
+    HERMIT_ANALYZE_PARTIAL_EXIT == 120,
+    "120 is analyze's partial result, carved out of the guest's range; see the allocation table"
+);
+const _: () = assert!(
     HERMIT_LOG_CAP_EXIT != 0
+        && HERMIT_ANALYZE_PARTIAL_EXIT != 0
         && HERMIT_VERIFICATION_DIVERGENCE_EXIT != 0
         && HERMIT_INTERNAL_FAILURE_EXIT != 0
+        && HERMIT_ANALYZE_PRECONDITION_EXIT != 0
         && GUEST_PROGRAM_NOT_FOUND_EXIT != 0
         && GUEST_PROGRAM_NOT_EXECUTABLE_EXIT != 0,
     "a failure code of 0 would invert every assert_eq!(code, Some(CONST)) into demanding success"
@@ -4002,6 +4084,7 @@ async fn dispatch_backend(
     control: Option<std::rc::Rc<ptrace_completion::Control>>,
 ) -> Result<ExitStatus, Error> {
     // Every launch path, ptrace's included, reaches the guest through here.
+    crate::cpu_profile_admission::resolve_launch_auto(&command, &mut config)?;
     crate::cpu_profile_admission::refuse_unadmitted_launch(&config, backend == Backend::Ptrace)?;
     detcore_model::virtual_timeout::refuse_debugger(config.virtual_timeout, config.gdbserver)?;
     crate::preemption_admission::refuse_unqualified_annotated_launch(&config)?;
@@ -4399,6 +4482,7 @@ async fn dispatch_output_backend(
     control: Option<std::rc::Rc<ptrace_completion::Control>>,
 ) -> Result<Output, Error> {
     // Every launch path, ptrace's included, reaches the guest through here.
+    crate::cpu_profile_admission::resolve_launch_auto(&command, &mut config)?;
     crate::cpu_profile_admission::refuse_unadmitted_launch(&config, backend == Backend::Ptrace)?;
     detcore_model::virtual_timeout::refuse_debugger(config.virtual_timeout, config.gdbserver)?;
     crate::preemption_admission::refuse_unqualified_annotated_launch(&config)?;
@@ -5455,6 +5539,84 @@ mod tests {
     }
 
     static SKID_OVERSHOOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// `untrap_passthrough_syscalls` leaves seven calls untrapped, which is
+    /// safe only with RCB time and without a preemption record. The public
+    /// library entry points refuse it otherwise, before the guest starts, as
+    /// `hermit run` does: the rule is checked in Detcore's
+    /// `facility_admission`, which every launch passes. A timerless
+    /// configuration and a recording one are each refused through both
+    /// `run` and `run_with_output`, as a policy refusal naming
+    /// `UntrapPassthroughRefusal`, and the guest's marker file is never
+    /// written. The control, the same mode with RCB time and no record, is
+    /// admitted by that check.
+    #[test]
+    fn the_library_entry_points_refuse_untrapping_without_its_prerequisites() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("guest-started");
+        let command = || {
+            let mut command = Command::new("/bin/sh");
+            command
+                .arg("-c")
+                .arg("touch \"$0\"")
+                .arg(marker.as_os_str());
+            command
+        };
+        let timerless = DetConfig {
+            untrap_passthrough_syscalls: true,
+            sequentialize_threads: true,
+            max_timeslice: None,
+            ..Default::default()
+        };
+        let qualified = DetConfig {
+            max_timeslice: std::num::NonZeroU64::new(10_000),
+            ..timerless.clone()
+        };
+        let recording = DetConfig {
+            record_preemptions: true,
+            ..qualified.clone()
+        };
+        let names = |error: &Error, refusal: detcore::UntrapPassthroughRefusal| {
+            error.chain().any(|cause| {
+                cause.downcast_ref::<detcore::UntrapPassthroughRefusal>() == Some(&refusal)
+                    || matches!(
+                        cause.downcast_ref::<reverie::Error>(),
+                        Some(reverie::Error::Tool(inner))
+                            if inner.downcast_ref::<detcore::UntrapPassthroughRefusal>()
+                                == Some(&refusal)
+                    )
+            })
+        };
+        for (config, refusal) in [
+            (timerless, detcore::UntrapPassthroughRefusal::NoRcbTime),
+            (
+                recording,
+                detcore::UntrapPassthroughRefusal::PreemptionRecord,
+            ),
+        ] {
+            let through_run = run(command(), config.clone(), false, &None)
+                .expect_err("run admitted the untrapped calls without their prerequisites");
+            let through_output = run_with_output(command(), config, false, &None).expect_err(
+                "run_with_output admitted the untrapped calls without their prerequisites",
+            );
+            for (route, error) in [("run", through_run), ("run_with_output", through_output)] {
+                assert!(names(&error, refusal), "{route}: {error:#}");
+                assert!(
+                    format!("{error:#}").contains(&refusal.to_string()),
+                    "{route}: {error:#}"
+                );
+                assert_eq!(
+                    SerializableError::from(error).kind(),
+                    FailureKind::PolicyRefusal,
+                    "{route}"
+                );
+                assert!(!marker.exists(), "{route}: the guest started");
+            }
+        }
+        assert_eq!(detcore::untrap_passthrough_admission(&qualified), Ok(()));
+        <detcore::Detcore as reverie::Tool>::facility_admission(&qualified)
+            .expect("the mode with RCB time and no record is admitted");
+    }
 
     /// The standard streams a launch hands a KVM guest are grouped by the
     /// descriptors themselves, not by this process's fds 0-2: a stdin that is
@@ -8165,9 +8327,6 @@ mod tests {
     /// `kernel_never_walks_robust_lists` (Reverie 93d3a168), `places_orphans`
     /// and `publishable_parent_death_signals` (Reverie f614c7c8) arrived with
     /// the Reverie pin of the first-party split; each is KVM's alone.
-    /// `rcb_clock_contract` (Reverie 7535309b) names how ptrace counts the
-    /// RCB clock a recording's coordinates use, and so e9patch's, whose guest
-    /// Hermit runs on ptrace; every other backend states none.
     fn golden_backend_capabilities(backend: CapabilityCase) -> serde_json::Value {
         let sabre = backend == CapabilityCase::Sabre;
         let kvm = backend == CapabilityCase::Kvm;
@@ -8253,8 +8412,9 @@ mod tests {
             // Signals 1 to 31 but SIGCHLD (17) and SIGSTOP, SIGTSTP, SIGTTIN
             // and SIGTTOU (19 to 22), as a kernel signal set.
             "publishable_parent_death_signals": if kvm { 0x7fc2_ffff_u64 } else { 0 },
-            // Reverie 7535309b: a perf counter on the guest thread's own host
-            // task, user mode only, read raw; only ptrace counts that way.
+            // Ptrace's perf counter is the qualified RCB clock contract,
+            // and an e9patch run reports ptrace's capabilities; LiteInst
+            // explicitly unqualifies its own.
             "rcb_clock_contract": if matches!(backend, CapabilityCase::Ptrace | CapabilityCase::E9patch) {
                 serde_json::json!("PerfCounterOnTargetThreadUserOnly")
             } else {
@@ -8394,8 +8554,8 @@ mod tests {
             // The legacy form carries no width for `hardware_watchpoints`;
             // it reads back as 0.
             config.backend.hardware_watchpoints = 0;
-            // The legacy form predates `rcb_clock_contract`; it reads back
-            // as `None`, DBT's value.
+            // The legacy form predates the RCB clock contract; it reads
+            // back as `None`.
             config.backend.rcb_clock_contract = None;
             assert_eq!(
                 detcore::to_legacy_backend_json(&config).unwrap(),
