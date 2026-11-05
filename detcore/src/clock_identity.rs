@@ -286,6 +286,13 @@ pub(crate) fn prepare_run_with(
             recording
                 .require_strict_mode(cfg.strict_schedule_boundaries)
                 .map_err(|error| PrepareError::Refused(error.to_string()))?;
+            // The same replay-input validation the priority route makes in
+            // `read_for_replay`, before identity admission, so a record that
+            // fails both takes the same refusal on either route. The
+            // scheduler validates the installed record again at construction.
+            recording
+                .validate_replay_inputs(&input_name("--replay-schedule-from", path), cfg.guest_ids)
+                .map_err(|refusal| PrepareError::Refused(refusal.to_string()))?;
             validated
                 .admit(&input_name("--replay-schedule-from", path), &recording)
                 .map_err(PrepareError::Refused)?;

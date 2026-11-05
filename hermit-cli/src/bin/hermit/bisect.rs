@@ -283,11 +283,11 @@ mod tests {
     use crate::app::container::PolicyRefusal;
 
     fn search_record(events: Vec<SchedEvent>) -> serde_json::Value {
-        let record = PreemptionRecord::from_sched_events(events)
+        let record = PreemptionRecord::from_sched_events_with_identity(events, known())
             .with_pipe_wake_latency(Some(3_000_000))
             .with_signal_state_copy(Some(true));
-        let mut record = serde_json::to_value(record).unwrap();
-        record["epoch"] = serde_json::json!(RECORDED);
+        let mut record: serde_json::Value = serde_json::from_str(&record.to_string()).unwrap();
+        settings(&mut record)["epoch"] = serde_json::json!(RECORDED);
         record
     }
 
@@ -332,7 +332,7 @@ mod tests {
         let record = |events, format| {
             let mut value = search_record(events);
             if let Some(format) = format {
-                value["format_version"] = serde_json::json!(format);
+                settings(&mut value)["format_version"] = serde_json::json!(format);
             }
             value
         };
@@ -444,8 +444,8 @@ mod tests {
         let numbered = |count, ids: Option<serde_json::Value>| {
             let mut record = search_record(vec![SchedEvent::branches(DetTid::from_raw(3), count)]);
             if let Some(ids) = ids {
-                record["guest_ids"] = ids;
-                record["reserved_input"] = provenance.clone();
+                settings(&mut record)["guest_ids"] = ids;
+                settings(&mut record)["reserved_input"] = provenance.clone();
             }
             record
         };
@@ -569,7 +569,7 @@ mod tests {
                 let mut good = good.clone();
                 let mut bad = bad.clone();
                 let changed = if change_good { &mut good } else { &mut bad };
-                changed[field] = value.clone();
+                settings(changed)[field] = value.clone();
                 let error = prepare_search_records(&good, &bad).unwrap_err();
                 let message = format!("{error:#}");
                 assert!(message.contains(cause), "{field}: {message}");
@@ -1001,14 +1001,12 @@ mod tests {
     #[test]
     fn bisect_replays_under_the_bad_schedules_expired_wait_charge() {
         use detcore_model::config::ExpiredWaitCharge;
-        let resources = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-resources");
         let dir = tempfile::tempdir().unwrap();
         let write = |fixture: &str, name: &str, once: bool| {
-            let source = resources.join(format!("flaky_cas_sequence_schedules-{fixture}.json"));
-            let mut record: serde_json::Value =
-                serde_json::from_str(&fs::read_to_string(source).unwrap()).unwrap();
+            let mut record = synthetic_schedule(fixture, known());
             if once {
-                record["expired_wait_runs_charged_once"] = serde_json::Value::from(true);
+                settings(&mut record)["expired_wait_runs_charged_once"] =
+                    serde_json::Value::from(true);
             }
             let path = dir.path().join(name);
             fs::write(&path, record.to_string()).unwrap();
@@ -1064,14 +1062,12 @@ mod tests {
     #[test]
     fn bisect_replays_under_the_bad_schedules_sleep_registration() {
         use detcore_model::config::SleepRegistration;
-        let resources = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-resources");
         let dir = tempfile::tempdir().unwrap();
         let write = |fixture: &str, name: &str, first_pass: bool| {
-            let source = resources.join(format!("flaky_cas_sequence_schedules-{fixture}.json"));
-            let mut record: serde_json::Value =
-                serde_json::from_str(&fs::read_to_string(source).unwrap()).unwrap();
+            let mut record = synthetic_schedule(fixture, known());
             if first_pass {
-                record["queued_sleeps_registered_at_first_pass"] = serde_json::Value::from(true);
+                settings(&mut record)["queued_sleeps_registered_at_first_pass"] =
+                    serde_json::Value::from(true);
             }
             let path = dir.path().join(name);
             fs::write(&path, record.to_string()).unwrap();

@@ -15107,7 +15107,8 @@ mod tests {
         let recording = directory.path().join("annotated.json");
         let summary_json = directory.path().join("summary.json");
         let tid = DetTid::from_raw(17);
-        let mut writer = crate::preemptions::PreemptionWriter::new(Some(recording.clone()));
+        let mut writer = crate::preemptions::PreemptionWriter::new(Some(recording.clone()))
+            .with_identity(crate::clock_identity::test_sources::known());
         writer.register_thread(tid, DEFAULT_PRIORITY);
         writer.insert_schedevent(SchedEvent::branches(tid, 10));
         writer.insert_reprioritization(tid, LogicalTime::from_nanos(100), 10, DEFAULT_PRIORITY, 20);
@@ -15124,13 +15125,15 @@ mod tests {
         );
         writer.flush().unwrap();
 
-        let (config, state, _, _) = cancellation_test_state_with_config(Config {
-            annotated_priority_replay: true,
-            replay_preemptions_from: Some(recording),
-            sequentialize_threads: true,
-            backend: reverie::BackendCapabilities::PTRACE,
-            ..Config::default()
-        });
+        let (config, state, _, _) = cancellation_test_state_with_config(
+            crate::clock_identity::test_sources::qualified(Config {
+                annotated_priority_replay: true,
+                replay_preemptions_from: Some(recording),
+                sequentialize_threads: true,
+                backend: reverie::BackendCapabilities::PTRACE,
+                ..Config::default()
+            }),
+        );
         assert_eq!(config.annotated_priority_replay_unqualified(), None);
         let refusal = {
             let mut scheduler = state.sched.lock().unwrap();
@@ -16026,17 +16029,22 @@ mod tests {
         let vfork = DetTid::from_raw(7);
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("schedule.json");
-        Recording::Legacy(PreemptionRecord::from_sched_events(vec![
-            SchedEvent::syscall(root, Sysno::getpid, SyscallPhase::Prehook),
-        ]))
+        Recording::Legacy(PreemptionRecord::from_sched_events_with_identity(
+            vec![SchedEvent::syscall(
+                root,
+                Sysno::getpid,
+                SyscallPhase::Prehook,
+            )],
+            Some(crate::clock_identity::test_sources::known()),
+        ))
         .write(&path)
         .unwrap();
-        let config = Config {
+        let config = crate::clock_identity::test_sources::qualified(Config {
             sequentialize_threads: false,
             replay_schedule_from: Some(path),
             record_preemptions: true,
             ..Config::default()
-        };
+        });
         let state = GlobalState::initialize(&config, false);
         let mm = MmId::initial(root);
         let before = {
@@ -19846,17 +19854,22 @@ mod tests {
         let trace_file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(
             trace_file.path(),
-            PreemptionRecord::from_sched_events(vec![]).to_string(),
+            PreemptionRecord::from_sched_events_with_identity(
+                vec![],
+                Some(crate::clock_identity::test_sources::known()),
+            )
+            .to_string(),
         )
         .unwrap();
-        let (config, state, tid, process) = cancellation_test_state_with_config(
-            Config {
-                sequentialize_threads: true,
-                replay_schedule_from: Some(trace_file.path().to_path_buf()),
-                ..Config::default()
-            }
-            .with_backend(|backend| backend.needs_killed_thread_rpc_cancellation = true),
-        );
+        let (config, state, tid, process) =
+            cancellation_test_state_with_config(crate::clock_identity::test_sources::qualified(
+                Config {
+                    sequentialize_threads: true,
+                    replay_schedule_from: Some(trace_file.path().to_path_buf()),
+                    ..Config::default()
+                }
+                .with_backend(|backend| backend.needs_killed_thread_rpc_cancellation = true),
+            ));
         assert!(config.max_timeslice.is_some());
         let length = LogicalTime::from_rcbs(83);
         let start = |first_slice: Option<LogicalTime>, past_global_first_execve: bool| {
@@ -24307,7 +24320,8 @@ mod tests {
         };
         let directory = tempfile::tempdir().unwrap();
         let recorded = directory.path().join("recorded.json");
-        let mut writer = crate::preemptions::PreemptionWriter::new(Some(recorded.clone()));
+        let mut writer = crate::preemptions::PreemptionWriter::new(Some(recorded.clone()))
+            .with_identity(crate::clock_identity::test_sources::known());
         writer.set_host_inputs(crate::host_inputs::input_set(
             &[
                 open("/etc/ld.so.cache", 9, 36887),
@@ -24319,14 +24333,14 @@ mod tests {
 
         let rerecorded = directory.path().join("rerecorded.json");
         let summary = directory.path().join("summary.json");
-        let config = Config {
+        let config = crate::clock_identity::test_sources::qualified(Config {
             sequentialize_threads: true,
             record_host_inputs: true,
             replay_preemptions_from: Some(recorded),
             record_preemptions: true,
             record_preemptions_to: Some(rerecorded.clone()),
             ..Config::default()
-        };
+        });
         let state = GlobalState::initialize(&config, false);
         let dettid = DetTid::from_raw(3);
         let sender_time = DetTime::new(&config);
@@ -24414,7 +24428,8 @@ mod tests {
         let input = "7d3f9b6284c6f36e77b425cac882e8fbbcc97a4727ec20790853076d0f463453";
         // The recording read "input\n" at each path.
         let recorded = directory.path().join("recorded.json");
-        let mut writer = crate::preemptions::PreemptionWriter::new(Some(recorded.clone()));
+        let mut writer = crate::preemptions::PreemptionWriter::new(Some(recorded.clone()))
+            .with_identity(crate::clock_identity::test_sources::known());
         writer.set_host_inputs(crate::host_inputs::input_set(
             &[&kept, &edited, &replaced].map(|file| HostInputRecord {
                 path: file.to_str().unwrap().to_owned(),
@@ -24436,12 +24451,12 @@ mod tests {
         std::fs::rename(&new, &replaced).unwrap();
 
         let summary = directory.path().join("summary.json");
-        let config = Config {
+        let config = crate::clock_identity::test_sources::qualified(Config {
             sequentialize_threads: true,
             record_host_inputs: true,
             replay_preemptions_from: Some(recorded),
             ..Config::default()
-        };
+        });
         let state = GlobalState::initialize(&config, false);
         let dettid = DetTid::from_raw(3);
         let sender_time = DetTime::new(&config);
@@ -24542,7 +24557,8 @@ mod tests {
                 recorded_identity.size += 1;
             }
             let recorded = directory.path().join("recorded.json");
-            let mut writer = crate::preemptions::PreemptionWriter::new(Some(recorded.clone()));
+            let mut writer = crate::preemptions::PreemptionWriter::new(Some(recorded.clone()))
+                .with_identity(crate::clock_identity::test_sources::known());
             writer.set_host_inputs(crate::host_inputs::input_set(
                 &[HostInputRecord {
                     path: guest_path.into(),
@@ -24558,7 +24574,7 @@ mod tests {
                 &BTreeSet::new(),
             ));
             writer.flush().unwrap();
-            let config = Config {
+            let config = crate::clock_identity::test_sources::qualified(Config {
                 sequentialize_threads: true,
                 record_host_inputs: true,
                 replay_preemptions_from: Some(recorded),
@@ -24568,7 +24584,7 @@ mod tests {
                     content: content.clone(),
                 }],
                 ..Config::default()
-            };
+            });
             let state = GlobalState::initialize(&config, false);
             let dettid = DetTid::from_raw(3);
             let before = state.global_time.lock().unwrap().as_nanos();
@@ -26020,7 +26036,6 @@ mod robust_exit_clock_tests {
 #[cfg(test)]
 mod replay_departure_tests {
     use super::*;
-    use crate::preemptions::PreemptionRecord;
     use crate::preemptions::PreemptionWriter;
 
     #[test]
@@ -26028,7 +26043,8 @@ mod replay_departure_tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("history.json");
         for marker in [None, Some(0), Some(71)] {
-            let mut writer = PreemptionWriter::new(None);
+            let mut writer = PreemptionWriter::new(None)
+                .with_identity(crate::clock_identity::test_sources::known());
             if let Some(event) = marker {
                 writer.mark_replay_departed(event);
             }
@@ -26039,12 +26055,12 @@ mod replay_departure_tests {
                 history.require_replay_mode(false).is_err(),
                 marker.is_some()
             );
-            let config = Config {
+            let config = crate::clock_identity::test_sources::qualified(Config {
                 replay_preemptions_from: Some(path.clone()),
                 replay_edited_preemptions: true,
                 record_preemptions: true,
                 ..Config::default()
-            };
+            });
             let global = GlobalState::for_tests(&config);
             let text = global
                 .sched
@@ -26054,7 +26070,11 @@ mod replay_departure_tests {
                 .take()
                 .unwrap()
                 .into_string();
-            let written: PreemptionRecord = serde_json::from_str(&text).unwrap();
+            let crate::preemptions::boundary_recording::Recording::Legacy(written) =
+                crate::preemptions::boundary_recording::Recording::decode(text.as_bytes()).unwrap()
+            else {
+                panic!("a legacy recording writes a legacy record");
+            };
             assert_eq!(written.replay_departed_at(), marker);
         }
     }

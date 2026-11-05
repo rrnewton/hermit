@@ -1000,7 +1000,11 @@ async fn legacy_callback_expired_deadline_trial_recording(annotated: bool, owner
     drop(scheduler);
     let departure = if record {
         let written = state.sched.lock().unwrap().preemption_writer.take().unwrap().into_string();
-        let recorded: crate::preemptions::PreemptionRecord = serde_json::from_str(&written).unwrap();
+        let crate::preemptions::boundary_recording::Recording::Legacy(recorded) =
+            crate::preemptions::boundary_recording::Recording::decode(written.as_bytes()).unwrap()
+        else {
+            panic!("a legacy recording writes a legacy record");
+        };
         assert!(recorded.require_faithful_replay().is_err(), "a record that omitted the expiry row must refuse faithful replay");
         recorded.replay_departed_at()
     } else { None };

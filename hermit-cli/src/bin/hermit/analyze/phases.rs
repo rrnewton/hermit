@@ -4987,10 +4987,15 @@ mod tests {
             (500_000_000, 500_000_000, true),
             (500_000_000, 200_000_000, false),
         ] {
-            PreemptionRecord::from_sched_events(Vec::new())
-                .with_chaos_timeslice(Some(recorded))
-                .write_to_disk(&record)
-                .unwrap();
+            PreemptionRecord::from_sched_events_with_identity(
+                Vec::new(),
+                Some(detcore::preemptions::HistoryIdentity::Known(
+                    reverie::pmu_config::RcbMetric::ConditionalBranchesRetiredUserV1,
+                )),
+            )
+            .with_chaos_timeslice(Some(recorded))
+            .write_to_disk(&record)
+            .unwrap();
             let args = crate::app::Args::try_parse_from([
                 "hermit".to_owned(),
                 "analyze".into(),
@@ -6129,7 +6134,8 @@ mod tests {
             let mut value: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
             if once {
-                value["expired_wait_runs_charged_once"] = serde_json::Value::from(true);
+                settings(&mut value)["expired_wait_runs_charged_once"] =
+                    serde_json::Value::from(true);
             }
             std::fs::write(&path, value.to_string()).unwrap();
             path
@@ -6230,7 +6236,8 @@ mod tests {
             let mut value: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
             if first_pass {
-                value["queued_sleeps_registered_at_first_pass"] = serde_json::Value::from(true);
+                settings(&mut value)["queued_sleeps_registered_at_first_pass"] =
+                    serde_json::Value::from(true);
             }
             std::fs::write(&path, value.to_string()).unwrap();
             path
