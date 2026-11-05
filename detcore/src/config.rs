@@ -434,6 +434,11 @@ mod tests {
     /// `GlobalRequest::RecordHostInput` carries.
     const HOST_INPUT_WIRE: [&str; 1] = ["pub struct HostFileIdentity {"];
 
+    /// The payload type package K item 2b slice 2b-3 added, which
+    /// `RecordExecStrings` and `ProcessExecStrings`'s response carry, in
+    /// tool_global.rs.
+    const EXEC_STRINGS_WIRE: [&str; 1] = ["pub struct ExecStrings {"];
+
     /// The lines of code of the item `source` declares, unindented, on the
     /// line `header`: the attributes just above it (its derives and serde
     /// attributes decide its encoding), the header, and its body through
@@ -797,13 +802,13 @@ mod tests {
         );
         assert_ne!(grown, source);
         assert_ne!(
-            definition_digest(&grown, payload, schedule, replayer, task_stat),
+            definition_digest(&grown, payload, schedule, replayer, task_stat, host_input),
             digest
         );
         let retyped = source.replacen("    pub envp: Vec<u8>,\n", "    pub envp: String,\n", 1);
         assert_ne!(retyped, source);
         assert_ne!(
-            definition_digest(&retyped, payload, schedule, replayer, task_stat),
+            definition_digest(&retyped, payload, schedule, replayer, task_stat, host_input),
             digest
         );
         let documented = source.replacen(
@@ -813,7 +818,7 @@ mod tests {
         );
         assert_ne!(documented, source);
         assert_eq!(
-            definition_digest(&documented, payload, schedule, replayer, task_stat),
+            definition_digest(&documented, payload, schedule, replayer, task_stat, host_input),
             digest
         );
 
