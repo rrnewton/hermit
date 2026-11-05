@@ -3301,7 +3301,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/pull/4889: 3492 + 2 = 3494
     // (wake unit + deferred-SIGCHLD negative arm).
     // drain/4709: main + this change's Detcore tests (+10, incl. the strict-scan case): 3524 + 10 = 3534.
-    ("test.detcore_unit", 3540),
+    ("test.detcore_unit", 3547),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4692,7 +4692,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // drain/4709: main + this change's CLI tests (+16): 800 + 16 = 816.
     // drain/4709: main + this change's CLI tests (+16): 816 + 16 = 817.
     // And replay_only_ignores_an_unused_requested_cpu_profile (revcodex fix): 816 + 1 = 817.
-    ("test.cli", 818),
+    ("test.cli", 819),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5384,7 +5384,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // drain/4709: main + this change's CLI tests (+16, same growth as test.cli): 719 + 16 = 735.
     // drain/4709: main + this change's CLI tests (+16, same growth as test.cli): 735 + 16 = 736.
     // And the same replay-only case: 735 + 1 = 736.
-    ("test.cli_on_host", 737),
+    ("test.cli_on_host", 738),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
@@ -5985,7 +5985,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR #4751: the same twelve units (same growth as test.detcore_unit): 3482.
     // And the same two replayed-switch wake units: 3492 + 2 = 3494.
     // drain/4709: main + this change's Detcore tests (+10, same growth as test.detcore_unit): 3524 + 10 = 3534.
-    ("test.detcore_unit_on_host", 3540),
+    ("test.detcore_unit_on_host", 3547),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
