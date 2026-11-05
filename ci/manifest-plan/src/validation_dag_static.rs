@@ -1994,7 +1994,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4920 (3): the prefix-trial unit: 1258 + 1 = 1259.
     // And https://github.com/rrnewton/hermit/pull/4735's two replay
     // rewrite-provenance refusal units: 1267 + 2 = 1269.
-    ("test.hermit_unit", 1269),
+    // And its public-library entry refusal unit: 1269 + 1 = 1270.
+    ("test.hermit_unit", 1270),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3297,7 +3298,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (wake unit + deferred-SIGCHLD negative arm).
     // And https://github.com/rrnewton/hermit/pull/4735's rewrite-provenance
     // round-trip unit: 3578 + 1 = 3579.
-    ("test.detcore_unit", 3579),
+    // And its heuristic-marker and shared-admission units: 3579 + 2 = 3581.
+    ("test.detcore_unit", 3581),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5949,7 +5951,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR #4751: the same twelve units (same growth as test.detcore_unit): 3482.
     // And the same two replayed-switch wake units: 3492 + 2 = 3494.
     // And the same rewrite-provenance unit as test.detcore_unit: 3579.
-    ("test.detcore_unit_on_host", 3579),
+    // And the same two marker/admission units: 3579 + 2 = 3581.
+    ("test.detcore_unit_on_host", 3581),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -6373,7 +6376,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4920 (3): the same unit: 1252 + 1 = 1253.
     // And the same two rewrite-provenance units as test.hermit_unit:
     // 1261 + 2 = 1263.
-    ("test.hermit_unit_on_host", 1263),
+    // And the same public-library entry unit: 1263 + 1 = 1264.
+    ("test.hermit_unit_on_host", 1264),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
