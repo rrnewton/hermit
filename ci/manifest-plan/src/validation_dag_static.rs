@@ -1999,7 +1999,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4920 (3): the prefix-trial unit: 1258 + 1 = 1259.
     // And PR #4743's eight hermit-unit additions on this base (trial-log,
     // bisection-checkpoint, workspace-source and guest-log units): +8.
-    ("test.hermit_unit", 1268),
+    ("test.hermit_unit", 1270),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6390,7 +6390,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4920 (3): the same unit: 1252 + 1 = 1253.
     // And PR #4743's eight hermit-unit additions on this base (trial-log,
     // bisection-checkpoint, workspace-source and guest-log units): +8.
-    ("test.hermit_unit_on_host", 1262),
+    ("test.hermit_unit_on_host", 1264),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
