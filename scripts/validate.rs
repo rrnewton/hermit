@@ -19848,7 +19848,10 @@ mod nextest_timeout_tests {
                 // c-programs/proc-fd-link-aliases and compat/ps). 2976 with R1108's
                 // c-programs/shared-file-threads on ptrace and KVM. 2977 with
                 // SIGSHARE S2b's KVM verify of c-programs/sigsuspend-sibling-signal-wake.
-                assert_eq!(all.len(), 2977, "the original all-owner population is retained");
+                // 2982 with #5154's guard cells: c-programs/madvise-guard-fault
+                // and c-programs/madvise-guard-regions, verify and replay on
+                // ptrace, and madvise-guard-regions verify on KVM.
+                assert_eq!(all.len(), 2982, "the original all-owner population is retained");
             }
             let expected = all.iter().map(|cell| cell.id.clone()).collect::<BTreeSet<_>>();
             assert_eq!(expected.len(), all.len(), "duplicate all-owner cell identity");

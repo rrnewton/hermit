@@ -3305,8 +3305,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Package K item 2b slices 2b-1 (6), 2b-2 (7), 2b-3 (4), 2b-4 (2) and
     // 2b-5 (6) units, SIGSHARE S2a's signal_state_reader_tests (15), S2b's
     // backend_signal_waits_tests and suspend_decline_tests (17) and S4's
-    // controlled child-exit parked_tests (5): 3534 + 62 = 3596.
-    ("test.detcore_unit", 3596),
+    // controlled child-exit parked_tests (5): 3534 + 62 = 3596. And S4's
+    // parked-sleep unit (the revastra2 review of PR 5192, F1): 3597.
+    ("test.detcore_unit", 3597),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5974,8 +5975,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same unit (same growth as test.detcore_unit, PR #4926): 3469 + 1 = 3470.
     // PR #4751: the same twelve units (same growth as test.detcore_unit): 3482.
     // And the same two replayed-switch wake units: 3492 + 2 = 3494.
-    // The same 62 units: 3534 + 62 = 3596.
-    ("test.detcore_unit_on_host", 3596),
+    // The same 63 units: 3534 + 63 = 3597.
+    ("test.detcore_unit_on_host", 3597),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
