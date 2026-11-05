@@ -239,6 +239,7 @@ static KILL_MULTITHREADED_PROCESS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PROCESS_SIGNAL_RECEIVER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static REALTIME_SIGNALS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PIPE_READ_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static BACKEND_SIGNAL_WAITS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static INOTIFY_BLOCKING_READ_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static OWN_PROCESS_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VDSO_SYMBOL_VERSIONS_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1634,6 +1635,32 @@ fn pipe_read_signal_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "pipe-read-signal guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn backend_signal_waits_guest() -> &'static Path {
+    BACKEND_SIGNAL_WAITS_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("backend-signal-waits");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create backend-signal-waits guest directory");
+        let guest = build_root.join("backend_signal_waits");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("hermit-cli/tests/fixtures/backend_signal_waits.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile backend-signal-waits guest");
+        assert!(
+            output.status.success(),
+            "backend-signal-waits guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -46655,6 +46682,84 @@ fn run_kvm_the_drain_decides_a_polled_call_from_the_backends_signal_state() {
                     "{backend} {mode}: no poll request names its signal-state task:\n{text}"
                 );
             }
+        }
+    }
+}
+
+/// SIGSHARE S2b: on KVM, whose own `rt_sigsuspend` never sleeps and whose
+/// masked `ppoll` was refused when it would wait, both waits now end the ways
+/// Linux ends them, decided at the step-2 drain from the signal state the
+/// backend reports (`Scheduler::wake_backend_signal_waits`): a sibling's
+/// signal, a timer's, a process-directed POSIX timer's with two waiters (one
+/// handler run), a default-fatal signal, a signal the temporary mask blocks
+/// (it does not end the wait), a pending ignored signal the mask lets in
+/// (discarded, and the wait goes on), and a child's exit SIGCHLD, which keeps
+/// the path it had before S2b (SIGSHARE S4). Each mode runs on ptrace and on
+/// KVM: the output is the native line, and each backend verifies at bitwise
+/// parity with nonzero compared INFO counts. Before S2b every KVM line but
+/// `sigchld`'s differed (the suspend returned ENOSYS at once, and the masked
+/// ppoll was refused by name).
+#[test]
+fn run_kvm_a_wait_under_a_temporary_mask_ends_as_on_linux() {
+    if kvm_unavailable("run_kvm_a_wait_under_a_temporary_mask_ends_as_on_linux") {
+        return;
+    }
+    let guest = backend_signal_waits_guest().to_str().unwrap().to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    for (mode, expected) in [
+        ("timer", "timer eintr=1 alarm_runs=1\n"),
+        ("posix-timer", "posix-timer eintr=1 usr1_runs=1\n"),
+        ("two-waiters", "two-waiters eintr=1,1 usr1_runs=1\n"),
+        (
+            "ignored-let-in",
+            "ignored-let-in before=1 eintr=1 usr1_runs=1 winch_after=0\n",
+        ),
+        (
+            "blocked-by-mask",
+            "blocked-by-mask eintr=1 usr1_in_wait=1 usr2_in_wait=1 usr1_runs=1\n",
+        ),
+        ("fatal", "fatal signaled=1 termsig=15\n"),
+        ("sigchld", "sigchld exited=1 status=7\n"),
+        ("ppoll-timer", "ppoll-timer rc=-4 alarm_runs=1\n"),
+        ("ppoll-sibling", "ppoll-sibling rc=-4 usr1_runs=1\n"),
+        (
+            "ppoll-ignored",
+            "ppoll-ignored before=1 rc=0 winch_after=0\n",
+        ),
+    ] {
+        for backend in ["ptrace", "kvm"] {
+            let backend_arg = format!("--backend={backend}");
+            let report = directory.path().join(format!("{mode}-{backend}.json"));
+            let report_arg = report.to_str().unwrap().to_owned();
+            let args = [
+                backend_arg.as_str(),
+                "run",
+                "--strict",
+                "--verify",
+                "--verify-strict",
+                "--verify-json",
+                &report_arg,
+                "--base-env=minimal",
+                "--epoch=2026-01-01T00:00:00Z",
+                "--",
+                guest.as_str(),
+                mode,
+            ];
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            assert_eq!(stdout(&output), expected, "{backend} {mode}");
+            let verdict: serde_json::Value =
+                serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+            assert_eq!(
+                verdict["bitwise_parity"], true,
+                "{backend} {mode}: {verdict}"
+            );
+            let compared = &verdict["compared_log_messages"];
+            assert!(
+                compared["left"].as_u64().is_some_and(|count| count > 0)
+                    && compared["left"] == compared["right"],
+                "{backend} {mode} compared no INFO messages: {verdict}"
+            );
         }
     }
 }
