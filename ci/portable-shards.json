@@ -113,7 +113,8 @@
         "test.command_strict_verify",
         "test.ignored_syscall_regressions",
         "test.envelope_levels",
-        "test.rr_suite_contract"
+        "test.rr_suite_contract",
+        "e2e.manifest_rr_on_host"
       ]
     },
     {
