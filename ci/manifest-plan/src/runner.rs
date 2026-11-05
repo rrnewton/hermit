@@ -709,6 +709,78 @@ pub struct ModeRecipe {
 /// the portable, hosted and quick profiles' subsets of them) select no label.
 pub const DEFAULT_RUN_TYPE: &str = "full";
 
+/// The expected-pass nightly run type. A cell earns this test-row label only
+/// after passing in the hermetic validation image at a stated head.
+pub const SUPER_RUN_TYPE: &str = "super";
+
+/// The negative-space nightly run type for tests that have not yet qualified
+/// for [`SUPER_RUN_TYPE`]. Their results structure the backlog; they are not
+/// expected-pass regression cells.
+pub const PRESSURE_RUN_TYPE: &str = "pressure";
+
+/// Manifest buckets whose every test row must carry exactly one tier marker.
+const TIERED_BUCKETS: [&str; 2] = ["gvisor", "rr"];
+
+/// The one tier marker shared by the gVisor and rr corpora and their
+/// selectors. It is authored as a test-row [`TestRecipe::labels`] value;
+/// selectors consume it through `--label super|pressure`.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Deserialize,
+    Serialize,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord
+)]
+#[serde(rename_all = "lowercase")]
+pub enum CellTier {
+    Super,
+    Pressure,
+}
+
+impl CellTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Super => SUPER_RUN_TYPE,
+            Self::Pressure => PRESSURE_RUN_TYPE,
+        }
+    }
+
+    fn from_labels(labels: &BTreeSet<&str>) -> Result<Option<Self>, String> {
+        match (
+            labels.contains(SUPER_RUN_TYPE),
+            labels.contains(PRESSURE_RUN_TYPE),
+        ) {
+            (true, false) => Ok(Some(Self::Super)),
+            (false, true) => Ok(Some(Self::Pressure)),
+            (false, false) => Ok(None),
+            (true, true) => Err(format!(
+                "labels contain both `{SUPER_RUN_TYPE}` and `{PRESSURE_RUN_TYPE}`"
+            )),
+        }
+    }
+}
+
+/// This cell's derived tier: `Some(Super)` or `Some(Pressure)` when the
+/// resolved labels carry that one marker, and `None` when they carry
+/// neither (every row outside the tiered buckets, and any untiered cell).
+/// A mode label can put a cell in a tier on its own: the compat corpus's
+/// heavy rows carry mode-level `super`, so their cells return
+/// `Some(CellTier::Super)` with no test-row marker. Manifest validation
+/// rejects a resolved cell carrying both markers, so a validated
+/// manifest cannot make this return an error.
+pub fn cell_tier(
+    test: &TestRecipe,
+    recipe: &ModeRecipe,
+    backend: Option<&str>,
+) -> Result<Option<CellTier>, String> {
+    CellTier::from_labels(&cell_labels(test, recipe, backend))
+        .map_err(|error| format!("{}: {error}", test.id))
+}
+
 /// The run types a cell belongs to: its test's `labels`, plus its mode's
 /// `labels` for its backend, or [`DEFAULT_RUN_TYPE`] alone when both are
 /// empty. A selection keeps a cell when the cell's run types meet the
@@ -2648,6 +2720,16 @@ fn validate_document_with_cpu(
             return Err(format!("{}: modes must be exactly {expected:?}", test.id));
         }
         validate_labels(&test.id, &test.labels)?;
+        validate_tier_marker(&test.id, stem, &test.labels)?;
+        // The tier is resolved per cell: a mode may add `super` for one
+        // backend (the compat corpus's heavy rows do), but no resolved
+        // cell may carry both tier markers.
+        for (mode, recipe) in &test.modes {
+            for backend in &recipe.backends_enabled {
+                cell_tier(test, recipe, Some(backend))
+                    .map_err(|error| format!("{}: {mode} on {backend}: {error}", test.id))?;
+            }
+        }
         for (mode, recipe) in &test.modes {
             validate_mode_with_cpu(
                 &test.id,
@@ -10701,6 +10783,17 @@ fn validate_mode_extensions(id: &str, mode: &str, recipe: &ModeRecipe) -> Result
     Ok(())
 }
 
+fn validate_tier_marker(id: &str, bucket: &str, labels: &[String]) -> Result<(), String> {
+    let label_set: BTreeSet<&str> = labels.iter().map(String::as_str).collect();
+    let tier = CellTier::from_labels(&label_set).map_err(|error| format!("{id}: {error}"))?;
+    if tier.is_none() && TIERED_BUCKETS.contains(&bucket) {
+        return Err(format!(
+            "{id}: bucket `{bucket}` requires exactly one tier label, `{SUPER_RUN_TYPE}` or `{PRESSURE_RUN_TYPE}`"
+        ));
+    }
+    Ok(())
+}
+
 /// Validate a test's run-type labels: lowercase words joined by `-`, unique.
 fn validate_labels(id: &str, labels: &[String]) -> Result<(), String> {
     let mut seen = BTreeSet::new();
@@ -12544,6 +12637,102 @@ corpus:
             let labels = bad.iter().map(|l| l.to_string()).collect::<Vec<_>>();
             assert!(validate_labels("t", &labels).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn tier_marker_is_exactly_one_row_label() {
+        let labels = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+        };
+        validate_tier_marker("gvisor/x", "gvisor", &labels(&["pressure"])).unwrap();
+        validate_tier_marker("rr/x", "rr", &labels(&["full", "super"])).unwrap();
+        validate_tier_marker("c-programs/x", "c-programs", &labels(&[])).unwrap();
+        assert!(validate_tier_marker("gvisor/x", "gvisor", &labels(&[])).is_err());
+        assert!(validate_tier_marker("rr/x", "rr", &labels(&["super", "pressure"])).is_err());
+
+        let mut test = recipe(true);
+        test.labels = labels(&["full", "super"]);
+        assert_eq!(
+            cell_tier(&test, &test.modes["verify"], Some("ptrace")).unwrap(),
+            Some(CellTier::Super)
+        );
+        test.labels = labels(&["pressure"]);
+        assert_eq!(
+            cell_tier(&test, &test.modes["verify"], Some("ptrace")).unwrap(),
+            Some(CellTier::Pressure)
+        );
+        assert_eq!(CellTier::Super.as_str(), "super");
+        assert_eq!(
+            serde_json::to_string(&CellTier::Pressure).unwrap(),
+            "\"pressure\""
+        );
+
+        // A mode label may put one backend's cell in a tier (the compat
+        // corpus's heavy rows carry mode-level `super`); the resolved
+        // cell still may not carry both markers.
+        let mut mode = test.modes["verify"].clone();
+        mode.labels = BTreeMap::from([("ptrace".into(), vec!["super".into()])]);
+        assert!(cell_tier(&test, &mode, Some("ptrace")).is_err());
+    }
+
+    #[test]
+    fn tier_marker_is_enforced_at_document_level() {
+        let five_modes = |id: &str, labels: Vec<String>| {
+            let mut test = recipe(true);
+            test.id = id.into();
+            test.labels = labels;
+            for mode in ["naked", "replay", "chaos", "custom"] {
+                let backends: &[&str] = if mode == "naked" {
+                    &["native"]
+                } else {
+                    &["ptrace", "dbt", "kvm", "sabre", "liteinst", "in-guest-trap"]
+                };
+                test.modes.insert(
+                    mode.into(),
+                    ModeRecipe {
+                        ci: CiSelectionSpec::Uniform(false),
+                        ci_disabled_reason: Some(CiDisabledReasonSpec::Uniform(
+                            "fixture cell: only the verify mode is measured here".into(),
+                        )),
+                        backends_disabled: backends
+                            .iter()
+                            .map(|backend| ((*backend).into(), "fixture mode is not run".into()))
+                            .collect(),
+                        ..ModeRecipe::default()
+                    },
+                );
+            }
+            test
+        };
+        let validate = |bucket: &str, test: TestRecipe| {
+            validate_document_with_cpu(
+                &ManifestDocument {
+                    image: None,
+                    schema: MANIFEST_SCHEMA,
+                    bucket: bucket.into(),
+                    timeout_seconds: None,
+                    slow_reason: None,
+                    test: vec![test],
+                },
+                bucket,
+                Path::new("/"),
+                15,
+                DEFAULT_TEST_CPU_TIMEOUT_SECONDS,
+            )
+        };
+        let untiered = five_modes("gvisor/x", vec![]);
+        let error = validate("gvisor", untiered).unwrap_err();
+        assert!(error.contains("requires exactly one tier label"), "{error}");
+        validate("gvisor", five_modes("gvisor/x", vec!["pressure".into()])).unwrap();
+        let mut both = five_modes("gvisor/x", vec!["pressure".into()]);
+        both.modes.get_mut("verify").unwrap().labels =
+            BTreeMap::from([("ptrace".into(), vec!["super".into()])]);
+        let error = validate("gvisor", both).unwrap_err();
+        assert!(error.contains("both"), "{error}");
+        validate("fixture", five_modes("fixture/x", vec![])).unwrap();
     }
 
     /// A mode's per-backend labels put that backend's cell in their run type

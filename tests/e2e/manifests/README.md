@@ -554,6 +554,17 @@ ci/manifest-plan/src/validation_dag_static.rs), carries only that DAG label, and
 owns that run type's required cells. A label that no cell carries is refused,
 so a typo cannot select nothing and pass.
 
+Two label values are reserved as the single tier marker for the `gvisor`
+and `rr` buckets: `super` (expected-pass nightly) and `pressure`
+(negative-space nightly). Every row in those buckets carries exactly one
+at test-row level, and no resolved cell may carry both (a mode may add
+`super` for one backend, as the compat corpus's heavy rows do). A row in the
+full validation sample carries `[full, super]`. There is no separately
+authored `tier` field: selectors consume the label directly
+(`--label super|pressure`). Promotion replaces `pressure` with
+`super` after the required hermetic-image evidence; a red super cell is a
+regression, never a silent demotion.
+
 `naked` must set `ci = false`; it runs only when explicitly selected. A mode
 with no enabled backend remains visible with `ci = false` and a reason for
 every disabled backend. Regular CI executes only cells with `ci = true`;
