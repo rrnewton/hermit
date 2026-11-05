@@ -1119,6 +1119,19 @@ fn is_file_or_symlink(path: &Path) -> bool {
         || std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
 }
 
+/// Whether `program` lies under a submodule declared in `.gitmodules`
+/// whose directory exists but holds no entries (not initialized).
+fn in_uninitialized_submodule(repo_root: &Path, program: &str) -> bool {
+    let Ok(modules) = std::fs::read_to_string(repo_root.join(".gitmodules")) else {
+        return false;
+    };
+    modules.lines().filter_map(|line| line.trim().strip_prefix("path = ")).any(|sub| {
+        program.starts_with(&format!("{sub}/"))
+            && std::fs::read_dir(repo_root.join(sub))
+                .is_ok_and(|mut entries| entries.next().is_none())
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn validate_and_expand(
     test: &Value,
@@ -1209,7 +1222,13 @@ fn validate_and_expand(
                 ));
             }
             let path = repo_root.join(program);
-            if !is_file_or_symlink(&path) {
+            // A program inside an uninitialized submodule (scorecard's
+            // commands-tier clones, fresh CI checkouts before
+            // pre.submodules) cannot be stat'ed here: the pinned gitlink
+            // is the existence authority until the submodule is populated,
+            // and the build that consumes the program initializes it
+            // first. An initialized submodule missing the file still dies.
+            if !is_file_or_symlink(&path) && !in_uninitialized_submodule(&repo_root, program) {
                 die(format!("{id}: program path does not exist: {program}"));
             }
             program_path = Some(path);
