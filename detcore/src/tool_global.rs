@@ -6167,6 +6167,11 @@ impl GlobalState {
                     .await
                     .signal_target_process(named),
             ),
+            GlobalRequest::SuspendHoldsDiscarded(process, signal) => R::SuspendHoldsDiscarded(
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .suspend_holds_discarded(process, signal),
+            ),
             GlobalRequest::CpuClockProcess(named) => R::CpuClockProcess(
                 self.lock_rpc_scheduler(false)
                     .await
@@ -8161,8 +8166,9 @@ pub enum SignalScope {
 /// and `RecordExitCode` (package K item 2b slice 2b-1, allocated 39 and
 /// renumbered 41 at its rebase onto 40). The next revision after 2b-1's adds
 /// `RecordExecStrings` and `ProcessExecStrings` (package K item 2b slice
-/// 2b-3) and is the current revision.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 42;
+/// 2b-3). The next revision after that appends `SuspendHoldsDiscarded`
+/// (SIGSHARE S2b) and is the current revision.
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 43;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
@@ -9167,6 +9173,11 @@ pub enum GlobalRequest {
     /// environment strings (`ProcessAuxvTable::current_exec_strings`).
     /// Appended last.
     ProcessExecStrings(DetPid),
+    /// Whether a parked `rt_sigsuspend` of the process still holds the signal
+    /// pending although Linux discarded it when it was sent
+    /// (`Scheduler::suspend_holds_discarded`), asked by a call that would stop
+    /// ignoring it (SIGSHARE S2b). Appended last.
+    SuspendHoldsDiscarded(DetPid, i32),
 }
 
 /// What a guest thread publishes of its CPU accounting with a request
@@ -9592,6 +9603,8 @@ pub enum GlobalResponse {
     /// number names and its image's number and recorded strings, if any.
     /// Appended last.
     ProcessExecStrings(DetPid, Option<(u64, Box<ExecStrings>)>),
+    /// The answer to `GlobalRequest::SuspendHoldsDiscarded`. Appended last.
+    SuspendHoldsDiscarded(bool),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -13928,6 +13941,26 @@ where
     let response = send_and_update_time(guest, GlobalRequest::CpuClockProcess(named)).await;
     match response.1 {
         GlobalResponse::CpuClockProcess(process) => process,
+        _ => unreachable!(),
+    }
+}
+
+/// Whether a parked `rt_sigsuspend` of `process` still holds `signal` pending
+/// although Linux discarded it when it was sent
+/// (`Scheduler::suspend_holds_discarded`).
+pub(crate) async fn suspend_holds_discarded<G, T>(
+    guest: &mut G,
+    process: DetPid,
+    signal: i32,
+) -> bool
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response =
+        send_and_update_time(guest, GlobalRequest::SuspendHoldsDiscarded(process, signal)).await;
+    match response.1 {
+        GlobalResponse::SuspendHoldsDiscarded(holds) => holds,
         _ => unreachable!(),
     }
 }

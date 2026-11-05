@@ -293,6 +293,10 @@ mod tests {
         // in `ProcessExecStrings`'s, the image's number. The digest covers
         // that payload type too (domain 7). Digest measured at this head.
         (42, "05097a2f4152ff09", "f013e36743d8d9e6"),
+        // Adds `GlobalRequest::SuspendHoldsDiscarded` and its response
+        // (SIGSHARE S2b, https://github.com/rrnewton/hermit/pull/5175): after(this
+        // base's last row); renumbered mechanically at each rebase.
+        (43, "33bdc9e3049122be", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
