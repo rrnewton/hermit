@@ -158,6 +158,7 @@ configuration without changing scheduling behavior.
 | `--skid-margin` | Configures the PMU timer's skid margin (ptrace and KVM), not a guest clock. |
 | `--replay-preemptions-from` | Loads per-thread preemption points. This CLI request refuses on a timerless backend rather than reducing the recording to a cooperative subset. |
 | `--chaos-per-thread-slowdown` | Retains its existing acceptance. It weights sampled RCB time at callbacks and does not itself need timer delivery. Its effect depends on the backend's clock progress and `use_rcb_time`. |
+| `--chaos-instruction-offset=N` | Arms a chaos timeslice's own maximum `k` single steps past its branch target, `k` drawn per timeslice from `0..=N` (see below). Needs `--chaos`, precise timers and the ptrace backend on x86_64, the only one that steps; every other backend refuses it, as does a replay of a record that carries offsets. |
 
 `--target-timeslice` is a cooperative deadline checked when control returns to
 Detcore. It cannot bound guest code that never
@@ -182,6 +183,68 @@ DBT's forced clear disables shared RCB-time accumulation; and the existing
 in-guest maximum refusal leaves shared RCB time off when callers disable the
 maximum. These clock differences are documented without adding a new chaos
 refusal or changing the existing weighting policy.
+
+### Preemptions inside straight-line code
+
+A precise timer stops the guest at the first instruction after the
+conditional branch that reaches its target, so a chaos preemption can land
+only right after a conditional branch. A race window with no conditional
+branch in it (a load, some arithmetic and a store) is never split, at any
+timeslice and seed. `--chaos-instruction-offset=N` arms the timer of each
+timeslice's own maximum as `TimerSchedule::RcbsAndInstructions(rcbs, k)`:
+the ptrace backend reaches the branch target and then single-steps `k` more
+instructions, crossing later conditional branches if the steps reach them, so
+the event can land anywhere in the code that follows. `k` is uniform in
+`0..=N`, drawn for each timeslice from a stream of its own keyed by the seed,
+the thread and the draw, so the timeslice lengths and priorities a seed draws
+are unchanged, and nothing is drawn with the option off.
+
+Virtual time stays a function of the branch count: the steps add only the
+branches they retire, so the event is charged exactly like any other. The
+overshoot check accepts up to one branch per step past the target. A
+preemption record keeps, for each such timeslice, the branch target its timer
+was armed for and `k` (straight-line code can return to an address without a
+conditional branch, so the step count, not an address, names the point), and
+`--replay-preemptions-from` arms the same timer. A written record omits the
+offsets when it has none, so a record made without the option is unchanged.
+A record whose rows hold one states `"format_version": 6`
+(`INSTRUCTION_OFFSET_ROWS_FORMAT`), which a Hermit that predates the offsets
+refuses by name rather than replaying those slices to their branch targets;
+every copy and edit of such rows keeps it, and this Hermit refuses offset rows
+in an older format. A record that drops the background starts its run noted
+(a shorter schedule prefix, an edit, the re-record of a schedule replay) goes
+below format 4 when it holds no offsets; with offset rows it keeps format 5
+and says `"background_starts_unnoted": true`, so that no reader takes the
+number for a claim to note every start, and a Hermit that reads only formats
+1 to 5 still refuses it by number. Either way it drops its `"stopless"`
+marks, which only a record that notes its starts holds. Rows copied alone, without the schedule trace and the
+jumps of global time of their run (`"rows_alone": true`), follow format 1's
+timing rules: they claim no list of jumps of global time and no switch-in
+charges. A schedule whose trace is only empty, such as a prefix of no events,
+keeps its format's timing and its jumps.
+Schedule traces do not carry the offsets: `--replay-schedule-from`,
+`--strict-schedule-boundaries`, `hermit analyze` and `hermit bisect` refuse
+the option and records that use it.
+
+Where host timing could decide the point, the run fails closed with the
+retryable skid marker instead of placing it:
+
+- Reverie records a stop that finds a precise event with an offset still
+  undelivered at or past its target branch, including the event's own
+  notification: the guest has then run an unknown number of instructions
+  past that branch.
+- Reverie records an interrupted step past the target that moved neither the
+  instruction pointer nor the counter (a `rep` iteration, a jump to itself):
+  it may have run.
+- Detcore records a dropped signal's stop that lands among the steps, and a
+  replay that finds the thread already at or past a recorded target.
+
+Each step is one ptrace stop of the preempted thread, about 35 us on x86_64,
+so a preemption costs up to `N` more; `N` is at most 256. The option is
+validated on x86_64 only: on aarch64 it is a policy refusal (exit status
+122). Every chaos timeslice end needs a real stop at its target while the
+option is on (`Config::slice_ends_need_a_stop`), so a lone thread's slice ends
+are not taken without a stop then (`Config::replays_lone_preemptions`).
 
 DBT's translation quantum is separate backend work. It does not implement
 Detcore's maximum-timeslice contract and is not changed by this inventory.

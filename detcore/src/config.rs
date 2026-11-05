@@ -100,14 +100,16 @@ mod tests {
     /// (https://github.com/rrnewton/hermit/pull/4735), 42 is package K
     /// item 2b slice 2b-1's
     /// (https://github.com/rrnewton/hermit/pull/5139, renumbered from its
-    /// row 41 at integration, in merge order), and 43,
+    /// row 41 at integration, in merge order), 43 is
     /// https://github.com/rrnewton/hermit/pull/4759's replay-backstop row
-    /// (renumbered from its row 42 at integration), is the current
-    /// revision. A change that lands below the last row removes its
-    /// entry, with its row. One that lands after a higher revision (any
-    /// of 33 to 39 after 43) appends its row above the last instead and
-    /// leaves its old number here, reserved as never landed: filling a
-    /// number in below a landed row would rewrite that row's digest.
+    /// (renumbered from its row 42 at integration), and 44, this
+    /// integration's renumbering of
+    /// https://github.com/rrnewton/hermit/pull/4769's row 41, is the
+    /// current revision. A change that lands below the last row removes
+    /// its entry, with its row. One that lands after a higher revision
+    /// (any of 33 to 39 after 44) appends its row above the last instead
+    /// and leaves its old number here, reserved as never landed: filling
+    /// a number in below a landed row would rewrite that row's digest.
     const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[33, 34, 35, 36, 37, 38, 39];
 
     /// Every revision of the global RPC, oldest first, with the digest of the
@@ -311,6 +313,17 @@ mod tests {
         // skipping 33 to 39 reserved for pending changes; digest
         // re-measured on the combined tree at regeneration).
         (43, "3ac5fc0756fc3ccd", "f013e36743d8d9e6"),
+        // Adds `GlobalRequest::PublishInstructionOffset` and
+        // `GlobalResponse::PublishInstructionOffset`, appended after the
+        // `CpuClockProcess` pair at the tail of each enum
+        // (https://github.com/rrnewton/hermit/pull/4769; 26 above
+        // https://github.com/rrnewton/hermit/pull/4728's 25 on its own
+        // base, renumbered to 41 at its rebase onto main's 40, then 44 at
+        // integration behind rows 41 to 43, skipping only the reserved
+        // 33 to 39; digest re-measured on the combined tree at
+        // regeneration).
+        (44, "910e9e00bc41b1cd", "f013e36743d8d9e6"),
+
     ];
 
     /// The lines of code, without comments or blank lines, of the type that

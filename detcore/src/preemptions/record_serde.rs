@@ -90,6 +90,10 @@ struct RawRecord {
     background_starts: Vec<BackgroundStart>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     rewrite_exclusives_in_memory: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    rows_alone: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    background_starts_unnoted: bool,
 }
 
 // The INFO comparison projection: RawRecord's exact serialization except the
@@ -839,7 +843,7 @@ mod tests {
     /// time.
     #[test]
     fn format_version_round_trips_through_the_record_serde() {
-        let format = crate::preemptions::PREEMPTION_RECORD_FORMAT;
+        let format = crate::preemptions::PREEMPTION_RECORD_FORMAT_MAX;
         let old = format!(r#"{{"per_thread":{{}},"global":[],"format_version":{format}}}"#);
         let record: PreemptionRecord = serde_json::from_str(&old).unwrap();
         assert_eq!(record.format_version, Some(format));

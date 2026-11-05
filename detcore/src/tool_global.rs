@@ -4217,6 +4217,16 @@ impl GlobalState {
             );
             return (None, R::PublishSignalDispositions(held));
         }
+        // Where the sender's ending timeslice's timer was armed
+        // (`publish_instruction_offset`): the same kind of message.
+        if let GlobalRequest::PublishInstructionOffset(offset) = request {
+            let taken = self
+                .sched
+                .lock()
+                .unwrap()
+                .publish_instruction_offset(dtid, request_mm, offset);
+            return (None, R::PublishInstructionOffset(taken));
+        }
         // A thread's mask from Detcore's copy
         // (`syscalls::signal_shadow::publish_mask`): the same kind of message.
         if let GlobalRequest::PublishSignalMask(mask) = request {
@@ -4571,6 +4581,9 @@ impl GlobalState {
             }
             GlobalRequest::PublishSignalMask(_) => {
                 unreachable!("a published mask is answered before clock accounting")
+            }
+            GlobalRequest::PublishInstructionOffset(_) => {
+                unreachable!("a published instruction offset is answered before clock accounting")
             }
             GlobalRequest::PublishRuntimePrivateMemory(_) => {
                 unreachable!("private-memory publication precedes clock accounting")
@@ -8238,11 +8251,13 @@ pub enum SignalScope {
 /// reserved 33 to 39. 41 adds `Rewrite::unmarked` to the
 /// `StoreExclusive` payload. 42 adds `WithCpuTime` and `RecordExitCode`
 /// (package K item 2b slice 2b-1, allocated 39, renumbered 41 at its
-/// rebase onto 40, then 42 at integration). The current revision 43
-/// adds `TraceSchedEventResponse::backstop` (PR #4759, allocated 25 on
-/// its own base, assigned 42 at its rebase onto 41, renumbered 43 at
+/// rebase onto 40, then 42 at integration). 43 adds
+/// `TraceSchedEventResponse::backstop` (PR #4759, allocated 25 on its
+/// own base, assigned 42 at its rebase onto 41, renumbered 43 at
+/// integration). The current revision 44 adds the
+/// `PublishInstructionOffset` pair (PR #4769, renumbered from 41 at
 /// integration).
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 43;
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 44;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
@@ -9225,7 +9240,6 @@ pub enum GlobalRequest {
     PostCrash(crate::post_crash::PostCrashEvent),
     /// The process a CPU clock id naming this id belongs to, if it names a
     /// live thread or an existing process (`Scheduler::cpu_clock_process`).
-    /// Appended last.
     CpuClockProcess(DetPid),
     /// Request `.1`, sent with what the calling thread publishes of its CPU
     /// accounting (`CpuPublication`, `Scheduler::publish_cpu_time`), where it
@@ -9235,8 +9249,13 @@ pub enum GlobalRequest {
     /// part of the global state sees it. Appended last.
     WithCpuTime(Box<CpuPublication>, Box<GlobalRequest>),
     /// Record `.1` as the exit code of process `.0`, in wait(2) encoding, in
-    /// the turn that ends it (`Scheduler::record_exit_code`). Appended last.
+    /// the turn that ends it (`Scheduler::record_exit_code`).
     RecordExitCode(DetPid, i32),
+    /// Where the timer of the sender's ending timeslice was armed
+    /// (`--chaos-instruction-offset`), for the change point it files next
+    /// (`Scheduler::publish_instruction_offset`). Answered before any clock or
+    /// scheduler accounting. Appended last.
+    PublishInstructionOffset(crate::resources::InstructionOffset),
 }
 
 /// What a guest thread publishes of its CPU accounting with a request
@@ -9652,10 +9671,13 @@ pub enum GlobalResponse {
     /// The answer to `GlobalRequest::CpuClockProcess`: the process the
     /// named task belongs to, and the incarnation of the named task's ID
     /// (`InodePool::incarnation`), so a CPU timer can bind to the task it
-    /// was created for and not to a later task reusing its number. Appended last.
+    /// was created for and not to a later task reusing its number.
     CpuClockProcess(Option<(DetPid, u32)>),
     /// The answer to `GlobalRequest::RecordExitCode`. Appended last.
     RecordExitCode(()),
+    /// Whether the scheduler took the offset (it takes nothing from a thread
+    /// it does not know, one killed, or a retired incarnation). Appended last.
+    PublishInstructionOffset(bool),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -10595,6 +10617,33 @@ where
         guest.send_rpc(message).await.1,
         GlobalResponse::PublishSignalMask(true)
     )
+}
+
+/// Tell the scheduler where the timer of the calling thread's ending timeslice
+/// was armed (`--chaos-instruction-offset`), just before the change point
+/// that ends it, which records it (`Scheduler::publish_instruction_offset`).
+/// Sent like [`publish_signal_mask`], only for a timeslice armed with an
+/// offset, so that a run without the option sends nothing more.
+pub(crate) async fn publish_instruction_offset<G, T>(
+    guest: &mut G,
+    offset: crate::resources::InstructionOffset,
+) where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let state = guest.thread_state();
+    let message = (
+        state.thread_logical_time.clone(),
+        state.mm_id,
+        GlobalRequest::PublishInstructionOffset(offset),
+    );
+    // A refusal means the thread is gone or retired: it files no change
+    // point that could record the offset.
+    let answer = guest.send_rpc(message).await.1;
+    debug_assert!(matches!(
+        answer,
+        GlobalResponse::PublishInstructionOffset(_)
+    ));
 }
 
 async fn publish_runtime_private_memory<G, T>(guest: &mut G)
@@ -15257,7 +15306,14 @@ mod tests {
         let path = directory.path().join("recording");
         let mut writer = crate::preemptions::PreemptionWriter::new(Some(path.clone()));
         writer.register_thread(tid, DEFAULT_PRIORITY);
-        writer.insert_reprioritization(tid, LogicalTime::from_nanos(100), 10, DEFAULT_PRIORITY, 20);
+        writer.insert_reprioritization(
+            tid,
+            LogicalTime::from_nanos(100),
+            10,
+            DEFAULT_PRIORITY,
+            20,
+            None,
+        );
         let mut scheduler = state.sched.lock().unwrap();
         scheduler.preemption_writer = Some(writer);
         let (summary, info_description) = scheduler
@@ -15307,7 +15363,14 @@ mod tests {
         });
         let mut writer = crate::preemptions::PreemptionWriter::new(Some(recording.clone()));
         writer.register_thread(tid, DEFAULT_PRIORITY);
-        writer.insert_reprioritization(tid, LogicalTime::from_nanos(100), 10, DEFAULT_PRIORITY, 20);
+        writer.insert_reprioritization(
+            tid,
+            LogicalTime::from_nanos(100),
+            10,
+            DEFAULT_PRIORITY,
+            20,
+            None,
+        );
         state.sched.lock().unwrap().preemption_writer = Some(writer);
 
         let cleanup = state
@@ -15419,6 +15482,7 @@ mod tests {
                     10,
                     DEFAULT_PRIORITY,
                     20,
+                    None,
                 );
                 state.sched.lock().unwrap().preemption_writer = Some(writer);
                 assert!(!recording.exists());
@@ -15485,7 +15549,14 @@ mod tests {
         let mut writer = crate::preemptions::PreemptionWriter::new(Some(recording.clone()));
         writer.register_thread(tid, DEFAULT_PRIORITY);
         writer.insert_schedevent(SchedEvent::branches(tid, 10));
-        writer.insert_reprioritization(tid, LogicalTime::from_nanos(100), 10, DEFAULT_PRIORITY, 20);
+        writer.insert_reprioritization(
+            tid,
+            LogicalTime::from_nanos(100),
+            10,
+            DEFAULT_PRIORITY,
+            20,
+            None,
+        );
         writer.insert_callback_checkpoint(
             tid,
             Origin {

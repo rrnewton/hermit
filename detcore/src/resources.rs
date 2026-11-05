@@ -87,6 +87,19 @@ pub struct ChaosEpochTransition {
     pub factor: RcbTimeMultiplier,
 }
 
+/// Where a chaos timeslice with `--chaos-instruction-offset` ends: `instructions`
+/// single steps after the thread's conditional-branch counter reaches
+/// `rcb_target`. Straight-line code can return to an address without a
+/// conditional branch (a repeated call, a backward jump, a `rep` instruction),
+/// so the step count, not an address, names the point.
+#[derive(PartialEq, Debug, Eq, Clone, Copy, Serialize, Deserialize, Hash)]
+pub struct InstructionOffset {
+    /// The thread's absolute PMU branch count the timer was armed for.
+    pub rcb_target: u64,
+    /// Single steps past that count, at least one.
+    pub instructions: u64,
+}
+
 /// Identity of one syscall executing outside Hermit's serialized guest turns.
 #[derive(
     PartialEq,
