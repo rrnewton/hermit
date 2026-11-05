@@ -6826,7 +6826,10 @@ fn selective_subset_bracket(root: &Path) -> Result<(), String> {
         )
     }) || full_tags
         .iter()
-        .any(|tag| !hermit_manifest_plan::dag_source_ownership::is_core(tag))
+        // Admitted = frozen core plus the registered post-split
+        // extensions select_core itself admits at generation; anything
+        // else (external backend nodes) still refuses.
+        .any(|tag| !hermit_manifest_plan::dag_source_ownership::is_admitted_core(tag))
     {
         return Err(
             "selective bracket: external cells or nodes reappeared in the core graph".into(),
