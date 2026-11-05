@@ -19,6 +19,7 @@ use anyhow::bail;
 use colored::Colorize;
 use detcore::preemptions::PreemptionReader;
 use detcore::preemptions::PreemptionRecord;
+use detcore::preemptions::boundary_recording::Recording;
 use detcore::types::DetTid;
 use detcore::types::SchedEvent;
 use detcore::util::truncated;
@@ -33,6 +34,9 @@ use reverie::process::ExitStatus;
 use reverie::process::Output;
 
 use crate::app::analyze::consts::*;
+use crate::app::analyze::race_report::TracedReplay;
+use crate::app::analyze::races::RacingAccesses;
+use crate::app::analyze::races::render_racing_accesses;
 use crate::app::analyze::rundata::RunData;
 use crate::app::analyze::stop;
 use crate::app::analyze::stop::StopSignals;
@@ -476,6 +480,45 @@ fn continued_record(
     )
 }
 
+/// How many events of the search's schedule keep their callback
+/// checkpoints in a race candidate's check of the `role` run: that run's own
+/// prefix (the baseline replayed one event fewer than the target's `len`),
+/// up to `unchanged`, where the edit starts.
+fn check_prefix_len(len: usize, role: &str, unchanged: usize) -> usize {
+    let own = if role == "baseline" {
+        len.saturating_sub(1)
+    } else {
+        len
+    };
+    own.min(unchanged)
+}
+
+/// The record a race candidate's check replays: `recorded`'s first
+/// `unchanged` events with their callback checkpoints, and `edited` (which
+/// starts with those events) as its schedule. Refused when the checkpoints do
+/// not fit the edited events, never replayed as a bare schedule: without them
+/// the unchanged events would not end their slices where the run did, and the
+/// check would measure another run than the one it names. The refusal is a
+/// [`PolicyRefusal`](crate::app::container::PolicyRefusal) named
+/// `HERMIT_CANDIDATE_CHECK_CHECKPOINTS` (docs/ERROR_CATALOG.md); it is the
+/// check's error, which its report names, and the analysis goes on.
+fn candidate_check_record(
+    recorded: &PreemptionRecord,
+    unchanged: usize,
+    edited: &[SchedEvent],
+) -> anyhow::Result<PreemptionRecord> {
+    recorded
+        .schedule_prefix(unchanged)
+        .with_schedule(edited.to_vec())
+        .ok_or_else(|| {
+            anyhow::Error::new(crate::app::container::PolicyRefusal).context(format!(
+                "HERMIT_CANDIDATE_CHECK_CHECKPOINTS: the callback checkpoints of the recording's \
+                 first {unchanged} events do not fit the edited schedule, and replaying it without \
+                 them would not follow the run it checks"
+            ))
+        })
+}
+
 /// The run of `thread`'s events in `schedule` from event `from` on.
 fn slice_from(schedule: &[SchedEvent], from: usize, thread: DetTid) -> Slice {
     let mut slice = Slice {
@@ -593,6 +636,8 @@ pub(super) struct StackReplay {
     /// The threads it ran at events `index - 1` and `index`, if it
     /// recorded them.
     ran: [Option<DetTid>; 2],
+    /// Its access trace, when it recorded one.
+    traced: Option<TracedReplay>,
 }
 
 impl StackReplay {
@@ -609,7 +654,7 @@ impl StackReplay {
 
 /// Where a replay left the schedule it replayed.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Departure {
+pub(super) enum Departure {
     /// At this event it ran another event than the schedule's: another
     /// thread, operation or instruction pointer, compared as the scheduler
     /// does when it takes a stack (the count and time aside).
@@ -678,7 +723,11 @@ fn same_event(expected: &SchedEvent, ran: &SchedEvent) -> bool {
 
 /// The first of the first `until` events of `requested` at which `realized`
 /// ran another event, or ended.
-fn departure(requested: &[SchedEvent], realized: &[SchedEvent], until: usize) -> Option<Departure> {
+pub(super) fn departure(
+    requested: &[SchedEvent],
+    realized: &[SchedEvent],
+    until: usize,
+) -> Option<Departure> {
     let until = until.min(requested.len());
     for (index, expected) in requested[..until].iter().enumerate() {
         match realized.get(index) {
@@ -698,7 +747,7 @@ fn departure(requested: &[SchedEvent], realized: &[SchedEvent], until: usize) ->
 
 /// The thread a stack was taken on, as the guest numbers it (which is the
 /// scheduler's numbering under Hermit's thread-id virtualization).
-fn stack_thread(stack: &PrettyBacktrace) -> Option<DetTid> {
+pub(super) fn stack_thread(stack: &PrettyBacktrace) -> Option<DetTid> {
     let thread = serde_json::to_value(stack)
         .ok()?
         .get("thread_id")?
@@ -958,11 +1007,14 @@ impl AnalyzeOpts {
         schedule_path: &Path,
         schedule: &[SchedEvent],
         index: usize,
+        trace: Option<(&'static str, u64)>,
         launch: impl FnOnce(&mut RunData) -> anyhow::Result<()>,
     ) -> anyhow::Result<StackReplay> {
-        let mut run = RunData::new_baseline(self, runname.to_string())?
+        let run = RunData::new_baseline(self, runname.to_string())?
             .with_schedule_replay_from(schedule_path.to_path_buf())
             .with_schedule_recording();
+        let (role, from) = trace.unzip();
+        let (mut run, request) = self.request_trace(run, role.unwrap_or_default(), from);
         let root_path = run.root_path();
         let realized = run.sched_path_out().to_path_buf();
         let paths = [
@@ -995,22 +1047,28 @@ impl AnalyzeOpts {
                 ),
             }
         }
-        let realized = PreemptionReader::try_new(&realized)
+        let realized_path = realized;
+        let realized = PreemptionReader::try_new(&realized_path)
             .with_context(|| {
                 format!(
                     "completed stack-trace replay {runname} has no readable recorded schedule at \
                      {}; retain the trial diagnostics and retry recording before analysis",
-                    realized.display()
+                    realized_path.display()
                 )
             })?
             .into_inner()
             .into_global();
         let ran_at = |event: usize| realized.get(event).map(|event| event.dettid);
+        let left_schedule = departure(schedule, &realized, index + 1);
+        let ran = [ran_at(index - 1), ran_at(index)];
+        let traced = request
+            .map(|request| request.ran_with(left_schedule.clone(), realized, &realized_path));
         Ok(StackReplay {
             met_target: run.is_a_match(),
             stacks,
-            left_schedule: departure(schedule, &realized, index + 1),
-            ran: [ran_at(index - 1), ran_at(index)],
+            left_schedule,
+            ran,
+            traced,
         })
     }
 
@@ -1158,8 +1216,26 @@ impl AnalyzeOpts {
         position: usize,
         continuation: MaybeTimeslice,
     ) -> anyhow::Result<(bool, Option<PrettyBacktrace>)> {
-        let (mut run, stack_path) =
+        let (is_match, stack, _) =
+            self.traced_prefix_stack(runname, schedule, len, position, continuation, None)?;
+        Ok((is_match, stack))
+    }
+
+    /// [`Self::prefix_stack`] for the target side of the report: with
+    /// `trace_from` set, the trial also records its schedule and an access
+    /// trace from that event.
+    fn traced_prefix_stack(
+        &self,
+        runname: &str,
+        schedule: &PreemptionRecord,
+        len: usize,
+        position: usize,
+        continuation: MaybeTimeslice,
+        trace_from: Option<u64>,
+    ) -> anyhow::Result<(bool, Option<PrettyBacktrace>, Option<TracedReplay>)> {
+        let (run, stack_path) =
             self.prefix_stack_trial(runname, schedule, len, position, continuation)?;
+        let (mut run, request) = self.request_trace(run, "target", trace_from);
         let is_match = self.launch_prefix_trial(&mut run, RunData::launch)?;
         eprintln!(
             ":: {}\n{}",
@@ -1172,7 +1248,11 @@ impl AnalyzeOpts {
             })?),
             Err(_) => None,
         };
-        Ok((is_match, stack))
+        let traced = request.map(|request| {
+            let realized = run.sched_path_out().to_path_buf();
+            request.ran(schedule.schedevents(), &realized, len)
+        });
+        Ok((is_match, stack, traced))
     }
 
     /// The prefix trial `prefix_stack` launches, and the file its stack goes
@@ -1202,13 +1282,16 @@ impl AnalyzeOpts {
         schedule: &PreemptionRecord,
         len: usize,
         continuation: MaybeTimeslice,
+        trace: Option<(&'static str, u64)>,
         launch: impl FnOnce(&mut RunData) -> anyhow::Result<bool>,
-    ) -> anyhow::Result<(CompletedScheduleTrial, PathBuf)> {
-        let mut run = self
+    ) -> anyhow::Result<(CompletedScheduleTrial, PathBuf, Option<TracedReplay>)> {
+        let run = self
             .prefix_trial(runname, schedule, len, continuation)?
             .with_schedule_recording();
-        let target_met = launch(&mut run)?;
+        let (role, from) = trace.unzip();
+        let (mut run, request) = self.request_trace(run, role.unwrap_or_default(), from);
         let path = run.sched_path_out().to_path_buf();
+        let target_met = launch(&mut run)?;
         let record = PreemptionReader::try_new(&path).with_context(|| {
             format!(
                 "completed prefix trial has no readable recorded schedule at {}; \
@@ -1218,13 +1301,71 @@ impl AnalyzeOpts {
         })?;
         let record = record.into_inner();
         RunData::require_complete_record(&record, &path)?;
+        let traced = request.map(|request| request.ran(schedule.schedevents(), &path, len));
         Ok((
             CompletedScheduleTrial {
                 target_met,
                 schedule: record.into_global(),
             },
             path,
+            traced,
         ))
+    }
+
+    /// The report's "Racing accesses" section for a prefix decision at
+    /// `decision`: `target` replayed the first `len` events of `schedule` and
+    /// `baseline` one fewer, both then continuing at `continuation`. The
+    /// stacks come from a replay of the target's continuation. `None` when a
+    /// side recorded no trace (`--no-racing-accesses`). `target_met`: whether
+    /// the target replay met the target.
+    fn prefix_racing_accesses(
+        &self,
+        decision: usize,
+        (schedule, len, continuation): (&PreemptionRecord, usize, MaybeTimeslice),
+        target: Option<TracedReplay>,
+        baseline: Option<TracedReplay>,
+        target_met: bool,
+    ) -> Option<RacingAccesses> {
+        let (target, baseline) = (target?, baseline?);
+        // `continued_record` refuses a record whose callback checkpoints do
+        // not attach to its events (UNATTACHED_CHECKPOINTS): a replay then
+        // fails with that refusal, never replaying a bare schedule.
+        let record = continued_record(schedule, len, &target.realized, &target.realized_path)
+            .map_err(|error| format!("{error:#}"));
+        // Where each run recorded the schedule a candidate's check edits.
+        let realized = [
+            ("target", target.realized_path.clone()),
+            ("baseline", baseline.realized_path.clone()),
+        ];
+        let racing = self.racing_accesses(
+            decision,
+            target,
+            baseline,
+            target_met,
+            |runname| {
+                let record = record
+                    .as_ref()
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+                self.prefix_trial(runname, record, record.schedevents().len(), continuation)
+            },
+            // A candidate's check replays a schedule of the run it checks
+            // under the callback checkpoints of that run's prefix, up to where
+            // the edit starts, then continues as the search's trials did.
+            |runname, role, edited, unchanged, replay| {
+                let edited_from = realized
+                    .iter()
+                    .find_map(|(side, path)| (*side == role).then_some(path.as_path()))
+                    .unwrap_or_else(|| Path::new(runname));
+                let edited = continued_record(
+                    schedule,
+                    check_prefix_len(len, role, unchanged),
+                    edited,
+                    edited_from,
+                )?;
+                self.prefix_trial(runname, &edited, replay, continuation)
+            },
+        );
+        Some(racing)
     }
 
     /// The report of `--prefix-search`: the stacks of the two threads that
@@ -1233,15 +1374,16 @@ impl AnalyzeOpts {
         let timeslice = found.continuation;
         self.phase6_record_prefix_outputs_with(
             found,
-            |runname, schedule, len, position| {
-                self.prefix_stack(runname, schedule, len, position, timeslice)
+            |runname, schedule, len, position, trace_from| {
+                self.traced_prefix_stack(runname, schedule, len, position, timeslice, trace_from)
             },
-            |schedule, len| {
+            |schedule, len, trace| {
                 self.prefix_continuation(
                     "final_baseline_schedule",
                     schedule,
                     len,
                     timeslice,
+                    trace,
                     |run| self.launch_prefix_trial(run, RunData::launch),
                 )
             },
@@ -1260,19 +1402,27 @@ impl AnalyzeOpts {
             &PreemptionRecord,
             usize,
             usize,
-        ) -> anyhow::Result<(bool, Option<PrettyBacktrace>)>,
-        C: FnOnce(&PreemptionRecord, usize) -> anyhow::Result<(CompletedScheduleTrial, PathBuf)>,
+            Option<u64>,
+        ) -> anyhow::Result<(bool, Option<PrettyBacktrace>, Option<TracedReplay>)>,
+        C: FnOnce(
+            &PreemptionRecord,
+            usize,
+            Option<(&'static str, u64)>,
+        )
+            -> anyhow::Result<(CompletedScheduleTrial, PathBuf, Option<TracedReplay>)>,
     {
         let PrefixDecision {
             schedule,
             decision,
             continuation: timeslice,
         } = found;
-        let (target_met, chosen) = stack(
+        let trace_from = self.race_trace_from(decision);
+        let (target_met, chosen, target_trace) = stack(
             "final_target_for_stacktraces",
             &schedule,
             decision + 1,
             decision,
+            trace_from,
         )?;
         if !target_met {
             bail!(
@@ -1286,7 +1436,11 @@ impl AnalyzeOpts {
         // so the prefix trial without event #decision runs first with its
         // schedule recorded, and the stack is taken from a replay of that
         // schedule's first decision + 1 events.
-        let (completed, continued_path) = continuation(&schedule, decision)?;
+        let (completed, continued_path, mut baseline_trace) = continuation(
+            &schedule,
+            decision,
+            trace_from.map(|from| ("baseline", from)),
+        )?;
         if completed.target_met {
             bail!(
                 "final baseline prefix continuation met the target criteria; no opposite-outcome \
@@ -1303,18 +1457,19 @@ impl AnalyzeOpts {
                 decision,
                 timeslice,
                 (target_met, &chosen),
-                (&continued, &continued_path),
+                (&continued, &continued_path, &mut baseline_trace),
             )?
         {
             return Ok(report);
         }
         let instead = if continued.len() > decision {
             let baseline = continued_record(&schedule, decision, &continued, &continued_path)?;
-            let (baseline_met, instead) = stack(
+            let (baseline_met, instead, _) = stack(
                 "final_baseline_for_stacktraces",
                 &baseline,
                 decision + 1,
                 decision,
+                None,
             )?;
             if baseline_met {
                 bail!(
@@ -1334,17 +1489,26 @@ impl AnalyzeOpts {
             None
         };
 
+        let racing_accesses = self.prefix_racing_accesses(
+            decision,
+            (&schedule, decision + 1, timeslice),
+            target_trace,
+            baseline_trace,
+            target_met,
+        );
+
         let report = self.prefix_report(
             schedule.schedevents(),
             decision,
             &continued,
-            [chosen, instead],
+            ([chosen, instead], racing_accesses),
             timeslice,
         );
         println!("{}", prefix_report_banner(&report));
         println!("{}", report.header);
         Self::print_stack("stack1", &report.critical_event1.stack);
         Self::print_stack("stack2", &report.critical_event2.stack);
+        Self::print_racing_accesses(&report.racing_accesses);
         println!("\n{}", report.additional_context);
         Ok(report)
     }
@@ -1355,7 +1519,10 @@ impl AnalyzeOpts {
         schedule: &[SchedEvent],
         decision: usize,
         continued: &[SchedEvent],
-        [chosen, instead]: [Option<PrettyBacktrace>; 2],
+        ([chosen, instead], racing_accesses): (
+            [Option<PrettyBacktrace>; 2],
+            Option<RacingAccesses>,
+        ),
         continuation: MaybeTimeslice,
     ) -> Report {
         let mut header = format!(
@@ -1387,6 +1554,7 @@ impl AnalyzeOpts {
             },
             branch_counter_warning: self.branch_counter_warning.clone(),
             deciding_event: None,
+            racing_accesses,
         }
     }
 
@@ -1405,7 +1573,7 @@ impl AnalyzeOpts {
         decision: usize,
         continuation: MaybeTimeslice,
         deciding: (bool, &Option<PrettyBacktrace>),
-        without_event: (&[SchedEvent], &Path),
+        without_event: (&[SchedEvent], &Path, &mut Option<TracedReplay>),
     ) -> anyhow::Result<Option<Report>> {
         self.report_timing_decision_with(
             schedule,
@@ -1420,6 +1588,7 @@ impl AnalyzeOpts {
                         record,
                         len,
                         continuation,
+                        self.race_trace_from(decision).map(|from| ("target", from)),
                         |run| self.launch_prefix_trial(run, RunData::launch),
                     )
                 },
@@ -1440,11 +1609,19 @@ impl AnalyzeOpts {
         decision: usize,
         continuation: MaybeTimeslice,
         (target_met, deciding): (bool, &Option<PrettyBacktrace>),
-        (continued, continued_path): (&[SchedEvent], &Path),
+        (continued, continued_path, baseline_trace): (
+            &[SchedEvent],
+            &Path,
+            &mut Option<TracedReplay>,
+        ),
         (continue_target, stack): (CT, S),
     ) -> anyhow::Result<Option<Report>>
     where
-        CT: FnOnce(&PreemptionRecord, usize) -> anyhow::Result<(CompletedScheduleTrial, PathBuf)>,
+        CT: FnOnce(
+            &PreemptionRecord,
+            usize,
+        )
+            -> anyhow::Result<(CompletedScheduleTrial, PathBuf, Option<TracedReplay>)>,
         S: Fn(
             &str,
             &PreemptionRecord,
@@ -1454,7 +1631,8 @@ impl AnalyzeOpts {
     {
         let events = schedule.schedevents();
         let thread = events[decision].dettid;
-        let (target_completed, target_continued_path) = continue_target(schedule, decision + 1)?;
+        let (target_completed, target_continued_path, target_trace) =
+            continue_target(schedule, decision + 1)?;
         if !target_completed.target_met {
             bail!(
                 "final target prefix continuation did not meet the target criteria; no \
@@ -1613,10 +1791,22 @@ impl AnalyzeOpts {
             println!("{warning}");
         }
         println!("{}", header);
+        // `target_met` is the stack-trace replay's (final_target_for_stacktraces)
+        // while `target_trace` is final_target_schedule's, above: both replay the
+        // same first `decision + 1` events of `schedule` and continue at
+        // `continuation`, so they agree on whether the target is met.
+        let racing_accesses = self.prefix_racing_accesses(
+            decision,
+            (schedule, decision + 1, continuation),
+            target_trace,
+            baseline_trace.take(),
+            target_met,
+        );
         println!("Thread {thread} at the deciding event #{decision}:");
         Self::print_stack("the deciding thread's stack", deciding);
         Self::print_stack("stack1", &stack1);
         Self::print_stack("stack2", &stack2);
+        Self::print_racing_accesses(&racing_accesses);
         println!("\n{}", context);
 
         Ok(Some(Report {
@@ -1636,6 +1826,7 @@ impl AnalyzeOpts {
                 event_index: decision,
                 stack: deciding.clone(),
             }),
+            racing_accesses,
         }))
     }
 
@@ -2244,18 +2435,23 @@ impl AnalyzeOpts {
         // #index - 1 and #index are the failing schedule's #index and
         // #index - 1, so each racing operation's stack can come from either
         // replay when the other one leaves its schedule first.
-        let baseline = self.replay_for_stacks(
+        // The schedules agree before event #index - 1, where the racing
+        // accesses' window starts.
+        let trace_from = self.race_trace_from(critical_event_index - 1);
+        let mut baseline = self.replay_for_stacks(
             runname2,
             &final_passing_path,
             &passing_schedule,
             critical_event_index,
+            trace_from.map(|from| ("baseline", from)),
             &launch,
         )?;
-        let target = self.replay_for_stacks(
+        let mut target = self.replay_for_stacks(
             runname1,
             &final_failing_path,
             &failing_schedule,
             critical_event_index,
+            trace_from.map(|from| ("target", from)),
             &launch,
         )?;
         require_repeated_outcomes(
@@ -2306,6 +2502,40 @@ impl AnalyzeOpts {
             stack1.map(|(stack, _)| stack),
             stack2.map(|(stack, _)| stack),
         );
+        let target_met = target.met_target;
+        let racing_accesses = match (target.traced.take(), baseline.traced.take()) {
+            (Some(target), Some(baseline)) => {
+                let realized = target.realized_path.clone();
+                let baseline_realized = baseline.realized_path.clone();
+                Some(self.racing_accesses(
+                    critical_event_index - 1,
+                    target,
+                    baseline,
+                    target_met,
+                    |runname| {
+                        Ok(RunData::new_baseline(self, runname.to_string())?
+                            .with_schedule_replay_from(realized.clone()))
+                    },
+                    // A candidate's check replays a schedule of the run it
+                    // checks under the callback checkpoints of that run's
+                    // recording, up to where the edit starts, then continues
+                    // without chaos at the trials' timeslice.
+                    |runname, role, edited, unchanged, replay| {
+                        let path = if role == "baseline" {
+                            &baseline_realized
+                        } else {
+                            &realized
+                        };
+                        let recorded = Recording::read(path)
+                            .and_then(|recording| recording.into_legacy("a race candidate's check"))
+                            .map_err(|error| anyhow::anyhow!("{error:#}"))?;
+                        let edited = candidate_check_record(&recorded, unchanged, edited)?;
+                        self.prefix_trial(runname, &edited, replay, self.trial_max_timeslice()?)
+                    },
+                ))
+            }
+            _ => None,
+        };
 
         // Also print to the screen, the branch-counter caveat first: the
         // report must not read as reproducible where its trials may not
@@ -2319,6 +2549,7 @@ impl AnalyzeOpts {
         println!("{}", header);
         Self::print_stack("stack1", &stack1);
         Self::print_stack("stack2", &stack2);
+        Self::print_racing_accesses(&racing_accesses);
         println!("\n{}", passing_context);
 
         if self.verbose {
@@ -2350,7 +2581,15 @@ impl AnalyzeOpts {
             },
             branch_counter_warning: self.branch_counter_warning.clone(),
             deciding_event: None,
+            racing_accesses,
         })
+    }
+
+    /// Print the report's "Racing accesses" block, when there is one.
+    fn print_racing_accesses(racing: &Option<RacingAccesses>) {
+        if let Some(racing) = racing {
+            println!("\n{}", render_racing_accesses(racing));
+        }
     }
 
     fn print_stack(which: &str, m_stack: &Option<PrettyBacktrace>) {
@@ -2957,7 +3196,11 @@ mod tests {
                 1,
                 None,
                 (true, &None),
-                (&continued, Path::new("final_baseline_schedule.preempts")),
+                (
+                    &continued,
+                    Path::new("final_baseline_schedule.preempts"),
+                    &mut None,
+                ),
                 (
                     |_, len| {
                         assert_eq!(len, 2);
@@ -2967,6 +3210,7 @@ mod tests {
                                 schedule: events(&[1, 2, 2, 1]),
                             },
                             PathBuf::from("final_target_schedule.preempts"),
+                            None,
                         ))
                     },
                     |runname, _, _, _| match runname {
@@ -3053,7 +3297,11 @@ mod tests {
                 1,
                 NonZeroU64::new(200_000_000),
                 (true, &deciding),
-                (&without, Path::new("final_baseline_schedule.preempts")),
+                (
+                    &without,
+                    Path::new("final_baseline_schedule.preempts"),
+                    &mut None,
+                ),
                 (
                     |seen, len| {
                         assert_eq!(seen, &record);
@@ -3064,6 +3312,7 @@ mod tests {
                                 schedule: with.clone(),
                             },
                             PathBuf::from("final_target_schedule.preempts"),
+                            None,
                         ))
                     },
                     |runname, variant, len, position| {
@@ -3156,7 +3405,11 @@ mod tests {
                     1,
                     NonZeroU64::new(200_000_000),
                     (true, &deciding),
-                    (&without, Path::new("final_baseline_schedule.preempts")),
+                    (
+                        &without,
+                        Path::new("final_baseline_schedule.preempts"),
+                        &mut None,
+                    ),
                     (
                         |seen, len| {
                             assert_eq!(seen, &record);
@@ -3167,6 +3420,7 @@ mod tests {
                                     schedule: with.clone(),
                                 },
                                 PathBuf::from("final_target_schedule.preempts"),
+                                None,
                             ))
                         },
                         |runname, variant, len, position| {
@@ -3261,19 +3515,20 @@ mod tests {
             1,
             None,
             (true, &deciding),
-            (&baseline.schedule, &baseline_path),
+            (&baseline.schedule, &baseline_path, &mut None),
             (
                 |seen, len| {
                     assert_eq!(seen, &source);
                     assert_eq!(len, 2);
-                    Ok(recorded_continuation_for_test(
+                    let (completed, path) = recorded_continuation_for_test(
                         &options,
                         "single_event_target",
                         seen,
                         len,
                         true,
                         &with,
-                    ))
+                    );
+                    Ok((completed, path, None))
                 },
                 |runname, variant, len, position| {
                     calls.borrow_mut().push(runname.to_owned());
@@ -3457,7 +3712,11 @@ mod tests {
                     1,
                     chosen,
                     (true, &None),
-                    (&without, Path::new("final_baseline_schedule.preempts")),
+                    (
+                        &without,
+                        Path::new("final_baseline_schedule.preempts"),
+                        &mut None,
+                    ),
                     (
                         |target, len| {
                             options.prefix_continuation(
@@ -3465,6 +3724,7 @@ mod tests {
                                 target,
                                 len,
                                 chosen,
+                                None,
                                 |run| {
                                     let written = PreemptionReader::try_new(run.sched_path_in())?
                                         .into_inner();
@@ -3536,6 +3796,7 @@ mod tests {
                 &dir.path().join("candidate.json"),
                 &[],
                 1,
+                None,
                 |run| {
                     assert!(!run.has_launched());
                     for extension in ["stack1", "stack2"] {
@@ -3750,7 +4011,7 @@ mod tests {
             assert!(!run.has_launched());
 
             let error = options
-                .replay_for_stacks("final", Path::new("schedule.json"), &[], 1, |run| {
+                .replay_for_stacks("final", Path::new("schedule.json"), &[], 1, None, |run| {
                     std::fs::write(run.root_path().with_extension("stack2"), "retained stack")?;
                     Err(stopped_trial(kind))
                 })
@@ -3849,15 +4110,17 @@ mod tests {
         options.tmp_dir = Some(dir.path().to_path_buf());
         let schedule = PreemptionRecord::from_sched_events(Vec::new());
         let error = options
-            .prefix_continuation("final_baseline_schedule", &schedule, 0, None, |_| Ok(false))
+            .prefix_continuation("final_baseline_schedule", &schedule, 0, None, None, |_| {
+                Ok(false)
+            })
             .err()
             .expect("a missing record must not stand in for an observed empty trace");
         assert!(
             error.to_string().contains("no readable recorded schedule"),
             "{error:#}"
         );
-        let (completed, _) = options
-            .prefix_continuation("final_baseline_schedule", &schedule, 0, None, |run| {
+        let (completed, _, _) = options
+            .prefix_continuation("final_baseline_schedule", &schedule, 0, None, None, |run| {
                 schedule
                     .write_to_disk(run.sched_path_out())
                     .map_err(anyhow::Error::msg)?;
@@ -3927,7 +4190,7 @@ mod tests {
                     decision: 1,
                     continuation: None,
                 },
-                |runname, _, prefix, position| {
+                |runname, _, prefix, position, _| {
                     stacks += 1;
                     assert_eq!((prefix, position), (2, 1));
                     let target_met = if runname == "final_target_for_stacktraces" {
@@ -3936,10 +4199,10 @@ mod tests {
                         baseline
                     };
                     target_met
-                        .map(|met| (met, None))
+                        .map(|met| (met, None, None))
                         .ok_or_else(|| Error::new(RunTimeoutMarker))
                 },
-                |_, prefix| {
+                |_, prefix, _| {
                     continuations += 1;
                     assert_eq!(prefix, 1);
                     Ok((
@@ -3948,6 +4211,7 @@ mod tests {
                             schedule: continued[..len].to_vec(),
                         },
                         PathBuf::from("final_baseline_schedule.preempts"),
+                        None,
                     ))
                 },
             );
@@ -4075,8 +4339,8 @@ mod tests {
         met: bool,
         events: &[SchedEvent],
     ) -> (CompletedScheduleTrial, PathBuf) {
-        let (completed, path) = options
-            .prefix_continuation(runname, source, len, None, |run| {
+        let (completed, path, _) = options
+            .prefix_continuation(runname, source, len, None, None, |run| {
                 let input = PreemptionReader::try_new(run.sched_path_in())?.into_inner();
                 input.validate().map_err(anyhow::Error::msg)?;
                 let input = serde_json::to_value(&input).unwrap();
@@ -4127,12 +4391,12 @@ mod tests {
                     decision: 2,
                     continuation: None,
                 },
-                |runname, record, len, position| {
+                |runname, record, len, position, _trace_from| {
                     assert_eq!((len, position), (3, 2));
                     replays.push((runname.to_owned(), record.clone()));
-                    Ok((runname == "final_target_for_stacktraces", None))
+                    Ok((runname == "final_target_for_stacktraces", None, None))
                 },
-                |record, len| {
+                |record, len, _trace| {
                     assert_eq!(len, 2);
                     let (completed, path) = recorded_continuation_for_test(
                         &options,
@@ -4143,7 +4407,7 @@ mod tests {
                         continued,
                     );
                     artifact = Some((path.clone(), std::fs::read(&path)?));
-                    Ok((completed, path))
+                    Ok((completed, path, None))
                 },
             );
             let (path, bytes) = artifact.expect("the baseline continuation was recorded");
@@ -4237,7 +4501,7 @@ mod tests {
                 2,
                 None,
                 (true, &None),
-                (&baseline.schedule, &baseline_path),
+                (&baseline.schedule, &baseline_path, &mut None),
                 (
                     |record, len| {
                         assert_eq!(len, 3);
@@ -4250,7 +4514,7 @@ mod tests {
                             target_continued,
                         );
                         target_artifact = Some((path.clone(), std::fs::read(&path)?));
-                        Ok((completed, path))
+                        Ok((completed, path, None))
                     },
                     |runname, record, _, _| {
                         replays
@@ -4330,6 +4594,17 @@ mod tests {
     /// end, so its slices end where the recording's did; a checkpoint past
     /// the prefix is dropped, and so is the one at its end while an event
     /// follows: that slice end is the next event's decision.
+    /// A check of the baseline keeps the checkpoints of the baseline's own
+    /// prefix, one event shorter than the target's, and neither keeps any
+    /// past where the edit starts.
+    #[test]
+    fn a_check_keeps_the_checkpoints_of_its_own_runs_prefix() {
+        assert_eq!(check_prefix_len(10, "target", 20), 10);
+        assert_eq!(check_prefix_len(10, "baseline", 20), 9);
+        assert_eq!(check_prefix_len(10, "target", 4), 4);
+        assert_eq!(check_prefix_len(10, "baseline", 4), 4);
+    }
+
     #[test]
     fn a_prefix_trial_keeps_the_target_checkpoints_within_its_prefix() {
         let parent = tempfile::tempdir().unwrap();
@@ -4428,6 +4703,73 @@ mod tests {
         );
     }
 
+    /// A candidate's check keeps the callback checkpoints of the unchanged
+    /// events it replays, and refuses an edit they do not fit instead of
+    /// replaying a bare schedule.
+    #[test]
+    fn a_candidate_check_refuses_checkpoints_that_do_not_fit_its_edit() {
+        let branches = |tid: i32, count: u32| {
+            serde_json::json!({
+                "dettid": tid, "op": "Branch", "count": count,
+                "start_rip": null, "end_rip": null, "end_time": null
+            })
+        };
+        let checkpoint = |row: usize, progress: u64, time: u64| {
+            serde_json::json!({
+                "history_index": row,
+                "origin": {
+                    "callback": "PmuTimer", "site": "Prehook", "progress": progress,
+                    "last_op": "Branch", "time": time, "rcbs": progress
+                }
+            })
+        };
+        let recorded: PreemptionRecord = serde_json::from_value(serde_json::json!({
+            "per_thread": {
+                "3": {
+                    "final_prio": 1000,
+                    "prio_changes": [[100, 1000], [300, 1000]],
+                    "preemption_rcbs": [10, 15]
+                },
+                "5": {"final_prio": 1000, "prio_changes": [[200, 1000]], "preemption_rcbs": [4]}
+            },
+            "global": [branches(3, 10), branches(5, 4), branches(3, 5)],
+            "callback_checkpoints": {
+                "3": [checkpoint(0, 10, 100), checkpoint(1, 15, 300)],
+                "5": [checkpoint(0, 4, 200)]
+            }
+        }))
+        .unwrap();
+        recorded.validate().unwrap();
+        let event = |value| serde_json::from_value::<SchedEvent>(value).unwrap();
+        // The first two events unchanged, then the edit: their checkpoints
+        // carry over.
+        let fits = [branches(3, 10), branches(5, 4), branches(5, 2)].map(event);
+        let kept = candidate_check_record(&recorded, 2, &fits).unwrap();
+        assert_eq!(kept.schedevents(), &fits[..]);
+        assert_eq!(
+            serde_json::to_value(&kept).unwrap()["callback_checkpoints"]["3"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        // An edit that leaves out an unchanged event the checkpoints name.
+        let error = candidate_check_record(&recorded, 2, &[event(branches(5, 4))]).unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::app::container::PolicyRefusal>()
+                .is_some(),
+            "{error:#}"
+        );
+        let error = error.to_string();
+        assert!(
+            error.starts_with(
+                "HERMIT_CANDIDATE_CHECK_CHECKPOINTS: the callback checkpoints of the recording's \
+                 first 2 events do not fit"
+            ),
+            "{error}"
+        );
+    }
+
     /// The final prefix report repeats the trial's counter caveat in its
     /// JSON and immediately below its banner, and omits it for exact counters.
     #[test]
@@ -4450,7 +4792,7 @@ mod tests {
                 .unwrap();
             assert_eq!(warnings.len(), usize::from(inexact));
             let expected = warnings.first().map(|line| line.trim_end());
-            let report = options.prefix_report(&schedule, 0, &schedule, [None, None], None);
+            let report = options.prefix_report(&schedule, 0, &schedule, ([None, None], None), None);
             let json = serde_json::to_value(&report).unwrap();
             assert_eq!(
                 json.get("branch_counter_warning")
@@ -5221,6 +5563,7 @@ mod tests {
                 ],
                 left_schedule,
                 ran: [Some(tid(3)), Some(tid(5))],
+                traced: None,
             };
             let target = StackReplay {
                 met_target: true,
@@ -5230,6 +5573,7 @@ mod tests {
                 ],
                 left_schedule: None,
                 ran: [Some(tid(5)), Some(tid(3))],
+                traced: None,
             };
             assert_eq!(
                 merge_stacks(&baseline, &target, 1, [tid(3), tid(5)]),
@@ -5313,6 +5657,7 @@ mod tests {
             stacks,
             left_schedule,
             ran,
+            traced: None,
         };
         // The passing schedule runs thread 5's read at #1093, then thread 7's
         // close at #1094; the failing one the other way round.
@@ -5625,7 +5970,11 @@ mod tests {
                 1,
                 NonZeroU64::new(200_000_000),
                 (true, &deciding),
-                (&without, Path::new("final_baseline_schedule.preempts")),
+                (
+                    &without,
+                    Path::new("final_baseline_schedule.preempts"),
+                    &mut None,
+                ),
                 (
                     |seen, len| {
                         assert_eq!(seen, &record);
@@ -5636,6 +5985,7 @@ mod tests {
                                 schedule: with.clone(),
                             },
                             PathBuf::from("final_target_schedule.preempts"),
+                            None,
                         ))
                     },
                     |runname, variant, len, position| {

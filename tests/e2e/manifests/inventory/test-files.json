@@ -626,6 +626,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/fd_reuse_close_race.c",
+      "runner": "hermit-cli/tests/analyze.rs",
+      "why": "tests/c/fd_reuse_close_race.c is owned by hermit-cli/tests/analyze.rs: The ignored analyze test compiles this guest, a deferred second close of a descriptor number another thread reopened, and checks that hermit analyze --prefix-search names the close and the other thread's failing lseek as racing accesses that no edge Hermit observes orders."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/fifo_peer.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/fifo_peer.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test runs this guest with a FIFO shared by two guest threads or processes, under strict verification and chaos seeds, and with a FIFO whose other end the test process itself holds as the host peer, and runs its wake-* modes for --pipe-wake-latency (hermit-cli/tests/sabre_examples.rs runs the exec'd ones on SaBRe too); it remains a guest fixture because a generic manifest cannot provide that host-side FIFO end or assert from the log that a host-peer FIFO is not polled."
@@ -2603,6 +2609,12 @@
       "path": "tests/c/robust_list_owner_death_routes.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace and KVM; ci=true)",
       "why": "tests/c/robust_list_owner_death_routes.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: robust-futex owner death by each Linux exit route (a thread's own exit over hand-written lists, including an entry another thread owns, a waiter, a pending entry holding 0, an unreadable word, and a NULL entry with a NULL pending entry; a robust priority-inheritance mutex; exit_group; a default-fatal signal; a SIGKILL to the own process; an exec by the owner, an exec that ends an owning sibling, a failed exec, a failed exec holding a robust mutex on a shared memfd page, and an exec whose argument string is a byte of an owned lock word) must mark and wake as native Linux does, observed from another process (https://github.com/rrnewton/hermit/issues/4529)"
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/rpc_shutdown_removes_client.c",
+      "runner": "hermit-cli/tests/analyze.rs",
+      "why": "tests/c/rpc_shutdown_removes_client.c is owned by hermit-cli/tests/analyze.rs: The ignored analyze test compiles this guest, a shutdown thread that removes a client before the server looks it up, with a poller napping throughout, and checks that hermit analyze --prefix-search checks its race candidates by intervention, saying how many events each edit moved and which threads they crossed, and that no poller nap decides."
     },
     {
       "disposition": "guest-fixture",

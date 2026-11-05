@@ -6,7 +6,10 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Names the two conflicting operations whose order decides the outcome.
+//! Names the conflicting operations whose order differs, around the deciding
+//! event, between a run that meets the target and one that does not. It
+//! shows what differs, not what decides: only a replay with an order
+//! reversed (the report's check by intervention) shows that one decides.
 //!
 //! Analyze finds the scheduling decision (event S) after which the guest
 //! meets its target, and replays the schedule with it (the target) and
@@ -101,7 +104,9 @@ use detcore_model::access_trace::EdgeKind;
 use detcore_model::access_trace::EventIndex;
 use detcore_model::access_trace::EventRef;
 use detcore_model::access_trace::FdOp;
+use detcore_model::access_trace::FileKind;
 use detcore_model::access_trace::LifetimeOp;
+use detcore_model::access_trace::OUT_BYTES_CAP;
 use detcore_model::access_trace::SyscallRecord;
 use detcore_model::access_trace::Task;
 use detcore_model::access_trace::TimerId;
@@ -114,9 +119,14 @@ use detcore_model::futex::FutexID;
 use detcore_model::futex::SharedMemoryObjectId;
 use detcore_model::pid::DetPid;
 use detcore_model::pid::DetTid;
+use regex::Regex;
+use reverie::PrettyBacktrace;
+use reverie::process::ExitStatus;
 use reverie::syscalls::Sysno;
 use serde::Deserialize;
 use serde::Serialize;
+
+use crate::app::analyze::types::ExitStatusConstraint;
 
 /// What the target and baseline continuations are compared over.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,6 +136,10 @@ pub struct Window {
     /// O: where the target meets its outcome; `None` means the end of the
     /// target trace.
     pub outcome: Option<OutcomeRef>,
+    /// The thread the target schedule runs at S, when the caller knows it.
+    /// A deciding event that no call enters or returns at (a timeslice that
+    /// ends between calls) is then taken at that thread's next call.
+    pub thread: Option<DetTid>,
 }
 
 /// The point at which the target meets its outcome.
@@ -148,9 +162,19 @@ pub enum RaceStatus {
     /// No conflicting pair; two timed waits or clock reads whose return
     /// order flips.
     Timing,
-    /// Several pairs or timed calls whose order changes, none of which the
-    /// evidence singles out; `candidates` ranks them.
+    /// Several pairs, changes of course or timed calls, none of which the
+    /// evidence singles out; `candidates` ranks them. A rank orders kinds of
+    /// evidence and is not a verdict: a candidate is shown to decide the
+    /// outcome only by its `check` (`decides`), and exactly one such makes
+    /// the status `found_by_intervention`.
     Candidates,
+    /// Candidates, of which exactly one decides by intervention: a replay
+    /// with that one's turn order reversed (its check says which events
+    /// moved, and which threads' events they crossed) changes whether the
+    /// run meets the target, while the unedited control replay does not.
+    /// `accesses` are that candidate's. The two runs did not show it as a
+    /// race of their own.
+    FoundByIntervention,
     /// The traces cover the window and hold neither kind of pair.
     NoneFound,
     /// The traces cannot answer.
@@ -198,6 +222,10 @@ pub struct RacingAccess {
     /// baseline only (`event` is `None`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended_first_by: Option<DetTid>,
+    /// The thread's stack at the call's entry in the target, from the stack
+    /// replay of the report; `None` until it is taken, or when it was not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack: Option<PrettyBacktrace>,
 }
 
 /// Kinds of resource, as the report names them.
@@ -342,7 +370,9 @@ pub struct ReorderedPair {
     pub accesses: [RacingAccess; 2],
 }
 
-/// One ranked entry of a `candidates` result.
+/// One ranked entry of a `candidates` result: what differs between the runs
+/// at one pair of calls. Its rank is the finder's order of kinds of
+/// evidence, not a finding that it decides; only its `check` can show that.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RaceCandidate {
     /// The resource the two accesses conflict on; `None` for two timed
@@ -351,7 +381,13 @@ pub struct RaceCandidate {
     pub resource: Option<ResourceText>,
     /// The two accesses, in target order.
     pub accesses: [RacingAccess; 2],
-    /// Their order in each run.
+    /// Their order in each run. For a change of course against the deciding
+    /// event, the baseline order is measured against the changed call's
+    /// counterpart there (the same thread's call of the same number), and
+    /// can be the same as the target's: that pair is listed for the change,
+    /// not for a flip. Without a counterpart the changed call sorts last in
+    /// the baseline, as any absent call does, and the evidence says no order
+    /// is measured there.
     pub order: RaceOrder,
     /// Whether the access the order is measured against (the victim, or the
     /// call whose time or course changed) happens before the outcome in the
@@ -360,9 +396,101 @@ pub struct RaceCandidate {
     /// Events from that access to the outcome in the target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub events_before_outcome: Option<u64>,
-    /// The evidence, in a sentence: which threads, what flipped, the
-    /// distance to the outcome and the happens-before relation.
+    /// The evidence, in a sentence: which threads, what differs (an order
+    /// that flips, or a change of course whose order with the deciding event
+    /// stays the same), why it is listed, the distance to the outcome and
+    /// the happens-before relation. It says nothing of whether the pair
+    /// decides; `check` does.
     pub evidence: String,
+    /// What a replay with this candidate's order reversed showed, when the
+    /// report checked it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<CandidateCheck>,
+}
+
+/// What reversing one candidate's order showed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckVerdict {
+    /// The reversed replay changed whether the run meets the target, and the
+    /// unedited control did not.
+    Decides,
+    /// The reversed replay ended as the run it edits did.
+    DoesNotDecide,
+    /// The replay could not follow the edited schedule (a moved event
+    /// needed one that now comes after it), so it shows nothing.
+    NotRealized,
+    /// No replay answered: there was nothing to move, or it did not finish.
+    NotChecked,
+}
+
+/// A check by intervention of one candidate: the edit, the replay and what
+/// it showed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CandidateCheck {
+    pub verdict: CheckVerdict,
+    /// The run whose realized schedule was edited, `target` or `baseline`.
+    pub edited: String,
+    /// The edit: `moving 7 events of thread 53 before thread 21's turn at
+    /// #39925, crossing thread 3 (2 events)`.
+    pub edit: String,
+    /// What the edit moved, when it made one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moved: Option<MovedEvents>,
+    /// The replay's name in the workspace (its reproducer is
+    /// `<trial>.repro`), when one ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial: Option<String>,
+    /// What the replay did, or why none answered.
+    pub detail: String,
+}
+
+/// The events a check's edit moved: one thread's, past the other thread's
+/// turn, and the events of other threads they crossed on the way.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MovedEvents {
+    /// The thread whose events moved.
+    pub thread: DetTid,
+    /// How many of its events moved.
+    pub events: usize,
+    /// `before` the other thread's turn (they now run earlier) or `after`
+    /// it (they are held back).
+    pub direction: String,
+    /// The event of the other access, whose turn they now precede or follow.
+    pub past_event: EventIndex,
+    /// The threads other than the pair whose events they crossed, with how
+    /// many of each; empty when they crossed only the other thread's.
+    pub crossed: Vec<CrossedThread>,
+}
+
+/// One thread's events that a check's edit moved others across.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CrossedThread {
+    pub thread: DetTid,
+    pub events: usize,
+}
+
+impl CandidateCheck {
+    /// `decides: reversing this turn order (moving 7 events of thread 53
+    /// before thread 21's turn at #39925, crossing thread 3 (2 events)) in
+    /// the target run misses the target; the unedited control meets it
+    /// (racing_candidate_1.repro)`.
+    pub fn sentence(&self) -> String {
+        let verdict = match self.verdict {
+            CheckVerdict::Decides => "decides",
+            CheckVerdict::DoesNotDecide => "does not decide",
+            CheckVerdict::NotRealized => "not realized",
+            CheckVerdict::NotChecked => "not checked",
+        };
+        let trial = self
+            .trial
+            .as_ref()
+            .map_or(String::new(), |t| format!(" ({t}.repro)"));
+        format!(
+            "{verdict}: reversing this turn order ({}) in the {} run {}{trial}",
+            self.edit, self.edited, self.detail
+        )
+    }
 }
 
 /// At most this many candidates are listed.
@@ -410,6 +538,10 @@ pub struct RacingAccesses {
     /// Sentences that qualify the result (each truncation, for one).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
+    /// The two traces the result comes from, target first, as file names
+    /// in the analysis workspace.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trace_files: Vec<String>,
 }
 
 /// At most this many other flipped pairs are listed.
@@ -440,7 +572,13 @@ impl RacingAccesses {
             candidates: Vec::new(),
             truncated: false,
             notes: Vec::new(),
+            trace_files: Vec::new(),
         }
+    }
+
+    /// The section when the traces cannot answer, and why.
+    pub fn unavailable(decision: EventIndex, reason: String) -> Self {
+        Self::bare(RaceStatus::Unavailable, decision, reason, None)
     }
 }
 
@@ -455,7 +593,11 @@ pub fn find_racing_accesses(
     window: Window,
     outcome_thread: Option<DetTid>,
 ) -> RacingAccesses {
-    let Window { decision, outcome } = window;
+    let Window {
+        decision,
+        outcome,
+        thread,
+    } = window;
     let unavailable =
         |reason| RacingAccesses::bare(RaceStatus::Unavailable, decision, reason, outcome.clone());
     for (name, trace) in [("target", target), ("baseline", baseline)] {
@@ -486,7 +628,8 @@ pub fn find_racing_accesses(
     }
 
     let end = outcome.as_ref().map_or(EventIndex::MAX, |o| o.event);
-    let finder = Finder::new(target, baseline, decision, end);
+    let mut finder = Finder::new(target, baseline, decision, end);
+    finder.deciding_thread = thread;
     let mut notes = truncation_notes(target, baseline, outcome.as_ref());
     let truncated = !notes.is_empty();
     notes.extend(finder.backward_edge_notes());
@@ -605,6 +748,571 @@ pub fn find_racing_accesses(
     result
 }
 
+/// The criteria a run meets the target by, as `hermit analyze` takes them.
+pub struct OutcomeCriteria<'a> {
+    /// `--target-stdout`.
+    pub stdout: Option<&'a Regex>,
+    /// `--target-stderr`.
+    pub stderr: Option<&'a Regex>,
+    /// `--target-exit-code`.
+    pub exit_code: &'a ExitStatusConstraint,
+    /// The root process, whose exit status the exit criterion is about;
+    /// `None` when unknown, which leaves the exit criterion out.
+    pub root: Option<DetPid>,
+}
+
+/// O, where the target trace meets its outcome at or after `decision`
+/// ([`outcome`]); `None` when the trace shows none, and when it is unknown.
+#[cfg(test)]
+fn outcome_point(
+    trace: &AccessTrace,
+    decision: EventIndex,
+    criteria: &OutcomeCriteria<'_>,
+) -> Option<OutcomeRef> {
+    outcome(trace, decision, criteria).point
+}
+
+/// What [`outcome`] finds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Outcome {
+    /// O, when the trace establishes it; `None` when it shows none or the
+    /// point is unknown, and the window runs to the end of the trace.
+    pub point: Option<OutcomeRef>,
+    /// Why the point is unknown, for the report's notes.
+    pub unknown: Option<String>,
+}
+
+/// O, where the target trace meets its outcome at or after `decision`: the
+/// first of the write to stdout or stderr after which that stream's output
+/// first matches its pattern, and the root process's `exit_group` whose code
+/// the criteria accept. The exit criterion is about the root process's
+/// status only, and `--target-exit-code=any` leaves it out: every run meets
+/// it. A signal that ends the process is not an outcome point: the trace
+/// records only the disposition observed before the signal's event, which
+/// does not show that the process died of it.
+///
+/// An output criterion reads only output the trace shows whole. The trace
+/// keeps the first [`OUT_BYTES_CAP`] bytes of each write to fd 1 or 2, so a
+/// longer write leaves a gap after them, and so does output the trace does
+/// not show at all: everything before its first event (unless it starts at
+/// event 0), a write it kept no bytes of, and output another call (sendfile,
+/// splice, sendmsg, ...) put on fd 1 or 2. Streams are told by descriptor
+/// number, so whatever makes another number reach the stream's open file, or
+/// fd 1 or 2 reach another, is a gap too, after which the stream's writes by
+/// number no longer tell what reaches it ([`redirects`]): none of them
+/// counts. That is an open or a dup onto descriptor 1 or 2 in any process (as
+/// `2>&1` or a child's `> file` does), a dup of 1 or 2 onto another number
+/// (`exec 3>&1`), and a write through another number to the stream's open
+/// file, which also catches an alias from before the trace (a launch with
+/// `3>&1`, or one a process inherited) that no call in it created; the
+/// stream's open files are those any process's descriptor 1 or 2 is seen to
+/// reach in the trace. And, without tracking which endpoint a file reaches,
+/// it is any open for writing, or import (SCM_RIGHTS, pidfd_getfd), of a file
+/// the trace does not show to be a regular file, a directory or a null-like
+/// device ([`not_provably_regular`], from the kind Detcore records in the
+/// open note): a pipe, FIFO, socket or terminal reopened by any spelling or
+/// reached directly may be the stream's own pipe or terminal, and an unknown
+/// kind (an import, a trace from before the kind was recorded) may be too. A call that creates a
+/// new pipe, socket or other anonymous file is not such an open: a new
+/// endpoint is not the stream's. An ordinary program that opens an unrelated
+/// pipe, FIFO or terminal for writing therefore loses output matching from
+/// there: the point is unknown, with a note naming the open. A pattern is matched only within
+/// the output since the stream's last gap, never across one, so the bytes on
+/// either side of a cut write never join into a match neither run printed.
+/// Once a gap comes before a stream's match, where that stream first matched
+/// is unknown (the missing bytes may hold an earlier match, or an earlier
+/// one may already have met it before `decision`). The exit then stands
+/// only if it comes before the stream's first gap; otherwise the point is
+/// unknown, `unknown` says which output, and the window runs to the end of
+/// the trace, so no candidate is cut off by a guessed outcome.
+pub fn outcome(
+    trace: &AccessTrace,
+    decision: EventIndex,
+    criteria: &OutcomeCriteria<'_>,
+) -> Outcome {
+    let mut syscalls: Vec<&SyscallRecord> = trace
+        .records
+        .iter()
+        .filter_map(|r| match r {
+            TraceRecord::Syscall(sys) => Some(sys),
+            _ => None,
+        })
+        .collect();
+    syscalls.sort_by_key(|sys| sys.pre);
+    let root = criteria
+        .root
+        .filter(|_| !matches!(criteria.exit_code, ExitStatusConstraint::Any));
+    let exited = syscalls
+        .iter()
+        .filter(|sys| sys.pre >= decision && Some(sys.pid) == root)
+        .find(|sys| {
+            sys.sysno == Sysno::exit_group
+                && criteria
+                    .exit_code
+                    .is_match(ExitStatus::Exited(sys.args[0] as i32 & 0xff))
+        })
+        .map(|sys| outcome_of(sys, sys.pre));
+    let patterns = [criteria.stdout, criteria.stderr];
+    let mut streams: [ShownOutput; 2] = Default::default();
+    if trace.header.from > 0 {
+        for (stream, pattern) in streams.iter_mut().zip(patterns) {
+            if pattern.is_some() {
+                stream.gap = Some((
+                    trace.header.from,
+                    format!(
+                        "before the trace's first event, {}, is not in it",
+                        trace.header.from
+                    ),
+                ));
+            }
+        }
+    }
+    let mut outputs: [BTreeSet<OpenFileId>; 2] = Default::default();
+    let channel_files: BTreeSet<OpenFileId> = syscalls
+        .iter()
+        .flat_map(|sys| &sys.accesses)
+        .filter_map(|access| match access {
+            Access::Channel { open_file, .. } => Some(*open_file),
+            _ => None,
+        })
+        .collect();
+    for access in syscalls.iter().flat_map(|sys| &sys.accesses) {
+        if let Access::Fd {
+            slot,
+            open_file: Some(file),
+            ..
+        } = access
+            && let Some(index) = output_stream(slot.fd)
+        {
+            outputs[index].insert(*file);
+        }
+    }
+    for sys in &syscalls {
+        for (index, why) in redirects(sys, &outputs, &channel_files) {
+            let stream = &mut streams[index];
+            if patterns[index].is_some() && stream.point.is_none() && !stream.met_before {
+                stream.redirected = true;
+                stream.since_gap.clear();
+                stream.gap.get_or_insert((sys.pre, why));
+            }
+        }
+        let Some((index, shown)) = shown_output(sys) else {
+            continue;
+        };
+        let (Some(pattern), stream) = (patterns[index], &mut streams[index]) else {
+            continue;
+        };
+        if stream.point.is_some() || stream.met_before || stream.redirected {
+            continue;
+        }
+        let kept = match shown {
+            Shown::Whole(bytes) | Shown::Cut(bytes) => bytes,
+            Shown::Unseen => &[][..],
+        };
+        stream.since_gap.push_str(&String::from_utf8_lossy(kept));
+        if pattern.is_match(&stream.since_gap) {
+            if sys.pre < decision {
+                // Output both runs share met the pattern before they parted.
+                stream.met_before = true;
+            } else if stream.gap.is_none() {
+                stream.point = Some(outcome_of(sys, sys.pre));
+            } else {
+                stream.matched_after_gap = true;
+            }
+        }
+        if !matches!(shown, Shown::Whole(_)) {
+            stream.since_gap.clear();
+            stream.gap.get_or_insert_with(|| {
+                let why = match shown {
+                    Shown::Cut(_) => format!(
+                        "of the write at event {} is cut at {OUT_BYTES_CAP} bytes in the trace",
+                        sys.pre
+                    ),
+                    _ => format!(
+                        "of {} at event {} is not in the trace",
+                        call_text(sys),
+                        sys.pre
+                    ),
+                };
+                (sys.pre, why)
+            });
+        }
+    }
+    let first = streams
+        .iter()
+        .filter_map(|stream| stream.point.clone())
+        .chain(exited)
+        .min_by_key(|o| o.event);
+    let unknown = streams
+        .iter()
+        .zip(["stdout", "stderr"])
+        .filter(|(stream, _)| stream.point.is_none() && !stream.met_before)
+        .filter_map(|(stream, name)| {
+            stream
+                .gap
+                .as_ref()
+                .map(|(at, why)| (*at, name, why, stream))
+        })
+        .min_by_key(|(at, ..)| *at);
+    match (first, unknown) {
+        (first, None) => Outcome {
+            point: first,
+            unknown: None,
+        },
+        (Some(first), Some((at, ..))) if first.event < at => Outcome {
+            point: Some(first),
+            unknown: None,
+        },
+        (_, Some((_, name, why, stream))) => Outcome {
+            point: None,
+            unknown: Some(format!(
+                "The outcome point is unknown: {name}'s output {why}, so where it first \
+                 matches its pattern cannot be told{}; the window runs to the end of the trace.",
+                if stream.matched_after_gap {
+                    " (it matches later, in output the trace shows whole)"
+                } else {
+                    ""
+                }
+            )),
+        },
+    }
+}
+
+/// One output stream as [`outcome`] reads it.
+#[derive(Default)]
+struct ShownOutput {
+    /// Its output since its last gap.
+    since_gap: String,
+    /// Its first gap: the event, and what is missing.
+    gap: Option<(EventIndex, String)>,
+    /// It matched before the deciding event, in output both runs share.
+    met_before: bool,
+    /// The first match, at or after the deciding event, with no gap before
+    /// it.
+    point: Option<OutcomeRef>,
+    /// It matched only after a gap.
+    matched_after_gap: bool,
+    /// A call replaced or aliased its descriptor ([`redirects`]): its writes
+    /// by number no longer count.
+    redirected: bool,
+}
+
+/// The output streams (0 for stdout, 1 for stderr) whose descriptor `sys`
+/// replaced or aliased, each with what it did: an open or a dup onto
+/// descriptor 1 or 2, in any process's table, or a dup of 1 or 2 onto
+/// another number. After it a write to fd 1 may not reach the run's stdout
+/// (a child's `> file`), and output may reach it through another number
+/// (`2>&1`, `exec 3>&1`), so the stream's writes by number no longer tell
+/// what it holds. A close alone redirects nothing; the open that reuses the
+/// number does.
+///
+/// Another number can reach a stream's open file (one of `outputs`, which
+/// any descriptor 1 or 2 is seen to reach) without a dup: an alias from
+/// before the trace or one a child inherited, seen when a write goes
+/// through it. And an open for writing, or an import, of a file the trace
+/// does not show to be a regular file (`channel_files` are those it shows
+/// moving channel data) may reach the stream's pipe or terminal by another
+/// open file: both streams.
+fn redirects(
+    sys: &SyscallRecord,
+    outputs: &[BTreeSet<OpenFileId>; 2],
+    channel_files: &BTreeSet<OpenFileId>,
+) -> Vec<(usize, String)> {
+    let stream = output_stream;
+    let mut found = Vec::new();
+    for access in &sys.accesses {
+        let Access::Fd {
+            slot,
+            op,
+            open_file,
+        } = access
+        else {
+            continue;
+        };
+        let reaches = |file: &Option<OpenFileId>| {
+            (0..2).find(|&index| file.is_some_and(|file| outputs[index].contains(&file)))
+        };
+        match op {
+            FdOp::Open { path, kind } => {
+                if stream(slot.fd).is_none()
+                    && !creates_a_new_file(sys.sysno)
+                    && opened_for_writing(sys)
+                    && let Some(kind) =
+                        not_provably_regular(path.as_deref(), *kind, *open_file, channel_files)
+                {
+                    for index in 0..2 {
+                        found.push((
+                            index,
+                            format!(
+                                "is not told by descriptor number after {} at event {} opened \
+                                 {kind} as descriptor {}",
+                                call_text(sys),
+                                sys.pre,
+                                slot.fd
+                            ),
+                        ));
+                    }
+                }
+            }
+            FdOp::Use
+                if stream(slot.fd).is_none()
+                    && output_fd(sys) == Some(slot.fd as u64)
+                    && sys.result.is_some_and(|written| written > 0) =>
+            {
+                if let Some(index) = reaches(open_file) {
+                    found.push((
+                        index,
+                        format!(
+                            "is not told by descriptor number after {} at event {} wrote to \
+                             descriptor {}'s open file through descriptor {}",
+                            call_text(sys),
+                            sys.pre,
+                            index + 1,
+                            slot.fd
+                        ),
+                    ));
+                }
+            }
+            _ => {}
+        }
+        if let (FdOp::Open { .. } | FdOp::Dup { .. }, Some(index)) = (op, stream(slot.fd)) {
+            found.push((
+                index,
+                format!(
+                    "is not told by descriptor number after {} at event {} replaced descriptor {}",
+                    call_text(sys),
+                    sys.pre,
+                    slot.fd
+                ),
+            ));
+        }
+        if let FdOp::Dup { source } = op
+            && let Some(index) = stream(*source)
+            && slot.fd != *source
+        {
+            found.push((
+                index,
+                format!(
+                    "is not told by descriptor number after {} at event {} made descriptor {} \
+                     another name for descriptor {source}",
+                    call_text(sys),
+                    sys.pre,
+                    slot.fd
+                ),
+            ));
+        }
+    }
+    found
+}
+
+/// What the trace keeps of a call's output to stdout or stderr.
+enum Shown<'a> {
+    /// All of it.
+    Whole(&'a [u8]),
+    /// Its first bytes; the rest is missing.
+    Cut(&'a [u8]),
+    /// None of it.
+    Unseen,
+}
+
+/// The stream (0 for fd 1, 1 for fd 2) that `sys` put output on, and what
+/// the trace keeps of it; `None` for a call that put none there.
+fn shown_output(sys: &SyscallRecord) -> Option<(usize, Shown<'_>)> {
+    let written = sys.result.filter(|r| *r > 0)? as u64;
+    let stream = match output_fd(sys)? {
+        1 => 0,
+        2 => 1,
+        _ => return None,
+    };
+    let kept = match (sys.sysno, sys.out_bytes.as_deref()) {
+        (Sysno::write | Sysno::writev | Sysno::pwrite64, Some(bytes)) => bytes,
+        _ => return Some((stream, Shown::Unseen)),
+    };
+    Some((
+        stream,
+        if kept.len() as u64 >= written {
+            Shown::Whole(kept)
+        } else {
+            Shown::Cut(kept)
+        },
+    ))
+}
+
+/// The output stream (0 for stdout, 1 for stderr) descriptor `fd` names by
+/// number.
+fn output_stream(fd: i32) -> Option<usize> {
+    match fd {
+        1 => Some(0),
+        2 => Some(1),
+        _ => None,
+    }
+}
+
+/// The devices whose open files cannot be a stream's pipe or terminal.
+const NOT_A_TERMINAL: [&str; 5] = [
+    "/dev/null",
+    "/dev/zero",
+    "/dev/full",
+    "/dev/random",
+    "/dev/urandom",
+];
+
+/// What an opened file may be, when the trace does not show that it is no
+/// stream's pipe or terminal: its open file moves channel data in the trace
+/// (a pipe, FIFO or socket, `channel_files`), or its kind (from its mode,
+/// as Detcore records it in the open note) is a pipe or FIFO, a socket, a
+/// character device other than [`NOT_A_TERMINAL`] by its recorded `path`
+/// (a terminal is one), another kind no stream is shown not to be, or
+/// unknown. `None` for a regular file or a directory, and for the null-like
+/// devices.
+fn not_provably_regular(
+    path: Option<&str>,
+    kind: Option<FileKind>,
+    file: Option<OpenFileId>,
+    channel_files: &BTreeSet<OpenFileId>,
+) -> Option<String> {
+    let name = path.unwrap_or("a descriptor with no recorded path");
+    if file.is_some_and(|file| channel_files.contains(&file)) {
+        return Some(format!(
+            "{name}, whose open file moves channel data (a pipe, FIFO or socket)"
+        ));
+    }
+    let what = match kind {
+        Some(FileKind::Regular | FileKind::Directory) => return None,
+        Some(FileKind::CharDevice) if path.is_some_and(|path| NOT_A_TERMINAL.contains(&path)) => {
+            return None;
+        }
+        Some(FileKind::CharDevice) => "a character device, which can be a terminal",
+        Some(FileKind::Fifo) => "a pipe or FIFO",
+        Some(FileKind::Socket) => "a socket",
+        Some(FileKind::BlockDevice) => "a block device",
+        Some(FileKind::Symlink) => "a symbolic link",
+        None => "whose kind the trace does not record",
+    };
+    Some(format!("{name}, {what}"))
+}
+
+/// Whether `sysno` makes a new pipe, socket or other anonymous file, whose
+/// endpoints are new and so no stream's: the open notes it makes are not
+/// reopens.
+fn creates_a_new_file(sysno: Sysno) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if matches!(
+        sysno,
+        Sysno::pipe | Sysno::eventfd | Sysno::epoll_create | Sysno::signalfd | Sysno::inotify_init
+    ) {
+        return true;
+    }
+    matches!(
+        sysno,
+        Sysno::pipe2
+            | Sysno::socketpair
+            | Sysno::socket
+            | Sysno::accept
+            | Sysno::accept4
+            | Sysno::eventfd2
+            | Sysno::epoll_create1
+            | Sysno::timerfd_create
+            | Sysno::signalfd4
+            | Sysno::memfd_create
+            | Sysno::inotify_init1
+            | Sysno::fanotify_init
+            | Sysno::userfaultfd
+            | Sysno::perf_event_open
+            | Sysno::pidfd_open
+            | Sysno::io_uring_setup
+    )
+}
+
+/// Whether the open `sys` made can be written through: not opened read-only
+/// or with `O_PATH`, by the flags of open, openat or open_by_handle_at (and
+/// creat, which always writes); any other call that installs a descriptor
+/// (openat2, whose flags are behind a pointer, a receipt or import) is taken
+/// to give a writable one.
+fn opened_for_writing(sys: &SyscallRecord) -> bool {
+    let flags = match sys.sysno {
+        #[cfg(target_arch = "x86_64")]
+        Sysno::open => sys.args[1],
+        Sysno::openat | Sysno::open_by_handle_at => sys.args[2],
+        _ => return true,
+    };
+    let (path_only, access) = (libc::O_PATH as u64, libc::O_ACCMODE as u64);
+    flags & path_only == 0 && flags & access != libc::O_RDONLY as u64
+}
+
+/// The descriptor an output call writes to, for the calls that can put
+/// output on a stream: the write family, sendfile, vmsplice, the send
+/// family, tee, splice and copy_file_range.
+fn output_fd(sys: &SyscallRecord) -> Option<u64> {
+    Some(match sys.sysno {
+        Sysno::write
+        | Sysno::writev
+        | Sysno::pwrite64
+        | Sysno::pwritev
+        | Sysno::pwritev2
+        | Sysno::sendfile
+        | Sysno::vmsplice
+        | Sysno::sendto
+        | Sysno::sendmsg
+        | Sysno::sendmmsg => sys.args[0],
+        Sysno::tee => sys.args[1],
+        Sysno::splice | Sysno::copy_file_range => sys.args[2],
+        _ => return None,
+    })
+}
+
+/// The sentence that says a signal is not the outcome point
+/// ([`outcome_point`]): the first signal record at or after `decision`, in
+/// the root process, whose signal the exit criterion accepts as a death and
+/// which comes before `outcome`, if any. It used to be taken as the outcome
+/// point; the trace does not show that the process died of it.
+pub fn uncounted_signal_outcome(
+    trace: &AccessTrace,
+    decision: EventIndex,
+    criteria: &OutcomeCriteria<'_>,
+    outcome: Option<&OutcomeRef>,
+) -> Option<String> {
+    let root = criteria
+        .root
+        .filter(|_| !matches!(criteria.exit_code, ExitStatusConstraint::Any))?;
+    let in_root = |tid: DetTid| {
+        trace
+            .records
+            .iter()
+            .any(|r| matches!(r, TraceRecord::Syscall(sys) if sys.tid == tid && sys.pid == root))
+    };
+    let signal = trace.records.iter().find_map(|r| match r {
+        TraceRecord::Signal(signal)
+            if signal.event >= decision
+                && outcome.is_none_or(|o| signal.event < o.event)
+                && in_root(signal.tid)
+                && nix::sys::signal::Signal::try_from(signal.signo).is_ok_and(|signo| {
+                    criteria
+                        .exit_code
+                        .is_match(ExitStatus::Signaled(signo, false))
+                }) =>
+        {
+            Some(signal)
+        }
+        _ => None,
+    })?;
+    Some(format!(
+        "{} reaches the root process at event {}; it is not taken as the outcome point: the \
+         access trace records only the disposition observed before the signal's event, not \
+         whether the process died of it.",
+        signal_text(signal.signo as u64),
+        signal.event
+    ))
+}
+
+fn outcome_of(sys: &SyscallRecord, event: EventIndex) -> OutcomeRef {
+    OutcomeRef {
+        event,
+        thread: sys.tid,
+        text: call_text(sys),
+    }
+}
+
 /// The first event of the earliest record that differs between the traces
 /// among records that end before `decision`. Such records hold the same
 /// events in both runs when both followed one schedule prefix.
@@ -672,14 +1380,13 @@ fn truncation_notes(
             format!("the outcome at event {}", o.event)
         });
         notes.push(format!(
-            "The target trace ends at event {target_last} without an end line, before {until}: \
-             accesses after it are not seen."
+            "The target trace stops at event {target_last}, before {until}: accesses after it \
+             are not seen."
         ));
     }
     if baseline.end.is_none() {
         notes.push(format!(
-            "The baseline trace ends at event {} without an end line: a call missing from it may \
-             have run later.",
+            "The baseline trace stops at event {}: a call missing from it may have run later.",
             last_event(baseline)
         ));
     }
@@ -1530,6 +2237,9 @@ struct Finder<'a> {
     processes: BTreeMap<DetTid, DetPid>,
     decision: EventIndex,
     end: EventIndex,
+    /// The thread the target schedule runs at the deciding event, when known
+    /// ([`Window::thread`]).
+    deciding_thread: Option<DetTid>,
 }
 
 impl<'a> Finder<'a> {
@@ -1560,6 +2270,7 @@ impl<'a> Finder<'a> {
             processes,
             decision,
             end,
+            deciding_thread: None,
         }
     }
 
@@ -1658,6 +2369,7 @@ impl<'a> Finder<'a> {
                 .copied()
                 .filter(|&nth| op.baseline.is_none() && nth <= sys.nth),
             ended_first_by: None,
+            stack: None,
         }
     }
 
@@ -1903,7 +2615,10 @@ impl<'a> Finder<'a> {
                     _ => continue,
                 };
                 let path = match op {
-                    FdOp::Open { path: Some(path) } => format!(" ({path})"),
+                    FdOp::Open {
+                        path: Some(path),
+                        kind: None,
+                    } => format!(" ({path})"),
                     _ => String::new(),
                 };
                 let event = HistoryEvent {
@@ -2377,6 +3092,7 @@ impl<'a> Finder<'a> {
             baseline_result: Some(result_text(call)),
             baseline_differs_from: None,
             ended_first_by: Some(kill.target.tid),
+            stack: None,
         };
         [
             self.access_of(Side {
@@ -2579,22 +3295,37 @@ impl<'a> Finder<'a> {
 
     /// The call whose entry or return is the deciding event in the target.
     fn deciding_call(&self) -> Option<Side<'a>> {
-        self.target.syscalls.iter().find_map(|&sys| {
-            let at = if sys.pre == self.decision {
-                AccessPoint::Entry
-            } else if sys.post == Some(self.decision) {
-                AccessPoint::Return
-            } else {
-                return None;
-            };
-            Some(Side {
-                op: Op {
-                    target: sys,
-                    baseline: self.counterpart(sys),
-                },
-                at,
+        let side = |sys: &'a SyscallRecord, at| Side {
+            op: Op {
+                target: sys,
+                baseline: self.counterpart(sys),
+            },
+            at,
+        };
+        self.target
+            .syscalls
+            .iter()
+            .find_map(|&sys| {
+                if sys.pre == self.decision {
+                    Some(side(sys, AccessPoint::Entry))
+                } else if sys.post == Some(self.decision) {
+                    Some(side(sys, AccessPoint::Return))
+                } else {
+                    None
+                }
             })
-        })
+            .or_else(|| {
+                // No call enters or returns at S: a timeslice of the deciding
+                // thread ends between its calls. What S decides is when that
+                // thread reaches its next call, which stands for it.
+                let thread = self.deciding_thread?;
+                self.target
+                    .syscalls
+                    .iter()
+                    .filter(|sys| sys.tid == thread && sys.pre > self.decision)
+                    .min_by_key(|sys| sys.pre)
+                    .map(|&sys| side(sys, AccessPoint::Entry))
+            })
     }
 
     /// For a pair whose partner has no place in the baseline, and whose
@@ -2639,28 +3370,63 @@ impl<'a> Finder<'a> {
         let toward = self.toward_outcome(victim, outcome);
         let unordered = hb_ends(sides.map(|s| Some((s.op.target, s.at))), false)
             .map(|(from, to)| happens_before(&self.target.edges, from, to));
+        // The pair's baseline order, measured against the changed call's
+        // counterpart (the same thread's call of the same number, at its
+        // entry); none is claimed when it or the deciding call has none.
+        let counterpart = change.side.op.baseline;
+        let measured = match (counterpart, deciding.op.baseline) {
+            (Some(b), Some(_)) => {
+                let measured_change = Side {
+                    op: Op {
+                        target: change.side.op.target,
+                        baseline: Some(b),
+                    },
+                    at: AccessPoint::Entry,
+                };
+                let measured_sides = if deciding.target_key() < changed.target_key() {
+                    [deciding, measured_change]
+                } else {
+                    [measured_change, deciding]
+                };
+                Ok((self.order_of(measured_sides), b.pre))
+            }
+            (None, _) => Err("the changed call"),
+            (Some(_), None) => Err("the deciding call"),
+        };
+        let order = match &measured {
+            Ok((order, _)) => order.clone(),
+            Err(_) => self.order_of(sides),
+        };
         let evidence = format!(
-            "{}; it takes its data from {} (#{}), and {}; the deciding event {} runs {}; {}; no \
-             access Hermit sees changes order around that change, so what decides may be an \
-             order in memory that syscalls do not show; {}",
+            "{}; it takes its data from {} (#{}), and {}; the deciding event {} runs {}; {}; it \
+             is listed for that change, ahead of order flips, and no access Hermit sees changes \
+             order around it, so what decides may be an order in memory that syscalls do not \
+             show; {}",
             describe(victim.op.target, victim.op.baseline),
             who(partner.op.target),
             partner.op.target.pre,
             change.text(),
             self.decision,
             who(deciding.op.target),
-            pair_hb_clause(unordered.as_ref()),
+            change_order_clause(
+                measured
+                    .as_ref()
+                    .map(|(order, at)| (order, *at))
+                    .map_err(|who| *who),
+                unordered.as_ref()
+            ),
             outcome_clause(who(victim.op.target), toward.as_ref())
         );
         Some((
             tid,
             RaceCandidate {
                 resource: None,
-                order: self.order_of(sides),
+                order,
                 accesses: sides.map(|side| self.access_of(side)),
                 reaches_outcome: toward.as_ref().is_some_and(|(v, _)| v.ordered),
                 events_before_outcome: toward.map(|(_, d)| d),
                 evidence,
+                check: None,
             },
         ))
     }
@@ -2729,6 +3495,7 @@ impl<'a> Finder<'a> {
             reaches_outcome: toward.as_ref().is_some_and(|(v, _)| v.ordered),
             events_before_outcome: toward.map(|(_, d)| d),
             evidence,
+            check: None,
         }
     }
 
@@ -2777,6 +3544,7 @@ impl<'a> Finder<'a> {
             reaches_outcome: toward.as_ref().is_some_and(|(v, _)| v.ordered),
             events_before_outcome: toward.map(|(_, d)| d),
             evidence,
+            check: None,
         }
     }
 
@@ -2822,6 +3590,7 @@ impl<'a> Finder<'a> {
             reaches_outcome: toward.as_ref().is_some_and(|(v, _)| v.ordered),
             events_before_outcome: toward.map(|(_, d)| d),
             evidence,
+            check: None,
         }
     }
 
@@ -3221,6 +3990,59 @@ fn outcome_clause(name: String, toward: Option<&(HbVerdict, u64)>) -> String {
     }
 }
 
+/// How a change of course and the deciding call stand in the two runs, and
+/// what orders them in the target. `measured` is their order with the
+/// baseline side measured at the changed call's counterpart (and where that
+/// counterpart enters), or which of the two has no baseline counterpart, in
+/// which case no baseline order is claimed: `the two run in the same order
+/// in both runs (the changed call's counterpart enters at #112 in the
+/// baseline), ordered in the target by futex wake thread 21 #100 -> thread
+/// 53 #108`.
+fn change_order_clause(
+    measured: Result<(&RaceOrder, EventIndex), &str>,
+    verdict: Option<&HbVerdict>,
+) -> String {
+    let runs = match measured {
+        Ok((order, at)) if order.target == order.baseline => format!(
+            "the two run in the same order in both runs (the changed call's counterpart enters at \
+             #{at} in the baseline)"
+        ),
+        Ok((_, at)) => format!(
+            "the two run in one order in the target and the other in the baseline (the changed \
+             call's counterpart enters at #{at} there)"
+        ),
+        Err(which) => format!(
+            "{which} has no counterpart in the baseline, so the two have no order there to \
+             compare"
+        ),
+    };
+    match verdict {
+        Some(v) if v.ordered => {
+            format!("{runs}; ordered in the target by {}", edge_chain(&v.edges))
+        }
+        Some(_) => format!("{runs}; unordered by the edges Hermit observes in the target"),
+        None => format!("{runs}; one of the two has no target event"),
+    }
+}
+
+/// `futex wake thread 21 #100 -> thread 53 #108, then ...`.
+fn edge_chain(edges: &[HbEdge]) -> String {
+    edges
+        .iter()
+        .map(|e| {
+            format!(
+                "{} thread {} #{} -> thread {} #{}",
+                edge_kind_text(e.kind),
+                e.from.tid,
+                e.from.event,
+                e.to.tid,
+                e.to.event
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", then ")
+}
+
 /// Whether edges order the two accesses of a candidate pair in the target.
 fn pair_hb_clause(verdict: Option<&HbVerdict>) -> String {
     match verdict {
@@ -3455,7 +4277,11 @@ fn call_text(sys: &SyscallRecord) -> String {
 fn path_text(sys: &SyscallRecord) -> Option<String> {
     sys.accesses.iter().find_map(|a| match a {
         Access::Fd {
-            op: FdOp::Open { path: Some(path) },
+            op:
+                FdOp::Open {
+                    path: Some(path),
+                    kind: None,
+                },
             ..
         } => Some(format!("{path:?}")),
         _ => None,
@@ -3560,18 +4386,26 @@ pub fn render_racing_accesses(r: &RacingAccesses) -> String {
              The order that flips is the return order of two timed calls:",
             r.decision
         )),
+        RaceStatus::FoundByIntervention => {
+            let resource = r
+                .resource
+                .as_ref()
+                .map_or(String::new(), |x| format!(" ({})", x.text));
+            lines.push(format!(
+                "Racing accesses{resource}, found by intervention, not as an order the two \
+                 runs show: {}.",
+                r.reason
+            ));
+        }
         RaceStatus::Candidates => {
             lines.push(format!("Racing accesses: {}.", r.reason));
             lines.push(
-                "Candidates, ranked (each says what differs between the runs; Hermit cannot \
-                 tell which decides):"
+                "Candidates, ranked (each says what differs between the runs; a rank is not a \
+                 verdict, and a candidate decides only where its check says so):"
                     .to_string(),
             );
-            for (i, c) in r.candidates.iter().enumerate() {
-                lines.push(format!("  {}. {}.", i + 1, c.evidence));
-                let [a, b] = &c.accesses;
-                lines.extend(access_lines([a, b]).into_iter().map(|l| format!("   {l}")));
-            }
+            lines.extend(candidate_lines(r));
+            lines.extend(undecided_lines(r));
             if let Some(o) = &r.outcome {
                 lines.push(format!(
                     "Outcome: {} by thread {} at #{}.",
@@ -3598,6 +4432,7 @@ pub fn render_racing_accesses(r: &RacingAccesses) -> String {
         if let Some(hb) = &r.happens_before {
             lines.push(happens_before_sentence(hb, [first, second]));
         }
+        lines.extend(stack_lines([first, second]));
     }
     if !r.also_reordered.is_empty() {
         lines.push("Also reordered:".to_string());
@@ -3616,8 +4451,172 @@ pub fn render_racing_accesses(r: &RacingAccesses) -> String {
             lines.push(format!("  and {} more", r.more_reordered));
         }
     }
+    if r.status == RaceStatus::FoundByIntervention {
+        lines.push("Candidates checked:".to_string());
+        lines.extend(candidate_lines(r));
+    }
     lines.extend(r.notes.iter().cloned());
     lines.join("\n")
+}
+
+/// Each candidate: its evidence, its accesses, their stacks and its check.
+/// A candidate whose check does not decide says it is not shown to decide,
+/// whatever its rank.
+fn candidate_lines(r: &RacingAccesses) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (i, c) in r.candidates.iter().enumerate() {
+        let decides = c
+            .check
+            .as_ref()
+            .is_some_and(|check| check.verdict == CheckVerdict::Decides);
+        let verdict = if decides { "" } else { "; not shown to decide" };
+        lines.push(format!("  {}. {}{verdict}.", i + 1, c.evidence));
+        let [a, b] = &c.accesses;
+        lines.extend(access_lines([a, b]).into_iter().map(|l| format!("   {l}")));
+        lines.extend(stack_lines([a, b]));
+        if let Some(check) = &c.check {
+            lines.push(format!("   Check: {}.", check.sentence()));
+        }
+    }
+    lines
+}
+
+/// For `candidates` whose checks ran and none of which decides: what that
+/// means, and what to try next. A reversal that ran as edited and left the
+/// outcome as it was clears its candidate, and only as far as one turn
+/// reversal in one run goes; a reversal that could not be replayed as
+/// edited, one never tried because its control did not reproduce the run,
+/// and a candidate not checked at all leave it untested, so the first
+/// sentence keeps them apart. Empty when no check ran or one decides.
+fn undecided_lines(r: &RacingAccesses) -> Vec<String> {
+    let checks: Vec<Option<&CandidateCheck>> =
+        r.candidates.iter().map(|c| c.check.as_ref()).collect();
+    let verdict = |v: CheckVerdict| {
+        checks
+            .iter()
+            .filter(|c| c.is_some_and(|c| c.verdict == v))
+            .count()
+    };
+    if r.status != RaceStatus::Candidates
+        || checks.iter().all(Option::is_none)
+        || verdict(CheckVerdict::Decides) > 0
+    {
+        return Vec::new();
+    }
+    let n = checks.len();
+    let ran = verdict(CheckVerdict::DoesNotDecide);
+    let not_realized = verdict(CheckVerdict::NotRealized);
+    // A check whose control did not reproduce the run names the control as
+    // its trial: its reversal was never tried.
+    let control_failed = checks
+        .iter()
+        .flatten()
+        .filter(|c| {
+            c.verdict == CheckVerdict::NotChecked
+                && c.trial.as_ref().is_some_and(|t| t.ends_with("_control"))
+        })
+        .count();
+    let not_checked = n - ran - not_realized - control_failed;
+    let plural = |count: usize| if count == 1 { "" } else { "s" };
+    let mut untested = Vec::new();
+    if not_realized > 0 {
+        untested.push(format!(
+            "{not_realized} reversal{} could not be replayed as edited",
+            plural(not_realized)
+        ));
+    }
+    if control_failed > 0 {
+        untested.push(format!(
+            "for {control_failed} the control did not reproduce the run, so {} reversal{} {} not \
+             tried",
+            if control_failed == 1 { "its" } else { "their" },
+            plural(control_failed),
+            if control_failed == 1 { "was" } else { "were" }
+        ));
+    }
+    if not_checked > 0 {
+        untested.push(format!(
+            "{not_checked} {} not checked",
+            if not_checked == 1 { "was" } else { "were" }
+        ));
+    }
+    let untested = untested.join("; ");
+    let head = format!(
+        "None of the {n} candidate{} was shown to decide",
+        if n == 1 { "" } else { "s" }
+    );
+    let summary = if ran == n {
+        format!(
+            "{head}: {} ran as edited and left the outcome as it was, so the outcome probably \
+             does not turn on any one of these candidates' orders alone (each check reverses one \
+             turn order in one run); it may turn on an order not ranked here, an order in memory \
+             that syscalls do not show, one outside the trace, or several together.",
+            if n == 1 {
+                "its reversal".to_string()
+            } else {
+                format!("all {n} reversals")
+            }
+        )
+    } else if ran == 0 {
+        format!(
+            "{head}, and none was tested: {untested}; the deciding interaction may be among them \
+             or elsewhere."
+        )
+    } else {
+        let rest = n - ran;
+        format!(
+            "{head}: {ran} reversal{} ran as edited and left the outcome as it was; of the other \
+             {rest}, {untested}; so {} untested, not cleared, and the deciding interaction may \
+             be among {} or elsewhere.",
+            plural(ran),
+            if rest == 1 {
+                "that one is"
+            } else {
+                "those are"
+            },
+            if rest == 1 { "it" } else { "them" }
+        )
+    };
+    let mut next = vec![
+        "rerun with --minimize if the analysis did not use it, so fewer chaos interventions \
+         surround the deciding event"
+            .to_string(),
+    ];
+    if r.truncated {
+        next.push(
+            "a wider --race-window, since a trace was cut short before the window ended"
+                .to_string(),
+        );
+    }
+    let unrealized: Vec<String> = checks
+        .iter()
+        .flatten()
+        .filter(|c| c.verdict == CheckVerdict::NotRealized)
+        .filter_map(|c| c.trial.as_ref().map(|t| format!("{t}.repro")))
+        .collect();
+    if !unrealized.is_empty() {
+        next.push(format!(
+            "the unrealized checks' replays ({} in the workspace) show where each left its edit",
+            unrealized.join(", ")
+        ));
+    }
+    vec![summary, format!("To look further: {}.", next.join("; "))]
+}
+
+/// Each access's stack at its entry, when the report took it.
+fn stack_lines(accesses: [&RacingAccess; 2]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for access in accesses {
+        if let Some(stack) = &access.stack {
+            lines.push(format!(
+                "{} at {}, the stack at its entry:",
+                access_name(access),
+                event_text(access.event)
+            ));
+            lines.push(stack.to_string().trim_end().to_string());
+        }
+    }
+    lines
 }
 
 /// `thread 9's close`.
@@ -3764,23 +4763,7 @@ fn happens_before_sentence(hb: &HappensBefore, accesses: [&RacingAccess; 2]) -> 
     let text = |v: &Option<HbVerdict>| match v {
         None => "not applicable: one of the accesses has no event there".to_string(),
         Some(v) if !v.ordered => unordered.to_string(),
-        Some(v) => {
-            let chain: Vec<String> = v
-                .edges
-                .iter()
-                .map(|e| {
-                    format!(
-                        "{} thread {} #{} -> thread {} #{}",
-                        edge_kind_text(e.kind),
-                        e.from.tid,
-                        e.from.event,
-                        e.to.tid,
-                        e.to.event
-                    )
-                })
-                .collect();
-            format!("ordered by {}", chain.join(", then "))
-        }
+        Some(v) => format!("ordered by {}", edge_chain(&v.edges)),
     };
     let caveat = if is_unordered(&hb.target) || is_unordered(&hb.baseline) {
         format!(" {INVISIBLE_SYNC_CAVEAT}")
@@ -3812,7 +4795,9 @@ mod tests {
     use detcore_model::access_trace::CursorOp;
     use detcore_model::access_trace::EdgeRecord;
     use detcore_model::access_trace::FutexOp;
+    use detcore_model::access_trace::ObservedSignalDisposition;
     use detcore_model::access_trace::ReturnedBytes;
+    use detcore_model::access_trace::SignalRecord;
     use detcore_model::access_trace::SyncObject;
     use detcore_model::access_trace::TraceEnd;
     use detcore_model::access_trace::TraceHeader;
@@ -3851,6 +4836,7 @@ mod tests {
     fn opened(path: &str) -> FdOp {
         FdOp::Open {
             path: Some(path.to_string()),
+            kind: None,
         }
     }
 
@@ -3963,6 +4949,7 @@ mod tests {
         outcome_thread: Option<i32>,
     ) -> RacingAccesses {
         let window = Window {
+            thread: None,
             decision: S,
             outcome: None,
         };
@@ -3988,6 +4975,7 @@ mod tests {
             baseline_result: results.1.map(str::to_string),
             baseline_differs_from: None,
             ended_first_by: None,
+            stack: None,
         }
     }
 
@@ -5751,6 +6739,7 @@ mod tests {
         outcome: (i32, EventIndex),
     ) -> RacingAccesses {
         let window = Window {
+            thread: None,
             decision: S,
             outcome: Some(OutcomeRef {
                 event: outcome.1,
@@ -6179,15 +7168,81 @@ mod tests {
             "{}",
             candidate.evidence
         );
+        // Its order does not flip, measured against the changed call's
+        // counterpart in the baseline (#112, after the deciding event), and
+        // it says so, and why it is listed.
+        assert_eq!(candidate.order.baseline, candidate.order.target);
+        assert!(
+            candidate.evidence.contains(
+                "; the two run in the same order in both runs (the changed call's counterpart \
+                 enters at #112 in the baseline); "
+            ) && candidate
+                .evidence
+                .contains("; it is listed for that change, ahead of order flips, "),
+            "{}",
+            candidate.evidence
+        );
         let text = render_racing_accesses(&r);
         assert!(
-            text.contains("Candidates, ranked (each says what differs between the runs; Hermit cannot tell which decides):\n  1. thread 3's read"),
+            text.contains("Candidates, ranked (each says what differs between the runs; a rank is not a verdict, and a candidate decides only where its check says so):\n  1. thread 3's read"),
+            "{text}"
+        );
+        // Ranked first, it is still not shown to decide.
+        assert!(
+            text.contains("reaches it through program order; not shown to decide.\n"),
             "{text}"
         );
         let json = serde_json::to_value(&r).unwrap();
         assert_eq!(json["status"], "candidates");
         assert_eq!(json["candidates"][0]["accesses"][1]["thread"], 53);
         assert_eq!(json["candidates"][0]["reaches_outcome"], true);
+    }
+
+    /// The baseline order of a change of course is measured at the changed
+    /// call's counterpart, not at the absent event that sorts last: a
+    /// counterpart that enters before the deciding call's event in the
+    /// baseline makes the order opposite, and a change with no counterpart
+    /// claims no order there.
+    #[test]
+    fn a_changed_course_is_ordered_by_its_baseline_counterpart() {
+        // In the baseline the deciding call (thread 21's write) returns only
+        // after the changed call's counterpart (#112) enters.
+        let (target, mut baseline) = fed_by_a_changed_course(false);
+        let deciding = baseline
+            .iter_mut()
+            .find(|sys| sys.tid == t(21) && sys.nth == 40)
+            .unwrap();
+        deciding.post = Some(115);
+        let (target, baseline) = (trace(target), trace(baseline));
+        let r = find_at(&target, &baseline, (3, 140));
+        assert_eq!(r.status, RaceStatus::Candidates, "{}", r.reason);
+        let [candidate] = r.candidates.as_slice() else {
+            panic!("{:?}", r.candidates);
+        };
+        assert_eq!(candidate.order.target, [0, 1]);
+        assert_eq!(candidate.order.baseline, [1, 0]);
+        assert!(
+            candidate.evidence.contains(
+                "; the two run in one order in the target and the other in the baseline (the \
+                 changed call's counterpart enters at #112 there); "
+            ),
+            "{}",
+            candidate.evidence
+        );
+
+        let order = RaceOrder {
+            target: [0, 1],
+            baseline: [0, 1],
+        };
+        assert_eq!(
+            change_order_clause(Err("the changed call"), None),
+            "the changed call has no counterpart in the baseline, so the two have no order there \
+             to compare; one of the two has no target event"
+        );
+        assert!(change_order_clause(Ok((&order, 7)), None).starts_with(
+            "the two run in the same order in both runs (the changed call's counterpart enters at \
+             #7 in the baseline)"
+        ));
     }
 
     #[test]
@@ -6441,13 +7496,17 @@ mod tests {
         assert!(r.truncated);
         assert_eq!(
             r.notes,
-            vec!["The baseline trace ends at event 102 without an end line: a call missing from it may have run later.".to_string()]
+            vec![
+                "The baseline trace stops at event 102: a call missing from it may have run later."
+                    .to_string()
+            ]
         );
 
         // A target cut before the outcome it should reach.
         let mut cut = target.clone();
         cut.end = None;
         let window = Window {
+            thread: None,
             decision: S,
             outcome: Some(OutcomeRef {
                 event: 200,
@@ -6457,7 +7516,13 @@ mod tests {
         };
         let r = find_racing_accesses(&cut, &baseline, window.clone(), Some(t(7)));
         assert!(r.truncated);
-        assert!(r.notes[0].starts_with("The target trace ends at event 104 without an end line, before the outcome at event 200"), "{:?}", r.notes);
+        assert!(
+            r.notes[0].starts_with(
+                "The target trace stops at event 104, before the outcome at event 200"
+            ),
+            "{:?}",
+            r.notes
+        );
         // The same cut trace covers an earlier outcome.
         let earlier = Window {
             outcome: Some(OutcomeRef {
@@ -7316,6 +8381,961 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_outcome_point_is_the_first_criterion_met_after_the_decision() {
+        let say = |pre, fd_number, text: &str| {
+            let mut sys = call(
+                pre,
+                7,
+                pre,
+                Sysno::write,
+                &[fd_number, 0x1000, text.len() as u64],
+                Some(text.len() as i64),
+                Vec::new(),
+            );
+            sys.out_bytes = Some(text.as_bytes().to_vec());
+            sys
+        };
+        let exit = |pre, code| call(pre, 9, pre, Sysno::exit_group, &[code], None, Vec::new());
+        let records = |calls: Vec<SyscallRecord>, fatal: Option<EventIndex>| {
+            // Thread 5, which the signal hits, is in the root process.
+            let mut records: Vec<TraceRecord> = vec![TraceRecord::Syscall(call(
+                80,
+                5,
+                1,
+                Sysno::getpid,
+                &[],
+                Some(3),
+                Vec::new(),
+            ))];
+            records.extend(calls.into_iter().map(TraceRecord::Syscall));
+            if let Some(event) = fatal {
+                records.push(TraceRecord::Signal(SignalRecord {
+                    event,
+                    tid: t(5),
+                    signo: libc::SIGABRT,
+                    code: 0,
+                    addr: None,
+                    sender: None,
+                    observed_disposition: ObservedSignalDisposition::Default,
+                }));
+            }
+            traced(records)
+        };
+        let pattern = Regex::new("double-close of file descriptor").unwrap();
+        let nonzero = ExitStatusConstraint::NonZero;
+        let root = Some(DetPid::from_raw(3));
+        let stderr_and_nonzero = OutcomeCriteria {
+            stdout: None,
+            stderr: Some(&pattern),
+            exit_code: &nonzero,
+            root,
+        };
+        // The pattern spans two writes; the second completes the match.
+        let trace = records(
+            vec![
+                say(90, 2, "starting\n"),
+                say(101, 2, "fdsan: double-close "),
+                say(103, 2, "of file descriptor 6\n"),
+                exit(110, 1),
+            ],
+            Some(108),
+        );
+        assert_eq!(
+            outcome_point(&trace, S, &stderr_and_nonzero),
+            Some(OutcomeRef {
+                event: 103,
+                thread: t(7),
+                text: "write(2, \"of file descriptor 6\", 21)".to_string(),
+            })
+        );
+        // Without a stderr pattern, the exit is the outcome: a signal that
+        // reaches the process under its default disposition, before the
+        // exit, is not shown to end it.
+        let nonzero_only = OutcomeCriteria {
+            stdout: None,
+            stderr: None,
+            exit_code: &nonzero,
+            root,
+        };
+        let exit_outcome = outcome_point(&trace, S, &nonzero_only);
+        assert_eq!(
+            exit_outcome.clone().map(|o| (o.event, o.thread, o.text)),
+            Some((110, t(9), "exit_group(1)".to_string()))
+        );
+        // The result says that the signal is not taken as the outcome, where
+        // it comes before the outcome point; not after it.
+        let note = uncounted_signal_outcome(&trace, S, &nonzero_only, exit_outcome.as_ref());
+        assert!(
+            note.as_deref().is_some_and(|note| note.starts_with(
+                "SIGABRT reaches the root \
+                 process at event 108; it is not taken as the outcome point"
+            )),
+            "{note:?}"
+        );
+        let write_outcome = outcome_point(&trace, S, &stderr_and_nonzero);
+        assert_eq!(
+            uncounted_signal_outcome(&trace, S, &stderr_and_nonzero, write_outcome.as_ref()),
+            None
+        );
+        // An exit code the criteria refuse, and output before the decision,
+        // are no outcome.
+        let zero = ExitStatusConstraint::Exact(0);
+        let exit_zero = OutcomeCriteria {
+            stdout: None,
+            stderr: Some(&pattern),
+            exit_code: &zero,
+            root,
+        };
+        let early = records(
+            vec![
+                say(95, 2, "fdsan: double-close of file descriptor 6\n"),
+                exit(110, 1),
+            ],
+            None,
+        );
+        assert_eq!(outcome_point(&early, S, &exit_zero), None);
+        assert_eq!(
+            outcome_point(&records(vec![exit(110, 0)], None), S, &exit_zero).map(|o| o.text),
+            Some("exit_group(0)".to_string())
+        );
+        // A child process's exit_group is not the root's status, and
+        // --target-exit-code=any leaves the exit criterion out: in both cases
+        // the root's matching write is the outcome.
+        let mut child_exit = exit(102, 1);
+        child_exit.tid = t(11);
+        child_exit.pid = DetPid::from_raw(11);
+        let child = records(
+            vec![
+                child_exit,
+                say(105, 2, "fdsan: double-close of file descriptor 6\n"),
+            ],
+            None,
+        );
+        let any = ExitStatusConstraint::Any;
+        for exit_code in [&nonzero, &any] {
+            let criteria = OutcomeCriteria {
+                stdout: None,
+                stderr: Some(&pattern),
+                exit_code,
+                root,
+            };
+            assert_eq!(
+                outcome_point(&child, S, &criteria).map(|o| (o.event, o.thread)),
+                Some((105, t(7))),
+                "{exit_code:?}"
+            );
+        }
+        let any_only = OutcomeCriteria {
+            stdout: None,
+            stderr: None,
+            exit_code: &any,
+            root,
+        };
+        assert_eq!(outcome_point(&trace, S, &any_only), None);
+    }
+
+    /// An output criterion is matched only within output the trace shows
+    /// whole: never across a write the trace cut at [`OUT_BYTES_CAP`] bytes,
+    /// output it does not show (before it starts, or put on stdout by another
+    /// call), and once such a gap comes before a match the point is unknown,
+    /// unless the exit comes first or output both runs share already met the
+    /// pattern before the deciding event.
+    #[test]
+    fn an_output_match_never_joins_output_across_a_gap() {
+        let say = |pre, written: usize, kept: &str| {
+            let mut sys = call(
+                pre,
+                7,
+                pre,
+                Sysno::write,
+                &[1, 0x1000, written as u64],
+                Some(written as i64),
+                Vec::new(),
+            );
+            sys.out_bytes = Some(kept.as_bytes().to_vec());
+            sys
+        };
+        let whole = |pre, text: &str| say(pre, text.len(), text);
+        let exit = |pre| call(pre, 9, pre, Sysno::exit_group, &[1], None, Vec::new());
+        let records = |calls: Vec<SyscallRecord>| {
+            traced(calls.into_iter().map(TraceRecord::Syscall).collect())
+        };
+        let pattern = Regex::new("ERROR").unwrap();
+        let (any, nonzero) = (ExitStatusConstraint::Any, ExitStatusConstraint::NonZero);
+        let root = Some(DetPid::from_raw(3));
+        let stdout_only = OutcomeCriteria {
+            stdout: Some(&pattern),
+            stderr: None,
+            exit_code: &any,
+            root,
+        };
+        let stdout_and_exit = OutcomeCriteria {
+            exit_code: &nonzero,
+            ..stdout_only
+        };
+        let at = |found: Outcome| found.point.map(|o| o.event);
+        // A 257-byte write ending in "ERX", whose first 256 bytes the trace
+        // keeps ("...ER"), then "ROR": no run printed ERROR there, so the cut
+        // write and the next never join into a match. A later whole ERROR
+        // matches, but the cut bytes may hold an earlier one: unknown.
+        let cut = format!("{}ER", "a".repeat(254));
+        let trace = records(vec![
+            say(101, 257, &cut),
+            whole(103, "ROR\n"),
+            whole(105, "ERROR\n"),
+        ]);
+        let found = outcome(&trace, S, &stdout_only);
+        assert_eq!(found.point, None);
+        assert_eq!(
+            found.unknown.as_deref(),
+            Some(
+                "The outcome point is unknown: stdout's output of the write at event 101 is cut \
+                 at 256 bytes in the trace, so where it first matches its pattern cannot be told \
+                 (it matches later, in output the trace shows whole); the window runs to the end \
+                 of the trace."
+            )
+        );
+        assert_eq!(outcome_point(&trace, S, &stdout_only), None);
+        // Whole writes join: "ER" then "ROR" is ERROR, at the second, and a
+        // cut write after the match changes nothing.
+        let trace = records(vec![
+            whole(101, "ER"),
+            whole(103, "ROR\n"),
+            say(105, 300, &cut),
+        ]);
+        let found = outcome(&trace, S, &stdout_only);
+        assert_eq!((at(found.clone()), found.unknown), (Some(103), None));
+        // The exit stands when it comes before the stream's first gap, and
+        // not when a gap comes first.
+        let trace = records(vec![exit(104), say(106, 300, &cut)]);
+        assert_eq!(at(outcome(&trace, S, &stdout_and_exit)), Some(104));
+        let trace = records(vec![say(102, 300, &cut), exit(104)]);
+        let found = outcome(&trace, S, &stdout_and_exit);
+        assert_eq!(found.point, None);
+        assert!(
+            found
+                .unknown
+                .is_some_and(|why| why.contains("event 102 is cut"))
+        );
+        // Output another call puts on stdout is not in the trace at all.
+        let sent = call(
+            101,
+            7,
+            101,
+            Sysno::sendfile,
+            &[1, 5, 0, 10],
+            Some(10),
+            Vec::new(),
+        );
+        let found = outcome(&records(vec![sent, whole(103, "ERROR\n")]), S, &stdout_only);
+        assert_eq!(found.point, None);
+        assert!(found.unknown.is_some_and(|why| {
+            why.contains("of sendfile(1, 5, 0x0, 10) at event 101 is not in the trace")
+                || why.contains("at event 101 is not in the trace")
+        }),);
+        // A trace that starts after event 0 has not kept the output before
+        // it, unless output both runs share met the pattern before the
+        // deciding event: then the stream gives no point and the exit stands.
+        let mut late = records(vec![whole(103, "ERROR\n")]);
+        late.header.from = 50;
+        let found = outcome(&late, S, &stdout_only);
+        assert_eq!(found.point, None);
+        assert!(
+            found
+                .unknown
+                .is_some_and(|why| why.contains("before the trace's first event, 50"))
+        );
+        let mut late = records(vec![whole(95, "ERROR\n"), exit(104)]);
+        late.header.from = 50;
+        assert_eq!(at(outcome(&late, S, &stdout_and_exit)), Some(104));
+    }
+
+    /// Output is told by descriptor number, so once a call replaces or
+    /// aliases descriptor 1 or 2 no write by number counts for that stream:
+    /// after `2>&1` the run's stdout holds the fd-2 writes and its stderr
+    /// none of them, after `exec 3>&1` it holds the fd-3 writes, and a
+    /// child's fd-1 writes after its `> file` are not in it at all. Each
+    /// would have given a match no run printed there; the point is unknown.
+    #[test]
+    fn an_output_stream_is_not_told_by_number_after_a_redirect() {
+        let write = |pre, tid: i32, fd: u64, text: &str| {
+            let mut sys = call(
+                pre,
+                tid,
+                pre,
+                Sysno::write,
+                &[fd, 0x1000, text.len() as u64],
+                Some(text.len() as i64),
+                Vec::new(),
+            );
+            sys.out_bytes = Some(text.as_bytes().to_vec());
+            sys
+        };
+        let slot = |files: i32, number: i32, op: FdOp| Access::Fd {
+            slot: FdSlot {
+                files: FilesId::initial(t(files)),
+                fd: number,
+            },
+            open_file: Some(file(7, 1)),
+            op,
+        };
+        let records = |calls: Vec<SyscallRecord>| {
+            traced(calls.into_iter().map(TraceRecord::Syscall).collect())
+        };
+        let (error, xx) = (Regex::new("ERROR").unwrap(), Regex::new("XX").unwrap());
+        let any = ExitStatusConstraint::Any;
+        let root = Some(DetPid::from_raw(3));
+        let stdout = OutcomeCriteria {
+            stdout: Some(&error),
+            stderr: None,
+            exit_code: &any,
+            root,
+        };
+        let stderr = OutcomeCriteria {
+            stdout: None,
+            stderr: Some(&xx),
+            ..stdout
+        };
+        let unknown = |trace: &AccessTrace, criteria: &OutcomeCriteria<'_>, why: &str| {
+            let found = outcome(trace, S, criteria);
+            assert_eq!(found.point, None, "{why}");
+            assert!(
+                found
+                    .unknown
+                    .as_deref()
+                    .is_some_and(|note| note.contains(why)),
+                "{why}: {:?}",
+                found.unknown
+            );
+        };
+        // 2>&1: dup2(1, 2), then "ER" on fd 1, "XX" on fd 2, "ROR" on fd 1.
+        let dup2 = call(
+            100,
+            7,
+            100,
+            Sysno::dup2,
+            &[1, 2],
+            Some(2),
+            vec![slot(3, 2, FdOp::Dup { source: 1 })],
+        );
+        let merged = records(vec![
+            dup2,
+            write(101, 7, 1, "ER"),
+            write(103, 7, 2, "XX"),
+            write(105, 7, 1, "ROR\n"),
+        ]);
+        unknown(
+            &merged,
+            &stdout,
+            "stdout's output is not told by descriptor number after dup2(1, 2) at event 100 made \
+             descriptor 2 another name for descriptor 1",
+        );
+        unknown(
+            &merged,
+            &stderr,
+            "stderr's output is not told by descriptor number after dup2(1, 2) at event 100 \
+             replaced descriptor 2",
+        );
+        // exec 3>&1: dup2(1, 3), then "ER", "XX" on fd 3, "ROR".
+        let dup3 = call(
+            100,
+            7,
+            100,
+            Sysno::dup2,
+            &[1, 3],
+            Some(3),
+            vec![slot(3, 3, FdOp::Dup { source: 1 })],
+        );
+        let aliased = records(vec![
+            dup3,
+            write(101, 7, 1, "ER"),
+            write(103, 7, 3, "XX"),
+            write(105, 7, 1, "ROR\n"),
+        ]);
+        unknown(
+            &aliased,
+            &stdout,
+            "made descriptor 3 another name for descriptor 1",
+        );
+        // A child's `> file`: its own descriptor 1 now names a file.
+        let mut redirected = call(
+            100,
+            11,
+            100,
+            Sysno::openat,
+            &[(-100i64) as u64, 0x2000, 0x241],
+            Some(1),
+            vec![slot(11, 1, opened("out.log"))],
+        );
+        redirected.pid = DetPid::from_raw(11);
+        let mut logged = write(101, 11, 1, "ERROR\n");
+        logged.pid = DetPid::from_raw(11);
+        unknown(
+            &records(vec![redirected, logged]),
+            &stdout,
+            "replaced descriptor 1",
+        );
+        // A close alone redirects nothing, and a match before any redirect
+        // stands.
+        let closed = call(
+            100,
+            7,
+            100,
+            Sysno::close,
+            &[1],
+            Some(0),
+            vec![slot(3, 1, FdOp::Close)],
+        );
+        let found = outcome(
+            &records(vec![write(101, 7, 1, "ERROR\n"), closed.clone()]),
+            S,
+            &stdout,
+        );
+        assert_eq!(found.point.map(|o| o.event), Some(101));
+        let mut dup_after = closed;
+        dup_after.pre = 103;
+        dup_after.accesses = vec![slot(3, 2, FdOp::Dup { source: 1 })];
+        let found = outcome(
+            &records(vec![write(101, 7, 1, "ERROR\n"), dup_after]),
+            S,
+            &stdout,
+        );
+        assert_eq!(found.point.map(|o| o.event), Some(101));
+    }
+
+    /// What the alias tests below share: stdout's open file `file(7, 1)`,
+    /// reached by fd 1 in the root's table; a write of `text` to `fd` by
+    /// `tid` through `open_file`; and the check that the point is unknown
+    /// with a note saying `why`.
+    fn seam_write(
+        pre: EventIndex,
+        tid: i32,
+        fd: i32,
+        open_file: OpenFileId,
+        text: &str,
+    ) -> SyscallRecord {
+        let mut sys = call(
+            pre,
+            tid,
+            pre,
+            Sysno::write,
+            &[fd as u64, 0x1000, text.len() as u64],
+            Some(text.len() as i64),
+            vec![Access::Fd {
+                slot: FdSlot {
+                    files: FilesId::initial(t(tid)),
+                    fd,
+                },
+                open_file: Some(open_file),
+                op: FdOp::Use,
+            }],
+        );
+        sys.out_bytes = Some(text.as_bytes().to_vec());
+        sys
+    }
+
+    /// The point `calls` give for an ERROR on `stream` (0 stdout, 1 stderr)
+    /// is unknown, with a note containing `why`.
+    fn assert_seam_unknown(calls: Vec<SyscallRecord>, stream: usize, why: &str) {
+        let pattern = Regex::new("ERROR").unwrap();
+        let any = ExitStatusConstraint::Any;
+        let criteria = OutcomeCriteria {
+            stdout: (stream == 0).then_some(&pattern),
+            stderr: (stream == 1).then_some(&pattern),
+            exit_code: &any,
+            root: Some(DetPid::from_raw(3)),
+        };
+        let trace = traced(calls.into_iter().map(TraceRecord::Syscall).collect());
+        let found = outcome(&trace, S, &criteria);
+        assert_eq!(found.point.map(|o| o.event), None, "{why}");
+        assert!(
+            found
+                .unknown
+                .as_deref()
+                .is_some_and(|note| note.contains(why)),
+            "{why}: {:?}",
+            found.unknown
+        );
+    }
+
+    /// An import of stdout's open file at another number, over SCM_RIGHTS
+    /// (Detcore notes an open of the existing open file), makes that number
+    /// another way to stdout: its write in the ER/ROR seam joins no match.
+    #[test]
+    fn an_output_imported_over_scm_rights_is_a_gap() {
+        let stdout = file(7, 1);
+        let received = call(
+            100,
+            7,
+            100,
+            Sysno::recvmsg,
+            &[5, 0x4000, 0],
+            Some(1),
+            vec![fd(
+                3,
+                Some(stdout),
+                FdOp::Open {
+                    path: None,
+                    kind: None,
+                },
+            )],
+        );
+        assert_seam_unknown(
+            vec![
+                received,
+                seam_write(101, 3, 1, stdout, "ER"),
+                seam_write(103, 3, 3, stdout, "XX"),
+                seam_write(105, 3, 1, stdout, "ROR\n"),
+            ],
+            0,
+            "opened a descriptor with no recorded path, whose kind the trace does not record as descriptor 3",
+        );
+    }
+
+    /// pidfd_getfd of a process's fd 1 does the same.
+    #[test]
+    fn an_output_taken_with_pidfd_getfd_is_a_gap() {
+        let stdout = file(7, 1);
+        let taken = call(
+            100,
+            7,
+            100,
+            Sysno::pidfd_getfd,
+            &[9, 1, 0],
+            Some(3),
+            vec![fd(
+                3,
+                Some(stdout),
+                FdOp::Open {
+                    path: None,
+                    kind: None,
+                },
+            )],
+        );
+        assert_seam_unknown(
+            vec![
+                taken,
+                seam_write(101, 3, 1, stdout, "ER"),
+                seam_write(103, 3, 3, stdout, "XX"),
+                seam_write(105, 3, 1, stdout, "ROR\n"),
+            ],
+            0,
+            "opened a descriptor with no recorded path, whose kind the trace does not record as descriptor 3",
+        );
+    }
+
+    /// An alias from before the trace, a launch with `3>&1`, has no call
+    /// in it that created it; the write through it to stdout's open file
+    /// shows it.
+    #[test]
+    fn an_output_alias_from_before_the_trace_is_a_gap() {
+        let stdout = file(7, 1);
+        assert_seam_unknown(
+            vec![
+                seam_write(101, 3, 1, stdout, "ER"),
+                seam_write(103, 3, 3, stdout, "XX"),
+                seam_write(105, 3, 1, stdout, "ROR\n"),
+            ],
+            0,
+            "wrote to descriptor 1's open file through descriptor 3",
+        );
+    }
+
+    /// A child that inherited such an alias across fork or exec writes
+    /// through it from its own table.
+    #[test]
+    fn an_output_alias_a_child_inherited_is_a_gap() {
+        let stdout = file(7, 1);
+        let mut child = seam_write(103, 11, 3, stdout, "XX");
+        child.pid = DetPid::from_raw(11);
+        assert_seam_unknown(
+            vec![
+                seam_write(101, 3, 1, stdout, "ER"),
+                child,
+                seam_write(105, 3, 1, stdout, "ROR\n"),
+            ],
+            0,
+            "wrote to descriptor 1's open file through descriptor 3",
+        );
+    }
+
+    /// An open for writing of a file the trace does not show to be a
+    /// regular file may reach a stream's pipe or terminal by a new open file,
+    /// whatever its spelling: Detcore records the open's resolved target and
+    /// kind, so `/proc/self/fd/1` reopened is a pipe (`pipe:[4026]`) or a
+    /// pts, a terminal opened directly is a character device, a named FIFO
+    /// is a FIFO by its kind or by its channel data, and an open whose kind
+    /// is not recorded (a dirfd-relative one from a trace before the field)
+    /// is unknown. Each, with its write in the ER/ROR seam, leaves the point
+    /// unknown.
+    #[test]
+    fn an_output_reopened_by_path_is_a_gap() {
+        let (stderr, reopened) = (file(7, 2), file(3, 9));
+        let opened = |path: &str, kind: Option<FileKind>| {
+            let mut sys = call(
+                100,
+                3,
+                100,
+                Sysno::openat,
+                &[(-100i64) as u64, 0x2000, libc::O_WRONLY as u64],
+                Some(3),
+                Vec::new(),
+            );
+            sys.accesses = vec![Access::Fd {
+                slot: FdSlot {
+                    files: FilesId::initial(t(3)),
+                    fd: 3,
+                },
+                open_file: Some(reopened),
+                op: opened_path(path, kind),
+            }];
+            sys
+        };
+        for (path, kind, why) in [
+            (
+                "pipe:[4026]",
+                Some(FileKind::Fifo),
+                "opened pipe:[4026], a pipe or FIFO",
+            ),
+            (
+                "/dev/pts/3",
+                Some(FileKind::CharDevice),
+                "opened /dev/pts/3, a character device, which can be a terminal",
+            ),
+            (
+                "/tmp/out.fifo",
+                Some(FileKind::Fifo),
+                "opened /tmp/out.fifo, a pipe or FIFO",
+            ),
+            (
+                "/proc/thread-self/fd/1",
+                None,
+                "opened /proc/thread-self/fd/1, whose kind the trace does not record",
+            ),
+            (
+                "fifo",
+                None,
+                "opened fifo, whose kind the trace does not record",
+            ),
+        ] {
+            assert_seam_unknown(
+                vec![
+                    opened(path, kind),
+                    seam_write(101, 3, 2, stderr, "ER"),
+                    seam_write(103, 3, 3, reopened, "XX"),
+                    seam_write(105, 3, 2, stderr, "ROR\n"),
+                ],
+                1,
+                why,
+            );
+        }
+        // A FIFO whose kind is not recorded: its write shows channel data.
+        let mut into_fifo = seam_write(103, 3, 3, reopened, "XX");
+        into_fifo.accesses.push(Access::Channel {
+            open_file: reopened,
+            id: None,
+            channel: ChannelKind::Fifo,
+            op: ChannelOp::Write,
+        });
+        assert_seam_unknown(
+            vec![
+                opened("/tmp/out.fifo", None),
+                seam_write(101, 3, 1, file(7, 1), "ER"),
+                into_fifo,
+                seam_write(105, 3, 1, file(7, 1), "ROR\n"),
+            ],
+            0,
+            "opened /tmp/out.fifo, whose open file moves channel data (a pipe, FIFO or socket)",
+        );
+    }
+
+    /// No gap where the open note shows the new open file cannot be a
+    /// stream's: a regular file opened for writing (a log written between ER
+    /// and ROR, by an absolute or a relative path), `/dev/null` opened for
+    /// writing, a terminal opened read-only, and a new pipe.
+    #[test]
+    fn an_open_of_a_regular_file_read_only_device_or_new_pipe_is_no_gap() {
+        let (stdout, log) = (file(7, 1), file(3, 9));
+        let open = |path: &str, kind: FileKind, flags: i32| {
+            let mut sys = call(
+                100,
+                3,
+                100,
+                Sysno::openat,
+                &[(-100i64) as u64, 0x2000, flags as u64],
+                Some(3),
+                Vec::new(),
+            );
+            sys.accesses = vec![Access::Fd {
+                slot: FdSlot {
+                    files: FilesId::initial(t(3)),
+                    fd: 3,
+                },
+                open_file: Some(log),
+                op: opened_path(path, Some(kind)),
+            }];
+            sys
+        };
+        let pipe = call(
+            100,
+            3,
+            100,
+            Sysno::pipe2,
+            &[0x3000, 0],
+            Some(0),
+            vec![
+                fd(
+                    3,
+                    Some(log),
+                    FdOp::Open {
+                        path: None,
+                        kind: Some(FileKind::Fifo),
+                    },
+                ),
+                fd(
+                    4,
+                    Some(file(3, 10)),
+                    FdOp::Open {
+                        path: None,
+                        kind: Some(FileKind::Fifo),
+                    },
+                ),
+            ],
+        );
+        let pattern = Regex::new("ERROR").unwrap();
+        let any = ExitStatusConstraint::Any;
+        let criteria = OutcomeCriteria {
+            stdout: Some(&pattern),
+            stderr: None,
+            exit_code: &any,
+            root: Some(DetPid::from_raw(3)),
+        };
+        let writable = libc::O_WRONLY | libc::O_CREAT;
+        for opened in [
+            open("/tmp/run.log", FileKind::Regular, writable),
+            open("run.log", FileKind::Regular, writable),
+            open("/dev/null", FileKind::CharDevice, libc::O_WRONLY),
+            open("/dev/tty", FileKind::CharDevice, libc::O_RDONLY),
+            pipe,
+        ] {
+            let trace = traced(
+                [
+                    opened,
+                    seam_write(101, 3, 1, stdout, "ER"),
+                    seam_write(103, 3, 3, log, "XX"),
+                    seam_write(105, 3, 1, stdout, "ROR\n"),
+                ]
+                .into_iter()
+                .map(TraceRecord::Syscall)
+                .collect(),
+            );
+            let found = outcome(&trace, S, &criteria);
+            assert_eq!(
+                (found.point.map(|o| o.event), found.unknown),
+                (Some(105), None)
+            );
+        }
+    }
+
+    fn opened_path(path: &str, kind: Option<FileKind>) -> FdOp {
+        FdOp::Open {
+            path: Some(path.to_string()),
+            kind,
+        }
+    }
+
+    /// A deciding event that no call enters or returns at (a timeslice that
+    /// ends between calls) is taken at its thread's next call: a reader fed
+    /// by a thread that changed course gives the change and that call as
+    /// the candidate, as it does when a call returns at the deciding event.
+    #[test]
+    fn a_deciding_event_between_calls_is_taken_at_its_threads_next_call() {
+        let (mut target, mut baseline) = fed_by_a_changed_course(false);
+        for calls in [&mut target, &mut baseline] {
+            // The shutdown thread's log write returns before the deciding
+            // event, which runs that thread on to its next call.
+            for sys in calls.iter_mut().filter(|sys| sys.tid == t(21)) {
+                sys.post = Some(S - 1);
+            }
+            calls.push(call(
+                102,
+                21,
+                41,
+                Sysno::write,
+                &[2, 0x7100, 25],
+                Some(25),
+                Vec::new(),
+            ));
+        }
+        let (target, baseline) = (trace(target), trace(baseline));
+        let window = |thread: Option<i32>| Window {
+            decision: S,
+            outcome: Some(OutcomeRef {
+                event: 140,
+                thread: t(3),
+                text: "write(1, ...)".to_string(),
+            }),
+            thread: thread.map(t),
+        };
+        let names_the_change = |r: &RacingAccesses| {
+            r.candidates
+                .iter()
+                .any(|c| c.accesses.iter().any(|a| a.thread == t(53) && a.nth == 150))
+        };
+        let unknown = find_racing_accesses(&target, &baseline, window(None), Some(t(3)));
+        assert!(!names_the_change(&unknown), "{:?}", unknown.candidates);
+        let r = find_racing_accesses(&target, &baseline, window(Some(21)), Some(t(3)));
+        assert_eq!(r.status, RaceStatus::Candidates, "{}", r.reason);
+        let [candidate] = r.candidates.as_slice() else {
+            panic!("{:?}", r.candidates);
+        };
+        assert_eq!(
+            candidate
+                .accesses
+                .iter()
+                .map(|a| (a.thread, a.nth))
+                .collect::<Vec<_>>(),
+            vec![(t(21), 41), (t(53), 150)]
+        );
+    }
+
+    /// When checks ran and none decides, the candidates block says so after
+    /// the list, keeps reversals that ran apart from checks that could not
+    /// replay theirs, and says what to try next; when one decides, or none
+    /// ran, it says nothing of the kind.
+    #[test]
+    fn candidates_none_of_which_decides_say_what_that_means() {
+        let base = fdsan();
+        let [first, second]: [RacingAccess; 2] = base.accesses.clone().try_into().unwrap();
+        let candidate = |verdict: Option<CheckVerdict>, n: usize, control: bool| RaceCandidate {
+            resource: base.resource.clone(),
+            accesses: [first.clone(), second.clone()],
+            order: base.order.clone().unwrap(),
+            reaches_outcome: true,
+            events_before_outcome: Some(10),
+            evidence: format!("evidence {n}"),
+            check: verdict.map(|verdict| CandidateCheck {
+                verdict,
+                edited: "target".to_string(),
+                edit: "moving 1 event of thread 9 before thread 7's turn at #7587, crossing no \
+                       other thread"
+                    .to_string(),
+                moved: None,
+                trial: Some(if control {
+                    format!("racing_candidate_{n}_control")
+                } else {
+                    format!("racing_candidate_{n}")
+                }),
+                detail: "the detail".to_string(),
+            }),
+        };
+        // Each candidate's verdict, and whether its trial was its control
+        // (a not_checked check whose control did not reproduce the run).
+        let with_trials = |verdicts: &[(Option<CheckVerdict>, bool)]| {
+            let mut r = base.clone();
+            r.status = RaceStatus::Candidates;
+            r.accesses = Vec::new();
+            r.candidates = verdicts
+                .iter()
+                .enumerate()
+                .map(|(i, (v, control))| candidate(*v, i + 1, *control))
+                .collect();
+            r
+        };
+        let with = |verdicts: &[Option<CheckVerdict>]| {
+            with_trials(&verdicts.iter().map(|v| (*v, false)).collect::<Vec<_>>())
+        };
+        use CheckVerdict::*;
+
+        let all_ran = render_racing_accesses(&with(&[Some(DoesNotDecide); 3]));
+        assert!(
+            all_ran.contains("\nNone of the 3 candidates was shown to decide: all 3 reversals ran as edited and left the outcome as it was, so the outcome probably does not turn on any one of these candidates' orders alone (each check reverses one turn order in one run); it may turn on an order not ranked here, an order in memory that syscalls do not show, one outside the trace, or several together.\nTo look further: rerun with --minimize if the analysis did not use it, so fewer chaos interventions surround the deciding event.\n"),
+            "{all_ran}"
+        );
+
+        let none_ran = render_racing_accesses(&with_trials(&[
+            (Some(NotRealized), false),
+            (Some(NotRealized), false),
+            (Some(NotChecked), true),
+        ]));
+        assert!(
+            none_ran.contains("\nNone of the 3 candidates was shown to decide, and none was tested: 2 reversals could not be replayed as edited; for 1 the control did not reproduce the run, so its reversal was not tried; the deciding interaction may be among them or elsewhere.\n")
+                && none_ran.contains("; the unrealized checks' replays (racing_candidate_1.repro, racing_candidate_2.repro in the workspace) show where each left its edit.\n"),
+            "{none_ran}"
+        );
+
+        let mut mixed = with(&[Some(DoesNotDecide), Some(NotRealized), None]);
+        mixed.truncated = true;
+        let mixed = render_racing_accesses(&mixed);
+        assert!(
+            mixed.contains("\nNone of the 3 candidates was shown to decide: 1 reversal ran as edited and left the outcome as it was; of the other 2, 1 reversal could not be replayed as edited; 1 was not checked; so those are untested, not cleared, and the deciding interaction may be among them or elsewhere.\n")
+                && mixed.contains("; a wider --race-window, since a trace was cut short before the window ended; "),
+            "{mixed}"
+        );
+
+        // Two that decide stay candidates, and say nothing of the kind.
+        let two = render_racing_accesses(&with(&[Some(Decides), Some(Decides), Some(NotRealized)]));
+        assert!(
+            !two.contains("was shown to decide") && !two.contains("To look further"),
+            "{two}"
+        );
+    }
+
+    #[test]
+    fn the_block_prints_each_access_stack_and_an_unavailable_reason() {
+        let mut r = fdsan();
+        let stack: PrettyBacktrace = serde_json::from_str(
+            r#"{"thread_id":9,"thread_name":null,"frames":[{"frame":{"ip":4096,"is_signal":false},"symbol":{"name":"raw_close","address":4000,"offset":96},"locations":[{"file":"model.cpp","line":285,"column":0}]}]}"#,
+        )
+        .unwrap();
+        r.accesses[0].stack = Some(stack);
+        let text = render_racing_accesses(&r);
+        let tail = text
+            .split_once("thread 9's close at #7587, the stack at its entry:\n")
+            .map(|(_, tail)| tail);
+        assert!(
+            tail.is_some_and(|tail| tail.starts_with("Stack trace for thread 9")
+                && tail.contains("raw_close + 0x60")),
+            "{text}"
+        );
+        assert!(
+            !text.contains("thread 7's lseek at #7589, the stack"),
+            "{text}"
+        );
+
+        // A candidate's accesses print their stacks under its entry too.
+        let mut candidates = r.clone();
+        candidates.status = RaceStatus::Candidates;
+        let [first, second] = std::mem::take(&mut candidates.accesses).try_into().unwrap();
+        candidates.candidates = vec![RaceCandidate {
+            resource: candidates.resource.clone(),
+            accesses: [first, second],
+            order: candidates.order.clone().unwrap(),
+            reaches_outcome: true,
+            events_before_outcome: Some(10),
+            evidence: "the evidence".to_string(),
+            check: None,
+        }];
+        let text = render_racing_accesses(&candidates);
+        assert!(
+            text.contains("  1. the evidence; not shown to decide.\n")
+                && text.contains(
+                    "thread 9's close at #7587, the stack at its entry:\nStack trace for thread 9"
+                ),
+            "{text}"
+        );
+
+        // No check ran: nothing is said about what the checks showed.
+        assert!(!text.contains("was shown to decide"), "{text}");
+
+        let gone = RacingAccesses::unavailable(7586, "the target replay records no access trace: backend `kvm` is refused: use --backend=ptrace".to_string());
+        assert_eq!(
+            render_racing_accesses(&gone),
+            "Racing accesses: unavailable: the target replay records no access trace: backend `kvm` is refused: use --backend=ptrace."
+        );
+    }
+
     /// The fdsan case of design section 8: thread 9 closes fd 6 a second
     /// time after thread 7 reused the number, so thread 7's lseek fails.
     fn fdsan() -> RacingAccesses {
@@ -7400,6 +9420,7 @@ mod tests {
             .concat(),
         );
         let window = Window {
+            thread: None,
             decision: 7586,
             outcome: Some(OutcomeRef {
                 event: 7593,

@@ -53,8 +53,10 @@ struct AnalyzeWorkloads {
     hello_race: PathBuf,
     racewrite_nostdlib: PathBuf,
     nanosleep_nocrash: PathBuf,
+    fd_reuse_close_race: PathBuf,
     race_then: PathBuf,
     refusal_after_race: PathBuf,
+    rpc_shutdown_removes_client: PathBuf,
 }
 
 fn command_output(mut command: Command, label: &str) -> Output {
@@ -200,6 +202,12 @@ fn workloads() -> &'static AnalyzeWorkloads {
             &nanosleep_nocrash,
         );
 
+        let fd_reuse_close_race = build_root.join("fd_reuse_close_race");
+        compile_c_pthread(
+            &repository.join("tests/c/fd_reuse_close_race.c"),
+            &fd_reuse_close_race,
+        );
+
         let race_then = build_root.join("analyze_race_then");
         compile_c_pthread(
             &repository.join("hermit-cli/tests/fixtures/analyze_race_then.c"),
@@ -212,12 +220,20 @@ fn workloads() -> &'static AnalyzeWorkloads {
             &refusal_after_race,
         );
 
+        let rpc_shutdown_removes_client = build_root.join("rpc_shutdown_removes_client");
+        compile_c_pthread(
+            &repository.join("tests/c/rpc_shutdown_removes_client.c"),
+            &rpc_shutdown_removes_client,
+        );
+
         AnalyzeWorkloads {
             hello_race,
             racewrite_nostdlib,
             nanosleep_nocrash,
+            fd_reuse_close_race,
             race_then,
             refusal_after_race,
+            rpc_shutdown_removes_client,
         }
     })
 }
@@ -236,6 +252,36 @@ fn run_analyze(
     analyze_opts: &[&str],
     expected_output: &str,
 ) -> serde_json::Value {
+    run_analyze_with(
+        label,
+        guest,
+        analyze_opts,
+        expected_output,
+        SkidMargin::Calibrated,
+    )
+}
+
+/// Whether an analysis takes the calibrated PMU skid margin the PMU analyze
+/// node passes in `HERMIT_ANALYZE_SKID_MARGIN` ([`add_calibrated_skid_margin`]).
+enum SkidMargin {
+    Calibrated,
+    /// Not taken, for the reason named. At `--max-timeslice=400000` the timer
+    /// stops a thread that computes between syscalls about every 40000
+    /// retired conditional branches, and Hermit places each such event by
+    /// stepping the guest through up to the margin's branches (its NOTICE
+    /// says so), so a large margin makes every trial of such a guest many
+    /// times slower without changing what the test checks.
+    Without(&'static str),
+}
+
+/// [`run_analyze`], with or without the calibrated skid margin.
+fn run_analyze_with(
+    label: &str,
+    guest: &Path,
+    analyze_opts: &[&str],
+    expected_output: &str,
+    margin: SkidMargin,
+) -> serde_json::Value {
     let _guard = analyze_lock();
     let report_dir = tempfile::tempdir().expect("failed to create analyze report directory");
     let report_file = report_dir.path().join("report.json");
@@ -244,7 +290,10 @@ fn run_analyze(
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command.arg("analyze");
     command.args(analyze_opts);
-    add_calibrated_skid_margin(&mut command, label);
+    match margin {
+        SkidMargin::Calibrated => add_calibrated_skid_margin(&mut command, label),
+        SkidMargin::Without(reason) => eprintln!("{label}: no calibrated skid margin: {reason}"),
+    }
     command
         .arg(format!("--report-file={}", report_file.display()))
         .arg(format!("--tmp-dir={}", tmp_dir.display()))
@@ -436,6 +485,178 @@ fn analyze_racewrite_nostdlib_prefix_search() {
     assert_ne!(
         thread("critical_event1"),
         thread("critical_event2"),
+        "{report}"
+    );
+}
+
+/// A shutdown that removes a client before the server looks it up
+/// (tests/c/rpc_shutdown_removes_client.c): the race is in memory, so the
+/// finder can only rank candidates, first the server's change of course
+/// against the deciding event. The report checks each candidate by
+/// intervention. Moving the server's turn before the shutdown's crosses the
+/// client and the poller, and the check says how many events of each; the
+/// server then cannot run as edited (it needs the request that now comes
+/// after it), so the check is not realized rather than a verdict. No
+/// poller nap decides.
+///
+/// This test is NOT in the PMU analyze node. Measured 2026-11-04 on an
+/// AMD EPYC 9D85 (the validation host class), whole-cgroup CPU of one
+/// systemd scope per run at the node's 20000-branch margin, it takes
+/// 24.31, 24.47 and 24.78 CPU-seconds against the node's ordinary
+/// 22-second per-test cap, and shrinking the poller's nap far enough to
+/// fit (600 microseconds and up) makes the analysis degenerate: the
+/// deciding event falls in startup (#53), the server-change replay
+/// departs at event #0, and no candidate check is realized -- the
+/// assertions below now refuse that shape. An exact-identity CPU
+/// allowance cannot admit it either today, because allowance selection
+/// drops ignored testcases (nextest_cpu::selected_inventory). It stays
+/// runnable by hand as an ignored test; re-inclusion is tracked in
+/// minibeads dh-zr6yo.
+#[test]
+#[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn analyze_checks_the_race_candidates_and_says_what_each_edit_moved() {
+    let report = run_analyze(
+        "analyze rpc_shutdown_removes_client --prefix-search",
+        &workloads().rpc_shutdown_removes_client,
+        &[
+            "--prefix-search",
+            "--run-arg=--base-env=empty",
+            "--target-stdout=call failed",
+        ],
+        "call failed",
+    );
+    let racing = &report["racing_accesses"];
+    assert_eq!(racing["status"], "candidates", "{report}");
+    let candidates = racing["candidates"].as_array().cloned().unwrap_or_default();
+    let calls = |c: &serde_json::Value| -> Vec<String> {
+        (0..2)
+            .map(|i| c["accesses"][i]["call"].as_str().unwrap_or("").to_owned())
+            .collect()
+    };
+    let change = candidates
+        .iter()
+        .find(|c| calls(c).iter().any(|call| call.contains("not found")))
+        .unwrap_or_else(|| panic!("no candidate names the server's change: {report}"));
+    let check = &change["check"];
+    assert_eq!(check["verdict"], "not_realized", "{report}");
+    // Guard against a degenerate analysis (F5): with too little poller
+    // traffic the deciding event falls in startup, before the server
+    // thread exists, the edit replay departs at event #0 instead of at
+    // the server's read, and no candidate check is realized -- while the
+    // assertions above still pass on the ranked text alone.
+    let decision = racing["decision"].as_u64().expect("decision event");
+    let server_thread = change["accesses"][1]["thread"]
+        .as_u64()
+        .expect("server thread");
+    let detail = check["detail"].as_str().unwrap_or("");
+    let departure: u64 = detail
+        .split("at event #")
+        .nth(1)
+        .and_then(|rest| {
+            rest.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .parse()
+                .ok()
+        })
+        .unwrap_or_else(|| panic!("no departure event in check detail: {report}"));
+    let departure_thread: u64 = detail
+        .split("(tid")
+        .nth(1)
+        .and_then(|rest| {
+            rest.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .parse()
+                .ok()
+        })
+        .unwrap_or_else(|| panic!("no departure thread in check detail: {report}"));
+    assert_eq!(
+        departure_thread, server_thread,
+        "the server-change replay must depart on the server thread: {report}"
+    );
+    assert!(
+        departure >= decision,
+        "the server-change replay departs at #{departure}, before the deciding \
+         event #{decision}: {report}"
+    );
+    assert!(
+        candidates.iter().any(|candidate| matches!(
+            candidate["check"]["verdict"].as_str(),
+            Some("decides" | "does_not_decide")
+        )),
+        "at least one candidate check must be realized: {report}"
+    );
+    assert!(
+        check["edit"].as_str().unwrap_or("").starts_with("moving ")
+            && check["moved"]["events"].as_u64().unwrap_or(0) > 0
+            && !check["moved"]["crossed"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .is_empty(),
+        "{report}"
+    );
+    for candidate in &candidates {
+        assert!(candidate["check"].is_object(), "{report}");
+        if calls(candidate)
+            .iter()
+            .any(|call| call.starts_with("nanosleep("))
+        {
+            assert_ne!(candidate["check"]["verdict"], "decides", "{report}");
+        }
+    }
+}
+
+/// A deferred second close of a descriptor number another thread reopened
+/// (tests/c/fd_reuse_close_race.c, the fdsan pattern): the report's
+/// "Racing accesses" section names the closer's close and the writer's lseek
+/// that fails with EBADF, on two threads, and no edge Hermit observes orders
+/// them.
+///
+/// It takes no calibrated skid margin. Power/weight, 2026-11-04, on an AMD
+/// EPYC 9D85 (the validation host class), whole-cgroup CPU of one systemd
+/// scope per run of this test alone: the writer's spin went from 3000000 to
+/// 100000 iterations. The recorded schedule keeps every event class
+/// (Syscall 138, OtherInstructions 100, Cpuid 21, Rdtsc 10; Branch 228 ->
+/// 101, of which the writer's timer slices 141 -> 14), and the test's CPU
+/// fell from 191 and 230 CPU-seconds (n=2) to 12.18 and 12.25 (n=2) without
+/// the margin, inside the node's 22-second cap. With
+/// `HERMIT_ANALYZE_SKID_MARGIN=20000` the shrunk test still takes 76 to 81
+/// CPU-seconds (n=3), because the margin steps every Branch event, the ~77
+/// startup slices included, so the exemption stays. Plain `--chaos` seeds
+/// 1-5 no longer fail on this host at the shrunk spin (the 3000000-iteration
+/// guest failed seeds 1-3); analyze's own search found the failing schedule
+/// in 5 of 5 measured runs. What the test checks is the race finder's
+/// report on the pair the search finds, not where a timer event lands.
+#[test]
+#[ignore = "slow: bisecting chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn analyze_names_the_close_racing_the_reused_descriptor() {
+    let report = run_analyze_with(
+        "analyze fd_reuse_close_race --prefix-search",
+        &workloads().fd_reuse_close_race,
+        &[
+            "--prefix-search",
+            "--run-arg=--base-env=empty",
+            "--target-stderr=failed with EBADF",
+        ],
+        "unordered by the edges Hermit observes",
+        SkidMargin::Without(
+            "stepping every Branch event through a 20000-branch margin, startup slices \
+             included, took 76 to 81 CPU-seconds on the validation host class against \
+             12.2 without it (see the test's documentation)",
+        ),
+    );
+    let racing = &report["racing_accesses"];
+    assert_eq!(racing["status"], "found", "{report}");
+    let access = |i: usize, field: &str| racing["accesses"][i][field].clone();
+    let call = |i: usize| access(i, "call").as_str().unwrap_or_default().to_owned();
+    assert!(call(0).starts_with("close("), "{report}");
+    assert!(call(1).starts_with("lseek("), "{report}");
+    assert_eq!(access(1, "result"), "-EBADF", "{report}");
+    assert_ne!(access(0, "thread"), access(1, "thread"), "{report}");
+    assert_eq!(
+        racing["happens_before"]["target"]["ordered"], false,
         "{report}"
     );
 }
