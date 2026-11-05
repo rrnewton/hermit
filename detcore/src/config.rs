@@ -100,8 +100,7 @@ mod tests {
     /// to https://github.com/rrnewton/hermit/pull/4885, and 45, this
     /// change's `TraceSchedEvent`/`WithWatchOrder` revision, is current.
     /// Remove an entry when its change lands, with its row.
-    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] =
-        &[33, 34, 35, 36, 37, 38, 39, 41, 42, 43, 44];
+    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[33, 34, 35, 36, 37, 38, 39, 41, 42, 43, 44];
 
     /// Every revision of the global RPC, oldest first, with the digest of the
     /// code of its two enums and its `Resources` payload. A change to any of
@@ -279,7 +278,7 @@ mod tests {
         // `GlobalResponse::WithWatchOrder` (#4796). Live-computed as 45 at
         // its rebase onto main's 40, skipping queued/advisory claims
         // 41-44; digest measured at the sealed head.
-        (45, "e909c0d8e85f5336", "f013e36743d8d9e6"),
+        (45, "b434f4f465fdbb8d", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
