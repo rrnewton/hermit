@@ -48,6 +48,12 @@ pub enum Verdict {
     /// outcome (an interior prefix may still miss the target). The report
     /// says so and names no event.
     ReproducedWithoutSchedule,
+    /// A budget (`--time-budget`, `--trial-budget`) ended the analysis before
+    /// it concluded (exit 120): `partial` says what it found so far, and the
+    /// report names no decision. While the default search runs, both event
+    /// fields name where its closest pair of schedules first differs, which
+    /// is the deciding event or one before it; otherwise they are absent.
+    Partial,
 }
 
 /// Why analyze concluded [`Verdict::ReproducedWithoutSchedule`]: the `verdict_reason`

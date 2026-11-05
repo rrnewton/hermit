@@ -8,7 +8,9 @@
 
 //! A mode for analyzing a hermit run.
 
+use std::cell::Cell;
 use std::cmp;
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::num::NonZeroU64;
 use std::path::Path;
@@ -33,20 +35,35 @@ use reverie::PrettyBacktrace;
 use reverie::process::ExitStatus;
 use reverie::process::Output;
 
+use crate::app::analyze::budget;
+use crate::app::analyze::budget::Budget;
+use crate::app::analyze::budget::BudgetExpired;
+use crate::app::analyze::budget::BudgetKind;
+use crate::app::analyze::checkpoint::BisectInterval;
+use crate::app::analyze::checkpoint::CHECKPOINT_VERSION;
+use crate::app::analyze::checkpoint::Checkpoint;
+use crate::app::analyze::checkpoint::FileIdentity;
+use crate::app::analyze::checkpoint::Identity;
+use crate::app::analyze::checkpoint::IntervalResume;
+use crate::app::analyze::checkpoint::Journal;
+use crate::app::analyze::checkpoint::Phase;
+use crate::app::analyze::checkpoint::PrefixBracket;
+use crate::app::analyze::checkpoint::Progress;
 use crate::app::analyze::consts::*;
 use crate::app::analyze::race_report::TracedReplay;
 use crate::app::analyze::races::RacingAccesses;
 use crate::app::analyze::races::render_racing_accesses;
 use crate::app::analyze::rundata::RunData;
+use crate::app::analyze::rundata::TrialEnd;
 use crate::app::analyze::stop;
 use crate::app::analyze::stop::StopSignals;
 use crate::app::analyze::stop::Stopped;
 use crate::app::analyze::types::AnalyzeOpts;
 use crate::app::analyze::types::ContinuationTimeslice;
 use crate::app::analyze::types::ExitStatusConstraint;
+use crate::app::analyze::types::PartialReport;
 use crate::app::analyze::types::Report;
 use crate::app::analyze::types::ReportCriticalEvent;
-use crate::app::analyze::types::TrialTimeout;
 use crate::app::analyze::verdict::AlternativeTiming;
 use crate::app::analyze::verdict::AnalyzeFailure;
 use crate::app::analyze::verdict::AnalyzePrecondition;
@@ -65,8 +82,9 @@ use crate::app::schedule_search::Config;
 use crate::app::schedule_search::CriticalSchedule;
 use crate::app::schedule_search::INEXACT_COUNTER_BRANCH_JITTER;
 use crate::app::schedule_search::NoSingleSwap;
+use crate::app::schedule_search::SearchStart;
 use crate::app::schedule_search::TrialOutcome;
-use crate::app::schedule_search::search_for_critical_schedule;
+use crate::app::schedule_search::search_for_critical_schedule_observed;
 
 /// Compare only preemptions, not recorded schedules.
 fn preempt_files_equal(path1: &Path, path2: &Path) -> bool {
@@ -206,6 +224,380 @@ fn knock_out_latest(record: &PreemptionRecord) -> Option<PreemptionRecord> {
     let pruned = record.without_default_threads();
     let knocked_out = pruned.with_latest_preempt_removed();
     (knocked_out != pruned).then_some(knocked_out)
+}
+
+/// What a partial report says about `--prefix-search`'s `bracket`. Short
+/// prefixes miss the target and long ones meet it, so the deciding event
+/// lies between the longest prefix known to miss and the shortest known to
+/// meet.
+fn describe_bracket(bracket: &PrefixBracket) -> String {
+    match (bracket.misses, bracket.meets) {
+        // The empty prefix meets the target: scheduler-alone evidence, not a
+        // range of events, and no event comes before it.
+        (_, Some(0)) => format!(
+            "The prefix search had found that replaying none of the target schedule's {} events \
+             meets the target ({}), continuing without chaos {}: there the target is reproduced \
+             without the target schedule, which localizes no event.\n",
+            bracket.events,
+            bracket.meets_run.as_deref().unwrap_or("a trial"),
+            bracket.continuation,
+        ),
+        (Some(misses), Some(meets)) => format!(
+            "The prefix search's bracket, continuing without chaos {}: replaying the first \
+             {misses} of the target schedule's {} events misses the target ({}), and replaying \
+             the first {meets} meets it ({}). The deciding event is one of events #{misses} to \
+             #{} ({} events), assuming, as the search does, that the outcome changes once along \
+             the schedule.\n",
+            bracket.continuation,
+            bracket.events,
+            bracket.misses_run.as_deref().unwrap_or("a trial"),
+            bracket.meets_run.as_deref().unwrap_or("a trial"),
+            meets - 1,
+            meets - misses,
+        ),
+        (None, Some(meets)) => format!(
+            "The prefix search had found that replaying the first {meets} of the target \
+             schedule's {} events meets the target ({}), continuing without chaos {}, but no \
+             shorter prefix whose trial finished and missed it yet: the deciding event is one \
+             of events #0 to #{}.\n",
+            bracket.events,
+            bracket.meets_run.as_deref().unwrap_or("a trial"),
+            bracket.continuation,
+            meets - 1,
+        ),
+        (misses, None) => format!(
+            "The prefix search had not yet found a prefix of the target schedule's {} events \
+             whose replay meets the target, continuing without chaos {}{}.\n",
+            bracket.events,
+            bracket.continuation,
+            misses.map_or_else(String::new, |misses| format!(
+                "; replaying the first {misses} misses it ({})",
+                bracket.misses_run.as_deref().unwrap_or("a trial")
+            )),
+        ),
+    }
+}
+
+/// `name`, an environment variable's name, as text that keeps every byte, so
+/// that two names never become one: as it is when it is UTF-8 without a
+/// backslash, and otherwise with each byte outside printable ASCII written
+/// `\xNN` and a backslash or quote escaped (`escape_ascii`), which always
+/// leaves a backslash in it.
+fn environment_name(name: &std::ffi::OsStr) -> String {
+    match name.to_str() {
+        Some(text) if !text.contains('\\') => text.to_owned(),
+        _ => std::os::unix::ffi::OsStrExt::as_bytes(name)
+            .escape_ascii()
+            .to_string(),
+    }
+}
+
+/// The command line that continues this analysis in `workspace`: this
+/// invocation's own ([`resume_command_from`]).
+fn resume_command(workspace: &Path) -> String {
+    resume_command_from(std::env::args_os().collect(), workspace)
+}
+
+/// The index in `args`, a `hermit` command line, of its subcommand: the first
+/// argument that is neither one of hermit's own options nor the value one
+/// takes, as hermit's parser defines them (`crate::app::Args`). In `hermit
+/// --log-file analyze analyze ...` it is the second `analyze`. `None` when
+/// there is none before a `--`.
+fn subcommand_index(args: &[std::ffi::OsString]) -> Option<usize> {
+    let command = <crate::app::Args as clap::CommandFactory>::command();
+    let takes_value =
+        |arg: Option<&clap::Arg>| arg.is_some_and(|arg| arg.get_action().takes_values());
+    let mut index = 1;
+    while index < args.len() {
+        // An option is text; anything else is the subcommand's place.
+        let Some(arg) = args[index].to_str() else {
+            return Some(index);
+        };
+        if arg == "--" {
+            return None;
+        }
+        let value_follows = if let Some(long) = arg.strip_prefix("--") {
+            !long.contains('=')
+                && takes_value(command.get_arguments().find(|candidate| {
+                    candidate
+                        .get_long_and_visible_aliases()
+                        .is_some_and(|names| names.contains(&long))
+                }))
+        } else if let Some(shorts) = arg.strip_prefix('-').filter(|shorts| !shorts.is_empty()) {
+            // A cluster of short options: the first that takes a value takes
+            // the rest of the cluster, or the next argument when it ends it.
+            let mut rest = shorts.chars();
+            let mut follows = false;
+            while let Some(short) = rest.next() {
+                if takes_value(command.get_arguments().find(|candidate| {
+                    candidate
+                        .get_short_and_visible_aliases()
+                        .is_some_and(|shorts| shorts.contains(&short))
+                })) {
+                    follows = rest.as_str().is_empty();
+                    break;
+                }
+            }
+            follows
+        } else {
+            return Some(index);
+        };
+        index += if value_follows { 2 } else { 1 };
+    }
+    None
+}
+
+/// `arg` as one word of a shell command: shell-quoted when it is UTF-8, and
+/// otherwise in bash's `$'...'` form, each byte outside printable ASCII as
+/// `\xNN`, so that no byte is lost.
+fn shell_word(arg: &std::ffi::OsStr) -> String {
+    match arg.to_str() {
+        Some(text) => shell_words::quote(text).into_owned(),
+        None => format!(
+            "$'{}'",
+            std::os::unix::ffi::OsStrExt::as_bytes(arg)
+                .iter()
+                .map(|&byte| match byte {
+                    b'\'' => "\\'".to_owned(),
+                    b'\\' => "\\\\".to_owned(),
+                    0x20..=0x7e => char::from(byte).to_string(),
+                    _ => format!("\\x{byte:02x}"),
+                })
+                .collect::<String>()
+        ),
+    }
+}
+
+/// `args`, a command line that runs `hermit analyze`, with
+/// `--resume=WORKSPACE` in place of any `--resume` among analyze's own
+/// options: those after the subcommand ([`subcommand_index`]) and before the
+/// first `--` after it, in either the split or the equals form. Everything
+/// else, hermit's own options before the subcommand and from that `--` on
+/// the `hermit run` arguments and the guest's, is kept as it is, a guest's
+/// own `--resume` among them, byte for byte ([`shell_word`]).
+fn resume_command_from(mut args: Vec<std::ffi::OsString>, workspace: &Path) -> String {
+    let start = subcommand_index(&args).map_or(args.len(), |at| at + 1);
+    let mut end = args[start..]
+        .iter()
+        .position(|arg| arg.as_os_str() == "--")
+        .map_or(args.len(), |at| start + at);
+    let mut index = start;
+    while index < end {
+        let arg = args[index].to_str();
+        if arg == Some("--resume") {
+            let taken = 2.min(end - index);
+            args.drain(index..index + taken);
+            end -= taken;
+        } else if arg.is_some_and(|arg| arg.starts_with("--resume=")) {
+            args.remove(index);
+            end -= 1;
+        } else {
+            index += 1;
+        }
+    }
+    let mut resume = std::ffi::OsString::from("--resume=");
+    resume.push(workspace.as_os_str());
+    args.insert(start, resume);
+    args.iter()
+        .map(|arg| shell_word(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The guest program `program` on the host: as it is when it names a path,
+/// else found on `PATH`. `None` when it is not there.
+fn find_program(program: &Path) -> Option<PathBuf> {
+    if program.components().count() > 1 {
+        return program.is_file().then(|| program.to_path_buf());
+    }
+    std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|dir| dir.join(program))
+            .find(|candidate| candidate.is_file())
+    })
+}
+
+/// The default search's interval, kept in the workspace as it narrows: the
+/// side that changed is written again, and the progress (`checkpoint`)
+/// names both.
+struct IntervalFiles {
+    paths: [PathBuf; 2],
+    /// The digest of the schedule each file holds (`events_digest`).
+    written: [Option<String>; 2],
+}
+
+/// The sha256 that `IntervalResume` keeps of the schedules `lists`: of each
+/// one's length and events as `std::hash::Hash` writes them, streamed
+/// rather than collected, since a schedule can hold millions of events.
+fn events_digest(lists: &[&[SchedEvent]]) -> String {
+    /// Collects what `Hash` writes.
+    struct Sink<'a>(&'a mut Vec<u8>);
+    impl std::hash::Hasher for Sink<'_> {
+        fn write(&mut self, bytes: &[u8]) {
+            self.0.extend_from_slice(bytes);
+        }
+        fn finish(&self) -> u64 {
+            0
+        }
+    }
+    struct Stream<'a> {
+        lists: std::slice::Iter<'a, &'a [SchedEvent]>,
+        events: std::slice::Iter<'a, SchedEvent>,
+        buf: Vec<u8>,
+        at: usize,
+    }
+    impl std::io::Read for Stream<'_> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            use std::hash::Hash as _;
+            if self.at == self.buf.len() {
+                self.buf.clear();
+                self.at = 0;
+                while self.buf.len() < 1 << 16 {
+                    match self.events.next() {
+                        Some(event) => event.hash(&mut Sink(&mut self.buf)),
+                        None => match self.lists.next() {
+                            Some(list) => {
+                                list.len().hash(&mut Sink(&mut self.buf));
+                                self.events = list.iter();
+                            }
+                            None => break,
+                        },
+                    }
+                }
+            }
+            let n = out.len().min(self.buf.len() - self.at);
+            out[..n].copy_from_slice(&self.buf[self.at..self.at + n]);
+            self.at += n;
+            Ok(n)
+        }
+    }
+    let stream = Stream {
+        lists: lists.iter(),
+        events: [].iter(),
+        buf: Vec::new(),
+        at: 0,
+    };
+    detcore::Digest::digest_reader(stream)
+        .expect("reading from memory does not fail")
+        .to_string()
+}
+
+/// Where the default search stands, besides its interval: what
+/// `IntervalResume` keeps.
+#[derive(Clone)]
+struct SearchState {
+    endpoints: String,
+    event_level: bool,
+    trials: usize,
+}
+
+impl IntervalFiles {
+    fn new(workspace: &Path) -> Self {
+        Self {
+            paths: [
+                workspace.join("interval_passing").with_extension(SCHED_EXT),
+                workspace.join("interval_failing").with_extension(SCHED_EXT),
+            ],
+            written: [None, None],
+        }
+    }
+
+    /// Record the interval `passing`, `failing`, at the start of `pass`
+    /// with its edit and swap `distances` and the search's `state`, or
+    /// before the first pass. Each file is replaced whole (written aside,
+    /// then renamed), and the progress names the interval only after both.
+    fn record(
+        &mut self,
+        opts: &AnalyzeOpts,
+        pass: Option<usize>,
+        [passing, failing]: [&[SchedEvent]; 2],
+        distances: Option<(usize, usize)>,
+        state: Option<SearchState>,
+    ) {
+        let mut hashes = [String::new(), String::new()];
+        let mut whole = true;
+        for (slot, events) in [passing, failing].into_iter().enumerate() {
+            let hash = events_digest(&[events]);
+            hashes[slot] = hash.clone();
+            if self.written[slot].as_ref() == Some(&hash) {
+                continue;
+            }
+            let path = &self.paths[slot];
+            let aside = path.with_extension("partial");
+            let written = opts
+                .write_trial_schedule_from(events.to_vec(), &[], &aside)
+                .and_then(|()| Ok(std::fs::rename(&aside, path)?));
+            match written {
+                Ok(()) => self.written[slot] = Some(hash),
+                Err(error) => {
+                    whole = false;
+                    self.written[slot] = None;
+                    note(&format!(
+                        ":: cannot write the search's interval to {}: {error:#}",
+                        path.display()
+                    ))
+                }
+            }
+        }
+        let common_prefix = passing
+            .iter()
+            .zip(failing)
+            .take_while(|(first, second)| first == second)
+            .count();
+        opts.progress.interval(BisectInterval {
+            pass,
+            edit_distance: distances.map(|(edit, _)| edit),
+            swap_distance: distances.map(|(_, swap)| swap),
+            passing: self.paths[0].clone(),
+            passing_events: passing.len(),
+            failing: self.paths[1].clone(),
+            failing_events: failing.len(),
+            common_prefix,
+            passing_event: passing.get(common_prefix).map(ToString::to_string),
+            failing_event: failing.get(common_prefix).map(ToString::to_string),
+            resume: state.filter(|_| whole).map(|state| IntervalResume {
+                endpoints: state.endpoints,
+                passing_hash: hashes[0].clone(),
+                failing_hash: hashes[1].clone(),
+                event_level: state.event_level,
+                trials: state.trials,
+            }),
+        });
+    }
+}
+
+/// How the last trial of each prefix ended, per continuation: it met the
+/// target or missed it, since a trial that does not finish ends the search.
+type Ends = BTreeMap<(usize, MaybeTimeslice), TrialEnd>;
+
+/// `--prefix-search`'s bracket at `continuation` over a schedule of
+/// `events` events, from each prefix's last trial (`ends`) and the run that
+/// was (`runs`).
+fn prefix_bracket(
+    ends: &Ends,
+    runs: &BTreeMap<(usize, MaybeTimeslice), String>,
+    continuation: MaybeTimeslice,
+    events: usize,
+) -> PrefixBracket {
+    let at = |end: TrialEnd| {
+        ends.iter()
+            .filter(move |((_, timeslice), ended)| *timeslice == continuation && **ended == end)
+            .map(|((prefix, _), _)| *prefix)
+    };
+    let meets = at(TrialEnd::Met).min();
+    let below = meets.unwrap_or(usize::MAX);
+    let misses = at(TrialEnd::Missed).filter(|&prefix| prefix < below).max();
+    let run = |prefix: Option<usize>| {
+        prefix.and_then(|prefix| runs.get(&(prefix, continuation)).cloned())
+    };
+    PrefixBracket {
+        events,
+        continuation: describe_continuation(continuation),
+        misses,
+        misses_run: run(misses),
+        meets,
+        meets_run: run(meets),
+    }
 }
 
 /// The result of `--prefix-search`: replaying the first `decision` events of
@@ -835,12 +1227,13 @@ fn require_repeated_outcomes(replays: &[(&str, bool, bool)], inspect: &str) -> a
 }
 
 /// Whether `ran` is the event `expected`, as the scheduler compares them when
-/// it takes a stack: the count and the time aside.
+/// it takes a stack: the count and the time aside, and only instruction
+/// pointers present in the recorded event constrain the observed ones.
 fn same_event(expected: &SchedEvent, ran: &SchedEvent) -> bool {
     expected.dettid == ran.dettid
         && expected.op == ran.op
-        && expected.start_rip == ran.start_rip
-        && expected.end_rip == ran.end_rip
+        && (expected.start_rip.is_none() || expected.start_rip == ran.start_rip)
+        && (expected.end_rip.is_none() || expected.end_rip == ran.end_rip)
 }
 
 /// The first of the first `until` events of `requested` at which `realized`
@@ -1244,7 +1637,12 @@ impl AnalyzeOpts {
         mut launch: impl FnMut(usize, usize, MaybeTimeslice) -> anyhow::Result<bool>,
     ) -> anyhow::Result<PrefixDecision> {
         let target = target_record.schedevents();
+        self.progress.phase(Phase::PrefixSearch);
         let mut trial = 0;
+        // How each prefix's last trial ended, per continuation, and the run
+        // that was.
+        let mut ends = Ends::new();
+        let mut runs = BTreeMap::new();
         let mut meets_target = |len: usize, continuation: MaybeTimeslice| -> anyhow::Result<bool> {
             trial += 1;
             let is_match = launch(trial, len, continuation)?;
@@ -1257,6 +1655,15 @@ impl AnalyzeOpts {
                     "baseline condition".to_string()
                 }
             );
+            let end = if is_match {
+                TrialEnd::Met
+            } else {
+                TrialEnd::Missed
+            };
+            ends.insert((len, continuation), end);
+            runs.insert((len, continuation), format!("prefix_round_{trial:03}"));
+            self.progress
+                .bracket(prefix_bracket(&ends, &runs, continuation, target.len()));
             Ok(is_match)
         };
 
@@ -1302,6 +1709,13 @@ impl AnalyzeOpts {
     /// return whether it met the target with the stack at schedule position
     /// `position`: a replayed event, or, at `len`, the first event the
     /// scheduler ran after the prefix.
+    ///
+    /// The stack is requested by schedule position
+    /// (`--stacktrace-at-schedule-positions`), not by traced index: the trial
+    /// can observe events its schedule does not hold before `position`, such
+    /// as a polling retry the recording did not make, and a traced index
+    /// would then name a neighbouring event
+    /// (https://github.com/rrnewton/hermit/issues/4917).
     fn prefix_stack(
         &self,
         runname: &str,
@@ -1327,11 +1741,9 @@ impl AnalyzeOpts {
         continuation: MaybeTimeslice,
         trace_from: Option<u64>,
     ) -> anyhow::Result<(bool, Option<PrettyBacktrace>, Option<TracedReplay>)> {
-        let run = self.prefix_trial(runname, schedule, len, continuation)?;
+        let (run, stack_path) =
+            self.prefix_stack_trial(runname, schedule, len, position, continuation)?;
         let (mut run, request) = self.request_trace(run, "target", trace_from);
-        let stack_path = run.root_path().with_extension("stack");
-        run.runopts.det_opts.det_config.stacktrace_event =
-            vec![(position as u64, Some(stack_path.clone()))];
         let is_match = self.launch_prefix_trial(&mut run, RunData::launch)?;
         eprintln!(
             ":: {}\n{}",
@@ -1349,6 +1761,24 @@ impl AnalyzeOpts {
             request.ran(schedule.schedevents(), &realized, len)
         });
         Ok((is_match, stack, traced))
+    }
+
+    /// The prefix trial `prefix_stack` launches, and the file its stack goes
+    /// to: the stack at schedule `position`, requested by position.
+    fn prefix_stack_trial(
+        &self,
+        runname: &str,
+        schedule: &PreemptionRecord,
+        len: usize,
+        position: usize,
+        continuation: MaybeTimeslice,
+    ) -> anyhow::Result<(RunData, PathBuf)> {
+        let mut run = self.prefix_trial(runname, schedule, len, continuation)?;
+        let stack_path = run.root_path().with_extension("stack");
+        let config = &mut run.runopts.det_opts.det_config;
+        config.stacktrace_event = vec![(position as u64, Some(stack_path.clone()))];
+        config.stacktrace_at_schedule_positions = true;
+        Ok((run, stack_path))
     }
 
     /// The completed outcome and schedule of a prefix trial: the replayed
@@ -1494,6 +1924,7 @@ impl AnalyzeOpts {
             decision,
             continuation: timeslice,
         } = found;
+        self.progress.phase(Phase::StackTraces);
         let trace_from = self.race_trace_from(decision);
         let (target_met, chosen, target_trace) = stack(
             "final_target_for_stacktraces",
@@ -1510,8 +1941,8 @@ impl AnalyzeOpts {
             );
         }
         // The thread the scheduler runs at event #decision once the prefix
-        // ends. `--stacktrace-event` names a position of the replayed schedule
-        // only, so the prefix trial without event #decision runs first with its
+        // ends. A stack is requested by a position of the replayed schedule,
+        // so the prefix trial without event #decision runs first with its
         // schedule recorded, and the stack is taken from a replay of that
         // schedule's first decision + 1 events.
         let (completed, continued_path, mut baseline_trace) = continuation(
@@ -1647,6 +2078,7 @@ impl AnalyzeOpts {
             branch_counter_warning: self.branch_counter_warning.clone(),
             deciding_event: None,
             racing_accesses,
+            partial: None,
         }
     }
 
@@ -1695,7 +2127,7 @@ impl AnalyzeOpts {
     /// continuation of a record's first `len` events and `stack` each
     /// stack-trace replay (its name, record, length and the event to take
     /// the stack at), both giving completed outcomes or ending the analysis.
-    fn report_timing_decision_with<ContinueTarget, Stack>(
+    fn report_timing_decision_with<CT, S>(
         &self,
         schedule: &PreemptionRecord,
         decision: usize,
@@ -1706,16 +2138,15 @@ impl AnalyzeOpts {
             &Path,
             &mut Option<TracedReplay>,
         ),
-        (continue_target, stack): (ContinueTarget, Stack),
+        (continue_target, stack): (CT, S),
     ) -> anyhow::Result<Option<Report>>
     where
-        ContinueTarget:
-            FnOnce(
-                &PreemptionRecord,
-                usize,
-            )
-                -> anyhow::Result<(CompletedScheduleTrial, PathBuf, Option<TracedReplay>)>,
-        Stack: Fn(
+        CT: FnOnce(
+            &PreemptionRecord,
+            usize,
+        )
+            -> anyhow::Result<(CompletedScheduleTrial, PathBuf, Option<TracedReplay>)>,
+        S: Fn(
             &str,
             &PreemptionRecord,
             usize,
@@ -1805,16 +2236,14 @@ impl AnalyzeOpts {
                             end: usize,
                             expected: bool|
              -> anyhow::Result<Option<PrettyBacktrace>> {
-                if end == decision {
-                    // A slice of one event ends where it starts. Reuse the
-                    // captured deciding stack; no new replay has an outcome
-                    // to compare with the search.
-                    Ok(deciding.clone())
-                } else {
-                    let (observed, captured) = stack(runname, variant, end + 1, end)?;
-                    require_repeated_outcomes(&[(runname, expected, observed)], runname)?;
-                    Ok(captured)
-                }
+                // Even a one-event slice has this continuation's endpoint:
+                // its operation batch can differ from the target event's,
+                // including after a soft count mismatch in the target
+                // continuation itself. Capture it from its own record and
+                // check the outcome even when no stack was captured.
+                let (observed, captured) = stack(runname, variant, end + 1, end)?;
+                require_repeated_outcomes(&[(runname, expected, observed)], runname)?;
+                Ok(captured)
             };
             let with_end = stack_at(
                 "final_target_slice_end_for_stacktraces",
@@ -1924,6 +2353,7 @@ impl AnalyzeOpts {
                 stack: deciding.clone(),
             }),
             racing_accesses,
+            partial: None,
         }))
     }
 
@@ -1942,21 +2372,26 @@ impl AnalyzeOpts {
     }
 
     /// Write analyze's final on-target and baseline schedules, stamped
-    /// ([`Self::stamp_trial_record`]), and say where.
+    /// ([`Self::stamp_trial_record`]) and with the callback checkpoints of
+    /// the part each shares with one of `sources`, the search's endpoint
+    /// records ([`trial_record_from`](crate::analyze::rundata::trial_record_from)), and say where.
     pub fn write_final_schedules(
         &self,
         failing: Vec<SchedEvent>,
         failing_path: &Path,
         passing: Vec<SchedEvent>,
         passing_path: &Path,
+        sources: &[&PreemptionRecord],
     ) {
-        self.write_trial_schedule(failing, failing_path).unwrap();
+        self.write_trial_schedule_from(failing, sources, failing_path)
+            .unwrap();
         eprintln!(
             "Wrote final on-target ({}) schedule to {}",
             self.display_criteria(),
             failing_path.display()
         );
-        self.write_trial_schedule(passing, passing_path).unwrap();
+        self.write_trial_schedule_from(passing, sources, passing_path)
+            .unwrap();
         eprintln!(
             "Wrote final baseline (off-target) schedule to {}",
             passing_path.display()
@@ -2009,6 +2444,240 @@ impl AnalyzeOpts {
         Ok(workspace)
     }
 
+    /// Write the analysis's checkpoint into the new workspace and open its
+    /// journal and progress there (`checkpoint`). Without --analyze-seed,
+    /// the seed of analyze's own random choices is drawn here, once, and
+    /// recorded, so that a resume makes the same choices.
+    fn start_checkpoint(&mut self) -> anyhow::Result<()> {
+        if self.analyze_seed.is_none() {
+            self.analyze_seed = Some(rand::random());
+            self.analyze_seed_drawn = true;
+        }
+        let workspace = self.get_tmp()?.to_path_buf();
+        Checkpoint {
+            version: CHECKPOINT_VERSION,
+            hermit_version: crate::app::version::Version::get().to_owned(),
+            identity: self.identity()?,
+        }
+        .write(&workspace)?;
+        self.journal = Journal::open(&workspace)?;
+        self.progress.write_into(&workspace);
+        Ok(())
+    }
+
+    /// `--resume`: adopt the workspace `resumed` and its journal, after
+    /// checking that this invocation analyzes what the recorded one did. A
+    /// difference refuses (exit 122) and names each one.
+    fn phase0_resume(&mut self, resumed: &Path) -> anyhow::Result<Workspace> {
+        let refuse = |message: String| {
+            anyhow::Error::new(crate::app::container::PolicyRefusal).context(message)
+        };
+        let checkpoint = Checkpoint::read(resumed).map_err(|error| {
+            refuse(format!(
+                "{error:#}. To analyze anyway, run the same command without --resume: that \
+                 starts a new analysis (in a new workspace)."
+            ))
+        })?;
+        let recorded = &checkpoint.identity;
+        if self.analyze_seed.is_none() {
+            self.analyze_seed = Some(recorded.analyze_seed);
+        }
+        let now = self.identity()?;
+        let differences = recorded.differences(&now);
+        if !differences.is_empty() {
+            return Err(refuse(format!(
+                "hermit analyze cannot resume the analysis in {}: it was of something else, so the \
+                 outcomes its journal records do not apply. What differs:\n  - {}\nTo continue \
+                 anyway, run the same command without --resume: that starts a new analysis (in a \
+                 new workspace) and leaves this one as it is.",
+                resumed.display(),
+                differences.join("\n  - ")
+            )));
+        }
+        let workspace = Workspace::adopt(resumed, self.workspace_retention())?;
+        self.tmp_dir = Some(workspace.path().to_path_buf());
+        self.journal = Journal::open(workspace.path())?;
+        self.resumed_progress = Progress::read(workspace.path());
+        if let Some(earlier) = &self.resumed_progress {
+            self.progress.carry(earlier);
+        }
+        self.progress.write_into(workspace.path());
+        eprintln!(
+            ":: Resuming the analysis in {} (started by {}): {} runs are journaled, and each \
+             takes its recorded outcome instead of running again.",
+            workspace.path().display(),
+            checkpoint.hermit_version,
+            self.journal.len()
+        );
+        Ok(workspace)
+    }
+
+    /// Why the workspace stays, whatever its retention says, after the
+    /// analysis ended with `result`: a partial report gave the command that
+    /// continues it, or a resumed analysis did not finish, and its adopted
+    /// workspace holds an earlier invocation's journaled runs.
+    fn keep_workspace_because(&self, result: &anyhow::Result<ExitStatus>) -> Option<&'static str> {
+        if self.partial_report_written {
+            Some("a budget ended the analysis; --resume continues it, as the report above says")
+        } else if self.resume.is_some() && result.is_err() {
+            Some(
+                "a resumed analysis that does not finish keeps its workspace and journal; \
+                 --resume continues it again",
+            )
+        } else {
+            None
+        }
+    }
+
+    /// `--resume`, `--time-budget` and `--trial-budget` are refused with
+    /// `--image`, by name (exit 122). A resume admits only an analysis of the
+    /// same guest, and an image's guest cannot be shown to be that: the run
+    /// arguments name the image as given, and a tag can name another image by
+    /// the next invocation, while the program runs from the image's root, which
+    /// each run materializes, not from the host's. A budget is refused with it,
+    /// since the partial report a budget ends with is continued by a resume.
+    pub(crate) fn refuse_resume_with_image(&self) -> anyhow::Result<()> {
+        let runopts = RunData::raw_runopts(self);
+        let Some(image) = runopts.image() else {
+            return Ok(());
+        };
+        let given: Vec<&str> = [
+            (self.resume.is_some(), "--resume"),
+            (self.time_budget != budget::TimeBudget::Off, "--time-budget"),
+            (
+                self.trial_budget != budget::TrialBudget::Off,
+                "--trial-budget",
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(given, option)| given.then_some(option))
+        .collect();
+        let Some((last, others)) = given.split_last() else {
+            return Ok(());
+        };
+        let named = if others.is_empty() {
+            last.to_string()
+        } else {
+            format!("{} and {last}", others.join(", "))
+        };
+        Err(
+            anyhow::Error::new(crate::app::container::PolicyRefusal).context(format!(
+                "{named} is refused with --image={image}: a resumed analysis must find the guest \
+                 it analyzed unchanged, and hermit analyze cannot show that of an image's guest, \
+                 whose reference can name another image by the next invocation and whose \
+                 program runs from the image's root. Run the analysis with --image and no \
+                 budget, or without --image."
+            )),
+        )
+    }
+
+    /// What this analysis is of: what a resume must find unchanged.
+    fn identity(&self) -> anyhow::Result<Identity> {
+        let hermit = FileIdentity {
+            path: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/proc/self/exe")),
+            ..FileIdentity::of(Path::new("/proc/self/exe"))?
+        };
+        let runopts = RunData::raw_runopts(self);
+        // An `--image` guest's program runs from the image's root, so no host
+        // file identifies it (and a resume is refused, by
+        // `refuse_resume_with_image`).
+        let program = match runopts.image() {
+            Some(_) => None,
+            None => runopts
+                .program()
+                .and_then(find_program)
+                .map(|path| FileIdentity::of(&path))
+                .transpose()?,
+        };
+        let unset = || "unset".to_owned();
+        let target = vec![
+            (
+                "--target-stdout".to_owned(),
+                self.target_stdout
+                    .as_ref()
+                    .map_or_else(unset, |regex| regex.as_str().to_owned()),
+            ),
+            (
+                "--target-stderr".to_owned(),
+                self.target_stderr
+                    .as_ref()
+                    .map_or_else(unset, |regex| regex.as_str().to_owned()),
+            ),
+            (
+                "--target-exit-code".to_owned(),
+                format!("{:?}", self.target_exit_code),
+            ),
+        ];
+        let search = [
+            ("--search", self.search.to_string()),
+            ("--prefix-search", self.prefix_search.to_string()),
+            ("--minimize", self.minimize.to_string()),
+            ("--run-needleman", self.run_needleman.to_string()),
+            ("--imprecise-search", self.imprecise_search.to_string()),
+            ("--selfcheck", self.selfcheck.to_string()),
+            ("--run1-seed", format!("{:?}", self.run1_seed)),
+            ("--run2-seed", format!("{:?}", self.run2_seed)),
+            ("--jitter-dist", format!("{:?}", self.jitter_dist)),
+            (
+                "--continuation-timeslice",
+                format!("{:?}", self.continuation_timeslice),
+            ),
+            ("--trial-timeout", format!("{:?}", self.trial_timeout)),
+            ("--max-log-bytes", format!("{:?}", self.max_log_bytes)),
+            ("--backend", format!("{:?}", self.backend)),
+        ]
+        .into_iter()
+        .map(|(option, value)| (option.to_owned(), value))
+        .collect();
+        let mut records = Vec::new();
+        for (option, path) in [
+            ("--run1-preemptions", &self.run1_preemptions),
+            ("--run2-preemptions", &self.run2_preemptions),
+            ("--run1-schedule", &self.run1_schedule),
+            ("--run2-schedule", &self.run2_schedule),
+        ] {
+            if let Some(path) = path {
+                records.push((option.to_owned(), FileIdentity::of(path)?));
+            }
+        }
+        // An `--image` guest's environment and directory come from the image's
+        // config, which a run materializes, and its command from an
+        // Entrypoint/Cmd not resolved here; a resume is refused with it
+        // (`refuse_resume_with_image`), so none are taken.
+        let (guest_env, guest_cwd) = match runopts.image() {
+            Some(_) => (Vec::new(), None),
+            None => {
+                let (guest_env, guest_cwd) = runopts.guest_inputs()?;
+                let guest_env = guest_env
+                    .iter()
+                    .map(|(name, value)| {
+                        (
+                            environment_name(name),
+                            detcore::Digest::new(std::os::unix::ffi::OsStrExt::as_bytes(
+                                value.as_os_str(),
+                            ))
+                            .to_string(),
+                        )
+                    })
+                    .collect();
+                (guest_env, Some(guest_cwd))
+            }
+        };
+        Ok(Identity {
+            hermit,
+            program,
+            run_args: self.run_arg.iter().chain(&self.run_args).cloned().collect(),
+            guest_env,
+            guest_cwd,
+            target,
+            search,
+            records,
+            analyze_seed: self
+                .analyze_seed
+                .context("the analyze seed is set before the identity is taken")?,
+        })
+    }
+
     /// What becomes of analyze's workspace: kept with `--keep-tmp`, and with
     /// `--verbose`, whose per-run logs are in it for the user to read;
     /// removed otherwise.
@@ -2029,7 +2698,7 @@ impl AnalyzeOpts {
     /// Create our workspace and verify the input run matches the criteria, or find one that does.
     /// Returns the results of the target run.
     fn phase1_establish_target_run(&mut self) -> Result<RunData, Error> {
-        let mut run1data = RunData::new_run1_target(self, "run1_target".to_string())?;
+        let run1data = RunData::new_run1_target(self, "run1_target".to_string())?;
         eprintln!(
             // `to_repro` is already a complete `hermit ... run ...` command.
             ":: {} {}",
@@ -2037,28 +2706,30 @@ impl AnalyzeOpts {
             run1data.to_repro()
         );
 
-        if let Some(p) = &self.run1_preemptions {
-            let preempts_path = run1data.preempts_path_out();
-            // Copy preempts to the output location as though they were recorded by this run:
-            std::fs::copy(p, preempts_path).expect("copy file to succeed");
-            if self.trial_timeout == TrialTimeout::Auto {
-                eprintln!(
-                    ":: --run1-preemptions runs no target run to measure, so runs are not \
-                     bounded until analyze replays the record to verify it (not every search \
-                     does); pass --trial-timeout=SECONDS to bound every trial."
-                );
-            }
-            // Careful, returning a NON-launched RunData just to contain the output path.
-            return Ok(run1data);
-        }
-
-        // Translate the seed into a set of preemptions we can work from.
+        // Run the target, from its seed or by replaying --run1-preemptions, and
+        // record the preemptions and schedule the search works from. A replay
+        // of the record is the target run like a seed's: it is measured for the
+        // trial bound, and --selfcheck compares its log.
         let mut run1data = run1data.with_preemption_recording();
         run1data.launch()?;
         self.record_endpoint(&run1data);
 
         if !run1data.is_a_match() {
-            let target = self.after_a_first_run_that_missed(|| self.do_search())?;
+            if let Some(record) = &self.run1_preemptions {
+                bail!(
+                    "the replay of --run1-preemptions {} did not meet the target criteria ({}). \
+                     A record replays the same only under the run arguments it was recorded \
+                     with (after `--`), --seed included: it sets the guest's random and fuzz \
+                     seeds and is not stored in the record. --search does not apply to a record; \
+                     to search, pass --run1-seed.",
+                    record.display(),
+                    self.display_criteria()
+                );
+            }
+            let target = self.after_a_first_run_that_missed(|| {
+                self.progress.phase(Phase::SearchForTarget);
+                self.do_search()
+            })?;
             self.record_endpoint(&target);
             Ok(target)
         } else if self.has_filters() {
@@ -2092,6 +2763,7 @@ impl AnalyzeOpts {
     ) -> anyhow::Result<RunData> {
         if self.minimize {
             // In this scenario we need to work with preemptions.
+            self.progress.phase(Phase::Minimize);
 
             let preempts_path = last_run.preempts_path_out();
             let (min_pr, min_pr_path, min_log_path) = self.minimize(preempts_path, global)?;
@@ -2154,6 +2826,7 @@ impl AnalyzeOpts {
         let min_preempts_path = min_run.preempts_path_out().to_path_buf();
 
         if self.selfcheck {
+            self.progress.phase(Phase::Selfcheck);
             yellow_msg("[selfcheck] Verifying target run preserved under preemption-replay");
 
             let runname = "run1b_selfcheck";
@@ -2202,6 +2875,7 @@ impl AnalyzeOpts {
         &mut self,
         matching_pr: PreemptionRecord,
     ) -> anyhow::Result<RunData> {
+        self.progress.phase(Phase::Baseline);
         if self.minimize {
             // Enforced by the clap conflicts_with annotations:
             assert!(self.run2_seed.is_none());
@@ -2274,18 +2948,29 @@ impl AnalyzeOpts {
     }
 
     /// Perform the binary search through schedule-space, identifying critical events.
+    ///
+    /// Each trial replays its schedule with the callback checkpoints of the
+    /// part it shares with the `target` or `baseline` record
+    /// ([`trial_record_from`](crate::analyze::rundata::trial_record_from)):
+    /// an endpoint replayed whole keeps all of them, and a spliced schedule
+    /// keeps those its unchanged prefix reaches, so its slices end where the
+    /// recording's did up to the first edit.
     pub fn phase5_bisect_traces(
         &self,
-        target: &[SchedEvent],
-        baseline: &[SchedEvent],
+        target: &PreemptionRecord,
+        baseline: &PreemptionRecord,
     ) -> anyhow::Result<CriticalSchedule> {
-        self.phase5_bisect_traces_with(target, baseline, |i, sched| {
+        self.phase5_bisect_traces_with(target.schedevents(), baseline.schedevents(), |i, sched| {
             let runname = format!("bisect_round_{:0wide$}", i, wide = 3);
             let mut newrun = RunData::new_baseline(self, runname)?
                 .with_schedule_replay() // Default input path
                 .with_schedule_recording(); // Default output path
             // Prepare the next synthetic schedule on disk:
-            self.write_trial_schedule(sched.to_owned(), newrun.sched_path_in())?;
+            self.write_trial_schedule_from(
+                sched.to_owned(),
+                &[target, baseline],
+                newrun.sched_path_in(),
+            )?;
 
             if self.verbose {
                 eprintln!(
@@ -2327,12 +3012,16 @@ impl AnalyzeOpts {
         baseline: &[SchedEvent],
         mut launch: impl FnMut(usize, &[SchedEvent]) -> anyhow::Result<CompletedScheduleTrial>,
     ) -> anyhow::Result<CriticalSchedule> {
-        let mut i = 0;
+        self.progress.phase(Phase::Bisect);
+        let endpoints = events_digest(&[baseline, target]);
+        let resumed = self.resumable_interval(&endpoints);
+        let resume = resumed.as_ref().map(|(resume, ..)| resume);
+        let trials = Cell::new(resume.map_or(0, |resume| resume.trials));
         // Unfinished trials have no observed outcome or realized trace. Keep
         // the typed error and the last completed endpoints by ending the search.
         let test_fn = |sched: &[SchedEvent]| -> TrialOutcome {
-            i += 1;
-            let completed = launch(i, sched)?;
+            trials.set(trials.get() + 1);
+            let completed = launch(trials.get(), sched)?;
             if completed.target_met {
                 eprintln!(" => Target condition ({})", self.display_criteria());
             } else {
@@ -2342,10 +3031,54 @@ impl AnalyzeOpts {
             Ok((!completed.target_met, completed.schedule))
         };
 
-        let target = target.to_vec(); // TODO: have search_for_critical_schedule borrow only.
-        let baseline = baseline.to_vec();
+        // Only an analysis that journals keeps its interval (`hermit bisect`
+        // keeps every trial's schedules anyway).
+        let mut interval = if self.journal.is_on() {
+            Some(IntervalFiles::new(self.get_tmp()?))
+        } else {
+            None
+        };
+        if let Some(interval) = &mut interval
+            && resumed.is_none()
+        {
+            interval.record(self, None, [baseline, target], None, None);
+        }
+        // TODO: have search_for_critical_schedule borrow only.
+        let (start, baseline, target) = match resumed {
+            Some((resume, pass, passing, failing)) => (
+                SearchStart::Interval {
+                    pass,
+                    event_level: resume.event_level,
+                },
+                passing,
+                failing,
+            ),
+            None => (SearchStart::Endpoints, baseline.to_vec(), target.to_vec()),
+        };
         let cfg = self.bisect_config();
-        let crit = search_for_critical_schedule(test_fn, baseline, target, &cfg)?;
+        let crit = search_for_critical_schedule_observed(
+            test_fn,
+            baseline,
+            target,
+            &cfg,
+            start,
+            &mut |at| {
+                if let Some(interval) = &mut interval {
+                    let state = SearchState {
+                        endpoints: endpoints.clone(),
+                        event_level: at.event_level,
+                        trials: trials.get(),
+                    };
+                    interval.record(
+                        self,
+                        Some(at.pass),
+                        [at.passing, at.failing],
+                        Some((at.edit_distance, at.swap_distance)),
+                        Some(state),
+                    );
+                }
+            },
+        )?;
         eprintln!(
             "Critical event of final on-target schedule is {}",
             crit.critical_event_index
@@ -2356,18 +3089,75 @@ impl AnalyzeOpts {
         Ok(crit)
     }
 
+    /// `--resume`: the interval the earlier invocation's search had reached
+    /// between `endpoints` (`events_digest` of the baseline and target
+    /// schedules), with its pass and its two schedules, if the progress
+    /// names one whose files are whole. The search restarts there: its
+    /// trials keep no schedules, so the journal alone could not bring it
+    /// back to that pass. With no such interval it starts over, and the
+    /// journal answers what it can.
+    fn resumable_interval(
+        &self,
+        endpoints: &str,
+    ) -> Option<(IntervalResume, usize, Vec<SchedEvent>, Vec<SchedEvent>)> {
+        let interval = self.resumed_progress.as_ref()?.interval.as_ref()?;
+        let (Some(pass), Some(resume)) = (interval.pass, interval.resume.clone()) else {
+            return None;
+        };
+        let load = |path: &Path, hash: &str| match PreemptionReader::try_new(path) {
+            Ok(reader) => {
+                let events = reader.into_inner().into_global();
+                (events_digest(&[&events]) == hash).then_some(events)
+            }
+            Err(error) => {
+                eprintln!(
+                    ":: The earlier invocation's interval schedule {} cannot be read: {error:#}.",
+                    path.display()
+                );
+                None
+            }
+        };
+        let loaded = (resume.endpoints == endpoints)
+            .then(|| {
+                Some((
+                    load(&interval.passing, &resume.passing_hash)?,
+                    load(&interval.failing, &resume.failing_hash)?,
+                ))
+            })
+            .flatten();
+        let Some((passing, failing)) = loaded else {
+            eprintln!(
+                ":: The earlier invocation's search interval (pass {pass}) is not this search's, \
+                 or its schedules are not whole; the search starts from its endpoints."
+            );
+            return None;
+        };
+        eprintln!(
+            ":: Resuming the search at pass {pass}, from the interval the earlier invocation \
+             reached ({} and {} events, {}); its {} trials do not run again.",
+            passing.len(),
+            failing.len(),
+            interval.edit_distance.map_or_else(
+                || "distance not measured".to_owned(),
+                |edit| format!("edit distance {edit}")
+            ),
+            resume.trials,
+        );
+        Some((resume, pass, passing, failing))
+    }
+
     /// Bisect a known passing/failing schedule pair and report the critical event ordering.
     pub fn bisect_schedule_pair(
         &mut self,
-        good: Vec<SchedEvent>,
-        bad: Vec<SchedEvent>,
+        good: PreemptionRecord,
+        bad: PreemptionRecord,
     ) -> anyhow::Result<ExitStatus> {
         // Bisect keeps its workspace, and says where when it exits.
         let _workspace = self.phase0_initialize(Retention::Keep { because: None })?;
         eprintln!(
             ":: Beginning schedule bisection using good/bad endpoints ({} / {} events)",
-            good.len(),
-            bad.len(),
+            good.schedevents().len(),
+            bad.schedevents().len(),
         );
 
         let critical = self.phase5_bisect_traces(&bad, &good)?;
@@ -2387,7 +3177,7 @@ impl AnalyzeOpts {
             "  critical event  #{index}: {}",
             critical.failing_schedule[index]
         );
-        let report = self.phase6_record_outputs(critical, None)?;
+        let report = self.phase6_record_outputs(critical, &[&bad, &good], None)?;
         println!("Swapping these adjacent events reproduces the good outcome.");
         if let Some(path) = &self.report_file {
             let text = serde_json::to_string_pretty(&report)?;
@@ -2430,9 +3220,10 @@ impl AnalyzeOpts {
     pub fn phase6_record_outputs(
         &self,
         crit: CriticalSchedule,
+        sources: &[&PreemptionRecord],
         target_run: Option<&Path>,
     ) -> Result<Report, Error> {
-        self.phase6_record_outputs_with(crit, target_run, RunData::launch)
+        self.phase6_record_outputs_with(crit, sources, target_run, RunData::launch)
     }
 
     /// [`Self::phase6_record_outputs`], with `launch` running each
@@ -2440,6 +3231,7 @@ impl AnalyzeOpts {
     fn phase6_record_outputs_with(
         &self,
         crit: CriticalSchedule,
+        sources: &[&PreemptionRecord],
         target_run: Option<&Path>,
         launch: impl Fn(&mut RunData) -> anyhow::Result<()>,
     ) -> Result<Report, Error> {
@@ -2449,6 +3241,7 @@ impl AnalyzeOpts {
             passing_schedule,
             critical_event_index,
         } = crit;
+        self.progress.phase(Phase::StackTraces);
 
         let runname1 = "final_target_for_stacktraces";
         let runname2 = "final_baseline_for_stacktraces";
@@ -2471,6 +3264,7 @@ impl AnalyzeOpts {
             &final_failing_path,
             passing_schedule.clone(),
             &final_passing_path,
+            sources,
         );
 
         let mut header = String::new();
@@ -2648,6 +3442,7 @@ impl AnalyzeOpts {
             branch_counter_warning: self.branch_counter_warning.clone(),
             deciding_event: None,
             racing_accesses,
+            partial: None,
         })
     }
 
@@ -2675,6 +3470,7 @@ impl AnalyzeOpts {
         self.refuse_outputs_trials_overwrite()?;
         self.refuse_unqualified_trial_timeout()?;
         self.refuse_unenforceable_trial_timeout()?;
+        self.refuse_resume_with_image()?;
         self.install_trial_pmu_config()?;
         self.admit_branch_counter(&mut crate::app::tracing::write_stderr_diagnostic)?;
         if let Some(notice) =
@@ -2713,6 +3509,7 @@ impl AnalyzeOpts {
         .into_iter()
         .filter_map(|(option, path)| Some((option, path?)))
         .collect();
+        Self::refuse_recordings_numbered_apart(&recordings)?;
         self.adopt_recorded_epoch(&recordings)?;
         // Every trial charges expired timed waits as the target did.
         self.adopt_expired_wait_charge(run1.as_deref())?;
@@ -2721,7 +3518,8 @@ impl AnalyzeOpts {
         // Every trial runs under the timeslice its recordings drew.
         self.adopt_recorded_timeslice(&recordings)?;
         self.refuse_unsound_continuation_timeslice()?;
-        self.refuse_recordings_under_another_pipe_wake_latency(&recordings)
+        self.refuse_recordings_under_another_pipe_wake_latency(&recordings)?;
+        self.prepare_trial_guest_ids(&recordings)
     }
 
     /// Take the settings `analyze` inherits from the global options: every
@@ -2735,13 +3533,22 @@ impl AnalyzeOpts {
     }
 
     pub fn main(&mut self, global: &GlobalOpts) -> anyhow::Result<ExitStatus> {
+        // The budget counts from here, before anything that takes time.
+        self.budget = Budget::new(self.time_budget, self.trial_budget);
         self.prepare(global)?;
         let _watchdog = self.max_memory.enforce("hermit analyze")?;
         // From here SIGTERM, SIGINT and SIGHUP end the run in progress and
         // the analysis, which then removes what it created like any other
         // ending, and the process dies of the signal (`raise_or_exit`).
         let stop_signals = StopSignals::install()?;
-        let mut workspace = self.phase0_initialize(self.workspace_retention())?;
+        let mut workspace = match self.resume.clone() {
+            Some(resumed) => self.phase0_resume(&resumed)?,
+            None => {
+                let workspace = self.phase0_initialize(self.workspace_retention())?;
+                self.start_checkpoint()?;
+                workspace
+            }
+        };
         let result = self.analyze(global);
         // An analysis that ends with an error keeps its workspace: the error
         // can name trial files and diagnostics in it (`incomplete_trial`, and
@@ -2750,8 +3557,12 @@ impl AnalyzeOpts {
         if let Err(error) = &result
             && error.downcast_ref::<Stopped>().is_none()
             && stop::check().is_ok()
+            && self.workspace_retention() == Retention::Remove
         {
             workspace.keep("the error above can name files in it");
+        }
+        if let Some(because) = self.keep_workspace_because(&result) {
+            workspace.keep(because);
         }
         drop(workspace);
         // Restored before the last check, so a signal from here on has its
@@ -2769,8 +3580,330 @@ impl AnalyzeOpts {
         Ok(ExitStatus::Signaled(signal, false))
     }
 
-    /// The analysis, in the workspace phase 0 created.
+    /// The analysis, in the workspace phase 0 created; a partial report
+    /// (exit 120) when a budget ends it first.
     fn analyze(&mut self, global: &GlobalOpts) -> anyhow::Result<ExitStatus> {
+        let result = self.analyze_steps(global);
+        self.end_on_budget(result)
+    }
+
+    /// `result`, or the partial report when a budget ended the analysis.
+    fn end_on_budget(&mut self, result: anyhow::Result<ExitStatus>) -> anyhow::Result<ExitStatus> {
+        match result {
+            Err(error) => match error.downcast::<BudgetExpired>() {
+                Ok(expired) => self.report_partial(expired),
+                Err(error) => Err(error),
+            },
+            done => done,
+        }
+    }
+
+    /// The report of an analysis a budget ended: why and where it stopped,
+    /// its best answer so far from the progress (`checkpoint`), the stacks of
+    /// the default search's pair when two replays fit the grace period, and
+    /// how to continue. Exits [`hermit::HERMIT_ANALYZE_PARTIAL_EXIT`].
+    fn report_partial(&mut self, expired: BudgetExpired) -> anyhow::Result<ExitStatus> {
+        let progress = self.progress.snapshot();
+        let workspace = self.get_tmp()?.to_path_buf();
+        let budget = self.budget.clone();
+        let elapsed = budget.elapsed();
+        let in_workspace = |path: &Path| {
+            path.strip_prefix(&workspace)
+                .unwrap_or(path)
+                .display()
+                .to_string()
+        };
+
+        let mut header = format!(
+            "PARTIAL RESULT. hermit analyze reached its {}{} after {} s, while {}, so what \
+             follows is its best answer so far, not the critical events.\n",
+            expired.kind.option(),
+            match expired.kind {
+                BudgetKind::TimeBudget =>
+                    budget
+                        .time_limit()
+                        .map_or_else(String::new, |limit| format!(
+                            " ({})",
+                            budget::describe(limit)
+                        )),
+                BudgetKind::TrialBudget => budget
+                    .trial_limit()
+                    .map_or_else(String::new, |limit| format!(" ({limit} runs)")),
+            },
+            elapsed.as_secs(),
+            progress.phase.describe(),
+        );
+        if let Some(run) = &expired.cut {
+            header.push_str(&format!(
+                "The budget cut {run} short; its outcome is not counted, and a resumed analysis \
+                 runs it again.\n"
+            ));
+        }
+        let mut replay_commands = Vec::new();
+        let mut critical = [None, None];
+        let mut stacks =
+            "not applicable: the default search had no pair of schedules yet".to_owned();
+        // The event the report's structured fields name: where the default
+        // search's closest pair first differs, while it searches. Otherwise
+        // they are left out.
+        let critical_index = match &progress.interval {
+            Some(interval) if progress.phase == Phase::Bisect => Some(interval.common_prefix),
+            _ => None,
+        };
+        if progress.phase == Phase::StackTraces {
+            // Only the final replays, once they repeat the search's outcomes,
+            // let analyze report what the search found.
+            header.push_str(
+                "The search had finished, but its final replays, which must repeat its outcomes \
+                 before analyze reports a decision, did not finish within the budget, so this \
+                 report names none; --resume runs them.\n",
+            );
+            stacks = "not taken: the budget ran out during the final replays; --resume takes them"
+                .to_owned();
+        } else if let Some(interval) = &progress.interval
+            && progress.phase == Phase::Bisect
+        {
+            header.push_str(&format!(
+                "The closest pair the default search found{}: a schedule whose replay misses the \
+                 target ({}, {} events) and one whose replay meets it ({}, {} events){}. ",
+                match interval.pass {
+                    Some(pass) => format!(" in {} passes", pass),
+                    None => " (its endpoint runs; the search had not replayed them yet)".to_owned(),
+                },
+                in_workspace(&interval.passing),
+                interval.passing_events,
+                in_workspace(&interval.failing),
+                interval.failing_events,
+                match (interval.edit_distance, interval.swap_distance) {
+                    (Some(edit), Some(swap)) => {
+                        format!(", at edit distance {edit} and swap distance {swap}")
+                    }
+                    _ => String::new(),
+                },
+            ));
+            header.push_str(&format!(
+                "They agree on their first {} events, so the deciding event is event #{} or a \
+                 later one: {}.\n",
+                interval.common_prefix,
+                interval.common_prefix,
+                match (&interval.passing_event, &interval.failing_event) {
+                    (Some(passing), Some(failing)) => format!(
+                        "there the passing schedule runs {passing}, and the failing one {failing}"
+                    ),
+                    _ => "there one of them has already ended".to_owned(),
+                }
+            ));
+            for (which, path) in [
+                ("passing", &interval.passing),
+                ("failing", &interval.failing),
+            ] {
+                // Each its own name, so that the two can run at once.
+                replay_commands.push(
+                    RunData::new_baseline(self, format!("interval_{which}_replay"))?
+                        .with_schedule_replay_from(path.clone())
+                        .to_repro(),
+                );
+            }
+            let taken;
+            (critical, taken) = self.partial_stacks(interval);
+            stacks = taken;
+            header.push_str(&format!("Stack traces: {stacks}.\n"));
+        } else if let Some(bracket) = &progress.bracket
+            && progress.phase == Phase::PrefixSearch
+        {
+            stacks = "not taken: a prefix search's bracket names a range of events".to_owned();
+            header.push_str(&describe_bracket(bracket));
+            for run in [&bracket.misses_run, &bracket.meets_run]
+                .into_iter()
+                .flatten()
+            {
+                if let Ok(command) =
+                    std::fs::read_to_string(workspace.join(run).with_extension("repro"))
+                {
+                    replay_commands.push(command.trim_end().to_owned());
+                }
+            }
+        } else {
+            header.push_str(
+                "The analysis had not reached its search yet, so there is no pair of schedules or \
+                 bracket to report.\n",
+            );
+        }
+        let runs_from_journal = self.journal.answered();
+        header.push_str(&format!(
+            "This invocation started {} runs{}.\n",
+            budget.trials_started(),
+            if runs_from_journal > 0 {
+                format!(" and took {runs_from_journal} from the journal of an earlier one")
+            } else {
+                String::new()
+            }
+        ));
+        let resume_command = resume_command(&workspace);
+        header.push_str(&format!(
+            "The workspace is kept: {}\nContinue the analysis with (add a budget to bound it \
+             again):\n  {resume_command}\n",
+            workspace.display()
+        ));
+
+        let [critical1, critical2] = critical;
+        let report = Report {
+            verdict: Verdict::Partial,
+            verdict_reason: None,
+            header: header.clone(),
+            additional_context: String::new(),
+            baseline_run: true,
+            critical_event1: critical_index.map(|event_index| ReportCriticalEvent {
+                event_index,
+                stack: critical1,
+            }),
+            critical_event2: critical_index.map(|event_index| ReportCriticalEvent {
+                event_index,
+                stack: critical2,
+            }),
+            branch_counter_warning: self.branch_counter_warning.clone(),
+            deciding_event: None,
+            racing_accesses: None,
+            partial: Some(PartialReport {
+                reason: expired.kind,
+                phase: progress.phase,
+                elapsed_seconds: elapsed.as_secs(),
+                time_budget_seconds: budget.time_limit().map(|limit| limit.as_secs()),
+                runs_started: budget.trials_started(),
+                trial_budget: budget.trial_limit(),
+                runs_from_journal,
+                cut_run: expired.cut.clone(),
+                interval: progress.interval.clone(),
+                bracket: progress.bracket.clone(),
+                stacks,
+                replay_commands,
+                workspace: workspace.clone(),
+                resume_command,
+            }),
+        };
+        println!(
+            "\n------------------------- hermit analyze report (PARTIAL) -------------------------"
+        );
+        if let Some(warning) = &self.branch_counter_warning {
+            println!("{warning}");
+        }
+        println!("{header}");
+        for (event, schedule) in [
+            (&report.critical_event1, "passing"),
+            (&report.critical_event2, "failing"),
+        ] {
+            if let Some(ReportCriticalEvent {
+                event_index,
+                stack: Some(stack),
+            }) = event
+            {
+                println!("The {schedule} schedule's thread at event #{event_index}:");
+                println!("{stack}");
+            }
+        }
+        note(&format!(
+            "HERMIT_ANALYZE_PARTIAL class={} phase={} workspace={}",
+            expired.kind.class(),
+            serde_json::to_value(progress.phase)
+                .ok()
+                .and_then(|phase| phase.as_str().map(str::to_owned))
+                .unwrap_or_default(),
+            workspace.display()
+        ));
+        if let Some(path) = &self.report_file {
+            std::fs::write(path, serde_json::to_string(&report)?)
+                .with_context(|| format!("cannot write the report to {}", path.display()))?;
+            eprintln!(
+                ":: {}\n {}",
+                "Partial analysis report written to:".yellow().bold(),
+                path.display()
+            );
+        }
+        self.partial_report_written = true;
+        Ok(ExitStatus::Exited(hermit::HERMIT_ANALYZE_PARTIAL_EXIT))
+    }
+
+    /// The stacks of the threads the two schedules of the default search's
+    /// `interval` run at the first event at which they differ, and what the
+    /// report says about them. They are taken only when two replays as slow
+    /// as the slowest endpoint run fit the grace period after the budget ran
+    /// out ([`Budget::stack_grace`]), and each replay is bounded by what is
+    /// left of it.
+    fn partial_stacks(&self, interval: &BisectInterval) -> ([Option<PrettyBacktrace>; 2], String) {
+        let grace = self.budget.stack_grace();
+        let fits = self
+            .endpoints
+            .slowest
+            .is_some_and(|slowest| slowest * 2 <= grace);
+        if !fits {
+            return (
+                [None, None],
+                format!(
+                    "not taken: two replays as slow as the slowest endpoint run ({}) do not fit \
+                     the grace period of {} s after the budget ran out (min(120 s, 5% of \
+                     --time-budget)); the replay commands below take them",
+                    self.endpoints
+                        .slowest
+                        .map_or("not measured".to_owned(), |slowest| format!(
+                            "{} s",
+                            slowest.as_secs()
+                        )),
+                    grace.as_secs()
+                ),
+            );
+        }
+        self.budget.open_grace(grace);
+        let mut stacks = [None, None];
+        let mut missing = Vec::new();
+        for (slot, (which, path)) in [
+            ("passing", &interval.passing),
+            ("failing", &interval.failing),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let taken = (|| -> anyhow::Result<Option<PrettyBacktrace>> {
+                let mut run = RunData::new_baseline(self, format!("partial_{which}_stack"))?
+                    .with_schedule_replay_from(path.clone());
+                let stack_path = run.root_path().with_extension("stack");
+                run.runopts.det_opts.det_config.stacktrace_event =
+                    vec![(interval.common_prefix as u64, Some(stack_path.clone()))];
+                match run.launch() {
+                    Ok(()) => {}
+                    Err(error) if error.downcast_ref::<RunTimeoutMarker>().is_some() => {}
+                    Err(error) => return Err(error),
+                }
+                Ok(File::open(&stack_path)
+                    .ok()
+                    .and_then(|file| serde_json::from_reader(file).ok()))
+            })();
+            match taken {
+                Ok(Some(stack)) => stacks[slot] = Some(stack),
+                Ok(None) => missing.push(format!("the {which} replay left no stack there")),
+                Err(error) if error.downcast_ref::<BudgetExpired>().is_some() => {
+                    missing.push(format!(
+                        "the {which} replay did not fit the grace period of {} s",
+                        grace.as_secs()
+                    ));
+                }
+                Err(error) => missing.push(format!("the {which} replay failed: {error:#}")),
+            }
+        }
+        self.budget.close_grace();
+        let said = if missing.is_empty() {
+            format!(
+                "taken from replays of both schedules within the grace period of {} s",
+                grace.as_secs()
+            )
+        } else {
+            format!("partly or not taken: {}", missing.join("; "))
+        };
+        (stacks, said)
+    }
+
+    /// The analysis, in the workspace phase 0 created.
+    fn analyze_steps(&mut self, global: &GlobalOpts) -> anyhow::Result<ExitStatus> {
+        self.progress.phase(Phase::TargetRun);
         {
             let dummy = RunData::new_baseline(self, "dummy".to_string())?;
             if !dummy.runopts.det_opts.det_config.chaos {
@@ -2827,19 +3960,24 @@ impl AnalyzeOpts {
 
         let baseline_sched_name = baseline_endpoint_run.sched_out_file_name();
         let target_sched_name = target_endpoint_run.sched_out_file_name();
-        let target = target_endpoint_run.sched_out()?;
-        let baseline = baseline_endpoint_run.sched_out()?;
+        target_endpoint_run.require_complete_output()?;
+        baseline_endpoint_run.require_complete_output()?;
+        let target = target_endpoint_run.preempts_out().clone();
+        let baseline = baseline_endpoint_run.preempts_out().clone();
 
         eprintln!(
             ":: {} (event lengths {} / {}): {} {}",
             "Beginning bisection using endpoints".yellow().bold(),
-            baseline.len(),
-            target.len(),
+            baseline.schedevents().len(),
+            target.schedevents().len(),
             baseline_sched_name,
             target_sched_name,
         );
-        let crit_sched = match own_bisection_end(self.phase5_bisect_traces(target, baseline))? {
+        let crit_sched = match own_bisection_end(self.phase5_bisect_traces(&target, &baseline))? {
             OwnBisectionEnd::Critical(crit_sched) => crit_sched,
+            // The two endpoints differ in events only one run executed: the
+            // decision is still within the failing schedule, and a prefix
+            // search needs no baseline to find it.
             OwnBisectionEnd::SearchPrefixes(error) => {
                 eprintln!(
                     ":: {} {error:#}\n:: Searching within the failing schedule instead \
@@ -2851,7 +3989,8 @@ impl AnalyzeOpts {
         };
 
         let target_run = target_endpoint_run.root_path();
-        let report = self.phase6_record_outputs(crit_sched, Some(&target_run))?;
+        let report =
+            self.phase6_record_outputs(crit_sched, &[&target, &baseline], Some(&target_run))?;
         self.write_report_and_exit(report)
     }
 
@@ -3054,6 +4193,7 @@ impl AnalyzeOpts {
             branch_counter_warning: self.branch_counter_warning.clone(),
             deciding_event: None,
             racing_accesses: None,
+            partial: None,
         });
         eprintln!("{}", verdict.class_line());
         self.success_status()
@@ -3106,6 +4246,7 @@ impl AnalyzeOpts {
         } else {
             // Verify that the new preemption record does in fact now cause a matching execution,
             // and rerecord during this verification with full recording that include sched events
+            self.progress.phase(Phase::TargetSchedule);
             yellow_msg(
                 "Verify target endpoint preemption record causes criteria to hold and record sched events",
             );
@@ -3186,11 +4327,17 @@ impl AnalyzeOpts {
         &self,
         mut launch: impl FnMut(u64, u64) -> Result<Option<RunData>, Error>,
     ) -> Result<RunData, Error> {
-        let search_seed = self.analyze_seed.unwrap_or_else(|| {
-            let seed: u64 = rand::random();
-            yellow_msg(&format!("WARNING: performing --search with system randomness, use --analyze-seed={} to repro.", seed));
-            seed
-        });
+        let search_seed = match self.analyze_seed {
+            Some(seed) if !self.analyze_seed_drawn => seed,
+            drawn => {
+                let seed = drawn.unwrap_or_else(rand::random);
+                yellow_msg(&format!(
+                    "WARNING: performing --search with system randomness, use --analyze-seed={} to repro.",
+                    seed
+                ));
+                seed
+            }
+        };
         yellow_msg(&format!("Failure search using RNG seed {}", search_seed));
         let mut rng = Pcg64Mcg::seed_from_u64(search_seed);
 
@@ -3406,7 +4553,7 @@ mod tests {
             let mut options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
             options.tmp_dir = Some(dir.path().to_path_buf());
             let error = options
-                .phase6_record_outputs_with(critical(&[1, 2, 1, 2], 2), None, |run| {
+                .phase6_record_outputs_with(critical(&[1, 2, 1, 2], 2), &[], None, |run| {
                     let met = if run.name() == "final_target_for_stacktraces" {
                         target_met
                     } else {
@@ -3651,10 +4798,10 @@ mod tests {
         }
     }
 
-    /// A one-event slice reuses the already-captured deciding stack. There
-    /// is no new slice-end replay whose outcome could be true or false.
+    /// A one-event slice still belongs to its own continuation. Capture both
+    /// endpoints and retain the separately labelled original deciding stack.
     #[test]
-    fn timing_reports_reuse_single_event_stacks_without_inventing_an_outcome() {
+    fn timing_reports_capture_single_event_slices_from_their_own_records() {
         let options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
         for target_is_short in [false, true] {
             let (with, without, ends) = if target_is_short {
@@ -3677,7 +4824,9 @@ mod tests {
                         &mut None,
                     ),
                     (
-                        |_, _| {
+                        |seen, len| {
+                            assert_eq!(seen, &record);
+                            assert_eq!(len, 2);
                             Ok((
                                 CompletedScheduleTrial {
                                     target_met: true,
@@ -3687,38 +4836,46 @@ mod tests {
                                 None,
                             ))
                         },
-                        |runname, _, len, position| {
+                        |runname, variant, len, position| {
                             calls.borrow_mut().push(runname.to_owned());
-                            match runname {
+                            let (expected, end, met, stack) = match runname {
                                 "final_target_next_for_stacktraces" => {
-                                    assert_eq!((len, position), (ends[0] + 2, ends[0] + 1));
-                                    Ok((true, Some(timing_report_stack(7, 0x10))))
+                                    (&with, ends[0] + 1, true, timing_report_stack(7, 0x10))
                                 }
                                 "final_baseline_next_for_stacktraces" => {
-                                    assert_eq!((len, position), (ends[1] + 2, ends[1] + 1));
-                                    Ok((false, Some(timing_report_stack(5, 0x10))))
+                                    (&without, ends[1] + 1, false, timing_report_stack(5, 0x10))
                                 }
-                                "final_target_slice_end_for_stacktraces" => {
-                                    assert!(!target_is_short, "the target stack is reused");
-                                    assert_eq!((len, position), (4, 3));
-                                    Ok((true, Some(timing_report_stack(3, 0x30))))
-                                }
+                                "final_target_slice_end_for_stacktraces" => (
+                                    &with,
+                                    ends[0],
+                                    true,
+                                    timing_report_stack(
+                                        3,
+                                        if target_is_short { 0x20 } else { 0x30 },
+                                    ),
+                                ),
                                 "final_baseline_slice_end_for_stacktraces" => {
-                                    assert!(target_is_short, "the baseline stack is reused");
-                                    assert_eq!((len, position), (3, 2));
-                                    Ok((false, Some(timing_report_stack(3, 0x40))))
+                                    (&without, ends[1], false, timing_report_stack(3, 0x40))
                                 }
                                 other => panic!("unexpected replay {other}"),
-                            }
+                            };
+                            assert_eq!(variant.schedevents(), expected);
+                            assert_eq!((len, position), (end + 1, end));
+                            Ok((met, Some(stack)))
                         },
                     ),
                 )
                 .unwrap()
-                .expect("reusing a stack must not fabricate a contradictory replay");
+                .expect("each continuation certifies its own endpoint");
             assert_eq!(
-                calls.borrow().len(),
-                3,
-                "two next-thread and one slice-end replay"
+                *calls.borrow(),
+                [
+                    "final_target_next_for_stacktraces",
+                    "final_baseline_next_for_stacktraces",
+                    "final_target_slice_end_for_stacktraces",
+                    "final_baseline_slice_end_for_stacktraces",
+                ],
+                "two next-thread and two slice-end replays"
             );
             assert_eq!(
                 report.critical_event1.as_ref().unwrap().event_index,
@@ -3728,16 +4885,223 @@ mod tests {
                 report.critical_event2.as_ref().unwrap().event_index,
                 ends[1]
             );
-            let reused = if target_is_short {
-                &report.critical_event1.as_ref().unwrap().stack
-            } else {
-                &report.critical_event2.as_ref().unwrap().stack
-            };
-            assert!(same_frames(
-                reused.as_ref().unwrap(),
-                deciding.as_ref().unwrap()
-            ));
+            assert_eq!(
+                report.critical_event1.as_ref().unwrap().stack,
+                Some(timing_report_stack(
+                    3,
+                    if target_is_short { 0x20 } else { 0x30 }
+                ))
+            );
+            assert_eq!(
+                report.critical_event2.as_ref().unwrap().stack,
+                Some(timing_report_stack(3, 0x40))
+            );
+            assert_eq!(report.deciding_event.unwrap().stack, deciding);
         }
+    }
+
+    /// Completed, admitted checkpoint-free records can have one-event slices
+    /// at the same index but different operation batches. The target can also
+    /// realize a different count than the original deciding event. Model the
+    /// completed producer through the real file reader, not a native guest.
+    fn single_event_timing_report_for_test(
+        target_count: u32,
+        target_met: bool,
+        baseline_met: bool,
+        captured: bool,
+    ) -> (anyhow::Result<Option<Report>>, Vec<String>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
+        options.tmp_dir = Some(dir.path().to_path_buf());
+        let source =
+            PreemptionRecord::from_sched_events(branch_events(&[(5, 1), (3, 100), (7, 1), (5, 1)]));
+        source.validate().unwrap();
+        let with = branch_events(&[(5, 1), (3, target_count), (7, 1), (5, 1)]);
+        let without = branch_events(&[(5, 1), (3, 1), (7, 1), (5, 1)]);
+        let (baseline, baseline_path) = recorded_continuation_for_test(
+            &options,
+            "single_event_baseline",
+            &source,
+            1,
+            false,
+            &without,
+        );
+        assert!(!baseline.target_met);
+        let calls = std::cell::RefCell::new(Vec::new());
+        let deciding = Some(timing_report_stack(3, 0x20));
+        let result = options.report_timing_decision_with(
+            &source,
+            1,
+            None,
+            (true, &deciding),
+            (&baseline.schedule, &baseline_path, &mut None),
+            (
+                |seen, len| {
+                    assert_eq!(seen, &source);
+                    assert_eq!(len, 2);
+                    let (completed, path) = recorded_continuation_for_test(
+                        &options,
+                        "single_event_target",
+                        seen,
+                        len,
+                        true,
+                        &with,
+                    );
+                    Ok((completed, path, None))
+                },
+                |runname, variant, len, position| {
+                    calls.borrow_mut().push(runname.to_owned());
+                    let (expected, prefix_len, end, met, stack) = match runname {
+                        "final_target_next_for_stacktraces" => {
+                            (&with, 2, 2, true, Some(timing_report_stack(7, 0x10)))
+                        }
+                        "final_baseline_next_for_stacktraces" => {
+                            (&without, 1, 2, false, Some(timing_report_stack(7, 0x10)))
+                        }
+                        "final_target_slice_end_for_stacktraces" => (
+                            &with,
+                            2,
+                            1,
+                            target_met,
+                            captured.then(|| {
+                                timing_report_stack(
+                                    3,
+                                    if target_count == 100 { 0x20 } else { 0x30 },
+                                )
+                            }),
+                        ),
+                        "final_baseline_slice_end_for_stacktraces" => (
+                            &without,
+                            1,
+                            1,
+                            baseline_met,
+                            captured.then(|| timing_report_stack(3, 0x40)),
+                        ),
+                        other => panic!("unexpected replay {other}"),
+                    };
+                    variant.validate().unwrap();
+                    assert_eq!(variant.schedevents(), expected);
+                    assert_prefix_metadata(variant, &source, prefix_len);
+                    assert_eq!((len, position), (end + 1, end));
+                    Ok((met, stack))
+                },
+            ),
+        );
+        let retained = PreemptionReader::try_new(&baseline_path)
+            .unwrap()
+            .into_inner();
+        assert_eq!(retained.schedevents(), &without);
+        (result, calls.into_inner())
+    }
+
+    #[test]
+    fn one_event_timing_slices_report_their_own_dynamic_endpoints() {
+        for target_count in [100, 101] {
+            let (result, calls) =
+                single_event_timing_report_for_test(target_count, true, false, true);
+            let report = result
+                .unwrap()
+                .expect("opposite completed outcomes certify the report");
+            assert_eq!(
+                report.critical_event2.as_ref().unwrap().stack,
+                Some(timing_report_stack(3, 0x40)),
+                "the one-branch baseline endpoint must not use the target deciding stack"
+            );
+            assert_eq!(
+                report.critical_event1.as_ref().unwrap().stack,
+                Some(timing_report_stack(
+                    3,
+                    if target_count == 100 { 0x20 } else { 0x30 }
+                )),
+                "the realized target endpoint must come from its own continued record"
+            );
+            assert_eq!(
+                (
+                    report.critical_event1.as_ref().unwrap().event_index,
+                    report.critical_event2.as_ref().unwrap().event_index
+                ),
+                (1, 1)
+            );
+            let deciding = report.deciding_event.unwrap();
+            assert_eq!(deciding.event_index, 1);
+            assert_eq!(deciding.stack, Some(timing_report_stack(3, 0x20)));
+            assert!(
+                report.header.contains(&format!(
+                    "runs 1 events ({target_count} retired conditional branches)"
+                )),
+                "{}",
+                report.header
+            );
+            assert!(
+                report
+                    .header
+                    .contains("runs 1 events (1 retired conditional branches)"),
+                "{}",
+                report.header
+            );
+            assert!(
+                !report.header.contains("same stack at both events"),
+                "{}",
+                report.header
+            );
+            assert_eq!(
+                calls,
+                [
+                    "final_target_next_for_stacktraces",
+                    "final_baseline_next_for_stacktraces",
+                    "final_target_slice_end_for_stacktraces",
+                    "final_baseline_slice_end_for_stacktraces",
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn one_event_timing_slice_replays_must_repeat_their_own_outcomes() {
+        for (target_met, baseline_met, contradicted, expected_calls) in [
+            (true, true, "final_baseline_slice_end_for_stacktraces", 4),
+            (false, false, "final_target_slice_end_for_stacktraces", 3),
+        ] {
+            for captured in [true, false] {
+                let (result, calls) =
+                    single_event_timing_report_for_test(100, target_met, baseline_met, captured);
+                let error = result
+                    .expect_err(
+                        "a contradictory one-event slice replay cannot certify the decision",
+                    )
+                    .to_string();
+                assert!(
+                    error.contains(&format!("{contradicted} observed the opposite")),
+                    "{error}"
+                );
+                assert!(
+                    error.contains("no opposite-outcome pair was established"),
+                    "{error}"
+                );
+                assert_eq!(calls.len(), expected_calls);
+                assert_eq!(calls.last().unwrap(), contradicted);
+            }
+        }
+        let (result, calls) = single_event_timing_report_for_test(100, true, false, false);
+        let report = result
+            .unwrap()
+            .expect("missing stacks do not invent a contradictory outcome");
+        assert_eq!(calls.len(), 4);
+        assert_eq!(
+            (
+                report.critical_event1.as_ref().unwrap().event_index,
+                report.critical_event2.as_ref().unwrap().event_index
+            ),
+            (2, 2)
+        );
+        assert_eq!(
+            report.critical_event1.as_ref().unwrap().stack,
+            Some(timing_report_stack(7, 0x10))
+        );
+        assert_eq!(
+            report.critical_event2.as_ref().unwrap().stack,
+            Some(timing_report_stack(7, 0x10))
+        );
     }
 
     /// The timing report creates another prefix continuation after the
@@ -4724,6 +6088,41 @@ mod tests {
         }
     }
 
+    /// A prefix stack trial asks for its stack by schedule position
+    /// (`--stacktrace-at-schedule-positions`), not by traced index: a trial
+    /// that makes a polling retry its recording did not make would otherwise
+    /// print a neighbouring event's stack
+    /// (https://github.com/rrnewton/hermit/issues/4917). The request names the
+    /// position, its stack file, and the replayed prefix, and the trial's
+    /// repro command carries the option.
+    #[test]
+    fn a_prefix_stack_trial_requests_its_stack_by_schedule_position() {
+        let parent = tempfile::tempdir().unwrap();
+        let tmp_dir = format!("--tmp-dir={}", parent.path().display());
+        let mut options =
+            AnalyzeOpts::try_parse_from(["analyze", tmp_dir.as_str(), "--", "/bin/true"]).unwrap();
+        let _workspace = options.phase0_initialize(Retention::Remove).unwrap();
+        let tid = detcore::types::DetTid::from_raw(3);
+        let target = PreemptionRecord::from_sched_events(vec![
+            SchedEvent::branches(tid, 10),
+            SchedEvent::branches(tid, 4),
+            SchedEvent::branches(tid, 5),
+        ]);
+        let (run, stack_path) = options
+            .prefix_stack_trial("final_target_for_stacktraces", &target, 3, 2, None)
+            .unwrap();
+        let config = &run.runopts.det_opts.det_config;
+        assert!(config.stacktrace_at_schedule_positions);
+        assert_eq!(config.stacktrace_event, vec![(2, Some(stack_path))]);
+        assert!(config.replay_schedule_from.is_some());
+        assert!(
+            run.to_repro()
+                .contains(" --stacktrace-at-schedule-positions"),
+            "{}",
+            run.to_repro()
+        );
+    }
+
     /// A candidate's check keeps the callback checkpoints of the unchanged
     /// events it replays, and refuses an edit they do not fit instead of
     /// replaying a bare schedule.
@@ -4889,6 +6288,121 @@ mod tests {
                 },
             );
             assert!(!sentence.contains("removes"), "{sentence}");
+        }
+    }
+
+    /// A bisection trial replays its schedule with the callback checkpoints,
+    /// per-thread histories and epoch of the endpoint record it shares the
+    /// longest prefix with (on a tie, one it replays whole, then the first),
+    /// as far as that prefix reaches: an endpoint replayed whole keeps all of
+    /// its checkpoints, and one that shares nothing is written as events
+    /// alone. A schedule edited right after its first event keeps none of the
+    /// target's checkpoints, though it takes the target's histories and
+    /// epoch: the one at that event's progress ended its slice, which decides
+    /// the edited event, so the scheduler decides it, as in a prefix trial
+    /// (`PreemptionRecord::schedule_prefix`).
+    #[test]
+    fn a_bisection_trial_keeps_the_checkpoints_of_the_part_it_shares_with_an_endpoint() {
+        let parent = tempfile::tempdir().unwrap();
+        let tmp_dir = format!("--tmp-dir={}", parent.path().display());
+        let mut options =
+            AnalyzeOpts::try_parse_from(["analyze", tmp_dir.as_str(), "--", "/bin/true"]).unwrap();
+        let retention = options.workspace_retention();
+        let _workspace = options.phase0_initialize(retention).unwrap();
+        let branches = |tid: u64, count: u32| {
+            serde_json::json!({
+                "dettid": tid, "op": "Branch", "count": count,
+                "start_rip": null, "end_rip": null, "end_time": null
+            })
+        };
+        let checkpoint = |row: usize, progress: u64, time: u64| {
+            serde_json::json!({
+                "history_index": row,
+                "origin": {
+                    "callback": "PmuTimer", "site": "Prehook", "progress": progress,
+                    "last_op": "Branch", "time": time, "rcbs": progress
+                }
+            })
+        };
+        let target: PreemptionRecord = serde_json::from_value(serde_json::json!({
+            "per_thread": {"3": {
+                "final_prio": 1000,
+                "prio_changes": [[100, 1000], [200, 1000]],
+                "preemption_rcbs": [10, 15]
+            }},
+            "global": [branches(3, 10), branches(3, 5)],
+            "epoch": "2026-01-01T00:00:00Z",
+            "callback_checkpoints": {"3": [checkpoint(0, 10, 100), checkpoint(1, 15, 200)]}
+        }))
+        .unwrap();
+        target.validate().unwrap();
+        let events = |list: Vec<serde_json::Value>| -> Vec<SchedEvent> {
+            serde_json::from_value(serde_json::Value::Array(list)).unwrap()
+        };
+        // The baseline has the same events and no checkpoints: on the tie the
+        // target, listed first, is the source.
+        let baseline = PreemptionRecord::from_sched_events(target.schedevents().clone());
+        let path = parent.path().join("trial.preempts");
+        // A second endpoint whose schedule only starts with the target's
+        // first event, and keeps no checkpoints.
+        let short = PreemptionRecord::from_sched_events(events(vec![branches(3, 10)]));
+        // (sources, schedule, checkpoints kept, whether the target's histories
+        // and epoch come with them)
+        for (sources, schedule, kept, from_target) in [
+            (
+                [&target, &baseline],
+                events(vec![branches(3, 10), branches(3, 5)]),
+                2,
+                true,
+            ),
+            (
+                [&target, &baseline],
+                events(vec![branches(3, 10), branches(5, 5), branches(3, 5)]),
+                0,
+                true,
+            ),
+            (
+                [&target, &baseline],
+                events(vec![branches(5, 5), branches(3, 10)]),
+                0,
+                false,
+            ),
+            // The longer shared prefix wins, whichever source is listed first.
+            (
+                [&short, &target],
+                events(vec![branches(3, 10), branches(3, 5)]),
+                2,
+                true,
+            ),
+            // A source that ends where the schedule goes on keeps its last
+            // slice end: no event of its own follows it.
+            (
+                [&target, &short],
+                events(vec![branches(3, 10), branches(3, 5), branches(5, 1)]),
+                2,
+                true,
+            ),
+            // On a tie, the source replayed whole wins.
+            ([&target, &short], events(vec![branches(3, 10)]), 0, false),
+        ] {
+            options
+                .write_trial_schedule_from(schedule.clone(), &sources, &path)
+                .unwrap();
+            let written = PreemptionReader::new(&path).load_all();
+            written.validate().unwrap();
+            assert_eq!(written.schedevents(), &schedule);
+            let points = serde_json::to_value(&written).unwrap()["callback_checkpoints"]["3"]
+                .as_array()
+                .map_or(0, |points| points.len());
+            assert_eq!(points, kept, "{schedule:?}");
+            assert_eq!(written.epoch().is_some(), from_target, "{schedule:?}");
+            assert_eq!(
+                serde_json::to_value(&written).unwrap()["per_thread"]
+                    .as_object()
+                    .map_or(0, |rows| rows.len()),
+                usize::from(from_target),
+                "{schedule:?}"
+            );
         }
     }
 
@@ -5953,6 +7467,109 @@ mod tests {
         );
     }
 
+    /// An unrecorded RIP is a wildcard, not a departure. This classification
+    /// determines which replay supplies the report's stack, not just wording.
+    #[test]
+    fn recorded_rip_wildcards_preserve_the_replays_stack_source() {
+        let tid = DetTid::from_raw;
+        for (start, end, observed_start, observed_end) in [
+            (None, None, Some(0x1000), None),
+            (None, None, None, Some(0x2000)),
+            (None, None, Some(0x1000), Some(0x2000)),
+            (Some(0x1000), None, Some(0x1000), Some(0x2000)),
+            (None, Some(0x2000), Some(0x1000), Some(0x2000)),
+        ] {
+            let mut requested = events(&[3, 5]);
+            requested[0].start_rip = start.and_then(std::num::NonZeroUsize::new);
+            requested[0].end_rip = end.and_then(std::num::NonZeroUsize::new);
+            let mut observed = requested.clone();
+            observed[0].start_rip = observed_start.and_then(std::num::NonZeroUsize::new);
+            observed[0].end_rip = observed_end.and_then(std::num::NonZeroUsize::new);
+            observed[0].count = 99;
+            let left_schedule = departure(&requested, &observed, 2);
+            assert_eq!(
+                left_schedule, None,
+                "extra unrecorded RIP information is not a departure"
+            );
+            let baseline = StackReplay {
+                met_target: false,
+                stacks: [
+                    Some(timing_report_stack(3, 0x31)),
+                    Some(timing_report_stack(5, 0x51)),
+                ],
+                left_schedule,
+                ran: [Some(tid(3)), Some(tid(5))],
+                traced: None,
+            };
+            let target = StackReplay {
+                met_target: true,
+                stacks: [
+                    Some(timing_report_stack(5, 0x52)),
+                    Some(timing_report_stack(3, 0x32)),
+                ],
+                left_schedule: None,
+                ran: [Some(tid(5)), Some(tid(3))],
+                traced: None,
+            };
+            assert_eq!(
+                merge_stacks(&baseline, &target, 1, [tid(3), tid(5)]),
+                [
+                    Some((
+                        timing_report_stack(3, 0x31),
+                        "the baseline replay".to_owned()
+                    )),
+                    Some((
+                        timing_report_stack(5, 0x51),
+                        "the baseline replay".to_owned()
+                    )),
+                ]
+            );
+        }
+        let mut requested = events(&[3, 5]);
+        requested[0].start_rip = std::num::NonZeroUsize::new(0x1000);
+        requested[0].end_rip = std::num::NonZeroUsize::new(0x2000);
+        assert_eq!(departure(&requested, &requested, 2), None);
+        for (start, end) in [
+            (None, Some(0x2000)),
+            (Some(0x1001), Some(0x2000)),
+            (Some(0x1000), None),
+            (Some(0x1000), Some(0x2001)),
+        ] {
+            let mut observed = requested.clone();
+            observed[0].start_rip = start.and_then(std::num::NonZeroUsize::new);
+            observed[0].end_rip = end.and_then(std::num::NonZeroUsize::new);
+            assert_eq!(
+                departure(&requested, &observed, 2),
+                Some(Departure::OtherEvent {
+                    index: 0,
+                    expected: requested[0].clone(),
+                    ran: observed[0].clone(),
+                }),
+                "a specified RIP must still be present and equal"
+            );
+        }
+        for other in [
+            SchedEvent::branches(tid(7), 10),
+            SchedEvent::syscall(
+                tid(3),
+                reverie::syscalls::Sysno::write,
+                detcore_model::schedule::SyscallPhase::Posthook,
+            ),
+        ] {
+            let requested = events(&[3, 5]);
+            let observed = vec![other.clone(), requested[1].clone()];
+            assert_eq!(
+                departure(&requested, &observed, 2),
+                Some(Departure::OtherEvent {
+                    index: 0,
+                    expected: requested[0].clone(),
+                    ran: other,
+                }),
+                "wildcard RIPs do not excuse a changed thread or operation"
+            );
+        }
+    }
+
     /// A stack either replay captured is reported, in the passing order, with
     /// the replay it came from: the target replay's events #index - 1 and
     /// #index are the passing schedule's #index and #index - 1. A replay that
@@ -6540,15 +8157,6 @@ mod tests {
         );
     }
 
-    /// Prefix outcomes need not be monotone. A guest whose thread B stores 2
-    /// twice and whose thread A stores 1 once, printing the final value, can
-    /// meet a target of "2" with none and all of the schedule replayed, yet
-    /// miss it at a cut between B's stores. The endpoint trials of such a
-    /// schedule try only the empty prefix, so when it meets the target at
-    /// every continuation the error states that observation (there is no miss
-    /// to bisect against) and claims nothing about the prefixes no trial ran.
-    /// Where the endpoints differ, interior flips do not matter: the search
-
     #[test]
     fn a_same_thread_critical_pair_is_flagged_and_a_cross_thread_one_is_not() {
         let caveat = critical_pair_caveat(&critical(&[3, 3, 5], 1))
@@ -6814,8 +8422,10 @@ mod tests {
                 dir.path().join("final-passing.json"),
                 dir.path().join("trial.json"),
             );
-            options.write_final_schedules(Vec::new(), &failing, Vec::new(), &passing);
-            options.write_trial_schedule(Vec::new(), &trial).unwrap();
+            options.write_final_schedules(Vec::new(), &failing, Vec::new(), &passing, &[]);
+            options
+                .write_trial_schedule_from(Vec::new(), &[], &trial)
+                .unwrap();
             [failing, passing, trial].map(|path| {
                 detcore::preemptions::read_recorded_expired_wait_runs_charged_once(&path).unwrap()
             })
@@ -6913,8 +8523,10 @@ mod tests {
                 dir.path().join("final-passing.json"),
                 dir.path().join("trial.json"),
             );
-            options.write_final_schedules(Vec::new(), &failing, Vec::new(), &passing);
-            options.write_trial_schedule(Vec::new(), &trial).unwrap();
+            options.write_final_schedules(Vec::new(), &failing, Vec::new(), &passing, &[]);
+            options
+                .write_trial_schedule_from(Vec::new(), &[], &trial)
+                .unwrap();
             [failing, passing, trial].map(|path| {
                 detcore::preemptions::read_recorded_queued_sleeps_registered_at_first_pass(&path)
                     .unwrap()
@@ -7020,8 +8632,10 @@ mod tests {
                 dir.path().join("final-passing.json"),
                 dir.path().join("trial.json"),
             );
-            options.write_final_schedules(Vec::new(), &failing, Vec::new(), &passing);
-            options.write_trial_schedule(Vec::new(), &trial).unwrap();
+            options.write_final_schedules(Vec::new(), &failing, Vec::new(), &passing, &[]);
+            options
+                .write_trial_schedule_from(Vec::new(), &[], &trial)
+                .unwrap();
             [failing, passing, trial]
                 .map(|path| detcore::preemptions::read_recorded_pipe_wake_latency(&path).unwrap())
         };
@@ -7099,7 +8713,9 @@ mod tests {
         let off = record("off", Some(false));
         let written = |options: &AnalyzeOpts| {
             let trial = dir.path().join("copy-trial.json");
-            options.write_trial_schedule(Vec::new(), &trial).unwrap();
+            options
+                .write_trial_schedule_from(Vec::new(), &[], &trial)
+                .unwrap();
             detcore::preemptions::read_recorded_signal_state_copy(&trial).unwrap()
         };
         let default = prepare(&on, &[]).unwrap();
@@ -7344,6 +8960,1006 @@ mod tests {
             );
         }
     }
+
+    /// A prefix search's trials as `RunData::launch` runs them: a trial the
+    /// journal holds takes its recorded outcome; any other first asks the
+    /// budget, then runs (here: `outcome`) and is journaled. Each trial's end
+    /// and run go into `ends` and `runs`, as `phase5_prefix_search` keeps
+    /// them for the bracket.
+    struct JournaledPrefixTrials {
+        journal: BTreeMap<usize, TrialEnd>,
+        ends: Ends,
+        runs: BTreeMap<(usize, MaybeTimeslice), String>,
+    }
+
+    impl JournaledPrefixTrials {
+        fn new() -> Self {
+            Self {
+                journal: BTreeMap::new(),
+                ends: Ends::new(),
+                runs: BTreeMap::new(),
+            }
+        }
+
+        fn trial(
+            &mut self,
+            budget: &Budget,
+            prefix: usize,
+            outcome: impl Fn(usize) -> TrialEnd,
+        ) -> anyhow::Result<bool> {
+            let end = match self.journal.get(&prefix) {
+                Some(&end) => end,
+                None => {
+                    budget.start_trial()?;
+                    let end = outcome(prefix);
+                    self.journal.insert(prefix, end);
+                    end
+                }
+            };
+            self.ends.insert((prefix, None), end);
+            self.runs
+                .insert((prefix, None), format!("prefix_round_{prefix}"));
+            Ok(end == TrialEnd::Met)
+        }
+    }
+
+    /// A budget that ends a prefix search leaves a bracket whose lower prefix
+    /// misses the target and whose upper prefix meets it, with the deciding
+    /// event between them. Resumed with the journal of the trials it ran, the
+    /// search runs only the trials it had not, and finds the event the
+    /// uninterrupted search finds.
+    #[test]
+    fn a_budget_ends_the_prefix_search_at_a_bracket_and_a_resume_finds_the_same_event() {
+        use crate::app::analyze::budget::TimeBudget;
+        use crate::app::analyze::budget::TrialBudget;
+        let (len, decision) = (37_710, 28_055);
+        let outcome = |prefix: usize| {
+            if prefix > decision {
+                TrialEnd::Met
+            } else {
+                TrialEnd::Missed
+            }
+        };
+        let mut uninterrupted_trials = 0;
+        let uninterrupted = search_prefix_boundary(len, |prefix| {
+            uninterrupted_trials += 1;
+            Ok(outcome(prefix) == TrialEnd::Met)
+        })
+        .unwrap();
+
+        let allowed = 7;
+        let budget = Budget::new(
+            TimeBudget::Off,
+            TrialBudget::Limit(NonZeroU64::new(allowed).unwrap()),
+        );
+        let mut trials = JournaledPrefixTrials::new();
+        let stopped = search_prefix_boundary(len, |prefix| trials.trial(&budget, prefix, outcome))
+            .unwrap_err();
+        let expired = stopped.downcast_ref::<BudgetExpired>().unwrap();
+        assert_eq!(expired.kind, BudgetKind::TrialBudget);
+        let bracket = prefix_bracket(&trials.ends, &trials.runs, None, len);
+        let (misses, meets) = (bracket.misses.unwrap(), bracket.meets.unwrap());
+        assert_eq!(outcome(misses), TrialEnd::Missed);
+        assert_eq!(outcome(meets), TrialEnd::Met);
+        assert!(misses <= decision && decision < meets, "{bracket:?}");
+        assert_eq!(bracket.meets_run, Some(format!("prefix_round_{meets}")));
+
+        let resumed_budget = Budget::default();
+        let resumed =
+            search_prefix_boundary(len, |prefix| trials.trial(&resumed_budget, prefix, outcome))
+                .unwrap();
+        assert_eq!(resumed, uninterrupted);
+        assert_eq!(
+            allowed + resumed_budget.trials_started(),
+            uninterrupted_trials as u64
+        );
+    }
+
+    /// A time budget ends the search the same way: no trial starts once the
+    /// time is spent, whatever the trial budget.
+    #[test]
+    fn a_time_budget_ends_the_prefix_search_once_the_time_is_spent() {
+        use std::sync::atomic::AtomicU64;
+        use std::sync::atomic::Ordering;
+
+        use crate::app::analyze::budget::TimeBudget;
+        use crate::app::analyze::budget::TrialBudget;
+        let seconds = std::sync::Arc::new(AtomicU64::new(0));
+        let clock = std::sync::Arc::clone(&seconds);
+        let budget = Budget::with_clock(
+            TimeBudget::Limit(std::time::Duration::from_secs(600)),
+            TrialBudget::Off,
+            std::sync::Arc::new(move || {
+                std::time::Duration::from_secs(clock.load(Ordering::SeqCst))
+            }),
+        );
+        let mut trials = JournaledPrefixTrials::new();
+        let stopped = search_prefix_boundary(1000, |prefix| {
+            // Every trial takes 250 s of the 600.
+            let end = trials.trial(&budget, prefix, |prefix| {
+                if prefix > 400 {
+                    TrialEnd::Met
+                } else {
+                    TrialEnd::Missed
+                }
+            });
+            seconds.fetch_add(250, Ordering::SeqCst);
+            end
+        })
+        .unwrap_err();
+        assert_eq!(
+            stopped.downcast_ref::<BudgetExpired>().unwrap().kind,
+            BudgetKind::TimeBudget
+        );
+        assert_eq!(budget.trials_started(), 3);
+        let bracket = prefix_bracket(&trials.ends, &trials.runs, None, 1000);
+        assert_eq!((bracket.misses, bracket.meets), (Some(375), Some(500)));
+    }
+
+    /// The bracket is the longest prefix whose trial missed the target and
+    /// the shortest whose trial met it.
+    #[test]
+    fn a_bracket_rests_on_finished_trials() {
+        let mut ends = Ends::new();
+        let mut runs = BTreeMap::new();
+        for (prefix, end) in [
+            (0, TrialEnd::Missed),
+            (10, TrialEnd::Missed),
+            (30, TrialEnd::Met),
+            (40, TrialEnd::Met),
+        ] {
+            ends.insert((prefix, None), end);
+            runs.insert((prefix, None), format!("prefix_round_{prefix:03}"));
+        }
+        let bracket = prefix_bracket(&ends, &runs, None, 50);
+        assert_eq!(bracket.misses, Some(10));
+        assert_eq!(bracket.meets, Some(30));
+        let said = describe_bracket(&bracket);
+        assert!(
+            said.contains(
+                "replaying the first 10 of the target schedule's 50 events misses the target \
+                 (prefix_round_010), and replaying the first 30 meets it (prefix_round_030). The \
+                 deciding event is one of events #10 to #29 (20 events)"
+            ),
+            "{said}"
+        );
+        // Before any trial met the target there is no upper end.
+        ends.retain(|_, end| *end != TrialEnd::Met);
+        let open = prefix_bracket(&ends, &runs, None, 50);
+        assert_eq!((open.misses, open.meets), (Some(10), None));
+        assert!(
+            describe_bracket(&open).contains("had not yet found a prefix"),
+            "{}",
+            describe_bracket(&open)
+        );
+    }
+
+    /// The options of an analysis of `/bin/true` in a fresh workspace under
+    /// `parent`, with `extra` options.
+    fn analysis_in(parent: &Path, extra: &[&str]) -> (AnalyzeOpts, Workspace) {
+        let tmp_dir = format!("--tmp-dir={}", parent.display());
+        let mut argv = vec!["analyze", tmp_dir.as_str()];
+        argv.extend(extra);
+        argv.extend(["--", "--chaos", "/bin/true"]);
+        let mut options = AnalyzeOpts::try_parse_from(argv).unwrap();
+        let workspace = options.phase0_initialize(Retention::Remove).unwrap();
+        (options, workspace)
+    }
+
+    /// A partial report says that it is partial, why, which phase was
+    /// running, its bracket, and the command that resumes the analysis; it
+    /// exits 120 and keeps the workspace.
+    #[test]
+    fn a_partial_report_says_why_where_and_how_to_resume() {
+        let parent = tempfile::tempdir().unwrap();
+        let report_file = parent.path().join("report.json");
+        let report = format!("--report-file={}", report_file.display());
+        let (mut options, _workspace) =
+            analysis_in(parent.path(), &[report.as_str(), "--trial-budget=1"]);
+        options.budget = Budget::new(options.time_budget, options.trial_budget);
+        options.budget.start_trial().unwrap();
+        let expired = options.budget.start_trial().unwrap_err();
+        options.progress.phase(Phase::PrefixSearch);
+        let mut ends = Ends::new();
+        ends.insert((100, None), TrialEnd::Missed);
+        ends.insert((200, None), TrialEnd::Met);
+        let runs = BTreeMap::from([
+            ((100, None), "prefix_round_004".to_owned()),
+            ((200, None), "prefix_round_003".to_owned()),
+        ]);
+        let bracket = prefix_bracket(&ends, &runs, None, 300);
+        options.progress.bracket(bracket.clone());
+
+        let status = options.report_partial(expired).unwrap();
+        assert_eq!(
+            status,
+            ExitStatus::Exited(hermit::HERMIT_ANALYZE_PARTIAL_EXIT)
+        );
+        assert!(options.partial_report_written);
+        let written: Report =
+            serde_json::from_str(&std::fs::read_to_string(&report_file).unwrap()).unwrap();
+        let partial = written.partial.unwrap();
+        assert_eq!(partial.reason, BudgetKind::TrialBudget);
+        assert_eq!(partial.phase, Phase::PrefixSearch);
+        assert_eq!(partial.bracket, Some(bracket));
+        assert_eq!(partial.runs_started, 1);
+        assert_eq!(partial.trial_budget, Some(1));
+        assert_eq!(&partial.workspace, options.tmp_dir.as_ref().unwrap());
+        assert!(
+            partial
+                .resume_command
+                .contains(&format!("--resume={}", partial.workspace.display())),
+            "{}",
+            partial.resume_command
+        );
+        for said in [
+            "PARTIAL RESULT. hermit analyze reached its --trial-budget (1 runs)",
+            "while searching the target schedule's prefixes (--prefix-search)",
+            "The deciding event is one of events #100 to #199 (100 events)",
+            "The workspace is kept",
+        ] {
+            assert!(
+                written.header.contains(said),
+                "{said:?} not in {}",
+                written.header
+            );
+        }
+    }
+
+    /// A resume refuses an analysis whose guest would start with another
+    /// environment or in another working directory, though its command line
+    /// is the same: a bare `--env NAME` takes the value from Hermit's own
+    /// environment, and a relative path resolves against the working
+    /// directory. Only the names of changed variables are said; their values
+    /// are not kept.
+    #[test]
+    fn a_resume_refuses_another_guest_environment_or_working_directory() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
+        const MODE: &str = "HERMIT_TEST_RESUME_MODE";
+        let identity = || {
+            AnalyzeOpts::try_parse_from([
+                "analyze",
+                "--analyze-seed=7",
+                "--",
+                "--base-env=minimal",
+                "--env",
+                MODE,
+                "--",
+                "/bin/true",
+            ])
+            .unwrap()
+            .identity()
+            .unwrap()
+        };
+        // SAFETY: this test runs alone in its process (`rerun_alone`).
+        unsafe { std::env::set_var(MODE, "A") };
+        let first = identity();
+        assert_eq!(first.differences(&identity()), Vec::<String>::new());
+        assert!(
+            first
+                .guest_env
+                .iter()
+                .any(|(name, value)| name == MODE && value != "A"),
+            "{:?}",
+            first.guest_env
+        );
+        unsafe { std::env::set_var(MODE, "B") };
+        let second = identity();
+        assert_eq!(
+            first.differences(&second),
+            [format!("the guest environment: {MODE} changed")]
+        );
+        let elsewhere = tempfile::tempdir().unwrap();
+        let before = std::env::current_dir().unwrap();
+        std::env::set_current_dir(elsewhere.path()).unwrap();
+        let third = identity();
+        std::env::set_current_dir(before).unwrap();
+        let moved = second.differences(&third);
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        assert!(
+            moved[0].starts_with("the guest working directory: recorded ")
+                && moved[0].ends_with(&format!(
+                    ", now {}",
+                    std::fs::canonicalize(elsewhere.path()).unwrap().display()
+                )),
+            "{moved:?}"
+        );
+    }
+
+    /// The command that resumes an analysis replaces analyze's own
+    /// `--resume`, in either form, and keeps every argument after analyze's
+    /// `--` as it is: the `hermit run` arguments and the guest's, whose own
+    /// `--resume checkpoint` or `--resume=x` is not analyze's.
+    #[test]
+    fn the_resume_command_keeps_the_guests_arguments() {
+        let args = |line: &str| line.split(' ').map(str::to_owned).collect::<Vec<_>>();
+        let resumed = |line: &str| {
+            let argv = args(line)
+                .into_iter()
+                .map(std::ffi::OsString::from)
+                .collect();
+            shell_words::split(&resume_command_from(argv, Path::new("/ws/new"))).unwrap()
+        };
+        // A global option's value can be the word `analyze`: the subcommand
+        // is where hermit's parser finds it, not the first such word.
+        assert_eq!(
+            resumed(
+                "hermit --log-file analyze analyze --prefix-search -- --base-env=minimal -- /bin/prog --resume"
+            ),
+            args(
+                "hermit --log-file analyze analyze --resume=/ws/new --prefix-search -- --base-env=minimal -- /bin/prog --resume"
+            )
+        );
+        assert_eq!(
+            resumed("hermit -l debug analyze --resume=/ws/old -- /bin/prog"),
+            args("hermit -l debug analyze --resume=/ws/new -- /bin/prog")
+        );
+        // A guest argument that is not UTF-8 keeps its bytes.
+        let mut argv: Vec<std::ffi::OsString> = args("hermit analyze -- /bin/prog")
+            .into_iter()
+            .map(std::ffi::OsString::from)
+            .collect();
+        argv.push(std::os::unix::ffi::OsStringExt::from_vec(
+            b"x\xffy'z".to_vec(),
+        ));
+        let command = resume_command_from(argv, Path::new("/ws/new"));
+        assert!(
+            command.ends_with(" -- /bin/prog $'x\\xffy\\'z'"),
+            "{command}"
+        );
+        assert_eq!(
+            resumed(
+                "hermit analyze --resume /ws/old --prefix-search -- --base-env=minimal -- \
+                 /bin/prog --resume checkpoint --resume=x"
+            ),
+            args(
+                "hermit analyze --resume=/ws/new --prefix-search -- --base-env=minimal -- \
+                 /bin/prog --resume checkpoint --resume=x"
+            )
+        );
+        assert_eq!(
+            resumed(
+                "hermit --log=info analyze --prefix-search --resume=/ws/old -- /bin/prog --resume"
+            ),
+            args(
+                "hermit --log=info analyze --resume=/ws/new --prefix-search -- /bin/prog --resume"
+            )
+        );
+        assert_eq!(
+            resumed("hermit analyze -- /bin/prog"),
+            args("hermit analyze --resume=/ws/new -- /bin/prog")
+        );
+    }
+
+    /// An environment variable's name is kept byte for byte: two names that
+    /// differ only in bytes that are not UTF-8 stay two names, and a resume
+    /// that finds the value under the other one is refused, naming both.
+    #[test]
+    fn guest_environment_names_are_kept_byte_for_byte() {
+        use std::os::unix::ffi::OsStrExt;
+        let name = |bytes: &[u8]| environment_name(std::ffi::OsStr::from_bytes(bytes));
+        assert_eq!(name(b"MODE"), "MODE");
+        assert_eq!(name(b"MODE\xff"), "MODE\\xff");
+        assert_ne!(name(b"MODE\xff"), name(b"MODE\xfe"));
+        // An escaped name keeps a backslash; one written with a backslash is
+        // escaped too, so it cannot read as another name's escape.
+        assert_ne!(name(b"MODE\\xff"), name(b"MODE\xff"));
+        let identity =
+            AnalyzeOpts::try_parse_from(["analyze", "--analyze-seed=7", "--", "/bin/true"])
+                .unwrap()
+                .identity()
+                .unwrap();
+        let holding = |bytes: &[u8]| {
+            let mut identity = identity.clone();
+            identity.guest_env = vec![(name(bytes), "digest of A".to_owned())];
+            identity
+        };
+        assert_eq!(
+            holding(b"MODE\xff").differences(&holding(b"MODE\xfe")),
+            ["the guest environment: MODE\\xfe set, MODE\\xff unset"]
+        );
+    }
+
+    /// A bracket whose shortest prefix known to meet the target is the empty
+    /// one is scheduler-alone evidence, not a range of events: a partial
+    /// report says so, names no event range and exits 120. Before, it
+    /// formatted `meets - 1` with `meets` 0.
+    #[test]
+    fn a_partial_report_with_the_empty_prefix_meeting_names_no_range() {
+        let parent = tempfile::tempdir().unwrap();
+        let report_file = parent.path().join("report.json");
+        let report = format!("--report-file={}", report_file.display());
+        let (mut options, _workspace) =
+            analysis_in(parent.path(), &[report.as_str(), "--trial-budget=1"]);
+        options.budget = Budget::new(options.time_budget, options.trial_budget);
+        options.budget.start_trial().unwrap();
+        let expired = options.budget.start_trial().unwrap_err();
+        options.progress.phase(Phase::PrefixSearch);
+        let mut ends = Ends::new();
+        ends.insert((0, None), TrialEnd::Met);
+        let runs = BTreeMap::from([((0, None), "prefix_round_001".to_owned())]);
+        let bracket = prefix_bracket(&ends, &runs, None, 300);
+        assert_eq!((bracket.misses, bracket.meets), (None, Some(0)));
+        options.progress.bracket(bracket);
+
+        let status = options.report_partial(expired).unwrap();
+        assert_eq!(
+            status,
+            ExitStatus::Exited(hermit::HERMIT_ANALYZE_PARTIAL_EXIT)
+        );
+        let written: Report =
+            serde_json::from_str(&std::fs::read_to_string(&report_file).unwrap()).unwrap();
+        assert_eq!(written.verdict, Verdict::Partial);
+        assert!(
+            written.header.contains(
+                "The prefix search had found that replaying none of the target schedule's 300 \
+                 events meets the target (prefix_round_001), continuing without chaos without PMU \
+                 timeslices: there the target is reproduced without the target schedule, which \
+                 localizes no event."
+            ),
+            "{}",
+            written.header
+        );
+        assert!(!written.header.contains("events #"), "{}", written.header);
+    }
+
+    /// A resumed analysis restarts its search from the interval the earlier
+    /// invocation recorded, with its trial count and warnings, when that
+    /// interval is of the same endpoints and its two files hold what it
+    /// names; otherwise the search starts from its endpoints.
+    #[test]
+    fn a_resume_restarts_the_search_only_from_a_whole_interval_of_its_endpoints() {
+        let parent = tempfile::tempdir().unwrap();
+        let (mut options, _workspace) = analysis_in(parent.path(), &[]);
+        options.progress.phase(Phase::Bisect);
+        let events = |tids: &[i32]| -> Vec<SchedEvent> {
+            tids.iter()
+                .map(|&tid| SchedEvent::branches(DetTid::from_raw(tid), 1))
+                .collect()
+        };
+        let (baseline, target) = (events(&[3, 3, 5, 5]), events(&[5, 5, 3, 3]));
+        let endpoints = events_digest(&[&baseline, &target]);
+        let (passing, failing) = (events(&[3, 5, 3, 5]), events(&[3, 5, 5, 3]));
+        let mut interval = IntervalFiles::new(options.tmp_dir.as_ref().unwrap());
+        interval.record(
+            &options,
+            Some(3),
+            [&passing, &failing],
+            Some((2, 1)),
+            Some(SearchState {
+                endpoints: endpoints.clone(),
+                event_level: true,
+                trials: 7,
+            }),
+        );
+        options.resumed_progress = Some(options.progress.snapshot());
+
+        let (resume, pass, resumed_passing, resumed_failing) =
+            options.resumable_interval(&endpoints).unwrap();
+        assert_eq!(pass, 3);
+        assert_eq!(resume.trials, 7);
+        assert!(resume.event_level);
+        assert_eq!(resumed_passing, passing);
+        assert_eq!(resumed_failing, failing);
+
+        // A search between other endpoints starts over.
+        assert!(options.resumable_interval("another digest").is_none());
+        // So does one whose file no longer holds what the interval names.
+        let recorded = options.progress.snapshot().interval.unwrap();
+        options
+            .write_trial_schedule_from(events(&[5, 3, 3, 5]), &[], &recorded.passing)
+            .unwrap();
+        assert!(options.resumable_interval(&endpoints).is_none());
+        // And one recorded before the search's first pass, which has no state.
+        interval.record(&options, None, [&baseline, &target], None, None);
+        options.resumed_progress = Some(options.progress.snapshot());
+        assert!(options.resumable_interval(&endpoints).is_none());
+        // A damaged workspace starts over too, without a panic: a truncated
+        // interval file, and a missing one.
+        let state = || SearchState {
+            endpoints: endpoints.clone(),
+            event_level: true,
+            trials: 7,
+        };
+        interval.record(
+            &options,
+            Some(3),
+            [&passing, &failing],
+            Some((2, 1)),
+            Some(state()),
+        );
+        options.resumed_progress = Some(options.progress.snapshot());
+        assert!(options.resumable_interval(&endpoints).is_some());
+        let recorded = options.progress.snapshot().interval.unwrap();
+        let whole = std::fs::read(&recorded.passing).unwrap();
+        std::fs::write(&recorded.passing, &whole[..whole.len() / 2]).unwrap();
+        assert!(options.resumable_interval(&endpoints).is_none());
+        interval.record(
+            &options,
+            Some(3),
+            [&passing, &failing],
+            Some((2, 1)),
+            Some(state()),
+        );
+        options.resumed_progress = Some(options.progress.snapshot());
+        let recorded = options.progress.snapshot().interval.unwrap();
+        std::fs::remove_file(&recorded.failing).unwrap();
+        assert!(options.resumable_interval(&endpoints).is_none());
+    }
+
+    /// A budget hit after the search finished, during its final replays,
+    /// reports no decision: only those replays, once they repeat the search's
+    /// outcomes, let analyze report one (main's completed-outcome rule). The
+    /// report's event fields stay empty, it says why, and analyze exits 120.
+    #[test]
+    fn a_budget_hit_during_the_final_replays_reports_no_decision() {
+        let parent = tempfile::tempdir().unwrap();
+        let report_file = parent.path().join("report.json");
+        let report = format!("--report-file={}", report_file.display());
+        let (mut options, _workspace) =
+            analysis_in(parent.path(), &[report.as_str(), "--time-budget=30m"]);
+        options.budget = Budget::new(options.time_budget, options.trial_budget);
+        options.progress.phase(Phase::StackTraces);
+        let expired = BudgetExpired {
+            kind: BudgetKind::TimeBudget,
+            cut: Some("final_target_for_stacktraces".to_owned()),
+        };
+
+        let status = options.report_partial(expired).unwrap();
+        assert_eq!(
+            status,
+            ExitStatus::Exited(hermit::HERMIT_ANALYZE_PARTIAL_EXIT)
+        );
+        let written: Report =
+            serde_json::from_str(&std::fs::read_to_string(&report_file).unwrap()).unwrap();
+        assert_eq!(written.verdict, Verdict::Partial);
+        assert!(written.critical_event1.is_none());
+        assert!(written.critical_event2.is_none());
+        assert!(written.deciding_event.is_none());
+        let partial = written.partial.unwrap();
+        assert_eq!(partial.phase, Phase::StackTraces);
+        assert_eq!(
+            partial.stacks,
+            "not taken: the budget ran out during the final replays; --resume takes them"
+        );
+        assert!(
+            written.header.contains(
+                "its final replays, which must repeat its outcomes before analyze reports a \
+                 decision, did not finish within the budget, so this report names none"
+            ),
+            "{}",
+            written.header
+        );
+    }
+
+    /// The same, through the real cut path: a prefix search with a trial
+    /// runner in place of the guest and `--trial-budget` set to the trials the
+    /// search takes, so the budget runs out at the first stack-trace run
+    /// (`final_target_for_stacktraces`), and `end_on_budget` reports it as
+    /// `analyze` does. The report names no decision, as above. Resumed
+    /// through the journal, the analysis answers the search's trials from it
+    /// and finishes with the deciding event, once its final replays ran.
+    #[test]
+    fn a_trial_budget_that_ends_at_the_final_replays_reports_no_decision() {
+        use std::sync::Arc;
+        use std::sync::Mutex;
+
+        use crate::app::analyze::rundata::TrialRunner;
+        let (len, deciding) = (200, 137);
+        let target = PreemptionRecord::from_sched_events(
+            (0..len)
+                .map(|i| SchedEvent::branches(DetTid::from_raw(3 + (i % 2)), 1))
+                .collect(),
+        );
+        // A trial meets the target when its prefix holds the deciding event.
+        let runner = |names: Arc<Mutex<Vec<String>>>| {
+            TrialRunner(Some(Arc::new(move |run: &mut RunData| {
+                names.lock().unwrap().push(run.name().to_owned());
+                let replayed = run
+                    .runopts
+                    .det_opts
+                    .det_config
+                    .replay_schedule_from
+                    .clone()
+                    .unwrap();
+                let prefix = PreemptionReader::new(&replayed)
+                    .load_all()
+                    .schedevents()
+                    .len();
+                // A completed run records the schedule it ran, which main's
+                // completed-outcome checks read: here, the one it replayed.
+                std::fs::copy(&replayed, run.sched_path_out()).unwrap();
+                run.finish_for_test(prefix > deciding, std::time::Duration::from_secs(1));
+                Ok(())
+            })))
+        };
+        let search = ["--target-stdout=FAILED", "--prefix-search"];
+
+        // How many trials the search takes, uninterrupted.
+        let parent = tempfile::tempdir().unwrap();
+        let counted = Arc::new(Mutex::new(Vec::new()));
+        let (mut uninterrupted, _uninterrupted_workspace) =
+            analysis_in(&parent.path().join("uninterrupted"), &search);
+        uninterrupted.start_checkpoint().unwrap();
+        uninterrupted.trial_runner = runner(counted.clone());
+        assert_eq!(
+            uninterrupted
+                .phase5_prefix_search(&target)
+                .unwrap()
+                .decision,
+            deciding
+        );
+        let search_trials = counted.lock().unwrap().len();
+
+        let report_file = parent.path().join("report.json");
+        let report = format!("--report-file={}", report_file.display());
+        let budget = format!("--trial-budget={search_trials}");
+        let mut args = search.to_vec();
+        args.extend([report.as_str(), budget.as_str()]);
+        let (mut options, mut workspace) = analysis_in(&parent.path().join("first"), &args);
+        workspace.keep("the resumed analysis owns it");
+        options.start_checkpoint().unwrap();
+        options.budget = Budget::new(options.time_budget, options.trial_budget);
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        options.trial_runner = runner(ran.clone());
+        let result = options
+            .phase5_prefix_search(&target)
+            .and_then(|decision| options.phase6_record_prefix_outputs(decision))
+            .map(|_| ExitStatus::SUCCESS);
+        let status = options.end_on_budget(result).unwrap();
+        assert_eq!(
+            status,
+            ExitStatus::Exited(hermit::HERMIT_ANALYZE_PARTIAL_EXIT)
+        );
+        // The search ran to its end; the stack-trace run never started.
+        assert_eq!(ran.lock().unwrap().len(), search_trials);
+        assert!(
+            !ran.lock()
+                .unwrap()
+                .iter()
+                .any(|name| name == "final_target_for_stacktraces")
+        );
+        let written: Report =
+            serde_json::from_str(&std::fs::read_to_string(&report_file).unwrap()).unwrap();
+        assert_eq!(written.verdict, Verdict::Partial);
+        assert!(written.deciding_event.is_none());
+        assert!(written.critical_event1.is_none());
+        assert!(written.critical_event2.is_none());
+        assert!(
+            !written.header.contains(&format!("event #{deciding}")),
+            "{}",
+            written.header
+        );
+        let partial = written.partial.unwrap();
+        assert_eq!(partial.reason, BudgetKind::TrialBudget);
+        assert_eq!(partial.phase, Phase::StackTraces);
+        assert_eq!(
+            partial.stacks,
+            "not taken: the budget ran out during the final replays; --resume takes them"
+        );
+
+        // Resumed, the search's trials come from the journal and only the
+        // stack-trace runs run.
+        let path = workspace.path().to_path_buf();
+        let resume = format!("--resume={}", path.display());
+        let mut argv = vec!["analyze", resume.as_str()];
+        argv.extend(search);
+        argv.extend(["--", "--chaos", "/bin/true"]);
+        let mut resumed = AnalyzeOpts::try_parse_from(argv).unwrap();
+        let resumed_workspace = resumed.phase0_resume(&path).unwrap();
+        let resumed_ran = Arc::new(Mutex::new(Vec::new()));
+        resumed.trial_runner = runner(resumed_ran.clone());
+        let decision = resumed.phase5_prefix_search(&target).unwrap();
+        assert_eq!(resumed.journal.answered() as usize, search_trials);
+        assert!(resumed_ran.lock().unwrap().is_empty());
+        let complete = resumed.phase6_record_prefix_outputs(decision).unwrap();
+        assert!(complete.partial.is_none());
+        assert_eq!(
+            complete.critical_event1.map(|event| event.event_index),
+            Some(deciding)
+        );
+        assert_eq!(
+            resumed_ran.lock().unwrap().first().map(String::as_str),
+            Some("final_target_for_stacktraces")
+        );
+        drop(resumed_workspace);
+        drop(workspace);
+    }
+
+    /// The default search's partial report names its pair of schedules, the
+    /// first event at which they differ and the commands that replay them,
+    /// and says when the stack traces did not fit the grace period.
+    #[test]
+    fn a_partial_bisection_names_its_pair_and_why_it_took_no_stacks() {
+        let parent = tempfile::tempdir().unwrap();
+        let (mut options, _workspace) = analysis_in(parent.path(), &["--time-budget=30m"]);
+        options.budget = Budget::new(options.time_budget, options.trial_budget);
+        options
+            .endpoints
+            .record(std::time::Duration::from_secs(400), None);
+        options.progress.phase(Phase::Bisect);
+        let events = |tids: &[i32]| -> Vec<SchedEvent> {
+            tids.iter()
+                .map(|&tid| SchedEvent::branches(DetTid::from_raw(tid), 1))
+                .collect()
+        };
+        let mut interval = IntervalFiles::new(options.tmp_dir.as_ref().unwrap());
+        interval.record(
+            &options,
+            Some(3),
+            [&events(&[3, 3, 5, 3]), &events(&[3, 3, 3, 5])],
+            Some((2, 1)),
+            None,
+        );
+        let recorded = options.progress.snapshot().interval.unwrap();
+        assert_eq!(recorded.common_prefix, 2);
+        assert!(recorded.passing.is_file() && recorded.failing.is_file());
+
+        let expired = BudgetExpired {
+            kind: BudgetKind::TimeBudget,
+            cut: Some("bisect_round_009".to_owned()),
+        };
+        assert_eq!(
+            options.report_partial(expired).unwrap(),
+            ExitStatus::Exited(hermit::HERMIT_ANALYZE_PARTIAL_EXIT)
+        );
+        let progress = options.progress.snapshot();
+        assert_eq!(progress.interval, Some(recorded));
+        // Two replays of a 400 s endpoint do not fit min(120 s, 5% of 30 min).
+        let partial_stacks = options
+            .partial_stacks(progress.interval.as_ref().unwrap())
+            .1;
+        assert!(
+            partial_stacks.starts_with(
+                "not taken: two replays as slow as the slowest endpoint run (400 s) do not fit \
+                 the grace period of 90 s"
+            ),
+            "{partial_stacks}"
+        );
+    }
+
+    /// `--resume` and the budgets are refused with `--image`, by name and
+    /// before any workspace: a resume cannot show an image's guest unchanged.
+    /// Without `--image`, or with it and neither, nothing is refused.
+    #[test]
+    fn a_resume_or_a_budget_is_refused_with_an_image() {
+        let options = |extra: &[&str], run: &[&str]| {
+            let mut argv = vec!["analyze"];
+            argv.extend(extra);
+            argv.push("--");
+            argv.extend(run);
+            AnalyzeOpts::try_parse_from(argv).unwrap()
+        };
+        let image = ["--image=app:latest", "/app/run"];
+        for (extra, named) in [
+            (&["--resume=/nonexistent"][..], "--resume"),
+            (&["--time-budget=30m"][..], "--time-budget"),
+            (&["--trial-budget=3"][..], "--trial-budget"),
+            (
+                &[
+                    "--trial-budget=3",
+                    "--time-budget=1h",
+                    "--resume=/nonexistent",
+                ][..],
+                "--resume, --time-budget and --trial-budget",
+            ),
+        ] {
+            let error = options(extra, &image)
+                .refuse_resume_with_image()
+                .unwrap_err();
+            assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+            let message = format!("{error:#}");
+            assert!(
+                message.starts_with(&format!("{named} is refused with --image=app:latest: ")),
+                "{message}"
+            );
+        }
+        options(&[], &image).refuse_resume_with_image().unwrap();
+        options(&["--trial-budget=3"], &["/app/run"])
+            .refuse_resume_with_image()
+            .unwrap();
+
+        // Through analyze's preflight, before a workspace exists.
+        let argv = [
+            "hermit",
+            "analyze",
+            "--trial-budget=3",
+            "--",
+            image[0],
+            image[1],
+        ];
+        let args = crate::app::Args::try_parse_from(argv).unwrap();
+        let crate::app::Subcommand::Analyze(mut analysis) = args.command else {
+            panic!("{argv:?} is not analyze")
+        };
+        let error = analysis.main(&args.global).unwrap_err();
+        assert!(
+            format!("{error:#}").starts_with("--trial-budget is refused with --image=app:latest"),
+            "{error:#}"
+        );
+        assert_eq!(analysis.tmp_dir, None, "no workspace was created");
+    }
+
+    /// An `--image` guest's program is in the image, so the identity takes no
+    /// host file for it, even one at the path the run arguments name; nor does
+    /// an image that supplies its program from its Entrypoint/Cmd fail or
+    /// panic, though its config is not read before a run materializes it.
+    #[test]
+    fn an_image_guest_takes_no_host_file_for_its_program() {
+        let identity = |run: &[&str]| {
+            let mut argv = vec!["analyze", "--"];
+            argv.extend(run);
+            let mut options = AnalyzeOpts::try_parse_from(argv).unwrap();
+            options.analyze_seed = Some(1);
+            options.identity().unwrap()
+        };
+        assert!(identity(&["/bin/sh"]).program.is_some(), "a host program");
+        assert_eq!(identity(&["--image=app:latest", "/bin/sh"]).program, None);
+        let default = identity(&["--image=app:latest"]);
+        assert_eq!(default.program, None);
+        assert_eq!(default.run_args, ["--image=app:latest"]);
+    }
+
+    /// A resume refuses an analysis of something else, names what differs,
+    /// and says how to start over; the same analysis resumes, with the seed
+    /// the first invocation drew.
+    #[test]
+    fn a_resume_refuses_another_analysis_and_says_how_to_start_over() {
+        let parent = tempfile::tempdir().unwrap();
+        let (mut first, mut workspace) = analysis_in(
+            parent.path(),
+            &["--target-stdout=FAILED", "--prefix-search"],
+        );
+        workspace.keep("the resumed analysis owns it");
+        first.start_checkpoint().unwrap();
+        let drawn = first.analyze_seed.unwrap();
+        let path = workspace.path().to_path_buf();
+        let resume = format!("--resume={}", path.display());
+
+        for (options, differs) in [
+            (
+                vec!["--target-stdout=PASSED", "--prefix-search"],
+                "the target --target-stdout: recorded FAILED, now PASSED",
+            ),
+            (
+                vec!["--target-stdout=FAILED"],
+                "the search option --prefix-search: recorded true, now false",
+            ),
+        ] {
+            let mut argv = vec!["analyze", resume.as_str()];
+            argv.extend(options);
+            argv.extend(["--", "--chaos", "/bin/true"]);
+            let mut again = AnalyzeOpts::try_parse_from(argv).unwrap();
+            let error = again.phase0_resume(&path).unwrap_err();
+            assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+            let message = format!("{error:#}");
+            assert!(message.contains(differs), "{message}");
+            assert!(
+                message.contains("To continue anyway, run the same command without --resume"),
+                "{message}"
+            );
+        }
+        let mut argv = vec!["analyze", resume.as_str()];
+        argv.extend(["--target-stdout=FAILED", "--prefix-search"]);
+        argv.extend(["--", "--chaos", "/bin/true"]);
+        let mut same = AnalyzeOpts::try_parse_from(argv).unwrap();
+        let resumed = same.phase0_resume(&path).unwrap();
+        assert_eq!(same.analyze_seed, Some(drawn));
+        assert_eq!(same.tmp_dir.as_deref(), Some(path.as_path()));
+        assert!(same.journal.is_on());
+        drop(resumed);
+        drop(workspace);
+    }
+
+    /// A resumed analysis that errors or is stopped keeps the workspace it
+    /// adopted, with the journal of the runs before it; one that finishes
+    /// leaves it to its retention, like a new analysis.
+    #[test]
+    fn a_resumed_analysis_keeps_its_workspace_unless_it_finishes() {
+        let parent = tempfile::tempdir().unwrap();
+        let (mut options, _workspace) = analysis_in(parent.path(), &[]);
+        let failed: anyhow::Result<ExitStatus> = Err(anyhow::anyhow!("interrupted"));
+        let finished: anyhow::Result<ExitStatus> = Ok(ExitStatus::SUCCESS);
+        assert_eq!(options.keep_workspace_because(&failed), None);
+        options.resume = Some(parent.path().to_path_buf());
+        assert!(
+            options
+                .keep_workspace_because(&failed)
+                .unwrap()
+                .contains("a resumed analysis that does not finish keeps its workspace")
+        );
+        assert_eq!(options.keep_workspace_because(&finished), None);
+        options.partial_report_written = true;
+        assert!(
+            options
+                .keep_workspace_because(&finished)
+                .unwrap()
+                .contains("a budget ended the analysis")
+        );
+    }
+
+    /// A prefix search that a trial budget ends, resumed through
+    /// `phase0_resume`, `RunData::launch` and the journal, with a trial runner
+    /// in place of the guest: the resumed search answers the trials the first
+    /// invocation ran from the journal, runs only the others, and decides
+    /// what an uninterrupted search decides.
+    #[test]
+    fn a_prefix_search_resumed_through_the_journal_decides_as_an_uninterrupted_one() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+
+        use crate::app::analyze::rundata::TrialRunner;
+        let (len, deciding) = (600, 437);
+        let target = PreemptionRecord::from_sched_events(
+            (0..len)
+                .map(|i| SchedEvent::branches(DetTid::from_raw(3 + (i % 2)), 1))
+                .collect(),
+        );
+        // A trial meets the target when its prefix holds the deciding event.
+        let runner = |count: Arc<AtomicUsize>| {
+            TrialRunner(Some(Arc::new(move |run: &mut RunData| {
+                count.fetch_add(1, Ordering::SeqCst);
+                let replayed = run
+                    .runopts
+                    .det_opts
+                    .det_config
+                    .replay_schedule_from
+                    .clone()
+                    .unwrap();
+                let prefix = PreemptionReader::new(&replayed)
+                    .load_all()
+                    .schedevents()
+                    .len();
+                run.finish_for_test(prefix > deciding, std::time::Duration::from_secs(1));
+                Ok(())
+            })))
+        };
+        let search = ["--target-stdout=FAILED", "--prefix-search"];
+
+        let parent = tempfile::tempdir().unwrap();
+        let uninterrupted_runs = Arc::new(AtomicUsize::new(0));
+        let (mut uninterrupted, _uninterrupted_workspace) =
+            analysis_in(&parent.path().join("uninterrupted"), &search);
+        uninterrupted.start_checkpoint().unwrap();
+        uninterrupted.trial_runner = runner(uninterrupted_runs.clone());
+        let expected = uninterrupted.phase5_prefix_search(&target).unwrap();
+        let all = uninterrupted_runs.load(Ordering::SeqCst);
+        assert!(all > 4, "{all} trials");
+
+        let stopped_runs = Arc::new(AtomicUsize::new(0));
+        let mut first_args = search.to_vec();
+        first_args.push("--trial-budget=4");
+        let (mut first, mut workspace) = analysis_in(&parent.path().join("first"), &first_args);
+        workspace.keep("the resumed analysis owns it");
+        first.start_checkpoint().unwrap();
+        first.budget = Budget::new(first.time_budget, first.trial_budget);
+        first.trial_runner = runner(stopped_runs.clone());
+        let Err(error) = first.phase5_prefix_search(&target) else {
+            panic!("the trial budget did not end the search");
+        };
+        assert!(error.downcast_ref::<BudgetExpired>().is_some(), "{error:#}");
+        assert_eq!(stopped_runs.load(Ordering::SeqCst), 4);
+
+        let path = workspace.path().to_path_buf();
+        let resume = format!("--resume={}", path.display());
+        let mut argv = vec!["analyze", resume.as_str()];
+        argv.extend(search);
+        argv.extend(["--", "--chaos", "/bin/true"]);
+        let mut resumed = AnalyzeOpts::try_parse_from(argv).unwrap();
+        let resumed_workspace = resumed.phase0_resume(&path).unwrap();
+        let resumed_runs = Arc::new(AtomicUsize::new(0));
+        resumed.trial_runner = runner(resumed_runs.clone());
+        let decided = resumed.phase5_prefix_search(&target).unwrap();
+        assert_eq!(decided.decision, expected.decision);
+        assert_eq!(decided.decision, deciding);
+        assert_eq!(resumed.journal.answered(), 4);
+        assert_eq!(resumed_runs.load(Ordering::SeqCst), all - 4);
+        drop(resumed_workspace);
+        drop(workspace);
+    }
 }
 
 #[cfg(test)]
@@ -7385,7 +10001,9 @@ mod replay_departure_tests {
                 &GlobalOpts::try_parse_from(["hermit"]).unwrap(),
                 &mut run,
             );
-            let projected = run.sched_out().cloned();
+            let projected = run
+                .require_complete_output()
+                .map(|()| run.preempts_out().schedevents().clone());
             let promoted = options.clone().save_final_target_sched_events(make_run());
             if marker.is_some() {
                 for error in [

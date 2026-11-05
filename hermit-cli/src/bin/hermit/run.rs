@@ -13000,6 +13000,25 @@ impl RunOpts {
         GuestPathMapping::Unchanged
     }
 
+    /// The environment and working directory the guest starts with, as its
+    /// command gives them: every variable it inherits or is given (the
+    /// `--base-env` one, an `--image`'s, then `--env`, a bare `--env NAME`
+    /// read from Hermit's own environment), and the directory (`--workdir`,
+    /// an `--image`'s, else Hermit's own).
+    pub(super) fn guest_inputs(
+        &self,
+    ) -> Result<
+        (
+            std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+            PathBuf,
+        ),
+        Error,
+    > {
+        let command = self.guest_command()?;
+        let directory = self.guest_current_dir(&command)?;
+        Ok((command.get_captured_envs(), directory))
+    }
+
     fn guest_current_dir(&self, command: &Command) -> Result<PathBuf, Error> {
         let directory = command
             .get_current_dir()
@@ -17233,6 +17252,23 @@ impl RunOpts {
     /// `--timeout` where that is shorter: `hermit analyze`'s per-trial bound.
     pub(crate) fn bound_run_timeout(&mut self, seconds: NonZeroU64) {
         self.timeout = Some(self.timeout.map_or(seconds, |own| own.min(seconds)));
+    }
+
+    /// The `--timeout` bound in whole seconds, as [`Self::set_run_timeout`]
+    /// takes it back: `hermit analyze` shortens a run's bound to the time its
+    /// budget has left and restores the run's own afterwards.
+    pub(crate) fn run_timeout_seconds(&self) -> Option<NonZeroU64> {
+        self.timeout
+    }
+
+    pub(crate) fn set_run_timeout(&mut self, seconds: Option<NonZeroU64>) {
+        self.timeout = seconds;
+    }
+
+    /// The guest program, as the run arguments name it: none when `--image`
+    /// leaves it to the image's Entrypoint/Cmd.
+    pub(crate) fn program(&self) -> Option<&Path> {
+        self.program.as_deref()
     }
 
     /// `--strict` promises a deterministic run, and on the ptrace and e9patch

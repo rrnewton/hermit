@@ -501,6 +501,20 @@ fn analyze_racewrite_nostdlib_prefix_search() {
 /// server then cannot run as edited (it needs the request that now comes
 /// after it), so the check is not realized rather than a verdict. No
 /// poller nap decides.
+///
+/// This test is NOT in the PMU analyze node. Measured 2026-11-04 on an
+/// AMD EPYC 9D85 (the validation host class), whole-cgroup CPU of one
+/// systemd scope per run at the node's 20000-branch margin, it takes
+/// 24.31, 24.47 and 24.78 CPU-seconds against the node's ordinary
+/// 22-second per-test cap, and shrinking the poller's nap far enough to
+/// fit (600 microseconds and up) makes the analysis degenerate: the
+/// deciding event falls in startup (#53), the server-change replay
+/// departs at event #0, and no candidate check is realized -- the
+/// assertions below now refuse that shape. An exact-identity CPU
+/// allowance cannot admit it either today, because allowance selection
+/// drops ignored testcases (nextest_cpu::selected_inventory). It stays
+/// runnable by hand as an ignored test; re-inclusion is tracked in
+/// minibeads dh-zr6yo.
 #[test]
 #[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
 fn analyze_checks_the_race_candidates_and_says_what_each_edit_moved() {
@@ -528,6 +542,54 @@ fn analyze_checks_the_race_candidates_and_says_what_each_edit_moved() {
         .unwrap_or_else(|| panic!("no candidate names the server's change: {report}"));
     let check = &change["check"];
     assert_eq!(check["verdict"], "not_realized", "{report}");
+    // Guard against a degenerate analysis (F5): with too little poller
+    // traffic the deciding event falls in startup, before the server
+    // thread exists, the edit replay departs at event #0 instead of at
+    // the server's read, and no candidate check is realized -- while the
+    // assertions above still pass on the ranked text alone.
+    let decision = racing["decision"].as_u64().expect("decision event");
+    let server_thread = change["accesses"][1]["thread"]
+        .as_u64()
+        .expect("server thread");
+    let detail = check["detail"].as_str().unwrap_or("");
+    let departure: u64 = detail
+        .split("at event #")
+        .nth(1)
+        .and_then(|rest| {
+            rest.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .parse()
+                .ok()
+        })
+        .unwrap_or_else(|| panic!("no departure event in check detail: {report}"));
+    let departure_thread: u64 = detail
+        .split("(tid")
+        .nth(1)
+        .and_then(|rest| {
+            rest.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .parse()
+                .ok()
+        })
+        .unwrap_or_else(|| panic!("no departure thread in check detail: {report}"));
+    assert_eq!(
+        departure_thread, server_thread,
+        "the server-change replay must depart on the server thread: {report}"
+    );
+    assert!(
+        departure >= decision,
+        "the server-change replay departs at #{departure}, before the deciding \
+         event #{decision}: {report}"
+    );
+    assert!(
+        candidates.iter().any(|candidate| matches!(
+            candidate["check"]["verdict"].as_str(),
+            Some("decides" | "does_not_decide")
+        )),
+        "at least one candidate check must be realized: {report}"
+    );
     assert!(
         check["edit"].as_str().unwrap_or("").starts_with("moving ")
             && check["moved"]["events"].as_u64().unwrap_or(0) > 0
@@ -555,16 +617,21 @@ fn analyze_checks_the_race_candidates_and_says_what_each_edit_moved() {
 /// that fails with EBADF, on two threads, and no edge Hermit observes orders
 /// them.
 ///
-/// It takes no calibrated skid margin. At `--max-timeslice=400000` the guest's
-/// writer, which computes between its syscalls, has 59 of a run's 64
-/// timeslices end at the timer, and under the PMU analyze node's margin every
-/// such event is placed by stepping through up to 20000 branches. Measured on
-/// an Intel Xeon Gold 6138 with this test's command: without the margin the
-/// analysis finishes in 33 s, its 18 trials taking 1.5 to 2.0 s each; with a
-/// margin of 20000 each trial takes 42 to 61 s, and the analysis had run 7 of
-/// them when a 420 s bound stopped it. What the test checks is the race
-/// finder's report on the pair the search finds, not where a timer event
-/// lands.
+/// It takes no calibrated skid margin. Power/weight, 2026-11-04, on an AMD
+/// EPYC 9D85 (the validation host class), whole-cgroup CPU of one systemd
+/// scope per run of this test alone: the writer's spin went from 3000000 to
+/// 100000 iterations. The recorded schedule keeps every event class
+/// (Syscall 138, OtherInstructions 100, Cpuid 21, Rdtsc 10; Branch 228 ->
+/// 101, of which the writer's timer slices 141 -> 14), and the test's CPU
+/// fell from 191 and 230 CPU-seconds (n=2) to 12.18 and 12.25 (n=2) without
+/// the margin, inside the node's 22-second cap. With
+/// `HERMIT_ANALYZE_SKID_MARGIN=20000` the shrunk test still takes 76 to 81
+/// CPU-seconds (n=3), because the margin steps every Branch event, the ~77
+/// startup slices included, so the exemption stays. Plain `--chaos` seeds
+/// 1-5 no longer fail on this host at the shrunk spin (the 3000000-iteration
+/// guest failed seeds 1-3); analyze's own search found the failing schedule
+/// in 5 of 5 measured runs. What the test checks is the race finder's
+/// report on the pair the search finds, not where a timer event lands.
 #[test]
 #[ignore = "slow: bisecting chaos schedules; requires PMU branch counters and working mount namespaces"]
 fn analyze_names_the_close_racing_the_reused_descriptor() {
@@ -578,9 +645,9 @@ fn analyze_names_the_close_racing_the_reused_descriptor() {
         ],
         "unordered by the edges Hermit observes",
         SkidMargin::Without(
-            "its CPU-bound writer is stepped through the margin at each timer event, which made \
-             each prefix trial take 42 to 61 s instead of 1.5 to 2.0 s (see the test's \
-             documentation)",
+            "stepping every Branch event through a 20000-branch margin, startup slices \
+             included, took 76 to 81 CPU-seconds on the validation host class against \
+             12.2 without it (see the test's documentation)",
         ),
     );
     let racing = &report["racing_accesses"];
@@ -1196,6 +1263,28 @@ fn analyze_race_then_with(
     (output, report)
 }
 
+/// [`analyze_race_then_with`], asserting that analyze succeeded and wrote a
+/// report naming a critical event: the combined output and the report.
+fn analyze_race_then(
+    label: &str,
+    then: &str,
+    analyze_opts: &[&str],
+) -> (String, serde_json::Value) {
+    let (output, report) = analyze_race_then_with(then, analyze_opts, &[]);
+    let combined = combined_output(&output);
+    assert!(
+        output.status.success(),
+        "{label} failed: {}\n{combined}",
+        output.status
+    );
+    let report = report.unwrap_or_else(|| panic!("{label}: no report\n{combined}"));
+    assert!(
+        report["critical_event1"]["event_index"].is_u64(),
+        "{label}: {report}"
+    );
+    (combined, report)
+}
+
 /// A race found only at a short timeslice: at the run's own 100 us, thread a
 /// is preempted before it claims even without chaos, so the scheduler alone
 /// meets the target and gives the prefix search nothing to bisect against.
@@ -1566,4 +1655,194 @@ fn analyze_targets_the_exit_code_hermit_run_reports() {
             "{label}: the target run did not match\n{combined}"
         );
     }
+}
+
+/// `--run1-preemptions` replays the record as the target run, measured for
+/// the trial bound and logged like a seed's run. Before, analyze did not run
+/// it at all, and the next phase unwrapped the log of a run that never ran
+/// (exit 101). The record is read from the host's /tmp, which the guest's
+/// container does not see, so analyze replays a copy in its workspace. A
+/// replay that misses the target ends the analysis with an error that says
+/// why.
+#[test]
+#[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn analyze_starts_from_a_recorded_target_run() {
+    let label = "analyze --prefix-search --run1-preemptions analyze_race_then plain";
+    let guest = &workloads().race_then;
+    let seed = race_then_target_seed_matching("plain", &[]);
+    // Recorded outside /tmp: the run's guest has a private one, and the
+    // record is written from inside the container.
+    let workspace =
+        tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("failed to create a workspace");
+    let recorded = workspace.path().join("target.preempts");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command
+        .args(["run", "--chaos"])
+        .arg(format!("--seed={seed}"))
+        .arg(format!("--record-preemptions-to={}", recorded.display()))
+        .arg("--")
+        .arg(guest)
+        .arg("plain");
+    let output = hermit_test::hermit_output(label, &mut command);
+    assert!(
+        output.status.success() && output.stdout == b"b-first\n",
+        "{label}: the recorded run missed the target\n{}",
+        combined_output(&output)
+    );
+    let host_tmp = tempfile::tempdir_in("/tmp").expect("failed to create a directory under /tmp");
+    let record = host_tmp.path().join("target.preempts");
+    fs::copy(&recorded, &record).unwrap();
+
+    let _guard = analyze_lock();
+    let analyze = |target_stdout: &str, report_file: &Path| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+        command
+            .args(["analyze", "--prefix-search", "--target-exit-code=0", "-v"])
+            .arg(format!("--target-stdout={target_stdout}"))
+            .arg(format!("--run1-preemptions={}", record.display()))
+            .arg(format!("--report-file={}", report_file.display()))
+            .args(["--", "--chaos"])
+            .arg(format!("--seed={seed}"))
+            .arg("--")
+            .arg(guest)
+            .arg("plain");
+        hermit_test::hermit_output(label, &mut command)
+    };
+    let report_file = workspace.path().join("report.json");
+    let output = analyze("b-first", &report_file);
+    let combined = combined_output(&output);
+    assert!(
+        output.status.success(),
+        "{label}: {}\n{combined}",
+        output.status
+    );
+    assert!(
+        combined.contains("First run matched target criteria")
+            && combined.contains("Runs from here on are bounded at"),
+        "{label}: the record was not run as the target\n{combined}"
+    );
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&report_file).unwrap()).unwrap();
+    assert!(
+        report["critical_event1"]["event_index"].is_u64(),
+        "{label}: {report}"
+    );
+
+    // The record's replay prints b-first, so a-first is a miss.
+    let output = analyze("a-first", &workspace.path().join("miss.json"));
+    let combined = combined_output(&output);
+    assert!(
+        !output.status.success()
+            && output.status.code() != Some(101)
+            && combined.contains("did not meet the target criteria")
+            && combined.contains("--seed included"),
+        "{label}: a missed replay: {}\n{combined}",
+        output.status
+    );
+}
+
+/// `--trial-budget` ends a prefix search with a partial report and exit 120,
+/// naming a bracket that holds the deciding event, and keeps the workspace
+/// even without --keep-tmp. `--resume` with that workspace answers the runs
+/// the first invocation journaled instead of running them, finishes the
+/// search, and finds the deciding event an uninterrupted analysis finds.
+#[test]
+#[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn a_budget_ends_analyze_with_a_partial_report_that_resume_finishes() {
+    let label = "analyze --prefix-search --trial-budget=4 analyze_race_then exit";
+    let (combined, uninterrupted) = analyze_race_then(label, "exit", &["--prefix-search"]);
+    // The deciding event; a timing decision's critical events are positions
+    // in its continuations instead.
+    let decision = uninterrupted["deciding_event"]["event_index"]
+        .as_u64()
+        .or(uninterrupted["critical_event1"]["event_index"].as_u64())
+        .unwrap_or_else(|| panic!("{label}: {uninterrupted}\n{combined}"));
+
+    let seed = race_then_target_seed();
+    let _guard = analyze_lock();
+    let report_dir = tempfile::tempdir().expect("failed to create analyze report directory");
+    let report_file = report_dir.path().join("report.json");
+    let tmp_dir = tmp_dir_in(report_dir.path());
+    let analyze = |extra: &[String]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+        command
+            .arg("analyze")
+            .args([
+                "--target-stdout=b-first",
+                "--target-exit-code=0",
+                "--trial-timeout=3",
+                "--prefix-search",
+            ])
+            .args(extra)
+            .arg(format!("--run1-seed={seed}"))
+            .arg(format!("--report-file={}", report_file.display()))
+            .arg(format!("--tmp-dir={}", tmp_dir.display()))
+            .args(["--", "--chaos", "--"])
+            .arg(&workloads().race_then)
+            .arg("exit");
+        let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
+        let report: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&report_file).unwrap_or_else(|error| {
+                panic!("{label}: no report ({error})\n{}", combined_output(&output))
+            }))
+            .unwrap();
+        (output, report)
+    };
+
+    let (output, partial) = analyze(&["--trial-budget=4".to_owned()]);
+    let said = combined_output(&output);
+    assert_eq!(output.status.code(), Some(120), "{label}\n{said}");
+    assert!(
+        said.contains("HERMIT_ANALYZE_PARTIAL class=trial-budget phase=prefix-search"),
+        "{label}: no class line\n{said}"
+    );
+    let details = &partial["partial"];
+    assert_eq!(details["reason"], "trial-budget", "{partial}");
+    assert_eq!(details["runs_started"], 4, "{partial}");
+    let bracket = &details["bracket"];
+    let (misses, meets) = (
+        bracket["misses"].as_u64().unwrap(),
+        bracket["meets"].as_u64().unwrap(),
+    );
+    assert!(
+        misses <= decision && decision < meets,
+        "{label}: event {decision} is not in the bracket {bracket}"
+    );
+    assert!(
+        partial["header"]
+            .as_str()
+            .unwrap()
+            .starts_with("PARTIAL RESULT."),
+        "{partial}"
+    );
+    let workspace = PathBuf::from(details["workspace"].as_str().unwrap());
+    assert!(
+        workspace.join("analyze-journal.jsonl").is_file(),
+        "{label}: the workspace was not kept\n{said}"
+    );
+    assert!(
+        details["resume_command"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("--resume={}", workspace.display())),
+        "{partial}"
+    );
+
+    let (output, resumed) = analyze(&[format!("--resume={}", workspace.display())]);
+    let said = combined_output(&output);
+    assert!(output.status.success(), "{label}: resume failed\n{said}");
+    assert_eq!(
+        said.matches("answered from the journal of an earlier invocation")
+            .count(),
+        4,
+        "{label}\n{said}"
+    );
+    assert!(resumed.get("partial").is_none(), "{resumed}");
+    for field in ["deciding_event", "critical_event1", "critical_event2"] {
+        assert_eq!(
+            resumed[field]["event_index"], uninterrupted[field]["event_index"],
+            "{label}: the resumed analysis found another {field} than the uninterrupted one\n{said}"
+        );
+    }
+    assert_no_workspace_left(label, &tmp_dir, &said);
 }

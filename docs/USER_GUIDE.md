@@ -1002,13 +1002,14 @@ workspace, a `hermit_analyze*` directory it creates in `--tmp-dir`, or else in
 `$TMPDIR` (`/tmp` when TMPDIR is unset); the paths it prints name that
 directory. Analyze removes the workspace when it exits after its report, and
 when SIGTERM, SIGINT or SIGHUP stops it; after an error it keeps it, since the
-error can name trial files in it (a trial that did not finish, say). A stop
-signal ends the run in progress and starts no other; analyze then removes the
-workspace and that run's own temporary directories, and dies of the signal, so
-a shell reports 128 plus its number (143 for SIGTERM). Pass `--keep-tmp` to
-keep the workspace, for example to rerun a reproducer; `--verbose` keeps it
-too, since the per-run logs it adds are written there. The report file
-(`--report-file`) and the `--tmp-dir` directory itself are never removed.
+error can name trial files in it (a trial that did not finish, say), and a
+budget's partial report keeps it too (see below). A stop signal ends the run
+in progress and starts no other; analyze then removes the workspace and that
+run's own temporary directories, and dies of the signal, so a shell reports
+128 plus its number (143 for SIGTERM). Pass `--keep-tmp` to keep the
+workspace, for example to rerun a reproducer; `--verbose` keeps it too, since
+the per-run logs it adds are written there. The report file (`--report-file`)
+and the `--tmp-dir` directory itself are never removed.
 
 While analyze runs, a bisection trial's schedules, as large as the endpoints'
 (hundreds of MB for a few million events), are removed as soon as the trial's
@@ -1135,6 +1136,197 @@ is `{"cause": "scheduler_alone", "timing_in_force": [...]}`, and without
 such settings `{"cause": "scheduler_alone"}`. A cause a later build adds
 reads as `unknown`. A report from before the field names the critical
 events.
+
+#### Racing accesses
+
+The report ends with a "Racing accesses" section (`racing_accesses` in a
+`--report-file`; `--no-racing-accesses` leaves it out). The final replays on
+each side of the deciding event record an access trace, and analyze compares
+the two from that event on. Its `status` says how far the evidence goes:
+
+| Status | Meaning |
+| --- | --- |
+| `found` | The evidence singles out one pair of conflicting syscalls on two threads whose order flips between the runs. |
+| `timing` | No conflicting pair; two timed calls whose return order flips. |
+| `candidates` | Up to three ranked candidates, none singled out; each says what differs between the runs. |
+| `found_by_intervention` | Exactly one candidate whose reversal changes the outcome while an unedited control does not. |
+| `none_found`, `unavailable` | Neither, with the reason. |
+
+A rank is not a verdict. Candidates are listed by kind of evidence: a thread's
+change of course that fed the outcome's input first, then waits in flight
+across the deciding event, then order flips the evidence supports, then the
+rest. Analyze checks each candidate by replaying one run with the candidate's
+turn order reversed, beside a control replay without the reversal, and the
+candidate's `Check:` line (`check` in the report file) says what that showed:
+`decides` (the reversal changed whether the run meets the target, and the
+control did not), `does not decide`, `not realized` (the replay could not
+follow the edited schedule; a timed sleep, for example, cannot return before
+its deadline) or `not checked`, with how many events the edit moved and which
+threads' events they crossed. A candidate whose check does not decide ends
+"not shown to decide", whatever its rank. Only `found_by_intervention` says an
+order decides the outcome. In a report file that sentence is not part of a
+candidate's `evidence`: read its `check.verdict`, which is `decides` only for
+a candidate shown to decide.
+
+When the checks ran and none decides, the report says so after the
+candidates, and keeps the cases apart. A reversal that ran as edited and left
+the outcome as it was clears its candidate, but only as far as one turn
+reversal in one run goes: when all of them did, the outcome probably does not
+turn on any one of these candidates' orders alone, and may turn on an order not
+ranked here, an order in memory that syscalls do not show, one outside the
+trace, or several together. A reversal that could not be replayed as edited
+(`not realized`), one never tried because its control did not reproduce the
+run, and a candidate not checked leave it untested, not cleared. Either way,
+nothing says the right pair is among the candidates. The report then lists what to try next: `--minimize`, so fewer
+chaos interventions surround the deciding event; a wider `--race-window` when a
+trace was cut short; and the unrealized checks' replays
+(`racing_candidate_N.repro`), which show where each left its edit. A report
+file carries the same information in the candidates' `check.verdict` values.
+
+For example, an RPC server's shutdown removes a client in memory just before
+the server's default handler looks the client up. No syscall shows that order,
+so the first candidate is the handler thread's change of course against the
+call the deciding event runs. The two run in the same order in both runs (in
+the baseline the order is measured at the handler's call of the same number,
+which there takes another course), and an edge Hermit observes orders them, so
+the candidate is listed for the change rather than for an order flip, and its
+check could not replay the reversal (stacks and part of the Check line left
+out):
+
+```text
+Racing accesses: thread 3's read(5, 0x7fffffffec48, 4) returns 4 in both runs but reaches different data; it takes its data from a thread whose calls change course after the deciding event, and no access Hermit sees changes order around that change.
+Candidates, ranked (each says what differs between the runs; a rank is not a verdict, and a candidate decides only where its check says so):
+  1. thread 3's read(5, 0x7fffffffec48, 4) returns 4 in both runs but reaches different data; it takes its data from thread 9's write (#716), and thread 9's calls change course at its call 5 (#704); the deciding event 668 runs thread 7's read; the two run in the same order in both runs (the changed call's counterpart enters at #703 in the baseline); ordered in the target by futex wake thread 7 #684 -> thread 9 #701; it is listed for that change, ahead of order flips, and no access Hermit sees changes order around it, so what decides may be an order in memory that syscalls do not show; thread 3's read is 24 events before the outcome and reaches it through program order; not shown to decide.
+     thread 7  #668  read(7, 0x7ffff73fde47, 1) = 1 (its return)
+     thread 9  #704  write(2, "server: client 3 not found, no handler", 39) = 39
+   Check: not realized: reversing this turn order (moving 8 events of thread 9 before thread 7's turn at #668, crossing thread 3 (1 event), thread 5 (3 events)) in the target run cannot be replayed as edited: the replay ran (...) at event #659, where the schedule has (...) (racing_candidate_1.repro).
+```
+
+Here thread 7 is the shutdown, thread 9 the default handler and thread 3 the
+client. The candidate names the right roles, but nothing in the two runs shows
+that their order decides the failure.
+
+Analyze's exit status says what it concluded. A conclusion is never reported
+as a failure of Hermit; only a failure to conclude exits 125, under a class
+line that says which. The class line is the first line on stderr:
+
+| Exit | Line on stderr | Meaning |
+| --- | --- | --- |
+| 0 (or `--success-exit-code`) | none | The report names the critical events (`"verdict": "critical_events"`). |
+| 0 (or `--success-exit-code`) | `HERMIT_ANALYZE_VERDICT class=reproduced-without-schedule` | The target is reproduced without the target schedule: without chaos the scheduler alone meets the target, so the prefix search localizes no event (which does not show that no event decides the outcome); debug that run directly. The report says why (`"verdict": "reproduced_without_schedule"`) and names no event. |
+| 2 | `HERMIT_ANALYZE_PRECONDITION class=target-not-reproduced` | The target run, the failing endpoint of a bisection, or `--minimize`'s last record does not meet the target criteria. |
+| 2 | `HERMIT_ANALYZE_PRECONDITION class=baseline-not-reproduced` | The baseline meets the target too, or the baseline the user chose does not finish. |
+| 2 | `HERMIT_ANALYZE_PRECONDITION class=no-prefix-continuation` | No continuation timeslice allows a prefix search. |
+| 2 | `HERMIT_ANALYZE_PRECONDITION class=endpoints-not-separable` | `hermit bisect` only: its search established no exact one-swap pair of schedules with opposite outcomes between `--good` and `--bad`. Analyze attempts a prefix search within the target schedule instead. |
+| 2 | `HERMIT_ANALYZE_PRECONDITION class=endpoints-identical` | `hermit bisect` only: `--good` and `--bad` contain identical event traces. |
+| 2 | none | clap's usage error: the command line did not parse. |
+| 120 | `HERMIT_ANALYZE_PARTIAL class=time-budget` or `class=trial-budget` | A budget (`--time-budget`, `--trial-budget`) ended the analysis, which reports its best answer so far (see below). |
+| 122 | `HERMIT_POLICY_REFUSAL class=policy-refusal` | Hermit refused the target run, or analyze or bisect refused its options or schedules. |
+| 123 | `HERMIT_LOG_CAP class=log-cap` | `--max-log-bytes` ended the analysis. |
+| 125 | `HERMIT_INTERNAL_FAILURE class=replay-not-reproducible` | `--selfcheck` found a difference, or a jittered schedule never replayed the same way twice: replay, Hermit's or this host's (`hermit host-capabilities` says whether its branch counter is exact), did not reproduce a run. |
+| 125 | `HERMIT_INTERNAL_FAILURE class=search-did-not-converge` | The event-level search did not converge within its passes. |
+| 125 | another `HERMIT_INTERNAL_FAILURE class=...` | Hermit failed. |
+| 128 + N | none | Signal N (SIGTERM, SIGINT or SIGHUP) stopped the analysis. |
+
+Exit 2 means that the inputs do not give analyze what it needs, as `diff` and
+`grep` exit 2 when they cannot do what was asked; the message says what to
+change. `--success-exit-code` refuses 2 and 120 to 127 for that reason. `hermit
+bisect` checks that its `--good` schedule misses the target and its `--bad`
+schedule meets it, and exits 2 with the same lines when one does not.
+
+A report file (`--report-file`) has one schema for every verdict: read its
+`verdict` first. `critical_events` fills `critical_event1` and
+`critical_event2` (and `deciding_event` for a timing decision);
+`reproduced_without_schedule` leaves them out, and the racing accesses
+(`racing_accesses`) too, and `header` says why. Its
+`verdict_reason` says what the scheduler alone shows. When the trials keep
+timing settings from the run arguments (`--pipe-wake-latency`,
+`--scheduler-turn-cost` other than the default charge), analyze runs one more
+trial, the empty prefix without them at the first continuation it tried: if it
+misses the target, the
+reason is `{"cause": "timing_semantics", "options": [...], "alternatives":
+[...], "trial": "..."}`, the settings cause the outcome, a two-seed search
+can end the same way, and a new failing run under the alternatives may have
+an event that decides it. Otherwise (it meets the target too, or it is not
+run because a `--run1-preemptions` recording fixes the settings) the reason
+is `{"cause": "scheduler_alone", "timing_in_force": [...]}`, and without
+such settings `{"cause": "scheduler_alone"}`. A cause a later build adds
+reads as `unknown`. A report from before the field names the critical
+events.
+
+A long analysis can be bounded, and it then reports its best answer so far
+instead of nothing. `--time-budget=DURATION` (`1800`, `30m`, `2h`) bounds the
+invocation's wall-clock time, and `--trial-budget=N` the number of runs it
+starts. The budget is checked before every run, and each run's `--timeout` is
+shortened to the time left; a run the budget cuts short is thrown away rather
+than counted as not meeting the target, so the budget decides only when
+analyze stops, never what it finds. When it runs out, analyze exits **120**
+after the stderr line `HERMIT_ANALYZE_PARTIAL class=time-budget` (or
+`class=trial-budget`) and a report that says it is partial, why, and which
+phase was running:
+
+- The default search reports the closest pair of schedules it found, a
+  schedule whose replay misses the target and one whose replay meets it
+  (`interval_passing.events` and `interval_failing.events` in the workspace),
+  their edit and swap distances, and the first event at which they differ: the
+  deciding event is that one or a later one. It takes the two schedules'
+  stacks there when two replays as slow as the slowest endpoint run fit
+  min(120 s, 5% of `--time-budget`) after the budget ran out, and says so when
+  they do not.
+- `--prefix-search` reports its bracket. Short prefixes miss the target and
+  long ones meet it, so the report names the longest prefix whose replay
+  finished and missed, the shortest whose replay met it, and the range of
+  events between them that holds the deciding event.
+- A budget that runs out after the search finished, during its final
+  replays, reports no decision: analyze names one only once those replays
+  repeat the search's outcomes, so the report's event fields are absent and
+  `partial.stacks` says why; `--resume` runs them. A partial report never
+  names a decision, so a script reads `partial` first.
+
+In a report file such a report's `verdict` is `partial`, and `partial` holds
+what it found. While the default search runs, `critical_event1` and
+`critical_event2` name where its closest pair first differs, which is the
+deciding event or one before it; otherwise the event fields are absent.
+
+Analyze stops itself only between runs, and the default search's computation
+between runs and the stack replays after the budget can take a little longer,
+so give a harness's own kill bound (a test timeout, `timeout(1)`) room above
+`--time-budget` plus min(120 s, 5% of it), for example a few minutes more.
+Analyze then stops itself first and writes its partial report and resume
+command, which an outer kill would lose.
+
+Analyze writes its progress into the workspace as it goes: every finished
+run's outcome (`analyze-journal.jsonl`), what the analysis is of
+(`analyze-checkpoint.json`) and the search's interval or bracket
+(`analyze-progress.json`). When a budget ends it, the workspace is kept even
+without `--keep-tmp`, and the report gives the command that continues it: the
+same arguments plus `--resume=WORKSPACE`. A resumed analysis runs again from
+its start, and every run in the journal takes its recorded outcome instead of
+running. A run its own bound stopped, or Hermit refused, is journaled too, and
+resumes as the same error, which ends the analysis there again: such a run has
+no outcome. The default search restarts at the pass whose interval the
+progress names, from that interval's two schedules in the workspace, rather
+than replaying its earlier passes, which would need every trial's schedules.
+So the resumed analysis makes the same decisions and reports what an
+uninterrupted analysis would. It refuses (exit 122), naming each difference,
+when the hermit binary, the guest program, the run arguments, the target
+criteria, the search options and `--max-log-bytes`, the record or schedule
+files given as runs, or `--analyze-seed` differ from the recorded ones; to
+start over anyway, run the command without `--resume`. With `--image` in the
+run arguments, `--resume`, `--time-budget` and `--trial-budget` are refused
+(exit 122): the image reference can name another image by the next invocation,
+and the program runs from the image's root, so analyze cannot show that a
+resumed analysis has the same guest. A workspace that `--keep-tmp` kept, or
+that a SIGKILL left, can be resumed the same way. A resumed analysis that
+errors or is stopped keeps the workspace, whatever its retention, so that it
+can be resumed again.
+
+```bash
+hermit analyze --prefix-search --time-budget=30m --run1-seed=1 \
+  --target-stdout='FAILED' -- --chaos -- PROGRAM          # exits 120 if the budget runs out
+hermit analyze --prefix-search --time-budget=30m --run1-seed=1 \
+  --target-stdout='FAILED' --resume=/tmp/hermit_analyzeXXXX -- --chaos -- PROGRAM
+```
 
 #### Racing accesses
 
