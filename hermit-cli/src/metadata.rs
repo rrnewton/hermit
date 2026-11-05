@@ -966,8 +966,8 @@ impl RecordVersion {
 // https://github.com/rrnewton/hermit/pull/5120
 // 0x19b -> 0x19c (reserved for this change in minibeads dh-gxmvo;
 // this change keeps 0x19c at its rebase onto main f76f9b8c, after
-// 0x19a shipped above; 0x19b stays reserved for the replayed-MAP_SHARED
-// fix-forward, and land-time numbering still applies): a parent's
+// 0x19a shipped above and 0x19b was taken by the replayed-MAP_SHARED
+// fix-forward above): a parent's
 // SIGCHLD that the scheduler defers until no other ordinary work is
 // runnable is re-admitted earlier where the kernel's copy was raised at
 // a point the schedule fixes (a child killed by SIGKILL, or one whose
