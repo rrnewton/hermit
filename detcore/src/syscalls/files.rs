@@ -4250,7 +4250,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 
         let capture = call.with_buf(Some(scratch)).with_len(chunk);
-        let mut contents = Vec::new();
+        let mut contents = Vec::with_capacity(MAX_SNAPSHOT_BYTES);
         loop {
             let bytes_read = self.record_or_replay(guest, capture).await? as usize;
             if bytes_read == 0 {
