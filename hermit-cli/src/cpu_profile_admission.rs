@@ -12,6 +12,9 @@
 //! Every class the v3 startup qualification cannot cover is refused by name.
 //! Neither nondefault profile silently falls back to v2 or native CPUID.
 
+use std::path::Path;
+use std::path::PathBuf;
+
 use detcore_model::cpu_profile::CpuProfile;
 use detcore_model::cpu_profile::HostXstate;
 use nix::sched::CpuSet;
@@ -397,6 +400,15 @@ fn admit_host_no_rdrand_with(
 /// CPUID snapshot. Refuse host mode before writing metadata or launching a
 /// guest rather than accidentally treating it as v3.
 pub fn check_record_or_replay(profile: CpuProfile) -> Result<(), CpuProfileRefusal> {
+    if profile == CpuProfile::Auto {
+        // `record start` resolves auto before this check, so a recording
+        // holds the profile that ran; one claiming auto was never written by
+        // Hermit, and replaying it would derive the profile again.
+        return Err(CpuProfileRefusal::new(
+            profile,
+            "a recording holds the named profile auto resolved to, never auto itself",
+        ));
+    }
     if profile == CpuProfile::HostNoRdrand {
         return Err(CpuProfileRefusal::new(
             profile,
@@ -405,6 +417,128 @@ pub fn check_record_or_replay(profile: CpuProfile) -> Result<(), CpuProfileRefus
              for repeated runs, or record with --cpu-profile=x86-64-v2 or x86-64-v3",
         ));
     }
+    Ok(())
+}
+
+/// How many script interpreters `--cpu-profile auto` follows before it
+/// refuses a chain as too long: the kernel bounds nested script
+/// interpretation too (`bprm` recursion in fs/exec.c), and an automatic
+/// consumer must not chase an unbounded chain either.
+const MAX_SCRIPT_HOPS: usize = 4;
+
+/// The named profile `--cpu-profile auto` resolves to for a guest program
+/// at host path `program`, with why ([`detcore::exec_record::auto_profile`]):
+/// from the declarations of the image it execs first and of that image's
+/// program interpreter, where `to_host` gives the host path of a path as
+/// the guest names it, or `None` where a mount with no source hides it in
+/// the launch view: a hidden interpreter refuses, rather than reading the
+/// host file its mount target shadows. `program` is the program in the
+/// launch's completed view (its mounts, binds and image rootfs already
+/// applied by the caller), and every script hop is mapped through
+/// `to_host` the same way. A script's interpreter is followed as the
+/// kernel follows it
+/// (Detcore's `script_interpreter`, the `load_script` rules: the line
+/// and the path end where the kernel ends them, at a newline and at a
+/// space, tab or NUL), through a bounded chain of scripts to the image
+/// the kernel would exec. Evidence is read strictly: a declaration
+/// beside a scan state that could not be decided refuses, rather than
+/// selecting from a lower bound. This chooses the profile before
+/// launch; Detcore's check of each executed image and interpreter
+/// (`Detcore::isa_refusal`) is still what refuses a run whose actual
+/// objects need more, so a pathname read here can never admit one.
+pub fn resolve_auto(
+    program: &Path,
+    to_host: impl Fn(&Path) -> Option<PathBuf>,
+) -> Result<(CpuProfile, String), String> {
+    use detcore::exec_record::IsaNeeds;
+    use detcore::exec_record::Script;
+    let mut image = program.to_path_buf();
+    for _ in 0..=MAX_SCRIPT_HOPS {
+        match detcore::exec_record::script_interpreter(&image) {
+            Script::Not => break,
+            Script::Interpreter(interpreter) => {
+                image = to_host(&interpreter)
+                    .ok_or_else(|| format!("{} is hidden by a mount", interpreter.display()))?;
+            }
+            Script::Declined => {
+                return Err(format!(
+                    "{} names no interpreter the kernel would run",
+                    image.display()
+                ));
+            }
+            Script::Unread => {
+                return Err(format!("{} is unreadable", image.display()));
+            }
+        }
+    }
+    if matches!(
+        detcore::exec_record::script_interpreter(&image),
+        Script::Interpreter(_)
+    ) {
+        return Err(format!(
+            "{} is a script chain longer than {MAX_SCRIPT_HOPS} interpreters",
+            program.display()
+        ));
+    }
+    let needs = IsaNeeds::read_path_strict(&image);
+    let mut objects = vec![(format!("the executable {}", image.display()), needs)];
+    if matches!(needs, None | Some(IsaNeeds::Malformed(_))) {
+        // Refused as unreadable or malformed, before its interpreter.
+        return detcore::exec_record::auto_profile(&objects);
+    }
+    match detcore::exec_record::program_interpreter(&image) {
+        Ok(None) => {}
+        Ok(Some(interpreter)) => {
+            let Some(host) = to_host(&interpreter) else {
+                return Err(format!(
+                    "its program interpreter {} is hidden by a mount",
+                    interpreter.display()
+                ));
+            };
+            objects.push((
+                format!("its program interpreter {}", interpreter.display()),
+                IsaNeeds::read_path_strict(&host),
+            ));
+        }
+        Err(why) => return Err(format!("{} cannot be read: {why}", image.display())),
+    }
+    detcore::exec_record::auto_profile(&objects)
+}
+
+/// Resolve a configuration's auto profile for a library launch of `command`
+/// ([`resolve_auto`] of the program it names, found as the launch finds it),
+/// before [`refuse_unadmitted_launch`]. `hermit run` and `hermit record
+/// start` resolve it earlier, before qualification; a configuration naming a
+/// profile is left as it is. A resolved x86-64-v3 is then admitted only as
+/// an explicit one is, so a library launch that never qualified the host
+/// refuses it by name.
+pub fn resolve_launch_auto(
+    command: &crate::Command,
+    config: &mut detcore::Config,
+) -> Result<(), CpuProfileRefusal> {
+    if config.cpu_profile != CpuProfile::Auto {
+        return Ok(());
+    }
+    let refuse = |why: String| CpuProfileRefusal::new(CpuProfile::Auto, why);
+    let Ok(program) = command.find_program() else {
+        // No program to read, so none for this launch to exec: its own
+        // error (or its backend's refusal) is the one to report, in its
+        // place. x86-64-v2 is named only so that nothing unresolved reaches
+        // the backend; should an exec succeed after all, Detcore's check of
+        // the executed objects still refuses one that needs more.
+        config.cpu_profile = CpuProfile::X86_64V2;
+        return Ok(());
+    };
+    // The pinned Reverie `Command` exposes no mounts or chroot to read
+    // back, so this library boundary cannot yet map the completed launch
+    // view: paths resolve as host paths. Detcore's per-exec ISA check of
+    // the objects actually executed still refuses one that needs more
+    // than the profile chosen here; resolving the mounted/chrooted view
+    // here waits on Reverie accessors for a command's mounts and chroot
+    // (revcodex on PR 4709).
+    let (profile, why) = resolve_auto(&program, |path| Some(path.to_path_buf())).map_err(refuse)?;
+    tracing::debug!("--cpu-profile auto resolved to {profile}: {why}");
+    config.cpu_profile = profile;
     Ok(())
 }
 
@@ -694,6 +828,11 @@ pub fn refuse_unadmitted_launch(
         return Ok(());
     }
     let refuse = |why: &str| Err(CpuProfileRefusal::new(config.cpu_profile, why));
+    if config.cpu_profile == CpuProfile::Auto {
+        return refuse(
+            "auto was not resolved to a named profile before launch (resolve_launch_auto)",
+        );
+    }
     if config.cpu_profile == CpuProfile::HostNoRdrand {
         // Library callers can configure the network engine directly, without
         // passing through RunOpts or its early artifact-creation guard.
@@ -1413,10 +1552,11 @@ mod tests {
             unadmitted.reason.contains("did not qualify"),
             "{unadmitted}"
         );
-        assert_eq!(
-            refuse_unadmitted_launch(&detcore::Config::default(), false),
-            Ok(())
-        );
+        let v2 = detcore::Config {
+            cpu_profile: CpuProfile::X86_64V2,
+            ..Default::default()
+        };
+        assert_eq!(refuse_unadmitted_launch(&v2, false), Ok(()));
 
         let refused = admit_with(&request("kvm"), || {
             panic!("a refused request probed the host")
@@ -1623,5 +1763,56 @@ mod tests {
                 .unwrap_err()
                 .contains("XSAVEERPTR")
         );
+    }
+
+    /// `--cpu-profile auto` follows a valid script chain (script to
+    /// script to an ELF image) through every hop, and refuses a chain
+    /// longer than the bound and a `#!` line naming no interpreter.
+    #[test]
+    fn auto_follows_a_script_chain_and_refuses_an_unbounded_one() {
+        use std::io::Write as _;
+        let directory = tempfile::tempdir().unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let script = |name: &str, interpreter: &std::path::Path| {
+            let path = directory.path().join(name);
+            let mut file = std::fs::File::create(&path).unwrap();
+            writeln!(file, "#!{}", interpreter.display()).unwrap();
+            path
+        };
+        // A -> B -> the test binary (an ELF image): both hops followed.
+        let b = script("b", &exe);
+        let a = script("a", &b);
+        let (profile, _) = super::resolve_auto(&a, |path| Some(path.to_path_buf()))
+            .expect("a valid chain resolves");
+        assert_eq!(profile, super::CpuProfile::X86_64V2);
+        // Every hop mapped through the caller's view: the same chain with
+        // its interpreter names mapped onto the files above (the image
+        // linked into the mapped view).
+        std::os::unix::fs::symlink(&exe, directory.path().join(exe.file_name().unwrap())).unwrap();
+        let (mapped, _) = super::resolve_auto(&a, |guest| {
+            // The view maps the chain's own names; system paths (the
+            // image's program interpreter) stay as they are.
+            if guest.starts_with("/tmp") || guest.parent() == exe.parent() {
+                Some(directory.path().join(guest.file_name().unwrap()))
+            } else {
+                Some(guest.to_path_buf())
+            }
+        })
+        .expect("a mapped chain resolves");
+        assert_eq!(mapped, super::CpuProfile::X86_64V2);
+        // A self-referring script is a chain past the bound, refused.
+        let loop_path = directory.path().join("loop");
+        std::fs::write(&loop_path, format!("#!{}\n", loop_path.display())).unwrap();
+        let why = super::resolve_auto(&loop_path, |path| Some(path.to_path_buf())).unwrap_err();
+        assert!(why.contains("script chain longer"), "{why}");
+        // A `#!` line naming no interpreter (NUL first) is declined.
+        let declined = directory.path().join("declined");
+        std::fs::write(&declined, b"#!\0/bin/sh\n").unwrap();
+        let why = super::resolve_auto(&declined, |path| Some(path.to_path_buf())).unwrap_err();
+        assert!(why.contains("names no interpreter"), "{why}");
+        // An interpreter hidden by a mount with no source refuses, rather
+        // than classifying the host file its target shadows.
+        let why = super::resolve_auto(&a, |_| None).unwrap_err();
+        assert!(why.contains("is hidden by a mount"), "{why}");
     }
 }

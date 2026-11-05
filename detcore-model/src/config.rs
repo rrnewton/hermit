@@ -235,9 +235,15 @@ pub struct Config {
     /// features without hardware randomness. The long help states each
     /// profile's host requirements and determinism limits. Like
     /// HERMIT_EPOCH, HERMIT_CPU_PROFILE supplies the value when the flag is
-    /// absent; an explicit flag wins, unset means x86-64-v2, and a value that
-    /// names no profile is refused. Admission is the same either way.
-    #[clap(long, value_enum, default_value_t, env = "HERMIT_CPU_PROFILE", long_help = crate::cpu_profile::CPU_PROFILE_LONG_HELP)]
+    /// absent; an explicit flag wins, and a value that names no profile is
+    /// refused. Unset means auto, for the command line and
+    /// [`Config::default`] alike: `hermit run` and `hermit record start`
+    /// resolve it to a named profile before launch, and the library's launch
+    /// functions resolve it from the program they launch. A serialized
+    /// configuration or recording without the field still means x86-64-v2
+    /// (`CpuProfile`'s own default), never auto. Admission is the same either
+    /// way.
+    #[clap(long, value_enum, default_value = "auto", env = "HERMIT_CPU_PROFILE", long_help = crate::cpu_profile::CPU_PROFILE_LONG_HELP)]
     #[serde(default)]
     pub cpu_profile: crate::cpu_profile::CpuProfile,
 
@@ -2329,7 +2335,10 @@ impl fmt::Display for Config {
         if !self.virtualize_cpuid {
             write!(f, " --no-virtualize-cpuid")?;
         }
-        if !self.cpu_profile.is_default() {
+        // The command line's default is auto, so every named profile, v2
+        // included, is written out: a rerun of this line runs that profile,
+        // and never derives one again.
+        if self.cpu_profile != crate::cpu_profile::CpuProfile::Auto {
             write!(f, " --cpu-profile={}", self.cpu_profile)?;
         }
         if !self.virtualize_metadata {
@@ -5010,6 +5019,10 @@ mod tests {
                 let sent = Config {
                     backend,
                     sequentialize_threads,
+                    // A launch sends a resolved profile: the legacy form has
+                    // no profile field and reads back as v2, so an unresolved
+                    // auto would not round-trip.
+                    cpu_profile: crate::cpu_profile::CpuProfile::X86_64V2,
                     ..Config::default()
                 };
                 let json = to_legacy_backend_json(&sent).unwrap();
@@ -5056,6 +5069,10 @@ mod tests {
                 let sent = Config {
                     backend,
                     sequentialize_threads,
+                    // A launch sends a resolved profile: the legacy form has
+                    // no profile field and reads back as v2, so an unresolved
+                    // auto would not round-trip.
+                    cpu_profile: crate::cpu_profile::CpuProfile::X86_64V2,
                     ..Config::default()
                 };
                 let legacy = to_legacy_backend_json(&sent).unwrap();
@@ -7497,9 +7514,15 @@ mod tests {
             let argv = std::iter::once("config").chain(args.lines());
             match Config::try_parse_from(argv) {
                 Ok(config) => println!(
-                    "cpu-profile={} wire={}",
+                    "cpu-profile={} wire={} default={}",
                     config.cpu_profile.name(),
-                    config_wire_default().cpu_profile.name()
+                    config_wire_default().cpu_profile.name(),
+                    // `Config::default` itself, where the environment it
+                    // reads parses (it exits on an invalid value).
+                    match Config::try_parse_from(["config"]) {
+                        Ok(_) => Config::default().cpu_profile.name(),
+                        Err(_) => "refused",
+                    }
                 ),
                 Err(error) => println!("refused: {:?}", error.kind()),
             }
@@ -7540,27 +7563,39 @@ mod tests {
                 .to_owned()
         };
 
-        assert_eq!(parse(None, &[]), "cpu-profile=x86-64-v2 wire=x86-64-v2");
+        // Unset on the command line is auto; the wire default stays v2.
+        assert_eq!(
+            parse(None, &[]),
+            "cpu-profile=auto wire=x86-64-v2 default=auto"
+        );
+        assert_eq!(
+            parse(Some("auto"), &[]),
+            "cpu-profile=auto wire=x86-64-v2 default=auto"
+        );
+        assert_eq!(
+            parse(Some("auto"), &["--cpu-profile=x86-64-v2"]),
+            "cpu-profile=x86-64-v2 wire=x86-64-v2 default=auto"
+        );
         assert_eq!(
             parse(Some("x86-64-v3"), &[]),
-            "cpu-profile=x86-64-v3 wire=x86-64-v2"
+            "cpu-profile=x86-64-v3 wire=x86-64-v2 default=x86-64-v3"
         );
         assert_eq!(
             parse(Some("host-no-rdrand"), &[]),
-            "cpu-profile=host-no-rdrand wire=x86-64-v2"
+            "cpu-profile=host-no-rdrand wire=x86-64-v2 default=host-no-rdrand"
         );
         assert_eq!(
             parse(None, &["--cpu-profile=x86-64-v3"]),
-            "cpu-profile=x86-64-v3 wire=x86-64-v2"
+            "cpu-profile=x86-64-v3 wire=x86-64-v2 default=auto"
         );
         assert_eq!(
             parse(Some("x86-64-v3"), &["--cpu-profile=x86-64-v2"]),
-            "cpu-profile=x86-64-v2 wire=x86-64-v2"
+            "cpu-profile=x86-64-v2 wire=x86-64-v2 default=x86-64-v3"
         );
         assert_eq!(parse(Some("x86-64-v4"), &[]), "refused: InvalidValue");
         assert_eq!(
             parse(Some("x86-64-v4"), &["--cpu-profile=x86-64-v2"]),
-            "cpu-profile=x86-64-v2 wire=x86-64-v2"
+            "cpu-profile=x86-64-v2 wire=x86-64-v2 default=refused"
         );
     }
 
@@ -7574,6 +7609,9 @@ mod tests {
         let sent = Config {
             backend: legacy_expressible(BackendCapabilities::DBT),
             seed: 7,
+            // A launch sends a resolved profile: the legacy form has no
+            // profile field and reads back as v2.
+            cpu_profile: crate::cpu_profile::CpuProfile::X86_64V2,
             ..Config::default()
         };
         let json = to_legacy_backend_json(&sent).unwrap();

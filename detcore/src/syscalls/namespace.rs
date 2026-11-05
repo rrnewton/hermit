@@ -550,6 +550,27 @@ pub(crate) fn guest_task_procfs(
     (namespace(&task.join("ns/mnt"))? == namespace(Path::new("/proc/self/ns/mnt"))?).then_some(task)
 }
 
+/// The procfs directory of guest thread `tid` for reading what names no
+/// path in it: the `exe` link's file and `auxv`. [`guest_task_procfs`]
+/// without its conditions on the guest's root and mount namespace, which
+/// matter only to a pathname looked up through the directory. `None` where
+/// guest threads are not host tasks (KVM).
+pub(crate) fn guest_task_objects_procfs(
+    backend: &reverie::BackendCapabilities,
+    tid: i32,
+) -> Option<PathBuf> {
+    if !crate::procfs_inode::tool_can_name_guest_descriptors(backend) {
+        return None;
+    }
+    Some(PathBuf::from(
+        if backend.tool_shares_guest_descriptor_table {
+            "/proc/thread-self".to_owned()
+        } else {
+            format!("/proc/{tid}")
+        },
+    ))
+}
+
 /// Whether the guest's pathname `path` may name an `exe` link Detcore
 /// could not resolve: its final component is `exe`, or it is empty (a
 /// descriptor for the link itself). The launcher guards look only at these
@@ -1678,6 +1699,133 @@ impl<T: RecordOrReplay> Detcore<T> {
         let at_phdr = crate::exec_record::auxv_entry(&auxv, libc::AT_PHDR)
             .ok_or("the auxiliary vector has no AT_PHDR")?;
         layout.start_brk(at_phdr)
+    }
+
+    /// Why the image the calling thread's exec just ran may not run under
+    /// the selected CPU profile: it, or the program interpreter the kernel
+    /// loaded for it, declares that it needs a higher x86-64 level than the
+    /// profile presents (`GNU_PROPERTY_X86_ISA_1_NEEDED`), which glibc's
+    /// loader checks against the CPUID Detcore answers. `None` where nothing
+    /// declares more, and where nothing can be compared:
+    ///
+    /// - host-no-rdrand, which masks the host's CPUID (hiding RDRAND, RDSEED
+    ///   and other nondeterministic features) but presents its ISA, so no
+    ///   fixed level describes it: excluding it proves nothing about a v3
+    ///   image on a v2 host, which then gets no typed refusal;
+    /// - `--no-virtualize-cpuid`, and an image whose CPUID is not intercepted
+    ///   (`Guest::has_cpuid_interception`): the guest sees the host's CPUID;
+    /// - a run that declares a launcher (DBT, SaBRe): the kernel exec'd the
+    ///   launcher, and the guest's loader runs under it before this callback;
+    /// - an object unread or declaring nothing, logged as unknown: that is
+    ///   no proof the image runs.
+    ///
+    /// The objects are the ones the exec ran, not ones found again by
+    /// pathname: the executable through `/proc/<pid>/exe`, which is the
+    /// file the kernel exec'd even where it was unlinked, renamed, a memfd
+    /// or outside the guest's root; the interpreter in the process's memory
+    /// at `AT_BASE`, its bytes as the kernel mapped them. A ptrace guest is
+    /// checked at its exec stop, before the interpreter's first instruction;
+    /// LiteInst's and in-guest-trap's callbacks come later, after the loader
+    /// has run.
+    ///
+    /// KVM is narrower than that, and no claim is made otherwise: the KVM
+    /// backend performs no per-exec ISA check after the first image. Its
+    /// `AdmitExec` admission is a file-identity hash of the image a later
+    /// exec would run, not an ISA declaration check, and `KvmGuest` has
+    /// no exec callback that reaches this function for a later image. A
+    /// KVM guest whose later exec runs an image declaring more than the
+    /// profile gets no typed refusal from this check; closing that gap
+    /// needs a KVM exec-time check that does not exist yet.
+    pub(crate) fn isa_refusal<G: Guest<Self>>(&self, guest: &G) -> Option<String> {
+        use crate::exec_record::IsaNeeds;
+        let profile = self.cfg.cpu_profile;
+        let level = profile.x86_64_level()?;
+        // The profile is what the guest sees only where Detcore answers its
+        // CPUID: virtualized, and intercepted for this image (ptrace arms
+        // CPUID faulting before this callback, or refuses the run).
+        if !self.cfg.virtualize_cpuid || !guest.has_cpuid_interception() || self.declares_launcher()
+        {
+            return None;
+        }
+        let dettid = guest.thread_state().dettid;
+        // Not `Self::guest_task_directory`, which has none after a chroot:
+        // nothing is looked up by a guest pathname here.
+        let Some(directory) = guest_task_objects_procfs(&self.cfg.backend, guest.tid().as_raw())
+        else {
+            tracing::debug!(
+                "[detcore, dtid {}] image ISA needs unknown: no procfs directory for the process",
+                dettid
+            );
+            return None;
+        };
+        let image = crate::util::RawFd::open(&directory.join("exe"), libc::O_RDONLY)
+            .ok()
+            .as_ref()
+            .and_then(IsaNeeds::read_file);
+        // The interpreter the kernel loaded, wherever AT_BASE says it did,
+        // read on its own evidence: its first file mapping at or above
+        // AT_BASE (its segment holding file offset 0, which need not be at
+        // AT_BASE itself), in the process's memory.
+        let base = crate::util::raw_read_file(&directory.join("auxv"))
+            .ok()
+            .and_then(|auxv| crate::exec_record::auxv_entry(&auxv, libc::AT_BASE))
+            .filter(|&base| base != 0);
+        let maps = base.and_then(|_| crate::util::raw_read_file(&directory.join("maps")).ok());
+        let mapping = base
+            .zip(maps.as_deref())
+            .and_then(|(base, maps)| crate::exec_record::first_image_mapping(maps, base));
+        let loader = base.map(|base| {
+            let (header, _) = mapping.as_ref()?;
+            IsaNeeds::read_mapped(base, *header, |address, buffer| {
+                let address = reverie::syscalls::Addr::from_raw(usize::try_from(address).ok()?)?;
+                guest.memory().read_exact(address, buffer).ok()
+            })
+        });
+        let objects = crate::exec_record::exec_objects(image, loader);
+        for &(what, needs) in &objects {
+            match needs {
+                Some(IsaNeeds::Level(_)) => {}
+                Some(IsaNeeds::Unmarked) => tracing::debug!(
+                    "[detcore, dtid {}] {} declares no x86 ISA level",
+                    dettid,
+                    what
+                ),
+                Some(IsaNeeds::Malformed(why)) => tracing::warn!(
+                    "[detcore, dtid {}] {} declares its x86 ISA level unreadably ({}): not compared",
+                    dettid,
+                    what,
+                    why
+                ),
+                None => tracing::warn!(
+                    "[detcore, dtid {}] {} is unreadable or not x86-64 ELF64: its x86 ISA level is unknown",
+                    dettid,
+                    what
+                ),
+            }
+        }
+        let (what, needed) = crate::exec_record::first_needing_above(level, &objects)?;
+        let path = crate::util::raw_read_link(&directory.join("exe"))
+            .map_or_else(|_| "?".into(), |path| path.display().to_string());
+        let what = match (what, &mapping) {
+            ("its program interpreter", Some((_, loader))) if !loader.is_empty() => {
+                format!(
+                    "its program interpreter {}",
+                    String::from_utf8_lossy(loader)
+                )
+            }
+            _ => what.to_owned(),
+        };
+        let remedy = if needed == 3 {
+            "rerun with --cpu-profile x86-64-v3, on a host that qualifies for it"
+        } else {
+            "no CPU profile presents it"
+        };
+        Some(format!(
+            "--cpu-profile {profile} refused: {what} of {path} declares that it needs {} \
+             (GNU_PROPERTY_X86_ISA_1_NEEDED), above the {} CPU this profile presents; {remedy}",
+            crate::exec_record::x86_64_level_name(needed),
+            crate::exec_record::x86_64_level_name(level),
+        ))
     }
 
     /// Check Detcore's model of the program break for the image an exec just

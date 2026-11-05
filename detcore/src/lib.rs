@@ -170,6 +170,7 @@ pub use config::to_legacy_backend_json;
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-1120): Review the public canonical Detcore root identity.
 pub use consts::ROOT_DETPID;
+pub use detcore_model::cpu_profile::CpuProfile;
 pub use detcore_model::pid::GuestIds;
 pub use digest::Digest;
 pub use finalization::FinalizationFailure;
@@ -768,6 +769,7 @@ pub fn v3_feature_words() -> Vec<(u32, u32, usize, u32)> {
 pub fn cpu_profile_admission_refusal(cfg: &Config) -> Option<&'static str> {
     use detcore_model::cpu_profile::CpuProfile;
     match cfg.cpu_profile {
+        CpuProfile::Auto => Some("auto was not resolved to a named profile before launch"),
         CpuProfile::X86_64V3 if cfg.cpu_profile_host.is_none() => {
             Some("the configuration carries no qualified host facts")
         }
@@ -5870,6 +5872,18 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // instruction, instead of reaching its CPUID provider.
         if let Some(why) = cpu_profile_admission_refusal(&self.cfg) {
             let message = format!("--cpu-profile {} refused: {why}", self.cfg.cpu_profile);
+            error!("{message}");
+            let _ = writeln!(crate::util::RetryingStderr, "{message}");
+            tool_global::unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT)
+                .await;
+        }
+        // Refuse an image that declares it needs more of the CPU than the
+        // profile presents, before its loader can refuse it by exiting
+        // ("Fatal glibc error: CPU does not support x86-64-v3", status 127)
+        // or execute instructions the virtual CPU denies having. Only a
+        // successful exec reaches this callback, so a failed one keeps the
+        // kernel's error.
+        if let Some(message) = self.isa_refusal(guest) {
             error!("{message}");
             let _ = writeln!(crate::util::RetryingStderr, "{message}");
             tool_global::unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT)

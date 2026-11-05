@@ -117,6 +117,10 @@ impl InterceptedCpuid {
                 profile: CpuProfile::HostNoRdrand,
                 xsave: [[0; 4]; XSAVE_SUBLEAVES],
             },
+            CpuProfile::Auto => panic!(
+                "--cpu-profile auto reached Detcore unresolved; the CLI resolves it to a named \
+                 profile before launch"
+            ),
         }
     }
 
@@ -288,6 +292,7 @@ impl InterceptedCpuid {
             // The virtual profiles' fixed vulnerability lists describe their
             // invented CPUs, not this host. Do not invent a host bug list.
             CpuProfile::HostNoRdrand => "",
+            CpuProfile::Auto => unreachable!("`Self::for_config` never builds an auto table"),
         };
         (0..cpus)
             .flat_map(|cpu| {
@@ -1268,7 +1273,17 @@ mod tests {
     #[test]
     fn a_v3_configuration_without_host_facts_is_refused() {
         use crate::cpu_profile_admission_refusal as refusal;
-        assert_eq!(refusal(&crate::Config::default()), None);
+        let v2 = crate::Config {
+            cpu_profile: CpuProfile::X86_64V2,
+            ..Default::default()
+        };
+        assert_eq!(refusal(&v2), None);
+        // Nor does Detcore run an unresolved auto, the unset default.
+        let auto = crate::Config {
+            cpu_profile: CpuProfile::Auto,
+            ..Default::default()
+        };
+        assert!(refusal(&auto).unwrap().contains("auto was not resolved"));
         let mut v3 = crate::Config {
             cpu_profile: CpuProfile::X86_64V3,
             ..Default::default()

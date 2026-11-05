@@ -201,12 +201,19 @@ pub struct StartOpts {
     #[clap(value_name = "PROGRAM", required = true)]
     program: Option<PathBuf>,
 
-    /// The CPU the recorded guest sees: x86-64-v2 (the default) or x86-64-v3,
-    /// offered only on qualified ptrace hosts. The long help states what the
-    /// qualification leaves uncovered. HERMIT_CPU_PROFILE supplies it when the
-    /// flag is absent, as for `hermit run`; the flag wins.
-    #[clap(long, value_enum, default_value_t, env = "HERMIT_CPU_PROFILE", long_help = detcore_model::cpu_profile::CPU_PROFILE_LONG_HELP)]
+    /// The CPU the recorded guest sees: auto (the default), x86-64-v2 or
+    /// x86-64-v3, offered only on qualified ptrace hosts. auto is resolved
+    /// before recording, and the recording holds what it resolved to. The
+    /// long help states what the qualification leaves uncovered.
+    /// HERMIT_CPU_PROFILE supplies it when the flag is absent, as for `hermit
+    /// run`; the flag wins.
+    #[clap(long, value_enum, default_value = "auto", env = "HERMIT_CPU_PROFILE", long_help = detcore_model::cpu_profile::CPU_PROFILE_LONG_HELP)]
     cpu_profile: detcore_model::cpu_profile::CpuProfile,
+
+    /// What `--cpu-profile auto` resolved to and why, logged once the
+    /// recording's tracing starts.
+    #[clap(skip)]
+    auto_resolution: Option<String>,
 
     /// Refuse to record (exit 122) on a host whose retired-conditional-branch counter
     /// fails Reverie's performance-counter validation, as `hermit run --strict` does: the
@@ -393,6 +400,28 @@ impl StartOpts {
     fn record_timeout(&self) -> Option<Duration> {
         self.record_timeout
             .map(|seconds| Duration::from_secs(seconds.get()))
+    }
+
+    /// The host path a guest path is read at in this launch's completed
+    /// view: under a `--mount` target, its source (the file the guest
+    /// sees); `None` where a mount with no source hides it. Outside every
+    /// mount, the path itself.
+    fn mapped_launch_path(&self, guest: &Path) -> Option<PathBuf> {
+        for mount in self.mount.iter().rev() {
+            if let Ok(suffix) = guest.strip_prefix(mount.get_target()) {
+                return mount.get_source().map(|source| {
+                    // An exact file bind has an empty suffix; joining it
+                    // would append a separator and name `SOURCE/`, which
+                    // no regular file can be read at.
+                    if suffix.as_os_str().is_empty() {
+                        source.to_path_buf()
+                    } else {
+                        source.join(suffix)
+                    }
+                });
+            }
+        }
+        Some(guest.to_path_buf())
     }
 
     fn guest_command(&self) -> Result<Command, Error> {
@@ -629,10 +658,52 @@ impl StartOpts {
         global: &GlobalOpts,
         preparation: RecordPreparation<'_>,
     ) -> Result<ExitStatus, Error> {
-        hermit::cpu_profile_admission::check_record_or_replay(self.cpu_profile).map_err(
-            |refusal| Error::new(crate::app::container::PolicyRefusal).context(refusal.to_string()),
-        )?;
-        if self.cpu_profile == detcore_model::cpu_profile::CpuProfile::X86_64V3 {
+        // A `--verify-replay-of` run never execs the original program: it
+        // replays the first run's recording, whose metadata names the
+        // recorded profile. Classifying the (possibly changed or missing)
+        // original here would refuse a replay that would have run, so
+        // Auto is resolved only for a run that records.
+        let replay_only = self.verify_replay_of.is_some();
+        // `--cpu-profile auto` records the named profile it resolves to
+        // (`hermit::cpu_profile_admission::resolve_auto`), so replay uses
+        // that profile and never derives it again. The program and every
+        // interpreter hop are read in this launch's completed view: a
+        // path under a `--mount` target is read at its source, as the
+        // guest sees it, never at the host file the target shadows.
+        if self.cpu_profile == detcore_model::cpu_profile::CpuProfile::Auto && !replay_only {
+            let found = self.guest_command()?.find_program().with_context(|| {
+                format!("Could not resolve program {:?} in PATH", self.program())
+            })?;
+            let refuse = |why: String| {
+                Error::new(crate::app::container::PolicyRefusal)
+                    .context(format!("--cpu-profile auto refused: {why}"))
+            };
+            let program = self
+                .mapped_launch_path(&found)
+                .ok_or_else(|| refuse(format!("{} is hidden by a mount", found.display())))?;
+            let (profile, why) = hermit::cpu_profile_admission::resolve_auto(&program, |guest| {
+                self.mapped_launch_path(guest)
+            })
+            .map_err(refuse)?;
+            let mut resolved = self.clone();
+            resolved.cpu_profile = profile;
+            resolved.auto_resolution =
+                Some(format!("--cpu-profile auto resolved to {profile}: {why}"));
+            return resolved.main_with_preparation(global, preparation);
+        }
+        if !replay_only {
+            hermit::cpu_profile_admission::check_record_or_replay(self.cpu_profile).map_err(
+                |refusal| {
+                    Error::new(crate::app::container::PolicyRefusal).context(refusal.to_string())
+                },
+            )?;
+        }
+        // A replay-only run likewise never qualifies this invocation's
+        // requested v3: the recording's own profile is selected and, if v3,
+        // qualified from its metadata in `Replay::spawn`. An unused ambient
+        // request must not refuse a replayable v2 recording on a host that
+        // cannot qualify for v3 (revcodex on PR 4709).
+        if !replay_only && self.cpu_profile == detcore_model::cpu_profile::CpuProfile::X86_64V3 {
             super::verify::CPU_PROFILE_V3_RAN.store(true, std::sync::atomic::Ordering::SeqCst);
             // Qualify here, before any container: a refusal ends the command at
             // once, and the recorder and replayer reuse the result.
@@ -678,6 +749,9 @@ impl StartOpts {
                 None,
                 move |(data, identity)| {
                     let _guard = global.init_tracing();
+                    if let Some(resolution) = &options.auto_resolution {
+                        tracing::debug!("{resolution}");
+                    }
                     identity.record_plan()?;
                     let command = options.guest_command()?;
                     let mountinfo = identity.mount_provenance()?;
@@ -1420,6 +1494,7 @@ mod tests {
         StartOpts {
             program: Some(PathBuf::from("/bin/true")),
             cpu_profile: Default::default(),
+            auto_resolution: None,
             strict: false,
             args: Vec::new(),
             env,
@@ -1494,7 +1569,7 @@ mod tests {
     const RECORD_CPU_PROFILE_ARGS_IN_CHILD: &str = "HERMIT_TEST_RECORD_CPU_PROFILE_ARGS";
 
     /// `record start --cpu-profile` reads HERMIT_CPU_PROFILE exactly as `hermit
-    /// run` does: unset is x86-64-v2, the flag wins, and a value that names no
+    /// run` does: unset is auto, the flag wins, and a value that names no
     /// profile is refused. Each parse runs in a child process given exactly
     /// the variable under test.
     #[test]
@@ -1546,7 +1621,8 @@ mod tests {
                 .to_owned()
         };
 
-        assert_eq!(parse(None, &[]), "cpu-profile=x86-64-v2");
+        assert_eq!(parse(None, &[]), "cpu-profile=auto");
+        assert_eq!(parse(Some("auto"), &[]), "cpu-profile=auto");
         assert_eq!(parse(Some("x86-64-v3"), &[]), "cpu-profile=x86-64-v3");
         assert_eq!(
             parse(Some("x86-64-v3"), &["--cpu-profile=x86-64-v2"]),
@@ -1924,6 +2000,7 @@ mod tests {
         let options = StartOpts {
             program: Some(PathBuf::from("/proc/self/exe")),
             cpu_profile: Default::default(),
+            auto_resolution: None,
             strict: false,
             args: Vec::new(),
             env: Vec::new(),
@@ -1962,6 +2039,45 @@ mod tests {
             calls.get(),
             0,
             "the refused /proc target reached preprocessing"
+        );
+    }
+
+    /// The completed-view mapping a recorded launch's images are read
+    /// through: an exact regular-file bind maps to its source unchanged
+    /// (joining the empty suffix would name `SOURCE/`, unreadable as a
+    /// file - the exact02b witness in revcodex's PR 4709 review), a path
+    /// under a directory bind joins its suffix, a sourceless mount hides
+    /// its target, and anything else is itself. Interpreter paths go
+    /// through the same mapping, so file binds of either are covered.
+    #[test]
+    fn mapped_launch_path_preserves_an_exact_file_bind() {
+        let mut options = start_options(Vec::new());
+        options.mount = vec![
+            Mount::bind("/host/prog-source", "/guest/prog"),
+            Mount::bind("/host/libdir", "/guest/lib"),
+            Mount::new("/guest/hidden"),
+        ];
+        // Raw OsStr: PathBuf equality treats a trailing slash (the old
+        // exact-bind bug, SOURCE/) as the same path as SOURCE.
+        assert_eq!(
+            options
+                .mapped_launch_path(Path::new("/guest/prog"))
+                .as_deref()
+                .map(Path::as_os_str),
+            Some(std::ffi::OsStr::new("/host/prog-source"))
+        );
+        assert_eq!(
+            options.mapped_launch_path(Path::new("/guest/lib/ld.so")),
+            Some(PathBuf::from("/host/libdir/ld.so"))
+        );
+        assert_eq!(options.mapped_launch_path(Path::new("/guest/hidden")), None);
+        assert_eq!(
+            options.mapped_launch_path(Path::new("/guest/hidden/ld.so")),
+            None
+        );
+        assert_eq!(
+            options.mapped_launch_path(Path::new("/bin/true")),
+            Some(PathBuf::from("/bin/true"))
         );
     }
 }

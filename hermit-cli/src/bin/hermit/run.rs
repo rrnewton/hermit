@@ -2317,6 +2317,11 @@ pub struct RunOpts {
     #[clap(skip)]
     prepared_program: Option<PathBuf>,
 
+    /// What `--cpu-profile auto` resolved to and why, for the diagnostic
+    /// line `--log=debug` and finer show.
+    #[clap(skip)]
+    auto_resolution: Option<String>,
+
     /// Why this host's retired-branch counter is inexact, if it is. Only the
     /// `--strict` refusal and the warning without `--strict` consult it; tests
     /// replace it to reach both on a host whose counters pass.
@@ -10534,8 +10539,13 @@ impl RunOpts {
     /// v3 binds qualified XSTATE facts; host-no-rdrand requires CPUID faulting
     /// without running the v3 XSTATE qualification. A v2 run is untouched.
     fn admit_cpu_profile(&mut self) -> Result<(), Error> {
+        self.resolve_auto_cpu_profile()?;
         let config = &self.det_opts.det_config;
-        if config.cpu_profile.is_default() {
+        // Still auto only where it could not resolve, which a later check or
+        // the launch refuses: nothing to admit.
+        if config.cpu_profile.is_default()
+            || config.cpu_profile == detcore_model::cpu_profile::CpuProfile::Auto
+        {
             return Ok(());
         }
         let backend = self.selected_backend();
@@ -10633,6 +10643,56 @@ impl RunOpts {
             "{option} needs a gdbserver, which only the ptrace backend runs: {cause}, so no \
              debugger could attach; {remedy}"
         )))
+    }
+
+    /// Resolve `--cpu-profile auto` to the named profile the guest program
+    /// and its program interpreter need
+    /// (`hermit::cpu_profile_admission::resolve_auto`), before that profile
+    /// is admitted like an explicit one. The configuration, and with it any
+    /// recording and the second run of `--verify`, then holds only the named
+    /// profile. A program auto cannot read or resolve is refused by name at
+    /// the launch.
+    fn resolve_auto_cpu_profile(&mut self) -> Result<(), Error> {
+        use detcore_model::cpu_profile::CpuProfile;
+        if self.det_opts.det_config.cpu_profile != CpuProfile::Auto {
+            return Ok(());
+        }
+        // A program that cannot run keeps its own fault (127 or 126), which
+        // `validate_program` reports in its place among the run's checks:
+        // auto stays unresolved, and nothing is admitted or launched for it.
+        if self.validate_program().is_err() {
+            return Ok(());
+        }
+        let (program, _, rootfs) = self.guest_program_on_host()?;
+        let to_host = |path: &Path| match &rootfs {
+            Some(rootfs) => Some(crate::app::image::resolve_in_rootfs(rootfs, path)),
+            None => match self.mapped_host_program(path) {
+                GuestPathMapping::Mapped(host) => Some(host),
+                GuestPathMapping::Unchanged => Some(path.to_path_buf()),
+                GuestPathMapping::Hidden => None,
+            },
+        };
+        // Where auto cannot resolve (an unreadable program, a level no
+        // profile presents), it stays auto: the run's own checks keep their
+        // place and their refusals, and the launch then refuses auto by name
+        // (`resolve_launch_auto`), before any guest runs. Never a guess.
+        let Ok((profile, why)) = hermit::cpu_profile_admission::resolve_auto(&program, to_host)
+        else {
+            return Ok(());
+        };
+        self.auto_resolution = Some(format!("--cpu-profile auto resolved to {profile}: {why}"));
+        self.det_opts.det_config.cpu_profile = profile;
+        Ok(())
+    }
+
+    /// Log what `--cpu-profile auto` resolved to, once tracing has started,
+    /// where the run's log goes (`--log=debug` and finer). Not at info: a
+    /// rerun from the run's manifest names the resolved profile, resolves
+    /// nothing, and must log what the original logged at info.
+    fn log_auto_resolution(&self) {
+        if let Some(resolution) = &self.auto_resolution {
+            tracing::debug!("{resolution}");
+        }
     }
 
     fn refuse_unqualified_liteinst_in_guest_options(&self) -> Result<(), Error> {
@@ -11495,6 +11555,7 @@ impl RunOpts {
         }
         if self.application_backend.is_some() && !self.verify {
             self.warn_no_namespace();
+            self.log_auto_resolution();
             let mode = if self.verify_run.is_some() {
                 super::backend_hook::Mode::SavedVerification
             } else {
@@ -13229,6 +13290,14 @@ impl RunOpts {
     }
 
     fn validate_program(&self) -> Result<(), Error> {
+        let (host, requested, rootfs) = self.guest_program_on_host()?;
+        validate_executable(&host, &requested, rootfs.as_deref())
+    }
+
+    /// Where the guest program is on the host, as [`Self::validate_program`]
+    /// checks it: its host path, the path as the command names it, and the
+    /// image rootfs it resolves in, if any.
+    fn guest_program_on_host(&self) -> Result<(PathBuf, PathBuf, Option<PathBuf>), Error> {
         // PROTOTYPE (--image): the guest program is interpreted inside the
         // materialized OCI rootfs, not on the host filesystem. Resolve and
         // validate it against the rootfs so that image-only binaries (e.g.
@@ -13300,21 +13369,23 @@ impl RunOpts {
                 }
             }
             if let Some((_, host)) = best {
-                return validate_executable(&host, &guest_abs, None);
+                validate_executable(&host, &guest_abs, None)?;
+                return Ok((host, guest_abs, None));
             }
             // Resolve chroot-aware: images (nixos/nix especially) expose
             // `/bin/sh` as a symlink to an absolute `/nix/store/...` target that
             // only resolves under the image root, so a naive host `stat` would
             // follow it against the host `/` and fail.
             let in_rootfs = crate::app::image::resolve_in_rootfs(&rootfs, &guest_abs);
-            return validate_executable(&in_rootfs, &guest_abs, Some(&rootfs));
+            validate_executable(&in_rootfs, &guest_abs, Some(&rootfs))?;
+            return Ok((in_rootfs, guest_abs, Some(rootfs)));
         }
 
         let command = self.guest_command()?;
         let requested = Path::new(command.get_program());
         if requested.is_absolute() {
             if let GuestPathMapping::Mapped(host) = self.mapped_host_program(requested) {
-                return validate_executable(&host, requested, None);
+                return Ok((host, requested.to_path_buf(), None));
             }
             if requested.starts_with(TMP_DIR) && self.tmp.is_none() && requested.exists() {
                 anyhow::bail!(
@@ -13325,7 +13396,8 @@ impl RunOpts {
                 );
             }
             self.refuse_program_under_dev_shm(requested)?;
-            return validate_executable(requested, requested, None);
+            validate_executable(requested, requested, None)?;
+            return Ok((requested.to_path_buf(), requested.to_path_buf(), None));
         }
 
         // ⚠️ SAME FAULT AS THE ABSOLUTE-PATH BRANCH ABOVE, SO THE SAME CODE.
@@ -13353,7 +13425,7 @@ impl RunOpts {
                 )
             })
             .map_err(|error| error.context(GuestProgramFault::NotFound))?;
-        validate_executable(&resolved, requested, None)
+        Ok((resolved, requested.to_path_buf(), None))
     }
 
     fn validate_executable_overlay_source_visibility(&self, source: &Path) -> Result<(), Error> {
@@ -15981,6 +16053,15 @@ impl RunOpts {
         self.config_capture = Some(config);
     }
 
+    /// Records that `--cpu-profile auto` resolved to `profile`, as
+    /// [`Self::resolve_auto_cpu_profile`] does from the program, for tests
+    /// of what a resolved run saves.
+    #[cfg(test)]
+    pub(crate) fn set_auto_resolution(&mut self, profile: detcore_model::cpu_profile::CpuProfile) {
+        self.auto_resolution = Some(format!("--cpu-profile auto resolved to {profile}"));
+        self.det_opts.det_config.cpu_profile = profile;
+    }
+
     /// Retain source identity independently of YAML capture, which may fail
     /// for a non-UTF-8 argument and does not run for embedded OCI commands.
     pub(crate) fn capture_max_timeslice_source(&mut self, matches: &clap::ArgMatches) {
@@ -16255,6 +16336,7 @@ impl RunOpts {
     /// implicit inputs this run resolved written out, so that loading it
     /// reproduces the run rather than resolving them again.
     pub(crate) fn saved_run_config(&self) -> Result<crate::app::run_config::RunConfig, Error> {
+        use crate::app::run_config::CPU_PROFILE_KEY;
         use crate::app::run_config::EPOCH_KEY;
         use crate::app::run_config::PID_BASE_KEY;
         use crate::app::run_config::SEED_FROM_KEY;
@@ -16293,6 +16375,15 @@ impl RunOpts {
             && let Some(base) = self.det_opts.det_config.guest_ids.base()
         {
             config.run.insert(PID_BASE_KEY.to_owned(), base.into());
+        }
+        // The profile auto resolved to, given or not: loading the config
+        // (`--config`, or `--from` a manifest) runs that profile and never
+        // derives one again.
+        if self.auto_resolution.is_some() {
+            config.run.insert(
+                CPU_PROFILE_KEY.to_owned(),
+                self.det_opts.det_config.cpu_profile.name().into(),
+            );
         }
         Ok(config)
     }
@@ -16950,8 +17041,11 @@ impl RunOpts {
             (self.namespace_only, "--namespace-only"),
             (self.verify, "--verify"),
             // Only `main` runs the host qualification the profile admits with.
+            // Not auto: each launch resolves that itself.
             (
-                !self.det_opts.det_config.cpu_profile.is_default(),
+                !self.det_opts.det_config.cpu_profile.is_default()
+                    && self.det_opts.det_config.cpu_profile
+                        != detcore_model::cpu_profile::CpuProfile::Auto,
                 match self.det_opts.det_config.cpu_profile {
                     detcore_model::cpu_profile::CpuProfile::HostNoRdrand => {
                         "--cpu-profile host-no-rdrand"
@@ -17118,6 +17212,7 @@ impl RunOpts {
         identity_sources: Option<&IdentityGuard>,
     ) -> Result<(ExitStatus, Option<Output>, Option<detcore::TerminalOutcome>), Error> {
         let _guard = global.init_tracing_for_backend(self.runtime_backend());
+        self.log_auto_resolution();
         hermit::proc_mount::warn_if_readonly_proc();
         // Inside the container: its mounts, the overlays among them, are in
         // place.
