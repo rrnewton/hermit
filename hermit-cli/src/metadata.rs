@@ -2497,7 +2497,6 @@ mod tests {
         // was rebased onto, not only the version before the original bump.
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x187)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x186)));
-        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x187)));
     }
 
     /// A recording from before the corrected RCB event (0x19a and earlier)

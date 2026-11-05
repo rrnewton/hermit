@@ -1191,6 +1191,41 @@ mod tests {
 
     /// Two schedules recorded under different `--pipe-wake-latency` values,
     /// off and `0` included, cannot be interpolated: no replay could
+    /// Two schedules recorded under different `--pipe-wake-latency` values,
+    /// off and `0` included, cannot be interpolated: no replay could
+    /// reproduce the result (https://github.com/rrnewton/hermit/issues/4380).
+    #[test]
+    fn interpolate_refuses_schedules_recorded_under_different_pipe_wake_latencies() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, latency: Option<u64>| {
+            let path = dir.path().join(name);
+            let record =
+                PreemptionRecord::from_sched_events(Vec::new()).with_pipe_wake_latency(latency);
+            std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
+            path
+        };
+        let off = write("off.json", None);
+        let zero = write("zero.json", Some(0));
+        let one_ms = write("one-ms.json", Some(1_000_000));
+        assert_eq!(
+            InterpolateOpts::common_pipe_wake_latency(&off, &off).unwrap(),
+            None
+        );
+        assert_eq!(
+            InterpolateOpts::common_pipe_wake_latency(&zero, &zero).unwrap(),
+            Some(0)
+        );
+        for (a, b) in [(&off, &zero), (&zero, &one_ms), (&one_ms, &off)] {
+            let error = InterpolateOpts::common_pipe_wake_latency(a, b).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("different --pipe-wake-latency values"),
+                "{error}"
+            );
+        }
+    }
+
     /// The interpolated schedule carries the identity, latency and copy
     /// setting both inputs state; inputs stating different identities are
     /// refused before anything is written.

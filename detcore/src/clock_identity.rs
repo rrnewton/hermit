@@ -282,7 +282,19 @@ pub(crate) fn prepare_run_with(
     let schedule = match &cfg.replay_schedule_from {
         None => None,
         Some(path) => {
-            let recording = Recording::read(path).map_err(PrepareError::Unreadable)?;
+            let recording = Recording::read(path).map_err(|error| {
+                // A format refusal keeps its policy exit, as the scheduler's
+                // loader gave it before preparation existed; only unreadable
+                // or malformed files keep the loader's panic class.
+                if error
+                    .chain()
+                    .any(|cause| cause.is::<crate::preemptions::RecordFormatRefusal>())
+                {
+                    PrepareError::Refused(format!("{error:#}"))
+                } else {
+                    PrepareError::Unreadable(error)
+                }
+            })?;
             recording
                 .require_strict_mode(cfg.strict_schedule_boundaries)
                 .map_err(|error| PrepareError::Refused(error.to_string()))?;
@@ -334,6 +346,23 @@ pub(crate) fn prepare_run_with(
         history.as_ref().map(HistoryReader::callback_checkpoints),
     ) {
         return Err(PrepareError::Refused(refusal));
+    }
+    // Faithful replay refuses a departed record before the pin too, unless
+    // the run explicitly explores edited histories; construction repeats
+    // the check on the installed objects.
+    if !cfg.replay_edited_preemptions {
+        if let Some(schedule) = &schedule {
+            schedule
+                .recording
+                .require_faithful_replay()
+                .map_err(|error| PrepareError::Refused(error.to_string()))?;
+        }
+        if let Some(history) = &history {
+            history
+                .recording()
+                .require_faithful_replay()
+                .map_err(|error| PrepareError::Refused(error.to_string()))?;
+        }
     }
     let clock = validated
         .commit(sources.state)

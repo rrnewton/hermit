@@ -293,6 +293,14 @@ impl<P: AsRef<OsStr>> Verify<P> {
             "{}",
             "::  Checking that event schedules match (fixed point)".bold()
         );
+        // Schedules stating different RCB identities count different things,
+        // so they differ even where their events agree.
+        let (_, left_identity) = Self::schedule_fields(&left.schedule_file)?;
+        let (_, right_identity) = Self::schedule_fields(&right.schedule_file)?;
+        if left_identity != right_identity {
+            println!("rcb_history identity differs: {left_identity:?} vs {right_identity:?}");
+            return Ok(false);
+        }
         Self::verify_lines(
             Self::format_json(&left.schedule_file)?,
             Self::format_json(&right.schedule_file)?,

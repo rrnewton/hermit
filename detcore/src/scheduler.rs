@@ -5438,8 +5438,9 @@ pub(crate) enum ReplayStacks {
 impl AdmittedSchedule {
     /// Resolves `cfg`'s stack selections against `recording`'s complete
     /// stream. In a slice-boundary schedule an index outside it, or one given
-    /// twice, is a policy refusal; in a legacy schedule an index outside it
-    /// panics, as indexing its events always has.
+    /// twice, is a policy refusal; in a legacy schedule an index at or past
+    /// the end resolves without a recorded event, naming the events the run
+    /// makes after the schedule runs out.
     pub(crate) fn new(cfg: &Config, recording: Recording) -> Result<Self, &'static str> {
         let stacks = match &recording {
             Recording::Legacy(_) => {
