@@ -1995,7 +1995,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And https://github.com/rrnewton/hermit/pull/4735's two replay
     // rewrite-provenance refusal units: 1267 + 2 = 1269.
     // And its public-library entry refusal unit: 1269 + 1 = 1270.
-    ("test.hermit_unit", 1270),
+    // And its matching-replay admission units (CLI and library):
+    // 1270 + 2 = 1272.
+    ("test.hermit_unit", 1272),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6377,7 +6379,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two rewrite-provenance units as test.hermit_unit:
     // 1261 + 2 = 1263.
     // And the same public-library entry unit: 1263 + 1 = 1264.
-    ("test.hermit_unit_on_host", 1264),
+    // And the same two matching-replay units: 1264 + 2 = 1266.
+    ("test.hermit_unit_on_host", 1266),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
