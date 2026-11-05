@@ -1,0 +1,451 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `hermit-cli/src/bin/hermit/podman_store.rs`."><title>podman_store.rs - source</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../../../" data-static-root-path="../../../../static.files/" data-current-crate="hermit" data-themes="" data-resource-suffix="" data-rustdoc-version="1.99.0-nightly (be8e82435 2026-07-11)" data-channel="nightly" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../../../static.files/storage-41dd4d93.js"></script><script defer src="../../../../static.files/src-script-813739b1.js"></script><script defer src="../../../../src-files.js"></script><script defer src="../../../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../../../static.files/favicon-044be391.svg"></head><body class="rustdoc src"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="sidebar"><div class="src-sidebar-title"><h2>Files</h2></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1><div class="sub-heading">hermit/bin/hermit/</div>podman_store.rs</h1><rustdoc-toolbar></rustdoc-toolbar></div><div class="example-wrap digits-3"><pre class="rust"><code><a href=#1 id=1 data-nosnippet>1</a><span class="comment">/*
+<a href=#2 id=2 data-nosnippet>2</a> * Copyright (c) Meta Platforms, Inc. and affiliates.
+<a href=#3 id=3 data-nosnippet>3</a> * All rights reserved.
+<a href=#4 id=4 data-nosnippet>4</a> *
+<a href=#5 id=5 data-nosnippet>5</a> * This source code is licensed under the BSD-style license found in the
+<a href=#6 id=6 data-nosnippet>6</a> * LICENSE file in the root directory of this source tree.
+<a href=#7 id=7 data-nosnippet>7</a> */
+<a href=#8 id=8 data-nosnippet>8</a>
+<a href=#9 id=9 data-nosnippet>9</a></span><span class="doccomment">//! Discovery of OCI images already present in the local containers/storage
+<a href=#10 id=10 data-nosnippet>10</a>//! image store, via the `podman` CLI.
+<a href=#11 id=11 data-nosnippet>11</a>//!
+<a href=#12 id=12 data-nosnippet>12</a>//! # Why the CLI and not a library
+<a href=#13 id=13 data-nosnippet>13</a>//!
+<a href=#14 id=14 data-nosnippet>14</a>//! `containers/image` and `containers/storage` — the components that own the
+<a href=#15 id=15 data-nosnippet>15</a>//! image store — are Go libraries. Linking them into this Rust binary means cgo
+<a href=#16 id=16 data-nosnippet>16</a>//! plus a compiled-in pin of one store implementation, while the on-disk format
+<a href=#17 id=17 data-nosnippet>17</a>//! is versioned and can differ per install (libpod state may be sqlite while
+<a href=#18 id=18 data-nosnippet>18</a>//! containers/storage metadata is still JSON). The store's *documented* surface
+<a href=#19 id=19 data-nosnippet>19</a>//! is the `podman` CLI, so that is what this module binds to. Parsing
+<a href=#20 id=20 data-nosnippet>20</a>//! `overlay-images/images.json` or `db.sql` directly would bind hermit to an
+<a href=#21 id=21 data-nosnippet>21</a>//! internal format and is deliberately not done here.
+<a href=#22 id=22 data-nosnippet>22</a>//!
+<a href=#23 id=23 data-nosnippet>23</a>//! # Relationship to [`crate::app::image`]
+<a href=#24 id=24 data-nosnippet>24</a>//!
+<a href=#25 id=25 data-nosnippet>25</a>//! `buildah` (used by [`crate::app::image::materialize_rootfs`]) and `podman` share
+<a href=#26 id=26 data-nosnippet>26</a>//! the same graph root, so `--image` already reads this same store. This module
+<a href=#27 id=27 data-nosnippet>27</a>//! adds the piece that was missing: turning a user-supplied *reference* into a
+<a href=#28 id=28 data-nosnippet>28</a>//! stable image *identity* before anything is cached against it, plus the
+<a href=#29 id=29 data-nosnippet>29</a>//! listing and inspection surface behind `hermit oci`.
+<a href=#30 id=30 data-nosnippet>30</a>
+<a href=#31 id=31 data-nosnippet>31</a></span><span class="kw">use </span>std::collections::BTreeMap;
+<a href=#32 id=32 data-nosnippet>32</a><span class="kw">use </span>std::process::Command;
+<a href=#33 id=33 data-nosnippet>33</a><span class="kw">use </span>std::process::Stdio;
+<a href=#34 id=34 data-nosnippet>34</a>
+<a href=#35 id=35 data-nosnippet>35</a><span class="kw">use </span>hermit::Context;
+<a href=#36 id=36 data-nosnippet>36</a><span class="kw">use </span>hermit::Error;
+<a href=#37 id=37 data-nosnippet>37</a><span class="kw">use </span>serde::Deserialize;
+<a href=#38 id=38 data-nosnippet>38</a>
+<a href=#39 id=39 data-nosnippet>39</a><span class="doccomment">/// Program used to talk to the local image store.
+<a href=#40 id=40 data-nosnippet>40</a></span><span class="kw">const </span>PODMAN: <span class="kw-2">&amp;</span>str = <span class="string">"podman"</span>;
+<a href=#41 id=41 data-nosnippet>41</a>
+<a href=#42 id=42 data-nosnippet>42</a><span class="doccomment">/// A resolved local image: the reference the user gave, plus the identity the
+<a href=#43 id=43 data-nosnippet>43</a>/// store assigned it.
+<a href=#44 id=44 data-nosnippet>44</a></span><span class="attr">#[derive(Debug, Clone, PartialEq, Eq)]
+<a href=#45 id=45 data-nosnippet>45</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">struct </span>ResolvedImage {
+<a href=#46 id=46 data-nosnippet>46</a>    <span class="doccomment">/// The reference as the user wrote it (tag, short id, digest, ...).
+<a href=#47 id=47 data-nosnippet>47</a>    </span><span class="kw">pub </span>reference: String,
+<a href=#48 id=48 data-nosnippet>48</a>    <span class="doccomment">/// The store's canonical 64-hex image ID. This — not [`Self::reference`] —
+<a href=#49 id=49 data-nosnippet>49</a>    /// is the identity anything may be cached against.
+<a href=#50 id=50 data-nosnippet>50</a>    </span><span class="kw">pub </span>id: String,
+<a href=#51 id=51 data-nosnippet>51</a>    <span class="doccomment">/// The image's manifest digest (`sha256:...`), when the store records one.
+<a href=#52 id=52 data-nosnippet>52</a>    </span><span class="kw">pub </span>digest: <span class="prelude-ty">Option</span>&lt;String&gt;,
+<a href=#53 id=53 data-nosnippet>53</a>}
+<a href=#54 id=54 data-nosnippet>54</a>
+<a href=#55 id=55 data-nosnippet>55</a><span class="doccomment">/// A row of `hermit oci ls`.
+<a href=#56 id=56 data-nosnippet>56</a></span><span class="attr">#[derive(Debug, Clone, Deserialize)]
+<a href=#57 id=57 data-nosnippet>57</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">struct </span>ImageSummary {
+<a href=#58 id=58 data-nosnippet>58</a>    <span class="attr">#[serde(rename = <span class="string">"Id"</span>)]
+<a href=#59 id=59 data-nosnippet>59</a>    </span><span class="kw">pub </span>id: String,
+<a href=#60 id=60 data-nosnippet>60</a>    <span class="attr">#[serde(rename = <span class="string">"Names"</span>, default)]
+<a href=#61 id=61 data-nosnippet>61</a>    </span><span class="kw">pub </span>names: <span class="prelude-ty">Option</span>&lt;Vec&lt;String&gt;&gt;,
+<a href=#62 id=62 data-nosnippet>62</a>    <span class="attr">#[serde(rename = <span class="string">"Size"</span>, default)]
+<a href=#63 id=63 data-nosnippet>63</a>    </span><span class="kw">pub </span>size: u64,
+<a href=#64 id=64 data-nosnippet>64</a>}
+<a href=#65 id=65 data-nosnippet>65</a>
+<a href=#66 id=66 data-nosnippet>66</a><span class="kw">impl </span>ImageSummary {
+<a href=#67 id=67 data-nosnippet>67</a>    <span class="doccomment">/// The best human-readable name for this image, or `&lt;none&gt;` when the image
+<a href=#68 id=68 data-nosnippet>68</a>    /// is untagged (an intermediate build layer, typically).
+<a href=#69 id=69 data-nosnippet>69</a>    </span><span class="kw">pub fn </span>display_name(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; String {
+<a href=#70 id=70 data-nosnippet>70</a>        <span class="self">self</span>.names
+<a href=#71 id=71 data-nosnippet>71</a>            .as_ref()
+<a href=#72 id=72 data-nosnippet>72</a>            .and_then(|names| names.first().cloned())
+<a href=#73 id=73 data-nosnippet>73</a>            .unwrap_or_else(|| <span class="string">"&lt;none&gt;"</span>.to_string())
+<a href=#74 id=74 data-nosnippet>74</a>    }
+<a href=#75 id=75 data-nosnippet>75</a>}
+<a href=#76 id=76 data-nosnippet>76</a>
+<a href=#77 id=77 data-nosnippet>77</a><span class="doccomment">/// A handle to the local image store.
+<a href=#78 id=78 data-nosnippet>78</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">struct </span>PodmanStore {
+<a href=#79 id=79 data-nosnippet>79</a>    <span class="doccomment">/// The store's graph root, as podman reports it. Recorded so error messages
+<a href=#80 id=80 data-nosnippet>80</a>    /// and `hermit oci inspect` can say *which* store was consulted.
+<a href=#81 id=81 data-nosnippet>81</a>    </span>graph_root: String,
+<a href=#82 id=82 data-nosnippet>82</a>}
+<a href=#83 id=83 data-nosnippet>83</a>
+<a href=#84 id=84 data-nosnippet>84</a><span class="doccomment">/// Total WALL budget for waiting out a locked podman database, shared by
+<a href=#85 id=85 data-nosnippet>85</a>/// every podman invocation in this binary. Concurrent validates share one
+<a href=#86 id=86 data-nosnippet>86</a>/// containers/storage store; its database lock is held for milliseconds,
+<a href=#87 id=87 data-nosnippet>87</a>/// so contention is transient — but an unbounded or silent retry would
+<a href=#88 id=88 data-nosnippet>88</a>/// hide a wedged store, so the wait is bounded and counted.
+<a href=#89 id=89 data-nosnippet>89</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">const </span>PODMAN_LOCK_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(<span class="number">120</span>);
+<a href=#90 id=90 data-nosnippet>90</a>
+<a href=#91 id=91 data-nosnippet>91</a><span class="doccomment">/// Whether podman's stderr reports the shared storage database lock.
+<a href=#92 id=92 data-nosnippet>92</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>podman_database_locked(stderr: <span class="kw-2">&amp;</span>str) -&gt; bool {
+<a href=#93 id=93 data-nosnippet>93</a>    stderr.contains(<span class="string">"database locked"</span>)
+<a href=#94 id=94 data-nosnippet>94</a>}
+<a href=#95 id=95 data-nosnippet>95</a>
+<a href=#96 id=96 data-nosnippet>96</a><span class="doccomment">/// Wait once for the podman database lock, counting the attempt out loud.
+<a href=#97 id=97 data-nosnippet>97</a>/// `attempt` is 1-based. Returns false when the budget is exhausted, in
+<a href=#98 id=98 data-nosnippet>98</a>/// which case the caller surfaces the lock failure (never retries past
+<a href=#99 id=99 data-nosnippet>99</a>/// the bound, never silently).
+<a href=#100 id=100 data-nosnippet>100</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>wait_for_podman_lock(attempt: u32, started: std::time::Instant) -&gt; bool {
+<a href=#101 id=101 data-nosnippet>101</a>    <span class="kw">let </span>elapsed = started.elapsed();
+<a href=#102 id=102 data-nosnippet>102</a>    <span class="kw">if </span>elapsed &gt;= PODMAN_LOCK_WAIT_BUDGET {
+<a href=#103 id=103 data-nosnippet>103</a>        <span class="kw">return </span><span class="bool-val">false</span>;
+<a href=#104 id=104 data-nosnippet>104</a>    }
+<a href=#105 id=105 data-nosnippet>105</a>    <span class="kw">let </span>delay =
+<a href=#106 id=106 data-nosnippet>106</a>        (std::time::Duration::from_millis(<span class="number">250</span>) * attempt).min(std::time::Duration::from_secs(<span class="number">5</span>));
+<a href=#107 id=107 data-nosnippet>107</a>    <span class="macro">eprintln!</span>(
+<a href=#108 id=108 data-nosnippet>108</a>        <span class="string">"hermit: podman database locked; lock wait attempt {attempt} \
+<a href=#109 id=109 data-nosnippet>109</a>         (elapsed {:.1}s of {:.0}s budget)"</span>,
+<a href=#110 id=110 data-nosnippet>110</a>        elapsed.as_secs_f64(),
+<a href=#111 id=111 data-nosnippet>111</a>        PODMAN_LOCK_WAIT_BUDGET.as_secs_f64(),
+<a href=#112 id=112 data-nosnippet>112</a>    );
+<a href=#113 id=113 data-nosnippet>113</a>    std::thread::sleep(delay);
+<a href=#114 id=114 data-nosnippet>114</a>    <span class="bool-val">true
+<a href=#115 id=115 data-nosnippet>115</a></span>}
+<a href=#116 id=116 data-nosnippet>116</a>
+<a href=#117 id=117 data-nosnippet>117</a><span class="doccomment">/// Run a podman command and capture stdout, mapping a nonzero exit to an error
+<a href=#118 id=118 data-nosnippet>118</a>/// that includes podman's own stderr (which is where its diagnostics go).
+<a href=#119 id=119 data-nosnippet>119</a></span><span class="kw">fn </span>podman_output(args: <span class="kw-2">&amp;</span>[<span class="kw-2">&amp;</span>str]) -&gt; <span class="prelude-ty">Result</span>&lt;String, Error&gt; {
+<a href=#120 id=120 data-nosnippet>120</a>    <span class="kw">let </span>started = std::time::Instant::now();
+<a href=#121 id=121 data-nosnippet>121</a>    <span class="kw">let </span><span class="kw-2">mut </span>attempt = <span class="number">0</span>;
+<a href=#122 id=122 data-nosnippet>122</a>    <span class="kw">loop </span>{
+<a href=#123 id=123 data-nosnippet>123</a>        <span class="kw">let </span>output = Command::new(PODMAN)
+<a href=#124 id=124 data-nosnippet>124</a>            .args(args)
+<a href=#125 id=125 data-nosnippet>125</a>            .stdin(Stdio::null())
+<a href=#126 id=126 data-nosnippet>126</a>            .output()
+<a href=#127 id=127 data-nosnippet>127</a>            .with_context(|| {
+<a href=#128 id=128 data-nosnippet>128</a>                <span class="macro">format!</span>(
+<a href=#129 id=129 data-nosnippet>129</a>                    <span class="string">"Failed to run `{PODMAN} {}`. `hermit oci` needs a rootless \
+<a href=#130 id=130 data-nosnippet>130</a>                     `{PODMAN}` on PATH."</span>,
+<a href=#131 id=131 data-nosnippet>131</a>                    args.join(<span class="string">" "</span>)
+<a href=#132 id=132 data-nosnippet>132</a>                )
+<a href=#133 id=133 data-nosnippet>133</a>            })<span class="question-mark">?</span>;
+<a href=#134 id=134 data-nosnippet>134</a>        <span class="kw">if </span>output.status.success() {
+<a href=#135 id=135 data-nosnippet>135</a>            <span class="kw">return </span><span class="prelude-val">Ok</span>(String::from_utf8_lossy(<span class="kw-2">&amp;</span>output.stdout).trim().to_string());
+<a href=#136 id=136 data-nosnippet>136</a>        }
+<a href=#137 id=137 data-nosnippet>137</a>        <span class="kw">let </span>stderr = String::from_utf8_lossy(<span class="kw-2">&amp;</span>output.stderr);
+<a href=#138 id=138 data-nosnippet>138</a>        attempt += <span class="number">1</span>;
+<a href=#139 id=139 data-nosnippet>139</a>        <span class="kw">if </span>!podman_database_locked(<span class="kw-2">&amp;</span>stderr) || !wait_for_podman_lock(attempt, started) {
+<a href=#140 id=140 data-nosnippet>140</a>            <span class="kw">return </span><span class="prelude-val">Err</span>(Error::msg(<span class="macro">format!</span>(
+<a href=#141 id=141 data-nosnippet>141</a>                <span class="string">"`{PODMAN} {}` failed ({}): {}"</span>,
+<a href=#142 id=142 data-nosnippet>142</a>                args.join(<span class="string">" "</span>),
+<a href=#143 id=143 data-nosnippet>143</a>                output.status,
+<a href=#144 id=144 data-nosnippet>144</a>                stderr.trim()
+<a href=#145 id=145 data-nosnippet>145</a>            )));
+<a href=#146 id=146 data-nosnippet>146</a>        }
+<a href=#147 id=147 data-nosnippet>147</a>    }
+<a href=#148 id=148 data-nosnippet>148</a>}
+<a href=#149 id=149 data-nosnippet>149</a>
+<a href=#150 id=150 data-nosnippet>150</a><span class="kw">impl </span>PodmanStore {
+<a href=#151 id=151 data-nosnippet>151</a>    <span class="doccomment">/// Detect a usable local image store. Returns `Ok(None)` when podman is
+<a href=#152 id=152 data-nosnippet>152</a>    /// absent or reports no store, so callers can fall back rather than fail.
+<a href=#153 id=153 data-nosnippet>153</a>    </span><span class="kw">pub fn </span>probe() -&gt; <span class="prelude-ty">Result</span>&lt;<span class="prelude-ty">Option</span>&lt;<span class="self">Self</span>&gt;, Error&gt; {
+<a href=#154 id=154 data-nosnippet>154</a>        <span class="kw">match </span>podman_output(<span class="kw-2">&amp;</span>[<span class="string">"info"</span>, <span class="string">"--format"</span>, <span class="string">"{{.Store.GraphRoot}}"</span>]) {
+<a href=#155 id=155 data-nosnippet>155</a>            <span class="prelude-val">Ok</span>(graph_root) <span class="kw">if </span>!graph_root.is_empty() =&gt; <span class="prelude-val">Ok</span>(<span class="prelude-val">Some</span>(<span class="self">Self </span>{ graph_root })),
+<a href=#156 id=156 data-nosnippet>156</a>            <span class="comment">// A podman that exists but cannot report a store is not usable, and
+<a href=#157 id=157 data-nosnippet>157</a>            // neither is a missing podman. Both are "no store here".
+<a href=#158 id=158 data-nosnippet>158</a>            </span><span class="kw">_ </span>=&gt; <span class="prelude-val">Ok</span>(<span class="prelude-val">None</span>),
+<a href=#159 id=159 data-nosnippet>159</a>        }
+<a href=#160 id=160 data-nosnippet>160</a>    }
+<a href=#161 id=161 data-nosnippet>161</a>
+<a href=#162 id=162 data-nosnippet>162</a>    <span class="kw">pub fn </span>graph_root(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;</span>str {
+<a href=#163 id=163 data-nosnippet>163</a>        <span class="kw-2">&amp;</span><span class="self">self</span>.graph_root
+<a href=#164 id=164 data-nosnippet>164</a>    }
+<a href=#165 id=165 data-nosnippet>165</a>
+<a href=#166 id=166 data-nosnippet>166</a>    <span class="doccomment">/// List the images in the store. `all` includes untagged intermediates.
+<a href=#167 id=167 data-nosnippet>167</a>    </span><span class="kw">pub fn </span>list(<span class="kw-2">&amp;</span><span class="self">self</span>, all: bool) -&gt; <span class="prelude-ty">Result</span>&lt;Vec&lt;ImageSummary&gt;, Error&gt; {
+<a href=#168 id=168 data-nosnippet>168</a>        <span class="kw">let </span><span class="kw-2">mut </span>args = <span class="macro">vec!</span>[<span class="string">"images"</span>, <span class="string">"--format"</span>, <span class="string">"json"</span>];
+<a href=#169 id=169 data-nosnippet>169</a>        <span class="kw">if </span>all {
+<a href=#170 id=170 data-nosnippet>170</a>            args.push(<span class="string">"--all"</span>);
+<a href=#171 id=171 data-nosnippet>171</a>        }
+<a href=#172 id=172 data-nosnippet>172</a>        <span class="kw">let </span>stdout = podman_output(<span class="kw-2">&amp;</span>args)<span class="question-mark">?</span>;
+<a href=#173 id=173 data-nosnippet>173</a>        <span class="kw">if </span>stdout.is_empty() {
+<a href=#174 id=174 data-nosnippet>174</a>            <span class="kw">return </span><span class="prelude-val">Ok</span>(Vec::new());
+<a href=#175 id=175 data-nosnippet>175</a>        }
+<a href=#176 id=176 data-nosnippet>176</a>        serde_json::from_str(<span class="kw-2">&amp;</span>stdout)
+<a href=#177 id=177 data-nosnippet>177</a>            .context(<span class="string">"Failed to parse `podman images --format json` output"</span>)
+<a href=#178 id=178 data-nosnippet>178</a>    }
+<a href=#179 id=179 data-nosnippet>179</a>
+<a href=#180 id=180 data-nosnippet>180</a>    <span class="doccomment">/// Resolve a reference to the store's canonical image identity **without
+<a href=#181 id=181 data-nosnippet>181</a>    /// touching the network**.
+<a href=#182 id=182 data-nosnippet>182</a>    ///
+<a href=#183 id=183 data-nosnippet>183</a>    /// `podman pull --policy=never` is the right primitive here: it accepts
+<a href=#184 id=184 data-nosnippet>184</a>    /// every reference form (tag, short id, full id, `name@sha256:...`),
+<a href=#185 id=185 data-nosnippet>185</a>    /// returns the canonical 64-hex ID, and is guaranteed not to contact a
+<a href=#186 id=186 data-nosnippet>186</a>    /// registry. That last property is what makes this safe to call on the
+<a href=#187 id=187 data-nosnippet>187</a>    /// normal `hermit oci run` path — resolution never silently downloads.
+<a href=#188 id=188 data-nosnippet>188</a>    </span><span class="kw">pub fn </span>resolve(<span class="kw-2">&amp;</span><span class="self">self</span>, reference: <span class="kw-2">&amp;</span>str) -&gt; <span class="prelude-ty">Result</span>&lt;ResolvedImage, Error&gt; {
+<a href=#189 id=189 data-nosnippet>189</a>        <span class="kw">let </span>id = podman_output(<span class="kw-2">&amp;</span>[<span class="string">"pull"</span>, <span class="string">"--policy=never"</span>, reference]).map_err(|e| {
+<a href=#190 id=190 data-nosnippet>190</a>            Error::msg(<span class="macro">format!</span>(
+<a href=#191 id=191 data-nosnippet>191</a>                <span class="string">"No local image matches {reference:?} in the store at {}. \
+<a href=#192 id=192 data-nosnippet>192</a>                 Use `hermit oci ls` to see what is available, or \
+<a href=#193 id=193 data-nosnippet>193</a>                 `hermit oci pull {reference}` to download it.\n  ({e})"</span>,
+<a href=#194 id=194 data-nosnippet>194</a>                <span class="self">self</span>.graph_root
+<a href=#195 id=195 data-nosnippet>195</a>            ))
+<a href=#196 id=196 data-nosnippet>196</a>        })<span class="question-mark">?</span>;
+<a href=#197 id=197 data-nosnippet>197</a>        <span class="self">self</span>.identify(reference, <span class="kw-2">&amp;</span>id)
+<a href=#198 id=198 data-nosnippet>198</a>    }
+<a href=#199 id=199 data-nosnippet>199</a>
+<a href=#200 id=200 data-nosnippet>200</a>    <span class="doccomment">/// Download `reference` into the store, then resolve it. This is the only
+<a href=#201 id=201 data-nosnippet>201</a>    /// method here that contacts a registry.
+<a href=#202 id=202 data-nosnippet>202</a>    </span><span class="kw">pub fn </span>pull(<span class="kw-2">&amp;</span><span class="self">self</span>, reference: <span class="kw-2">&amp;</span>str) -&gt; <span class="prelude-ty">Result</span>&lt;ResolvedImage, Error&gt; {
+<a href=#203 id=203 data-nosnippet>203</a>        <span class="kw">let </span>id = podman_output(<span class="kw-2">&amp;</span>[<span class="string">"pull"</span>, reference]).map_err(|e| {
+<a href=#204 id=204 data-nosnippet>204</a>            Error::msg(<span class="macro">format!</span>(
+<a href=#205 id=205 data-nosnippet>205</a>                <span class="string">"Failed to pull {reference:?}. If the registry is reachable only \
+<a href=#206 id=206 data-nosnippet>206</a>                 through a proxy, run hermit under that proxy.\n  ({e})"
+<a href=#207 id=207 data-nosnippet>207</a>            </span>))
+<a href=#208 id=208 data-nosnippet>208</a>        })<span class="question-mark">?</span>;
+<a href=#209 id=209 data-nosnippet>209</a>        <span class="self">self</span>.identify(reference, <span class="kw-2">&amp;</span>id)
+<a href=#210 id=210 data-nosnippet>210</a>    }
+<a href=#211 id=211 data-nosnippet>211</a>
+<a href=#212 id=212 data-nosnippet>212</a>    <span class="doccomment">/// Turn a store-reported ID into a [`ResolvedImage`], attaching the
+<a href=#213 id=213 data-nosnippet>213</a>    /// manifest digest when the store records one.
+<a href=#214 id=214 data-nosnippet>214</a>    </span><span class="kw">fn </span>identify(<span class="kw-2">&amp;</span><span class="self">self</span>, reference: <span class="kw-2">&amp;</span>str, id: <span class="kw-2">&amp;</span>str) -&gt; <span class="prelude-ty">Result</span>&lt;ResolvedImage, Error&gt; {
+<a href=#215 id=215 data-nosnippet>215</a>        <span class="kw">let </span>id = normalize_image_id(id).ok_or_else(|| {
+<a href=#216 id=216 data-nosnippet>216</a>            Error::msg(<span class="macro">format!</span>(
+<a href=#217 id=217 data-nosnippet>217</a>                <span class="string">"podman returned an unrecognized image id for {reference:?}: {id:?}"
+<a href=#218 id=218 data-nosnippet>218</a>            </span>))
+<a href=#219 id=219 data-nosnippet>219</a>        })<span class="question-mark">?</span>;
+<a href=#220 id=220 data-nosnippet>220</a>        <span class="comment">// An image built locally has no manifest digest until it is pushed or
+<a href=#221 id=221 data-nosnippet>221</a>        // pulled, so a missing digest is normal and must not be an error.
+<a href=#222 id=222 data-nosnippet>222</a>        </span><span class="kw">let </span>digest = podman_output(<span class="kw-2">&amp;</span>[<span class="string">"image"</span>, <span class="string">"inspect"</span>, <span class="kw-2">&amp;</span>id, <span class="string">"--format"</span>, <span class="string">"{{.Digest}}"</span>])
+<a href=#223 id=223 data-nosnippet>223</a>            .ok()
+<a href=#224 id=224 data-nosnippet>224</a>            .filter(|d| d.starts_with(<span class="string">"sha256:"</span>));
+<a href=#225 id=225 data-nosnippet>225</a>        <span class="prelude-val">Ok</span>(ResolvedImage {
+<a href=#226 id=226 data-nosnippet>226</a>            reference: reference.to_string(),
+<a href=#227 id=227 data-nosnippet>227</a>            id,
+<a href=#228 id=228 data-nosnippet>228</a>            digest,
+<a href=#229 id=229 data-nosnippet>229</a>        })
+<a href=#230 id=230 data-nosnippet>230</a>    }
+<a href=#231 id=231 data-nosnippet>231</a>
+<a href=#232 id=232 data-nosnippet>232</a>    <span class="doccomment">/// The image's declared `Config.Env` and `Config.WorkingDir`.
+<a href=#233 id=233 data-nosnippet>233</a>    </span><span class="kw">pub fn </span>config(<span class="kw-2">&amp;</span><span class="self">self</span>, image: <span class="kw-2">&amp;</span>ResolvedImage) -&gt; <span class="prelude-ty">Result</span>&lt;ImageRunConfig, Error&gt; {
+<a href=#234 id=234 data-nosnippet>234</a>        <span class="kw">let </span>stdout = podman_output(<span class="kw-2">&amp;</span>[
+<a href=#235 id=235 data-nosnippet>235</a>            <span class="string">"image"</span>,
+<a href=#236 id=236 data-nosnippet>236</a>            <span class="string">"inspect"</span>,
+<a href=#237 id=237 data-nosnippet>237</a>            <span class="kw-2">&amp;</span>image.id,
+<a href=#238 id=238 data-nosnippet>238</a>            <span class="string">"--format"</span>,
+<a href=#239 id=239 data-nosnippet>239</a>            <span class="string">"{{json .Config}}"</span>,
+<a href=#240 id=240 data-nosnippet>240</a>        ])<span class="question-mark">?</span>;
+<a href=#241 id=241 data-nosnippet>241</a>        <span class="kw">let </span>raw: RawConfig = serde_json::from_str(<span class="kw-2">&amp;</span>stdout)
+<a href=#242 id=242 data-nosnippet>242</a>            .context(<span class="string">"Failed to parse `podman image inspect` config output"</span>)<span class="question-mark">?</span>;
+<a href=#243 id=243 data-nosnippet>243</a>        <span class="prelude-val">Ok</span>(ImageRunConfig {
+<a href=#244 id=244 data-nosnippet>244</a>            env: raw
+<a href=#245 id=245 data-nosnippet>245</a>                .env
+<a href=#246 id=246 data-nosnippet>246</a>                .unwrap_or_default()
+<a href=#247 id=247 data-nosnippet>247</a>                .iter()
+<a href=#248 id=248 data-nosnippet>248</a>                .filter_map(|entry| entry.split_once(<span class="string">'='</span>))
+<a href=#249 id=249 data-nosnippet>249</a>                .map(|(k, v)| (k.to_string(), v.to_string()))
+<a href=#250 id=250 data-nosnippet>250</a>                .collect(),
+<a href=#251 id=251 data-nosnippet>251</a>            workdir: raw.working_dir.filter(|w| !w.is_empty() &amp;&amp; w != <span class="string">"/"</span>),
+<a href=#252 id=252 data-nosnippet>252</a>            cmd: raw.cmd.unwrap_or_default(),
+<a href=#253 id=253 data-nosnippet>253</a>            entrypoint: raw.entrypoint.unwrap_or_default(),
+<a href=#254 id=254 data-nosnippet>254</a>        })
+<a href=#255 id=255 data-nosnippet>255</a>    }
+<a href=#256 id=256 data-nosnippet>256</a>
+<a href=#257 id=257 data-nosnippet>257</a>    <span class="doccomment">/// The overlay directories backing this image's filesystem, in the order
+<a href=#258 id=258 data-nosnippet>258</a>    /// an `overlay` mount wants them (topmost first).
+<a href=#259 id=259 data-nosnippet>259</a>    ///
+<a href=#260 id=260 data-nosnippet>260</a>    /// This is what makes a future copy-free materialization possible: the
+<a href=#261 id=261 data-nosnippet>261</a>    /// merged rootfs can be mounted directly from the store's own layers inside
+<a href=#262 id=262 data-nosnippet>262</a>    /// hermit's user namespace, instead of being copied out.
+<a href=#263 id=263 data-nosnippet>263</a>    </span><span class="kw">pub fn </span>overlay_dirs(<span class="kw-2">&amp;</span><span class="self">self</span>, image: <span class="kw-2">&amp;</span>ResolvedImage) -&gt; <span class="prelude-ty">Result</span>&lt;Vec&lt;String&gt;, Error&gt; {
+<a href=#264 id=264 data-nosnippet>264</a>        <span class="kw">let </span>stdout = podman_output(<span class="kw-2">&amp;</span>[
+<a href=#265 id=265 data-nosnippet>265</a>            <span class="string">"image"</span>,
+<a href=#266 id=266 data-nosnippet>266</a>            <span class="string">"inspect"</span>,
+<a href=#267 id=267 data-nosnippet>267</a>            <span class="kw-2">&amp;</span>image.id,
+<a href=#268 id=268 data-nosnippet>268</a>            <span class="string">"--format"</span>,
+<a href=#269 id=269 data-nosnippet>269</a>            <span class="string">"{{json .GraphDriver}}"</span>,
+<a href=#270 id=270 data-nosnippet>270</a>        ])<span class="question-mark">?</span>;
+<a href=#271 id=271 data-nosnippet>271</a>        <span class="kw">let </span>graph: GraphDriver = serde_json::from_str(<span class="kw-2">&amp;</span>stdout)
+<a href=#272 id=272 data-nosnippet>272</a>            .context(<span class="string">"Failed to parse `podman image inspect` GraphDriver output"</span>)<span class="question-mark">?</span>;
+<a href=#273 id=273 data-nosnippet>273</a>        <span class="kw">if </span>graph.name != <span class="string">"overlay" </span>{
+<a href=#274 id=274 data-nosnippet>274</a>            <span class="kw">return </span><span class="prelude-val">Err</span>(Error::msg(<span class="macro">format!</span>(
+<a href=#275 id=275 data-nosnippet>275</a>                <span class="string">"image {} uses the {:?} storage driver; only `overlay` exposes \
+<a href=#276 id=276 data-nosnippet>276</a>                 mountable layer directories"</span>,
+<a href=#277 id=277 data-nosnippet>277</a>                image.id, graph.name
+<a href=#278 id=278 data-nosnippet>278</a>            )));
+<a href=#279 id=279 data-nosnippet>279</a>        }
+<a href=#280 id=280 data-nosnippet>280</a>        <span class="prelude-val">Ok</span>(overlay_layer_order(
+<a href=#281 id=281 data-nosnippet>281</a>            graph.data.get(<span class="string">"UpperDir"</span>).map(String::as_str),
+<a href=#282 id=282 data-nosnippet>282</a>            graph.data.get(<span class="string">"LowerDir"</span>).map(String::as_str),
+<a href=#283 id=283 data-nosnippet>283</a>        ))
+<a href=#284 id=284 data-nosnippet>284</a>    }
+<a href=#285 id=285 data-nosnippet>285</a>}
+<a href=#286 id=286 data-nosnippet>286</a>
+<a href=#287 id=287 data-nosnippet>287</a><span class="doccomment">/// The subset of an image's config that affects how hermit runs it.
+<a href=#288 id=288 data-nosnippet>288</a></span><span class="attr">#[derive(Debug, Default, PartialEq, Eq)]
+<a href=#289 id=289 data-nosnippet>289</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">struct </span>ImageRunConfig {
+<a href=#290 id=290 data-nosnippet>290</a>    <span class="kw">pub </span>env: Vec&lt;(String, String)&gt;,
+<a href=#291 id=291 data-nosnippet>291</a>    <span class="kw">pub </span>workdir: <span class="prelude-ty">Option</span>&lt;String&gt;,
+<a href=#292 id=292 data-nosnippet>292</a>    <span class="kw">pub </span>cmd: Vec&lt;String&gt;,
+<a href=#293 id=293 data-nosnippet>293</a>    <span class="kw">pub </span>entrypoint: Vec&lt;String&gt;,
+<a href=#294 id=294 data-nosnippet>294</a>}
+<a href=#295 id=295 data-nosnippet>295</a>
+<a href=#296 id=296 data-nosnippet>296</a><span class="attr">#[derive(Deserialize)]
+<a href=#297 id=297 data-nosnippet>297</a></span><span class="kw">struct </span>RawConfig {
+<a href=#298 id=298 data-nosnippet>298</a>    <span class="attr">#[serde(rename = <span class="string">"Env"</span>)]
+<a href=#299 id=299 data-nosnippet>299</a>    </span>env: <span class="prelude-ty">Option</span>&lt;Vec&lt;String&gt;&gt;,
+<a href=#300 id=300 data-nosnippet>300</a>    <span class="attr">#[serde(rename = <span class="string">"WorkingDir"</span>)]
+<a href=#301 id=301 data-nosnippet>301</a>    </span>working_dir: <span class="prelude-ty">Option</span>&lt;String&gt;,
+<a href=#302 id=302 data-nosnippet>302</a>    <span class="attr">#[serde(rename = <span class="string">"Cmd"</span>)]
+<a href=#303 id=303 data-nosnippet>303</a>    </span>cmd: <span class="prelude-ty">Option</span>&lt;Vec&lt;String&gt;&gt;,
+<a href=#304 id=304 data-nosnippet>304</a>    <span class="attr">#[serde(rename = <span class="string">"Entrypoint"</span>)]
+<a href=#305 id=305 data-nosnippet>305</a>    </span>entrypoint: <span class="prelude-ty">Option</span>&lt;Vec&lt;String&gt;&gt;,
+<a href=#306 id=306 data-nosnippet>306</a>}
+<a href=#307 id=307 data-nosnippet>307</a>
+<a href=#308 id=308 data-nosnippet>308</a><span class="attr">#[derive(Deserialize)]
+<a href=#309 id=309 data-nosnippet>309</a></span><span class="kw">struct </span>GraphDriver {
+<a href=#310 id=310 data-nosnippet>310</a>    <span class="attr">#[serde(rename = <span class="string">"Name"</span>)]
+<a href=#311 id=311 data-nosnippet>311</a>    </span>name: String,
+<a href=#312 id=312 data-nosnippet>312</a>    <span class="attr">#[serde(rename = <span class="string">"Data"</span>, default)]
+<a href=#313 id=313 data-nosnippet>313</a>    </span>data: BTreeMap&lt;String, String&gt;,
+<a href=#314 id=314 data-nosnippet>314</a>}
+<a href=#315 id=315 data-nosnippet>315</a>
+<a href=#316 id=316 data-nosnippet>316</a><span class="doccomment">/// Assemble the overlay layer list, topmost first.
+<a href=#317 id=317 data-nosnippet>317</a>///
+<a href=#318 id=318 data-nosnippet>318</a>/// podman reports `UpperDir` (the image's own top layer) separately from the
+<a href=#319 id=319 data-nosnippet>319</a>/// colon-separated `LowerDir` chain, and `LowerDir` is absent entirely for a
+<a href=#320 id=320 data-nosnippet>320</a>/// single-layer image. An `overlay` mount wants all of them as `lowerdir` in
+<a href=#321 id=321 data-nosnippet>321</a>/// topmost-first order, because hermit supplies its own writable upper layer.
+<a href=#322 id=322 data-nosnippet>322</a></span><span class="kw">fn </span>overlay_layer_order(upper: <span class="prelude-ty">Option</span>&lt;<span class="kw-2">&amp;</span>str&gt;, lower: <span class="prelude-ty">Option</span>&lt;<span class="kw-2">&amp;</span>str&gt;) -&gt; Vec&lt;String&gt; {
+<a href=#323 id=323 data-nosnippet>323</a>    <span class="kw">let </span><span class="kw-2">mut </span>dirs = Vec::new();
+<a href=#324 id=324 data-nosnippet>324</a>    <span class="kw">if let </span><span class="prelude-val">Some</span>(upper) = upper.map(str::trim).filter(|u| !u.is_empty()) {
+<a href=#325 id=325 data-nosnippet>325</a>        dirs.push(upper.to_string());
+<a href=#326 id=326 data-nosnippet>326</a>    }
+<a href=#327 id=327 data-nosnippet>327</a>    <span class="kw">if let </span><span class="prelude-val">Some</span>(lower) = lower {
+<a href=#328 id=328 data-nosnippet>328</a>        dirs.extend(
+<a href=#329 id=329 data-nosnippet>329</a>            lower
+<a href=#330 id=330 data-nosnippet>330</a>                .split(<span class="string">':'</span>)
+<a href=#331 id=331 data-nosnippet>331</a>                .map(str::trim)
+<a href=#332 id=332 data-nosnippet>332</a>                .filter(|d| !d.is_empty())
+<a href=#333 id=333 data-nosnippet>333</a>                .map(str::to_string),
+<a href=#334 id=334 data-nosnippet>334</a>        );
+<a href=#335 id=335 data-nosnippet>335</a>    }
+<a href=#336 id=336 data-nosnippet>336</a>    dirs
+<a href=#337 id=337 data-nosnippet>337</a>}
+<a href=#338 id=338 data-nosnippet>338</a>
+<a href=#339 id=339 data-nosnippet>339</a><span class="doccomment">/// Accept the forms podman prints for an image id and reduce them to bare
+<a href=#340 id=340 data-nosnippet>340</a>/// 64-hex. `podman pull` prints the bare id; some paths print `sha256:&lt;id&gt;`.
+<a href=#341 id=341 data-nosnippet>341</a></span><span class="kw">fn </span>normalize_image_id(raw: <span class="kw-2">&amp;</span>str) -&gt; <span class="prelude-ty">Option</span>&lt;String&gt; {
+<a href=#342 id=342 data-nosnippet>342</a>    <span class="kw">let </span>candidate = raw.trim();
+<a href=#343 id=343 data-nosnippet>343</a>    <span class="kw">let </span>candidate = candidate.strip_prefix(<span class="string">"sha256:"</span>).unwrap_or(candidate);
+<a href=#344 id=344 data-nosnippet>344</a>    (candidate.len() == <span class="number">64 </span>&amp;&amp; candidate.chars().all(|c| c.is_ascii_hexdigit()))
+<a href=#345 id=345 data-nosnippet>345</a>        .then(|| candidate.to_ascii_lowercase())
+<a href=#346 id=346 data-nosnippet>346</a>}
+<a href=#347 id=347 data-nosnippet>347</a>
+<a href=#348 id=348 data-nosnippet>348</a><span class="attr">#[cfg(test)]
+<a href=#349 id=349 data-nosnippet>349</a></span><span class="kw">mod </span>tests {
+<a href=#350 id=350 data-nosnippet>350</a>    <span class="kw">use super</span>::<span class="kw-2">*</span>;
+<a href=#351 id=351 data-nosnippet>351</a>
+<a href=#352 id=352 data-nosnippet>352</a>    <span class="attr">#[test]
+<a href=#353 id=353 data-nosnippet>353</a>    </span><span class="kw">fn </span>normalize_image_id_accepts_bare_and_prefixed_hex() {
+<a href=#354 id=354 data-nosnippet>354</a>        <span class="kw">let </span>id = <span class="string">"1ee23df5e47b5b7331304af929f5461f9f516f5c166c3031832d2adfd22f323c"</span>;
+<a href=#355 id=355 data-nosnippet>355</a>        <span class="macro">assert_eq!</span>(normalize_image_id(id).as_deref(), <span class="prelude-val">Some</span>(id));
+<a href=#356 id=356 data-nosnippet>356</a>        <span class="macro">assert_eq!</span>(
+<a href=#357 id=357 data-nosnippet>357</a>            normalize_image_id(<span class="kw-2">&amp;</span><span class="macro">format!</span>(<span class="string">"sha256:{id}"</span>)).as_deref(),
+<a href=#358 id=358 data-nosnippet>358</a>            <span class="prelude-val">Some</span>(id)
+<a href=#359 id=359 data-nosnippet>359</a>        );
+<a href=#360 id=360 data-nosnippet>360</a>        <span class="macro">assert_eq!</span>(
+<a href=#361 id=361 data-nosnippet>361</a>            normalize_image_id(<span class="kw-2">&amp;</span><span class="macro">format!</span>(<span class="string">"  {id}\n"</span>)).as_deref(),
+<a href=#362 id=362 data-nosnippet>362</a>            <span class="prelude-val">Some</span>(id)
+<a href=#363 id=363 data-nosnippet>363</a>        );
+<a href=#364 id=364 data-nosnippet>364</a>        <span class="macro">assert_eq!</span>(
+<a href=#365 id=365 data-nosnippet>365</a>            normalize_image_id(<span class="kw-2">&amp;</span>id.to_ascii_uppercase()).as_deref(),
+<a href=#366 id=366 data-nosnippet>366</a>            <span class="prelude-val">Some</span>(id),
+<a href=#367 id=367 data-nosnippet>367</a>            <span class="string">"podman ids are case-insensitive hex; normalize to lowercase"
+<a href=#368 id=368 data-nosnippet>368</a>        </span>);
+<a href=#369 id=369 data-nosnippet>369</a>    }
+<a href=#370 id=370 data-nosnippet>370</a>
+<a href=#371 id=371 data-nosnippet>371</a>    <span class="comment">// A short id is a *reference*, not an identity: accepting one here would
+<a href=#372 id=372 data-nosnippet>372</a>    // reintroduce exactly the aliasing that keying on the resolved id removes.
+<a href=#373 id=373 data-nosnippet>373</a>    </span><span class="attr">#[test]
+<a href=#374 id=374 data-nosnippet>374</a>    </span><span class="kw">fn </span>normalize_image_id_rejects_short_ids_and_non_hex() {
+<a href=#375 id=375 data-nosnippet>375</a>        <span class="macro">assert_eq!</span>(normalize_image_id(<span class="string">"1ee23df5e47b"</span>), <span class="prelude-val">None</span>);
+<a href=#376 id=376 data-nosnippet>376</a>        <span class="macro">assert_eq!</span>(normalize_image_id(<span class="string">""</span>), <span class="prelude-val">None</span>);
+<a href=#377 id=377 data-nosnippet>377</a>        <span class="macro">assert_eq!</span>(normalize_image_id(<span class="string">"not-an-id"</span>), <span class="prelude-val">None</span>);
+<a href=#378 id=378 data-nosnippet>378</a>        <span class="comment">// 64 chars but not hex.
+<a href=#379 id=379 data-nosnippet>379</a>        </span><span class="macro">assert_eq!</span>(normalize_image_id(<span class="kw-2">&amp;</span><span class="string">"z"</span>.repeat(<span class="number">64</span>)), <span class="prelude-val">None</span>);
+<a href=#380 id=380 data-nosnippet>380</a>    }
+<a href=#381 id=381 data-nosnippet>381</a>
+<a href=#382 id=382 data-nosnippet>382</a>    <span class="comment">// A single-layer image reports no LowerDir at all; the upper layer alone is
+<a href=#383 id=383 data-nosnippet>383</a>    // the whole filesystem.
+<a href=#384 id=384 data-nosnippet>384</a>    </span><span class="attr">#[test]
+<a href=#385 id=385 data-nosnippet>385</a>    </span><span class="kw">fn </span>overlay_layer_order_handles_single_layer_image() {
+<a href=#386 id=386 data-nosnippet>386</a>        <span class="macro">assert_eq!</span>(
+<a href=#387 id=387 data-nosnippet>387</a>            overlay_layer_order(<span class="prelude-val">Some</span>(<span class="string">"/store/overlay/aaa/diff"</span>), <span class="prelude-val">None</span>),
+<a href=#388 id=388 data-nosnippet>388</a>            <span class="macro">vec!</span>[<span class="string">"/store/overlay/aaa/diff"</span>.to_string()]
+<a href=#389 id=389 data-nosnippet>389</a>        );
+<a href=#390 id=390 data-nosnippet>390</a>    }
+<a href=#391 id=391 data-nosnippet>391</a>
+<a href=#392 id=392 data-nosnippet>392</a>    <span class="comment">// Multi-layer: upper first, then the LowerDir chain in the order podman
+<a href=#393 id=393 data-nosnippet>393</a>    // already gives it (topmost first).
+<a href=#394 id=394 data-nosnippet>394</a>    </span><span class="attr">#[test]
+<a href=#395 id=395 data-nosnippet>395</a>    </span><span class="kw">fn </span>overlay_layer_order_puts_upper_before_the_lower_chain() {
+<a href=#396 id=396 data-nosnippet>396</a>        <span class="macro">assert_eq!</span>(
+<a href=#397 id=397 data-nosnippet>397</a>            overlay_layer_order(
+<a href=#398 id=398 data-nosnippet>398</a>                <span class="prelude-val">Some</span>(<span class="string">"/store/overlay/top/diff"</span>),
+<a href=#399 id=399 data-nosnippet>399</a>                <span class="prelude-val">Some</span>(<span class="string">"/store/overlay/mid/diff:/store/overlay/base/diff"</span>),
+<a href=#400 id=400 data-nosnippet>400</a>            ),
+<a href=#401 id=401 data-nosnippet>401</a>            <span class="macro">vec!</span>[
+<a href=#402 id=402 data-nosnippet>402</a>                <span class="string">"/store/overlay/top/diff"</span>.to_string(),
+<a href=#403 id=403 data-nosnippet>403</a>                <span class="string">"/store/overlay/mid/diff"</span>.to_string(),
+<a href=#404 id=404 data-nosnippet>404</a>                <span class="string">"/store/overlay/base/diff"</span>.to_string(),
+<a href=#405 id=405 data-nosnippet>405</a>            ]
+<a href=#406 id=406 data-nosnippet>406</a>        );
+<a href=#407 id=407 data-nosnippet>407</a>    }
+<a href=#408 id=408 data-nosnippet>408</a>
+<a href=#409 id=409 data-nosnippet>409</a>    <span class="attr">#[test]
+<a href=#410 id=410 data-nosnippet>410</a>    </span><span class="kw">fn </span>overlay_layer_order_skips_empty_components() {
+<a href=#411 id=411 data-nosnippet>411</a>        <span class="macro">assert_eq!</span>(
+<a href=#412 id=412 data-nosnippet>412</a>            overlay_layer_order(<span class="prelude-val">Some</span>(<span class="string">"  "</span>), <span class="prelude-val">Some</span>(<span class="string">"/a/diff::/b/diff:"</span>)),
+<a href=#413 id=413 data-nosnippet>413</a>            <span class="macro">vec!</span>[<span class="string">"/a/diff"</span>.to_string(), <span class="string">"/b/diff"</span>.to_string()]
+<a href=#414 id=414 data-nosnippet>414</a>        );
+<a href=#415 id=415 data-nosnippet>415</a>        <span class="macro">assert!</span>(overlay_layer_order(<span class="prelude-val">None</span>, <span class="prelude-val">None</span>).is_empty());
+<a href=#416 id=416 data-nosnippet>416</a>    }
+<a href=#417 id=417 data-nosnippet>417</a>
+<a href=#418 id=418 data-nosnippet>418</a>    <span class="attr">#[test]
+<a href=#419 id=419 data-nosnippet>419</a>    </span><span class="kw">fn </span>image_summary_display_name_falls_back_for_untagged_images() {
+<a href=#420 id=420 data-nosnippet>420</a>        <span class="kw">let </span>untagged = ImageSummary {
+<a href=#421 id=421 data-nosnippet>421</a>            id: <span class="string">"a"</span>.repeat(<span class="number">64</span>),
+<a href=#422 id=422 data-nosnippet>422</a>            names: <span class="prelude-val">None</span>,
+<a href=#423 id=423 data-nosnippet>423</a>            size: <span class="number">0</span>,
+<a href=#424 id=424 data-nosnippet>424</a>        };
+<a href=#425 id=425 data-nosnippet>425</a>        <span class="macro">assert_eq!</span>(untagged.display_name(), <span class="string">"&lt;none&gt;"</span>);
+<a href=#426 id=426 data-nosnippet>426</a>
+<a href=#427 id=427 data-nosnippet>427</a>        <span class="kw">let </span>named = ImageSummary {
+<a href=#428 id=428 data-nosnippet>428</a>            id: <span class="string">"b"</span>.repeat(<span class="number">64</span>),
+<a href=#429 id=429 data-nosnippet>429</a>            names: <span class="prelude-val">Some</span>(<span class="macro">vec!</span>[<span class="string">"localhost/example:1"</span>.to_string()]),
+<a href=#430 id=430 data-nosnippet>430</a>            size: <span class="number">1</span>,
+<a href=#431 id=431 data-nosnippet>431</a>        };
+<a href=#432 id=432 data-nosnippet>432</a>        <span class="macro">assert_eq!</span>(named.display_name(), <span class="string">"localhost/example:1"</span>);
+<a href=#433 id=433 data-nosnippet>433</a>    }
+<a href=#434 id=434 data-nosnippet>434</a>
+<a href=#435 id=435 data-nosnippet>435</a>    <span class="attr">#[test]
+<a href=#436 id=436 data-nosnippet>436</a>    </span><span class="kw">fn </span>database_locked_matches_only_the_lock_diagnostic() {
+<a href=#437 id=437 data-nosnippet>437</a>        <span class="macro">assert!</span>(podman_database_locked(
+<a href=#438 id=438 data-nosnippet>438</a>            <span class="string">"Error: database locked: timeout waiting for database lock"
+<a href=#439 id=439 data-nosnippet>439</a>        </span>));
+<a href=#440 id=440 data-nosnippet>440</a>        <span class="macro">assert!</span>(!podman_database_locked(<span class="string">"Error: no such image"</span>));
+<a href=#441 id=441 data-nosnippet>441</a>        <span class="macro">assert!</span>(!podman_database_locked(<span class="string">""</span>));
+<a href=#442 id=442 data-nosnippet>442</a>    }
+<a href=#443 id=443 data-nosnippet>443</a>
+<a href=#444 id=444 data-nosnippet>444</a>    <span class="attr">#[test]
+<a href=#445 id=445 data-nosnippet>445</a>    </span><span class="kw">fn </span>lock_wait_refuses_once_the_budget_is_spent() {
+<a href=#446 id=446 data-nosnippet>446</a>        <span class="kw">let </span>spent = std::time::Instant::now()
+<a href=#447 id=447 data-nosnippet>447</a>            - (PODMAN_LOCK_WAIT_BUDGET + std::time::Duration::from_secs(<span class="number">1</span>));
+<a href=#448 id=448 data-nosnippet>448</a>        <span class="macro">assert!</span>(!wait_for_podman_lock(<span class="number">1</span>, spent));
+<a href=#449 id=449 data-nosnippet>449</a>    }
+<a href=#450 id=450 data-nosnippet>450</a>}
+</code></pre></div></section></main></body></html>

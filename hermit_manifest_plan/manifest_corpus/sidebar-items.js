@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["ROOT_DIR_PLACEHOLDER","VALIDATE_RUN_STATE_PLACEHOLDER","XDG_CONFIG_HOME_PLACEHOLDER"],"fn":["check_direct_placeholders","direct_shell_word","expand_corpus","resolve_direct_placeholders","validate_run_state"]};

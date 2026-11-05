@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["EVENT_BYTES","SPAN_BYTES"],"enum":["BufferKind","RecordFailure"],"fn":["record_layer_with_failure","record_layer_with_failure_and_ansi","record_subscriber_with_failure"],"struct":["FormatterLimits","RecordStatus"]};

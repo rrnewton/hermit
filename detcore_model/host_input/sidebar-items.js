@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["HOST_INPUT_CHANGED_SINCE_RECORDING_MARKER","HOST_INPUT_CONTENT_LIMIT"],"fn":["guest_rebound","host_input_changed","is_kernel_object"],"struct":["HostFileIdentity","HostInput","HostInputChange","HostInputLogEnd","HostInputRecord","HostInputSet","HostInputSnapshot","HostMutationRecord"]};
