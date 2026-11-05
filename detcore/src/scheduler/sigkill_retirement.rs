@@ -587,7 +587,12 @@ impl Scheduler {
         let cohort = (processes.len() > 1).then_some(token);
         for process in processes {
             if !already_notified.contains(&process) {
-                self.own_killed_child_notification(process, reservation.uid, cohort);
+                self.own_killed_child_notification(
+                    process,
+                    reservation.uid,
+                    cohort,
+                    reservation.sender,
+                );
             }
         }
         // A report the notification did not consume is forgotten, as
@@ -603,8 +608,15 @@ impl Scheduler {
     /// parent's SIGCHLD, a hold until the kernel's publication; otherwise
     /// Linux's siginfo (`CLD_KILLED`, `SIGKILL`) on the scheduler's copy, and
     /// the child-exit timer. The first copy delivered stands for the exit
-    /// (`child_exit_sigchld`).
-    fn own_killed_child_notification(&mut self, process: DetPid, uid: u32, cohort: Option<u64>) {
+    /// (`child_exit_sigchld`). `sender` sent the SIGKILL, in its committed
+    /// turn, which fences the parent's copy (`SigchldFence::by`).
+    fn own_killed_child_notification(
+        &mut self,
+        process: DetPid,
+        uid: u32,
+        cohort: Option<u64>,
+        sender: DetTid,
+    ) {
         let Some(parent) = self.thread_tree.parent_process(&process) else {
             return;
         };
@@ -620,10 +632,11 @@ impl Scheduler {
         ) {
             return;
         }
-        let notification = if self.backend.reports_child_exit_publication {
-            self.classify_child_exit_notification(process, parent)
-        } else {
-            super::ChildExitNotification::Undecided
+        let notification = match self.child_exit_publication() {
+            Ok(super::ChildExitPublication::Reported) => {
+                self.classify_child_exit_notification(process, parent)
+            }
+            Err(_) => super::ChildExitNotification::Undecided,
         };
         match notification {
             super::ChildExitNotification::None | super::ChildExitNotification::Discard => {
@@ -631,6 +644,9 @@ impl Scheduler {
                     self.child_exit_publications_pending.insert(process);
                     self.sigkill.unpublished.insert(process);
                 }
+                // A discarded copy is pending at a point the schedule fixes;
+                // an ignored one is never sent (`fence_child_exit_sigchld`).
+                self.fence_child_exit_sigchld(parent, Some(notification), sender);
             }
             super::ChildExitNotification::Deliver | super::ChildExitNotification::Undecided => {
                 // The kernel sends the parent its own SIGCHLD too, once the
@@ -639,11 +655,14 @@ impl Scheduler {
                 // returns (`CommitSigkill`), so the kernel's copy is pending at
                 // a point the schedule fixes and is delivered first; the
                 // scheduler's copy then sends nothing (`child_exit_sigchld`).
-                if self.backend.reports_child_exit_publication
+                if self.child_exit_publication().is_ok()
                     && !self.child_exit_publications_completed.remove(&process)
                 {
                     self.child_exit_publications_pending.insert(process);
                     self.sigkill.unpublished.insert(process);
+                }
+                if self.child_exit_publication().is_ok() {
+                    self.fence_child_exit_sigchld(parent, Some(notification), sender);
                 }
                 self.child_exit_sigchld.exit_status.insert(
                     process,
