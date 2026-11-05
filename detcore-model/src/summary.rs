@@ -628,9 +628,11 @@ pub struct DesyncNote {
 /// The `--watch` part of a [`RunSummary`].
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
 pub struct WatchRunSummary {
-    /// Threads that armed their watches.
+    /// Threads that armed their watches in at least one image interval.
     pub armed: u64,
-    /// Threads that never did, and why.
+    /// Intervals that never did, by thread and why. A thread can appear
+    /// here for a post-exec interval and still count in `armed` for an
+    /// earlier one.
     pub unarmed: Vec<(DetTid, crate::access_trace::WatchUnarmed)>,
     /// Hits on every thread.
     pub hits: u64,
@@ -649,7 +651,7 @@ impl fmt::Display for WatchRunSummary {
                 .iter()
                 .map(|(tid, why)| format!("thread {tid} ({why:?})"))
                 .collect();
-            write!(f, "; never armed: {}", unarmed.join(", "))?;
+            write!(f, "; uncovered intervals: {}", unarmed.join(", "))?;
         }
         writeln!(f)
     }
