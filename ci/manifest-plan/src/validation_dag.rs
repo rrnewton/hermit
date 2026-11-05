@@ -5955,18 +5955,25 @@ sys.exit(37)
             );
         }
         assert!(channels.contains("HERMIT_ISOLATION_JOBS"), "{channels:?}");
-        // The lone-slice allowance is node-scoped, not a global ptrace policy.
-        // Both authored and sharded commands retain the literal marker, while
-        // the KVM node and every other node retain their existing environment.
+        // The lone-slice and race-candidates allowances are node-scoped, not
+        // global ptrace policies. Both authored and sharded commands retain
+        // the literal marker, while the KVM node and every other node retain
+        // their existing environment.
         const SCOPE: &str = "HERMIT_NEXTEST_BUDGET_SCOPE";
+        const PMU_ANALYZE_TAG: &str = "super.pmu_analyze_hello_race_stress_calibrated_skid";
         for step in &steps {
+            let expected_scope = match step.tag().as_str() {
+                PMU_INTEGRATION_TAG => Some("pmu-integration"),
+                PMU_ANALYZE_TAG => Some("pmu-analyze"),
+                _ => None,
+            };
             assert_eq!(
                 step.env.get(SCOPE).map(String::as_str),
-                (step.tag() == PMU_INTEGRATION_TAG).then_some("pmu-integration"),
+                expected_scope,
                 "{}",
                 step.tag()
             );
-            if step.tag() == PMU_INTEGRATION_TAG {
+            if expected_scope.is_some() {
                 assert!(pinned_root_command(step).contains(&format!(" --env {SCOPE} ")));
             }
         }
@@ -5974,9 +5981,16 @@ sys.exit(37)
         materialize_node_shards(&mut sharded, PMU_INTEGRATION_TAG, PMU_INTEGRATION_SHARDS).unwrap();
         let tags = pmu_integration_shard_tags();
         for step in &sharded.steps {
+            let expected_scope = if tags.contains(&step.tag()) {
+                Some("pmu-integration")
+            } else if step.tag() == PMU_ANALYZE_TAG {
+                Some("pmu-analyze")
+            } else {
+                None
+            };
             assert_eq!(
                 step.env.get(SCOPE).map(String::as_str),
-                tags.contains(&step.tag()).then_some("pmu-integration"),
+                expected_scope,
                 "{}",
                 step.tag()
             );

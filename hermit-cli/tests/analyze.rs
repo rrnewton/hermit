@@ -552,16 +552,21 @@ fn analyze_checks_the_race_candidates_and_says_what_each_edit_moved() {
 /// that fails with EBADF, on two threads, and no edge Hermit observes orders
 /// them.
 ///
-/// It takes no calibrated skid margin. At `--max-timeslice=400000` the guest's
-/// writer, which computes between its syscalls, has 59 of a run's 64
-/// timeslices end at the timer, and under the PMU analyze node's margin every
-/// such event is placed by stepping through up to 20000 branches. Measured on
-/// an Intel Xeon Gold 6138 with this test's command: without the margin the
-/// analysis finishes in 33 s, its 18 trials taking 1.5 to 2.0 s each; with a
-/// margin of 20000 each trial takes 42 to 61 s, and the analysis had run 7 of
-/// them when a 420 s bound stopped it. What the test checks is the race
-/// finder's report on the pair the search finds, not where a timer event
-/// lands.
+/// It takes no calibrated skid margin. Power/weight, 2026-11-04, on an AMD
+/// EPYC 9D85 (the validation host class), whole-cgroup CPU of one systemd
+/// scope per run of this test alone: the writer's spin went from 3000000 to
+/// 100000 iterations. The recorded schedule keeps every event class
+/// (Syscall 138, OtherInstructions 100, Cpuid 21, Rdtsc 10; Branch 228 ->
+/// 101, of which the writer's timer slices 141 -> 14), and the test's CPU
+/// fell from 191 and 230 CPU-seconds (n=2) to 12.18 and 12.25 (n=2) without
+/// the margin, inside the node's 22-second cap. With
+/// `HERMIT_ANALYZE_SKID_MARGIN=20000` the shrunk test still takes 76 to 81
+/// CPU-seconds (n=3), because the margin steps every Branch event, the ~77
+/// startup slices included, so the exemption stays. Plain `--chaos` seeds
+/// 1-5 no longer fail on this host at the shrunk spin (the 3000000-iteration
+/// guest failed seeds 1-3); analyze's own search found the failing schedule
+/// in 5 of 5 measured runs. What the test checks is the race finder's
+/// report on the pair the search finds, not where a timer event lands.
 #[test]
 #[ignore = "slow: bisecting chaos schedules; requires PMU branch counters and working mount namespaces"]
 fn analyze_names_the_close_racing_the_reused_descriptor() {
@@ -575,9 +580,9 @@ fn analyze_names_the_close_racing_the_reused_descriptor() {
         ],
         "unordered by the edges Hermit observes",
         SkidMargin::Without(
-            "its CPU-bound writer is stepped through the margin at each timer event, which made \
-             each prefix trial take 42 to 61 s instead of 1.5 to 2.0 s (see the test's \
-             documentation)",
+            "stepping every Branch event through a 20000-branch margin, startup slices \
+             included, took 76 to 81 CPU-seconds on the validation host class against \
+             12.2 without it (see the test's documentation)",
         ),
     );
     let racing = &report["racing_accesses"];
