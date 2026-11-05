@@ -34,11 +34,12 @@
 //! acquire taken at the atomic rather than at the load, and a release taken at
 //! the atomic rather than at the store, order the same memory accesses.
 //!
-//! The conditional compare-and-swap loops are not rewritten at all: the
-//! original stores only when its comparison matches, so on a read-only
-//! word a mismatch exits without a store, while a CAS asks for write
-//! permission before it compares and would fault where the original
-//! does not. Those loops keep their native exclusive form.
+//! Compare idioms (`CasCompare`, `CasZero`) are matched but never rewritten:
+//! they are always left alone as `compare-exit`. A `CAS` in their place would
+//! differ from the original exactly where the comparison fails, where the
+//! original never executes its store-exclusive: `CASAL` keeps its release
+//! semantics there, and its write-permission check faults on a read-only word
+//! the original only reads.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -80,10 +81,23 @@ pub enum Refusal {
     /// The window is decoded but is not one of the four idioms.
     NotCanonical,
     /// A direct branch elsewhere in the scanned range targets the inside of
-    /// the sequence, so the replacement could be entered part-way. Only
-    /// direct branches are checked: an indirect branch's target (a jump
-    /// table, a landing pad) is not known here.
+    /// the sequence, so the replacement could be entered part-way. A known
+    /// loader or function entry inside the sequence counts the same way:
+    /// control can start there without executing the sequence's first
+    /// instruction. Only direct branches are checked for unknown targets:
+    /// an indirect branch's target (a jump table, a landing pad) is not
+    /// known here.
     BranchIntoSequence,
+    /// The sequence is a compare idiom (CAS): its failing-comparison exit
+    /// leaves the load-exclusive's reservation in place in the original,
+    /// and any store-exclusive that exit can reach could consume that
+    /// reservation. The replacement's single atomic creates no
+    /// reservation, so such a store would silently stop storing. Which
+    /// executable bytes a compare exit can reach cannot be proved from
+    /// section flags alone (an executable mapping, not `SHF_EXECINSTR`,
+    /// decides what can execute), so every compare idiom is left alone
+    /// as `compare-exit`, without a rewrite, by construction.
+    CompareExit,
     /// The idiom matched but its registers break an assumption the
     /// replacement needs; the string names which one.
     Registers(&'static str),
@@ -91,16 +105,26 @@ pub enum Refusal {
     UnsupportedOperation,
     /// A branch the replacement must move no longer reaches its target.
     BranchOutOfRange,
-    /// A conditional compare-and-swap loop (`CasZero` or `CasCompare`):
-    /// the original stores only when its comparison matches, so on a
-    /// read-only word a mismatch exits without any store, while a CAS
-    /// asks for write permission before it compares and would fault.
-    /// No same-length replacement preserves that, so the loop is left
-    /// as it is.
-    ConditionalCas,
     /// A relocation points into the sequence, so the loader writes those
     /// bytes itself, for the instruction that used to be there.
     Relocated,
+    /// An `LDR` (literal) or `ADR` in the image's code reaches the
+    /// sequence's bytes, so they may be a literal pool, which is data
+    /// however its words decode.
+    LiteralInsideSequence,
+    /// Only the unwind table says the sequence is code, and it lies in a
+    /// range the code addresses as data, between the address an `LDR`
+    /// (literal), `ADR` or `ADRP` gives and the next instruction a branch
+    /// reaches: a table placed after a call that does not return.
+    AddressedData,
+    /// No mapping symbol (`$x`, `$d`) marks the section the sequence is in,
+    /// so nothing proves which of its bytes are code, and it is left as it
+    /// is.
+    NoMappingSymbols,
+    /// The section holds a mapping symbol, named here, that is neither `$x`
+    /// nor `$d` (AArch32's `$a` or `$t`, or an unknown one), so its mapping
+    /// symbols do not prove where its code is.
+    UnsupportedMappingSymbol(String),
     /// The scanned range (or another executable section) holds an
     /// instruction that is not positively known not to be a direct
     /// branch, so an interior entry cannot be ruled out.
@@ -151,7 +175,7 @@ impl Report {
 
 /// A code range to scan: `words` are the instructions at `base`.
 pub fn plan(words: &[u32], base: u64) -> Report {
-    plan_with_external_targets(words, base, &HashSet::new())
+    plan_with_entries(words, base, &HashSet::new(), &HashSet::new())
 }
 
 /// The same, told the direct branch targets of the code OUTSIDE this range:
@@ -163,8 +187,61 @@ pub fn plan_with_external_targets(
     base: u64,
     external_targets: &HashSet<u64>,
 ) -> Report {
+    plan_with_entries(words, base, external_targets, &HashSet::new())
+}
+
+/// The same, also told the addresses control is known to start at without
+/// executing what precedes them: the loader entry (`e_entry`), defined
+/// function symbols and unwind-table (FDE) entries. A known entry inside a
+/// sequence refuses it, and a known entry at a sequence's head means any
+/// setup instruction before the head can be bypassed, so an argument that
+/// setup ran (the sub-word compare's zero-extension) does not hold. Code-span
+/// membership alone proves neither.
+pub fn plan_with_entries(
+    words: &[u32],
+    base: u64,
+    external_targets: &HashSet<u64>,
+    known_entries: &HashSet<u64>,
+) -> Report {
+    plan_with_external_store(words, base, external_targets, known_entries, false)
+}
+
+/// The same, also told whether code outside this range holds a
+/// store-exclusive. Retained for caller compatibility; it no longer
+/// decides anything: compare idioms are left alone as `compare-exit`
+/// whether or not any other store-exclusive is known, because the set
+/// of executable bytes a compare exit can reach is not proved.
+///
+/// The entry protection fails closed: a word in the range that might be a
+/// direct branch with an unknown target
+/// ([`unknown_direct_branch_possible`]) refuses every rewrite in it.
+pub fn plan_with_external_store(
+    words: &[u32],
+    base: u64,
+    external_targets: &HashSet<u64>,
+    known_entries: &HashSet<u64>,
+    _external_store_exclusive: bool,
+) -> Report {
+    let mut report = plan_section(words, base, external_targets, known_entries);
+    if words
+        .iter()
+        .any(|word| unknown_direct_branch_possible(*word))
+    {
+        refuse_patched(&mut report, Refusal::UnknownDirectBranch);
+    }
+    report
+}
+
+/// [`plan_with_external_store`] without its fail-closed entry rule, which
+/// the caller applies itself over the words it may execute: an image's
+/// executable sections also hold data, whose words decode as anything.
+pub fn plan_section(
+    words: &[u32],
+    base: u64,
+    external_targets: &HashSet<u64>,
+    known_entries: &HashSet<u64>,
+) -> Report {
     let decoded: Vec<Insn> = words.iter().copied().map(decode).collect();
-    let unknown_branch = words.iter().any(|w| unknown_direct_branch_possible(*w));
     let branches = direct_branches(&decoded, base);
     let mut targets: HashSet<u64> = branches.iter().map(|(_, target)| *target).collect();
     targets.extend(external_targets.iter().copied());
@@ -186,22 +263,36 @@ pub fn plan_with_external_targets(
             Insn::LoadExcl { .. } => report.exclusive_instructions += 1,
             Insn::StoreExcl { .. } => {
                 report.exclusive_instructions += 1;
-                if unknown_branch {
-                    report.refused.push(RefusedSite {
-                        addr: addr(index),
-                        reason: Refusal::UnknownDirectBranch,
-                    });
-                    continue;
-                }
-                match match_sequence(words, &decoded, index, base, &branches, external_targets) {
+                match match_sequence(
+                    words,
+                    &decoded,
+                    index,
+                    base,
+                    &branches,
+                    external_targets,
+                    known_entries,
+                ) {
                     Ok(site) => {
                         let start = ((site.addr - base) / 4) as usize;
-                        let interior_entered = (start + 1..start + site.words.len())
-                            .any(|i| targets.contains(&addr(i)));
+                        let interior_entered = (start + 1..start + site.words.len()).any(|i| {
+                            targets.contains(&addr(i)) || known_entries.contains(&addr(i))
+                        });
+                        // A compare idiom's failing exit keeps the original's
+                        // exclusive reservation; the replacement creates
+                        // none, and a store-exclusive that exit reaches could
+                        // consume that reservation. Coverage of every such
+                        // store cannot be proved, so compare idioms are
+                        // left alone unconditionally.
+                        let compare_exit = matches!(site.idiom, Idiom::CasCompare | Idiom::CasZero);
                         if interior_entered {
                             report.refused.push(RefusedSite {
                                 addr: addr(index),
                                 reason: Refusal::BranchIntoSequence,
+                            });
+                        } else if compare_exit {
+                            report.refused.push(RefusedSite {
+                                addr: addr(index),
+                                reason: Refusal::CompareExit,
                             });
                         } else {
                             report.patched.push(site);
@@ -217,6 +308,19 @@ pub fn plan_with_external_targets(
         }
     }
     report
+}
+
+/// Move every planned rewrite of `report` to its refusals, for `reason`.
+pub fn refuse_patched(report: &mut Report, reason: Refusal) {
+    let refused: Vec<RefusedSite> = report
+        .patched
+        .drain(..)
+        .map(|site| RefusedSite {
+            addr: site.addr,
+            reason: reason.clone(),
+        })
+        .collect();
+    report.refused.extend(refused);
 }
 
 /// Scope cut, if review ever requires it: when true, the rewrite runs
@@ -318,8 +422,9 @@ fn match_sequence(
     decoded: &[Insn],
     store: usize,
     base: u64,
-    _branches: &[(usize, u64)],
-    _external_targets: &HashSet<u64>,
+    branches: &[(usize, u64)],
+    external_targets: &HashSet<u64>,
+    known_entries: &HashSet<u64>,
 ) -> Result<Site, Refusal> {
     let (size, store_ord, rs, rv, rn) = match decoded[store] {
         Insn::StoreExcl {
@@ -389,6 +494,15 @@ fn match_sequence(
     };
     let sf = size.is_64();
     let zero_status = insn::mov_reg(false, rs, ZR);
+    // Whether anything outside the sequence can jump straight to its first
+    // instruction. The loop's own backward branch does, and that is the only
+    // entry an argument about what ran BEFORE the loop may ignore.
+    let head = base + 4 * start as u64;
+    let entered_from_outside = external_targets.contains(&head)
+        || known_entries.contains(&head)
+        || branches
+            .iter()
+            .any(|(index, target)| *target == head && (*index < start || *index > close));
     let (idiom, words) = match (store - start, decoded[start + 1]) {
         (1, _) => (Idiom::Swap, swap(size, ord, rs, rt, rv, rn, zero_status)?),
         (2, alu @ Insn::Alu { .. }) => (
@@ -412,14 +526,30 @@ fn match_sequence(
                 nonzero: true,
                 sf: branch_sf,
                 rt: branch_rt,
-                offset: _,
+                offset: branch_offset,
             },
-        ) if branch_rt == rt && branch_sf == sf => {
-            return Err(Refusal::ConditionalCas);
-        }
-        (3, Insn::Cmp { .. }) if matches!(decoded[start + 2], Insn::CondBranch { cond: 1, .. }) => {
-            return Err(Refusal::ConditionalCas);
-        }
+        ) if branch_rt == rt && branch_sf == sf => (
+            Idiom::CasZero,
+            cas_zero(size, ord, rt, rv, rn, sf, branch_offset, zero_status)?,
+        ),
+        (3, cmp) => (
+            Idiom::CasCompare,
+            cas_compare(
+                cmp,
+                decoded[start + 2],
+                words[start + 1],
+                size,
+                ord,
+                rt,
+                rv,
+                rn,
+                sf,
+                zero_status,
+                (!entered_from_outside)
+                    .then(|| start.checked_sub(1).map(|i| decoded[i]))
+                    .flatten(),
+            )?,
+        ),
         _ => return Err(Refusal::NotCanonical),
     };
     Ok(Site {
@@ -460,6 +590,35 @@ fn swap(
 }
 
 /// `LDxXR Rt, [Rn]; CBNZ Rt, out; STxXR Rs, Rv, [Rn]; CBNZ Rs` stores only
+/// into a zero location, which is a compare-and-swap against zero.
+#[allow(clippy::too_many_arguments)]
+fn cas_zero(
+    size: Size,
+    ord: Ordering,
+    rt: Reg,
+    rv: Reg,
+    rn: Reg,
+    sf: bool,
+    branch_offset: i64,
+    zero_status: u32,
+) -> Result<Vec<u32>, Refusal> {
+    if rt == ZR || rv == rt {
+        return Err(Refusal::Registers(
+            "the load destination must carry the expected value",
+        ));
+    }
+    // The kept branch sits one instruction later than it did, so its
+    // displacement shrinks by that instruction to reach the same target.
+    let branch =
+        insn::compare_branch(true, sf, rt, branch_offset - 4).ok_or(Refusal::BranchOutOfRange)?;
+    Ok(vec![
+        insn::mov_reg(sf, rt, ZR),
+        insn::cas(size, ord, rt, rv, rn),
+        branch,
+        zero_status,
+    ])
+}
+
 #[allow(clippy::too_many_arguments)]
 fn rmw(
     alu: Insn,
@@ -547,6 +706,87 @@ fn rmw(
     ])
 }
 
+#[allow(clippy::too_many_arguments)]
+fn cas_compare(
+    cmp: Insn,
+    branch: Insn,
+    cmp_word: u32,
+    size: Size,
+    ord: Ordering,
+    rt: Reg,
+    rv: Reg,
+    rn: Reg,
+    sf: bool,
+    zero_status: u32,
+    before: Option<Insn>,
+) -> Result<Vec<u32>, Refusal> {
+    let (cmp_sf, cmp_rn, operand) = match cmp {
+        Insn::Cmp { sf, rn, operand } => (sf, rn, operand),
+        _ => return Err(Refusal::NotCanonical),
+    };
+    // B.NE, condition 0b0001.
+    let Insn::CondBranch { cond: 1, offset } = branch else {
+        return Err(Refusal::NotCanonical);
+    };
+    // The kept branch sits one instruction later than it did.
+    let branch_word = insn::cond_branch(1, offset - 4).ok_or(Refusal::BranchOutOfRange)?;
+    if cmp_rn != rt || cmp_sf != sf {
+        return Err(Refusal::NotCanonical);
+    }
+    if rt == ZR || rv == rt {
+        return Err(Refusal::Registers(
+            "the load destination must carry the expected value",
+        ));
+    }
+    let expected = match operand {
+        Operand::Reg(rm) if rm == rt => {
+            return Err(Refusal::Registers("the compared value is the loaded value"));
+        }
+        // A sub-word compare against a register compares the zero-extended
+        // loaded value over the full register, while CASB/CASH compare only
+        // the low bits, so the two disagree whenever the register's high bits
+        // are set -- unless the instruction just before the loop zero-extended
+        // that very register to the access width, which is what the compiler's
+        // own outline-atomics helpers do. That argument needs the extension to
+        // have RUN, so the caller passes it only when nothing outside the
+        // sequence can branch straight to the loop head and no known loader
+        // or function entry is the loop head.
+        Operand::Reg(rm)
+            if !matches!(size, Size::W | Size::X)
+                && !matches!(
+                    before,
+                    Some(Insn::ZeroExtend { bits, rd, .. })
+                        if rd == rm && bits == if matches!(size, Size::B) { 8 } else { 16 }
+                ) =>
+        {
+            let _ = rm;
+            return Err(Refusal::Registers("a sub-word compare against a register"));
+        }
+        Operand::Reg(rm) => insn::mov_reg(sf, rt, rm),
+        Operand::Imm(k) if k >= width_limit(size) => {
+            return Err(Refusal::Registers(
+                "the compared immediate exceeds the access width",
+            ));
+        }
+        Operand::Imm(k) => insn::movz(sf, rt, k),
+    };
+    Ok(vec![
+        expected,
+        insn::cas(size, ord, rt, rv, rn),
+        cmp_word,
+        branch_word,
+        zero_status,
+    ])
+}
+
+fn width_limit(size: Size) -> u32 {
+    match size {
+        Size::B => 1 << 8,
+        Size::H => 1 << 16,
+        _ => u32::MAX,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -616,26 +856,6 @@ mod tests {
             Refusal::ExclusivePair,
         ),
         (
-            "cas_zero_x_al",
-            &[0xc85ffc20, 0xb5000080, 0xc802fc23, 0x35ffffa2],
-            Refusal::ConditionalCas,
-        ),
-        (
-            "cas_compare_gcc_x_al",
-            &[0xc85ffc66, 0xeb0400df, 0x54000081, 0xc807fc62, 0x35ffff87],
-            Refusal::ConditionalCas,
-        ),
-        (
-            "cas_compare_llvm_status_is_destination",
-            &[0xc85ffd4c, 0xeb0b019f, 0x540000a1, 0xc80cfd48, 0x35ffff8c],
-            Refusal::ConditionalCas,
-        ),
-        (
-            "cas_compare_immediate_halfword",
-            &[0x485ffc20, 0x71001c1f, 0x54000081, 0x4802fc23, 0x35ffff82],
-            Refusal::ConditionalCas,
-        ),
-        (
             "compare_branches_on_equal",
             &[0xc85ffc66, 0xeb0400df, 0x54000080, 0xc807fc62, 0x35ffff87],
             Refusal::NotCanonical,
@@ -651,14 +871,34 @@ mod tests {
             Refusal::NotCanonical,
         ),
         (
-            "subword_compare_against_a_register_is_a_conditional_cas",
+            "subword_compare_against_a_register",
             &[0x085ffc20, 0x6b04001f, 0x54000081, 0x0802fc23, 0x35ffff82],
-            Refusal::ConditionalCas,
+            Refusal::Registers("a sub-word compare against a register"),
         ),
         (
             "memory_access_between_the_pair",
             &[0xc85ffc64, 0xf94000e6, 0xc805fc64, 0x35ffffa5],
             Refusal::Undecoded,
+        ),
+        (
+            "cas_compare_is_left_alone_compare_exit",
+            &[0xc85ffc66, 0xeb0400df, 0x54000081, 0xc807fc62, 0x35ffff87],
+            Refusal::CompareExit,
+        ),
+        (
+            "cas_compare_llvm_status_is_destination",
+            &[0xc85ffd4c, 0xeb0b019f, 0x540000a1, 0xc80cfd48, 0x35ffff8c],
+            Refusal::CompareExit,
+        ),
+        (
+            "cas_compare_immediate_halfword",
+            &[0x485ffc20, 0x71001c1f, 0x54000081, 0x4802fc23, 0x35ffff82],
+            Refusal::CompareExit,
+        ),
+        (
+            "cas_zero_is_left_alone_compare_exit",
+            &[0xc85ffc20, 0xb5000080, 0xc802fc23, 0x35ffffa2],
+            Refusal::CompareExit,
         ),
     ];
 
@@ -700,29 +940,6 @@ mod tests {
             let after = plan(&words, BASE);
             assert_eq!(after.exclusive_instructions, 0, "{name} after rewriting");
         }
-    }
-
-    /// The read-only mismatch oracle: the conditional-CAS loops are
-    /// refused, so a guest whose comparison misses on a read-only word
-    /// keeps its native no-store exit instead of faulting at a CAS that
-    /// demands write permission before comparing. The unconditional
-    /// loops, whose native form always attempts the store, still rewrite.
-    #[test]
-    fn a_conditional_cas_is_refused_so_a_read_only_mismatch_cannot_fault() {
-        let conditional_cas: [&[u32]; 2] = [
-            &[0xc85ffc20, 0xb5000080, 0xc802fc23, 0x35ffffa2], // cas-zero
-            &[0xc85ffc66, 0xeb0400df, 0x54000081, 0xc807fc62, 0x35ffff87], // cas-compare
-        ];
-        for words in conditional_cas {
-            let report = plan(words, BASE);
-            assert_eq!(report.patched, vec![]);
-            assert_eq!(
-                report.refused.first().map(|r| r.reason.clone()),
-                Some(Refusal::ConditionalCas)
-            );
-        }
-        let (_, _, rmw, _) = CASES[0];
-        assert_eq!(plan(rmw, BASE).patched.len(), 1);
     }
 
     #[test]
@@ -924,12 +1141,10 @@ mod tests {
     }
 
     #[test]
-    fn a_sub_word_register_compare_is_a_conditional_cas_and_stays_refused() {
+    fn a_zero_extension_before_the_loop_admits_a_sub_word_register_compare() {
         // uxtb w16,w0; ldaxrb w0,[x2]; cmp w0,w16; b.ne out; stlxrb w17,w1,[x2]; cbnz w17
-        // is the compiler's own byte compare-and-swap helper. It used to be
-        // rewritten when a zero extension proved the compare's high bits
-        // clear; as a conditional CAS it now stays native like the others,
-        // with or without that proof.
+        // is the compiler's own byte compare-and-swap helper: the zero extension
+        // proves the high bits of w16 are clear, so CASALB compares what CMP does.
         let loop_words = [
             0x085f_fc40,
             0x6b10_001f,
@@ -937,18 +1152,213 @@ mod tests {
             0x0811_fc41,
             0x35ff_ff91,
         ];
-        for words in [loop_words.to_vec(), {
-            let mut w = vec![0x5300_1c10];
-            w.extend_from_slice(&loop_words);
-            w
-        }] {
+        let mut words = vec![0x5300_1c10];
+        words.extend_from_slice(&loop_words);
+        let report = plan(&words, BASE);
+        // The zero-extension proof passes, but a compare idiom is left
+        // alone as compare-exit in any case.
+        assert_eq!(report.patched, vec![], "{report:?}");
+        assert_eq!(
+            report.refused.first().map(|r| r.reason.clone()),
+            Some(Refusal::CompareExit)
+        );
+
+        // Without the zero extension the same loop stays refused.
+        let report = plan(&loop_words, BASE);
+        assert_eq!(report.patched, vec![]);
+        assert_eq!(
+            report.refused.first().map(|r| r.reason.clone()),
+            Some(Refusal::Registers("a sub-word compare against a register"))
+        );
+
+        // The reviewer's repro: a direct branch to the loop head skips the
+        // zero extension, so the proof it carries does not hold and the loop
+        // must stay refused. With w16 = 0x141 and the byte in memory 0x41,
+        // the original branches out and leaves memory alone, while a CASALB
+        // comparing only the low byte would store.
+        let mut words = vec![0x1400_0002u32, 0x5300_1c10];
+        words.extend_from_slice(&loop_words);
+        let report = plan(&words, BASE);
+        assert_eq!(report.patched, vec![], "{report:?}");
+        assert_eq!(
+            report.refused.first().map(|r| r.reason.clone()),
+            Some(Refusal::Registers("a sub-word compare against a register"))
+        );
+
+        // A branch to the zero extension itself is what the real helpers do,
+        // and it keeps the proof: the extension still runs, so the only
+        // refusal is compare-exit.
+        let mut words = vec![0x1400_0001u32, 0x5300_1c10];
+        words.extend_from_slice(&loop_words);
+        let report = plan(&words, BASE);
+        assert_eq!(report.patched, vec![], "{report:?}");
+        assert_eq!(
+            report.refused.first().map(|r| r.reason.clone()),
+            Some(Refusal::CompareExit)
+        );
+
+        // An outside branch to the head also refuses it when it comes from
+        // another executable section.
+        let mut head_targets = HashSet::new();
+        head_targets.insert(BASE + 4);
+        let mut words = vec![0x5300_1c10u32];
+        words.extend_from_slice(&loop_words);
+        let report = plan_with_external_targets(&words, BASE, &head_targets);
+        assert_eq!(report.patched, vec![], "{report:?}");
+
+        // A zero extension of the wrong width, or of another register, does not.
+        for before in [0x5300_3c10u32, 0x5300_1c13] {
+            let mut words = vec![before];
+            words.extend_from_slice(&loop_words);
             let report = plan(&words, BASE);
-            assert_eq!(report.patched, vec![], "{report:?}");
-            assert_eq!(
-                report.refused.first().map(|r| r.reason.clone()),
-                Some(Refusal::ConditionalCas)
-            );
+            assert_eq!(report.patched, vec![], "{before:#010x}");
         }
+    }
+
+    #[test]
+    fn a_known_entry_inside_a_sequence_refuses_it() {
+        // cas_compare_gcc_x_al with the loader entry at its CMP (the second
+        // instruction): starting there executes a different instruction in
+        // the replacement, whose first word materialises the expected value
+        // and whose second is the CAS itself.
+        let original = [0xc85ffc66, 0xeb0400df, 0x54000081, 0xc807fc62, 0x35ffff87];
+        let mut entries = HashSet::new();
+        entries.insert(BASE + 4);
+        let report = plan_with_entries(&original, BASE, &HashSet::new(), &entries);
+        assert_eq!(report.patched, vec![], "{report:?}");
+        assert_eq!(
+            report.refused.first().map(|r| r.reason.clone()),
+            Some(Refusal::BranchIntoSequence)
+        );
+        // The same entry at the sequence's head is its ordinary start; a
+        // compare idiom is still left alone as compare-exit.
+        let mut entries = HashSet::new();
+        entries.insert(BASE);
+        let report = plan_with_entries(&original, BASE, &HashSet::new(), &entries);
+        assert_eq!(report.patched, vec![], "{report:?}");
+        assert_eq!(
+            report.refused.first().map(|r| r.reason.clone()),
+            Some(Refusal::CompareExit)
+        );
+    }
+
+    #[test]
+    fn a_known_entry_at_the_head_bypasses_the_zero_extension() {
+        // uxtb w16,w0; ldaxrb w0,[x2]; cmp w0,w16; b.ne out; stlxrb w17,w1,[x2];
+        // cbnz w17 -- with the function's entry (STT_FUNC or FDE) at the
+        // ldaxrb, a caller reaching it through ADR/BLR never runs the uxtb,
+        // so the sub-word register compare must stay refused exactly as a
+        // direct branch to the head keeps it refused.
+        let loop_words = [
+            0x085f_fc40,
+            0x6b10_001f,
+            0x5400_0081,
+            0x0811_fc41,
+            0x35ff_ff91,
+        ];
+        let mut words = vec![0x5300_1c10];
+        words.extend_from_slice(&loop_words);
+        let mut entries = HashSet::new();
+        entries.insert(BASE + 4);
+        let report = plan_with_entries(&words, BASE, &HashSet::new(), &entries);
+        assert_eq!(report.patched, vec![], "{report:?}");
+        assert_eq!(
+            report.refused.first().map(|r| r.reason.clone()),
+            Some(Refusal::Registers("a sub-word compare against a register"))
+        );
+    }
+
+    #[test]
+    fn a_compare_exit_that_exports_its_reservation_is_refused() {
+        // ldaxr x0,[x2]; cbnz x0,out; stlxr w3,x1,[x2]; cbnz w3,loop;
+        // out: stlxr w4,x1,[x2] -- the original's failing-compare exit
+        // reaches `out` holding the ldaxr's reservation, so the outside
+        // stlxr stores; the replacement's CAS makes no reservation and it
+        // would not. The sequence is refused, not silently rewritten.
+        let words = [
+            0xc85f_fc40,
+            0xb500_0060,
+            0xc803_fc41,
+            0x35ff_ffa3,
+            0xc804_fc41,
+        ];
+        let report = plan(&words, BASE);
+        assert_eq!(report.patched, vec![], "{report:?}");
+        assert!(
+            report
+                .refused
+                .iter()
+                .any(|r| r.reason == Refusal::CompareExit),
+            "{report:?}"
+        );
+        // Without the outside store the same loop is also left alone:
+        // compare idioms are not rewritten at all.
+        let report = plan(&words[..4], BASE);
+        assert_eq!(report.patched, vec![], "{report:?}");
+        assert!(
+            report
+                .refused
+                .iter()
+                .any(|r| r.reason == Refusal::CompareExit),
+            "{report:?}"
+        );
+
+        // The compare form exports its reservation the same way.
+        let original = [0xc85ffc66, 0xeb0400df, 0x54000081, 0xc807fc62, 0x35ffff87];
+        let mut words = original.to_vec();
+        words.push(0xc807_fc62);
+        let report = plan(&words, BASE);
+        assert_eq!(report.patched, vec![], "{report:?}");
+        assert!(
+            report
+                .refused
+                .iter()
+                .any(|r| r.reason == Refusal::CompareExit),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn a_compare_loop_is_left_alone_even_with_no_other_store() {
+        let words = [0xc85f_fc40, 0xb500_0060, 0xc803_fc41, 0x35ff_ffa3];
+        let report = plan(&words, BASE);
+        assert_eq!(report.patched, vec![], "{report:?}");
+        assert!(
+            report
+                .refused
+                .iter()
+                .any(|r| r.reason == Refusal::CompareExit),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn a_compare_exit_is_refused_when_another_section_holds_a_store() {
+        // The same CasZero loop as above, told a store-exclusive exists in
+        // another executable section: a section boundary does not clear
+        // the monitor, so the outside store could still consume the
+        // reservation the failing exit leaves.
+        let words = [0xc85f_fc40, 0xb500_0060, 0xc803_fc41, 0x35ff_ffa3];
+        let report = plan_with_external_store(&words, BASE, &HashSet::new(), &HashSet::new(), true);
+        assert_eq!(report.patched, vec![], "{report:?}");
+        assert!(
+            report
+                .refused
+                .iter()
+                .any(|r| r.reason == Refusal::CompareExit),
+            "{report:?}"
+        );
+        // Told there is none, the same loop is still left alone.
+        let report =
+            plan_with_external_store(&words, BASE, &HashSet::new(), &HashSet::new(), false);
+        assert_eq!(report.patched, vec![], "{report:?}");
+        assert!(
+            report
+                .refused
+                .iter()
+                .any(|r| r.reason == Refusal::CompareExit),
+            "{report:?}"
+        );
     }
 
     #[test]

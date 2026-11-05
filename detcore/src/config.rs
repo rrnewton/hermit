@@ -94,8 +94,7 @@ mod tests {
     /// https://github.com/rrnewton/hermit/pull/4728's, 31 is
     /// https://github.com/rrnewton/hermit/pull/4867's, 32 is the stopless
     /// layout on top of 31's, and 40, the `CpuClockProcess` pair allocated
-    /// to https://github.com/rrnewton/hermit/pull/4885, is the current
-    /// revision.
+    /// to https://github.com/rrnewton/hermit/pull/4885, landed before the current revision 41.
     const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[33, 34, 35, 36, 37, 38, 39];
 
     /// Every revision of the global RPC, oldest first, with the digest of the
@@ -270,6 +269,12 @@ mod tests {
         // (the stopless layout on top of 31), skipping reserved 33 to 39;
         // digests measured at this head).
         (40, "3919013da0508f27", "f013e36743d8d9e6"),
+        // The `StoreExclusive` payload's `Rewrite` says whether a mapping's
+        // file holds loops no mapping symbol proves (`unmarked`), which the
+        // run names in its summary; its fields cross the wire positionally.
+        // Follows landed revision 40 while 33 to 39 remain reserved.
+        // The combined payload digest is measured during this replay.
+        (41, "424f7d348b80d8be", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
@@ -290,10 +295,12 @@ mod tests {
     /// The types `GlobalRequest::StoreExclusive` carries, declared in
     /// `store_exclusive.rs` inside its modules. Their fields cross the RPC in
     /// positional bincode as the enums' own do.
-    const STORE_EXCLUSIVE_PAYLOAD: [&str; 3] = [
+    const STORE_EXCLUSIVE_PAYLOAD: [&str; 5] = [
         "pub enum Report {",
         "pub struct ScannedMapping {",
         "pub struct Found {",
+        "pub struct Rewrite {",
+        "pub struct LiveMapping {",
     ];
 
     /// The lines of code, as [`definition`] gives them, of the type that

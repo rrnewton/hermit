@@ -238,6 +238,12 @@ mod model {
     use std::path::Path;
     use std::sync::Arc;
 
+    use detcore_model::summary::ExclusiveRewrite;
+    use detcore_model::summary::RunSummary;
+
+    use crate::aarch64_lse::elf::FilePlan;
+    use crate::aarch64_lse::elf::FileReport;
+
     /// An Arm CPU PMU, as `/sys/bus/event_source/devices/<name>` describes
     /// it.
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -383,15 +389,35 @@ mod model {
         /// Loops the rewrite was asked for and could not write: the guest's
         /// memory or the file could not be read or written. They still retry.
         pub failed: u64,
+        /// Whether the file holds exclusive loops in an executable section no
+        /// mapping symbol it accepts proves: one nothing marks, which the
+        /// rewrite leaves as `no-mapping-symbols`, or one holding a mapping
+        /// symbol other than `$x` and `$d`, left as
+        /// `unsupported-mapping-symbol` (`FileReport::unproven`). Those of
+        /// this range are among `left`.
+        pub unmarked: bool,
     }
 
     impl Rewrite {
+        /// This range's rewrite once each planned sequence in it was tried
+        /// (`rewritten` and `failed` counted): every other pair its scan
+        /// attributed to it is left ([`left_in_mapping`]), and the file is
+        /// marked if its plan left loops no mapping symbol it accepts proves.
+        pub(crate) fn settled(self, pairs: u64, report: &FileReport) -> Rewrite {
+            Rewrite {
+                left: left_in_mapping(pairs, self.rewritten, self.failed),
+                unmarked: report.unproven() != 0,
+                ..self
+            }
+        }
+
         /// Add another range's counts.
         fn add(self, other: Rewrite) -> Rewrite {
             Rewrite {
                 rewritten: self.rewritten + other.rewritten,
                 left: self.left + other.left,
                 failed: self.failed + other.failed,
+                unmarked: self.unmarked || other.unmarked,
             }
         }
 
@@ -603,11 +629,11 @@ mod model {
         add(
             &mut charge,
             report
-                .refused_examples
+                .refused_sites
                 .capacity()
                 .saturating_mul(size_of::<(u64, String)>()),
         );
-        for (_, why) in &report.refused_examples {
+        for (_, why) in &report.refused_sites {
             add(&mut charge, why.capacity());
         }
         add(
@@ -801,6 +827,131 @@ mod model {
     /// not written.
     pub(crate) fn left_in_mapping(pairs: u64, rewritten: u64, failed: u64) -> u64 {
         pairs.saturating_sub(rewritten + failed)
+    }
+
+    /// One mapping's in-memory rewrite once its file's plan is known. Every
+    /// path ends with [`Rewrite::settled`], so a file whose plan left loops
+    /// no mapping symbol proves is named however the rewrite went. `memory`
+    /// is the guest's code, `None` when it could not be opened: then no
+    /// sequence is tried, and every pair counts as not written. `range` is
+    /// where the mapping starts, and the file offset and length it maps.
+    /// Returns the rewrite and how many sequences run past the mapping's end,
+    /// left whole.
+    pub(crate) fn rewrite_planned<M: GuestCode>(
+        plan: &FilePlan,
+        pairs: u64,
+        memory: Option<&M>,
+        range: (u64, u64, u64),
+        page: u64,
+        new: &dyn Fn(u64, u64) -> bool,
+        path: &Path,
+    ) -> (Rewrite, u64) {
+        let (rewrite, crossing) = match memory {
+            Some(memory) => try_planned(plan, memory, range, page, new, path),
+            // A failure before any sequence is tried counts at least one,
+            // even in a mapping whose scan paired nothing: it may hold a
+            // split sequence.
+            None => (
+                Rewrite {
+                    failed: pairs.max(1),
+                    ..Rewrite::default()
+                },
+                0,
+            ),
+        };
+        // Every pair the scan found that was neither rewritten nor failed is
+        // left: refused by the rewriter, not the file's bytes in memory, or
+        // old code that may be running; and so is each sequence split across
+        // this mapping's end.
+        (rewrite.settled(pairs, &plan.report), crossing)
+    }
+
+    /// Try each of `plan`'s sequences that lies in the mapping `range`
+    /// describes, through `memory`: write it where the guest's memory still
+    /// holds the file's bytes and `new` says none of it can have run, within
+    /// one page. Returns the counts before [`Rewrite::settled`] and the
+    /// sequences that start here and run into the next mapping.
+    fn try_planned<M: GuestCode>(
+        plan: &FilePlan,
+        memory: &M,
+        (map_start, map_offset, map_len): (u64, u64, u64),
+        page: u64,
+        new: &dyn Fn(u64, u64) -> bool,
+        path: &Path,
+    ) -> (Rewrite, u64) {
+        let mut rewrite = Rewrite::default();
+        // Sequences that start here and run into the next mapping: left
+        // whole. The scan counted each pair in the mapping that holds its
+        // load, so they are among the `pairs` of this one or the next.
+        let mut crossing = 0;
+        for patch in &plan.patches {
+            let address = match place(
+                patch.offset,
+                patch.original.len() as u64,
+                map_start,
+                map_offset,
+                map_len,
+            ) {
+                Placement::Outside => continue,
+                Placement::CrossesEnd => {
+                    crossing += 1;
+                    continue;
+                }
+                Placement::At(address) => address,
+            };
+            if crosses_page(address, patch.original.len() as u64, page) {
+                tracing::debug!(
+                    "[store-exclusive] the sequence at {address:#x} crosses a page; left, so that \
+                     no page drop can leave half of it"
+                );
+                continue;
+            }
+            let mut current = vec![0u8; patch.original.len()];
+            if let Err(error) = memory.read(address, &mut current) {
+                tracing::debug!(
+                    "[store-exclusive] cannot read the guest's code at {address:#x}: {error}"
+                );
+                rewrite.failed += 1;
+                continue;
+            }
+            let end = address + patch.original.len() as u64;
+            match step(
+                &current,
+                &patch.original,
+                &patch.rewritten,
+                new(address, end),
+            ) {
+                Step::Done => {
+                    rewrite.rewritten += 1;
+                }
+                Step::Leave => {
+                    tracing::debug!(
+                        "[store-exclusive] the guest's code at {address:#x} is not the file's, \
+                         or may already have run; left"
+                    );
+                }
+                Step::Write => {
+                    match write_sequence(memory, address, &patch.original, &patch.rewritten) {
+                        Written::Rewritten => {
+                            rewrite.rewritten += 1;
+                        }
+                        Written::Failed(why) => {
+                            tracing::debug!(
+                                "[store-exclusive] the guest's code at {address:#x} was not \
+                                 rewritten: {why}"
+                            );
+                            rewrite.failed += 1;
+                        }
+                        Written::Broken(why) => panic!(
+                            "the in-memory rewrite of {} left the guest's code at {address:#x} \
+                             holding neither its loop nor the replacement: {why}",
+                            path.display()
+                        ),
+                    }
+                }
+            }
+        }
+        (rewrite, crossing)
     }
 
     /// How far a file opened for a mapping is proven to be the mapped object.
@@ -1023,24 +1174,60 @@ mod model {
         /// the ranges of one address space, the one that left or could not
         /// write the most (then the one with the most loops), so that the
         /// three counts describe one process and the worst exposure is the
-        /// one shown.
+        /// one shown. The unmarked flag instead covers every address space:
+        /// worse numeric exposure elsewhere cannot hide an unproven file.
         pub(crate) fn rewrites_per_path(&self) -> BTreeMap<String, Rewrite> {
             self.found
                 .iter()
                 .map(|(path, spaces)| {
-                    let rewrite = spaces
+                    let mut unmarked = false;
+                    let mut rewrite = spaces
                         .values()
                         .map(|ranges| {
                             ranges
                                 .values()
                                 .fold(Rewrite::default(), |sum, (_, rewrite)| sum.add(*rewrite))
                         })
+                        .inspect(|rewrite| unmarked |= rewrite.unmarked)
                         .max_by_key(|r| (r.left + r.failed, r.rewritten + r.left + r.failed))
                         .unwrap_or_default();
+                    rewrite.unmarked |= unmarked;
                     (path.clone(), rewrite)
                 })
                 .filter(|(_, rewrite)| !rewrite.is_empty())
                 .collect()
+        }
+
+        /// Project the rewrite counts and unmarked filenames into the run summary.
+        pub(crate) fn fill_rewrite_summary(&self, summary: &mut RunSummary) {
+            // The files whose loops were left for want of mapping symbols
+            // are named beside those the overlay left
+            // (`Config::rewrite_exclusives_unmarked`).
+            let mut unmarked_files = Vec::new();
+            summary.exclusive_rewrites = self
+                .rewrites_per_path()
+                .into_iter()
+                .map(|(path, rewrite)| {
+                    let Rewrite {
+                        rewritten,
+                        left,
+                        failed,
+                        unmarked,
+                    } = rewrite;
+                    if unmarked {
+                        unmarked_files.push(path.clone());
+                    }
+                    (
+                        path,
+                        ExclusiveRewrite {
+                            rewritten,
+                            left,
+                            failed,
+                        },
+                    )
+                })
+                .collect();
+            summary.exclusive_rewrite_unmarked.extend(unmarked_files);
         }
 
         /// The exclusive loops of each guest path that can still retry, in the
@@ -1114,7 +1301,6 @@ mod runtime {
     use std::sync::Arc;
     use std::sync::Mutex;
 
-    use detcore_model::summary::ExclusiveRewrite;
     use detcore_model::summary::RunSummary;
     use detcore_model::summary::StoreExclusiveCounts;
     use procfs::process::MMPermissions;
@@ -1140,26 +1326,19 @@ mod runtime {
     use super::model::LiveMapping;
     use super::model::Opened;
     use super::model::PairTally;
-    use super::model::Placement;
     use super::model::Range;
     use super::model::Rewrite;
     use super::model::ScannedMapping;
-    use super::model::Step;
     use super::model::Trigger;
-    use super::model::Written;
     use super::model::arm_cpu_pmus;
     use super::model::combine;
     use super::model::covering;
-    use super::model::crosses_page;
-    use super::model::left_in_mapping;
     use super::model::merge_overlaps;
     use super::model::page_span;
-    use super::model::place;
     use super::model::plan_charge;
+    use super::model::rewrite_planned;
     use super::model::sequence_is_new;
-    use super::model::step;
     use super::model::was_executable;
-    use super::model::write_sequence;
     use crate::Config;
     use crate::Detcore;
     use crate::RecordOrReplay;
@@ -1353,26 +1532,7 @@ mod runtime {
             summary.exclusive_pairs = self.pairs.pairs_per_path();
             summary.exclusive_rewrite_cache_peak = PLANS.lock().unwrap().peak() as u64;
             summary.counter_reads = self.pairs.counter_reads_per_path();
-            summary.exclusive_rewrites = self
-                .pairs
-                .rewrites_per_path()
-                .into_iter()
-                .map(|(path, rewrite)| {
-                    let Rewrite {
-                        rewritten,
-                        left,
-                        failed,
-                    } = rewrite;
-                    (
-                        path,
-                        ExclusiveRewrite {
-                            rewritten,
-                            left,
-                            failed,
-                        },
-                    )
-                })
-                .collect();
+            self.pairs.fill_rewrite_summary(summary);
             match self.counts() {
                 Some(Ok(counts)) => summary.store_exclusives = Some(*counts),
                 Some(Err(reason)) => summary.store_exclusives_unavailable = Some(reason.clone()),
@@ -2054,7 +2214,7 @@ mod runtime {
         }
         let mut bytes = Vec::new();
         bytes
-            .try_reserve_exact(stamp.0 as usize)
+            .try_reserve_exact(stamp.0 as usize + 1)
             .map_err(|error| error.to_string())?;
         // Read at most one byte past the bound, so a file that grows while it
         // is read can neither pass the bound nor grow the buffer unchecked.
@@ -2073,6 +2233,7 @@ mod runtime {
         {
             return Err("the file changed while it was read".to_owned());
         }
+        // The plan is a function of the bytes alone, so the cache keys them.
         if let Some(plan) = PLANS.lock().unwrap().get(&bytes) {
             return Ok(plan);
         }
@@ -2113,9 +2274,9 @@ mod runtime {
     /// process alone, so the file and every other process mapping it keep the
     /// original, and the kernel keeps the instruction cache coherent with the
     /// written page. A shared or writable mapping is left alone. Each
-    /// sequence is written whole or not at all ([`write_sequence`]); if the
-    /// guest's memory ends up holding neither, the run ends here.
-    #[allow(clippy::too_many_arguments)]
+    /// sequence is written whole or not at all (`write_sequence`, through
+    /// [`rewrite_planned`]); if the guest's memory ends up holding neither,
+    /// the run ends here.
     fn rewrite_mapping(
         tid: Pid,
         path: &Path,
@@ -2160,93 +2321,25 @@ mod runtime {
             .write(true)
             .open(format!("/proc/{}/mem", tid.as_raw()))
         {
-            Ok(memory) => ProcMem(memory),
+            Ok(memory) => Some(ProcMem(memory)),
             Err(error) => {
                 debug!(
                     "[store-exclusive] cannot open /proc/{}/mem to rewrite {}: {error}",
                     tid.as_raw(),
                     path.display()
                 );
-                return (all_failed, 0);
+                None
             }
         };
-        let mut rewrite = Rewrite::default();
-        let page = page_size();
-        // Sequences that start here and run into the next mapping: left
-        // whole. The scan counted each pair in the mapping that holds its
-        // load, so they are among the `pairs` of this one or the next.
-        let mut crossing = 0;
-        for patch in &plan.patches {
-            let address = match place(
-                patch.offset,
-                patch.original.len() as u64,
-                map.address.0,
-                key.offset,
-                key.len,
-            ) {
-                Placement::Outside => continue,
-                Placement::CrossesEnd => {
-                    crossing += 1;
-                    continue;
-                }
-                Placement::At(address) => address,
-            };
-            if crosses_page(address, patch.original.len() as u64, page) {
-                debug!(
-                    "[store-exclusive] the sequence at {address:#x} crosses a page; left, so that \
-                     no page drop can leave half of it"
-                );
-                continue;
-            }
-            let mut current = vec![0u8; patch.original.len()];
-            if let Err(error) = memory.read(address, &mut current) {
-                debug!("[store-exclusive] cannot read the guest's code at {address:#x}: {error}");
-                rewrite.failed += 1;
-                continue;
-            }
-            let end = address + patch.original.len() as u64;
-            match step(
-                &current,
-                &patch.original,
-                &patch.rewritten,
-                new(address, end),
-            ) {
-                Step::Done => {
-                    rewrite.rewritten += 1;
-                }
-                Step::Leave => {
-                    debug!(
-                        "[store-exclusive] the guest's code at {address:#x} is not the file's, \
-                         or may already have run; left"
-                    );
-                }
-                Step::Write => {
-                    match write_sequence(&memory, address, &patch.original, &patch.rewritten) {
-                        Written::Rewritten => {
-                            rewrite.rewritten += 1;
-                        }
-                        Written::Failed(why) => {
-                            debug!(
-                                "[store-exclusive] the guest's code at {address:#x} was not \
-                                 rewritten: {why}"
-                            );
-                            rewrite.failed += 1;
-                        }
-                        Written::Broken(why) => panic!(
-                            "the in-memory rewrite of {} left the guest's code at {address:#x} \
-                             holding neither its loop nor the replacement: {why}",
-                            path.display()
-                        ),
-                    }
-                }
-            }
-        }
-        // Every pair the scan found that was neither rewritten nor failed is
-        // left: refused by the rewriter, not the file's bytes in memory, or
-        // old code that may be running; and so is each sequence split across
-        // this mapping's end.
-        rewrite.left = left_in_mapping(pairs, rewrite.rewritten, rewrite.failed);
-        (rewrite, crossing)
+        rewrite_planned(
+            plan,
+            pairs,
+            memory.as_ref(),
+            (map.address.0, key.offset, key.len),
+            page_size(),
+            new,
+            path,
+        )
     }
 
     /// Open `path` as the guest names it: resolved inside the guest's root
@@ -2780,6 +2873,7 @@ mod tests {
     use super::model::parse_cpu_list;
     use super::model::place;
     use super::model::plan_charge;
+    use super::model::rewrite_planned;
     use super::model::sequence_is_new;
     use super::model::spine_bound;
     use super::model::step;
@@ -2809,6 +2903,95 @@ mod tests {
     const ADD_X1_X0_1: u32 = 0x9100_0401; // add x1, x0, #1
     const CBNZ_W3: u32 = 0x3500_0003; // cbnz w3, .
 
+    /// The in-memory rewrite counts one mapping from its file's own plan, on
+    /// every exit once the plan is known (`rewrite_planned`, which
+    /// `rewrite_mapping`, aarch64 only, ends with): a file whose `.text` holds
+    /// an AArch32 `$a` after its `$x`, and a stripped file, have nothing to
+    /// write and are named as holding loops no mapping symbol this reader
+    /// accepts proves, whether the guest's memory could be opened (the pair
+    /// is left) or not (the pair is not written). A fully marked file is
+    /// never named: its loop is written, or not written when the memory
+    /// could not be opened.
+    #[test]
+    fn the_in_memory_rewrite_names_a_file_its_plan_does_not_prove() {
+        use crate::aarch64_lse::elf::plan_bytes;
+        use crate::aarch64_lse::elf::tests::LOOP;
+        use crate::aarch64_lse::elf::tests::elf_image;
+        let plan = |image: &[u8]| plan_bytes(image).unwrap().expect("an aarch64 ELF image");
+        // The mapping maps the whole image at address 0, in one page.
+        let finish = |plan: &crate::aarch64_lse::elf::FilePlan, image: &[u8], opened: bool| {
+            let code = FakeCode::new(image, Vec::new());
+            rewrite_planned(
+                plan,
+                1,
+                opened.then_some(&code),
+                (0, 0, image.len() as u64),
+                4096,
+                &|_, _| true,
+                std::path::Path::new("image"),
+            )
+        };
+        let mut unsupported = elf_image(&LOOP, Some(&[(1, 0, true), (1, 5, false)]));
+        let names = b"\0$x\0$d\0";
+        let at = unsupported
+            .windows(names.len())
+            .position(|window| window == names)
+            .expect("the mapping symbols' names");
+        unsupported[at + 4..at + 6].copy_from_slice(b"$a");
+        for image in [unsupported, elf_image(&LOOP, None)] {
+            let unproven = plan(&image);
+            assert!(unproven.patches.is_empty(), "{unproven:?}");
+            let named = |rewrite: Rewrite| Rewrite {
+                unmarked: true,
+                ..rewrite
+            };
+            assert_eq!(
+                finish(&unproven, &image, true),
+                (
+                    named(Rewrite {
+                        left: 1,
+                        ..Rewrite::default()
+                    }),
+                    0
+                ),
+                "{unproven:?}"
+            );
+            assert_eq!(
+                finish(&unproven, &image, false),
+                (
+                    named(Rewrite {
+                        failed: 1,
+                        ..Rewrite::default()
+                    }),
+                    0
+                ),
+                "{unproven:?}"
+            );
+        }
+        let image = elf_image(&LOOP, Some(&[(1, 0, true)]));
+        let marked = plan(&image);
+        assert_eq!(marked.patches.len(), 1, "{marked:?}");
+        assert_eq!(
+            finish(&marked, &image, true),
+            (
+                Rewrite {
+                    rewritten: 1,
+                    ..Rewrite::default()
+                },
+                0
+            )
+        );
+        assert_eq!(
+            finish(&marked, &image, false),
+            (
+                Rewrite {
+                    failed: 1,
+                    ..Rewrite::default()
+                },
+                0
+            )
+        );
+    }
     #[test]
     fn classifies_exclusive_loads_and_stores() {
         for load in [
@@ -3270,9 +3453,9 @@ mod tests {
             ..FilePlan::default()
         };
         plan.report.patched.insert("rmw", 1);
-        plan.report.refused_examples = Vec::with_capacity(3);
+        plan.report.refused_sites = Vec::with_capacity(3);
         plan.report
-            .refused_examples
+            .refused_sites
             .push((0x10, String::with_capacity(40)));
         let shared = 2 * size_of::<usize>() + size_of::<Option<FilePlan>>();
         let expected = shared
@@ -3646,6 +3829,133 @@ mod tests {
         assert_eq!(at(0x3000, 16), Placement::Outside);
     }
 
+    /// Whether a file holds loops no mapping symbol proves follows its
+    /// ranges into the per-path tally: one range of a file that says so is
+    /// enough, so the run can name the file beside those the overlay left
+    /// (`RunSummary::exclusive_rewrite_unmarked`).
+    #[test]
+    fn a_file_with_unproven_loops_is_named_in_the_tally() {
+        let stripped = "/lib64/libstdc++.so.6";
+        let with = |offset, unmarked| ScannedMapping {
+            rewrite: Rewrite {
+                left: 2,
+                unmarked,
+                ..Rewrite::default()
+            },
+            ..mapping(stripped, offset, 0x1000, 2)
+        };
+        let mut tally = PairTally::default();
+        tally.note(
+            &("0".to_owned(), 1),
+            &[with(0, false), with(0x4000, true)],
+            None,
+        );
+        let rewrites = tally.rewrites_per_path();
+        assert_eq!(
+            rewrites.get(stripped),
+            Some(&Rewrite {
+                rewritten: 0,
+                left: 4,
+                failed: 0,
+                unmarked: true,
+            })
+        );
+        let mut proved = PairTally::default();
+        proved.note(&("0".to_owned(), 1), &[with(0, false)], None);
+        assert!(!proved.rewrites_per_path()[stripped].unmarked);
+    }
+
+    #[test]
+    fn an_unproven_file_is_named_even_when_another_space_has_worse_counts() {
+        use detcore_model::summary::ExclusiveRewrite;
+        use detcore_model::summary::RunSummary;
+
+        let path = "/lib64/libstripped.so";
+        let with = |address, rewritten, left, failed, unmarked| ScannedMapping {
+            address,
+            rewrite: Rewrite {
+                rewritten,
+                left,
+                failed,
+                unmarked,
+            },
+            ..mapping(path, 0, 0x1000, rewritten + left + failed)
+        };
+        for reverse in [false, true] {
+            for unmarked in [false, true] {
+                let mut spaces = [
+                    (
+                        ("0".to_owned(), 1),
+                        vec![with(0x40_0000, 0, 1, 0, unmarked)],
+                    ),
+                    (
+                        ("01".to_owned(), 0),
+                        vec![
+                            with(0x40_0000, 0, 1, 0, false),
+                            with(0x50_0000, 0, 1, 0, false),
+                        ],
+                    ),
+                ];
+                if reverse {
+                    spaces.reverse();
+                }
+                let mut tally = PairTally::default();
+                for (space, mappings) in spaces {
+                    tally.note(&space, &mappings, None);
+                }
+                let mut summary = RunSummary {
+                    exclusive_rewrites: [("/stale".to_owned(), ExclusiveRewrite::default())]
+                        .into_iter()
+                        .collect(),
+                    exclusive_rewrite_unmarked: vec!["/overlay/unproved".to_owned()],
+                    ..RunSummary::default()
+                };
+                tally.fill_rewrite_summary(&mut summary);
+                // Numeric counts still describe the worse single space,
+                // including both aliases, rather than summing the spaces.
+                assert_eq!(summary.exclusive_rewrites.len(), 1);
+                assert_eq!(
+                    summary.exclusive_rewrites[path],
+                    ExclusiveRewrite {
+                        rewritten: 0,
+                        left: 2,
+                        failed: 0,
+                    }
+                );
+                let mut expected = vec!["/overlay/unproved".to_owned()];
+                if unmarked {
+                    expected.push(path.to_owned());
+                }
+                assert_eq!(summary.exclusive_rewrite_unmarked, expected);
+            }
+        }
+
+        // Equal numeric keys keep max_by_key's last-space winner. The
+        // earlier space's marker must survive without choosing its counts.
+        let mut tie = PairTally::default();
+        tie.note(
+            &("0".to_owned(), 1),
+            &[with(0x40_0000, 5, 2, 1, true)],
+            None,
+        );
+        tie.note(
+            &("01".to_owned(), 0),
+            &[with(0x40_0000, 5, 1, 2, false)],
+            None,
+        );
+        let mut summary = RunSummary::default();
+        tie.fill_rewrite_summary(&mut summary);
+        assert_eq!(
+            summary.exclusive_rewrites[path],
+            ExclusiveRewrite {
+                rewritten: 5,
+                left: 1,
+                failed: 2,
+            }
+        );
+        assert_eq!(summary.exclusive_rewrite_unmarked, vec![path.to_owned()]);
+    }
+
     /// The in-memory rewrite is tallied like the pairs: summed over one
     /// address space's ranges, the largest sum over address spaces, and only
     /// for the paths it touched.
@@ -3657,6 +3967,7 @@ mod tests {
                 rewritten,
                 left,
                 failed,
+                unmarked: false,
             },
             ..mapping(libc, offset, 0x1000, pairs)
         };
@@ -3683,6 +3994,7 @@ mod tests {
                 rewritten: 17,
                 left: 2,
                 failed: 1,
+                unmarked: false,
             })
         );
         assert!(!rewrites.contains_key("/bin/plain"), "{rewrites:?}");
@@ -3719,6 +4031,7 @@ mod tests {
                 rewritten: 3,
                 left: 3,
                 failed: 0,
+                unmarked: false,
             })
         );
         // With equal remaining exposure, the process with more loops.
@@ -3731,6 +4044,7 @@ mod tests {
                 rewritten: 18,
                 left: 2,
                 failed: 0,
+                unmarked: false,
             })
         );
     }
