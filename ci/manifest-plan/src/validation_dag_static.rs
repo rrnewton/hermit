@@ -3297,7 +3297,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and 11 drain-decision rows): 3524 + 15 = 3539, listed.
     // And SIGSHARE S2b's scheduler::backend_signal_waits_tests (15 rows) and
     // syscalls::signal::suspend_decline_tests (2): 3539 + 17 = 3556, listed.
-    ("test.detcore_unit", 3556),
+    // And SIGSHARE S4's five scheduler::parked_tests controlled child-exit
+    // units (one S2b row renamed in place): 3556 + 5 = 3561, listed.
+    ("test.detcore_unit", 3561),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4983,7 +4985,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 132 + 1 = 133 (132 run_kvm_ plus the named setup test), listed.
     // And SIGSHARE S2b's run_kvm_a_wait_under_a_temporary_mask_ends_as_on_linux:
     // 133 + 1 = 134 (133 run_kvm_ plus the named setup test), listed.
-    ("privileged-test.cli_kvm", 134),
+    // And SIGSHARE S4's
+    // run_kvm_a_child_exit_sigchld_reaches_a_one_thread_parent_as_on_linux:
+    // 134 + 1 = 135 (134 run_kvm_ plus the named setup test), listed.
+    ("privileged-test.cli_kvm", 135),
     // The required tests of hermit-cli/tests/deadline_slice_cap.rs on KVM: the
     // suite's 42 tests less the rows of its known-gap ledger
     // (hermit-cli/tests/deadline_slice_cap.kvm-gaps.tsv), measured on Hermit
@@ -5442,7 +5447,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same F2-d0 descriptor-directory links test: 131 + 1 = 132, listed.
     // And the same SIGSHARE S2a drain-decision test: 132 + 1 = 133, listed.
     // And the same SIGSHARE S2b temporary-mask test: 133 + 1 = 134, listed.
-    ("privileged-only-test.cli_kvm", 134),
+    // And the same SIGSHARE S4 child-exit test: 134 + 1 = 135, listed.
+    ("privileged-only-test.cli_kvm", 135),
     ("privileged-only-test.pmu_buck_chaos_cases_on_host", 6),
     // And the KVM unreadable futex word test: 56.
     // And run_kvm_a_parked_sleep_carries_the_deadline_cap: 57.
@@ -5499,7 +5505,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same F2-d0 descriptor-directory links test: 131 + 1 = 132.
     // And the same SIGSHARE S2a drain-decision test: 132 + 1 = 133.
     // And the same SIGSHARE S2b temporary-mask test: 133 + 1 = 134.
-    ("privileged-only-test.cli_kvm_on_host", 134),
+    // And the same SIGSHARE S4 child-exit test: 134 + 1 = 135.
+    ("privileged-only-test.cli_kvm_on_host", 135),
     ("test.app_strict_verify_on_host", 8),
     ("test.arbitrary_binaries_on_host", 4),
     ("test.command_strict_verify_on_host", 9),
@@ -5961,7 +5968,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two replayed-switch wake units: 3492 + 2 = 3494.
     // And the same fifteen SIGSHARE S2a units: 3524 + 15 = 3539, listed.
     // And the same seventeen SIGSHARE S2b units: 3539 + 17 = 3556, listed.
-    ("test.detcore_unit_on_host", 3556),
+    // And the same five SIGSHARE S4 units: 3556 + 5 = 3561, listed.
+    ("test.detcore_unit_on_host", 3561),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
