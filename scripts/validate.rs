@@ -19789,8 +19789,9 @@ mod nextest_timeout_tests {
                 // 2974 with package K slice K10's three KVM verify cells
                 // (c-programs/thread-self-procfs-handoff,
                 // c-programs/proc-fd-link-aliases and compat/ps). 2976 with R1108's
-                // c-programs/shared-file-threads on ptrace and KVM.
-                assert_eq!(all.len(), 2976, "the original all-owner population is retained");
+                // c-programs/shared-file-threads on ptrace and KVM. 2977 with
+                // SIGSHARE S2b's KVM verify of c-programs/sigsuspend-sibling-signal-wake.
+                assert_eq!(all.len(), 2977, "the original all-owner population is retained");
             }
             let expected = all.iter().map(|cell| cell.id.clone()).collect::<BTreeSet<_>>();
             assert_eq!(expected.len(), all.len(), "duplicate all-owner cell identity");
@@ -20786,8 +20787,10 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // run_kvm_descriptor_links_through_a_descriptor_directory_answer_as_linux:
         // 132. And SIGSHARE S2a's
         // run_kvm_the_drain_decides_a_polled_call_from_the_backends_signal_state:
-        // 133, matching the DAG pin in validation_dag_static.
-        ("privileged-only-test.cli_kvm", 133usize),
+        // 133. And SIGSHARE S2b's
+        // run_kvm_a_wait_under_a_temporary_mask_ends_as_on_linux: 134, matching
+        // the DAG pin in validation_dag_static.
+        ("privileged-only-test.cli_kvm", 134usize),
     ] {
         let step = privileged
             .steps
