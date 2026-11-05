@@ -4072,6 +4072,13 @@ impl LegacyBackendKeys {
         // only by the versioned envelope of `encode_backend_config_json`,
         // never by these keys.
         backend.hardware_watchpoints = 0;
+        // Added after the legacy form froze: the RCB clock contract is
+        // `None` for DBT, the form's only reader (its counter is not a
+        // qualified contract), so it reads back as `None`. The ptrace
+        // starting constant's `Some` is preserved exactly only by the
+        // versioned envelope of `encode_backend_config_json`, never by
+        // these keys.
+        backend.rcb_clock_contract = None;
         backend
     }
 }
@@ -5267,6 +5274,9 @@ mod tests {
         // The legacy form carries no width for `hardware_watchpoints`: it
         // reads back as 0, the minimal width (see `LegacyBackendKeys::capabilities`).
         backend.hardware_watchpoints = 0;
+        // Added after the legacy form froze: it reads back as `None` (see
+        // `LegacyBackendKeys::capabilities`).
+        backend.rcb_clock_contract = None;
         backend
     }
 
@@ -8802,6 +8812,14 @@ mod tests {
                     value
                         .as_u64()
                         .expect("a u64 signal set encodes as a number");
+                }
+                // An `Option` unit-variant contract: bare `None` in the
+                // default, or the variant's name; one byte either way.
+                "rcb_clock_contract" => {
+                    assert!(
+                        value.is_null() || value.is_string(),
+                        "{name}={value} is not an optional unit variant"
+                    );
                 }
                 _ => assert!(value.is_boolean(), "{name}={value} is not a bool"),
             }
