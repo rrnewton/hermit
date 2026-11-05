@@ -328,7 +328,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // analyze_reports_a_target_met_without_chaos_as_reproduced_without_the_schedule):
     // 8 + 2 = 10.
     // And the resume change's a_budget_ends_analyze_with_a_partial_report_that_resume_finishes: 10 + 1 = 11.
-    ("super.pmu_analyze_hello_race_stress_calibrated_skid", 11),
+    // And the resume change's a_budget_ends_analyze_with_a_partial_report_that_resume_finishes:
+    // 11 + 1 = 12.
+    ("super.pmu_analyze_hello_race_stress_calibrated_skid", 12),
     // Measured 189 - 185 embedded qualifier tests = four allocator/source-copy
     // cases. The same 185 qualifier identities now run once through the existing
     // allocator producer's script-test harness, with none dropped or ignored.
@@ -2018,7 +2020,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // classification, timing-trial naming and report-schema tests in
     // app::analyze and the bin's exit-code test), measured by nextest list
     // at the rebased head against main de84048e: 1314 + 14 = 1328.
-    ("test.hermit_unit", 1329),
+    // PR #4746's 37 added hermit-run lib units (budget, checkpoint, journal,
+    // resume and their refusals; nextest-list delta): 1329 + 37 = 1366.
+    ("test.hermit_unit", 1366),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6435,7 +6439,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // test.hermit_unit (dh-jqhfx, PR 5182): 1262 + 5 = 1267.
     // And the same fourteen PR #4752 verdict units as test.hermit_unit
     // (none in the hosted CPUID-faulting skip set): 1308 + 14 = 1322.
-    ("test.hermit_unit_on_host", 1323),
+    // PR #4746: the same 37 hermit-run units: 1323 + 37 = 1360.
+    ("test.hermit_unit_on_host", 1360),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
