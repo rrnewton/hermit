@@ -840,6 +840,8 @@ async fn a_task_the_table_does_not_hold_has_no_directory() {
 /// The caller's own process, by its number, a sibling thread's number and
 /// `task/<tid>`, and every other spelling Detcore does not decide here,
 /// stay with their handlers: nothing is decided and nothing injected.
+/// (Another process's other files are decided here since slice 2b-5:
+/// `another_processs_other_names_are_decided_here`.)
 #[tokio::test]
 async fn the_callers_own_process_and_other_files_are_left_to_their_handlers() {
     for path in [
@@ -848,13 +850,57 @@ async fn the_callers_own_process_and_other_files_are_left_to_their_handlers() {
         format!("/proc/{}/task/{}/fd/1", LEADER.as_raw(), WORKER.as_raw()),
         format!("/proc/self/fd/{PROC}/{}/cmdline", LEADER.as_raw()),
         "/proc/self/cmdline".to_owned(),
-        format!("/proc/{}/status", OTHER.as_raw()),
+        format!("/proc/{}/task/{}/status", LEADER.as_raw(), WORKER.as_raw()),
+        format!("/proc/{}", OTHER.as_raw()),
+        format!("/proc/{}/task", OTHER.as_raw()),
         "/proc/1/cmdline".to_owned(),
+        "/proc/1/maps".to_owned(),
     ] {
         let (answer, reached) = open(&path, Err(Errno::ENOENT)).await;
         assert!(answer.is_none(), "{path}: {answer:?}");
         assert!(reached.is_empty(), "{path}: {reached:?}");
     }
+}
+
+/// Every other name below another guest process's directory is decided
+/// here, never left to the backend's procfs (ruling 2 of package K item 2b
+/// slice 2b-5), once the kernel beneath lets the call reach its walk: a name
+/// Linux's task directory lacks, or a non-number below `fd`, is ENOENT; a
+/// name Linux has that Detcore does not render for another process (`maps`,
+/// a path below `ns`, and `status` where this configuration does not render
+/// it) is refused by name.
+#[tokio::test]
+async fn another_processs_other_names_are_decided_here() {
+    let other = OTHER.as_raw();
+    for path in [
+        format!("/proc/{other}/bogus"),
+        format!("/proc/{other}/fd/abc"),
+        format!("/proc/{other}/task/{other}/timers"),
+    ] {
+        let (answer, reached) = open(&path, Err(Errno::ENOENT)).await;
+        assert!(
+            matches!(answer, Some(Err(Error::Errno(Errno::ENOENT)))),
+            "{path}: {answer:?}"
+        );
+        assert_eq!(reached.len(), 1, "{path}: {reached:?}");
+    }
+    for path in [
+        format!("/proc/{other}/maps"),
+        format!("/proc/{other}/ns/net"),
+        format!("/proc/{other}/status"),
+        format!("/proc/{other}/exe"),
+    ] {
+        let (answer, reached) = open(&path, Err(Errno::ENOENT)).await;
+        assert_refused(&answer, Sysno::openat, &path);
+        assert_eq!(reached.len(), 1, "{path}: {reached:?}");
+    }
+    // The kernel's own answer to the call's arguments stands.
+    let path = format!("/proc/{other}/maps");
+    let (answer, _) = open(&path, Err(Errno::EINVAL)).await;
+    assert!(
+        matches!(answer, Some(Err(Error::Errno(Errno::EINVAL)))),
+        "{path}: {answer:?}"
+    );
 }
 
 /// Hermit's own init is left to the backend, its cmdline, its descriptor

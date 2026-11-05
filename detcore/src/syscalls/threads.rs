@@ -5032,6 +5032,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             let thread_state = guest.thread_state_mut();
             thread_state.file_metadata = Arc::new(Mutex::new(new_metadata));
+            // The table the exec gives this thread, for another process's
+            // reads of it (`tool_local::THREAD_TABLES`): this thread holds its
+            // turn through the exec, so no reader sees either table in
+            // between; a failed exec notes the old one back below.
+            crate::tool_local::note_thread_table(
+                &self.cfg,
+                thread_state.dettid,
+                &thread_state.file_metadata,
+            );
             thread_state.adopt_process_files();
             thread_state.memory_metadata = Arc::new(Mutex::new(MemoryMetadata::new()));
             thread_state.mm_id = old_mm_id.for_exec(detpid);
@@ -5050,6 +5059,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             let thread_state = guest.thread_state_mut();
             thread_state.file_metadata = old_metadata;
+            crate::tool_local::note_thread_table(
+                &self.cfg,
+                thread_state.dettid,
+                &thread_state.file_metadata,
+            );
             thread_state.process_files = old_process_files;
             thread_state.memory_metadata = old_memory_metadata;
             thread_state.mm_id = old_mm_id;

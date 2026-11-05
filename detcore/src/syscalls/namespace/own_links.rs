@@ -95,6 +95,17 @@
 //! refused by name. Both backends then give one semantics, Linux's: ptrace's
 //! kernel renders it, KVM's Detcore renders it from records of the same
 //! state.
+//!
+//! Another process's descriptor links, `fd/<n>` (package K item 2b slice
+//! 2b-5), are the kernel's on ptrace, as before. On KVM Detcore renders them
+//! ([`Detcore::readlink_other_descriptor`]) from the table that process
+//! holds in its model and the backend's `link_path` fact for that process's
+//! descriptor, with Linux's order of answers (`proc_lookupfd_common`,
+//! `proc_fd_access_allowed`, `proc_fd_link`): no task, or no such
+//! descriptor (a zombie has none), is `ENOENT`; the access check refuses
+//! with `EACCES`; then the descriptor's file as `d_path` renders it, with
+//! Detcore's own names for placeholders and for a pipe's or a socket's
+//! inode, as for the caller's own links.
 
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::ffi::OsStringExt;
@@ -1175,6 +1186,223 @@ impl<T: RecordOrReplay> Detcore<T> {
             .link_path(reverie::Pid::from_raw(backend), PathLink::Executable)
             .ok()
             .map(|text| text.as_bytes().to_vec())
+    }
+
+    /// `readlink` of another guest process's descriptor link at `path`,
+    /// `/proc/<pid>/fd/<fd>` or `/proc/<pid>/task/<tid>/fd/<fd>` (`task`),
+    /// followed as `past` says, into the guest's `buffer` of `buffer_len`
+    /// bytes, where Detcore reads another task's descriptor table
+    /// (`tool_local::reads_thread_tables`, KVM; package K item 2b slice 2b-5
+    /// of <https://github.com/rrnewton/hermit/issues/5063>). The caller
+    /// (`Detcore::other_process_procfs_answer`) has found the task to be
+    /// another guest process's and let the kernel beneath judge the call's
+    /// own arguments.
+    ///
+    /// Linux's answers, in its order: the walk finds no task, or a task
+    /// whose table has no descriptor `fd`, which a task that has exited no
+    /// longer has (`proc_lookupfd_common` and `tid_fd_mode`, fs/proc/fd.c),
+    /// `ENOENT`; the access check (`proc_fd_access_allowed`,
+    /// `PTRACE_MODE_READ_FSCREDS`, fs/proc/base.c, modelled as for `exe`)
+    /// refuses with `EACCES`; then `proc_fd_link` names the descriptor's file
+    /// as `d_path` renders it. The table is the one the task holds in
+    /// Detcore's model (`tool_local::thread_table`: the leader's for a
+    /// process's directory), read in the caller's turn while every other
+    /// guest thread is parked, so it holds what the target's own calls made
+    /// it, in the guest's order. The text is the backend's `link_path` fact
+    /// for that process's descriptor (a path, " (deleted)" once unlinked, or
+    /// an object's name), with Detcore's own names where it has them, as for
+    /// the caller's own links: a placeholder's procfs directory or file, and
+    /// a pipe's or a socket's inode number from Detcore's pool for the raw
+    /// identity Detcore took at the descriptor's open (an inherited standard
+    /// stream's fixed number).
+    ///
+    /// A slash after the link follows it: `ENOTDIR` for a file that is not a
+    /// directory and `EINVAL` for a directory, by the file type Detcore took
+    /// at the open. What Detcore cannot render exactly is refused by name: a
+    /// `.` looked up past the link, whose search permission only the file's
+    /// own lookup checks; a table a receive may have filled with descriptors
+    /// Detcore does not know; a descriptor it keeps no description of; a
+    /// thread's own table, which the backend does not name; and a descriptor
+    /// whose file the backend's records do not name as Detcore's do.
+    pub(crate) async fn readlink_other_descriptor<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: Sysno,
+        (path, task, fd): (&Path, crate::procfs::BoundTask, i32),
+        past: Past,
+        (buffer, buffer_len): (Option<AddrMut<'_, libc::c_char>>, usize),
+    ) -> Result<i64, Error> {
+        let size = super::readlink_size(buffer_len)?;
+        let found = crate::tool_global::procfs_task(guest, task).await;
+        if !found.exists || found.without_mm {
+            return Err(Errno::ENOENT.into());
+        }
+        let refuse = |why: &str| {
+            format!(
+                "unsupported: readlink of {}, another process's descriptor link: {why} \
+                 (https://github.com/rrnewton/hermit/issues/5063)",
+                path.display()
+            )
+        };
+        let holder = task.thread.unwrap_or(task.process);
+        let table = crate::tool_local::thread_table(crate::types::DetTid::from_raw(holder));
+        let leader = crate::tool_local::thread_table(crate::types::DetTid::from_raw(task.process));
+        let table = match (table, leader) {
+            (Some(table), Some(leader)) if std::sync::Arc::ptr_eq(&table, &leader) => table,
+            (Some(_), _) => {
+                let reason = refuse(
+                    "the thread holds a descriptor table of its own, which the backend's \
+                     records do not name",
+                );
+                return self.refuse_unrendered_link(guest, sysno, &reason).await;
+            }
+            (None, _) => {
+                let reason = refuse("Detcore holds no descriptor table for that task");
+                return self.refuse_unrendered_link(guest, sysno, &reason).await;
+            }
+        };
+        let observed = table.lock().unwrap().observed_descriptor(fd);
+        let observed = match observed {
+            crate::tool_local::ObservedEntry::Held(observed) => observed,
+            crate::tool_local::ObservedEntry::Absent => return Err(Errno::ENOENT.into()),
+            crate::tool_local::ObservedEntry::Unknown => {
+                let reason = refuse(
+                    "a receive in that process may have installed descriptors Detcore does \
+                     not know",
+                );
+                return self.refuse_unrendered_link(guest, sysno, &reason).await;
+            }
+            crate::tool_local::ObservedEntry::Unmodelled => {
+                let reason = refuse("Detcore keeps no description of that descriptor");
+                return self.refuse_unrendered_link(guest, sysno, &reason).await;
+            }
+        };
+        Self::link_read_allowed(guest, task).await??;
+        match past {
+            Past::Nothing => {}
+            Past::Slash => {
+                let Some(stat) = observed.stat else {
+                    let reason = refuse("Detcore took no file type for that descriptor");
+                    return self.refuse_unrendered_link(guest, sysno, &reason).await;
+                };
+                return Err(if stat.mode & libc::S_IFMT == libc::S_IFDIR {
+                    Errno::EINVAL
+                } else {
+                    Errno::ENOTDIR
+                }
+                .into());
+            }
+            Past::Walk => {
+                let reason = refuse(
+                    "a lookup past it, whose search permission only that file's own lookup \
+                     would check",
+                );
+                return self.refuse_unrendered_link(guest, sysno, &reason).await;
+            }
+        }
+        let target = match self
+            .other_descriptor_link_target(guest, holder, fd, &observed)
+            .await?
+        {
+            Ok(target) => target,
+            Err(why) => {
+                let reason = refuse(why);
+                return self.refuse_unrendered_link(guest, sysno, &reason).await;
+            }
+        };
+        let target = fits_d_path(&target)?;
+        let copied = &target[..target.len().min(size)];
+        let address = buffer.ok_or(Errno::EFAULT)?;
+        match copy_link_out(guest, address.cast::<u8>(), copied)? {
+            Some(copied) => Ok(copied),
+            None => guest
+                .memory()
+                .write_exact(address.cast::<u8>(), copied)
+                .map(|()| copied.len() as i64)
+                .map_err(|_| Errno::EFAULT.into()),
+        }
+    }
+
+    /// The target of descriptor `fd` of the process thread `holder` belongs
+    /// to, which Detcore describes as `observed`
+    /// ([`Self::readlink_other_descriptor`]): `Ok(Ok(text))`, Linux's readlink
+    /// text; `Ok(Err(why))` where Detcore cannot render it exactly.
+    async fn other_descriptor_link_target<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        holder: i32,
+        fd: i32,
+        observed: &crate::tool_local::ObservedDescriptor,
+    ) -> Result<Result<Vec<u8>, &'static str>, Error> {
+        // A placeholder directory names the `/proc` directory it stands for.
+        if let Some(directory) = &observed.placeholder_link {
+            return Ok(Ok(directory.as_os_str().as_bytes().to_vec()));
+        }
+        let fact = match Self::kernel_procfs_number(guest, holder).await {
+            Some(backend) => guest
+                .link_path(reverie::Pid::from_raw(backend), PathLink::Descriptor(fd))
+                .map(|text| text.as_bytes().to_vec()),
+            None => Err(FactError::NotProvided),
+        };
+        let text = match fact {
+            Ok(text) => text,
+            // An object the backend keeps itself and does not name: the
+            // procfs file Detcore recorded at the descriptor's open.
+            Err(FactError::NotProvided) => {
+                return Ok(observed
+                    .procfs_link
+                    .as_ref()
+                    .map(|name| name.as_os_str().as_bytes().to_vec())
+                    .ok_or(
+                        "the backend keeps that descriptor's file itself and does not name it, \
+                         and Detcore recorded no procfs file at its open",
+                    ));
+            }
+            Err(FactError::Errno(Errno::EBADF | Errno::ESRCH)) => {
+                return Ok(Err(
+                    "the backend's records do not hold the descriptor Detcore's table holds",
+                ));
+            }
+            Err(FactError::Errno(errno)) => return Err(errno.into()),
+            Err(_) => return Ok(Err("the backend could not name the descriptor's file")),
+        };
+        // A placeholder file, confirmed by the identity Detcore took at the
+        // open, names the procfs file it stands for.
+        if let Some(path) = self.placeholder_link_within_level(guest, &text) {
+            return Ok(
+                if observed.stat.is_some_and(|stat| {
+                    crate::syscalls::files::rendered_procfs::placeholder_identity(
+                        stat.dev, stat.inode,
+                    )
+                    .is_some()
+                }) {
+                    Ok(path.as_os_str().as_bytes().to_vec())
+                } else {
+                    Err("its file is named as a placeholder Detcore cannot confirm")
+                },
+            );
+        }
+        let Some(identity) = super::anonymous_proc_fd_identity(&text) else {
+            return Ok(Ok(text));
+        };
+        let inode = match crate::syscalls::deterministic_stdio_inode_for_resource(
+            fd,
+            observed.resource.clone(),
+        ) {
+            Some(inode) => inode,
+            None => {
+                let Some(stat) = observed.stat else {
+                    return Ok(Err("Detcore took no identity for that descriptor's object"));
+                };
+                crate::tool_global::determinize_inode(
+                    guest,
+                    crate::types::RawInode::new(stat.dev, stat.inode),
+                )
+                .await
+                .0
+            }
+        };
+        Ok(Ok(format!("{}:[{inode}]", identity.kind).into_bytes()))
     }
 
     /// Whether Detcore records each filesystem group's working directory,
