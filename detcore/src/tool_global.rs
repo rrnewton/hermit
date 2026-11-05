@@ -2749,7 +2749,14 @@ impl GlobalState {
             }
             request => request,
         };
-        let time_from_guest = guest_time.as_nanos();
+        let time_from_guest = std::panic::catch_unwind(|| guest_time.as_nanos())
+            .unwrap_or_else(|panic| {
+                eprintln!(
+                    "DBT_CLOCK_RPC_DIAGNOSTIC pid={} tid={} request_discriminant={:?}",
+                    std::process::id(), from.as_raw(), std::mem::discriminant(&request)
+                );
+                std::panic::resume_unwind(panic)
+            });
         // The thread's own computation and syscalls, excluding clock advances
         // (`DetTime::advance_to`), for `--work-span-report`.
         let work_span_cpu = self.cfg.work_span_report.is_some().then(|| {

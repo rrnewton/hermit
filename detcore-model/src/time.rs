@@ -461,6 +461,7 @@ pub struct DetTime {
     extra_nanos: u64,
 
     /// Baseline amount of time to add.
+    #[serde(serialize_with = "diagnostic_serialize_clock_origin")]
     starting_micros: Microseconds,
 
     /// Multiplier for all time advances.
@@ -474,6 +475,25 @@ pub struct DetTime {
 }
 
 // Don't derive Default because it would give us a 0.0 multiplier:
+// Temporary diagnostic only: preserve the original u64 serialization exactly.
+fn diagnostic_serialize_clock_origin<S: serde::Serializer>(
+    value: &Microseconds,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    if *value > u64::MAX / 1_000 {
+        eprintln!(
+            "DBT_CLOCK_SERIALIZE_ORIGIN_DIAGNOSTIC pid={} starting_micros={value} origin_le={:02x?}",
+            std::process::id(),
+            value.to_le_bytes()
+        );
+        eprintln!(
+            "DBT_CLOCK_SERIALIZE_BACKTRACE_DIAGNOSTIC pid={} {}",
+            std::process::id(), std::backtrace::Backtrace::force_capture()
+        );
+    }
+    value.serialize(serializer)
+}
+
 impl Default for DetTime {
     fn default() -> Self {
         DetTime {
@@ -656,6 +676,18 @@ impl DetTime {
 
     /// Project deterministic logical time into a rough number of nanoseconds.
     pub fn as_nanos(&self) -> LogicalTime {
+        if self.starting_micros > u64::MAX / 1_000 {
+            eprintln!(
+                "DBT_CLOCK_ORIGIN_DIAGNOSTIC pid={} starting_micros={} syscalls={} syscall_nanos={:?} rcbs={} weighted_rcbs={:?} nondet_instrs={} extra_nanos={} multiplier_bits={} inherited_nanos={}",
+                std::process::id(), self.starting_micros, self.syscalls,
+                self.syscall_nanos, self.rcbs, self.weighted_rcbs, self.nondet_instrs,
+                self.extra_nanos, self.multiplier.to_bits(), self.inherited_nanos.as_nanos()
+            );
+            eprintln!(
+                "DBT_CLOCK_ORIGIN_BACKTRACE_DIAGNOSTIC pid={} {}",
+                std::process::id(), std::backtrace::Backtrace::force_capture()
+            );
+        }
         // Note: these counts could be pre-collapsed into scalar within the DetTime
         // representation.  But currently we leave them separate for debuggability.
         let syscall_nanos = self
