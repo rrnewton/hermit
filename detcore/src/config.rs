@@ -88,13 +88,24 @@ mod tests {
 
     /// Revisions reserved for a change that is not on this base yet, which
     /// `GLOBAL_RPC_REVISIONS` therefore skips: 33 to 39 are reserved for
-    /// pending changes in the coordinator's allocation table (39 for kvm
-    /// 2b-1). At this head 28 is https://github.com/rrnewton/hermit/pull/4789's,
+    /// pending changes in the coordinator's allocation table (39 was kvm
+    /// 2b-1's, which took 41 at its rebase onto 40 and leaves 39 reserved as
+    /// never landed). At this head 28 is https://github.com/rrnewton/hermit/pull/4789's,
     /// 29 is https://github.com/rrnewton/hermit/pull/4884's, 30 is
     /// https://github.com/rrnewton/hermit/pull/4728's, 31 is
     /// https://github.com/rrnewton/hermit/pull/4867's, 32 is the stopless
-    /// layout on top of 31's, and 40, the `CpuClockProcess` pair allocated
-    /// to https://github.com/rrnewton/hermit/pull/4885, landed before the current revision 41.
+    /// layout on top of 31's, 40 is the `CpuClockProcess` pair allocated
+    /// to https://github.com/rrnewton/hermit/pull/4885, 41 is the
+    /// `StoreExclusive` payload's `Rewrite::unmarked`
+    /// (https://github.com/rrnewton/hermit/pull/4735), and 42, package K
+    /// item 2b slice 2b-1's
+    /// (https://github.com/rrnewton/hermit/pull/5139, renumbered from its
+    /// row 41 at integration, in merge order), is the current revision.
+    /// A change that lands below the last row removes its entry, with its
+    /// row. One that lands after a higher revision (any of 33 to 39 after
+    /// 42) appends its row above the last instead and leaves its old
+    /// number here, reserved as never landed: filling a number in below
+    /// a landed row would rewrite that row's digest.
     const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[33, 34, 35, 36, 37, 38, 39];
 
     /// Every revision of the global RPC, oldest first, with the digest of the
@@ -275,6 +286,18 @@ mod tests {
         // Follows landed revision 40 while 33 to 39 remain reserved.
         // The combined payload digest is measured during this replay.
         (41, "424f7d348b80d8be", "f013e36743d8d9e6"),
+        // Adds `GlobalRequest::WithCpuTime`, which carries a thread's CPU
+        // accounting on its request (`CpuPublication`), and
+        // `GlobalRequest::RecordExitCode` and its response, and gives
+        // `ThreadDeregistration` its `wait_status` (package K item 2b slice
+        // 2b-1, revision 39 allocated by the kvm lane's coordinator,
+        // renumbered 41 at its rebase onto main's 40, then 42 at
+        // integration behind revision 41 above, skipping reserved 33 to
+        // 39). The digest covers those payload types too (domain 6:
+        // `ThreadDeregistration`, `CpuPublication`, `TaskCpuTimes`), as row
+        // 32 extended it to its own. Digest re-measured on the combined
+        // tree at regeneration.
+        (42, "604a16eb9b7bfd1a", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
@@ -335,6 +358,18 @@ mod tests {
     const TRACE_REPLY_WIRE: [&str; 1] = ["pub struct TraceSchedEventResponse {"];
     const REPLAYED_SLICE_END_WIRE: [&str; 1] = ["pub struct ReplayedSliceEnd {"];
 
+    /// The payload types package K item 2b slice 2b-1 added or changed and
+    /// its variants carry: `DeregisterThread`'s `ThreadDeregistration` (its
+    /// `wait_status`) and `WithCpuTime`'s `CpuPublication`, in tool_global.rs,
+    /// and the `TaskCpuTimes` that holds, in procfs/task_stat.rs. Listed by
+    /// hand, as revision 32 listed its own; covering every serialized
+    /// payload's layout mechanically is minibeads dh-uxyyj.
+    const PROCFS_PAYLOAD_WIRE: [&str; 2] = [
+        "pub struct ThreadDeregistration {",
+        "pub struct CpuPublication {",
+    ];
+    const TASK_CPU_TIMES_WIRE: [&str; 1] = ["pub struct TaskCpuTimes {"];
+
     /// The lines of code of the item `source` declares, unindented, on the
     /// line `header`: the attributes just above it (its derives and serde
     /// attributes decide its encoding), the header, and its body through
@@ -377,9 +412,16 @@ mod tests {
     /// A digest of the code of `GlobalRequest` and `GlobalResponse` in
     /// `source`, of the StoreExclusive payload's types in `payload`, of the
     /// scheduled event's wire items in `schedule`, and of the trace reply's
-    /// wire items in `source` and `replayer`: their variants, fields, payload
-    /// types, order and attributes, not their documentation.
-    fn definition_digest(source: &str, payload: &str, schedule: &str, replayer: &str) -> String {
+    /// wire items in `source` and `replayer`, and of 2b-1's payload types in
+    /// `source` and `task_stat`: their variants, fields, payload types, order
+    /// and attributes, not their documentation.
+    fn definition_digest(
+        source: &str,
+        payload: &str,
+        schedule: &str,
+        replayer: &str,
+        task_stat: &str,
+    ) -> String {
         let request = definition(source, "pub enum GlobalRequest {").join("\n");
         let response = definition(source, "pub enum GlobalResponse {").join("\n");
         let payload = STORE_EXCLUSIVE_PAYLOAD
@@ -393,12 +435,18 @@ mod tests {
             wire_items(replayer, &REPLAYED_SLICE_END_WIRE),
         ]
         .join("\n");
+        let procfs = [
+            wire_items(source, &PROCFS_PAYLOAD_WIRE),
+            wire_items(task_stat, &TASK_CPU_TIMES_WIRE),
+        ]
+        .join("\n");
         fnv_domains(&[
             (0, request.as_bytes()),
             (1, response.as_bytes()),
             (3, payload.as_bytes()),
             (4, event.as_bytes()),
             (5, reply.as_bytes()),
+            (6, procfs.as_bytes()),
         ])
     }
 
@@ -418,7 +466,8 @@ mod tests {
         let payload = include_str!("store_exclusive.rs");
         let schedule = include_str!("../../detcore-model/src/schedule.rs");
         let replayer = include_str!("scheduler/replayer.rs");
-        let digest = definition_digest(source, payload, schedule, replayer);
+        let task_stat = include_str!("procfs/task_stat.rs");
+        let digest = definition_digest(source, payload, schedule, replayer, task_stat);
         let resources = include_str!("resources.rs");
         let resources_digest = resources_definition_digest(resources);
         let revision = crate::tool_global::GLOBAL_RPC_REVISION;
@@ -460,7 +509,7 @@ mod tests {
             1,
         );
         assert_eq!(
-            definition_digest(&documented, payload, schedule, replayer),
+            definition_digest(&documented, payload, schedule, replayer, task_stat),
             digest
         );
         let added = source.replacen(
@@ -469,7 +518,7 @@ mod tests {
             1,
         );
         assert_ne!(
-            definition_digest(&added, payload, schedule, replayer),
+            definition_digest(&added, payload, schedule, replayer, task_stat),
             digest
         );
         // Retype GlobalRequest's VirtualInotifyCookies wherever it sits: later
@@ -481,7 +530,7 @@ mod tests {
         );
         assert_ne!(retyped, source);
         assert_ne!(
-            definition_digest(&retyped, payload, schedule, replayer),
+            definition_digest(&retyped, payload, schedule, replayer, task_stat),
             digest
         );
         // A field added to a payload type changes it too, as this change's
@@ -494,7 +543,7 @@ mod tests {
         );
         assert_ne!(grown, payload);
         assert_ne!(
-            definition_digest(source, &grown, schedule, replayer),
+            definition_digest(source, &grown, schedule, replayer, task_stat),
             digest
         );
         let documented = payload.replacen(
@@ -504,7 +553,7 @@ mod tests {
         );
         assert_ne!(documented, payload);
         assert_eq!(
-            definition_digest(source, &documented, schedule, replayer),
+            definition_digest(source, &documented, schedule, replayer, task_stat),
             digest
         );
         // The event `TraceSchedEvent` carries is detcore-model's: a field
@@ -516,7 +565,10 @@ mod tests {
             1,
         );
         assert_ne!(grown, schedule);
-        assert_ne!(definition_digest(source, payload, &grown, replayer), digest);
+        assert_ne!(
+            definition_digest(source, payload, &grown, replayer, task_stat),
+            digest
+        );
         let carried = schedule.replacen(
             "let written_stopless = *stopless || !serializer.is_human_readable();",
             "let written_stopless = *stopless;",
@@ -524,7 +576,7 @@ mod tests {
         );
         assert_ne!(carried, schedule);
         assert_ne!(
-            definition_digest(source, payload, &carried, replayer),
+            definition_digest(source, payload, &carried, replayer, task_stat),
             digest
         );
         let documented = schedule.replacen(
@@ -534,7 +586,7 @@ mod tests {
         );
         assert_ne!(documented, schedule);
         assert_eq!(
-            definition_digest(source, payload, &documented, replayer),
+            definition_digest(source, payload, &documented, replayer, task_stat),
             digest
         );
         // So is the reply: a field added to the replayed slice end it holds,
@@ -545,7 +597,10 @@ mod tests {
             1,
         );
         assert_ne!(grown, replayer);
-        assert_ne!(definition_digest(source, payload, schedule, &grown), digest);
+        assert_ne!(
+            definition_digest(source, payload, schedule, &grown, task_stat),
+            digest
+        );
         let retyped = source.replacen(
             "    timeslice: Option<ReplayedSliceEnd>,\n",
             "    timeslice: Option<LogicalTime>,\n",
@@ -553,7 +608,7 @@ mod tests {
         );
         assert_ne!(retyped, source);
         assert_ne!(
-            definition_digest(&retyped, payload, schedule, replayer),
+            definition_digest(&retyped, payload, schedule, replayer, task_stat),
             digest
         );
         let documented = replayer.replacen(
@@ -563,7 +618,39 @@ mod tests {
         );
         assert_ne!(documented, replayer);
         assert_eq!(
-            definition_digest(source, payload, schedule, &documented),
+            definition_digest(source, payload, schedule, &documented, task_stat),
+            digest
+        );
+        // And 2b-1's payload types: a field added to `ThreadDeregistration` or
+        // to `TaskCpuTimes` changes the digest; a doc line does not.
+        let grown = source.replacen(
+            "pub struct ThreadDeregistration {\n",
+            "pub struct ThreadDeregistration {\n    pub(crate) added: u32,\n",
+            1,
+        );
+        assert_ne!(grown, source);
+        assert_ne!(
+            definition_digest(&grown, payload, schedule, replayer, task_stat),
+            digest
+        );
+        let grown = task_stat.replacen(
+            "pub struct TaskCpuTimes {\n",
+            "pub struct TaskCpuTimes {\n    pub added: LogicalTime,\n",
+            1,
+        );
+        assert_ne!(grown, task_stat);
+        assert_ne!(
+            definition_digest(source, payload, schedule, replayer, &grown),
+            digest
+        );
+        let documented = source.replacen(
+            "pub struct CpuPublication {\n",
+            "pub struct CpuPublication {\n    /// Documentation only.\n",
+            1,
+        );
+        assert_ne!(documented, source);
+        assert_eq!(
+            definition_digest(&documented, payload, schedule, replayer, task_stat),
             digest
         );
 

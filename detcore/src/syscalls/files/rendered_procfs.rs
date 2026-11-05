@@ -1184,7 +1184,10 @@ pub(super) enum IoAccessByCredentials {
 /// - the reader's filesystem IDs must be its real IDs (Detcore makes the
 ///   guest's credential calls no-ops, so they keep the IDs the guest started
 ///   with), else, or where an ID reads as [`OVERFLOW_ID`], so that whether
-///   they are cannot be told, the answer is unanswerable;
+///   they are cannot be told, the credentials cannot answer, and the kernel
+///   is asked the FSCREDS check itself
+///   ([`Detcore::inject_pidfd_namespace_answer`]), else the read is refused
+///   by name;
 /// - REALCREDS refuses: FSCREDS refuses too (the effective set is within
 ///   the permitted set, so commoncap's FSCREDS condition implies its
 ///   REALCREDS one);
@@ -1303,6 +1306,21 @@ pub(super) enum PidfdAccess {
     /// The check was not reached: `pidfd_open` failed (`opened` false), or
     /// the ioctl failed before the check (`opened` true), with `errno`.
     NotAsked { opened: bool, errno: Errno },
+}
+
+/// Why the kernel's own check could not be asked through a pidfd
+/// ([`PidfdAccess::NotAsked`]), for a named refusal.
+fn pidfd_not_asked_reason(opened: bool, errno: Errno) -> String {
+    match (opened, errno) {
+        (true, Errno::ESRCH) => {
+            "the task has exited, so the kernel has no namespaces of it to ask about".to_owned()
+        }
+        (false, Errno::EMFILE | Errno::ENFILE) => {
+            format!("the pidfd needs a free descriptor ({errno})")
+        }
+        (false, errno) => format!("pidfd_open failed with {errno}"),
+        (true, errno) => format!("the ioctl failed with {errno}"),
+    }
 }
 
 /// [`PidfdAccess`] from the ioctl's result, once `pidfd_open` has
@@ -2998,13 +3016,18 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// for the call's length; where it cannot be asked (the task has exited,
     /// so its namespaces are gone, or no descriptor is free), Detcore's
     /// record of user namespaces answers ([`io_access_by_user_namespaces`]),
-    /// which the clones that made each namespace fixed in their turns.
+    /// which the clones that made each namespace fixed in their turns. Where
+    /// the reader's credentials cannot tell the FSCREDS answer from the
+    /// REALCREDS one (its filesystem IDs are not its real IDs, or read as the
+    /// overflow ID, as every ID does in a user namespace with no mapping),
+    /// the kernel is asked the FSCREDS check through the pidfd too.
     ///
     /// Where that cannot decide Linux's answer (a nested PID namespace, whose
     /// numbers are not the table's; `kcmp` or `capget` unavailable; the cases
     /// [`io_access_by_real_credentials`] and [`io_access_by_user_namespaces`]
-    /// name), the run stops with a named refusal (the failure policy), never
-    /// an EACCES Linux might not give.
+    /// name, where the pidfd cannot be asked either), the run stops with a
+    /// named refusal (the failure policy), never an EACCES Linux might not
+    /// give.
     async fn io_read_allowed_by_number<G: Guest<Self>>(
         guest: &mut G,
         named: i32,
@@ -3102,17 +3125,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                                 unreachable!("the record of user namespaces answers by itself")
                             }
                             IoAccessByCredentials::Unanswerable(detail) => {
-                                let why = match (opened, errno) {
-                                    (true, Errno::ESRCH) => "the task has exited, so the kernel \
-                                                             has no namespaces of it to ask \
-                                                             about"
-                                        .to_owned(),
-                                    (false, Errno::EMFILE | Errno::ENFILE) => {
-                                        format!("the pidfd needs a free descriptor ({errno})")
-                                    }
-                                    (false, errno) => format!("pidfd_open failed with {errno}"),
-                                    (true, errno) => format!("the ioctl failed with {errno}"),
-                                };
+                                let why = pidfd_not_asked_reason(opened, errno);
                                 let reason = refuse(format!(
                                     "the task's permitted capabilities are within the reader's \
                                      permitted set but not its effective set, which lacks \
@@ -3130,8 +3143,22 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
             }
             IoAccessByCredentials::Unanswerable(detail) => {
-                let reason = refuse(detail.to_owned());
-                Err(Self::scratch_failure(guest, Sysno::read, reason).await)
+                // The credentials cannot tell Linux's answer: the kernel is
+                // asked the FSCREDS check itself, which reads the reader's
+                // filesystem IDs whatever they read as from its namespace.
+                match Self::inject_pidfd_namespace_answer(guest, kernel).await {
+                    Ok(PidfdAccess::Allowed) => Ok(Ok(())),
+                    Ok(PidfdAccess::Refused) => Ok(Err(Errno::EACCES)),
+                    Ok(PidfdAccess::NotAsked { opened, errno }) => {
+                        let why = pidfd_not_asked_reason(opened, errno);
+                        let reason = refuse(format!(
+                            "{detail}; and the kernel's own check, asked through a pidfd's \
+                             user-namespace ioctl, cannot answer ({why})"
+                        ));
+                        Err(Self::scratch_failure(guest, Sysno::read, reason).await)
+                    }
+                    Err(reason) => Err(Self::scratch_failure(guest, Sysno::read, reason).await),
+                }
             }
         }
     }
@@ -3871,17 +3898,18 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// recorded no argument area for its image (the same backends and stacks
     /// as for `auxv`).
     ///
-    /// And whether `file` is a process's `stat` that the kernel serves:
-    /// another process's (package K slice D4c-1 renders the reader's own
-    /// process's only), or, where the name's source is Detcore's record
-    /// (`Self::comm_source`), the caller's own before a name is recorded
-    /// (`procfs::task_stat::renders_task_stat`).
+    /// And whether `file` is a process's `stat` that the kernel serves: where
+    /// the name's source is Detcore's record (`Self::comm_source`), a task's
+    /// before a name is recorded; any task's of the process table is
+    /// rendered otherwise, whichever process reads it
+    /// (`procfs::task_stat::renders_task_stat`, package K slices D4c-1 and
+    /// 2b-1).
     ///
     /// And whether `file` is a task's `comm` that the kernel serves: every
     /// one where the name's source is the kernel
-    /// ([`Self::kernel_serves_every_comm`]), and elsewhere another process's,
-    /// or the caller's own before a name is recorded
-    /// (`procfs::task_stat::renders_task_comm`, package K slice A+).
+    /// ([`Self::kernel_serves_every_comm`]), and elsewhere a task's before a
+    /// name is recorded (`procfs::task_stat::renders_task_comm`, package K
+    /// slices A+ and 2b-1).
     async fn kept_by_kernel<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -3906,14 +3934,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 return true;
             }
             let facts = crate::tool_global::task_stat_facts(guest, task).await;
-            let own = self.own_detpid(guest).as_raw();
-            return !crate::procfs::task_stat::renders_task_comm(&facts, own, self.comm_source());
+            return !crate::procfs::task_stat::renders_task_comm(&facts, self.comm_source());
         }
         if file.is_task_stat() {
             let facts = crate::tool_global::task_stat_facts(guest, task).await;
             let own = self.own_detpid(guest).as_raw();
-            let rendered =
-                crate::procfs::task_stat::renders_task_stat(&facts, own, self.comm_source());
+            let rendered = crate::procfs::task_stat::renders_task_stat(&facts, self.comm_source());
             // The guest-visible parent of a process whose real parent is
             // outside the guest's tree (the run's root, and a CLONE_PARENT
             // child of such a process), which no other record of Detcore's
@@ -3921,11 +3947,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             // turn, before any descriptor of its rendered stat exists: a
             // descriptor that reaches another process (across fork or
             // SCM_RIGHTS) renders it (`Scheduler::guest_visible_parent`).
-            // Every rendered stat of a process is opened, or listed, by one of
-            // its own threads, so this runs before any other process can read
-            // one. The global tool ignores it for a process whose model knows
-            // its parent.
+            // Such a process also records it at its first clone
+            // (`Detcore::record_external_parent_at_clone`), before any
+            // process it creates can read its stat; another process's
+            // stat, read before either, shows the parent as 0, the parent
+            // outside the namespace. The global tool ignores it for a
+            // process whose model knows its parent.
             if rendered
+                && facts.process == Some(own)
                 && facts.parent.is_none()
                 && let Ok(parent) = guest.inject(syscalls::Getppid::new()).await
             {
@@ -4256,8 +4285,17 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///   ([`Self::getppid_numbered_parent`]).
     /// - `rsslim`: the described process's virtual `RLIMIT_RSS`, whoever
     ///   reads it (`procfs::task_stat::TaskStatFacts::rsslim`).
-    /// - The CPU times, for the reader's own process's file
-    ///   ([`Self::stat_cpu_times`]).
+    /// - The CPU times: for the reader's own process's file, its own
+    ///   accounting ([`Self::stat_cpu_times`]); for another process's, what
+    ///   that process last published (`procfs::task_stat::TaskStatFacts::cpu`,
+    ///   package K item 2b slice 2b-1).
+    /// - Whether the reader may trace the task, which `do_task_stat` asks
+    ///   (`procfs::task_stat::TaskStat::permitted`): always within its own
+    ///   thread group, and for another, Detcore's model of
+    ///   `ptrace_may_access(PTRACE_MODE_READ_FSCREDS)`
+    ///   ([`Self::io_read_allowed`], the same check a task's `io` makes),
+    ///   asked at each rendering, as Linux asks it at each `show`. A model
+    ///   that cannot decide is its named refusal (`Err`).
     pub(super) async fn rendered_task_stat<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -4308,8 +4346,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         let cpu = if own && file.is_task_stat() {
             Self::stat_cpu_times(guest, task)
         } else {
-            crate::procfs::task_stat::TaskCpuTimes::default()
+            facts.cpu
         };
+        let permitted =
+            own || file.is_task_comm() || Self::io_read_allowed(guest, task).await?.is_ok();
         Ok(Some(crate::procfs::task_stat::TaskStat {
             pid: described,
             comm,
@@ -4319,6 +4359,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             rsslim: facts.rsslim,
             processor: facts.cpus.current(guest.config().virtual_cpu_count()),
             cpu,
+            permitted,
         }))
     }
 
