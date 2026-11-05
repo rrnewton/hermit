@@ -1,0 +1,10 @@
+{
+  "at": "2026-10-14T12:02:37.568249+00:00",
+  "source": "/dev/md0",
+  "size": 3760476651520,
+  "used": 2973739929600,
+  "available": 613665452032,
+  "mount": "/home/newton",
+  "scope": "ordinary post-runtime command boundary; no continuous monitor or peak claim",
+  "floor_bytes": 400000000000
+}

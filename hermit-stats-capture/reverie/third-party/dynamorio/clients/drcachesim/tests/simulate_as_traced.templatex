@@ -1,0 +1,8 @@
+Cache simulation results:
+Core #0 \(traced CPU\(s\): #0\)
+  L1I0 \(size=32768, assoc=8, block=64, LRU\) stats:
+.*
+Core #10 \(traced CPU\(s\): #11\)
+.*
+LL \(size=8388608, assoc=16, block=64, LRU\) stats:
+.*

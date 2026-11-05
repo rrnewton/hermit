@@ -1,0 +1,65 @@
+   Compiling quote v1.0.47
+   Compiling hermit v0.4.1 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f/hermit-cli)
+    Checking hermit-resources v0.4.1 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f/hermit-resources)
+    Checking hermit-test-workdir v0.4.1 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f/common/test-workdir)
+   Compiling syn v3.0.3
+   Compiling syn v2.0.119
+   Compiling serde_derive v1.0.229
+   Compiling serde_repr v0.1.21
+   Compiling thiserror-impl v2.0.19
+   Compiling async-trait v0.1.91
+   Compiling clap_derive v4.6.4
+    Checking thiserror v2.0.19
+   Compiling tokio-macros v2.7.1
+   Compiling futures-macro v0.3.33
+   Compiling tracing-attributes v0.1.31
+   Compiling derive_more-impl v1.0.0
+   Compiling scroll_derive v0.13.1
+   Compiling foreign-types-macros v0.2.3
+   Compiling fbinit_macros v0.2.0 (https://github.com/facebookexperimental/rust-shed.git?branch=main#84a82026)
+    Checking clap v4.6.4
+    Checking fbinit v0.2.0 (https://github.com/facebookexperimental/rust-shed.git?branch=main#84a82026)
+    Checking foreign-types v0.5.0
+    Checking unwind v0.4.2
+    Checking futures-util v0.3.33
+    Checking scroll v0.13.0
+    Checking tracing v0.1.44
+    Checking goblin v0.10.7
+    Checking serde v1.0.229
+    Checking bytes v1.12.1
+    Checking chrono v0.4.45
+    Checking syscalls v0.6.18
+    Checking bincode v2.0.1
+    Checking linked-hash-map v0.5.6
+    Checking tracing-serde v0.2.0
+    Checking bitvec v1.1.1
+    Checking rand_pcg v0.10.2
+    Checking serde_yaml v0.9.34+deprecated
+    Checking tokio v1.53.1
+    Checking reverie-memory v0.4.1 (https://github.com/rrnewton/reverie.git?rev=dde3f9da33a0474d0fa9b273a25100fc0db4d751#dde3f9da)
+    Checking procfs-core v0.18.0
+    Checking tracing-subscriber v0.3.23
+    Checking derive_more v1.0.0
+    Checking futures-executor v0.3.33
+    Checking reverie-syscalls v0.4.1 (https://github.com/rrnewton/reverie.git?rev=dde3f9da33a0474d0fa9b273a25100fc0db4d751#dde3f9da)
+    Checking futures v0.3.33
+    Checking tracing-appender v0.2.5
+    Checking procfs v0.18.0
+    Checking reverie-process v0.4.1 (https://github.com/rrnewton/reverie.git?rev=dde3f9da33a0474d0fa9b273a25100fc0db4d751#dde3f9da)
+    Checking tokio-util v0.7.19
+    Checking tokio-stream v0.1.19
+    Checking reverie-core v0.4.1 (https://github.com/rrnewton/reverie.git?rev=dde3f9da33a0474d0fa9b273a25100fc0db4d751#dde3f9da)
+    Checking safeptrace v0.4.1 (https://github.com/rrnewton/reverie.git?rev=dde3f9da33a0474d0fa9b273a25100fc0db4d751#dde3f9da)
+    Checking reverie-rpc-transport v0.4.1 (https://github.com/rrnewton/reverie.git?rev=dde3f9da33a0474d0fa9b273a25100fc0db4d751#dde3f9da)
+    Checking detcore-model v0.4.1 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f/detcore-model)
+    Checking reverie-ptrace v0.4.1 (https://github.com/rrnewton/reverie.git?rev=dde3f9da33a0474d0fa9b273a25100fc0db4d751#dde3f9da)
+    Checking reverie-sabre-stats v0.4.1 (https://github.com/rrnewton/reverie.git?rev=dde3f9da33a0474d0fa9b273a25100fc0db4d751#dde3f9da)
+    Checking reverie-kvm v0.4.1 (https://github.com/rrnewton/reverie.git?rev=dde3f9da33a0474d0fa9b273a25100fc0db4d751#dde3f9da)
+    Checking reverie-dbt v0.4.0 (https://github.com/rrnewton/reverie.git?rev=dde3f9da33a0474d0fa9b273a25100fc0db4d751#dde3f9da)
+    Checking hermit-detcore v0.4.1 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f/detcore)
+    Checking reverie-inguest v0.4.1 (https://github.com/rrnewton/reverie.git?rev=dde3f9da33a0474d0fa9b273a25100fc0db4d751#dde3f9da)
+    Checking reverie-liteinst v0.4.1 (https://github.com/rrnewton/reverie.git?rev=dde3f9da33a0474d0fa9b273a25100fc0db4d751#dde3f9da)
+    Checking detcore-dbt v0.4.0 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f/detcore-dbt)
+ Documenting hermit v0.4.1 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f/hermit-cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 30.44s
+   Generated /home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit/doc/hermit/index.html and 2 other files

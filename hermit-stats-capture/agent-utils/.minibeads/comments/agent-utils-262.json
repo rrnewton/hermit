@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-262-ccb54cc962a",
+    "issue_id": "agent-utils-262",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Phase 1 (page only) landed: 'Search before <day>' walks up to 5 older pages (15 s budget, stops after 3 new matches) in both layouts, Enter starts it, Stop cancels; Hide read steps aside while filtering; scrolling no longer auto-loads under a filter (it loaded the whole history); Main offers 'Search All — thread replies too'. Server-side search over older history (Phase 2) is planned through #208 persistent-cache M8 (FTS index), so this stays open for that.",
+    "created_at": "2026-10-13T11:52:47.878414620Z",
+    "updated_at": "2026-10-13T11:52:47.878414620Z"
+  }
+]

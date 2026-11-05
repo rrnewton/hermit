@@ -1,0 +1,17 @@
+description: Reproduce the scheduler peer-cancellation/deadline overlap under contention
+
+steps:
+  - group: python
+    job: peer-cancellation
+    desc: peer failure followed by a distinct outer run-deadline cancellation
+    cmd: >-
+      cd py && python3 -m pytest -q
+      tests/test_step_end_journal.py::test_peer_cancellation_survives_a_later_deadline_in_the_same_run
+    jobs_flag: ""
+    timeout: 30
+    cpu_timeout: 60
+    hint:
+      est_duration_s: 7
+      classification: latency-bound
+      preferred_inner_jobs: 1
+      rss_baseline_bytes: 536870912

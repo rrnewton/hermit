@@ -1,0 +1,18 @@
+[
+  {
+    "id": "agent-utils-219-cdc87ba8714",
+    "issue_id": "agent-utils-219",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Feasibility done, doc updated (section 0, 2026-10-08): ~/work/vibe-talk-reports/2026-10-04-emoji-reactions.md. Google Chat: reaction counts already arrive on every history row the adapter reads and are dropped; the chat bridge's acks (eyes = reached the bridge, check = in the agent transcript) are visible there. Who reacted needs a per-message call; when, only the event stream. Slack needs a per-message call (~4 s); Discord carries counts in message reads. Caveats: acks are placed as the owner's own account; the same emoji means different things per space (labels need per-channel config); a reaction-only change never reaches the page through #203 deltas until the adapter compares reactions. Recommended: phase 1 Google Chat read-only 2.5-3.5 days, phase 2 delivery line + 'waiting' 1-1.5 days, phase 3 live 1-1.5 days.",
+    "created_at": "2026-10-08T15:54:36.104289461Z",
+    "updated_at": "2026-10-08T15:54:36.104289461Z"
+  },
+  {
+    "id": "agent-utils-219-ceddd7c3ca3",
+    "issue_id": "agent-utils-219",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Owner, 2026-10-08 18:00 CEST: start it. Scope: just show reactions (emoji and count) under messages. Not who reacted, not reacting from vibe-talk (later perhaps an on-demand who-reacted fetch on hover, as Google Chat does).",
+    "created_at": "2026-10-08T16:06:41.694191677Z",
+    "updated_at": "2026-10-08T16:06:41.694191677Z"
+  }
+]

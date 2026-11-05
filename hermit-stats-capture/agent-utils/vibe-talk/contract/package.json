@@ -1,0 +1,11 @@
+{
+  "name": "vibe-talk-contract-tools",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Generates and checks vibe-talk's browser contract artifacts from the Rust-derived JSON Schema",
+  "license": "MIT",
+  "devDependencies": {
+    "ajv": "8.17.1",
+    "typescript": "5.9.3"
+  }
+}

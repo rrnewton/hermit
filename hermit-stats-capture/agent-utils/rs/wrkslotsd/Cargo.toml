@@ -1,0 +1,31 @@
+[package]
+name = "wrkslotsd"
+version = "0.1.0"
+description = "Read-only observer and disposable index for hash-linked slot event logs"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+clap = { version = "4.5", features = ["derive"] }
+libc = "0.2"
+rusqlite = { version = "0.37", features = ["bundled"] }
+rustix = { version = "1.1", features = ["fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+sha2 = "0.10"
+
+[[bin]]
+name = "wrkslotsd"
+path = "src/main.rs"
+
+[lib]
+name = "wrkslotsd"
+path = "src/lib.rs"
+
+[lints]
+workspace = true

@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "herdr-run"
+version = "0.4.0"
+description = "Run allowlisted shell commands through Herdr panes and collect audited results."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Ryan Newton" }]
+keywords = ["agents", "sandbox", "terminal", "herdr", "allowlist"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: POSIX :: Linux",
+]
+# No runtime dependencies: the configuration file is read by herdr-run's own YAML-subset parser.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["mypy", "pytest"]
+
+[project.urls]
+Repository = "https://github.com/rrnewton/agent-utils"
+Issues = "https://github.com/rrnewton/agent-utils/issues"
+
+[project.scripts]
+herdr-run = "herdr_run.cli:main"
+
+[tool.setuptools]
+packages = ["herdr_run"]
+package-dir = { herdr_run = "." }
+include-package-data = false
+
+[tool.setuptools.package-data]
+herdr_run = ["py.typed", "README.md", "USER_GUIDE.md", "QUICKSTART.md", "config_template.yaml"]

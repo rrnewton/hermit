@@ -1,0 +1,16 @@
+   Compiling hermit v0.4.1 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture/hermit-cli)
+    Checking hermit-resources v0.4.1 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture/hermit-resources)
+    Checking hermit-test-workdir v0.4.1 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture/common/test-workdir)
+    Checking reverie-rpc-transport v0.4.1 (https://github.com/rrnewton/reverie.git?rev=ff30c5bac6040c14122d33d60f5dfb91953c7099#ff30c5ba)
+    Checking detcore-model v0.4.1 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture/detcore-model)
+    Checking reverie-ptrace v0.4.1 (https://github.com/rrnewton/reverie.git?rev=ff30c5bac6040c14122d33d60f5dfb91953c7099#ff30c5ba)
+    Checking reverie-kvm v0.4.1 (https://github.com/rrnewton/reverie.git?rev=ff30c5bac6040c14122d33d60f5dfb91953c7099#ff30c5ba)
+    Checking reverie-sabre-stats v0.4.1 (https://github.com/rrnewton/reverie.git?rev=ff30c5bac6040c14122d33d60f5dfb91953c7099#ff30c5ba)
+    Checking reverie-dbt v0.4.0 (https://github.com/rrnewton/reverie.git?rev=ff30c5bac6040c14122d33d60f5dfb91953c7099#ff30c5ba)
+    Checking hermit-detcore v0.4.1 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture/detcore)
+    Checking reverie-inguest v0.4.1 (https://github.com/rrnewton/reverie.git?rev=ff30c5bac6040c14122d33d60f5dfb91953c7099#ff30c5ba)
+    Checking reverie-liteinst v0.4.1 (https://github.com/rrnewton/reverie.git?rev=ff30c5bac6040c14122d33d60f5dfb91953c7099#ff30c5ba)
+    Checking detcore-dbt v0.4.0 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture/detcore-dbt)
+ Documenting hermit v0.4.1 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture/hermit-cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 25.45s
+   Generated /home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit/doc/hermit/index.html and 2 other files

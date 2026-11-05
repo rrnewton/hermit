@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# Provide the repository's pinned Node 22 from the official release archive.
+#
+# The browser checks are written against Node 22, matching CI. A host's own node is whatever that
+# host happens to have, so validation runs this exact release instead: the official nodejs.org
+# archive for NODE_VERSION, checked against the sha256 that release publishes in SHASUMS256.txt
+# before anything in it is extracted or run. It is unpacked once into a per-user cache and reused.
+# A cached archive that does not match is deleted and refused; an install is reused only while
+# its stamp names the pinned checksum and its node reports the pinned version.
+#
+#   scripts/provision-node22            download if needed, verify, install; print the bin dir
+#   scripts/provision-node22 --bin-dir  print the bin dir of a verified install, or exit 1
+#                                       without downloading (scripts/with-node22 asks this)
+#
+# AGENT_UTILS_NODE_DIST_URL replaces https://nodejs.org/dist for a mirror; the checksum still
+# decides. The cache is $XDG_CACHE_HOME/agent-utils/node, else ~/.cache/agent-utils/node.
+set -euo pipefail
+
+NODE_VERSION=22.23.3
+# From https://nodejs.org/dist/v22.23.3/SHASUMS256.txt
+SHA256_LINUX_X64=df450af89261115ef9f9e3830c3eeb2cc9213b63c720b1af623cb5dcbe2e02de
+SHA256_LINUX_ARM64=a44aeb94849a299b22df10b9e622ec2f605c2183501bc40590705131de7c740f
+
+case "$(uname -s)-$(uname -m)" in
+  Linux-x86_64) arch=x64 want="$SHA256_LINUX_X64" ;;
+  Linux-aarch64 | Linux-arm64) arch=arm64 want="$SHA256_LINUX_ARM64" ;;
+  *)
+    echo "provision-node22: no pinned Node $NODE_VERSION for $(uname -s) $(uname -m)" >&2
+    exit 2
+    ;;
+esac
+
+name="node-v$NODE_VERSION-linux-$arch"
+cache="${XDG_CACHE_HOME:-${HOME:?}/.cache}/agent-utils/node"
+install="$cache/$name"
+archive="$cache/$name.tar.xz"
+stamp="$install/.verified-sha256"
+
+verified_install() {
+  [ -f "$stamp" ] && [ "$(cat -- "$stamp")" = "$want" ] && [ -x "$install/bin/node" ] &&
+    [ "$("$install/bin/node" --version 2>/dev/null)" = "v$NODE_VERSION" ]
+}
+
+if [ "$#" -eq 1 ] && [ "$1" = "--bin-dir" ]; then
+  verified_install || exit 1
+  printf '%s\n' "$install/bin"
+  exit 0
+elif [ "$#" -ne 0 ]; then
+  echo "usage: scripts/provision-node22 [--bin-dir]" >&2
+  exit 2
+fi
+
+mkdir -p -- "$cache"
+exec 9>"$cache/.$name.lock"
+flock 9
+
+if verified_install; then
+  echo "provision-node22: $name is installed and verified" >&2
+  printf '%s\n' "$install/bin"
+  exit 0
+fi
+
+if [ ! -f "$archive" ]; then
+  url="${AGENT_UTILS_NODE_DIST_URL:-https://nodejs.org/dist}/v$NODE_VERSION/$name.tar.xz"
+  echo "provision-node22: downloading $url" >&2
+  if ! curl -fsSL --connect-timeout 30 --max-time 900 --retry 3 -o "$archive.part" -- "$url"; then
+    rm -f -- "$archive.part"
+    echo "provision-node22: download failed: $url" >&2
+    exit 1
+  fi
+  mv -f -- "$archive.part" "$archive"
+fi
+
+got="$(sha256sum -- "$archive" | cut -d' ' -f1)"
+if [ "$got" != "$want" ]; then
+  rm -f -- "$archive"
+  echo "provision-node22: SHA256 MISMATCH for $name.tar.xz: got $got, want $want." >&2
+  echo "provision-node22: the archive was deleted and nothing was installed." >&2
+  exit 1
+fi
+
+rm -rf -- "$install" "$install.part"
+mkdir -p -- "$install.part"
+tar -xJf "$archive" -C "$install.part" --strip-components=1
+printf '%s\n' "$want" >"$install.part/.verified-sha256"
+mv -- "$install.part" "$install"
+if ! verified_install; then
+  echo "provision-node22: $install/bin/node does not report v$NODE_VERSION after install" >&2
+  exit 1
+fi
+echo "provision-node22: installed $name (sha256 ${want:0:12})" >&2
+printf '%s\n' "$install/bin"

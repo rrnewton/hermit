@@ -1,0 +1,5 @@
+{
+  "include": [{"path": "cap-child.json", "namespace": "child"}],
+  "resource_caps": {"z": 1, "a": 1},
+  "steps": []
+}

@@ -1,0 +1,135 @@
+   Compiling quote v1.0.47
+   Compiling serde_core v1.0.229
+   Compiling serde v1.0.229
+    Checking memchr v2.8.3
+   Compiling autocfg v1.5.1
+    Checking pin-project-lite v0.2.17
+   Compiling parking_lot_core v0.9.12
+    Checking scopeguard v1.2.0
+    Checking once_cell v1.21.4
+   Compiling syscalls v0.6.18
+    Checking linux-raw-sys v0.12.1
+   Compiling cfg_aliases v0.2.2
+    Checking simd-adler32 v0.3.10
+    Checking adler2 v2.0.1
+    Checking slab v0.4.12
+    Checking iana-time-zone v0.1.65
+    Checking futures v0.1.31
+    Checking bitflags v1.3.2
+   Compiling unicode-segmentation v1.13.3
+    Checking foldhash v0.2.0
+   Compiling virtue v0.0.18
+   Compiling object v0.39.1
+   Compiling paste v1.0.15
+    Checking equivalent v1.0.2
+   Compiling zmij v1.0.23
+   Compiling unicode-xid v0.2.6
+   Compiling version_check v0.9.5
+   Compiling cpp_demangle v0.5.1
+    Checking unty v0.0.4
+    Checking hex v0.4.3
+    Checking typed-arena v2.0.2
+   Compiling anyhow v1.0.104
+   Compiling procfs v0.18.0
+    Checking itoa v1.0.18
+    Checking fallible-iterator v0.3.0
+    Checking plain v0.2.3
+    Checking typenum v1.20.1
+    Checking rustc-demangle v0.1.28
+    Checking gimli v0.33.0
+    Checking lock_api v0.4.14
+   Compiling nix v0.30.1
+    Checking raw-cpuid v10.7.0
+    Checking never-say-never v6.6.666
+    Checking byteorder v1.5.0
+    Checking hashbrown v0.17.1
+    Checking vmm-sys-util v0.15.0
+   Compiling reverie-kvm v0.4.1 (https://github.com/rrnewton/reverie.git?rev=ff30c5bac6040c14122d33d60f5dfb91953c7099#ff30c5ba)
+    Checking miniz_oxide v0.8.9
+   Compiling reverie-ptrace v0.4.1 (https://github.com/rrnewton/reverie.git?rev=ff30c5bac6040c14122d33d60f5dfb91953c7099#ff30c5ba)
+    Checking cpufeatures v0.2.17
+    Checking fastrand v2.5.0
+   Compiling hermit v0.4.1 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture/hermit-cli)
+    Checking hermit-resources v0.4.1 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture/hermit-resources)
+    Checking tracing-core v0.1.36
+    Checking pretty v0.12.5
+   Compiling generic-array v0.14.7
+    Checking parking_lot v0.12.5
+   Compiling num-traits v0.2.19
+   Compiling memoffset v0.9.1
+   Compiling convert_case v0.6.0
+   Compiling syn v3.0.3
+   Compiling syn v2.0.119
+    Checking aho-corasick v1.1.4
+    Checking kvm-bindings v0.14.1
+    Checking flate2 v1.1.9
+    Checking tracing-log v0.2.0
+    Checking indexmap v2.14.0
+   Compiling bincode_derive v2.0.1
+    Checking rand_distr v0.6.0
+    Checking regex-automata v0.4.16
+    Checking object v0.40.0
+    Checking block-buffer v0.10.4
+    Checking crypto-common v0.1.7
+    Checking digest v0.10.7
+    Checking sha2 v0.10.9
+    Checking bitflags v2.13.1
+    Checking serde_json v1.0.151
+    Checking uuid v1.24.0
+    Checking rustix v1.1.4
+    Checking kvm-ioctls v0.25.0
+   Compiling serde_derive v1.0.229
+   Compiling serde_repr v0.1.21
+   Compiling thiserror-impl v2.0.19
+   Compiling async-trait v0.1.91
+   Compiling clap_derive v4.6.4
+    Checking regex v1.13.1
+    Checking matchers v0.2.0
+    Checking env_filter v2.0.0
+    Checking env_logger v0.11.11
+    Checking addr2line v0.26.1
+    Checking quickcheck v1.1.0
+    Checking thiserror v2.0.19
+   Compiling futures-macro v0.3.33
+   Compiling tokio-macros v2.7.1
+   Compiling tracing-attributes v0.1.31
+   Compiling scroll_derive v0.13.1
+   Compiling derive_more-impl v1.0.0
+   Compiling foreign-types-macros v0.2.3
+   Compiling fbinit_macros v0.2.0 (https://github.com/facebookexperimental/rust-shed.git?branch=main#84a82026)
+    Checking fbinit v0.2.0 (https://github.com/facebookexperimental/rust-shed.git?branch=main#84a82026)
+    Checking foreign-types v0.5.0
+    Checking unwind v0.4.2
+    Checking futures-util v0.3.33
+    Checking scroll v0.13.0
+    Checking goblin v0.10.7
+    Checking tracing v0.1.44
+    Checking terminal_size v0.4.4
+    Checking tempfile v3.27.0
+    Checking clap_builder v4.6.2
+    Checking bytes v1.12.1
+    Checking chrono v0.4.45
+    Checking bincode v2.0.1
+    Checking linked-hash-map v0.5.6
+    Checking tracing-serde v0.2.0
+    Checking bitvec v1.1.1
+    Checking rand_pcg v0.10.2
+    Checking serde_yaml v0.9.34+deprecated
+    Checking reverie-memory v0.4.1 (https://github.com/rrnewton/reverie.git?rev=ff30c5bac6040c14122d33d60f5dfb91953c7099#ff30c5ba)
+    Checking tokio v1.53.1
+    Checking procfs-core v0.18.0
+    Checking tracing-subscriber v0.3.23
+    Checking clap v4.6.4
+    Checking derive_more v1.0.0
+    Checking futures-executor v0.3.33
+    Checking reverie-syscalls v0.4.1 (https://github.com/rrnewton/reverie.git?rev=ff30c5bac6040c14122d33d60f5dfb91953c7099#ff30c5ba)
+    Checking futures v0.3.33
+    Checking tracing-appender v0.2.5
+    Checking reverie-process v0.4.1 (https://github.com/rrnewton/reverie.git?rev=ff30c5bac6040c14122d33d60f5dfb91953c7099#ff30c5ba)
+    Checking tokio-util v0.7.19
+    Checking tokio-stream v0.1.19
+    Checking reverie-core v0.4.1 (https://github.com/rrnewton/reverie.git?rev=ff30c5bac6040c14122d33d60f5dfb91953c7099#ff30c5ba)
+    Checking safeptrace v0.4.1 (https://github.com/rrnewton/reverie.git?rev=ff30c5bac6040c14122d33d60f5dfb91953c7099#ff30c5ba)
+    Checking detcore-model v0.4.1 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture/detcore-model)
+    Checking hermit-detcore v0.4.1 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture/detcore)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 37.38s

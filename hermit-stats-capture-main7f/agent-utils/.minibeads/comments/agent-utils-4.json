@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-4-c6cf0a3cf3a",
+    "issue_id": "agent-utils-4",
+    "author": "gpt-5.6-sol",
+    "body": "[gpt-5.6-sol] Implemented display_override [standalone] with display browser retained as the fallback; kept Apple standalone meta mode absent for the iOS microphone fallback; added a current-Chrome CDP installability test and centralized Cache-Control: no-store for every /api/ and /mcp response. Evidence: Chrome 151.0.7922.34 reported zero manifest errors and zero installability errors; make -C vibe-talk validate passed, including clippy, 450 library tests, 90 API tests, both browser-page suites, DAG validation, and Android speech self-tests. adb reported no attached device, so this proves current-Chrome installability via CDP but not a physical Android launcher/menu round trip. The repository-wide make validate passed hygiene, docs, build, and strict typing before encountering the unrelated flaky py/agentctl/foreign/tests/test_agent_runner.py::test_stop_marker_preserves_active_turn_grace_period and later being terminated.",
+    "created_at": "2026-09-25T03:01:31.484343081Z",
+    "updated_at": "2026-09-25T03:01:31.484343081Z"
+  }
+]

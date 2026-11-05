@@ -1,0 +1,11 @@
+    Checking reverie-memory v0.4.1 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/reverie-stats-capture-main16ff/reverie-memory)
+   Compiling reverie-dbt v0.4.0 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/reverie-stats-capture-main16ff/reverie-dbt)
+    Checking reverie-process v0.4.1 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/reverie-stats-capture-main16ff/reverie-process)
+    Checking reverie-syscalls v0.4.1 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/reverie-stats-capture-main16ff/reverie-syscalls)
+    Checking reverie-core v0.4.1 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/reverie-stats-capture-main16ff/reverie)
+ Documenting reverie-core v0.4.1 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/reverie-stats-capture-main16ff/reverie)
+    Checking reverie-rpc-transport v0.4.1 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/reverie-stats-capture-main16ff/reverie-rpc-transport)
+warning: reverie-dbt@0.4.0: DynamoRIO build cache HIT key=sha256:ff4576416a64218bcbccb4528cee86e5fc4da7119267d963751b37c39f68e542 observed_unix_seconds=1791983664 install=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit/debug/reverie-dbt-native-cache/dynamorio-install-ff4576416a64218bcbccb4528cee86e5fc4da7119267d963751b37c39f68e542
+ Documenting reverie-dbt v0.4.0 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/reverie-stats-capture-main16ff/reverie-dbt)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 7.26s
+   Generated /home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit/doc/reverie/index.html and 4 other files

@@ -1,0 +1,36 @@
+# Herdr workspace LABEL holding this project's command tabs.
+workspace: agent-cmds
+
+# Tab-label schema. {agent} = invoking agent, {project} = project directory basename.
+tab_name: "{agent}"
+
+# Working directory for commands (relative paths resolve against the project root).
+cwd: null
+
+# THE ALLOWLIST. Programs that may run. Keep it small.
+allow:
+  - git
+  - gh
+
+# Wrapper programs that may PRECEDE an allowlisted program, never run on their own.
+prefixes:
+  - with-proxy
+
+# Defense in depth (see Threat model) — not the boundary.
+deny_global:
+  git: ["-c", "--config-env", "--exec-path", "--namespace"]
+deny_subcommand:
+  git: ["filter-branch", "daemon", "instaweb"]
+  gh:  ["alias", "extension", "ext", "codespace", "cs"]
+deny_anywhere: ["--upload-pack", "--receive-pack"]
+
+# Git-IGNORED directory for run spools and the audit log.
+spool_dir: .herdr-run
+
+timeout_seconds: 900          # wait for the command's exit code
+ready_timeout_seconds: 0      # wait for the pane to go idle (0 = refuse immediately)
+
+readiness: both               # 'both' = process signal AND prompt veto; 'process' = drop the veto
+prompt_tail: null             # e.g. "$ ". null = infer from ~/.bashrc / ~/.zshrc, abstain on failure
+
+broker: direct                # 'direct' | 'systemd-run' (see Brokering)

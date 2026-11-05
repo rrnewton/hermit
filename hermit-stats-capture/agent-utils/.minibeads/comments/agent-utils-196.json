@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-196-cea1f59a9ee",
+    "issue_id": "agent-utils-196",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Closed: landed in d8fd9b79..23b12be1, deployed on devbig014 (4a63ae8). Live check against the main space: 8 of the latest 50 messages flagged, every Working… placeholder caught. Unverified: the Settings editor on a phone. Known gap: its 'Matches N of M' counts only thread roots in Main view.",
+    "created_at": "2026-10-04T12:59:39.904530121Z",
+    "updated_at": "2026-10-04T12:59:39.904530121Z"
+  }
+]

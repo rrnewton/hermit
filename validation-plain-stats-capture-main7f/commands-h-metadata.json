@@ -1,0 +1,32 @@
+{
+  "stem": "h-metadata",
+  "argv": [
+    "cargo",
+    "metadata",
+    "--offline",
+    "--locked",
+    "--format-version",
+    "1"
+  ],
+  "cwd": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f",
+  "head": "d09ef1a3e7f46a5206e464b562a22c2e77ae9699",
+  "base": "7f53641d93b2332b1ce53f1b97026cd0d32cb9f1",
+  "R": "dde3f9da33a0474d0fa9b273a25100fc0db4d751",
+  "prefix": [
+    "nice",
+    "-n",
+    "19",
+    "taskset",
+    "--cpu-list",
+    "0-39"
+  ],
+  "unset_env": [
+    "TMPDIR"
+  ],
+  "env": {
+    "CARGO_HOME": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home",
+    "CARGO_TARGET_DIR": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit",
+    "CARGO_BUILD_JOBS": "40",
+    "CMAKE_BUILD_PARALLEL_LEVEL": "40"
+  }
+}

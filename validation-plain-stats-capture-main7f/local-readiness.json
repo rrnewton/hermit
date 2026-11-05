@@ -1,0 +1,88 @@
+{
+  "at": "2026-10-14T13:10:09.437483+00:00",
+  "method": "Exact gitlinks locally materialized from preserved populated stack-fix providers. H nested Reverie gitlinks use direct16ff provider to avoid excess alternate nesting. No network/compiler; host-only.",
+  "submodules": [
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/reverie-stats-capture-main16ff/third-party/dynamorio",
+      "provider": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/d3-procfs-stack-v1/hermit-main00591/reverie/third-party/dynamorio",
+      "head": "929840ad9190e5086775e8debc0f0b79b4208d59"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/reverie-stats-capture-main16ff/third-party/dynamorio/third_party/elfutils",
+      "provider": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/d3-procfs-stack-v1/hermit-main00591/reverie/third-party/dynamorio/third_party/elfutils",
+      "head": "302252356da5475670ac5b10dadd091c59689425"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/reverie-stats-capture-main16ff/third-party/dynamorio/third_party/libipt",
+      "provider": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/d3-procfs-stack-v1/hermit-main00591/reverie/third-party/dynamorio/third_party/libipt",
+      "head": "c848a85c3104e2f5780741f85de5c9e65476ece2"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/reverie-stats-capture-main16ff/third-party/dynamorio/third_party/zlib",
+      "provider": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/d3-procfs-stack-v1/hermit-main00591/reverie/third-party/dynamorio/third_party/zlib",
+      "head": "51b7f2abdade71cd9bb0e7a373ef2610ec6f9daf"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/reverie-stats-capture-main16ff/third-party/e9patch",
+      "provider": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/d3-procfs-stack-v1/hermit-main00591/reverie/third-party/e9patch",
+      "head": "6c2c03c1da74b14daf1788a9f8dccfa354ce04a6"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/reverie-stats-capture-main16ff/third-party/sabre",
+      "provider": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/d3-procfs-stack-v1/hermit-main00591/reverie/third-party/sabre",
+      "head": "41113f849f8799932ed8c7883f5a4de616b9e9fa"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f/agent-utils",
+      "provider": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/d3-procfs-stack-v1/hermit-main00591/agent-utils",
+      "head": "2bd7f9562d74fa96d24050cdd8c7746349ff5244"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f/reverie",
+      "provider": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/reverie-stats-capture-main16ff",
+      "head": "dde3f9da33a0474d0fa9b273a25100fc0db4d751"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f/reverie/third-party/dynamorio",
+      "provider": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/d3-procfs-stack-v1/hermit-main00591/reverie/third-party/dynamorio",
+      "head": "929840ad9190e5086775e8debc0f0b79b4208d59"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f/reverie/third-party/dynamorio/third_party/elfutils",
+      "provider": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/d3-procfs-stack-v1/hermit-main00591/reverie/third-party/dynamorio/third_party/elfutils",
+      "head": "302252356da5475670ac5b10dadd091c59689425"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f/reverie/third-party/dynamorio/third_party/libipt",
+      "provider": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/d3-procfs-stack-v1/hermit-main00591/reverie/third-party/dynamorio/third_party/libipt",
+      "head": "c848a85c3104e2f5780741f85de5c9e65476ece2"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f/reverie/third-party/dynamorio/third_party/zlib",
+      "provider": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/d3-procfs-stack-v1/hermit-main00591/reverie/third-party/dynamorio/third_party/zlib",
+      "head": "51b7f2abdade71cd9bb0e7a373ef2610ec6f9daf"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f/reverie/third-party/e9patch",
+      "provider": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/d3-procfs-stack-v1/hermit-main00591/reverie/third-party/e9patch",
+      "head": "6c2c03c1da74b14daf1788a9f8dccfa354ce04a6"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f/reverie/third-party/sabre",
+      "provider": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/d3-procfs-stack-v1/hermit-main00591/reverie/third-party/sabre",
+      "head": "41113f849f8799932ed8c7883f5a4de616b9e9fa"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f/third-party/rr",
+      "provider": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/d3-procfs-stack-v1/hermit-main00591/third-party/rr",
+      "head": "39e5c18e7e43236b7ca0fb1eb647fe9c93e3934e"
+    }
+  ],
+  "R_ignored_lock_sha256": "fa0c9f049cc98e31cc082a4d44e5d9f93f03fe5f30b352661176a9b54f3f81e6",
+  "R_ignored_lock_provider": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/reverie-stats-capture/Cargo.lock",
+  "H_tracked_lock_sha256": "e92f74f943ba9a8fb1f5cb8f1bb74db800979ad0390374d68e9085bcff8185ae",
+  "retained_setup_refusals": [
+    "initial absent old submodule provider, git clone128",
+    "second H DynamoRIO clone through newR added one excess Git alternate nesting level,128; Git removed its failed clone, empty destination remained"
+  ]
+}

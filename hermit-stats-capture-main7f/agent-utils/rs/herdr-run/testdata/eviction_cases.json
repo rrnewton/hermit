@@ -1,0 +1,103 @@
+{
+  "_about": "Golden cases for least-recently-used tab replacement. The Rust unit tests (rs/herdr-run/src/evict.rs) and the Python unit tests (py/tests/test_herdr_run_evict.py) both load this file, so the two editions must agree on every case: the pure decisions are pinned here because the differential harness cannot stand up a live Herdr server. Records are listed oldest run first, the order load_run_records returns.",
+  "order": [
+    {
+      "name": "unrecorded panes first in listing order, then oldest last run first; the latest record for a pane wins",
+      "panes": [["p1", "t1"], ["p2", "t2"], ["p3", "t3"], ["p4", "t4"]],
+      "records": [
+        {"pane_id": "p1", "run_id": "20261001T090000-early-1", "agent": "early"},
+        {"pane_id": "p3", "run_id": "20261001T100000-middle-2", "agent": "middle"},
+        {"pane_id": "p1", "run_id": "20261001T110000-late-3", "agent": "late"}
+      ],
+      "expected": [
+        {"pane_id": "p2", "tab_id": "t2", "last_run": null, "agent": null, "tab_panes": 1},
+        {"pane_id": "p4", "tab_id": "t4", "last_run": null, "agent": null, "tab_panes": 1},
+        {"pane_id": "p3", "tab_id": "t3", "last_run": "20261001T100000-middle-2", "agent": "middle", "tab_panes": 1},
+        {"pane_id": "p1", "tab_id": "t1", "last_run": "20261001T110000-late-3", "agent": "late", "tab_panes": 1}
+      ]
+    },
+    {
+      "name": "a split tab reports its pane count on every pane",
+      "panes": [["p1", "t1"], ["p2", "t1"], ["p3", "t2"]],
+      "records": [],
+      "expected": [
+        {"pane_id": "p1", "tab_id": "t1", "last_run": null, "agent": null, "tab_panes": 2},
+        {"pane_id": "p2", "tab_id": "t1", "last_run": null, "agent": null, "tab_panes": 2},
+        {"pane_id": "p3", "tab_id": "t2", "last_run": null, "agent": null, "tab_panes": 1}
+      ]
+    },
+    {
+      "name": "records without a pane or run id, and records for panes not listed, are ignored",
+      "panes": [["p1", "t1"], ["p2", "t2"]],
+      "records": [
+        {"pane_id": "p2", "run_id": "20261001T080000-kept-1", "agent": "kept"},
+        {"run_id": "20261001T090000-nopane-2", "agent": "nopane"},
+        {"pane_id": "p1", "agent": "norun"},
+        {"pane_id": "gone", "run_id": "20261001T100000-gone-3", "agent": "gone"},
+        {"pane_id": "p1", "run_id": "20261001T110000-anonymous-4"}
+      ],
+      "expected": [
+        {"pane_id": "p2", "tab_id": "t2", "last_run": "20261001T080000-kept-1", "agent": "kept", "tab_panes": 1},
+        {"pane_id": "p1", "tab_id": "t1", "last_run": "20261001T110000-anonymous-4", "agent": null, "tab_panes": 1}
+      ]
+    }
+  ],
+  "idle": [
+    {
+      "name": "the shell owns the foreground and is alone in its session",
+      "process": {"shell_pid": 100, "foreground_pgid": 100, "foreground": [[100, "bash", "/bin/bash"]]},
+      "session": {"shell_sid": 100, "others": []},
+      "expected": {"idle": true, "reason": "shell bash (100) owns the foreground group; no other process in session 100"}
+    },
+    {
+      "name": "a running command owns the foreground",
+      "process": {"shell_pid": 100, "foreground_pgid": 200, "foreground": [[200, "git", "git push"]]},
+      "session": {"shell_sid": 100, "others": [200]},
+      "expected": {"idle": false, "reason": "foreground pgid 200 != shell pid 100; running: git"}
+    },
+    {
+      "name": "a background job is still in the shell's session",
+      "process": {"shell_pid": 100, "foreground_pgid": 100, "foreground": [[100, "bash", "/bin/bash"]]},
+      "session": {"shell_sid": 100, "others": [201, 205]},
+      "expected": {"idle": false, "reason": "session 100 still holds 2 other process(es): 201, 205"}
+    },
+    {
+      "name": "the shell's stat cannot be read",
+      "process": {"shell_pid": 100, "foreground_pgid": 100, "foreground": [[100, "bash", "/bin/bash"]]},
+      "session": {"shell_sid": null, "others": null},
+      "expected": {"idle": false, "reason": "cannot read the session of shell 100; treating the tab as busy"}
+    },
+    {
+      "name": "the shell does not lead its session",
+      "process": {"shell_pid": 100, "foreground_pgid": 100, "foreground": [[100, "bash", "/bin/bash"]]},
+      "session": {"shell_sid": 50, "others": null},
+      "expected": {"idle": false, "reason": "shell 100 does not lead its session (session 50); treating the tab as busy"}
+    },
+    {
+      "name": "the process table cannot be listed",
+      "process": {"shell_pid": 100, "foreground_pgid": 100, "foreground": [[100, "bash", "/bin/bash"]]},
+      "session": {"shell_sid": 100, "others": null},
+      "expected": {"idle": false, "reason": "cannot list processes in session 100; treating the tab as busy"}
+    }
+  ],
+  "run_time": [
+    ["20261003T002657-worker-3424993", "2026-10-03T00:26:57Z"],
+    ["20261003T002657", "2026-10-03T00:26:57Z"],
+    ["2026100T0026570-worker-1", null],
+    ["short", null],
+    ["", null]
+  ],
+  "session_id": [
+    ["123 (bash) S 1 123 123 34816 123 4194560", 123],
+    ["456 (a) b) (c) R 1 2 77 0", 77],
+    ["789 (truncated) S 1", null],
+    ["no parenthesis here", null]
+  ],
+  "refusal": [
+    {"skipped": [["p1", "busy"]], "expected": "None of its 1 tab(s) could be replaced: pane p1: busy."},
+    {
+      "skipped": [["p1", "a"], ["p2", "b"], ["p3", "c"], ["p4", "d"], ["p5", "e"]],
+      "expected": "None of its 5 tab(s) could be replaced: pane p1: a; pane p2: b; pane p3: c; and 2 more."
+    }
+  ]
+}

@@ -1,0 +1,160 @@
+description: Tool-owned Rust regression suites
+
+# The suites build into rs/target/validation-tests, never rs/target itself. rs/target holds the
+# tracked launchers' cache (rs/bin/cargo-runner). `cargo test` relinks a package's binaries there
+# with its dev-dependency features, so the next launcher call, from any step running beside the
+# suite, found its stamped binary replaced and ran `cargo clean` for that package, deleting the
+# test binaries of the suite still running: a test that re-executed itself got ENOENT.
+
+resource_caps:
+  cargo-target: 4
+
+steps:
+  - group: agentctl
+    job: test
+    desc: agentctl Rust tests
+    cmd: >-
+      host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
+      RUST_TEST_THREADS=1 cargo test --release --manifest-path rs/Cargo.toml
+      --target "$host_target" --target-dir rs/target/validation-tests -p agentctl ${DAGRUN_EXTRA_ARGS}
+    cmdtype: cargo-test
+    labels: [validation-workspace, validation-rust-workspace-tests, component-agentctl]
+    timeout: 1200
+    cpu_timeout: 2400
+    hint: &rust_test_hint
+      resources: {cargo-target: 1}
+      est_duration_s: 180
+      classification: cpu-bound
+      preferred_inner_jobs: 8
+      rss_baseline_bytes: 3221225472
+
+  - group: chat-subscription
+    job: core
+    desc: chat-subscription core Rust tests
+    cmd: >-
+      host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
+      RUST_TEST_THREADS=1 cargo test --release --manifest-path rs/Cargo.toml
+      --target "$host_target" --target-dir rs/target/validation-tests -p chat-subscription ${DAGRUN_EXTRA_ARGS}
+    cmdtype: cargo-test
+    labels: [validation-workspace, validation-rust-workspace-tests, component-agentctl]
+    timeout: 600
+    cpu_timeout: 1200
+    hint: *rust_test_hint
+
+  - group: chat-subscription
+    job: plugin
+    desc: chat-subscription plugin Rust tests
+    cmd: >-
+      host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
+      RUST_TEST_THREADS=1 cargo test --release --manifest-path rs/Cargo.toml
+      --target "$host_target" --target-dir rs/target/validation-tests -p chat-subscription-plugin ${DAGRUN_EXTRA_ARGS}
+    cmdtype: cargo-test
+    labels: [validation-workspace, validation-rust-workspace-tests, component-agentctl]
+    timeout: 600
+    cpu_timeout: 1200
+    hint: *rust_test_hint
+
+  - group: chat-subscription
+    job: fake
+    desc: chat-subscription fake plugin Rust tests
+    cmd: >-
+      host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
+      RUST_TEST_THREADS=1 cargo test --release --manifest-path rs/Cargo.toml
+      --target "$host_target" --target-dir rs/target/validation-tests -p chat-subscription-fake ${DAGRUN_EXTRA_ARGS}
+    cmdtype: cargo-test
+    labels: [validation-workspace, validation-rust-workspace-tests, component-agentctl]
+    timeout: 600
+    cpu_timeout: 1200
+    hint: *rust_test_hint
+
+  - group: dagrun
+    job: test
+    desc: dagrun Rust tests, including boxed integration tests
+    cmd: >-
+      host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
+      RUST_TEST_THREADS=1 cargo test --release --manifest-path rs/Cargo.toml
+      --target "$host_target" --target-dir rs/target/validation-tests -p dagrun ${DAGRUN_EXTRA_ARGS}
+    cmdtype: cargo-test
+    labels: [validation-workspace, validation-rust-workspace-tests, component-dagrun]
+    delegated_children: true
+    timeout: 1800
+    cpu_timeout: 3600
+    hint: *rust_test_hint
+
+  - group: herdr-run
+    job: test
+    desc: herdr-run Rust tests
+    cmd: >-
+      host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
+      RUST_TEST_THREADS=1 cargo test --release --manifest-path rs/Cargo.toml
+      --target "$host_target" --target-dir rs/target/validation-tests -p herdr-run ${DAGRUN_EXTRA_ARGS}
+    cmdtype: cargo-test
+    labels: [validation-workspace, validation-rust-workspace-tests, component-herdr-run]
+    timeout: 600
+    cpu_timeout: 1200
+    hint: *rust_test_hint
+
+  - group: planner
+    job: test
+    desc: pr-landing-planner Rust tests
+    cmd: >-
+      host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
+      RUST_TEST_THREADS=1 cargo test --release --manifest-path rs/Cargo.toml
+      --target "$host_target" --target-dir rs/target/validation-tests -p pr-landing-planner ${DAGRUN_EXTRA_ARGS}
+    cmdtype: cargo-test
+    labels: [validation-workspace, validation-rust-workspace-tests, component-planner]
+    timeout: 600
+    cpu_timeout: 1200
+    hint: *rust_test_hint
+
+  - group: gh-paced
+    job: test
+    desc: gh-paced Rust tests
+    cmd: >-
+      host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
+      RUST_TEST_THREADS=1 cargo test --release --manifest-path rs/Cargo.toml
+      --target "$host_target" --target-dir rs/target/validation-tests -p gh-paced ${DAGRUN_EXTRA_ARGS}
+    cmdtype: cargo-test
+    labels: [validation-workspace, validation-rust-workspace-tests]
+    timeout: 600
+    cpu_timeout: 1200
+    hint: *rust_test_hint
+
+  - group: agent-usage
+    job: test
+    desc: agent-usage Rust tests
+    cmd: >-
+      host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
+      RUST_TEST_THREADS=1 cargo test --release --manifest-path rs/Cargo.toml
+      --target "$host_target" --target-dir rs/target/validation-tests -p agent-usage ${DAGRUN_EXTRA_ARGS}
+    cmdtype: cargo-test
+    labels: [validation-workspace, validation-rust-workspace-tests]
+    timeout: 600
+    cpu_timeout: 1200
+    hint: *rust_test_hint
+
+  - group: tick-hub
+    job: test
+    desc: tick-hub Rust tests
+    cmd: >-
+      host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
+      RUST_TEST_THREADS=1 cargo test --release --manifest-path rs/Cargo.toml
+      --target "$host_target" --target-dir rs/target/validation-tests -p tick-hub ${DAGRUN_EXTRA_ARGS}
+    cmdtype: cargo-test
+    labels: [validation-workspace, validation-rust-workspace-tests, component-tick-hub]
+    timeout: 600
+    cpu_timeout: 1200
+    hint: *rust_test_hint
+
+  - group: wrkslots
+    job: test
+    desc: wrkslots daemon Rust tests
+    cmd: >-
+      host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
+      RUST_TEST_THREADS=1 cargo test --release --manifest-path rs/Cargo.toml
+      --target "$host_target" --target-dir rs/target/validation-tests -p wrkslotsd ${DAGRUN_EXTRA_ARGS}
+    cmdtype: cargo-test
+    labels: [validation-workspace, validation-rust-workspace-tests, component-wrkslots]
+    timeout: 600
+    cpu_timeout: 1200
+    hint: *rust_test_hint

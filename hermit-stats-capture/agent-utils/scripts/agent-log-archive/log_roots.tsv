@@ -1,0 +1,9 @@
+# machine_or_*	archive_name	source_path_relative_to_home	requirement
+*	.orc	.orc	required
+*	.tg	.tg	required
+*	.claude	.claude	required
+*	.codex	.codex	required
+*	.gt	.gt	optional
+*	.beads	.beads	optional
+*	.claude-accounts	.claude-accounts	optional
+*	gt	gt	optional

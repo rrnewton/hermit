@@ -1,0 +1,53 @@
+{
+  "at": "2026-10-14T11:46:58.341906+00:00",
+  "head": "e7307c2c2aa7f97d0f4aa209ea47122d0915cfc5",
+  "method": "local shared clones at exact gitlinks, host-only; no network or Cargo",
+  "submodules": [
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture/agent-utils",
+      "local_provider": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-shared-verify-d3-v1/source-main199d/agent-utils",
+      "head": "2bd7f9562d74fa96d24050cdd8c7746349ff5244"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture/third-party/rr",
+      "local_provider": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-shared-verify-d3-v1/source-main199d/third-party/rr",
+      "head": "39e5c18e7e43236b7ca0fb1eb647fe9c93e3934e"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture/reverie",
+      "local_provider": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/reverie-stats-capture",
+      "head": "ff30c5bac6040c14122d33d60f5dfb91953c7099"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture/reverie/third-party/dynamorio",
+      "local_provider": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-shared-verify-d3-v1/source-main199d/reverie/third-party/dynamorio",
+      "head": "929840ad9190e5086775e8debc0f0b79b4208d59"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture/reverie/third-party/dynamorio/third_party/libipt",
+      "local_provider": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-shared-verify-d3-v1/source-main199d/reverie/third-party/dynamorio/third_party/libipt",
+      "head": "c848a85c3104e2f5780741f85de5c9e65476ece2"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture/reverie/third-party/dynamorio/third_party/zlib",
+      "local_provider": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-shared-verify-d3-v1/source-main199d/reverie/third-party/dynamorio/third_party/zlib",
+      "head": "51b7f2abdade71cd9bb0e7a373ef2610ec6f9daf"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture/reverie/third-party/dynamorio/third_party/elfutils",
+      "local_provider": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-shared-verify-d3-v1/source-main199d/reverie/third-party/dynamorio/third_party/elfutils",
+      "head": "302252356da5475670ac5b10dadd091c59689425"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture/reverie/third-party/e9patch",
+      "local_provider": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-shared-verify-d3-v1/source-main199d/reverie/third-party/e9patch",
+      "head": "6c2c03c1da74b14daf1788a9f8dccfa354ce04a6"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture/reverie/third-party/sabre",
+      "local_provider": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-shared-verify-d3-v1/source-main199d/reverie/third-party/sabre",
+      "head": "41113f849f8799932ed8c7883f5a4de616b9e9fa"
+    }
+  ],
+  "status": ""
+}

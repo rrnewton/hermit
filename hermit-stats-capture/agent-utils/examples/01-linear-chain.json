@@ -1,0 +1,16 @@
+{
+  "description": "A trivial linear chain: build -> test -> package. Nothing runs in parallel, so the wall time is the sum of the steps.",
+  "steps": [
+    {"group": "build", "job": "compile", "desc": "compile the sources",
+     "description": "Compile the sources. The first link in the chain; everything waits on it.",
+     "cmd": "echo '[build] compiling' && sleep 2"},
+    {"group": "test", "job": "unit", "desc": "run the unit tests",
+     "description": "Run the unit tests, but only after the build has succeeded.",
+     "cmd": "echo '[test] running unit tests' && sleep 2",
+     "deps": ["build.compile"]},
+    {"group": "package", "job": "tarball", "desc": "assemble the release tarball",
+     "description": "Assemble the release tarball once the tests pass.",
+     "cmd": "echo '[package] building tarball' && sleep 2",
+     "deps": ["test.unit"]}
+  ]
+}

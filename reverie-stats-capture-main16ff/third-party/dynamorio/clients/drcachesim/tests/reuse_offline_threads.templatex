@@ -1,0 +1,51 @@
+Reuse distance tool aggregated results:
+Total accesses: [0-9]+
+Instruction accesses: [0-9]+
+Data accesses: [0-9]+
+Unique accesses: [0-9]+
+Unique cache lines accessed: [0-9]+
+Distance limit: 0
+Pruned addresses: 0
+Pruned address hits: 0
+
+Reuse distance mean: [0-9.]+
+Reuse distance median: 1
+Reuse distance standard deviation: [0-9.]+
+Reuse distance histogram bin multiplier: [0-9.]+
+Reuse distance histogram:
+                      All References       :            Data References
+Distance       Count  Percent  Cumulative  :       Count  Percent  Cumulative
+       0     *[0-9]+  *[0-9.]+%  *[0-9.]+%     :     *[0-9]+   *[0-9.]+%   *[0-9.]+%
+       1     *[0-9]+  *[0-9.]+%  *[0-9.]+%     :     *[0-9]+   *[0-9.]+%   *[0-9.]+%
+.*
+Reuse distance threshold = 100 cache lines
+Top 10 frequently referenced cache lines
+        cache line:     #references   #distant refs
+    0x[0-9a-f]+:      *[0-9]+,         *[0-9]+
+    0x[0-9a-f]+:      *[0-9]+,         *[0-9]+
+.*
+Top 10 distant repeatedly referenced cache lines
+        cache line:     #references   #distant refs
+    0x[0-9a-f]+:      *[0-9]+,         *[0-9]+
+    0x[0-9a-f]+:      *[0-9]+,         *[0-9]+
+.*==================================================
+Reuse distance tool results for shard [0-9]+ \(thread [0-9]+\):
+Total accesses: [0-9]+
+Instruction accesses: [0-9]+
+Data accesses: [0-9]+
+Unique accesses: [0-9]+
+Unique cache lines accessed: [0-9]+
+Distance limit: 0
+Pruned addresses: 0
+Pruned address hits: 0
+
+Reuse distance mean: [0-9.]+
+Reuse distance median: [0-9]+
+Reuse distance standard deviation: [0-9.]+
+Reuse distance histogram bin multiplier: [0-9.]+
+Reuse distance histogram:
+                      All References       :            Data References
+Distance       Count  Percent  Cumulative  :       Count  Percent  Cumulative
+       0     *[0-9]+  *[0-9.]+%  *[0-9.]+%     :     *[0-9]+   *[0-9.]+%   *[0-9.]+%
+       1     *[0-9]+  *[0-9.]+%  *[0-9.]+%     :     *[0-9]+   *[0-9.]+%   *[0-9.]+%
+.*

@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-18-c9a51cbd78a",
+    "issue_id": "agent-utils-18",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Closing #18 offline-message-cache. Delivered in the commit \"vibe-talk: draw saved channel messages before the network answers\".\n\n- /voice keeps a bounded snapshot in localStorage, scoped to a token fingerprint plus channel: 120 messages and 120 thread cards per channel, 12 channels in LRU order, about 600,000 characters. It shrinks under quota pressure, the outbox wins the space, and damaged entries are dropped.\n- The snapshot is drawn before any request answers. Exactly one bounded newest-page refresh follows for the channel and view on screen. It merges corrections and new rows without duplicates, and the live stream carries on from there. Main, Threads, All and cached threads reproject locally with no request.\n- A failed or offline refresh keeps the rows and says 'Offline' or 'Refresh failed' with the saved time. Pending sends and read state are kept.\n- Sign-out, a token change (on either page or in another tab), a 401 and a read 403 clear it. Channels the server stops listing are pruned. Paging cursors are never saved. Nothing goes to CacheStorage or a service worker.\n- Tests: request-count assertions for each criterion in tests/js/voice_page.test.mjs (reload, merge, offline, eviction, identity separation). tests/offline_cache_browser.py (make offline-cache-browser) runs in real Chromium at 412x915.\n\nClosed ahead of the combined train's live QA. That QA must show the cached cold start on the deployment before this closure is published.\n\nUnverified:\n- A cold start with no network at all still cannot load the page. Assets are no-store and there is no app-shell service worker.\n- An installed PWA on a physical phone.\n- The snapshot is plain text in the browser's storage on the device, not encrypted at rest.",
+    "created_at": "2026-09-25T06:45:02.113179559Z",
+    "updated_at": "2026-09-25T06:45:02.113179559Z"
+  }
+]

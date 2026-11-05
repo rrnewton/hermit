@@ -1,0 +1,26 @@
+[
+  {
+    "id": "agent-utils-47-c13c6e42c66",
+    "issue_id": "agent-utils-47",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] First triage step done: the extra length comes from the provider's own generation, not from a stall in transport. Content-free, from the provider's per-response timing:\n- The stalled control generated 4,697 tokens over 134 s and produced 165 s of audio.\n- The two post-cut reads of the same message each generated about 2,050 tokens over about 55 s and produced 68 s of audio.\n- A stalled read of the other long message generated 7,263 tokens over 140 s.\n- On the stalled control, tokens never paused for more than 0.57 s and audio chunks never for more than 4.9 s.\n\nSo during the roughly 75 s stretch with no transcript, the provider keeps generating output that becomes audio but no transcript text. The bridge forwards it faithfully.\n\nNext steps:\n1. Measure audio energy over that stretch, to tell silence or filler from speech that has no transcript.\n2. Take the timings to the provider side.\n\nNo bridge change is indicated so far.",
+    "created_at": "2026-09-26T09:38:34.029760707Z",
+    "updated_at": "2026-09-26T09:38:34.029760707Z"
+  },
+  {
+    "id": "agent-utils-47-c4057e50cf0",
+    "issue_id": "agent-utils-47",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] 2026-10-12 investigation (report ~/work/vibe-talk-reports/2026-10-12-voice-runtime-findings.md): the TTS model abandons text at identifiers/URLs and runs to its 2048-token per-sentence cap (~75 s). Two dev-only Kepler overrides (direct verbatim path + runaway guard) currently prevent the stall; the direct path depends on vibe-talk's prompt framing matching byte for byte, now pinned by a test. #187 speaks identifiers/URLs as words, which should reduce guard trips. Remaining work is in the private voice backend (drop the abandoned tail before retry; explicit protocol flag instead of prompt matching). Keeping open for the acceptance matrix.",
+    "created_at": "2026-10-12T22:11:39.670665261Z",
+    "updated_at": "2026-10-12T22:11:39.670665261Z"
+  },
+  {
+    "id": "agent-utils-47-c3ed4563d5e",
+    "issue_id": "agent-utils-47",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Verified 2026-10-13 09:50Z on devbig014 after the voice stack was rebuilt on the updated private draft stack (TTS sentence stop-and-retry, exact reads routed directly to TTS, the read-aloud prompt framing pinned by a test in vibe-talk): two fresh-session verbatim reads of a 578-character message both PASSED scripts/voice-read-acceptance.py: complete, not interrupted, 35.6 s and 34.0 s of audio, longest gap 2.4 s and 3.2 s, 0.06 s of audio per character. No 75 s stall and no overrun. Unverified: the private-stack fixes are unpublished drafts running locally, so a deployment built from the upstream stack would not have them until they land there.",
+    "created_at": "2026-10-13T09:47:58.675606896Z",
+    "updated_at": "2026-10-13T09:47:58.675606896Z"
+  }
+]

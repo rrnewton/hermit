@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-41-cc707a6f85d",
+    "issue_id": "agent-utils-41",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Landed as ba28f37. A WriteScope extractor checks the Authorization header before Path, Query or Json on the six routes that propose, confirm, withdraw, read a proposal or post: the four /api/v1/post-proposals routes, /api/v1/channels/{id}/reply and /api/v1/channels/{id}/ask. A read token gets 403 and no token gets 401 whatever body, content type, query or channel id it sends; a write token still gets the parser's exact 422 or 400. The regression test is a_caller_without_write_scope_is_refused_before_its_request_is_parsed in tests/post_gate.rs; reverting any one handler, or moving the scope after Path, fails it. Independently reviewed, and make validate-all passed 93/93. Every other /api route is tracked in #42 api-scope-first. Not deployed and no live post; deployment is handed to the deployment owner.",
+    "created_at": "2026-09-26T02:05:58.172932773Z",
+    "updated_at": "2026-09-26T02:05:58.172932773Z"
+  }
+]

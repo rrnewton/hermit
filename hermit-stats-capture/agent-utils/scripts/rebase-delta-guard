@@ -1,0 +1,688 @@
+#!/usr/bin/env bash
+# TRACKED tool: prove a rebase moved the base and changed nothing else.
+#
+# WHY THIS EXISTS. On 2026-08-08 a conflict-free `git rebase` in a consuming
+# checkout silently re-serialized ci/dag/portable.json end to end: the delta went
+# from 99,021 bytes to 155,143, keys reordered, hunk `@@ -1,492 +1,947 @@`, with
+# NO conflict, NO warning, and a clean `git status`. The cause was an UNTRACKED,
+# machine-local `$GIT_DIR/info/attributes` binding that file to a re-serializing
+# merge driver; the default rebase backend runs a 3-way merge per file, so the
+# driver fired even though the patch would have applied cleanly.
+#
+# It was caught only because someone happened to know the delta's byte count from
+# a measurement minutes earlier. That is not a control. This is.
+#
+# The mechanism is not specific to that repository or that driver. Any
+# re-serializing merge driver, smudge/clean filter, mis-resolved conflict, or
+# mis-picked commit produces the same signature: a successful rebase, a clean
+# tree, and a delta that is no longer the one you wrote. The binding lives in
+# untracked config, so no hosted CI job can ever observe it -- the check has to
+# run where the rebase runs.
+#
+# THE HABIT IT ENCODES, which matters more than the check: RECORD THE IDENTITY
+# BEFORE YOU START; DO NOT SEARCH FOR IT AFTERWARDS. `record` captures the base,
+# head, and exact intended onto commit as SHAs up front, plus a sidecar used to
+# detect a mismatched record. `verify` never re-resolves a branch name. Two agents lost time on
+# 2026-08-08 recovering a pre-rebase SHA with `git log --grep | tail -1` and
+# getting a rebased commit back. It is the same principle as never reading
+# FETCH_HEAD or a symbolic ref in a shared checkout: do not re-derive an identity
+# you could have captured.
+#
+# USAGE
+#   rebase-delta-guard record [--repo DIR] [--base REV] [--onto REV]
+#   rebase-delta-guard verify [--repo DIR] [--new-base REV] [--keep]
+#   rebase-delta-guard check  OLD_BASE OLD_HEAD NEW_BASE NEW_HEAD [--repo DIR]
+#   rebase-delta-guard conflict-files [-z|--null] [--repo DIR]
+#   rebase-delta-guard status|clear [--repo DIR]
+#
+#   $ onto=$(git rev-parse origin/main)
+#   $ rebase-delta-guard record --onto "$onto"  # before the rebase
+#   $ git rebase --apply "$onto"                 # use the same immutable SHA
+#   $ rebase-delta-guard verify                   # after
+#
+# SAFE CONFLICT ITERATION. A conflicted gitlink is a directory on disk, so raw
+# `git diff --name-only --diff-filter=U` output is unsafe input to grep, sed, or
+# any other file-oriented loop. `conflict-files` reads the unmerged index modes,
+# emits ordinary conflicted files only, and reports every mode-160000 gitlink it
+# skips. Use `--null` with a NUL-aware reader for arbitrary path names.
+#
+# WHAT IS COMPARED. `git diff BASE HEAD` on both sides, ignoring exactly the two
+# things that legitimately move when the base moves:
+#   * `index <blob>..<blob>` lines  -- blob hashes follow content from the new base
+#   * `@@ -a,b +c,d @@` hunk headers -- offsets shift when lines are added above
+# Every other line must match byte for byte: the file list, the mode lines,
+# every single +/- content line, and every encoded binary patch payload. Rename
+# detection is disabled so the comparison cannot flip on a heuristic that reads
+# the base.
+#
+# EXIT STATUS -- 3 is not a pass; treat it as fail-closed.
+#   0  the delta is unchanged
+#   1  the delta CHANGED -- inspect before pushing
+#   2  usage or internal error
+#   3  indeterminate: no complete recording, the explicit new base contradicts
+#      the recorded onto commit, or HEAD does not contain that exact commit.
+#      A count or commit subject is not an identity and is never used to derive
+#      the post-rebase base.
+#
+# RECORD/VERIFY DELIBERATELY SUPPORTS LINEAR SERIES ONLY. `record` rejects merges
+# in OLD_BASE..OLD_HEAD and `verify` rejects them in the current series too.
+# Use the stateless ``check`` form with all four revisions when an explicit
+# snapshot comparison of a merge-containing history is intentional. In every
+# form, each base must be an ancestor of its corresponding head; a diff between
+# unrelated histories is not a rebase delta.
+
+set -uo pipefail
+
+readonly PROGRAM=${0##*/}
+
+die() {
+    printf '%s: %s\n' "$PROGRAM" "$*" >&2
+    exit 2
+}
+
+indeterminate() {
+    printf '%s: INDETERMINATE — %s\n' "$PROGRAM" "$*" >&2
+    return 3
+}
+
+usage() {
+    sed -n '/^# USAGE$/,/^# WHAT IS COMPARED/ {
+        /^# WHAT IS COMPARED/q
+        s/^# \{0,1\}//
+        p
+    }' "$0"
+}
+
+repo_dir=""
+
+# Resolve the state file. Deliberately the PER-WORKTREE git dir, not the common
+# dir: linked worktrees share $GIT_COMMON_DIR, so a single state file there would
+# let two agents rebasing two worktrees of one repository overwrite each other's
+# recording. Getting that wrong would reintroduce the shared-mutable-state class
+# this tool was written in response to.
+state_path() {
+    local gd
+    gd=$(git -C "$repo_dir" rev-parse --git-dir 2>/dev/null) || return 1
+    case "$gd" in
+        /*) ;;
+        *) gd="$(git -C "$repo_dir" rev-parse --show-toplevel)/$gd" ;;
+    esac
+    printf '%s/rebase-delta-guard.state' "$gd"
+}
+
+STATE_OLD_BASE=""
+STATE_OLD_HEAD=""
+STATE_SERIES=""
+STATE_ONTO=""
+
+strict_regular_file() {
+    [[ -f $1 && ! -L $1 ]]
+}
+
+# Parse the fixed record format without evaluating a byte of it as shell code.
+# The state file is authority over which commits are compared, so permissive
+# parsing is not resilience: a missing/duplicate/extra field makes the answer
+# indeterminate. The subjects sidecar is part of the same record, not optional.
+load_record() {
+    local state=$1 subjects="${1}.subjects"
+    local -a fields=()
+    local old_base old_head series onto resolved subject_count expected_subjects cmp_rc
+    local sha_pattern='[0-9a-f]{40}|[0-9a-f]{64}'
+
+    if ! strict_regular_file "$state"; then
+        indeterminate "the recorded state is missing or is not a regular file: $state"
+        return 3
+    fi
+    if ! strict_regular_file "$subjects"; then
+        indeterminate "the recorded subjects are missing or are not a regular file: $subjects"
+        return 3
+    fi
+    if ! mapfile -t fields < "$state"; then
+        indeterminate "the recorded state cannot be read: $state"
+        return 3
+    fi
+    if ((${#fields[@]} != 4)); then
+        indeterminate "the recorded state does not contain exactly old_base, old_head, series, and onto"
+        return 3
+    fi
+    if [[ ${fields[0]} =~ ^old_base=($sha_pattern)$ ]]; then
+        old_base=${BASH_REMATCH[1]}
+    else
+        indeterminate "the recorded old_base is malformed"
+        return 3
+    fi
+    if [[ ${fields[1]} =~ ^old_head=($sha_pattern)$ ]]; then
+        old_head=${BASH_REMATCH[1]}
+    else
+        indeterminate "the recorded old_head is malformed"
+        return 3
+    fi
+    if [[ ${fields[2]} =~ ^series=([1-9][0-9]*)$ ]]; then
+        series=${BASH_REMATCH[1]}
+    else
+        indeterminate "the recorded series count is malformed"
+        return 3
+    fi
+    if ((${#series} > 10)) || ((series > 2147483647)); then
+        indeterminate "the recorded series count is outside the supported range"
+        return 3
+    fi
+    if [[ ${fields[3]} =~ ^onto=($sha_pattern)$ ]]; then
+        onto=${BASH_REMATCH[1]}
+    else
+        indeterminate "the recorded onto commit is malformed"
+        return 3
+    fi
+
+    resolved=$(resolve "$old_base") || {
+        indeterminate "the recorded old_base is not an available commit"
+        return 3
+    }
+    if [[ $resolved != "$old_base" ]]; then
+        indeterminate "the recorded old_base is not a canonical full commit SHA"
+        return 3
+    fi
+    resolved=$(resolve "$old_head") || {
+        indeterminate "the recorded old_head is not an available commit"
+        return 3
+    }
+    if [[ $resolved != "$old_head" ]]; then
+        indeterminate "the recorded old_head is not a canonical full commit SHA"
+        return 3
+    fi
+    resolved=$(resolve "$onto") || {
+        indeterminate "the recorded onto commit is not available"
+        return 3
+    }
+    if [[ $resolved != "$onto" ]]; then
+        indeterminate "the recorded onto commit is not a canonical full commit SHA"
+        return 3
+    fi
+    if ! subject_count=$(wc -l < "$subjects" | tr -d '[:space:]'); then
+        indeterminate "the recorded subjects cannot be measured"
+        return 3
+    fi
+    if [[ ! $subject_count =~ ^[0-9]+$ || $subject_count != "$series" ]]; then
+        indeterminate "the recorded subjects are incomplete or malformed (expected $series line(s), found ${subject_count:-unknown})"
+        return 3
+    fi
+    expected_subjects=$(mktemp) || die "cannot create a temporary subjects file"
+    if ! GIT_NO_REPLACE_OBJECTS=1 git -C "$repo_dir" log \
+        --no-show-signature --format=%s \
+        "$old_base..$old_head" > "$expected_subjects"; then
+        rm -f "$expected_subjects"
+        indeterminate "the recorded commit subjects cannot be reconstructed"
+        return 3
+    fi
+    cmp -s "$subjects" "$expected_subjects"
+    cmp_rc=$?
+    rm -f "$expected_subjects"
+    if ((cmp_rc == 1)); then
+        indeterminate "the subjects sidecar does not match the recorded commits"
+        return 3
+    fi
+    if ((cmp_rc != 0)); then
+        indeterminate "the subjects sidecar cannot be validated"
+        return 3
+    fi
+
+    STATE_OLD_BASE=$old_base
+    STATE_OLD_HEAD=$old_head
+    STATE_SERIES=$series
+    STATE_ONTO=$onto
+}
+
+resolve() {
+    GIT_NO_REPLACE_OBJECTS=1 git -C "$repo_dir" rev-parse --verify --quiet \
+        "${1}^{commit}" 2>/dev/null
+}
+
+short() {
+    git -C "$repo_dir" rev-parse --short "$1" 2>/dev/null || printf '%s' "${1:0:9}"
+}
+
+# The canonical diff. --no-renames keeps the comparison from depending on a
+# similarity heuristic that reads the base; --no-ext-diff, --no-textconv and
+# --no-color keep local drivers/configuration and terminal settings out of the
+# answer. The algorithm, heuristics, prefixes, path order, quoting and submodule
+# rendering are pinned so two checkouts compare the commits, not their config.
+# --binary is
+# essential: without the binary patch payload, two different rewrites of the
+# same binary path both collapse to the identical ``Binary files ... differ``
+# marker after the blob-hash line is normalized away.
+canonical_diff() {
+    LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 git --no-pager \
+        -c core.quotePath=true \
+        -c diff.algorithm=myers \
+        -c diff.mnemonicPrefix=false \
+        -c diff.noprefix=false \
+        -C "$repo_dir" diff \
+        --binary \
+        --full-index \
+        --no-color \
+        --no-ext-diff \
+        --no-textconv \
+        --no-renames \
+        --diff-algorithm=myers \
+        --no-indent-heuristic \
+        --src-prefix=a/ \
+        --dst-prefix=b/ \
+        --line-prefix= \
+        --submodule=short \
+        --ignore-submodules=none \
+        -O /dev/null \
+        "$1" "$2" --
+}
+
+normalized_diff() {
+    canonical_diff "$1" "$2" |
+        sed -E '/^index [0-9a-f]+\.\.[0-9a-f]+/d; /^@@ /d'
+}
+
+raw_diff_bytes() {
+    canonical_diff "$1" "$2" | wc -c | tr -d '[:space:]'
+}
+
+changed_files() {
+    LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 git --no-pager \
+        -c core.quotePath=true \
+        -c diff.algorithm=myers \
+        -C "$repo_dir" diff \
+        --no-color --no-ext-diff --no-textconv --no-renames \
+        --ignore-submodules=none --name-only -O /dev/null \
+        "$1" "$2" -- | wc -l | tr -d '[:space:]'
+}
+
+require_ancestor() {
+    local base=$1 head=$2 label=$3 rc
+    GIT_NO_REPLACE_OBJECTS=1 git -C "$repo_dir" merge-base \
+        --is-ancestor "$base" "$head" >/dev/null 2>&1
+    rc=$?
+    if ((rc == 0)); then
+        return 0
+    fi
+    if ((rc == 1)); then
+        die "$label base $(short "$base") is not an ancestor of head $(short "$head"); unrelated histories are not a rebase delta"
+    fi
+    die "cannot determine whether $label base $(short "$base") is an ancestor of head $(short "$head")"
+}
+
+reject_merge_series() {
+    local base=$1 head=$2 label=$3 merges
+    merges=$(GIT_NO_REPLACE_OBJECTS=1 git -C "$repo_dir" rev-list \
+        --min-parents=2 "$base..$head") ||
+        die "cannot inspect the $label series for merge commits"
+    [[ -z $merges ]] ||
+        die "the $label series contains merge commits; record/verify requires a linear series (use check with four explicit revisions for a snapshot comparison)"
+}
+
+# ---------------------------------------------------------------- compare -----
+compare() (
+    local old_base=$1 old_head=$2 new_base=$3 new_head=$4
+    local tmp before_bytes after_bytes before_files after_files cmp_rc
+    require_ancestor "$old_base" "$old_head" "old"
+    require_ancestor "$new_base" "$new_head" "new"
+    tmp=$(mktemp -d) || die "cannot create a temporary directory"
+    # The subshell gives this temporary directory one unambiguous lifetime. Expanding the path
+    # while constructing trap source would turn a caller-influenced TMPDIR quote into code.
+    trap 'rm -rf -- "$tmp"' EXIT
+
+    if ! normalized_diff "$old_base" "$old_head" > "$tmp/before"; then
+        indeterminate "could not generate the recorded pre-rebase diff"
+        return 3
+    fi
+    if ! normalized_diff "$new_base" "$new_head" > "$tmp/after"; then
+        indeterminate "could not generate the current post-rebase diff"
+        return 3
+    fi
+    if ! before_bytes=$(raw_diff_bytes "$old_base" "$old_head"); then
+        indeterminate "could not measure the recorded pre-rebase diff"
+        return 3
+    fi
+    if ! after_bytes=$(raw_diff_bytes "$new_base" "$new_head"); then
+        indeterminate "could not measure the current post-rebase diff"
+        return 3
+    fi
+    if ! before_files=$(changed_files "$old_base" "$old_head"); then
+        indeterminate "could not enumerate files in the recorded pre-rebase diff"
+        return 3
+    fi
+    if ! after_files=$(changed_files "$new_base" "$new_head"); then
+        indeterminate "could not enumerate files in the current post-rebase diff"
+        return 3
+    fi
+    if [[ ! $before_bytes =~ ^[0-9]+$ || ! $after_bytes =~ ^[0-9]+$ ||
+          ! $before_files =~ ^[0-9]+$ || ! $after_files =~ ^[0-9]+$ ]]; then
+        indeterminate "a diff measurement command returned malformed output"
+        return 3
+    fi
+
+    printf 'before: %s..%s  %s bytes, %s file(s)\n' \
+        "$(short "$old_base")" "$(short "$old_head")" "$before_bytes" "$before_files"
+    printf 'after:  %s..%s  %s bytes, %s file(s)\n' \
+        "$(short "$new_base")" "$(short "$new_head")" "$after_bytes" "$after_files"
+
+    cmp -s "$tmp/before" "$tmp/after"
+    cmp_rc=$?
+    case $cmp_rc in
+        0)
+            printf '%s: OK — every content line matches; only blob hashes and hunk offsets moved\n' "$PROGRAM"
+            return 0
+            ;;
+        1) ;;
+        *)
+            indeterminate "could not compare the generated diffs"
+            return 3
+            ;;
+    esac
+
+    local only_after only_before
+    # LC_ALL=C ON THE `comm` CALLS TOO, NOT JUST THE SORTS. `comm` re-validates its input
+    # ordering in the AMBIENT locale, so C-collated files read as unsorted under any UTF-8
+    # locale; it warns, the chain below fires, and this degrades to INDETERMINATE on a rewrite
+    # it had already detected correctly. The two must agree on collation or the pairing is a
+    # coin flip decided by the caller's environment.
+    if ! LC_ALL=C sort "$tmp/before" > "$tmp/before.sorted" ||
+       ! LC_ALL=C sort "$tmp/after" > "$tmp/after.sorted" ||
+       ! LC_ALL=C comm -13 "$tmp/before.sorted" "$tmp/after.sorted" > "$tmp/only-after" ||
+       ! LC_ALL=C comm -23 "$tmp/before.sorted" "$tmp/after.sorted" > "$tmp/only-before"; then
+        indeterminate "the deltas differ, but diagnostic generation failed"
+        return 3
+    fi
+    only_after=$(<"$tmp/only-after")
+    only_before=$(<"$tmp/only-before")
+
+    printf '\n%s: FAIL — the rebase changed your delta\n\n' "$PROGRAM"
+    printf '  lines only in the new delta: %s\n' "$(printf '%s\n' "$only_after" | grep -c . || true)"
+    printf '  lines only in the old delta: %s\n' "$(printf '%s\n' "$only_before" | grep -c . || true)"
+    printf '\n'
+    printf '%s\n' "$only_after" | head -n 12 | sed 's/^/  + /'
+    printf '%s\n' "$only_before" | head -n 12 | sed 's/^/  - /'
+    cat <<'EOF'
+
+A silent whole-file re-serialization looks exactly like this: the rebase reports
+success, `git status` is clean, and the delta is many times larger. Check with
+`git check-attr merge -- <path>` whether a custom merge driver is bound, and
+replay with `git rebase --apply`, which uses `git apply` instead of a per-file
+3-way merge and therefore preserves bytes on a conflict-free rebase.
+EOF
+    return 1
+)
+
+# ----------------------------------------------------------------- record -----
+cmd_record() {
+    local base_rev="" onto_rev="" upstream="" old_base old_head onto series state state_tmp subjects_tmp subject_count
+    while (($#)); do
+        case $1 in
+            --base) base_rev=${2:-}; shift 2 || die "--base needs a value" ;;
+            --onto) onto_rev=${2:-}; shift 2 || die "--onto needs a value" ;;
+            --repo) shift 2 ;;
+            *) die "unexpected argument to record: $1" ;;
+        esac
+    done
+
+    old_head=$(resolve HEAD) || die "cannot resolve HEAD"
+
+    if [[ -z $base_rev || -z $onto_rev ]]; then
+        upstream=$(GIT_NO_REPLACE_OBJECTS=1 git -C "$repo_dir" rev-parse \
+            --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null) || upstream=""
+        [[ -n $upstream ]] || die "no upstream is configured for this branch; pass both missing identities explicitly with --base <rev> and --onto <rev>.
+   Guessing a rebase identity is the error this tool exists to prevent."
+    fi
+
+    if [[ -n $base_rev ]]; then
+        old_base=$(resolve "$base_rev") || die "cannot resolve --base $base_rev"
+    else
+        old_base=$(GIT_NO_REPLACE_OBJECTS=1 git -C "$repo_dir" merge-base \
+            "$upstream" HEAD 2>/dev/null) ||
+            die "cannot compute merge-base against $upstream; pass --base <rev>"
+    fi
+    if [[ -n $onto_rev ]]; then
+        onto=$(resolve "$onto_rev") || die "cannot resolve --onto $onto_rev"
+    else
+        onto=$(resolve "$upstream") || die "cannot resolve upstream $upstream as the intended onto commit"
+    fi
+
+    [[ $old_base != "$old_head" ]] || die "base and head are the same commit; there is no delta to guard"
+
+    require_ancestor "$old_base" "$old_head" "old"
+    reject_merge_series "$old_base" "$old_head" "recorded"
+
+    series=$(GIT_NO_REPLACE_OBJECTS=1 git -C "$repo_dir" rev-list \
+        --count "$old_base..$old_head") || die "cannot count the series"
+    [[ $series =~ ^[1-9][0-9]*$ ]] || die "git returned a malformed series count"
+
+    state=$(state_path) || die "not inside a git work tree"
+    umask 077
+    state_tmp=$(mktemp "${state}.tmp.XXXXXX") || die "cannot create a temporary state file"
+    subjects_tmp=$(mktemp "${state}.subjects.tmp.XXXXXX") || {
+        rm -f "$state_tmp"
+        die "cannot create a temporary subjects file"
+    }
+    if ! {
+        printf 'old_base=%s\n' "$old_base"
+        printf 'old_head=%s\n' "$old_head"
+        printf 'series=%s\n' "$series"
+        printf 'onto=%s\n' "$onto"
+    } > "$state_tmp"; then
+        rm -f "$state_tmp" "$subjects_tmp"
+        die "cannot write the recorded state"
+    fi
+    # Commit subjects, newest first. They are not identities and never authorize
+    # base derivation; load_record reconstructs them from the recorded SHAs only
+    # to detect an incomplete or mismatched state/sidecar pair.
+    if ! GIT_NO_REPLACE_OBJECTS=1 git -C "$repo_dir" log \
+        --no-show-signature --format=%s \
+        "$old_base..$old_head" > "$subjects_tmp"; then
+        rm -f "$state_tmp" "$subjects_tmp"
+        die "cannot record the commit subjects"
+    fi
+    if ! subject_count=$(wc -l < "$subjects_tmp" | tr -d '[:space:]') ||
+       [[ ! $subject_count =~ ^[0-9]+$ || $subject_count != "$series" ]]; then
+        rm -f "$state_tmp" "$subjects_tmp"
+        die "the recorded subjects are incomplete (expected $series line(s), found ${subject_count:-unknown})"
+    fi
+    if ! chmod 600 "$state_tmp" "$subjects_tmp" ||
+       ! mv -fT "$subjects_tmp" "${state}.subjects" ||
+       ! mv -fT "$state_tmp" "$state"; then
+        rm -f "$state_tmp" "$subjects_tmp"
+        die "cannot publish the complete recorded state"
+    fi
+
+    printf 'recorded: base %s  head %s  series %s commit(s)  onto %s\n' \
+        "$old_base" "$old_head" "$series" "$onto"
+    printf 'state: %s\n' "$state"
+    printf 'rebase with the captured identity: git rebase --apply %s\n' "$onto"
+    printf 'after the rebase, run: %s verify\n' "$PROGRAM"
+}
+
+# ----------------------------------------------------------------- verify -----
+cmd_verify() {
+    local new_base_rev="" keep=0 state new_head new_base
+    local old_base old_head onto explicit_base ancestor_rc
+    while (($#)); do
+        case $1 in
+            --new-base) new_base_rev=${2:-}; shift 2 || die "--new-base needs a value" ;;
+            --keep) keep=1; shift ;;
+            --repo) shift 2 ;;
+            *) die "unexpected argument to verify: $1" ;;
+        esac
+    done
+
+    state=$(state_path) || die "not inside a git work tree"
+    if [[ ! -e $state && ! -L $state ]]; then
+        printf '%s: INDETERMINATE — nothing was recorded for this worktree.\n' "$PROGRAM" >&2
+        # shellcheck disable=SC2016
+        printf '   Run `%s record` BEFORE the rebase. Reconstructing the\n' "$PROGRAM" >&2
+        printf '   pre-rebase head afterwards is the mistake this tool exists to remove.\n' >&2
+        return 3
+    fi
+    load_record "$state" || return 3
+    old_base=$STATE_OLD_BASE
+    old_head=$STATE_OLD_HEAD
+    onto=$STATE_ONTO
+
+    require_ancestor "$old_base" "$old_head" "recorded old"
+    reject_merge_series "$old_base" "$old_head" "recorded"
+
+    new_head=$(resolve HEAD) || die "cannot resolve HEAD"
+
+    new_base=$onto
+    if [[ -n $new_base_rev ]]; then
+        explicit_base=$(resolve "$new_base_rev") || die "cannot resolve --new-base $new_base_rev"
+        if [[ $explicit_base != "$onto" ]]; then
+            indeterminate "explicit new base $explicit_base contradicts recorded onto commit $onto"
+            return 3
+        fi
+    fi
+    GIT_NO_REPLACE_OBJECTS=1 git -C "$repo_dir" merge-base \
+        --is-ancestor "$new_base" "$new_head" >/dev/null 2>&1
+    ancestor_rc=$?
+    if ((ancestor_rc == 1)); then
+        indeterminate "HEAD does not contain the recorded onto commit $new_base"
+        return 3
+    fi
+    if ((ancestor_rc != 0)); then
+        indeterminate "cannot establish whether HEAD contains the recorded onto commit"
+        return 3
+    fi
+    reject_merge_series "$new_base" "$new_head" "current"
+
+    local rc=0
+    compare "$old_base" "$old_head" "$new_base" "$new_head" || rc=$?
+    if ((rc == 0 || rc == 1)); then
+        ((keep)) || rm -f "$state" "${state}.subjects"
+    fi
+    return "$rc"
+}
+
+# ------------------------------------------------------------------ other -----
+cmd_conflict_files() (
+    local null_output=0 tmp record metadata path mode object stage extra
+    local kind quoted
+    local -a order=()
+    local -A seen=() kinds=()
+    while (($#)); do
+        case $1 in
+            -z | --null) null_output=1; shift ;;
+            --repo) shift 2 ;;
+            *) die "unexpected argument to conflict-files: $1" ;;
+        esac
+    done
+
+    tmp=$(mktemp) || die "cannot create a temporary unmerged-index file"
+    trap 'rm -f -- "$tmp"' EXIT
+    if ! GIT_NO_REPLACE_OBJECTS=1 git -C "$repo_dir" ls-files \
+        --unmerged -z -- > "$tmp"; then
+        die "cannot enumerate the unmerged index"
+    fi
+
+    while IFS= read -r -d '' record; do
+        [[ $record == *$'\t'* ]] || die "git returned a malformed unmerged-index record"
+        metadata=${record%%$'\t'*}
+        path=${record#*$'\t'}
+        read -r mode object stage extra <<< "$metadata"
+        [[ $mode =~ ^[0-7]{6}$ && $object =~ ^[0-9a-f]+$ && $stage =~ ^[123]$ && -z ${extra:-} ]] ||
+            die "git returned malformed unmerged-index metadata"
+        if [[ -z ${seen["$path"]+present} ]]; then
+            seen["$path"]=1
+            order+=("$path")
+            kinds["$path"]=file
+        fi
+        # A file/submodule type conflict is a gitlink risk too: one 160000 stage
+        # is enough to keep the on-disk directory away from file-oriented tools.
+        if [[ $mode == 160000 ]]; then
+            kinds["$path"]=gitlink
+        fi
+    done < "$tmp"
+
+    for path in "${order[@]}"; do
+        kind=${kinds["$path"]}
+        if [[ $kind == gitlink ]]; then
+            printf -v quoted '%q' "$path"
+            printf '%s: skipped conflicted gitlink %s (index mode 160000); handle it as a submodule, never as a file\n' \
+                "$PROGRAM" "$quoted" >&2
+            continue
+        fi
+        if ((null_output)); then
+            printf '%s\0' "$path"
+        else
+            [[ $path != *$'\n'* ]] || die "a conflicted file path contains a newline; rerun conflict-files --null"
+            printf '%s\n' "$path"
+        fi
+    done
+)
+
+cmd_check() {
+    (($# == 4)) || die "check needs exactly four revisions: OLD_BASE OLD_HEAD NEW_BASE NEW_HEAD"
+    local r=() rev
+    for rev in "$@"; do
+        local sha
+        sha=$(resolve "$rev") || die "not a commit: $rev"
+        r+=("$sha")
+    done
+    compare "${r[0]}" "${r[1]}" "${r[2]}" "${r[3]}"
+}
+
+cmd_status() {
+    local state
+    state=$(state_path) || die "not inside a git work tree"
+    if [[ ! -e $state && ! -L $state ]]; then
+        printf '%s: no recording for this worktree (%s)\n' "$PROGRAM" "$state"
+        return 3
+    fi
+    load_record "$state" || return 3
+    printf 'state: %s\n' "$state"
+    printf 'old_base=%s\nold_head=%s\nseries=%s\nonto=%s\n' \
+        "$STATE_OLD_BASE" "$STATE_OLD_HEAD" "$STATE_SERIES" "$STATE_ONTO"
+}
+
+cmd_clear() {
+    local state
+    state=$(state_path) || die "not inside a git work tree"
+    rm -f "$state" "$state.subjects"
+    printf '%s: cleared %s\n' "$PROGRAM" "$state"
+}
+
+# ------------------------------------------------------------------- main -----
+main() {
+    local args=()
+    # --repo may appear anywhere; pull it out first so every subcommand honours it.
+    while (($#)); do
+        case $1 in
+            --repo)
+                repo_dir=${2:-}
+                [[ -n $repo_dir ]] || die "--repo needs a value"
+                shift 2
+                ;;
+            -h | --help)
+                usage
+                return 0
+                ;;
+            *)
+                args+=("$1")
+                shift
+                ;;
+        esac
+    done
+    [[ -n $repo_dir ]] || repo_dir=$PWD
+    git -C "$repo_dir" rev-parse --show-toplevel >/dev/null 2>&1 ||
+        die "$repo_dir is not inside a git work tree"
+
+    ((${#args[@]})) || { usage; return 2; }
+    local sub=${args[0]}
+    unset 'args[0]'
+    set -- ${args[@]+"${args[@]}"}
+
+    case $sub in
+        record) cmd_record "$@" ;;
+        verify) cmd_verify "$@" ;;
+        check) cmd_check "$@" ;;
+        conflict-files) cmd_conflict_files "$@" ;;
+        status) cmd_status ;;
+        clear) cmd_clear ;;
+        *) die "unknown subcommand: $sub (record|verify|check|conflict-files|status|clear)" ;;
+    esac
+}
+
+main "$@"

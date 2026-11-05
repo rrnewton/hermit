@@ -1,0 +1,96 @@
+# --- build outputs (produced by ./setup) ---
+# top-level convenience symlink -> the tracked common dispatcher
+/bin
+/rs/target/
+/rs/.agent-utils-locks/
+/rs/.agent-utils-snapshots/
+
+# --- python ---
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+.venv/
+
+# --- default profile store (dagrun Feature D auto-logging) ---
+# Runs and sweeps auto-append resource-usage CSVs here by default; it is machine-local
+# perf data, not source. Delete this line to check the history in instead (project choice).
+.dagrun/
+
+# --- default run spool + audit log (herdr-run) ---
+# Command stdout/stderr/exit codes and the sandbox-crossing audit log land here by default; it is
+# machine-local command OUTPUT, not source, and must never be committed.
+.herdr-run/
+.herdr-agent/
+.herdr-agents/
+.herdr-chat/
+
+# --- default fired-state store (tick-hub) ---
+# `tick-hub tick --flush` writes per-reminder last-fired epochs here by default; it is
+# machine-local runtime state, not source.
+.tick-hub/
+
+# --- default work dir (parallel-experiment-runner) ---
+# A sweep writes per-worker logs + its sample store under `<work-dir>/ignored/` by default;
+# it is machine-local runtime output, not source.
+ignored/
+
+# --- vibe-talk (Discord/voice bridge service) ---
+# Its own build tree: vibe-talk is outside the rs/ workspace and has its own target dir. Keep the
+# wildcard so ignored artifacts left in a pre-rename checkout remain ignored after an update.
+/*-talk/target/
+# A filled-in configuration holds the Discord bot token and this server's API tokens.
+# Only vibe-talk.example.toml is tracked; a real one must never be committed.
+/*-talk/*-talk.toml
+/*-talk/*.local.toml
+/*-talk/.env
+# Local QA output: screenshots, traces, console/network logs from Playwright runs against
+# a locally running vibe-talk. Evidence, never source; images must never be committed.
+/*-talk/debug/
+
+# --- editor / os ---
+*.swp
+.DS_Store
+
+# vibe-talk local credentials and scratch — never commit these.
+# token1/token2 are the read/write bearer tokens.
+#
+# KEEP the per-checkout credential-file rule even though nothing reads that path any more:
+# scripts/run.sh no longer has a per-checkout config layer, so a file there is
+# inert — but it is exactly where someone would put credentials out of habit,
+# and an ignore rule costs nothing. Do not "clean this up" as dead config.
+# The *~ rule at the bottom matters for the same reason: an editor backup of a
+# credential file is just as sensitive as the original. Wildcards keep artifacts
+# from a pre-rename checkout protected too.
+/*-talk/.*-talk.env
+/*-talk/token1
+/*-talk/token2
+/*-talk/cloudflared.deb
+*~
+
+# Agent worktrees created for parallel work. Never tracked: they are checkouts of
+# this same repository, and committing one would nest the repo inside itself.
+/.claude/
+
+# A test fixture that is a real cargo project, so running its own suite leaves a
+# build tree inside the repository. `/rs/target/` above does not cover it: this is
+# a NESTED target dir belonging to the fixture, not to the workspace, and the
+# workspace pattern is anchored. Left untracked it is merely noise; the reason it
+# is named here is that `git add rs/` sweeps 63 artifact files into a commit,
+# which is exactly what happened once.
+/rs/safe-ci-dag-runner/tests/fixtures/*/target/
+
+# Per-run profiling CSVs the runner appends beside its own sources.
+/rs/safe-ci-dag-runner/.safe-ci-dag-runner/
+
+# The same profiling directory, at the repo root when the runner is invoked from here.
+/.safe-ci-dag-runner/
+py/tests/js/browser/benchmark-report.txt
+py/tests/js/browser/benchmark-report.json
+py/tests/js/browser/qa-archive-report.txt
+
+# Agent session registry and bridge state
+.agentctl/

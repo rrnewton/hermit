@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-186-c29dc33c10f",
+    "issue_id": "agent-utils-186",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Delivered by #217 markdown-blocks (b81e6ad2): bare URLs are comrak autolinks, sanitised by ammonia with url_schemes {http, https}, target=_blank and rel='noopener noreferrer nofollow' (src/render.rs); #227 github-link-abbrev labels GitHub links. Closing.",
+    "created_at": "2026-10-12T19:31:37.424075238Z",
+    "updated_at": "2026-10-12T19:31:37.424075238Z"
+  }
+]

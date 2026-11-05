@@ -1,0 +1,106 @@
+/* **********************************************************
+ * Copyright (c) 2017-2025 Google, Inc.  All rights reserved.
+ * **********************************************************/
+
+/*
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * * Redistributions of source code must retain the above copyright notice,
+ *   this list of conditions and the following disclaimer.
+ *
+ * * Redistributions in binary form must reproduce the above copyright notice,
+ *   this list of conditions and the following disclaimer in the documentation
+ *   and/or other materials provided with the distribution.
+ *
+ * * Neither the name of Google, Inc. nor the names of its contributors may be
+ *   used to endorse or promote products derived from this software without
+ *   specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL VMWARE, INC. OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH
+ * DAMAGE.
+ */
+
+#ifndef _REUSE_TIME_H_
+#define _REUSE_TIME_H_
+
+#include <stdint.h>
+
+#include <mutex>
+#include <string>
+#include <unordered_map>
+
+#include "analysis_tool.h"
+#include "memref.h"
+#include "trace_entry.h"
+
+namespace dynamorio {
+namespace drmemtrace {
+
+class reuse_time_t : public analysis_tool_t {
+public:
+    reuse_time_t(unsigned int line_size, unsigned int verbose);
+    ~reuse_time_t() override;
+    std::string
+    initialize_stream(memtrace_stream_t *serial_stream) override;
+    std::string
+    initialize_shard_type(shard_type_t shard_type) override;
+    bool
+    process_memref(const memref_t &memref) override;
+    bool
+    print_results() override;
+    bool
+    parallel_shard_supported() override;
+    void *
+    parallel_shard_init_stream(int shard_index, void *worker_data,
+                               memtrace_stream_t *stream) override;
+    bool
+    parallel_shard_exit(void *shard_data) override;
+    bool
+    parallel_shard_memref(void *shard_data, const memref_t &memref) override;
+    std::string
+    parallel_shard_error(void *shard_data) override;
+
+protected:
+    // Just like for reuse_distance_t, we assume that the shard unit is the unit over
+    // which we should measure time.  By default this is a traced thread.
+    struct shard_data_t {
+        std::unordered_map<addr_t, int64_t> time_map;
+        int64_t time_stamp = 0;
+        int64_t total_instructions = 0;
+        std::unordered_map<int64_t, int64_t> reuse_time_histogram;
+        memref_tid_t tid = 0; // For SHARD_BY_THREAD.
+        int64_t core = 0;     // For SHARD_BY_CORE.
+        std::string error;
+    };
+
+    void
+    print_shard_results(const shard_data_t *shard);
+
+    const unsigned int knob_verbose_;
+    const unsigned int knob_line_size_;
+    const unsigned int line_size_bits_;
+
+    static const std::string TOOL_NAME;
+
+    std::unordered_map<int, shard_data_t *> shard_map_;
+    // This mutex is only needed in parallel_shard_init.  In all other accesses to
+    // shard_map (process_memref, print_results) we are single-threaded.
+    std::mutex shard_map_mutex_;
+    shard_type_t shard_type_ = SHARD_BY_THREAD;
+    memtrace_stream_t *serial_stream_ = nullptr;
+};
+
+} // namespace drmemtrace
+} // namespace dynamorio
+
+#endif /* _REUSE_TIME_H_ */

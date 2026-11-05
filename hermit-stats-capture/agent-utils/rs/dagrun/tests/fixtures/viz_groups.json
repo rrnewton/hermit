@@ -1,0 +1,7 @@
+{"steps":[
+  {"group":"build","job":"app","cmd":"true","labels":["full"]},
+  {"group":"build","job":"lib","cmd":"true","deps":["build.app"]},
+  {"group":"test","job":"unit","cmd":"true","labels":["quick","full"],"deps":["build.app","build.lib"]},
+  {"group":"test","job":"lint","cmd":"true","labels":["quick"],"deps":["build.app"]},
+  {"group":"e2e","job":"smoke","cmd":"true","labels":["full"],"deps":["build.app","test.unit"]}
+]}

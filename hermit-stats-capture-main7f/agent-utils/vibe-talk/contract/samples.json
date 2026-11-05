@@ -1,0 +1,1520 @@
+{
+  "ApiErrorBody": [
+    {
+      "detail": "why",
+      "error": "bad_request"
+    }
+  ],
+  "BookmarkResponse": [
+    {
+      "bookmark": {
+        "anchor": {
+          "message_id": "301",
+          "place": "above",
+          "thread_id": "t1",
+          "timestamp": "2026-09-25T12:00:00+00:00"
+        },
+        "revision": 1790000000002
+      },
+      "bookmark_notice": "the bookmark is this server's own",
+      "changed": true,
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      }
+    },
+    {
+      "bookmark": {
+        "anchor": {
+          "message_id": "301",
+          "place": "below",
+          "timestamp": "2026-09-25T12:00:00+00:00"
+        },
+        "revision": 1790000000002
+      },
+      "bookmark_notice": "the bookmark is this server's own",
+      "changed": false,
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      }
+    },
+    {
+      "bookmark": {
+        "anchor": null,
+        "revision": 0
+      },
+      "bookmark_notice": "the bookmark is this server's own",
+      "changed": true,
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      }
+    }
+  ],
+  "ClientConfigResponse": [
+    {
+      "channel_discovery_supported": true,
+      "channel_registration_supported": true,
+      "channels": [
+        {
+          "added": false,
+          "alias": null,
+          "id": "100",
+          "label": "general",
+          "provider": "discord",
+          "writable": true
+        },
+        {
+          "added": true,
+          "alias": "ops",
+          "id": "100",
+          "label": "general",
+          "provider": "discord",
+          "writable": false
+        },
+        {
+          "added": false,
+          "alias": null,
+          "id": "C0123ABCDE",
+          "label": "team",
+          "provider": "slack",
+          "writable": true
+        }
+      ],
+      "chat_provider_name": "Chat",
+      "conversational_voice": {
+        "instance_id": "instance",
+        "name": "voice",
+        "settings_url": "https://voice.example/settings"
+      },
+      "elevenlabs_agent_id": "agent",
+      "hidden_channels": [
+        {
+          "added": false,
+          "alias": null,
+          "id": "3333333333",
+          "label": "home base",
+          "provider": "discord",
+          "writable": true
+        }
+      ],
+      "idempotent_posts_supported": true,
+      "live_delivery": "push",
+      "live_poll_seconds": 5,
+      "noise_rules": {
+        "matching": "a message counts as read when its whole text is one of these",
+        "rules": [
+          "Working…",
+          "Thinking*"
+        ]
+      },
+      "owner_author_id": "7",
+      "providers": [
+        {
+          "channel_discovery_supported": false,
+          "channel_registration_supported": false,
+          "idempotent_posts_supported": true,
+          "key": "discord",
+          "live_delivery": "push",
+          "live_poll_seconds": 5,
+          "name": "Discord",
+          "owner_author_id": "7",
+          "self_author_id": "9",
+          "threading_supported": true,
+          "upstream_clear_supported": true,
+          "upstream_read_mark_supported": false
+        },
+        {
+          "channel_discovery_supported": true,
+          "channel_registration_supported": true,
+          "key": "slack",
+          "live_delivery": "poll",
+          "live_poll_seconds": 30,
+          "name": "Slack",
+          "owner_author_id": null,
+          "replies_in_thread": true,
+          "self_author_id": "U0SELF0001",
+          "threading_supported": true,
+          "upstream_read_mark_supported": false
+        }
+      ],
+      "read_aloud": {
+        "backend": "browser",
+        "label": "This device",
+        "local_only": false,
+        "playback": "audio"
+      },
+      "replay_enabled": true,
+      "replies_in_thread": true,
+      "self_author_id": "9",
+      "speech_prep_enabled": true,
+      "threading_supported": true,
+      "token_scope": "write",
+      "upstream_clear_supported": true,
+      "upstream_read_mark_supported": true,
+      "version": "0.0.0",
+      "voice_prompt": {
+        "changeable": true,
+        "delivery": "page",
+        "edited_from_version": 8,
+        "instructions": "Call me Sam.",
+        "max_instructions_chars": 4000,
+        "max_system_prompt_chars": 20000,
+        "prompt_version": 9,
+        "system_prompt": "You read me the chat.",
+        "system_prompt_edited": true
+      },
+      "voice_settings": {
+        "ask_before_send": true,
+        "changeable": true
+      }
+    },
+    {
+      "channel_discovery_supported": false,
+      "channel_registration_supported": false,
+      "channels": [
+        {
+          "added": false,
+          "alias": null,
+          "id": "100",
+          "label": "general",
+          "provider": "discord",
+          "writable": true
+        },
+        {
+          "added": true,
+          "alias": "ops",
+          "id": "100",
+          "label": "general",
+          "provider": "discord",
+          "writable": false
+        },
+        {
+          "added": false,
+          "alias": null,
+          "id": "C0123ABCDE",
+          "label": "team",
+          "provider": "slack",
+          "writable": true
+        }
+      ],
+      "chat_provider_name": "Chat",
+      "conversational_voice": {
+        "name": "voice"
+      },
+      "elevenlabs_agent_id": null,
+      "live_delivery": "poll",
+      "live_poll_seconds": 5,
+      "owner_author_id": null,
+      "providers": [
+        {
+          "channel_discovery_supported": false,
+          "channel_registration_supported": false,
+          "key": "discord",
+          "live_delivery": "poll",
+          "live_poll_seconds": 5,
+          "name": "Discord",
+          "owner_author_id": null,
+          "self_author_id": null,
+          "threading_supported": false,
+          "upstream_read_mark_supported": false
+        },
+        {
+          "channel_discovery_supported": false,
+          "channel_registration_supported": false,
+          "key": "slack",
+          "live_delivery": "poll",
+          "live_poll_seconds": 30,
+          "name": "Slack",
+          "owner_author_id": null,
+          "replies_in_thread": true,
+          "self_author_id": null,
+          "threading_supported": true,
+          "upstream_read_mark_supported": false
+        }
+      ],
+      "read_aloud": {
+        "backend": "browser",
+        "label": "This device",
+        "local_only": true,
+        "playback": "browser"
+      },
+      "replay_enabled": false,
+      "self_author_id": null,
+      "speech_prep_enabled": false,
+      "summaries_unavailable": "elevenlabs.api_key is not configured",
+      "threading_supported": false,
+      "token_scope": "read",
+      "upstream_read_mark_supported": false,
+      "version": "0.0.0"
+    },
+    {
+      "channel_discovery_supported": false,
+      "channel_registration_supported": false,
+      "channels": [
+        {
+          "added": false,
+          "alias": null,
+          "id": "100",
+          "label": "general",
+          "provider": "discord",
+          "writable": true
+        },
+        {
+          "added": true,
+          "alias": "ops",
+          "id": "100",
+          "label": "general",
+          "provider": "discord",
+          "writable": false
+        },
+        {
+          "added": false,
+          "alias": null,
+          "id": "C0123ABCDE",
+          "label": "team",
+          "provider": "slack",
+          "writable": true
+        }
+      ],
+      "chat_provider_name": "Chat",
+      "conversational_voice": {
+        "name": "voice"
+      },
+      "elevenlabs_agent_id": null,
+      "live_delivery": "off",
+      "live_poll_seconds": 5,
+      "owner_author_id": null,
+      "providers": [
+        {
+          "channel_discovery_supported": false,
+          "channel_registration_supported": false,
+          "key": "discord",
+          "live_delivery": "off",
+          "live_poll_seconds": 5,
+          "name": "Discord",
+          "owner_author_id": null,
+          "self_author_id": null,
+          "threading_supported": false,
+          "upstream_read_mark_supported": false
+        },
+        {
+          "channel_discovery_supported": false,
+          "channel_registration_supported": false,
+          "key": "slack",
+          "live_delivery": "poll",
+          "live_poll_seconds": 30,
+          "name": "Slack",
+          "owner_author_id": null,
+          "replies_in_thread": true,
+          "self_author_id": null,
+          "threading_supported": true,
+          "upstream_read_mark_supported": false
+        }
+      ],
+      "read_aloud": {
+        "backend": "browser",
+        "label": "This device",
+        "local_only": true,
+        "playback": "browser"
+      },
+      "replay_enabled": false,
+      "self_author_id": null,
+      "speech_prep_enabled": false,
+      "summaries_unavailable": "elevenlabs.api_key is not configured",
+      "threading_supported": false,
+      "token_scope": "read",
+      "upstream_read_mark_supported": false,
+      "version": "0.0.0"
+    }
+  ],
+  "CommittedPostResponse": [
+    {
+      "parts": [
+        {
+          "author": "someone",
+          "author_id": "7",
+          "author_is_bot": false,
+          "channel_id": "100",
+          "content": "hello",
+          "id": "300",
+          "reply_to": null,
+          "spoken_time": "",
+          "timestamp": "2026-09-25T12:00:00+00:00"
+        }
+      ],
+      "posted": {
+        "author": "someone",
+        "author_id": "7",
+        "author_is_bot": false,
+        "channel_id": "100",
+        "content": "hello",
+        "id": "300",
+        "reply_to": null,
+        "spoken_time": "",
+        "timestamp": "2026-09-25T12:00:00+00:00"
+      },
+      "serial": 3
+    }
+  ],
+  "LiveDeleteEvent": [
+    {
+      "channel_id": "100",
+      "from_tail": false,
+      "message_id": "300",
+      "replayed": true
+    }
+  ],
+  "LiveMessageEvent": [
+    {
+      "from_tail": false,
+      "message": {
+        "author": "someone",
+        "author_id": "7",
+        "author_is_bot": false,
+        "channel_id": "100",
+        "content": "hello",
+        "id": "300",
+        "reply_to": null,
+        "spoken_time": "",
+        "timestamp": "2026-09-25T12:00:00+00:00"
+      },
+      "replayed": false,
+      "self_posted": false,
+      "untrusted_content_notice": "third-party text"
+    },
+    {
+      "from_tail": true,
+      "message": {
+        "author": "someone",
+        "author_id": "7",
+        "author_is_bot": false,
+        "channel_id": "100",
+        "content": "[build-bot] Status, 15:05Z. hello",
+        "content_html": "<p><em>hello</em></p>\n",
+        "heading": {
+          "cut": 28,
+          "tag": "build-bot",
+          "time": "15:05Z",
+          "title": "Status"
+        },
+        "id": "301",
+        "noise": true,
+        "reactions": [
+          {
+            "count": 1,
+            "emoji": "👀"
+          },
+          {
+            "count": 2,
+            "custom": true,
+            "custom_id": "112233",
+            "emoji": "party-parrot"
+          }
+        ],
+        "reply_to": "200",
+        "spoken_content": "hello, spoken",
+        "spoken_time": "noon",
+        "thread": {
+          "id": "t1",
+          "is_root": false,
+          "reply_count": 3,
+          "reply_count_exact": true,
+          "root_message_id": "200"
+        },
+        "timestamp": "2026-09-25T12:00:00+00:00"
+      },
+      "replayed": true,
+      "self_posted": true,
+      "untrusted_content_notice": "third-party text"
+    }
+  ],
+  "LiveResetEvent": [
+    {
+      "detail": "re-read",
+      "missed": 12
+    }
+  ],
+  "Message": [
+    {
+      "author": "someone",
+      "author_id": "7",
+      "author_is_bot": false,
+      "channel_id": "100",
+      "content": "hello",
+      "id": "300",
+      "reply_to": null,
+      "spoken_time": "",
+      "timestamp": "2026-09-25T12:00:00+00:00"
+    },
+    {
+      "author": "someone",
+      "author_id": "7",
+      "author_is_bot": false,
+      "channel_id": "100",
+      "content": "[build-bot] Status, 15:05Z. hello",
+      "content_html": "<p><em>hello</em></p>\n",
+      "heading": {
+        "cut": 28,
+        "tag": "build-bot",
+        "time": "15:05Z",
+        "title": "Status"
+      },
+      "id": "301",
+      "noise": true,
+      "reactions": [
+        {
+          "count": 1,
+          "emoji": "👀"
+        },
+        {
+          "count": 2,
+          "custom": true,
+          "custom_id": "112233",
+          "emoji": "party-parrot"
+        }
+      ],
+      "reply_to": "200",
+      "spoken_content": "hello, spoken",
+      "spoken_time": "noon",
+      "thread": {
+        "id": "t1",
+        "is_root": false,
+        "reply_count": 3,
+        "reply_count_exact": true,
+        "root_message_id": "200"
+      },
+      "timestamp": "2026-09-25T12:00:00+00:00"
+    },
+    {
+      "author": "someone",
+      "author_id": "7",
+      "author_is_bot": false,
+      "channel_id": "100",
+      "content": "hello",
+      "id": "302",
+      "reactions": [],
+      "reply_to": null,
+      "spoken_time": "",
+      "timestamp": "2026-09-25T12:00:00+00:00"
+    }
+  ],
+  "MessagesResponse": [
+    {
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      },
+      "complete": false,
+      "dismissed": [
+        "300"
+      ],
+      "messages": [
+        {
+          "author": "someone",
+          "author_id": "7",
+          "author_is_bot": false,
+          "channel_id": "100",
+          "content": "hello",
+          "id": "300",
+          "reply_to": null,
+          "spoken_time": "",
+          "timestamp": "2026-09-25T12:00:00+00:00"
+        },
+        {
+          "author": "someone",
+          "author_id": "7",
+          "author_is_bot": false,
+          "channel_id": "100",
+          "content": "[build-bot] Status, 15:05Z. hello",
+          "content_html": "<p><em>hello</em></p>\n",
+          "heading": {
+            "cut": 28,
+            "tag": "build-bot",
+            "time": "15:05Z",
+            "title": "Status"
+          },
+          "id": "301",
+          "noise": true,
+          "reactions": [
+            {
+              "count": 1,
+              "emoji": "👀"
+            },
+            {
+              "count": 2,
+              "custom": true,
+              "custom_id": "112233",
+              "emoji": "party-parrot"
+            }
+          ],
+          "reply_to": "200",
+          "spoken_content": "hello, spoken",
+          "spoken_time": "noon",
+          "thread": {
+            "id": "t1",
+            "is_root": false,
+            "reply_count": 3,
+            "reply_count_exact": true,
+            "root_message_id": "200"
+          },
+          "timestamp": "2026-09-25T12:00:00+00:00"
+        }
+      ],
+      "untrusted_content_notice": "third-party text"
+    },
+    {
+      "as_of": "2026-10-12T09:00:00Z",
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      },
+      "complete": true,
+      "dismissed": [],
+      "messages": [
+        {
+          "author": "someone",
+          "author_id": "7",
+          "author_is_bot": false,
+          "channel_id": "100",
+          "content": "hello",
+          "id": "300",
+          "reply_to": null,
+          "spoken_time": "",
+          "timestamp": "2026-09-25T12:00:00+00:00"
+        }
+      ],
+      "untrusted_content_notice": "third-party text"
+    }
+  ],
+  "PendingPostResponse": [
+    {
+      "proposal": {
+        "channel_id": "111",
+        "channel_name": "lead team",
+        "expires_in_ms": 120000,
+        "handle": "AAAAAAAAAAAAAAAAAAAAAA",
+        "reply_to": "300",
+        "serial": 3,
+        "text": "on my way"
+      }
+    },
+    {
+      "proposal": {
+        "channel_id": "111",
+        "channel_name": "lead team",
+        "expires_in_ms": 1,
+        "handle": "BBBBBBBBBBBBBBBBBBBBBB",
+        "reply_to": null,
+        "serial": 4,
+        "text": "on my way"
+      }
+    },
+    {
+      "proposal": null
+    }
+  ],
+  "PinChangeResponse": [
+    {
+      "changed": true,
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      },
+      "message_id": "301",
+      "pin": {
+        "author": "someone",
+        "author_id": "7",
+        "author_is_bot": true,
+        "content": "(ops2) hello",
+        "content_html": "<p><strong>hello</strong></p>\n",
+        "heading": {
+          "cut": 7,
+          "tag": "ops2"
+        },
+        "message_id": "301",
+        "pinned_at_ms": 1790000000000,
+        "thread_id": "t1",
+        "thread_root": true,
+        "timestamp": "2026-09-25T12:00:00+00:00",
+        "truncated": true
+      },
+      "pinned": true,
+      "pins_notice": "pins are this server's own",
+      "revision": 1790000000001,
+      "unpinned": [
+        "200"
+      ]
+    },
+    {
+      "changed": false,
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      },
+      "message_id": "301",
+      "pinned": false,
+      "pins_notice": "pins are this server's own",
+      "revision": 1790000000001,
+      "unpinned": []
+    }
+  ],
+  "PinsResponse": [
+    {
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      },
+      "limit": 100,
+      "pins": [
+        {
+          "author": "someone",
+          "author_id": "7",
+          "author_is_bot": false,
+          "content": "hello",
+          "message_id": "300",
+          "pinned_at_ms": 1790000000000,
+          "thread_id": null,
+          "thread_root": false,
+          "timestamp": "2026-09-25T12:00:00+00:00",
+          "truncated": false
+        },
+        {
+          "author": "someone",
+          "author_id": "7",
+          "author_is_bot": true,
+          "content": "(ops2) hello",
+          "content_html": "<p><strong>hello</strong></p>\n",
+          "heading": {
+            "cut": 7,
+            "tag": "ops2"
+          },
+          "message_id": "301",
+          "pinned_at_ms": 1790000000000,
+          "thread_id": "t1",
+          "thread_root": true,
+          "timestamp": "2026-09-25T12:00:00+00:00",
+          "truncated": true
+        }
+      ],
+      "pins_notice": "pins are this server's own",
+      "revision": 1790000000000,
+      "untrusted_content_notice": "third-party text"
+    },
+    {
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      },
+      "limit": 100,
+      "pins": [],
+      "pins_notice": "pins are this server's own",
+      "revision": 0,
+      "untrusted_content_notice": "third-party text"
+    }
+  ],
+  "ThreadSummary": [
+    {
+      "id": "t1",
+      "reply_count": null,
+      "reply_count_exact": false,
+      "root": {
+        "author": "someone",
+        "author_id": "7",
+        "author_is_bot": false,
+        "channel_id": "100",
+        "content": "hello",
+        "id": "300",
+        "reply_to": null,
+        "spoken_time": "",
+        "timestamp": "2026-09-25T12:00:00+00:00"
+      },
+      "title": "a thread",
+      "updated_at": "2026-09-25T12:00:00+00:00"
+    },
+    {
+      "id": "t1",
+      "reply_count": null,
+      "reply_count_exact": false,
+      "root": null,
+      "title": "a thread",
+      "updated_at": "2026-09-25T12:00:00+00:00"
+    }
+  ],
+  "TimelineResponse": [
+    {
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      },
+      "dismissed": [
+        "150"
+      ],
+      "has_more": true,
+      "has_threads": true,
+      "limit": 50,
+      "messages": [
+        {
+          "author": "someone",
+          "author_id": "7",
+          "author_is_bot": false,
+          "channel_id": "100",
+          "content": "hello",
+          "id": "300",
+          "reply_to": null,
+          "spoken_time": "",
+          "timestamp": "2026-09-25T12:00:00+00:00"
+        },
+        {
+          "author": "someone",
+          "author_id": "7",
+          "author_is_bot": false,
+          "channel_id": "100",
+          "content": "[build-bot] Status, 15:05Z. hello",
+          "content_html": "<p><em>hello</em></p>\n",
+          "heading": {
+            "cut": 28,
+            "tag": "build-bot",
+            "time": "15:05Z",
+            "title": "Status"
+          },
+          "id": "301",
+          "noise": true,
+          "reactions": [
+            {
+              "count": 1,
+              "emoji": "👀"
+            },
+            {
+              "count": 2,
+              "custom": true,
+              "custom_id": "112233",
+              "emoji": "party-parrot"
+            }
+          ],
+          "reply_to": "200",
+          "spoken_content": "hello, spoken",
+          "spoken_time": "noon",
+          "thread": {
+            "id": "t1",
+            "is_root": false,
+            "reply_count": 3,
+            "reply_count_exact": true,
+            "root_message_id": "200"
+          },
+          "timestamp": "2026-09-25T12:00:00+00:00"
+        }
+      ],
+      "next_before": "cursor",
+      "notice": "scope note",
+      "returned": 2,
+      "thread": null,
+      "threads": [],
+      "untrusted_content_notice": "third-party text",
+      "view": "main"
+    },
+    {
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      },
+      "dismissed": [
+        "150"
+      ],
+      "has_more": false,
+      "has_threads": false,
+      "limit": 50,
+      "messages": [],
+      "next_before": null,
+      "notice": null,
+      "returned": 2,
+      "thread": null,
+      "threads": [
+        {
+          "id": "t1",
+          "reply_count": null,
+          "reply_count_exact": false,
+          "root": {
+            "author": "someone",
+            "author_id": "7",
+            "author_is_bot": false,
+            "channel_id": "100",
+            "content": "hello",
+            "id": "300",
+            "reply_to": null,
+            "spoken_time": "",
+            "timestamp": "2026-09-25T12:00:00+00:00"
+          },
+          "title": "a thread",
+          "updated_at": "2026-09-25T12:00:00+00:00"
+        },
+        {
+          "id": "t1",
+          "reply_count": null,
+          "reply_count_exact": false,
+          "root": null,
+          "title": "a thread",
+          "updated_at": "2026-09-25T12:00:00+00:00"
+        }
+      ],
+      "untrusted_content_notice": "third-party text",
+      "view": "threads"
+    },
+    {
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      },
+      "dismissed": [
+        "150"
+      ],
+      "has_more": false,
+      "has_threads": false,
+      "limit": 50,
+      "messages": [
+        {
+          "author": "someone",
+          "author_id": "7",
+          "author_is_bot": false,
+          "channel_id": "100",
+          "content": "[build-bot] Status, 15:05Z. hello",
+          "content_html": "<p><em>hello</em></p>\n",
+          "heading": {
+            "cut": 28,
+            "tag": "build-bot",
+            "time": "15:05Z",
+            "title": "Status"
+          },
+          "id": "301",
+          "noise": true,
+          "reactions": [
+            {
+              "count": 1,
+              "emoji": "👀"
+            },
+            {
+              "count": 2,
+              "custom": true,
+              "custom_id": "112233",
+              "emoji": "party-parrot"
+            }
+          ],
+          "reply_to": "200",
+          "spoken_content": "hello, spoken",
+          "spoken_time": "noon",
+          "thread": {
+            "id": "t1",
+            "is_root": false,
+            "reply_count": 3,
+            "reply_count_exact": true,
+            "root_message_id": "200"
+          },
+          "timestamp": "2026-09-25T12:00:00+00:00"
+        }
+      ],
+      "next_before": null,
+      "notice": null,
+      "returned": 1,
+      "thread": {
+        "id": "t1",
+        "reply_count": null,
+        "reply_count_exact": false,
+        "root": {
+          "author": "someone",
+          "author_id": "7",
+          "author_is_bot": false,
+          "channel_id": "100",
+          "content": "hello",
+          "id": "300",
+          "reply_to": null,
+          "spoken_time": "",
+          "timestamp": "2026-09-25T12:00:00+00:00"
+        },
+        "title": "a thread",
+        "updated_at": "2026-09-25T12:00:00+00:00"
+      },
+      "threads": [],
+      "untrusted_content_notice": "third-party text",
+      "view": "thread"
+    },
+    {
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      },
+      "dismissed": [
+        "150"
+      ],
+      "has_more": false,
+      "has_threads": false,
+      "limit": 50,
+      "messages": [],
+      "next_before": null,
+      "notice": null,
+      "returned": 0,
+      "thread": null,
+      "threads": [],
+      "untrusted_content_notice": "third-party text",
+      "view": "flat"
+    },
+    {
+      "bookmark": {
+        "anchor": {
+          "message_id": "301",
+          "place": "above",
+          "thread_id": "t1",
+          "timestamp": "2026-09-25T12:00:00+00:00"
+        },
+        "revision": 1790000000002
+      },
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      },
+      "dismissed": [
+        "150"
+      ],
+      "has_more": false,
+      "has_threads": false,
+      "limit": 50,
+      "messages": [
+        {
+          "author": "someone",
+          "author_id": "7",
+          "author_is_bot": false,
+          "channel_id": "100",
+          "content": "hello",
+          "id": "300",
+          "reply_to": null,
+          "spoken_time": "",
+          "timestamp": "2026-09-25T12:00:00+00:00"
+        }
+      ],
+      "next_after": "forward",
+      "next_before": null,
+      "notice": null,
+      "pins_revision": 1790000000000,
+      "returned": 1,
+      "thread": null,
+      "threads": [],
+      "untrusted_content_notice": "third-party text",
+      "view": "main"
+    },
+    {
+      "bookmark": {
+        "anchor": null,
+        "revision": 0
+      },
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      },
+      "delta": {
+        "complete": true,
+        "deleted": [
+          "299"
+        ],
+        "more": false,
+        "removed_threads": []
+      },
+      "dismissed": [
+        "150"
+      ],
+      "has_more": false,
+      "has_threads": true,
+      "limit": 50,
+      "messages": [
+        {
+          "author": "someone",
+          "author_id": "7",
+          "author_is_bot": false,
+          "channel_id": "100",
+          "content": "[build-bot] Status, 15:05Z. hello",
+          "content_html": "<p><em>hello</em></p>\n",
+          "heading": {
+            "cut": 28,
+            "tag": "build-bot",
+            "time": "15:05Z",
+            "title": "Status"
+          },
+          "id": "301",
+          "noise": true,
+          "reactions": [
+            {
+              "count": 1,
+              "emoji": "👀"
+            },
+            {
+              "count": 2,
+              "custom": true,
+              "custom_id": "112233",
+              "emoji": "party-parrot"
+            }
+          ],
+          "reply_to": "200",
+          "spoken_content": "hello, spoken",
+          "spoken_time": "noon",
+          "thread": {
+            "id": "t1",
+            "is_root": false,
+            "reply_count": 3,
+            "reply_count_exact": true,
+            "root_message_id": "200"
+          },
+          "timestamp": "2026-09-25T12:00:00+00:00"
+        }
+      ],
+      "next_after": "forward-2",
+      "next_before": null,
+      "notice": null,
+      "reply_dismissals": {
+        "from": "150",
+        "messages": [
+          "299",
+          "150"
+        ]
+      },
+      "returned": 1,
+      "thread": null,
+      "threads": [],
+      "untrusted_content_notice": "third-party text",
+      "view": "main"
+    },
+    {
+      "as_of": "2026-10-04T07:00:00Z",
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      },
+      "delta": {
+        "complete": false,
+        "deleted": [],
+        "more": true,
+        "removed_threads": [
+          "gone-thread"
+        ]
+      },
+      "dismissed": [
+        "150"
+      ],
+      "has_more": false,
+      "has_threads": false,
+      "limit": 50,
+      "messages": [],
+      "next_after": "forward-3",
+      "next_before": null,
+      "notice": null,
+      "returned": 1,
+      "thread": null,
+      "threads": [
+        {
+          "id": "t1",
+          "reply_count": null,
+          "reply_count_exact": false,
+          "root": null,
+          "title": "a thread",
+          "updated_at": "2026-09-25T12:00:00+00:00"
+        }
+      ],
+      "untrusted_content_notice": "third-party text",
+      "view": "threads"
+    }
+  ],
+  "UpstreamClearNowResponse": [
+    {
+      "attempt": {
+        "at_ms": 1790000010000,
+        "message_at_ms": 1790000005000,
+        "message_id": "300",
+        "previous": "2026-09-25T11:00:00Z",
+        "result": "advanced",
+        "target": "2026-09-25T12:00:00Z"
+      },
+      "message_at_ms": 1790000005000,
+      "message_id": "300",
+      "outcome": "pushed",
+      "state": {
+        "channel": {
+          "added": false,
+          "alias": null,
+          "id": "100",
+          "label": "general",
+          "provider": "discord",
+          "writable": true
+        },
+        "enabled_at_ms": 1790000000000,
+        "failures": 0,
+        "last": {
+          "at_ms": 1790000010000,
+          "message_at_ms": 1790000005000,
+          "message_id": "300",
+          "previous": "2026-09-25T11:00:00Z",
+          "result": "advanced",
+          "target": "2026-09-25T12:00:00Z"
+        },
+        "mode": "on",
+        "pending": false,
+        "previous_cursor": "2026-09-25T11:00:00Z",
+        "provider_name": "Google Chat",
+        "pushed": {
+          "at_ms": 1790000010000,
+          "message_at_ms": 1790000005000,
+          "message_id": "300",
+          "previous": "2026-09-25T11:00:00Z",
+          "result": "advanced",
+          "target": "2026-09-25T12:00:00Z"
+        },
+        "supported": true
+      }
+    },
+    {
+      "message_at_ms": 1790000005000,
+      "message_id": "300",
+      "outcome": "covered",
+      "state": {
+        "channel": {
+          "added": false,
+          "alias": null,
+          "id": "100",
+          "label": "general",
+          "provider": "discord",
+          "writable": true
+        },
+        "enabled_at_ms": 1790000000000,
+        "failures": 0,
+        "mode": "dry_run",
+        "pending": false,
+        "provider_name": "Google Chat",
+        "supported": true
+      }
+    },
+    {
+      "attempt": {
+        "at_ms": 1790000010000,
+        "error": "Google Chat returned HTTP 502: mark-read failed",
+        "message_at_ms": 1790000005000,
+        "message_id": "300",
+        "result": "failed"
+      },
+      "message_at_ms": 1790000005000,
+      "message_id": "300",
+      "outcome": "failed",
+      "state": {
+        "channel": {
+          "added": false,
+          "alias": null,
+          "id": "100",
+          "label": "general",
+          "provider": "discord",
+          "writable": true
+        },
+        "enabled_at_ms": 1790000000000,
+        "failures": 1,
+        "last": {
+          "at_ms": 1790000010000,
+          "error": "Google Chat returned HTTP 502: mark-read failed",
+          "message_at_ms": 1790000005000,
+          "message_id": "300",
+          "result": "failed"
+        },
+        "mode": "on",
+        "pending": true,
+        "provider_name": "Google Chat",
+        "retry_at_ms": 1790000040000,
+        "supported": true
+      }
+    }
+  ],
+  "UpstreamClearState": [
+    {
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      },
+      "failures": 0,
+      "mode": "off",
+      "pending": false,
+      "provider_name": "Google Chat",
+      "supported": true
+    },
+    {
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      },
+      "enabled_at_ms": 1790000000000,
+      "failures": 1,
+      "last": {
+        "at_ms": 1790000060000,
+        "error": "Google Chat returned HTTP 502: mark-read failed",
+        "message_at_ms": 1790000050000,
+        "message_id": "301",
+        "result": "failed"
+      },
+      "mode": "on",
+      "pending": true,
+      "previous_cursor": "2026-09-25T11:00:00Z",
+      "provider_name": "Google Chat",
+      "pushed": {
+        "at_ms": 1790000010000,
+        "message_at_ms": 1790000005000,
+        "message_id": "300",
+        "previous": "2026-09-25T11:00:00Z",
+        "result": "advanced",
+        "target": "2026-09-25T12:00:00Z"
+      },
+      "retry_at_ms": 1790000090000,
+      "supported": true
+    },
+    {
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      },
+      "enabled_at_ms": 1790000000000,
+      "failures": 0,
+      "last": {
+        "at_ms": 1790000010000,
+        "error": "one thread of a larger space",
+        "message_at_ms": 1790000005000,
+        "message_id": "300",
+        "result": "unavailable"
+      },
+      "mode": "dry_run",
+      "pending": false,
+      "provider_name": "Google Chat",
+      "supported": true,
+      "unavailable": "one thread of a larger space"
+    }
+  ],
+  "VibeTalkV1ClientFrame": [
+    {
+      "type": "audio_start"
+    },
+    {
+      "type": "audio_end"
+    },
+    {
+      "text": "hi",
+      "type": "prompt"
+    },
+    {
+      "type": "interrupt"
+    },
+    {
+      "type": "quit"
+    }
+  ],
+  "VibeTalkV1ServerFrame": [
+    {
+      "type": "session_started"
+    },
+    {
+      "greeting": true,
+      "session_id": "s1",
+      "type": "session_started"
+    },
+    {
+      "role": "user",
+      "text": "hi",
+      "type": "transcript"
+    },
+    {
+      "final": false,
+      "role": "assistant",
+      "text": "hello",
+      "turn": 1,
+      "type": "transcript"
+    },
+    {
+      "type": "turn_complete"
+    },
+    {
+      "interrupted": true,
+      "turn": 1,
+      "type": "turn_complete"
+    },
+    {
+      "type": "error"
+    },
+    {
+      "detail": "why",
+      "message": "failed",
+      "type": "error"
+    }
+  ],
+  "VoicePromptSettings": [
+    {
+      "changeable": true,
+      "delivery": "page",
+      "edited_from_version": 8,
+      "instructions": "Call me Sam.",
+      "max_instructions_chars": 4000,
+      "max_system_prompt_chars": 20000,
+      "prompt_version": 9,
+      "system_prompt": "You read me the chat.",
+      "system_prompt_edited": true
+    },
+    {
+      "changeable": false,
+      "delivery": "profile",
+      "instructions": "",
+      "max_instructions_chars": 4000,
+      "max_system_prompt_chars": 20000,
+      "prompt_version": 9,
+      "system_prompt": "You are a voice assistant.",
+      "system_prompt_edited": false
+    }
+  ],
+  "VoiceSession": [
+    {
+      "input_sample_rate": 16000,
+      "output_sample_rate": 24000,
+      "protocol": "vibe-talk-v1",
+      "provider": "Voice",
+      "valid_for_seconds": 60,
+      "websocket_url": "wss://voice.example/session"
+    },
+    {
+      "input_sample_rate": 16000,
+      "output_sample_rate": 24000,
+      "protocol": "vibe-talk-v1",
+      "provider": "Voice",
+      "websocket_url": "wss://voice.example/session"
+    },
+    {
+      "agent_prompt": {
+        "instructions_applied": true,
+        "override_allowed": true,
+        "system_prompt_applied": true,
+        "text": "You read me the chat.",
+        "transport": "prompt_override"
+      },
+      "input_sample_rate": 16000,
+      "output_sample_rate": 16000,
+      "protocol": "elevenlabs",
+      "provider": "ElevenLabs",
+      "valid_for_seconds": 900,
+      "websocket_url": "wss://voice.example/session"
+    },
+    {
+      "agent_prompt": {
+        "instructions_applied": true,
+        "system_prompt_applied": false,
+        "text": "Call me Sam.",
+        "transport": "contextual_update"
+      },
+      "input_sample_rate": 16000,
+      "output_sample_rate": 16000,
+      "protocol": "elevenlabs",
+      "provider": "ElevenLabs",
+      "valid_for_seconds": 900,
+      "websocket_url": "wss://voice.example/session"
+    },
+    {
+      "agent_prompt": {
+        "instructions_applied": false,
+        "override_allowed": false,
+        "system_prompt_applied": false,
+        "transport": "not_sent"
+      },
+      "input_sample_rate": 16000,
+      "output_sample_rate": 16000,
+      "protocol": "elevenlabs",
+      "provider": "ElevenLabs",
+      "valid_for_seconds": 900,
+      "websocket_url": "wss://voice.example/session"
+    }
+  ],
+  "VoiceSettings": [
+    {
+      "ask_before_send": true,
+      "changeable": true
+    },
+    {
+      "ask_before_send": false,
+      "changeable": true
+    },
+    {
+      "ask_before_send": true,
+      "changeable": false
+    }
+  ]
+}

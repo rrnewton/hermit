@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# agent-utils build/setup driver.
+#
+# Usage:
+#   ./setup            build BOTH python and rust (default)
+#   ./setup both       same
+#   ./setup py         python only: mypy-strict typecheck
+#   ./setup rs         rust only:   verify/build every tracked Cargo-backed launcher
+#   ./setup rs --clean remove the Rust cache first, then rebuild every launcher
+#
+# Every mode wires ./bin at the TRACKED engine resolver (common/bin). The resolver runs the tracked
+# Python entrypoint by default and the tracked Cargo-backed Rust launcher only on explicit
+# DAGRUN_ENGINE=rust, logging which engine won on every invocation.
+#
+# `make` just calls `./setup`.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Absolute path to this script, resolved BEFORE `cd`, so `--help` works no matter
+# how the script was invoked (e.g. `agent-utils/setup -h` by relative path from a
+# parent directory, which used to break `sed ... "$0"` after the cd).
+SELF="$ROOT/$(basename -- "${BASH_SOURCE[0]}")"
+cd "$ROOT"
+
+# Render each paired tool's README and embedded guide from a shared template plus an edition
+# fragment, then verify package-tree links to the authoritative documents. Run regardless of the
+# py/rs/both selection so every distributable artifact stays current.
+embed_userguides() {
+  echo "==> [docs] render standalone package docs from shared templates + edition fragments"
+  command -v python3 >/dev/null || { echo "docs: python3 not found (needed to embed guides)" >&2; return 1; }
+  python3 "$ROOT/scripts/embed_userguides.py"
+}
+
+WHAT="both"
+CLEAN=0
+for arg in "$@"; do
+  case "$arg" in
+    py|rs|both) WHAT="$arg" ;;
+    --clean)    CLEAN=1 ;;
+    -h|--help)  sed -n '1d;/^set -/q;s/^# \{0,1\}//p' "$SELF"; exit 0 ;;
+    *) echo "setup: unknown arg: $arg (want py|rs|both [--clean])" >&2; exit 2 ;;
+  esac
+done
+
+setup_py() {
+  echo "==> [py] mypy strict typecheck + wire bin"
+  command -v python3 >/dev/null || { echo "py: python3 not found" >&2; return 1; }
+  if ! python3 -m mypy --version >/dev/null 2>&1; then
+    echo "py: mypy not installed. Install it (e.g. 'with-proxy pip install mypy')." >&2
+    return 1
+  fi
+  ( cd py && python3 -m mypy . )
+  # Launcher targets are tracked as executable source files. Do not chmod through
+  # their symlinks here: the repository contract checks the committed modes and
+  # shebangs, and setup must not hide or dirty a broken checkout.
+  if [ -d py/bin ]; then
+    for entrypoint in py/bin/*; do
+      [ -e "$entrypoint" ] || continue
+      [ -L "$entrypoint" ] || chmod +x "$entrypoint"
+    done
+  fi
+  # Smoke-check that every entrypoint starts without third-party imports. This catches a runtime
+  # dependency imported at module scope taking down `--help` on a minimal host.
+  echo "==> [py] check-deps (dependency-free entrypoint smoke test)"
+  python3 "$ROOT/scripts/check_deps.py"
+  echo "==> [py] ok"
+}
+
+setup_rs() {
+  local runner legacy unexpected launcher tool target
+  local -a rust_tools=(dagrun cpuset-alloc tick-hub pr-landing-planner herdr-run herdr-agent agentctl)
+  echo "==> [rs] verify/build tracked Cargo-backed launchers"
+  command -v cargo >/dev/null || { echo "rs: cargo not found" >&2; return 1; }
+  command -v flock >/dev/null || { echo "rs: flock not found" >&2; return 1; }
+  local lock_root="$ROOT/rs/.agent-utils-locks"
+  mkdir -p "$lock_root"
+  if [ "$CLEAN" = 1 ]; then
+    echo "==> [rs] --clean: removing the repository-local Cargo cache before rebuilding"
+    flock "$lock_root/cache.lock" rm -rf -- "$ROOT/rs/target"
+  fi
+
+  runner="$ROOT/rs/bin/cargo-runner"
+  if [ ! -f "$runner" ] || [ -L "$runner" ] || [ ! -x "$runner" ]; then
+    echo "rs: tracked rs/bin/cargo-runner is missing, linked, or non-executable" >&2
+    return 1
+  fi
+  # Migrate the four adjacent stamps written by setup versions that copied binaries into rs/bin.
+  # These exact files were generated cache metadata; no other unexpected entry is removed.
+  for tool in dagrun cpuset-alloc tick-hub pr-landing-planner; do
+    legacy="$ROOT/rs/bin/$tool.provenance"
+    if [ -f "$legacy" ] && [ ! -L "$legacy" ]; then
+      rm -f -- "$legacy"
+      echo "rs: removed legacy cache metadata ${legacy#"$ROOT"/}"
+    elif [ -e "$legacy" ] || [ -L "$legacy" ]; then
+      echo "rs: legacy metadata path is not a regular file; refusing: ${legacy#"$ROOT"/}" >&2
+      return 1
+    fi
+  done
+  unexpected="$(find "$ROOT/rs/bin" -mindepth 1 -maxdepth 1 \
+    ! -name cargo-runner ! -name dagrun ! -name cpuset-alloc \
+    ! -name tick-hub ! -name pr-landing-planner ! -name herdr-run \
+    ! -name herdr-agent ! -name agentctl -print -quit)"
+  if [ -n "$unexpected" ]; then
+    echo "rs: unexpected rs/bin entry refused: ${unexpected#"$ROOT"/}" >&2
+    return 1
+  fi
+
+  for tool in "${rust_tools[@]}"; do
+    launcher="$ROOT/rs/bin/$tool"
+    if [ ! -L "$launcher" ] || [ "$(readlink -- "$launcher")" != cargo-runner ]; then
+      echo "rs: $tool must be the tracked symlink to cargo-runner" >&2
+      return 1
+    fi
+    target="$(AGENT_UTILS_RS_ENSURE_ONLY=1 "$launcher")"
+    echo "rs: ready $tool -> ${target#"$ROOT"/}"
+  done
+  echo "==> [rs] ok"
+}
+
+wire_bin() { rm -f bin; ln -s "$1" bin; echo "==> ./bin -> $1"; }
+
+embed_userguides
+case "$WHAT" in
+  py)   setup_py ;;
+  rs)   setup_rs ;;
+  both) setup_py; setup_rs ;;
+esac
+# Wire ./bin at the TRACKED, deterministic engine resolver (common/bin) regardless of what was
+# built. The resolver defaults to the tracked Python entrypoint and runs Rust ONLY on explicit
+# DAGRUN_ENGINE=rust (never a silent fallback), logging which engine won on every run. This replaces
+# the old footgun where `both` wired ./bin straight at the UNTRACKED rs/bin, letting a stale
+# locally-built Rust binary silently beat the tracked entrypoint.
+wire_bin "common/bin"
+if [ "$WHAT" = rs ]; then
+  echo "==> note: run Rust via DAGRUN_ENGINE=rust ./bin/dagrun (default is tracked Python; rs/bin is Cargo-backed)"
+fi
+echo "setup: done ($WHAT)"

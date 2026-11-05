@@ -1,0 +1,790 @@
+# vibe-talk's test suites, as a DAG that dagrun can box.
+#
+# WHY THIS EXISTS
+#
+# The old tool-local validation ran these steps one after another, unboxed, with no ceiling on what
+# any of them could consume. That was tolerable while every suite was cheap. It stopped being tolerable the day a
+# screenshot server was found still running SIX DAYS after the run that started it, holding a port,
+# reparented to init, with its own configuration directory long deleted. A run that cannot bound
+# what it starts cannot clean up after what it starts.
+#
+# dagrun is this repository's own answer to exactly that: per-step wall and CPU timeouts, memory
+# limits, and process-tree teardown enforced inside nested cgroups. A step that hangs is reaped
+# with its whole descendant tree, whether or not the step remembered to trap a signal.
+# Repository-level `make validate` now includes this fragment in that shared boxed graph; the
+# tool-local `make -C vibe-talk validate` remains an explicit unboxed escape hatch.
+#
+# WHAT THE SHAPE SAYS
+#
+# The six cheap checks are independent of each other and of the build, so they run concurrently
+# and one failing does not hide the others. Everything that needs a compiled binary hangs off
+# `build.release`, which is stated once rather than paid for per step.
+#
+# THE BROWSER CAP IS THE POINT OF THE `resource_caps` BLOCK. Playwright is the only genuinely
+# expensive thing here — a real Chromium per run — and two of them at once on a laptop is how a
+# test suite becomes the reason the laptop is unusable. `browser: 1` is a semaphore: any number of
+# steps may DECLARE the resource, and at most one holds it at a time.
+#
+# HOW TO RUN IT
+#
+#   dagrun run --dag vibe-talk/tests.dag.yaml
+#
+# from the repository root, which is the working directory every `cmd` below assumes. `make
+# validate-boxed` in vibe-talk/ is the same thing with the paths already right.
+
+description: vibe-talk fmt, lint, unit, PWA, offline-cache, page and screenshot suites, boxed
+
+resource_caps:
+  # A real browser. One at a time, however many steps ask for it.
+  browser: 1
+
+steps:
+  # ---- the cheap gates, which need nothing built ------------------------------------------------
+  - group: check
+    job: fmt
+    desc: rustfmt, in check mode
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && cargo fmt --all -- --check
+    jobs_flag: ""
+    cpu_timeout: 60
+    hint:
+      est_duration_s: 5
+      classification: light
+      rss_baseline_bytes: 268435456
+
+  - group: check
+    job: clippy
+    desc: clippy over every target, warnings denied
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && cargo clippy --all-targets --locked -- -D warnings
+    jobs_flag: ""
+    jobs_env: CARGO_BUILD_JOBS
+    cpu_timeout: 900
+    hint:
+      est_duration_s: 120
+      classification: cpu-bound
+      preferred_inner_jobs: 8
+      # Clippy holds the whole crate graph. This is the step most likely to be the memory high
+      # water mark of the run, and the one worth a real number rather than a default.
+      rss_baseline_bytes: 3221225472
+
+  - group: check
+    job: scripts
+    desc: strict typing and no explicit Any in the Python operator tools
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && make scripts-check
+    jobs_flag: ""
+    cpu_timeout: 120
+    hint:
+      est_duration_s: 5
+      classification: light
+      rss_baseline_bytes: 536870912
+
+  # The generated browser contract matches the schema, and voice.js type-checks against it. The
+  # schema's own freshness against the Rust types is a `cargo test` in `test.unit`.
+  # The contract check runs the generator's tools (Ajv, TypeScript) from contract/node_modules, so
+  # it depends on the step that installs them from contract/package-lock.json rather than on
+  # whoever last ran `npm ci` in this checkout. A repeat run with the same lockfile does nothing.
+  - group: setup
+    job: contract-tools
+    desc: install the contract generator's lockfile-pinned tools
+    labels: [validation-vibe-talk]
+    cmd: scripts/provision-node-packages vibe-talk/contract
+    jobs_flag: ""
+    timeout: 600
+    cpu_timeout: 300
+    hint:
+      est_duration_s: 2
+      classification: latency-bound
+      rss_baseline_bytes: 536870912
+
+  - group: check
+    job: contract
+    desc: generated browser contract is current, and tsc --checkJs over voice.js
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && make contract-check typecheck
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    cpu_timeout: 120
+    hint:
+      est_duration_s: 8
+      classification: light
+      rss_baseline_bytes: 536870912
+
+  # The physical Android run is opt-in. Its evaluator is not: silence and wrong-language speech
+  # are negative controls here, requiring no phone, browser, capture device or STT service.
+  - group: check
+    job: android-speech-self-test
+    desc: offline controls for the Android rendered-speech evaluator
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 scripts/android-device-speech.py --self-test
+    jobs_flag: ""
+    cpu_timeout: 30
+    hint:
+      est_duration_s: 2
+      classification: light
+      rss_baseline_bytes: 268435456
+
+  # The live runner opens fresh provider sessions and may consume paid time. Its metric and output
+  # controls are pure and deterministic, so validate those without dialing any endpoint.
+  - group: check
+    job: voice-read-acceptance-self-test
+    desc: offline controls for the provider-neutral long-read acceptance runner
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 scripts/voice-read-acceptance.py --self-test
+    jobs_flag: ""
+    cpu_timeout: 30
+    hint:
+      est_duration_s: 1
+      classification: light
+      rss_baseline_bytes: 268435456
+
+  - group: check
+    job: live-hint-adapter-self-test
+    desc: offline framing, retry, privacy, and child-cleanup controls for live change hints
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 scripts/live-hint-adapter.py --self-test
+    jobs_flag: ""
+    timeout: 30
+    cpu_timeout: 15
+    hint:
+      est_duration_s: 2
+      classification: light
+      rss_baseline_bytes: 268435456
+
+  # Chrome's own installability verdict. Unlike the fake-DOM suite, this exercises manifest
+  # parsing, icon loading, secure-origin rules and the selected display mode in the browser engine.
+  - group: check
+    job: pwa-installability
+    desc: current Chromium CDP installability check with an Android viewport
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/pwa_installability.py
+    jobs_flag: ""
+    timeout: 60
+    cpu_timeout: 30
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 5
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#225 enter-to-send` in the browser engine: real keys in the reply box. With the default, Shift+Enter
+  # is a new line and Enter posts the reply; with "Enter to send" turned off in Settings (its hint naming
+  # the key that sends, kept across a real reload), Enter is a new line and posts nothing, and Ctrl+Enter
+  # posts. A step of its own, not another walk in offline-cache-browser, whose CPU is near its cap.
+  # Measured on 2026-10-08: about 2s wall.
+  - group: check
+    job: enter-to-send-browser
+    desc: Enter in the reply box sends by default and is a new line with Enter to send off, in current Chromium
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/enter_to_send_browser.py
+    jobs_flag: ""
+    timeout: 60
+    cpu_timeout: 30
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 3
+      classification: latency-bound
+      rss_baseline_bytes: 536870912
+
+  # `#18 offline-message-cache` in the browser engine: saved rows drawn across a real reload before
+  # the network answers, one newest-page read, local view switches, a real fetch failure, sign-out
+  # clearing, empty Cache Storage and no service worker. `#32 freshness-pill-overlap`: refreshing,
+  # offline and failed, the pill clear of the view tabs and the list's header, #scroll-area unmoved,
+  # and a scrolled reader held in place as the pill comes and goes.
+  - group: check
+    job: offline-cache-browser
+    desc: saved-message snapshot and a read-scope sign-in in current Chromium at 412x915 and 360x800 Android viewports and a 1280x800 desk
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/offline_cache_browser.py
+    jobs_flag: ""
+    # The walk has grown with every page feature it checks (search bar, Pinned, Links and their kinds,
+    # tiles, the desktop dock, reply arrows) and measured 70-75 s wall and 42-46 s of CPU on a loaded
+    # host on 2026-10-08, against the old 90 s / 45 s — so a passing run was killed for its CPU. The
+    # budgets are a backstop against a hung browser, not a speed target: about twice the measurement.
+    # With the gathered-replies walk (`#214 reply-arrow`, `#215 reply-coalesce`) a passing run on the
+    # same host measured 155 s wall and 90 s of CPU, against 180 s / 100 s.
+    timeout: 320
+    cpu_timeout: 180
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 155
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#219 emoji-reactions` in the browser engine: each message's reaction strip under its text,
+  # inside its row and the screen, clear of the row's buttons and links, the thread root's reply count
+  # below it, and each count legible, at two phone widths and a desk, in the dark and light schemes.
+  - group: check
+    job: reactions-browser
+    desc: emoji reaction strips laid out in current Chromium at 412x915 and 360x800 Android viewports and a 1280x800 desk
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/reactions_browser.py
+    jobs_flag: ""
+    timeout: 60
+    cpu_timeout: 30
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 4
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#242 rich-headers` in the browser engine: each headed row's tag, title and time drawn whole —
+  # beside the time and the buttons where the list is wide enough, as the row's first line where it
+  # is not — the words they restate hidden and every one of them in the header, a combined row's
+  # second message as written, the ⋯ menu over the row below, and the Settings switch drawing every
+  # first line as written across a reload, at a phone and a desk, in one column and two.
+  - group: check
+    job: rich-headers-browser
+    desc: rich headers laid out in current Chromium at a 412x915 Android viewport and a 1280x800 desk, one column and two
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/rich_headers_browser.py
+    jobs_flag: ""
+    timeout: 60
+    cpu_timeout: 30
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 5
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#7 read-aloud-latency` in the browser engine: a prepared read audible within a second of the
+  # tap while its audio arrives at speaking pace, a switch and a stop closing the response, and
+  # only a read heard to its end archived. The `<audio src>` control must take seconds. A read that
+  # opens with silence reports when speech began as well (`#191 read-aloud-first-lag`).
+  - group: check
+    job: read-aloud-browser
+    desc: read-aloud tap to audible in current Chromium, with an <audio> negative control
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/read_aloud_browser.py
+    jobs_flag: ""
+    timeout: 90
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 16
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#49 post-confirmation-card-hold` in the browser engine: a real touch on Send the moment a first
+  # card appears in a typed call commits nothing, and Send enables itself after the hold.
+  - group: check
+    job: post-confirm-browser
+    desc: a tap on a just-shown post-confirmation card's Send commits nothing in current Chromium
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/post_confirm_browser.py
+    jobs_flag: ""
+    timeout: 60
+    cpu_timeout: 30
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 5
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#268 voice-call-drops` in the browser engine: a spoken call on Chromium's fake microphone against
+  # a mock `vibe-talk-v1` bridge — no microphone frame inside the greeting's hand-off; a "Yes." whose
+  # final transcript arrives after the agent's "One moment." commits the card once; the page's notice
+  # waits for that turn to complete before closing the segment; the server's close is said and
+  # recorded; a hang-up sends one goodbye. Measured on 2026-10-13: about 8s wall.
+  - group: check
+    job: voice-call-drops-browser
+    desc: a spoken call replaying the bridge's event order — the greeting hand-off, a yes answered before its final transcript, the notice's wait, and how the call ended — in current Chromium
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/voice_call_drops_browser.py
+    jobs_flag: ""
+    timeout: 90
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 8
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#241 voice-composer` in the browser engine: the message box under the call's transcript and the
+  # Voice/Channel switch on screen and uncovered at idle, focused, in a typed conversation and in a
+  # call, at 412x915 (and with the on-screen keyboard's share of the screen taken away, as the
+  # viewport's `interactive-widget=resizes-content` has Chrome on Android do) and 1280x800; focus and
+  # typing open nothing; the first Enter opens one typed conversation whose message goes once as a
+  # `vibe-talk-v1` prompt, with no microphone; a message during a call goes down its socket. Measured
+  # on 2026-10-12: about 3.3s wall.
+  - group: check
+    job: voice-composer-browser
+    desc: the call's message box and the view switch on screen while the box is focused, and its first send, in current Chromium at 412x915 and 1280x800
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/voice_composer_browser.py
+    jobs_flag: ""
+    timeout: 60
+    cpu_timeout: 30
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 4
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#220 view-switch-instant` in the browser engine: All to Main and back in the bar's real picker
+  # with every timeline request intercepted — no read, never an empty list or the loading line, the
+  # reader's message kept — and All never read drawn at once from held rows, read once behind them;
+  # then paged, Main drawn from All keeping its way back, and All walked back to the reader's message
+  # before it is drawn. A step of its own, not another walk in offline-cache-browser, whose CPU is
+  # already near its cap. Measured in the full gate: 3.8s wall, 3.0s CPU, a 333MB peak.
+  - group: check
+    job: view-switch-browser
+    desc: Main and All switched from what the page holds, with every timeline request counted, in current Chromium
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/view_switch_browser.py
+    jobs_flag: ""
+    timeout: 60
+    cpu_timeout: 30
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 4
+      classification: latency-bound
+      rss_baseline_bytes: 536870912
+
+  # `#221 read-modes` in the browser engine: entering a thread lands on its first unread message,
+  # unfolded, under the pill, in Show read, Collapse read and Hide read, at 412x915 and 1280x800; the
+  # collapsed run's line is a 44px target a real tap opens with the reader unmoved; an old thread,
+  # drawn from the rows All holds and read behind them, ends where one entered with every row held
+  # does, its read held at a gate the walk opens rather than for a fixed time; and, `#222
+  # unread-replies`, on Main under Hide read the read root is kept by its unread replies, says
+  # "4 unread" beside "52 replies", the longest pairs ("about 52 replies" and "12+ unread") stay one
+  # line each beside each other, and a real tap on that count lands on the first of them.
+  # Measured under dagrun with the Main step: 17s wall on a host at load 320, 5.5s CPU, a 349MB peak.
+  - group: check
+    job: read-modes-browser
+    desc: a thread entered on its first unread, a collapsed read run opened by a real tap, and Main's unread-replies count, in current Chromium at 412x915 and 1280x800
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/read_modes_browser.py
+    jobs_flag: ""
+    timeout: 90
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 15
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#224 keyboard-shortcuts` in the browser engine, the keys pressed through CDP Input.dispatchKeyEvent
+  # so that the browser's own default scrolling runs: PgUp, PgDn, Space, Shift+Space, Home and End move
+  # the channel's list with the focus where the page put it on load and after a view switch, and Space
+  # does not press the switch; "/" opens the search with its field focused; Ctrl+S goes to the message box
+  # from the list, the search field and Settings, and Ctrl+Enter from the list, the browser's Save page
+  # refused (`#248 composer-key`); "," and Ctrl+, open Settings with its screen focused, PgDn scrolls it and Escape
+  # returns to the list unmoved; in the message box PgUp pages the list and Ctrl+Home/End jump it; then
+  # the keymap: j, k and the arrows move a visible focus ring the list follows, e marks Done on the
+  # server and moves on to the next unread, PgDn brings the ring to the page, Enter folds, and -> enters
+  # a thread that <- and Esc leave, back on the message it was opened from; Ctrl+K opens the channel
+  # picker, Esc leaves it for the list, a channel chosen from it gives the keys back to the list, and
+  # Help left by "," after "?" still goes back to Settings from Settings. Measured under dagrun on
+  # 2026-10-09 on a host at load 220: 27s wall (most of it waiting for each animated scroll to come to
+  # rest), 6.4s CPU, a 358MB peak.
+  - group: check
+    job: keyboard-browser
+    desc: the scroll, search and Settings keys and the keymap pressed through CDP in current Chromium at 1280x800
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/keyboard_browser.py
+    jobs_flag: ""
+    timeout: 120
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 27
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#229 desktop-two-column` in the browser engine: the layout button draws Main and the right column
+  # side by side inside the window at 1440x900 and 1280x800, neither under 440px, the view picker
+  # greyed and the width handle gone; the right column's cards are one height, newest activity at the foot,
+  # the summarised thread by its name and summary and the long question cut to three lines, still three
+  # under the mouse and whole once a click highlights it (`#277 thread-card-focus`); a card's replies
+  # button and a Main message's Thread(N) select a thread on the right under its name, each column scrolls
+  # alone under the wheel over it, the X goes back to the cards, a 900px window is one column in the view
+  # it was in and two again when widened, real keys (] Esc j -> [) move between the columns and through
+  # the cards, and a phone's width draws neither the button nor the column. `#261 two-column-connectors`:
+  # the links from Main's roots to their cards drawn for exactly the pairs on screen, touching their
+  # boxes in their colours, the selected card's link pointing off screen, Main's 1.5 s glide to its
+  # root (smooth, cancelled by the reader's scroll, one step under reduced motion). `#262
+  # search-load-older`: a search reads no older page by itself, and its bounded walk back — Enter in two
+  # columns at 1280x800, a tap on a 412x915 phone — finds older matches under a step back that holds
+  # still. Measured on 2026-10-13: about 22s wall, most of it the glides' waits.
+  - group: check
+    job: two-column-browser
+    desc: Main and a thread side by side, cards, selection, independent scrolling, the narrow fallback, the links between roots and cards with their glide, and the search's walk back to older matches, in current Chromium at 1440x900 and 1280x800, and the walk on a 412x915 phone
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/two_column_browser.py
+    jobs_flag: ""
+    timeout: 120
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 22
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#277 thread-card-focus` in the browser engine, at 1280x800 over the right column's cards with a mouse
+  # and the keys, and at 412x915 over the Threads list by touch: every card contracted, the one under the
+  # mouse too; a click or a tap highlights one, shown whole and not entered, and every other card's edge
+  # and every other link turns the page's grey — by the colour Chromium computes and by the pixels a
+  # screenshot holds there — the highlighted card's own staying in its thread's colour; its replies button
+  # enters its thread, <- or Back comes out to it still highlighted, Esc puts the highlight out, and ->
+  # enters the card the keys are on. Measured on 2026-10-13: about 5s wall.
+  - group: check
+    job: thread-card-focus-browser
+    desc: one thread card highlighted and shown whole, every other card's edge and link grey by computed colour and by pixels, its replies button and -> entering it, <- and Esc coming back, in current Chromium at 1280x800 and 412x915
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/thread_card_focus_browser.py
+    jobs_flag: ""
+    timeout: 90
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 5
+
+  # `#280 scroll-stability` in the browser engine, at 1280x800 in two columns with a mouse and at 412x915
+  # in one by touch: with the reader scrolled up in Main, the first row on screen and its offset hold
+  # within a pixel while a message and a reply arrive live, a refresh redraws the list with a message
+  # above grown, a read sent while the reader was on the newest line lands after they scrolled up (the
+  # owner's jump to the bottom), summaries arrive, and the focus moves (the mouse, ] [ Tab, a card opening
+  # its thread); at the desk, sampled at every frame for 2.5 s, past the 1.5 s wait before the glide
+  # between the columns, the mouse crossing the cards to the dock and to the top bar with nothing pressed,
+  # and ] on its own, move nothing; a reader on the newest line follows a live message to the foot; the
+  # list of threads opens at its foot and stays there under the mouse and a moved thread; a thread with
+  # nothing unread, and one whose newest reply alone is unread, open at their foot, and older replies
+  # coming in keep the row at the head; after a reload the read behind the saved rows leaves the
+  # reader where they scrolled; and, last, a card highlighted by a click with the mouse going on over
+  # another card to the dock moves nothing, while the mouse resting on it glides its root on screen
+  # (`#277 thread-card-focus`). Measured on 2026-10-13: about 62s wall, most of it the 2.5 s holds.
+  - group: check
+    job: scroll-stability-browser
+    desc: the message lists hold the reader's row through live messages, refreshes, a read landing after a scroll, summaries, focus moves and the mouse crossing the cards with or without a card highlighted, follow only a reader on the newest line, and open threads at their foot, in current Chromium at 1280x800 and 412x915
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/scroll_stability_browser.py
+    jobs_flag: ""
+    timeout: 200
+    cpu_timeout: 120
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 60
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#240 reading-bookmark` in the browser engine, at 1280x800 with a mouse and keys and at 412x915 by
+  # touch: the bookmark set on a message (Shift+B, or the row's menu) is a solid two-pixel line in the
+  # accent in the room between that row and the one above, touching neither; scrolled away, the
+  # Bookmark chip points up at it, directly right of Newest on the bottom line and overlapping no
+  # other chip; b or a tap on the chip puts the line at the top of the list under the pill, the
+  # message under it selected; a reply goes to the newest message, says b goes back, and b does; and
+  # a Done on the message under the line slides it to the next one, conditionally, on the server too.
+  # Measured on 2026-10-12: about 6s wall.
+  - group: check
+    job: bookmark-browser
+    desc: the reading bookmark set, jumped to, kept across a reply and advanced by Done, in current Chromium at 1280x800 and 412x915
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/bookmark_browser.py
+    jobs_flag: ""
+    timeout: 90
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 6
+
+  # `#243 filter-keeps-selection` in the browser engine, the owner's own sequence at 1280x800 with a
+  # mouse and at 412x915 with a finger: search, Pinned, a pin chosen, the filter cleared -- the pin's row
+  # in the channel's list stands where it stood in the Pinned list, within a pixel, and half a second
+  # later still does; then a pin two pages older than the newest page, chosen and cleared with the reads
+  # held: the head of the list says "Loading earlier messages…" on the screen, and let go, the channel is
+  # walked back and the old pin's row stands where it stood; then a pin that is the second part of a
+  # combined row, whose own text stands where it stood; then the long message just above that row,
+  # opened by the reader's click or tap, which stays where they saw it. Measured on 2026-10-12: about
+  # 7s wall.
+  - group: check
+    job: filter-place-browser
+    desc: a pin chosen under Pinned stays where it stood when the filter is cleared, an old one walked back to, a combined row's second part by its own text, and a message the reader opens next stays put, in current Chromium at 1280x800 and 412x915
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/filter_place_browser.py
+    jobs_flag: ""
+    timeout: 90
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 7
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#249 search-highlight`, `#250 date-separators` and `#251 author-filter` in the browser engine, at
+  # 1280x800 with a mouse and 412x915 and 360x800 with a finger, over a week of a channel read at a fixed
+  # noon in New York's zone: eight day rules in the owner's words ("Today, Oct 12, Mon"), each between
+  # its row and the one above, the bookmark's line nearer its message than its day's rule; "engine"
+  # leaves four messages, each hit lit in the highlighter's colour once the typing pauses, the link found
+  # by its address outlined, a folded answer's hit said under it, and each gap's line saying the days it
+  # reaches, on one line or two broken only between its count and its days; every line as wide as the
+  # list, whatever side its row is drawn on; on the narrow phone the list starts below the hanging author
+  # filter, so scrolled no row passes under it; then the author filter shows only the owner's fourteen
+  # prompts, "14 of 30 loaded", the prompt chosen staying within a pixel, and back again. Measured on
+  # 2026-10-12: about 6s wall.
+  - group: check
+    job: search-dates-browser
+    desc: a search's hits and gaps, the days ruled off and ranged, and the author filter keeping the chosen prompt in place, in current Chromium at 1280x800 and 412x915
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/search_dates_browser.py
+    jobs_flag: ""
+    timeout: 90
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 6
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#247 reply-continuity` in the browser engine, at 1280x800 with a mouse and at 412x915 by touch, at
+  # 80%, 100% and 130% text: Reply on a message in the middle of the list, just under where the title
+  # bar goes, half under the list's top edge, low on the screen, a reply in its gutter, and one taller
+  # than the screen. Its words are the list's computed size and width, its top stays where the row's was
+  # (within 1px) or is clamped to the top, the box comes up directly under it, a low one moves up only as
+  # far as shows it whole, a tall one keeps its top, and Cancel comes back to the pixel; the reply screen
+  # is tinted in the dark scheme and the light. Measured on 2026-10-12: about 18s wall. `#185
+  # reply-new-thread` added two short runs at both sizes on a channel whose messages each head an empty
+  # thread: "Start a new thread" offered between the box and Send, ticking it keeping the message where
+  # Reply put it (one low on the screen too), and Send posting into the message's thread. With them:
+  # about 27s wall. And `#267 quote-reply`: words selected by a mouse drag, a triple-click or as a long
+  # press leaves them make Reply "Quote reply", and r or a tap opens the reply with them quoted and the
+  # caret under them; on a phone at 393 and 360 wide, on long names and reply counts, the label moves
+  # no row's words ("Quote" at Reply's width where "Quote reply" would wrap the header line). With it:
+  # about 38s wall.
+  - group: check
+    job: reply-continuity-browser
+    desc: the replied message kept at the list's size and place, the box under it, the tint, and Quote reply, in current Chromium at 1280x800 and 412x915, and Quote reply moving no row at 393 and 360 wide
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/reply_continuity_browser.py
+    jobs_flag: ""
+    timeout: 150
+    cpu_timeout: 110
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 38
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#277 reply-in-column` in the browser engine, at 1280x800 in two columns with a mouse and the keys:
+  # Reply and Quote reply (words dragged over) pressed in each column open the reply box at that column's
+  # foot -- inside the column, under its list, its chips standing on it -- with both columns where they
+  # were to the pixel, the message answered edged in the accent and unmoved, and the focus in the box
+  # under any quote; Escape on the empty box, Cancel, Send and Enter put the box back and both columns
+  # where they were, the keys on the pressed column's list, and a sent reply is posted where the reply
+  # screen posts it (Main's message to Main, the thread's into it). A message low in the left column moves
+  # up only as far as shows it over the box, and back on Cancel; a window narrowed to 900px hands a reply
+  # open on the right to the reply screen with its words; and one column is the reply screen, as it was.
+  # Measured on 2026-10-13: about 3s wall.
+  - group: check
+    job: reply-in-column-browser
+    desc: Reply and Quote reply open in the column they were pressed in, both columns staying put, and Send, Cancel, Escape and Enter putting everything back, in current Chromium at 1280x800
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/reply_in_column_browser.py
+    jobs_flag: ""
+    timeout: 90
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 3
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#252 thread-button-state` in the browser engine, at 412x915 by touch and 1280x800 with a mouse: on
+  # Main, in the dark scheme and the light, a new message's Thread tag -- the thread Google Chat names
+  # for every message, which nobody has answered -- is drawn exactly as Reply beside it (border, ink,
+  # font size, height, no background) while an answered root's Thread(N) wears its thread's colour,
+  # each inside its row and uncovered; the grey tag opens the empty thread with the message alone in
+  # it and the focus in its box, the first reply typed there is posted with the message's thread id,
+  # and back on Main the tag is the coloured Thread(1); at the desk, in two columns, the empty thread
+  # opens on the right with that column's box focused. Measured on 2026-10-12: about 6s wall.
+  - group: check
+    job: thread-button-browser
+    desc: a new message's grey Thread drawn as Reply, starting its thread with the box focused, and turning coloured at the first reply, in current Chromium at 412x915 and 1280x800
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/thread_button_browser.py
+    jobs_flag: ""
+    timeout: 90
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 6
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#245 done-feedback` in the browser engine: on a threaded channel at 1280x800, in the dark scheme and
+  # the light one, a selected unread message is ringed solid in the accent and a selected read one
+  # dashed in grey on the same lit surface, each at 3:1 or more against it, by computed style; e draws
+  # the moment on the row it left (the done-marking animation running, the dashed grey ring at the read
+  # strength, then neither); the Undo chip names the message and puts it back, and an Undo inside the
+  # hold takes the ring away at once; under reduced motion the same look arrives with no animation; at
+  # 412x915 and 1280x800 in both schemes the moment and a selected read message, measured, with nothing
+  # floating over the message box; on a 360px and a 412px phone the Undo chip says only "Undo", taking no
+  # line a bare one did not, and at 1280x800 it names the message on one line; and at all three, walked
+  # up from the end of the list a few pixels at a time through the message box, no chip and no status
+  # pill ever meets the box or its Send. Served through Playwright's request routing, so it opens no port.
+  # Measured on 2026-10-12: about 40s wall.
+  - group: check
+    job: done-feedback-browser
+    desc: selected read ringed dashed grey and selected unread solid in the accent in both schemes, the moment of a Done and every Undo, reduced motion, a plain Undo chip on phones and a named one on a desk, and nothing floating over the message box at any scroll position, in current Chromium
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/done_feedback_browser.py
+    jobs_flag: ""
+    timeout: 180
+    cpu_timeout: 90
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 40
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#244 elision-word-count` in the browser engine, in seven layouts — phones at 360 and 412px, at 80%
+  # and 150% text, a 1280 desk, the widest reading column, two columns: every folded row's one label
+  # claims no more words or characters than its clamp really hides, found by the rects of its
+  # characters, on a line as wide as the text and at its size; a wall is labelled with at least half of
+  # what it hides; a 300-character message says nothing on a desk; Chinese and a bare address are
+  # counted in characters; a table the clamp draws whole says nothing, and a table over prose, a code
+  # block and a list of short items say no more than they hide; a rich header's row holds with the
+  # switch on and off. Served through Playwright's request routing, so it opens no port. Measured on
+  # 2026-10-12: about 7s wall.
+  - group: check
+    job: elision-browser
+    desc: every folded message's label claims no more than its clamp hides, in seven layouts, in current Chromium
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/elision_browser.py
+    jobs_flag: ""
+    timeout: 120
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 7
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # ---- the build everything else needs ----------------------------------------------------------
+  - group: build
+    job: release
+    desc: the release binary the server-shaped suites run against
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && cargo build --release --locked
+    jobs_flag: ""
+    jobs_env: CARGO_BUILD_JOBS
+    cpu_timeout: 1800
+    hint:
+      est_duration_s: 240
+      classification: cpu-bound
+      preferred_inner_jobs: 16
+      rss_baseline_bytes: 4294967296
+
+  - group: smoke
+    job: cli-help
+    desc: the built service binary exposes its operator help without configuration
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && ./target/release/vibe-talk --help >/dev/null
+    jobs_flag: ""
+    deps: [build.release]
+    timeout: 60
+    cpu_timeout: 30
+    hint:
+      est_duration_s: 1
+      classification: light
+      rss_baseline_bytes: 134217728
+
+  # ---- suites that need it ----------------------------------------------------------------------
+  #
+  # `cargo test` runs the Rust tests AND both page suites through their own harnesses, so each page
+  # suite has one owner in the complete graph rather than being paid for twice.
+  - group: test
+    job: unit
+    desc: the Rust suites, and the page suites through their harnesses
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && cargo test --release --locked
+    jobs_flag: ""
+    jobs_env: CARGO_BUILD_JOBS
+    deps: [build.release]
+    cpu_timeout: 1800
+    hint:
+      est_duration_s: 180
+      classification: cpu-bound
+      preferred_inner_jobs: 8
+      rss_baseline_bytes: 3221225472
+
+  # `#277 send-order` in the browser engine, against the real server binary and its real provider
+  # client: a mock Google Chat bridge on loopback fails A at once; B waits behind A, saying so, and
+  # the bridge never sees it; A goes again under the same nonce and lands, then B; across a real
+  # reload a message still waits behind the one before it, and Retry on that one lands both, in
+  # order; Dismiss on a failing message lets the next go; a slow bridge is given one post at a time,
+  # in order; and a post whose caller hangs up mid-post still lands before the next one reaches the
+  # bridge. It starts the release binary, so it hangs off the build; the server and the bridge are
+  # its own, on free loopback ports, and stopped with it. Measured on 2026-10-13: about 14.3s wall,
+  # most of it the page's own 3 s wait before A goes again, a 4 s watch that a reload sends nothing,
+  # and the slow bridge's own 0.8 s per post and 2.5 s on the post whose caller hung up.
+  - group: check
+    job: send-order-browser
+    desc: messages to one destination land in the order written, through a bridge that fails the first, across a reload, past a Dismiss, on a slow bridge and after a caller hangs up, in current Chromium against the real server
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/send_order_browser.py
+    jobs_flag: ""
+    deps: [build.release]
+    timeout: 120
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 15
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # THE ONE THAT LEAKED. It starts a real server and drives a real Chromium at it. Boxed, its
+  # descendants are reaped with it whether or not the script's own trap fires -- which is the whole
+  # reason this file exists, because for six days that trap did not.
+  - group: shots
+    job: screenshots
+    desc: the screenshot harness — a real server and a real browser
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && ./scripts/run.sh --screenshots --theme dark
+    jobs_flag: ""
+    deps: [build.release]
+    # Wall, not only CPU: a browser waiting on a page that never loads burns no CPU at all, so a
+    # CPU budget alone would let it hang until the run timeout. This is the hang backstop.
+    timeout: 900
+    cpu_timeout: 600
+    hint:
+      resources: {browser: 1}
+      # MEASURED, not guessed. Everything in this block used to be an estimate for a step that had
+      # never once started -- the `cmd` above did not parse, so the job failed in milliseconds and
+      # no profile of it could exist. The first run that got through put the walk at 284s wall,
+      # 170s CPU and a 682MB peak, against guesses of 120s and 4GiB. Both were wrong by more than
+      # a factor of two, in opposite directions, which is the worst way for a scheduler estimate
+      # to be wrong: it under-books the time and over-books the memory at the same time.
+      #
+      # 300 rather than 284 because this is a whole-walk figure and the walk grows a state at a
+      # time; re-measure with `dagrun run --dag vibe-talk/tests.dag.yaml --selected
+      # shots.screenshots --ignore-selected-deps` and read `.dagrun/profiles/step_profiles_*.csv`.
+      # Unusually for this file, the number travels: at 0.60 effective cores this step is waiting,
+      # not computing, so a slower machine does not stretch it the way it stretches clippy.
+      est_duration_s: 300
+      # latency-bound, not cpu-bound: most of its wall time is waiting for a page to settle, and
+      # telling the scheduler otherwise makes it reserve cores it will not use. Confirmed by the
+      # same run -- 0.60 effective cores over 284 seconds.
+      classification: latency-bound
+      preferred_inner_jobs: 4
+      # 1GiB against a 682MB observed peak.
+      #
+      # This is NOT what the planner reserves for this step, and a previous version of this
+      # comment said it was. `sizing.step_mem_cap_bytes` is "an explicit hard cap wins; otherwise
+      # factor x the RSS baseline" -- so while `hard_mem_max_bytes` below is set, the baseline is
+      # never consulted for the footprint sum. It is still worth being true: the visualiser reads
+      # it, and `--refine-memory` compares profile-derived peaks against it.
+      rss_baseline_bytes: 1073741824
+      # THE CAP IS THE RESERVATION. That is the part worth knowing before making this number
+      # comfortable: because an explicit cap wins outright, whatever is written here is what
+      # `schedulable_peak_mem_bytes` adds up when it decides how many steps may run at once. A cap
+      # set high "just to be safe" is not free -- it is spent against the run's memory budget for
+      # the step's whole duration, which is the serialization #113 dagrun-memory-admission is
+      # about, and this step is held for 284 seconds at a time.
+      #
+      # So: a backstop sized from the measurement rather than from imagination. 3GiB is 4.4x the
+      # observed 682MB peak, which still catches a browser that genuinely runs away -- the thing
+      # this cap exists for -- while reserving half of what 6GiB did. Re-measure before lowering
+      # it further; `peak_bytes` in the profile CSV is the column.
+      hard_mem_max_bytes: 3221225472

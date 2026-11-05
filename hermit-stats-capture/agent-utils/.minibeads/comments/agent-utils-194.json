@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-194-c3d46ccccef",
+    "issue_id": "agent-utils-194",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Closed: landed in 89a58979 + c14c14cf, deployed on devbig014 (4a63ae8). Unverified on a physical phone: whether 8 threads fit one screen at the owner's font size.",
+    "created_at": "2026-10-04T12:59:39.900551915Z",
+    "updated_at": "2026-10-04T12:59:39.900551915Z"
+  }
+]

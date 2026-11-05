@@ -1,0 +1,333 @@
+# Python tests are owned by tool, not by one monolithic workspace lane. This is both a useful
+# execution shape and the selection boundary: a change to tick-hub can run tick-hub's tests without
+# paying for agentctl, wrkviz, or dagrun. `run_component_tests.py --self-test` fails if a new test
+# file is unowned or multiply owned.
+
+description: Tool-owned Python regression suites
+
+resource_caps:
+  # Shared with the lifecycle fragment when both are included in the repository graph.
+  lifecycle-io: 5
+
+steps:
+  - group: agentctl
+    job: shard-0
+    desc: agentctl Python tests, shard 1 of 2
+    cmd: python3 scripts/run_component_tests.py --component agentctl --shard 0/2 -- -q
+    jobs_flag: ""
+    labels: [validation-workspace, validation-python-component-tests, validation-pytest-shards, component-agentctl]
+    timeout: 900
+    cpu_timeout: 1800
+    hint: &python_test_hint
+      est_duration_s: 150
+      classification: latency-bound
+      preferred_inner_jobs: 2
+      rss_baseline_bytes: 1610612736
+
+  - group: agentctl
+    job: shard-1
+    desc: agentctl Python tests, shard 2 of 2
+    cmd: python3 scripts/run_component_tests.py --component agentctl --shard 1/2 -- -q
+    jobs_flag: ""
+    labels: [validation-workspace, validation-python-component-tests, validation-pytest-shards, component-agentctl]
+    timeout: 900
+    cpu_timeout: 1800
+    hint: *python_test_hint
+
+  - group: dagrun
+    job: shard-0
+    desc: dagrun Python tests, shard 1 of 2
+    cmd: python3 scripts/run_component_tests.py --component dagrun --shard 0/2 -- -q {args}
+    jobs_flag: ""
+    labels: [validation-workspace, validation-python-component-tests, validation-pytest-shards, component-dagrun]
+    delegated_children: true
+    timeout: 900
+    cpu_timeout: 1800
+    hint:
+      est_duration_s: 150
+      classification: latency-bound
+      preferred_inner_jobs: 2
+      rss_baseline_bytes: 1610612736
+      hard_mem_max_bytes: 2147483648
+
+  - group: dagrun
+    job: shard-1
+    desc: dagrun Python tests, shard 2 of 2
+    cmd: python3 scripts/run_component_tests.py --component dagrun --shard 1/2 -- -q {args}
+    jobs_flag: ""
+    labels: [validation-workspace, validation-python-component-tests, validation-pytest-shards, component-dagrun]
+    delegated_children: true
+    timeout: 900
+    cpu_timeout: 1800
+    hint:
+      est_duration_s: 150
+      classification: latency-bound
+      preferred_inner_jobs: 2
+      rss_baseline_bytes: 1610612736
+      hard_mem_max_bytes: 2147483648
+
+  - group: experiment-runner
+    job: test
+    desc: parallel-experiment-runner Python tests
+    cmd: python3 scripts/run_component_tests.py --component experiment-runner -- -q
+    jobs_flag: ""
+    labels: [validation-workspace, validation-python-component-tests, component-experiment-runner]
+    timeout: 600
+    cpu_timeout: 900
+    hint: *python_test_hint
+
+  - group: experiment-runner
+    job: cli-smoke
+    desc: experiment runner version, guide, and dry planning scenarios
+    cmd: >-
+      cd py &&
+      python3 -m parallel_experiment_runner --version &&
+      python3 -m parallel_experiment_runner quickstart >/dev/null &&
+      python3 -m parallel_experiment_runner plan-round --name smoke --seeds 0-3
+      --cpu-cores 1 --memory 1G --max-concurrency 2 -- /bin/true {seed}
+    jobs_flag: ""
+    labels: [validation-workspace, component-experiment-runner]
+    timeout: 120
+    cpu_timeout: 120
+    hint:
+      est_duration_s: 3
+      classification: light
+      preferred_inner_jobs: 1
+      rss_baseline_bytes: 134217728
+
+  - group: herdr-run
+    job: test
+    desc: herdr-run Python tests
+    cmd: python3 scripts/run_component_tests.py --component herdr-run -- -q
+    jobs_flag: ""
+    labels: [validation-workspace, validation-python-component-tests, component-herdr-run]
+    timeout: 600
+    cpu_timeout: 900
+    hint: *python_test_hint
+
+  - group: planner
+    job: test
+    desc: pr-landing-planner Python tests
+    cmd: python3 scripts/run_component_tests.py --component planner -- -q
+    jobs_flag: ""
+    labels: [validation-workspace, validation-python-component-tests, component-planner]
+    timeout: 600
+    cpu_timeout: 900
+    hint: *python_test_hint
+
+  - group: planner
+    job: cli-smoke
+    desc: planner version and bundled fixture in every output format
+    cmd: >-
+      cd py &&
+      python3 -m pr_landing_planner --version &&
+      python3 -m pr_landing_planner plan
+      --fixture pr_landing_planner/examples/pr-landing-demo.yaml
+      --flaky-signatures pr_landing_planner/examples/flaky-signatures.yaml --format human
+      >/dev/null &&
+      python3 -m pr_landing_planner plan
+      --fixture pr_landing_planner/examples/pr-landing-demo.yaml
+      --flaky-signatures pr_landing_planner/examples/flaky-signatures.yaml --format json
+      >/dev/null &&
+      python3 -m pr_landing_planner plan
+      --fixture pr_landing_planner/examples/pr-landing-demo.yaml
+      --flaky-signatures pr_landing_planner/examples/flaky-signatures.yaml --format actions
+      >/dev/null
+    jobs_flag: ""
+    labels: [validation-workspace, component-planner]
+    timeout: 120
+    cpu_timeout: 120
+    hint:
+      est_duration_s: 3
+      classification: light
+      preferred_inner_jobs: 1
+      rss_baseline_bytes: 134217728
+
+  - group: repository-infrastructure
+    job: test
+    desc: repository wiring and validation infrastructure tests
+    cmd: python3 scripts/run_component_tests.py --component repository-infrastructure -- -q
+    jobs_flag: ""
+    labels: [validation-workspace, validation-python-component-tests, component-repository-infrastructure]
+    timeout: 600
+    cpu_timeout: 1200
+    hint: *python_test_hint
+
+  - group: repository-infrastructure
+    job: cli-surface
+    desc: every Python main function is exposed through package metadata
+    cmd: cd py && python3 -m pytest -q tests/test_cli_surface.py
+    jobs_flag: ""
+    labels: [validation-python, validation-python-component-tests, component-repository-infrastructure]
+    timeout: 60
+    cpu_timeout: 60
+    hint:
+      est_duration_s: 1
+      classification: light
+      preferred_inner_jobs: 1
+      # A full-load run reached the prior 160 MiB learned cap and recorded three OOM kills.
+      # Keep an authored 256 MiB floor so the normal runtime margin supplies 320 MiB.
+      rss_baseline_bytes: 268435456
+
+  - group: repository-infrastructure
+    job: cli-no-optional-deps
+    desc: Python entrypoints remain usable without optional YAML support
+    cmd: cd py && python3 -m pytest -q tests/test_cli_smoke_no_optional_deps.py
+    jobs_flag: ""
+    labels: [validation-python, validation-python-component-tests, component-repository-infrastructure]
+    timeout: 120
+    cpu_timeout: 120
+    hint:
+      est_duration_s: 3
+      classification: light
+      preferred_inner_jobs: 1
+      rss_baseline_bytes: 268435456
+
+  - group: repository-infrastructure
+    job: dispatch-wiring
+    desc: Python and Rust tool launchers agree with package metadata
+    cmd: cd py && python3 -m pytest -q tests/test_repo_dispatch_wiring.py
+    jobs_flag: ""
+    labels: [validation-python, validation-rust, validation-python-component-tests, component-repository-infrastructure]
+    timeout: 300
+    cpu_timeout: 300
+    hint:
+      est_duration_s: 15
+      classification: latency-bound
+      preferred_inner_jobs: 1
+      rss_baseline_bytes: 536870912
+
+  - group: repository-infrastructure
+    job: cross-environment
+    desc: the cross-language harness remains isolated from ambient Python paths
+    cmd: cd py && python3 -m pytest -q tests/test_cross_env_is_hermetic.py
+    jobs_flag: ""
+    labels: [validation-python, validation-cross, validation-python-component-tests, component-repository-infrastructure]
+    timeout: 120
+    cpu_timeout: 120
+    hint:
+      est_duration_s: 3
+      classification: light
+      preferred_inner_jobs: 1
+      rss_baseline_bytes: 268435456
+
+  - group: repository-infrastructure
+    job: cross-skip-accounting
+    desc: a skipped cross-language check is never counted as a pass, and each lane states its coverage
+    cmd: cd py && python3 -m pytest -q tests/test_cross_skip_accounting.py
+    jobs_flag: ""
+    labels: [validation-python, validation-cross, validation-python-component-tests, component-repository-infrastructure]
+    timeout: 120
+    cpu_timeout: 120
+    hint:
+      est_duration_s: 3
+      classification: light
+      preferred_inner_jobs: 1
+      rss_baseline_bytes: 268435456
+
+  - group: repository-infrastructure
+    job: package-contract
+    desc: package validation and lifecycle partitions remain complete
+    cmd: cd py && python3 -m pytest -q tests/test_packaging_infrastructure.py
+    jobs_flag: ""
+    labels:
+      [validation-docs, validation-python, validation-rust, validation-packages, validation-python-packages, validation-rust-packages, validation-python-component-tests, component-dagrun, component-wrkslots, component-repository-infrastructure]
+    timeout: 300
+    cpu_timeout: 300
+    hint:
+      est_duration_s: 15
+      classification: latency-bound
+      preferred_inner_jobs: 1
+      rss_baseline_bytes: 536870912
+
+  - group: repository-infrastructure
+    job: validation-graph
+    desc: graph inventory, labels, and selection closure remain complete
+    cmd: cd py && python3 -m pytest -q tests/test_validation_graph_contract.py
+    jobs_flag: ""
+    labels:
+      [validation-workspace, validation-rust, validation-cross, validation-vibe-talk, validation-python-component-tests, component-dagrun, component-repository-infrastructure]
+    timeout: 120
+    cpu_timeout: 120
+    hint:
+      est_duration_s: 3
+      classification: light
+      preferred_inner_jobs: 1
+      rss_baseline_bytes: 268435456
+
+  - group: tick-hub
+    job: test
+    desc: tick-hub Python tests
+    cmd: python3 scripts/run_component_tests.py --component tick-hub -- -q
+    jobs_flag: ""
+    labels: [validation-workspace, validation-python-component-tests, component-tick-hub]
+    timeout: 600
+    cpu_timeout: 900
+    hint: *python_test_hint
+
+  - group: tick-hub
+    job: cli-smoke
+    desc: tick-hub version and bundled dry-run example
+    cmd: >-
+      cd py &&
+      python3 -m tick_hub --version &&
+      python3 -m tick_hub tick --config tick_hub/examples/tick-hub-ops.yaml
+      --state tick_hub/examples/tick-hub-state.yaml --now 0 --no-header >/dev/null
+    jobs_flag: ""
+    labels: [validation-workspace, component-tick-hub]
+    timeout: 120
+    cpu_timeout: 120
+    hint:
+      est_duration_s: 3
+      classification: light
+      preferred_inner_jobs: 1
+      rss_baseline_bytes: 134217728
+
+  - group: wrkslots
+    job: test
+    desc: wrkslots non-lifecycle Python tests
+    cmd: python3 scripts/run_component_tests.py --component wrkslots -- -q
+    jobs_flag: ""
+    labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, component-wrkslots]
+    timeout: 600
+    cpu_timeout: 1200
+    hint:
+      resources: {lifecycle-io: 1}
+      est_duration_s: 150
+      classification: latency-bound
+      preferred_inner_jobs: 2
+      rss_baseline_bytes: 1610612736
+
+  - group: wrkviz
+    job: shard-0
+    desc: wrkviz Python tests, shard 1 of 2
+    cmd: python3 scripts/run_component_tests.py --component wrkviz --shard 0/2 -- -q
+    jobs_flag: ""
+    labels: [validation-workspace, validation-python-component-tests, validation-pytest-shards, component-wrkviz]
+    timeout: 900
+    cpu_timeout: 1800
+    hint: *python_test_hint
+
+  - group: wrkviz
+    job: shard-1
+    desc: wrkviz Python tests, shard 2 of 2
+    cmd: python3 scripts/run_component_tests.py --component wrkviz --shard 1/2 -- -q
+    jobs_flag: ""
+    labels: [validation-workspace, validation-python-component-tests, validation-pytest-shards, component-wrkviz]
+    timeout: 900
+    cpu_timeout: 1800
+    hint: *python_test_hint
+
+  - group: wrkviz
+    job: cli-smoke
+    desc: wrkviz dependency-free quickstart scenario
+    cmd: cd py && python3 -m wrkviz quickstart >/dev/null
+    jobs_flag: ""
+    labels: [validation-workspace, component-wrkviz]
+    timeout: 120
+    cpu_timeout: 120
+    hint:
+      est_duration_s: 2
+      classification: light
+      preferred_inner_jobs: 1
+      rss_baseline_bytes: 134217728

@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wrkviz"
+version = "0.1.0"
+description = "An agent timeline reconstruction, visualisation and summary tool: durable, multi-resolution timelines built from coordinator and subagent transcripts."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Ryan Newton" }]
+keywords = ["agents", "timeline", "transcripts", "visualization"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: POSIX",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["mypy", "pytest"]
+
+[project.urls]
+Repository = "https://github.com/rrnewton/agent-utils"
+Issues = "https://github.com/rrnewton/agent-utils/issues"
+
+[project.scripts]
+wrkviz = "wrkviz.cli:main"
+
+[tool.setuptools]
+packages = ["wrkviz"]
+package-dir = { wrkviz = "." }
+include-package-data = false
+
+[tool.setuptools.package-data]
+wrkviz = [
+  "py.typed",
+  "README.md",
+  "USER_GUIDE.md",
+  "static/*.html",
+  "static/*.js",
+  "static/*.css",
+  "static/vendor/*.js",
+  "static/vendor/*.txt",
+  "static/vendor/*.md",
+]

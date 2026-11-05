@@ -1,0 +1,14 @@
+# tick-hub example ops-state (per-host runtime state).
+#
+# This is the strict, typed runtime-state file the tick reads at the start of each tick (pass it via
+# `--state`). It is the generic analog of a per-host `.ops-state.yaml`. In real use it is per-machine
+# and typically gitignored; this checked-in copy is a template for the examples.
+
+enabled: true             # master switch; false => the tick emits its summary + health only
+tick_frequency_min: 30    # desired cadence; `--current-tick-min N` emits an actualize ACTION if N differs
+label: example-host       # optional identity shown in the state summary line
+
+# Caller-defined toggles read by a reminder's `requires_flags`. Values may be bool / int / string.
+flags:
+  benchmark_enabled: true
+  ops_in_charge: true

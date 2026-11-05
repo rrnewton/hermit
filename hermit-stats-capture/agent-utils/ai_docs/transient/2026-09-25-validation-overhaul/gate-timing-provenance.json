@@ -1,0 +1,36 @@
+{
+  "aggregate_cpu_seconds": 3278.946,
+  "aggregate_step_wall_seconds": 3570.372,
+  "all_gates_green": true,
+  "canonical_dag": "validation.dag.yaml",
+  "canonical_expanded_dag_sha256": "f505890968060bd6577491f8329faa151675ec319c8029980f92f5cbba4b8f05",
+  "canonical_gate_listing_sha256": "c0efad8c32d12c51e916d6cbbb387543c5dd1c5eb8d46f5eecabb889d53bd98d",
+  "canonical_root_dag_sha256": "66e39b8adbd0cfbe5370b68ddc59c2b3275f8514843317e2b91b20dc3dbd4e6e",
+  "gate_count": 92,
+  "generated_evidence_paths_allowed_to_differ": [
+    "ai_docs/transient/2026-09-25-validation-overhaul/gate-timing-provenance.json",
+    "ai_docs/transient/2026-09-25-validation-overhaul/gate-timing-ranking.tsv",
+    "ai_docs/transient/2026-09-25-validation-overhaul/test-timing-provenance.json",
+    "ai_docs/transient/2026-09-25-validation-overhaul/test-timing-ranking.tsv"
+  ],
+  "graph_wall_seconds": 436.775,
+  "memory_max_event_steps": {},
+  "ranking": "ai_docs/transient/2026-09-25-validation-overhaul/gate-timing-ranking.tsv",
+  "ranking_sha256": "efd2626e99ef80308ec01c4fff4275cecc2eabac42019f64fae5385258ec908d",
+  "run_id": "18d8a746d8b9efeb003f47c3",
+  "run_metadata": {
+    "container_class": "affinity316_cpu-max-3200000_100000",
+    "enforcement_kind": "cgroup-v2",
+    "git_sha": "867aa25d80c0a510529a42e19614736139aab648",
+    "machine_id": "AMD_EPYC_9D85_158-Core_Processor",
+    "outer_jobs": "24",
+    "profile_base_sha": "867aa25d80c0a510529a42e19614736139aab648",
+    "runner_name": "run",
+    "timestamp": "2026-09-25T19:40:11Z"
+  },
+  "schema": "agent-utils-validation-gate-ranking/v2",
+  "selected_profile_rows_sha256": "aadf9096f65dd5fa6c5bdbc844adab847df7db14a4ceca1efe540cb939f1fe81",
+  "source_git_sha": "867aa25d80c0a510529a42e19614736139aab648",
+  "source_inputs_match_clean_head_at_generation": true,
+  "source_profile": ".dagrun/audit-final-867aa25d80c0.4zsDhM/step_profiles_AMD_EPYC_9D85_158-Core_Processor_affinity316_cpu-max-3200000_100000.csv"
+}

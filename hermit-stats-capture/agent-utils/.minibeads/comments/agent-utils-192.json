@@ -1,0 +1,18 @@
+[
+  {
+    "id": "agent-utils-192-cb9713e5f93",
+    "issue_id": "agent-utils-192",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] What a reboot of devbig014 would currently lose (all runtime drop-ins under /run/user/<uid>/systemd/user): (1) vibe-talk-google-chat.service.d/50-devbig014-release.conf selecting the app release under ~/.local/lib/vibe-talk-google-chat/releases/; (2) vibe-talk-gchat-adapter.service.d/50-devbig014-release.conf selecting the devbig014-only adapter release under ~/.local/lib/vibe-talk-meta/releases/ and its own config adapter-devbig014.json (own registry tracked-channels-devbig014.json, because the shared registry is also written by the other host's adapter), plus MemoryHigh=800M. The Slack app's 'current' symlink is a file and survives. Making these durable needs ConditionHost-scoped units or drop-ins in the dotsynced config that the other host ignores.",
+    "created_at": "2026-10-04T16:03:15.796635341Z",
+    "updated_at": "2026-10-04T16:03:15.796635341Z"
+  },
+  {
+    "id": "agent-utils-192-cfa1803ffbb",
+    "issue_id": "agent-utils-192",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] #192 done: durable copy of the devbig014 drop-ins and keepalive units in ~/.local/lib/vibe-talk-devbig014/systemd/user, applied at boot by devbig014-vibe-talk-overrides.service (ConditionHost=devbig014; ~/.config/systemd is not synced to devbig030 by dotsync), deploy script moved to ~/.local/lib/vibe-talk-devbig014/bin/deploy.sh. Switch verified with identical loaded config and one restart. A user generator was not possible: systemd 260 searches no user-writable user-generators directory.",
+    "created_at": "2026-10-12T19:57:16.965076856Z",
+    "updated_at": "2026-10-12T19:57:16.965076856Z"
+  }
+]

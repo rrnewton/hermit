@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-8-ce1ec8957ab",
+    "issue_id": "agent-utils-8",
+    "author": "gpt-5.6-sol",
+    "body": "[gpt-5.6-sol] Contract proof complete: the two linked sources have distinct stable app-channel identities, provider reads remain scoped to their registered resources, and messages normalize to the selected app channel. Provider-neutral API and browser regressions now preserve both ordered channel choices while thread timelines are off and keep an unrelated child projection hidden. Private resource details are recorded only in the private checkout.",
+    "created_at": "2026-09-25T04:21:39.310785469Z",
+    "updated_at": "2026-09-25T04:21:39.310785469Z"
+  }
+]

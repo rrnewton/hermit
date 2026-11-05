@@ -1,0 +1,6 @@
+{
+  "include": [
+    {"path": "empty.json", "namespace": "empty", "after": ["missing.step"]}
+  ],
+  "steps": []
+}

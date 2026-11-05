@@ -1,0 +1,4 @@
+target/
+*.toml.local
+vibe-talk.toml
+.git/

@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'"
+    >
+    <title>wrkviz</title>
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" href="style.css">
+  </head>
+  <body>
+    <header class="app-header">
+      <div class="brand-block">
+        <div class="brand-mark" aria-hidden="true"></div>
+        <div class="brand-copy">
+          <div class="site-heading">
+            <h1 id="site-title">Agent Timeline</h1>
+            <details id="site-identity-details" class="site-identity-details" hidden>
+              <summary aria-label="Show all projects and execution hosts">Identity details</summary>
+              <div id="site-identity-list" class="site-identity-list"></div>
+            </details>
+          </div>
+          <p id="dataset-meta" class="dataset-meta">Loading timeline…</p>
+        </div>
+      </div>
+
+      <div class="controls" aria-label="Timeline controls">
+        <label class="control-field">
+          <span>Team</span>
+          <select id="team-filter" data-testid="team-filter" aria-label="Filter by team">
+            <option value="">All teams</option>
+          </select>
+        </label>
+        <label class="control-field search-field">
+          <span>Search</span>
+          <input
+            id="search"
+            data-testid="search"
+            type="search"
+            placeholder="Agent, phase, message…"
+            autocomplete="off"
+          >
+        </label>
+        <label class="control-field search-scope-field">
+          <span>Search in</span>
+          <select id="search-scope" data-testid="search-scope" aria-label="Choose search scope">
+            <option value="labels">Timeline labels</option>
+            <option value="owner-prompts">My prompts</option>
+            <option value="agent-responses">Agent responses</option>
+            <option value="all-transcript">All transcript</option>
+          </select>
+        </label>
+        <button id="fit" data-testid="fit" class="button button-primary" type="button">
+          Fit timeline
+        </button>
+        <button id="glossary-open" data-testid="glossary-open" class="button" type="button">
+          Project glossary
+        </button>
+        <details id="summary-menu" class="summary-menu">
+          <summary>Summary files</summary>
+          <div id="summary-files" class="summary-files" aria-label="Summary files"></div>
+        </details>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section
+        class="timeline-card"
+        data-testid="timeline"
+        tabindex="0"
+        aria-label="Agent activity timeline"
+        aria-keyshortcuts="+ - ArrowLeft ArrowRight Home"
+      >
+        <div class="timeline-toolbar">
+          <div class="range-controls">
+            <div id="view-range" class="view-range">—</div>
+            <div class="zoom-buttons" role="group" aria-label="Timeline zoom">
+              <button
+                id="zoom-out"
+                data-testid="zoom-out"
+                class="zoom-button"
+                type="button"
+                title="Zoom out"
+                aria-label="Zoom out"
+              >−</button>
+              <button
+                id="zoom-in"
+                data-testid="zoom-in"
+                class="zoom-button"
+                type="button"
+                title="Zoom in"
+                aria-label="Zoom in"
+              >+</button>
+            </div>
+          </div>
+          <div class="legend" aria-label="Agent state legend">
+            <span><i class="legend-dot state-active"></i>Active</span>
+            <span><i class="legend-dot state-tool"></i>Tool</span>
+            <span><i class="legend-dot state-waiting"></i>Waiting</span>
+            <span><i class="legend-dot state-idle"></i>Idle</span>
+            <span><i class="legend-dot state-blocked"></i>Blocked</span>
+            <span><i class="legend-dot summary-available-dot"></i>Summary available</span>
+          </div>
+          <div class="view-options" aria-label="Timeline display options">
+            <label class="toggle-control" title="Use one dedicated row for every agent">
+              <input id="per-agent-tracks" type="checkbox">
+              <span>Per-agent tracks</span>
+            </label>
+            <label class="toggle-control" title="Show detailed intermediate message edges everywhere">
+              <input id="show-global-messages" type="checkbox">
+              <span>Detailed messages (global)</span>
+            </label>
+            <label class="toggle-control" title="Show detailed edges connected to the highlighted item">
+              <input id="show-highlighted-messages" type="checkbox" checked>
+              <span>Detailed messages (highlighted)</span>
+            </label>
+          </div>
+        </div>
+
+        <aside
+          id="search-results"
+          class="search-results-drawer"
+          data-testid="search-results"
+          aria-label="Transcript search results"
+          hidden
+        >
+          <header class="search-results-header">
+            <div>
+              <strong id="search-results-title">Transcript search</strong>
+              <span id="search-results-count" class="search-results-count"></span>
+            </div>
+            <div class="search-results-actions">
+              <label class="search-sort-field">
+                <span>Sort</span>
+                <select id="search-sort" data-testid="search-sort" aria-label="Sort search results">
+                  <option value="relevance">Relevance</option>
+                  <option value="newest">Newest</option>
+                </select>
+              </label>
+              <button
+                id="search-results-close"
+                class="icon-button search-results-close"
+                type="button"
+                aria-label="Clear transcript search"
+              >×</button>
+            </div>
+          </header>
+          <div id="search-results-status" class="search-results-status" role="status"></div>
+          <div id="search-results-list" class="search-results-list" role="list"></div>
+        </aside>
+
+        <div id="rollup-row" class="rollup-row" data-testid="rollups">
+          <div class="rollup-label" aria-hidden="true">
+            <span>HOUR</span>
+            <span>DAY</span>
+            <span>WEEK</span>
+            <span>MONTH</span>
+            <span>QUARTER</span>
+          </div>
+          <div id="rollup-track" class="rollup-track"></div>
+        </div>
+
+        <svg id="time-axis" class="time-axis" aria-hidden="true"></svg>
+        <div
+          id="timeline-scroll"
+          class="timeline-scroll"
+          tabindex="0"
+          aria-label="Scrollable agent tracks"
+        >
+          <svg
+            id="timeline-svg"
+            class="timeline-svg"
+            role="group"
+            aria-label="Timeline tracks for coordinator and subagents"
+          ></svg>
+          <div id="empty-state" class="empty-state" hidden>No tracks match the current filters.</div>
+        </div>
+      </section>
+    </main>
+
+    <footer id="stats" class="stats-bar" data-testid="stats" aria-label="Visible-range statistics">
+      <div class="stats-range">
+        <span class="stats-kicker">VISIBLE RANGE</span>
+        <strong id="stats-range-label">—</strong>
+      </div>
+      <div id="stats-values" class="stats-values"></div>
+    </footer>
+
+    <div id="tooltip" class="tooltip" data-testid="tooltip" role="tooltip" hidden>
+      <strong id="tooltip-title"></strong>
+      <p id="tooltip-body"></p>
+      <div id="tooltip-stats" class="tooltip-stats"></div>
+    </div>
+
+    <div id="modal" class="modal-backdrop" data-testid="modal" hidden>
+      <section
+        class="modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="modal-title"
+      >
+        <header class="modal-header">
+          <div>
+            <p id="modal-eyebrow" class="modal-eyebrow"></p>
+            <h2 id="modal-title">Details</h2>
+          </div>
+          <button id="modal-close" class="icon-button" type="button" aria-label="Close details">×</button>
+        </header>
+        <div id="modal-summary" class="modal-summary"></div>
+        <nav
+          id="modal-tabs"
+          class="modal-tabs"
+          data-testid="tabs"
+          role="tablist"
+          aria-label="Detail views"
+        ></nav>
+        <div id="modal-content" class="modal-content"></div>
+      </section>
+    </div>
+
+    <div
+      id="timeline-context-menu"
+      class="context-menu"
+      data-testid="timeline-context-menu"
+      role="menu"
+      aria-labelledby="context-menu-title"
+      hidden
+    >
+      <div id="context-menu-title" class="context-menu-title"></div>
+      <div id="context-menu-actions" class="context-menu-actions"></div>
+    </div>
+
+    <div
+      id="lane-agent-menu"
+      class="lane-agent-menu"
+      data-testid="lane-agent-menu"
+      role="menu"
+      aria-labelledby="lane-agent-menu-title"
+      hidden
+    >
+      <div id="lane-agent-menu-title" class="lane-agent-menu-title"></div>
+      <div id="lane-agent-menu-actions" class="lane-agent-menu-actions"></div>
+    </div>
+
+    <div id="load-error" class="load-error" role="alert" hidden></div>
+    <script src="vendor/markdown-it-15.0.0.min.js" defer></script>
+    <script src="timeline-core.js" defer></script>
+    <script src="app.js" defer></script>
+  </body>
+</html>

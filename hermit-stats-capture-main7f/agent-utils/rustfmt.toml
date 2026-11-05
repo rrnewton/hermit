@@ -1,0 +1,3 @@
+# agent-utils uses rustfmt's defaults. Keep this file even though it sets no
+# options: rustfmt otherwise searches upward and can apply an enclosing
+# repository's formatting policy when agent-utils is checked out as a submodule.

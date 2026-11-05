@@ -1,0 +1,6 @@
+{
+  "exit": 128,
+  "classification": "local Git provider setup, before Cargo/build/test",
+  "reason": "parked Reverie stats checkout had an unpopulated DynamoRIO submodule directory",
+  "correction": "use already-populated exact-gitlink provider in preserved stack-fix checkout"
+}

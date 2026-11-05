@@ -1,0 +1,3 @@
+source `dirname $0`/util.sh
+record sigill$bitness
+debug_gdb_only signal_checkpoint

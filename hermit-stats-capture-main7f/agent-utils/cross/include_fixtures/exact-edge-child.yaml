@@ -1,0 +1,12 @@
+steps:
+  - group: work
+    job: midpoint
+    cmd: "true"
+    hint:
+      est_duration_s: 1
+  - group: work
+    job: terminal
+    cmd: 'test -f "$INCLUDE_EXACT_MARKER"'
+    deps: [work.midpoint]
+    hint:
+      est_duration_s: 1

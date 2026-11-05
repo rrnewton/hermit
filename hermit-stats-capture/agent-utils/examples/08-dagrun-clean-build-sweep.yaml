@@ -1,0 +1,50 @@
+description: >-
+  Real clean-build scaling benchmark for the dagrun Rust binary. Each invocation compiles into a
+  fresh target directory beneath DAGRUN_CARGO_SWEEP_ROOT, so every width starts without compiled
+  artifacts while preserving the caller's Cargo registry/source cache and the repository target.
+  Set DAGRUN_CARGO_SWEEP_ROOT to compare widths: it must already exist, and the target directories
+  beneath it are RETAINED for you to measure and remove. Leave it unset and the example still runs
+  from a bare checkout, into a throwaway root it deletes on the way out. This offline fixture
+  requires cached dependencies and targets x86_64-unknown-linux-gnu.
+steps:
+  - group: build
+    job: dagrun
+    desc: clean release build of the dagrun binary
+    # Two modes, and the difference between them is only WHO owns the artifacts.
+    #
+    # A caller comparing widths needs the target directories to survive the run, so when they name
+    # a root theirs is used untouched and nothing is cleaned up. That is the benchmark.
+    #
+    # But the unset case used to be `${...:?}`, a hard refusal, which meant this example could not
+    # run from a bare checkout and failed the job that runs every example. The fix is not to drop
+    # the cleanup contract along with the refusal: one target directory measured 57 MB, and a
+    # sweep makes one per width, so defaulting to a root nobody removes would trade a loud
+    # failure for an example that silently grows /tmp every time it runs. Instead, when we invent
+    # the root we also own it, and it goes away.
+    #
+    # Cleanup is therefore inside the timed step, but only on the path that is a smoke run. The
+    # measured path keeps its artifacts and so does no cleanup, and its timing is unaffected.
+    cmd: |
+      root="${DAGRUN_CARGO_SWEEP_ROOT:-}"
+      if [ -n "$root" ]; then
+        # Caller-chosen: must already exist, so a typo fails loudly instead of being created.
+        keep=1
+      else
+        keep=0
+        root=$(mktemp -d "${TMPDIR:-/tmp}/dagrun-cargo-sweep.XXXXXXXX") || exit 1
+      fi
+      target=$(mktemp -d "$root/target.XXXXXXXX") || exit 1
+      status=0
+      CARGO_INCREMENTAL=0 CARGO_NET_OFFLINE=true CARGO_TARGET_DIR="$target" \
+        cargo build --manifest-path rs/Cargo.toml --package dagrun --bin dagrun \
+        --release --locked --offline --target x86_64-unknown-linux-gnu --quiet \
+        $DAGRUN_EXTRA_ARGS || status=$?
+      # Unconditional, so a failed build does not strand the root we invented.
+      [ "$keep" = 1 ] || rm -rf -- "$root"
+      exit $status
+    cmdtype: cargo-build
+    timeout: 1800
+    cpu_timeout: 3600
+    hint:
+      classification: cpu-bound
+      hard_mem_max_bytes: 17179869184

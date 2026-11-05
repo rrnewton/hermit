@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-15-c20697ac3e5f",
+    "issue_id": "agent-utils-15",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Final live acceptance, 2026-09-25 23:48\u201323:51Z. One sequential, read-only session on the deployed 1a9baed build. The served voice.js matched the landed hash. The front-door sign-in hop was bypassed: the page and websocket went through the local ingress, with the websocket path and read-scope credential unchanged. The front-door hop is covered by the owner's signed-in phone test. #15 transcript-dedup: PASS. After two spoken turns the log held 5 rows in order assistant, user, assistant, user, assistant: 2 user rows and 3 assistant rows, which is one finalized row per utterance per side. The same sentence spoken twice was kept as 2 separate rows with identical text. 0 rows repeated text. 12 user partials and 2 assistant partials were folded into their final rows. Closing.",
+    "created_at": "2026-09-25T23:54:35.158742000Z",
+    "updated_at": "2026-09-25T23:54:35.158742000Z"
+  }
+]

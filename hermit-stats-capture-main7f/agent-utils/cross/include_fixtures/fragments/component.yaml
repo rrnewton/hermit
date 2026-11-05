@@ -1,0 +1,20 @@
+include:
+  - path: leaf.json
+    namespace: leaf
+    after: [prep.ready]
+description: child description is not promoted
+default_step_timeout: 0
+resource_caps:
+  gpu: 2
+steps:
+  - group: test
+    job: unit
+    cmd: "true"
+    deps: [leaf.build.app]
+  - group: diagnose
+    job: unit
+    cmd: "true"
+    explains: [test.unit]
+  - group: prep
+    job: ready
+    cmd: "true"

@@ -1,0 +1,73 @@
+{
+  "H": "d09ef1a3e7f46a5206e464b562a22c2e77ae9699",
+  "R": "dde3f9da33a0474d0fa9b273a25100fc0db4d751",
+  "commands": [
+    {
+      "stem": "h-hermit-default",
+      "exit": 0,
+      "started_at": "2026-10-14T13:18:15Z",
+      "ended_at": "2026-10-14T13:20:54Z",
+      "summaries": [
+        "Summary [   6.173s] 896 tests run: 896 passed, 0 skipped"
+      ]
+    },
+    {
+      "stem": "h-hermit-dbt",
+      "exit": 0,
+      "started_at": "2026-10-14T13:21:05Z",
+      "ended_at": "2026-10-14T13:23:42Z",
+      "summaries": [
+        "Summary [   6.191s] 936 tests run: 936 passed, 0 skipped"
+      ]
+    },
+    {
+      "stem": "h-cli11",
+      "exit": 0,
+      "started_at": "2026-10-14T13:23:53Z",
+      "ended_at": "2026-10-14T13:24:35Z",
+      "summaries": [
+        "Summary [  21.261s] 11 tests run: 11 passed, 407 skipped"
+      ]
+    },
+    {
+      "stem": "h-terminal6",
+      "exit": 0,
+      "started_at": "2026-10-14T13:24:46Z",
+      "ended_at": "2026-10-14T13:24:48Z",
+      "summaries": [
+        "Summary [   1.464s] 6 tests run: 6 passed, 0 skipped"
+      ]
+    },
+    {
+      "stem": "h-procfs-debug",
+      "exit": 0,
+      "started_at": "2026-10-14T13:25:09Z",
+      "ended_at": "2026-10-14T13:26:26Z",
+      "summaries": [
+        "Summary [   0.104s] 2 tests run: 2 passed, 49 skipped"
+      ]
+    },
+    {
+      "stem": "h-clippy-all-features",
+      "exit": 0,
+      "started_at": "2026-10-14T13:27:17Z",
+      "ended_at": "2026-10-14T13:28:08Z",
+      "summaries": []
+    },
+    {
+      "stem": "h-doc",
+      "exit": 0,
+      "started_at": "2026-10-14T13:28:19Z",
+      "ended_at": "2026-10-14T13:28:50Z",
+      "summaries": []
+    },
+    {
+      "stem": "h-fmt",
+      "exit": 0,
+      "started_at": "2026-10-14T13:29:03Z",
+      "ended_at": "2026-10-14T13:29:08Z",
+      "summaries": []
+    }
+  ],
+  "qualification": "Literal selected functional results. No credit for skipped/unselected cases or blanket canonical/backend assurance."
+}

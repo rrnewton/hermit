@@ -1,0 +1,19 @@
+   Compiling hermit v0.4.1 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture/hermit-cli)
+   Compiling hermit-test-workdir v0.4.1 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture/common/test-workdir)
+   Compiling reverie-dbt v0.4.0 (https://github.com/rrnewton/reverie.git?rev=ff30c5bac6040c14122d33d60f5dfb91953c7099#ff30c5ba)
+   Compiling reverie-rpc-transport v0.4.1 (https://github.com/rrnewton/reverie.git?rev=ff30c5bac6040c14122d33d60f5dfb91953c7099#ff30c5ba)
+   Compiling detcore-dbt v0.4.0 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture/detcore-dbt)
+error[E0433]: cannot find type `DbtBackendStatsAggregator` in this scope
+    --> hermit-cli/src/bin/hermit/backends.rs:2363:30
+     |
+2363 |         let mut aggregator = DbtBackendStatsAggregator::new();
+     |                              ^^^^^^^^^^^^^^^^^^^^^^^^^ use of undeclared type `DbtBackendStatsAggregator`
+     |
+help: consider importing this struct
+     |
+2335 +     use reverie_dbt::backend_stats::DbtBackendStatsAggregator;
+     |
+
+For more information about this error, try `rustc --explain E0433`.
+error: could not compile `hermit` (bin "hermit" test) due to 1 previous error
+error: command `/home/newton/.rustup/toolchains/nightly-2026-07-12-x86_64-unknown-linux-gnu/bin/cargo test --no-run --message-format json-render-diagnostics --package hermit --lib --bins --features dbt --profile validate --locked --offline` exited with code 101

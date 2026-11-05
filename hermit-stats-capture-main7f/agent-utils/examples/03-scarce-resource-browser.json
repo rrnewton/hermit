@@ -1,0 +1,21 @@
+{
+  "description": "A named scarce resource: the browser cap admits only one e2e step at a time, while ordinary unit tests still run in parallel.",
+  "resource_caps": {"browser": 1},
+  "steps": [
+    {"group": "build", "job": "app", "desc": "compile the web app",
+     "description": "Compile the web app before any end-to-end flow can run.",
+     "cmd": "echo '[build] compiling web app' && sleep 2"},
+    {"group": "e2e", "job": "login", "desc": "browser login flow (needs the browser)",
+     "description": "Login flow. Demands the browser resource, so it serializes against checkout.",
+     "cmd": "echo '[e2e] login flow' && sleep 3",
+     "deps": ["build.app"], "hint": {"resources": {"browser": 1}}},
+    {"group": "e2e", "job": "checkout", "desc": "browser checkout flow (needs the browser)",
+     "description": "Checkout flow. Also needs the browser; waits until login releases it.",
+     "cmd": "echo '[e2e] checkout flow' && sleep 3",
+     "deps": ["build.app"], "hint": {"resources": {"browser": 1}}},
+    {"group": "test", "job": "unit", "desc": "unit tests (no browser; free to run in parallel)",
+     "description": "Unit tests. No browser demand, so they run alongside whichever e2e step holds it.",
+     "cmd": "echo '[test] unit tests' && sleep 3",
+     "deps": ["build.app"]}
+  ]
+}

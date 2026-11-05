@@ -1,0 +1,79 @@
+    Checking memchr v2.8.3
+    Checking adler2 v2.0.1
+    Checking pin-project-lite v0.2.17
+    Checking simd-adler32 v0.3.10
+    Checking scopeguard v1.2.0
+    Checking futures v0.1.31
+    Checking slab v0.4.12
+    Checking iana-time-zone v0.1.65
+    Checking foldhash v0.2.0
+    Checking linux-raw-sys v0.12.1
+    Checking once_cell v1.21.4
+    Checking equivalent v1.0.2
+    Checking hex v0.4.3
+    Checking unty v0.0.4
+    Checking serde_core v1.0.229
+    Checking cpp_demangle v0.5.1
+    Checking gimli v0.33.0
+   Compiling typenum v1.20.1
+    Checking plain v0.2.3
+    Checking typed-arena v2.0.2
+    Checking rustc-demangle v0.1.28
+    Checking fallible-iterator v0.3.0
+    Checking bitflags v1.3.2
+    Checking anyhow v1.0.104
+    Checking byteorder v1.5.0
+    Checking never-say-never v6.6.666
+    Checking miniz_oxide v0.9.1
+    Checking parking_lot_core v0.9.12
+    Checking lock_api v0.4.14
+    Checking memoffset v0.9.1
+    Checking num-traits v0.2.19
+    Checking hashbrown v0.17.1
+    Checking tracing-core v0.1.36
+    Checking itoa v1.0.18
+   Compiling cpufeatures v0.2.17
+    Checking fastrand v2.5.0
+    Checking zmij v1.0.23
+    Checking scroll v0.13.0
+    Checking thiserror v2.0.21
+    Checking derive_more v1.0.0
+    Checking getrandom v0.4.3
+    Checking raw-cpuid v10.7.0
+    Checking parking_lot v0.12.5
+    Checking goblin v0.10.7
+    Checking tracing v0.1.44
+    Checking tokio v1.53.3
+   Compiling generic-array v0.14.7
+    Checking flate2 v1.1.10
+    Checking chrono v0.4.45
+    Checking indexmap v2.14.2
+    Checking futures-util v0.3.34
+    Checking object v0.39.1
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling digest v0.10.7
+   Compiling sha2 v0.10.9
+    Checking object v0.40.0
+   Compiling reverie-dbt v0.4.0 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/reverie-stats-capture/reverie-dbt)
+    Checking bitflags v2.13.2
+    Checking serde v1.0.229
+    Checking serde_json v1.0.154
+    Checking rustix v1.1.5
+    Checking nix v0.30.1
+    Checking procfs-core v0.18.0
+    Checking syscalls v0.6.18
+    Checking bincode v2.0.1
+    Checking linked-hash-map v0.5.6
+    Checking reverie-memory v0.4.1 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/reverie-stats-capture/reverie-memory)
+    Checking futures-executor v0.3.34
+    Checking futures v0.3.34
+    Checking addr2line v0.26.1
+    Checking procfs v0.18.0
+    Checking tempfile v3.27.0
+    Checking reverie-syscalls v0.4.1 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/reverie-stats-capture/reverie-syscalls)
+    Checking reverie-process v0.4.1 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/reverie-stats-capture/reverie-process)
+warning: reverie-dbt@0.4.0: DynamoRIO build cache HIT key=sha256:ff4576416a64218bcbccb4528cee86e5fc4da7119267d963751b37c39f68e542 observed_unix_seconds=1791978353 install=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit/debug/reverie-dbt-native-cache/dynamorio-install-ff4576416a64218bcbccb4528cee86e5fc4da7119267d963751b37c39f68e542
+    Checking reverie-core v0.4.1 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/reverie-stats-capture/reverie)
+    Checking reverie-rpc-transport v0.4.1 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/reverie-stats-capture/reverie-rpc-transport)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 11.17s

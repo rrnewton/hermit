@@ -1,0 +1,11 @@
+
+running 6 tests
+test launcher::tests::stats_capture::inherited_input_capture_keeps_output_and_global_when_stats_are_missing ... ok
+test launcher::tests::stats_capture::reader_capture_keeps_output_and_global_when_stats_are_malformed ... ok
+test launcher::tests::stats_capture::stats_capture_distinguishes_missing_and_empty_and_cleans_its_directory ... ok
+test launcher::tests::stats_capture::stats_capture_keeps_read_failure_distinct_from_malformed_records ... ok
+test launcher::tests::stats_capture::stats_capture_retains_exact_record_order_after_decoding_and_cleanup ... ok
+test launcher::tests::stats_capture::status_capture_keeps_read_failure_after_physical_completion ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 153 filtered out; finished in 0.02s
+

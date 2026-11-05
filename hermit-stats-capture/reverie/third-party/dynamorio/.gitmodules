@@ -1,0 +1,11 @@
+[submodule "third_party/libipt"]
+    path = third_party/libipt
+    url = https://github.com/intel/libipt.git
+[submodule "third_party/zlib"]
+    path = third_party/zlib
+    url = https://github.com/madler/zlib.git
+[submodule "third_party/elfutils"]
+    path = third_party/elfutils
+# Source is https://sourceware.org/git/elfutils.git but we have had
+# many pull failures (i#7253) so we use a local fork:
+    url = https://github.com/DynamoRIO/elfutils.git

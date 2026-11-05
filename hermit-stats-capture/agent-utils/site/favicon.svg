@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <title>agent-utils</title>
+  <rect width="32" height="32" rx="7" fill="#0b6b69"/>
+  <path d="M16 11v4.5M8.5 20.5V16h15v4.5M16 15.5v5" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="16" cy="8" r="3.5" fill="#ffffff"/>
+  <rect x="5" y="20.5" width="7" height="5.5" rx="1.6" fill="#ffffff"/>
+  <rect x="12.5" y="20.5" width="7" height="5.5" rx="1.6" fill="#ffffff"/>
+  <rect x="20" y="20.5" width="7" height="5.5" rx="1.6" fill="#ffffff"/>
+</svg>

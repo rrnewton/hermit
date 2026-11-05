@@ -1,0 +1,26 @@
+{
+  "base": "55f75cbaf7db7b2715f639c14d09a508d9a78932",
+  "status": "M  Cargo.lock\nM  ci/configure-build-jobs.sh\nM  ci/run-with-reverie-dbt-budget.sh\nM  detcore-dbt/Cargo.toml\nM  detcore-liteinst/Cargo.toml\nM  detcore-model/Cargo.toml\nM  detcore-sabre/Cargo.toml\nM  detcore/Cargo.toml\nM  detcore/tests/testutils/Cargo.toml\nM  hermit-cli/BUCK\nM  hermit-cli/Cargo.toml\nM  hermit-cli/src/bin/hermit/backends.rs\nM  hermit-cli/src/bin/hermit/verify_run.rs\nM  hermit-install/Cargo.toml\nM  liteinst-runtime-build/Cargo.lock\nM  liteinst-runtime-build/Cargo.toml\nM  liteinst-runtime-build/runtime/Cargo.toml\nM  reverie\nM  scripts/lib/reverie_dbt_inventory.rs\n",
+  "paths": [
+    "Cargo.lock",
+    "ci/configure-build-jobs.sh",
+    "ci/run-with-reverie-dbt-budget.sh",
+    "detcore-dbt/Cargo.toml",
+    "detcore-liteinst/Cargo.toml",
+    "detcore-model/Cargo.toml",
+    "detcore-sabre/Cargo.toml",
+    "detcore/Cargo.toml",
+    "detcore/tests/testutils/Cargo.toml",
+    "hermit-cli/BUCK",
+    "hermit-cli/Cargo.toml",
+    "hermit-cli/src/bin/hermit/backends.rs",
+    "hermit-cli/src/bin/hermit/verify_run.rs",
+    "hermit-install/Cargo.toml",
+    "liteinst-runtime-build/Cargo.lock",
+    "liteinst-runtime-build/Cargo.toml",
+    "liteinst-runtime-build/runtime/Cargo.toml",
+    "reverie",
+    "scripts/lib/reverie_dbt_inventory.rs"
+  ],
+  "numstat": "17\t17\tCargo.lock\n6\t2\tci/configure-build-jobs.sh\n5\t1\tci/run-with-reverie-dbt-budget.sh\n2\t2\tdetcore-dbt/Cargo.toml\n4\t4\tdetcore-liteinst/Cargo.toml\n2\t2\tdetcore-model/Cargo.toml\n5\t5\tdetcore-sabre/Cargo.toml\n2\t2\tdetcore/Cargo.toml\n2\t2\tdetcore/tests/testutils/Cargo.toml\n1\t1\thermit-cli/BUCK\n7\t7\thermit-cli/Cargo.toml\n92\t121\thermit-cli/src/bin/hermit/backends.rs\n5\t3\thermit-cli/src/bin/hermit/verify_run.rs\n2\t2\thermit-install/Cargo.toml\n11\t11\tliteinst-runtime-build/Cargo.lock\n1\t1\tliteinst-runtime-build/Cargo.toml\n1\t1\tliteinst-runtime-build/runtime/Cargo.toml\n1\t1\treverie\n1\t1\tscripts/lib/reverie_dbt_inventory.rs\n"
+}

@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-224-c3c3eb93fda",
+    "issue_id": "agent-utils-224",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Study and proposal written for owner review: ~/work/vibe-talk-reports/2026-10-08-keyboard-shortcuts.md (Slack, Discord, Google Chat, Teams, Telegram, Element, Zulip, Mattermost, Gmail; WCAG 2.1.4). Core proposal: Up/Down (and j/k) select, e Done and advance, Enter/o fold, Right opens thread, Left/Escape back, Alt+Up/Down channel, Mod+K channel picker, ? cheat sheet; single keys never fire in fields and can be switched off. 12 open questions in the doc.",
+    "created_at": "2026-10-08T16:27:20.616937383Z",
+    "updated_at": "2026-10-08T16:27:20.616937383Z"
+  }
+]

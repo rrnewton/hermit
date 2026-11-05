@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentctl"
+version = "0.1.0"
+description = "Manage persistent coding agents, delegate work, and keep their terminals accessible."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Ryan Newton" }]
+keywords = ["agents", "terminal", "codex", "claude", "muse", "chat"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: POSIX :: Linux",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["mypy", "pytest"]
+
+[project.urls]
+Repository = "https://github.com/rrnewton/agent-utils"
+Issues = "https://github.com/rrnewton/agent-utils/issues"
+
+[project.scripts]
+agentctl = "agentctl.cli:main"
+herdr-agent = "agentctl.legacy_cli:main"
+herdr-subagents = "agentctl.foreign_cli:main"
+herdr-chat = "agentctl.chat:main"
+
+[tool.setuptools]
+packages = ["agentctl", "agentctl.foreign", "agentctl.foreign.mcp"]
+package-dir = { agentctl = "." }
+include-package-data = false
+
+[tool.setuptools.package-data]
+agentctl = ["py.typed", "README.md", "USER_GUIDE.md", "QUICKSTART.md", "AGENT_USER_GUIDE.md", "FOREIGN_USER_GUIDE.md", "CHAT_USER_GUIDE.md", "AGENTCTL_SKILL.md"]

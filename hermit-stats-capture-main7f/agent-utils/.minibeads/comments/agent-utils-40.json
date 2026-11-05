@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-40-c2a1b6007bf",
+    "issue_id": "agent-utils-40",
+    "author": "opus-5.5/typescript-contract",
+    "body": "[opus 5.5] Landed on main as aed6fd2410e60eec5e2d67beb9194654e7a17b1d. On that exact tree: make validate-all exit 0 (93 steps, including vibe-talk.check.contract, the screenshot harness, offline-cache, PWA and read-aloud browsers); page suites 650/650 under Node 22. Not verified here: the deployed live app (deployment is owned separately). Known limits: TypeScript runs non-strict checkJs; a pre-existing scene-35 screenshot race was reproduced without this change and is being raised as its own issue.",
+    "created_at": "2026-09-26T00:23:38.781750724Z",
+    "updated_at": "2026-09-26T00:23:38.781750724Z"
+  }
+]

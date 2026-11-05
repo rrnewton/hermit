@@ -1,0 +1,164 @@
+
+running 159 tests
+test backend_stats::tests::a_terminal_image_is_counted_as_a_backend_failure ... ok
+test backend_stats::tests::absorb_wire_stream_rejects_trailing_partial_record ... ok
+test backend_stats::tests::aggregation_is_order_independent ... ok
+test backend_stats::tests::aggregation_sums_additive_and_maxes_peaks ... ok
+test backend_stats::tests::decode_rejects_bad_magic_version_and_truncation ... ok
+test backend_stats::tests::disabled_request_does_not_collect_snapshot ... ok
+test backend_stats::tests::display_is_deterministic_and_contains_no_raw_identity ... ok
+test backend_stats::tests::dr_stats_absent_is_counted_and_excluded_from_translation_totals ... ok
+test backend_stats::tests::runtime_kind_counts_are_deterministic ... ok
+test backend_stats::tests::the_native_client_writes_the_flag_bits_this_decoder_reads ... ok
+test backend_stats::tests::unknown_runtime_code_decodes_to_unknown_not_error ... ok
+test backend_stats::tests::wire_record_round_trips_exactly ... ok
+test evidence::tests::all_records_distinguishes_initialization_positions_that_the_count_hides ... ok
+test evidence::tests::all_records_keeps_each_initialization_record_at_its_stream_position ... ok
+test evidence::tests::all_records_returns_an_initialization_only_stream_with_no_comparable_record ... ok
+test evidence::tests::backend_failure_truncates_without_publishing_an_artifact ... ok
+test evidence::tests::collector_accepts_a_child_announced_after_its_final_frame ... ok
+test evidence::tests::collector_accepts_root_final_before_descendant_final ... ok
+test evidence::tests::collector_acknowledges_only_an_exact_transport_retry ... ok
+test evidence::tests::collector_charges_held_initializations_against_the_memory_bound_when_accepted ... ok
+test evidence::tests::collector_keeps_the_order_of_comparable_records_across_images ... ok
+test evidence::tests::collector_places_a_child_initialization_wherever_the_host_accepted_it ... ok
+test evidence::tests::collector_places_initializations_of_images_with_no_comparable_record_at_the_end ... ok
+test evidence::tests::collector_process_state_is_bounded ... ok
+test evidence::tests::collector_refuses_a_backend_failure_from_any_process ... ok
+test evidence::tests::collector_refuses_a_changed_same_sequence_retry ... ok
+test evidence::tests::collector_refuses_an_announced_child_without_final_evidence ... ok
+test evidence::tests::collector_rejects_data_and_lifecycle_before_initialization ... ok
+test evidence::tests::collector_rejects_duplicate_final ... ok
+test evidence::tests::collector_rejects_duplicate_malformed_and_truncated_initialization ... ok
+test evidence::tests::collector_reports_a_child_backend_failure_before_a_missing_root_final ... ok
+test evidence::tests::collector_requires_exact_final_outcome ... ok
+test evidence::tests::collector_requires_exec_before_cancel_and_accepts_valid_cancel ... ok
+test evidence::tests::collector_requires_exec_for_restart_and_reinitializes_the_new_image ... ok
+test evidence::tests::collector_retains_backend_failure_across_exec_and_exact_retry ... ok
+test evidence::tests::collector_retains_process_image_initializations_in_the_raw_artifact ... ok
+test evidence::tests::comparable_records_cannot_spend_the_room_held_initializations_reserve ... ok
+test evidence::tests::coordinator_records_are_refused_unless_canonical_and_comparable ... ok
+test evidence::tests::coordinator_records_land_where_they_were_absorbed ... ok
+test evidence::tests::decoder_filters_each_authenticated_process_image_initialization_record ... ok
+test evidence::tests::decoder_rejects_truncation_and_digest_changes ... ok
+test evidence::tests::decoder_requires_exact_initialization_and_rejects_lookalikes ... ok
+test evidence::tests::denied_publication_truncates_the_output ... ok
+test evidence::tests::evidence_session_can_be_claimed_only_before_one_run ... ok
+test evidence::tests::framed_evidence_round_trips_and_rejects_injected_lines ... ok
+test evidence::tests::independent_artifacts_return_only_comparable_records ... ok
+test evidence::tests::native_initialization_record_matches_the_decoder_protocol ... ok
+test evidence::tests::native_internal_exits_mark_the_final_outcome ... ok
+test evidence::tests::native_processes_finalize_after_their_runtime_output ... ok
+test evidence::tests::native_runtime_abi_is_checked_before_runtime_callbacks ... ok
+test evidence::tests::native_runtime_callbacks_are_page_isolated_and_sealed_before_use ... ok
+test evidence::tests::native_shutdown_precedes_evidence_background_quiescence ... ok
+test evidence::tests::native_syscall_exit_defers_final_to_thread_and_process_exit ... ok
+test evidence::tests::process_clone_result_callback_runs_after_the_kernel_result ... ok
+test evidence::tests::reparented_group_member_can_send_its_first_start_and_data ... ok
+test launcher::tests::a_backend_failure_under_protected_evidence_keeps_the_captured_stderr ... ignored, requires built DynamoRIO and native client; run explicitly with --ignored
+test launcher::tests::a_failed_run_keeps_its_error_and_carries_its_output ... ok
+test launcher::tests::a_kept_output_reader_reads_exactly_its_cap_from_a_source_that_never_ends ... ok
+test launcher::tests::a_kept_output_reader_returns_what_it_read_while_a_writer_still_holds_the_pipe ... ok
+test launcher::tests::a_kept_output_reader_stops_although_a_writer_never_pauses ... ok
+test launcher::tests::a_post_launch_evidence_failure_never_reports_a_spawn_kind ... ok
+test launcher::tests::a_terminal_exit_marks_its_stats_record_as_a_backend_failure ... ignored, requires built DynamoRIO and native client; run explicitly with --ignored
+test launcher::tests::an_error_without_exit_status_keeps_its_own_kind ... ok
+test launcher::tests::cancellable_output_reader_stops_with_a_live_writer ... ok
+test launcher::tests::client_arguments_and_isolation_flag_precede_guest_separator ... ok
+test launcher::tests::config_only_bootstrap_cannot_satisfy_the_application_request_guard ... ok
+test launcher::tests::diagnostic_descriptor_198_clears_cloexec_and_survives_exec ... ok
+test launcher::tests::diagnostic_file_keeps_live_summary_out_of_guest_stderr ... ignored, requires built DynamoRIO and native client; run explicitly with --ignored
+test launcher::tests::diagnostic_file_preserves_process_group_cleanup_and_exit_status ... ok
+test launcher::tests::diagnostic_file_rejects_a_read_only_handle ... ok
+test launcher::tests::diagnostic_file_separates_guest_stderr_from_diagnostics ... ok
+test launcher::tests::exact_environment_replaces_launcher_environment ... ok
+test launcher::tests::failed_guest_status_is_preserved_before_coordinator_request ... ok
+test launcher::tests::inherited_input::coordinated_reader_releases_parent_readers_before_pumping ... ok
+test launcher::tests::keeps_diagnostics_out_of_guest_stderr_redirections ... ok
+test launcher::tests::missing_or_closed_diagnostic_descriptor_fails_closed ... ok
+test launcher::tests::native_runtime_abi_mismatch_fails_before_guest_execution ... ignored, requires built DynamoRIO and native client; run explicitly with --ignored
+test launcher::tests::preserves_bare_non_script_program_token ... ok
+test launcher::tests::process_group_modes_are_opt_in ... ok
+test launcher::tests::process_group_wait_times_out_while_a_live_member_remains ... ok
+test launcher::tests::protected_evidence_initializes_when_tracing_is_off ... ignored, requires built DynamoRIO and native client; run explicitly with --ignored
+test launcher::tests::protected_evidence_keeps_a_backend_failure_after_sender_lookup_misses ... ignored, requires built DynamoRIO and native client; run explicitly with --ignored
+test launcher::tests::protected_evidence_preserves_a_normal_guest_exit_101 ... ignored, requires built DynamoRIO and native client; run explicitly with --ignored
+test launcher::tests::protected_evidence_preserves_a_normal_guest_signal_with_an_exit_callback ... ignored, requires built DynamoRIO and native client; run explicitly with --ignored
+test launcher::tests::protected_evidence_refuses_a_backend_failure_before_returning_output ... ignored, requires built DynamoRIO and native client; run explicitly with --ignored
+test launcher::tests::protected_evidence_refuses_a_valid_frame_from_outside_the_guest_tree ... ignored, requires built DynamoRIO and native client; run explicitly with --ignored
+test launcher::tests::protected_evidence_refuses_an_announced_child_killed_before_start ... ignored, requires built DynamoRIO and native client; run explicitly with --ignored
+test launcher::tests::protected_evidence_rejects_direct_emitter_entry ... ignored, requires built DynamoRIO and native client; run explicitly with --ignored
+test launcher::tests::protected_evidence_rejects_disclosed_credentials_and_config_mutation ... ignored, requires built DynamoRIO and native client; run explicitly with --ignored
+test launcher::tests::protected_evidence_retries_after_a_dropped_acknowledgement ... ignored, requires built DynamoRIO and native client; run explicitly with --ignored
+test launcher::tests::quiet_live_runtime_does_not_write_to_guest_stderr ... ignored, requires built DynamoRIO and native client; run explicitly with --ignored
+test launcher::tests::resolves_bare_shebang_program_from_command_path ... ok
+test launcher::tests::resolves_bare_shebang_program_from_exact_environment_path ... ok
+test launcher::tests::resolves_relative_path_from_guest_directory ... ok
+test launcher::tests::resolves_source_root_and_cmake_directory_layouts ... ok
+test launcher::tests::resolves_symlinked_shebang_program_without_canonicalizing ... ok
+test launcher::tests::returns_when_child_exits_while_input_source_is_blocked ... ok
+test launcher::tests::stats_capture::inherited_input_capture_keeps_output_and_global_when_stats_are_missing ... ok
+test launcher::tests::stats_capture::reader_capture_keeps_output_and_global_when_stats_are_malformed ... ok
+test launcher::tests::stats_capture::stats_capture_distinguishes_missing_and_empty_and_cleans_its_directory ... ok
+test launcher::tests::stats_capture::stats_capture_keeps_read_failure_distinct_from_malformed_records ... ok
+test launcher::tests::stats_capture::stats_capture_retains_exact_record_order_after_decoding_and_cleanup ... ok
+test launcher::tests::stats_capture::status_capture_keeps_read_failure_after_physical_completion ... ok
+test launcher::tests::stats_sink_drain_of_a_truncated_stream_is_an_error ... ok
+test launcher::tests::stats_sink_drain_of_missing_file_yields_an_empty_snapshot ... ok
+test launcher::tests::stats_sink_drains_and_aggregates_appended_records ... ok
+test launcher::tests::stats_sink_passes_the_records_path_to_the_client ... ok
+test launcher::tests::streaming_input_reaches_child_before_source_closes ... ok
+test launcher::tests::supplies_captured_standard_input ... ok
+test launcher::tests::unset_diagnostic_file_preserves_the_shared_stderr_stream ... ok
+test launcher::tests::wraps_guest_program_arguments_directory_and_environment ... ok
+test launcher::tests::wraps_shebang_program_with_its_interpreter ... ok
+test sync_rpc::initial_config_tests::address_and_connect_failures_keep_their_original_error_classes ... ok
+test sync_rpc::initial_config_tests::close_is_consumed_once_and_preserves_primary_and_secondary_errors ... ok
+test sync_rpc::initial_config_tests::exact_config_is_returned_after_close_without_a_request_or_eof_wait ... ok
+test sync_rpc::initial_config_tests::strict_initial_frame_rejects_truncation_size_decode_and_trailing_errors ... ok
+test sync_rpc::shared_client_tests::actual_dbt_clients_share_transport_and_keep_callback_and_pending_request_boundaries ... ok
+test sync_rpc::tests::private_rpc_connect_failure_closes_original_and_duplicate_once ... ok
+test sync_rpc::tests::private_rpc_relocation_failure_closes_the_original_once ... ok
+test sync_rpc::tests::private_rpc_socket_leaves_closed_stdio_available ... ok
+test tests::align_up_rounds_to_power_of_two ... ok
+test tests::backtrace_returns_none_when_registers_are_unavailable ... ok
+test tests::backtrace_walks_the_guest_frame_pointer_chain ... ok
+test tests::copied_vfork_first_syscall_uses_the_copied_child_path ... ok
+test tests::copied_vfork_is_classified_before_the_shared_memory_return ... ok
+test tests::core_file_io_syscalls_dispatch_through_guest ... ok
+test tests::dbt_memory_compare_exchange_reports_the_native_result ... ok
+test tests::dbt_memory_without_a_native_compare_exchange_is_unsupported ... ok
+test tests::dbt_stack_allocations_are_valid_in_process_and_aligned ... ok
+test tests::deterministic_ports_advance_past_explicit_bindings ... ok
+test tests::deterministic_random_stream_positions_do_not_collide ... ok
+test tests::deterministic_random_streams_are_reproducible_and_distinct ... ok
+test tests::duplicated_descriptors_inherit_random_tracking ... ok
+test tests::explicit_port_collision_is_still_refused ... ok
+test tests::independent_runtimes_keep_deterministic_ports_without_host_collision ... ok
+test tests::port_zero_runtime_child ... ok
+test tests::ppid_reflects_constructed_parent_and_root_status ... ok
+test tests::procfs_snapshots_cover_volatile_files ... ok
+test tests::prototype_startup_preserves_positive_control_and_refuses_missing_authority ... ok
+test tests::prototype_tool_uses_shared_guest_contract ... ok
+test tests::prototype_tool_virtualizes_uname_release ... ok
+test tests::rewrite_filter_covers_deterministic_policies ... ok
+test tests::run_ready_resumes_a_cross_thread_woken_future ... ok
+test tests::set_regs_forwards_exact_register_file_to_native_writer ... ok
+test tests::set_regs_surfaces_writer_failure_as_errno ... ok
+test tests::signal_admission_drives_real_tool_and_preserves_selected_siginfo ... ok
+test tests::signal_admission_preserves_error_and_terminal_tail_injection ... ok
+test tests::signal_admission_refuses_transformation_without_fabricating_siginfo ... ok
+test tests::signal_admission_suppression_does_not_commit_a_replacement ... ok
+test tests::signal_wait_translation_requires_a_tail_injected_wait_record ... ok
+test tests::startup_abi_preserves_layout_and_requires_initialized_native_mode ... ok
+test tests::tail_inject_defers_exact_syscall_and_suspends ... ok
+test tests::thread_init_records_process_ppid_for_current_ppid ... ok
+test tools::tests::chaos_default_config_truncates_without_interrupting ... ok
+test tools::tests::chaos_read_alternates_interrupt_and_truncation ... ok
+test tools::tests::chaos_read_respects_no_read_and_disabled_interrupt ... ok
+test tools::tests::chrome_trace_settles_pending_and_computes_durations ... ok
+test tools::tests::chrome_trace_tracks_multiple_threads_independently ... ok
+test tools::tests::counter2_host_persists_thread_state_and_runs_exit_lifecycle ... ok
+
+test result: ok. 144 passed; 0 failed; 15 ignored; 0 measured; 0 filtered out; finished in 5.52s
+

@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-215-c8d8f95852a",
+    "issue_id": "agent-utils-215",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Owner, 2026-10-08 16:40 CEST, on reply semantics: reply-to may be an edge to an arbitrary parent, so A<-B, B<-C and A<-B, A<-C are different trees. For coalescing treat both the same: the group is the parent plus all its transitive descendants (and, where a provider has threads, the thread's replies), drawn as one bridge from the parent to a chronological linearization of the group. Drawing the real tree is a possible later option. A single click on an arrow still jumps to the message's ACTUAL parent. Provider facts: Discord replies carry message_reference (any message, chains possible); Google Chat has threads (the N replies count, Thread(N)) and separately quote-replies (quotedMessageMetadata), which the adapter maps to reply_to; Slack has threads only and no reply pointer. reply_to is upstream data, passed through by the vibe-talk server and cached only in the adapter's memory and the page's browser cache.",
+    "created_at": "2026-10-08T14:54:30.164889596Z",
+    "updated_at": "2026-10-08T14:54:30.164889596Z"
+  }
+]

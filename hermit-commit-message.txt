@@ -1,0 +1,21 @@
+Use shared DBT statistics capture
+
+[hermit2, dbt, gpt-6-astra, devbig014, role=impl]
+
+Plain Language Summary and Project Impact
+
+Use Reverie's shared statistics sink and reader instead of Hermit's duplicate temporary-file and wire-aggregation owner. Strict verification retains its missing, empty, malformed and inconsistent-evidence refusals. Saved runs retain the exact native record bytes through the existing writer and offline reader.
+
+The Reverie pin advances to ff30c5bac6040c14122d33d60f5dfb91953c7099. Its new capture test module makes the tracked DBT inventory 953 files. SDK recipe inputs remain unchanged; budget values and validation selections are preserved.
+
+Determinism
+
+The capture stays at the same outer allocation and completion points. Hermit's TMPDIR, hermit-dbt-verify-stats- prefix, records.bin leaf and container bind declaration remain intact. Native counters, record order, strict comparators, complete-evidence/FINAL requirements and status/latch refusal ordering do not change.
+
+Linux Semantics
+
+The physical Reader, inherited-input and status calls, Global cleanup and filesystem visibility are unchanged. Reverie owns allocation, native argument construction, reading and decoding; Hermit retains only its existing bind declaration and execution-evidence policy. No records are added to the container result protocol.
+
+Validation
+
+The concrete ownership and saved-byte regression were independently source-reviewed. Direct pinned rustfmt and diff whitespace checks passed; actual tracked-path enumeration supports the inventory change. Existing strict negatives are retained, and the existing whole-tree test now checks unequal binary records through the saved-run writer. Plain Cargo execution and named inventory checks are pending at this source commit; no runtime or full validation result is claimed.

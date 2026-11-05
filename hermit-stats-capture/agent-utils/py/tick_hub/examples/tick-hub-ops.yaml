@@ -1,0 +1,74 @@
+# tick-hub example reminder set (literate YAML edition)
+#
+# This file is ISOMORPHIC to tick-hub-ops.json (same directory): both load to the EXACT same
+# TickConfig. YAML buys two things a JSON config cannot have: (1) comments like this block, and
+# (2) multi-line block-scalar descriptions — so the reminder set documents itself inline.
+#
+# Run one tick against it (dry-run: prints the lines, persists no state):
+#   tick-hub tick --config py/tick_hub/examples/tick-hub-ops.yaml
+# Pair it with a per-host runtime state file (py/tick_hub/examples/tick-hub-state.yaml):
+#   tick-hub tick --config py/tick_hub/examples/tick-hub-ops.yaml \
+#     --state py/tick_hub/examples/tick-hub-state.yaml
+#
+# The gate commands here are intentionally hermetic (plain `echo`/`exit`), so a tick is fully
+# reproducible with `--now <epoch>` and needs no external services — a caller swaps them for real
+# checks (a `gh` query, a `git` status, a file probe, ...).
+
+description: |-
+  A small, self-contained tick-hub reminder set demonstrating the four building blocks: a plain
+  timed reminder, a gated + value-capturing reminder, a flag-gated reminder, and a health check.
+
+reminders:
+  # 1) A plain TIMED reminder: no gate, so it fires whenever its cadence has elapsed. ~6h here; on a
+  #    fresh state it has never fired and so fires on the first tick.
+  - name: git_sync
+    cadence_secs: 21600          # ~6h; 0 would mean "every tick"
+    emit:
+      kind: action
+      skill: git-sync
+      title: fetch origin and reconcile the working branch
+
+  # 2) A GATED reminder that CAPTURES a live value from its gate's stdout. `when: always` means the
+  #    gate is run only to capture `key=value` output; `{count}` is interpolated into the title, and
+  #    the captured `count` is also merged into the ACTION's fields.
+  - name: backlog_size
+    cadence_secs: 0
+    gate:
+      cmd: echo count=42         # a real caller would compute the ready-work count here
+      when: always
+      capture: true
+    emit:
+      kind: action
+      skill: backlog-triage
+      fields:
+        threshold: "20"
+      title: "backlog has {count} ready items (threshold {threshold})"
+
+  # 3) A FLAG-GATED reminder: fires only when the ops-state's `benchmark_enabled` flag is truthy.
+  #    With the sample state file it fires; flip the flag to false and it is suppressed.
+  - name: benchmark
+    cadence_secs: 0
+    requires_flags: [benchmark_enabled]
+    emit:
+      kind: action
+      skill: run-benchmark
+      title: refresh the recorded benchmark numbers
+
+  # 4) A NOTE reminder gated on a shell CHECK: only surfaces (as a NOTE) when the check exits 0.
+  #    `exit 1` here means it stays quiet; change the command to `true` to see the NOTE.
+  - name: disk_watch
+    cadence_secs: 0
+    gate:
+      cmd: exit 1                # pretend disk is fine -> no note
+      when: success
+    emit:
+      kind: note
+      title: disk headroom is low on this host
+
+health_checks:
+  # Freshness of a periodic artifact. This glob intentionally matches nothing, so the tick reports
+  # `missing` — point it at a real backup/log directory to get `ok`/`stale` instead.
+  - name: db_backup
+    glob: /var/backups/app-db-*.sql
+    threshold_secs: 93600        # 26h
+    detail: newest database snapshot

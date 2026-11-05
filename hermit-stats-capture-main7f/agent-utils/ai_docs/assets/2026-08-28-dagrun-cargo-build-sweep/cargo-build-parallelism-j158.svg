@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 620" role="img" aria-labelledby="chart-title chart-desc">
+  <title id="chart-title">Parallelism over time: build.dagrun</title>
+  <desc id="chart-desc">Parallelism trace for build.dagrun at requested inner_jobs 158. The blue line is interval effective CPU cores, the dashed purple line is requested inner_jobs, and the orange line is thread count on the right axis.</desc>
+  <style>
+    text { font-family: ui-sans-serif, system-ui, sans-serif; fill: #172033; }
+    .title { font-size: 22px; font-weight: 700; }
+    .subtitle { font-size: 12px; fill: #526077; }
+    .axis { stroke: #667085; stroke-width: 1; }
+    .grid { stroke: #d7dde8; stroke-width: 1; }
+    .tick { font-size: 11px; fill: #526077; }
+    .legend { font-size: 12px; }
+    .context { font-size: 11px; }
+  </style>
+  <text x="82" y="38" class="title">Parallelism over time: build.dagrun</text>
+  <text x="82" y="60" class="subtitle">Interval CPU use, requested inner_jobs, and observed process thread count.</text>
+  <line x1="82.00" y1="475.00" x2="910.00" y2="475.00" class="grid"/>
+  <text x="72.00" y="479.00" text-anchor="end" class="tick">0</text>
+  <text x="920.00" y="479.00" class="tick">0</text>
+  <line x1="82.00" y1="397.60" x2="910.00" y2="397.60" class="grid"/>
+  <text x="72.00" y="401.60" text-anchor="end" class="tick">40</text>
+  <text x="920.00" y="401.60" class="tick">10</text>
+  <line x1="82.00" y1="320.20" x2="910.00" y2="320.20" class="grid"/>
+  <text x="72.00" y="324.20" text-anchor="end" class="tick">80</text>
+  <text x="920.00" y="324.20" class="tick">20</text>
+  <line x1="82.00" y1="242.80" x2="910.00" y2="242.80" class="grid"/>
+  <text x="72.00" y="246.80" text-anchor="end" class="tick">120</text>
+  <text x="920.00" y="246.80" class="tick">30</text>
+  <line x1="82.00" y1="165.40" x2="910.00" y2="165.40" class="grid"/>
+  <text x="72.00" y="169.40" text-anchor="end" class="tick">160</text>
+  <text x="920.00" y="169.40" class="tick">40</text>
+  <line x1="82.00" y1="88.00" x2="910.00" y2="88.00" class="grid"/>
+  <text x="72.00" y="92.00" text-anchor="end" class="tick">200</text>
+  <text x="920.00" y="92.00" class="tick">50</text>
+  <line x1="82.00" y1="88.00" x2="82.00" y2="475.00" class="axis"/>
+  <line x1="910.00" y1="88.00" x2="910.00" y2="475.00" class="axis"/>
+  <line x1="82.00" y1="475.00" x2="910.00" y2="475.00" class="axis"/>
+  <text x="20" y="281.50" text-anchor="middle" class="tick" transform="rotate(-90 20 281.50)">effective cores</text>
+  <text x="982" y="281.50" text-anchor="middle" class="tick" transform="rotate(90 982 281.50)">thread count</text>
+  <line x1="82.00" y1="475.00" x2="82.00" y2="480.00" class="axis"/>
+  <text x="82.00" y="497.00" text-anchor="middle" class="tick">0</text>
+  <line x1="289.00" y1="475.00" x2="289.00" y2="480.00" class="axis"/>
+  <text x="289.00" y="497.00" text-anchor="middle" class="tick">2.33</text>
+  <line x1="496.00" y1="475.00" x2="496.00" y2="480.00" class="axis"/>
+  <text x="496.00" y="497.00" text-anchor="middle" class="tick">4.66</text>
+  <line x1="703.00" y1="475.00" x2="703.00" y2="480.00" class="axis"/>
+  <text x="703.00" y="497.00" text-anchor="middle" class="tick">7</text>
+  <line x1="910.00" y1="475.00" x2="910.00" y2="480.00" class="axis"/>
+  <text x="910.00" y="497.00" text-anchor="middle" class="tick">9.33</text>
+  <text x="496.00" y="519.00" text-anchor="middle" class="tick">elapsed seconds</text>
+  <line data-series="requested-inner-jobs" x1="82.00" y1="169.27" x2="910.00" y2="169.27" stroke="#8f5bd7" stroke-width="2" stroke-dasharray="8 5"/>
+  <path data-series="effective-cores" d="M 82.10 462.90 H 104.25 V 463.43 H 126.44 V 461.87 H 148.61 V 462.26 H 170.81 V 469.68 H 193.00 V 473.08 H 215.20 V 471.75 H 237.37 V 471.22 H 259.58 V 470.57 H 281.76 V 465.59 H 303.97 V 465.85 H 326.14 V 457.26 H 348.37 V 472.06 H 370.54 V 473.09 H 392.73 V 473.10 H 414.90 V 473.09 H 437.12 V 473.10 H 459.30 V 473.09 H 481.50 V 473.09 H 503.67 V 473.08 H 525.89 V 473.09 H 548.08 V 473.10 H 570.27 V 473.09 H 592.45 V 472.62 H 614.66 V 463.48 H 636.84 V 452.34 H 659.04 V 445.56 H 681.22 V 453.38 H 703.43 V 466.83 H 725.61 V 457.53 H 747.81 V 444.41 H 769.98 V 444.36 H 792.18 V 444.36 H 814.37 V 446.62 H 836.58 V 458.07 H 858.75 V 468.68 H 880.96 V 472.06 H 903.15 V 473.98 H 910.00" fill="none" stroke="#1769aa" stroke-width="3"/>
+  <path data-series="thread-count" d="M 104.25 165.40 H 126.44 V 235.06 H 148.61 V 281.50 H 170.81 V 211.84 H 193.00 V 420.82 H 215.20 V 420.82 H 237.37 V 382.12 H 259.58 V 382.12 H 281.76 V 382.12 H 303.97 V 242.80 H 326.14 V 420.82 H 348.37 V 343.42 H 370.54 V 420.82 H 392.73 V 420.82 H 414.90 V 420.82 H 437.12 V 420.82 H 459.30 V 420.82 H 481.50 V 420.82 H 503.67 V 420.82 H 525.89 V 420.82 H 548.08 V 420.82 H 570.27 V 420.82 H 592.45 V 420.82 H 614.66 V 389.86 H 636.84 V 343.42 H 659.04 V 296.98 H 681.22 V 304.72 H 703.43 V 358.90 H 725.61 V 389.86 H 747.81 V 281.50 H 769.98 V 281.50 H 792.18 V 281.50 H 814.37 V 281.50 H 836.58 V 320.20 H 858.75 V 374.38 H 880.96 V 382.12 H 903.15 V 273.76 H 910.00 V 475.00" fill="none" stroke="#d97706" stroke-width="2.5"/>
+  <circle data-elapsed-s="0.250661" cx="104.25" cy="462.90" r="3.5" fill="#1769aa"/>
+  <circle data-elapsed-s="0.500606" cx="126.44" cy="463.43" r="3.5" fill="#1769aa"/>
+  <circle data-elapsed-s="0.75034" cx="148.61" cy="461.87" r="3.5" fill="#1769aa"/>
+  <circle data-elapsed-s="1.000499" cx="170.81" cy="462.26" r="3.5" fill="#1769aa"/>
+  <circle data-elapsed-s="1.250501" cx="193.00" cy="469.68" r="3.5" fill="#1769aa"/>
+  <circle data-elapsed-s="1.500512" cx="215.20" cy="473.08" r="3.5" fill="#1769aa"/>
+  <circle data-elapsed-s="1.750318" cx="237.37" cy="471.75" r="3.5" fill="#1769aa"/>
+  <circle data-elapsed-s="2.000464" cx="259.58" cy="471.22" r="3.5" fill="#1769aa"/>
+  <circle data-elapsed-s="2.250418" cx="281.76" cy="470.57" r="3.5" fill="#1769aa"/>
+  <circle data-elapsed-s="2.500626" cx="303.97" cy="465.59" r="3.5" fill="#1769aa"/>
+  <circle data-elapsed-s="2.750333" cx="326.14" cy="465.85" r="3.5" fill="#1769aa"/>
+  <circle data-elapsed-s="3.000741" cx="348.37" cy="457.26" r="3.5" fill="#1769aa"/>
+  <circle data-elapsed-s="3.25053" cx="370.54" cy="472.06" r="3.5" fill="#1769aa"/>
+  <circle data-elapsed-s="3.500543" cx="392.73" cy="473.09" r="3.5" fill="#1769aa"/>
+  <circle data-elapsed-s="3.750293" cx="414.90" cy="473.10" r="3.5" fill="#1769aa"/>
+  <circle data-elapsed-s="4.000598" cx="437.12" cy="473.09" r="3.5" fill="#1769aa"/>
+  <circle data-elapsed-s="4.250459" cx="459.30" cy="473.10" r="3.5" fill="#1769aa"/>
+  <circle data-elapsed-s="4.500504" cx="481.50" cy="473.09" r="3.5" fill="#1769aa"/>
+  <circle data-elapsed-s="4.750228" cx="503.67" cy="473.09" r="3.5" fill="#1769aa"/>
+  <circle data-elapsed-s="5.000543" cx="525.89" cy="473.08" r="3.5" fill="#1769aa"/>
+  <circle data-elapsed-s="5.250548" cx="548.08" cy="473.09" r="3.5" fill="#1769aa"/>
+  <circle data-elapsed-s="5.500527" cx="570.27" cy="473.10" r="3.5" fill="#1769aa"/>
+  <circle data-elapsed-s="5.750403" cx="592.45" cy="473.09" r="3.5" fill="#1769aa"/>
+  <circle data-elapsed-s="6.000578" cx="614.66" cy="472.62" r="3.5" fill="#1769aa"/>
+  <circle data-elapsed-s="6.250542" cx="636.84" cy="463.48" r="3.5" fill="#1769aa"/>
+  <circle data-elapsed-s="6.500532" cx="659.04" cy="452.34" r="3.5" fill="#1769aa"/>
+  <circle data-elapsed-s="6.750411" cx="681.22" cy="445.56" r="3.5" fill="#1769aa"/>
+  <circle data-elapsed-s="7.000605" cx="703.43" cy="453.38" r="3.5" fill="#1769aa"/>
+  <circle data-elapsed-s="7.250481" cx="725.61" cy="466.83" r="3.5" fill="#1769aa"/>
+  <circle data-elapsed-s="7.500582" cx="747.81" cy="457.53" r="3.5" fill="#1769aa"/>
+  <circle data-elapsed-s="7.750398" cx="769.98" cy="444.41" r="3.5" fill="#1769aa"/>
+  <circle data-elapsed-s="8.000457" cx="792.18" cy="444.36" r="3.5" fill="#1769aa"/>
+  <circle data-elapsed-s="8.250448" cx="814.37" cy="444.36" r="3.5" fill="#1769aa"/>
+  <circle data-elapsed-s="8.500589" cx="836.58" cy="446.62" r="3.5" fill="#1769aa"/>
+  <circle data-elapsed-s="8.750421" cx="858.75" cy="458.07" r="3.5" fill="#1769aa"/>
+  <circle data-elapsed-s="9.00062" cx="880.96" cy="468.68" r="3.5" fill="#1769aa"/>
+  <circle data-elapsed-s="9.250608" cx="903.15" cy="472.06" r="3.5" fill="#1769aa"/>
+  <circle data-elapsed-s="9.32775" cx="910.00" cy="473.98" r="3.5" fill="#1769aa"/>
+  <line x1="82.00" y1="557.00" x2="117.00" y2="557.00" stroke="#1769aa" stroke-width="3"/>
+  <text x="126.00" y="561.00" class="legend">Interval effective cores</text>
+  <line x1="337.00" y1="557.00" x2="372.00" y2="557.00" stroke="#8f5bd7" stroke-width="2" stroke-dasharray="8 5"/>
+  <text x="381.00" y="561.00" class="legend">Requested inner_jobs: 158</text>
+  <line x1="617.00" y1="557.00" x2="652.00" y2="557.00" stroke="#d97706" stroke-width="2.5"/>
+  <text x="661.00" y="561.00" class="legend">Thread count (right axis)</text>
+</svg>

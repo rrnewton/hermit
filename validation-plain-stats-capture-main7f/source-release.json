@@ -1,0 +1,53 @@
+{
+  "at": "2026-10-14T13:07:00.604637+00:00",
+  "sources": [
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/reverie-stats-capture-main16ff",
+      "head": "dde3f9da33a0474d0fa9b273a25100fc0db4d751",
+      "status": "",
+      "toolchain": "[toolchain]\n# @fb-only: path = \"../../../third-party/rust-toolchain/rustup/current/basic\"\n# Pinned to the last known-good nightly. nightly-2026-07-30 (rustc 8ab9fdff5)\n# changed cargo's cdylib artifact uplift under `cargo test`, so\n# `target/debug/libreverie_examples.so` is no longer present when the\n# reverie-examples liteinst integration tests run, breaking all reverie CI.\n# Unpin once the cdylib/`cargo test` interaction is fixed upstream or the\n# liteinst fixture is made robust to the artifact layout.\nchannel = \"nightly-2026-07-29\" # @oss-only\n# Date-pinning installs a fresh dated toolchain; rustup only adds clippy/rustfmt\n# for it when they are requested here (the unpinned `nightly` got them from the\n# CI toolchain-setup action). Both shipped in the 2026-07-29 nightly.\ncomponents = [\"clippy\", \"rustfmt\"] # @oss-only\n",
+      "gitlinks": [
+        {
+          "path": "third-party/dynamorio",
+          "sha": "929840ad9190e5086775e8debc0f0b79b4208d59",
+          "present": false
+        },
+        {
+          "path": "third-party/e9patch",
+          "sha": "6c2c03c1da74b14daf1788a9f8dccfa354ce04a6",
+          "present": false
+        },
+        {
+          "path": "third-party/sabre",
+          "sha": "41113f849f8799932ed8c7883f5a4de616b9e9fa",
+          "present": false
+        }
+      ],
+      "lock_exists": false
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f",
+      "head": "d09ef1a3e7f46a5206e464b562a22c2e77ae9699",
+      "status": "",
+      "toolchain": "[toolchain]\n# @fb-only: path = \"../../../third-party/rust-toolchain/rustup/current/basic\"\n# Pinned so the OSS Buck2 build is reproducible. The shim's Rust toolchain is\n# `system_rust_toolchain`, which runs whatever `rustc` is on PATH; under rustup\n# that resolves through this file, so a floating `nightly` gives a cold reviewer\n# a different compiler on a different day and leaves every other bootstrap pin\n# (Buck2 release, Reindeer revision) without effect. nightly-2026-07-12 is the\n# toolchain used by the recorded Buck2 validation: rustc 1.99.0-nightly\n# (be8e82435 2026-07-11). See docs/BUCK2_OSS.md.\nchannel = \"nightly-2026-07-12\" # @oss-only\n# Date-pinning installs a fresh dated toolchain; rustup only adds clippy and\n# rustfmt for it when they are requested here.\ncomponents = [\"clippy\", \"rustfmt\"] # @oss-only\n",
+      "gitlinks": [
+        {
+          "path": "agent-utils",
+          "sha": "2bd7f9562d74fa96d24050cdd8c7746349ff5244",
+          "present": false
+        },
+        {
+          "path": "reverie",
+          "sha": "dde3f9da33a0474d0fa9b273a25100fc0db4d751",
+          "present": false
+        },
+        {
+          "path": "third-party/rr",
+          "sha": "39e5c18e7e43236b7ca0fb1eb647fe9c93e3934e",
+          "present": false
+        }
+      ],
+      "lock_exists": true
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-184-c031e1f04e9",
+    "issue_id": "agent-utils-184",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Verified 2026-10-13 09:55Z on devbig014, voice stack rebuilt on the private draft stack including the bridge close-once fix (draft D124878004) and the DGW interrupt routing (D121750125): scripts/voice-read-acceptance.py's same-socket interrupted re-answer gate passed 2 of 2 fresh-session trials: one interrupt each, the cut origin turn (3) followed by a complete follow-up answer (turn 4) on the same socket, follow-up coverage 1.00 and origin coverage 0.09. So a barge-in no longer ends the session. Unverified: the fixes are unpublished private drafts running locally; an upstream-built stack lacks them until they land.",
+    "created_at": "2026-10-13T09:48:50.028983993Z",
+    "updated_at": "2026-10-13T09:48:50.028983993Z"
+  }
+]

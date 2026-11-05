@@ -1,0 +1,18 @@
+[package]
+name = "chat-subscription"
+version = "0.1.0"
+description = "Provider-neutral ordered chat subscription and durable acknowledgement contracts"
+readme = "README.md"
+keywords = ["chat", "events", "subscriptions", "webhooks"]
+categories = ["api-bindings", "asynchronous"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde_json = "1"
+
+[lints]
+workspace = true

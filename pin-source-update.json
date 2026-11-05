@@ -1,0 +1,25 @@
+{
+  "old": "e1ecaeb31a0bb1f8b86f36e769296ab6a7de3782",
+  "new": "ff30c5bac6040c14122d33d60f5dfb91953c7099",
+  "pin_only_paths": [
+    "Cargo.lock",
+    "detcore-dbt/Cargo.toml",
+    "detcore-liteinst/Cargo.toml",
+    "detcore-model/Cargo.toml",
+    "detcore-sabre/Cargo.toml",
+    "detcore/Cargo.toml",
+    "detcore/tests/testutils/Cargo.toml",
+    "hermit-cli/BUCK",
+    "hermit-cli/Cargo.toml",
+    "hermit-install/Cargo.toml",
+    "liteinst-runtime-build/Cargo.lock",
+    "liteinst-runtime-build/Cargo.toml",
+    "liteinst-runtime-build/runtime/Cargo.toml"
+  ],
+  "sdk_note_paths": [
+    "ci/configure-build-jobs.sh",
+    "ci/run-with-reverie-dbt-budget.sh"
+  ],
+  "inventory": 953,
+  "inventory_evidence": "reverie-precommit-review.json: exact staged tracked-path enumeration 952 -> 953"
+}

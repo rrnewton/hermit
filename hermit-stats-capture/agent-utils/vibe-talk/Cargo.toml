@@ -1,0 +1,134 @@
+[workspace]
+members = ["."]
+
+[package]
+name = "vibe-talk"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/rrnewton/agent-utils"
+authors = ["Ryan Newton"]
+description = "A voice-agent bridge that reads and answers about Discord channels from a phone."
+publish = false
+# There are two binaries, and every `cargo run` in the README, in scripts/, and in CI means the
+# server. Without this, adding the mock turned all of them into "could not determine which binary
+# to run" — a second target must not change what the first command in the quickstart does.
+default-run = "vibe-talk"
+
+[lib]
+name = "vibe_talk"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vibe-talk"
+path = "src/main.rs"
+
+# The offline ElevenLabs substitute, as a process, for the browser harness and the smoke script.
+# NOTE FOR THE CONTAINERFILE: an explicit `[[bin]]` whose path does not exist makes cargo refuse
+# to read this manifest at all, which would break the image's dependency-cache stage — that stage
+# writes only src/main.rs and src/lib.rs. Containerfile creates a matching placeholder; if this
+# target is renamed or moved, that placeholder has to move with it.
+[[bin]]
+name = "vibe-talk-mock-elevenlabs"
+path = "src/bin/mock_elevenlabs.rs"
+
+[dependencies]
+anyhow = "1"
+# The sanitizer every rendered message body passes through before it reaches the page. See
+# `src/render.rs`: comrak writes the HTML, and ammonia decides what of it may exist.
+ammonia = "4"
+async-trait = "0.1"
+axum = { version = "0.8", default-features = false, features = [
+    "http1",
+    "json",
+    "query",
+    "tokio",
+] }
+base64 = "0.22"
+bytes = "1"
+# Message bodies are rendered HERE, not in the browser: GitHub-flavoured Markdown with chat's line
+# breaks. Without default features, which are its command-line front end and syntax highlighting —
+# neither is wanted by a server that only parses a document and formats it. 0.55 rather than the
+# newest because 0.56 raised its minimum Rust past this crate's declared 1.85.
+comrak = { version = "0.55", default-features = false }
+# Ticket minting only: 256 bits from the system CSPRNG. Already in the tree transitively.
+getrandom = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+# `tzdb-bundle-always` compiles the IANA database into the binary. The runtime image has no
+# `tzdata` package, and a server that fell back to UTC for want of one would silently reproduce
+# the wrong-zone bug this dependency was added to fix. See `src/clock.rs`.
+jiff = { version = "0.2.24", default-features = false, features = [
+    "std",
+    "tzdb-bundle-always",
+] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+    # Read-aloud forwards the vendor's audio to the browser as it arrives rather than buffering the
+    # whole file first, which is what lets playback start before generation has finished.
+    "stream",
+] }
+# SHA-256 only, for the content hashes the page's static files are cached under (`src/http/assets.rs`).
+# Already in the tree transitively, through rustls.
+ring = { version = "0.17", default-features = false }
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
+# Derives the checked-in wire contract (`src/contract.rs`) from the same types serde serializes, so the
+# browser's generated declarations and validators cannot describe a shape the server does not send.
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+# `process` runs `[summaries.llm].bearer_token_command` with a timeout that KILLS a hung child
+# (`kill_on_drop`), which `std::process` cannot do without leaking a blocked thread.
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+# `rustls-tls-webpki-roots` is what lets this crate dial a `wss://` URL at all: without a TLS
+# feature, `connect_async` refuses the scheme outright, and the ONLY signed URL ElevenLabs mints is
+# `wss://`. rustls rather than native-tls, and bundled roots rather than the platform store, so
+# that the summariser's socket makes the same trust decision as `reqwest` above it -- one TLS
+# stack, and a trust set that does not vary with the host the container happens to run on.
+#
+# It costs a SECOND copy of `webpki-roots` in the lockfile (0.26 for tungstenite, 1.0 for reqwest),
+# because the two crates pin different majors. That is a duplicated root list, not a second TLS
+# implementation, and it collapses on its own the moment tungstenite moves to 1.0.
+tokio-tungstenite = { version = "0.30", default-features = false, features = [
+    "connect",
+    "handshake",
+    "rustls-tls-webpki-roots",
+] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Response compression. Everything the server sent went out uncompressed — the page script alone
+# was 836 KB on every cold load, over phone and airplane links. Already in the tree transitively.
+tower-http = { version = "0.6", default-features = false, features = ["compression-br", "compression-gzip"] }
+# The URL parser ammonia judges a link's address with, asked the same question before the HTML is
+# written so a link the sanitizer would strip is shown as text instead. Already in the tree through
+# ammonia and reqwest; see `render::web_address`.
+url = "2"
+
+# The message cache's file lock and its directory-ownership check (`src/cache/file.rs`): `flock`,
+# the effective user id, and the host name the default cache path carries. Safe wrappers, because
+# this crate forbids `unsafe`, and the standard library's own `File::lock` arrived after the
+# declared Rust 1.85.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", default-features = false, features = ["fs", "process", "std", "system"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+# The live ElevenLabs client is exercised against a one-shot loopback HTTP server, which is what
+# pins the API key to a HEADER rather than the query string. That needs raw sockets in tests.
+#
+# `test-util` is what makes the poll loop's rate-limit BACKOFF assertable: the assertion is about
+# how long the loop waited, and against the real clock that is either a slow test or a flaky one.
+# With a paused clock the elapsed time is exact and the suite still finishes instantly.
+tokio = { version = "1", features = ["io-util", "net", "test-util"] }
+# A loopback TLS server that REQUIRES a client certificate, so a test can prove the summariser's
+# `client_identity_file` is actually presented in a handshake, and the rotated one after a reload.
+# Already in the tree through reqwest, with the same features (ring, no aws-lc), so it adds nothing
+# to the lockfile but this line's own entry.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+tower = { version = "0.5", features = ["util"] }
+
+[lints.rust]
+missing_docs = "deny"

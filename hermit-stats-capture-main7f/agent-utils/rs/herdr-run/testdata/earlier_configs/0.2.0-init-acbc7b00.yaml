@@ -1,0 +1,137 @@
+# .herdr-run.yaml — how this project runs commands in a terminal pane.
+#
+# Written by `herdr-run init`. Every key below is present and set to the value the tool would use
+# anyway, so deleting this whole file changes nothing: it exists so the policy is reviewable in the
+# project's own history and so there is one place to look. Delete any line whose default suits you.
+#
+# The nearest `.herdr-run.yaml` (or `.herdr-run.yml`) found by searching upward from the working
+# directory wins, the way `.gitignore` does. `herdr-run status` says which file is actually in
+# effect, and `herdr-run config` prints every value it resolved to.
+
+
+# ===========================================================================
+# THE ALLOWLIST — a human-only knob
+# ===========================================================================
+#
+# DO NOT LET AN AGENT EDIT THIS SECTION, and do not edit it if you are one.
+#
+# An agent that can widen its own allowlist does not have one. Keep this file where the agents
+# cannot write to it: the usual arrangement is agents working inside `worktrees/slotNN/` while this
+# file stays at the top of the project, simply outside their write scope. Without that separation
+# the list below is a comment rather than a policy, and should be read as one.
+#
+# Only these programs may be submitted. Keep the list short. "An agent may run git" is the actual
+# privilege being granted, and git writes files, runs hooks out of the repository it is pointed at,
+# and honours ambient configuration — the entries here matter far more than the deny lists further
+# down, which are only defence in depth.
+allow:
+  - git
+  - gh
+
+# ALLOW-EVERYTHING MODE. Replace the list above with one entry:
+#
+#     allow: ["*"]
+#
+# Any program is then admitted. This is a named mode rather than an oversight: it fits a project
+# where the pane is not meant to be a trust boundary at all and the reason for routing through it
+# is something else — a working directory, a login session, a machine. Everything except the
+# program-name check still applies: terminal control characters are still refused, the program must
+# still be a bare name resolved from the pane's own PATH, wrapper prefixes must still be declared
+# below, and every deny_* rule still bites. "*" has to be the only entry — `allow: ["*", "git"]`
+# is an error, because it reads narrower than it is.
+
+# Wrapper programs that may PRECEDE an allowlisted program, and may never run on their own.
+# Each may appear at most once in a command.
+prefixes:
+  - with-proxy
+
+# Programs whose subcommand must appear in a positive list. A program named here can run nothing
+# else, whatever `allow` says. `cargo` is the built-in case: even its dependency-oriented commands
+# can execute an ambiently configured compiler wrapper, credential provider, or fetch helper, so it
+# is never admitted without an explicit list, and never at all unless you add it to `allow` above.
+allow_subcommand:
+  cargo: [fetch, update, generate-lockfile, vendor, metadata, tree, search]
+
+# Defence in depth, NOT the boundary: these remove the best-known ways an allowlisted program can
+# be talked into running something else. Do not mistake a full deny list for containment.
+deny_global:
+  git: ["-c", "--config-env", "--exec-path", "--namespace"]
+  gh: []
+  # Cargo accepts these on either side of its subcommand; attached forms are refused too.
+  cargo: ["--config", "-Z"]
+deny_subcommand:
+  git: ["filter-branch", "daemon", "instaweb"]
+  gh: ["alias", "extension", "ext", "codespace", "cs"]
+deny_anywhere: ["--upload-pack", "--receive-pack"]
+
+# Global options that consume the FOLLOWING token as their value. Needed so that the first real
+# argument is recognised as the subcommand and not mistaken for an option's value.
+value_options:
+  git: ["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env"]
+  gh: ["-R", "--repo"]
+  cargo: ["--manifest-path", "--config", "-Z", "-p", "--package", "--target-dir"]
+
+
+# ===========================================================================
+# WHERE COMMANDS RUN
+# ===========================================================================
+
+# Workspace LABEL holding this project's command tabs. One label per project keeps projects from
+# counting against each other's pane cap.
+workspace: agent-cmds
+
+# Tab-label schema, one tab per agent. {agent} is the invoking agent, {project} the project
+# directory's basename. Nothing else is accepted, and no format specifications.
+tab_name: "{agent}"
+
+# Working directory for commands. null means the caller's own directory; a relative path is
+# resolved against the directory holding this file.
+cwd: null
+
+# Process names accepted as an interactive shell when judging whether a pane is idle.
+shells: [bash, zsh, sh, dash, fish, ksh]
+
+# How Herdr control calls are made: 'direct' when the server's socket is reachable from the caller,
+# 'systemd-run' when it is not. This does not affect how the server itself is started.
+broker: direct
+
+
+# ===========================================================================
+# TIMING AND SAFETY AROUND A SHARED PANE
+# ===========================================================================
+
+# How long to wait for a command's exit code before giving up on it. The command is NOT killed:
+# it is running in a terminal this process does not own.
+timeout_seconds: 900
+
+# How long to wait for the pane to become idle. 0 refuses immediately when it is busy, which is the
+# right default for a pane a human may also be typing into.
+ready_timeout_seconds: 0
+
+# 'both' requires the foreground-process signal AND lets a prompt check veto on positive evidence
+# of a half-typed line. 'process' drops the prompt veto.
+readiness: both
+
+# The rendered prompt suffix, e.g. "$ ". null infers it from the shell rc file and abstains rather
+# than guessing when it cannot.
+prompt_tail: null
+
+
+# ===========================================================================
+# WHAT IS KEPT ON DISK
+# ===========================================================================
+
+# Run spools and the audit log. MUST be git-ignored: this holds command output, not source.
+spool_dir: .herdr-run
+
+# Completed run spools older than this are pruned when a LATER run is written. Active, timed-out,
+# and incomplete runs are kept regardless of age. The audit log is never pruned.
+retention_days: 4
+
+# Refuse to open a NEW tab once the workspace already holds this many panes; 0 disables the cap.
+# Existing tabs are never affected, so a cap can never break work already in progress. Nothing
+# closes a tab automatically — `herdr-run reap` reports which ones are provably finished with.
+max_panes: 32
+
+# The remote `herdr-run net-doctor` probes with `git ls-remote`.
+probe_remote: https://github.com/git/git

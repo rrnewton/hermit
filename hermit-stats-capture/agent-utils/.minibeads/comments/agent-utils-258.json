@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-258-cae7b839400",
+    "issue_id": "agent-utils-258",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Channel-level clear for Slack built (opt-in provider key upstream_clear; never moves the cursor backwards; thread channels and permission errors refused). Thread replies cannot be marked read with an OAuth user token (subscriptions.thread.mark is session-token only and the proxy rejects unlisted methods), so they stay unread in Slack. Shim change is a devbig014 copy pending deploy.",
+    "created_at": "2026-10-12T23:04:36.318175806Z",
+    "updated_at": "2026-10-12T23:04:36.318175806Z"
+  }
+]

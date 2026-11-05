@@ -1,0 +1,14 @@
+{
+  "name": "wrkviz-browser-tests",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Hermetic Playwright interaction checks for wrkviz",
+  "scripts": {
+    "serve-fixture": "node fixture-server.cjs",
+    "test": "playwright test",
+    "test:headed": "playwright test --headed"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.61.0"
+  }
+}

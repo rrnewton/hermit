@@ -1,0 +1,13 @@
+   Compiling hermit v0.4.1 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f/hermit-cli)
+    Finished `validate` profile [optimized] target(s) in 0.68s
+────────────
+ Nextest run ID 2fcc8e8d-7d64-4181-933f-78488372a6bf with nextest profile: default
+    Starting 6 tests across 1 binary
+        PASS [   0.320s] hermit::inherited_terminal_read dbt_inherited_terminal_short_read_allows_parent_progress
+        PASS [   0.416s] hermit::inherited_terminal_read dbt_terminal_alias_survives_failed_and_successful_exec
+        PASS [   0.416s] hermit::inherited_terminal_read dbt_terminal_read_observes_peer_cleared_nonblocking_after_exec
+        PASS [   0.099s] hermit::inherited_terminal_read native_inherited_terminal_short_read_allows_parent_progress
+        PASS [   0.101s] hermit::inherited_terminal_read native_terminal_alias_survives_failed_and_successful_exec
+        PASS [   0.110s] hermit::inherited_terminal_read native_terminal_read_observes_peer_cleared_nonblocking_after_exec
+────────────
+     Summary [   1.464s] 6 tests run: 6 passed, 0 skipped

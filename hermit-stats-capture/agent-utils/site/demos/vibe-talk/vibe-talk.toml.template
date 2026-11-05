@@ -1,0 +1,65 @@
+# The vibe-talk configuration record_demo.py writes for one recording run.
+#
+# record_demo.py fills in each placeholder (a name in braces) with Python's str.format, so a
+# literal brace anywhere in this file, comments included, must be doubled. It writes the result to
+# vibe-talk.toml in the run's directory (mode 0700). Every placeholder sits inside a quoted
+# string, so this template is itself valid TOML. Every token is a throwaway: the mock bridge and
+# the mock Messages API accept anything, and nothing listens beyond 127.0.0.1.
+#
+#   vibe_port, bridge_port, llm_port   --port-base and the next two ports
+#   zone                               the time zone the page shows times in
+#   bridge_token, owner_id             the owner's account, encoded in the token's first segment
+#   read_token, write_token            the page signs in with the write token
+#   ingest_token                       lets the mock bridge send change hints
+#   channel_id                         the one fictional Google Chat space
+#   run_dir                            the run's directory: store, key file and logs
+
+[server]
+bind = "127.0.0.1:{vibe_port}"
+timezone = "{zone}"
+
+[chat]
+default_fetch_limit = 50
+max_fetch_limit = 100
+
+# The mock speaks the Discord-compatible bridge contract, as a Google Chat bridge does.
+[discord]
+provider_name = "Google Chat"
+markup = "google-chat"
+api_base = "http://127.0.0.1:{bridge_port}/api/v10"
+thread_api = "bridge"
+bot_token = "{bridge_token}"
+owner_user_id = "{owner_id}"
+# The bridge sends a change hint for every new message, so this is only the recovery bound.
+live_poll_seconds = 120
+max_post_chars = 4000
+
+[auth]
+read_token = "{read_token}"
+write_token = "{write_token}"
+
+[ingest]
+token = "{ingest_token}"
+
+[[channels]]
+id = "{channel_id}"
+label = "acme"
+writable = true
+
+[read_aloud]
+backend = "browser"
+
+[storage]
+path = "{run_dir}/vibe-talk.sqlite3"
+
+[summaries]
+threshold_chars = 280
+
+# The mock Messages API: canned summaries and thread names in the Anthropic API's dialect.
+[summaries.llm]
+dialect = "anthropic"
+base_url = "http://127.0.0.1:{llm_port}"
+api_key_file = "{run_dir}/llm-key"
+model = "demo-summarizer"
+requests_per_minute = 600
+burst = 50

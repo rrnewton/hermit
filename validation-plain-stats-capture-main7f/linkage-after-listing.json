@@ -1,0 +1,31 @@
+{
+  "checked_at": "2026-10-14T13:40:21.223776+00:00",
+  "files": [
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit/validate/hermit",
+      "sha256": "358186c198d4ed2fd5c19c5014b90be600b31294e5ba95a6aaf4cdd6467d5630",
+      "equals_runtime_capture": false
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit/validate/deps/libdetcore_dbt.so",
+      "sha256": "5be15998e86e897b8151481fdd9666dc24ae48fe1f1d05c93840bda52a83d686",
+      "equals_runtime_capture": true
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit/validate/deps/detcore-dbt-native-dde3f9d-9652929dea52e7d2/libreverie_dbt_client.so",
+      "sha256": "d2274547511c838bc70114afc664b777adf6aae28c1c2d1886e228e23e3de774",
+      "equals_runtime_capture": true
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit/validate/deps/detcore-dbt-native-dde3f9d-9652929dea52e7d2/CMakeCache.txt",
+      "sha256": "9f58aa5df39faff7b6494bbe43b3f8bef966c42978e44086379470f9c5a6377b",
+      "equals_runtime_capture": true
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit/validate/deps/detcore-dbt-native-dde3f9d-9652929dea52e7d2/CMakeFiles/reverie_dbt_client.dir/link.txt",
+      "sha256": "9dff6a12bda0d7147d506d3a68546cbfef75d34abf922e772130ba28dff6a49b",
+      "equals_runtime_capture": true
+    }
+  ],
+  "qualification": "Shared working target is mutable. production-linkage.json captured the actual CLI11/terminal6 build before maintained-feature listing. A later CLI feature rebuild is not a rerun or a replacement runtime result."
+}

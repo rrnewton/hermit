@@ -1,0 +1,93 @@
+rank	step	wall_seconds	aggregate_cpu_seconds	peak_mib	cap_mib	cap_used_pct	memory_events_max	memory_peak_censored	aggregate_wall_share_pct	cumulative_aggregate_wall_pct	coverage_rationale	recommendation
+1	cross.dagrun.differential	432.399	509.206	227.77	2560.00	8.9	0	false	12.111	12.111	Python/Rust parity across dagrun's observable command surface	retain; dominant critical path, so split or parallelize before adding cases
+2	vibe-talk.shots.screenshots	285.314	176.312	659.90	3072.00	21.5	0	false	7.991	20.102	real-browser rendering and interaction coverage that unit tests cannot provide	retain selected/browser coverage; profile and shard before widening
+3	rust.dagrun.test	212.443	135.458	1479.30	7680.00	19.3	0	false	5.950	26.052	scheduler, containment, timeout, and process-tree integration behavior	retain process-safety coverage; shard isolated integration tests if stable
+4	cross.agentctl.differential	192.955	171.605	1747.45	3200.00	54.6	0	false	5.404	31.456	Python/Rust parity for agent lifecycle and remote-control behavior	retain cross-runtime contract; reduce repeated process startup if optimizing
+5	rust.agentctl.test	157.312	120.170	134.51	7680.00	1.8	0	false	4.406	35.862	agentctl Rust tests	retain; profile or shard before expanding this gate
+6	python-lifecycle.host.shard-2	155.186	148.317	342.07	1280.00	26.7	0	false	4.346	40.209	lifecycle host-visible shard 3 of 3	retain destructive-safety coverage in isolated, width-capped shards
+7	examples.run.rust	143.321	106.761	559.36	16384.00	3.4	0	false	4.014	44.223	shipped examples behave as documented with the Rust engine	retain user-facing contract; keep component-selective
+8	examples.run.python	138.685	98.327	571.93	16384.00	3.5	0	false	3.884	48.107	shipped examples behave as documented with the Python engine	retain user-facing contract; keep component-selective
+9	python.dagrun.shard-0	137.282	128.000	675.09	2048.00	33.0	0	false	3.845	51.952	dagrun Python tests, shard 1 of 2	retain; profile or shard before expanding this gate
+10	python-lifecycle.namespace.shard-1	120.228	114.474	182.84	1280.00	14.3	0	false	3.367	55.320	lifecycle namespace shard 2 of 6	retain destructive-safety coverage in isolated, width-capped shards
+11	python.dagrun.shard-1	115.353	93.716	690.02	2048.00	33.7	0	false	3.231	58.551	dagrun Python tests, shard 2 of 2	retain; keep component-selective
+12	python-lifecycle.namespace.shard-0	110.147	103.018	156.04	1280.00	12.2	0	false	3.085	61.636	lifecycle namespace shard 1 of 6	retain destructive-safety coverage in isolated, width-capped shards
+13	python-lifecycle.namespace.shard-3	106.024	99.771	161.99	1280.00	12.7	0	false	2.970	64.605	lifecycle namespace shard 4 of 6	retain destructive-safety coverage in isolated, width-capped shards
+14	python-lifecycle.namespace.shard-4	104.121	98.454	183.82	1280.00	14.4	0	false	2.916	67.522	lifecycle namespace shard 5 of 6	retain destructive-safety coverage in isolated, width-capped shards
+15	python-lifecycle.host.shard-0	102.974	97.898	244.70	1280.00	19.1	0	false	2.884	70.406	lifecycle host-visible shard 1 of 3	retain destructive-safety coverage in isolated, width-capped shards
+16	python-lifecycle.namespace.shard-5	99.686	94.292	175.14	1280.00	13.7	0	false	2.792	73.198	lifecycle namespace shard 6 of 6	retain destructive-safety coverage in isolated, width-capped shards
+17	python.repository-infrastructure.test	94.168	116.241	783.53	1920.00	40.8	0	false	2.637	75.835	fail-closed repository routing, packaging, and launcher infrastructure	retain fail-closed coverage; shard the component if it stays above two minutes
+18	python-lifecycle.namespace.shard-2	93.133	91.978	723.40	1280.00	56.5	0	false	2.608	78.444	lifecycle namespace shard 3 of 6	retain destructive-safety coverage in isolated, width-capped shards
+19	python.wrkslots.test	86.590	79.464	725.52	1920.00	37.8	0	false	2.425	80.869	wrkslots non-lifecycle Python tests	retain; keep component-selective
+20	cross.agentctl.herdr-agent-differential	66.545	56.412	788.73	2560.00	30.8	0	false	1.864	82.733	herdr-agent Python and Rust commands agree	retain cross-runtime contract; keep component-selective
+21	python.agentctl.shard-0	60.668	31.468	182.37	1920.00	9.5	0	false	1.699	84.432	agentctl Python tests, shard 1 of 2	retain; keep component-selective
+22	timeline.browser.functional	47.514	51.208	615.39	1280.00	48.1	0	false	1.331	85.763	drive timeline interactions in Chromium	retain real-browser contract; keep browser-selective
+23	python-lifecycle.host.shard-1	47.427	41.352	217.95	1280.00	17.0	0	false	1.328	87.091	lifecycle host-visible shard 2 of 3	retain destructive-safety coverage in isolated, width-capped shards
+24	python.wrkviz.shard-1	47.146	37.187	505.49	1920.00	26.3	0	false	1.320	88.412	wrkviz Python tests, shard 2 of 2	retain; keep component-selective
+25	python.wrkviz.shard-0	43.983	34.214	452.32	1920.00	23.6	0	false	1.232	89.643	wrkviz Python tests, shard 1 of 2	retain; keep component-selective
+26	python.agentctl.shard-1	36.967	23.991	184.56	1920.00	9.6	0	false	1.035	90.679	agentctl Python tests, shard 2 of 2	retain; keep component-selective
+27	rust-packages.rust.agentctl	29.093	75.262	1558.91	7680.00	20.3	0	false	0.815	91.494	package and smoke the agentctl and chat-subscription Rust crates once	retain installability contract; keep component-selective
+28	vibe-talk.test.unit	26.851	25.555	318.46	7680.00	4.1	0	false	0.752	92.246	the Rust suites, and the page suites through their harnesses	retain application contract; keep vibe-talk-selective
+29	cross.planner.differential	21.917	20.488	141.78	512.00	27.7	0	false	0.614	92.860	pr-landing-planner Python and Rust commands agree	retain cross-runtime contract; keep component-selective
+30	rust-packages.rust.dagrun	20.086	69.852	2125.39	7680.00	27.7	0	false	0.563	93.422	package and smoke the dagrun Rust crate	retain installability contract; keep component-selective
+31	vibe-talk.check.read-aloud-browser	16.322	3.494	332.88	1280.00	26.0	0	false	0.457	93.879	read-aloud tap to audible in current Chromium, with an <audio> negative control	retain application contract; keep vibe-talk-selective
+32	cross.herdr-run.differential	14.817	14.733	223.02	2560.00	8.7	0	false	0.415	94.294	herdr-run Python and Rust commands agree	retain cross-runtime contract; keep component-selective
+33	vibe-talk.check.offline-cache-browser	12.968	6.551	368.36	1280.00	28.8	0	false	0.363	94.658	saved-message snapshot in current Chromium at 412x915 and 360x800 Android viewports and a 1280x800 desk	retain application contract; keep vibe-talk-selective
+34	cross.tick-hub.differential	12.583	10.182	140.83	2560.00	5.5	0	false	0.352	95.010	tick-hub Python and Rust commands agree	retain cross-runtime contract; keep component-selective
+35	rust.wrkslots.test	12.130	8.534	151.34	7680.00	2.0	0	false	0.340	95.350	wrkslots daemon Rust tests	retain; low measured wall-clock cost
+36	rust-packages.rust.herdr-run	9.476	33.711	749.93	7680.00	9.8	0	false	0.265	95.615	package and smoke the herdr-run Rust crate	retain installability contract; keep component-selective
+37	rust-packages.rust.planner	8.420	32.617	923.05	7680.00	12.0	0	false	0.236	95.851	package and smoke the planner Rust crate	retain installability contract; keep component-selective
+38	cross.dagrun.cpuset-differential	7.630	6.344	146.73	2560.00	5.7	0	false	0.214	96.065	cpuset allocator Python and Rust commands agree	retain cross-runtime contract; keep component-selective
+39	packages.python.agentctl	7.610	6.893	193.64	1280.00	15.1	0	false	0.213	96.278	build and smoke-install the agentctl Python distribution	retain installability contract; keep component-selective
+40	timeline.browser.benchmark-instrument	7.358	2.361	228.30	1280.00	17.8	0	false	0.206	96.484	prove the real-site benchmark records every advertised metric	retain real-browser contract; keep browser-selective
+41	timeline.browser.benchmark	7.300	2.367	235.14	1280.00	18.4	0	false	0.204	96.688	enforce timeline pan and zoom redraw budgets	retain real-browser contract; keep browser-selective
+42	packages.python.wrkviz	6.846	6.392	197.77	1280.00	15.5	0	false	0.192	96.880	build and smoke-install the wrkviz Python distribution	retain installability contract; keep component-selective
+43	repository.check.python-types	6.197	5.913	282.15	2560.00	11.0	0	false	0.174	97.054	strict repository Python typing with no explicit Any	retain; low measured wall-clock cost
+44	rust-packages.rust.tick-hub	6.139	15.597	433.82	7680.00	5.6	0	false	0.172	97.226	package and smoke the tick-hub Rust crate	retain installability contract; keep component-selective
+45	python.repository-infrastructure.validation-graph	5.924	4.958	166.98	320.00	52.2	0	false	0.166	97.391	graph inventory, labels, and selection closure remain complete	retain; low measured wall-clock cost
+46	packages.python.wrkslots	5.644	5.262	299.89	1280.00	23.4	0	false	0.158	97.550	build and smoke-install the wrkslots Python distribution	retain installability contract; keep component-selective
+47	packages.python.dagrun	5.464	4.791	181.69	1280.00	14.2	0	false	0.153	97.703	build and smoke-install the dagrun Python distribution	retain installability contract; keep component-selective
+48	python.repository-infrastructure.package-contract	5.356	4.713	186.20	640.00	29.1	0	false	0.150	97.853	package validation and lifecycle partitions remain complete	retain; low measured wall-clock cost
+49	rust.tick-hub.test	4.495	0.241	38.03	7680.00	0.5	0	false	0.126	97.979	tick-hub Rust tests	retain; low measured wall-clock cost
+50	packages.python.tick-hub	4.318	4.034	160.70	1280.00	12.6	0	false	0.121	98.099	build and smoke-install the tick-hub Python distribution	retain installability contract; keep component-selective
+51	repository.check.entrypoints	4.318	4.021	69.95	640.00	10.9	0	false	0.121	98.220	dependency-free Python entrypoint smoke checks	retain; low measured wall-clock cost
+52	packages.python.planner	4.258	3.958	163.32	1280.00	12.8	0	false	0.119	98.340	build and smoke-install the planner Python distribution	retain installability contract; keep component-selective
+53	python.herdr-run.test	4.214	3.569	579.65	1920.00	30.2	0	false	0.118	98.458	herdr-run Python tests	retain; low measured wall-clock cost
+54	packages.python.herdr-run	3.964	3.642	163.53	1280.00	12.8	0	false	0.111	98.569	build and smoke-install the herdr-run Python distribution	retain installability contract; keep component-selective
+55	python.repository-infrastructure.dispatch-wiring	3.955	2.658	167.89	640.00	26.2	0	false	0.111	98.679	Python and Rust tool launchers agree with package metadata	retain; low measured wall-clock cost
+56	packages.python.experiment-runner	3.843	3.407	160.86	1280.00	12.6	0	false	0.108	98.787	build and smoke-install the experiment runner Python distribution	retain installability contract; keep component-selective
+57	repository.build.rust-launchers	3.298	4.143	246.28	10240.00	2.4	0	false	0.092	98.879	build the Rust workspace and verify tracked launchers	retain; low measured wall-clock cost
+58	repository.hygiene.pytest-sharder	3.117	2.213	173.68	256.00	67.8	0	false	0.087	98.967	deterministic shards are disjoint and complete	retain; low measured wall-clock cost
+59	rust.herdr-run.test	2.885	1.344	50.96	7680.00	0.7	0	false	0.081	99.048	herdr-run Rust tests	retain; low measured wall-clock cost
+60	python.tick-hub.test	2.753	1.380	112.01	1920.00	5.8	0	false	0.077	99.125	tick-hub Python tests	retain; low measured wall-clock cost
+61	rust.chat-subscription.fake	2.707	0.150	24.03	7680.00	0.3	0	false	0.076	99.201	chat-subscription fake plugin Rust tests	retain; low measured wall-clock cost
+62	python.repository-infrastructure.cli-no-optional-deps	2.299	2.078	81.91	320.00	25.6	0	false	0.064	99.265	Python entrypoints remain usable without optional YAML support	retain; low measured wall-clock cost
+63	vibe-talk.check.pwa-installability	1.896	1.088	240.23	1280.00	18.8	0	false	0.053	99.318	current Chromium CDP installability check with an Android viewport	retain application contract; keep vibe-talk-selective
+64	python.repository-infrastructure.cli-surface	1.865	1.612	182.92	320.00	57.2	0	false	0.052	99.370	every Python main function is exposed through package metadata	retain; low measured wall-clock cost
+65	python.planner.test	1.594	1.357	109.95	1920.00	5.7	0	false	0.045	99.415	pr-landing-planner Python tests	retain; low measured wall-clock cost
+66	repository.format.rust	1.525	1.365	44.33	320.00	13.9	0	false	0.043	99.458	rustfmt checks the workspace	retain; low measured wall-clock cost
+67	vibe-talk.check.scripts	1.465	1.050	144.03	640.00	22.5	0	false	0.041	99.499	strict typing and no explicit Any in the Python operator tools	retain application contract; keep vibe-talk-selective
+68	repository.hygiene.validation-selector	1.412	0.954	287.63	640.00	44.9	0	false	0.040	99.538	prove validation routing fails safe	retain; low measured wall-clock cost
+69	python.experiment-runner.test	1.390	0.894	109.47	1920.00	5.7	0	false	0.039	99.577	parallel-experiment-runner Python tests	retain; low measured wall-clock cost
+70	cross.check.mypy	1.388	0.863	136.27	320.00	42.6	0	false	0.039	99.616	strict typing and no-Any policy for cross-language Python inputs	retain cross-runtime contract; keep component-selective
+71	repository.hygiene.component-manifest	1.209	0.334	194.98	320.00	60.9	0	false	0.034	99.650	every Python test has exactly one declared owner	retain; low measured wall-clock cost
+72	repository.hygiene.client-names	1.088	0.841	124.29	320.00	38.8	0	false	0.030	99.680	reject consuming-project names anywhere in the repository	retain; low measured wall-clock cost
+73	python.planner.cli-smoke	0.999	0.582	97.04	160.00	60.6	0	false	0.028	99.708	planner version and bundled fixture in every output format	retain; low measured wall-clock cost
+74	python.experiment-runner.cli-smoke	0.996	0.365	105.95	160.00	66.2	0	false	0.028	99.736	experiment runner version, guide, and dry planning scenarios	retain; low measured wall-clock cost
+75	cross.dagrun.cpu-footprint	0.945	0.616	79.19	320.00	24.7	0	false	0.026	99.763	CPU-footprint contract tests	retain cross-runtime contract; keep component-selective
+76	python.repository-infrastructure.cross-environment	0.905	0.679	83.56	320.00	26.1	0	false	0.025	99.788	the cross-language harness remains isolated from ambient Python paths	retain; low measured wall-clock cost
+77	rust.chat-subscription.plugin	0.893	0.338	43.03	7680.00	0.6	0	false	0.025	99.813	chat-subscription plugin Rust tests	retain; low measured wall-clock cost
+78	vibe-talk.check.android-speech-self-test	0.845	0.487	68.47	320.00	21.4	0	false	0.024	99.837	offline controls for the Android rendered-speech evaluator	retain application contract; keep vibe-talk-selective
+79	vibe-talk.check.fmt	0.639	0.416	28.05	320.00	8.8	0	false	0.018	99.855	rustfmt, in check mode	retain application contract; keep vibe-talk-selective
+80	python.wrkviz.cli-smoke	0.602	0.289	63.22	160.00	39.5	0	false	0.017	99.871	wrkviz dependency-free quickstart scenario	retain; low measured wall-clock cost
+81	vibe-talk.check.clippy	0.523	0.276	53.61	7680.00	0.7	0	false	0.015	99.886	clippy over every target, warnings denied	retain application contract; keep vibe-talk-selective
+82	python.tick-hub.cli-smoke	0.514	0.248	100.37	160.00	62.7	0	false	0.014	99.900	tick-hub version and bundled dry-run example	retain; low measured wall-clock cost
+83	repository.docs.embedded-userguides	0.481	0.297	53.04	320.00	16.6	0	false	0.013	99.914	generated package guides match their source templates	retain; low measured wall-clock cost
+84	repository.hygiene.documented-defaults	0.451	0.247	51.84	320.00	16.2	0	false	0.013	99.927	compare documented defaults with implementation constants	retain; low measured wall-clock cost
+85	vibe-talk.build.release	0.421	0.186	45.80	20480.00	0.2	0	false	0.012	99.938	the release binary the server-shaped suites run against	retain application contract; keep vibe-talk-selective
+86	repository.hygiene.documented-defaults-self-test	0.398	0.224	52.85	160.00	33.0	0	false	0.011	99.950	prove the documented-default guard can fail	retain; low measured wall-clock cost
+87	rust.planner.test	0.396	0.202	44.90	7680.00	0.6	0	false	0.011	99.961	pr-landing-planner Rust tests	retain; low measured wall-clock cost
+88	repository.check.test-suite-selector	0.389	0.023	4.81	160.00	3.0	0	false	0.011	99.972	reject invalid language-suite selections	retain; low measured wall-clock cost
+89	repository.check.rust-clippy	0.345	0.184	33.53	10240.00	0.3	0	false	0.010	99.981	clippy every workspace target with warnings denied	retain; low measured wall-clock cost
+90	repository.hygiene.client-names-self-test	0.287	0.084	52.59	160.00	32.9	0	false	0.008	99.989	prove the client-name guard can fail	retain; low measured wall-clock cost
+91	rust.chat-subscription.core	0.278	0.140	40.39	7680.00	0.5	0	false	0.008	99.997	chat-subscription core Rust tests	retain; low measured wall-clock cost
+92	vibe-talk.smoke.cli-help	0.107	0.003	1.20	160.00	0.8	0	false	0.003	100.000	the built service binary exposes its operator help without configuration	retain application contract; keep vibe-talk-selective

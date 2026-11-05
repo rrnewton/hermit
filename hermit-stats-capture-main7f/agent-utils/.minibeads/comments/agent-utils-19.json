@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-19-cb3f17a86df",
+    "issue_id": "agent-utils-19",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Closing #19 channel-browser. Delivered in 021a46c (vibe-talk: browse and add the channels a registration bridge can see).\n\n- Contract: a registration-capable bridge may answer GET /channel-directory?query=&limit=&cursor= with {entries:[{source,name,registered_channel_id}],next_cursor,truncated}. source and cursor are opaque, and the answer is parsed strictly (src/directory.rs).\n- Server: GET /api/v1/channel-directory needs WRITE scope. It validates the query, limit and cursor locally, marks entries already tracked against the live channel list, and keeps denied (403), unsupported (501) and rejected (400) apart. client-config advertises channel_discovery_supported.\n- Page: Settings > Browse channels is debounced search over a paged list. It adds through the existing POST /api/v1/channels, so a browsed channel is probed and persisted exactly like a pasted one. It covers loading, empty, error, denied, unsupported, duplicate (409) and pagination states on a narrow viewport. Visible and accessible copy names the chat service, never the bridge.\n- Provider enumeration lives only in the private adapter. The public tree has no provider names, URLs, auth or identifiers.\n- Tests: tests/api.rs covers the directory route, scope, marking, paging, local refusals and upstream failure meanings. tests/js/voice_page.test.mjs has 10 channel-browser tests.\n\nClosed ahead of the combined train's live QA. That QA must show Browse channels listing, searching and marking tracked sources against the deployed private adapter before this closure is published. Adding a channel is proved by the existing registration path; the live QA does not create a new registration, to avoid changing the restored tracking state.\n\nUnverified: paging past the first page against the live account, unless that account sees more than one page of channels; deeper paging is covered by the fake-bridge API and page tests.",
+    "created_at": "2026-09-25T06:46:14.441901111Z",
+    "updated_at": "2026-09-25T06:46:14.441901111Z"
+  }
+]

@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-32-c41c932b23d",
+    "issue_id": "agent-utils-32",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Fixed: while the freshness pill has something to say (refreshing, offline, failed), #pane-discord reserves its height at the head of the list (padding inside #scroll-area, from CSS tokens shared with the pill); the pill is one ellipsised line so the reservation is exact. The toggle runs through preservingScroll, so a reader mid-list or at the newest line stays put as the pill comes and goes; a reader at the very top is left to see the header move down out from under it. Verified: tests/offline_cache_browser.py in Chromium 151 at 412x915, 360x800 (Pixel 7 UA, touch) and 1280x800 (fine pointer, desktop regime): at scrollTop 0 in all three states, with and without view tabs, the pill meets neither the tabs, any header seam nor the first row, and #scroll-area is the same box with and without it; and, on the channel's own poll (page clock), the pill appearing and clearing moves a mid-list reader's row by under 2px, keeps a reader at the newest line there, and leaves a reader at the top at scrollTop 0. Negative controls: f38aad7's CSS/JS covers the seam; the first cut (8b5b042) moved the mid-list row 44.4px and left the newest line 45px below. voice_page 593/593 includes a fake-DOM test of when the room is reserved. Known and accepted: below 360px wide the failed-state text is ellipsised (its full text is still announced); the failed read's error banner moving the list by its own height predates this and is not addressed here. Unverified: a physical iPhone and the live deployment.",
+    "created_at": "2026-09-25T11:56:01.857373998Z",
+    "updated_at": "2026-09-25T11:56:01.857373998Z"
+  }
+]

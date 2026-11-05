@@ -1,0 +1,11 @@
+{
+  "head": "342daf53c1691da42ae7067850540a06bec504b4",
+  "path": "hermit-cli/tests/cli.rs",
+  "selector": "run_dbt_verify_replays_stdin_bytes_and_eof",
+  "function_sha256": "f75e69171a79e3404a75c7f1c4cdc8616a8c9d6b323fd1bf7700e82369ff4757",
+  "backend": "DBT",
+  "log_level": "default",
+  "relaxations": "none",
+  "asserted": "matched, bitwise_parity true, canonical, compare_io_buffers true, each run exit0+32stdout bytes+exact SHA256+nonzero INFO count; one emitted copy",
+  "temporary_report": "Not retained after tempfile cleanup; numeric INFO counts not separately observed."
+}

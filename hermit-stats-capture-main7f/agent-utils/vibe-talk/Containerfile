@@ -1,0 +1,76 @@
+# Build and run vibe-talk under Podman (or Docker; nothing here is Podman-specific).
+#
+#   podman build -t vibe-talk -f vibe-talk/Containerfile vibe-talk
+#   podman run --rm -p 8080:8080 \
+#     -e VIBE_TALK_DISCORD_BOT_TOKEN=... -e VIBE_TALK_READ_TOKEN=... \
+#     -e VIBE_TALK_WRITE_TOKEN=... -e VIBE_TALK_CHANNELS='123:lead team:rw' \
+#     vibe-talk
+#
+# The image contains no configuration and no secret. Everything comes in at run time, from the
+# environment or from a mounted configuration file, so the same image runs on a laptop, on this
+# host, and in a cloud without a rebuild.
+
+FROM docker.io/library/rust:1-slim-bookworm AS build
+WORKDIR /src
+
+# Dependencies first, so an edit to src/ does not refetch and rebuild the whole tree.
+#
+# Every explicit `[[bin]]` in Cargo.toml needs a placeholder here. Cargo refuses to read a
+# manifest whose declared target path does not exist — not "skips that target", refuses the whole
+# manifest — so a missing placeholder fails this stage before a single dependency is fetched.
+# `src/bin/mock_elevenlabs.rs` is the offline ElevenLabs substitute; it is built here only because
+# the manifest mentions it, and it is deliberately NOT copied into the runtime image below.
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir -p src/bin \
+    && printf '//! placeholder\nfn main() {}\n' > src/main.rs \
+    && printf '//! placeholder for dependency caching\n' > src/lib.rs \
+    && printf '//! placeholder\nfn main() {}\n' > src/bin/mock_elevenlabs.rs \
+    && cargo build --release --locked \
+    && rm -rf src
+
+COPY src ./src
+COPY web ./web
+COPY prompts ./prompts
+# Touch the entry points so cargo cannot reuse the placeholder build above. Only the server is
+# built: the image ships a bridge, not a machine that can mint fake conversations.
+RUN touch src/main.rs src/lib.rs && cargo build --release --locked --bin vibe-talk
+
+FROM docker.io/library/debian:bookworm-slim
+# TLS roots, for Discord and (later) ElevenLabs. rustls is used, so no OpenSSL runtime is needed.
+# Deliberately NO `tzdata`: the IANA database is compiled into the binary (`jiff`, feature
+# `tzdb-bundle-always`), because a runtime image without one would make `server.timezone` fail —
+# or worse, fall back to UTC — and quietly reproduce the wrong-zone bug it was added to fix.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Never run the bridge as root: it holds a Discord bot token and is meant to face the internet.
+RUN useradd --system --create-home --uid 10001 vibe
+
+# Durable state. THE IMAGE IS NOT STORAGE: a directory created here lives in the container's
+# writable layer and is destroyed by `podman rm`, by a rebuild, and by a re-pull. So this
+# directory exists only to be a MOUNT POINT — declare a volume over it, or the transcripts and
+# read marks written into it are lost the first time the container is replaced, silently, with no
+# error anywhere. `scripts/run.sh` bind-mounts a host directory here; the VOLUME below is the
+# backstop for a hand-run container, and it yields an anonymous volume that is easy to orphan, so
+# prefer an explicit `-v`.
+#
+# 0700 and owned by the server's user because what lands in there is the owner's speech and
+# third-party channel text. See the README's "Durable state" section.
+RUN install -d -m 0700 -o 10001 -g 10001 /var/lib/vibe-talk
+VOLUME ["/var/lib/vibe-talk"]
+
+USER vibe
+WORKDIR /home/vibe
+
+COPY --from=build /src/target/release/vibe-talk /usr/local/bin/vibe-talk
+
+ENV VIBE_TALK_BIND=0.0.0.0:8080 \
+    VIBE_TALK_CONFIG=/etc/vibe-talk/vibe-talk.toml \
+    VIBE_TALK_STORAGE_PATH=/var/lib/vibe-talk/vibe-talk.sqlite3 \
+    RUST_LOG=info
+EXPOSE 8080
+
+# There is no default configuration file in the image on purpose: starting with no credentials must
+# fail loudly rather than come up with a guessable one.
+ENTRYPOINT ["/usr/local/bin/vibe-talk"]

@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-34-cb4f9e70f7a",
+    "issue_id": "agent-utils-34",
+    "author": "opus-5.5/voice-chat-write-confirm",
+    "body": "[opus 5.5] Landed as 349bc9b on main (make validate-all: 93 of 93 steps passed, exit 0; reviewed independently twice). post_reply now only proposes; a pending proposal is committed once, by handle, restating channel, text and reply target, within 120 s. Logs are content-free, and the read-scope tool list is unchanged. UNVERIFIED: a live send to a real channel. It awaits explicit owner authorization and was not attempted. A voice bridge may be given write scope only if it commits confirmed_by speaker_turn under the README rules: only after a read-back that finished normally, and never through a replacement session. The gate binds the model, not the write credential. Remaining low item, not in scope: a card that appears when none was showing gets no Send hold.",
+    "created_at": "2026-09-26T01:34:02.707898126Z",
+    "updated_at": "2026-09-26T01:34:02.707898126Z"
+  }
+]

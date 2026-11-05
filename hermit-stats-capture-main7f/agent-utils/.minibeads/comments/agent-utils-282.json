@@ -1,0 +1,26 @@
+[
+  {
+    "id": "agent-utils-282-c02b8fa437e",
+    "issue_id": "agent-utils-282",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Review fixes, remote-ops audit W8. (1) A full thread read is held for the next Flat read only when it agrees with the root the same read fetched: it ends at the root's latest_reply, that is not the root itself, and holds reply_count replies (or Flat's 50). A lagging replies feed, a reply posted mid-read and then deleted, and a root without latest_reply (count-only, where a delete plus an add is invisible) are now read in full on the next Flat read instead of reused for up to 15 minutes; a root without latest_reply gets no saving at all, and the README says the saving depends on the server reporting it. (2) A thread view read that shows the held replies otherwise (an edit) drops them, so the next Flat read rereads that thread (3 + 2 calls) and shows the edit; a matching thread view costs nothing extra. Tests in vibe-talk/tests/slack_flat_calls.rs count conversations.replies per Flat read and fail before each fix. Still unverified against the bridge: whether its history rows carry latest_reply, and whether its message JSON is identical across reads (if not, every thread view drops that thread's held replies: one extra full thread read on the next Flat read, never staleness).",
+    "created_at": "2026-10-13T20:36:10.496403269Z",
+    "updated_at": "2026-10-13T20:36:10.496403269Z"
+  },
+  {
+    "id": "agent-utils-282-c99c51afd8d",
+    "issue_id": "agent-utils-282",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Review round 1 fixes, remote-ops audit W8. (1) A full thread read is held only when the WHOLE thread, counted from the same calls (replies_newest_counted), holds reply_count real replies and the read ends at latest_reply; the old min(count, 50) check verified nothing for threads over 50 replies. A thread too long to read in one window (over 10 pages) has no count and is read on every Flat read, as before W8. (2) The forward read counts every message it brings, system events included (replies_all_after), and merges only when exactly as many came back as the count grew by, all real: the documented hole (a deletion hidden behind a system event and a reply) is closed. (3) A Flat read already under way when the thread view reads a thread stores nothing it read of that thread, and a full read's reconcile clock starts when it began, so the thread view's edit propagation holds even across that race. (4) The README names the remaining exposure: a reply the replies feed lists but the root does not yet count waits for the root or the 15-minute reconcile. Tests: 17 in vibe-talk/tests/slack_flat_calls.rs; the four guards the review found untested (adds_up, forward-read full_at, last == latest, the count) each fail under their mutation. Still unverified against the bridge: whether its history rows carry latest_reply.",
+    "created_at": "2026-10-13T22:47:44.849854231Z",
+    "updated_at": "2026-10-13T22:47:44.849854231Z"
+  },
+  {
+    "id": "agent-utils-282-ca1a21c11c8",
+    "issue_id": "agent-utils-282",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Review round 2 fix, remote-ops audit W8 (commit fd272d8a). Two overlapping Flat reads (two devices or tabs, the page's poll beside its count read, or a recent read through Flat) could let an older read store its copy of a thread over a newer read's, or into the slot the newer read emptied. The next Flat read then reused that copy at no call, taking back an edit already on screen. Comparing full_at or start times cannot order two forward reads built on one held copy, or a read that began first but fetched last after a rate limit. Now every finished read of a thread is noted under the lock, thread views included. A Flat read stores only if no read of that thread finished after it began; otherwise it stores nothing and drops what is held unless the two agree where they overlap. Overlapping polls that read alike keep the saving; ones that differ cost one full read of that thread, never a stale copy. Tests: 23 in vibe-talk/tests/slack_flat_calls.rs. The reviewer's p3 and p5, and two variants the full_at comparison misses, fail at 26e0f277. Two more fail under a refused read that never drops or always drops. The reviewer's 8 probes pass. Still unverified against the bridge: whether its history rows carry latest_reply.",
+    "created_at": "2026-10-13T23:31:46.031072906Z",
+    "updated_at": "2026-10-13T23:31:46.031072906Z"
+  }
+]

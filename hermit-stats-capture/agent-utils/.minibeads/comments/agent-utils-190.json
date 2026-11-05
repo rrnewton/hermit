@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-190-c63a69422ce",
+    "issue_id": "agent-utils-190",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Owner, 2026-10-07 09:53 CEST (phone, on the go): asked the voice assistant to summarize his chats; it said it could not. Logs (07:52Z): list_channels reached the server and succeeded; no further tool call ever reached it. The oxide log shows the model emitting the Cosmos-native 'bridge' pseudo-tool three times (filler speech: 'Checking all three channels for the last 24 hours', 'Scanning all three channels now'), oxide suppressing each as unknown, one get_current_time call, and then an apology. It never called chat_digest_channel. Two earlier responses in that turn were INTERRUPTED by voice-activity barge-in. 'bridge' suppression has happened 58 times since 09-24; on 10-04 a bridge was followed by real digest calls and that session worked. Investigating root cause and fix.",
+    "created_at": "2026-10-07T08:00:12.842579225Z",
+    "updated_at": "2026-10-07T08:00:12.842579225Z"
+  }
+]

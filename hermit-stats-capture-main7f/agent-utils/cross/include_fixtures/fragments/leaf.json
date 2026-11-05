@@ -1,0 +1,12 @@
+{
+  "resource_caps": {"browser": 1},
+  "steps": [
+    {
+      "group": "build",
+      "job": "app",
+      "cmd": "true",
+      "labels": ["fast"],
+      "fail_fast_family": "compile"
+    }
+  ]
+}

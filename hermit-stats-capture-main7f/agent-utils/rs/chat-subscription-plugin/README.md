@@ -1,0 +1,1 @@
+../../common/docs/chat-subscription-plugin/README.md

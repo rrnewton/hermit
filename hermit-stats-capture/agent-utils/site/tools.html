@@ -1,0 +1,819 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-VlTH164C/x5AZ/X45xVH2ltqg3cRsEpzyV0XZoamWUE='; style-src 'self'; img-src 'self'; media-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Tools: what each agent-utils tool is for</title>
+<meta name="description" content="Every agent-utils tool, introduced by the problem it solves, what you get and what it needs, with its status, editions and links to its README, user guide, quickstart, related work and source.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<script>
+(function () {
+  var root = document.documentElement;
+  var key = "agent-utils-theme";
+  var saved = null;
+  try { saved = window.localStorage.getItem(key); } catch (error) { saved = null; }
+  if (saved === "light" || saved === "dark") { root.setAttribute("data-theme", saved); }
+  root.classList.add("js");
+  function sync() {
+    var current = root.getAttribute("data-theme") || "system";
+    var buttons = document.querySelectorAll("[data-theme-choice]");
+    for (var i = 0; i < buttons.length; i += 1) {
+      buttons[i].setAttribute("aria-pressed", String(buttons[i].getAttribute("data-theme-choice") === current));
+    }
+  }
+  document.addEventListener("click", function (event) {
+    var button = event.target && event.target.closest ? event.target.closest("[data-theme-choice]") : null;
+    if (!button) { return; }
+    var choice = button.getAttribute("data-theme-choice");
+    if (choice === "light" || choice === "dark") { root.setAttribute("data-theme", choice); } else { root.removeAttribute("data-theme"); }
+    try {
+      if (choice === "light" || choice === "dark") { window.localStorage.setItem(key, choice); } else { window.localStorage.removeItem(key); }
+    } catch (error) { /* storage blocked: the choice lasts for this page only */ }
+    sync();
+  });
+  document.addEventListener("DOMContentLoaded", sync);
+}());
+</script>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+<div class="wrap header-inner">
+<a class="brand" href="index.html"><svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true" focusable="false"><rect class="mark-bg" width="32" height="32" rx="7"></rect><path class="mark-line" d="M16 11v4.5M8.5 20.5V16h15v4.5M16 15.5v5"></path><circle class="mark-fg" cx="16" cy="8" r="3.5"></circle><rect class="mark-fg" x="5" y="20.5" width="7" height="5.5" rx="1.6"></rect><rect class="mark-fg" x="12.5" y="20.5" width="7" height="5.5" rx="1.6"></rect><rect class="mark-fg" x="20" y="20.5" width="7" height="5.5" rx="1.6"></rect></svg><span>agent-utils</span></a>
+<nav class="site-nav" aria-label="Site">
+<ul>
+<li><a href="index.html">Overview</a></li>
+<li><a href="architecture.html">Architecture</a></li>
+<li><a href="tools.html" aria-current="page">Tools</a></li>
+<li><a href="vibe-talk.html">vibe-talk demo</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/QUICKSTART.md">Quickstart</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils">Source</a></li>
+</ul>
+</nav>
+<div class="theme-switch" role="group" aria-label="Color theme">
+<button type="button" data-theme-choice="system" aria-pressed="true">System</button>
+<button type="button" data-theme-choice="light" aria-pressed="false">Light</button>
+<button type="button" data-theme-choice="dark" aria-pressed="false">Dark</button>
+</div>
+</div>
+</header>
+<main id="main">
+
+<div class="page-head">
+<div class="wrap">
+<p class="eyebrow">Tools</p>
+<h1>The tools</h1>
+<p class="lead">Each tool below starts with the problem it solves, then what you get and what it needs. Status and editions are stated as the repository's own documents state them. A tool's own <code>quickstart</code>, user guide and <code>--help</code> stay the authority for how to use it.</p>
+<p>Several tools exist twice, as independent Python and Rust implementations called <em>editions</em>; the badge on each tool says which it has. Paired editions follow a two-edition contract: they share their core commands and output, and each one's extras are listed. A harness runs the Python edition unless you ask for Rust.</p>
+<nav class="toc" aria-label="Tools on this page">
+<div>
+<p class="toc-label">Core</p>
+<ul>
+<li><a href="#agentctl">agentctl</a></li>
+<li><a href="#wrkslots">wrkslots</a></li>
+<li><a href="#agentctl-chat">agentctl chat</a></li>
+</ul>
+<p class="toc-label">External</p>
+<ul>
+<li><a href="#herdr">Herdr</a></li>
+</ul>
+</div>
+<div>
+<p class="toc-label">Optional</p>
+<ul>
+<li><a href="#herdr-run">herdr-run</a></li>
+<li><a href="#tick-hub">tick-hub</a></li>
+<li><a href="#dagrun">dagrun</a></li>
+<li><a href="#cpuset-alloc">cpuset-alloc</a></li>
+<li><a href="#parallel-experiment-runner">parallel-experiment-runner</a></li>
+</ul>
+</div>
+<div>
+<p class="toc-label">Optional, continued</p>
+<ul>
+<li><a href="#wrkviz">wrkviz</a></li>
+<li><a href="#gh-paced">gh-paced</a></li>
+<li><a href="#agent-usage">agent-usage</a></li>
+<li><a href="#vibe-talk">vibe-talk</a></li>
+<li><a href="#pr-landing-planner">pr-landing-planner</a></li>
+</ul>
+</div>
+<div>
+<p class="toc-label">Supporting pieces</p>
+<ul>
+<li><a href="#skills">Agent skills</a></li>
+<li><a href="#herdr-agent">Compatibility commands</a></li>
+<li><a href="#chat-subscription">chat-subscription libraries</a></li>
+<li><a href="#wrkslotsd">wrkslotsd</a></li>
+</ul>
+</div>
+</nav>
+</div>
+</div>
+
+<div class="wrap">
+
+<section aria-labelledby="core">
+<div class="group-head">
+<h2 id="core">Core</h2>
+<p>agentctl and wrkslots are always set up; the chat bridge is core too, but you can connect it later. Together they let one coordinator delegate safely: named sessions, isolated workspaces, and a way for you to reach the coordinator.</p>
+</div>
+
+<section class="tool tool-core" id="agentctl" aria-labelledby="agentctl-title">
+<div class="tool-head">
+<h3 id="agentctl-title"><code>agentctl</code></h3>
+<p class="badges"><span class="badge badge-core">core</span><span class="badge badge-warn">beta</span><span class="badge badge-edition">Python + Rust</span></p>
+</div>
+<p class="tool-lede">One interface for starting, messaging, reading and stopping persistent coding agents, while each agent's own terminal stays open to a human.</p>
+<dl class="tool-facts">
+<dt>Problem</dt>
+<dd>A coordinator, or a person, runs several long-lived agents. Follow-up work has to reach the right one exactly once, their output has to be readable, they have to survive crashes, and you still want to type into any of them directly.</dd>
+<dt>What you get</dt>
+<dd>Named sessions in a local registry. A durable prompt queue that tells "safely pending" (exit 75) apart from "possibly submitted" (exit 76) and never replays the second. Launch profiles that you write. Pause, attach and resume for taking over, and revive and adopt for recovering after a crash or restart.</dd>
+<dt>Needs</dt>
+<dd>Linux, Python 3.10 or newer (or a Rust build), and Herdr for interactive control. No hosted account and no always-running manager process.</dd>
+<dt>Use it when</dt>
+<dd>You delegate to agents that persist between prompts, from a coordinator, a script or your own shell.</dd>
+<dt>Status</dt>
+<dd>Core. The agentctl skill calls it beta software, and both editions are at version 0.1. <code>agentctl wait</code> reports readiness for input, not completion, and a successful start or send proves delivery, not that the work is done.</dd>
+<dt>Editions</dt>
+<dd>The Python and Rust editions share the interactive core and one user guide. The Python package adds headless workers, the polling Google Chat transport and launcher, and an MCP interface. The Rust crate adds the event-driven plugin chat host, a coordinator inbox (<code>agentctl inbox</code>), <code>codex-goal</code> and <code>--project-box</code>.</dd>
+</dl>
+<div class="tool-cols">
+<div>
+<h4>Key capabilities</h4>
+<ul>
+<li><code>start</code>, <code>send</code>, <code>read</code>, <code>wait</code>, <code>status</code>, <code>list</code> and <code>stop</code> on named sessions.</li>
+<li>Checks the recipient pane before and after every keystroke, reads it back to confirm delivery, and quarantines a probable misroute.</li>
+<li>Launch profiles in a private, git-ignored <code>.agentctl/profiles.json</code>: which agent CLI (the profile's <code>harness</code> field), mode, model, effort, literal arguments and environment, passed without shell expansion.</li>
+<li><code>start --slot</code> runs an agent inside a wrkslots slot's box.</li>
+<li><code>doctor</code> compares the registry with what Herdr reports; <code>capabilities</code> lists what this installation includes.</li>
+<li><code>agentctl skill install</code> installs its bundled skill for supported agent CLIs.</li>
+</ul>
+</div>
+<div>
+<h4>Documentation</h4>
+<ul class="doc-links">
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/py/agentctl/README.md">README</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/py/agentctl/QUICKSTART.md">Quickstart</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/py/agentctl/USER_GUIDE.md">User guide (both editions)</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/py/agentctl/USER_GUIDE.md#dependencies-and-available-adapters">Dependencies and adapters by edition</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/py/agentctl/USER_GUIDE.md#private-launch-profiles-and-harness-skills">Launch profiles</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/py/agentctl/USER_GUIDE.md#observe-and-take-over">Observe and take over</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/py/agentctl/USER_GUIDE.md#stop-and-recover">Stop and recover</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/rs/agentctl/src/embedded_inbox_quickstart.md">Coordinator inbox (Rust)</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/agentctl/RELATED_WORK.md">Related work</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agentctl/SKILL.md">Agent skill</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/cross/agentctl_differential.py">Cross-edition tests</a> (the shared interactive core only; <code>agentctl chat</code> is not compared)</li>
+<li>Source: <a href="https://github.com/rrnewton/agent-utils/tree/main/py/agentctl">Python</a>, <a href="https://github.com/rrnewton/agent-utils/tree/main/rs/agentctl">Rust</a></li>
+</ul>
+</div>
+</div>
+<p class="back-to-top"><a href="#main">Back to top</a></p>
+</section>
+
+<section class="tool tool-core" id="wrkslots" aria-labelledby="wrkslots-title">
+<div class="tool-head">
+<h3 id="wrkslots-title"><code>wrkslots</code></h3>
+<p class="badges"><span class="badge badge-core">core</span><span class="badge badge-edition">Python</span></p>
+</div>
+<p class="tool-lede">Gives each agent its own Git worktree slot on its own branch, records who owns it, and removes it only after proving nothing still uses it.</p>
+<dl class="tool-facts">
+<dt>Problem</dt>
+<dd>Several agents on one machine need checkouts that do not collide, do not fill the disk, and do not lose work when an agent dies. Cleanup has to be safe even when the original owner is gone.</dd>
+<dt>What you get</dt>
+<dd>Slots for agents (salvaged before removal) and for validation (disposable). Handoffs stored outside the checkout, and release while the owner keeps running. Removal that fails closed. An append-only, hash-linked event history with crash recovery. Audit and unpushed-work reports, and holds for anything a human must keep.</dd>
+<dt>Needs</dt>
+<dd>Python 3.10 or newer, Git and Linux <code>/proc</code>. Disk-image slots need <code>mkfs.ext4</code> plus passwordless sudo or <code>fuse2fs</code> with <code>/dev/fuse</code>. Running a command in a slot's box needs a systemd user manager and either unprivileged user namespaces or passwordless sudo.</dd>
+<dt>Use it when</dt>
+<dd>More than one agent works on the same repository at once, or you have to clean up after agents you did not start.</dd>
+<dt>Status</dt>
+<dd>Core, at version 0.6. The box is "an accident boundary for cooperative agents", not containment against a hostile one. The FUSE image backend is about ten times slower for metadata-heavy work than the kernel backend.</dd>
+<dt>Editions</dt>
+<dd>Python only, an explicit exception to the two-edition contract. A read-only Rust observer, <a href="#wrkslotsd">wrkslotsd</a>, exists for diagnostics.</dd>
+</dl>
+<div class="tool-cols">
+<div>
+<h4>Key capabilities</h4>
+<ul>
+<li><code>create</code> provisions and registers a slot on a fresh branch in one step.</li>
+<li>Reclaim requires an expired time-to-live, a "dead" verdict from the project's liveness command, a dead exact owner process, and agreement from process, mount, Git and path checks. Unavailable evidence refuses.</li>
+<li>Salvage pushes only to configured remotes; otherwise it writes a verified local Git bundle, and removal refuses if it cannot.</li>
+<li>Disk-image slots: one sparse ext4 image each, about 70 MiB when fresh.</li>
+<li><code>wrkslots run SLOT -- CMD</code>: per-slot systemd limits, a fresh <code>/tmp</code>, and a view in which only the slot and named paths are writable.</li>
+<li><code>status --all-machines</code>, <code>doctor</code>, <code>audit</code>, <code>unpushed</code>, <code>hold</code>, <code>clean-caches</code> and <code>recover</code>.</li>
+</ul>
+</div>
+<div>
+<h4>Documentation</h4>
+<ul class="doc-links">
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/wrkslots/README.md">README</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/wrkslots/USER_GUIDE.md">User guide</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/wrkslots/USER_GUIDE.md#normal-lifecycle">Normal lifecycle</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/wrkslots/USER_GUIDE.md#disk-image-slots">Disk-image slots</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/wrkslots/USER_GUIDE.md#running-commands-and-agents-inside-a-slots-box">Running inside a slot's box</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/wrkslots/USER_GUIDE.md#limits-of-the-box">Limits of the box</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/wrkslots/USER_GUIDE.md#giving-a-slot-back-while-the-owner-keeps-running">Giving a slot back</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/wrkslots/USER_GUIDE.md#git-remotes-and-salvage">Git remotes and salvage</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/wrkslots/RELATED_WORK.md">Related work</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/skills/wrkslots/SKILL.md">Agent skill</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/py/wrkslots/examples/agentctl_liveness_probe.py">The agentctl-backed liveness probe</a></li>
+<li>Source: <a href="https://github.com/rrnewton/agent-utils/tree/main/py/wrkslots">Python</a></li>
+</ul>
+</div>
+</div>
+<p class="back-to-top"><a href="#main">Back to top</a></p>
+</section>
+
+<section class="tool tool-core" id="agentctl-chat" aria-labelledby="agentctl-chat-title">
+<div class="tool-head">
+<h3 id="agentctl-chat-title"><code>agentctl chat</code></h3>
+<p class="badges"><span class="badge badge-core">core</span><span class="badge">connect later</span><span class="badge badge-edition">Python + Rust, different bridges</span></p>
+</div>
+<p class="tool-lede">Connects a chat space to one coordinator running in Herdr: allowed messages are typed into its pane, and its marked replies go back to the original thread.</p>
+<dl class="tool-facts">
+<dt>Problem</dt>
+<dd>You want to hand the coordinator work, and hear back, while you are away from the terminal, without giving every worker its own chat connection.</dd>
+<dt>What you get</dt>
+<dd>Messages from allowlisted senders only, stored durably before anything else happens. A reaction that means "received", not "done". Replies the agent writes between marker lines in its own output, posted to the right thread and retried under a stable request ID so they are not posted twice. A delivery whose outcome is uncertain is recorded, never retyped.</dd>
+<dt>Needs</dt>
+<dd>Herdr. For Google Chat: a space ID, your user ID for the allowlist, and an OAuth access token or a command that prints one.</dd>
+<dt>Use it when</dt>
+<dd>You want to reach the coordinator from chat. Without it, you talk to the coordinator in its Herdr tab.</dd>
+<dt>Status</dt>
+<dd>Core, and setup lets you connect it later. Google Chat works today through the polling transport, once an hour by default; <code>--interval</code> sets a shorter cycle, down to a fraction of a second, and an operator-supplied event command delivers messages at once. The subscription-plugin protocol has no shipping provider yet. A coordinator started with <code>chat launch</code> belongs to the bridge's shell, not to agentctl's registry, so <code>agentctl send coordinator</code>, which tick-hub's delivery script uses, does not reach it. Prompts arrive as pasted terminal input, not through the agent CLI's own protocol, and reply capture depends on Herdr's bounded scrollback, so a clipped reply fails visibly rather than being guessed.</dd>
+<dt>Editions</dt>
+<dd>Two different bridges. Python: Google Chat polling, operator adapters, <code>chat launch</code> to start a coordinator and its bridge together in one Herdr pane, and <code>chat context</code>. Rust: an event-driven host for an installed subscription plugin, a separate one-shot outbound helper, and <code>sent</code> and <code>thread</code> for checking delivery. The agentctl-chat skill describes the Rust bridge.</dd>
+</dl>
+<div class="tool-cols">
+<div>
+<h4>Key capabilities</h4>
+<ul>
+<li>One bridge connects one configuration to one coordinator; attachments are not forwarded.</li>
+<li>Several replies per request are allowed, including progress updates.</li>
+<li>Restart-safe: requests and replies live in the bridge's state directory.</li>
+<li>In the Rust protocol, a provider gap stops the bridge rather than risking a silent loss; automatic reconnect after a gap is refused.</li>
+</ul>
+</div>
+<div>
+<h4>Documentation</h4>
+<ul class="doc-links">
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/py/agentctl/CHAT_USER_GUIDE.md">Chat user guide (Python, Google Chat)</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/py/agentctl/CHAT_USER_GUIDE.md#how-the-connection-works">How the connection works</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/py/agentctl/CHAT_USER_GUIDE.md#scope">Scope</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/rs/agentctl/src/embedded_chat_quickstart.md">Chat quickstart (Rust)</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/rs/agentctl/src/embedded_chat_userguide.md">Chat user guide (Rust)</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/py/agentctl/USER_GUIDE.md#chat-and-mcp-extensions">Chat and MCP extensions</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agentctl-chat/SKILL.md">Agent skill: answering bridged chat</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/agentctl/RELATED_WORK.md#claude-code-channels-chat-connects-to-the-harness">Related work: chat that connects to the harness</a></li>
+</ul>
+</div>
+</div>
+<p class="back-to-top"><a href="#main">Back to top</a></p>
+</section>
+</section>
+
+<section aria-labelledby="external">
+<div class="group-head">
+<h2 id="external">External dependency</h2>
+<p>Not part of agent-utils, and not maintained here.</p>
+</div>
+
+<section class="tool tool-external" id="herdr" aria-labelledby="herdr-title">
+<div class="tool-head">
+<h3 id="herdr-title">Herdr</h3>
+<p class="badges"><span class="badge badge-external">external</span><span class="badge badge-edition">tested with 0.8</span></p>
+</div>
+<p class="tool-lede">A separately maintained, persistent terminal server. Every agent in a harness runs as its own terminal interface in one of its tabs.</p>
+<dl class="tool-facts">
+<dt>Problem</dt>
+<dd>Coding agents need a terminal that outlives whatever started them, and a person needs to be able to attach to any agent's real interface and take over.</dd>
+<dt>What you get</dt>
+<dd>Workspaces, tabs and panes with a command-line and socket interface. agentctl uses it to open tabs, deliver prompts and wait for readiness; the chat bridges and herdr-run also run through it, each with its own adapter.</dd>
+<dt>Needs</dt>
+<dd>Install it from its upstream project, then start it once with <code>herdr</code>. The setup agent offers to install it if it is missing.</dd>
+<dt>Status</dt>
+<dd>External. agent-utils was last tested with Herdr 0.8; if a newer release misbehaves, report the version.</dd>
+</dl>
+<h4>Documentation</h4>
+<ul class="doc-links">
+<li><a href="https://github.com/herdrdev/herdr">Upstream project</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agent-utils-setup/SKILL.md#phase-1-dependencies">Setup's dependency table and install hints</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/herdr-run/RELATED_WORK.md">Herdr compared with tmux, OpenSSH and Pexpect</a></li>
+</ul>
+<p class="back-to-top"><a href="#main">Back to top</a></p>
+</section>
+</section>
+
+<section aria-labelledby="optional">
+<div class="group-head">
+<h2 id="optional">Optional</h2>
+<p>Offered during setup, never forced on you, and addable later by asking the coordinator. Not every one is offered by setup: cpuset-alloc, parallel-experiment-runner and agent-usage are used directly.</p>
+</div>
+
+<section class="tool" id="herdr-run" aria-labelledby="herdr-run-title">
+<div class="tool-head">
+<h3 id="herdr-run-title"><code>herdr-run</code></h3>
+<p class="badges"><span class="badge">optional</span><span class="badge badge-edition">Python + Rust</span></p>
+</div>
+<p class="tool-lede">Runs an allowlisted command in a visible Herdr pane, outside whatever confines the caller, and returns its real output and exit code.</p>
+<dl class="tool-facts">
+<dt>Problem</dt>
+<dd>An agent whose sandbox blocks a legitimate operation, such as <code>git push</code>, <code>gh</code> or a dependency fetch, needs a sanctioned, visible and recorded way to run it. The pane is not a child of the caller, so the caller's network policy, environment and lifetime do not apply to the command.</dd>
+<dt>What you get</dt>
+<dd>A per-project allowlist (<code>.herdr-run.yaml</code>) that only a person widens. Byte-exact standard output and error, the command's own exit status, and distinct codes for refusals and wrapper failures. A private audit log of refusals, admissions and completions, in a pane anyone can watch.</dd>
+<dt>Needs</dt>
+<dd>Linux with a working systemd user manager, and Herdr (tested with 0.8.0).</dd>
+<dt>Use it when</dt>
+<dd>An agent must run a specific, approved command that its own sandbox refuses.</dd>
+<dt>Status</dt>
+<dd>Optional, at version 0.4. Its allowlist is "a cooperative safety rail", not a containment boundary against a hostile process running as the same user. A command that outruns its timeout keeps running. The audit log is best-effort. Its end-to-end differential tests run against a fake Herdr.</dd>
+<dt>Editions</dt>
+<dd>Python and Rust, cross-checked by the differential tests.</dd>
+</dl>
+<div class="tool-cols">
+<div>
+<h4>Key capabilities</h4>
+<ul>
+<li>Splits the command, checks the bare program name against policy, re-quotes every argument, and refuses known self-escapes.</li>
+<li>Captures results through files, not by scraping the screen.</li>
+<li>Will not type over a person: readiness checks are conservative, and one lock per pane serializes use.</li>
+<li>Bounded tabs: at the cap, a new tab replaces the least recently used idle one, and <code>reap</code> reports finished ones.</li>
+<li>Run records are pruned after four days by default. <code>net-doctor</code> checks that a pane can reach what the caller's sandbox cannot.</li>
+</ul>
+</div>
+<div>
+<h4>Documentation</h4>
+<ul class="doc-links">
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/herdr-run/QUICKSTART.md">Quickstart</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/herdr-run/rendered/python/README.md">README (Python)</a>, <a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/herdr-run/rendered/rust/README.md">README (Rust)</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/herdr-run/rendered/python/USER_GUIDE.md">User guide (Python)</a>, <a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/herdr-run/rendered/rust/USER_GUIDE.md">User guide (Rust)</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/herdr-run/rendered/rust/USER_GUIDE.md#why-you-would-want-this">Why you would want this</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/herdr-run/rendered/rust/USER_GUIDE.md#trust-and-safety-model--read-before-widening-allow">Trust and safety model</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/herdr-run/rendered/rust/USER_GUIDE.md#exit-codes">Exit codes</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/herdr-run/rendered/rust/USER_GUIDE.md#the-pane-cap-and-reap">The pane cap and reap</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/herdr-run/RELATED_WORK.md">Related work</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/skills/herdr-run/SKILL.md">Agent skill</a></li>
+<li>Source: <a href="https://github.com/rrnewton/agent-utils/tree/main/py/herdr_run">Python</a>, <a href="https://github.com/rrnewton/agent-utils/tree/main/rs/herdr-run">Rust</a></li>
+</ul>
+</div>
+</div>
+<p class="back-to-top"><a href="#main">Back to top</a></p>
+</section>
+
+<section class="tool" id="tick-hub" aria-labelledby="tick-hub-title">
+<div class="tool-head">
+<h3 id="tick-hub-title"><code>tick-hub</code></h3>
+<p class="badges"><span class="badge">optional</span><span class="badge badge-edition">Python + Rust</span></p>
+</div>
+<p class="tool-lede">One cron job, timer or heartbeat evaluates many recurring duties, each on its own cadence, and prints stable lines such as <code>HEALTH:</code>, <code>ACTION:</code>, <code>NOTE:</code>, <code>ERROR:</code> and <code>NO_RESULT:</code>.</p>
+<dl class="tool-facts">
+<dt>Problem</dt>
+<dd>A coordinator has many recurring duties: status reports, freshness checks, conditions a shell command can test. Without tick-hub each needs its own timer, and each speaks its own format.</dd>
+<dt>What you get</dt>
+<dd>Reminders with a cadence, flags, shell gates and dependencies. File-freshness checks reported as ok, stale or missing. A deterministic line protocol, state written only when you pass <code>--flush</code>, and strict JSON or YAML configuration.</dd>
+<dt>Needs</dt>
+<dd>Python 3.10 or newer, or a Rust build. In a harness, the delivery script and timer come from the setup templates and need a user systemd manager.</dd>
+<dt>Use it when</dt>
+<dd>The coordinator should be reminded of something on a schedule, or told when a file has gone stale.</dd>
+<dt>Status</dt>
+<dd>Optional, at version 0.2. It does not schedule itself or deliver what it prints; in a harness, a small <code>tick-deliver</code> script run by a 15-minute timer sends the tick's output to the coordinator with <code>agentctl send</code> whenever it contains an <code>ACTION:</code> line. Action handlers must be idempotent, because an interrupted run can emit an action before its state is written. There is no related-work document yet.</dd>
+<dt>Editions</dt>
+<dd>Python and Rust, cross-checked by the differential tests.</dd>
+</dl>
+<h4>Documentation</h4>
+<ul class="doc-links">
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/tick-hub/rendered/python/README.md">README (Python)</a>, <a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/tick-hub/rendered/rust/README.md">README (Rust)</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/tick-hub/rendered/rust/README.md#output-contract">Output contract</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/tick-hub/rendered/python/USER_GUIDE.md">User guide (Python)</a>, <a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/tick-hub/rendered/rust/USER_GUIDE.md">User guide (Rust)</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/tick-hub/rendered/rust/USER_GUIDE.md#operational-guidance">Operational guidance</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/tree/main/skills/agent-utils-setup/templates/tick-hub">Harness delivery templates</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agent-utils-setup/SKILL.md#add-a-tool-later">Adding it to a harness</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/skills/tick-hub/SKILL.md">Agent skill</a></li>
+<li>Source: <a href="https://github.com/rrnewton/agent-utils/tree/main/py/tick_hub">Python</a>, <a href="https://github.com/rrnewton/agent-utils/tree/main/rs/tick-hub">Rust</a></li>
+</ul>
+<p class="back-to-top"><a href="#main">Back to top</a></p>
+</section>
+
+<section class="tool" id="dagrun" aria-labelledby="dagrun-title">
+<div class="tool-head">
+<h3 id="dagrun-title"><code>dagrun</code></h3>
+<p class="badges"><span class="badge">optional</span><span class="badge badge-edition">Python + Rust</span></p>
+</div>
+<p class="tool-lede">Runs a dependency graph of build and test steps with bounded concurrency, resource-aware planning, Linux cgroup containment and per-step profiling.</p>
+<dl class="tool-facts">
+<dt>Problem</dt>
+<dd>Validation run one step at a time is slow. Run all at once, it overloads a shared machine, and one runaway step can take the host with it.</dd>
+<dt>What you get</dt>
+<dd>Steps run in dependency order under separate limits on active steps and total CPUs. Admission accounts for memory and for scarce named resources such as a browser. Every step is boxed in a cgroup. You also get profiles, speedup sweeps, and timeouts that freeze evidence before they kill.</dd>
+<dt>Needs</dt>
+<dd>Python 3.10 or newer, or a Rust build. Containment needs Linux cgroup v2 and a delegated systemd user scope. Without them a run exits with status 3 unless you pass <code>--allow-cgroup-failure</code> and accept running unboxed, with a visible warning.</dd>
+<dt>Use it when</dt>
+<dd>Your checks could run in parallel but must share one machine politely. This repository runs its own validation graph, more than a hundred steps, through it.</dd>
+<dt>Status</dt>
+<dd>Optional, at version 0.15, the highest version in the suite. Its README says the shared resource-caps file has known gaps that must be resolved before it is treated as a trustworthy host policy. There is no related-work document yet; the planner design surveys the literature.</dd>
+<dt>Editions</dt>
+<dd>Python and Rust, cross-checked by the differential tests.</dd>
+</dl>
+<div class="tool-cols">
+<div>
+<h4>Key capabilities</h4>
+<ul>
+<li>Strict JSON or YAML graphs with namespaced include fragments; list, ASCII, dot, JSON and YAML views.</li>
+<li>Planners: greedy longest-first, critical path, and CPA, which picks per-step widths from measured speedup curves.</li>
+<li>Profiles, parallel-speedup sweeps, and an HTML profile report.</li>
+<li><code>dagrun capabilities</code> reports which limits this host can actually enforce.</li>
+<li>Ships <a href="#cpuset-alloc">cpuset-alloc</a> and <code>dagrun pin-run</code> for hard CPU reservations.</li>
+</ul>
+</div>
+<div>
+<h4>Documentation</h4>
+<ul class="doc-links">
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/dagrun/rendered/python/README.md">README (Python)</a>, <a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/dagrun/rendered/rust/README.md">README (Rust)</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/dagrun/rendered/python/USER_GUIDE.md">User guide (Python)</a>, <a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/dagrun/rendered/rust/USER_GUIDE.md">User guide (Rust)</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/dagrun/rendered/rust/USER_GUIDE.md#run-safely">Run safely</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/dagrun/rendered/rust/USER_GUIDE.md#profiles-sweeps-and-portable-summaries">Profiles and sweeps</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/dagrun/rendered/rust/README.md#attributable-test-runner-timeouts">Attributable timeouts</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/dagrun/PLANNER_DESIGN.md">Planner design</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/examples/README.md">Runnable example graphs</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/validation.dag.yaml">This repository's validation graph</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/skills/dagrun/SKILL.md">Agent skill</a></li>
+<li>Source: <a href="https://github.com/rrnewton/agent-utils/tree/main/py/dagrun">Python</a>, <a href="https://github.com/rrnewton/agent-utils/tree/main/rs/dagrun">Rust</a></li>
+</ul>
+</div>
+</div>
+<p class="back-to-top"><a href="#main">Back to top</a></p>
+</section>
+
+<section class="tool" id="cpuset-alloc" aria-labelledby="cpuset-alloc-title">
+<div class="tool-head">
+<h3 id="cpuset-alloc-title"><code>cpuset-alloc</code></h3>
+<p class="badges"><span class="badge">optional</span><span class="badge">ships with dagrun</span><span class="badge badge-edition">Python + Rust</span></p>
+</div>
+<p class="tool-lede">Reserves disjoint CPU sets in a durable ledger shared across processes, and hard-pins a benchmark's whole process tree.</p>
+<dl class="tool-facts">
+<dt>Problem</dt>
+<dd>Concurrent benchmarks or jobs on one host need CPU cores that do not overlap, and reservations left behind by crashed processes must be reclaimed safely.</dd>
+<dt>What you get</dt>
+<dd><code>cpuset-alloc run --cores N --tag T -- CMD</code> launches the command in a cgroup scope verified to be limited to its reserved CPUs, plus <code>status</code> and <code>reclaim</code>. Stale holders are recognized by process ID and start time.</dd>
+<dt>Needs</dt>
+<dd>Linux cgroups. It is a companion command inside the dagrun distribution and crate; setup does not offer it separately.</dd>
+<dt>Status</dt>
+<dd>It refuses to run when hard pinning cannot be proved, and never falls back to an affinity mask a process could escape. <code>status</code> also sweeps stale records, so read the ledger file first when crash evidence matters.</dd>
+</dl>
+<h4>Documentation</h4>
+<ul class="doc-links">
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/dagrun/rendered/rust/README.md#cpu-set-companion">The CPU-set companion</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/dagrun/rendered/python/USER_GUIDE.md#collision-free-cpu-reservations">Collision-free CPU reservations</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/skills/cpuset-alloc/SKILL.md">Agent skill</a></li>
+</ul>
+<p class="back-to-top"><a href="#main">Back to top</a></p>
+</section>
+
+<section class="tool" id="parallel-experiment-runner" aria-labelledby="parallel-experiment-runner-title">
+<div class="tool-head">
+<h3 id="parallel-experiment-runner-title"><code>parallel-experiment-runner</code></h3>
+<p class="badges"><span class="badge">optional</span><span class="badge badge-edition">Python</span></p>
+</div>
+<p class="tool-lede">Runs concurrent seed-sweep workers under dagrun's containment, each with enforced CPU, memory, process-count and wall-clock limits.</p>
+<dl class="tool-facts">
+<dt>Problem</dt>
+<dd>Chaos searches, fuzz sweeps, flaky-test hunts and parameter scans can pile up processes and saturate a host.</dd>
+<dt>What you get</dt>
+<dd>Each seed becomes one boxed dagrun step. Concurrency is sized from measured idle-core headroom, never more than 316 workers, after a short calibration ramp. A cost estimate comes first (or an explicit UNSET) and measured actuals after. A breach ends in a clean kill of the whole subtree that names what was breached.</dd>
+<dt>Needs</dt>
+<dd>Python 3.10 or newer, dagrun, and Linux cgroup v2. It refuses to run uncontained (exit 3) unless you pass <code>--allow-cgroup-failure</code>.</dd>
+<dt>Status</dt>
+<dd>Optional, at version 0.3, and not offered by setup. In its own words, "a resource box against a BUG in our own code, NOT a security sandbox": no seccomp and no user-namespace isolation. There is no related-work document yet.</dd>
+<dt>Editions</dt>
+<dd>Python only, an explicit exception to the two-edition contract.</dd>
+</dl>
+<h4>Documentation</h4>
+<ul class="doc-links">
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/parallel-experiment-runner/README.md">README</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/parallel-experiment-runner/USER_GUIDE.md">User guide</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/parallel-experiment-runner/USER_GUIDE.md#the-four-guarantees">The four guarantees</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/parallel-experiment-runner/USER_GUIDE.md#resource-containment-not-a-security-sandbox">Resource containment, not a security sandbox</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/skills/parallel-experiment-runner/SKILL.md">Agent skill</a></li>
+<li>Source: <a href="https://github.com/rrnewton/agent-utils/tree/main/py/parallel_experiment_runner">Python</a></li>
+</ul>
+<p class="back-to-top"><a href="#main">Back to top</a></p>
+</section>
+
+<section class="tool" id="wrkviz" aria-labelledby="wrkviz-title">
+<div class="tool-head">
+<h3 id="wrkviz-title"><code>wrkviz</code></h3>
+<p class="badges"><span class="badge">optional</span><span class="badge badge-edition">Python</span></p>
+</div>
+<p class="tool-lede">Builds a self-contained, zoomable local website from agent transcripts: a timeline of what a coordinator and its subagents did.</p>
+<dl class="tool-facts">
+<dt>Problem</dt>
+<dd>After days of multi-agent work it is hard to see who did what and when, how agents forked and joined, and what each phase achieved.</dd>
+<dt>What you get</dt>
+<dd>One track per agent, with fork and join edges and active, tool, waiting and idle intervals. Cached summaries from phrase level up to quarterly. A static site served on <code>127.0.0.1</code> with no CDN, and a command-line query tool. It imports Codex and Claude Code transcripts, including nested subagents.</dd>
+<dt>Needs</dt>
+<dd>Python 3.10 or newer. Summaries use an installed <code>codex</code> CLI by default, or Claude Code, or an offline heuristic backend; ingestion, formatting and serving use only the standard library.</dd>
+<dt>Use it when</dt>
+<dd>You want to look back at a long run, explain it to someone, or keep an archive of it.</dd>
+<dt>Status</dt>
+<dd>Optional, at version 0.1. Only the summarize stage spends model calls, and a failed backend never silently falls back to another model. Hosted serving is deliberately deferred, and one refresh writes one team's archive. Archives contain transcript text; treat them like the logs.</dd>
+<dt>Editions</dt>
+<dd>Python only, an explicit exception to the two-edition contract.</dd>
+</dl>
+<h4>Documentation</h4>
+<ul class="doc-links">
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/wrkviz/README.md">README</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/wrkviz/USER_GUIDE.md">User guide</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/wrkviz/USER_GUIDE.md#separate-stages">Which stages spend tokens</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/wrkviz/USER_GUIDE.md#security-and-privacy">Security and privacy</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/wrkviz/USER_GUIDE.md#supported-inputs-and-deployment-boundaries">Supported inputs and boundaries</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/wrkviz/RELATED_WORK.md">Related work</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/skills/wrkviz/SKILL.md">Agent skill</a></li>
+<li>Source: <a href="https://github.com/rrnewton/agent-utils/tree/main/py/wrkviz">Python</a></li>
+</ul>
+<p class="back-to-top"><a href="#main">Back to top</a></p>
+</section>
+
+<section class="tool" id="gh-paced" aria-labelledby="gh-paced-title">
+<div class="tool-head">
+<h3 id="gh-paced-title"><code>gh-paced</code></h3>
+<p class="badges"><span class="badge">optional</span><span class="badge">build from source</span><span class="badge badge-edition">Rust</span></p>
+</div>
+<p class="tool-lede">A wrapper in front of the GitHub CLI that charges every <code>gh</code> call against per-host budgets and waits, or refuses, before GitHub has to push back.</p>
+<dl class="tool-facts">
+<dt>Problem</dt>
+<dd><code>gh</code> does no pacing. Agents looping over it, on several hosts that share one account, can trip GitHub's secondary rate limits, and an account that keeps calling after that risks suspension.</dd>
+<dt>What you get</dt>
+<dd>Each call classified as read, search, write or credential, and charged against budgets sized so four hosts sharing one account stay well under GitHub's documented limits. One write in flight at a time. A 15-minute pause after any rate-limit, abuse or 403 response. A guard that refuses oversized or base64-heavy write bodies, and watch loops refused unless you allow them.</dd>
+<dt>Needs</dt>
+<dd>Linux, the real <code>gh</code> binary, and a Rust toolchain to build it.</dd>
+<dt>Status</dt>
+<dd>Optional, at version 0.1, built from <code>rs/</code> and in no package index; no agent skill. Budgets are per host, hosts do not share state, and only calls made through it are paced. It classifies from the command line, so it cannot see the HTTP requests <code>gh</code> makes itself. It lowers the risk of tripping limits; it cannot promise an account will never be limited.</dd>
+<dt>Editions</dt>
+<dd>Rust only.</dd>
+</dl>
+<h4>Documentation</h4>
+<ul class="doc-links">
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/gh-paced/QUICKSTART.md">Quickstart</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/gh-paced/USER_GUIDE.md">User guide</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/gh-paced/USER_GUIDE.md#why-it-exists">Why it exists</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/gh-paced/USER_GUIDE.md#budgets-and-the-github-limits-behind-them">Budgets and the limits behind them</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/gh-paced/USER_GUIDE.md#the-write-content-guard">The write content guard</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/gh-paced/USER_GUIDE.md#limitations">Limitations</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/gh-paced/RELATED_WORK.md">Related work</a></li>
+<li>Source: <a href="https://github.com/rrnewton/agent-utils/tree/main/rs/gh-paced">Rust</a></li>
+</ul>
+<p class="back-to-top"><a href="#main">Back to top</a></p>
+</section>
+
+<section class="tool" id="agent-usage" aria-labelledby="agent-usage-title">
+<div class="tool-head">
+<h3 id="agent-usage-title"><code>agent-usage</code></h3>
+<p class="badges"><span class="badge">optional</span><span class="badge">build from source</span><span class="badge badge-edition">Rust</span></p>
+</div>
+<p class="tool-lede">Reports plan usage, reset times and burn rates for Claude Code and Codex, plus local token use, without making a model call.</p>
+<dl class="tool-facts">
+<dt>Problem</dt>
+<dd>Agents cannot see their own budgets. A person can type <code>/status</code>, but for an agent, starting a throwaway session to read it costs a full start-up, and probing with a model call costs tokens.</dd>
+<dt>What you get</dt>
+<dd>Each plan window the provider reports, with percentage used and reset time. Burn over 15 minutes, 1, 3 and 24 hours, and whether a window would fill before it resets. Local token use from transcripts. Text, JSON, one-line or cached output, and an optional background process that keeps 15-minute history.</dd>
+<dt>Needs</dt>
+<dd>Linux or macOS, <code>curl</code>, optionally <code>sqlite3</code>, and a Rust toolchain to build it.</dd>
+<dt>Status</dt>
+<dd>Optional, at version 0.1, built from source and in no package index. Setup does not offer it and it has no agent skill. Plan percentages exist only for subscription logins; API-key, cloud-provider and gateway setups get local burn only. Its tests run against fakes, and its README lists what it has not measured.</dd>
+<dt>Editions</dt>
+<dd>Rust only.</dd>
+</dl>
+<h4>Documentation</h4>
+<ul class="doc-links">
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/rs/agent-usage/README.md">README</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/rs/agent-usage/README.md#which-hosts-get-percentages">Which hosts get percentages</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/rs/agent-usage/README.md#not-measured">Not measured</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/agent-usage/QUICKSTART.md">Quickstart</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/agent-usage/USER_GUIDE.md">User guide</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/agent-usage/USER_GUIDE.md#sources">Where the numbers come from</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/agent-usage/RELATED_WORK.md">Related work</a></li>
+<li>Source: <a href="https://github.com/rrnewton/agent-utils/tree/main/rs/agent-usage">Rust</a></li>
+</ul>
+<p class="back-to-top"><a href="#main">Back to top</a></p>
+</section>
+
+<section class="tool" id="vibe-talk" aria-labelledby="vibe-talk-title">
+<div class="tool-head">
+<h3 id="vibe-talk-title"><code>vibe-talk</code></h3>
+<p class="badges"><span class="badge">optional</span><span class="badge badge-warn">early</span><span class="badge badge-edition">Rust service</span></p>
+</div>
+<p class="tool-lede">A small Rust web server and phone web app for reading, discussing and replying to your agents' chat messages, with summaries, read-aloud and voice conversation. <a href="vibe-talk.html">Its own page</a> shows it in five short clips, recorded against local mocks.</p>
+<dl class="tool-facts">
+<dt>Problem</dt>
+<dd>Agents post long messages, often many before you look. On a phone, and especially by ear, you need a short summary of each, a way to ask for one particular message in full, and a way to reply.</dd>
+<dt>What you get</dt>
+<dd>A phone web app with main, thread and all-message views, drafts, an outbox, reactions and search. Summaries and thread names. Read-aloud through ElevenLabs or the phone's own speech engine, and voice conversation. An MCP endpoint and a JSON API. Separate read and write tokens, configured channels as an allowlist, and posts that cannot ping <code>@everyone</code>, <code>@here</code> or a role; a reply notifies only the users its text mentions.</dd>
+<dt>Needs</dt>
+<dd>A host to run it (a native build or a container), something in front of it that terminates TLS if you expose it (the microphone needs HTTPS), a chat-provider credential, and optionally a voice vendor and a model provider for summaries. It is a bridge, deliberately not run next to the coding agents.</dd>
+<dt>Status</dt>
+<dd>Optional and early, at version 0.0.1. In its own status table, Discord reading and posting are written and unit-tested but have never run against live Discord. The voice-agent path has not been shown working end to end, model summaries have met only a local mock, and device speech is a prototype. Reading through a compatible Google Chat bridge has seen real read-only traffic. Slack support is tested against a local fake.</dd>
+<dt>Editions</dt>
+<dd>One Rust implementation with its own Cargo workspace, lockfile and CI workflow, outside the two-edition contract. A service, not a command-line tool, and it has no agent skill.</dd>
+</dl>
+<h4>Documentation</h4>
+<ul class="doc-links">
+<li><a href="vibe-talk.html">Clips, providers and maturity</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/vibe-talk/README.md">README</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/vibe-talk/README.md#status-what-works-what-is-stubbed">Status: what works, what is stubbed</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/vibe-talk/README.md#known-gaps">Known gaps</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/vibe-talk/QUICKSTART.md">Quickstart</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/vibe-talk/QUICKSTART.md#read-this-before-you-start">Read this before you start</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/vibe-talk/README.md#security">Security</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/vibe-talk/README.md#from-zero">Deployment requirements</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/vibe-talk/RELATED_WORK.md">Related work</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/.github/workflows/vibe-talk.yml">CI workflow</a></li>
+<li>Source: <a href="https://github.com/rrnewton/agent-utils/tree/main/vibe-talk">vibe-talk/</a></li>
+</ul>
+<p class="back-to-top"><a href="#main">Back to top</a></p>
+</section>
+
+<section class="tool" id="pr-landing-planner" aria-labelledby="pr-landing-planner-title">
+<div class="tool-head">
+<h3 id="pr-landing-planner-title"><code>pr-landing-planner</code></h3>
+<p class="badges"><span class="badge badge-warn">experimental</span><span class="badge badge-edition">Python + Rust</span></p>
+</div>
+<p class="tool-lede">An advisory planner that turns a queue of pull requests into per-PR actions and conflict-safe groups.</p>
+<dl class="tool-facts">
+<dt>Problem</dt>
+<dd>Landing many pull requests means working out which ones conflict, what order they must go in, whose CI evidence still applies to the exact head, and which can land together.</dd>
+<dt>What you get</dt>
+<dd>Real merge-conflict detection, dependency ordering, CI classification, and evidence that must name each PR's exact head. Output for people, as canonical JSON, or as line-oriented actions. An offline fixture mode, and a live mode that uses <code>gh</code> and <code>git</code> against a local clone.</dd>
+<dt>Needs</dt>
+<dd>Python 3.10 or newer, or a Rust build; <code>gh</code> and <code>git</code> for live mode. Fixture mode needs no network.</dd>
+<dt>Status</dt>
+<dd>Experimental, at version 0.1. It "never merges, rebases, labels, refires, or otherwise mutates a pull request"; live mode only updates private refs in the clone you give it and may write a local plan archive. A separate, authorized operator does any landing, guided by the pr-landing-operations skill, and only where the repository's own rules allow it. There is no related-work document yet.</dd>
+<dt>Editions</dt>
+<dd>Python and Rust, cross-checked by the differential tests.</dd>
+</dl>
+<h4>Documentation</h4>
+<ul class="doc-links">
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/pr-landing-planner/rendered/python/README.md">README (Python)</a>, <a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/pr-landing-planner/rendered/rust/README.md">README (Rust)</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/pr-landing-planner/rendered/python/USER_GUIDE.md">User guide (Python)</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/pr-landing-planner/rendered/rust/USER_GUIDE.md#exact-head-landing-context-and-validation-authority">Exact-head evidence</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/pr-landing-planner/rendered/rust/USER_GUIDE.md#safety-model">Safety model</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/skills/pr-landing-planner/SKILL.md">Agent skill: planner</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/skills/pr-landing-operations/SKILL.md">Agent skill: landing operations</a></li>
+<li>Source: <a href="https://github.com/rrnewton/agent-utils/tree/main/py/pr_landing_planner">Python</a>, <a href="https://github.com/rrnewton/agent-utils/tree/main/rs/pr-landing-planner">Rust</a></li>
+</ul>
+<p class="back-to-top"><a href="#main">Back to top</a></p>
+</section>
+</section>
+
+<section aria-labelledby="supporting">
+<div class="group-head">
+<h2 id="supporting">Supporting pieces</h2>
+<p>Instructions for agents, older command names, libraries, and a diagnostic component. Useful to know about, not usually chosen on their own.</p>
+</div>
+
+<section class="tool" id="skills" aria-labelledby="skills-title">
+<div class="tool-head">
+<h3 id="skills-title">Agent skills</h3>
+<p class="badges"><span class="badge">documentation for agents</span></p>
+</div>
+<p class="tool-lede">Instructions written for agents, designed as one set: two suite skills, and one skill for most tools with a command.</p>
+<dl class="tool-facts">
+<dt>Problem</dt>
+<dd>An agent needs consistent rules for setting the suite up, running a project as coordinator, and using each tool, and a copied manual drifts from the installed tool.</dd>
+<dt>What you get</dt>
+<dd>The setup skill (the adoption procedure, its templates and "add a tool later" recipes) and the coordinator skill (priorities, delegation, supervision, landing, reporting, shared-machine safety). Tool skills point to each tool's <code>quickstart</code>, <code>--help</code> and user guide instead of copying them.</dd>
+<dt>Status</dt>
+<dd>Setup links four skills into a harness by default (setup, coordinator, agentctl, wrkslots) plus those of the optional tools you choose. gh-paced, agent-usage and vibe-talk have no skill. herdr-agent's skill covers the older interface.</dd>
+</dl>
+<h4>Documentation</h4>
+<ul class="doc-links">
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/skills/README.md">Skills index</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/skills/README.md#install-in-a-harness">Install in a harness</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agent-utils-setup/SKILL.md">Setup skill</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agent-utils-coordinator/SKILL.md">Coordinator skill</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/tree/main/skills/agent-utils-setup/templates">Setup templates</a></li>
+</ul>
+<p class="back-to-top"><a href="#main">Back to top</a></p>
+</section>
+
+<section class="tool" id="herdr-agent" aria-labelledby="herdr-agent-title">
+<div class="tool-head">
+<h3 id="herdr-agent-title">Compatibility commands: <code>herdr-agent</code>, <code>herdr-subagents</code>, <code>herdr-chat</code></h3>
+<p class="badges"><span class="badge">compatibility</span></p>
+</div>
+<p class="tool-lede">Older command names that keep existing scripts and state directories working. Start new integrations with <code>agentctl</code>.</p>
+<dl class="tool-facts">
+<dt>herdr-agent</dt>
+<dd>Durably queues and submits prompts to an agent in an exact Herdr pane, with the same "pending" (75) and "possibly submitted" (76) outcomes as agentctl. Ships in both editions and is covered by the differential tests.</dd>
+<dt>herdr-subagents</dt>
+<dd>Headless workers, now the same as <code>agentctl start --mode headless</code>. Python only.</dd>
+<dt>herdr-chat</dt>
+<dd>The Python chat bridge under its old name, with its old state directory. Python only.</dd>
+</dl>
+<h4>Documentation</h4>
+<ul class="doc-links">
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/py/agentctl/USER_GUIDE.md#compatibility-entry-points">Compatibility entry points</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/py/agentctl/USER_GUIDE.md#headless-worker-extension">Headless worker extension</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/skills/herdr-agent/SKILL.md">herdr-agent skill</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/reviews/herdr-agent.md">Paired-port review</a></li>
+</ul>
+<p class="back-to-top"><a href="#main">Back to top</a></p>
+</section>
+
+<section class="tool" id="chat-subscription" aria-labelledby="chat-subscription-title">
+<div class="tool-head">
+<h3 id="chat-subscription-title"><code>chat-subscription</code> libraries</h3>
+<p class="badges"><span class="badge">library</span><span class="badge badge-edition">Rust</span></p>
+</div>
+<p class="tool-lede">Two Rust libraries that define how chat providers plug into the Rust chat host as separate processes.</p>
+<dl class="tool-facts">
+<dt>Problem</dt>
+<dd>A chat bridge must not lose or double-process messages across disconnects, and providers should plug in as separate executables without a dynamic-library interface or credentials in the protocol.</dd>
+<dt>What you get</dt>
+<dd><code>chat-subscription</code>: ordered events, opaque replay cursors, explicit checkpoint and gap events, and a durable acknowledgement boundary. <code>chat-subscription-plugin</code>: the same contract as a bounded, versioned, length-prefixed JSON process protocol, with a Linux process host and a deterministic fake provider for conformance tests.</dd>
+<dt>Status</dt>
+<dd>Version 0.1 libraries with no commands. No provider plugin ships yet. Plugins are trusted same-user code; the private process group is for cleanup and supervision, not containment.</dd>
+</dl>
+<h4>Documentation</h4>
+<ul class="doc-links">
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/chat-subscription/README.md">chat-subscription README</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/chat-subscription-plugin/README.md">chat-subscription-plugin README</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/chat-subscription-plugin/README.md#version-1-wire-contract">Version 1 wire contract</a></li>
+<li>Source: <a href="https://github.com/rrnewton/agent-utils/tree/main/rs/chat-subscription">chat-subscription</a>, <a href="https://github.com/rrnewton/agent-utils/tree/main/rs/chat-subscription-plugin">chat-subscription-plugin</a>, <a href="https://github.com/rrnewton/agent-utils/tree/main/rs/chat-subscription-fake">conformance fake</a></li>
+</ul>
+<p class="back-to-top"><a href="#main">Back to top</a></p>
+</section>
+
+<section class="tool" id="wrkslotsd" aria-labelledby="wrkslotsd-title">
+<div class="tool-head">
+<h3 id="wrkslotsd-title"><code>wrkslotsd</code></h3>
+<p class="badges"><span class="badge">diagnostic</span><span class="badge">unpublished</span><span class="badge badge-edition">Rust</span></p>
+</div>
+<p class="tool-lede">A read-only observer of the wrkslots event log that rebuilds a disposable SQLite index and reconstructs decisions for diagnosis.</p>
+<dl class="tool-facts">
+<dt>Status</dt>
+<dd>Unpublished. It cannot change anything: no cleanup, no deletion, no repository changes, and it cannot apply a plan. Python wrkslots remains the authority for slot lifecycles, and the index is not an authenticated store.</dd>
+</dl>
+<h4>Documentation</h4>
+<ul class="doc-links">
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/wrkslots/RELATED_WORK.md#current-implementation-and-migration-boundary">Current implementation and migration boundary</a></li>
+<li>Source: <a href="https://github.com/rrnewton/agent-utils/tree/main/rs/wrkslotsd">Rust</a></li>
+</ul>
+<p class="back-to-top"><a href="#main">Back to top</a></p>
+</section>
+</section>
+
+</div>
+
+<section class="section" aria-labelledby="install-title">
+<div class="wrap">
+<h2 id="install-title">Installing a tool on its own</h2>
+<div class="prose">
+<p>In a harness the core tools need no installing: the commands in <code>agent-utils/bin</code> run straight from the checkout on the Python edition. The exceptions are gh-paced and agent-usage, which are built with <code>cargo</code>, and vibe-talk, which is deployed separately. To use one tool outside a harness, install it from a checkout of this repository:</p>
+<pre tabindex="0" role="region" aria-label="Installing one tool from a checkout"><code>python3 -m pip install ./py/wrkslots      # a Python distribution
+cargo install --path rs/agentctl          # a Rust crate</code></pre>
+<p>Every paired tool and every Python-only tool has its own installable distribution; gh-paced and agent-usage are built from <code>rs/</code>. This site does not claim that any of them is published to a package index. See the <a href="https://github.com/rrnewton/agent-utils/blob/main/py/README.md">Python distributions</a> and <a href="https://github.com/rrnewton/agent-utils/blob/main/rs/README.md">Rust crates</a> for the full lists.</p>
+</div>
+</div>
+</section>
+
+</main>
+<footer class="site-footer">
+<div class="wrap">
+<div class="footer-grid">
+<div>
+<h2>Project</h2>
+<ul>
+<li><a href="https://github.com/rrnewton/agent-utils">Source on GitHub</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/issues">Issues</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/LICENSE">License (MIT)</a></li>
+</ul>
+</div>
+<div>
+<h2>Documentation</h2>
+<ul>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/README.md">README</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/QUICKSTART.md">Quickstart</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/skills/README.md">Skills</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/README.md">Tool documentation</a></li>
+</ul>
+</div>
+<div>
+<h2>This site</h2>
+<ul>
+<li><a href="index.html">Overview</a></li>
+<li><a href="architecture.html">Architecture</a></li>
+<li><a href="tools.html">Tools</a></li>
+<li><a href="vibe-talk.html">vibe-talk demo</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/tree/main/site">Page source (site/)</a></li>
+</ul>
+</div>
+</div>
+<p class="footer-note">agent-utils is MIT-licensed, pre-1.0 software for Linux. Herdr is a separate project. This site is hand-written HTML and CSS with no external resources; its only script remembers your color theme.</p>
+</div>
+</footer>
+</body>
+</html>

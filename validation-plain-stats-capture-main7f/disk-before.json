@@ -1,0 +1,9 @@
+{
+  "at": "2026-10-14T13:10:40.685281+00:00",
+  "source": "/dev/md0",
+  "available": 781304754176,
+  "estimated_additional_bytes": 68719476736,
+  "estimated_remaining": 712585277440,
+  "no_build_floor_bytes": 650000000000,
+  "estimate_not_measured_footprint": true
+}

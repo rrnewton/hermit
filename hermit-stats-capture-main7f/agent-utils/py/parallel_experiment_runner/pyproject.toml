@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "parallel-experiment-runner"
+version = "0.3.1"
+description = "Run boxed, resource-bounded concurrent seed sweeps."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Ryan Newton" }]
+keywords = ["experiments", "scheduler", "cgroups", "resource-containment"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: POSIX :: Linux",
+]
+dependencies = ["dagrun>=0.13.1"]
+
+[project.optional-dependencies]
+dev = ["mypy", "pytest"]
+
+[project.urls]
+Repository = "https://github.com/rrnewton/agent-utils"
+Issues = "https://github.com/rrnewton/agent-utils/issues"
+
+[project.scripts]
+parallel-experiment-runner = "parallel_experiment_runner.cli:main"
+
+[tool.setuptools]
+packages = ["parallel_experiment_runner"]
+package-dir = { parallel_experiment_runner = "." }
+include-package-data = false
+
+[tool.setuptools.package-data]
+parallel_experiment_runner = ["py.typed", "README.md", "USER_GUIDE.md", "examples/*.json"]

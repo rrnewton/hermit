@@ -1,0 +1,73 @@
+{
+  "description": "A small, self-contained tick-hub reminder set demonstrating the four building blocks: a plain\ntimed reminder, a gated + value-capturing reminder, a flag-gated reminder, and a health check.",
+  "health_checks": [
+    {
+      "name": "db_backup",
+      "glob": "/var/backups/app-db-*.sql",
+      "threshold_secs": 93600,
+      "detail": "newest database snapshot"
+    }
+  ],
+  "reminders": [
+    {
+      "name": "git_sync",
+      "cadence_secs": 21600,
+      "requires_flags": [],
+      "gate": null,
+      "emit": {
+        "kind": "action",
+        "title": "fetch origin and reconcile the working branch",
+        "skill": "git-sync",
+        "fields": {}
+      }
+    },
+    {
+      "name": "backlog_size",
+      "cadence_secs": 0,
+      "requires_flags": [],
+      "gate": {
+        "cmd": "echo count=42",
+        "when": "always",
+        "capture": true
+      },
+      "emit": {
+        "kind": "action",
+        "title": "backlog has {count} ready items (threshold {threshold})",
+        "skill": "backlog-triage",
+        "fields": {
+          "threshold": "20"
+        }
+      }
+    },
+    {
+      "name": "benchmark",
+      "cadence_secs": 0,
+      "requires_flags": [
+        "benchmark_enabled"
+      ],
+      "gate": null,
+      "emit": {
+        "kind": "action",
+        "title": "refresh the recorded benchmark numbers",
+        "skill": "run-benchmark",
+        "fields": {}
+      }
+    },
+    {
+      "name": "disk_watch",
+      "cadence_secs": 0,
+      "requires_flags": [],
+      "gate": {
+        "cmd": "exit 1",
+        "when": "success",
+        "capture": false
+      },
+      "emit": {
+        "kind": "note",
+        "title": "disk headroom is low on this host",
+        "skill": "",
+        "fields": {}
+      }
+    }
+  ]
+}

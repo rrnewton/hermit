@@ -1,0 +1,2823 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
+    <!--
+      `#241 voice-composer`. `interactive-widget=resizes-content` is what keeps the dock ON SCREEN
+      while a message box has the focus. The frame is a fixed `100dvh` grid with the dock as its
+      last row, and Chrome on Android, left to its default (`resizes-visual`), opens the on-screen
+      keyboard OVER the layout: `100dvh` does not shrink, the browser pans to the focused box, and
+      the dock — the Voice/Channel switch, Hang up, Talk — ends up underneath the keyboard. Told to
+      resize the content, the browser shrinks the layout to what is left above the keyboard, so the
+      grid lays itself out again with the dock directly above the keys and the list, which holds
+      the box, scrolled to it. Safari does not read this key yet; there the keyboard still pans.
+    -->
+    <meta name="color-scheme" content="dark light" />
+    <title>vibe-talk — voice</title>
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/icons/icon-192.png" />
+    <link rel="icon" type="image/svg+xml" sizes="any" href="/icons/icon.svg" />
+    <link rel="apple-touch-icon" href="/icons/icon-192.png" />
+    <!--
+      Deliberately NOT declared here, and this is not an oversight:
+
+        * `apple-mobile-web-app-capable`. Chrome understands the manifest's display_override and
+          installs the page as standalone. Safari currently ignores that member and falls back to
+          display: browser; opting it into standalone separately would restore the long-standing
+          iOS microphone re-prompt risk (WebKit 185448, 215884). The app-like feel below is built
+          entirely from layout and gesture properties, which need no such declaration.
+        * Any third-party script, font, or stylesheet. Local files only, no CDN, and nothing built at deploy time: the one generated script
+          (contract.js) is checked in beside the code it validates.
+    -->
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="stylesheet" href="/voice.css" />
+  </head>
+  <body>
+    <!--
+      The frame. `body` is a three-row grid — top bar, body, dock — and it is the whole viewport.
+      Nothing outside the one scrolling element scrolls, so a drag anywhere else moves nothing,
+      which is the difference between this and a web page.
+
+      The rule the whole layout serves: the MAJORITY OF THE SPACE BELONGS TO CONTENT — the
+      transcript, and the controls. Anything explanatory is available on request and is not
+      standing on the screen. Where a boundary has to be shown, it is a thin labelled separator,
+      not a paragraph; the paragraph lives one tap inside it.
+    -->
+    <header id="topbar">
+      <div id="topbar-row" class="topbar-row">
+        <!-- On the settings screen the header becomes a plain title bar with a way back, which is
+             what a phone application does. It used to leave this row empty and put a "Back" button
+             in the body, which reads as an unfinished page. -->
+        <button id="close-settings" class="icon-button" type="button" aria-label="Back" title="Back" hidden>
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M14.5 5 8 12l6.5 7" />
+          </svg>
+        </button>
+        <!-- The reply screen gets its OWN way back rather than borrowing the settings one. They
+             go to different places, and scripts/screenshots.py drives #close-settings by name. -->
+        <button id="close-reply" class="icon-button" type="button" aria-label="Back" title="Back" hidden>
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M14.5 5 8 12l6.5 7" />
+          </svg>
+        </button>
+        <!-- `#85 voice-desktop-review`. Help gets its OWN way back, for the same reason the reply
+             screen does: it goes somewhere different. Settings returns to the call; Help returns
+             to Settings, which is where the reader was and what they were doing. -->
+        <button id="close-help" class="icon-button" type="button" aria-label="Back" title="Back" hidden>
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M14.5 5 8 12l6.5 7" />
+          </svg>
+        </button>
+        <!-- `#194 thread-picker-polish`. The Threads screen gets its OWN way back as well: it returns
+             to the channel it lists, at the line the reader left. -->
+        <button id="close-threads" class="icon-button" type="button" aria-label="Back" title="Back" hidden>
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M14.5 5 8 12l6.5 7" />
+          </svg>
+        </button>
+        <span id="topbar-title" class="topbar-title" hidden>Settings</span>
+
+        <!--
+          `#58 control-bar`. The TOP home of the control bar, and empty in the markup on purpose:
+          the bar itself is declared in the dock below, which is where it lives by default. This is
+          a mount point, and `setPlacement()` moves the one bar between the two.
+
+          Two mounts rather than two copies of the bar. A second copy would be a second set of ids,
+          and the page would then have to keep two gears and two switches agreeing about which
+          screen is up — which is the defect, not the layout.
+        -->
+        <div id="control-bar-top"></div>
+
+        <!--
+          `#129 message-search` used to keep its magnifying glass at the end of this row, and that
+          is why the header cost a row on every main screen: a 2.4rem strip, plus the status-bar
+          inset, holding one small icon in its corner. `#197 floating-search` took it out — the
+          owner's word for that strip was "wasteful" — and the glass now floats over the top of the
+          list beside the freshness pill (see #channel-freshness-anchor below). This row is back to
+          what `#58 control-bar` left it: a title bar with a way back, or the control bar when the
+          reader has asked for it up here, and otherwise not on screen at all.
+        -->
+      </div>
+    </header>
+
+    <main id="frame-body">
+      <!-- Failures are shown HERE, in the page, on whichever screen is up. An error that exists
+           only in the browser console is an error the owner has to open dev tools to read, which
+           on a phone means it may as well not exist. -->
+      <div id="error-wrap" class="panel error" role="alert" hidden>
+        <span id="error" hidden></span>
+        <!-- `#209 voice-socket-open`. Shown only when a start never reached the voice service. -->
+        <button id="retry-start" class="chip" type="button" hidden>Try again</button>
+        <button id="dismiss-error" class="chip" type="button" aria-label="Dismiss error">×</button>
+      </div>
+
+      <!--
+        `#63 status-line-placement`. This used to be a permanent grid row at the top of the dock,
+        costing a strip of a phone screen on every frame for a line that is blank most of the time.
+        It is now a TRANSIENT message: it ships hidden, appears when there is something to say, and
+        takes itself away a few seconds later.
+
+        An overlay rather than a collapsing row, and the ids are unchanged on purpose:
+
+          * OVERLAY, because a row that appears and disappears resizes #scroll-area and jitters the
+            transcript under the reader's thumb. Nothing else on this page is positioned, and the
+            rule in web/voice.css says why this one is.
+          * `status-line`, `status` and `data-state` are exactly as they were, so `setState`, the
+            dot colours, the page suite's own state helper and scripts/screenshots.py all keep
+            working — this is a move, not a rename.
+
+        Nothing that must survive is kept here. Errors live in #error above, close codes in the
+        settings connection detail, and conversation boundaries are seams in the transcript. What
+        is left is a thing that was true a moment ago, and that is allowed to go away.
+      -->
+      <div id="status-line" data-state="idle" hidden>
+        <span class="status-dot" aria-hidden="true"></span>
+        <span id="status" role="status" aria-live="polite"></span>
+        <button id="dismiss-status" class="chip" type="button" aria-label="Dismiss">×</button>
+      </div>
+
+      <!--
+        `#34 voice-chat-write-confirm`. The voice agent's `post_reply` does not send: it PROPOSES,
+        and this card is one of the two ways the owner confirms. It shows exactly what the server
+        will post — channel, reply target, text — because that is what Send commits, and nothing
+        the agent says can change it once it is on screen. It appears only during a write-scope
+        call, and it is an overlay for the same reason #status-line is: appearing must not move the
+        transcript under the reader's thumb.
+      -->
+      <section id="post-confirm" class="panel" role="alertdialog" aria-labelledby="post-confirm-title" hidden>
+        <h2 id="post-confirm-title">Post this as your bot?</h2>
+        <p id="post-confirm-where"></p>
+        <p id="post-confirm-text"></p>
+        <p id="post-confirm-expiry" class="hint"></p>
+        <div class="row">
+          <button id="post-confirm-cancel" class="secondary" type="button">Don't send</button>
+          <button id="post-confirm-send" type="button">Send</button>
+        </div>
+      </section>
+
+      <div id="screens">
+        <!-- ------------------------------------------------------------------ sign-in screen -->
+        <section id="screen-signin" class="screen" tabindex="-1" aria-label="Sign in">
+          <h1>vibe-talk</h1>
+          <p class="hint">Server: <code id="signin-server-url"></code></p>
+
+          <label for="api-token">Write token</label>
+          <input id="api-token" type="password" autocomplete="off" placeholder="paste the token" />
+          <div class="row">
+            <button id="save-token" type="button">Save token</button>
+          </div>
+          <p id="token-state" class="hint" aria-live="polite">no token saved in this browser</p>
+        </section>
+
+        <!-- --------------------------------------------------------------------- main screen -->
+        <section id="screen-main" class="screen" hidden>
+          <!-- Shown once, then gone. The same text stays reachable from Settings, so dismissing
+               it loses nothing. -->
+          <div id="connection-banner" class="panel banner" hidden>
+            <span id="connection-detail" class="muted"></span>
+            <button id="dismiss-banner" class="chip" type="button">Dismiss</button>
+          </div>
+
+          <div id="channel-navigation" hidden>
+            <div id="channel-view-tabs" role="group" aria-label="Channel view" hidden>
+              <button id="channel-view-main" type="button" aria-pressed="true">Main</button>
+              <button id="channel-view-threads" type="button" aria-pressed="false">Threads</button>
+              <button id="channel-view-flat" type="button" aria-pressed="false">All</button>
+            </div>
+            <!--
+              `#194 thread-picker-polish`. The open thread's identity, in the thread picker's own
+              words — "13h · 16 · its name" — with the name less shortened, because there is room.
+            -->
+            <div id="thread-heading" hidden>
+              <button id="thread-back" class="secondary" type="button">← Back</button>
+              <span id="thread-facts" class="thread-facts" hidden></span>
+              <span id="thread-title">Thread</span>
+            </div>
+          </div>
+
+          <!--
+            `#18 offline-message-cache`. How old the channel rows are, whenever they are not a read
+            that just succeeded: saved on this device and refreshing, or kept after a refresh that
+            failed. It floats over the top of the list — outside the scroller, so it never scrolls
+            away, and below the view tabs, so it never covers one. A zero-height anchor, so its
+            appearing resizes nothing; the channel pane reserves its height at the head of the
+            list instead, so it never covers the header either. It is a status and not an alert:
+            it is spoken once when it changes, never interrupts.
+
+            `#197 floating-search`. The anchor is now the LINE everything floating over the top of
+            the list is centred on, and the search glass shares it: the owner asked for the glass
+            as "a floating icon ... on the same vertical height as the refresh status floating
+            widget", and two things centred on one line cannot drift apart the way two things each
+            positioned by their own arithmetic can. The pill stays centred over the list; the glass
+            sits at the right-hand end of the same line, so the two read as one band of status
+            rather than as a status and a stray button.
+
+            `#211 link-filter`. The glass was drawn the pill's height until the owner, on his phone,
+            called it "very small": it is a larger disc now, still centred on the same line, and the
+            bar it opens is taller to match.
+          -->
+          <div id="channel-freshness-anchor">
+            <p id="channel-freshness" data-state="fresh" role="status" aria-live="polite" hidden></p>
+            <!--
+              `#129 message-search`, floating since `#197 floating-search`. Closed, this is the glass
+              and nothing else. Open, it grows along the line into a bar across the top of the list
+              — field, count, the filters, and the glass as its way out — and the pill gives way to
+              it, as it already gives way to a pull. At the top of the list is also where an
+              on-screen keyboard never reaches: it rises from the bottom, so the field and the first
+              matches under it stay in view while the reader types. The list reserves the bar's
+              height at its head while it is open, so the first match is never underneath it.
+
+              ONE place in both placements of the control bar. With the bar moved up into the
+              header the glass still floats here, so the field no longer competes with the bar for
+              a 375px row and neither has to yield to the other.
+
+              The count says the DENOMINATOR is what has been loaded. Since `#128
+              transcript-history` the record on screen is a bounded suffix of a longer one, so "no
+              matches" has to be distinguishable from "not here" by a reader who has not scrolled
+              up yet.
+            -->
+            <div id="search-float" role="search">
+              <input
+                id="search-field"
+                class="search-field"
+                type="search"
+                autocomplete="off"
+                placeholder="Search loaded messages"
+                aria-label="Search loaded messages; Enter searches older messages"
+                title="Filters the messages already on screen. Quote a phrase to match it whole. Enter searches older messages, a few pages at a time."
+                hidden
+              />
+              <span id="search-count" class="search-count" role="status" aria-live="polite" hidden></span>
+              <!--
+                `#251 author-filter`. Whose messages: everyone's, only yours, or only everyone else's,
+                in turn, as the owner asked — "filter on prompts vs agent responses (me vs them)". One
+                button that cycles, as the read mode's does, because the bar already holds the field,
+                the count, two filters and the glass on a 360px line. Yours are the messages the page
+                draws as yours (the right-hand tiles, and the call's "you"); theirs is every other
+                message, people and agents alike. With nothing typed, "only yours" is every prompt you
+                wrote among the messages loaded. Over the call view too, as Links is, and it goes with
+                the bar as the other filters do. Each state draws its own icon: a speech bubble whose
+                tail is on the side the messages it keeps are drawn on.
+              -->
+              <button id="author-filter" class="icon-button" type="button" data-author="everyone" aria-pressed="false" aria-label="Everyone's messages. Press for only yours" title="Everyone's messages — press for only yours" hidden>
+                <svg class="icon author-icon" data-author="everyone" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M4 3.5h8a1.8 1.8 0 0 1 1.8 1.8v4.4A1.8 1.8 0 0 1 12 11.5H8l-3 2.8v-2.8H4a1.8 1.8 0 0 1-1.8-1.8V5.3A1.8 1.8 0 0 1 4 3.5z" />
+                  <path d="M16.6 9.5H20a1.8 1.8 0 0 1 1.8 1.8v4.4A1.8 1.8 0 0 1 20 17.5h-1v2.8l-3-2.8h-4a1.8 1.8 0 0 1-1.8-1.8v-1.2" />
+                </svg>
+                <svg class="icon author-icon" data-author="mine" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M6 4.5h12a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2v4l-4-4H6a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2z" />
+                </svg>
+                <svg class="icon author-icon" data-author="theirs" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M18 4.5H6a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2v4l4-4h8a2 2 0 0 0 2-2v-7a2 2 0 0 0-2-2z" />
+                </svg>
+              </button>
+              <!--
+                `#211 link-filter`. The Links filter, immediately beside Pinned and only while the bar
+                is open, as the owner asked: "another little icon next to it with a hyperlink symbol".
+                On, the list keeps only the messages that hold a link, and each of those shows its
+                links and nothing else, one per line, each opening in a new tab. Over the call view as
+                well as the channel, because it filters what the search filters: the messages loaded
+                in the view on screen. It goes with the bar exactly as Pinned does.
+              -->
+              <button id="links-filter" class="icon-button" type="button" aria-pressed="false" aria-label="Show only links" title="Show only links" hidden>
+                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M10.5 13.5a4.2 4.2 0 0 0 5.9 0l3.1-3.1a4.2 4.2 0 0 0-5.9-5.9l-1.4 1.4" />
+                  <path d="M13.5 10.5a4.2 4.2 0 0 0-5.9 0l-3.1 3.1a4.2 4.2 0 0 0 5.9 5.9l1.4-1.4" />
+                </svg>
+              </button>
+              <!--
+                `#206 pin-message`. The Pinned filter, IMMEDIATELY beside the glass and only while the
+                bar is open, as the owner asked: on, the list is this channel's pinned messages and
+                nothing else — whatever the view and whatever Hide read says — and the search text
+                still narrows it. Closing the bar clears the text, and turns this off with it, so no
+                filter is ever left in force behind a control that is not on screen.
+              -->
+              <button id="pinned-filter" class="icon-button" type="button" aria-pressed="false" aria-label="Show only pinned messages" title="Show only pinned messages" hidden>
+                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M8.5 3.5h7" />
+                  <path class="pin-head" d="M10 3.5v6L7 13.5h10l-3-4v-6" />
+                  <path d="M12 13.5v7" />
+                </svg>
+              </button>
+              <button id="search-toggle" class="icon-button" type="button" aria-label="Search messages" title="Search messages" aria-pressed="false" hidden>
+                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="10.5" cy="10.5" r="6.5" />
+                  <path d="m15.3 15.3 4.2 4.2" />
+                </svg>
+              </button>
+              <!--
+                `#212 link-filter`. Toggles that float UNDER the Links button while Links is on, and
+                only then, as the owner asked: "3 buttons to pop up under the link icon I just
+                clicked. They should be named PRs Commits Actions and be toggled on by default.
+                Unselecting them filters out all the links that are just GitHub links to commits PRs
+                etc". Each one, turned off, takes one kind of link out of the Links view; the number
+                beside its name is how many of the links in view are of that kind. The choice is kept
+                on this device.
+
+                `#266 link-filter-kinds`. Then Issues, Files and Other: "together that should be all
+                of them", and "Other is the catch all". Every link is of exactly one of the six, so
+                the numbers add up to every link in view. Six are wider than a phone once their
+                numbers are up, so the row scrolls sideways there rather than leave the screen.
+
+                Last in the bar rather than beside Links, so it stands between none of the filters on
+                the bar's line: it is out of that line altogether, and web/voice.css hangs it under
+                Links from here.
+              -->
+              <div id="link-kinds" role="group" aria-label="Kinds of link to show" hidden>
+                <button id="link-kind-pr" class="link-kind" type="button" aria-pressed="true" title="Show links to pull requests">PRs<span id="link-kind-pr-count" class="link-kind-count"></span></button>
+                <button id="link-kind-commit" class="link-kind" type="button" aria-pressed="true" title="Show links to commits and comparisons">Commits<span id="link-kind-commit-count" class="link-kind-count"></span></button>
+                <button id="link-kind-action" class="link-kind" type="button" aria-pressed="true" title="Show links to Actions runs and checks">Actions<span id="link-kind-action-count" class="link-kind-count"></span></button>
+                <button id="link-kind-issue" class="link-kind" type="button" aria-pressed="true" title="Show links to issues">Issues<span id="link-kind-issue-count" class="link-kind-count"></span></button>
+                <button id="link-kind-file" class="link-kind" type="button" aria-pressed="true" title="Show links to files and folders of code">Files<span id="link-kind-file-count" class="link-kind-count"></span></button>
+                <button id="link-kind-other" class="link-kind" type="button" aria-pressed="true" title="Show links to everything else: documents, pages and other sites">Other<span id="link-kind-other-count" class="link-kind-count"></span></button>
+              </div>
+            </div>
+          </div>
+
+          <!--
+            THE one scrolling element on the page.
+
+            `#224 keyboard-shortcuts`. Focusable (`tabindex="-1"`: by script and by a click, never
+            by Tab) because the browser's own scrolling keys (PgUp, PgDn, Space, Home, End and the
+            arrows) scroll the element that holds the focus, or failing that the DOCUMENT, and this
+            document never scrolls. With the focus on the body or on a control in the dock those
+            keys did nothing at all. web/voice.js hands the focus here when the screen or the view
+            changes, and when one of those keys arrives from somewhere it cannot act; see
+            `routeScrollKey`. A named region, so a screen reader landing here says "Messages"
+            rather than reading the whole list out.
+          -->
+          <div id="scroll-area" tabindex="-1" role="region" aria-label="Messages">
+            <!--
+              `#129 message-search`. A filter that matches nothing otherwise leaves a BLANK
+              region and no explanation: every row is still in the list, so neither pane's own
+              empty state fires, and the only thing saying what happened is "0 of 13 loaded" in
+              small grey type at the end of the search bar. That is not an answer to "where did
+              my messages go", and a reader who does not find it concludes the page broke.
+
+              ONE notice for both panes, because only one of them is ever on screen, and at the
+              TOP of the scrolling element so it sits beside the step-further-back control rather
+              than below a screen of nothing. It says "loaded" for the reason the count does:
+              since `#128 transcript-history` what is on screen is a bounded suffix of a longer
+              record, and "nobody said that" is a claim this page cannot make.
+            -->
+            <p id="search-empty" class="search-empty" role="status" hidden>
+              Nothing in the messages loaded so far matches that search.
+            </p>
+            <!--
+              `#262 search-load-older`. One column on Main, a search nothing loaded matches: Main holds a
+              thread's first message and none of its replies, and All has them. The search is kept.
+            -->
+            <button id="search-in-all" class="chip" type="button" hidden>Search All — thread replies too</button>
+            <div id="pane-voice">
+              <!-- At idle the transcript is the largest empty thing on the screen, so the
+                   invitation belongs HERE, in the space that is doing nothing — not in the one
+                   strip at the bottom edge where the hardware shows text worst. -->
+              <div id="empty-state">
+                <svg class="empty-mark" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round">
+                  <rect x="9" y="2.5" width="6" height="11" rx="3" />
+                  <path d="M5 11a7 7 0 0 0 14 0" />
+                  <path d="M12 18v3.5" />
+                </svg>
+                <!-- BOTH ways in, because there are two and they are different kinds of
+                     conversation: Talk opens the microphone, the box below never does. Naming only
+                     Talk here is what made the typed path look like a mode of the spoken one. -->
+                <p id="empty-line">Tap Talk to speak, or write to the agent below.</p>
+              </div>
+              <!--
+                `#128 transcript-history`. The transcript is durable, and a durable record is
+                longer than a screen. The page restores a BOUNDED suffix of it and walks further
+                back one server-cursored step at a time, exactly as the channel view does.
+
+                Above the turns and inside the scrolling element, so it scrolls away as the reader
+                moves down — it is the top of the record, not a fixture of the screen. A real
+                control as well as an automatic one: scrolling to the top takes the next step,
+                and this is what says a step is possible, what a keyboard can reach, and what
+                reports one in flight.
+              -->
+              <button id="load-older-turns" class="chip" type="button" hidden>Earlier turns</button>
+              <ol id="transcript" class="messages"></ol>
+              <!--
+                `#241 voice-composer`. The owner: "Type mode on voice agent takes away my
+                Voice/Channel toggle ... I'd actually like to move over to the same metaphor as the
+                channels view. Can we just have a message box at the BOTTOM of the scroll history?"
+
+                So this is the channel's composer, in the call's view: the last thing in the
+                scrolling list, the same box and the same Send, and ALWAYS HERE — idle, in a typed
+                conversation and in a call. It replaces `#59 text-entry-button`, which turned the
+                control bar into a text field and so took the switch, the gear and every other
+                member of the bar away for as long as you were typing. Nothing on the bar changes
+                now when you write.
+
+                Writing needs no mode of the agent's. During a call a typed turn goes down the
+                socket that is already open. With nothing open, the FIRST SEND starts a typed
+                conversation — no microphone — and the message goes the moment it opens; clicking
+                into the box, or typing in it, opens nothing and costs nothing. See `sendTyped` in
+                web/voice.js.
+              -->
+              <div id="voice-composer">
+                <textarea id="compose-text" rows="3" autocomplete="off" enterkeyhint="send"
+                          placeholder="Message the agent…" aria-label="Message the agent"></textarea>
+                <button id="send-text" type="button"
+                        title="Send this to the agent. With no call open it starts a typed conversation, which never opens the microphone.">Send</button>
+              </div>
+            </div>
+
+            <div id="pane-discord" hidden>
+              <!--
+                NOTHING LIVES ABOVE THE MESSAGES ANY MORE, and that is the whole point.
+                `#83 channel-selector-in-bar` already found this once: a control placed here is
+                inside #scroll-area, so it scrolls away the moment you read anything — and
+                `#65 scrollback-paging` then made scrolling toward it PREPEND more history, so it
+                RECEDES as you approach. The channel picker moved to the bar for exactly that
+                reason, and Refresh and the archive filter were left behind with a justification
+                that did not survive contact with a long channel: on a real backlog they are
+                simply unreachable.
+
+                Refresh is gone rather than moved. Pull past either end of the list to re-read —
+                up past the newest message, where the reader usually is (`#188
+                pull-refresh-bottom`), or down past the oldest — the standard idiom, implemented
+                as `#pull-refresh`, and the one a thumb reaches without hunting. `Hide archived` is
+                a control bar member now.
+              -->
+              <!--
+                `#63 status-line-placement`. The channel's own summary — how much is loaded, and
+                whether that is the whole channel — used to be a line on the status strip, and that
+                strip is transient now. A standing fact about what you are looking at does not
+                belong in a message that takes itself away after six seconds, so it is an entry at
+                the head of the view, in the same idiom the transcript uses for a conversation
+                boundary, and it scrolls off as the reader moves down.
+
+                Its own list rather than the first row of #discord-log: that log's children are the
+                channel's MESSAGES, and the page and its suite both count on that.
+              -->
+              <ol id="channel-summary" class="messages"></ol>
+
+              <!--
+                `#49 cached-summaries`. Present only while summary mode is on, and it says the one
+                thing the collapsed rows cannot say for themselves: WHO wrote the short line you
+                are reading. There IS a comprehension being paid for now — every one of those lines
+                is a model's paraphrase, bought per summary — so naming its author is the
+                difference between quoting a machine and appearing to quote the person. The backend
+                is quoted from the server's own answer rather than guessed here, so it cannot
+                describe a summariser this deployment does not run.
+
+                It carries the other standing fact too: a server with no summariser configured
+                cannot make ANY of these lines, which is a permanent condition and belongs in a
+                sentence that stays on screen rather than in a status pill that erases itself.
+                `data-unavailable` is what web/voice.css colours that case by; see there for why a
+                quiet grey hint was not enough.
+              -->
+              <p id="summary-note" class="hint" hidden></p>
+
+              <!--
+                `#61 unread-status`, said in the interface rather than left to be discovered from a
+                divergence. This text is QUOTED from the server's answer and is not written here:
+                one statement, in one place, and a page that drifted from the server's own posture
+                could not do so silently.
+              -->
+              <p id="inbox-note" class="hint" hidden></p>
+
+              <!--
+                Declaring bankruptcy. Bulk and destructive, so it says how many it is about to
+                clear before it does it, takes two taps, and is undoable afterwards — the same
+                armed idiom the Clear control on the dock uses, for the same reason.
+              -->
+              <button id="clear-backlog" class="chip" type="button" hidden>Clear the backlog</button>
+
+              <!--
+                `#65 scrollback-paging`. A channel read is a WINDOW, never the whole channel, and
+                until now the window was all there was: the oldest message on screen was the end of
+                what this page could ever show you. This walks further back, one server-cursored
+                step at a time.
+
+                It sits above the log and inside the scrolling element, so it scrolls away as the
+                reader moves down — it is the top of the history, not a fixture of the screen. It
+                is a real control as well as an automatic one: scrolling to the top loads the next
+                step, and this is what says so, what a keyboard can reach, and what reports that a
+                step is in flight.
+              -->
+              <button id="load-older" class="chip" type="button" hidden>Older messages</button>
+              <!--
+                `#262 search-load-older`. While a search, Links or whose messages chooses rows, the
+                control above says "Search before Oct 3" and walks a few older pages a tap; what the
+                last walk found is said here, under it, until the search changes. A status, written
+                once when a walk ends.
+              -->
+              <p id="search-older-note" class="hint search-older-note" role="status" hidden></p>
+              <p id="timeline-notice" class="hint" hidden></p>
+              <p id="channel-loading" class="channel-loading hint" role="status" aria-live="polite" hidden>
+                Loading messages…
+              </p>
+              <ol id="thread-list" class="messages" hidden></ol>
+              <ol id="discord-log" class="messages"></ol>
+              <!--
+                `#206 pin-message`. What the Pinned filter shows, in place of the list above: this
+                channel's pinned messages in the order they were sent, each drawn from the message
+                itself where it is loaded and from what the server kept of it where it is not. A list
+                of its own, so the channel's rows — and everything that reads them — are left exactly
+                as they were while it is up.
+              -->
+              <ol id="pinned-log" class="messages" aria-label="Pinned messages" hidden></ol>
+              <ol id="outgoing-log" class="messages" aria-label="Outgoing messages" hidden></ol>
+              <div id="channel-composer">
+                <!-- No heading line: it read like one more message. The box says where the message
+                     goes in its placeholder, and names itself to a screen reader the same way. -->
+                <textarea id="channel-compose-text" rows="3" placeholder="Message the main channel…" aria-label="Message the main channel" aria-describedby="channel-compose-state"></textarea>
+                <button id="channel-send" type="button">Send</button>
+                <p id="channel-compose-state" class="hint" role="status" aria-live="polite"></p>
+              </div>
+            </div>
+          </div>
+
+          <!--
+            `#277 reply-in-column`. Where a reply opened in the LEFT column of two is written: the reply
+            screen's own box (#reply-compose, moved here while it is open, so there is one box, one Send
+            and one set of rules), at the foot of the column under its list. The owner: "Reply in the
+            right column or left column, whichever I clicked the reply button in." Both columns stay on
+            screen as they were; Send or Cancel puts the box back and the column where it was. The right
+            column's is #side-reply, which stands in for this one there (`COLUMN_IDS`). web/voice.css
+            places it only in two columns; empty and hidden otherwise.
+          -->
+          <div id="column-reply" role="group" aria-label="Reply" hidden></div>
+
+          <!--
+            `#229 desktop-two-column`. The RIGHT COLUMN of the desk's two-column layout: Main stays in
+            #scroll-area on the left, and this column shows one thread of the channel or, with none
+            selected, a card for each thread to choose one from. The owner: "the right column contains
+            the messages from the selected thread. When no thread is selected it contains a list of
+            threads ... We need a button on the right hand side thread column to 'exit' (deselect) the
+            thread and go back to the list."
+
+            The stylesheet ALONE decides whether it is on screen: web/voice.css draws it only inside the
+            desktop block, at 1000px and wider, while #screen-main carries `data-columns="two"`. Every
+            other window, and every phone, never shows it, so nothing about the one-column page changes.
+            web/voice.js learns whether two columns are in force by asking whether this has a box.
+
+            The thread is drawn by the SAME code that draws a thread in #scroll-area. Each `side-` id
+            below stands in for one of that pane's while web/voice.js works on this column
+            (`COLUMN_IDS`), so the read modes, the landing on the first unread, the reply arrows, Done,
+            pins, older history and the composer are one implementation, not two. Every id is in this
+            markup, because the page suite builds its DOM from this file.
+
+            `#231 two-column-polish`. ONE named region, the scroller, as #scroll-area is the left
+            column's: the keys hand the focus to it, and a screen reader landing there hears what the
+            column shows, "Thread: its name" or "Threads", rather than the list read out. The column
+            around it used to be a second region named "Thread", so every way in said "Thread" twice.
+          -->
+          <div id="side-column">
+            <div id="side-heading">
+              <span id="side-facts" class="thread-facts" hidden></span>
+              <span id="side-title">Threads</span>
+              <!--
+                `#259 thread-list-unread-filter`. The owner: "Some have "N unread" and others are fully
+                read... I would like a toggle at the top in the banner that says "Threads" in the upper
+                left to filter it to unread only." Beside that heading, and only while it heads the
+                cards: pressed, the cards are the threads with unread replies, by the rule of the chip
+                that says "N unread" or "N new" on a card. Kept on this device.
+              -->
+              <button id="side-unread-only" class="chip" type="button" aria-pressed="false" title="Show only the threads with unread replies" hidden>Unread only</button>
+              <button id="side-close" class="icon-button" type="button" aria-label="Close thread" title="Back to the list of threads" hidden>
+                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                  <path d="M6 6l12 12M18 6 6 18" />
+                </svg>
+              </button>
+            </div>
+            <!--
+              `#231 two-column-polish`. How old the right column's rows are, whenever they are not a
+              read that just succeeded: in the freshness pill's own words — "Refresh failed · showing
+              messages from 07:23" — on one quiet line under the heading, and gone with the next read
+              that lands. The pill floats over the left column alone, so a failed refresh of this one
+              used to say nothing at all. A current column says nothing here: the pill says how
+              current the channel is. A status, spoken once when it changes, as the pill is.
+            -->
+            <p id="side-freshness" data-state="fresh" role="status" aria-live="polite" hidden></p>
+            <div id="side-scroll" tabindex="-1" role="region" aria-label="Threads">
+              <p id="side-search-empty" class="search-empty" role="status" hidden>
+                Nothing in the messages loaded so far matches that search.
+              </p>
+              <!--
+                No thread selected: one card per thread, newest activity at the foot, as the channel's
+                lists have their newest message (`#261 two-column-connectors`), and the way to older
+                threads at the head, above the oldest.
+              -->
+              <div id="side-list">
+                <p id="side-list-state" class="hint" role="status" aria-live="polite"></p>
+                <button id="side-more-threads" class="secondary" type="button" hidden>Older threads…</button>
+                <ul id="side-cards" class="side-cards" aria-label="Threads in this channel"></ul>
+              </div>
+              <!-- A thread selected: the thread, exactly as #pane-discord draws one. -->
+              <div id="side-pane" hidden>
+                <ol id="side-summary" class="messages"></ol>
+                <p id="side-summary-note" class="hint" hidden></p>
+                <p id="side-inbox-note" class="hint" hidden></p>
+                <button id="side-clear-backlog" class="chip" type="button" hidden>Clear the backlog</button>
+                <button id="side-older" class="chip" type="button" hidden>Older messages</button>
+                <p id="side-search-older-note" class="hint search-older-note" role="status" hidden></p>
+                <p id="side-notice" class="hint" hidden></p>
+                <p id="side-loading" class="channel-loading hint" role="status" aria-live="polite" hidden>
+                  Loading thread…
+                </p>
+                <ol id="side-thread-list" class="messages" hidden></ol>
+                <ol id="side-log" class="messages"></ol>
+                <ol id="side-pinned-log" class="messages" aria-label="Pinned messages" hidden></ol>
+                <ol id="side-outgoing-log" class="messages" aria-label="Outgoing messages" hidden></ol>
+                <div id="side-composer">
+                  <textarea id="side-compose-text" rows="3" placeholder="Reply in this thread…" aria-label="Reply in this thread" aria-describedby="side-compose-state"></textarea>
+                  <button id="side-send" type="button">Send</button>
+                  <p id="side-compose-state" class="hint" role="status" aria-live="polite"></p>
+                </div>
+              </div>
+            </div>
+            <!-- `#277 reply-in-column`. The right column's place for a reply opened in it: see #column-reply. -->
+            <div id="side-reply" role="group" aria-label="Reply" hidden></div>
+            <div id="side-tools">
+              <button id="side-jump-newest" class="chip" type="button" aria-label="Jump to the newest message" hidden>
+                <svg class="chip-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 5v13" />
+                  <path d="M6 12.5 12 19l6-6.5" />
+                </svg>
+                <span id="side-jump-newest-label">Newest</span>
+              </button>
+            </div>
+          </div>
+
+          <!--
+            `#261 two-column-connectors`. The links between the columns: from each root on Main to its
+            thread's card on the right, right-angled through the gap between them, in the thread's
+            colour, as a diff tool joins a hunk on the left to its counterpart on the right. Empty, and
+            drawn by web/voice.js only while two columns show the cards; web/voice.css draws it only in
+            the two-column block, over the main screen, and lets every press through. A picture of what
+            the tags and the cards already say, so it is hidden from assistive technology.
+          -->
+          <svg id="column-links" aria-hidden="true" focusable="false"></svg>
+
+          <!--
+            `#68 pull-to-refresh`. What the gesture SAYS while it is happening: armed, and then in
+            flight. A refresh that is silent is indistinguishable from no refresh at all, which is
+            the complaint the issue opens with.
+
+            A SIBLING of #scroll-area for the same two reasons the chips and the width handle are:
+            the scroll area carries the fade-under-the-header mask, and this affordance appears at
+            exactly the top edge where that mask is strongest — inside, it would announce itself by
+            dissolving. Out here it is positioned against #screen-main, so it adds no grid row and
+            cannot change the height of the thing being pulled.
+
+            `#188 pull-refresh-bottom`. A pull UP past the newest message puts it at the foot of
+            the list instead (`data-edge="end"`), where it also says what the refresh found —
+            "Updated 07:15" or "Refresh failed" — for a moment before it goes. Hidden from assistive
+            technology at both ends: it describes a touch, and the freshness pill above the list,
+            a polite live region, already announces how current the channel is.
+
+            It ships EMPTY and hidden: every word it says belongs to a state of the gesture, and a
+            label sitting in the markup is one the page would have to remember to take away.
+          -->
+          <div id="pull-refresh" data-state="idle" aria-hidden="true" hidden></div>
+
+          <!--
+            Two chips that float over the bottom corner of the list, and are absent whenever there
+            is nothing for them to do.
+
+            OUTSIDE #scroll-area on purpose. That element carries the fade-under-the-header mask,
+            and anything inside it is faded with the content — including a control that has to stay
+            legible. Out here it is positioned against #screen-main instead, which is why that rule
+            gained `position: relative`.
+          -->
+          <!--
+            The reading-width handle. `#55 voice-desktop-app`.
+
+            A SIBLING of #scroll-area, never a child of it: the scroll area carries the
+            fade-under-the-header mask and anything inside it is faded with the content. It is
+            absolutely positioned against #screen-main, so it adds no grid row and cannot change
+            the height of the thing being read.
+
+            `display: none` outside the desktop regime — there is no column to resize on a phone —
+            so the settings slider below is the way this is reached without a mouse. Both drive the
+            same value; neither is the master.
+          -->
+          <div id="width-grip" role="separator" aria-orientation="vertical" tabindex="0"
+               aria-label="reading width" aria-valuemin="45" aria-valuemax="120" aria-valuenow="72"
+               title="Drag to set how wide the reading column is. Arrow keys work too."></div>
+
+          <div id="scroll-tools">
+            <!--
+              `#207 scrollback-jump`. The way back to the newest message, FIRST in the row and so at
+              its left end, with every other chip at the right (web/voice.css). It is up whenever
+              the list on screen is scrolled away from its newest message, not only when something
+              arrives below: the reader who has wandered up the history is the one who wants the
+              way back. An arrival changes what it SAYS — "3 new", in the accent — rather than
+              raising a second control beside it. See `renderJumpNewest`.
+            -->
+            <button id="jump-newest" class="chip" type="button" aria-label="Jump to the newest message" hidden>
+              <svg class="chip-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 5v13" />
+                <path d="M6 12.5 12 19l6-6.5" />
+              </svg>
+              <span id="jump-newest-label">Newest</span>
+            </button>
+            <!--
+              `#240 reading-bookmark`. The way back to this channel's bookmark, the line the reader keeps
+              above one message (Shift+B). DIRECTLY RIGHT of the jump to the newest message, because the
+              two are the pair a reader goes between: down to answer, back up to where they were
+              reading. Up only while the line is off the screen, its arrow pointing toward it. b does
+              the same. See `renderJumpBookmark`.
+            -->
+            <button id="jump-bookmark" class="chip" type="button" aria-label="Jump to your bookmark" hidden>
+              <svg class="chip-icon bookmark-arrow" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 19V6" />
+                <path d="M6 11.5 12 5l6 6.5" />
+              </svg>
+              <span id="jump-bookmark-label">Bookmark</span>
+            </button>
+            <!--
+              `#49 cached-summaries`. Summary mode is OPT-IN and it is a mode, not a per-row
+              control: collapsing to a prefix stays the default and costs nothing, and a button on
+              every long row would spend a model call every time a thumb slipped. It lives beside
+              "Collapse all" because the two act on the same thing — what a folded message shows.
+            -->
+            <!--
+              `#204 reply-arrow`. The way back from a reply's arrow: offered only while the reply
+              that was tapped is off the screen, because the jump took the reader away from it.
+              See `landOnAnswered`.
+            -->
+            <button id="back-to-reply" class="chip" type="button" hidden>Back to reply</button>
+            <button id="summarise" class="chip" type="button" aria-pressed="false" hidden>
+              <span id="summarise-label">Summaries</span>
+            </button>
+            <!--
+              `#50 todo-view`. The way back from a dismissal, including a bulk one. It carries the
+              exact set the server said it cleared, so it restores that and nothing else — and it
+              is absent until there is something to undo.
+            -->
+            <button id="undo-dismiss" class="chip" type="button" hidden>
+              <span id="undo-dismiss-label">Undo</span>
+            </button>
+            <!--
+              `#193 compose-draft-loss`. The way back from dismissing an unsent message in the outbox,
+              for a few seconds after, naming the message it puts back. Settings keeps it for days
+              longer, under Recently dismissed.
+            -->
+            <button id="undo-send-dismiss" class="chip" type="button" hidden>Undo dismiss</button>
+            <!-- The pair. Collapse all shipped alone, which made the fold a one-way door at the
+                 list level: you could put every message away and then had to open them one at a
+                 time. Each is present only when it has work to do, so at rest neither is here, in a
+                 fully-folded list only Expand is, and in a mixed list both are. -->
+            <button id="expand-all" class="chip" type="button" hidden>
+              <span id="expand-all-label">Expand all</span>
+            </button>
+            <button id="collapse-all" class="chip" type="button" hidden>
+              <span id="collapse-all-label">Collapse all</span>
+            </button>
+          </div>
+        </section>
+
+        <!-- -------------------------------------------------------------------- reply screen -->
+        <!--
+          `#51 reply-view`. A reply is a different ACT from reading, so it gets a screen rather
+          than a box wedged under the channel: the message being answered has to stay legible while
+          you write, and on a phone a text field under a list means the keyboard covers both.
+
+          Every id here is declared in the MARKUP and never created from script. The test fixture
+          derives the page's element set from this file by regex and throws for anything else, so
+          an element invented at runtime fails there rather than silently at the roadside.
+        -->
+        <section id="screen-reply" class="screen" hidden>
+          <!-- `#200 reply-context`. ONE scroll, holding the conversation the message being
+               answered is in: its earlier messages, oldest at the top, then the message itself.
+               It opens at the message, so the context is above it and reached by scrolling up,
+               and the composer below it stays on screen. Contained: reading back must not move
+               the channel behind it, and a flick that reaches the end must not become a page
+               gesture. The rows are built by `renderReplyContext` in web/voice.js.
+
+               `#247 reply-continuity`. The message is drawn as the channel draws its row, at the
+               same size and in the same place: its top stays where it was on the list, and the
+               scroll ends at its foot, so the box sits directly under it. #reply-lead is the room
+               that puts it there when too little came before it to fill the space above. See
+               `placeReplyMessage`. -->
+          <div id="reply-scroll" tabindex="-1" role="region" aria-label="The conversation being answered">
+            <div id="reply-lead" aria-hidden="true"></div>
+            <button id="reply-context-more" class="secondary" type="button" hidden>Load earlier messages</button>
+            <p id="reply-context-state" class="hint" aria-live="polite" hidden></p>
+            <ul id="reply-context" class="messages" aria-label="Earlier messages"></ul>
+            <ul id="reply-target" class="messages" aria-label="The message being answered"></ul>
+          </div>
+          <!-- `#247 reply-continuity`. Everything under the conversation, as one block: on a desk it
+               is held to the reading column the rows above it are, in the type that column is
+               measured in.
+
+               `#277 reply-in-column`. In two columns this block, ids and all, is moved to the foot
+               of the column Reply was pressed in (#column-reply or #side-reply) and back here when
+               the reply closes: the same box whichever screen it is on. It stays the LAST child of
+               this screen, which is where it is put back. -->
+          <div id="reply-compose" class="reply-compose">
+            <!-- Who is being answered, and the id the answer goes to, on the label's line: under the
+                 message rather than between it and the earlier ones, so that the message itself is
+                 drawn exactly as the channel draws it. -->
+            <div class="reply-label-row">
+              <label for="reply-text">Your reply</label>
+              <p id="reply-target-meta" class="hint"></p>
+            </div>
+            <textarea id="reply-text" rows="4" placeholder="write a reply"></textarea>
+            <!-- `#185 reply-new-thread`. Where Send will post, said before it does: a reply goes
+                 where the message it answers is, and starting a new thread from a main-channel
+                 message is a choice offered only where the chat service can do it. -->
+            <label id="reply-branch-row" class="toggle" hidden>
+              <input id="reply-branch" type="checkbox" />
+              Start a new thread from this message
+            </label>
+            <p id="reply-destination" class="hint" hidden></p>
+            <div class="row">
+              <button id="reply-cancel" class="secondary" type="button">Cancel</button>
+              <button id="reply-send" type="button">Send reply</button>
+            </div>
+            <!-- A send that failed says so HERE, next to the text it did not send, and the text
+                 stays in the box. -->
+            <p id="reply-state" class="hint" aria-live="polite"></p>
+          </div>
+        </section>
+
+        <!-- ------------------------------------------------------------------ threads screen -->
+        <!--
+          `#194 thread-picker-polish`. Every thread in the channel, where the bar's thread picker
+          lists only one screenful of them and then "… Older threads". Newest activity first, each
+          row named exactly as the picker names it plus the server's one-sentence summary; Load
+          older steps back one server page at a time. Rows are built by `renderThreadDirectory` in
+          web/voice.js; choosing one opens that thread on the channel.
+        -->
+        <section id="screen-threads" class="screen" tabindex="-1" aria-label="Threads" hidden>
+          <p id="thread-directory-state" class="hint" role="status" aria-live="polite"></p>
+          <ul id="thread-directory-list" class="thread-directory" aria-label="Threads in this channel"></ul>
+          <div class="channel-actions">
+            <button id="thread-directory-more" class="secondary" type="button" hidden>Load older</button>
+            <button id="thread-directory-retry" class="secondary" type="button" hidden>Try again</button>
+          </div>
+        </section>
+
+        <!-- ----------------------------------------------------------------- settings screen -->
+        <!--
+          `#85 voice-desktop-review`. TWO screens, and the split is the point.
+
+          Settings had become a document with controls buried in it: every knob carried two or
+          three paragraphs explaining itself, so finding the switch you wanted meant reading past
+          everything you already knew. The owner's report was exactly that — "the long explanations
+          should be in some separate help/support area, not on one big settings page".
+
+          So this screen is now CONTROLS AND LABELS ONLY. Each group has at most one short line of
+          orientation and a `?` that opens the same group's entry in Help, and since `#271
+          settings-groups` the groups sit as rows inside a handful of bordered sections. Nothing
+          explanatory longer than a sentence lives here; the paragraphs are all one tap away and
+          are still exactly one tap away, rather than being deleted.
+
+          The order is deliberate too. Connection status is LAST, because it is a readout rather
+          than a setting and it was standing at the top of the screen holding the position a reader
+          arrives at — and what they arrive wanting is a switch.
+        -->
+        <section id="screen-settings" class="screen" tabindex="-1" aria-label="Settings" hidden>
+          <div class="settings-column">
+            <!--
+              `#271 settings-groups`. A HANDFUL OF SECTIONS, each one card.
+
+              The owner, 2026-10-13: "organize the settings page a little more logically so it
+              doesn't look like so many individual granular options" — with a Voice agent group
+              holding at least resuming and live messages, and a Messages group. Twenty-two cards
+              of equal weight read as twenty-two separate decisions; five sections read as five
+              places to look. So each section is the bordered card now, and the controls inside it
+              are rows under small headings, separated by rules (web/voice.css,
+              `.settings-section`). Every control, every `?` and every id is unchanged: only where
+              each one sits and how loud its heading is changed.
+
+              The sections, in order:
+                Voice agent — what it may send, what it is told, what it hears and remembers.
+                Messages — how a channel's messages are marked, drawn and read out.
+                Channels — the one per-channel box.
+                Screen and keys — text size, width, the control bar and the keyboard.
+                Storage and connection — what this device and server keep, and the readout.
+
+              Connection status is still LAST, for the reason given on it below.
+            -->
+            <section class="settings-section" id="settings-voice-agent" aria-labelledby="settings-voice-agent-title">
+              <h2 id="settings-voice-agent-title">Voice agent</h2>
+              <p class="hint">What the agent may send, what it is told, and what it hears.</p>
+
+              <section class="settings-group">
+                <div class="group-head">
+                  <h3>Sending</h3>
+                  <button class="help-link" id="help-link-voice-send" type="button" data-help="voice-send" aria-label="About asking before the voice agent sends" title="What this changes">?</button>
+                </div>
+                <!--
+                  `#271 settings-groups`. FIRST in the Voice agent section, under a heading that says
+                  what it is about. It used to be a card called "Voice" near the foot of the screen,
+                  and the owner, looking for the way to let the agent send without approval, did not
+                  find it there.
+
+                  `#264 voice-send-approval`. The SERVER's setting, not this browser's: it decides
+                  what the agent's post_reply does and which prompt the server hands the agent, for
+                  every device and every voice provider. So it is drawn from client-config and redrawn
+                  from what the PUT answers, as the noise rules are, never from the click alone.
+
+                  ON by default. Each state has one honest line in `#voice-ask-before-send-state`,
+                  written by `renderVoiceSendSetting` in web/voice.js: what the agent does, and — for
+                  off — what that exposes. Hidden as a whole, editor and all, when the server does not
+                  report the setting, which is an older server that always asks.
+
+                  `#voice-send-untick` is the way to send without asking, said where the owner looked
+                  for it; hidden once the box is unticked, when it would describe the other state.
+
+                  `#voice-send-hosted` is the warning that the switch does not reach everything. The
+                  server obeys it at once, but a hosted agent's own send rules are in its prompt,
+                  and its tool approval for post_reply is in its provider's console. The prompt
+                  follows the switch only when the provider lets this page replace it
+                  (`#272 voice-agent-instructions`); the approval never does. Shown unless a bridge
+                  fetches the prompt as each call opens, and worded by `renderVoiceSendHosted` from
+                  what the last call's agent was given. Served with the wording for not knowing.
+                -->
+                <div id="voice-send-editor" hidden>
+                  <label class="toggle">
+                    <input id="voice-ask-before-send" type="checkbox" checked />
+                    Ask me before the voice agent sends
+                  </label>
+                  <p id="voice-send-untick" class="hint">Untick it to let the agent send as soon as you ask, with no read-back.</p>
+                  <p id="voice-send-hosted" class="hint" hidden>The server changes at once. The agent's own instructions follow at its next call only if its provider lets this page replace its prompt; if not, paste the new prompt into the provider's console by hand. Change post_reply's approval there to match, either way.</p>
+                </div>
+                <p id="voice-ask-before-send-state" class="hint" aria-live="polite"></p>
+              </section>
+
+              <!--
+                `#272 voice-agent-instructions`. The owner's own words for the agent: "a section for
+                additional instructions that the user can fill in" and "a collapse section to
+                actually edit the system prompt". The SERVER's, like the switch above — kept in its
+                store, shared by every device, and put into the prompt when a call opens — so both
+                boxes are drawn from client-config and redrawn from what the PUT stored.
+
+                Each box has its own Save, because each is a write to the server that a half-typed
+                text must not make. The system prompt is FOLDED: it is long, it is changed rarely,
+                and the instructions box is what the owner reaches for. What the agent may do —
+                read, send, or ask first — is not in either box; the server adds it after them from
+                the token and the switch above, which the line inside the fold says.
+
+                `#voice-prompt-state` says how the words reach this deployment's agent and, after a
+                call, what that call was actually given. Written by `renderVoicePrompt` in
+                web/voice.js. Hidden as a whole, editor and all, when the server does not report
+                the setting, which is an older server.
+              -->
+              <section class="settings-group" id="voice-instructions-group">
+                <div class="group-head">
+                  <h3>Instructions</h3>
+                  <button class="help-link" id="help-link-voice-instructions" type="button" data-help="voice-instructions" aria-label="About the voice agent's instructions" title="What these change, and what they cannot">?</button>
+                </div>
+                <div id="voice-prompt-editor" hidden>
+                  <label for="voice-instructions">Additional instructions</label>
+                  <textarea
+                    id="voice-instructions"
+                    rows="4"
+                    placeholder="For example: call me Sam, and keep answers short."
+                    aria-describedby="voice-instructions-state"
+                  ></textarea>
+                  <div class="channel-actions">
+                    <button id="save-voice-instructions" class="secondary" type="button" disabled>Save</button>
+                  </div>
+                  <p id="voice-instructions-state" class="hint" aria-live="polite"></p>
+                  <details id="voice-system-prompt-fold" class="settings-fold">
+                    <summary>Edit the system prompt</summary>
+                    <p class="hint">What the agent may do, read or send, is added after it from your token and the switch above.</p>
+                    <textarea
+                      id="voice-system-prompt"
+                      rows="12"
+                      spellcheck="false"
+                      aria-label="System prompt"
+                      aria-describedby="voice-system-prompt-state"
+                    ></textarea>
+                    <div class="channel-actions">
+                      <button id="save-voice-system-prompt" class="secondary" type="button" disabled>Save</button>
+                      <button id="restore-voice-system-prompt" class="secondary" type="button">Restore the shipped prompt</button>
+                    </div>
+                    <p id="voice-system-prompt-state" class="hint" aria-live="polite"></p>
+                  </details>
+                </div>
+                <p id="voice-prompt-state" class="hint" aria-live="polite"></p>
+              </section>
+
+              <section class="settings-group">
+                <div class="group-head">
+                  <h3>Resuming</h3>
+                  <button class="help-link" id="help-link-resuming" type="button" data-help="resuming" aria-label="About resuming" title="What this really does">?</button>
+                </div>
+                <!--
+                  `#46 conversation-replay`. FOUR states, and the screen must be able to say each of
+                  them: off on the server, off here, resumed, and resumed IN PART. A single "resuming"
+                  light would be the feature claiming a continuity it does not have, which is the one
+                  failure this whole thing is arranged around.
+                -->
+                <p id="resume-state" class="hint" aria-live="polite"></p>
+                <label class="toggle">
+                  <input id="resume-toggle" type="checkbox" />
+                  Tell a new call what was already said
+                </label>
+                <p class="hint">Off by default: it re-sends earlier conversation content to the voice vendor.</p>
+              </section>
+
+              <section class="settings-group">
+                <div class="group-head">
+                  <h3>Live messages</h3>
+                  <button class="help-link" id="help-link-live-messages" type="button" data-help="live-messages" aria-label="About live messages" title="What this costs">?</button>
+                </div>
+                <!--
+                  `#44 live-push`. Two separate facts, and the screen must not let them blur into one
+                  "live" light: whether the CHANNEL VIEW updates by itself, and whether an arriving
+                  message is spoken into a call in progress. The first costs nothing and is on whenever
+                  the server is ingesting; the second spends money and interrupts, and is off until it
+                  is asked for.
+                -->
+                <p id="live-state" class="hint" aria-live="polite"></p>
+                <!--
+                  THREE options, not a checkbox, because "say something about it" and "read it out
+                  word for word" are different amounts of the reader's time and the vendor's money,
+                  and a two-state control forces the expensive one to stand in for both.
+
+                  No `selected` here on purpose: the live value is filled in by `renderReadNew` from
+                  the same key the bar button writes, so there is exactly one truth about the mode
+                  and not a markup default that disagrees with it after a reload.
+                -->
+                <label for="relay-to-agent">Arriving messages during a call</label>
+                <select id="relay-to-agent">
+                  <option value="off">Don't tell the agent</option>
+                  <option value="gist">Say what each one says, briefly</option>
+                  <option value="full">Read them out in full</option>
+                </select>
+                <p class="hint">Briefly, by default. Both speaking modes send channel text to the voice vendor and take conversation time.</p>
+              </section>
+
+              <section class="settings-group">
+                <div class="group-head">
+                  <h3>Canned prompts</h3>
+                  <button class="help-link" id="help-link-canned-prompts" type="button" data-help="canned-prompts" aria-label="About the canned prompts" title="What these send">?</button>
+                </div>
+                <p class="hint">What the two prompt buttons send. Empty a field to restore its default.</p>
+
+                <label for="prompt-summary">Sumry</label>
+                <textarea id="prompt-summary" rows="3"></textarea>
+
+                <label for="prompt-blockers">Blockers — spends coding-agent work</label>
+                <textarea id="prompt-blockers" rows="4"></textarea>
+                <p id="prompt-state" class="hint" aria-live="polite"></p>
+              </section>
+
+              <section class="settings-group">
+                <div class="group-head">
+                  <h3>Microphone</h3>
+                  <button class="help-link" id="help-link-microphone" type="button" data-help="microphone" aria-label="About the microphone settings" title="What these do">?</button>
+                </div>
+                <p class="hint">Applied to your next call, not the one in progress.</p>
+
+                <label class="toggle">
+                  <input id="mic-echo-cancellation" type="checkbox" checked />
+                  Echo cancellation
+                </label>
+                <label class="toggle">
+                  <input id="mic-noise-suppression" type="checkbox" checked />
+                  Noise suppression
+                </label>
+                <label class="toggle">
+                  <input id="mic-auto-gain" type="checkbox" checked />
+                  Automatic gain control
+                </label>
+                <p id="mic-settings-state" class="hint" aria-live="polite"></p>
+              </section>
+
+              <!--
+                The way OUT of this page to the thing that decides how the agent behaves.
+
+                The voice, the tools and the first message all live in the vendor's own console, and
+                none of them is editable here — this deployment supplies an agent id and connects to
+                whatever that agent already is. So does the system prompt, unless the agent lets a
+                client replace it (`#272 voice-agent-instructions`, Instructions above). Debugging
+                "why did it say that" therefore usually ends on that page, and on a phone getting
+                there meant finding the console, signing in, and picking the right agent out of a
+                list by an id nobody remembers. One tap instead.
+
+                The id is printed BESIDE the link rather than only inside it. It is the durable half:
+                a console reorganises its own URLs whenever it likes, and when the deep link stops
+                landing the id is still what is needed to find the agent by hand.
+              -->
+              <section class="settings-group" id="agent-settings" hidden>
+                <div class="group-head">
+                  <h3>Provider</h3>
+                </div>
+                <p class="hint">
+                  Its voice and tools are configured at the vendor. Its prompt is too, unless it
+                  lets this page replace it; see Instructions above.
+                </p>
+                <p class="hint">
+                  <a id="agent-console-link" class="external-link" href="#" target="_blank" rel="noopener noreferrer">Open voice provider configuration</a>
+                </p>
+                <p class="hint">Provider id: <code id="agent-id" class="agent-id"></code></p>
+              </section>
+            </section>
+
+            <section class="settings-section" id="settings-messages" aria-labelledby="settings-messages-title">
+              <h2 id="settings-messages-title">Messages</h2>
+              <p class="hint">How messages are marked, shown and read out.</p>
+
+              <section class="settings-group">
+                <div class="group-head">
+                  <h3>Your own messages</h3>
+                  <button class="help-link" id="help-link-mark-own" type="button" data-help="mark-own" aria-label="About marking your own messages read" title="What this does">?</button>
+                </div>
+                <!--
+                  ON by default, and deliberately: a message this bridge posted is one the owner
+                  dictated moments earlier. It is already read by the only definition that matters,
+                  and leaving it in the queue means the queue is partly a record of things he said.
+                -->
+                <label class="toggle">
+                  <input id="mark-own-read" type="checkbox" checked />
+                  Mark my own messages as read
+                </label>
+                <p class="hint">Greyed here, and kept out of the queue.</p>
+              </section>
+
+              <section class="settings-group">
+                <div class="group-head">
+                  <h3>Read automatically</h3>
+                  <button class="help-link" id="help-link-auto-read" type="button" data-help="auto-read" aria-label="About messages read automatically" title="What these match">?</button>
+                </div>
+                <!--
+                  `#196 auto-read-noise`. The SERVER's list, not this browser's: it is kept in the
+                  store and shared by every device and by the voice agent, so it is edited here and
+                  read back from the answer rather than from what was typed. The sentence saying how
+                  a rule matches is the server's too — `#noise-matching` quotes it, the same rule
+                  `#alias-note` follows — because the matcher lives on the server and a second
+                  description here would be a second thing that can drift from it.
+
+                  Hidden as a whole when the server does not report the list, which is an older
+                  server or one whose store is failing; `#noise-state` then says so.
+                -->
+                <div id="noise-editor" hidden>
+                  <p id="noise-matching" class="hint"></p>
+                  <!-- Rows are built by `renderNoiseRules` in web/voice.js: the rule, and Remove. -->
+                  <ul id="noise-rule-list" class="noise-rules" aria-label="Messages read automatically"></ul>
+                  <p id="noise-count" class="hint" aria-live="polite"></p>
+                  <label for="noise-rule-new">Add a message</label>
+                  <input
+                    id="noise-rule-new"
+                    type="text"
+                    maxlength="200"
+                    autocomplete="off"
+                    enterkeyhint="done"
+                    placeholder="Working…"
+                    aria-describedby="noise-state"
+                  />
+                  <div class="channel-actions">
+                    <button id="add-noise-rule" class="secondary" type="button">Add</button>
+                  </div>
+                </div>
+                <p id="noise-state" class="hint" aria-live="polite"></p>
+              </section>
+
+              <section class="settings-group">
+                <div class="group-head">
+                  <h3>Combining messages</h3>
+                  <button class="help-link" id="help-link-combining" type="button" data-help="combining" aria-label="About combining messages" title="What this does">?</button>
+                </div>
+                <!--
+                  ON by default. An agent writing past Discord's length limit has its post split in
+                  two, and the second half continues mid-word a fraction of a second later. Drawn as
+                  two rows that is unreadable; drawn as one it is the message that was written.
+                  Display only — nothing here changes which messages exist.
+                -->
+                <label class="toggle">
+                  <input id="combine-messages" type="checkbox" checked />
+                  Show messages sent seconds apart as one
+                </label>
+                <p class="hint">Same author, within five seconds. Turn it off to see the raw rows.</p>
+              </section>
+
+              <section class="settings-group">
+                <div class="group-head">
+                  <h3>Rich headers</h3>
+                  <button class="help-link" id="help-link-rich-headers" type="button" data-help="rich-headers" aria-label="About rich headers" title="What this does">?</button>
+                </div>
+                <!--
+                  `#242 rich-headers`. ON by default. Agents posting through one shared account name
+                  themselves at the head of a message — "[build-bot] Status, 9:05 PM ET." — and that
+                  first line moves into the row's header: the tag, the title and the time. The
+                  server finds the pieces; this switch only decides whether the page shows them
+                  there or draws the line as written. Display only, and nothing is ever dropped:
+                  off, every row is exactly what it was before this existed.
+                -->
+                <label class="toggle">
+                  <input id="rich-headers" type="checkbox" checked />
+                  Show an agent's tag, title and time in the message header
+                </label>
+                <p class="hint">Turn it off to see each message's first line as it was written.</p>
+              </section>
+
+              <!--
+                `#193 compose-draft-loss`. A send dismissed from the outbox unsent is not gone at one
+                tap: it is kept here, on this device only, for a week (the newest ten), and Put back
+                returns it to its channel's outbox. web/voice.js writes the list and the line above it.
+              -->
+              <section class="settings-group">
+                <div class="group-head">
+                  <h3>Recently dismissed</h3>
+                </div>
+                <p id="dismissed-sends-state" class="hint" aria-live="polite"></p>
+                <ol id="dismissed-sends" class="dismissed-sends" aria-label="Recently dismissed messages" hidden></ol>
+                <button id="forget-dismissed-sends" class="secondary" type="button" hidden>Forget these now</button>
+              </section>
+
+              <section class="settings-group">
+                <div class="group-head">
+                  <h3>How messages are said</h3>
+                  <button class="help-link" id="help-link-speech-prep" type="button" data-help="speech-prep" aria-label="About how messages are said" title="What the server rewrites">?</button>
+                </div>
+                <!--
+                  REPORTED, not controlled. The switch is `speakable.enabled` in the server's own
+                  configuration, because the rewrite happens before a message reaches any page and
+                  the same prepared body goes to the voice agent's own tool calls, which never touch
+                  this browser. A control here would be a switch that silently governed one of the
+                  three paths. What the screen owes the reader is which arm this deployment is in —
+                  they are flipping it to compare two runs.
+                -->
+                <p id="speech-prep-state" class="hint" aria-live="polite"></p>
+              </section>
+
+              <section class="settings-group">
+                <div class="group-head">
+                  <h3>Message audio</h3>
+                </div>
+                <label for="settings-audio-source">Read messages with</label>
+                <select id="settings-audio-source">
+                  <option id="settings-agent-audio" value="agent">Agent audio</option>
+                  <option value="device">Device voice</option>
+                </select>
+                <p class="hint">Car audio: use Agent audio.</p>
+              </section>
+            </section>
+
+            <section class="settings-section" id="settings-channels" aria-labelledby="settings-channels-title">
+              <div class="group-head">
+                <h2 id="settings-channels-title">Channels</h2>
+                <button class="help-link" id="help-link-channel-alias" type="button" data-help="channel-alias" aria-label="About channels" title="What this changes, and what it does not">?</button>
+              </div>
+
+              <!--
+                `#39 channel-alias`. A name of the OWNER's own for a channel, so that addressing one
+                out loud is possible at all: a snowflake is unsayable and a configured label like
+                "build noise" is not what anyone says either. The three things it deliberately is
+                NOT are stated in Help, and they are the whole point of the feature.
+              -->
+              <!--
+                THE PER-CHANNEL SECTION, and the only one on this screen.
+                Everything else here is a setting about the app; everything in here is a setting about
+                ONE channel, and which one is chosen once at the top rather than separately by each
+                control. Before this the alias editor carried its own picker, which read as a quirk of
+                renaming rather than as the shape of the screen — and there was nowhere at all to put
+                a second per-channel control.
+              -->
+              <!--
+                THE PER-CHANNEL BOX, and the only one on this screen.
+                Everything else here is a setting about the app; everything in here is about ONE
+                channel, chosen once at the top rather than separately by each control.
+
+                IT IS SMALL WHEN IT IS DOING NOTHING. The first version laid every field out at once
+                — a rename box, an id box, a name box, a checkbox — and on a phone that is most of a
+                screen of text entry standing open for two acts that are each performed rarely. So
+                what is always visible is the picker, one line saying what this channel IS, and the
+                verbs. The fields belong to the verb and appear with it.
+              -->
+              <section class="settings-group" id="channel-settings" aria-labelledby="settings-channels-title">
+                <p class="hint">Chat service: <span id="chat-provider-settings">Chat</span></p>
+                <label for="settings-channel">Channel</label>
+                <select id="settings-channel" aria-describedby="channel-facts"></select>
+                <!-- What this channel IS: the name in force, and where it came from. -->
+                <p id="channel-facts" class="hint" aria-live="polite"></p>
+
+                <div class="channel-actions">
+                  <button id="rename-channel" class="secondary" type="button" aria-expanded="false" aria-controls="rename-fields">Rename</button>
+                  <!--
+                    `#199 removable-config-channels`. Offered for EVERY channel on the list. One added
+                    here is forgotten. One from the configuration file is hidden instead, because the
+                    server never writes that file — it would otherwise come back on the next restart
+                    — and the hidden list below offers it back.
+                  -->
+                  <button id="remove-channel" class="secondary" type="button" hidden>Remove</button>
+                  <button id="open-add-channel" class="secondary" type="button" aria-expanded="false" aria-controls="add-channel-fields">Add a channel</button>
+                  <!-- `#19 channel-browser`. Only offered when the server says the bridge can list its
+                       channels; otherwise pasting a link under "Add a channel" is the way in. -->
+                  <button id="open-browse-channels" class="secondary" type="button" aria-expanded="false" aria-controls="browse-channel-fields" hidden>Browse channels</button>
+                </div>
+                <p id="remove-channel-state" class="hint" aria-live="polite"></p>
+
+                <!--
+                  `#199 removable-config-channels`. Configured channels taken off the list, each with
+                  the one act that puts it back. Hidden while there are none. Rows are built by
+                  `renderHiddenChannels` in web/voice.js, in the directory's row shape: a name and a
+                  button.
+                -->
+                <div id="hidden-channels" hidden>
+                  <p class="hint">Hidden channels from this server's configuration:</p>
+                  <ul id="hidden-channel-list" class="channel-directory" aria-label="Hidden channels"></ul>
+                </div>
+
+                <div id="rename-fields" hidden>
+                  <label for="channel-alias">Call it</label>
+                  <input
+                    id="channel-alias"
+                    type="text"
+                    maxlength="60"
+                    autocomplete="off"
+                    aria-describedby="alias-state"
+                  />
+                  <p id="alias-state" class="hint" aria-live="polite"></p>
+                  <div class="channel-actions">
+                    <button id="save-alias" class="secondary" type="button">Save</button>
+                    <button id="clear-alias" class="secondary" type="button">Use the configured label</button>
+                    <button id="cancel-rename" class="secondary" type="button">Cancel</button>
+                  </div>
+                  <!--
+                    The SERVER's own standing statement about what an alias is, quoted and never
+                    rewritten — the same rule `#inbox-note` follows. A second copy of a policy here
+                    would be a second thing that can drift from the one the server actually enforces.
+                  -->
+                  <p id="alias-note" class="hint"></p>
+                </div>
+
+                <div id="add-channel-fields" hidden>
+                  <p id="new-channel-help" class="hint">
+                    Enter the channel ID supplied by this deployment. The chat connector must
+                    already have access to the channel in the chat service.
+                  </p>
+                  <label id="new-channel-id-label" for="new-channel-id">Channel ID</label>
+                  <input
+                    id="new-channel-id"
+                    type="text"
+                    inputmode="numeric"
+                    maxlength="20"
+                    autocomplete="off"
+                    placeholder="17 to 20 digits"
+                    aria-describedby="add-channel-state"
+                  />
+                  <label for="new-channel-label">Call it</label>
+                  <input
+                    id="new-channel-label"
+                    type="text"
+                    maxlength="60"
+                    autocomplete="off"
+                    aria-describedby="add-channel-state"
+                  />
+                  <!--
+                    OFF BY DEFAULT, and it is the one control in here that widens what the bridge can
+                    SAY rather than what it can read. Left as a deliberate act rather than a
+                    convenience.
+                  -->
+                  <label id="new-channel-writable-row" class="row" for="new-channel-writable">
+                    <input id="new-channel-writable" type="checkbox" />
+                    <span>Let this app post here</span>
+                  </label>
+                  <div class="channel-actions">
+                    <button id="add-channel" class="secondary" type="button">Add</button>
+                    <button id="cancel-add-channel" class="secondary" type="button">Cancel</button>
+                  </div>
+                  <p id="add-channel-state" class="hint" aria-live="polite"></p>
+                </div>
+
+                <!--
+                  `#19 channel-browser`. The channels the bridge can see, searchable, one tap to add.
+                  Rows are built by `renderChannelDirectory` in web/voice.js; a channel this app
+                  already reads is marked and has no Add button, so it cannot be added twice.
+                -->
+                <div id="browse-channel-fields" hidden>
+                  <label for="channel-directory-search">Search channels</label>
+                  <input
+                    id="channel-directory-search"
+                    type="search"
+                    maxlength="100"
+                    autocomplete="off"
+                    enterkeyhint="search"
+                    placeholder="type part of a name"
+                    aria-describedby="channel-directory-state"
+                    aria-controls="channel-directory-list"
+                  />
+                  <p id="channel-directory-state" class="hint" aria-live="polite"></p>
+                  <ul id="channel-directory-list" class="channel-directory" aria-label="Channels you can add"></ul>
+                  <div class="channel-actions">
+                    <button id="channel-directory-more" class="secondary" type="button" hidden>Show more</button>
+                    <button id="channel-directory-retry" class="secondary" type="button" hidden>Try again</button>
+                    <button id="close-browse-channels" class="secondary" type="button">Done</button>
+                  </div>
+                </div>
+
+                <!--
+                  `#232 upstream-mark-read`. Clear this channel's unread state in its chat service's
+                  own app as vibe-talk receives each message, so that app's unread list keeps the
+                  people and vibe-talk keeps the agents. The SERVER does it, with no page open, so the
+                  choice is the server's own, read and written through /upstream-clear and never kept
+                  on this device. Shown only when the channel's service can do it, and only to a
+                  token that may change it. The warning is always on screen beside the choice, because
+                  what it does to the other app is the whole decision. Built by `renderUpstreamClear`
+                  in web/voice.js.
+                -->
+                <div id="upstream-clear" hidden>
+                  <hr class="settings-rule" />
+                  <label for="upstream-clear-mode">Clear unread in <span id="upstream-clear-provider">the chat service</span></label>
+                  <select id="upstream-clear-mode" aria-describedby="upstream-clear-warning upstream-clear-threads upstream-clear-state">
+                    <option value="off">Off</option>
+                    <option value="dry_run">Dry run: log only, mark nothing</option>
+                    <option value="on">On</option>
+                  </select>
+                  <p id="upstream-clear-warning" class="hint">
+                    Marks EVERY message in this channel read in
+                    <span id="upstream-clear-warning-provider">the chat service</span> as soon as
+                    vibe-talk receives it, including messages from people. The first message
+                    vibe-talk receives after it is on also marks everything already unread there
+                    read, people's messages too. vibe-talk's own unread and Done state are not changed.
+                  </p>
+                  <!--
+                    `#253 upstream-clear-polish`. Said plainly and on its own line, because it is the
+                    part that surprises: the service's read marker that can be moved covers the main
+                    conversation only, and nothing available can mark a thread read.
+                  -->
+                  <p id="upstream-clear-threads" class="hint">
+                    Thread replies stay unread in
+                    <span id="upstream-clear-threads-provider">the chat service</span>; only the main
+                    conversation is cleared.
+                  </p>
+                  <!--
+                    Save changes the mode. "Mark read now" (or "Try it now" in a dry run) is a one-shot
+                    act on the mode already saved: it pushes the newest message at once, and its
+                    progress and result go in the status line below. Shown only while the saved mode
+                    is on or a dry run and the choice above still matches it.
+                  -->
+                  <div class="channel-actions">
+                    <button id="upstream-clear-save" class="secondary" type="button" disabled>Save</button>
+                    <button id="upstream-clear-push" class="secondary" type="button" hidden>Mark read now</button>
+                  </div>
+                  <p id="upstream-clear-state" class="hint" aria-live="polite"></p>
+                </div>
+
+                <!--
+                  WHO IS WHO, and it is IN HERE because it was always a fact about one channel and
+                  was drawn as a fact about the app.
+
+                  It used to be its own group, above this one, listing every account seen in every
+                  channel the reader had ever opened — so the answer to "who is in this channel" was
+                  a list that grew as OTHER channels were read, and the sole-other-bot guess was a
+                  census of the whole deployment rather than of the conversation being drawn. A
+                  second bot in a channel the reader had glanced at once could stop the coding agent
+                  being recognised in the channel they were actually reading. The heading said "in
+                  the channel" throughout, which is the tell: the copy already described the thing
+                  the code was not doing.
+
+                  It is subordinate to the picker above, like everything else in this box: change
+                  the channel and this list changes with it. A CHOICE made here is still about the
+                  ACCOUNT rather than about the channel — see `renderIdentityRows` in web/voice.js,
+                  and the sentence under the list, which says so on screen.
+                -->
+                <hr class="settings-rule" />
+                <div class="group-head">
+                  <h3>Who is who in this channel</h3>
+                  <button class="help-link" id="help-link-identities" type="button" data-help="identities" aria-label="About channel identities" title="How these are guessed">?</button>
+                </div>
+                <p class="hint">
+                  Everyone who has spoken in the channel above. Italic means guessed. A choice
+                  follows the account into every channel.
+                </p>
+                <!-- Rows are built by `renderIdentityRows` in web/voice.js. Empty until this channel
+                     has been read, and it says so rather than showing a blank panel. -->
+                <div id="identity-list"></div>
+                <p id="identity-state" class="hint" aria-live="polite"></p>
+              </section>
+            </section>
+
+            <section class="settings-section" id="settings-screen" aria-labelledby="settings-screen-title">
+              <h2 id="settings-screen-title">Screen and keys</h2>
+
+              <section class="settings-group">
+                <div class="group-head">
+                  <h3>Text size</h3>
+                </div>
+                <!--
+                  MESSAGE TEXT ONLY, not the whole interface. A reader asking for more words on a
+                  phone screen is not asking for a bigger Reply button, and scaling the row would
+                  scale its controls with it. Percent rather than points: it multiplies whatever the
+                  stylesheet's own size is, so the two lists stay in proportion.
+
+                  `#230 text-size-buttons`. A − and a + either side of the slider, one step of it
+                  each, for a thumb that cannot land a five-per-cent drag on a phone. They step by
+                  the slider's own step through the slider's own code (`stepMsgScale` in voice.js),
+                  and each is disabled at the end it moves towards.
+                -->
+                <div class="msg-scale-row">
+                  <button
+                    id="msg-scale-smaller"
+                    class="secondary step-button"
+                    type="button"
+                    aria-label="Smaller text"
+                    aria-controls="msg-scale"
+                    title="Smaller text"
+                  >−</button>
+                  <input
+                    id="msg-scale"
+                    type="range"
+                    min="80"
+                    max="150"
+                    step="5"
+                    aria-label="message text size, percent"
+                  />
+                  <button
+                    id="msg-scale-larger"
+                    class="secondary step-button"
+                    type="button"
+                    aria-label="Larger text"
+                    aria-controls="msg-scale"
+                    title="Larger text"
+                  >+</button>
+                </div>
+                <p id="msg-scale-state" class="hint" aria-live="polite"></p>
+              </section>
+
+              <section class="settings-group">
+                <div class="group-head">
+                  <h3>Reading width</h3>
+                  <button class="help-link" id="help-link-reading-width" type="button" data-help="reading-width" aria-label="About the reading width" title="What this does">?</button>
+                </div>
+                <input
+                  id="reading-width"
+                  type="range"
+                  min="45"
+                  max="120"
+                  step="1"
+                  aria-label="reading width in characters"
+                />
+                <p id="reading-width-state" class="hint" aria-live="polite"></p>
+              </section>
+
+              <section class="settings-group">
+                <div class="group-head">
+                  <h3>Control bar</h3>
+                  <button class="help-link" id="help-link-control-bar" type="button" data-help="control-bar" aria-label="About the control bar" title="What this does">?</button>
+                </div>
+                <label for="bar-placement">Where the control bar sits</label>
+                <select id="bar-placement" aria-describedby="bar-placement-state">
+                  <option value="bottom">Bottom — above the big buttons</option>
+                  <option value="top">Top — under the title</option>
+                </select>
+                <p id="bar-placement-state" class="hint" aria-live="polite"></p>
+              </section>
+
+              <section class="settings-group">
+                <div class="group-head">
+                  <h3>Typing</h3>
+                </div>
+                <!--
+                  `#225 enter-to-send`. One rule for every message box — the channel, a thread, a
+                  reply and the call — where each used to have its own. ON by default, which is what
+                  the channel's box always did. The hint under it is written by web/voice.js: with
+                  the switch off it names the key that sends instead, in the words on the reader's
+                  own keyboard (Cmd on an Apple one, Ctrl elsewhere), which the markup cannot know.
+                -->
+                <label class="toggle">
+                  <input id="enter-sends" type="checkbox" checked aria-describedby="enter-sends-hint" />
+                  Enter to send
+                </label>
+                <p id="enter-sends-hint" class="hint" aria-live="polite"></p>
+              </section>
+
+              <section class="settings-group">
+                <div class="group-head">
+                  <h3>Keyboard</h3>
+                  <button class="help-link" id="help-link-keyboard" type="button" data-help="keyboard" aria-label="Every keyboard shortcut" title="Every key">?</button>
+                </div>
+                <!--
+                  `#224 keyboard-shortcuts`. The keys that type a character — j, k, e, /, ? and the rest
+                  — can be turned off, which is what WCAG 2.1.4 asks of them; Escape, the arrows, Enter
+                  and the Ctrl or Cmd chords stay. ON by default. The line under it is written by
+                  web/voice.js, which names the chord's key as the reader's own keyboard names it. The
+                  `?` opens the list of every key, which `?` on the keyboard opens too.
+                -->
+                <label class="toggle">
+                  <input id="single-keys" type="checkbox" checked aria-describedby="single-keys-hint" />
+                  Single-key shortcuts
+                </label>
+                <p id="single-keys-hint" class="hint" aria-live="polite"></p>
+              </section>
+            </section>
+
+            <section class="settings-section" id="settings-storage" aria-labelledby="settings-storage-title">
+              <h2 id="settings-storage-title">Storage and connection</h2>
+
+              <section class="settings-group">
+                <div class="group-head">
+                  <h3>Stored conversations</h3>
+                  <button class="help-link" id="help-link-storage" type="button" data-help="storage" aria-label="About stored conversations" title="Where these are kept">?</button>
+                </div>
+                <p id="storage-state" class="hint" aria-live="polite"></p>
+                <button id="forget-conversations" class="secondary" type="button">
+                  Forget stored conversations
+                </button>
+              </section>
+
+              <section class="settings-group">
+                <div class="group-head">
+                  <h3>Token</h3>
+                </div>
+                <p class="hint">Server: <code id="settings-server-url"></code></p>
+                <button id="forget-token" class="secondary" type="button">Forget token and sign out</button>
+              </section>
+
+              <!--
+                LAST, and that is the change. This is a READOUT, not a setting — it says what the
+                current conversation is and what the last close code was — and it was occupying the
+                first thing a reader sees on a screen they came to in order to change something.
+              -->
+              <section class="settings-group">
+                <div class="group-head">
+                  <h3>Connection status</h3>
+                  <button class="help-link" id="help-link-connection" type="button" data-help="connection" aria-label="About the connection status" title="What this is">?</button>
+                </div>
+                <div id="settings-detail" class="panel muted">no conversation yet</div>
+              </section>
+            </section>
+
+            <p class="hint">
+              <button id="open-help" class="secondary" type="button">Open help</button>
+            </p>
+          </div>
+        </section>
+
+        <!-- --------------------------------------------------------------------- help screen -->
+        <!--
+          `#85 voice-desktop-review`. Everything that used to stand between the reader and a switch.
+
+          Not deleted, and that distinction is the whole design: every paragraph here was on the
+          settings screen, and each one is still exactly one tap from the control it is about,
+          because each `?` scrolls this screen to the matching entry. What changed is that a reader
+          who already knows what echo cancellation is no longer reads about it to reach the switch.
+
+          Each entry's id is `help-<slug>`, matching the `data-help` on its `?`. Both are declared
+          in the MARKUP: the page suite derives its element set from this file and refuses an id
+          invented at runtime.
+
+          `#246 help-sections`. Each entry is a <details>, FOLDED, so the screen reads as a list of
+          headings. The ? that opened Help opens its own entry and folds the rest (`showHelp`), and
+          the button at the top opens or folds them all. Native disclosure, so a summary is a
+          button to a screen reader and the keyboard, and the browser's own find (Ctrl+F) searches
+          folded entries and opens the one it lands in, where the browser does that (Chromium and
+          Firefox do).
+        -->
+        <section id="screen-help" class="screen" tabindex="-1" aria-label="Help" hidden>
+          <div class="settings-column">
+            <p class="hint">
+              What each control does, and what it costs. Every entry here is reachable from the
+              matching <strong>?</strong> on the settings screen; tap a heading to open it.
+            </p>
+            <button id="fold-help" class="secondary" type="button">Expand all</button>
+
+            <details id="help-controls" class="help-entry">
+              <summary><h2>What the controls do</h2></summary>
+              <p id="continuity-note" class="hint">
+                <strong>Mute</strong> keeps the call open and keeps the agent's context; it only
+                stops sending it your audio. Your phone will still show the microphone as in use,
+                because the microphone really is still open — which is what lets unmuting drop you
+                back into the same conversation rather than a new one. Muting and unmuting each
+                send the agent a note saying the pause is deliberate, because withholding your
+                audio looks to it exactly like you going quiet, and that is what makes it start
+                asking whether you are still there. Whether it honours that note has not been
+                tested against the live service yet. The call is billed while muted either way:
+                what is metered is the conversation being open.
+                <strong>Hang up</strong> ends the conversation. The vendor cannot resume a call once
+                it has closed, so the next call is always a new one; the lines already on screen stay
+                there because they are still your own record of what was said, and the transcript
+                marks where one conversation ended and the next began. With <strong>Resuming</strong>
+                turned on, this server reads the earlier lines back to the new call so it can carry
+                on from them — that is a reconstruction from our side, not the same conversation, and
+                the transcript seam says which of the two you got.
+                <strong>Sound</strong> silences the agent's voice without silencing the agent: its
+                replies keep arriving as text in the transcript. It keeps receiving that audio and
+                throws it away rather than asking for a text-only conversation, because the response
+                format is settled once when the conversation opens — switching it would mean closing
+                and reopening the socket, and a reopened socket is a new conversation that remembers
+                nothing. Silencing the agent must not cost you its memory.
+                <strong>The message box</strong> at the bottom of the call's transcript is for
+                writing to the agent, and it is always there — writing never changes the control
+                bar, so the Voice/Channel switch stays where it is. During a call a message goes into
+                the same conversation you are speaking in, so a typed turn and a spoken one land in
+                the same transcript and the agent answers either one out loud. With
+                <strong>nothing open</strong>, your first message starts a <strong>typed
+                conversation</strong> and goes as soon as it is open; clicking into the box or typing
+                in it opens nothing. A typed conversation never asks for the microphone, so there is
+                no permission prompt and no in-use indicator, and there is no Talk or Sound button
+                because there is no microphone to mute and no voice to silence — End chat ends it,
+                and Talk is back for a spoken call. That is a different kind of conversation, chosen
+                when it opens — not a call with two switches thrown, which is what it used to take.
+                This page also asks the agent for a text-only response, but that is an override an
+                agent's own settings can refuse; if it is refused the agent's audio is received and
+                thrown away, the connection details say so, and nothing about the microphone
+                changes. Whatever you have half-written stays in the box when you leave the screen
+                or reload, until it is sent.
+                <strong>Clear</strong> empties this screen only and never makes the agent forget
+                anything. It asks twice, because it sits under your thumb and it cannot be undone.
+                It also leaves the stored record on the server untouched, so the conversation comes
+                back the next time you sign in — <strong>Forget stored conversations</strong> is the
+                only control that erases that, and it leaves the screen alone in return.
+              </p>
+            </details>
+
+            <!--
+              `#224 keyboard-shortcuts`. Every key the page answers. The list is written by
+              web/voice.js from the same table the keys are answered from (`KEYMAP`), so it cannot
+              say a key the page does not answer, or miss one it does; and in the words on the
+              reader's own keyboard, Cmd and Option on an Apple one, Ctrl and Alt elsewhere.
+            -->
+            <details id="help-keyboard" class="help-entry">
+              <summary><h2>Keyboard</h2></summary>
+              <p class="hint">
+                On a computer the messages can be read and dealt with from the keyboard. The arrows,
+                or j and k, move a ring from message to message; what a key does to "the selected
+                message" it does to the one in the ring. The mouse moves the same ring: moving it
+                over a message, or clicking one, selects that message, and the next key goes on from
+                there. Only one message is ever lit, ringed solid in blue while it is unread and
+                dashed in grey once it is read; marking it Done turns its ring grey as the ring moves
+                on, and the Undo chip names it. A list that scrolls under a mouse you are not
+                moving leaves the ring where the keys put it. A tap on a touch screen selects a
+                message without lighting it. A key that types a character never acts while you are
+                typing in a box: Esc and the Ctrl or Cmd chords do. Those single keys can be turned
+                off under Keyboard in Settings. Nothing here starts a call, and Esc never marks
+                anything read. Ctrl+S (Cmd+S on a Mac) goes to the message box from anywhere, the
+                search box included, and so does Ctrl+Enter when you are not in a box; it used to
+                open the search, which / and the magnifying glass still do.
+              </p>
+              <div id="keyboard-keys" role="group" aria-label="Keyboard shortcuts"></div>
+            </details>
+
+            <details id="help-microphone" class="help-entry">
+              <summary><h2>Microphone</h2></summary>
+              <p class="hint">
+                These are asked of the browser when the microphone opens, so a change applies to
+                your <strong>next</strong> call, not the one in progress.
+              </p>
+              <p class="hint">
+                <strong>Echo cancellation</strong> stops the agent hearing itself through your
+                speaker and answering its own voice. Headphones solve this too; leave it on if you
+                are on speakerphone.
+              </p>
+              <p class="hint">
+                <strong>Noise suppression</strong> filters steady background noise — a fan, road
+                noise, a room's hum.
+              </p>
+              <p class="hint">
+                <strong>Automatic gain control</strong> amplifies quiet input. In a near-silent room
+                it boosts small incidental sounds — a phone being set down — until they cross the
+                speech threshold and get transcribed as words. Turn it <strong>off</strong> if you
+                are getting phantom transcripts.
+              </p>
+            </details>
+
+            <details id="help-control-bar" class="help-entry">
+              <summary><h2>Control bar</h2></summary>
+              <p class="hint">
+                The strip carrying the gear and the Voice/Channel switch. It can sit under the title
+                at the top of the screen, or in the dock directly above the big buttons —
+                <strong>bottom is the default</strong>, because that is where your thumb already is
+                and because the header then costs no row at all. The gear is deliberately at the far
+                <strong>left</strong> of it: it is the control you least want to hit by accident.
+              </p>
+            </details>
+
+            <details id="help-canned-prompts" class="help-entry">
+              <summary><h2>Canned prompts</h2></summary>
+              <p class="hint">
+                What the prompt buttons say. <strong>Prompts</strong> in the control bar opens a
+                tray of them above the bar; tapping one sends exactly this text into the live
+                conversation, as though you had typed it, and puts the tray away. Emptying a field
+                puts its default back rather than leaving a button that does nothing. All of them
+                are greyed out when there is no call, because there is nothing for the sentence to
+                reach — the tray still opens then, so you can see what they are.
+              </p>
+              <p class="hint">
+                <strong>Sumry</strong> deliberately says <strong>recent messages</strong> and not
+                "my unread messages since I last spoke". Read state and account identity depend on
+                the configured chat service, and the bridge may post on your behalf. This prompt
+                therefore asks about the recent messages available to the agent.
+              </p>
+              <p class="hint">
+                <strong>Blockers makes the coding agent do work.</strong> It is not a question about
+                the channel; it asks the voice agent to go and get the coding agent to report. It is
+                drawn as an ordinary button rather than a warning: the cost is real, but a control
+                that looks like a fault report is worse than one whose cost is stated here.
+              </p>
+            </details>
+
+            <details id="help-identities" class="help-entry">
+              <summary><h2>Who is who in this channel</h2></summary>
+              <p class="hint">
+                The call transcript tells its two speakers apart by side, colour and corner. The
+                channel can do the same, but only once it knows which account is which. A display
+                name alone cannot reliably distinguish you, the bridge and the coding agent. The
+                list sits inside <strong>Channels</strong>, under the channel picker, and shows
+                everyone who has spoken in <em>that</em> channel, with what this page guessed shown
+                in italics; change any of them and the channel is redrawn.
+              </p>
+              <p class="hint">
+                The guesses, in the order they are tried: the account this bridge posts as is
+                <strong>you</strong> — your own replies and anything your voice bot says go out
+                through it, so they are your words even though a bot delivered them; a lone bot that
+                is not this bridge is the <strong>coding agent</strong>; everyone else is another
+                person or another bot. With two candidate bots the guess refuses rather than picking
+                one. The guess is made per channel, so a bot that only ever speaks somewhere else
+                cannot spoil the guess here.
+              </p>
+              <p class="hint">
+                A <em>choice</em>, though, is about the account rather than the room: an account is
+                the same account wherever it speaks, so choosing here applies in every channel it
+                appears in, and you do not have to name your coding agent once per channel. Nothing
+                here is sent anywhere: it is stored in this browser and affects only how the channel
+                is drawn.
+              </p>
+            </details>
+
+            <details id="help-channel" class="help-entry">
+              <summary><h2>The channel, and the inbox</h2></summary>
+              <p class="hint">
+                The channel view shows messages from <span id="chat-provider-help">Chat</span>,
+                rendered from a small, fixed markdown subset. Message text is written by other
+                people and bots: it is escaped
+                before anything else happens and is never treated as markup or as an instruction.
+                Every line shows its author and its message id, so a message the agent describes can
+                be checked against a real one — or shown not to exist.
+              </p>
+              <p class="hint">
+                A message somebody has <strong>answered</strong> is dimmed. That is derived from the
+                reply references on the answering messages — so it can
+                only see answers that are <strong>loaded</strong>: a reply further back than you have
+                walked is invisible, and a message can be dimmed later than it should have been,
+                never earlier.
+              </p>
+              <p class="hint">
+                A message that is itself a <strong>reply</strong> is set in from the left, with an
+                arrow in the space beside it. When the message it answers is the one directly above,
+                the arrow leaves the top of its left side and reaches up until it touches that
+                message. When the message it answers is anywhere else, the arrow leaves the middle of
+                its left side and slants away up to the left, touching nothing. Tap the arrow to go to
+                the message it answers, which is lit for a moment: in this view if it is here, in
+                <strong>All</strong> if it is in another part of the channel, and a few older pages
+                back if it is not loaded yet. If it is further back than that, or gone, the status
+                line says so. <strong>Back to reply</strong> takes you back to where you tapped.
+              </p>
+              <p class="hint">
+                <strong>Reply</strong> says how many replies a message has once they are loaded:
+                <strong>Reply (2)</strong>, yours counted from the moment you press Send. Replies in a
+                thread that point at no message are counted by the thread's chips instead. When a
+                reply is not directly below, the message it answers has a small blue circle on its
+                lower-left corner, the other end of the reply's arrow: tap it to go to the reply, and
+                tap again for the next one.
+              </p>
+              <p class="hint">
+                <strong>Quote reply.</strong> Select some of a message's words (drag over them, or
+                double- or triple-click) and its <strong>Reply</strong> becomes
+                <strong>Quote reply</strong>; where the row has no room for that without moving its
+                words, it reads <strong>Quote</strong>. It opens the reply with
+                those words at the top, each line starting <code>&gt;</code>, then an empty line, and
+                the box ready for the rest. It posts where Reply would; on Slack that is the message's
+                thread. A draft you had started stays, under the quote, and a quote you leave untouched
+                is not kept as a draft. Up to 1,000 characters are quoted: a longer selection is cut
+                there and ends with “…”. On a computer, <kbd>r</kbd> on the selected message quotes the
+                words selected in it; on a phone, select by pressing and holding, then tap
+                <strong>Quote reply</strong>.
+              </p>
+              <p class="hint">
+                <strong>N replies</strong> under a message gathers its replies, and the replies to
+                those, directly beneath it, in time order, joined to it by one line, and leaves
+                everything else where it was. Tapping a reply's arrow twice gathers the whole
+                conversation it is in, under the first message of it that is loaded. Nothing is read
+                or archived by it, and the message stays where it was on the screen. The <strong>×</strong> beside the line, or the
+                pressed <strong>N replies</strong>, puts the replies back in time order; so do changing
+                view or channel, and filtering from the search bar. <strong>Thread(N)</strong> opens
+                a message's thread.
+              </p>
+              <p class="hint">
+                On <strong>Main</strong>, a message whose thread holds unread replies says how many
+                beside its <strong>N replies</strong>: <strong>M unread</strong>, which opens the thread
+                at the first of them. <strong>Hide read</strong> and <strong>Collapse read</strong>
+                keep that message in view, though it is read itself. It counts the replies this page
+                holds; <strong>M+ unread</strong> means there may be more, and <strong>N new</strong>
+                means the chat service reports replies this page has not loaded yet, which a tap
+                reads.
+              </p>
+              <p class="hint">
+                <strong>Archive</strong> is your own judgement, and it is recorded on the
+                <strong>server</strong> — so it survives a different browser, a different device and
+                a cleared cache. Swipe a row on a touch screen, or use the row's button on any
+                device; swiping an archived row puts it back. By default an archived row stays
+                where it is, <strong>greyed and drained of colour</strong>, so you can see what you
+                have dealt with and change your mind.
+              </p>
+              <p class="hint">
+                <strong>A reply you send marks what it answers Done</strong>, as its
+                <strong>Done</strong> button would, with <strong>Undo</strong> to take it back. Only
+                that message is marked, never the rest of its thread, and a send that fails marks
+                nothing.
+              </p>
+              <p class="hint">
+                The button beside Pace says what the list does with messages already read —
+                archived, your own, or read automatically — and a tap moves it on to the next:
+                <strong>Show read</strong> shows them greyed; <strong>Collapse read</strong> turns
+                each run of two or more into one line, <em>… 12 read messages …</em>, which a tap
+                opens, while keeping a thread's first message and the newest message in view;
+                <strong>Hide read</strong> takes them out of the list entirely, which is what turns
+                the channel from a log into a queue. A search, Links or whose messages opens every
+                collapsed run, so nothing they match is behind a line; and while one is on, on a chat
+                service with threads, Hide read steps aside too, so a read message that matches is
+                shown, greyed — an old match is read by definition. Closing the search puts Hide read
+                back.
+              </p>
+              <p class="hint">
+                <strong>Searching.</strong> The magnifying glass filters the messages already loaded:
+                every word you type has to be in a message for it to stay, and a quoted phrase has to
+                be there whole. Each place a word is found is highlighted, the message's text, its
+                header and its links included; a link found only by its address is outlined. A folded
+                message whose match is further down says so under it, with a few words either side,
+                and a tap opens it. Where the search leaves messages out between two it shows, a line
+                says how many: <em>… 12 unmatched messages …</em>.
+              </p>
+              <p class="hint">
+                <strong>Searching further back.</strong> Only what is loaded is searched, so while a
+                search, Links or whose messages is on, the button at the head of the list says
+                <em>Search before Oct 3</em>, the day the list reaches back to. Press it, or
+                <kbd>Enter</kbd> in the search field — a phone keyboard's Search key — and it reads up
+                to five older pages, for at most about fifteen seconds, stopping once three more
+                messages match; meanwhile it says <em>Searching… 2 of 5 · Stop</em>, and pressing it
+                stops. What it found is said under it, and the matches appear right below, the line
+                above the first saying how many messages it skipped. Each press is one more search,
+                never more on its own — and while a search, Links or whose messages is on, scrolling to
+                the top of the list loads nothing by itself: this button, or <kbd>Enter</kbd>, is the
+                way back, so a search cannot read a channel's whole history unasked. Main holds a thread's first message and none of its replies: in
+                one column, a search nothing on Main matches offers <em>Search All — thread replies
+                too</em>; in two columns, the cards on the right are found by what the thread's first
+                message says and by the replies this page has loaded, and the thread selected there
+                searches its own older replies.
+              </p>
+              <p class="hint">
+                <strong>Days.</strong> A line above the first message of each day says which day it
+                is — <em>Today, Oct 12, Mon</em>, <em>Yesterday, Oct 11, Sun</em>, or the date and
+                weekday, <em>Oct 3, Sat</em>, with the year when it is not this one — by this
+                device's clock and calendar, and it moves on at midnight by itself. Where messages
+                are left out between two shown ones, by a filter or a collapsed run, the days they
+                reach are said once, on that line: <em>… 12 unmatched messages · Oct 3 – 5 …</em>,
+                or <em>Oct 9 – Today</em>. So a search that finds a few messages days apart shows
+                each gap's days as one range, never a stack of lines.
+              </p>
+              <p class="hint">
+                <strong>Yours, or theirs.</strong> The speech bubble left of Links in the search bar
+                shows only your messages — with nothing typed, every prompt you wrote among the
+                messages loaded — then only everyone else's, people and agents alike, then everyone's
+                again; <kbd>Shift</kbd>+<kbd>M</kbd> does the same. Your messages are the ones drawn as
+                yours, on the right. A message has to pass every filter in the bar: the search text,
+                Links, Pinned and whose it is. On a chat service with threads Hide read steps aside
+                while one of them is on, as Collapse read does, so your own messages show even when
+                they count as read; on one without, Hide read still applies, and with your own
+                messages counted as read it leaves none of yours to show.
+              </p>
+              <p class="hint">
+                <strong>A filter keeps your place.</strong> Typing or clearing a search, closing it,
+                turning <strong>Pinned</strong> or <strong>Links</strong> on or off, whose messages,
+                the kinds of link
+                under Links, and the read mode each leave the message you selected where it is on the
+                screen — with nothing selected, the message at the top. So a pin found under
+                <strong>Pinned</strong> and selected is still in front of you when the filter goes, among
+                the messages around it; one older than anything loaded is fetched first, with
+                <em>Loading earlier messages…</em> at the head of the list. When the new filter hides
+                the message, the nearest one shown takes its place, and the status line says so. It
+                stays put, new messages and all, until you scroll or do something in the list.
+              </p>
+              <p class="hint">
+                Opening a thread takes you to its <strong>first unread message</strong>, already
+                expanded, with the thread's first message above it when both fit. A thread with
+                nothing unread opens on its newest message, as before.
+              </p>
+              <p class="hint">
+                <strong>Two columns.</strong> On a desk, in a window at least 1000 pixels wide, the
+                button with two panes beside the view picker puts <strong>Main</strong> on the left and
+                a thread on the right. The view picker greys out: there is nothing left for it to
+                choose. With no thread selected, the right column lists the channel's threads, newest
+                activity at the bottom as in the channel, each as its name and summary when they have
+                been summarised, or else its first message, three lines at most. A click on a card
+                <strong>highlights</strong> it: it shows all of it, and every other card's edge and every
+                other line between the columns go grey, until you click another card, the same one
+                again, or press <kbd>Esc</kbd>. The card's <strong>N replies · M unread</strong> opens
+                its thread, and so does <kbd>→</kbd>, on the highlighted card or the one the keys are
+                on; <kbd>←</kbd> comes back to the cards. <strong>Unread only</strong> beside its
+                heading narrows the list to the threads with unread replies, and is remembered on this
+                device. The search finds a card by its own words or by the replies already loaded for
+                its thread, and says <em>in replies</em> on a card it found only there. A line in each
+                thread's colour joins its first message on the left to its card
+                on the right while both are on screen; the highlighted card, or else the message or
+                card you select, draws its line even when the other end is off screen, pointing up or down to it, and if you stay on it
+                for about a second and a half the other column scrolls that end into view. A
+                thread's <strong>Thread(N)</strong>, its <strong>N
+                replies</strong> or <strong>M unread</strong>, the Threads screen and a card's
+                <strong>N replies · M unread</strong> each select the thread on the right; a tap on a message still only opens or folds
+                it. The <strong>×</strong> at the top of the right column goes back to the list. The
+                search, Links and the read mode apply to both columns, and <kbd>[</kbd> and
+                <kbd>]</kbd> move the keys between them. <strong>Reply</strong> and <strong>Quote
+                reply</strong> open the reply box at the foot of the column you pressed them in, with
+                the message you are answering edged in the accent where it stands; both columns stay
+                on screen, and <strong>Send reply</strong>, <strong>Cancel</strong> or
+                <kbd>Esc</kbd> puts the column back where it was. A reply that does not go says so on
+                the status line, and that column's <strong>Newest</strong> reads <strong>Reply not
+                sent</strong> until you go down to it and its <strong>Retry</strong>. A narrower window
+                shows one column again, in the view you left it in, and keeps the choice for when the
+                window is wide again; a reply you were writing moves to the reply screen with your words.
+              </p>
+              <p class="hint">
+                When the configured chat provider supports it, the row's <strong>⋯</strong> menu
+                offers <strong>Mark read in</strong> <em>that service</em>. It moves the chat
+                service's own read marker for the whole space to that message, so the service's
+                own app shows it as read. Read markers only move forward. This does not archive
+                anything here; <strong>Done</strong> remains local and undoable.
+              </p>
+            </details>
+
+            <details id="help-mark-own" class="help-entry">
+              <summary><h2>Your own messages</h2></summary>
+              <p class="hint">
+                A message posted on your behalf is one you dictated moments earlier, so it is
+                already read by the only definition that matters. Leaving it in the queue would
+                make the queue partly a record of things <em>you</em> said rather than things
+                waiting for you.
+              </p>
+              <p class="hint">
+                With this on they are greyed in the channel, collapsed under
+                <strong>Collapse read</strong> and left out of the list under
+                <strong>Hide read</strong>. It is not an archive: nothing is recorded on the
+                server, there is nothing to undo, and turning it off brings every one of them
+                straight back. Nothing here changes anything in the source chat service.
+              </p>
+            </details>
+
+            <details id="help-auto-read" class="help-entry">
+              <summary><h2>Read automatically</h2></summary>
+              <p class="hint">
+                Some messages are only placeholders — a coding agent posting <em>Working…</em>
+                while it works, with the real answer arriving later as a separate message. A
+                message whose whole text matches one of these rules counts as read the moment it
+                arrives: it is dimmed in the channel, left out of the list behind
+                <strong>Hide read</strong>, never read aloud or passed to the voice agent as news,
+                and not counted when the agent counts or summarizes a channel.
+              </p>
+              <p class="hint">
+                Matching is deliberately simple, so a rule never hides more than you expect. The
+                message's whole text must equal the rule, ignoring case, extra spaces, emphasis
+                such as <em>_italics_</em> or <strong>**bold**</strong> around it, and the
+                difference between three dots and the single ellipsis character. A message that
+                merely starts with the rule is a real message and is not matched. To match how a
+                message starts instead, end the rule with <code>*</code>, as in
+                <code>Thinking*</code>.
+              </p>
+              <p class="hint">
+                Nothing is recorded per message: the rules are checked against each message as it
+                reads now. A placeholder later edited into a real answer shows as unread again, and
+                removing a rule brings back everything it matched. If a rule catches a message you
+                wanted, <strong>Not noise</strong> on that row brings back just that one message.
+                The rules are kept on the server and shared by every device you use; the voice
+                agent cannot change them. Like <strong>Done</strong>, this is this app's own read
+                state and changes nothing in the source chat service.
+              </p>
+            </details>
+
+            <details id="help-combining" class="help-entry">
+              <summary><h2>Combining messages</h2></summary>
+              <p class="hint">
+                Chat services limit message length, so a client sending a long one may
+                <strong>split it into parts</strong>. The next part can begin mid-sentence — often
+                mid-word — and lands a fraction of a second after the first. With this on, messages
+                from the <strong>same author within five seconds</strong> of each other are drawn as
+                one, with a line break between them. A person almost never sends twice that fast.
+              </p>
+              <p class="hint">
+                It is <strong>display only</strong>. Nothing is merged anywhere else: each part is
+                still its own chat message with its own id, and this app still holds them that
+                way. Marking a combined row as dealt with marks <strong>every</strong> message in
+                it, reading it aloud reads all of it, and a row counts as dealt with only when all
+                of its messages are — so a half-archived row shows as still waiting rather than
+                hiding something you have not seen. A <strong>reply</strong> goes to the first
+                message of the group, which is the one the rest is a continuation of.
+              </p>
+              <p class="hint">
+                Turn it off to see the original messages, one row per message. That
+                is worth doing when you are checking whether a specific message exists — press and
+                hold a row to see every id it is showing.
+              </p>
+            </details>
+
+            <details id="help-rich-headers" class="help-entry">
+              <summary><h2>Rich headers</h2></summary>
+              <p class="hint">
+                Agents that post through one shared account often say who they are at the start of
+                a message, in square brackets or parentheses, with a title and a time:
+                <code>[build-bot] Status, 9:05 PM ET.</code> With this on, that first line moves into
+                the message's header: the <em>tag</em> in quiet italics, the <strong>title</strong>
+                in bold, and the time after an <code>@</code>. The rest of the message is the body.
+              </p>
+              <p class="hint">
+                Where the header has room — on a wide screen — the pieces sit beside the time and
+                the buttons. Where it does not, they become the first line of the message instead.
+                Either way <strong>nothing is left out</strong>: every word of the first line is
+                shown somewhere, and copying, searching and reading aloud use the message exactly
+                as written.
+              </p>
+              <p class="hint">
+                The server only lifts out what it is sure of: a tag in square brackets, or one in
+                parentheses that the same author has used to start more than one message in the
+                channel. Anything else is drawn as written. Turn this off to see every first line
+                as it was written.
+              </p>
+            </details>
+
+            <details id="help-channel-alias" class="help-entry">
+              <summary><h2>Channels</h2></summary>
+              <p class="hint">
+                Everything in this group is about <strong>one channel</strong> — the one chosen at
+                the top of it. Every other setting on the screen applies to the whole app.
+              </p>
+              <p class="hint">
+                <strong>Adding a channel</strong> needs the channel ID supplied by this deployment.
+                The chat connector must already have access to that channel in the chat service.
+                The channel is
+                <strong>read before it is accepted</strong>, so a mistyped id or a channel the bot
+                cannot see is refused straight away rather than joining the list and failing later.
+              </p>
+              <p class="hint">
+                <strong>Let this app post here</strong> is off unless you turn it on, and it is
+                the one switch that widens what this app can <em>say</em> rather than what it can
+                read. Leaving it off means the channel can be read and replied to from this app but
+                is not somewhere the agent can be told to post.
+              </p>
+              <p class="hint">
+                Any channel can be <strong>removed</strong> from your list here. One added here is
+                forgotten. One that came from the server's configuration file is
+                <strong>hidden</strong> instead, because the server never writes that file: it stays
+                off your list across restarts, and <strong>Show again</strong> under Hidden channels
+                puts it back. Adding it again from Browse or by its id does the same.
+              </p>
+              <h2>What to call a channel</h2>
+              <p class="hint">
+                Give a channel a name of your own. This app then uses it everywhere it would have
+                shown the configured label — the picker, the channel summary, and <strong>the name
+                the voice agent is given</strong>, so what you say out loud is what it was told.
+              </p>
+              <p class="hint">
+                It is <strong>ours and local</strong>: it is kept on this server, the chat service is never
+                told, the channel is not renamed there, and nobody outside this deployment sees it
+                — the same standing as which messages you have dealt with. Clearing it puts the
+                configured label back.
+              </p>
+              <p class="hint">
+                It is also <strong>not something the agent can set</strong>. The agent is given the
+                name and cannot choose it, because a model that renames the channels it also
+                reports on can make its own reports unrecognisable.
+              </p>
+            </details>
+
+            <details id="help-reading-width" class="help-entry">
+              <summary><h2>Reading width</h2></summary>
+              <p class="hint">
+                On a wide screen with a mouse, the transcript and the channel are held to a column
+                rather than filling the window: a line of text stops being readable somewhere past
+                ninety characters, and a maximised browser is twice that. Drag the edge of the
+                column, or use the slider — they set the same thing. On a phone it does nothing,
+                because there is no room for a column and no margin to put beside it.
+              </p>
+            </details>
+
+            <details id="help-resuming" class="help-entry">
+              <summary><h2>Resuming</h2></summary>
+              <p class="hint">
+                The vendor cannot resume a conversation once the connection closes. What this does
+                instead is hand the new call a written record of the earlier one, so it can carry on
+                from it. It is a <strong>reconstruction</strong>: a new conversation that has been
+                told what happened, not the old one continued.
+              </p>
+              <p class="hint">
+                It <strong>re-sends earlier conversation content to the voice vendor on every new
+                call</strong> — your own speech, and any channel text the agent read out to you,
+                which was written by other people. That is why it is off by default. The record is
+                capped by the server; when it does not all fit, the oldest lines are dropped and
+                both you and the agent are told the reconstruction is partial.
+              </p>
+            </details>
+
+            <details id="help-live-messages" class="help-entry">
+              <summary><h2>Live messages</h2></summary>
+              <p class="hint">
+                When this server is set to watch the channel, new messages appear on their own
+                rather than at the next refresh. A deployment can use bounded polling or push
+                delivery from a provider adapter; Settings says which mode this server is using.
+              </p>
+              <p class="hint">
+                <strong>Arriving messages during a call</strong> has three settings, on the bar as
+                <strong>Read new</strong> and in Settings by name. <em>Don't tell the agent</em>
+                leaves a call alone entirely. <em>Briefly</em> — the default — has the agent say in
+                one sentence what arrived. <em>In full</em> has it read each message out word for
+                word, which is what you want when the channel is the conversation and slow going
+                when it is not. Both speaking modes send channel text to
+                <strong>the voice vendor</strong> and spend conversation time. Replies this server
+                posted are never sent back — otherwise the agent would hear its own answer and
+                reply to it.
+              </p>
+              <p class="hint">
+                A burst arriving at once becomes <strong>one</strong> spoken turn, not one per
+                message. Messages that land within about a second of each other are collected and
+                announced together, because a coding agent posting four lines in a row would
+                otherwise interrupt four times and leave no gap to answer in.
+              </p>
+              <p class="hint">
+                It only works <strong>while this page is open</strong>. The conversation socket
+                belongs to this browser, not to the server, so closing the tab ends the relay even
+                though the server keeps watching the channel.
+              </p>
+              <p class="hint">
+                <strong>Only messages that arrive while the feed is connected are sent.</strong>
+                When this page attaches to the channel it is first handed what the server already
+                published, so the list catches up; that catch-up is never announced to the agent,
+                because a burst of older messages read out as though they had just been said is
+                worse than not hearing them at all. Anything that landed while the feed was
+                reconnecting is on screen but was not spoken.
+              </p>
+            </details>
+
+            <details id="help-speech-prep" class="help-entry">
+              <summary><h2>How messages are said</h2></summary>
+              <p class="hint">
+                Before a message is read out — by the agent during a call, or by the tap-to-listen
+                button — this server rewrites it for the ear. Markdown comes off, so
+                <code>**deploy**</code> is not read as <em>asterisk asterisk deploy asterisk
+                asterisk</em>. Timestamps become <em>three hours ago</em> instead of an ISO string
+                read out character by character. Long numeric ids get a short name such as
+                <em>UID ending in 009</em>, while a tag like <code>D1234567890</code> becomes
+                <em>Diff ending in 890</em>. The channel view still shows exactly what was typed;
+                only the spoken form changes.
+              </p>
+              <p class="hint">
+                UID and diff endings are stable across restarts. Hash codes still get short letter
+                names that remain consistent while this server is running.
+              </p>
+              <p class="hint">
+                It is <strong>on unless the operator turned it off</strong>, in this server's own
+                configuration rather than here — the rewrite happens before a message reaches this
+                page, and the voice agent's own tool calls never pass through this browser, so a
+                switch on this screen could only govern one of the three paths. Turning it off is
+                the control arm for tuning the agent's prompt: it makes every difference between
+                two runs the prompt rather than this.
+              </p>
+            </details>
+
+            <details id="help-storage" class="help-entry">
+              <summary><h2>Stored conversations</h2></summary>
+              <p class="hint">
+                This server keeps the transcript of each call in a database file on the machine it
+                runs on, so a reload no longer loses the conversation. It is not encrypted: anyone
+                with access to that machine's filesystem can read it, and it holds both your own
+                speech and any channel text the assistant read out to you. Older conversations are
+                dropped automatically once the server's retention limit is reached.
+              </p>
+            </details>
+
+            <details id="help-voice-send" class="help-entry">
+              <summary><h2>Asking before the voice agent sends</h2></summary>
+              <p class="hint">
+                On, which is how this server ships, the voice agent never posts by itself. When you
+                ask it to send something it drafts the message and reads it back in one fixed
+                form — <em>To lead team: on it, rebasing now. Send it?</em> — and a card shows the
+                exact text. Tap <strong>Send</strong>, or answer with a plain <em>yes</em>,
+                <em>yeah</em>, <em>yep</em>, <em>do it</em>, <em>go ahead</em>, <em>sure</em> or
+                <em>please do</em> — one word of filler such as <em>yes please</em> is fine.
+                <em>Send it</em> works too, but not straight after the question, where it could be
+                the agent's own voice. This page, not the agent, decides that you said yes: only as
+                your very next answer after a read-back that you heard to the end without
+                interrupting, only for the draft this call made, and only if the read-back was the
+                card's text word for word with nothing added. If anything else was said in between,
+                ask the agent to read it back again. Answering its question about sending,
+                <em>no</em>, <em>cancel</em>, <em>stop</em> or <em>wait</em> withdraws the draft,
+                and so does any answer that starts with one of them. Anything longer — "yes, and
+                tell him I'm late" — sends nothing. Whenever you answer something like a yes, the
+                page then tells the agent, and you, whether it was sent; a typed yes never sends.
+              </p>
+              <p class="hint">
+                It cannot tell your voice from anyone else's: a passenger or the radio saying
+                <em>yeah</em> straight after a read-back counts as you. A short word is also the
+                easiest for speech recognition to mishear. Only plain words can be confirmed by
+                voice: a draft with a mention, a link, a symbol such as + or #, an emoji, a time,
+                or formatting such as strikethrough needs a tap, because a voice drops exactly
+                those and the words alone would still match. The read-back names the
+                channel, not the message a reply answers; the card shows that. Spoken yes needs echo
+                cancellation on, so the agent's own <em>Send it?</em> is not heard as your answer.
+              </p>
+              <p class="hint">
+                Off, the agent posts as soon as you ask, and tells you once the server says it was
+                sent. There is no read-back and no card. That also means a chat
+                message the agent reads could talk it into posting, which is why this is on unless
+                you turn it off. The change applies to the server at once and to the agent from its
+                next call — except an agent hosted by its voice provider whose prompt was pasted
+                into the provider's console by hand. That one follows only if the provider lets
+                this page replace its prompt; otherwise it needs the new prompt pasted again. Its
+                approval for post_reply, set in the same console, is changed by hand either way.
+                The line under the switch says which applies, from what the last call was given.
+              </p>
+            </details>
+
+            <details id="help-voice-instructions" class="help-entry">
+              <summary><h2>Instructions for the voice agent</h2></summary>
+              <p class="hint">
+                <strong>Additional instructions</strong> are added to what the agent is told at the
+                start of every call: how to address you, how long to talk, what to leave out. Save
+                keeps them on the server, so every device and every later call has them. Empty the
+                box and save to remove them.
+              </p>
+              <p class="hint">
+                <strong>Edit the system prompt</strong> opens the base instructions themselves —
+                the ones about summarising, reading aloud and treating chat text as untrusted —
+                for you to change. Save keeps your copy; <strong>Restore the shipped prompt</strong>
+                goes back to the one this server ships, and deletes your copy, so it asks for a
+                second tap first. When a newer version of vibe-talk changes
+                the shipped prompt, your copy does not change with it, and the line under the box
+                says which version it was saved against. The shipped prompt tells the agent never
+                to follow instructions found inside chat messages; take that out and a message it
+                reads has more sway over it.
+              </p>
+              <p class="hint">
+                Neither box can change what the agent is able to do. Whether it can send at all
+                comes from the token it holds, and whether it asks first comes from the Sending
+                switch; the server adds that part after your words, and enforces it whatever the
+                prompt says.
+              </p>
+              <p class="hint">
+                How your words reach the agent depends on the voice service. A voice bridge run with
+                this server fetches the prompt as each call starts, so both reach its next call. A
+                hosted agent is configured in its provider's console, so this page hands them over
+                as the call starts: the whole prompt, if the agent's security settings allow the
+                system prompt to be overridden; otherwise only the additional instructions, as a
+                note at the start of the call, and your edited prompt does not reach it. The line
+                under Instructions says which happened on the last call.
+              </p>
+              <p class="hint">
+                An agent that allows its prompt to be replaced is given this server's prompt on
+                every call, even with nothing of yours saved — the shipped one, with the send rules
+                for the Sending switch — so the prompt in its provider's console is not used, and
+                with only instructions saved the shipped prompt takes its place. That prompt is
+                written for an agent that may send: give such an agent the write token, or one
+                holding the read token is told it can send and is refused every time. An agent
+                that does not allow it, with nothing of yours saved, starts exactly as it did
+                before.
+              </p>
+            </details>
+
+            <details id="help-connection" class="help-entry">
+              <summary><h2>Connection status</h2></summary>
+              <p class="hint">
+                What the current conversation is, what audio format it negotiated, and why the last
+                one closed — including the close code, which is the one thing on this page written
+                for whoever is debugging it rather than for you. It is a readout, not a setting,
+                which is why it sits at the end.
+              </p>
+            </details>
+          </div>
+        </section>
+      </div>
+    </main>
+
+    <!--
+      The dock: the third grid ROW, not a pinned or absolutely positioned overlay, which is why it
+      cannot drift, overlap the transcript, or be scrolled off the bottom of the page.
+
+      Status sits at the TOP of the dock, ABOVE the controls. On a phone with rounded corners the
+      bottom strip of the screen is where text is least legible — the owner's iPhone clipped the
+      first word of a line that lived down there. Moving it above the control pane removes that
+      whole class of defect rather than mitigating it, and the horizontal safe-area insets in
+      voice.css keep it clear of the curve on both sides.
+    -->
+    <footer id="dock">
+      <!--
+        `#58 control-bar`. The BOTTOM home, and the default one — so the bar is where it belongs
+        even if web/voice.js never runs. The bar is declared here rather than in the header for
+        exactly that reason: a mount point that is empty until script moves something into it is a
+        control that does not exist on a page whose script died.
+
+        DIRECTLY ABOVE THE BIG BUTTON BAR, which is what the owner asked for and is not the same
+        thing as "at the bottom": below #control-pane would put small icons under the thumb that is
+        reaching for Talk, and pinning it to the viewport floor would put it in the corner
+        curvature that ate the first word of the status line on the owner's iPhone.
+
+        The order inside the bar is the owner's too, and it is a right-handed thumb argument rather
+        than a symmetry one:
+
+          * the GEAR is leftmost — the control you least want to hit by accident, so it is the one
+            furthest from where the thumb rests;
+          * #bar-pack takes the space between them and is where every later button goes;
+          * the Voice/Discord SWITCH is rightmost, under the thumb, because it is the one you
+            actually flick.
+      -->
+      <div id="control-bar-bottom">
+        <div id="control-bar" data-placement="bottom">
+          <!-- An icon, not a word: settings is a destination, not something you read the label of
+               every time you look at the screen. -->
+          <button id="open-settings" class="bar-button" type="button" aria-label="Settings" title="Settings">
+            <svg class="mini-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="3.1" />
+              <path d="M19.4 14.5a1.6 1.6 0 0 0 .33 1.77l.06.06a1.9 1.9 0 1 1-2.7 2.7l-.06-.06a1.6 1.6 0 0 0-1.77-.33 1.6 1.6 0 0 0-.98 1.47v.17a1.9 1.9 0 1 1-3.82 0v-.09a1.6 1.6 0 0 0-1.05-1.47 1.6 1.6 0 0 0-1.77.33l-.06.06a1.9 1.9 0 1 1-2.7-2.7l.06-.06a1.6 1.6 0 0 0 .33-1.77 1.6 1.6 0 0 0-1.47-.98H3.5a1.9 1.9 0 1 1 0-3.82h.09a1.6 1.6 0 0 0 1.47-1.05 1.6 1.6 0 0 0-.33-1.77l-.06-.06a1.9 1.9 0 1 1 2.7-2.7l.06.06a1.6 1.6 0 0 0 1.77.33h.08a1.6 1.6 0 0 0 .98-1.47V3.5a1.9 1.9 0 1 1 3.82 0v.09a1.6 1.6 0 0 0 .98 1.47 1.6 1.6 0 0 0 1.77-.33l.06-.06a1.9 1.9 0 1 1 2.7 2.7l-.06.06a1.6 1.6 0 0 0-.33 1.77v.08a1.6 1.6 0 0 0 1.47.98h.17a1.9 1.9 0 1 1 0 3.82h-.09a1.6 1.6 0 0 0-1.47.98z" />
+            </svg>
+          </button>
+
+          <!--
+            THE PACK POINT. Empty today and deliberately so: `#59 text-entry-button` and `#60
+            canned-prompt-buttons` add buttons HERE, and the bar was built as a container that
+            packs rather than as a two-item layout that has to be rewritten the first time a third
+            button arrives. It takes the space left over, and it scrolls sideways rather than
+            wrapping or clipping when the buttons outgrow a narrow phone.
+          -->
+          <div id="bar-pack">
+            <button id="audio-source" class="bar-button" type="button" role="switch"
+                    aria-checked="false" aria-label="Read messages with device audio"
+                    title="Device audio. Tap to use the configured agent instead." hidden>
+              <svg id="audio-device-icon" class="mini-icon" data-icon="device" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="7" y="2.5" width="10" height="19" rx="2" />
+                <path d="M10 5h4M11 18.5h2" />
+              </svg>
+              <svg id="audio-agent-icon" class="mini-icon" data-icon="cloud" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" hidden>
+                <path d="M7.5 18.5h9a4.5 4.5 0 0 0 .7-8.95A6 6 0 0 0 5.8 8.2 4.25 4.25 0 0 0 7.5 18.5Z" />
+                <path d="M10 12.5v3M14 11v4.5" />
+              </svg>
+            </button>
+            <!--
+              `#83 channel-selector-in-bar`. WHICH CHANNEL you are reading, chosen from the bar
+              rather than from a row at the top of the scrollback.
+
+              FIRST in the pack, immediately right of the gear, and that is the reachability
+              argument rather than a taste one: the pack scrolls sideways when it is full, so the
+              member at its left edge is the one that is on screen without scrolling anything —
+              and "this control cannot be reached" is the entire defect being fixed.
+
+              Being first is a DOM-ORDER fact and settles nothing about width: a sixth control on a
+              375px strip pushes the last member of the pack out of its visible window whatever the
+              order is. What settles that is `PACK_VIEWS` in web/voice.js, which puts this member on
+              the channel view and the three that talk to the agent on the call view, and the page
+              suite's "THE BAR FITS ON THE OWNER'S 375px PHONE" — which prices whatever the bar
+              really shows against the widths declared in web/voice.css.
+
+              A `select`, not a button that opens something: the platform's own picker is the one
+              a thumb already knows, and it needs no menu of this page's invention.
+            -->
+            <select id="discord-channel" class="bar-select" aria-label="channel"
+                    title="Which channel this view is reading. Changing it starts that channel at its newest message."></select>
+
+            <!--
+              `gchat-thread-selector`. What part of the channel to read, beside the channel it
+              belongs to and always there: Main (messages posted to the channel itself), All
+              (every message, threads included), then each thread by name, most recently active
+              first. A `select` for the same reason the channel picker is one.
+
+              `#231 two-column-polish`. Greyed in two columns with `aria-disabled`, not `disabled`, as
+              a bar button with nothing to act on is (see web/voice.css): a disabled control is no Tab
+              stop and not reliably a hover target, so the reason it is greyed reached nobody but a
+              mouse that waited on it. It stays a stop, says it is unavailable and why
+              (#thread-select-note), and a press on it opens nothing and says why in the status line.
+            -->
+            <select id="thread-select" class="bar-select" aria-label="thread" aria-describedby="thread-select-note"
+                    title="Which part of the channel to read: Main, All, or one thread."></select>
+
+            <!--
+              `#229 desktop-two-column`. One column or two: Main on the left and a thread on the
+              right, as other chat clients' desktop apps lay a channel out. Beside the view picker,
+              because in two columns that picker has nothing to choose and greys out. A toggle with a
+              fixed name and `aria-pressed`, so a screen reader says "Two columns, pressed" once
+              rather than a name that changes and a state as well; the tooltip names what a press does.
+
+              ONLY ON A DESK WIDE ENOUGH FOR TWO COLUMNS: web/voice.css draws it inside the desktop
+              block at 1000px and wider and nowhere else, so a phone and a narrow window never see it.
+              The choice is kept on this device, and a window narrowed below that width shows one
+              column without forgetting it.
+            -->
+            <button id="column-toggle" class="bar-button" type="button" aria-pressed="false"
+                    aria-label="Two columns" title="Show Main and a thread side by side" hidden>
+              <svg class="mini-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3.5" y="5" width="17" height="14" rx="2" />
+                <path d="M12 5v14" />
+              </svg>
+            </button>
+
+            <!--
+              `#60 canned-prompt-buttons` put the canned questions ON the strip, one button each.
+              ONE button now opens all of them, and the reason is arithmetic: the bar is a single
+              375px row, each canned prompt cost it a member, and the list is meant to GROW — the
+              custom prompts the owner wants next would each have taken another slot off a strip
+              that was already priced to the edge. A tray costs one slot however many it holds.
+
+              The buttons themselves are still declared here, in the markup, one per entry in
+              `CANNED_PROMPTS` — the page suite derives its element set from this file and refuses
+              an id invented at runtime, which is the rule that keeps "a third prompt is an entry
+              and not a code path" honest rather than merely intended.
+            -->
+            <button
+              id="prompts-open"
+              class="bar-button"
+              type="button"
+              aria-expanded="false"
+              aria-controls="prompts-tray"
+              title="Canned questions for the agent. Editable in Settings."
+            >
+              <!-- A stack of lines with a chevron ABOVE it: a list, and the direction it opens.
+                   The chevron is the half that says this is a menu rather than an action, which
+                   matters on a strip where every other member does something immediately. -->
+              <svg class="mini-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                <path d="m8 7.5 4-3.5 4 3.5" />
+                <path d="M5.5 12h13M5.5 16h13M5.5 20h8" />
+              </svg>
+              <span id="prompts-open-label" class="mini-label">Prompts</span>
+            </button>
+
+            <!--
+              THREE STATES, CYCLED BY TAPPING, and the arithmetic is why. A `<select>` needs 5rem
+              before its own padding and border, which the strip did not have while the call view
+              held Type and Prompts as well (`#241 voice-composer` has since taken Type off the
+              strip); a `.bar-button` needs 2.75rem, which it does.
+              So the control on the bar is a button that steps off → gist → full → off, and the
+              same three values are also a real `<select>` in Settings, where there is room to name
+              them. Both write one key; see `RELAY_MODES` in web/voice.js.
+
+              The label and the tooltip are filled in from script, by `renderReadNew`, because the
+              live one depends on the mode — there is no honest static text for a control with
+              three meanings, and a copy here would be the wrong one two thirds of the time.
+
+              The icon is a SPEAKER WITH TWO WAVES, and the waves are what carries the mode: none
+              for off, the near one for gist, both for full. That reads as "how much comes out",
+              which is exactly what the three modes differ in.
+            -->
+            <button
+              id="read-new"
+              class="bar-button"
+              type="button"
+              data-mode="gist"
+            >
+              <svg class="mini-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4 9.5h3l4.5-4v13l-4.5-4H4z" />
+                <path class="wave wave-near" d="M15 9.5a4 4 0 0 1 0 5" />
+                <path class="wave wave-far" d="M17.75 7a7.5 7.5 0 0 1 0 10" />
+              </svg>
+              <span id="read-new-label" class="mini-label">Gist</span>
+            </button>
+          </div>
+
+          <!--
+            The tray, and the two prompts in it.
+
+            A SIBLING OF THE PACK AND INSIDE THE BAR. Inside, because the bar is one element that
+            moves between the header mount and the dock mount, and a tray parented anywhere else
+            would have to be taught to follow it. Out of the pack, because the pack is the part
+            that scrolls sideways and a menu that can scroll out from under the button that opened
+            it is not a menu. It takes no width from the strip at all — see `#prompts-tray` in
+            web/voice.css, which takes it out of flow and hangs it off whichever edge the bar is
+            resting against.
+
+            The two entries differ in WEIGHT — Sumry asks the voice agent to read and summarize,
+            while Blockers spends CODING-AGENT work on one tap — and that difference used to be
+            drawn, in the warm colour an armed Clear uses. IT NO LONGER IS, at the owner's request:
+            on a desktop screen the warm outline did not read as "this one is expensive", it read
+            as a WARNING SYMBOL, as though the button were reporting a fault. A control that looks
+            broken is worse than one whose cost is only in its tooltip, so the weight difference
+            lives in the `title` and in the Settings text.
+
+            What they DO carry visually is whether they can be pressed at all: with no call open
+            there is nothing for either sentence to reach, so both grey out and say why. See
+            `renderCannedPrompts` in web/voice.js. The tray still opens at idle, deliberately — a
+            reader has to be able to SEE what the prompts are in order to learn why they are dead.
+
+            What each one says is EDITABLE, in Settings, and the defaults are filled in from script
+            rather than typed into the markup — see `CANNED_PROMPTS` in web/voice.js. The TOOLTIPS
+            live there too, and for the same reason: `renderCannedPrompts` swaps them for the
+            disabled sentence and back, so a copy here would go stale on the first swap.
+          -->
+          <div id="prompts-tray" role="group" aria-label="Canned prompts" hidden>
+            <button
+              id="canned-summary"
+              class="tray-button"
+              type="button"
+            >
+              <svg class="tray-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M5.5 4.5h13v15h-13z" />
+                <path d="M8.5 9h7M8.5 12h7M8.5 15h4" />
+              </svg>
+              <span id="canned-summary-label" class="tray-label">Sumry</span>
+            </button>
+
+            <button
+              id="canned-blockers"
+              class="tray-button"
+              type="button"
+            >
+              <!-- A CLIPBOARD, not a warning triangle, and the change is the point. The triangle
+                   with an exclamation in it is the universal "something is wrong" mark, so at a
+                   glance the bar looked like it was reporting a fault rather than offering an
+                   action — the owner read it exactly that way. What this button actually asks for
+                   is a STATUS REPORT from the coding agent, which is what a clipboard says. It
+                   stays visibly distinct from Sumry's plain document. -->
+              <svg class="tray-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M9.5 4.5h5a1 1 0 0 1 1 1v1h-7v-1a1 1 0 0 1 1-1z" />
+                <path d="M8.5 6h-2v13.5h11V6h-2" />
+                <path d="m9.5 11.5 1.5 1.5 3-3" />
+                <path d="M9.5 16.5h5" />
+              </svg>
+              <span id="canned-blockers-label" class="tray-label">Blockers</span>
+            </button>
+          </div>
+
+          <!-- ONE switch, not two labels. It carries the word for the view you are in, and a knob
+               that moves, so it reads as a control with two positions rather than as one item that
+               has been disabled. -->
+          <button
+            id="view-switch"
+            class="switch"
+            type="button"
+            role="switch"
+            aria-checked="false"
+            aria-label="switch between the call and the channel"
+          >
+            <span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span>
+            <span id="view-switch-label" class="switch-word">Voice</span>
+          </button>
+        </div>
+      </div>
+
+      <!--
+        A dense tile: two small controls stacked in the left column to exactly the height of the
+        large ones, which each span both rows. Nothing is a fixed pixel width, so the pane fills
+        the screen horizontally as well as vertically.
+
+            ┌────┬──────────┬──────────┐
+            │ 🔊 │          │          │
+            ├────┤ Hang up  │   Talk   │
+            │ 🗑  │          │          │
+            └────┴──────────┴──────────┘
+
+        Hang up is present only while there is a call to hang up. Idle and after a call has ended,
+        the two large columns become ONE action — the thing there actually is to do — rather than
+        a dead warm-coloured button sitting beside a live one.
+      -->
+      <div id="control-pane" hidden>
+        <button id="speaker" class="control control-mini on" type="button" aria-pressed="false" title="Silence the agent's voice. Its replies keep arriving as text in the transcript.">
+          <svg class="mini-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 9.5h3.5L12 5.5v13L7.5 14.5H4z" />
+            <path class="speaker-wave" d="M15.5 9a4 4 0 0 1 0 6" />
+            <path class="speaker-wave" d="M18 6.8a7.5 7.5 0 0 1 0 10.4" />
+            <path id="speaker-slash" class="speaker-slash" d="M15.5 8.5 L21 15.5" />
+          </svg>
+          <span id="speaker-label" class="mini-label">Sound</span>
+        </button>
+
+        <!-- Destructive, and now under a thumb. It arms on the first tap and only clears on the
+             second, because the placement is what makes an accidental tap likely. -->
+        <button id="clear-view" class="control control-mini" type="button" title="Clear the transcript from this screen. It does not end the call and the agent forgets nothing.">
+          <svg class="mini-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 6.5h16" />
+            <path d="M9.5 6.5V4.6a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1v1.9" />
+            <path d="M6.5 6.5 7.4 19a1.4 1.4 0 0 0 1.4 1.3h6.4a1.4 1.4 0 0 0 1.4-1.3l.9-12.5" />
+            <path d="M10.4 10v6.4M13.6 10v6.4" />
+          </svg>
+          <span id="clear-view-label" class="mini-label">Clear</span>
+        </button>
+
+        <button id="hang-up" class="control control-hangup" type="button" hidden>
+          <svg class="control-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M2.8 13.2a13 13 0 0 1 18.4 0l-2.6 2.6a2 2 0 0 1-2.6.2l-1.4-1a1.4 1.4 0 0 1-.6-1.1v-1.5a10 10 0 0 0-4.4 0v1.5a1.4 1.4 0 0 1-.6 1.1l-1.4 1a2 2 0 0 1-2.6-.2z" />
+          </svg>
+          <span id="hangup-label" class="control-label">Hang up</span>
+        </button>
+
+        <!--
+          The archive filter, in the BAR. It changes what the list is, so it belongs beside the
+          other things that act on the list rather than inside the list it filters.
+
+          `#221 read-modes`: a cycle of three — Show read, Collapse read, Hide read — and it names
+          the one the list is in. One icon per mode, the others `hidden` by web/voice.js: an eye for
+          everything shown, a line of dots between two rules for runs collapsed to a line, and the
+          filter it always was for read messages left out. The name is two words in two spans, so
+          a desk's one-row dock can stack them in two short lines.
+        -->
+        <button id="todo-filter" class="control control-read" type="button" aria-pressed="false" data-read-mode="show" hidden>
+          <svg class="control-icon read-mode-icon" data-mode="show" viewBox="0 0 24 24" aria-hidden="true" fill="none"
+               stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M2.5 12s3.5-6.5 9.5-6.5 9.5 6.5 9.5 6.5-3.5 6.5-9.5 6.5S2.5 12 2.5 12z" />
+            <circle cx="12" cy="12" r="2.6" />
+          </svg>
+          <svg class="control-icon read-mode-icon" data-mode="collapse" hidden viewBox="0 0 24 24" aria-hidden="true" fill="none"
+               stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 5h16M4 19h16" />
+            <path d="M7 12h.01M12 12h.01M17 12h.01" stroke-width="2.6" />
+          </svg>
+          <svg class="control-icon read-mode-icon" data-mode="hide" hidden viewBox="0 0 24 24" aria-hidden="true" fill="none"
+               stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 5h18l-7 8v6l-4 2v-8z" />
+          </svg>
+          <span id="todo-filter-label" class="control-label"><span class="read-mode-verb">Show</span><span class="read-mode-noun"> read</span></span>
+        </button>
+
+        <!--
+          Reading pace, beside the control it acts on. A popover rather than a fourth control in
+          the bar: it is adjusted rarely and read never, so it should not hold a permanent tile.
+        -->
+        <button id="read-speed" class="control control-read" type="button" hidden
+                aria-haspopup="dialog" aria-expanded="false">
+          <svg class="control-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none"
+               stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 18a9 9 0 1 1 16 0" />
+            <path d="M12 14l4.5-4.5" />
+          </svg>
+          <span id="read-speed-label" class="control-label">Pace</span>
+        </button>
+
+        <!--
+          Anchored to the dock rather than to the row, because it belongs to the MODE and not to
+          any one message. `hidden` until asked for.
+        -->
+        <div id="speed-popover" class="popover" role="dialog" aria-label="Reading pace" hidden>
+          <label id="speed-value" for="read-speed-range">Pace</label>
+          <input
+            id="read-speed-range"
+            type="range"
+            min="50"
+            max="200"
+            step="5"
+            aria-label="reading pace, percent of the agent's own"
+          />
+          <p id="read-pace-help" class="hint">
+            Unset, a message is read at whatever pace the voice agent is configured with.
+          </p>
+        </div>
+
+        <!--
+          Read-aloud. Sits where Talk sits and takes its place in the CHANNEL view: talking to the
+          voice agent and being read a channel message are two different things to want, and the
+          one you want is decided by which list you are looking at.
+
+          Declared HERE, after the filter and the pace and just before Talk, so the markup runs in
+          the order the reader sees: Hide read, Pace, Read. The phone tile places all three by
+          explicit grid column and does not care; the desktop row is laid out in this order, and
+          Tab follows it on both (`#218 desktop-dock`).
+        -->
+        <button id="read-aloud" class="control control-read" type="button" aria-pressed="false" hidden>
+          <span class="control-ring" aria-hidden="true"></span>
+          <svg
+            class="control-icon"
+            viewBox="0 0 24 24"
+            aria-hidden="true"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.8"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <path d="M11 5 6.5 9H3v6h3.5L11 19z" />
+            <path d="M15.5 8.5a5 5 0 0 1 0 7" />
+            <path d="M18.5 5.5a9 9 0 0 1 0 13" />
+          </svg>
+          <span id="read-aloud-label" class="control-label">Read</span>
+        </button>
+
+        <button id="talk" class="control control-talk" type="button">
+          <span class="control-ring" aria-hidden="true"></span>
+          <svg
+            class="control-icon"
+            viewBox="0 0 24 24"
+            aria-hidden="true"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.8"
+            stroke-linecap="round"
+          >
+            <rect x="9" y="2.5" width="6" height="11" rx="3" />
+            <path d="M5 11a7 7 0 0 0 14 0" />
+            <path d="M12 18v3.5" />
+            <path id="talk-slash" class="control-slash" d="M4 3.5 L20 20.5" />
+          </svg>
+          <span id="talk-label" class="control-label">Talk</span>
+          <!-- The memory caveat, attached to the action it is about, in one clause. It replaces a
+               paragraph that used to sprawl across the transcript after every hang-up. -->
+          <span id="talk-note" class="control-note" hidden></span>
+        </button>
+      </div>
+
+      <!--
+        `#231 two-column-polish`. Why the view picker is greyed, when it is: its description
+        (`aria-describedby`), which a screen reader says with it, focused or read. Hidden, because it
+        is a description and not a line of the dock; a description is read from the element it names
+        whether or not that is drawn. Outside #bar-pack, whose every member is a control on the
+        strip, and last in the dock, where it stands between no two things a rule of web/voice.css
+        pairs (`#control-bar-bottom + #control-pane` is one). Empty while the picker chooses.
+      -->
+      <p id="thread-select-note" hidden></p>
+    </footer>
+
+    <!-- The generated wire-contract validators first: voice.js checks what it receives with them. -->
+    <script src="/contract.js"></script>
+    <script src="/voice.js"></script>
+  </body>
+</html>

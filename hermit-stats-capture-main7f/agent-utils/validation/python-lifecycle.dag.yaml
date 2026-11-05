@@ -1,0 +1,212 @@
+# The wrkslots lifecycle suite is intentionally isolated from the ordinary Python suites. Its
+# tests create real repositories, worktrees, processes, namespaces, and recovery state; running
+# all 1,130 cases in one pytest process accounted for more than half of the historical validation
+# wall clock. Each namespaced shard below receives its own PID/user namespace and pytest temp root.
+# Parameterized cases from one test function stay together within a shard.
+
+description: Parallel, isolated shards of the wrkslots lifecycle regression suite
+
+resource_caps:
+  # Real Git/process scans contend on procfs and filesystem metadata. Post-fix sweeps completed at
+  # 247.7s/731 CPU-s (width 4), 190.0s/743 CPU-s (width 5), and 218.3s/749 CPU-s (width 6).
+  # Five is both the fastest observation and cheaper than six; the component fragment shares this
+  # cap with its non-lifecycle wrkslots process tests.
+  lifecycle-io: 5
+  # These tests require the initial identity namespace or host-visible process IDs. Limit their
+  # concurrency independently from the safely namespaced partition until repeated sweeps prove a
+  # higher setting is both faster and contamination-free.
+  host-lifecycle: 3
+
+steps:
+  - group: namespace
+    job: shard-0
+    desc: lifecycle namespace shard 1 of 6
+    cmd: >-
+      cd py && if command -v unshare >/dev/null 2>&1 &&
+      unshare --user --map-root-user --pid --fork --mount-proc true >/dev/null 2>&1; then
+      test_python="$(python3 -c 'import os, sys; print(os.path.realpath(sys.executable))')" &&
+      exec unshare --user --map-root-user --pid --fork --mount-proc "$test_python"
+      ../scripts/pid_namespace_init.py -- python3 ../scripts/run_pytest_shard.py --shard 0/6 --
+      -q -c pyproject.toml --rootdir=. wrkslots/tests/test_lifecycle.py -m 'not ordinary_environment';
+      else exec python3 ../scripts/run_pytest_shard.py --shard 0/6 -- -q -c pyproject.toml
+      --rootdir=. wrkslots/tests/test_lifecycle.py -m 'not ordinary_environment'; fi
+    jobs_flag: ""
+    labels: [validation-workspace, validation-pytest-shards, validation-python-namespace-tests, component-wrkslots]
+    timeout: 900
+    cpu_timeout: 1800
+    hint:
+      resources: {lifecycle-io: 1}
+      est_duration_s: 230
+      classification: latency-bound
+      preferred_inner_jobs: 2
+      rss_baseline_bytes: 1073741824
+
+  - group: namespace
+    job: shard-1
+    desc: lifecycle namespace shard 2 of 6
+    cmd: >-
+      cd py && if command -v unshare >/dev/null 2>&1 &&
+      unshare --user --map-root-user --pid --fork --mount-proc true >/dev/null 2>&1; then
+      test_python="$(python3 -c 'import os, sys; print(os.path.realpath(sys.executable))')" &&
+      exec unshare --user --map-root-user --pid --fork --mount-proc "$test_python"
+      ../scripts/pid_namespace_init.py -- python3 ../scripts/run_pytest_shard.py --shard 1/6 --
+      -q -c pyproject.toml --rootdir=. wrkslots/tests/test_lifecycle.py -m 'not ordinary_environment';
+      else exec python3 ../scripts/run_pytest_shard.py --shard 1/6 -- -q -c pyproject.toml
+      --rootdir=. wrkslots/tests/test_lifecycle.py -m 'not ordinary_environment'; fi
+    jobs_flag: ""
+    labels: [validation-workspace, validation-pytest-shards, validation-python-namespace-tests, component-wrkslots]
+    timeout: 900
+    cpu_timeout: 1800
+    hint:
+      resources: {lifecycle-io: 1}
+      est_duration_s: 230
+      classification: latency-bound
+      preferred_inner_jobs: 2
+      rss_baseline_bytes: 1073741824
+      # A later successful run reached the previous 768 MiB hard ceiling and recorded 845
+      # memory.events.max events, so that sample proves only a censored lower bound. Leave the
+      # authored 1 GiB baseline unpinned: the normal 1.25 runtime margin yields a 1280 MiB cap,
+      # while ordinary profile feedback cannot lower the authored floor.
+
+  - group: namespace
+    job: shard-2
+    desc: lifecycle namespace shard 3 of 6
+    cmd: >-
+      cd py && if command -v unshare >/dev/null 2>&1 &&
+      unshare --user --map-root-user --pid --fork --mount-proc true >/dev/null 2>&1; then
+      test_python="$(python3 -c 'import os, sys; print(os.path.realpath(sys.executable))')" &&
+      exec unshare --user --map-root-user --pid --fork --mount-proc "$test_python"
+      ../scripts/pid_namespace_init.py -- python3 ../scripts/run_pytest_shard.py --shard 2/6 --
+      -q -c pyproject.toml --rootdir=. wrkslots/tests/test_lifecycle.py -m 'not ordinary_environment';
+      else exec python3 ../scripts/run_pytest_shard.py --shard 2/6 -- -q -c pyproject.toml
+      --rootdir=. wrkslots/tests/test_lifecycle.py -m 'not ordinary_environment'; fi
+    jobs_flag: ""
+    labels: [validation-workspace, validation-pytest-shards, validation-python-namespace-tests, component-wrkslots]
+    timeout: 900
+    cpu_timeout: 1800
+    hint:
+      resources: {lifecycle-io: 1}
+      est_duration_s: 230
+      classification: latency-bound
+      preferred_inner_jobs: 2
+      rss_baseline_bytes: 1073741824
+
+  - group: namespace
+    job: shard-3
+    desc: lifecycle namespace shard 4 of 6
+    cmd: >-
+      cd py && if command -v unshare >/dev/null 2>&1 &&
+      unshare --user --map-root-user --pid --fork --mount-proc true >/dev/null 2>&1; then
+      test_python="$(python3 -c 'import os, sys; print(os.path.realpath(sys.executable))')" &&
+      exec unshare --user --map-root-user --pid --fork --mount-proc "$test_python"
+      ../scripts/pid_namespace_init.py -- python3 ../scripts/run_pytest_shard.py --shard 3/6 --
+      -q -c pyproject.toml --rootdir=. wrkslots/tests/test_lifecycle.py -m 'not ordinary_environment';
+      else exec python3 ../scripts/run_pytest_shard.py --shard 3/6 -- -q -c pyproject.toml
+      --rootdir=. wrkslots/tests/test_lifecycle.py -m 'not ordinary_environment'; fi
+    jobs_flag: ""
+    labels: [validation-workspace, validation-pytest-shards, validation-python-namespace-tests, component-wrkslots]
+    timeout: 900
+    cpu_timeout: 1800
+    hint:
+      resources: {lifecycle-io: 1}
+      est_duration_s: 230
+      classification: latency-bound
+      preferred_inner_jobs: 2
+      rss_baseline_bytes: 1073741824
+
+  - group: namespace
+    job: shard-4
+    desc: lifecycle namespace shard 5 of 6
+    cmd: >-
+      cd py && if command -v unshare >/dev/null 2>&1 &&
+      unshare --user --map-root-user --pid --fork --mount-proc true >/dev/null 2>&1; then
+      test_python="$(python3 -c 'import os, sys; print(os.path.realpath(sys.executable))')" &&
+      exec unshare --user --map-root-user --pid --fork --mount-proc "$test_python"
+      ../scripts/pid_namespace_init.py -- python3 ../scripts/run_pytest_shard.py --shard 4/6 --
+      -q -c pyproject.toml --rootdir=. wrkslots/tests/test_lifecycle.py -m 'not ordinary_environment';
+      else exec python3 ../scripts/run_pytest_shard.py --shard 4/6 -- -q -c pyproject.toml
+      --rootdir=. wrkslots/tests/test_lifecycle.py -m 'not ordinary_environment'; fi
+    jobs_flag: ""
+    labels: [validation-workspace, validation-pytest-shards, validation-python-namespace-tests, component-wrkslots]
+    timeout: 900
+    cpu_timeout: 1800
+    hint:
+      resources: {lifecycle-io: 1}
+      est_duration_s: 230
+      classification: latency-bound
+      preferred_inner_jobs: 2
+      rss_baseline_bytes: 1073741824
+
+  - group: namespace
+    job: shard-5
+    desc: lifecycle namespace shard 6 of 6
+    cmd: >-
+      cd py && if command -v unshare >/dev/null 2>&1 &&
+      unshare --user --map-root-user --pid --fork --mount-proc true >/dev/null 2>&1; then
+      test_python="$(python3 -c 'import os, sys; print(os.path.realpath(sys.executable))')" &&
+      exec unshare --user --map-root-user --pid --fork --mount-proc "$test_python"
+      ../scripts/pid_namespace_init.py -- python3 ../scripts/run_pytest_shard.py --shard 5/6 --
+      -q -c pyproject.toml --rootdir=. wrkslots/tests/test_lifecycle.py -m 'not ordinary_environment';
+      else exec python3 ../scripts/run_pytest_shard.py --shard 5/6 -- -q -c pyproject.toml
+      --rootdir=. wrkslots/tests/test_lifecycle.py -m 'not ordinary_environment'; fi
+    jobs_flag: ""
+    labels: [validation-workspace, validation-pytest-shards, validation-python-namespace-tests, component-wrkslots]
+    timeout: 900
+    cpu_timeout: 1800
+    hint:
+      resources: {lifecycle-io: 1}
+      est_duration_s: 230
+      classification: latency-bound
+      preferred_inner_jobs: 2
+      rss_baseline_bytes: 1073741824
+
+  - group: host
+    job: shard-0
+    desc: lifecycle host-visible shard 1 of 3
+    cmd: >-
+      cd py && python3 ../scripts/run_pytest_shard.py --shard 0/3 --
+      -q -c pyproject.toml --rootdir=. wrkslots/tests/test_lifecycle.py -m ordinary_environment
+    jobs_flag: ""
+    labels: [validation-workspace, validation-pytest-shards, component-wrkslots]
+    timeout: 900
+    cpu_timeout: 1800
+    hint:
+      resources: {host-lifecycle: 1, lifecycle-io: 1}
+      est_duration_s: 225
+      classification: latency-bound
+      preferred_inner_jobs: 2
+      rss_baseline_bytes: 1073741824
+
+  - group: host
+    job: shard-1
+    desc: lifecycle host-visible shard 2 of 3
+    cmd: >-
+      cd py && python3 ../scripts/run_pytest_shard.py --shard 1/3 --
+      -q -c pyproject.toml --rootdir=. wrkslots/tests/test_lifecycle.py -m ordinary_environment
+    jobs_flag: ""
+    labels: [validation-workspace, validation-pytest-shards, component-wrkslots]
+    timeout: 900
+    cpu_timeout: 1800
+    hint:
+      resources: {host-lifecycle: 1, lifecycle-io: 1}
+      est_duration_s: 225
+      classification: latency-bound
+      preferred_inner_jobs: 2
+      rss_baseline_bytes: 1073741824
+
+  - group: host
+    job: shard-2
+    desc: lifecycle host-visible shard 3 of 3
+    cmd: >-
+      cd py && python3 ../scripts/run_pytest_shard.py --shard 2/3 --
+      -q -c pyproject.toml --rootdir=. wrkslots/tests/test_lifecycle.py -m ordinary_environment
+    jobs_flag: ""
+    labels: [validation-workspace, validation-pytest-shards, component-wrkslots]
+    timeout: 900
+    cpu_timeout: 1800
+    hint:
+      resources: {host-lifecycle: 1, lifecycle-io: 1}
+      est_duration_s: 225
+      classification: latency-bound
+      preferred_inner_jobs: 2
+      rss_baseline_bytes: 1073741824

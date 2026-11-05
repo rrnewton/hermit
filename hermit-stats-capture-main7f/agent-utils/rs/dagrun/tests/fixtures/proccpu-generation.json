@@ -1,0 +1,469 @@
+[
+  {
+    "name": "named-group-own-and-waited",
+    "rows": [
+      {
+        "pid": 100,
+        "group": 100,
+        "ticks": 40,
+        "poll": 0,
+        "state": "R"
+      },
+      {
+        "pid": 101,
+        "group": 100,
+        "ticks": 30,
+        "poll": 0,
+        "state": "R"
+      },
+      {
+        "pid": 200,
+        "group": 200,
+        "ticks": 39996,
+        "poll": 0,
+        "state": "R"
+      }
+    ],
+    "expected": 70
+  },
+  {
+    "name": "measured-zero",
+    "rows": [
+      {
+        "pid": 100,
+        "group": 100,
+        "ticks": 0,
+        "poll": 0,
+        "state": "R"
+      }
+    ],
+    "expected": 0
+  },
+  {
+    "name": "absent-is-unknown",
+    "rows": [
+      {
+        "pid": 200,
+        "group": 200,
+        "ticks": 10,
+        "poll": 0,
+        "state": "R"
+      }
+    ],
+    "expected": null
+  },
+  {
+    "name": "parent-after-child-credit",
+    "rows": [
+      {
+        "pid": 101,
+        "group": 100,
+        "ticks": 5,
+        "poll": 1,
+        "state": "X"
+      },
+      {
+        "pid": 100,
+        "group": 100,
+        "ticks": 5,
+        "poll": 0,
+        "state": "R"
+      }
+    ],
+    "expected": 5
+  },
+  {
+    "name": "unreaped-zombie-keeps-cpu",
+    "rows": [
+      {
+        "pid": 100,
+        "group": 100,
+        "ticks": 2,
+        "poll": 0,
+        "state": "R"
+      },
+      {
+        "pid": 101,
+        "group": 100,
+        "ticks": 5,
+        "poll": 1,
+        "state": "Z"
+      }
+    ],
+    "expected": 7
+  },
+  {
+    "name": "fresh-counter-never-summed",
+    "rows": [
+      {
+        "pid": 101,
+        "group": 100,
+        "ticks": 5,
+        "poll": 1,
+        "state": "Z",
+        "fresh_ticks": 500
+      }
+    ],
+    "expected": 5
+  },
+  {
+    "name": "released-stat-esrch",
+    "rows": [
+      {
+        "pid": 101,
+        "group": 100,
+        "ticks": 5,
+        "poll": 1,
+        "state": "gone"
+      },
+      {
+        "pid": 100,
+        "group": 100,
+        "ticks": 5,
+        "poll": 0,
+        "state": "R"
+      }
+    ],
+    "expected": 5
+  },
+  {
+    "name": "nested-transfer",
+    "rows": [
+      {
+        "pid": 102,
+        "group": 100,
+        "ticks": 3,
+        "poll": 1,
+        "state": "gone"
+      },
+      {
+        "pid": 101,
+        "group": 100,
+        "ticks": 6,
+        "poll": 1,
+        "state": "X"
+      },
+      {
+        "pid": 100,
+        "group": 100,
+        "ticks": 9,
+        "poll": 0,
+        "state": "R"
+      }
+    ],
+    "expected": 9
+  },
+  {
+    "name": "parallel-credit",
+    "rows": [
+      {
+        "pid": 101,
+        "group": 100,
+        "ticks": 2,
+        "poll": 1,
+        "state": "X"
+      },
+      {
+        "pid": 102,
+        "group": 100,
+        "ticks": 3,
+        "poll": 1,
+        "state": "gone"
+      },
+      {
+        "pid": 100,
+        "group": 100,
+        "ticks": 6,
+        "poll": 0,
+        "state": "R"
+      }
+    ],
+    "expected": 6
+  },
+  {
+    "name": "hup-zombie",
+    "rows": [
+      {
+        "pid": 101,
+        "group": 100,
+        "ticks": 5,
+        "poll": 17,
+        "state": "Z"
+      }
+    ],
+    "expected": 5
+  },
+  {
+    "name": "live-worker-after-leader-exit",
+    "rows": [
+      {
+        "pid": 100,
+        "group": 100,
+        "ticks": 8,
+        "poll": 0,
+        "state": "Z"
+      }
+    ],
+    "expected": 8
+  },
+  {
+    "name": "all-members-gone",
+    "rows": [
+      {
+        "pid": 100,
+        "group": 100,
+        "ticks": 8,
+        "poll": 1,
+        "state": "gone"
+      }
+    ],
+    "expected": null
+  },
+  {
+    "name": "held-stat-identity-mismatch",
+    "rows": [
+      {
+        "pid": 100,
+        "group": 100,
+        "ticks": 8,
+        "poll": 1,
+        "state": "Z",
+        "fresh_pid": 101
+      }
+    ],
+    "error": true
+  },
+  {
+    "name": "aggregate-overflow",
+    "rows": [
+      {
+        "pid": 100,
+        "group": 100,
+        "ticks": 18446744073709551615,
+        "poll": 0,
+        "state": "R"
+      },
+      {
+        "pid": 101,
+        "group": 100,
+        "ticks": 1,
+        "poll": 0,
+        "state": "R"
+      }
+    ],
+    "error": true
+  },
+  {
+    "name": "terminal-ambiguous-D",
+    "rows": [
+      {
+        "pid": 100,
+        "group": 100,
+        "ticks": 8,
+        "poll": 1,
+        "state": "D"
+      }
+    ],
+    "error": true
+  },
+  {
+    "name": "terminal-ambiguous-I",
+    "rows": [
+      {
+        "pid": 100,
+        "group": 100,
+        "ticks": 8,
+        "poll": 1,
+        "state": "I"
+      }
+    ],
+    "error": true
+  },
+  {
+    "name": "terminal-ambiguous-P",
+    "rows": [
+      {
+        "pid": 100,
+        "group": 100,
+        "ticks": 8,
+        "poll": 1,
+        "state": "P"
+      }
+    ],
+    "error": true
+  },
+  {
+    "name": "terminal-ambiguous-R",
+    "rows": [
+      {
+        "pid": 100,
+        "group": 100,
+        "ticks": 8,
+        "poll": 1,
+        "state": "R"
+      }
+    ],
+    "error": true
+  },
+  {
+    "name": "terminal-ambiguous-S",
+    "rows": [
+      {
+        "pid": 100,
+        "group": 100,
+        "ticks": 8,
+        "poll": 1,
+        "state": "S"
+      }
+    ],
+    "error": true
+  },
+  {
+    "name": "terminal-ambiguous-T",
+    "rows": [
+      {
+        "pid": 100,
+        "group": 100,
+        "ticks": 8,
+        "poll": 1,
+        "state": "T"
+      }
+    ],
+    "error": true
+  },
+  {
+    "name": "terminal-ambiguous-t",
+    "rows": [
+      {
+        "pid": 100,
+        "group": 100,
+        "ticks": 8,
+        "poll": 1,
+        "state": "t"
+      }
+    ],
+    "error": true
+  },
+  {
+    "name": "terminal-ambiguous-?",
+    "rows": [
+      {
+        "pid": 100,
+        "group": 100,
+        "ticks": 8,
+        "poll": 1,
+        "state": "?"
+      }
+    ],
+    "error": true
+  },
+  {
+    "name": "unexpected-poll-4",
+    "rows": [
+      {
+        "pid": 100,
+        "group": 100,
+        "ticks": 8,
+        "poll": 4,
+        "state": "Z"
+      }
+    ],
+    "error": true
+  },
+  {
+    "name": "unexpected-poll-8",
+    "rows": [
+      {
+        "pid": 100,
+        "group": 100,
+        "ticks": 8,
+        "poll": 8,
+        "state": "Z"
+      }
+    ],
+    "error": true
+  },
+  {
+    "name": "unexpected-poll-32",
+    "rows": [
+      {
+        "pid": 100,
+        "group": 100,
+        "ticks": 8,
+        "poll": 32,
+        "state": "Z"
+      }
+    ],
+    "error": true
+  },
+  {
+    "name": "fresh-error-EACCES",
+    "rows": [
+      {
+        "pid": 100,
+        "group": 100,
+        "ticks": 8,
+        "poll": 1,
+        "state": "error",
+        "error": "EACCES"
+      }
+    ],
+    "error": true
+  },
+  {
+    "name": "fresh-error-EIO",
+    "rows": [
+      {
+        "pid": 100,
+        "group": 100,
+        "ticks": 8,
+        "poll": 1,
+        "state": "error",
+        "error": "EIO"
+      }
+    ],
+    "error": true
+  },
+  {
+    "name": "fresh-error-malformed",
+    "rows": [
+      {
+        "pid": 100,
+        "group": 100,
+        "ticks": 8,
+        "poll": 1,
+        "state": "error",
+        "error": "malformed"
+      }
+    ],
+    "error": true
+  },
+  {
+    "name": "fresh-error-deadline",
+    "rows": [
+      {
+        "pid": 100,
+        "group": 100,
+        "ticks": 8,
+        "poll": 1,
+        "state": "error",
+        "error": "deadline"
+      }
+    ],
+    "error": true
+  },
+  {
+    "name": "fresh-error-resource",
+    "rows": [
+      {
+        "pid": 100,
+        "group": 100,
+        "ticks": 8,
+        "poll": 1,
+        "state": "error",
+        "error": "resource"
+      }
+    ],
+    "error": true
+  }
+]

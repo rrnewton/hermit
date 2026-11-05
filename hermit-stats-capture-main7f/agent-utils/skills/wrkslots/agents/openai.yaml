@@ -1,0 +1,4 @@
+interface:
+  display_name: "Wrkslots"
+  short_description: "Safely manage one worktree slot per agent"
+  default_prompt: "Use $wrkslots to create, inspect, record the handoff for, or remove an isolated worktree slot safely."

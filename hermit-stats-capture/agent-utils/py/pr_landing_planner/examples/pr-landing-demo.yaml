@@ -1,0 +1,79 @@
+# A self-contained FakeHost fixture demonstrating every planner outcome, network-free.
+#   pr-landing-planner plan --fixture pr-landing-demo.yaml --flaky-signatures flaky-signatures.yaml
+#
+# Expected: #1043 land-now; #987 rebase-then-land (behind + conflicts with #942); #942
+# refire-stale-gate; #1050 wait (evaluate-once race); #1049 refire-ci (flaky, WITH the signatures
+# file); #2001/#2002 escalate-runner-outage (systemic, >= outage-min-prs); #3001 held (draft);
+# #3002 held depends-on #3001 via base-ref stacking.
+repo: OWNER/NAME
+base: integration
+prs:
+  - number: 1043
+    title: fast, fresh, all green
+    head_ref: feat-a
+    additions: 10
+    labels: [validated-locally, p1]
+    changed_files: [src/a.rs]
+    checks:
+      - {name: CI, status: COMPLETED, conclusion: SUCCESS}
+      - {name: merge-gate, status: COMPLETED, conclusion: SUCCESS}
+  - number: 987
+    title: green but 6 behind base and conflicts with 942
+    head_ref: feat-b
+    additions: 40
+    commits_behind: 6
+    changed_files: [src/shared.rs, src/b.rs]
+    checks:
+      - {name: CI, status: COMPLETED, conclusion: SUCCESS}
+      - {name: merge-gate, status: COMPLETED, conclusion: SUCCESS}
+  - number: 942
+    title: CI green, gate stale (ds-4171)
+    head_ref: feat-c
+    changed_files: [src/shared.rs, src/c.rs]
+    checks:
+      - {name: CI, status: COMPLETED, conclusion: SUCCESS}
+      - {name: merge-gate, status: COMPLETED, conclusion: FAILURE, text: stale result}
+  - number: 1050
+    title: gate fired while CI queued (ds-xdc7m9)
+    head_ref: feat-d
+    changed_files: [src/d.rs]
+    checks:
+      - {name: CI, status: IN_PROGRESS, conclusion: ""}
+      - {name: merge-gate, status: COMPLETED, conclusion: FAILURE, text: "Full CI still queued; rerun after CI completes"}
+  - number: 1049
+    title: red on wasm-core (flaky when signatured)
+    head_ref: feat-e
+    changed_files: [src/e.rs]
+    checks:
+      - {name: wasm-core, status: COMPLETED, conclusion: FAILURE, text: browser flake}
+      - {name: merge-gate, status: COMPLETED, conclusion: SUCCESS}
+  - number: 2001
+    title: merge-gate job never ran (ds-69ih3r)
+    head_ref: feat-f
+    changed_files: [src/f.rs]
+    checks:
+      - {name: CI, status: COMPLETED, conclusion: SUCCESS}
+      - {name: merge-gate, status: COMPLETED, conclusion: FAILURE, text: "BlobNotFound", duration_secs: 3}
+  - number: 2002
+    title: merge-gate job never ran on another branch (ds-69ih3r)
+    head_ref: feat-g
+    changed_files: [src/g.rs]
+    checks:
+      - {name: CI, status: COMPLETED, conclusion: SUCCESS}
+      - {name: merge-gate, status: COMPLETED, conclusion: STARTUP_FAILURE, text: "no runner"}
+  - number: 3001
+    title: draft WIP (held)
+    head_ref: feat-h
+    is_draft: true
+    changed_files: [src/h.rs]
+    checks:
+      - {name: CI, status: COMPLETED, conclusion: SUCCESS}
+  - number: 3002
+    title: stacked on the draft (held, depends-on-held)
+    head_ref: feat-i
+    base_ref: feat-h
+    changed_files: [src/i.rs]
+    checks:
+      - {name: CI, status: COMPLETED, conclusion: SUCCESS}
+conflicts:
+  - {a: 987, b: 942, paths: [src/shared.rs]}

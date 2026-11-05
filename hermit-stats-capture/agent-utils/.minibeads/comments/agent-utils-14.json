@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-14-c12c46bfe5c6",
+    "issue_id": "agent-utils-14",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Final live acceptance, 2026-09-25 23:48\u201323:51Z. One sequential, read-only session on the deployed 1a9baed build. The served voice.js matched the landed hash. The front-door sign-in hop was bypassed: the page and websocket went through the local ingress, with the websocket path and read-scope credential unchanged. The front-door hop is covered by the owner's signed-in phone test. #14 voice-agent-prompt: PASS. The served profile uses the read prompt variant, version 2, and its fingerprint matches the pinned value. The agent behaved as that prompt requires. It named only read chat tools as chat tools, said none can post, summarized from a read tool call, and declined the send request in T3. Zero posts. Closing.",
+    "created_at": "2026-09-25T23:54:35.158742000Z",
+    "updated_at": "2026-09-25T23:54:35.158742000Z"
+  }
+]

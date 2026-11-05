@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wrkslots"
+version = "0.6.0"
+description = "Manage crash-recoverable Git worktree slots for coordinating coding agents."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Ryan Newton" }]
+keywords = ["git", "worktree", "agents", "coordination", "recovery"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: POSIX :: Linux",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["mypy", "pytest"]
+
+[project.urls]
+Repository = "https://github.com/rrnewton/agent-utils"
+Issues = "https://github.com/rrnewton/agent-utils/issues"
+
+[project.scripts]
+wrkslots = "wrkslots.cli:main"
+
+[tool.setuptools]
+packages = ["wrkslots"]
+package-dir = { wrkslots = "." }
+include-package-data = false
+
+[tool.setuptools.package-data]
+wrkslots = ["py.typed", "README.md", "USER_GUIDE.md", "examples/*.py"]

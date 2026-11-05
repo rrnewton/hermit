@@ -1,0 +1,12 @@
+# tick-hub reminders for the coordinator. bin/tick-deliver runs one tick from the harness root
+# every 15 minutes and sends any ACTION lines to the coordinator with agentctl.
+# Preview without changing state: agent-utils/bin/tick-hub tick --config ops.yaml
+reminders:
+  - name: owner_status
+    # Slightly under an hour: the timer fires on a 15-minute grid with up to a minute of slack,
+    # so a cadence of exactly 3600 seconds could slip to two hours.
+    cadence_secs: 3540
+    emit:
+      kind: action
+      skill: owner-status
+      title: "send the owner a short status summary: what landed, what is in flight, what is blocked"

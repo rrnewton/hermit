@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# TRACKED helper: print a deterministic fingerprint of the agent-utils Rust SOURCE tree.
+#
+# SINGLE SOURCE OF TRUTH for source<->binary provenance. The tracked rs/bin Cargo launcher uses
+# this fingerprint before and after a cached workspace build, then stores it beside the resulting
+# target binary. Two independent hash implementations would themselves be the defect class this
+# guards against, so there is deliberately only one.
+#
+# Output (stdout): a single line, "<64-hex sha256>", covering the WORKING-TREE contents of every
+# tracked or nonignored untracked file under rs/ EXCEPT the launcher links in rs/bin and rs/target
+# outputs. Including untracked source is essential during development: a newly created module must
+# invalidate an older binary before its first commit. Any manifest, lockfile, or source-content
+# change refreshes the stamp.
+# Exits nonzero (no output) if the rs/ source cannot be enumerated, so callers fail closed.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../.." && pwd)"
+cd "$ROOT"
+
+# Include cached paths plus nonignored untracked paths. NUL delimiters preserve every legal Git
+# filename, and the pinned bytewise sort makes the path stream stable everywhere. Do not feed Git
+# through process substitution: bash reports `mapfile`'s status, not the producer's, so a Git that
+# emitted a partial path list and then failed could otherwise produce a trusted partial fingerprint.
+scratch="$(mktemp -d "${TMPDIR:-/tmp}/agent-utils-rs-fingerprint.XXXXXXXX")"
+trap 'rm -rf -- "$scratch"' EXIT
+if ! git ls-files -z --cached --others --exclude-standard -- \
+    rs ':!rs/bin' ':!rs/target' >"$scratch/paths.raw"; then
+    echo "rs-source-fingerprint: could not enumerate rs/ source under $ROOT" >&2
+    exit 3
+fi
+if ! LC_ALL=C sort -z "$scratch/paths.raw" >"$scratch/paths.sorted"; then
+    echo "rs-source-fingerprint: could not sort rs/ source paths under $ROOT" >&2
+    exit 3
+fi
+mapfile -d '' -t files <"$scratch/paths.sorted"
+if ((${#files[@]} == 0)); then
+    echo "rs-source-fingerprint: no rs/ source files found under $ROOT (not a checkout?)" >&2
+    exit 3
+fi
+
+# One sha256sum process emits both content digests and paths (so renames also move the
+# fingerprint); hashing that deterministic stream avoids a subprocess per source file.
+sha256sum -- "${files[@]}" | sha256sum | cut -d' ' -f1

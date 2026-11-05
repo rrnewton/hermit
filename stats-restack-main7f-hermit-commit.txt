@@ -1,0 +1,21 @@
+Use the shared DBT statistics capture owner
+
+[hermit2, dbt, gpt-6-astra, devbig014, role=impl]
+
+Plain Language Summary and Project Impact
+
+Hermit now uses Reverie's shared statistics sink and captured-record reader instead of owning another allocation/read/codec implementation. Strict verification keeps its existing missing, empty, unreadable, malformed and inconsistent-statistics refusals; saved runs retain the exact raw records. The shared sink retains Hermit's existing outer allocation, temporary-directory prefix, bind declaration and post-run completion boundary.
+
+Task: Package D shared statistics capture
+
+Determinism
+
+Native measurements and aggregation are unchanged. Cleanup, protected evidence and latch refusal still precede statistics policy; records are not replaced by an empty or invented measurement. The existing default-feature test gate and strict saved/offline assertions remain intact.
+
+Linux Semantics
+
+Preserve TMPDIR placement, directory-name shape, records.bin leaf, container bind and caller-owned lifetime. Reader streaming/cancellation, inherited input, status, process cleanup and primary failure order use their existing routes. The incoming output-future stack repair is unchanged.
+
+Validation
+
+The two consumer after-images exactly match the reviewed parked successor 342daf53c1691da42ae7067850540a06bec504b4, including its cfg-local test import correction. Every pin advances from 16ffab7c558c47c78c43aa8e0e4242eb2deeeb3d to dde3f9da33a0474d0fa9b273a25100fc0db4d751; incoming manifest features and SDK history are preserved. Actual tracked reverie-dbt enumeration is 953 files, while native/SDK recipe source is unchanged. Diff whitespace and staged-path audits passed. New-pair plain Cargo execution is pending; earlier results remain bound to their original heads. No full-validation or fresh native/cohort claim is made here.

@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <title>Vibe Talk</title>
+  <desc>A mint speech bubble with a navy sound wave on a dark navy background.</desc>
+  <defs>
+    <linearGradient id="bubble" x1="128" y1="128" x2="382" y2="354" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#99eadb"/>
+      <stop offset="1" stop-color="#50c7b6"/>
+    </linearGradient>
+  </defs>
+  <!-- Full bleed background; the bubble and wave fit within the maskable safe circle. -->
+  <path fill="#152638" d="M0 0h512v512H0z"/>
+  <path fill="url(#bubble)" d="M176 128h160a64 64 0 0 1 64 64v86a64 64 0 0 1-64 64H229l-69 48c-9 6-19-2-16-12l12-40a64 64 0 0 1-44-60v-86a64 64 0 0 1 64-64Z"/>
+  <g fill="none" stroke="#152638" stroke-width="18" stroke-linecap="round">
+    <path d="M184 218v36"/>
+    <path d="M220 198v76"/>
+    <path d="M256 180v112"/>
+    <path d="M292 204v64"/>
+    <path d="M328 220v32"/>
+  </g>
+</svg>

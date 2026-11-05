@@ -1,0 +1,3 @@
+source `dirname $0`/util.sh
+record invalid_interpreter$bitness
+debug_gdb_only invalid_interpreter

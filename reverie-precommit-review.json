@@ -1,0 +1,14 @@
+{
+  "base": "e1ecaeb31a0bb1f8b86f36e769296ab6a7de3782",
+  "paths": [
+    "reverie-dbt/src/backend_stats.rs",
+    "reverie-dbt/src/launcher.rs",
+    "reverie-dbt/src/launcher/tests/stats_capture.rs",
+    "reverie-dbt/src/lib.rs"
+  ],
+  "numstat": "82\t0\treverie-dbt/src/backend_stats.rs\n47\t29\treverie-dbt/src/launcher.rs\n256\t0\treverie-dbt/src/launcher/tests/stats_capture.rs\n1\t0\treverie-dbt/src/lib.rs\n",
+  "status": "M  reverie-dbt/src/backend_stats.rs\nM  reverie-dbt/src/launcher.rs\nA  reverie-dbt/src/launcher/tests/stats_capture.rs\nM  reverie-dbt/src/lib.rs\n",
+  "inventory_before": 952,
+  "inventory_after": 953,
+  "new_file_sha256": "468efa01acfe556c11b463fd6c160ce9644d9dd01a6a33d8589cbd42c581c609"
+}

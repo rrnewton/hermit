@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# TRACKED, deterministic engine resolver for repository-local tool commands.
+#
+# The paired commands (`dagrun`, `cpuset-alloc`, `tick-hub`, `pr-landing-planner`, `herdr-run`, `herdr-agent`, and `agentctl`) have tracked Python and Cargo-backed Rust launchers under their respective `*/bin`
+# directories. `wrkviz`, `parallel-experiment-runner`, and `wrkslots` are intentionally Python-only.
+# Every tracked command link in this directory points here, so the top-level `./bin` symlink exposes
+# one consistent command surface after any setup mode.
+#
+# Contract enforced here
+# ----------------------
+#   * DETERMINISTIC + TRACKED default: with no override, ALWAYS the tracked Python entrypoint.
+#   * Rust is opt-in ONLY, via DAGRUN_ENGINE=rust. Its tracked launcher asks Cargo to validate the
+#     workspace cache and provenance before executing; it never silently falls back.
+#   * LOGS WHICH ENGINE WON on every invocation (one stderr line), so the resolved engine and its
+#     exact path are always visible in logs.
+#
+# The resolved tool name is this script's invocation basename. The tracked links for `dagrun`,
+# `cpuset-alloc`, `pr-landing-planner`, `tick-hub`, `wrkviz`,
+# `parallel-experiment-runner`, `wrkslots`, `herdr-run`, and `herdr-agent` all point here.
+set -euo pipefail
+
+# Locate the agent-utils root from the resolver's REAL path (follow the symlink chain), independent
+# of how the tool was invoked. common/bin/engine-resolver -> root is two levels up.
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"
+
+TOOL="$(basename "$0")"
+if [[ "$TOOL" == "engine-resolver" ]]; then
+    echo "engine-resolver: invoke via a tracked tool symlink, not directly" >&2
+    exit 2
+fi
+
+# Deterministic default: the TRACKED Python entrypoint. Rust is explicit opt-in only.
+ENGINE="${DAGRUN_ENGINE:-python}"
+
+case "$ENGINE" in
+    python|py)
+        TARGET="$ROOT/py/bin/$TOOL"
+        if [[ ! -e "$TARGET" ]]; then
+            echo "[$TOOL] engine=python: no tracked entrypoint at py/bin/$TOOL" >&2
+            exit 127
+        fi
+        echo "[$TOOL] engine=python (tracked entrypoint: py/bin/$TOOL)" >&2
+        exec "${CI_HUB_PYTHON:-python3}" "$TARGET" "$@"
+        ;;
+    rust|rs)
+        # The tracked rs/bin link invokes the shared Cargo/provenance launcher. It checks the real
+        # workspace cache on every invocation, rejects replaced artifacts, and rebuilds stale source
+        # before exec. Never fall back to Python silently; that would re-hide an engine mismatch.
+        TARGET="$ROOT/rs/bin/$TOOL"
+        if [[ ! -x "$TARGET" ]]; then
+            echo "[$TOOL] engine=rust requested but no tracked launcher exists at rs/bin/$TOOL. Refusing to silently fall back to Python." >&2
+            exit 127
+        fi
+        echo "[$TOOL] engine=rust (tracked Cargo launcher: ${TARGET#"$ROOT"/})" >&2
+        unset AGENT_UTILS_RS_ENSURE_ONLY
+        exec "$TARGET" "$@"
+        ;;
+    *)
+        echo "[$TOOL] DAGRUN_ENGINE='$ENGINE' is invalid (want 'python' or 'rust')" >&2
+        exit 2
+        ;;
+esac

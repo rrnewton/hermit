@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-199-c60d5839697",
+    "issue_id": "agent-utils-199",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Closed: landed locally (8ae393c1; push awaiting the owner's OK) and deployed on devbig014. Remove now hides a configured channel in the server's store; Settings offers Show again, and re-adding it from the channel browser also brings it back. Unverified on the phone.",
+    "created_at": "2026-10-04T16:03:06.898573525Z",
+    "updated_at": "2026-10-04T16:03:06.898573525Z"
+  }
+]

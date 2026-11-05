@@ -1,0 +1,48 @@
+fn run_dbt_verify_replays_stdin_bytes_and_eof() {
+    if dbt_unavailable("run_dbt_verify_replays_stdin_bytes_and_eof") {
+        return;
+    }
+    let _guard = hermit_run_guard();
+    let root = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let report_path = root.path().join("verdict.json");
+    let args = [
+        "--backend=dbt",
+        "run",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        report_path.to_str().unwrap(),
+        "--",
+        "/bin/cat",
+    ];
+    // The existing pipe helper closes its writer after these bytes. Cat must
+    // read that EOF in both executions; output must be emitted only once.
+    let input = b"first\0line\nlast-without-newline\xff";
+    let output = hermit_with_stdin(&args, input);
+    assert_success(&output, &args);
+    assert_eq!(output.stdout, input);
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(report_path).unwrap()).unwrap();
+    assert_eq!(report["verdict"], "matched", "{report}");
+    assert_eq!(report["bitwise_parity"], true, "{report}");
+    assert_eq!(report["comparison"]["strictness"], "canonical");
+    assert_eq!(report["comparison"]["compare_io_buffers"], true);
+    for side in ["left", "right"] {
+        assert_eq!(report["compared_outputs"][side]["exit_code"], 0, "{report}");
+        assert_eq!(
+            report["compared_outputs"][side]["stdout_bytes"],
+            input.len(),
+            "{report}"
+        );
+        assert_eq!(
+            report["compared_outputs"][side]["stdout_sha256"],
+            detcore::Digest::new(input).to_string(),
+            "{report}"
+        );
+        assert!(
+            report["compared_log_messages"][side].as_u64().unwrap() > 0,
+            "{report}"
+        );
+    }
+}

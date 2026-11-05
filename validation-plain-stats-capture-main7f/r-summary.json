@@ -1,0 +1,70 @@
+{
+  "head": "dde3f9da33a0474d0fa9b273a25100fc0db4d751",
+  "commands": [
+    {
+      "stem": "r-metadata",
+      "exit": 0,
+      "start": "2026-10-14T13:11:15Z",
+      "end": "2026-10-14T13:11:16Z",
+      "summary": []
+    },
+    {
+      "stem": "r-capture-focused",
+      "exit": 0,
+      "start": "2026-10-14T13:11:31Z",
+      "end": "2026-10-14T13:11:50Z",
+      "summary": [
+        "test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 153 filtered out; finished in 0.03s"
+      ]
+    },
+    {
+      "stem": "r-core-full",
+      "exit": 0,
+      "start": "2026-10-14T13:12:08Z",
+      "end": "2026-10-14T13:12:14Z",
+      "summary": [
+        "test result: ok. 112 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.35s"
+      ]
+    },
+    {
+      "stem": "r-dbt-default",
+      "exit": 0,
+      "start": "2026-10-14T13:12:39Z",
+      "end": "2026-10-14T13:12:44Z",
+      "summary": [
+        "test result: ok. 144 passed; 0 failed; 15 ignored; 0 measured; 0 filtered out; finished in 5.52s"
+      ]
+    },
+    {
+      "stem": "r-dbt-no-default",
+      "exit": 0,
+      "start": "2026-10-14T13:13:00Z",
+      "end": "2026-10-14T13:13:14Z",
+      "summary": [
+        "test result: ok. 137 passed; 0 failed; 15 ignored; 0 measured; 0 filtered out; finished in 5.47s"
+      ]
+    },
+    {
+      "stem": "r-clippy",
+      "exit": 0,
+      "start": "2026-10-14T13:13:31Z",
+      "end": "2026-10-14T13:13:43Z",
+      "summary": []
+    },
+    {
+      "stem": "r-doc",
+      "exit": 0,
+      "start": "2026-10-14T13:14:23Z",
+      "end": "2026-10-14T13:14:30Z",
+      "summary": []
+    },
+    {
+      "stem": "r-fmt",
+      "exit": 0,
+      "start": "2026-10-14T13:17:24Z",
+      "end": "2026-10-14T13:17:32Z",
+      "summary": []
+    }
+  ],
+  "scope": "Component/library checks. Fake launcher tests are not native DR or RPC evidence; ignored tests are uncredited."
+}

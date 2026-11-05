@@ -1,0 +1,7 @@
+   Compiling hermit v0.4.1 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f/hermit-cli)
+   Compiling reverie-kvm v0.4.1 (https://github.com/rrnewton/reverie.git?rev=dde3f9da33a0474d0fa9b273a25100fc0db4d751#dde3f9da)
+   Compiling reverie-ptrace v0.4.1 (https://github.com/rrnewton/reverie.git?rev=dde3f9da33a0474d0fa9b273a25100fc0db4d751#dde3f9da)
+   Compiling reverie-sabre-stats v0.4.1 (https://github.com/rrnewton/reverie.git?rev=dde3f9da33a0474d0fa9b273a25100fc0db4d751#dde3f9da)
+   Compiling reverie-inguest v0.4.1 (https://github.com/rrnewton/reverie.git?rev=dde3f9da33a0474d0fa9b273a25100fc0db4d751#dde3f9da)
+   Compiling reverie-liteinst v0.4.1 (https://github.com/rrnewton/reverie.git?rev=dde3f9da33a0474d0fa9b273a25100fc0db4d751#dde3f9da)
+    Finished `validate` profile [optimized] target(s) in 2m 17s

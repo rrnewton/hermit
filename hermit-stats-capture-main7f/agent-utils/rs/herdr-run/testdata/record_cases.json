@@ -1,0 +1,626 @@
+{
+  "_about": "Golden cases for run records and the session cache (sweep.py, reap.py, session.py / sweep.rs, session.rs): reap scope, the evidence folded from records, and which cache entries load. Both unit-test suites load this file.",
+  "scope_config": {
+    "workspace": "cmds",
+    "tab_name": "{agent}"
+  },
+  "scope": [
+    [
+      "p1",
+      [
+        {
+          "pane_id": "p1",
+          "agent": "kvm",
+          "tab": {
+            "id": "t1",
+            "label": "kvm"
+          },
+          "workspace": {
+            "id": "w1",
+            "label": "cmds"
+          }
+        }
+      ],
+      [
+        true,
+        "t1",
+        "kvm",
+        "cmds"
+      ]
+    ],
+    [
+      "p1",
+      [
+        {
+          "pane_id": "p1",
+          "agent": "kvm",
+          "tab": {
+            "id": 5,
+            "label": "kvm"
+          },
+          "workspace": {
+            "id": "w1",
+            "label": "cmds"
+          }
+        }
+      ],
+      [
+        false,
+        null,
+        null,
+        null
+      ]
+    ],
+    [
+      "p1",
+      [
+        {
+          "pane_id": "p1",
+          "agent": "kvm",
+          "tab": "x",
+          "workspace": {
+            "id": "w1",
+            "label": "cmds"
+          }
+        }
+      ],
+      [
+        false,
+        null,
+        null,
+        null
+      ]
+    ],
+    [
+      "p1",
+      [
+        {
+          "pane_id": "p1",
+          "agent": "kvm",
+          "workspace": {
+            "id": "w1",
+            "label": "cmds"
+          }
+        }
+      ],
+      [
+        false,
+        null,
+        null,
+        null
+      ]
+    ],
+    [
+      "p1",
+      [
+        {
+          "pane_id": "p1",
+          "agent": 7,
+          "tab": {
+            "id": "t1",
+            "label": "kvm"
+          },
+          "workspace": {
+            "label": "cmds"
+          }
+        }
+      ],
+      [
+        false,
+        null,
+        null,
+        null
+      ]
+    ],
+    [
+      "p1",
+      [
+        {
+          "pane_id": "p1",
+          "agent": "kvm",
+          "tab": {
+            "id": "t1",
+            "label": "kvm"
+          },
+          "workspace": {
+            "label": "other"
+          }
+        }
+      ],
+      [
+        false,
+        "t1",
+        "kvm",
+        "other"
+      ]
+    ],
+    [
+      "p1",
+      [
+        {
+          "pane_id": "p1",
+          "agent": "o'neil",
+          "tab": {
+            "id": "t1",
+            "label": "o'neil-old"
+          },
+          "workspace": {
+            "label": "cmds"
+          }
+        }
+      ],
+      [
+        false,
+        "t1",
+        "o'neil-old",
+        "cmds"
+      ]
+    ],
+    [
+      "p1",
+      [
+        {
+          "pane_id": "p1",
+          "agent": "kvm",
+          "tab": {
+            "label": "kvm"
+          },
+          "workspace": {
+            "label": "cmds"
+          }
+        },
+        {
+          "pane_id": "p1",
+          "agent": "new",
+          "tab": {
+            "id": "t9",
+            "label": "new"
+          },
+          "workspace": {
+            "label": "cmds"
+          }
+        }
+      ],
+      [
+        true,
+        "t9",
+        "new",
+        "cmds"
+      ]
+    ],
+    [
+      "p2",
+      [
+        {
+          "pane_id": "p1",
+          "agent": "kvm",
+          "tab": {
+            "label": "kvm"
+          },
+          "workspace": {
+            "label": "cmds"
+          }
+        }
+      ],
+      [
+        false,
+        null,
+        null,
+        null
+      ]
+    ],
+    [
+      "p1",
+      [
+        {
+          "pane_id": "p1",
+          "agent": "bad\nname",
+          "tab": {
+            "label": "bad\nname"
+          },
+          "workspace": {
+            "label": "cmds"
+          }
+        }
+      ],
+      [
+        false,
+        null,
+        "bad\nname",
+        "cmds"
+      ]
+    ]
+  ],
+  "evidence": [
+    [
+      "p1",
+      [
+        {
+          "pane_id": "p1",
+          "exit_code": 0,
+          "readiness": {
+            "shell_pid": 42,
+            "boot_id": "3f2b1c8e-0000-4000-8000-000000000001",
+            "shell_start_ticks": 900
+          }
+        }
+      ],
+      [
+        true
+      ],
+      [
+        42,
+        "3f2b1c8e-0000-4000-8000-000000000001",
+        900
+      ]
+    ],
+    [
+      "p1",
+      [
+        {
+          "pane_id": "p1",
+          "exit_code": null,
+          "readiness": {
+            "shell_pid": 42,
+            "boot_id": "3f2b1c8e-0000-4000-8000-000000000001",
+            "shell_start_ticks": 900
+          }
+        }
+      ],
+      [
+        false
+      ],
+      [
+        42,
+        "3f2b1c8e-0000-4000-8000-000000000001",
+        900
+      ]
+    ],
+    [
+      "p1",
+      [
+        {
+          "pane_id": "p1",
+          "exit_code": 0,
+          "from_cache": true
+        }
+      ],
+      [],
+      null
+    ],
+    [
+      "p1",
+      [
+        {
+          "pane_id": "p1",
+          "exit_code": 0,
+          "readiness": {
+            "shell_pid": 9223372036854775808,
+            "boot_id": "3f2b1c8e-0000-4000-8000-000000000001",
+            "shell_start_ticks": 1
+          }
+        }
+      ],
+      [
+        true
+      ],
+      null
+    ],
+    [
+      "p1",
+      [
+        {
+          "pane_id": "p1",
+          "exit_code": 0,
+          "readiness": {
+            "shell_pid": 42,
+            "boot_id": "3f2b1c8e-0000-4000-8000-000000000001",
+            "shell_start_ticks": 1
+          }
+        },
+        {
+          "pane_id": "p1",
+          "exit_code": 0,
+          "readiness": {
+            "shell_pid": 9223372036854775808,
+            "boot_id": "3f2b1c8e-0000-4000-8000-000000000001",
+            "shell_start_ticks": 1
+          }
+        }
+      ],
+      [
+        true,
+        true
+      ],
+      [
+        42,
+        "3f2b1c8e-0000-4000-8000-000000000001",
+        1
+      ]
+    ],
+    [
+      "p1",
+      [
+        {
+          "pane_id": "p1",
+          "exit_code": 0,
+          "readiness": {
+            "shell_pid": 42,
+            "boot_id": "3f2b1c8e-0000-4000-8000-000000000001",
+            "shell_start_ticks": -5
+          }
+        },
+        {
+          "pane_id": "p1",
+          "exit_code": 0,
+          "readiness": {
+            "shell_pid": 42,
+            "boot_id": "3f2b1c8e-0000-4000-8000-000000000001",
+            "shell_start_ticks": -6
+          }
+        }
+      ],
+      [
+        true,
+        true
+      ],
+      [
+        42,
+        "3f2b1c8e-0000-4000-8000-000000000001",
+        null
+      ]
+    ],
+    [
+      "p1",
+      [
+        {
+          "pane_id": "p1",
+          "exit_code": 0,
+          "readiness": {
+            "shell_pid": 42,
+            "boot_id": " \u3000 ",
+            "shell_start_ticks": 9
+          }
+        }
+      ],
+      [
+        true
+      ],
+      [
+        42,
+        null,
+        9
+      ]
+    ],
+    [
+      "p1",
+      [
+        {
+          "pane_id": "p1",
+          "exit_code": 0,
+          "readiness": {
+            "shell_pid": 42,
+            "boot_id": "\u001c",
+            "shell_start_ticks": 9
+          }
+        }
+      ],
+      [
+        true
+      ],
+      [
+        42,
+        "\u001c",
+        9
+      ]
+    ],
+    [
+      "p1",
+      [
+        {
+          "pane_id": "p1",
+          "exit_code": 0,
+          "readiness": {
+            "shell_pid": 42,
+            "boot_id": "3f2b1c8e-0000-4000-8000-000000000001",
+            "shell_start_ticks": 18446744073709551616
+          }
+        }
+      ],
+      [
+        true
+      ],
+      [
+        42,
+        "3f2b1c8e-0000-4000-8000-000000000001",
+        null
+      ]
+    ],
+    [
+      "p1",
+      [
+        {
+          "pane_id": "p1",
+          "exit_code": 0,
+          "readiness": "x"
+        }
+      ],
+      [
+        true
+      ],
+      null
+    ]
+  ],
+  "cache": [
+    [
+      {
+        "agent-cmds\u0000a": {
+          "workspace_id": "w1",
+          "tab_id": "w1:t1",
+          "pane_id": "w1:p1",
+          "workspace_label": "other",
+          "tab_label": "a"
+        }
+      },
+      [
+        "w1",
+        "w1:t1",
+        "w1:p1",
+        "other",
+        "a"
+      ]
+    ],
+    [
+      {
+        "agent-cmds\u0000a": {
+          "workspace_id": "w1",
+          "tab_id": "w1:t1",
+          "pane_id": "w1:p1"
+        }
+      },
+      [
+        "w1",
+        "w1:t1",
+        "w1:p1",
+        null,
+        null
+      ]
+    ],
+    [
+      {
+        "agent-cmds\u0000a": {
+          "workspace_id": "w1",
+          "tab_id": "w1:t1",
+          "pane_id": "w1:p1",
+          "tab_label": 5
+        }
+      },
+      null
+    ],
+    [
+      {
+        "agent-cmds\u0000a": {
+          "workspace_id": "w1",
+          "tab_id": null,
+          "pane_id": "w1:p1"
+        }
+      },
+      null
+    ],
+    [
+      {
+        "agent-cmds\u0000a": {
+          "workspace_id": "w1",
+          "tab_id": "t",
+          "pane_id": "p",
+          "extra": [
+            1
+          ]
+        }
+      },
+      [
+        "w1",
+        "t",
+        "p",
+        null,
+        null
+      ]
+    ],
+    [
+      {
+        "agent-cmds\u0000a": "nope"
+      },
+      null
+    ],
+    [
+      [
+        "not",
+        "an",
+        "object"
+      ],
+      null
+    ]
+  ],
+  "stored": [
+    [
+      null,
+      "agent-cmds\u0000a",
+      [
+        "w1",
+        "w1:t1",
+        "w1:p1",
+        "cmds",
+        "a"
+      ],
+      "{\n  \"agent-cmds\\u0000a\": {\n    \"pane_id\": \"w1:p1\",\n    \"tab_id\": \"w1:t1\",\n    \"tab_label\": \"a\",\n    \"workspace_id\": \"w1\",\n    \"workspace_label\": \"cmds\"\n  }\n}\n",
+      [
+        "session-cache.json",
+        "session-cache.json.lock"
+      ]
+    ],
+    [
+      "{\"other\u0000b\": {\"workspace_id\": \"w\", \"tab_id\": \"t\", \"pane_id\": \"p\"}}",
+      "agent-cmds\u0000a",
+      [
+        "w1",
+        "w1:t1",
+        "w1:p1",
+        "cmds",
+        "caf\u00e9 \u202e"
+      ],
+      "{\n  \"agent-cmds\\u0000a\": {\n    \"pane_id\": \"w1:p1\",\n    \"tab_id\": \"w1:t1\",\n    \"tab_label\": \"caf\u00e9 \\u202e\",\n    \"workspace_id\": \"w1\",\n    \"workspace_label\": \"cmds\"\n  }\n}\n",
+      [
+        "session-cache.json",
+        "session-cache.json.lock"
+      ]
+    ],
+    [
+      "not json",
+      "k",
+      [
+        "w",
+        "t",
+        "p",
+        "it's",
+        "\"q\""
+      ],
+      "{\n  \"k\": {\n    \"pane_id\": \"p\",\n    \"tab_id\": \"t\",\n    \"tab_label\": \"\\\"q\\\"\",\n    \"workspace_id\": \"w\",\n    \"workspace_label\": \"it's\"\n  }\n}\n",
+      [
+        "session-cache.json",
+        "session-cache.json.lock"
+      ]
+    ],
+    [
+      "{\"k\": 5, \"z\": [1.5, -0.0, 10000000000000000.0]}",
+      "k",
+      [
+        "w",
+        "t",
+        "p",
+        "l",
+        "m"
+      ],
+      "{\n  \"k\": {\n    \"pane_id\": \"p\",\n    \"tab_id\": \"t\",\n    \"tab_label\": \"m\",\n    \"workspace_id\": \"w\",\n    \"workspace_label\": \"l\"\n  },\n  \"z\": [\n    1.5,\n    -0.0,\n    1e+16\n  ]\n}\n",
+      [
+        "session-cache.json",
+        "session-cache.json.lock"
+      ]
+    ],
+    [
+      "[1]",
+      "k\u0001",
+      [
+        "w",
+        "t",
+        "p",
+        "l",
+        "\ud83d\ude00"
+      ],
+      "{\n  \"k\\u0001\": {\n    \"pane_id\": \"p\",\n    \"tab_id\": \"t\",\n    \"tab_label\": \"\ud83d\ude00\",\n    \"workspace_id\": \"w\",\n    \"workspace_label\": \"l\"\n  }\n}\n",
+      [
+        "session-cache.json",
+        "session-cache.json.lock"
+      ]
+    ]
+  ]
+}

@@ -1,0 +1,31 @@
+[package]
+name = "pr-landing-planner"
+version = "0.1.0"
+description = "Conflict-graph and CI-aware advisory pull-request landing planner"
+readme = "README.md"
+keywords = ["pull-request", "ci", "git", "planning"]
+categories = ["command-line-utilities", "development-tools"]
+edition = "2021"
+rust-version.workspace = true
+license = "MIT"
+repository = "https://github.com/rrnewton/agent-utils"
+authors = ["Ryan Newton"]
+
+[dependencies]
+regex = "1"
+serde = "1"
+serde_json = "1"
+serde_norway = "0.9"
+sha2 = "0.10"
+shell-words = "1"
+
+[[bin]]
+name = "pr-landing-planner"
+path = "src/main.rs"
+
+[lib]
+name = "pr_landing_planner"
+path = "src/lib.rs"
+
+[lints]
+workspace = true

@@ -1,0 +1,18 @@
+[
+  {
+    "id": "agent-utils-208-ca91d63823b",
+    "issue_id": "agent-utils-208",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Plan written and reviewed (two adversarial passes, revision 2): ~/work/vibe-talk-reports/2026-10-05-persistent-cache-plan.md. Recommendation: profiling first (P1-P2), then quick wins (keep the adapter snapshot ~36 h; a cold Flat page from one newest-first call), and decide Google Chat disk persistence after a week of profiling data. Owner decisions listed in its section 7. Nothing implemented.",
+    "created_at": "2026-10-05T07:48:22.507384980Z",
+    "updated_at": "2026-10-05T07:48:22.507384980Z"
+  },
+  {
+    "id": "agent-utils-208-c0578c3a599",
+    "issue_id": "agent-utils-208",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Plan revision 3.1 at the owner's go-ahead (2026-10-13). Milestones M1 summary-keep (store v14 cut_at; summaries survive cap changes, reloads and restarts; hits cost no upstream read), M2 bridge-recent-flat (off by default, shadow mode) and M3 upstream-profile landed in this batch. M4 cache-store is in progress; M5-M11 follow.",
+    "created_at": "2026-10-13T09:31:07.641025228Z",
+    "updated_at": "2026-10-13T09:31:07.641025228Z"
+  }
+]

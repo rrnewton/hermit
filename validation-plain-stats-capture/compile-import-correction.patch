@@ -1,0 +1,12 @@
+diff --git a/hermit-cli/src/bin/hermit/backends.rs b/hermit-cli/src/bin/hermit/backends.rs
+index bad4438096..e5e20aacb4 100644
+--- a/hermit-cli/src/bin/hermit/backends.rs
++++ b/hermit-cli/src/bin/hermit/backends.rs
+@@ -2350,6 +2350,7 @@ mod tests {
+         stdin_reads: u64,
+         memory_hash: u64,
+     ) -> DbtBackendStatsSnapshot {
++        use reverie_dbt::backend_stats::DbtBackendStatsAggregator;
+         use reverie_dbt::backend_stats::DbtProcessRecord;
+ 
+         let record = DbtProcessRecord {

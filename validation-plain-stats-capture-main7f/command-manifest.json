@@ -1,0 +1,1108 @@
+{
+  "closed_at": "2026-10-14T13:41:02.179122+00:00",
+  "H": "d09ef1a3e7f46a5206e464b562a22c2e77ae9699",
+  "R": "dde3f9da33a0474d0fa9b273a25100fc0db4d751",
+  "commands": [
+    {
+      "stem": "r-metadata",
+      "argv": [
+        "cargo",
+        "metadata",
+        "--offline",
+        "--locked",
+        "--format-version",
+        "1"
+      ],
+      "cwd": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/reverie-stats-capture-main16ff",
+      "head": "dde3f9da33a0474d0fa9b273a25100fc0db4d751",
+      "base": "16ffab7c558c47c78c43aa8e0e4242eb2deeeb3d",
+      "prefix": [
+        "nice",
+        "-n",
+        "19",
+        "taskset",
+        "--cpu-list",
+        "0-39"
+      ],
+      "env": {
+        "CARGO_HOME": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home",
+        "CARGO_TARGET_DIR": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit",
+        "CARGO_BUILD_JOBS": "40",
+        "CMAKE_BUILD_PARALLEL_LEVEL": "40",
+        "TMPDIR": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/d1tmp"
+      },
+      "started_at": "2026-10-14T13:11:15Z",
+      "ended_at": "2026-10-14T13:11:16Z",
+      "exit": 0,
+      "shell_display": "nice -n 19 taskset --cpu-list 0-39 env CARGO_HOME=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home CARGO_TARGET_DIR=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit CARGO_BUILD_JOBS=40 CMAKE_BUILD_PARALLEL_LEVEL=40 TMPDIR=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/d1tmp cargo metadata --offline --locked --format-version 1"
+    },
+    {
+      "stem": "r-capture-focused",
+      "argv": [
+        "cargo",
+        "test",
+        "--offline",
+        "--locked",
+        "-p",
+        "reverie-dbt",
+        "--lib",
+        "launcher::tests::stats_capture",
+        "--",
+        "--test-threads=1"
+      ],
+      "cwd": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/reverie-stats-capture-main16ff",
+      "head": "dde3f9da33a0474d0fa9b273a25100fc0db4d751",
+      "base": "16ffab7c558c47c78c43aa8e0e4242eb2deeeb3d",
+      "prefix": [
+        "nice",
+        "-n",
+        "19",
+        "taskset",
+        "--cpu-list",
+        "0-39"
+      ],
+      "env": {
+        "CARGO_HOME": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home",
+        "CARGO_TARGET_DIR": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit",
+        "CARGO_BUILD_JOBS": "40",
+        "CMAKE_BUILD_PARALLEL_LEVEL": "40",
+        "TMPDIR": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/d1tmp"
+      },
+      "started_at": "2026-10-14T13:11:31Z",
+      "ended_at": "2026-10-14T13:11:50Z",
+      "exit": 0,
+      "shell_display": "nice -n 19 taskset --cpu-list 0-39 env CARGO_HOME=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home CARGO_TARGET_DIR=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit CARGO_BUILD_JOBS=40 CMAKE_BUILD_PARALLEL_LEVEL=40 TMPDIR=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/d1tmp cargo test --offline --locked -p reverie-dbt --lib launcher::tests::stats_capture -- --test-threads=1"
+    },
+    {
+      "stem": "r-core-full",
+      "argv": [
+        "cargo",
+        "test",
+        "--offline",
+        "--locked",
+        "-p",
+        "reverie-core",
+        "--lib",
+        "--",
+        "--test-threads=1"
+      ],
+      "cwd": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/reverie-stats-capture-main16ff",
+      "head": "dde3f9da33a0474d0fa9b273a25100fc0db4d751",
+      "base": "16ffab7c558c47c78c43aa8e0e4242eb2deeeb3d",
+      "prefix": [
+        "nice",
+        "-n",
+        "19",
+        "taskset",
+        "--cpu-list",
+        "0-39"
+      ],
+      "env": {
+        "CARGO_HOME": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home",
+        "CARGO_TARGET_DIR": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit",
+        "CARGO_BUILD_JOBS": "40",
+        "CMAKE_BUILD_PARALLEL_LEVEL": "40",
+        "TMPDIR": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/d1tmp"
+      },
+      "started_at": "2026-10-14T13:12:08Z",
+      "ended_at": "2026-10-14T13:12:14Z",
+      "exit": 0,
+      "shell_display": "nice -n 19 taskset --cpu-list 0-39 env CARGO_HOME=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home CARGO_TARGET_DIR=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit CARGO_BUILD_JOBS=40 CMAKE_BUILD_PARALLEL_LEVEL=40 TMPDIR=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/d1tmp cargo test --offline --locked -p reverie-core --lib -- --test-threads=1"
+    },
+    {
+      "stem": "r-dbt-default",
+      "argv": [
+        "cargo",
+        "test",
+        "--offline",
+        "--locked",
+        "-p",
+        "reverie-dbt",
+        "--lib",
+        "--",
+        "--test-threads=1"
+      ],
+      "cwd": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/reverie-stats-capture-main16ff",
+      "head": "dde3f9da33a0474d0fa9b273a25100fc0db4d751",
+      "base": "16ffab7c558c47c78c43aa8e0e4242eb2deeeb3d",
+      "prefix": [
+        "nice",
+        "-n",
+        "19",
+        "taskset",
+        "--cpu-list",
+        "0-39"
+      ],
+      "env": {
+        "CARGO_HOME": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home",
+        "CARGO_TARGET_DIR": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit",
+        "CARGO_BUILD_JOBS": "40",
+        "CMAKE_BUILD_PARALLEL_LEVEL": "40",
+        "TMPDIR": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/d1tmp"
+      },
+      "started_at": "2026-10-14T13:12:39Z",
+      "ended_at": "2026-10-14T13:12:44Z",
+      "exit": 0,
+      "shell_display": "nice -n 19 taskset --cpu-list 0-39 env CARGO_HOME=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home CARGO_TARGET_DIR=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit CARGO_BUILD_JOBS=40 CMAKE_BUILD_PARALLEL_LEVEL=40 TMPDIR=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/d1tmp cargo test --offline --locked -p reverie-dbt --lib -- --test-threads=1"
+    },
+    {
+      "stem": "r-dbt-no-default",
+      "argv": [
+        "cargo",
+        "test",
+        "--offline",
+        "--locked",
+        "-p",
+        "reverie-dbt",
+        "--no-default-features",
+        "--lib",
+        "--",
+        "--test-threads=1"
+      ],
+      "cwd": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/reverie-stats-capture-main16ff",
+      "head": "dde3f9da33a0474d0fa9b273a25100fc0db4d751",
+      "base": "16ffab7c558c47c78c43aa8e0e4242eb2deeeb3d",
+      "prefix": [
+        "nice",
+        "-n",
+        "19",
+        "taskset",
+        "--cpu-list",
+        "0-39"
+      ],
+      "env": {
+        "CARGO_HOME": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home",
+        "CARGO_TARGET_DIR": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit",
+        "CARGO_BUILD_JOBS": "40",
+        "CMAKE_BUILD_PARALLEL_LEVEL": "40",
+        "TMPDIR": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/d1tmp"
+      },
+      "started_at": "2026-10-14T13:13:00Z",
+      "ended_at": "2026-10-14T13:13:14Z",
+      "exit": 0,
+      "shell_display": "nice -n 19 taskset --cpu-list 0-39 env CARGO_HOME=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home CARGO_TARGET_DIR=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit CARGO_BUILD_JOBS=40 CMAKE_BUILD_PARALLEL_LEVEL=40 TMPDIR=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/d1tmp cargo test --offline --locked -p reverie-dbt --no-default-features --lib -- --test-threads=1"
+    },
+    {
+      "stem": "r-clippy",
+      "argv": [
+        "cargo",
+        "clippy",
+        "--offline",
+        "--locked",
+        "-p",
+        "reverie-core",
+        "-p",
+        "reverie-dbt",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "cwd": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/reverie-stats-capture-main16ff",
+      "head": "dde3f9da33a0474d0fa9b273a25100fc0db4d751",
+      "base": "16ffab7c558c47c78c43aa8e0e4242eb2deeeb3d",
+      "prefix": [
+        "nice",
+        "-n",
+        "19",
+        "taskset",
+        "--cpu-list",
+        "0-39"
+      ],
+      "env": {
+        "CARGO_HOME": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home",
+        "CARGO_TARGET_DIR": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit",
+        "CARGO_BUILD_JOBS": "40",
+        "CMAKE_BUILD_PARALLEL_LEVEL": "40",
+        "TMPDIR": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/d1tmp"
+      },
+      "started_at": "2026-10-14T13:13:31Z",
+      "ended_at": "2026-10-14T13:13:43Z",
+      "exit": 0,
+      "shell_display": "nice -n 19 taskset --cpu-list 0-39 env CARGO_HOME=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home CARGO_TARGET_DIR=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit CARGO_BUILD_JOBS=40 CMAKE_BUILD_PARALLEL_LEVEL=40 TMPDIR=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/d1tmp cargo clippy --offline --locked -p reverie-core -p reverie-dbt --all-targets -- -D warnings"
+    },
+    {
+      "stem": "r-doc",
+      "argv": [
+        "cargo",
+        "doc",
+        "--offline",
+        "--locked",
+        "-p",
+        "reverie-core",
+        "-p",
+        "reverie-dbt",
+        "--no-deps"
+      ],
+      "cwd": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/reverie-stats-capture-main16ff",
+      "head": "dde3f9da33a0474d0fa9b273a25100fc0db4d751",
+      "base": "16ffab7c558c47c78c43aa8e0e4242eb2deeeb3d",
+      "prefix": [
+        "nice",
+        "-n",
+        "19",
+        "taskset",
+        "--cpu-list",
+        "0-39"
+      ],
+      "env": {
+        "CARGO_HOME": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home",
+        "CARGO_TARGET_DIR": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit",
+        "CARGO_BUILD_JOBS": "40",
+        "CMAKE_BUILD_PARALLEL_LEVEL": "40",
+        "TMPDIR": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/d1tmp",
+        "RUSTDOCFLAGS": "-D warnings"
+      },
+      "started_at": "2026-10-14T13:14:23Z",
+      "ended_at": "2026-10-14T13:14:30Z",
+      "exit": 0,
+      "shell_display": "nice -n 19 taskset --cpu-list 0-39 env CARGO_HOME=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home CARGO_TARGET_DIR=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit CARGO_BUILD_JOBS=40 CMAKE_BUILD_PARALLEL_LEVEL=40 TMPDIR=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/d1tmp 'RUSTDOCFLAGS=-D warnings' cargo doc --offline --locked -p reverie-core -p reverie-dbt --no-deps"
+    },
+    {
+      "stem": "r-fmt",
+      "argv": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--",
+        "--check"
+      ],
+      "cwd": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/reverie-stats-capture-main16ff",
+      "head": "dde3f9da33a0474d0fa9b273a25100fc0db4d751",
+      "base": "16ffab7c558c47c78c43aa8e0e4242eb2deeeb3d",
+      "prefix": [
+        "nice",
+        "-n",
+        "19",
+        "taskset",
+        "--cpu-list",
+        "0-39"
+      ],
+      "env": {
+        "CARGO_HOME": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home",
+        "CARGO_TARGET_DIR": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit",
+        "CARGO_BUILD_JOBS": "40",
+        "CMAKE_BUILD_PARALLEL_LEVEL": "40",
+        "TMPDIR": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/d1tmp"
+      },
+      "started_at": "2026-10-14T13:17:24Z",
+      "ended_at": "2026-10-14T13:17:32Z",
+      "exit": 0,
+      "shell_display": "nice -n 19 taskset --cpu-list 0-39 env CARGO_HOME=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home CARGO_TARGET_DIR=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit CARGO_BUILD_JOBS=40 CMAKE_BUILD_PARALLEL_LEVEL=40 TMPDIR=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/d1tmp cargo fmt --all -- --check"
+    },
+    {
+      "stem": "h-metadata",
+      "argv": [
+        "cargo",
+        "metadata",
+        "--offline",
+        "--locked",
+        "--format-version",
+        "1"
+      ],
+      "cwd": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f",
+      "head": "d09ef1a3e7f46a5206e464b562a22c2e77ae9699",
+      "base": "7f53641d93b2332b1ce53f1b97026cd0d32cb9f1",
+      "R": "dde3f9da33a0474d0fa9b273a25100fc0db4d751",
+      "prefix": [
+        "nice",
+        "-n",
+        "19",
+        "taskset",
+        "--cpu-list",
+        "0-39"
+      ],
+      "unset_env": [
+        "TMPDIR"
+      ],
+      "env": {
+        "CARGO_HOME": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home",
+        "CARGO_TARGET_DIR": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit",
+        "CARGO_BUILD_JOBS": "40",
+        "CMAKE_BUILD_PARALLEL_LEVEL": "40"
+      },
+      "started_at": "2026-10-14T13:17:57Z",
+      "ended_at": "2026-10-14T13:18:00Z",
+      "exit": 0,
+      "shell_display": "nice -n 19 taskset --cpu-list 0-39 env -u TMPDIR CARGO_HOME=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home CARGO_TARGET_DIR=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit CARGO_BUILD_JOBS=40 CMAKE_BUILD_PARALLEL_LEVEL=40 cargo metadata --offline --locked --format-version 1"
+    },
+    {
+      "stem": "h-hermit-default",
+      "argv": [
+        "cargo",
+        "nextest",
+        "run",
+        "--offline",
+        "--locked",
+        "--cargo-profile",
+        "validate",
+        "-p",
+        "hermit",
+        "--lib",
+        "--bins",
+        "-j",
+        "40"
+      ],
+      "cwd": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f",
+      "head": "d09ef1a3e7f46a5206e464b562a22c2e77ae9699",
+      "base": "7f53641d93b2332b1ce53f1b97026cd0d32cb9f1",
+      "R": "dde3f9da33a0474d0fa9b273a25100fc0db4d751",
+      "prefix": [
+        "nice",
+        "-n",
+        "19",
+        "taskset",
+        "--cpu-list",
+        "0-39"
+      ],
+      "unset_env": [
+        "TMPDIR"
+      ],
+      "env": {
+        "CARGO_HOME": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home",
+        "CARGO_TARGET_DIR": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit",
+        "CARGO_BUILD_JOBS": "40",
+        "CMAKE_BUILD_PARALLEL_LEVEL": "40"
+      },
+      "started_at": "2026-10-14T13:18:15Z",
+      "ended_at": "2026-10-14T13:20:54Z",
+      "exit": 0,
+      "shell_display": "nice -n 19 taskset --cpu-list 0-39 env -u TMPDIR CARGO_HOME=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home CARGO_TARGET_DIR=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit CARGO_BUILD_JOBS=40 CMAKE_BUILD_PARALLEL_LEVEL=40 cargo nextest run --offline --locked --cargo-profile validate -p hermit --lib --bins -j 40"
+    },
+    {
+      "stem": "h-hermit-dbt",
+      "argv": [
+        "cargo",
+        "nextest",
+        "run",
+        "--offline",
+        "--locked",
+        "--cargo-profile",
+        "validate",
+        "-p",
+        "hermit",
+        "--features",
+        "dbt",
+        "--lib",
+        "--bins",
+        "-j",
+        "40"
+      ],
+      "cwd": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f",
+      "head": "d09ef1a3e7f46a5206e464b562a22c2e77ae9699",
+      "base": "7f53641d93b2332b1ce53f1b97026cd0d32cb9f1",
+      "R": "dde3f9da33a0474d0fa9b273a25100fc0db4d751",
+      "prefix": [
+        "nice",
+        "-n",
+        "19",
+        "taskset",
+        "--cpu-list",
+        "0-39"
+      ],
+      "unset_env": [
+        "TMPDIR"
+      ],
+      "env": {
+        "CARGO_HOME": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home",
+        "CARGO_TARGET_DIR": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit",
+        "CARGO_BUILD_JOBS": "40",
+        "CMAKE_BUILD_PARALLEL_LEVEL": "40"
+      },
+      "started_at": "2026-10-14T13:21:05Z",
+      "ended_at": "2026-10-14T13:23:42Z",
+      "exit": 0,
+      "shell_display": "nice -n 19 taskset --cpu-list 0-39 env -u TMPDIR CARGO_HOME=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home CARGO_TARGET_DIR=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit CARGO_BUILD_JOBS=40 CMAKE_BUILD_PARALLEL_LEVEL=40 cargo nextest run --offline --locked --cargo-profile validate -p hermit --features dbt --lib --bins -j 40"
+    },
+    {
+      "stem": "h-cli11",
+      "argv": [
+        "cargo",
+        "nextest",
+        "run",
+        "--offline",
+        "--locked",
+        "--cargo-profile",
+        "validate",
+        "-p",
+        "hermit",
+        "--features",
+        "dbt",
+        "--test",
+        "cli",
+        "-j",
+        "1",
+        "-E",
+        "test(=dbt_verify_retains_captures_under_the_names_the_harness_scans_for) | test(=dbt_verify_without_json_rejects_io_buffer_content_divergence) | test(=run_dbt_keeps_diagnostics_out_of_guest_stderr) | test(=run_dbt_recovers_after_failed_exec) | test(=run_dbt_verify_keeps_the_diagnostic_of_a_backend_failure) | test(=run_dbt_verify_returns_with_blocked_stdin_source_after_both_runs) | test(=run_dbt_verify_replays_stdin_bytes_and_eof) | test(=verify_run::paired_verify_runs_keep_logs_and_need_no_run_two_after_a_rejected_run_one) | test(=verify_run::paired_verify_runs_refuse_unlike_runs_and_find_a_difference) | test(=verify_run::paired_verify_runs_report_what_run_verify_reports_on_dbt) | test(=verify_run::paired_verify_runs_report_what_run_verify_reports_on_ptrace)"
+      ],
+      "cwd": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f",
+      "head": "d09ef1a3e7f46a5206e464b562a22c2e77ae9699",
+      "base": "7f53641d93b2332b1ce53f1b97026cd0d32cb9f1",
+      "R": "dde3f9da33a0474d0fa9b273a25100fc0db4d751",
+      "prefix": [
+        "nice",
+        "-n",
+        "19",
+        "taskset",
+        "--cpu-list",
+        "0-39"
+      ],
+      "unset_env": [
+        "TMPDIR"
+      ],
+      "env": {
+        "CARGO_HOME": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home",
+        "CARGO_TARGET_DIR": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit",
+        "CARGO_BUILD_JOBS": "40",
+        "CMAKE_BUILD_PARALLEL_LEVEL": "40",
+        "HERMIT_REQUIRE_DBT": "1"
+      },
+      "started_at": "2026-10-14T13:23:53Z",
+      "ended_at": "2026-10-14T13:24:35Z",
+      "exit": 0,
+      "shell_display": "nice -n 19 taskset --cpu-list 0-39 env -u TMPDIR CARGO_HOME=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home CARGO_TARGET_DIR=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit CARGO_BUILD_JOBS=40 CMAKE_BUILD_PARALLEL_LEVEL=40 HERMIT_REQUIRE_DBT=1 cargo nextest run --offline --locked --cargo-profile validate -p hermit --features dbt --test cli -j 1 -E 'test(=dbt_verify_retains_captures_under_the_names_the_harness_scans_for) | test(=dbt_verify_without_json_rejects_io_buffer_content_divergence) | test(=run_dbt_keeps_diagnostics_out_of_guest_stderr) | test(=run_dbt_recovers_after_failed_exec) | test(=run_dbt_verify_keeps_the_diagnostic_of_a_backend_failure) | test(=run_dbt_verify_returns_with_blocked_stdin_source_after_both_runs) | test(=run_dbt_verify_replays_stdin_bytes_and_eof) | test(=verify_run::paired_verify_runs_keep_logs_and_need_no_run_two_after_a_rejected_run_one) | test(=verify_run::paired_verify_runs_refuse_unlike_runs_and_find_a_difference) | test(=verify_run::paired_verify_runs_report_what_run_verify_reports_on_dbt) | test(=verify_run::paired_verify_runs_report_what_run_verify_reports_on_ptrace)'"
+    },
+    {
+      "stem": "h-terminal6",
+      "argv": [
+        "cargo",
+        "nextest",
+        "run",
+        "--offline",
+        "--locked",
+        "--cargo-profile",
+        "validate",
+        "-p",
+        "hermit",
+        "--features",
+        "dbt",
+        "--test",
+        "inherited_terminal_read",
+        "-j",
+        "1"
+      ],
+      "cwd": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f",
+      "head": "d09ef1a3e7f46a5206e464b562a22c2e77ae9699",
+      "base": "7f53641d93b2332b1ce53f1b97026cd0d32cb9f1",
+      "R": "dde3f9da33a0474d0fa9b273a25100fc0db4d751",
+      "prefix": [
+        "nice",
+        "-n",
+        "19",
+        "taskset",
+        "--cpu-list",
+        "0-39"
+      ],
+      "unset_env": [
+        "TMPDIR"
+      ],
+      "env": {
+        "CARGO_HOME": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home",
+        "CARGO_TARGET_DIR": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit",
+        "CARGO_BUILD_JOBS": "40",
+        "CMAKE_BUILD_PARALLEL_LEVEL": "40",
+        "HERMIT_REQUIRE_DBT": "1"
+      },
+      "started_at": "2026-10-14T13:24:46Z",
+      "ended_at": "2026-10-14T13:24:48Z",
+      "exit": 0,
+      "shell_display": "nice -n 19 taskset --cpu-list 0-39 env -u TMPDIR CARGO_HOME=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home CARGO_TARGET_DIR=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit CARGO_BUILD_JOBS=40 CMAKE_BUILD_PARALLEL_LEVEL=40 HERMIT_REQUIRE_DBT=1 cargo nextest run --offline --locked --cargo-profile validate -p hermit --features dbt --test inherited_terminal_read -j 1"
+    },
+    {
+      "stem": "h-procfs-debug",
+      "cwd": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f",
+      "head": "d09ef1a3e7f46a5206e464b562a22c2e77ae9699",
+      "R": "dde3f9da33a0474d0fa9b273a25100fc0db4d751",
+      "prefix": [
+        "nice",
+        "-n",
+        "19",
+        "taskset",
+        "--cpu-list",
+        "0-39"
+      ],
+      "unset_env": [
+        "TMPDIR"
+      ],
+      "env": {
+        "CARGO_HOME": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home",
+        "CARGO_TARGET_DIR": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit",
+        "CARGO_BUILD_JOBS": "40",
+        "CMAKE_BUILD_PARALLEL_LEVEL": "40"
+      },
+      "argv": [
+        "cargo",
+        "nextest",
+        "run",
+        "--offline",
+        "--locked",
+        "-p",
+        "hermit",
+        "--features",
+        "third-party-backends,kvm-execution-tests",
+        "--test",
+        "procfs_determinism",
+        "-E",
+        "test(=chroot_mountinfo_subset_keeps_fdinfo_identity_consistent) | test(=chroot_mountinfo_subset_keeps_fdinfo_identity_consistent_with_readonly_proc)"
+      ],
+      "qualification": "One exact-two DEBUG Nextest regression check on the incoming landed shared frame fix; no repeated rounds or stack override.",
+      "base": "7f53641d93b2332b1ce53f1b97026cd0d32cb9f1",
+      "started_at": "2026-10-14T13:25:09Z",
+      "ended_at": "2026-10-14T13:26:26Z",
+      "exit": 0,
+      "shell_display": "nice -n 19 taskset --cpu-list 0-39 env -u TMPDIR CARGO_HOME=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home CARGO_TARGET_DIR=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit CARGO_BUILD_JOBS=40 CMAKE_BUILD_PARALLEL_LEVEL=40 cargo nextest run --offline --locked -p hermit --features third-party-backends,kvm-execution-tests --test procfs_determinism -E 'test(=chroot_mountinfo_subset_keeps_fdinfo_identity_consistent) | test(=chroot_mountinfo_subset_keeps_fdinfo_identity_consistent_with_readonly_proc)'"
+    },
+    {
+      "stem": "h-clippy-all-features",
+      "argv": [
+        "cargo",
+        "clippy",
+        "--offline",
+        "--locked",
+        "--workspace",
+        "--all-targets",
+        "--all-features",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "cwd": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f",
+      "head": "d09ef1a3e7f46a5206e464b562a22c2e77ae9699",
+      "base": "7f53641d93b2332b1ce53f1b97026cd0d32cb9f1",
+      "R": "dde3f9da33a0474d0fa9b273a25100fc0db4d751",
+      "prefix": [
+        "nice",
+        "-n",
+        "19",
+        "taskset",
+        "--cpu-list",
+        "0-39"
+      ],
+      "unset_env": [
+        "TMPDIR"
+      ],
+      "env": {
+        "CARGO_HOME": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home",
+        "CARGO_TARGET_DIR": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit",
+        "CARGO_BUILD_JOBS": "40",
+        "CMAKE_BUILD_PARALLEL_LEVEL": "40"
+      },
+      "started_at": "2026-10-14T13:27:17Z",
+      "ended_at": "2026-10-14T13:28:08Z",
+      "exit": 0,
+      "shell_display": "nice -n 19 taskset --cpu-list 0-39 env -u TMPDIR CARGO_HOME=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home CARGO_TARGET_DIR=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit CARGO_BUILD_JOBS=40 CMAKE_BUILD_PARALLEL_LEVEL=40 cargo clippy --offline --locked --workspace --all-targets --all-features -- -D warnings"
+    },
+    {
+      "stem": "h-doc",
+      "argv": [
+        "cargo",
+        "doc",
+        "--offline",
+        "--locked",
+        "-p",
+        "hermit",
+        "--all-features",
+        "--no-deps"
+      ],
+      "cwd": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f",
+      "head": "d09ef1a3e7f46a5206e464b562a22c2e77ae9699",
+      "base": "7f53641d93b2332b1ce53f1b97026cd0d32cb9f1",
+      "R": "dde3f9da33a0474d0fa9b273a25100fc0db4d751",
+      "prefix": [
+        "nice",
+        "-n",
+        "19",
+        "taskset",
+        "--cpu-list",
+        "0-39"
+      ],
+      "unset_env": [
+        "TMPDIR"
+      ],
+      "env": {
+        "CARGO_HOME": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home",
+        "CARGO_TARGET_DIR": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit",
+        "CARGO_BUILD_JOBS": "40",
+        "CMAKE_BUILD_PARALLEL_LEVEL": "40",
+        "RUSTDOCFLAGS": "-D warnings"
+      },
+      "started_at": "2026-10-14T13:28:19Z",
+      "ended_at": "2026-10-14T13:28:50Z",
+      "exit": 0,
+      "shell_display": "nice -n 19 taskset --cpu-list 0-39 env -u TMPDIR CARGO_HOME=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home CARGO_TARGET_DIR=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit CARGO_BUILD_JOBS=40 CMAKE_BUILD_PARALLEL_LEVEL=40 'RUSTDOCFLAGS=-D warnings' cargo doc --offline --locked -p hermit --all-features --no-deps"
+    },
+    {
+      "stem": "h-fmt",
+      "argv": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--",
+        "--check"
+      ],
+      "cwd": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f",
+      "head": "d09ef1a3e7f46a5206e464b562a22c2e77ae9699",
+      "base": "7f53641d93b2332b1ce53f1b97026cd0d32cb9f1",
+      "R": "dde3f9da33a0474d0fa9b273a25100fc0db4d751",
+      "prefix": [
+        "nice",
+        "-n",
+        "19",
+        "taskset",
+        "--cpu-list",
+        "0-39"
+      ],
+      "unset_env": [
+        "TMPDIR"
+      ],
+      "env": {
+        "CARGO_HOME": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home",
+        "CARGO_TARGET_DIR": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit",
+        "CARGO_BUILD_JOBS": "40",
+        "CMAKE_BUILD_PARALLEL_LEVEL": "40"
+      },
+      "started_at": "2026-10-14T13:29:03Z",
+      "ended_at": "2026-10-14T13:29:08Z",
+      "exit": 0,
+      "shell_display": "nice -n 19 taskset --cpu-list 0-39 env -u TMPDIR CARGO_HOME=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home CARGO_TARGET_DIR=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit CARGO_BUILD_JOBS=40 CMAKE_BUILD_PARALLEL_LEVEL=40 cargo fmt --all -- --check"
+    },
+    {
+      "stem": "list-hermit_unit",
+      "argv": [
+        "cargo",
+        "nextest",
+        "list",
+        "--offline",
+        "--locked",
+        "--cargo-profile",
+        "validate",
+        "--message-format",
+        "json",
+        "-p",
+        "hermit",
+        "--features",
+        "third-party-backends,kvm-native-test-support",
+        "--lib",
+        "--bins",
+        "--",
+        "--skip",
+        "ptrace_completion::tests::real_random_",
+        "--skip",
+        "kvm_execution_tests::"
+      ],
+      "cwd": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f",
+      "head": "d09ef1a3e7f46a5206e464b562a22c2e77ae9699",
+      "base": "7f53641d93b2332b1ce53f1b97026cd0d32cb9f1",
+      "R": "dde3f9da33a0474d0fa9b273a25100fc0db4d751",
+      "prefix": [
+        "nice",
+        "-n",
+        "19",
+        "taskset",
+        "--cpu-list",
+        "0-39"
+      ],
+      "unset_env": [
+        "TMPDIR"
+      ],
+      "env": {
+        "CARGO_HOME": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home",
+        "CARGO_TARGET_DIR": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit",
+        "CARGO_BUILD_JOBS": "40",
+        "CMAKE_BUILD_PARALLEL_LEVEL": "40"
+      },
+      "job": "hermit_unit",
+      "declared_count": "1041",
+      "source_command": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_EPOCH --env HERMIT_PREPARED_NEXTEST_REQUIRED --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_BUCK_DOTSLASH --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env L4_REPS --env NEXTEST_EXPECTED_EXECUTED --env NEXTEST_PREPARED_BUILD_SELECTION --env NEXTEST_TEST_THREADS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends,kvm-native-test-support --lib --bins -j 1 -- --skip ptrace_completion::tests::real_random_ --skip kvm_execution_tests::'",
+      "prepared_build_selection": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends,kvm-native-test-support\",\"--lib\",\"--bins\"]",
+      "equivalence": "Only execution profile/job plumbing removed; original package/features/filter/skips retained.",
+      "started_at": "2026-10-14T13:29:50Z",
+      "ended_at": "2026-10-14T13:32:08Z",
+      "exit": 0,
+      "shell_display": "nice -n 19 taskset --cpu-list 0-39 env -u TMPDIR CARGO_HOME=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home CARGO_TARGET_DIR=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit CARGO_BUILD_JOBS=40 CMAKE_BUILD_PARALLEL_LEVEL=40 cargo nextest list --offline --locked --cargo-profile validate --message-format json -p hermit --features third-party-backends,kvm-native-test-support --lib --bins -- --skip ptrace_completion::tests::real_random_ --skip kvm_execution_tests::"
+    },
+    {
+      "stem": "list-cli",
+      "argv": [
+        "cargo",
+        "nextest",
+        "list",
+        "--offline",
+        "--locked",
+        "--cargo-profile",
+        "validate",
+        "--message-format",
+        "json",
+        "-p",
+        "hermit",
+        "--features",
+        "third-party-backends",
+        "--test",
+        "cli",
+        "--",
+        "--skip",
+        "run_kvm_",
+        "--skip",
+        "backend_accepted_in_global_position",
+        "--skip",
+        "run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them",
+        "--skip",
+        "run_dbt_strict_returns_with_blocked_stdin_source",
+        "--skip",
+        "run_dbt_verifies_pipe_backpressure",
+        "--skip",
+        "run_dbt_keeps_diagnostics_out_of_guest_stderr",
+        "--skip",
+        "run_dbt_recovers_after_failed_exec",
+        "--skip",
+        "run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls",
+        "--skip",
+        "run_dbt_verifies_queued_self_signals",
+        "--skip",
+        "run_dbt_verifies_self_prlimit",
+        "--skip",
+        "run_dbt_verifies_shell_process_lifecycle",
+        "--skip",
+        "run_dbt_verifies_simple_env_shebang",
+        "--skip",
+        "run_liteinst_rejects_non_fork_clone",
+        "--skip",
+        "run_liteinst_handles_inherited_ignored_sigchld",
+        "--skip",
+        "run_liteinst_verifies_forked_guest",
+        "--skip",
+        "run_liteinst_verifies_raw_fork_guest",
+        "--skip",
+        "skid_overshoot_and_guest_failure_have_different_exit_codes",
+        "--skip",
+        "run_ptrace_nonleader_exec_preserves_identity_and_time",
+        "--skip",
+        "run_ptrace_nonleader_exec_preserves_preemption",
+        "--skip",
+        "run_ptrace_nonleader_exec_displaces_runnable_leader",
+        "--skip",
+        "run_ptrace_nonleader_exec_refuses_preemption_artifacts",
+        "--skip",
+        "run_chaos_preemption_replay_reuses_the_recorded_epoch",
+        "--skip",
+        "max_log_bytes_preemption_stacktrace_exits_promptly_when_stderr_is_a_full_pipe",
+        "--skip",
+        "poll_timeout_returns_on_time_while_another_thread_spins",
+        "--skip",
+        "a_guests_sigchld_to_a_futex_waiting_sibling_beside_a_cpu_bound_one_ends_its_wait",
+        "--skip",
+        "happens_before_relative_anchor_holds_the_first_call_after_its_base",
+        "--skip",
+        "happens_before_relative_anchor_state_is_not_inherited_by_a_new_thread",
+        "--skip",
+        "happens_before_unfired_relative_anchor_is_refused_with_its_base",
+        "--skip",
+        "happens_before_hold_budget_ends_a_hold_a_spinner_never_releases",
+        "--skip",
+        "happens_before_posthook_anchor_on_an_interrupted_call_is_refused_by_name",
+        "--skip",
+        "happens_before_hold_in_a_vfork_child_is_refused_by_name"
+      ],
+      "cwd": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f",
+      "head": "d09ef1a3e7f46a5206e464b562a22c2e77ae9699",
+      "base": "7f53641d93b2332b1ce53f1b97026cd0d32cb9f1",
+      "R": "dde3f9da33a0474d0fa9b273a25100fc0db4d751",
+      "prefix": [
+        "nice",
+        "-n",
+        "19",
+        "taskset",
+        "--cpu-list",
+        "0-39"
+      ],
+      "unset_env": [
+        "TMPDIR"
+      ],
+      "env": {
+        "CARGO_HOME": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home",
+        "CARGO_TARGET_DIR": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit",
+        "CARGO_BUILD_JOBS": "40",
+        "CMAKE_BUILD_PARALLEL_LEVEL": "40"
+      },
+      "job": "cli",
+      "declared_count": "385",
+      "source_command": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_EPOCH --env HERMIT_PREPARED_NEXTEST_REQUIRED --env HERMIT_REQUIRE_DAP --env HERMIT_REQUIRE_DAP_GDB --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_BUCK_DOTSLASH --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env L4_REPS --env NEXTEST_EXPECTED_EXECUTED --env NEXTEST_PREPARED_BUILD_SELECTION --env NEXTEST_TEST_THREADS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; HERMIT_LITEINST_TEST_BINARY=$PWD/target/ci/hermit ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them --skip run_dbt_strict_returns_with_blocked_stdin_source --skip run_dbt_verifies_pipe_backpressure --skip run_dbt_keeps_diagnostics_out_of_guest_stderr --skip run_dbt_recovers_after_failed_exec --skip run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls --skip run_dbt_verifies_queued_self_signals --skip run_dbt_verifies_self_prlimit --skip run_dbt_verifies_shell_process_lifecycle --skip run_dbt_verifies_simple_env_shebang --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest --skip skid_overshoot_and_guest_failure_have_different_exit_codes --skip run_ptrace_nonleader_exec_preserves_identity_and_time --skip run_ptrace_nonleader_exec_preserves_preemption --skip run_ptrace_nonleader_exec_displaces_runnable_leader --skip run_ptrace_nonleader_exec_refuses_preemption_artifacts --skip run_chaos_preemption_replay_reuses_the_recorded_epoch --skip max_log_bytes_preemption_stacktrace_exits_promptly_when_stderr_is_a_full_pipe --skip poll_timeout_returns_on_time_while_another_thread_spins --skip a_guests_sigchld_to_a_futex_waiting_sibling_beside_a_cpu_bound_one_ends_its_wait --skip happens_before_relative_anchor_holds_the_first_call_after_its_base --skip happens_before_relative_anchor_state_is_not_inherited_by_a_new_thread --skip happens_before_unfired_relative_anchor_is_refused_with_its_base --skip happens_before_hold_budget_ends_a_hold_a_spinner_never_releases --skip happens_before_posthook_anchor_on_an_interrupted_call_is_refused_by_name --skip happens_before_hold_in_a_vfork_child_is_refused_by_name'",
+      "prepared_build_selection": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"cli\"]",
+      "equivalence": "Only execution profile/job plumbing removed; original package/features/filter/skips retained.",
+      "started_at": "2026-10-14T13:32:27Z",
+      "ended_at": "2026-10-14T13:34:34Z",
+      "exit": 0,
+      "shell_display": "nice -n 19 taskset --cpu-list 0-39 env -u TMPDIR CARGO_HOME=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home CARGO_TARGET_DIR=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit CARGO_BUILD_JOBS=40 CMAKE_BUILD_PARALLEL_LEVEL=40 cargo nextest list --offline --locked --cargo-profile validate --message-format json -p hermit --features third-party-backends --test cli -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them --skip run_dbt_strict_returns_with_blocked_stdin_source --skip run_dbt_verifies_pipe_backpressure --skip run_dbt_keeps_diagnostics_out_of_guest_stderr --skip run_dbt_recovers_after_failed_exec --skip run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls --skip run_dbt_verifies_queued_self_signals --skip run_dbt_verifies_self_prlimit --skip run_dbt_verifies_shell_process_lifecycle --skip run_dbt_verifies_simple_env_shebang --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest --skip skid_overshoot_and_guest_failure_have_different_exit_codes --skip run_ptrace_nonleader_exec_preserves_identity_and_time --skip run_ptrace_nonleader_exec_preserves_preemption --skip run_ptrace_nonleader_exec_displaces_runnable_leader --skip run_ptrace_nonleader_exec_refuses_preemption_artifacts --skip run_chaos_preemption_replay_reuses_the_recorded_epoch --skip max_log_bytes_preemption_stacktrace_exits_promptly_when_stderr_is_a_full_pipe --skip poll_timeout_returns_on_time_while_another_thread_spins --skip a_guests_sigchld_to_a_futex_waiting_sibling_beside_a_cpu_bound_one_ends_its_wait --skip happens_before_relative_anchor_holds_the_first_call_after_its_base --skip happens_before_relative_anchor_state_is_not_inherited_by_a_new_thread --skip happens_before_unfired_relative_anchor_is_refused_with_its_base --skip happens_before_hold_budget_ends_a_hold_a_spinner_never_releases --skip happens_before_posthook_anchor_on_an_interrupted_call_is_refused_by_name --skip happens_before_hold_in_a_vfork_child_is_refused_by_name"
+    },
+    {
+      "stem": "list-cli_on_host",
+      "argv": [
+        "cargo",
+        "nextest",
+        "list",
+        "--offline",
+        "--locked",
+        "--cargo-profile",
+        "validate",
+        "--message-format",
+        "json",
+        "-p",
+        "hermit",
+        "--features",
+        "third-party-backends",
+        "--test",
+        "cli",
+        "-E",
+        "not (test(=liteinst_backend_stats_report_the_guests_own_dispatch_paths) | test(=liteinst_in_guest_programs::in_guest_trap_dispatch_record_reports_no_patched_sites) | test(=liteinst_in_guest_programs::in_guest_trap_refuses_a_guest_library_that_turns_site_patching_back_on) | test(=liteinst_in_guest_programs::in_guest_trap_sets_site_patching_off_and_refuses_a_caller_who_turns_it_on) | test(=liteinst_in_guest_programs::in_guest_trap_sigalrm_scalar_identity_matches_ptrace) | test(=liteinst_in_guest_programs::in_guest_trap_verifies_a_program_with_no_site_patched) | test(=liteinst_in_guest_programs::liteinst_in_guest_a_root_that_aborts_ends_with_its_own_status) | test(=liteinst_in_guest_programs::liteinst_in_guest_abnormal_exit_after_registration_does_not_hang) | test(=liteinst_in_guest_programs::liteinst_in_guest_admitted_sigalrm_leaves_the_guest_heap_as_the_program_made_it) | test(=liteinst_in_guest_programs::liteinst_in_guest_an_undeliverable_sigalrm_is_a_loss_and_stops_the_guest) | test(=liteinst_in_guest_programs::liteinst_in_guest_checks_and_hides_the_config_fingerprint) | test(=liteinst_in_guest_programs::liteinst_in_guest_close_range_releases_ports_like_ptrace) | test(=liteinst_in_guest_programs::liteinst_in_guest_cpuid_in_a_late_loaded_library_runs) | test(=liteinst_in_guest_programs::liteinst_in_guest_alarm_outside_emulated_sleep_keeps_its_loss) | test(=liteinst_in_guest_programs::liteinst_in_guest_default_fatal_alarms_end_emulated_sleeps_and_verify) | test(=liteinst_in_guest_programs::liteinst_in_guest_noninterrupting_alarms_preserve_sleep_and_pending_state) | test(=liteinst_in_guest_programs::liteinst_in_guest_detcore_micro_suite) | test(=liteinst_in_guest_programs::liteinst_in_guest_dispatch_record_reports_patched_sites) | test(=liteinst_in_guest_programs::liteinst_in_guest_dup_aliases_share_one_cursor_after_fork) | test(=liteinst_in_guest_programs::liteinst_in_guest_encoding_and_digest_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_exit_reaping_matches_ptrace) | test(=liteinst_in_guest_programs::liteinst_in_guest_file_and_text_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_fork_child_heap_is_the_parents) | test(=liteinst_in_guest_programs::liteinst_in_guest_fork_runs_without_hanging) | test(=liteinst_in_guest_programs::liteinst_in_guest_formatting_and_sequence_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_heap_growth_avoids_trampoline_mappings) | test(=liteinst_in_guest_programs::liteinst_in_guest_identity_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_max_log_bytes_exits_promptly_when_stderr_is_a_full_pipe) | test(=liteinst_in_guest_programs::liteinst_in_guest_path_and_language_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_python_entropy) | test(=liteinst_in_guest_programs::liteinst_in_guest_python_random_example) | test(=liteinst_in_guest_programs::liteinst_in_guest_reads_a_plain_file_on_a_fuse_filesystem) | test(=liteinst_in_guest_programs::liteinst_in_guest_refuses_a_guest_that_opens_dev_fuse) | test(=liteinst_in_guest_programs::liteinst_in_guest_round2_arithmetic_and_predicate_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round2_encoding_and_comparison_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round2_representation_and_path_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round3_encoding_and_compression_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round3_portable_system_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round3_stdin_filter_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_runtime_bootstrap_is_not_charged_to_host_identity_uptime) | test(=liteinst_in_guest_programs::liteinst_in_guest_runtime_calls_none_of_the_converted_libc_wrappers) | test(=liteinst_in_guest_programs::liteinst_in_guest_runtime_leaves_the_guest_heap_as_the_program_made_it) | test(=liteinst_in_guest_programs::liteinst_in_guest_runtime_owned_self_signals_refuse_verification) | test(=liteinst_in_guest_programs::liteinst_in_guest_self_signal_deaths_are_scheduled_and_verify) | test(=liteinst_in_guest_programs::liteinst_in_guest_semantic_file_and_sqlite_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_semantic_text_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_serves_its_own_userfaultfd_and_exits_registered) | test(=liteinst_in_guest_programs::liteinst_in_guest_shell_and_entropy_consumer) | test(=liteinst_in_guest_programs::liteinst_in_guest_sigalrm_committed_at_an_instruction_trap_runs_before_exit) | test(=liteinst_in_guest_programs::liteinst_in_guest_sigalrm_handler_is_virtual_and_published) | test(=liteinst_in_guest_programs::liteinst_in_guest_sigalrm_handler_runs_at_syscall_completion) | test(=liteinst_in_guest_programs::liteinst_in_guest_sigalrm_pending_at_handler_return_runs_before_the_next_syscall) | test(=liteinst_in_guest_programs::liteinst_in_guest_tool_directory_reads_stay_out_of_the_guest_heap) | test(=liteinst_in_guest_programs::liteinst_in_guest_unscheduled_deaths_complete_and_refuse_verification) | test(=liteinst_in_guest_programs::liteinst_in_guest_user_address_limit_queries_keep_the_guest_errno) | test(=liteinst_in_guest_programs::liteinst_in_guest_virtual_identity_and_time) | test(=liteinst_in_guest_programs::liteinst_sigalrm_scalar_identity_keeps_handler_admission_controls) | test(=liteinst_in_guest_refuses_a_guest_socket_at_the_forwarding_number) | test(=liteinst_in_guest_verify_compares_the_records_the_guest_forwards) | test(=liteinst_in_guest_verify_forwards_records_by_the_cli_filters_per_target_answer) | test(=liteinst_in_guest_verify_log_keeps_records_in_ptraces_order) | test(=liteinst_in_guest_verify_survives_a_guest_stderr_without_a_reader) | test(=liteinst_in_guest_verify_with_records_past_the_log_bound_is_no_result) | test(=run_liteinst_finds_the_runtime_staged_as_an_installed_resource))",
+        "--",
+        "--skip",
+        "run_kvm_",
+        "--skip",
+        "backend_accepted_in_global_position",
+        "--skip",
+        "run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them",
+        "--skip",
+        "run_dbt_strict_returns_with_blocked_stdin_source",
+        "--skip",
+        "run_dbt_verifies_pipe_backpressure",
+        "--skip",
+        "run_dbt_keeps_diagnostics_out_of_guest_stderr",
+        "--skip",
+        "run_dbt_recovers_after_failed_exec",
+        "--skip",
+        "run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls",
+        "--skip",
+        "run_dbt_verifies_queued_self_signals",
+        "--skip",
+        "run_dbt_verifies_self_prlimit",
+        "--skip",
+        "run_dbt_verifies_shell_process_lifecycle",
+        "--skip",
+        "run_dbt_verifies_simple_env_shebang",
+        "--skip",
+        "run_liteinst_rejects_non_fork_clone",
+        "--skip",
+        "run_liteinst_handles_inherited_ignored_sigchld",
+        "--skip",
+        "run_liteinst_verifies_forked_guest",
+        "--skip",
+        "run_liteinst_verifies_raw_fork_guest",
+        "--skip",
+        "skid_overshoot_and_guest_failure_have_different_exit_codes",
+        "--skip",
+        "run_ptrace_nonleader_exec_preserves_identity_and_time",
+        "--skip",
+        "run_ptrace_nonleader_exec_preserves_preemption",
+        "--skip",
+        "run_ptrace_nonleader_exec_displaces_runnable_leader",
+        "--skip",
+        "run_ptrace_nonleader_exec_refuses_preemption_artifacts",
+        "--skip",
+        "run_chaos_preemption_replay_reuses_the_recorded_epoch",
+        "--skip",
+        "max_log_bytes_preemption_stacktrace_exits_promptly_when_stderr_is_a_full_pipe",
+        "--skip",
+        "poll_timeout_returns_on_time_while_another_thread_spins",
+        "--skip",
+        "a_guests_sigchld_to_a_futex_waiting_sibling_beside_a_cpu_bound_one_ends_its_wait",
+        "--skip",
+        "happens_before_relative_anchor_holds_the_first_call_after_its_base",
+        "--skip",
+        "happens_before_relative_anchor_state_is_not_inherited_by_a_new_thread",
+        "--skip",
+        "happens_before_unfired_relative_anchor_is_refused_with_its_base",
+        "--skip",
+        "happens_before_hold_budget_ends_a_hold_a_spinner_never_releases",
+        "--skip",
+        "happens_before_posthook_anchor_on_an_interrupted_call_is_refused_by_name",
+        "--skip",
+        "happens_before_hold_in_a_vfork_child_is_refused_by_name"
+      ],
+      "cwd": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f",
+      "head": "d09ef1a3e7f46a5206e464b562a22c2e77ae9699",
+      "base": "7f53641d93b2332b1ce53f1b97026cd0d32cb9f1",
+      "R": "dde3f9da33a0474d0fa9b273a25100fc0db4d751",
+      "prefix": [
+        "nice",
+        "-n",
+        "19",
+        "taskset",
+        "--cpu-list",
+        "0-39"
+      ],
+      "unset_env": [
+        "TMPDIR"
+      ],
+      "env": {
+        "CARGO_HOME": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home",
+        "CARGO_TARGET_DIR": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit",
+        "CARGO_BUILD_JOBS": "40",
+        "CMAKE_BUILD_PARALLEL_LEVEL": "40"
+      },
+      "job": "cli_on_host",
+      "declared_count": "321",
+      "source_command": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; HERMIT_LITEINST_TEST_BINARY=$PWD/target/ci/hermit ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -E 'not (test(=liteinst_backend_stats_report_the_guests_own_dispatch_paths) | test(=liteinst_in_guest_programs::in_guest_trap_dispatch_record_reports_no_patched_sites) | test(=liteinst_in_guest_programs::in_guest_trap_refuses_a_guest_library_that_turns_site_patching_back_on) | test(=liteinst_in_guest_programs::in_guest_trap_sets_site_patching_off_and_refuses_a_caller_who_turns_it_on) | test(=liteinst_in_guest_programs::in_guest_trap_sigalrm_scalar_identity_matches_ptrace) | test(=liteinst_in_guest_programs::in_guest_trap_verifies_a_program_with_no_site_patched) | test(=liteinst_in_guest_programs::liteinst_in_guest_a_root_that_aborts_ends_with_its_own_status) | test(=liteinst_in_guest_programs::liteinst_in_guest_abnormal_exit_after_registration_does_not_hang) | test(=liteinst_in_guest_programs::liteinst_in_guest_admitted_sigalrm_leaves_the_guest_heap_as_the_program_made_it) | test(=liteinst_in_guest_programs::liteinst_in_guest_an_undeliverable_sigalrm_is_a_loss_and_stops_the_guest) | test(=liteinst_in_guest_programs::liteinst_in_guest_checks_and_hides_the_config_fingerprint) | test(=liteinst_in_guest_programs::liteinst_in_guest_close_range_releases_ports_like_ptrace) | test(=liteinst_in_guest_programs::liteinst_in_guest_cpuid_in_a_late_loaded_library_runs) | test(=liteinst_in_guest_programs::liteinst_in_guest_alarm_outside_emulated_sleep_keeps_its_loss) | test(=liteinst_in_guest_programs::liteinst_in_guest_default_fatal_alarms_end_emulated_sleeps_and_verify) | test(=liteinst_in_guest_programs::liteinst_in_guest_noninterrupting_alarms_preserve_sleep_and_pending_state) | test(=liteinst_in_guest_programs::liteinst_in_guest_detcore_micro_suite) | test(=liteinst_in_guest_programs::liteinst_in_guest_dispatch_record_reports_patched_sites) | test(=liteinst_in_guest_programs::liteinst_in_guest_dup_aliases_share_one_cursor_after_fork) | test(=liteinst_in_guest_programs::liteinst_in_guest_encoding_and_digest_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_exit_reaping_matches_ptrace) | test(=liteinst_in_guest_programs::liteinst_in_guest_file_and_text_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_fork_child_heap_is_the_parents) | test(=liteinst_in_guest_programs::liteinst_in_guest_fork_runs_without_hanging) | test(=liteinst_in_guest_programs::liteinst_in_guest_formatting_and_sequence_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_heap_growth_avoids_trampoline_mappings) | test(=liteinst_in_guest_programs::liteinst_in_guest_identity_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_max_log_bytes_exits_promptly_when_stderr_is_a_full_pipe) | test(=liteinst_in_guest_programs::liteinst_in_guest_path_and_language_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_python_entropy) | test(=liteinst_in_guest_programs::liteinst_in_guest_python_random_example) | test(=liteinst_in_guest_programs::liteinst_in_guest_reads_a_plain_file_on_a_fuse_filesystem) | test(=liteinst_in_guest_programs::liteinst_in_guest_refuses_a_guest_that_opens_dev_fuse) | test(=liteinst_in_guest_programs::liteinst_in_guest_round2_arithmetic_and_predicate_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round2_encoding_and_comparison_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round2_representation_and_path_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round3_encoding_and_compression_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round3_portable_system_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round3_stdin_filter_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_runtime_bootstrap_is_not_charged_to_host_identity_uptime) | test(=liteinst_in_guest_programs::liteinst_in_guest_runtime_calls_none_of_the_converted_libc_wrappers) | test(=liteinst_in_guest_programs::liteinst_in_guest_runtime_leaves_the_guest_heap_as_the_program_made_it) | test(=liteinst_in_guest_programs::liteinst_in_guest_runtime_owned_self_signals_refuse_verification) | test(=liteinst_in_guest_programs::liteinst_in_guest_self_signal_deaths_are_scheduled_and_verify) | test(=liteinst_in_guest_programs::liteinst_in_guest_semantic_file_and_sqlite_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_semantic_text_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_serves_its_own_userfaultfd_and_exits_registered) | test(=liteinst_in_guest_programs::liteinst_in_guest_shell_and_entropy_consumer) | test(=liteinst_in_guest_programs::liteinst_in_guest_sigalrm_committed_at_an_instruction_trap_runs_before_exit) | test(=liteinst_in_guest_programs::liteinst_in_guest_sigalrm_handler_is_virtual_and_published) | test(=liteinst_in_guest_programs::liteinst_in_guest_sigalrm_handler_runs_at_syscall_completion) | test(=liteinst_in_guest_programs::liteinst_in_guest_sigalrm_pending_at_handler_return_runs_before_the_next_syscall) | test(=liteinst_in_guest_programs::liteinst_in_guest_tool_directory_reads_stay_out_of_the_guest_heap) | test(=liteinst_in_guest_programs::liteinst_in_guest_unscheduled_deaths_complete_and_refuse_verification) | test(=liteinst_in_guest_programs::liteinst_in_guest_user_address_limit_queries_keep_the_guest_errno) | test(=liteinst_in_guest_programs::liteinst_in_guest_virtual_identity_and_time) | test(=liteinst_in_guest_programs::liteinst_sigalrm_scalar_identity_keeps_handler_admission_controls) | test(=liteinst_in_guest_refuses_a_guest_socket_at_the_forwarding_number) | test(=liteinst_in_guest_verify_compares_the_records_the_guest_forwards) | test(=liteinst_in_guest_verify_forwards_records_by_the_cli_filters_per_target_answer) | test(=liteinst_in_guest_verify_log_keeps_records_in_ptraces_order) | test(=liteinst_in_guest_verify_survives_a_guest_stderr_without_a_reader) | test(=liteinst_in_guest_verify_with_records_past_the_log_bound_is_no_result) | test(=run_liteinst_finds_the_runtime_staged_as_an_installed_resource))' -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them --skip run_dbt_strict_returns_with_blocked_stdin_source --skip run_dbt_verifies_pipe_backpressure --skip run_dbt_keeps_diagnostics_out_of_guest_stderr --skip run_dbt_recovers_after_failed_exec --skip run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls --skip run_dbt_verifies_queued_self_signals --skip run_dbt_verifies_self_prlimit --skip run_dbt_verifies_shell_process_lifecycle --skip run_dbt_verifies_simple_env_shebang --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest --skip skid_overshoot_and_guest_failure_have_different_exit_codes --skip run_ptrace_nonleader_exec_preserves_identity_and_time --skip run_ptrace_nonleader_exec_preserves_preemption --skip run_ptrace_nonleader_exec_displaces_runnable_leader --skip run_ptrace_nonleader_exec_refuses_preemption_artifacts --skip run_chaos_preemption_replay_reuses_the_recorded_epoch --skip max_log_bytes_preemption_stacktrace_exits_promptly_when_stderr_is_a_full_pipe --skip poll_timeout_returns_on_time_while_another_thread_spins --skip a_guests_sigchld_to_a_futex_waiting_sibling_beside_a_cpu_bound_one_ends_its_wait --skip happens_before_relative_anchor_holds_the_first_call_after_its_base --skip happens_before_relative_anchor_state_is_not_inherited_by_a_new_thread --skip happens_before_unfired_relative_anchor_is_refused_with_its_base --skip happens_before_hold_budget_ends_a_hold_a_spinner_never_releases --skip happens_before_posthook_anchor_on_an_interrupted_call_is_refused_by_name --skip happens_before_hold_in_a_vfork_child_is_refused_by_name",
+      "prepared_build_selection": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"cli\"]",
+      "equivalence": "Only execution profile/job plumbing removed; original package/features/filter/skips retained.",
+      "started_at": "2026-10-14T13:34:51Z",
+      "ended_at": "2026-10-14T13:34:51Z",
+      "exit": 0,
+      "shell_display": "nice -n 19 taskset --cpu-list 0-39 env -u TMPDIR CARGO_HOME=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home CARGO_TARGET_DIR=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit CARGO_BUILD_JOBS=40 CMAKE_BUILD_PARALLEL_LEVEL=40 cargo nextest list --offline --locked --cargo-profile validate --message-format json -p hermit --features third-party-backends --test cli -E 'not (test(=liteinst_backend_stats_report_the_guests_own_dispatch_paths) | test(=liteinst_in_guest_programs::in_guest_trap_dispatch_record_reports_no_patched_sites) | test(=liteinst_in_guest_programs::in_guest_trap_refuses_a_guest_library_that_turns_site_patching_back_on) | test(=liteinst_in_guest_programs::in_guest_trap_sets_site_patching_off_and_refuses_a_caller_who_turns_it_on) | test(=liteinst_in_guest_programs::in_guest_trap_sigalrm_scalar_identity_matches_ptrace) | test(=liteinst_in_guest_programs::in_guest_trap_verifies_a_program_with_no_site_patched) | test(=liteinst_in_guest_programs::liteinst_in_guest_a_root_that_aborts_ends_with_its_own_status) | test(=liteinst_in_guest_programs::liteinst_in_guest_abnormal_exit_after_registration_does_not_hang) | test(=liteinst_in_guest_programs::liteinst_in_guest_admitted_sigalrm_leaves_the_guest_heap_as_the_program_made_it) | test(=liteinst_in_guest_programs::liteinst_in_guest_an_undeliverable_sigalrm_is_a_loss_and_stops_the_guest) | test(=liteinst_in_guest_programs::liteinst_in_guest_checks_and_hides_the_config_fingerprint) | test(=liteinst_in_guest_programs::liteinst_in_guest_close_range_releases_ports_like_ptrace) | test(=liteinst_in_guest_programs::liteinst_in_guest_cpuid_in_a_late_loaded_library_runs) | test(=liteinst_in_guest_programs::liteinst_in_guest_alarm_outside_emulated_sleep_keeps_its_loss) | test(=liteinst_in_guest_programs::liteinst_in_guest_default_fatal_alarms_end_emulated_sleeps_and_verify) | test(=liteinst_in_guest_programs::liteinst_in_guest_noninterrupting_alarms_preserve_sleep_and_pending_state) | test(=liteinst_in_guest_programs::liteinst_in_guest_detcore_micro_suite) | test(=liteinst_in_guest_programs::liteinst_in_guest_dispatch_record_reports_patched_sites) | test(=liteinst_in_guest_programs::liteinst_in_guest_dup_aliases_share_one_cursor_after_fork) | test(=liteinst_in_guest_programs::liteinst_in_guest_encoding_and_digest_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_exit_reaping_matches_ptrace) | test(=liteinst_in_guest_programs::liteinst_in_guest_file_and_text_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_fork_child_heap_is_the_parents) | test(=liteinst_in_guest_programs::liteinst_in_guest_fork_runs_without_hanging) | test(=liteinst_in_guest_programs::liteinst_in_guest_formatting_and_sequence_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_heap_growth_avoids_trampoline_mappings) | test(=liteinst_in_guest_programs::liteinst_in_guest_identity_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_max_log_bytes_exits_promptly_when_stderr_is_a_full_pipe) | test(=liteinst_in_guest_programs::liteinst_in_guest_path_and_language_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_python_entropy) | test(=liteinst_in_guest_programs::liteinst_in_guest_python_random_example) | test(=liteinst_in_guest_programs::liteinst_in_guest_reads_a_plain_file_on_a_fuse_filesystem) | test(=liteinst_in_guest_programs::liteinst_in_guest_refuses_a_guest_that_opens_dev_fuse) | test(=liteinst_in_guest_programs::liteinst_in_guest_round2_arithmetic_and_predicate_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round2_encoding_and_comparison_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round2_representation_and_path_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round3_encoding_and_compression_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round3_portable_system_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round3_stdin_filter_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_runtime_bootstrap_is_not_charged_to_host_identity_uptime) | test(=liteinst_in_guest_programs::liteinst_in_guest_runtime_calls_none_of_the_converted_libc_wrappers) | test(=liteinst_in_guest_programs::liteinst_in_guest_runtime_leaves_the_guest_heap_as_the_program_made_it) | test(=liteinst_in_guest_programs::liteinst_in_guest_runtime_owned_self_signals_refuse_verification) | test(=liteinst_in_guest_programs::liteinst_in_guest_self_signal_deaths_are_scheduled_and_verify) | test(=liteinst_in_guest_programs::liteinst_in_guest_semantic_file_and_sqlite_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_semantic_text_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_serves_its_own_userfaultfd_and_exits_registered) | test(=liteinst_in_guest_programs::liteinst_in_guest_shell_and_entropy_consumer) | test(=liteinst_in_guest_programs::liteinst_in_guest_sigalrm_committed_at_an_instruction_trap_runs_before_exit) | test(=liteinst_in_guest_programs::liteinst_in_guest_sigalrm_handler_is_virtual_and_published) | test(=liteinst_in_guest_programs::liteinst_in_guest_sigalrm_handler_runs_at_syscall_completion) | test(=liteinst_in_guest_programs::liteinst_in_guest_sigalrm_pending_at_handler_return_runs_before_the_next_syscall) | test(=liteinst_in_guest_programs::liteinst_in_guest_tool_directory_reads_stay_out_of_the_guest_heap) | test(=liteinst_in_guest_programs::liteinst_in_guest_unscheduled_deaths_complete_and_refuse_verification) | test(=liteinst_in_guest_programs::liteinst_in_guest_user_address_limit_queries_keep_the_guest_errno) | test(=liteinst_in_guest_programs::liteinst_in_guest_virtual_identity_and_time) | test(=liteinst_in_guest_programs::liteinst_sigalrm_scalar_identity_keeps_handler_admission_controls) | test(=liteinst_in_guest_refuses_a_guest_socket_at_the_forwarding_number) | test(=liteinst_in_guest_verify_compares_the_records_the_guest_forwards) | test(=liteinst_in_guest_verify_forwards_records_by_the_cli_filters_per_target_answer) | test(=liteinst_in_guest_verify_log_keeps_records_in_ptraces_order) | test(=liteinst_in_guest_verify_survives_a_guest_stderr_without_a_reader) | test(=liteinst_in_guest_verify_with_records_past_the_log_bound_is_no_result) | test(=run_liteinst_finds_the_runtime_staged_as_an_installed_resource))' -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them --skip run_dbt_strict_returns_with_blocked_stdin_source --skip run_dbt_verifies_pipe_backpressure --skip run_dbt_keeps_diagnostics_out_of_guest_stderr --skip run_dbt_recovers_after_failed_exec --skip run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls --skip run_dbt_verifies_queued_self_signals --skip run_dbt_verifies_self_prlimit --skip run_dbt_verifies_shell_process_lifecycle --skip run_dbt_verifies_simple_env_shebang --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest --skip skid_overshoot_and_guest_failure_have_different_exit_codes --skip run_ptrace_nonleader_exec_preserves_identity_and_time --skip run_ptrace_nonleader_exec_preserves_preemption --skip run_ptrace_nonleader_exec_displaces_runnable_leader --skip run_ptrace_nonleader_exec_refuses_preemption_artifacts --skip run_chaos_preemption_replay_reuses_the_recorded_epoch --skip max_log_bytes_preemption_stacktrace_exits_promptly_when_stderr_is_a_full_pipe --skip poll_timeout_returns_on_time_while_another_thread_spins --skip a_guests_sigchld_to_a_futex_waiting_sibling_beside_a_cpu_bound_one_ends_its_wait --skip happens_before_relative_anchor_holds_the_first_call_after_its_base --skip happens_before_relative_anchor_state_is_not_inherited_by_a_new_thread --skip happens_before_unfired_relative_anchor_is_refused_with_its_base --skip happens_before_hold_budget_ends_a_hold_a_spinner_never_releases --skip happens_before_posthook_anchor_on_an_interrupted_call_is_refused_by_name --skip happens_before_hold_in_a_vfork_child_is_refused_by_name"
+    },
+    {
+      "stem": "helper-dag-check",
+      "argv": [
+        "cargo",
+        "run",
+        "--offline",
+        "--locked",
+        "-p",
+        "hermit-manifest-plan",
+        "--bin",
+        "generate-validation-dag",
+        "--",
+        "--check"
+      ],
+      "cwd": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f",
+      "head": "d09ef1a3e7f46a5206e464b562a22c2e77ae9699",
+      "base": "7f53641d93b2332b1ce53f1b97026cd0d32cb9f1",
+      "R": "dde3f9da33a0474d0fa9b273a25100fc0db4d751",
+      "prefix": [
+        "nice",
+        "-n",
+        "19",
+        "taskset",
+        "--cpu-list",
+        "0-39"
+      ],
+      "unset_env": [
+        "TMPDIR"
+      ],
+      "env": {
+        "CARGO_HOME": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home",
+        "CARGO_TARGET_DIR": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit",
+        "CARGO_BUILD_JOBS": "40",
+        "CMAKE_BUILD_PARALLEL_LEVEL": "40"
+      },
+      "started_at": "2026-10-14T13:35:40Z",
+      "ended_at": "2026-10-14T13:36:11Z",
+      "exit": 0,
+      "shell_display": "nice -n 19 taskset --cpu-list 0-39 env -u TMPDIR CARGO_HOME=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home CARGO_TARGET_DIR=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit CARGO_BUILD_JOBS=40 CMAKE_BUILD_PARALLEL_LEVEL=40 cargo run --offline --locked -p hermit-manifest-plan --bin generate-validation-dag -- --check"
+    },
+    {
+      "stem": "helper-sync",
+      "argv": [
+        "cargo",
+        "run",
+        "--offline",
+        "--locked",
+        "-p",
+        "hermit-manifest-plan",
+        "--bin",
+        "test-harness",
+        "--",
+        "sync-cells",
+        "--check"
+      ],
+      "cwd": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f",
+      "head": "d09ef1a3e7f46a5206e464b562a22c2e77ae9699",
+      "base": "7f53641d93b2332b1ce53f1b97026cd0d32cb9f1",
+      "R": "dde3f9da33a0474d0fa9b273a25100fc0db4d751",
+      "prefix": [
+        "nice",
+        "-n",
+        "19",
+        "taskset",
+        "--cpu-list",
+        "0-39"
+      ],
+      "unset_env": [
+        "TMPDIR"
+      ],
+      "env": {
+        "CARGO_HOME": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home",
+        "CARGO_TARGET_DIR": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit",
+        "CARGO_BUILD_JOBS": "40",
+        "CMAKE_BUILD_PARALLEL_LEVEL": "40"
+      },
+      "started_at": "2026-10-14T13:36:27Z",
+      "ended_at": "2026-10-14T13:36:30Z",
+      "exit": 0,
+      "shell_display": "nice -n 19 taskset --cpu-list 0-39 env -u TMPDIR CARGO_HOME=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home CARGO_TARGET_DIR=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit CARGO_BUILD_JOBS=40 CMAKE_BUILD_PARALLEL_LEVEL=40 cargo run --offline --locked -p hermit-manifest-plan --bin test-harness -- sync-cells --check"
+    },
+    {
+      "stem": "helper-manifest-json",
+      "argv": [
+        "cargo",
+        "run",
+        "--offline",
+        "--locked",
+        "-p",
+        "hermit-manifest-plan",
+        "--bin",
+        "hermit-manifest-plan",
+        "--",
+        "--format",
+        "json"
+      ],
+      "cwd": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f",
+      "head": "d09ef1a3e7f46a5206e464b562a22c2e77ae9699",
+      "base": "7f53641d93b2332b1ce53f1b97026cd0d32cb9f1",
+      "R": "dde3f9da33a0474d0fa9b273a25100fc0db4d751",
+      "prefix": [
+        "nice",
+        "-n",
+        "19",
+        "taskset",
+        "--cpu-list",
+        "0-39"
+      ],
+      "unset_env": [
+        "TMPDIR"
+      ],
+      "env": {
+        "CARGO_HOME": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home",
+        "CARGO_TARGET_DIR": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit",
+        "CARGO_BUILD_JOBS": "40",
+        "CMAKE_BUILD_PARALLEL_LEVEL": "40"
+      },
+      "started_at": "2026-10-14T13:36:54Z",
+      "ended_at": "2026-10-14T13:36:56Z",
+      "exit": 0,
+      "shell_display": "nice -n 19 taskset --cpu-list 0-39 env -u TMPDIR CARGO_HOME=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home CARGO_TARGET_DIR=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit CARGO_BUILD_JOBS=40 CMAKE_BUILD_PARALLEL_LEVEL=40 cargo run --offline --locked -p hermit-manifest-plan --bin hermit-manifest-plan -- --format json"
+    },
+    {
+      "stem": "helper-inventory",
+      "argv": [
+        "./scripts/patch-reverie-dbt-buck.rs",
+        "--check-inventory"
+      ],
+      "cwd": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f",
+      "head": "d09ef1a3e7f46a5206e464b562a22c2e77ae9699",
+      "base": "7f53641d93b2332b1ce53f1b97026cd0d32cb9f1",
+      "R": "dde3f9da33a0474d0fa9b273a25100fc0db4d751",
+      "prefix": [
+        "nice",
+        "-n",
+        "19",
+        "taskset",
+        "--cpu-list",
+        "0-39"
+      ],
+      "unset_env": [
+        "TMPDIR"
+      ],
+      "env": {
+        "CARGO_HOME": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home",
+        "CARGO_TARGET_DIR": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit",
+        "CARGO_BUILD_JOBS": "40",
+        "CMAKE_BUILD_PARALLEL_LEVEL": "40",
+        "CARGO_NET_OFFLINE": "true"
+      },
+      "started_at": "2026-10-14T13:37:20Z",
+      "ended_at": "2026-10-14T13:39:30Z",
+      "exit": 0,
+      "shell_display": "nice -n 19 taskset --cpu-list 0-39 env -u TMPDIR CARGO_HOME=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home CARGO_TARGET_DIR=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit CARGO_BUILD_JOBS=40 CMAKE_BUILD_PARALLEL_LEVEL=40 CARGO_NET_OFFLINE=true ./scripts/patch-reverie-dbt-buck.rs --check-inventory"
+    }
+  ]
+}

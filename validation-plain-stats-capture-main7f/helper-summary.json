@@ -1,0 +1,35 @@
+{
+  "H": "d09ef1a3e7f46a5206e464b562a22c2e77ae9699",
+  "R": "dde3f9da33a0474d0fa9b273a25100fc0db4d751",
+  "helpers": [
+    {
+      "stem": "helper-dag-check",
+      "exit": 0,
+      "stdout_sha256": "e67cff82a58623d5fe359887b62a1a7c4b423ecefe1ee1d0f4f38f65f4f5a697",
+      "stderr_sha256": "edff0e50ee9f5d0fe1acdacaf5a13b7839893fd7d0b68b85c68cb83d62c12737"
+    },
+    {
+      "stem": "helper-sync",
+      "exit": 0,
+      "stdout_sha256": "9805cfcba76e1be90d4adfce3349abb20212a2ef4be7487de61b16fc78fee6fe",
+      "stderr_sha256": "db525734c368c45a37f7361f913b8aa76626a0c90cff31493450372f9932398b"
+    },
+    {
+      "stem": "helper-manifest-json",
+      "exit": 0,
+      "stdout_sha256": "6f4b17cdb20272e3c509709249a252b5fa492de4213c9f20a2b50b338ddc0b66",
+      "stderr_sha256": "242d8c63df498e9acb59e56d3cb6e5be1d59d68de33af7d3b1d424e786e3c224"
+    },
+    {
+      "stem": "helper-inventory",
+      "exit": 0,
+      "stdout_sha256": "0656b3e83723739c749031a6fb8e4efa9207e9991a38fec8011e8678c4019097",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "inventory_expected_and_actual": 953,
+  "DAG": "canonical and fresh",
+  "sync": "expected plan and optional cells current",
+  "manifest_json": "parsed successfully",
+  "source_generation_or_edits": false
+}

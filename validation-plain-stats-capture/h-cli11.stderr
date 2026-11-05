@@ -1,0 +1,18 @@
+   Compiling hermit v0.4.1 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture/hermit-cli)
+    Finished `validate` profile [optimized] target(s) in 20.67s
+────────────
+ Nextest run ID 35c04a06-8111-4810-8fd4-ed871a41777f with nextest profile: default
+    Starting 11 tests across 1 binary (407 tests skipped)
+        PASS [   1.400s] hermit::cli dbt_verify_retains_captures_under_the_names_the_harness_scans_for
+        PASS [   0.962s] hermit::cli dbt_verify_without_json_rejects_io_buffer_content_divergence
+        PASS [   2.648s] hermit::cli run_dbt_keeps_diagnostics_out_of_guest_stderr
+        PASS [   2.745s] hermit::cli run_dbt_recovers_after_failed_exec
+        PASS [   1.376s] hermit::cli run_dbt_verify_keeps_the_diagnostic_of_a_backend_failure
+        PASS [   1.449s] hermit::cli run_dbt_verify_replays_stdin_bytes_and_eof
+        PASS [   0.884s] hermit::cli run_dbt_verify_returns_with_blocked_stdin_source_after_both_runs
+        PASS [   0.204s] hermit::cli verify_run::paired_verify_runs_keep_logs_and_need_no_run_two_after_a_rejected_run_one
+        PASS [   0.281s] hermit::cli verify_run::paired_verify_runs_refuse_unlike_runs_and_find_a_difference
+        PASS [   8.989s] hermit::cli verify_run::paired_verify_runs_report_what_run_verify_reports_on_dbt
+        PASS [   1.540s] hermit::cli verify_run::paired_verify_runs_report_what_run_verify_reports_on_ptrace
+────────────
+     Summary [  22.481s] 11 tests run: 11 passed, 407 skipped

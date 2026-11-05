@@ -1,0 +1,154 @@
+{
+  "H": {
+    "head": "d09ef1a3e7f46a5206e464b562a22c2e77ae9699",
+    "base": "7f53641d93b2332b1ce53f1b97026cd0d32cb9f1",
+    "provider": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f",
+    "pin": "dde3f9da33a0474d0fa9b273a25100fc0db4d751",
+    "clean": true
+  },
+  "R": {
+    "head": "dde3f9da33a0474d0fa9b273a25100fc0db4d751",
+    "base": "16ffab7c558c47c78c43aa8e0e4242eb2deeeb3d",
+    "provider": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/reverie-stats-capture-main16ff",
+    "clean": true
+  },
+  "pin_file_joins": [
+    {
+      "path": "Cargo.lock",
+      "new_pin_occurrences": 34,
+      "sha256": "e92f74f943ba9a8fb1f5cb8f1bb74db800979ad0390374d68e9085bcff8185ae",
+      "inverse_byte_equal": true
+    },
+    {
+      "path": "detcore-dbt/Cargo.toml",
+      "new_pin_occurrences": 2,
+      "sha256": "8003be97bb611fb56b603f389c2878453cc0c37fec8877bff39decc9176277ef",
+      "inverse_byte_equal": true
+    },
+    {
+      "path": "detcore-liteinst/Cargo.toml",
+      "new_pin_occurrences": 4,
+      "sha256": "51240793a2db28ee1c2ac576ec39a4fea6ffdd7e1d83b0ff233c52ec9bdb5e54",
+      "inverse_byte_equal": true
+    },
+    {
+      "path": "detcore-model/Cargo.toml",
+      "new_pin_occurrences": 2,
+      "sha256": "248fc9747c43a156e1d8595ca851f8b22c584ec0dcfe94ae0a00c3336363361c",
+      "inverse_byte_equal": true
+    },
+    {
+      "path": "detcore-sabre/Cargo.toml",
+      "new_pin_occurrences": 5,
+      "sha256": "0ff575ca05913f7e6d16657d35327f3c88619df5b24505baa61ae3fa4bb30717",
+      "inverse_byte_equal": true
+    },
+    {
+      "path": "detcore/Cargo.toml",
+      "new_pin_occurrences": 2,
+      "sha256": "ad553caa0ab136191d057883a96f99ade4d2ef644f67a24d4aed920b5e8620aa",
+      "inverse_byte_equal": true
+    },
+    {
+      "path": "detcore/tests/testutils/Cargo.toml",
+      "new_pin_occurrences": 2,
+      "sha256": "62ed2916bc1dc842f0cdc8ae12ecbfc4d1a1faf985bbb06424ff806d8670f354",
+      "inverse_byte_equal": true
+    },
+    {
+      "path": "hermit-cli/BUCK",
+      "new_pin_occurrences": 1,
+      "sha256": "b1a572461371eadab1e7afebd3cfcc76a8212dcb1fe9fcd41cdd7d975643ba76",
+      "inverse_byte_equal": true
+    },
+    {
+      "path": "hermit-cli/Cargo.toml",
+      "new_pin_occurrences": 7,
+      "sha256": "0503018dd17b271cb607a7f483d2d1ad1af22e98a1eb9ff596d008e8bd7a05f3",
+      "inverse_byte_equal": true
+    },
+    {
+      "path": "hermit-install/Cargo.toml",
+      "new_pin_occurrences": 2,
+      "sha256": "8c12155587269a9c0e649bdd1c74ee9e0124faad48189c22bb2490217de0f223",
+      "inverse_byte_equal": true
+    },
+    {
+      "path": "liteinst-runtime-build/Cargo.lock",
+      "new_pin_occurrences": 22,
+      "sha256": "50526c7013bc3bdc2b4ca705fd8bd26e90424ff034c090a316023b80a039fb4d",
+      "inverse_byte_equal": true
+    },
+    {
+      "path": "liteinst-runtime-build/Cargo.toml",
+      "new_pin_occurrences": 1,
+      "sha256": "b72f0a1edd08714e97889d94084127c38ee6a1d163b5669239ab1a5516523146",
+      "inverse_byte_equal": true
+    },
+    {
+      "path": "liteinst-runtime-build/runtime/Cargo.toml",
+      "new_pin_occurrences": 1,
+      "sha256": "02f9a62cbd420de224bb793621cd60f162bfcd90550754566ace7f3dd9072f13",
+      "inverse_byte_equal": true
+    }
+  ],
+  "sdk_git_object_joins": [
+    {
+      "path": "reverie-dbt/build.rs",
+      "base_object": "ff1eeb32b140ae477894126af21296723c1ba582",
+      "candidate_object": "ff1eeb32b140ae477894126af21296723c1ba582",
+      "equal": true
+    },
+    {
+      "path": "reverie-dbt/vendor/dynamorio",
+      "base_object": "3be3524be8355bacf65d4a5296be7cfe30fdd9ce",
+      "candidate_object": "3be3524be8355bacf65d4a5296be7cfe30fdd9ce",
+      "equal": true
+    },
+    {
+      "path": "reverie-dbt/Cargo.toml",
+      "base_object": "0e24d047d544a3daae2d6350270b26ceb74139d1",
+      "candidate_object": "0e24d047d544a3daae2d6350270b26ceb74139d1",
+      "equal": true
+    },
+    {
+      "path": "reverie-dbt/native/CMakeLists.txt",
+      "base_object": "bcfb298a4f87ed190d7fdc52393e01d1245a8fe3",
+      "candidate_object": "bcfb298a4f87ed190d7fdc52393e01d1245a8fe3",
+      "equal": true
+    },
+    {
+      "path": "third-party",
+      "base_object": "fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a",
+      "candidate_object": "fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a",
+      "equal": true
+    },
+    {
+      "path": "Cargo.toml",
+      "base_object": "293992554d9966678cc161d8bcd65bc26b9faea7",
+      "candidate_object": "293992554d9966678cc161d8bcd65bc26b9faea7",
+      "equal": true
+    },
+    {
+      "path": "rust-toolchain.toml",
+      "base_object": "b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9",
+      "candidate_object": "b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9",
+      "equal": true
+    }
+  ],
+  "sdk_qualification": "Source equality only; historical SDK key/budget carry does not establish current native client/runtime linkage or a measured build. Actual tool/environment key is executor-owned.",
+  "inventory": {
+    "base": 952,
+    "candidate": 953,
+    "declared": 953,
+    "added": [
+      "reverie-dbt/src/launcher/tests/stats_capture.rs"
+    ],
+    "removed": [],
+    "nul_name_list_sha256": "1b0f1d5be474b0ed186867f61c699dcf5288d8d7d78f8b5a8af9e07bdc7c71f8",
+    "qualification": "Tracked-path enumeration, not execution of the maintained inventory checker."
+  },
+  "stack_fix_preserved": true,
+  "DAG_and_count_source_preserved": true,
+  "runtime": "pending, no historical pass carried"
+}

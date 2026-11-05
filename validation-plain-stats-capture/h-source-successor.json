@@ -1,0 +1,8 @@
+{
+  "at": "2026-10-14T11:55:31.895160+00:00",
+  "head": "342daf53c1691da42ae7067850540a06bec504b4",
+  "parent": "e7307c2c2aa7f97d0f4aa209ea47122d0915cfc5",
+  "status": "",
+  "R": "ff30c5bac6040c14122d33d60f5dfb91953c7099",
+  "correction": "One local import in existing cfg(dbt) test helper; initial compile exit101 preserved."
+}

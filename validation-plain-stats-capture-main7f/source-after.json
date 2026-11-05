@@ -1,0 +1,99 @@
+{
+  "closed_at": "2026-10-14T13:40:21.161431+00:00",
+  "sources": [
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/reverie-stats-capture-main16ff",
+      "head": "dde3f9da33a0474d0fa9b273a25100fc0db4d751",
+      "status": "",
+      "Cargo.lock_sha256": "fa0c9f049cc98e31cc082a4d44e5d9f93f03fe5f30b352661176a9b54f3f81e6",
+      "toolchain_sha256": "9cce75ca502f4ab084b6fbe6bcc18cc406706eb19bc024ff403871cdf5927956",
+      "tree": "be01369a269270f030dce529a12b75e20556532f"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f",
+      "head": "d09ef1a3e7f46a5206e464b562a22c2e77ae9699",
+      "status": "",
+      "Cargo.lock_sha256": "e92f74f943ba9a8fb1f5cb8f1bb74db800979ad0390374d68e9085bcff8185ae",
+      "toolchain_sha256": "1d4013c1df116df05baff23371620b48406da21bb9c636107b85e9c415eb0740",
+      "tree": "ff43deaffda7cd04d38dde4d97b5ba51ebca4b4c"
+    }
+  ],
+  "submodules": [
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/reverie-stats-capture-main16ff/third-party/dynamorio",
+      "head": "929840ad9190e5086775e8debc0f0b79b4208d59",
+      "status": ""
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/reverie-stats-capture-main16ff/third-party/dynamorio/third_party/elfutils",
+      "head": "302252356da5475670ac5b10dadd091c59689425",
+      "status": ""
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/reverie-stats-capture-main16ff/third-party/dynamorio/third_party/libipt",
+      "head": "c848a85c3104e2f5780741f85de5c9e65476ece2",
+      "status": ""
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/reverie-stats-capture-main16ff/third-party/dynamorio/third_party/zlib",
+      "head": "51b7f2abdade71cd9bb0e7a373ef2610ec6f9daf",
+      "status": ""
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/reverie-stats-capture-main16ff/third-party/e9patch",
+      "head": "6c2c03c1da74b14daf1788a9f8dccfa354ce04a6",
+      "status": ""
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/reverie-stats-capture-main16ff/third-party/sabre",
+      "head": "41113f849f8799932ed8c7883f5a4de616b9e9fa",
+      "status": ""
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f/agent-utils",
+      "head": "2bd7f9562d74fa96d24050cdd8c7746349ff5244",
+      "status": ""
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f/reverie",
+      "head": "dde3f9da33a0474d0fa9b273a25100fc0db4d751",
+      "status": ""
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f/reverie/third-party/dynamorio",
+      "head": "929840ad9190e5086775e8debc0f0b79b4208d59",
+      "status": ""
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f/reverie/third-party/dynamorio/third_party/elfutils",
+      "head": "302252356da5475670ac5b10dadd091c59689425",
+      "status": ""
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f/reverie/third-party/dynamorio/third_party/libipt",
+      "head": "c848a85c3104e2f5780741f85de5c9e65476ece2",
+      "status": ""
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f/reverie/third-party/dynamorio/third_party/zlib",
+      "head": "51b7f2abdade71cd9bb0e7a373ef2610ec6f9daf",
+      "status": ""
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f/reverie/third-party/e9patch",
+      "head": "6c2c03c1da74b14daf1788a9f8dccfa354ce04a6",
+      "status": ""
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f/reverie/third-party/sabre",
+      "head": "41113f849f8799932ed8c7883f5a4de616b9e9fa",
+      "status": ""
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f/third-party/rr",
+      "head": "39e5c18e7e43236b7ca0fb1eb647fe9c93e3934e",
+      "status": ""
+    }
+  ],
+  "qualification": "Exact frozen heads and clean tracked/untracked-normal state after all commands; dependency locks unchanged."
+}

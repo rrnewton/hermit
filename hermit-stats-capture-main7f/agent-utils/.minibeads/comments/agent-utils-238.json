@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-238-c7ed9219ccf",
+    "issue_id": "agent-utils-238",
+    "author": "opus 5.5",
+    "body": "[opus 5.5] M1 partly landed on main (71d4b8d1): MUSE-STATUS and MUSE-PROOFS (client/muse_editor.rs; fuzzed 440k frames against Python with 0 mismatches; fixes Rust typing into a paused Muse editor), NESTED-RECORDS (full v2/v3 read, nested write-back, anchor migration; cross group nested_records), CODEX-GOAL (agentctl codex-goal get|set|clear), capabilities.build provenance, skill-install tests, and the HL-18 interim retirement of dead turn-runner workers (refuses while a runner may still be starting). Still open in M1: CLI-EXIT and CLI-JSONFMT (await owner Q1/Q2); nested-record refusal wording differs from Python for some malformed rows. Also raised the agentctl differential limit to 1200 s (it took 648 s under load).",
+    "created_at": "2026-10-12T04:44:49.629045716Z",
+    "updated_at": "2026-10-12T04:44:49.629045716Z"
+  }
+]

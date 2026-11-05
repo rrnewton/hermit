@@ -1,0 +1,230 @@
+name: vibe-talk
+
+# vibe-talk is a service, not one of the paired command-line tools, and it lives outside the `rs/`
+# workspace with its own lockfile. The canonical repository validation graph includes its normal
+# build, unit, and browser contract. This focused workflow retains the distinct MSRV and container
+# artifact checks that the local graph cannot replace.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'vibe-talk/**'
+      - '.github/workflows/vibe-talk.yml'
+  pull_request:
+    paths:
+      - 'vibe-talk/**'
+      - '.github/workflows/vibe-talk.yml'
+  workflow_dispatch:
+
+jobs:
+  msrv:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: vibe-talk
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - name: check the declared Rust 1.85 MSRV
+        run: cargo check --locked --all-targets
+
+  container:
+    # The image is the deployment artifact; a Containerfile that stopped building would otherwise
+    # only be discovered at deploy time.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: build the container image
+        run: podman build -t vibe-talk:ci -f vibe-talk/Containerfile vibe-talk
+      # Rootless container networking is the part of this job most likely to differ between a
+      # laptop and a hosted runner, and a port that is unreachable there looks exactly like a
+      # server that refused to start. Record what the runner actually provides, always, so that
+      # distinction is readable from the log rather than guessed at afterwards.
+      - name: record the container runtime and its networking
+        run: |
+          podman version
+          podman info --format 'rootless={{.Host.Security.Rootless}} network={{.Host.NetworkBackend}}'
+          ip -brief address || true
+      - name: the server refuses to start without credentials
+        run: |
+          set -o pipefail
+          if podman run --rm vibe-talk:ci --version | grep -q '^vibe-talk '; then
+            echo "version smoke ok"
+          else
+            echo "the image did not report its version" >&2
+            exit 1
+          fi
+          # No credentials in the environment: startup must FAIL rather than come up with defaults.
+          if podman run --rm vibe-talk:ci; then
+            echo "the server started with no configuration at all" >&2
+            exit 1
+          fi
+      # The startup channel probe, proven able to REFUSE in the real image. The unit tests prove it
+      # classifies correctly; only this proves the binary actually runs it before serving.
+      - name: the startup probe refuses a bot that cannot read its channels
+        run: |
+          # No --fake-discord: the real Discord client, a bogus token, and a channel nobody owns.
+          # Whichever way CI's egress falls the answer is a probe failure — a 401 if discord.com is
+          # reachable, "never reached Discord" if it is not — and either way the server must not
+          # come up.
+          if out=$(podman run --rm \
+            -e VIBE_TALK_DISCORD_BOT_TOKEN=not-a-real-token \
+            -e VIBE_TALK_READ_TOKEN=ci-read-token-0000000000000 \
+            -e VIBE_TALK_WRITE_TOKEN=ci-write-token-000000000000 \
+            -e "VIBE_TALK_CHANNELS=424242:ci channel:rw" \
+            vibe-talk:ci 2>&1); then
+            echo "the server started even though its channel could not be read:" >&2
+            echo "$out" >&2
+            exit 1
+          fi
+          echo "$out"
+          grep -q "startup channel probe" <<<"$out" \
+            || { echo "it refused, but not because of the probe" >&2; exit 1; }
+
+      - name: ...and the skip switch turns it off, loudly
+        run: |
+          set -euo pipefail
+          # A server that never answers and a published port that never forwards produce the same
+          # curl error. Say which one happened, with the container's own state and log, instead of
+          # failing on a bare curl that names neither.
+          wait_for_health() {
+            local port="$1" name="$2" i
+            for i in $(seq 1 30); do
+              if curl -fsS "http://127.0.0.1:${port}/healthz"; then
+                echo
+                return 0
+              fi
+              sleep 1
+            done
+            echo "the server at 127.0.0.1:${port} never answered /healthz within 30s" >&2
+            echo "--- podman ps -a ---" >&2
+            podman ps -a >&2 || true
+            echo "--- podman logs ${name} ---" >&2
+            podman logs "${name}" >&2 || true
+            echo "--- podman port ${name} ---" >&2
+            podman port "${name}" >&2 || true
+            echo "--- listening sockets ---" >&2
+            ss -ltnp >&2 || true
+            echo "--- verbose curl ---" >&2
+            curl -v --max-time 5 "http://127.0.0.1:${port}/healthz" >&2 || true
+            return 1
+          }
+          podman run -d --rm --name vibe-talk-skip -p 18081:8080 \
+            -e VIBE_TALK_DISCORD_BOT_TOKEN=not-a-real-token \
+            -e VIBE_TALK_READ_TOKEN=ci-read-token-0000000000000 \
+            -e VIBE_TALK_WRITE_TOKEN=ci-write-token-000000000000 \
+            -e "VIBE_TALK_CHANNELS=424242:ci channel:rw" \
+            -e VIBE_TALK_SKIP_STARTUP_PROBE=1 \
+            vibe-talk:ci
+          wait_for_health 18081 vibe-talk-skip
+          # A skip that says nothing is the same silent start the probe was added to remove.
+          # Container log forwarding can trail the health response, so wait for the evidence.
+          # Do not use grep -q here: it closes the pipe after a match, podman logs receives
+          # SIGPIPE, and pipefail turns the successful match into a failed condition.
+          announced=0
+          for _ in $(seq 1 100); do
+            if podman logs vibe-talk-skip 2>&1 \
+              | grep -i "SKIPPING the startup channel probe" >/dev/null; then
+              announced=1
+              break
+            fi
+            sleep 0.1
+          done
+          if [[ "$announced" != 1 ]]; then
+            echo "the skip was not announced" >&2
+            podman logs vibe-talk-skip >&2
+            exit 1
+          fi
+          podman stop vibe-talk-skip
+
+      - name: the running server requires a token
+        run: |
+          set -euo pipefail
+          # A server that never answers and a published port that never forwards produce the same
+          # curl error. Say which one happened, with the container's own state and log, instead of
+          # failing on a bare curl that names neither.
+          wait_for_health() {
+            local port="$1" name="$2" i
+            for i in $(seq 1 30); do
+              if curl -fsS "http://127.0.0.1:${port}/healthz"; then
+                echo
+                return 0
+              fi
+              sleep 1
+            done
+            echo "the server at 127.0.0.1:${port} never answered /healthz within 30s" >&2
+            echo "--- podman ps -a ---" >&2
+            podman ps -a >&2 || true
+            echo "--- podman logs ${name} ---" >&2
+            podman logs "${name}" >&2 || true
+            echo "--- podman port ${name} ---" >&2
+            podman port "${name}" >&2 || true
+            echo "--- listening sockets ---" >&2
+            ss -ltnp >&2 || true
+            echo "--- verbose curl ---" >&2
+            curl -v --max-time 5 "http://127.0.0.1:${port}/healthz" >&2 || true
+            return 1
+          }
+          podman run -d --rm --name vibe-talk-ci -p 18080:8080 \
+            -e VIBE_TALK_DISCORD_BOT_TOKEN=not-a-real-token \
+            -e VIBE_TALK_READ_TOKEN=ci-read-token-0000000000000 \
+            -e VIBE_TALK_WRITE_TOKEN=ci-write-token-000000000000 \
+            -e "VIBE_TALK_CHANNELS=424242:ci channel:rw,515151:ci read-only:ro" \
+            vibe-talk:ci --fake-discord
+          wait_for_health 18080 vibe-talk-ci
+          test "$(curl -s -o /dev/null -w '%{http_code}' 127.0.0.1:18080/api/v1/channels)" = 401
+          test "$(curl -s -o /dev/null -w '%{http_code}' \
+            -H 'Authorization: Bearer ci-read-token-0000000000000' \
+            127.0.0.1:18080/api/v1/channels)" = 200
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+            -H 'Authorization: Bearer ci-read-token-0000000000000' \
+            -H 'content-type: application/json' -d '{"text":"no"}' \
+            127.0.0.1:18080/api/v1/channels/424242/reply)" = 403
+
+      # The script the README tells the owner to run after `podman run` is run here against the
+      # same image, so it cannot rot into a recipe that does not work. It is the deployment check;
+      # a deployment check that has never been executed is worse than none.
+      - name: the documented deployment check passes against the image
+        run: |
+          set -euo pipefail
+          vibe-talk/scripts/verify-deployment.sh \
+            --url http://127.0.0.1:18080 \
+            --channel 424242 \
+            --read-token ci-read-token-0000000000000 \
+            --write-token ci-write-token-000000000000
+
+      # ...and reports a FAILURE rather than a pass when the thing it checks is untrue. A green
+      # check that cannot go red certifies nothing.
+      - name: the deployment check fails when it should
+        run: |
+          set -euo pipefail
+          # A channel outside the allowlist must be refused, so pointing --channel at one must fail.
+          if vibe-talk/scripts/verify-deployment.sh --url http://127.0.0.1:18080 \
+              --channel 777777 --read-token ci-read-token-0000000000000 --skip-post; then
+            echo "the check passed against an unconfigured channel" >&2
+            exit 1
+          fi
+          # A read-only channel must refuse post_reply, so the posting half must fail there.
+          if vibe-talk/scripts/verify-deployment.sh --url http://127.0.0.1:18080 \
+              --channel 515151 --read-token ci-read-token-0000000000000 \
+              --write-token ci-write-token-000000000000; then
+            echo "the check reported a successful post to a read-only channel" >&2
+            exit 1
+          fi
+          # A wrong token must not pass.
+          if vibe-talk/scripts/verify-deployment.sh --url http://127.0.0.1:18080 \
+              --channel 424242 --read-token wrong-token-0000000000000000 --skip-post; then
+            echo "the check passed with a wrong read token" >&2
+            exit 1
+          fi
+          podman stop vibe-talk-ci
+
+      # The LAUNCHER, as opposed to the image. Everything above tests what the container serves;
+      # nothing above ran run.sh, which is the script the owner actually types. That gap was not
+      # theoretical: run.sh inherited the host's container log driver, so on a rootless host whose
+      # default is journald `run.sh --logs` returned empty output while promising in --help and
+      # --status that logs are retained and readable. Its own suite catches that, and its own
+      # suite had no runner. `vibe-talk/Makefile` said "CI runs it on every change", which is the
+      # kind of claim that stops anyone checking; this step is what makes it true.
+      - name: the launcher's own self-test
+        run: make -C vibe-talk container-smoke

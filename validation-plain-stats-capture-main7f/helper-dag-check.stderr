@@ -1,0 +1,48 @@
+   Compiling proc-macro2 v1.0.107
+   Compiling lock_api v0.4.14
+   Compiling bytes v1.12.1
+   Compiling num-traits v0.2.19
+   Compiling tracing-core v0.1.36
+   Compiling parking_lot v0.12.5
+   Compiling quote v1.0.47
+   Compiling syn v3.0.3
+   Compiling syn v2.0.119
+   Compiling serde_derive v1.0.229
+   Compiling serde_repr v0.1.21
+   Compiling thiserror-impl v2.0.19
+   Compiling async-trait v0.1.91
+   Compiling clap_derive v4.6.4
+   Compiling thiserror v2.0.19
+   Compiling futures-macro v0.3.33
+   Compiling scroll_derive v0.13.1
+   Compiling derive_more-impl v1.0.0
+   Compiling tokio-macros v2.7.1
+   Compiling tracing-attributes v0.1.31
+   Compiling clap v4.6.4
+   Compiling tokio v1.53.1
+   Compiling scroll v0.13.0
+   Compiling futures-util v0.3.33
+   Compiling tracing v0.1.44
+   Compiling goblin v0.10.7
+   Compiling serde v1.0.229
+   Compiling syscalls v0.6.18
+   Compiling chrono v0.4.45
+   Compiling bincode v2.0.1
+   Compiling linked-hash-map v0.5.6
+   Compiling serde_norway v0.9.42
+   Compiling bitvec v1.1.1
+   Compiling serde_yaml v0.9.34+deprecated
+   Compiling reverie-memory v0.4.1 (https://github.com/rrnewton/reverie.git?rev=dde3f9da33a0474d0fa9b273a25100fc0db4d751#dde3f9da)
+   Compiling derive_more v1.0.0
+   Compiling dagrun v0.15.0 (https://github.com/rrnewton/agent-utils.git?rev=2bd7f9562d74fa96d24050cdd8c7746349ff5244#2bd7f956)
+   Compiling reverie-syscalls v0.4.1 (https://github.com/rrnewton/reverie.git?rev=dde3f9da33a0474d0fa9b273a25100fc0db4d751#dde3f9da)
+   Compiling procfs-core v0.18.0
+   Compiling futures-executor v0.3.33
+   Compiling futures v0.3.33
+   Compiling reverie-process v0.4.1 (https://github.com/rrnewton/reverie.git?rev=dde3f9da33a0474d0fa9b273a25100fc0db4d751#dde3f9da)
+   Compiling procfs v0.18.0
+   Compiling reverie-core v0.4.1 (https://github.com/rrnewton/reverie.git?rev=dde3f9da33a0474d0fa9b273a25100fc0db4d751#dde3f9da)
+   Compiling detcore-model v0.4.1 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f/detcore-model)
+   Compiling hermit-manifest-plan v0.4.0 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f/ci/manifest-plan)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 29.55s
+     Running `/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit/debug/generate-validation-dag --check`

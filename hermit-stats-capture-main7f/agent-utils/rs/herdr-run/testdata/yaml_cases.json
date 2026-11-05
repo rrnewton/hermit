@@ -1,0 +1,535 @@
+{
+  "_about": "Golden cases for the configuration YAML subset (yamlcore.py / yaml.rs). Values are rendered canonically: null, true/false, integers in decimal, floats as Python repr, strings with the shared quote rule, [a, b] and {\"k\": v} in document order. Both unit-test suites load this file.",
+  "cases": [
+    {
+      "name": "empty",
+      "text": "",
+      "value": "null"
+    },
+    {
+      "name": "comment only",
+      "text": "# nothing\n",
+      "value": "null"
+    },
+    {
+      "name": "document markers",
+      "text": "---\na: 1\n...\n",
+      "value": "{\"a\": 1}"
+    },
+    {
+      "name": "yaml directive",
+      "text": "%YAML 1.2\n---\na: b\n",
+      "value": "{\"a\": \"b\"}"
+    },
+    {
+      "name": "core scalars",
+      "text": "a: ~\nb: null\nc:\nd: true\ne: False\nf: 0o17\ng: 0x1F\nh: -12\ni: 1.5\nj: .5\nk: 1e3\nl: 007\nm: yes\nn: on\no: 0b101\np: '1'\nq: \"x\"\n",
+      "value": "{\"a\": null, \"b\": null, \"c\": null, \"d\": true, \"e\": false, \"f\": 15, \"g\": 31, \"h\": -12, \"i\": 1.5, \"j\": 0.5, \"k\": 1000.0, \"l\": \"007\", \"m\": \"yes\", \"n\": \"on\", \"o\": 5, \"p\": \"1\", \"q\": \"x\"}"
+    },
+    {
+      "name": "explicit tags",
+      "text": "a: !!str 12\nb: !!int '5'\nc: !!float 1\nd: !!bool true\ne: !!null\nf: !!seq [a]\ng: !!map {a: b}\n",
+      "value": "{\"a\": \"12\", \"b\": 5, \"c\": 1.0, \"d\": true, \"e\": null, \"f\": [\"a\"], \"g\": {\"a\": \"b\"}}"
+    },
+    {
+      "name": "block and flow",
+      "text": "allow:\n- git\n- gh\nother: [x, {y: z}, \"q\"]\nm:\n  n: [1,\n    2]\n",
+      "value": "{\"allow\": [\"git\", \"gh\"], \"other\": [\"x\", {\"y\": \"z\"}, \"q\"], \"m\": {\"n\": [1, 2]}}"
+    },
+    {
+      "name": "compact sequences",
+      "text": "- - a\n  - b\n- k: v\n  j: w\n-\n  - deep\n",
+      "value": "[[\"a\", \"b\"], {\"k\": \"v\", \"j\": \"w\"}, [\"deep\"]]"
+    },
+    {
+      "name": "quoting and escapes",
+      "text": "a: 'it''s'\nb: \"t\\tu\\u00e9\\U0001F600\\x41\\N\\_\\L\\P\\e\\0\"\nc: url://h/p?x=1#frag\nd: x #comment\n'quoted key': 1\n",
+      "value": "{\"a\": \"it's\", \"b\": \"t\\tu\\u{e9}\\u{1f600}A\\u{85}\\u{a0}\\u{2028}\\u{2029}\\u{1b}\\u{0}\", \"c\": \"url://h/p?x=1#frag\", \"d\": \"x\", \"quoted key\": 1}"
+    },
+    {
+      "name": "flow key without value",
+      "text": "a: {b, c: d}\n",
+      "value": "{\"a\": {\"b\": null, \"c\": \"d\"}}"
+    },
+    {
+      "name": "bom and crlf",
+      "text": "\ufeffa: b\r\nc: d\r",
+      "value": "{\"a\": \"b\", \"c\": \"d\"}"
+    },
+    {
+      "name": "huge integers",
+      "text": "a: 999999999999999999999999999999999999999999999999999999999999\nb: -999999999999999999999999999999999999999\nc: 0xffffffffffffffffffffffffffffffffffffffff\n",
+      "value": "{\"a\": 100000000000000000000000000000000000000, \"b\": -100000000000000000000000000000000000000, \"c\": 100000000000000000000000000000000000000}"
+    },
+    {
+      "name": "anchor",
+      "text": "a: &x 1\n",
+      "error": "anchors and aliases are not supported at line 1 column 4"
+    },
+    {
+      "name": "alias",
+      "text": "a: *x\n",
+      "error": "anchors and aliases are not supported at line 1 column 4"
+    },
+    {
+      "name": "block scalar",
+      "text": "a: |\n  x\n",
+      "error": "block scalars (| and >) are not supported at line 1 column 4"
+    },
+    {
+      "name": "explicit key",
+      "text": "? a\n: b\n",
+      "error": "explicit mapping keys (?) are not supported at line 1 column 1"
+    },
+    {
+      "name": "multi-line plain",
+      "text": "a: b\n  c\n",
+      "error": "plain scalars must not span lines at line 2 column 3"
+    },
+    {
+      "name": "multi-line quoted",
+      "text": "a: 'x\n  y'\n",
+      "error": "quoted scalars must not span lines at line 1 column 4"
+    },
+    {
+      "name": "binary tag",
+      "text": "a: !!binary aGk=\n",
+      "error": "unsupported tag \"!!binary\" at line 1 column 4"
+    },
+    {
+      "name": "local tag",
+      "text": "a: !local x\n",
+      "error": "unsupported tag \"!local\" at line 1 column 4"
+    },
+    {
+      "name": "verbatim tag",
+      "text": "a: !<tag:yaml.org,2002:str> x\n",
+      "error": "unsupported tag \"!<tag:yaml.org,2002:str>\" at line 1 column 4"
+    },
+    {
+      "name": "tag directive",
+      "text": "%TAG !e! tag:x,2000:\n---\na: !e!x y\n",
+      "error": "%TAG directives are not supported at line 1 column 1"
+    },
+    {
+      "name": "unknown directive",
+      "text": "%FOO bar\n---\na: b\n",
+      "error": "unknown directive \"%FOO\" at line 1 column 1"
+    },
+    {
+      "name": "yaml 1.3",
+      "text": "%YAML 1.3\n---\na: b\n",
+      "error": "unsupported YAML version \"1.3\" at line 1 column 7"
+    },
+    {
+      "name": "directive without marker",
+      "text": "%YAML 1.2\na: b\n",
+      "error": "a directive must be followed by '---' at line 2 column 1"
+    },
+    {
+      "name": "two documents",
+      "text": "a: 1\n---\nb: 2\n",
+      "error": "multiple documents are not supported at line 2 column 1"
+    },
+    {
+      "name": "content after end",
+      "text": "a: 1\n...\nb: 2\n",
+      "error": "multiple documents are not supported at line 3 column 1"
+    },
+    {
+      "name": "int key",
+      "text": "1: x\n",
+      "error": "mapping keys must be strings at line 1 column 1"
+    },
+    {
+      "name": "bool key",
+      "text": "true: x\n",
+      "error": "mapping keys must be strings at line 1 column 1"
+    },
+    {
+      "name": "null key",
+      "text": "~: x\n",
+      "error": "mapping keys must be strings at line 1 column 1"
+    },
+    {
+      "name": "float key",
+      "text": "1.5: x\n",
+      "error": "mapping keys must be strings at line 1 column 1"
+    },
+    {
+      "name": "str-tagged key",
+      "text": "!!str 1: x\n",
+      "value": "{\"1\": \"x\"}"
+    },
+    {
+      "name": "int-tagged key",
+      "text": "!!int '1': x\n",
+      "error": "mapping keys must be strings at line 1 column 7"
+    },
+    {
+      "name": "duplicate key",
+      "text": "a: 1\na: 2\n",
+      "error": "duplicate mapping key \"a\" at line 2 column 1"
+    },
+    {
+      "name": "merge key",
+      "text": "<<: {a: b}\n",
+      "error": "YAML merge keys are not supported at line 1 column 1"
+    },
+    {
+      "name": "infinity",
+      "text": "a: .inf\n",
+      "error": "non-finite numbers are not supported at line 1 column 4"
+    },
+    {
+      "name": "nan float tag",
+      "text": "a: !!float .nan\n",
+      "error": "non-finite numbers are not supported at line 1 column 12"
+    },
+    {
+      "name": "overflowing float",
+      "text": "a: 1e400\n",
+      "error": "number out of range at line 1 column 4"
+    },
+    {
+      "name": "tab separator",
+      "text": "a:\tb\n",
+      "error": "tab characters are only allowed inside quoted scalars and comments at line 1 column 3"
+    },
+    {
+      "name": "tab indentation",
+      "text": "\ta: b\n",
+      "error": "tab characters are only allowed inside quoted scalars and comments at line 1 column 1"
+    },
+    {
+      "name": "tab in quoted",
+      "text": "a: \"x\ty\"\n",
+      "value": "{\"a\": \"x\\ty\"}"
+    },
+    {
+      "name": "tab in comment",
+      "text": "a: b # c\td\n",
+      "value": "{\"a\": \"b\"}"
+    },
+    {
+      "name": "surrogate escape",
+      "text": "a: \"\\uD800\"\n",
+      "error": "escape \"\\\\uD800\" is not a valid Unicode scalar value at line 1 column 5"
+    },
+    {
+      "name": "bad escape",
+      "text": "a: \"\\q\"\n",
+      "error": "invalid escape \"\\\\q\" at line 1 column 5"
+    },
+    {
+      "name": "short hex escape",
+      "text": "a: \"\\x4\"\n",
+      "error": "invalid escape \"\\\\x4\\\"\" at line 1 column 5"
+    },
+    {
+      "name": "unterminated flow sequence",
+      "text": "a: [b\n",
+      "error": "unterminated flow sequence at line 1 column 4"
+    },
+    {
+      "name": "unterminated flow mapping",
+      "text": "a: {b\n",
+      "error": "unterminated flow mapping at line 1 column 4"
+    },
+    {
+      "name": "empty flow entry",
+      "text": "a: [b, , c]\n",
+      "error": "expected a value in a flow collection at line 1 column 8"
+    },
+    {
+      "name": "yaml 1.1 sexagesimal",
+      "text": "a: !!int 1:30\n",
+      "error": "\"1:30\" is not a valid !!int value at line 1 column 10"
+    },
+    {
+      "name": "yaml 1.1 underscore",
+      "text": "a: !!int 1_000\n",
+      "error": "\"1_000\" is not a valid !!int value at line 1 column 10"
+    },
+    {
+      "name": "quoted null tag",
+      "text": "a: !!null ''\n",
+      "error": "\"\" is not a valid !!null value at line 1 column 11"
+    },
+    {
+      "name": "str tag on sequence",
+      "text": "a: !!str [git]\n",
+      "error": "!!str can only tag a scalar at line 1 column 4"
+    },
+    {
+      "name": "seq tag on scalar",
+      "text": "a: !!seq x\n",
+      "error": "!!seq can only tag a sequence at line 1 column 4"
+    },
+    {
+      "name": "mapping in value",
+      "text": "a: b: c\n",
+      "error": "mapping values are not allowed here at line 1 column 5"
+    },
+    {
+      "name": "sequence in value",
+      "text": "a: - b\n",
+      "error": "block sequence entries are not allowed here at line 1 column 4"
+    },
+    {
+      "name": "more indented key",
+      "text": "a: 1\n b: 2\n",
+      "error": "plain scalars must not span lines at line 2 column 2"
+    },
+    {
+      "name": "text after flow",
+      "text": "a: [x]y\n",
+      "error": "unexpected text after a value at line 1 column 7"
+    },
+    {
+      "name": "control character",
+      "text": "a: \u0001\n",
+      "error": "unacceptable character U+0001 at line 1 column 4"
+    },
+    {
+      "name": "del character",
+      "text": "a: \u007f\n",
+      "error": "unacceptable character U+007F at line 1 column 4"
+    },
+    {
+      "name": "nested too deep",
+      "text": "allow: [[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n",
+      "error": "collections nested more than 128 levels deep at line 1 column 135"
+    },
+    {
+      "name": "nested at the limit",
+      "text": "allow: [[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n",
+      "value": "{\"allow\": [[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}"
+    },
+    {
+      "name": "at sign",
+      "text": "a: @x\n",
+      "error": "a plain scalar cannot start with \"@\" at line 1 column 4"
+    },
+    {
+      "name": "backtick",
+      "text": "a: `x\n",
+      "error": "a plain scalar cannot start with \"`\" at line 1 column 4"
+    },
+    {
+      "name": "percent",
+      "text": "a: %x\n",
+      "error": "a plain scalar cannot start with \"%\" at line 1 column 4"
+    },
+    {
+      "name": "missing colon",
+      "text": "a: x\nb\n",
+      "error": "expected a mapping key followed by ':' at line 2 column 1"
+    },
+    {
+      "name": "complex flow key",
+      "text": "a: {[x]: y}\n",
+      "error": "mapping keys must be strings at line 1 column 5"
+    },
+    {
+      "name": "mapping in flow sequence",
+      "text": "a: [x: y]\n",
+      "error": "a flow sequence entry cannot be a mapping at line 1 column 6"
+    },
+    {
+      "name": "sequence then key",
+      "text": "- a\nb: c\n",
+      "error": "expected the end of the document at line 2 column 1"
+    },
+    {
+      "name": "text after quoted",
+      "text": "a: \"x\" y\n",
+      "error": "unexpected text after a value at line 1 column 8"
+    },
+    {
+      "name": "colon in flow plain",
+      "text": "a: [:x]\n",
+      "error": "a plain scalar cannot start with \":\" at line 1 column 5"
+    },
+    {
+      "name": "two tags",
+      "text": "a: !!str !!int 1\n",
+      "error": "a plain scalar cannot start with \"!\" at line 1 column 10"
+    },
+    {
+      "name": "multi-line flow plain",
+      "text": "a: [b\n  c]\n",
+      "error": "plain scalars must not span lines at line 2 column 3"
+    },
+    {
+      "name": "root scalar",
+      "text": "just text\n",
+      "value": "\"just text\""
+    },
+    {
+      "name": "root sequence",
+      "text": "- a\n- b\n",
+      "value": "[\"a\", \"b\"]"
+    },
+    {
+      "name": "content after marker",
+      "text": "--- a: b\n",
+      "error": "content after '---' is not supported at line 1 column 5"
+    },
+    {
+      "name": "indented root",
+      "text": "  a: 1\n  b: 2\n",
+      "value": "{\"a\": 1, \"b\": 2}"
+    },
+    {
+      "name": "dedented root tail",
+      "text": "  a: 1\nb: 2\n",
+      "error": "expected the end of the document at line 2 column 1"
+    },
+    {
+      "name": "trailing comma",
+      "text": "a: [x, y,]\nb: {c: d,}\n",
+      "value": "{\"a\": [\"x\", \"y\"], \"b\": {\"c\": \"d\"}}"
+    },
+    {
+      "name": "empty collections",
+      "text": "a: {}\nb: []\nc: [ ]\n",
+      "value": "{\"a\": {}, \"b\": [], \"c\": []}"
+    },
+    {
+      "name": "tag then newline value",
+      "text": "a: !!seq\n  - x\n",
+      "value": "{\"a\": [\"x\"]}"
+    },
+    {
+      "name": "tag then scalar on next line",
+      "text": "a: !!str\n  x\n",
+      "error": "a tag must be on the same line as its scalar at line 1 column 4"
+    },
+    {
+      "name": "raw line separator in a deny entry",
+      "text": "allow: [git]\ndeny_global:\n  git: [-c\u2028, --exec-path\u2029]\n",
+      "error": "U+2028 is not allowed: YAML 1.1 reads it as a line break and YAML 1.2 does not at line 3 column 11"
+    },
+    {
+      "name": "raw paragraph separator in a plain scalar",
+      "text": "a: b\u2029c\n",
+      "error": "U+2029 is not allowed: YAML 1.1 reads it as a line break and YAML 1.2 does not at line 1 column 5"
+    },
+    {
+      "name": "raw next line in a comment",
+      "text": "# x\u0085allow: [curl]\na: b\n",
+      "error": "U+0085 is not allowed: YAML 1.1 reads it as a line break and YAML 1.2 does not at line 1 column 4"
+    },
+    {
+      "name": "raw line separator in a quoted scalar",
+      "text": "a: 'x\u2028y'\n",
+      "error": "U+2028 is not allowed: YAML 1.1 reads it as a line break and YAML 1.2 does not at line 1 column 6"
+    },
+    {
+      "name": "escaped separators are explicit",
+      "text": "a: \"x\\Ly\\Pz\\N\"\n",
+      "value": "{\"a\": \"x\\u{2028}y\\u{2029}z\\u{85}\"}"
+    },
+    {
+      "name": "raw no-break space is ordinary",
+      "text": "a: b\u00a0c\n",
+      "value": "{\"a\": \"b\\u{a0}c\"}"
+    },
+    {
+      "name": "raw zero-width space is ordinary",
+      "text": "a\u200b: b\n",
+      "value": "{\"a\\u{200b}\": \"b\"}"
+    },
+    {
+      "name": "decimal with a leading zero is a string",
+      "text": "a: 007\nb: -00\n",
+      "value": "{\"a\": \"007\", \"b\": \"-00\"}"
+    },
+    {
+      "name": "signed radix integers",
+      "text": "a: 0b101\nb: +0x10\nc: -0o7\nd: 0B1\n",
+      "value": "{\"a\": 5, \"b\": 16, \"c\": -7, \"d\": \"0B1\"}"
+    },
+    {
+      "name": "underscore digits are a string",
+      "text": "a: 1_000\n",
+      "value": "{\"a\": \"1_000\"}"
+    },
+    {
+      "name": "float tag reads leading zeros",
+      "text": "a: !!float 007\n",
+      "value": "{\"a\": 7.0}"
+    },
+    {
+      "name": "int tag refuses leading zeros",
+      "text": "a: !!int 007\n",
+      "error": "\"007\" is not a valid !!int value at line 1 column 10"
+    },
+    {
+      "name": "yaml 1.1 booleans are strings",
+      "text": "a: [yes, no, on, off, y, n]\n",
+      "value": "{\"a\": [\"yes\", \"no\", \"on\", \"off\", \"y\", \"n\"]}"
+    },
+    {
+      "name": "question mark key in a flow mapping",
+      "text": "a: {?x}\n",
+      "error": "explicit mapping keys (?) are not supported at line 1 column 5"
+    },
+    {
+      "name": "question mark key with a value in a flow mapping",
+      "text": "a: {?x: 1}\n",
+      "error": "explicit mapping keys (?) are not supported at line 1 column 5"
+    },
+    {
+      "name": "question mark after another flow entry",
+      "text": "a: {x: 1, ?y}\n",
+      "error": "explicit mapping keys (?) are not supported at line 1 column 11"
+    },
+    {
+      "name": "question mark in a flow sequence",
+      "text": "a: [?x]\n",
+      "error": "explicit mapping keys (?) are not supported at line 1 column 5"
+    },
+    {
+      "name": "question mark in a flow value",
+      "text": "a: {k: ?x}\n",
+      "error": "explicit mapping keys (?) are not supported at line 1 column 8"
+    },
+    {
+      "name": "question mark inside a block plain scalar",
+      "text": "a: ?x\n",
+      "value": "{\"a\": \"?x\"}"
+    },
+    {
+      "name": "colon starting the line after a plain flow key",
+      "text": "a: {x\n :y}\n",
+      "error": "a ':' on a later line than its plain key must be followed by a space: YAML readers disagree on whether it starts the value or continues the key at line 2 column 2"
+    },
+    {
+      "name": "colon starting the line after a plain flow key, unindented",
+      "text": "a: {x\n:y}\n",
+      "error": "a ':' on a later line than its plain key must be followed by a space: YAML readers disagree on whether it starts the value or continues the key at line 2 column 1"
+    },
+    {
+      "name": "spaced colon on the line after a plain flow key",
+      "text": "a: {x\n : y}\n",
+      "value": "{\"a\": {\"x\": \"y\"}}"
+    },
+    {
+      "name": "colon closing the line after a plain flow key",
+      "text": "a: {x\n :}\n",
+      "value": "{\"a\": {\"x\": null}}"
+    },
+    {
+      "name": "adjacent colon after a quoted flow key on a later line",
+      "text": "a: {\"x\"\n :y}\n",
+      "value": "{\"a\": {\"x\": \"y\"}}"
+    },
+    {
+      "name": "colon inside a flow plain key",
+      "text": "a: {x :y}\n",
+      "value": "{\"a\": {\"x :y\": null}}"
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+[Unit]
+Description=Content-free Slack event hints for one vibe-talk channel
+Documentation=https://github.com/rrnewton/agent-utils/tree/main/vibe-talk#change-hint-acceleration
+Wants=network-online.target
+After=network-online.target vibe-talk.service
+Requires=vibe-talk.service
+PartOf=vibe-talk.service
+
+[Service]
+Type=exec
+# Replace all REPLACE_* values and both absolute executable paths. conversation tail makes the
+# whole-channel user-token subscription explicit instead of relying on an ambient inbox stream.
+# The filter emits message-create events only, structured output is one JSON object per line, and
+# no heartbeat records are requested. Every argument is invoked literally; no shell is involved.
+ExecStart=/usr/bin/python3 /REPLACE_WITH_CHECKOUT/vibe-talk/scripts/live-hint-adapter.py --url http://127.0.0.1:8080 --channel REPLACE_CHANNEL_ID --token-file %h/.config/vibe-talk/ingest-token -- /REPLACE_WITH_META_BIN/meta slack.conversation tail --channel-id=REPLACE_CHANNEL_ID --event-types=message.created --catchup=oldest --include-iris-seq-id --quiet --output=json
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+# Longer than one bounded HTTP attempt plus child-group cleanup, so systemd does not SIGKILL at
+# the adapter's own graceful-stop boundary.
+TimeoutStopSec=30
+
+UMask=0077
+# These are Meta CLI managed-runtime budgets, not requirements of live-hint-adapter.py itself.
+# On a devserver the tail client mounts its packaged runtime and settles above 512 tasks and 1 GiB.
+# That runtime also aborts inside NoNewPrivileges or PrivateTmp, so this Meta-specific example
+# deliberately omits those otherwise useful sandbox directives. Re-evaluate these choices when
+# replacing the command after `--` with a different event source.
+LimitCORE=0
+MemoryHigh=1G
+MemoryMax=2G
+MemorySwapMax=0
+TasksMax=2048
+
+[Install]
+WantedBy=default.target

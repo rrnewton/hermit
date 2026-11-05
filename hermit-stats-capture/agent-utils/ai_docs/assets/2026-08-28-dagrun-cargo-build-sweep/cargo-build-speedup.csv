@@ -1,0 +1,10 @@
+step,inner_jobs,speedup,ideal_speedup,cpu_s,cpu_growth,peak_bytes,recommended,regression
+build.dagrun,1,1,1,49.212,1,408268800,false,false
+build.dagrun,2,1.855,2,49.241,1.00058928717,441335808,false,false
+build.dagrun,4,3.304,4,49.465,1.00514102251,496488448,false,false
+build.dagrun,8,4.576,8,49.698,1.00987564009,610500608,false,false
+build.dagrun,16,5.31,10,49.853,1.01302527839,760164352,true,false
+build.dagrun,32,5.339,10,49.83,1.0125579127,755642368,false,false
+build.dagrun,64,5.349,10,49.984,1.01568723076,755105792,false,false
+build.dagrun,88,5.331,10,49.926,1.01450865643,739745792,false,false
+build.dagrun,158,5.344,10,49.946,1.01491506137,753590272,false,false

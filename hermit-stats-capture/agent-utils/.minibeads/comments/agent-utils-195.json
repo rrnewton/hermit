@@ -1,0 +1,18 @@
+[
+  {
+    "id": "agent-utils-195-c8db0ac1f33",
+    "issue_id": "agent-utils-195",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Delivered in the vibe-talk commit that adds this file. (1) Background re-reads (poll, live catch-up) no longer raise the banner when the freshness pill already carries the failure; a timeout reads '<service> is slow to answer · showing messages from HH:MM', and channel-read banners are reworded (the provider's own message, no JSON). (2) The reply route takes idempotency_key; a registration bridge gets a per-part nonce derived from the key and the part's text, so the page's retry reuses the provider request id; client-config reports idempotent_posts_supported and 207 bodies carry retryable. Where supported the page retries transient failures after 5 s, 15 s, 45 s, sooner on 'online' or when visible again, then stops and offers Retry; never a 4xx, never after a reload, not a reply's remainder after a partial post. A message sent while the browser reports offline is held and sent when online, for every provider. (3) Newest-page reads give up client-side after 20 s; before this the page had no bound. Unverified: not exercised against the live adapter or Google Chat; Google Chat's request-id retention is assumed to cover the ~2 minute retry schedule; direct Discord and Slack still leave ambiguous failures to a manual Retry (Discord enforce_nonce is not used); the 20 s bound sits above the observed 10-12.5 s normal reads rather than under 10 s, because the proxy's 10 s limit is on reading the request head, not the response.",
+    "created_at": "2026-10-04T11:26:18.424370426Z",
+    "updated_at": "2026-10-04T11:26:18.424370426Z"
+  },
+  {
+    "id": "agent-utils-194-cba4e5fa99b",
+    "issue_id": "agent-utils-194",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Follow-up from review: the promise that an automatic retry cannot post twice was not true for every 207. The page resends a 207's unsent text, and the server splits it again. That second split could cut the failed part differently, giving it a different key, so the provider could not recognise the retry. This happened when a code fence sat in a part that had already posted, when a fence was cut across the failed part, and when nothing had posted from a multi-part fenced message, because the joined parts are not the original text. It could also happen when a remainder part repeated a part that had already posted. Fixed: (1) a 207 with nothing posted now hands back the request's own text as unsent; (2) the splitter reserves room for a closing fence only when this part reopens one or the remaining text contains one; (3) each 207 now carries resumable, computed by re-splitting the remainder and checking that its first part is the failed part and that no part repeats one already posted (and false for a reply's remainder). The page treats a 207 that is not resumable, or that does not say, as unprovable: no automatic retry, and the row asks the reader to check history. Also: a gateway's non-JSON 5xx on a send is now retried where keyed, and a waiting row's cause ends with a full stop. Still left to the reader: a long message whose failed part opens or closes a code block cut across parts.",
+    "created_at": "2026-10-04T12:08:24.439499460Z",
+    "updated_at": "2026-10-04T12:08:24.439499460Z"
+  }
+]

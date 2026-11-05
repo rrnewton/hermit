@@ -1,0 +1,98 @@
+description: Browser-functional and interaction-budget checks for the timeline viewer
+
+resource_caps:
+  browser: 1
+
+steps:
+  # The browser checks run Playwright from py/tests/js/browser/node_modules and drive the Chromium
+  # build that Playwright version names, so they depend on the step that installs both rather than
+  # on whoever last ran `npm install` there. The directory tracks no lockfile (see its README); its
+  # package.json pins @playwright/test exactly, and Playwright pins its own dependencies exactly.
+  # The browser checks run under scripts/with-node22, which prefers the pinned Node 22 release
+  # this step installs (official archive, sha256-verified, cached per user) over the host's node.
+  - group: setup
+    job: node22
+    desc: install the pinned Node 22 release, verified against its published sha256
+    cmd: scripts/provision-node22
+    jobs_flag: ""
+    labels: [validation-timeline, component-wrkviz]
+    timeout: 900
+    cpu_timeout: 300
+    hint:
+      est_duration_s: 2
+      classification: latency-bound
+      rss_baseline_bytes: 536870912
+
+  - group: setup
+    job: browser-deps
+    desc: install the pinned Playwright and the Chromium build it drives
+    cmd: >-
+      scripts/provision-node-packages py/tests/js/browser &&
+      cd py/tests/js/browser &&
+      ../../../../scripts/with-node22 npx playwright install chromium
+    jobs_flag: ""
+    deps: [setup.node22]
+    labels: [validation-timeline, component-wrkviz]
+    timeout: 900
+    cpu_timeout: 600
+    hint:
+      est_duration_s: 5
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  - group: browser
+    job: functional
+    desc: drive timeline interactions in Chromium
+    # This graph already supplies containment. Calling the tool Makefile here would start a
+    # second dagrun `box`, which the scheduler correctly refuses as an unflattened nested run.
+    cmd: >-
+      cd py/tests/js/browser &&
+      ../../../../scripts/with-node22 npx playwright test --reporter=line
+    jobs_flag: ""
+    deps: [setup.browser-deps]
+    labels: [validation-timeline, component-wrkviz]
+    timeout: 600
+    cpu_timeout: 900
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 45
+      classification: latency-bound
+      preferred_inner_jobs: 2
+      rss_baseline_bytes: 1073741824
+
+  - group: browser
+    job: benchmark-instrument
+    desc: prove the real-site benchmark records every advertised metric
+    cmd: >-
+      cd py/tests/js/browser &&
+      ../../../../scripts/with-node22 node --test benchmark-site.test.cjs
+    jobs_flag: ""
+    deps: [setup.browser-deps]
+    labels: [validation-timeline, component-wrkviz]
+    timeout: 600
+    cpu_timeout: 900
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 15
+      classification: latency-bound
+      preferred_inner_jobs: 2
+      rss_baseline_bytes: 1073741824
+
+  - group: browser
+    job: benchmark
+    desc: enforce timeline pan and zoom redraw budgets
+    cmd: >-
+      cd py/tests/js/browser &&
+      ../../../../scripts/with-node22 node --test benchmark-budget.test.cjs &&
+      printf '\n' && cat benchmark-report.txt
+    jobs_flag: ""
+    deps: [setup.browser-deps]
+    labels: [validation-timeline, component-wrkviz]
+    timeout: 600
+    cpu_timeout: 900
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 15
+      classification: latency-bound
+      preferred_inner_jobs: 2
+      rss_baseline_bytes: 1073741824

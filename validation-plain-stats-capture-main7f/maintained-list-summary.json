@@ -1,0 +1,49 @@
+{
+  "head": "d09ef1a3e7f46a5206e464b562a22c2e77ae9699",
+  "R": "dde3f9da33a0474d0fa9b273a25100fc0db4d751",
+  "lists": [
+    {
+      "job": "hermit_unit",
+      "stem": "list-hermit_unit",
+      "exit": 0,
+      "enumerated": 1046,
+      "selected_nonignored": 1041,
+      "ignored_total": 0,
+      "filtered_nonignored": 5,
+      "filtered_ignored": 0,
+      "selected_ignored": 0,
+      "declared_count": 1041,
+      "count_matches": true,
+      "raw_json_sha256": "cbc586b1dbca46c9862d63151ed08737fd18afcc307e0d86ffd05fb67d8eb196"
+    },
+    {
+      "job": "cli",
+      "stem": "list-cli",
+      "exit": 0,
+      "enumerated": 491,
+      "selected_nonignored": 385,
+      "ignored_total": 5,
+      "filtered_nonignored": 101,
+      "filtered_ignored": 5,
+      "selected_ignored": 0,
+      "declared_count": 385,
+      "count_matches": true,
+      "raw_json_sha256": "2e47cd1054ac39ab1ec414f19aa1518e4d2fccd9f070e30f1aa92c8801f70735"
+    },
+    {
+      "job": "cli_on_host",
+      "stem": "list-cli_on_host",
+      "exit": 0,
+      "enumerated": 491,
+      "selected_nonignored": 321,
+      "ignored_total": 5,
+      "filtered_nonignored": 165,
+      "filtered_ignored": 5,
+      "selected_ignored": 0,
+      "declared_count": 321,
+      "count_matches": true,
+      "raw_json_sha256": "4f1825e6e6af70177c7ef7729bbd98231498ce36a92f94fb632c84f9945f979e"
+    }
+  ],
+  "qualification": "Fresh enumeration only, not execution of these maintained populations. Original features/skips/hosted filter retained. Ignored and filtered are separate and uncredited."
+}

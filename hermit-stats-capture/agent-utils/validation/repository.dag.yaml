@@ -1,0 +1,230 @@
+# Repository-wide checks that are not owned by one tool. Tool-specific regression, packaging, and
+# cross-language fragments are included by `validation.dag.yaml` beside this file.
+
+description: Shared repository hygiene, generated-document, build, and lint checks
+
+resource_caps:
+  # Workspace tests and clippy are Cargo builds under rs/target. Count every Cargo consumer
+  # against one cap so a lint lane cannot silently turn four deliberately bounded test builds
+  # into five.
+  cargo-target: 4
+
+steps:
+  - group: hygiene
+    job: component-manifest
+    desc: every Python test has exactly one declared owner
+    cmd: python3 scripts/run_component_tests.py --self-test
+    jobs_flag: ""
+    labels: [validation-hygiene]
+    timeout: 60
+    hint:
+      est_duration_s: 1
+      classification: light
+      # The inventory grew to 185 component tests and touched the former 200 MiB runtime ceiling,
+      # recording memory.events.max despite passing. A 256 MiB authored floor yields a 320 MiB cap
+      # so future measurements remain uncensored while the hygiene check stays tightly bounded.
+      rss_baseline_bytes: 268435456
+
+  - group: hygiene
+    job: pytest-sharder
+    desc: deterministic shards are disjoint and complete
+    cmd: python3 scripts/run_pytest_shard.py --self-test
+    jobs_flag: ""
+    labels: [validation-hygiene]
+    timeout: 60
+    hint:
+      est_duration_s: 1
+      classification: light
+      rss_baseline_bytes: 134217728
+      # The real cancellation self-test launches a supervised pytest worker and child. Historical
+      # pre-test feedback lowered MemoryMax to 80,281,600 B and OOM-killed that new process tree;
+      # keep bounded headroom for the test's deliberate three-process peak.
+      hard_mem_max_bytes: 268435456
+
+  - group: hygiene
+    job: validation-selector
+    desc: prove validation routing fails safe
+    cmd: python3 scripts/validate.py --self-test
+    jobs_flag: ""
+    labels: [validation-hygiene]
+    timeout: 60
+    hint:
+      est_duration_s: 1
+      classification: light
+      # The self-test repeatedly exercises the complete ownership manifest and a real temporary
+      # Git repository. Its step-cgroup peak reached 425 MiB after child-process accounting, while
+      # the old ~160 MiB derived cap OOM-killed it. Keep a bounded ceiling with measured headroom.
+      rss_baseline_bytes: 536870912
+
+  - group: hygiene
+    job: client-names-self-test
+    desc: prove the client-name guard can fail
+    cmd: python3 scripts/check_client_names.py --self-test
+    jobs_flag: ""
+    labels: [validation-hygiene]
+    timeout: 60
+    hint:
+      est_duration_s: 1
+      classification: light
+      rss_baseline_bytes: 134217728
+
+  - group: hygiene
+    job: client-names
+    desc: reject consuming-project names anywhere in the repository
+    cmd: python3 scripts/check_client_names.py
+    jobs_flag: ""
+    labels: [validation-hygiene]
+    timeout: 120
+    hint:
+      est_duration_s: 2
+      classification: light
+      rss_baseline_bytes: 268435456
+
+  - group: hygiene
+    job: documented-defaults-self-test
+    desc: prove the documented-default guard can fail
+    cmd: python3 scripts/check_documented_defaults.py --self-test
+    jobs_flag: ""
+    labels: [validation-hygiene]
+    timeout: 60
+    hint:
+      est_duration_s: 1
+      classification: light
+      rss_baseline_bytes: 134217728
+
+  - group: hygiene
+    job: documented-defaults
+    desc: compare documented defaults with implementation constants
+    cmd: python3 scripts/check_documented_defaults.py
+    jobs_flag: ""
+    labels: [validation-hygiene]
+    timeout: 120
+    hint:
+      est_duration_s: 2
+      classification: light
+      rss_baseline_bytes: 268435456
+
+  - group: hygiene
+    job: site-self-test
+    desc: prove the website checker can fail
+    cmd: python3 scripts/check_site.py --self-test
+    jobs_flag: ""
+    labels: [validation-hygiene]
+    timeout: 60
+    hint:
+      est_duration_s: 1
+      classification: light
+      rss_baseline_bytes: 134217728
+
+  - group: hygiene
+    job: site
+    desc: website pages parse, links resolve, and nothing loads from another origin
+    cmd: python3 scripts/check_site.py
+    jobs_flag: ""
+    labels: [validation-hygiene]
+    timeout: 120
+    hint:
+      est_duration_s: 1
+      classification: light
+      rss_baseline_bytes: 134217728
+
+  - group: docs
+    job: embedded-userguides
+    desc: generated package guides match their source templates
+    cmd: python3 scripts/embed_userguides.py --check
+    jobs_flag: ""
+    labels: [validation-docs]
+    timeout: 120
+    hint:
+      est_duration_s: 2
+      classification: light
+      rss_baseline_bytes: 268435456
+
+  - group: format
+    job: rust
+    desc: rustfmt checks the workspace
+    cmd: cargo fmt --all --manifest-path rs/Cargo.toml -- --check
+    jobs_flag: ""
+    labels: [validation-workspace, validation-rust]
+    timeout: 120
+    hint:
+      est_duration_s: 5
+      classification: light
+      rss_baseline_bytes: 268435456
+
+  - group: build
+    job: rust-launchers
+    desc: build the Rust workspace and verify tracked launchers
+    cmd: ./setup rs
+    deps: [docs.embedded-userguides]
+    jobs_flag: ""
+    jobs_env: CARGO_BUILD_JOBS
+    labels: [validation-workspace, validation-rust]
+    timeout: 1200
+    cpu_timeout: 2400
+    hint:
+      resources: {cargo-target: 1}
+      est_duration_s: 180
+      classification: cpu-bound
+      # Cold-workspace sweep (1,2,4,8,16,24,32) found the elbow at 8:
+      # 43.2s at 8 versus 41.5s at 16, with no further gain through 32.
+      preferred_inner_jobs: 8
+      rss_baseline_bytes: 4294967296
+
+  - group: check
+    job: python-types
+    desc: strict repository Python typing with no explicit Any
+    cmd: make mypy
+    jobs_flag: ""
+    labels: [validation-workspace, validation-python]
+    timeout: 600
+    cpu_timeout: 900
+    hint:
+      est_duration_s: 30
+      classification: cpu-bound
+      preferred_inner_jobs: 2
+      rss_baseline_bytes: 2147483648
+
+  - group: check
+    job: entrypoints
+    desc: dependency-free Python entrypoint smoke checks
+    cmd: make check-deps
+    jobs_flag: ""
+    labels: [validation-workspace, validation-python]
+    timeout: 300
+    hint:
+      est_duration_s: 15
+      classification: latency-bound
+      rss_baseline_bytes: 536870912
+
+  - group: check
+    job: test-suite-selector
+    desc: reject invalid language-suite selections
+    cmd: make check-test-suite-selector
+    jobs_flag: ""
+    labels: [validation-workspace, validation-python]
+    timeout: 60
+    hint:
+      est_duration_s: 1
+      classification: light
+      rss_baseline_bytes: 134217728
+
+  - group: check
+    job: rust-clippy
+    desc: clippy every workspace target with warnings denied
+    cmd: >-
+      host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
+      cargo clippy --release --workspace --all-targets --manifest-path rs/Cargo.toml
+      --target "$host_target" ${DAGRUN_EXTRA_ARGS} -- -D warnings
+    deps: [build.rust-launchers]
+    cmdtype: cargo-build
+    labels: [validation-workspace, validation-rust]
+    timeout: 1200
+    cpu_timeout: 2400
+    hint:
+      resources: {cargo-target: 1}
+      est_duration_s: 180
+      classification: cpu-bound
+      # Share the measured Cargo-workspace elbow with the incremental clippy pass.
+      preferred_inner_jobs: 8
+      rss_baseline_bytes: 4294967296

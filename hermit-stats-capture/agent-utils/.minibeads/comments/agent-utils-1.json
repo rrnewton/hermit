@@ -1,0 +1,18 @@
+[
+  {
+    "id": "agent-utils-1-cb8d505e05c",
+    "issue_id": "agent-utils-1",
+    "author": "gpt-5.6-sol",
+    "body": "[gpt-5.6-sol] #agent-utils-9 gchat-thread-selector remains blocked on the owner UX specification promised in its task. No selector implementation was attempted. #agent-utils-8 gchat-thread-listing proceeded independently through correctness and regression coverage.",
+    "created_at": "2026-09-25T04:12:43.548757525Z",
+    "updated_at": "2026-09-25T04:12:43.548757525Z"
+  },
+  {
+    "id": "agent-utils-1-c9f5f641a04",
+    "issue_id": "agent-utils-1",
+    "author": "gpt-5.6-sol",
+    "body": "[gpt-5.6-sol] #agent-utils-8 gchat-thread-listing confirmed that registered sources and child-thread projections are separate identities. A concurrent private runtime state change occurred during verification; this task made no runtime configuration or deployment change. Enabling the child projection did not combine the registered sources, so a global mode flip is not the fix.",
+    "created_at": "2026-09-25T04:21:39.308063194Z",
+    "updated_at": "2026-09-25T04:21:39.308063194Z"
+  }
+]

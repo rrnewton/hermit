@@ -1,0 +1,19 @@
+{
+  "name": "chaos-divergence-demo",
+  "command": ["/bin/sh", "-c", "echo seed {seed}; exit 0"],
+  "worker_limits": {
+    "cpu_cores": 1,
+    "memory_bytes": 1073741824,
+    "cpu_timeout_s": 30,
+    "wall_timeout_s": 60,
+    "disk_bytes": 1073741824
+  },
+  "hit": {
+    "regex": "DIVERGENCE|panic",
+    "hit_exit_codes": [134]
+  },
+  "identity": {
+    "backend": "demo",
+    "image": "chaos-sweep-example"
+  }
+}

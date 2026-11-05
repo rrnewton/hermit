@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-36-57a26359e41",
+    "issue_id": "agent-utils-36",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Closing #36 thread-view-phone-overflow: fixed by 52d66ab and verified deployed. Before landing: bare make validate exit code 0 (19/19, dagrun-boxed) and make mypy clean. The real-Chromium check in tests/offline_cache_browser.py passes at 412x915, 360x800 and 1280x800 and fails without the fix (757 px page at 412). The deployment coordinator rebuilt the release binary from exactly 52d66ab and restarted only the app; the served voice.css matches the 52d66ab blob. Live, read-only (no non-GET request), the affected thread with 40 rows at Android width: the document is 360/390/412 px wide at 360/390/412 px viewports (732 at each before), 0 elements past the right edge (1196/1152/1134 before), and the title ellipsised (254/284/306 px). Two independent runs of the same script agree.",
+    "created_at": "2026-09-25T19:41:51.552485000Z",
+    "updated_at": "2026-09-25T19:41:51.552485000Z"
+  }
+]

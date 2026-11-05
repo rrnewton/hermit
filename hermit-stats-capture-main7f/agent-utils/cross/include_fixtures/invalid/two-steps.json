@@ -1,0 +1,6 @@
+{
+  "steps": [
+    {"group": "z", "job": "j", "cmd": "true"},
+    {"group": "a", "job": "j", "cmd": "true"}
+  ]
+}

@@ -1,0 +1,1859 @@
+{
+  "_about": "Golden cases for the Herdr protocol client (client.py / client.rs): scripted command results, the exact argv each method sends, and the exact value or error it returns. Both unit-test suites run every case against a fake command runner.",
+  "herdr": "/opt/herdr/bin/herdr",
+  "cases": [
+    {
+      "method": "workspace_id_for_label",
+      "args": [
+        "wanted"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\": {\"workspaces\": [{\"label\": \"wanted\", \"workspace_id\": \"w1\"}]}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "workspace",
+          "list"
+        ]
+      ],
+      "ok": "w1"
+    },
+    {
+      "method": "workspace_id_for_label",
+      "args": [
+        "wanted"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\": {\"workspaces\": []}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "workspace",
+          "list"
+        ]
+      ],
+      "ok": null
+    },
+    {
+      "method": "workspace_id_for_label",
+      "args": [
+        "a"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\": {\"workspaces\": [{\"label\": \"a\", \"workspace_id\": \"w1\"}, {\"label\": \"a\", \"workspace_id\": \"w2\"}]}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "workspace",
+          "list"
+        ]
+      ],
+      "error": "workspace label \"a\" is ambiguous: 2 matching IDs"
+    },
+    {
+      "method": "workspace_id_for_label",
+      "args": [
+        "it's"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\": {\"workspaces\": [{\"label\": \"it's\", \"workspace_id\": \"w1\"}, {\"label\": \"it's\", \"workspace_id\": \"w2\"}]}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "workspace",
+          "list"
+        ]
+      ],
+      "error": "workspace label \"it's\" is ambiguous: 2 matching IDs"
+    },
+    {
+      "method": "workspace_id_for_label",
+      "args": [
+        "a"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "not json",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "workspace",
+          "list"
+        ]
+      ],
+      "error": "workspace list: herdr returned non-JSON output: \"not json\""
+    },
+    {
+      "method": "workspace_id_for_label",
+      "args": [
+        "a"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "workspace",
+          "list"
+        ]
+      ],
+      "error": "workspace list: herdr returned non-JSON output: \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\""
+    },
+    {
+      "method": "workspace_id_for_label",
+      "args": [
+        "a"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\": {\"workspaces\": []}, \"x\": NaN}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "workspace",
+          "list"
+        ]
+      ],
+      "error": "workspace list: herdr returned non-JSON output: \"{\\\"result\\\": {\\\"workspaces\\\": []}, \\\"x\\\": NaN}\""
+    },
+    {
+      "method": "workspace_id_for_label",
+      "args": [
+        "a"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\": {\"workspaces\": []}, \"x\": 1e400}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "workspace",
+          "list"
+        ]
+      ],
+      "error": "workspace list: herdr returned non-JSON output: \"{\\\"result\\\": {\\\"workspaces\\\": []}, \\\"x\\\": 1e400}\""
+    },
+    {
+      "method": "workspace_id_for_label",
+      "args": [
+        "a"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\": {\"workspaces\": [\"\\ud800\"]}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "workspace",
+          "list"
+        ]
+      ],
+      "error": "workspace list: herdr returned non-JSON output: \"{\\\"result\\\": {\\\"workspaces\\\": [\\\"\\\\ud800\\\"]}}\""
+    },
+    {
+      "method": "workspace_id_for_label",
+      "args": [
+        "a"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "[]",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "workspace",
+          "list"
+        ]
+      ],
+      "error": "workspace list: Herdr response is not an object"
+    },
+    {
+      "method": "workspace_id_for_label",
+      "args": [
+        "a"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "workspace",
+          "list"
+        ]
+      ],
+      "error": "workspace list: Herdr response has no result object"
+    },
+    {
+      "method": "workspace_id_for_label",
+      "args": [
+        "a"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\":[]}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "workspace",
+          "list"
+        ]
+      ],
+      "error": "workspace list: Herdr response has no result object"
+    },
+    {
+      "method": "workspace_id_for_label",
+      "args": [
+        "a"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\":{}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "workspace",
+          "list"
+        ]
+      ],
+      "error": "workspace list.workspaces: expected an array"
+    },
+    {
+      "method": "workspace_id_for_label",
+      "args": [
+        "a"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\":{\"workspaces\":\"x\"}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "workspace",
+          "list"
+        ]
+      ],
+      "error": "workspace list.workspaces: expected an array"
+    },
+    {
+      "method": "workspace_id_for_label",
+      "args": [
+        "a"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\":{\"workspaces\":[false]}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "workspace",
+          "list"
+        ]
+      ],
+      "error": "workspace list entry: expected an object"
+    },
+    {
+      "method": "workspace_id_for_label",
+      "args": [
+        "a"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\": {\"workspaces\": [{\"label\": false, \"workspace_id\": \"w1\"}]}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "workspace",
+          "list"
+        ]
+      ],
+      "error": "workspace list entry: \"label\" is not a string"
+    },
+    {
+      "method": "workspace_id_for_label",
+      "args": [
+        "a"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\": {\"workspaces\": [{\"label\": \"a\", \"workspace_id\": 7}]}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "workspace",
+          "list"
+        ]
+      ],
+      "error": "workspace list entry: \"workspace_id\" is not a string"
+    },
+    {
+      "method": "workspace_id_for_label",
+      "args": [
+        "a"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\": {\"workspaces\": [{\"label\": \"a\", \"workspace_id\": \"w1\"}, 5]}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "workspace",
+          "list"
+        ]
+      ],
+      "error": "workspace list entry: expected an object"
+    },
+    {
+      "method": "workspace_id_for_label",
+      "args": [
+        "a"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          1,
+          "boom",
+          "\n"
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "workspace",
+          "list"
+        ]
+      ],
+      "error": "workspace list: boom"
+    },
+    {
+      "method": "workspace_id_for_label",
+      "args": [
+        "a"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          23,
+          "less-useful stdout",
+          "decisive stderr"
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "workspace",
+          "list"
+        ]
+      ],
+      "error": "workspace list: decisive stderr"
+    },
+    {
+      "method": "workspace_id_for_label",
+      "args": [
+        "a"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          -9,
+          "",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "workspace",
+          "list"
+        ]
+      ],
+      "error": "workspace list: exit -9"
+    },
+    {
+      "method": "workspace_id_for_label",
+      "args": [
+        "a"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          2,
+          "  \n",
+          " \t "
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "workspace",
+          "list"
+        ]
+      ],
+      "error": "workspace list: exit 2"
+    },
+    {
+      "method": "tab_id_for_label",
+      "args": [
+        "w1",
+        "agent"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\": {\"tabs\": [{\"label\": \"agent\", \"tab_id\": \"w1:t1\"}]}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "tab",
+          "list",
+          "--workspace",
+          "w1"
+        ]
+      ],
+      "ok": "w1:t1"
+    },
+    {
+      "method": "tab_id_for_label",
+      "args": [
+        "w1",
+        "agent"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\": {\"tabs\": [{\"label\": \"agent\", \"tab_id\": \"t1\"}, {\"label\": \"agent\", \"tab_id\": \"t2\"}]}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "tab",
+          "list",
+          "--workspace",
+          "w1"
+        ]
+      ],
+      "error": "tab label \"agent\" is ambiguous: 2 matching IDs"
+    },
+    {
+      "method": "panes",
+      "args": [
+        null
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\": {\"panes\": [{\"pane_id\": \"p1\", \"tab_id\": \"t1\", \"workspace_id\": \"w1\"}]}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "pane",
+          "list"
+        ]
+      ],
+      "ok": [
+        [
+          "p1",
+          "t1",
+          "w1"
+        ]
+      ]
+    },
+    {
+      "method": "panes",
+      "args": [
+        "wanted"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\": {\"panes\": [{\"pane_id\": \"p1\", \"tab_id\": \"t1\", \"workspace_id\": \"other\"}]}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "pane",
+          "list",
+          "--workspace",
+          "wanted"
+        ]
+      ],
+      "error": "pane list: returned pane \"p1\" from workspace \"other\", expected \"wanted\""
+    },
+    {
+      "method": "panes",
+      "args": [
+        "w1"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\": {\"panes\": [{\"pane_id\": \"p1\", \"tab_id\": \"t1\", \"workspace_id\": \"other\"}, {\"pane_id\": 5}]}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "pane",
+          "list",
+          "--workspace",
+          "w1"
+        ]
+      ],
+      "error": "pane list entry: \"pane_id\" is not a string"
+    },
+    {
+      "method": "panes",
+      "args": [
+        "w1"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\": {}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "pane",
+          "list",
+          "--workspace",
+          "w1"
+        ]
+      ],
+      "error": "pane list.panes: expected an array"
+    },
+    {
+      "method": "process_info",
+      "args": [
+        "p"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\": {\"process_info\": {\"pane_id\": \"p\", \"shell_pid\": 7, \"foreground_process_group_id\": 7, \"foreground_processes\": [{\"pid\": 7, \"name\": \"bash\", \"cmdline\": \"-bash\"}]}}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "pane",
+          "process-info",
+          "--pane",
+          "p"
+        ]
+      ],
+      "ok": [
+        "p",
+        7,
+        7,
+        [
+          [
+            7,
+            "bash",
+            "-bash"
+          ]
+        ]
+      ]
+    },
+    {
+      "method": "process_info",
+      "args": [
+        "wanted"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\": {\"process_info\": {\"pane_id\": \"other\", \"shell_pid\": 7, \"foreground_process_group_id\": 7, \"foreground_processes\": []}}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "pane",
+          "process-info",
+          "--pane",
+          "wanted"
+        ]
+      ],
+      "error": "pane process-info: returned pane \"other\", expected \"wanted\""
+    },
+    {
+      "method": "process_info",
+      "args": [
+        "p"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\": {\"process_info\": {\"pane_id\": \"p\", \"shell_pid\": 0, \"foreground_process_group_id\": 7, \"foreground_processes\": []}}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "pane",
+          "process-info",
+          "--pane",
+          "p"
+        ]
+      ],
+      "error": "pane process-info: \"shell_pid\" is outside the positive Linux pid_t range"
+    },
+    {
+      "method": "process_info",
+      "args": [
+        "p"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\": {\"process_info\": {\"pane_id\": \"p\", \"shell_pid\": 1180591620717411303424, \"foreground_process_group_id\": 7, \"foreground_processes\": []}}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "pane",
+          "process-info",
+          "--pane",
+          "p"
+        ]
+      ],
+      "error": "pane process-info: \"shell_pid\" is not an integer"
+    },
+    {
+      "method": "process_info",
+      "args": [
+        "p"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\": {\"process_info\": {\"pane_id\": \"p\", \"shell_pid\": 9223372036854775808, \"foreground_process_group_id\": 7, \"foreground_processes\": []}}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "pane",
+          "process-info",
+          "--pane",
+          "p"
+        ]
+      ],
+      "error": "pane process-info: \"shell_pid\" is not an integer"
+    },
+    {
+      "method": "process_info",
+      "args": [
+        "p"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\": {\"process_info\": {\"pane_id\": \"p\", \"shell_pid\": -0, \"foreground_process_group_id\": 7, \"foreground_processes\": []}}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "pane",
+          "process-info",
+          "--pane",
+          "p"
+        ]
+      ],
+      "error": "pane process-info: \"shell_pid\" is not an integer"
+    },
+    {
+      "method": "process_info",
+      "args": [
+        "p"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\": {\"process_info\": {\"pane_id\": \"p\", \"shell_pid\": true, \"foreground_process_group_id\": 7, \"foreground_processes\": []}}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "pane",
+          "process-info",
+          "--pane",
+          "p"
+        ]
+      ],
+      "error": "pane process-info: \"shell_pid\" is not an integer"
+    },
+    {
+      "method": "process_info",
+      "args": [
+        "p"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\": {\"process_info\": {\"pane_id\": \"p\", \"shell_pid\": 7.0, \"foreground_process_group_id\": 7, \"foreground_processes\": []}}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "pane",
+          "process-info",
+          "--pane",
+          "p"
+        ]
+      ],
+      "error": "pane process-info: \"shell_pid\" is not an integer"
+    },
+    {
+      "method": "process_info",
+      "args": [
+        "p"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\": {\"process_info\": {\"pane_id\": \"p\", \"shell_pid\": 7, \"foreground_process_group_id\": 7, \"foreground_processes\": [{\"pid\": 7, \"name\": 5}]}}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "pane",
+          "process-info",
+          "--pane",
+          "p"
+        ]
+      ],
+      "error": "foreground process: \"name\" is not a string"
+    },
+    {
+      "method": "process_info",
+      "args": [
+        "p"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\": {\"process_info\": null}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "pane",
+          "process-info",
+          "--pane",
+          "p"
+        ]
+      ],
+      "error": "pane process-info: \"process_info\" is not an object"
+    },
+    {
+      "method": "create_workspace",
+      "args": [
+        "it's",
+        "/work"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\": {\"workspace\": {\"workspace_id\": \"w\"}, \"tab\": {\"tab_id\": \"t\"}, \"root_pane\": {\"pane_id\": \"p\"}}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "workspace",
+          "create",
+          "--label",
+          "it's",
+          "--cwd",
+          "/work",
+          "--no-focus"
+        ]
+      ],
+      "ok": [
+        "w",
+        "t",
+        "p"
+      ]
+    },
+    {
+      "method": "create_workspace",
+      "args": [
+        "x",
+        "/work"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\": {\"workspace\": {\"workspace_id\": \"w\"}, \"tab\": null, \"root_pane\": {\"pane_id\": \"p\"}}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "workspace",
+          "create",
+          "--label",
+          "x",
+          "--cwd",
+          "/work",
+          "--no-focus"
+        ]
+      ],
+      "error": "workspace create: \"tab\" is not an object"
+    },
+    {
+      "method": "create_tab",
+      "args": [
+        "w",
+        "agent",
+        "/work"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\": {\"tab\": {\"tab_id\": \"t2\"}}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "tab",
+          "create",
+          "--workspace",
+          "w",
+          "--label",
+          "agent",
+          "--cwd",
+          "/work",
+          "--no-focus"
+        ]
+      ],
+      "ok": "t2"
+    },
+    {
+      "method": "create_tab",
+      "args": [
+        "w",
+        "agent",
+        "/work"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\": {\"tab_id\": \"t3\"}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "tab",
+          "create",
+          "--workspace",
+          "w",
+          "--label",
+          "agent",
+          "--cwd",
+          "/work",
+          "--no-focus"
+        ]
+      ],
+      "ok": "t3"
+    },
+    {
+      "method": "create_tab",
+      "args": [
+        "w",
+        "agent",
+        "/work"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\": {\"tab\": null}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "tab",
+          "create",
+          "--workspace",
+          "w",
+          "--label",
+          "agent",
+          "--cwd",
+          "/work",
+          "--no-focus"
+        ]
+      ],
+      "error": "tab create: \"tab\" is not an object"
+    },
+    {
+      "method": "read",
+      "args": [
+        "p"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "$ text\r\nmore\r",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "pane",
+          "read",
+          "p",
+          "--source",
+          "recent-unwrapped"
+        ]
+      ],
+      "ok": "$ text\r\nmore\r"
+    },
+    {
+      "method": "read",
+      "args": [
+        "p"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          1,
+          "ignored stdout",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "pane",
+          "read",
+          "p",
+          "--source",
+          "recent-unwrapped"
+        ]
+      ],
+      "error": "pane read p: exit 1"
+    },
+    {
+      "method": "read",
+      "args": [
+        "p"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          1,
+          "",
+          "  pane gone \n"
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "pane",
+          "read",
+          "p",
+          "--source",
+          "recent-unwrapped"
+        ]
+      ],
+      "error": "pane read p: pane gone"
+    },
+    {
+      "method": "run",
+      "args": [
+        "p",
+        "git status"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "pane",
+          "run",
+          "p",
+          "git status"
+        ]
+      ],
+      "ok": null
+    },
+    {
+      "method": "run",
+      "args": [
+        "p",
+        "git status"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          1,
+          "",
+          " \n"
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "pane",
+          "run",
+          "p",
+          "git status"
+        ]
+      ],
+      "error": "pane run p: exit 1"
+    },
+    {
+      "method": "pane_exists",
+      "args": [
+        "p"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\": {}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "pane",
+          "get",
+          "p"
+        ]
+      ],
+      "ok": true
+    },
+    {
+      "method": "pane_exists",
+      "args": [
+        "p"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          1,
+          "",
+          "no such pane"
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "pane",
+          "get",
+          "p"
+        ]
+      ],
+      "ok": false
+    },
+    {
+      "method": "rename_tab",
+      "args": [
+        "t1",
+        "label"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\": {}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "tab",
+          "rename",
+          "t1",
+          "label"
+        ]
+      ],
+      "ok": null
+    },
+    {
+      "method": "close_tab",
+      "args": [
+        "t1"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          3,
+          "",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "tab",
+          "close",
+          "t1"
+        ]
+      ],
+      "error": "tab close t1: exit 3"
+    },
+    {
+      "method": "server_running",
+      "args": [],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"server\": {\"running\": true}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "status",
+          "--json"
+        ]
+      ],
+      "ok": true
+    },
+    {
+      "method": "server_running",
+      "args": [],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"server\": {\"running\": 1}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "status",
+          "--json"
+        ]
+      ],
+      "ok": false
+    },
+    {
+      "method": "server_running",
+      "args": [],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"server\": null}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "status",
+          "--json"
+        ]
+      ],
+      "ok": false
+    },
+    {
+      "method": "server_running",
+      "args": [],
+      "broker": "direct",
+      "responses": [
+        [
+          1,
+          "{\"server\": {\"running\": true}}",
+          "down"
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "status",
+          "--json"
+        ]
+      ],
+      "ok": false
+    },
+    {
+      "method": "server_running",
+      "args": [],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "not json",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "status",
+          "--json"
+        ]
+      ],
+      "ok": false
+    },
+    {
+      "method": "server_running",
+      "args": [],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"server\": {\"running\": true}, \"x\": NaN}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "status",
+          "--json"
+        ]
+      ],
+      "ok": false
+    },
+    {
+      "method": "ensure_server",
+      "args": [
+        2
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"server\": {\"running\": true}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "status",
+          "--json"
+        ]
+      ],
+      "ok": false
+    },
+    {
+      "method": "ensure_server",
+      "args": [
+        2
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          1,
+          "",
+          ""
+        ],
+        [
+          1,
+          "",
+          "boom\n"
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "status",
+          "--json"
+        ],
+        [
+          "/usr/bin/systemd-run",
+          "--user",
+          "--collect",
+          "--unit",
+          "herdr-run-server",
+          "--description",
+          "herdr-run Herdr server (outside the agent sandbox)",
+          "--setenv",
+          "HOME=/home/account",
+          "--setenv",
+          "TOKIO_WORKER_THREADS=16",
+          "/opt/herdr/bin/herdr",
+          "server"
+        ]
+      ],
+      "error": "cannot start the Herdr server: boom"
+    },
+    {
+      "method": "ensure_server",
+      "args": [
+        2
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          1,
+          "",
+          ""
+        ],
+        [
+          1,
+          "Unit already exists",
+          ""
+        ],
+        [
+          0,
+          "{\"server\": {\"running\": true}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "status",
+          "--json"
+        ],
+        [
+          "/usr/bin/systemd-run",
+          "--user",
+          "--collect",
+          "--unit",
+          "herdr-run-server",
+          "--description",
+          "herdr-run Herdr server (outside the agent sandbox)",
+          "--setenv",
+          "HOME=/home/account",
+          "--setenv",
+          "TOKIO_WORKER_THREADS=16",
+          "/opt/herdr/bin/herdr",
+          "server"
+        ],
+        [
+          "/opt/herdr/bin/herdr",
+          "status",
+          "--json"
+        ]
+      ],
+      "ok": true
+    },
+    {
+      "method": "ensure_server",
+      "args": [
+        2
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          1,
+          "",
+          ""
+        ],
+        [
+          0,
+          "",
+          ""
+        ],
+        [
+          1,
+          "",
+          ""
+        ],
+        [
+          1,
+          "",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "status",
+          "--json"
+        ],
+        [
+          "/usr/bin/systemd-run",
+          "--user",
+          "--collect",
+          "--unit",
+          "herdr-run-server",
+          "--description",
+          "herdr-run Herdr server (outside the agent sandbox)",
+          "--setenv",
+          "HOME=/home/account",
+          "--setenv",
+          "TOKIO_WORKER_THREADS=16",
+          "/opt/herdr/bin/herdr",
+          "server"
+        ],
+        [
+          "/opt/herdr/bin/herdr",
+          "status",
+          "--json"
+        ],
+        [
+          "/opt/herdr/bin/herdr",
+          "status",
+          "--json"
+        ]
+      ],
+      "error": "the Herdr server did not become ready after 2 attempts; check 'systemctl --user status herdr-run-server'"
+    },
+    {
+      "method": "ensure_server",
+      "args": [
+        1
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          1,
+          "",
+          ""
+        ],
+        [
+          -15,
+          "",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "status",
+          "--json"
+        ],
+        [
+          "/usr/bin/systemd-run",
+          "--user",
+          "--collect",
+          "--unit",
+          "herdr-run-server",
+          "--description",
+          "herdr-run Herdr server (outside the agent sandbox)",
+          "--setenv",
+          "HOME=/home/account",
+          "--setenv",
+          "TOKIO_WORKER_THREADS=16",
+          "/opt/herdr/bin/herdr",
+          "server"
+        ]
+      ],
+      "error": "cannot start the Herdr server: exit -15"
+    },
+    {
+      "method": "ensure_server",
+      "args": [
+        1
+      ],
+      "broker": "systemd-run",
+      "responses": [
+        [
+          1,
+          "",
+          ""
+        ],
+        [
+          3,
+          "  out  ",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/usr/bin/systemd-run",
+          "--user",
+          "--wait",
+          "--pipe",
+          "--collect",
+          "--quiet",
+          "--setenv",
+          "HOME=/home/account",
+          "/opt/herdr/bin/herdr",
+          "status",
+          "--json"
+        ],
+        [
+          "/usr/bin/systemd-run",
+          "--user",
+          "--collect",
+          "--unit",
+          "herdr-run-server",
+          "--description",
+          "herdr-run Herdr server (outside the agent sandbox)",
+          "--setenv",
+          "HOME=/home/account",
+          "--setenv",
+          "TOKIO_WORKER_THREADS=16",
+          "/opt/herdr/bin/herdr",
+          "server"
+        ]
+      ],
+      "error": "cannot start the Herdr server: out"
+    },
+    {
+      "method": "workspace_id_for_label",
+      "args": [
+        "a"
+      ],
+      "broker": "systemd-run",
+      "responses": [
+        [
+          0,
+          "{\"result\": {\"workspaces\": []}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/usr/bin/systemd-run",
+          "--user",
+          "--wait",
+          "--pipe",
+          "--collect",
+          "--quiet",
+          "--setenv",
+          "HOME=/home/account",
+          "/opt/herdr/bin/herdr",
+          "workspace",
+          "list"
+        ]
+      ],
+      "ok": null
+    },
+    {
+      "method": "run",
+      "args": [
+        "p",
+        "git status"
+      ],
+      "broker": "systemd-run",
+      "responses": [
+        [
+          1,
+          "",
+          "fail"
+        ]
+      ],
+      "calls": [
+        [
+          "/usr/bin/systemd-run",
+          "--user",
+          "--wait",
+          "--pipe",
+          "--collect",
+          "--quiet",
+          "--setenv",
+          "HOME=/home/account",
+          "/opt/herdr/bin/herdr",
+          "pane",
+          "run",
+          "p",
+          "git status"
+        ]
+      ],
+      "error": "pane run p: fail"
+    },
+    {
+      "method": "read",
+      "args": [
+        "p"
+      ],
+      "broker": "systemd-run",
+      "responses": [
+        [
+          0,
+          "text",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/usr/bin/systemd-run",
+          "--user",
+          "--wait",
+          "--pipe",
+          "--collect",
+          "--quiet",
+          "--setenv",
+          "HOME=/home/account",
+          "/opt/herdr/bin/herdr",
+          "pane",
+          "read",
+          "p",
+          "--source",
+          "recent-unwrapped"
+        ]
+      ],
+      "ok": "text"
+    },
+    {
+      "method": "workspace_id_for_label",
+      "args": [
+        "a"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\": {\"workspaces\": [], \"x\": \"\\ud800\", \"x\": 1}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "workspace",
+          "list"
+        ]
+      ],
+      "error": "workspace list: herdr returned non-JSON output: \"{\\\"result\\\": {\\\"workspaces\\\": [], \\\"x\\\": \\\"\\\\ud800\\\", \\\"x\\\": 1}}\""
+    },
+    {
+      "method": "workspace_id_for_label",
+      "args": [
+        "a"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\": {\"workspaces\": [\"\\udc00\"], \"workspaces\": []}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "workspace",
+          "list"
+        ]
+      ],
+      "error": "workspace list: herdr returned non-JSON output: \"{\\\"result\\\": {\\\"workspaces\\\": [\\\"\\\\udc00\\\"], \\\"workspaces\\\": []}}\""
+    },
+    {
+      "method": "workspace_id_for_label",
+      "args": [
+        "a"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          3,
+          "",
+          "boom \u001b[31m red \u202e done\n"
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "workspace",
+          "list"
+        ]
+      ],
+      "error": "workspace list: \"boom \\u{1b}[31m red \\u{202e} done\""
+    },
+    {
+      "method": "workspace_id_for_label",
+      "args": [
+        "a"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          1,
+          "",
+          "error: first line\n\ncaused by: second\n"
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "workspace",
+          "list"
+        ]
+      ],
+      "error": "workspace list: \"error: first line\\n\\ncaused by: second\""
+    },
+    {
+      "method": "workspace_id_for_label",
+      "args": [
+        "a"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          2,
+          "plain stdout detail\n",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "workspace",
+          "list"
+        ]
+      ],
+      "error": "workspace list: plain stdout detail"
+    }
+  ]
+}

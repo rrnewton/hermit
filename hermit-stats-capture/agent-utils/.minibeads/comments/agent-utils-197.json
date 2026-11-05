@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-197-ca5db610e07",
+    "issue_id": "agent-utils-197",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Closed: landed in 0f40100a, deployed on devbig014 (4a63ae8); real-Chromium checks at 412/360/1280 px. Unverified on a physical phone with a notch inset.",
+    "created_at": "2026-10-04T12:59:39.909034767Z",
+    "updated_at": "2026-10-04T12:59:39.909034767Z"
+  }
+]

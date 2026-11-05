@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-185-c137aadba12",
+    "issue_id": "agent-utils-185",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Partly delivered in f822a788..02923363 (deployed 4a63ae8): a reply goes where the message lives (thread reply -> its thread; main-channel message -> main channel with reply_to), and a 'Start a new thread from this message' checkbox appears for main-channel roots with no replies (Google Chat). Remaining: Discord needs a server capability to create a thread from a message, and Slack cannot quote in the main channel (its reply_to always threads) — the page needs a provider capability flag for both.",
+    "created_at": "2026-10-04T12:59:29.035909303Z",
+    "updated_at": "2026-10-04T12:59:29.035909303Z"
+  }
+]

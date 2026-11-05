@@ -1,0 +1,19 @@
+Import the statistics codec in the DBT test fixture
+
+[hermit2, dbt, gpt-6-astra, devbig014, role=impl]
+
+Plain Language Summary and Project Impact
+
+Restore the existing DBT statistics fixture's explicit codec import after production aggregation moved to Reverie's shared capture owner. This repairs DBT lib/bin test compilation without restoring duplicate production aggregation or changing any assertion.
+
+Determinism
+
+The single import is local to the existing cfg(dbt) test helper. Runtime code, counters, verification policy and test observations are unchanged.
+
+Linux Semantics
+
+No guest execution, file lifetime, input, syscall or container behavior changes. The default-feature test build remains free of a DBT-only unused import.
+
+Validation
+
+The parent e7307c2c2aa7f97d0f4aa209ea47122d0915cfc5 passed 895 default library/binary tests, then the DBT test build failed with E0433 before executing tests. That failed attempt is retained. Direct pinned rustfmt and diff whitespace checks pass; the unchanged DBT suite will rerun on this successor.

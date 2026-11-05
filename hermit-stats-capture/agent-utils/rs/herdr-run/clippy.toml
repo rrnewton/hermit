@@ -1,0 +1,7 @@
+# The environment of every child herdr-run starts is built by `child_environment` (src/client.rs)
+# from this process's own, with the `Command`'s explicit changes applied. The standard library
+# offers no stable way to see that `env_clear` was called, so that plan could not honour it: refuse
+# the call instead of letting a child silently inherit everything.
+disallowed-methods = [
+    { path = "std::process::Command::env_clear", reason = "ExecPlan in src/client.rs cannot see env_clear; pass the variables a child needs through env() and env_remove()" },
+]

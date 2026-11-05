@@ -1,0 +1,3 @@
+warning: reverie-dbt@0.4.0: DynamoRIO build cache HIT key=sha256:ff4576416a64218bcbccb4528cee86e5fc4da7119267d963751b37c39f68e542 observed_unix_seconds=1791983493 install=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit/debug/reverie-dbt-native-cache/dynamorio-install-ff4576416a64218bcbccb4528cee86e5fc4da7119267d963751b37c39f68e542
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.14s
+     Running unittests src/lib.rs (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit/debug/deps/reverie_dbt-fd22d46a7c40f344)

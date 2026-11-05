@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 620" role="img" aria-labelledby="chart-title chart-desc">
+  <title id="chart-title">Parallel speedup: build.dagrun</title>
+  <desc id="chart-desc">Observed parallel speedup for build.dagrun. Recommended inner_jobs is 16. No regression point is recorded. A compact panel reports CPU work growth and peak memory.</desc>
+  <style>
+    text { font-family: ui-sans-serif, system-ui, sans-serif; fill: #172033; }
+    .title { font-size: 22px; font-weight: 700; }
+    .subtitle { font-size: 12px; fill: #526077; }
+    .axis { stroke: #667085; stroke-width: 1; }
+    .grid { stroke: #d7dde8; stroke-width: 1; }
+    .tick { font-size: 11px; fill: #526077; }
+    .legend { font-size: 12px; }
+    .context { font-size: 11px; }
+  </style>
+  <text x="82" y="38" class="title">Parallel speedup: build.dagrun</text>
+  <text x="82" y="59" class="subtitle">Observed wall-time speedup; widths are spaced by log2(inner_jobs).</text>
+  <line x1="82.00" y1="400.00" x2="950.00" y2="400.00" class="grid"/>
+  <text x="72.00" y="404.00" text-anchor="end" class="tick">0×</text>
+  <line x1="82.00" y1="336.80" x2="950.00" y2="336.80" class="grid"/>
+  <text x="72.00" y="340.80" text-anchor="end" class="tick">2×</text>
+  <line x1="82.00" y1="273.60" x2="950.00" y2="273.60" class="grid"/>
+  <text x="72.00" y="277.60" text-anchor="end" class="tick">4×</text>
+  <line x1="82.00" y1="210.40" x2="950.00" y2="210.40" class="grid"/>
+  <text x="72.00" y="214.40" text-anchor="end" class="tick">6×</text>
+  <line x1="82.00" y1="147.20" x2="950.00" y2="147.20" class="grid"/>
+  <text x="72.00" y="151.20" text-anchor="end" class="tick">8×</text>
+  <line x1="82.00" y1="84.00" x2="950.00" y2="84.00" class="grid"/>
+  <text x="72.00" y="88.00" text-anchor="end" class="tick">10×</text>
+  <line x1="82.00" y1="84.00" x2="82.00" y2="400.00" class="axis"/>
+  <line x1="82.00" y1="400.00" x2="950.00" y2="400.00" class="axis"/>
+  <line x1="82.00" y1="400.00" x2="82.00" y2="405.00" class="axis"/>
+  <text x="82.00" y="422.00" text-anchor="middle" class="tick">1</text>
+  <line x1="200.84" y1="400.00" x2="200.84" y2="405.00" class="axis"/>
+  <text x="200.84" y="422.00" text-anchor="middle" class="tick">2</text>
+  <line x1="319.69" y1="400.00" x2="319.69" y2="405.00" class="axis"/>
+  <text x="319.69" y="422.00" text-anchor="middle" class="tick">4</text>
+  <line x1="438.53" y1="400.00" x2="438.53" y2="405.00" class="axis"/>
+  <text x="438.53" y="422.00" text-anchor="middle" class="tick">8</text>
+  <line x1="557.37" y1="400.00" x2="557.37" y2="405.00" class="axis"/>
+  <text x="557.37" y="422.00" text-anchor="middle" class="tick">16</text>
+  <line x1="676.21" y1="400.00" x2="676.21" y2="405.00" class="axis"/>
+  <text x="676.21" y="422.00" text-anchor="middle" class="tick">32</text>
+  <line x1="795.06" y1="400.00" x2="795.06" y2="405.00" class="axis"/>
+  <text x="795.06" y="422.00" text-anchor="middle" class="tick">64</text>
+  <line x1="849.66" y1="400.00" x2="849.66" y2="405.00" class="axis"/>
+  <text x="849.66" y="422.00" text-anchor="middle" class="tick">88</text>
+  <line x1="950.00" y1="400.00" x2="950.00" y2="405.00" class="axis"/>
+  <text x="950.00" y="422.00" text-anchor="middle" class="tick">158</text>
+  <text x="516.00" y="443.00" text-anchor="middle" class="tick">inner_jobs (log2 spacing)</text>
+  <polyline data-series="ideal-speedup" data-clipped="true" points="82.00,368.40 200.84,336.80 319.69,273.60 438.53,147.20 557.37,84.00 676.21,84.00 795.06,84.00 849.66,84.00 950.00,84.00" fill="none" stroke="#98a2b3" stroke-width="2" stroke-dasharray="7 5"/>
+  <polyline data-series="observed-speedup" points="82.00,368.40 200.84,341.38 319.69,295.59 438.53,255.40 557.37,232.20 676.21,231.29 795.06,230.97 849.66,231.54 950.00,231.13" fill="none" stroke="#1769aa" stroke-width="3"/>
+  <circle data-width="1" cx="82.00" cy="368.40" r="4.5" fill="#1769aa" stroke="#ffffff" stroke-width="1.5"/>
+  <circle data-width="2" cx="200.84" cy="341.38" r="4.5" fill="#1769aa" stroke="#ffffff" stroke-width="1.5"/>
+  <circle data-width="4" cx="319.69" cy="295.59" r="4.5" fill="#1769aa" stroke="#ffffff" stroke-width="1.5"/>
+  <circle data-width="8" cx="438.53" cy="255.40" r="4.5" fill="#1769aa" stroke="#ffffff" stroke-width="1.5"/>
+  <circle data-width="16" cx="557.37" cy="232.20" r="4.5" fill="#1769aa" stroke="#ffffff" stroke-width="1.5"/>
+  <circle data-width="32" cx="676.21" cy="231.29" r="4.5" fill="#1769aa" stroke="#ffffff" stroke-width="1.5"/>
+  <circle data-width="64" cx="795.06" cy="230.97" r="4.5" fill="#1769aa" stroke="#ffffff" stroke-width="1.5"/>
+  <circle data-width="88" cx="849.66" cy="231.54" r="4.5" fill="#1769aa" stroke="#ffffff" stroke-width="1.5"/>
+  <circle data-width="158" cx="950.00" cy="231.13" r="4.5" fill="#1769aa" stroke="#ffffff" stroke-width="1.5"/>
+  <line data-marker="recommended" x1="557.37" y1="84.00" x2="557.37" y2="400.00" stroke="#16825d" stroke-width="2" stroke-dasharray="3 4"/>
+  <text x="557.37" y="99.00" text-anchor="middle" class="legend" fill="#116149">recommended: j16</text>
+  <line x1="690.00" y1="55" x2="725.00" y2="55" stroke="#98a2b3" stroke-width="2" stroke-dasharray="7 5"/>
+  <text x="735.00" y="59" class="legend">Ideal linear (clipped at chart ceiling)</text>
+  <line x1="690.00" y1="35" x2="725.00" y2="35" stroke="#1769aa" stroke-width="3"/>
+  <text x="735.00" y="39" class="legend">Observed speedup</text>
+  <rect data-context="cpu-memory" x="82.00" y="468.00" width="868.00" height="115" rx="5" fill="#f5f7fa" stroke="#d7dde8"/>
+  <text x="96.00" y="490.00" class="legend" font-weight="700">CPU-growth / memory context</text>
+  <text x="96.00" y="515.00" class="context" font-weight="700">j1 (baseline)</text>
+  <text x="96.00" y="537.00" class="context">CPU work: 1.00× base</text>
+  <text x="96.00" y="558.00" class="context">Peak memory: 389.4 MiB</text>
+  <text x="376.00" y="515.00" class="context" font-weight="700">j16 (recommended)</text>
+  <text x="376.00" y="537.00" class="context">CPU work: 1.01× base</text>
+  <text x="376.00" y="558.00" class="context">Peak memory: 724.9 MiB</text>
+  <text x="656.00" y="515.00" class="context" font-weight="700">j158 (widest)</text>
+  <text x="656.00" y="537.00" class="context">CPU work: 1.01× base</text>
+  <text x="656.00" y="558.00" class="context">Peak memory: 718.7 MiB</text>
+</svg>

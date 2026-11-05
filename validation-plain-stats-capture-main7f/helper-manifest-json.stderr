@@ -1,0 +1,3 @@
+   Compiling hermit-manifest-plan v0.4.0 (/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-package-d-next-v1/hermit-stats-capture-main7f/ci/manifest-plan)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.42s
+     Running `/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit/debug/hermit-manifest-plan --format json`

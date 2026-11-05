@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Run a command under Node 22, matching the version installed by repository CI.
+#
+# A developer shell may expose an older system Node even when nvm already has Node 22 installed.
+# Validation must not silently test under a different runtime from CI, and it must not download a
+# toolchain as a side effect. Prefer the pinned release scripts/provision-node22 installed and
+# verified, which validation provisions in its own step; otherwise the active Node when it is
+# exactly major 22; otherwise an existing nvm installation; and fail with an actionable message if
+# no route is available. This script never downloads anything itself.
+set -euo pipefail
+
+if [ "$#" -eq 0 ]; then
+  echo "usage: scripts/with-node22 COMMAND [ARG ...]" >&2
+  exit 2
+fi
+
+if pinned="$("$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/provision-node22" --bin-dir)"; then
+  PATH="$pinned:$PATH"
+  export PATH
+fi
+
+node_major() {
+  command -v node >/dev/null 2>&1 || return 1
+  node -p 'process.versions.node.split(".")[0]' 2>/dev/null
+}
+
+if [ "$(node_major || true)" != 22 ]; then
+  candidate_nvm_dir="${NVM_DIR:-}"
+  if [ -z "$candidate_nvm_dir" ] && [ -n "${HOME:-}" ]; then
+    candidate_nvm_dir="$HOME/.nvm"
+  fi
+  if [ -n "$candidate_nvm_dir" ] && [ -s "$candidate_nvm_dir/nvm.sh" ]; then
+    # nvm is intentionally sourced only when the active toolchain is wrong. GitHub Actions and
+    # shells which already selected Node 22 take the direct path and need no nvm installation.
+    NVM_DIR="$candidate_nvm_dir"
+    export NVM_DIR
+    # shellcheck source=/dev/null
+    . "$NVM_DIR/nvm.sh"
+    nvm use --silent 22 >/dev/null 2>&1 || true
+  fi
+fi
+
+actual_version="$(node --version 2>/dev/null || printf 'not installed')"
+if [ "$(node_major || true)" != 22 ]; then
+  echo "with-node22: Node 22 is required (active: $actual_version)" >&2
+  echo "with-node22: install/activate Node 22, or provide it through nvm" >&2
+  exit 127
+fi
+
+exec "$@"

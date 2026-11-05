@@ -1,0 +1,3 @@
+source `dirname $0`/util.sh
+record rdtsc$bitness
+debug_gdb_only x86/step_rdtsc

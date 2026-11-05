@@ -1,0 +1,435 @@
+# vibe-talk configuration.
+#
+# Copy to vibe-talk.toml (which is gitignored) or mount it into the container at
+# /etc/vibe-talk/vibe-talk.toml. Every value here can also come from the environment, and the
+# environment WINS, so a container can be given its secrets without them ever touching a disk.
+#
+# NEVER commit a filled-in copy of this file.
+
+[server]
+# Address to listen on. In a container this must be 0.0.0.0, not 127.0.0.1.
+# Environment: VIBE_TALK_BIND
+bind = "0.0.0.0:8080"
+
+# The URL this server is reachable at from outside, when you know it. Recorded so the deployment is
+# self-describing; nothing depends on it yet.
+# Environment: VIBE_TALK_PUBLIC_BASE_URL
+# public_base_url = "https://vibetalk.dev"
+
+# YOUR time zone, as an IANA name. Message times are converted into it once, here on the server,
+# and handed onward already formatted and labelled ("09:51:25 EDT") so the voice agent can read one
+# out without converting or relabelling it. The exact UTC instant travels alongside for anything
+# that computes with a time. Defaults to UTC; a name the database does not know stops the server
+# rather than quietly becoming UTC. The zone database is compiled into the binary.
+# Environment: VIBE_TALK_TIMEZONE
+# timezone = "America/New_York"
+
+[discord]
+# Source service named in errors, diagnostics, and the app. A compatible bridge can set
+# this to "Google Chat"; the HTTP wire format and existing configuration keys stay the same.
+provider_name = "Discord"
+# How the service writes message text, for the page's renderer: "discord", or "google-chat" for a
+# bridge serving Google Chat, where *a* is bold and a link may arrive as <https://...|label>.
+# markup = "discord"
+# The most one message may hold. A longer one is cut into parts. Discord itself takes 2000
+# characters and never more. A bridge takes what is set here, and 2000 characters when neither is
+# set; with markup = "google-chat" it is also held to Google Chat's 32,000 bytes. Under 500 is
+# refused. Set what the bridge itself accepts in one request.
+# max_post_chars = 2000
+# max_post_bytes = 30000
+# Thread protocol: "native" for Discord, "bridge" for compatible normalized thread endpoints,
+# or "off" for an older bridge without thread support. Thread ids and cursors are opaque.
+thread_api = "native"
+# With thread_api = "bridge" only: what answers a read of a channel's most recent messages,
+# "messages" (GET /channels/{id}/messages, the default) or "flat" (the newest page of the bridge's
+# Flat view, served from its kept copy and labelled with as_of when that copy is stale). Try
+# recent_view_shadow = true first: it keeps reading /messages and counts where Flat disagrees, in
+# GET /api/v1/diagnostics. It does not apply with "flat". The checking Flat reads are not free: a
+# bridge may serve them ahead of /messages, stopping the one it is running while it brings a stale
+# or cold copy forward. So they run one at a time, only after recent reads have stopped for three
+# seconds; a read soon after a quiet spell or a bridge restart can still wait behind one.
+# recent_view = "messages"
+# recent_view_shadow = false
+# Enable only when api_base names a compatible bridge with POST /channels/{id}/read.
+# This moves the source provider's read cursor; Done/archive remains local and reversible.
+upstream_read_marks = false
+# Enable only when api_base names a compatible bridge with POST /channels and DELETE /channels/{id}.
+# POST /channels must return {"id":"path-safe-stable-id","created":true|false}; it may also
+# return boolean "writable", which defaults to false when omitted. The bridge owns that policy.
+# DELETE /channels/{id} must be idempotent and return 204 even when the id is already absent.
+# The web app then accepts a provider-neutral channel link or reference and lets the bridge resolve it.
+# The bridge also receives a path-safe nonce on message POSTs and must pass it through as its
+# provider request id; one logical post keeps the same nonce across internal retries.
+channel_registration = false
+# Bot token for the SECOND, dedicated bot — not the one your coding agents use.
+# Environment: VIBE_TALK_DISCORD_BOT_TOKEN
+bot_token = "REPLACE-ME"
+
+# Deadline for one ordinary provider HTTP request, in seconds. Compatible bridges that perform a
+# bounded upstream command may need longer than the default 20. Values outside 1–120 are refused.
+request_timeout_seconds = 20
+
+# How many messages a read returns by default, and the ceiling a caller may request.
+default_fetch_limit = 50
+max_fetch_limit = 100
+
+# Cost ceiling for count_messages. Discord publishes no message count, so counting means walking
+# backwards a hundred messages per request against a shared rate limit. Past this many, the count
+# stops and answers "at least N" instead of spending more requests.
+max_count_scan = 500
+
+# LIVE INGESTION: how often, in seconds, each allowlisted channel is read for messages nobody
+# asked for. `0` — the default — turns it OFF, and off means the /voice page's live stream
+# attaches and receives nothing until you set this.
+#
+# Off by default on purpose. Every tick is ONE Discord request PER CHANNEL, forever, whether or
+# not anybody is looking; this server does not yet honour `Retry-After`, and a 429 from Discord
+# reaches the caller as HTTP 502. Under 5 seconds is refused outright rather than clamped.
+# 30 is a reasonable place to start. Environment: VIBE_TALK_LIVE_POLL_SECONDS
+live_poll_seconds = 0
+
+# owner_user_id is YOUR Discord user id, and it cannot be worked out from anything above.
+#
+# The bot token identifies the BOT — the server reads that straight out of it, so messages this
+# bridge posts on your behalf are recognised for free. A bot's account has no relationship to the
+# human reading the channel, though, so messages YOU type into Discord yourself are just somebody
+# else's until you say otherwise. Set this and they are drawn as yours.
+#
+# How to get it: in Discord, User Settings -> Advanced -> Developer Mode on, then right-click your
+# OWN name on any message -> Copy User ID. (The same Developer Mode is what gives you Copy Channel
+# ID for the [[channels]] block below.)
+#
+# Public: a user id is on every message that account has ever sent. Settings can also assign it
+# per account, in the browser, with no restart.
+# owner_user_id = "000000000000000000"
+
+# MORE PROVIDERS. One server can read several chat services at once. Each extra one is a
+# [[providers]] entry; channels name it with `provider = "<key>"`. Without a [discord] section, every
+# channel must name its provider. See "Several chat providers in one server" in README.md.
+# Environment: VIBE_TALK_PROVIDER_<KEY>_TOKEN supplies an entry's token (key upper-cased, - as _).
+#
+# [[providers]]
+# key = "slack"
+# kind = "slack"                 # "slack", or "discord" for Discord or a Discord-compatible bridge
+# name = "Slack"
+# api_base = "https://slack.com/api"
+# token = "xoxb-REPLACE-ME"
+# owner_user_id = "U0123ABCDEF"
+# live_poll_seconds = 30
+# channel_registration = true    # accept pasted Slack links in the app
+# registered_channels_writable = false
+# channel_discovery = true
+# upstream_clear = false         # offer "Clear unread in Slack" in Settings; needs a user token
+
+[auth]
+# Credentials THIS server demands of its callers. Not Discord's, not ElevenLabs'.
+# Generate them with:  openssl rand -base64 33
+# The read token goes in your phone and in the voice agent's tool configuration.
+# The write token is what lets something post as your bot: give it out far more carefully.
+# Environment: VIBE_TALK_READ_TOKEN / VIBE_TALK_WRITE_TOKEN
+read_token = "REPLACE-ME-at-least-24-characters"
+write_token = "REPLACE-ME-different-and-at-least-24-characters"
+
+# Optional provider-neutral input for an external adapter. Leave this whole section absent to
+# disable both POST /api/v1/live/events and POST /api/v1/live/hints. The token is deliberately
+# separate from both browser credentials and must be at least 24 characters. Both routes still
+# accept only channels from the allowlist below.
+#
+# Full pushed events remain a second source and are refused for a provider with
+# live_poll_seconds. Content-free hints MAY be combined with polling: they wake its one existing
+# cursor rather than publishing a second copy. Environment: VIBE_TALK_INGEST_TOKEN
+# [ingest]
+# token = "REPLACE-ME-third-distinct-token-at-least-24-characters"
+
+# Channels this server may touch. This list is an ALLOWLIST: a channel that is not here cannot be
+# read or posted to through the API even with a valid token, however many channels the bot is in.
+# `writable = false` is the safe default; only mark a channel writable if you want the bridge to be
+# able to speak in it.
+#
+# Every channel listed here is checked at startup: the server reads ONE message from each and
+# refuses to start if it cannot, naming the channel and the fix. Adding the bot to the SERVER is
+# not the same as adding it to a private CHANNEL, and that omission is what this catches.
+# Set VIBE_TALK_SKIP_STARTUP_PROBE=1 (or pass --skip-startup-probe) to start without the check;
+# the skip is logged loudly.
+# Environment: VIBE_TALK_CHANNELS="123:lead team:rw,456:build noise:ro" (a fourth field names
+# the provider: "C0123ABCDEF:team:rw:slack"). In the file, the same is `provider = "slack"`.
+[[channels]]
+id = "000000000000000000"
+label = "lead team"
+writable = true
+
+[[channels]]
+id = "111111111111111111"
+label = "build noise"
+writable = false
+
+[read_aloud]
+# Message read-aloud is independent of conversational voice mode.
+# "elevenlabs" preserves the server audio path and is the default when omitted.
+# "browser" uses Web Speech on the phone without ElevenLabs credentials or requests.
+# Browser mode selects only voices reported as localService by the browser. The phone's
+# speech engine controls actual synthesis; check its offline voice settings if required.
+# Environment: VIBE_TALK_READ_ALOUD_BACKEND
+backend = "elevenlabs"
+
+[speakable]
+# Rewrite message bodies before anything says them out loud. ON when this section is absent.
+#
+# What the pass does: takes Discord's markdown off, so the voice stops saying "asterisk asterisk
+# deploy asterisk asterisk"; turns timestamps into "three hours ago" instead of reading an ISO
+# string character by character; and gives long numeric ids and hash codes a letter — "large
+# number A" — that means the SAME value every time it comes up, so a listener can tell "the same
+# one" from "a different one" without hearing nineteen digits.
+#
+# What it costs: the letters are only meaningful beside a transcript that introduced them, the
+# table is lost on restart, and the spoken body is a second copy of any message the pass actually
+# changed. Turn it off to hear a deployment exactly as it was typed — which is what you want while
+# tuning the voice agent's own prompt, so that a difference between two runs is the prompt.
+#
+# It does NOT control the time-zone conversion: a message carries a local `spoken_time` either way.
+# Environment: VIBE_TALK_SPEAKABLE (true/false — an unreadable value refuses to start)
+enabled = true
+
+[elevenlabs]
+# Optional: the Discord half of this server works without them. Set BOTH to use /voice and
+# GET /api/v1/signed-url, which is how you talk to an agent that has "Enable Authentication"
+# turned on: that setting closes the public talk-to link, and a conversation can then only be
+# started from a short-lived signed URL minted with the account API key.
+#
+# agent_id is public (it identifies a widget) and is handed to the web app. api_key is an ACCOUNT
+# secret — it can spend money — and never leaves the server: it goes to ElevenLabs in a header, is
+# never put in a URL, and is redacted out of every error message.
+#
+# Where to get them:
+#   agent_id  https://elevenlabs.io/app/agents -> create or open an agent; the id is in the
+#             dashboard URL and starts with "agent_".
+#   api_key   https://elevenlabs.io/app/settings/api-keys -> Create API Key -> copy. Shown once.
+#
+# With either one unset, /api/v1/signed-url answers 503 and names the setting you are missing. It
+# never falls back to an unsigned URL, because that failure would surface later, in a browser, in
+# a car, as a conversation that silently will not start.
+#
+# Without a [summaries.llm] section, these two also decide whether MESSAGE SUMMARIES work at all:
+# the summariser is then this same agent, so a deployment with neither shows every long message as
+# a failed summary. See [summaries] below.
+# Environment: VIBE_TALK_ELEVENLABS_AGENT_ID / VIBE_TALK_ELEVENLABS_API_KEY
+#              VIBE_TALK_ELEVENLABS_VOICE_ID
+#
+# voice_id is OPTIONAL, and most deployments should leave it unset.
+#
+# An agent and a voice are different things in ElevenLabs' model: an agent is a prompt, an
+# LLM, tools AND a voice, while the text-to-speech API takes a voice and knows nothing
+# about agents. So they cannot be one setting. But the agent HAS a voice, and with voice_id
+# unset the server reads it off the configured agent -- so a channel message is read aloud
+# in the same voice that talks to you, from the one thing you configured.
+#
+# Set it only when those should DIFFER. With neither set, the ElevenLabs read-aloud
+# backend refuses and names both: it does not use the account's first catalogue voice,
+# because that is not a decision anybody made.
+# agent_id = "agent_..."
+# api_key = "REPLACE-ME"
+
+# Where to mint signed URLs from. Only change this to point at a regional endpoint or a proxy.
+# Environment: VIBE_TALK_ELEVENLABS_API_BASE
+# api_base = "https://api.elevenlabs.io/v1"
+
+[conversation]
+# The live voice provider used by /voice. `elevenlabs` is the default and keeps the existing
+# signed-URL flow. `websocket` selects a deployment-managed endpoint that speaks the public
+# vibe-talk-v1 protocol: JSON prompt/transcript control frames and 16-bit little-endian mono PCM
+# binary frames. Provider endpoints belong in deployment configuration, never in source.
+# backend = "elevenlabs"
+# websocket_url = "wss://voice-provider.example/ws"
+# A path means the page's own host, which suits a bridge behind the same front door as the page:
+# websocket_url = "/ws?mode=voice"
+# label = "WebSocket voice provider"
+#
+# "Ask me before the voice agent sends" (#264 voice-send-approval). ON by default: the agent's
+# post_reply only proposes a message, reads it back and asks "Send it?", and nothing is posted
+# until you say yes or tap Send on the voice page. Off, post_reply posts at once when you ask —
+# and a chat message the agent reads could also talk it into posting. This is only the SHIPPED
+# default: the checkbox in Settings stores your own choice on the server and wins over it until a
+# purge. A hosted agent whose prompt was pasted into its console by hand must be given the new
+# prompt (GET /api/v1/voice-agent) whenever this changes.
+# ask_before_send = true
+
+[storage]
+# Durable state: the /voice conversation transcript, how far you have read in each channel,
+# and the cached summaries below. Everything else this server does is stateless — a channel is
+# never cached as a channel. A cached SUMMARY is: it is a model's paraphrase of somebody else's
+# message, written from that message, so it is a second at-rest copy of third-party text and is
+# bounded and purged as one.
+#
+# UNSET MEANS OFF, and off is honest: the routes that need a store answer 503
+# storage_not_configured rather than keeping state in memory that evaporates on restart.
+#
+# The path must be ABSOLUTE. A relative path is resolved against the working directory, which in
+# a container is a directory INSIDE THE IMAGE — that store works perfectly until the next rebuild
+# and then is gone, with no error. In a container this must be a mounted volume; the image
+# defaults it to /var/lib/vibe-talk/vibe-talk.sqlite3 and declares a VOLUME there.
+#
+# The file is created 0600 and its directory 0700. Anyone with filesystem access to the host can
+# still read it: it holds your own speech and third-party channel text in the clear.
+# Environment: VIBE_TALK_STORAGE_PATH
+# path = "/var/lib/vibe-talk/vibe-talk.sqlite3"
+
+# Retention. Enforced on every write, not by a sweeper that might not run. EVERY table is
+# bounded: an unbounded one is both a disk problem and a privacy problem, and the second is worse.
+# max_conversations = 50            # oldest dropped first; at least 1
+# max_turns_per_conversation = 1000 # further turns are refused with 413; at least 1
+# max_summaries = 2000              # least recently written dropped first; at least 1. Thread
+#                                   # names are counted separately against the same number
+# max_dismissals = 10000            # "dealt with" marks, oldest dropped first; at least 1
+# retain_days = 30                  # 0 means no age limit. Applies to conversations, since the
+#                                   # last turn.
+# summary_retain_days = 30          # Defaults to retain_days; 0 means no age limit. Applies to
+#                                   # cached summaries, thread sentences and thread names, since
+#                                   # they were last USED by the write token (a read-token hit
+#                                   # keeps nothing alive). For a summary it is the only thing that
+#                                   # collects an entry whose message was edited or deleted
+#                                   # upstream, because such an entry is unreachable by key and
+#                                   # nothing announces it — so keep it within how long the chat
+#                                   # provider itself keeps messages.
+#                                   #
+#                                   # Neither applies to max_dismissals, and that is deliberate:
+#                                   # expiring a "dealt with" mark would put a message you
+#                                   # cleared last month back into your to-do list because time
+#                                   # passed, with nothing on the row saying why. The count bound
+#                                   # is enough there — it is the one table holding no message
+#                                   # text, only two snowflakes and an instant.
+
+[summaries]
+# How a long channel message is turned into one short line. Every setting here that changes what a
+# summary SAYS is folded into the cache key (see src/summarize/policy_version), so changing one
+# makes every summary produced under the old settings unreachable at once and a startup sweep
+# deletes them. That is the intent: a changed instruction is a changed summary, and serving the old
+# text would be worse than regenerating. threshold_chars and reply_timeout_seconds change no word
+# of a summary and are NOT in the key, and neither is the length an answer is cut at: an answer is
+# stored whole and cut when it is shown, so changing them asks the model for nothing again.
+#
+# threshold_chars: below this a message is not summarised at all — it is already short enough to
+# read, and it must be at least target_chars or the "summary" comes back longer than the original.
+# threshold_chars = 400
+# target_chars = 160
+# context_messages = 3        # how many preceding messages ride along as context
+#
+# The model to ask. NOTE: nothing reads this — the ElevenLabs agent runs whichever model it is
+# configured with, and [summaries.llm] below names its own `model` and never falls back to this
+# one — so today it does exactly one thing: it is folded into the cache key, so setting it
+# invalidates every summary produced without it.
+# Environment: VIBE_TALK_SUMMARY_MODEL
+# model = "..."
+
+# WHICH SUMMARISER: [summaries.llm] below when it is present, else the ElevenLabs agent. There is
+# no `backend` key. There used to be one, and an "extractive" summariser that truncated, cost
+# nothing, and was the default. It has been DELETED. It never comprehended anything — it handed you
+# the opening of the message it claimed to summarise, which the collapsed row already shows you.
+#
+# Without [summaries.llm], summaries come from the conversational agent named in [elevenlabs],
+# asked in TEXT over its own WebSocket with audio generation suppressed. That makes
+# elevenlabs.agent_id and elevenlabs.api_key load-bearing for summaries: WITHOUT THEM AND WITHOUT
+# [summaries.llm] THERE IS NO SUMMARISER AT ALL. The
+# server still starts, and says so; every summary request then refuses by name, and the /voice page
+# draws those rows RED. It does not fall back to truncation, because a silent fallback is
+# indistinguishable from the agent working badly.
+#
+# A configuration that still says `backend = "extractive"` is REFUSED at startup, by name, rather
+# than being ignored: an upgrade must not quietly change what your summaries are. `backend =
+# "elevenlabs_agent"` still starts and warns loudly that the key selects nothing. Delete the line.
+#
+# Every summary answer carries the summariser's name, so a page can never imply a model summary it
+# did not get, and generated_in_ms, so a deployment can see what a round trip to the agent actually
+# costs without instrumenting anything.
+#
+# NOTHING IN THE AGENT SUMMARISER HAS BEEN RUN AGAINST LIVE ELEVENLABS, and it is the path when
+# [summaries.llm] is absent. The protocol was read out of the vendor's SDK and is exercised offline against this
+# repository's own mock, which was written from the same reading. The first real conversation is
+# the experiment.
+
+# HOW THE SUMMARISER'S CONVERSATION IS POOLED. Both of the first two are folded into the cache key,
+# because both change what a summary SAYS.
+#
+# A ConvAI socket is a CONVERSATION: everything asked down one stays in the agent's context,
+# including its own previous answers, and there is no event that resets it. So a socket shared by
+# too many summaries writes the last one in front of all the earlier ones, and a socket per
+# summary pays a mint, a TLS handshake and an initiation round trip every time — and ElevenLabs
+# bills connection time as well as tokens. These are the two dials between those failures; see the
+# module doc of src/summarize/agent.rs for the arithmetic behind the defaults.
+# max_per_socket = 8            # summaries one conversation serves before it is recycled; min 1
+# socket_idle_seconds = 30      # quiet after which a held conversation is closed
+# reply_timeout_seconds = 30    # ceiling on one turn, and on one opening handshake; min 1
+
+# [summaries.llm] — SUMMARIES AND THREAD NAMES FROM ONE PLAIN MESSAGES API CALL APIECE.
+# No agent harness and NO TOOLS: the request type cannot carry one. Each long message becomes one
+# sentence, and each thread gets a short hyphenated name (chosen once, then kept) and a sentence
+# refreshed at 1, 2, 4 and 8 messages and then every 10. Thread names are made in the background
+# after a thread list is read with the write token, never on the read itself.
+#
+# THE TEXT OF THE MESSAGES BEING SUMMARISED IS SENT TO THE MODEL PROVIDER CONFIGURED HERE.
+#
+# Secrets come ONLY from files (or, for a bearer token, a command's output), read at call time and
+# never logged; `api_key = "..."` inline is refused. Every path must be absolute. Only dialect,
+# model and max_tokens reach the cache key. The full list of keys is in the README's Summaries
+# section. A host that shares this file with another can keep its own [summaries.llm] in an
+# overlay: `--config-overlay /etc/vibe-talk/this-host.toml` (or VIBE_TALK_CONFIG_OVERLAY). An
+# overlay that names [summaries.llm] REPLACES this section whole — nothing here, a key file
+# included, is inherited — so write the complete section there.
+#
+# The Anthropic API:
+# [summaries.llm]
+# dialect = "anthropic"
+# api_key_file = "/run/secrets/anthropic-api-key"
+# model = "claude-haiku-4-5"         # the default
+# max_tokens = 120                   # output budget per call
+# timeout_secs = 30                  # per request; also how long, in all, a summary waits for slots
+# requests_per_minute = 15           # client-side ceiling, summaries and thread names together
+# burst = 3                          # calls allowed back to back before that pace applies
+#
+# Google Vertex:
+# [summaries.llm]
+# dialect = "vertex"
+# project = "my-gcp-project"
+# region = "global"                  # or "us-east5", ...
+# bearer_token_command = ["gcloud", "auth", "print-access-token"]   # or bearer_token_file = "..."
+#
+# A gateway that speaks the Vertex path and authenticates by client certificate:
+# [summaries.llm]
+# dialect = "vertex"
+# base_url = "https://models.gateway.example/v1"
+# project = "my-project"
+# region = "global"
+# client_identity_file = "/path/to/identity.pem"   # cert chain + key; re-read when it changes
+# ca_bundle_file = "/path/to/private-root.pem"     # if it chains to a private root
+# [summaries.llm.extra_headers]
+# x-client-name = "vibe-talk"                  # not for secrets
+
+[replay]
+# RESUMING A CONVERSATION ACROSS A HANG-UP. The vendor cannot resume a closed conversation, so
+# what this does instead is hand the NEW call a written record of the earlier one: a
+# reconstruction, not a continuation, and the /voice page says which of the two you got.
+#
+# Only the ElevenLabs backend can carry a replay. With conversation.backend = "websocket" there is
+# no frame for it, so the page is told replay is off and the server warns at startup.
+#
+# OFF by default, and the reason is privacy rather than caution: every new call re-sends earlier
+# conversation content — your own speech AND any Discord text the agent read out to you,
+# written by other people — to the voice vendor. Turn it on deliberately.
+# Environment: VIBE_TALK_REPLAY_ENABLED
+enabled = false
+
+# The budget. The most recent turns are kept until either ceiling is reached and the OLDEST are
+# dropped; when anything is dropped, the payload says so and the page says "in part". Both are
+# guesses until measured — the payload is billed per call and the model's window is finite — and
+# `scripts/run.sh --smoke-agent --replay-check` is the only thing that can measure them.
+# Environment: VIBE_TALK_REPLAY_MAX_CHARS / VIBE_TALK_REPLAY_MAX_TURNS
+# max_chars = 6000
+# max_turns = 40
+
+# How the record reaches the vendor. "contextual_update" (the default) is a client event sent
+# immediately after the initiation message, documented as non-interrupting background information.
+# "client_data" carries the text on the initiation message itself, under dynamic_variables; it
+# depends on the agent's dashboard security settings permitting overrides and fails SILENTLY when
+# they do not. Which one a deployment actually honours for the FIRST agent turn is a question only
+# the billed check can answer, which is why both exist.
+# Environment: VIBE_TALK_REPLAY_TRANSPORT
+# transport = "contextual_update"

@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-203-ce8ed265a87",
+    "issue_id": "agent-utils-203",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Closed: landed locally as 297e6629 (push awaiting the owner's OK) and deployed on devbig014 with the incremental adapter release (runtime drop-in; the shared adapter file is unchanged). Measured through the app: a full read 0.03 s (75 KB), a delta from its cursor 0.01-0.05 s (849 bytes), delta complete=true so polls use it. A snapshot older than 5 minutes is now brought forward by one created-after list (~2 s) instead of a full scan, and channels read in the last 15 minutes are kept current in the background. Unverified on the phone; reconcile scans every 30 minutes mean a quote or attachment changed on an old message without a live event can take up to 30 minutes to show.",
+    "created_at": "2026-10-04T16:03:06.874912274Z",
+    "updated_at": "2026-10-04T16:03:06.874912274Z"
+  }
+]

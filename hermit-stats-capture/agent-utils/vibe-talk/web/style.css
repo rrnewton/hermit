@@ -1,0 +1,257 @@
+:root {
+  --bg: #14161a;
+  --panel: #1d2026;
+  --edge: #2c313a;
+  --ink: #e7e9ee;
+  --muted: #99a1b0;
+  --accent: #5b9dd9;
+  --warn: #d98a5b;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f6f7f9;
+    --panel: #ffffff;
+    --edge: #d9dde4;
+    --ink: #1a1d22;
+    --muted: #5d6674;
+    --accent: #24618f;
+    --warn: #9a5416;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 16px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  padding-bottom: 3rem;
+}
+
+header {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--edge);
+}
+
+h1 {
+  font-size: 1.1rem;
+  margin: 0;
+  letter-spacing: 0.02em;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.hint {
+  color: var(--muted);
+  font-size: 0.85rem;
+  margin: 0.5rem 0;
+}
+
+nav {
+  display: flex;
+  border-bottom: 1px solid var(--edge);
+}
+
+nav button {
+  flex: 1;
+  padding: 0.9rem 0.5rem;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--muted);
+  font: inherit;
+}
+
+nav button.active {
+  color: var(--ink);
+  border-bottom-color: var(--accent);
+}
+
+main {
+  padding: 0.75rem 1rem;
+}
+
+.tab {
+  display: none;
+}
+
+.tab.active {
+  display: block;
+}
+
+.row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  margin: 0.5rem 0;
+}
+
+.row > * {
+  min-height: 2.75rem;
+}
+
+select,
+input {
+  flex: 1;
+  min-width: 0;
+  padding: 0.5rem 0.6rem;
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid var(--edge);
+  border-radius: 0.4rem;
+  font: inherit;
+}
+
+button {
+  padding: 0.55rem 0.9rem;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 0.4rem;
+  font: inherit;
+}
+
+button.secondary {
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid var(--edge);
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 0.5rem;
+  padding: 0.75rem;
+  margin: 0.5rem 0;
+}
+
+/* An error the page must not be able to hide: full width, its own colour, and never `muted`. */
+.panel.error {
+  border-color: var(--warn);
+  color: var(--warn);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+#error-wrap {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.65rem;
+}
+
+#error-wrap[hidden] {
+  display: none;
+}
+
+#error {
+  min-width: 0;
+}
+
+#dismiss-error {
+  flex: 0 0 auto;
+}
+
+button.ok {
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid var(--accent);
+}
+
+button[disabled] {
+  opacity: 0.6;
+}
+
+.messages {
+  list-style: none;
+  margin: 0.75rem 0 0;
+  padding: 0;
+}
+
+.messages li {
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 0.5rem;
+  padding: 0.6rem 0.7rem;
+  margin-bottom: 0.5rem;
+}
+
+.messages li.selected {
+  border-color: var(--accent);
+}
+
+.meta {
+  display: flex;
+  gap: 0.5rem;
+  font-size: 0.78rem;
+  color: var(--muted);
+  margin-bottom: 0.25rem;
+}
+
+.body {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.ambiguous {
+  color: var(--warn);
+  font-size: 0.85rem;
+}
+
+#status {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 0.5rem 1rem;
+  background: var(--panel);
+  border-top: 1px solid var(--edge);
+  color: var(--muted);
+  font-size: 0.85rem;
+  min-height: 2rem;
+}
+
+/* Microphone settings: a disclosure, deliberately quieter than the Start button above it. */
+.settings {
+  border: 1px solid var(--edge);
+  border-radius: 0.5rem;
+  padding: 0 0.75rem;
+  margin: 0.75rem 0;
+}
+
+.settings[open] {
+  padding-bottom: 0.5rem;
+}
+
+.settings > summary {
+  padding: 0.7rem 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+
+.toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  min-height: 2.75rem;
+}
+
+/* The generic `input` rule above stretches and pads text fields; a checkbox wants neither. */
+.toggle input[type="checkbox"] {
+  flex: 0 0 auto;
+  width: 1.15rem;
+  height: 1.15rem;
+  min-height: 0;
+  padding: 0;
+  accent-color: var(--accent);
+}

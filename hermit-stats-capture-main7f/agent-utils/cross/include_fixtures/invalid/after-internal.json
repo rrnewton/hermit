@@ -1,0 +1,10 @@
+{
+  "include": [
+    {
+      "path": "two-steps.json",
+      "namespace": "x",
+      "after": ["x.z.j", "x.a.j"]
+    }
+  ],
+  "steps": []
+}

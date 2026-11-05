@@ -1,0 +1,10 @@
+[Unit]
+Description={{PROJECT}} harness: tick-hub every 15 minutes (each reminder's cadence is in ops.yaml)
+
+[Timer]
+OnCalendar=*:0/15
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

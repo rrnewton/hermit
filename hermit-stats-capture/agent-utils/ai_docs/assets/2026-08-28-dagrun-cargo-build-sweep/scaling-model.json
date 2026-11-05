@@ -1,0 +1,28 @@
+{
+  "schema": 2,
+  "machine_id": "AMD_EPYC_9D64_88-Core_Processor",
+  "container_class": "affinity176_cpu-max-15840000_100000",
+  "plateau_wall_tolerance": "0.100",
+  "max_cpu_work_growth": "1.500",
+  "memory_min_samples_per_width": 3,
+  "steps": [
+    {
+      "step": "build.dagrun",
+      "workload_digest": "2f4c4ac59ef7e17b",
+      "baseline_inner_jobs": 1,
+      "recommended_inner_jobs": 16,
+      "regression_inner_jobs": null,
+      "levels": [
+        {"inner_jobs": 1, "wall_s": "49.332", "raw_wall_s": "49.774", "wall_min_s": "49.296", "wall_max_s": "49.417", "speedup": "1.000", "cpu_s": "49.212", "effective_cores": "0.989", "throttled_s": "0.306", "peak_bytes": 408268800, "peak_samples": 3, "peak_floor_bytes": null, "peak_floor_samples": 0, "parallel_efficiency": "1.000", "samples": 3},
+        {"inner_jobs": 2, "wall_s": "26.593", "raw_wall_s": "26.832", "wall_min_s": "26.204", "wall_max_s": "26.623", "speedup": "1.855", "cpu_s": "49.241", "effective_cores": "1.837", "throttled_s": "0.175", "peak_bytes": 441335808, "peak_samples": 3, "peak_floor_bytes": null, "peak_floor_samples": 0, "parallel_efficiency": "0.928", "samples": 3},
+        {"inner_jobs": 4, "wall_s": "14.931", "raw_wall_s": "15.074", "wall_min_s": "14.874", "wall_max_s": "14.932", "speedup": "3.304", "cpu_s": "49.465", "effective_cores": "3.287", "throttled_s": "0.133", "peak_bytes": 496488448, "peak_samples": 3, "peak_floor_bytes": null, "peak_floor_samples": 0, "parallel_efficiency": "0.826", "samples": 3},
+        {"inner_jobs": 8, "wall_s": "10.780", "raw_wall_s": "10.993", "wall_min_s": "10.765", "wall_max_s": "10.936", "speedup": "4.576", "cpu_s": "49.698", "effective_cores": "4.537", "throttled_s": "0.044", "peak_bytes": 610500608, "peak_samples": 3, "peak_floor_bytes": null, "peak_floor_samples": 0, "parallel_efficiency": "0.572", "samples": 3},
+        {"inner_jobs": 16, "wall_s": "9.291", "raw_wall_s": "9.358", "wall_min_s": "9.237", "wall_max_s": "9.420", "speedup": "5.310", "cpu_s": "49.853", "effective_cores": "5.332", "throttled_s": "0.011", "peak_bytes": 760164352, "peak_samples": 3, "peak_floor_bytes": null, "peak_floor_samples": 0, "parallel_efficiency": "0.332", "samples": 3},
+        {"inner_jobs": 32, "wall_s": "9.240", "raw_wall_s": "9.318", "wall_min_s": "9.230", "wall_max_s": "9.526", "speedup": "5.339", "cpu_s": "49.830", "effective_cores": "5.348", "throttled_s": "0.000", "peak_bytes": 755642368, "peak_samples": 3, "peak_floor_bytes": null, "peak_floor_samples": 0, "parallel_efficiency": "0.167", "samples": 3},
+        {"inner_jobs": 64, "wall_s": "9.223", "raw_wall_s": "9.308", "wall_min_s": "9.201", "wall_max_s": "9.245", "speedup": "5.349", "cpu_s": "49.984", "effective_cores": "5.370", "throttled_s": "0.000", "peak_bytes": 755105792, "peak_samples": 3, "peak_floor_bytes": null, "peak_floor_samples": 0, "parallel_efficiency": "0.084", "samples": 3},
+        {"inner_jobs": 88, "wall_s": "9.254", "raw_wall_s": "9.328", "wall_min_s": "9.240", "wall_max_s": "9.279", "speedup": "5.331", "cpu_s": "49.926", "effective_cores": "5.355", "throttled_s": "0.000", "peak_bytes": 739745792, "peak_samples": 3, "peak_floor_bytes": null, "peak_floor_samples": 0, "parallel_efficiency": "0.061", "samples": 3},
+        {"inner_jobs": 158, "wall_s": "9.231", "raw_wall_s": "9.329", "wall_min_s": "9.201", "wall_max_s": "9.332", "speedup": "5.344", "cpu_s": "49.946", "effective_cores": "5.354", "throttled_s": "0.000", "peak_bytes": 753590272, "peak_samples": 3, "peak_floor_bytes": null, "peak_floor_samples": 0, "parallel_efficiency": "0.034", "samples": 3}
+      ]
+    }
+  ]
+}

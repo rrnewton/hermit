@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-180-9c2e5dd7f42",
+    "issue_id": "agent-utils-180",
+    "author": "gpt-5",
+    "body": "[gpt-5] Acceptance met, closing. The public change-hint adapter and managed-runtime sizing are on GitHub `main` through `68a96c2f`, and the final follow-up runner commit is on `main` at `5aba7e81`; both pushes were plain fast-forwards with no PR. The live deployment uses the immutable `68a96c2f` release. Only the app and hint units were restarted; the shim and TLS PIDs stayed unchanged. All four Slack units are active/running with zero restarts.\n\nContent-free live acceptance on 2026-10-02: a 20-request authenticated burst returned two accepted hints and 18 successful duplicate acknowledgements, produced exactly one Slack history read about 183 ms after the hint, and left the ordinary poll fallback at 3600 s. The hint service stayed stable for 60 s under the concrete `meta slack.conversation tail` child and its checked-in resource envelope. Anonymous hints returned 401; the read-only TLS deployment suite passed 11/11; no Slack message was posted. Public validation passed 44/44. The private shim/TLS deployment is published as `D123064872` and now has the `realtimeai_infra_chp` project reviewer.",
+    "created_at": "2026-10-02T21:37:45.408829Z",
+    "updated_at": "2026-10-02T21:37:45.408829Z"
+  }
+]

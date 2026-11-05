@@ -1,0 +1,51 @@
+description: >-
+  Three-node scaling benchmark for `dagrun sweep --target-time`: an embarrassingly parallel
+  workload, a workload capped at four useful workers, and serial work that adds interference when
+  asked to run wider. Every command accepts `--jobs N` through the generic-with-flag cmdtype.
+steps:
+  - group: scale
+    job: parallel
+    desc: embarrassingly parallel fixed work
+    cmd: >-
+      python3 examples/dagrun-scaling-workload.py --kind parallel
+      --work "${DAGRUN_SYNTH_WORK:-30000000}"
+    cmdtype: generic-with-flag
+    jobs_flag: --jobs
+    cpu_timeout: 600
+    hint:
+      classification: cpu-bound
+      preferred_inner_jobs: 1
+      est_duration_s: 3
+      hard_mem_max_bytes: 4294967296
+
+  - group: scale
+    job: four-core
+    desc: useful parallelism saturates at four workers
+    cmd: >-
+      python3 examples/dagrun-scaling-workload.py --kind four-core
+      --work "${DAGRUN_SYNTH_WORK:-30000000}"
+    cmdtype: generic-with-flag
+    jobs_flag: --jobs
+    deps: [scale.parallel]
+    cpu_timeout: 600
+    hint:
+      classification: cpu-bound
+      preferred_inner_jobs: 1
+      est_duration_s: 3
+      hard_mem_max_bytes: 4294967296
+
+  - group: scale
+    job: sequential
+    desc: serial critical work plus wider-run interference
+    cmd: >-
+      python3 examples/dagrun-scaling-workload.py --kind sequential
+      --work "${DAGRUN_SYNTH_WORK:-30000000}"
+    cmdtype: generic-with-flag
+    jobs_flag: --jobs
+    deps: [scale.four-core]
+    cpu_timeout: 600
+    hint:
+      classification: cpu-bound
+      preferred_inner_jobs: 1
+      est_duration_s: 3
+      hard_mem_max_bytes: 4294967296

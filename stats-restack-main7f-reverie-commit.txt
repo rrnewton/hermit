@@ -1,0 +1,21 @@
+Share DBT statistics capture ownership
+
+[hermit2, dbt, gpt-6-astra, devbig014, role=impl]
+
+Plain Language Summary and Project Impact
+
+Expose the launcher's statistics sink and a presence-aware captured artifact so Hermit uses one allocation, client-configuration, file-reading and decoding owner. Callers retain their existing temporary-directory naming and completion boundaries. Saved-run verification retains exact raw process records; absent, empty, unreadable and malformed artifacts remain distinct.
+
+Task: Package D shared statistics capture
+
+Determinism
+
+This changes ownership, not the native record format, counters or aggregation. Existing optional statistics calls retain their missing-file-to-empty-snapshot behavior. Strict callers keep their existing evidence policy instead of manufacturing a measured result.
+
+Linux Semantics
+
+The temporary-file placement, native append-mode writes, caller-owned lifetime and existing Reader, inherited-input and status execution routes are unchanged. Callers consume the sink at their existing post-reap boundary; cleanup and primary failures retain their ordering.
+
+Validation
+
+The four changed after-images exactly match the independently reviewed earlier statistics commit ff30c5bac6040c14122d33d60f5dfb91953c7099. Their predecessors are unchanged in this fixed base 16ffab7c558c47c78c43aa8e0e4242eb2deeeb3d. The six focused ownership, presence and raw-record tests remain intact. Diff whitespace checks passed. Previous component results remain bound to the earlier source; plain Cargo checks of this new pair are pending. No native backend or full-validation result is claimed here.

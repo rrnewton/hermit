@@ -1,0 +1,1 @@
+Superseded untested draft: moved allocation inside container and raw records through IPC. Root required preserving custom TMPDIR, original prefix and host capture/bind/completion boundaries. No Cargo, runtime or commit credit. Active sources implement the narrower shared-owner transfer.

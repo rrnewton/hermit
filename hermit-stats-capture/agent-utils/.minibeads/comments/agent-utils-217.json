@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-217-cbd5202d344",
+    "issue_id": "agent-utils-217",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Owner, 2026-10-08 17:18-17:33 CEST: do not hand-roll a Markdown renderer. Decision: render on the vibe-talk server with an off-the-shelf Rust renderer (comrak, GFM including bare-URL autolinks) plus the ammonia sanitizer, as crates.io and docs.rs do; send the page HTML rather than both HTML and raw text where the page does not need the raw text; turn on HTTP response compression (the server sends everything uncompressed today, voice.js alone is 836 KB); remove the page's hand-written renderer.",
+    "created_at": "2026-10-08T15:33:51.301399277Z",
+    "updated_at": "2026-10-08T15:33:51.301399277Z"
+  }
+]

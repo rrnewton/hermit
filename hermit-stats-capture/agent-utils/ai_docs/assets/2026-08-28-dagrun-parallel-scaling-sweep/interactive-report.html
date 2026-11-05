@@ -1,0 +1,585 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dagrun synthetic graph scaling</title>
+<style>
+:root {
+  color-scheme: dark;
+  --bg: #09111d;
+  --panel: #101c2d;
+  --panel-2: #14243a;
+  --ink: #edf5ff;
+  --muted: #9fb1c7;
+  --line: #2a405a;
+  --cyan: #59d8e6;
+  --blue: #6ba7ff;
+  --amber: #ffc96b;
+  --rose: #ff7e9b;
+  --green: #73dfa4;
+  --shadow: 0 18px 45px rgba(0, 0, 0, .28);
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background:
+    radial-gradient(circle at 12% -10%, rgba(57, 118, 180, .28), transparent 34rem),
+    radial-gradient(circle at 90% 5%, rgba(59, 189, 178, .13), transparent 30rem),
+    var(--bg);
+  color: var(--ink);
+  font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+header { padding: 34px clamp(20px, 4vw, 64px) 20px; }
+h1 { margin: 0 0 8px; font-size: clamp(28px, 4vw, 48px); letter-spacing: -.035em; }
+h2, h3 { margin: 0; }
+.lede { color: var(--muted); max-width: 92ch; }
+.source { margin-top: 10px; color: #7890aa; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+main { padding: 0 clamp(20px, 4vw, 64px) 64px; }
+.panel {
+  background: linear-gradient(155deg, rgba(20, 36, 58, .96), rgba(13, 25, 41, .96));
+  border: 1px solid rgba(115, 155, 197, .2);
+  border-radius: 16px;
+  box-shadow: var(--shadow);
+  margin: 18px 0;
+  overflow: hidden;
+}
+.panel-head { padding: 20px 22px 12px; }
+.panel-head p { color: var(--muted); margin: 6px 0 0; }
+.controls {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 12px;
+  padding: 18px 22px 22px;
+  border-top: 1px solid rgba(115, 155, 197, .15);
+}
+label { color: var(--muted); font-size: 12px; font-weight: 650; letter-spacing: .04em; text-transform: uppercase; }
+select {
+  display: block; width: 100%; margin-top: 6px; padding: 9px 11px;
+  color: var(--ink); background: #0b1727; border: 1px solid #34506d; border-radius: 8px;
+}
+.warnings { margin: 16px 0; padding: 0; list-style: none; }
+.warnings li { margin: 7px 0; padding: 10px 13px; border-left: 3px solid var(--amber); background: rgba(255, 201, 107, .08); color: #ffe6b7; }
+#dag-wrap { overflow-x: auto; padding: 4px 12px 18px; }
+#dag-svg { display: block; width: 100%; min-width: 720px; max-height: 640px; }
+.edge { fill: none; stroke: #3a5877; stroke-width: 2; opacity: .8; }
+.dag-node { cursor: pointer; outline: none; }
+.dag-node circle { fill: #173653; stroke: #5a87b1; stroke-width: 2; transition: r .2s, fill .2s, stroke .2s; }
+.dag-node:hover circle, .dag-node:focus circle { fill: #205171; stroke: var(--cyan); }
+.dag-node.selected circle { fill: #14546a; stroke: var(--cyan); stroke-width: 4; }
+.node-tag { fill: white; font-size: 13px; font-weight: 750; text-anchor: middle; pointer-events: none; }
+.node-cpu { fill: #b8cadc; font-size: 10px; text-anchor: middle; pointer-events: none; }
+.legend-note { padding: 0 22px 18px; color: var(--muted); font-size: 12px; }
+.step-head { display: flex; flex-wrap: wrap; gap: 14px; justify-content: space-between; align-items: start; padding: 22px; }
+.step-head p { margin: 4px 0 0; color: var(--muted); max-width: 85ch; }
+.step-picker { min-width: min(330px, 100%); }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); gap: 1px; background: var(--line); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.card { background: var(--panel); padding: 15px 18px; min-height: 82px; }
+.card span { display: block; color: var(--muted); font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; }
+.card strong { display: block; margin-top: 7px; font-size: 22px; }
+.capture-section { padding: 18px 18px 2px; }
+.capture-section > p { color: var(--muted); margin: 4px 0 12px; }
+.capture-list { display: grid; gap: 10px; }
+.capture {
+  border: 1px solid rgba(115, 155, 197, .2); border-radius: 10px;
+  background: rgba(5, 14, 25, .5); padding: 13px 15px;
+}
+.capture-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.capture-head strong { margin-right: auto; }
+.status { border: 1px solid currentColor; border-radius: 999px; padding: 2px 8px; font-size: 10px; font-weight: 800; text-transform: uppercase; }
+.status.complete { color: var(--green); }
+.status.failed { color: var(--rose); }
+.status.running { color: var(--amber); }
+.status.skipped { color: var(--muted); }
+.capture-meta, .capture-path { color: var(--muted); font-size: 12px; margin-top: 5px; }
+.capture-path { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
+.capture-errors { color: #ffc2cf; margin: 8px 0 0; padding-left: 20px; }
+.capture-trials { display: grid; gap: 7px; margin-top: 10px; }
+.capture-trial { border-left: 2px solid #3d5875; padding: 5px 0 5px 11px; }
+.capture-artifacts { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 4px; }
+.capture-artifacts code, .capture-artifacts a { color: #b9d7ed; font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
+.capture-artifacts a:hover, .capture-artifacts a:focus { color: var(--cyan); }
+.charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); gap: 14px; padding: 18px; }
+.chart { background: rgba(5, 14, 25, .58); border: 1px solid rgba(115, 155, 197, .17); border-radius: 12px; padding: 14px; min-width: 0; }
+.chart h3 { font-size: 15px; }
+.chart p { margin: 3px 0 8px; color: var(--muted); font-size: 12px; min-height: 35px; }
+.chart svg { display: block; width: 100%; height: auto; min-height: 270px; }
+.axis { stroke: #59718b; stroke-width: 1; }
+.grid { stroke: #263b52; stroke-width: 1; }
+.tick { fill: #90a6be; font-size: 10px; }
+.axis-label { fill: #b9c9da; font-size: 11px; font-weight: 650; }
+.point { stroke: rgba(8, 18, 31, .8); stroke-width: 1.5; opacity: .72; }
+.fit { fill: none; stroke: var(--cyan); stroke-width: 3; }
+.reference { fill: none; stroke: #6c8096; stroke-width: 1.5; stroke-dasharray: 7 5; }
+.trace-line { fill: none; stroke: var(--cyan); stroke-width: 2.5; }
+.trace-thread { fill: none; stroke: var(--amber); stroke-width: 2; opacity: .82; }
+.trace-request { fill: none; stroke: var(--rose); stroke-width: 1.5; stroke-dasharray: 7 5; }
+.empty { fill: #9fb1c7; text-anchor: middle; font-size: 13px; }
+.trace-controls { padding: 0 18px 18px; display: grid; grid-template-columns: minmax(250px, 1fr) auto; gap: 14px; align-items: end; }
+.trace-meta { color: var(--muted); font-size: 12px; }
+.footer { color: #71879f; text-align: center; padding-top: 18px; font-size: 12px; }
+@media (max-width: 650px) {
+  .trace-controls { grid-template-columns: 1fr; }
+  .charts { padding: 10px; }
+  .panel-head, .step-head { padding-left: 16px; padding-right: 16px; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>Dagrun synthetic graph scaling</h1>
+  <div class="lede">Explore scaling behavior across profiling generations. Points are individual successful trials; cyan fitted lines are per-width medians recomputed from the active filters.</div>
+  <div class="source">DAG: examples/07-graph-scaling-sweep.yaml<br>Profile store: /tmp/dagrun-scaling-paper-full.pMCnnH</div>
+</header>
+<main>
+
+  <section class="panel" aria-labelledby="filter-title">
+    <div class="panel-head"><h2 id="filter-title">Historical window</h2><p>Commit, environment, and workload controls update every graph and fitted curve together.</p></div>
+    <div class="controls">
+      <label>Commit history<select id="commit-limit"></select></label>
+      <label>Machine / container<select id="environment-filter"></select></label>
+      <label>Workload revision<select id="workload-filter"></select></label>
+    </div>
+  </section>
+  <section class="panel" aria-labelledby="graph-title">
+    <div class="panel-head"><h2 id="graph-title">DAG CPU-work map</h2><p>Click a node to drill down. Circle area scales with median CPU-seconds for the active historical window (with a small legibility floor).</p></div>
+    <div id="dag-wrap"><svg id="dag-svg" role="img" aria-label="Interactive DAG profile map"></svg></div>
+    <div class="legend-note">Arrows follow dependency order. Node weights and labels change when the historical filters change.</div>
+  </section>
+  <section class="panel" aria-labelledby="step-title">
+    <div class="step-head">
+      <div><h2 id="step-title"></h2><p id="step-description"></p></div>
+      <label class="step-picker">Step<select id="step-select"></select></label>
+    </div>
+    <div class="cards">
+      <div class="card"><span>Samples</span><strong id="card-samples">—</strong></div>
+      <div class="card"><span>Commits in view</span><strong id="card-commits">—</strong></div>
+      <div class="card"><span>Best median speedup</span><strong id="card-best">—</strong></div>
+      <div class="card"><span>Economic sweet spot</span><strong id="card-sweet">—</strong></div>
+      <div class="card"><span>RSS at sweet spot</span><strong id="card-memory">—</strong></div>
+      <div class="card"><span>Window</span><strong id="history-label">—</strong></div>
+    </div>
+    <div class="capture-section">
+      <h3>Profiler captures</h3>
+      <p>Perf and wprof follow-up trials taken at a selected scaling width. Artifact paths are relative to the profile store.</p>
+      <div id="capture-list" class="capture-list" aria-live="polite"></div>
+    </div>
+    <div class="charts">
+      <article class="chart"><h3>Parallel speedup</h3><p>Each trial is normalized to its own commit/environment/workload baseline. Dashed gray is ideal scaling.</p><svg id="speedup-chart" role="img" aria-label="Parallel speedup scatterplot"></svg></article>
+      <article class="chart"><h3>Memory response</h3><p>Peak resident memory as requested inner parallelism changes.</p><svg id="memory-chart" role="img" aria-label="Peak memory scatterplot"></svg></article>
+      <article class="chart"><h3>CPU-work efficiency</h3><p>Baseline CPU-seconds divided by measured CPU-seconds. 100% conserves work; lower values expose parallel overhead.</p><svg id="efficiency-chart" role="img" aria-label="CPU work efficiency scatterplot"></svg></article>
+    </div>
+    <div class="legend-note">Point color moves from blue for older commits to gold for newer commits. Hover a point for commit, run, wall, CPU, and memory details.</div>
+  </section>
+  <section class="panel" aria-labelledby="trace-title">
+    <div class="panel-head"><h2 id="trace-title">Parallelism over time</h2><p>Inspect sequential startup/shutdown regions and whether requested workers became effective CPU occupancy.</p></div>
+    <div class="trace-controls"><label>Trace run<select id="trace-select"></select></label><div id="trace-meta" class="trace-meta"></div></div>
+    <div class="chart" style="margin:0 18px 18px"><svg id="timeline-chart" role="img" aria-label="Effective parallelism over time"></svg></div>
+  </section>
+  <div class="footer">Standalone dagrun profile report · no network access or external assets required</div>
+</main>
+<script id="dagrun-report-data" type="application/json">{"captures":[],"commits":[{"sha":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","timestamp":"2026-08-28T18:28:44"}],"dag_path":"examples/07-graph-scaling-sweep.yaml","environments":[{"key":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","label":"AMD_EPYC_9D64_88-Core_Processor / affinity176_cpu-max-15840000_100000"}],"graph":{"description":"Three-node scaling benchmark for `dagrun sweep --target-time`: an embarrassingly parallel workload, a workload capped at four useful workers, and serial work that adds interference when asked to run wider. Every command accepts `--jobs N` through the generic-with-flag cmdtype.","edges":[{"from":"scale.parallel","to":"scale.four-core"},{"from":"scale.four-core","to":"scale.sequential"}],"height":320,"steps":[{"deps":[],"desc":"embarrassingly parallel fixed work","description":"","layer":0,"order":0,"tag":"scale.parallel","x":110.0,"y":160.0},{"deps":["scale.parallel"],"desc":"useful parallelism saturates at four workers","description":"","layer":1,"order":1,"tag":"scale.four-core","x":380.0,"y":160.0},{"deps":["scale.four-core"],"desc":"serial critical work plus wider-run interference","description":"","layer":2,"order":2,"tag":"scale.sequential","x":650.0,"y":160.0}],"width":760},"profile_dir":"/tmp/dagrun-scaling-paper-full.pMCnnH","records":[{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.5060000000000002,"effective_cores":0.9628,"elapsed_s":2.603,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":1,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":45064192,"run_id":"18d00b6d370c311400285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.four-core","timestamp":"2026-08-28T18:26:55","workload":"ad150b9172b0f2e4"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.513,"effective_cores":0.9486,"elapsed_s":2.649,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":1,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":45178880,"run_id":"18d00b6dd5c1644c00285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.four-core","timestamp":"2026-08-28T18:26:58","workload":"ad150b9172b0f2e4"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.508,"effective_cores":0.9647,"elapsed_s":2.6,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":1,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":46977024,"run_id":"18d00b6e717bd29f00285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.four-core","timestamp":"2026-08-28T18:27:01","workload":"ad150b9172b0f2e4"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.561,"effective_cores":1.7814,"elapsed_s":1.437,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":2,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":47144960,"run_id":"18d00b6ec7f61d1200285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.four-core","timestamp":"2026-08-28T18:27:02","workload":"ad150b9172b0f2e4"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.558,"effective_cores":1.7984,"elapsed_s":1.422,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":2,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":46284800,"run_id":"18d00b6f1d90ada700285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.four-core","timestamp":"2026-08-28T18:27:03","workload":"ad150b9172b0f2e4"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.597,"effective_cores":1.7806,"elapsed_s":1.458,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":2,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":47394816,"run_id":"18d00b6f763a120000285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.four-core","timestamp":"2026-08-28T18:27:05","workload":"ad150b9172b0f2e4"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.6270000000000002,"effective_cores":3.0002,"elapsed_s":0.876,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":4,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":49422336,"run_id":"18d00b6fab4551eb00285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.four-core","timestamp":"2026-08-28T18:27:06","workload":"ad150b9172b0f2e4"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.6060000000000003,"effective_cores":3.0471,"elapsed_s":0.855,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":4,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":46669824,"run_id":"18d00b6fdf17610f00285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.four-core","timestamp":"2026-08-28T18:27:07","workload":"ad150b9172b0f2e4"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.5589999999999997,"effective_cores":3.0635,"elapsed_s":0.835,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":4,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":47636480,"run_id":"18d00b7011b8b14800285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.four-core","timestamp":"2026-08-28T18:27:08","workload":"ad150b9172b0f2e4"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.569,"effective_cores":3.1464,"elapsed_s":0.816,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":8,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":46862336,"run_id":"18d00b704344dd0400285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.four-core","timestamp":"2026-08-28T18:27:08","workload":"ad150b9172b0f2e4"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.615,"effective_cores":3.1345,"elapsed_s":0.834,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":8,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":46309376,"run_id":"18d00b7075c6e73600285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.four-core","timestamp":"2026-08-28T18:27:09","workload":"ad150b9172b0f2e4"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.553,"effective_cores":3.1342,"elapsed_s":0.815,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":8,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":46751744,"run_id":"18d00b70a725806300285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.four-core","timestamp":"2026-08-28T18:27:10","workload":"ad150b9172b0f2e4"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.654,"effective_cores":3.1786,"elapsed_s":0.835,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":16,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":48087040,"run_id":"18d00b70d9beef0f00285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.four-core","timestamp":"2026-08-28T18:27:11","workload":"ad150b9172b0f2e4"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.5709999999999997,"effective_cores":3.153,"elapsed_s":0.815,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":16,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":49573888,"run_id":"18d00b710b2de82800285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.four-core","timestamp":"2026-08-28T18:27:12","workload":"ad150b9172b0f2e4"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.516,"effective_cores":3.0858,"elapsed_s":0.815,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":16,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":46985216,"run_id":"18d00b713ca7a7ec00285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.four-core","timestamp":"2026-08-28T18:27:13","workload":"ad150b9172b0f2e4"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.569,"effective_cores":3.076,"elapsed_s":0.835,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":32,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":46710784,"run_id":"18d00b716f4506ae00285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.four-core","timestamp":"2026-08-28T18:27:13","workload":"ad150b9172b0f2e4"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.682,"effective_cores":2.9281,"elapsed_s":0.916,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":32,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":47652864,"run_id":"18d00b71a6aea70c00285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.four-core","timestamp":"2026-08-28T18:27:14","workload":"ad150b9172b0f2e4"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.566,"effective_cores":3.1463,"elapsed_s":0.816,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":32,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":46669824,"run_id":"18d00b71d816f63600285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.four-core","timestamp":"2026-08-28T18:27:15","workload":"ad150b9172b0f2e4"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.5789999999999997,"effective_cores":3.1668,"elapsed_s":0.814,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":64,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":45854720,"run_id":"18d00b7209734a6e00285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.four-core","timestamp":"2026-08-28T18:27:16","workload":"ad150b9172b0f2e4"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.605,"effective_cores":3.0455,"elapsed_s":0.855,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":64,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":48582656,"run_id":"18d00b723d32d1dd00285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.four-core","timestamp":"2026-08-28T18:27:17","workload":"ad150b9172b0f2e4"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.5789999999999997,"effective_cores":3.0153,"elapsed_s":0.855,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":64,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":46546944,"run_id":"18d00b7270fdc4aa00285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.four-core","timestamp":"2026-08-28T18:27:18","workload":"ad150b9172b0f2e4"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.5149999999999997,"effective_cores":3.0819,"elapsed_s":0.816,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":88,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":46804992,"run_id":"18d00b72a263dbd100285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.four-core","timestamp":"2026-08-28T18:27:19","workload":"ad150b9172b0f2e4"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.565,"effective_cores":3.1455,"elapsed_s":0.815,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":88,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":48463872,"run_id":"18d00b72d3c85f4600285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.four-core","timestamp":"2026-08-28T18:27:19","workload":"ad150b9172b0f2e4"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.574,"effective_cores":3.1615,"elapsed_s":0.814,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":88,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":47206400,"run_id":"18d00b73052cd2f700285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.four-core","timestamp":"2026-08-28T18:27:20","workload":"ad150b9172b0f2e4"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.573,"effective_cores":3.2359,"elapsed_s":0.795,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":158,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":47685632,"run_id":"18d00b73368881db00285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.four-core","timestamp":"2026-08-28T18:27:21","workload":"ad150b9172b0f2e4"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.5959999999999996,"effective_cores":3.1075,"elapsed_s":0.835,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":158,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":47599616,"run_id":"18d00b73692ad48c00285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.four-core","timestamp":"2026-08-28T18:27:22","workload":"ad150b9172b0f2e4"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.586,"effective_cores":3.0966,"elapsed_s":0.835,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":158,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":48316416,"run_id":"18d00b739bc659ee00285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.four-core","timestamp":"2026-08-28T18:27:23","workload":"ad150b9172b0f2e4"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.524,"effective_cores":0.9699,"elapsed_s":2.602,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":1,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":47628288,"run_id":"18d00b6834c5b3f400285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.parallel","timestamp":"2026-08-28T18:26:34","workload":"d10656527075060e"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.494,"effective_cores":0.9579,"elapsed_s":2.603,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":1,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":44769280,"run_id":"18d00b68d0b6e86100285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.parallel","timestamp":"2026-08-28T18:26:36","workload":"d10656527075060e"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.528,"effective_cores":0.9568,"elapsed_s":2.642,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":1,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":43343872,"run_id":"18d00b696fcd659400285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.parallel","timestamp":"2026-08-28T18:26:39","workload":"d10656527075060e"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.549,"effective_cores":1.7728,"elapsed_s":1.437,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":2,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":47022080,"run_id":"18d00b69c6ea31e000285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.parallel","timestamp":"2026-08-28T18:26:41","workload":"d10656527075060e"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.5290000000000004,"effective_cores":1.785,"elapsed_s":1.416,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":2,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":46551040,"run_id":"18d00b6a1c1c6cd000285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.parallel","timestamp":"2026-08-28T18:26:42","workload":"d10656527075060e"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.5399999999999996,"effective_cores":1.768,"elapsed_s":1.437,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":2,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":48226304,"run_id":"18d00b6a728c56dc00285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.parallel","timestamp":"2026-08-28T18:26:43","workload":"d10656527075060e"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.5589999999999997,"effective_cores":3.137,"elapsed_s":0.816,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":4,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":48414720,"run_id":"18d00b6aa3fd58d600285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.parallel","timestamp":"2026-08-28T18:26:44","workload":"d10656527075060e"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.563,"effective_cores":3.1459,"elapsed_s":0.814,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":4,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":47190016,"run_id":"18d00b6ad55a26f800285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.parallel","timestamp":"2026-08-28T18:26:45","workload":"d10656527075060e"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.605,"effective_cores":3.1178,"elapsed_s":0.835,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":4,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":48017408,"run_id":"18d00b6b07f5a58f00285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.parallel","timestamp":"2026-08-28T18:26:46","workload":"d10656527075060e"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.5709999999999997,"effective_cores":5.005,"elapsed_s":0.514,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":8,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":55005184,"run_id":"18d00b6b27741bfd00285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.parallel","timestamp":"2026-08-28T18:26:46","workload":"d10656527075060e"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.579,"effective_cores":5.0082,"elapsed_s":0.515,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":8,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":54865920,"run_id":"18d00b6b46eb1ca900285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.parallel","timestamp":"2026-08-28T18:26:47","workload":"d10656527075060e"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.5829999999999997,"effective_cores":5.0248,"elapsed_s":0.514,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":8,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":55001088,"run_id":"18d00b6b665dee2e00285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.parallel","timestamp":"2026-08-28T18:26:47","workload":"d10656527075060e"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.586,"effective_cores":7.3261,"elapsed_s":0.353,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":16,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":77000704,"run_id":"18d00b6b7c3d3b3f00285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.parallel","timestamp":"2026-08-28T18:26:48","workload":"d10656527075060e"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.622,"effective_cores":7.0222,"elapsed_s":0.374,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":16,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":76996608,"run_id":"18d00b6b93593df300285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.parallel","timestamp":"2026-08-28T18:26:48","workload":"d10656527075060e"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.607,"effective_cores":6.977,"elapsed_s":0.374,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":16,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":76722176,"run_id":"18d00b6baa76f61c00285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.parallel","timestamp":"2026-08-28T18:26:49","workload":"d10656527075060e"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.7600000000000002,"effective_cores":8.2856,"elapsed_s":0.333,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":32,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":120496128,"run_id":"18d00b6bbf3087f400285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.parallel","timestamp":"2026-08-28T18:26:49","workload":"d10656527075060e"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":3.143,"effective_cores":8.8915,"elapsed_s":0.353,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":32,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":120348672,"run_id":"18d00b6bd516ff2a00285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.parallel","timestamp":"2026-08-28T18:26:49","workload":"d10656527075060e"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.816,"effective_cores":7.9484,"elapsed_s":0.354,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":32,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":120344576,"run_id":"18d00b6beb14d3f500285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.parallel","timestamp":"2026-08-28T18:26:50","workload":"d10656527075060e"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":4.287,"effective_cores":14.6424,"elapsed_s":0.293,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":64,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":206757888,"run_id":"18d00b6bfd606c2800285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.parallel","timestamp":"2026-08-28T18:26:50","workload":"d10656527075060e"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":3.7249999999999996,"effective_cores":12.716,"elapsed_s":0.293,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":64,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":208748544,"run_id":"18d00b6c0fb0c07700285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.parallel","timestamp":"2026-08-28T18:26:50","workload":"d10656527075060e"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":3.492,"effective_cores":11.9122,"elapsed_s":0.293,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":64,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":207441920,"run_id":"18d00b6c21fd70ef00285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.parallel","timestamp":"2026-08-28T18:26:51","workload":"d10656527075060e"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":4.164,"effective_cores":15.2481,"elapsed_s":0.273,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":88,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":273866752,"run_id":"18d00b6c336a88ab00285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.parallel","timestamp":"2026-08-28T18:26:51","workload":"d10656527075060e"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":4.177,"effective_cores":14.2431,"elapsed_s":0.293,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":88,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":273403904,"run_id":"18d00b6c465562ea00285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.parallel","timestamp":"2026-08-28T18:26:51","workload":"d10656527075060e"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":4.317,"effective_cores":13.7702,"elapsed_s":0.313,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":88,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":274558976,"run_id":"18d00b6c59e79d3c00285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.parallel","timestamp":"2026-08-28T18:26:52","workload":"d10656527075060e"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":6.2379999999999995,"effective_cores":18.7284,"elapsed_s":0.333,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":158,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":455249920,"run_id":"18d00b6c6e94e1b500285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.parallel","timestamp":"2026-08-28T18:26:52","workload":"d10656527075060e"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":6.236,"effective_cores":17.6556,"elapsed_s":0.353,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":158,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":467918848,"run_id":"18d00b6c847948e400285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.parallel","timestamp":"2026-08-28T18:26:52","workload":"d10656527075060e"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":5.9670000000000005,"effective_cores":16.373,"elapsed_s":0.364,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":158,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":457568256,"run_id":"18d00b6c9b0cc0ab00285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.parallel","timestamp":"2026-08-28T18:26:53","workload":"d10656527075060e"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.5319999999999996,"effective_cores":0.959,"elapsed_s":2.64,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":1,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":60137472,"run_id":"18d00b7439f7603800285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.sequential","timestamp":"2026-08-28T18:27:25","workload":"6627a4277874250a"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.524,"effective_cores":0.9559,"elapsed_s":2.64,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":1,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":44400640,"run_id":"18d00b74d83414bb00285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.sequential","timestamp":"2026-08-28T18:27:28","workload":"6627a4277874250a"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":2.6149999999999998,"effective_cores":0.9671,"elapsed_s":2.704,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":1,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":44380160,"run_id":"18d00b757a3f693100285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.sequential","timestamp":"2026-08-28T18:27:31","workload":"6627a4277874250a"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":3.7600000000000002,"effective_cores":0.9672,"elapsed_s":3.888,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":2,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":60354560,"run_id":"18d00b7662bf808900285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.sequential","timestamp":"2026-08-28T18:27:35","workload":"6627a4277874250a"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":3.784,"effective_cores":0.9635,"elapsed_s":3.927,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":2,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":43765760,"run_id":"18d00b774db0747400285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.sequential","timestamp":"2026-08-28T18:27:39","workload":"6627a4277874250a"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":3.717,"effective_cores":0.9698,"elapsed_s":3.832,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":2,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":45637632,"run_id":"18d00b78345c59e200285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.sequential","timestamp":"2026-08-28T18:27:42","workload":"6627a4277874250a"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":4.4110000000000005,"effective_cores":1.3347,"elapsed_s":3.305,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":4,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":46796800,"run_id":"18d00b78fa3120f800285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.sequential","timestamp":"2026-08-28T18:27:46","workload":"6627a4277874250a"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":4.357,"effective_cores":1.3425,"elapsed_s":3.245,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":4,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":46514176,"run_id":"18d00b79bc70ed4e00285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.sequential","timestamp":"2026-08-28T18:27:49","workload":"6627a4277874250a"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":4.380999999999999,"effective_cores":1.3404,"elapsed_s":3.268,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":4,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":46624768,"run_id":"18d00b7a80148c2600285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.sequential","timestamp":"2026-08-28T18:27:52","workload":"6627a4277874250a"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":4.859999999999999,"effective_cores":1.6289,"elapsed_s":2.983,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":8,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":65798144,"run_id":"18d00b7b32b5955c00285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.sequential","timestamp":"2026-08-28T18:27:55","workload":"6627a4277874250a"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":4.725,"effective_cores":1.5832,"elapsed_s":2.984,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":8,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":53981184,"run_id":"18d00b7be56dbd9800285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.sequential","timestamp":"2026-08-28T18:27:58","workload":"6627a4277874250a"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":5.269,"effective_cores":1.4949,"elapsed_s":3.525,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":8,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":54218752,"run_id":"18d00b7cb850cd4700285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.sequential","timestamp":"2026-08-28T18:28:02","workload":"6627a4277874250a"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":4.896,"effective_cores":1.7337,"elapsed_s":2.824,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":16,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":76783616,"run_id":"18d00b7d616dde4400285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.sequential","timestamp":"2026-08-28T18:28:05","workload":"6627a4277874250a"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":4.861000000000001,"effective_cores":1.722,"elapsed_s":2.823,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":16,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":91627520,"run_id":"18d00b7e0a8af29f00285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.sequential","timestamp":"2026-08-28T18:28:08","workload":"6627a4277874250a"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":4.896999999999999,"effective_cores":1.7354,"elapsed_s":2.822,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":16,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":75890688,"run_id":"18d00b7eb39b574a00285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.sequential","timestamp":"2026-08-28T18:28:10","workload":"6627a4277874250a"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":5.162,"effective_cores":1.7784,"elapsed_s":2.902,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":32,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":120565760,"run_id":"18d00b7f616f1c7300285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.sequential","timestamp":"2026-08-28T18:28:13","workload":"6627a4277874250a"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":5.513,"effective_cores":1.8728,"elapsed_s":2.944,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":32,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":135028736,"run_id":"18d00b8011b2a3dd00285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.sequential","timestamp":"2026-08-28T18:28:16","workload":"6627a4277874250a"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":5.235,"effective_cores":1.8675,"elapsed_s":2.803,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":32,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":122236928,"run_id":"18d00b80b9957b9d00285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.sequential","timestamp":"2026-08-28T18:28:19","workload":"6627a4277874250a"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":5.763,"effective_cores":2.0729,"elapsed_s":2.78,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":64,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":209637376,"run_id":"18d00b816018c92000285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.sequential","timestamp":"2026-08-28T18:28:22","workload":"6627a4277874250a"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":6.092,"effective_cores":2.2057,"elapsed_s":2.762,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":64,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":209891328,"run_id":"18d00b8205978df700285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.sequential","timestamp":"2026-08-28T18:28:25","workload":"6627a4277874250a"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":6.225,"effective_cores":2.2536,"elapsed_s":2.763,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":64,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":225959936,"run_id":"18d00b82ab1c856d00285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.sequential","timestamp":"2026-08-28T18:28:27","workload":"6627a4277874250a"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":6.529,"effective_cores":2.3463,"elapsed_s":2.783,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":88,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":276238336,"run_id":"18d00b8351cb700f00285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.sequential","timestamp":"2026-08-28T18:28:30","workload":"6627a4277874250a"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":6.8100000000000005,"effective_cores":2.465,"elapsed_s":2.763,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":88,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":271826944,"run_id":"18d00b83f74a6cb000285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.sequential","timestamp":"2026-08-28T18:28:33","workload":"6627a4277874250a"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":6.698,"effective_cores":2.4422,"elapsed_s":2.743,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":88,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":272506880,"run_id":"18d00b849b992a0300285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.sequential","timestamp":"2026-08-28T18:28:36","workload":"6627a4277874250a"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":8.823,"effective_cores":2.9774,"elapsed_s":2.964,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":158,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":466096128,"run_id":"18d00b854d0c4aca00285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.sequential","timestamp":"2026-08-28T18:28:39","workload":"6627a4277874250a"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":9.104,"effective_cores":3.2035,"elapsed_s":2.842,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":158,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":473583616,"run_id":"18d00b85f744263f00285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.sequential","timestamp":"2026-08-28T18:28:42","workload":"6627a4277874250a"},{"commit":"bea36ab6fbb2bf77048caa9d58e82dffcd0d9225","container":"affinity176_cpu-max-15840000_100000","cpu_s":8.221,"effective_cores":2.9337,"elapsed_s":2.802,"environment":"AMD_EPYC_9D64_88-Core_Processor␟affinity176_cpu-max-15840000_100000","jobs":158,"machine":"AMD_EPYC_9D64_88-Core_Processor","peak_bytes":467169280,"run_id":"18d00b869f1aa14b00285160","runner":"sweep","source":"step_profiles_AMD_EPYC_9D64_88-Core_Processor_affinity176_cpu-max-15840000_100000.csv","step":"scale.sequential","timestamp":"2026-08-28T18:28:44","workload":"6627a4277874250a"}],"schema":1,"traces":[],"warnings":[],"workloads":["6627a4277874250a","ad150b9172b0f2e4","d10656527075060e"]}</script>
+<script>
+"use strict";
+const DATA = JSON.parse(document.getElementById("dagrun-report-data").textContent);
+const NS = "http://www.w3.org/2000/svg";
+const state = { step: DATA.graph.steps[0].tag, trace: null, commits: new Set(), environment: "all", workload: "all", recordsByStep: new Map() };
+const byId = id => document.getElementById(id);
+
+function svgEl(name, attrs = {}, text = null) {
+  const node = document.createElementNS(NS, name);
+  Object.entries(attrs).forEach(([key, value]) => node.setAttribute(key, String(value)));
+  if (text !== null) node.textContent = String(text);
+  return node;
+}
+function htmlEl(name, className = "", text = null) {
+  const node = document.createElement(name);
+  if (className) node.className = className;
+  if (text !== null) node.textContent = String(text);
+  return node;
+}
+function median(values) {
+  if (!values.length) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+function finite(value) { return typeof value === "number" && Number.isFinite(value); }
+function minimum(values, fallback = null) { return values.length ? values.reduce((best, value) => value < best ? value : best) : fallback; }
+function maximum(values, fallback = null) { return values.length ? values.reduce((best, value) => value > best ? value : best) : fallback; }
+function shortSha(sha) { return sha === "(unknown)" ? sha : sha.slice(0, 10); }
+function fmt(value, digits = 2) { return finite(value) ? value.toFixed(digits).replace(/\.0+$/, "").replace(/(\.\d*?)0+$/, "$1") : "—"; }
+function bytes(value) {
+  if (!finite(value)) return "—";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let amount = value, index = 0;
+  while (amount >= 1024 && index < units.length - 1) { amount /= 1024; index += 1; }
+  return `${fmt(amount, amount >= 100 ? 0 : 1)} ${units[index]}`;
+}
+function selectedCommits() {
+  const all = DATA.commits.map(item => item.sha);
+  const raw = byId("commit-limit").value;
+  return raw === "all" ? new Set(all) : new Set(all.slice(-Number(raw)));
+}
+function refreshFilterState() {
+  state.commits = selectedCommits();
+  state.environment = byId("environment-filter").value;
+  state.workload = byId("workload-filter").value;
+  state.recordsByStep = new Map();
+  DATA.records.forEach(row => {
+    if (!baseFilter(row)) return;
+    if (!state.recordsByStep.has(row.step)) state.recordsByStep.set(row.step, []);
+    state.recordsByStep.get(row.step).push(row);
+  });
+}
+function baseFilter(item) {
+  if (!state.commits.has(item.commit)) return false;
+  if (state.environment !== "all" && item.environment !== state.environment) return false;
+  if (state.workload === "legacy" && item.workload !== "") return false;
+  if (state.workload !== "all" && state.workload !== "legacy" && item.workload !== state.workload) return false;
+  return true;
+}
+function visibleRecords(step = state.step) { return state.recordsByStep.get(step) || []; }
+function cohortKey(row) { return [row.step, row.commit, row.environment, row.workload].join("\u241f"); }
+function normalizedRecords(step = state.step) {
+  const rows = visibleRecords(step);
+  const cohorts = new Map();
+  rows.forEach(row => {
+    const key = cohortKey(row);
+    if (!cohorts.has(key)) cohorts.set(key, []);
+    cohorts.get(key).push(row);
+  });
+  const result = [];
+  cohorts.forEach(cohort => {
+    const baselineJobs = minimum(cohort.map(row => row.jobs));
+    const baselineRows = cohort.filter(row => row.jobs === baselineJobs);
+    const baselineWall = median(baselineRows.map(row => row.elapsed_s).filter(finite));
+    const baselineCpu = median(baselineRows.map(row => row.cpu_s).filter(finite));
+    cohort.forEach(row => result.push({
+      ...row,
+      baseline_jobs: baselineJobs,
+      speedup: finite(baselineWall) ? baselineWall / row.elapsed_s : null,
+      cpu_efficiency: finite(baselineCpu) && finite(row.cpu_s) && row.cpu_s > 0 ? 100 * baselineCpu / row.cpu_s : null
+    }));
+  });
+  return result;
+}
+function groupedMedians(points, field) {
+  const groups = new Map();
+  points.forEach(point => {
+    if (!finite(point[field])) return;
+    if (!groups.has(point.jobs)) groups.set(point.jobs, []);
+    groups.get(point.jobs).push(point[field]);
+  });
+  return [...groups.entries()].map(([jobs, values]) => ({jobs, value: median(values)})).sort((a, b) => a.jobs - b.jobs);
+}
+function commitColor(commit) {
+  const commits = DATA.commits.map(item => item.sha);
+  const index = Math.max(0, commits.indexOf(commit));
+  const t = commits.length <= 1 ? 1 : index / (commits.length - 1);
+  const hue = 214 - 165 * t;
+  return `hsl(${hue} 80% 64%)`;
+}
+function activeCommitLabel() {
+  const commits = DATA.commits.filter(item => selectedCommits().has(item.sha));
+  if (!commits.length) return "no commits";
+  if (commits.length === DATA.commits.length) return `all ${commits.length} commits`;
+  return `latest ${commits.length} commit${commits.length === 1 ? "" : "s"}`;
+}
+
+function buildControls() {
+  const commitSelect = byId("commit-limit");
+  const choices = [1, 3, 5, 10, 25].filter(number => number < DATA.commits.length);
+  const allOption = document.createElement("option");
+  allOption.value = "all"; allOption.textContent = `All history (${DATA.commits.length})`;
+  commitSelect.append(allOption);
+  choices.forEach(number => {
+    const option = document.createElement("option");
+    option.value = String(number); option.textContent = `Last ${number} commit${number === 1 ? "" : "s"}`;
+    commitSelect.append(option);
+  });
+  const environment = byId("environment-filter");
+  environment.append(new Option(`All environments (${DATA.environments.length})`, "all"));
+  DATA.environments.forEach(item => environment.append(new Option(item.label, item.key)));
+  const workload = byId("workload-filter");
+  workload.append(new Option("All workload revisions", "all"));
+  if (DATA.records.some(row => row.workload === "") || DATA.captures.some(capture => capture.workload === "")) workload.append(new Option("Legacy data (no digest)", "legacy"));
+  DATA.workloads.forEach(digest => workload.append(new Option(digest, digest)));
+  const stepSelect = byId("step-select");
+  DATA.graph.steps.forEach(step => stepSelect.append(new Option(step.tag, step.tag)));
+  stepSelect.value = state.step;
+  [commitSelect, environment, workload].forEach(control => control.addEventListener("change", updateAll));
+  stepSelect.addEventListener("change", () => selectStep(stepSelect.value));
+}
+
+function renderDag() {
+  const svg = byId("dag-svg");
+  svg.replaceChildren();
+  svg.setAttribute("viewBox", `0 0 ${DATA.graph.width} ${DATA.graph.height}`);
+  const defs = svgEl("defs");
+  const marker = svgEl("marker", {id: "arrow", viewBox: "0 0 10 10", refX: 8, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto-start-reverse"});
+  marker.append(svgEl("path", {d: "M 0 0 L 10 5 L 0 10 z", fill: "#3a5877"}));
+  defs.append(marker); svg.append(defs);
+  const positions = new Map(DATA.graph.steps.map(step => [step.tag, step]));
+  DATA.graph.edges.forEach(edge => {
+    const from = positions.get(edge.from), to = positions.get(edge.to);
+    if (!from || !to) return;
+    const middle = (from.x + to.x) / 2;
+    svg.append(svgEl("path", {class: "edge", d: `M ${from.x} ${from.y} C ${middle} ${from.y}, ${middle} ${to.y}, ${to.x} ${to.y}`, "marker-end": "url(#arrow)"}));
+  });
+  DATA.graph.steps.forEach(step => {
+    const group = svgEl("g", {class: "dag-node", transform: `translate(${step.x} ${step.y})`, tabindex: 0, role: "button", "aria-label": `Open ${step.tag}`, "data-step": step.tag});
+    const circle = svgEl("circle", {r: 28});
+    const title = svgEl("title", {}, step.tag); circle.append(title);
+    const label = step.tag.length > 22 ? `${step.tag.slice(0, 20)}…` : step.tag;
+    group.append(circle, svgEl("text", {class: "node-tag", y: -2}, label), svgEl("text", {class: "node-cpu", y: 16}, "no samples"));
+    group.addEventListener("click", () => selectStep(step.tag));
+    group.addEventListener("keydown", event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); selectStep(step.tag); } });
+    svg.append(group);
+  });
+}
+
+function updateDagWeights() {
+  const medians = new Map();
+  DATA.graph.steps.forEach(step => {
+    const cpu = visibleRecords(step.tag).map(row => row.cpu_s).filter(finite);
+    medians.set(step.tag, median(cpu));
+  });
+  const maxCpu = maximum([...medians.values()].filter(finite), 0);
+  document.querySelectorAll(".dag-node").forEach(group => {
+    const tag = group.dataset.step;
+    const cpu = medians.get(tag);
+    const area = finite(cpu) && maxCpu > 0 ? Math.max(1450, 9000 * cpu / maxCpu) : 1200;
+    group.querySelector("circle").setAttribute("r", Math.sqrt(area / Math.PI).toFixed(2));
+    group.querySelector(".node-cpu").textContent = finite(cpu) ? `${fmt(cpu, 1)} CPU-s` : "no samples";
+    group.classList.toggle("selected", tag === state.step);
+  });
+}
+
+function renderScatter(svg, points, field, options) {
+  svg.replaceChildren();
+  const width = 640, height = 330, margin = {left: 58, right: 18, top: 18, bottom: 48};
+  svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  const valid = points.filter(point => finite(point[field]));
+  if (!valid.length) {
+    svg.append(svgEl("text", {class: "empty", x: width / 2, y: height / 2}, "No measurements match these filters"));
+    return;
+  }
+  const jobs = [...new Set(valid.map(point => point.jobs))].sort((a, b) => a - b);
+  const logMin = Math.log2(minimum(jobs, 1)), logMax = Math.log2(maximum(jobs, 1));
+  const x = value => margin.left + (logMax === logMin ? .5 : (Math.log2(value) - logMin) / (logMax - logMin)) * (width - margin.left - margin.right);
+  const values = valid.map(point => point[field]);
+  let yMin = options.zero ? 0 : minimum(values, 0);
+  let yMax = maximum(values, options.reference || 0);
+  if (options.zero) yMax *= 1.12;
+  else { const pad = Math.max((yMax - yMin) * .12, yMax * .04, .01); yMin = Math.max(0, yMin - pad); yMax += pad; }
+  if (yMax <= yMin) yMax = yMin + 1;
+  const y = value => height - margin.bottom - (value - yMin) / (yMax - yMin) * (height - margin.top - margin.bottom);
+  for (let tick = 0; tick <= 4; tick += 1) {
+    const value = yMin + tick * (yMax - yMin) / 4;
+    const py = y(value);
+    svg.append(svgEl("line", {class: "grid", x1: margin.left, x2: width - margin.right, y1: py, y2: py}));
+    svg.append(svgEl("text", {class: "tick", x: margin.left - 8, y: py + 4, "text-anchor": "end"}, options.format(value)));
+  }
+  jobs.forEach(job => {
+    const px = x(job);
+    svg.append(svgEl("line", {class: "grid", x1: px, x2: px, y1: margin.top, y2: height - margin.bottom}));
+    svg.append(svgEl("text", {class: "tick", x: px, y: height - margin.bottom + 19, "text-anchor": "middle"}, job));
+  });
+  svg.append(svgEl("line", {class: "axis", x1: margin.left, x2: width - margin.right, y1: height - margin.bottom, y2: height - margin.bottom}));
+  svg.append(svgEl("line", {class: "axis", x1: margin.left, x2: margin.left, y1: margin.top, y2: height - margin.bottom}));
+  svg.append(svgEl("text", {class: "axis-label", x: (margin.left + width - margin.right) / 2, y: height - 10, "text-anchor": "middle"}, "Requested inner jobs (log₂ scale)"));
+  svg.append(svgEl("text", {class: "axis-label", transform: `translate(14 ${(margin.top + height - margin.bottom) / 2}) rotate(-90)`, "text-anchor": "middle"}, options.axis));
+  if (finite(options.reference) && options.reference >= yMin && options.reference <= yMax) {
+    svg.append(svgEl("line", {class: "reference", x1: margin.left, x2: width - margin.right, y1: y(options.reference), y2: y(options.reference)}));
+  }
+  if (options.ideal) {
+    const ideal = jobs.map(job => ({jobs: job, value: job / minimum(jobs, 1)})).filter(point => point.value >= yMin && point.value <= yMax);
+    if (ideal.length > 1) svg.append(svgEl("path", {class: "reference", d: ideal.map((point, index) => `${index ? "L" : "M"} ${x(point.jobs)} ${y(point.value)}`).join(" ")}));
+  }
+  const fit = groupedMedians(valid, field);
+  if (fit.length > 1) svg.append(svgEl("path", {class: "fit", d: fit.map((point, index) => `${index ? "L" : "M"} ${x(point.jobs)} ${y(point.value)}`).join(" ")}));
+  valid.forEach(point => {
+    const circle = svgEl("circle", {class: "point", cx: x(point.jobs), cy: y(point[field]), r: 4.5, fill: commitColor(point.commit)});
+    circle.append(svgEl("title", {}, [
+      `${shortSha(point.commit)} · ${point.timestamp || "unknown time"}`,
+      `${point.jobs} jobs · ${options.tooltip(point[field])}`,
+      `wall ${fmt(point.elapsed_s, 3)} s · CPU ${fmt(point.cpu_s, 3)} s · RSS ${bytes(point.peak_bytes)}`,
+      point.run_id ? `run ${point.run_id}` : point.source
+    ].join("\n")));
+    svg.append(circle);
+  });
+}
+
+function sweetSpot(points) {
+  const speed = groupedMedians(points, "speedup");
+  if (!speed.length) return null;
+  const efficiency = new Map(groupedMedians(points, "cpu_efficiency").map(item => [item.jobs, item.value]));
+  const best = maximum(speed.map(item => item.value), 0);
+  const eligible = speed.filter(item => item.value >= best / 1.1 && (!efficiency.has(item.jobs) || efficiency.get(item.jobs) >= 100 / 1.5));
+  return (eligible.length ? eligible : speed.filter(item => item.value >= best / 1.1))[0] || speed[speed.length - 1];
+}
+
+function updateCards(points) {
+  const commits = new Set(points.map(point => point.commit));
+  const best = groupedMedians(points, "speedup").reduce((value, item) => Math.max(value, item.value), 0);
+  const spot = sweetSpot(points);
+  const spotRows = spot ? points.filter(point => point.jobs === spot.jobs) : [];
+  const memory = median(spotRows.map(point => point.peak_bytes).filter(finite));
+  byId("card-samples").textContent = String(points.length);
+  byId("card-commits").textContent = String(commits.size);
+  byId("card-best").textContent = best ? `${fmt(best, 2)}×` : "—";
+  byId("card-sweet").textContent = spot ? `${spot.jobs} jobs` : "—";
+  byId("card-memory").textContent = bytes(memory);
+  byId("history-label").textContent = activeCommitLabel();
+  return spot ? spot.jobs : null;
+}
+
+function visibleCaptures() {
+  return DATA.captures.filter(capture => capture.step === state.step && baseFilter(capture));
+}
+function renderCaptures() {
+  const container = byId("capture-list");
+  container.replaceChildren();
+  const captures = visibleCaptures().sort((a, b) => b.created_at.localeCompare(a.created_at) || b.capture_id.localeCompare(a.capture_id));
+  if (!captures.length) {
+    container.append(htmlEl("div", "capture-meta", "No perf or wprof captures match this step and history window."));
+    return;
+  }
+  captures.forEach(capture => {
+    const card = htmlEl("article", "capture");
+    const head = htmlEl("div", "capture-head");
+    head.append(
+      htmlEl("strong", "", `${capture.capture_id} · ${capture.jobs} jobs`),
+      htmlEl("span", `status ${capture.state}`, capture.state)
+    );
+    card.append(head);
+    card.append(htmlEl("div", "capture-meta", `${shortSha(capture.commit)} · ${capture.created_at || "unknown time"} · selected speedup ${fmt(capture.speedup, 2)}×`));
+    card.append(htmlEl("div", "capture-path", `manifest: ${capture.manifest_path}`));
+    if (capture.errors.length) {
+      const errors = htmlEl("ul", "capture-errors");
+      capture.errors.forEach(error => errors.append(htmlEl("li", "", error)));
+      card.append(errors);
+    }
+    const trials = htmlEl("div", "capture-trials");
+    capture.trials.forEach(trial => {
+      const item = htmlEl("div", "capture-trial");
+      const label = `${trial.kind} · ${trial.state} · ${trial.inner_jobs} jobs · ${fmt(trial.measured_wall_s, 3)}s`;
+      item.append(htmlEl("strong", "", label));
+      if (trial.error) item.append(htmlEl("div", "capture-errors", trial.error));
+      const artifacts = htmlEl("div", "capture-artifacts");
+      if (!trial.artifacts.length) artifacts.append(htmlEl("span", "capture-meta", "No retained artifacts"));
+      trial.artifacts.forEach(artifact => {
+        const suffix = artifact.exists ? "" : " (missing)";
+        const label = `${artifact.role}: ${artifact.path} · ${bytes(artifact.size_bytes)}${suffix}`;
+        if (artifact.exists) {
+          const link = htmlEl("a", "", label);
+          link.setAttribute("href", artifact.href);
+          artifacts.append(link);
+        } else {
+          artifacts.append(htmlEl("code", "", label));
+        }
+      });
+      item.append(artifacts);
+      trials.append(item);
+    });
+    card.append(trials);
+    container.append(card);
+  });
+}
+
+function updateCharts() {
+  const points = normalizedRecords();
+  const sweet = updateCards(points);
+  renderScatter(byId("speedup-chart"), points, "speedup", {zero: true, ideal: true, axis: "Speedup (×)", format: value => `${fmt(value, 1)}×`, tooltip: value => `${fmt(value, 3)}× speedup`});
+  renderScatter(byId("memory-chart"), points, "peak_bytes", {zero: true, axis: "Peak RSS", format: bytes, tooltip: bytes});
+  renderScatter(byId("efficiency-chart"), points, "cpu_efficiency", {zero: false, reference: 100, axis: "CPU-work efficiency", format: value => `${fmt(value, 0)}%`, tooltip: value => `${fmt(value, 1)}% CPU-work efficiency`});
+  renderCaptures();
+  updateTraceSelector(sweet);
+}
+
+function selectStep(tag) {
+  state.step = tag;
+  byId("step-select").value = tag;
+  const step = DATA.graph.steps.find(item => item.tag === tag);
+  byId("step-title").textContent = tag;
+  byId("step-description").textContent = step.description || step.desc || "No authored description.";
+  updateDagWeights();
+  updateCharts();
+}
+
+function traceLabel(trace) {
+  return `${shortSha(trace.commit)} · ${trace.jobs} jobs · ${trace.timestamp || trace.run_id}`;
+}
+function updateTraceSelector(sweet) {
+  const select = byId("trace-select");
+  const traces = DATA.traces.filter(trace => trace.step === state.step && baseFilter(trace)).sort((a, b) => b.timestamp.localeCompare(a.timestamp) || b.run_id.localeCompare(a.run_id));
+  select.replaceChildren();
+  if (!traces.length) {
+    select.disabled = true; select.append(new Option("No matching traces", "")); state.trace = null; renderTimeline(null); return;
+  }
+  select.disabled = false;
+  traces.forEach(trace => select.append(new Option(traceLabel(trace), trace.key)));
+  const prior = traces.find(trace => trace.key === state.trace);
+  const preferred = prior || traces.find(trace => sweet !== null && trace.jobs === sweet) || traces[0];
+  state.trace = preferred.key; select.value = preferred.key; renderTimeline(preferred);
+}
+
+function renderTimeline(trace) {
+  const svg = byId("timeline-chart");
+  svg.replaceChildren();
+  const width = 1120, height = 350, margin = {left: 58, right: 58, top: 18, bottom: 46};
+  svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  if (!trace || !trace.points.length) {
+    svg.append(svgEl("text", {class: "empty", x: width / 2, y: height / 2}, "No interval trace matches these filters"));
+    byId("trace-meta").textContent = "Enable --profile-timeseries during a run or sweep to collect interval data.";
+    return;
+  }
+  const corePoints = trace.points.filter(point => finite(point.effective_cores));
+  const threadPoints = trace.points.filter(point => finite(point.thread_count));
+  const maxTime = maximum(trace.points.map(point => point.elapsed_s), 1e-9);
+  const maxCore = Math.max(1, trace.jobs, maximum(corePoints.map(point => point.effective_cores), 0)) * 1.12;
+  const maxThread = Math.max(1, maximum(threadPoints.map(point => point.thread_count), 0)) * 1.12;
+  const x = value => margin.left + value / maxTime * (width - margin.left - margin.right);
+  const yCore = value => height - margin.bottom - value / maxCore * (height - margin.top - margin.bottom);
+  const yThread = value => height - margin.bottom - value / maxThread * (height - margin.top - margin.bottom);
+  for (let tick = 0; tick <= 4; tick += 1) {
+    const py = margin.top + tick * (height - margin.top - margin.bottom) / 4;
+    const coreValue = maxCore * (1 - tick / 4), threadValue = maxThread * (1 - tick / 4);
+    svg.append(svgEl("line", {class: "grid", x1: margin.left, x2: width - margin.right, y1: py, y2: py}));
+    svg.append(svgEl("text", {class: "tick", x: margin.left - 8, y: py + 4, "text-anchor": "end"}, fmt(coreValue, 1)));
+    svg.append(svgEl("text", {class: "tick", x: width - margin.right + 8, y: py + 4}, fmt(threadValue, 0)));
+  }
+  for (let tick = 0; tick <= 5; tick += 1) {
+    const value = maxTime * tick / 5, px = x(value);
+    svg.append(svgEl("line", {class: "grid", x1: px, x2: px, y1: margin.top, y2: height - margin.bottom}));
+    svg.append(svgEl("text", {class: "tick", x: px, y: height - margin.bottom + 18, "text-anchor": "middle"}, `${fmt(value, 1)}s`));
+  }
+  svg.append(svgEl("line", {class: "axis", x1: margin.left, x2: width - margin.right, y1: height - margin.bottom, y2: height - margin.bottom}));
+  svg.append(svgEl("text", {class: "axis-label", transform: `translate(14 ${(margin.top + height - margin.bottom) / 2}) rotate(-90)`, "text-anchor": "middle"}, "Effective cores"));
+  svg.append(svgEl("text", {class: "axis-label", transform: `translate(${width - 8} ${(margin.top + height - margin.bottom) / 2}) rotate(90)`, "text-anchor": "middle"}, "Threads"));
+  const path = (points, getter, scale) => points.map((point, index) => `${index ? "L" : "M"} ${x(point.elapsed_s)} ${scale(getter(point))}`).join(" ");
+  if (corePoints.length) svg.append(svgEl("path", {class: "trace-line", d: path(corePoints, point => point.effective_cores, yCore)}));
+  if (threadPoints.length) svg.append(svgEl("path", {class: "trace-thread", d: path(threadPoints, point => point.thread_count, yThread)}));
+  svg.append(svgEl("line", {class: "trace-request", x1: margin.left, x2: width - margin.right, y1: yCore(trace.jobs), y2: yCore(trace.jobs)}));
+  corePoints.forEach(point => {
+    const circle = svgEl("circle", {class: "point", cx: x(point.elapsed_s), cy: yCore(point.effective_cores), r: 3.5, fill: "#59d8e6"});
+    circle.append(svgEl("title", {}, `${fmt(point.elapsed_s, 3)}s · ${fmt(point.effective_cores, 2)} effective cores · ${point.thread_count ?? "—"} threads · ${point.sample_kind}`));
+    svg.append(circle);
+  });
+  byId("trace-meta").textContent = `${shortSha(trace.commit)} · requested ${trace.jobs} jobs · cyan effective cores · amber threads · dashed requested width · ${trace.source}`;
+}
+
+function updateAll() { refreshFilterState(); updateDagWeights(); updateCharts(); }
+
+buildControls();
+refreshFilterState();
+renderDag();
+byId("trace-select").addEventListener("change", event => {
+  state.trace = event.target.value;
+  renderTimeline(DATA.traces.find(trace => trace.key === state.trace) || null);
+});
+selectStep(state.step);
+</script>
+</body>
+</html>

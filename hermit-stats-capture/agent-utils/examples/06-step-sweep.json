@@ -1,0 +1,33 @@
+{
+  "description": "A DAG built to demonstrate the per-step profiling tools: `sweep` (parallel-speedup study), `run --selected` (run selected steps and their dependencies), `run --profile` (per-step table), and the default auto-logging profile store. The `build.app` step is a small CPU-bound workload that ACTUALLY scales with its inner parallelism: it splits a fixed amount of pure-shell work across N parallel workers, where N is the inner-jobs width the runner passes in via the step's jobs_flag. So `sweep --step build.app --jobs 1..8` shows a real speedup curve, and every run/sweep auto-appends resource-usage CSVs to ./.dagrun/profiles/.",
+  "steps": [
+    {
+      "group": "build",
+      "job": "app",
+      "desc": "parallel compile (simulated CPU work that scales with -j)",
+      "description": "A stand-in for a parallel build. It reads the inner-jobs width the runner appends to the command (via jobs_flag '-j%d', so -j4 arrives as $1), splits ~1.2M pure-shell iterations across that many background workers, and waits for them. More workers finish the fixed work sooner (up to the core count), so `sweep --step build.app --jobs 1..N` produces a genuine speedup curve. Sweep this step to see it.",
+      "cmd": "run() { n=${1#-j}; n=${n:-1}; per=$((1200000 / n)); pids=; for i in $(seq 1 \"$n\"); do ( x=0; while [ \"$x\" -lt \"$per\" ]; do x=$((x+1)); done ) & pids=\"$pids $!\"; done; wait $pids; echo \"built (split 1200000 iters across ${n} worker(s))\"; }; run",
+      "jobs_flag": "-j%d",
+      "hint": {
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 4,
+        "est_duration_s": 3
+      }
+    },
+    {
+      "group": "test",
+      "job": "unit",
+      "desc": "unit tests",
+      "description": "A quick downstream step so the DAG is more than one node: it depends on build.app and just echoes. Use `run --selected test.unit` to run it after build.app, or add `--ignore-selected-deps` when the build output is already present and only this step should run.",
+      "cmd": "echo unit-tests-ok && sleep 0.2",
+      "deps": ["build.app"]
+    },
+    {
+      "group": "package",
+      "job": "tarball",
+      "desc": "package the build",
+      "cmd": "echo packaged && sleep 0.2",
+      "deps": ["test.unit"]
+    }
+  ]
+}

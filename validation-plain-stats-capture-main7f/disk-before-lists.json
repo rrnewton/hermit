@@ -1,0 +1,7 @@
+{
+  "sampled_at": "2026-10-14T13:29:20.345030+00:00",
+  "available_bytes": 787044286464,
+  "build_floor_bytes": 650000000000,
+  "floor_satisfied": true,
+  "qualification": "Host boundary sample, not attributed task allocation."
+}

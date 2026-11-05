@@ -1,0 +1,18 @@
+{
+  "parked_at": "2026-10-14T12:13:09.811865+00:00",
+  "reason": "Coordinator priority changed to procfs_determinism ptrace stack overflow; no further statistics checks scheduled.",
+  "H": "342daf53c1691da42ae7067850540a06bec504b4",
+  "R": "ff30c5bac6040c14122d33d60f5dfb91953c7099",
+  "last_command": "helper-dag-check",
+  "last_command_result": "2026-10-14T12:10:18Z\nexit=0\n2026-10-14T12:10:50Z\n",
+  "pending": [
+    "helper-sync",
+    "helper-manifest-json",
+    "helper-inventory",
+    "final closed handback report"
+  ],
+  "counts_changed": false,
+  "cargo_active": false,
+  "H_status": "",
+  "R_status": ""
+}

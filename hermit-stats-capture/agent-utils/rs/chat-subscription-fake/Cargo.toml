@@ -1,0 +1,22 @@
+[package]
+name = "chat-subscription-fake"
+version = "0.1.0"
+description = "Deterministic conformance backend for chat subscription hosts and plugins"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+chat-subscription = { version = "0.1.0", path = "../chat-subscription" }
+chat-subscription-plugin = { version = "0.1.0", path = "../chat-subscription-plugin" }
+serde_json = "1"
+
+[[bin]]
+name = "chat-subscription-fake-plugin"
+path = "src/main.rs"
+
+[lints]
+workspace = true

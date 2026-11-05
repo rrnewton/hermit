@@ -1,0 +1,27 @@
+{
+  "slot": "slot-a",
+  "generation": 1,
+  "actor": {
+    "pid": 10,
+    "start_ticks": 110,
+    "boot_id": "11111111-2222-3333-4444-555555555555",
+    "host_id": "neutral-host",
+    "cgroup_path": "/neutral.slice/worker.scope"
+  },
+  "runner": {
+    "pid": 11,
+    "start_ticks": 111,
+    "boot_id": "11111111-2222-3333-4444-555555555555",
+    "host_id": "neutral-host",
+    "cgroup_path": "/neutral.slice/worker.scope"
+  },
+  "handoff_writer": null,
+  "coordinator_authorized": true,
+  "owner_state": "dead",
+  "registered_liveness": "dead",
+  "heartbeat_age_seconds": 601,
+  "heartbeat_ttl_seconds": 600,
+  "validate_complete": false,
+  "live_validate_owner": false,
+  "salvage_archive_root": null
+}

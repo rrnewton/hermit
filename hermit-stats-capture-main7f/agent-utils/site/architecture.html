@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-VlTH164C/x5AZ/X45xVH2ltqg3cRsEpzyV0XZoamWUE='; style-src 'self'; img-src 'self'; media-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Architecture: how agent-utils fits together</title>
+<meta name="description" content="The layers of an agent-utils harness and what each one is responsible for, a delegated task from request to report, the harness directory, where state lives, and how the owner stays in the loop.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<script>
+(function () {
+  var root = document.documentElement;
+  var key = "agent-utils-theme";
+  var saved = null;
+  try { saved = window.localStorage.getItem(key); } catch (error) { saved = null; }
+  if (saved === "light" || saved === "dark") { root.setAttribute("data-theme", saved); }
+  root.classList.add("js");
+  function sync() {
+    var current = root.getAttribute("data-theme") || "system";
+    var buttons = document.querySelectorAll("[data-theme-choice]");
+    for (var i = 0; i < buttons.length; i += 1) {
+      buttons[i].setAttribute("aria-pressed", String(buttons[i].getAttribute("data-theme-choice") === current));
+    }
+  }
+  document.addEventListener("click", function (event) {
+    var button = event.target && event.target.closest ? event.target.closest("[data-theme-choice]") : null;
+    if (!button) { return; }
+    var choice = button.getAttribute("data-theme-choice");
+    if (choice === "light" || choice === "dark") { root.setAttribute("data-theme", choice); } else { root.removeAttribute("data-theme"); }
+    try {
+      if (choice === "light" || choice === "dark") { window.localStorage.setItem(key, choice); } else { window.localStorage.removeItem(key); }
+    } catch (error) { /* storage blocked: the choice lasts for this page only */ }
+    sync();
+  });
+  document.addEventListener("DOMContentLoaded", sync);
+}());
+</script>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+<div class="wrap header-inner">
+<a class="brand" href="index.html"><svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true" focusable="false"><rect class="mark-bg" width="32" height="32" rx="7"></rect><path class="mark-line" d="M16 11v4.5M8.5 20.5V16h15v4.5M16 15.5v5"></path><circle class="mark-fg" cx="16" cy="8" r="3.5"></circle><rect class="mark-fg" x="5" y="20.5" width="7" height="5.5" rx="1.6"></rect><rect class="mark-fg" x="12.5" y="20.5" width="7" height="5.5" rx="1.6"></rect><rect class="mark-fg" x="20" y="20.5" width="7" height="5.5" rx="1.6"></rect></svg><span>agent-utils</span></a>
+<nav class="site-nav" aria-label="Site">
+<ul>
+<li><a href="index.html">Overview</a></li>
+<li><a href="architecture.html" aria-current="page">Architecture</a></li>
+<li><a href="tools.html">Tools</a></li>
+<li><a href="vibe-talk.html">vibe-talk demo</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/QUICKSTART.md">Quickstart</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils">Source</a></li>
+</ul>
+</nav>
+<div class="theme-switch" role="group" aria-label="Color theme">
+<button type="button" data-theme-choice="system" aria-pressed="true">System</button>
+<button type="button" data-theme-choice="light" aria-pressed="false">Light</button>
+<button type="button" data-theme-choice="dark" aria-pressed="false">Dark</button>
+</div>
+</div>
+</header>
+<main id="main">
+
+<div class="page-head">
+<div class="wrap">
+<p class="eyebrow">Architecture</p>
+<h1>How the suite fits together</h1>
+<p class="lead">agent-utils turns a project's Git checkout into a harness that one person can supervise. This page goes one level below <a href="index.html#architecture">the overview figure</a>: what each layer is responsible for, how one task travels through it, and where its state lives. Every section links to the document that is the authority for it. The repository's own documents also call agent CLIs such as Claude Code and Codex "harnesses"; this site calls those agent CLIs and keeps "harness" for the directory.</p>
+</div>
+</div>
+
+<section class="section" id="layers" aria-labelledby="layers-title">
+<div class="wrap">
+<div class="section-head">
+<h2 id="layers-title">Layers and responsibilities</h2>
+<p>Each layer has one job and a narrow interface to the next. The coordinator talks to subagents only through agentctl and wrkslots, never by typing into terminals directly, and only the coordinator talks to the owner. The colored bar beside each layer's section below is that layer's color in <a href="index.html#architecture">the overview figure</a>.</p>
+</div>
+<div class="table-wrap" role="region" aria-labelledby="layers-caption" tabindex="0">
+<table class="table-stack" role="table">
+<caption id="layers-caption">The layers, top to bottom</caption>
+<thead role="rowgroup">
+<tr role="row"><th scope="col" role="columnheader">Layer</th><th scope="col" role="columnheader">Piece</th><th scope="col" role="columnheader">Responsible for</th><th scope="col" role="columnheader">Status</th></tr>
+</thead>
+<tbody role="rowgroup">
+<tr role="row"><th scope="row" role="rowheader">Owner</th><td role="cell" data-label="Piece">You, optionally reading a chat space on a phone with <a href="tools.html#vibe-talk"><code>vibe-talk</code></a></td><td role="cell" data-label="Responsible for">Goals, priorities, and policy: launch profiles, the herdr-run allowlist, the harness <code>AGENTS.md</code>, the project's landing rules.</td><td role="cell" data-label="Status">vibe-talk optional</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Owner channel</th><td role="cell" data-label="Piece">Herdr tab, <a href="tools.html#agentctl-chat"><code>agentctl chat</code></a></td><td role="cell" data-label="Responsible for">Getting your requests to the coordinator and its replies back to you.</td><td role="cell" data-label="Status">chat bridge core, can be connected later</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Coordinator</th><td role="cell" data-label="Piece">One agent and the <a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agent-utils-coordinator/SKILL.md">coordinator skill</a></td><td role="cell" data-label="Responsible for">Turning goals into tasks, delegating, checking claims, landing, reporting.</td><td role="cell" data-label="Status">core</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Sessions</th><td role="cell" data-label="Piece"><a href="tools.html#agentctl"><code>agentctl</code></a> on <a href="tools.html#herdr">Herdr</a></td><td role="cell" data-label="Responsible for">Named agents that outlive their launcher, durable prompt delivery, human takeover.</td><td role="cell" data-label="Status">core (beta); Herdr external</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Workspaces</th><td role="cell" data-label="Piece"><a href="tools.html#wrkslots"><code>wrkslots</code></a></td><td role="cell" data-label="Responsible for">One isolated worktree per task, ownership and handoff records, safe removal, salvage.</td><td role="cell" data-label="Status">core</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Recurring work</th><td role="cell" data-label="Piece"><a href="tools.html#tick-hub"><code>tick-hub</code></a></td><td role="cell" data-label="Responsible for">Reminders and health checks delivered to the coordinator on a timer.</td><td role="cell" data-label="Status">optional</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Validation and landing</th><td role="cell" data-label="Piece">The project's own checks, <a href="tools.html#dagrun"><code>dagrun</code></a>, <a href="tools.html#herdr-run"><code>herdr-run</code></a>, <a href="tools.html#gh-paced"><code>gh-paced</code></a></td><td role="cell" data-label="Responsible for">Proving work before it lands, reaching the network when a sandbox blocks it, pacing GitHub.</td><td role="cell" data-label="Status">optional</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="layer-block arch-owner">
+<h3 id="owner">The owner</h3>
+<p>You decide what gets done and you own the policy. The coordinator writes launch profiles exactly as you state them and never invents models, flags or permission settings. It must not edit the skills or the harness <code>AGENTS.md</code> unless you ask; when you do ask, it makes the change, records it in <code>AGENTS.md</code> and commits the harness. Widening the herdr-run allowlist is your decision, not an agent's.</p>
+<p class="small"><a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agent-utils-coordinator/SKILL.md#skills-and-instructions-are-owner-controlled">Skills and instructions are owner-controlled</a></p>
+</div>
+
+<div class="layer-block arch-channel">
+<h3 id="channel">The owner channel</h3>
+<p>The simplest channel is the coordinator's own Herdr tab: attach to it and type. Pause automation with <code>agentctl pause</code> before you type into a terminal a script also writes to.</p>
+<p>The chat bridge, <code>agentctl chat</code>, connects one chat space to the coordinator. It accepts messages only from allowlisted senders, stores each one durably, and marks it with a reaction that means "received", not "done". Herdr then pastes the message into the coordinator's pane. The agent replies between two marker lines; the bridge posts each reply to the original thread and retries it under a stable request ID so it is not posted twice.</p>
+<p>agentctl's Python and Rust editions have different chat bridges. The Python bridge polls Google Chat's public API, once an hour by default; <code>--interval</code> sets a shorter cycle, down to a fraction of a second, and an operator-supplied event command delivers messages at once. The Rust bridge is an event-driven host for subscription plugins, and no plugin ships yet. Without chat, you use the Herdr tab.</p>
+<p>vibe-talk, optional and early, is a separately deployed phone reader for a chat service: one-sentence summaries of long messages, named threads, replies from the phone, and voice. It reads and posts in the chat; it does not start or type into agents. So it reaches the coordinator only if agentctl chat bridges the same chat space, and today that needs a piece you supply: vibe-talk reaches Google Chat only through a Discord-compatible bridge, none of which ships here, and agentctl chat has no Discord or Slack transport without an adapter you write. That combination is not documented or tested. <a href="vibe-talk.html">vibe-talk's page</a> shows it in five short clips.</p>
+<p class="small"><a href="https://github.com/rrnewton/agent-utils/blob/main/py/agentctl/CHAT_USER_GUIDE.md#how-the-connection-works">How the connection works</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agentctl-chat/SKILL.md">How an agent answers bridged chat</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/chat-subscription-plugin/README.md">Plugin protocol</a></p>
+</div>
+
+<div class="layer-block arch-coordinator">
+<h3 id="coordinator">The coordinator</h3>
+<p>The coordinator is an ordinary coding agent started in the harness root. At the start of every session it reads the harness <code>AGENTS.md</code> and the coordinator skill. Where the two disagree, the harness file wins, and inside the primary checkout that repository's own rules win.</p>
+<p>Its priorities are fixed: what you explicitly asked; a red main branch back to green; finishing work in flight; then the backlog. It treats a subagent's blocker as a claim to investigate, and it checks results by content. Setup starts it as the registered agentctl session <code>coordinator</code>, and with chat connected it points the bridge at that session with <code>agentctl chat run</code>; registration is what lets timers, scripts and other agents reach it with <code>agentctl send coordinator</code>. A coordinator started instead with the shorter <code>agentctl chat launch</code> belongs to the bridge's shell instead and is not in agentctl's registry, so <code>agentctl send coordinator</code>, which tick-hub's delivery script uses, does not reach it.</p>
+<p class="small"><a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agent-utils-coordinator/SKILL.md#priorities">Priorities</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agent-utils-setup/templates/AGENTS.md">Harness AGENTS.md template</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agent-utils-setup/SKILL.md#phase-7-hand-off-to-the-owner">How setup starts it</a></p>
+</div>
+
+<div class="layer-block arch-sessions">
+<h3 id="sessions">Sessions: agentctl on Herdr</h3>
+<p>Herdr is a persistent terminal server, installed separately. Every agent runs as its own terminal interface in a Herdr tab, so a person can attach and take over at any time. agentctl and herdr-run each talk to Herdr through their own adapter.</p>
+<p>agentctl keeps a registry of named sessions in the harness's private <code>.agentctl/</code> directory. It needs no hosted account and no always-running manager process. Prompts go through a durable queue. Exit code 75 means a prompt is safely pending and can be retried with <code>agentctl drain</code>. Exit code 76 means it may already have been submitted, so it is set aside for inspection and never resent automatically. <code>agentctl start --slot</code> starts an agent inside a wrkslots slot. <code>agentctl wait</code> reports that an agent is ready for input, which is not the same as finished.</p>
+<p class="small"><a href="https://github.com/rrnewton/agent-utils/blob/main/py/agentctl/USER_GUIDE.md">agentctl user guide</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/py/agentctl/USER_GUIDE.md#observe-and-take-over">Observe and take over</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/py/agentctl/USER_GUIDE.md#boxing-an-agent-to-a-wrkslots-slot">Boxing an agent to a slot</a></p>
+</div>
+
+<div class="layer-block arch-workspaces">
+<h3 id="workspaces">Workspaces: wrkslots</h3>
+<p>Each task gets a slot: a linked worktree of the primary checkout on a fresh branch, created from the remote-tracking default branch. Where the host allows it (passwordless sudo, or <code>fuse2fs</code>), setup's default keeps each slot in its own sparse ext4 image, so a runaway build fills its own image rather than the disk, and removal deletes one file. Each slot gets its own systemd resource limits. An optional file-system sandbox makes only the slot, its Git directories and named paths writable; it is an accident boundary for cooperative agents, not a security boundary.</p>
+<p>wrkslots records ownership in an append-only, hash-linked event history. It removes a slot on one of two paths. Ordinary reclaim needs the slot's time-to-live to have expired, the harness liveness check (<code>bin/agent-liveness</code>, which asks agentctl) to report the agent dead, the exact owner process to be gone, and process, mount, Git and path checks to agree. When the owner instead writes a handoff and releases the slot itself, the coordinator must read that handoff, and the census of processes using the slot and the salvage still run, but the waits for the owner to exit, for the liveness check and for the time-to-live are skipped. Either way, unpublished commits are pushed to a configured salvage remote or kept in a verified local bundle before anything is deleted.</p>
+<p class="small"><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/wrkslots/USER_GUIDE.md#normal-lifecycle">Normal lifecycle</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/wrkslots/USER_GUIDE.md#disk-image-slots">Disk-image slots</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/wrkslots/USER_GUIDE.md#limits-of-the-box">Limits of the box</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/py/wrkslots/examples/agentctl_liveness_probe.py">The liveness probe</a></p>
+</div>
+
+<div class="layer-block arch-recurring">
+<h3 id="recurring">Recurring work: tick-hub</h3>
+<p>tick-hub decides which reminders and freshness checks are due and prints lines such as <code>HEALTH:</code>, <code>ACTION:</code>, <code>NOTE:</code>, <code>ERROR:</code> and <code>NO_RESULT:</code>; it does not schedule or deliver anything itself. In a harness, a user systemd timer runs a small <code>tick-deliver</code> script every 15 minutes. When a tick's output contains an <code>ACTION:</code> line, the script sends that output to the coordinator's agentctl session with <code>agentctl send</code>, the same queue your own messages use, and a message that has to wait stays queued for the next run.</p>
+<p class="small"><a href="https://github.com/rrnewton/agent-utils/tree/main/skills/agent-utils-setup/templates/tick-hub">Delivery templates</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/tick-hub/rendered/rust/README.md#output-contract">Output contract</a></p>
+</div>
+
+<div class="layer-block arch-landing">
+<h3 id="landing">Validation and landing</h3>
+<p>The project's own rules decide how work lands: pull requests or direct pushes, required reviews, required checks. The coordinator validates before pushing, never trusts an exit status read after a pipe, and after a push or merge reads the result back from the remote by content. dagrun can run the project's validation graph locally under resource limits. herdr-run runs an allowlisted command, such as <code>git push</code>, when the agent's own sandbox blocks the network. gh-paced paces GitHub calls. pr-landing-planner, which is experimental, can propose a landing order but never acts on it.</p>
+<p class="small"><a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agent-utils-coordinator/SKILL.md#landing">Landing rules</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agent-utils-coordinator/SKILL.md#shared-machine-safety">Shared-machine safety</a></p>
+</div>
+</div>
+</section>
+
+<section class="section" id="lifecycle" aria-labelledby="lifecycle-title">
+<div class="wrap">
+<div class="section-head">
+<h2 id="lifecycle-title">A delegated task, end to end</h2>
+<p>This is the path in the harness <code>AGENTS.md</code> template, with the file-system sandbox off (the default). Placeholders are in angle brackets; <code>$WS</code> is the harness's wrkslots command and <code>$AU</code> its agent-utils <code>bin/</code>.</p>
+</div>
+<ol class="steps prose">
+<li>
+<h3>You ask <span class="who">owner</span></h3>
+<p>In the coordinator's tab or in chat: "Please have a subagent add CONTRIBUTING.md and land it." The coordinator turns the request into a task with a short name, its slug (for example <code>add-contributing</code>), and an explicit write destination: which repository, which slot, which branch, and whether the agent may write.</p>
+</li>
+<li>
+<h3>A fresh slot <span class="who">coordinator · wrkslots</span></h3>
+<p>The coordinator fetches the primary checkout's remote, because a slot starts from the remote-tracking branch, then creates the slot:</p>
+<pre tabindex="0" role="region" aria-label="Commands that create a slot"><code>git -C &lt;primary&gt; fetch origin
+$WS create &lt;slot&gt; --slot-type agent --coordinator-authorized \
+  --agent &lt;name&gt; --task &lt;slug&gt; --purpose "&lt;one line&gt;" \
+  --coordinator-pid &lt;pid&gt; --repo &lt;primary&gt;=&lt;primary&gt; \
+  --branch &lt;primary&gt;=&lt;name&gt;/&lt;slug&gt;</code></pre>
+</li>
+<li>
+<h3>A subagent with a full brief <span class="who">coordinator · agentctl</span></h3>
+<p>It starts a subagent in the slot with one of your launch profiles and a brief that states the goal and why, the slot and branch, how to validate, how to report back, and the slot protocol:</p>
+<pre tabindex="0" role="region" aria-label="Command that starts a subagent in the slot"><code>AGENTCTL_WRKSLOTS_BIN=$WS $AU/agentctl start &lt;name&gt; --cwd &lt;harness&gt; \
+  --profile &lt;profile&gt; --slot &lt;slot&gt; --file &lt;brief&gt;</code></pre>
+<p>The subagent appears as a new tab in the project's Herdr workspace. Every task gets a fresh agent name.</p>
+</li>
+<li>
+<h3>Work in the slot only <span class="who">subagent</span></h3>
+<p>The subagent binds itself as the slot's owner (<code>wrkslots adopt</code>), works and commits only on its branch, and publishes as the project's rules require. It then writes a handoff (what changed, the commit, how it was validated, open questions), releases the slot and replies.</p>
+</li>
+<li>
+<h3>Supervise without guessing <span class="who">coordinator</span></h3>
+<p><code>agentctl status</code> and <code>agentctl read</code> show progress, and the reply in <code>read</code> is what says the work is finished. A successful start or send proves delivery, not completion. If delivery is uncertain (exit 76), the coordinator looks before it resends.</p>
+</li>
+<li>
+<h3>Verify by content <span class="who">coordinator</span></h3>
+<p>It reads the diff, the test output and the pushed ref, then the handoff (<code>$WS read-handoff</code>). "Tests pass" counts only once it knows which tests ran, on which commit, with what result.</p>
+</li>
+<li>
+<h3>Stop and remove <span class="who">coordinator · wrkslots</span></h3>
+<pre tabindex="0" role="region" aria-label="Commands that stop the subagent and remove its slot"><code>$AU/agentctl stop &lt;name&gt;
+$WS remove &lt;slot&gt; --coordinator-pid &lt;pid&gt; --expected-generation &lt;n&gt;</code></pre>
+<p>wrkslots refuses unless it can prove nothing uses the slot, and it salvages any unpublished commits first. A refusal names its reason. Nobody deletes a slot by hand.</p>
+</li>
+<li>
+<h3>Land under the project's rules <span class="who">coordinator</span></h3>
+<p>It validates with the repository's own command, lands as the repository allows, and reads the result back from the remote. In the quickstart run, the coordinator checked the landed file byte for byte against the remote.</p>
+</li>
+<li>
+<h3>Report substance <span class="who">coordinator → owner</span></h3>
+<p>It tells you what changed and why it matters, cites work by issue or pull-request number and slug (<code>#&lt;number&gt; &lt;slug&gt;</code>), and says what it did not verify, along with anything left over, such as a pushed working branch it could delete.</p>
+</li>
+</ol>
+<div class="callout">
+<p class="callout-title">With the sandbox on</p>
+<p>A sandboxed subagent cannot write the wrkslots registry, so it does not adopt or release its slot. It replies with its handoff, and the coordinator removes the slot after <code>agentctl stop</code> once the slot's time-to-live has passed.</p>
+<p class="small"><a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agent-utils-setup/templates/AGENTS.md#delegating-a-task">Delegating a task (template)</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agent-utils-coordinator/SKILL.md#slot-lifecycle">Slot lifecycle</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/QUICKSTART.md#8-the-coordinator-and-its-first-task">The recorded first task</a></p>
+</div>
+</div>
+</section>
+
+<section class="section" id="harness" aria-labelledby="harness-title">
+<div class="wrap">
+<div class="section-head">
+<h2 id="harness-title">The harness directory</h2>
+<p>Setup turns the checkout you started in into the harness root and moves the checkout inside it, unchanged. For a repository <code>foobar</code>:</p>
+</div>
+<pre class="tree" tabindex="0" role="region" aria-label="The harness directory"><code>~/work/foobar/                  <span class="c">harness root; the coordinator runs here</span>
+├── AGENTS.md                   <span class="c">you are the coordinator; layout, tools, delegation,</span>
+│                               <span class="c">suite configuration, and your project rules</span>
+├── CLAUDE.md -&gt; AGENTS.md
+├── foobar/                     <span class="c">primary checkout, an independent repository</span>
+├── agent-utils/                <span class="c">clone, submodule, or symlink to an existing checkout</span>
+│   ├── bin/                    <span class="c">tool dispatchers; Python edition, nothing to build</span>
+│   └── skills/
+├── worktrees/                  <span class="c">wrkslots control directory</span>
+│   ├── slots/&lt;slot&gt;/           <span class="c">one checkout (or disk image) per task</span>
+│   └── wrkslots                <span class="c">the wrkslots command for this harness</span>
+├── bin/agent-liveness          <span class="c">exit 0 dead, 1 alive, 2 unverifiable</span>
+├── .agents/skills/             <span class="c">links into agent-utils/skills/</span>
+├── .claude/skills -&gt; ../.agents/skills
+├── .agentctl/                  <span class="c">session registry and launch profiles; private</span>
+└── .wrkslots.yml               <span class="c">slot policy, commented key by key</span></code></pre>
+<div class="prose">
+<p>The harness is its own small Git repository, local unless you add a remote, so its configuration and rules are versioned. Its <code>.gitignore</code> excludes the primary checkout, <code>agent-utils/</code>, <code>worktrees/</code>, <code>.agentctl/</code>, herdr-run's spool and any chat configuration. agentctl refuses to use launch profiles unless <code>.agentctl/</code> is ignored.</p>
+<p>Skills are linked rather than copied, so updating agent-utils updates every skill. By default setup links four skills: the setup and coordinator skills plus agentctl and wrkslots. It adds the skill of each optional tool you choose. The <code>bin/</code> dispatchers run the Python edition and print one <code>engine=</code> line on standard error; the Rust edition runs only when you ask for it with <code>DAGRUN_ENGINE=rust</code>, and never as a silent fallback. The name is historical: that variable is one switch for every dispatcher. Under <code>rust</code>, the Python-only tools (wrkslots, wrkviz, parallel-experiment-runner and the older <code>herdr-chat</code> and <code>herdr-subagents</code> names) refuse with exit 127, and the Rust edition is built through Cargo on first use, so set it for one command, not for a whole harness.</p>
+<p class="small"><a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agent-utils-setup/SKILL.md#what-setup-produces">What setup produces</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agent-utils-setup/SKILL.md#phase-5-execute">Phase 5: Execute</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/QUICKSTART.md#6-the-result">A real result</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/common/bin/engine-resolver">The dispatcher</a></p>
+</div>
+</div>
+</section>
+
+<section class="section" id="state" aria-labelledby="state-title">
+<div class="wrap">
+<div class="section-head">
+<h2 id="state-title">Where state lives</h2>
+<p>Everything the suite keeps is a file you can read on the machine; there is no hosted service and no database server.</p>
+</div>
+<div class="table-wrap" role="region" aria-labelledby="state-caption" tabindex="0">
+<table class="table-stack" role="table">
+<caption id="state-caption">State, its location, and who owns it</caption>
+<thead role="rowgroup">
+<tr role="row"><th scope="col" role="columnheader">State</th><th scope="col" role="columnheader">Where</th><th scope="col" role="columnheader">Owned by</th><th scope="col" role="columnheader">In the harness repository?</th></tr>
+</thead>
+<tbody role="rowgroup">
+<tr role="row"><th scope="row" role="rowheader">The project's code and history</th><td role="cell" data-label="Where">The primary checkout and its remote</td><td role="cell" data-label="Owned by">The project</td><td role="cell" data-label="In the harness repository?">No: an independent repository</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Rules and suite configuration</th><td role="cell" data-label="Where"><code>AGENTS.md</code></td><td role="cell" data-label="Owned by">You; the coordinator edits it only on request</td><td role="cell" data-label="In the harness repository?">Yes</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Slot policy</th><td role="cell" data-label="Where"><code>.wrkslots.yml</code></td><td role="cell" data-label="Owned by">You</td><td role="cell" data-label="In the harness repository?">Yes</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Skill links</th><td role="cell" data-label="Where"><code>.agents/skills/</code></td><td role="cell" data-label="Owned by">Setup</td><td role="cell" data-label="In the harness repository?">Yes</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Launch profiles</th><td role="cell" data-label="Where"><code>.agentctl/profiles.json</code>, owner-only permissions</td><td role="cell" data-label="Owned by">You</td><td role="cell" data-label="In the harness repository?">No: private and ignored</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Session registry and prompt queue</th><td role="cell" data-label="Where"><code>.agentctl/</code> (inbox, in-flight, failed, processed)</td><td role="cell" data-label="Owned by">agentctl</td><td role="cell" data-label="In the harness repository?">No</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Slot checkouts</th><td role="cell" data-label="Where"><code>worktrees/slots/&lt;slot&gt;/</code>, or one sparse image per slot</td><td role="cell" data-label="Owned by">wrkslots</td><td role="cell" data-label="In the harness repository?">No</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Ownership history and handoffs</th><td role="cell" data-label="Where">The wrkslots control directory under <code>worktrees/</code>, outside the slot checkouts</td><td role="cell" data-label="Owned by">wrkslots</td><td role="cell" data-label="In the harness repository?">No</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Salvaged commits</th><td role="cell" data-label="Where">A configured salvage remote, otherwise a verified bundle under <code>worktrees/wrkslots-salvage/</code></td><td role="cell" data-label="Owned by">wrkslots</td><td role="cell" data-label="In the harness repository?">No</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Chat bridge intake and replies</th><td role="cell" data-label="Where">The bridge's own state directory, usually under <code>.agentctl/</code>; configuration in <code>chat.json</code></td><td role="cell" data-label="Owned by">agentctl chat</td><td role="cell" data-label="In the harness repository?">No</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Run records and audit log</th><td role="cell" data-label="Where"><code>.herdr-run/</code>; run spools pruned after four days by default</td><td role="cell" data-label="Owned by">herdr-run</td><td role="cell" data-label="In the harness repository?">No</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Reminder cadence</th><td role="cell" data-label="Where"><code>.tick-hub/</code>, written only on <code>--flush</code></td><td role="cell" data-label="Owned by">tick-hub</td><td role="cell" data-label="In the harness repository?">No</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Terminal scrollback</th><td role="cell" data-label="Where">Herdr, with bounded history</td><td role="cell" data-label="Owned by">Herdr</td><td role="cell" data-label="In the harness repository?">No</td></tr>
+</tbody>
+</table>
+</div>
+<p class="prose small muted">Durable decisions do not belong in any of these. The coordinator skill puts defects, findings and landing evidence in the project's issue tracker, pull requests or tracked files, because a terminal pane or a chat thread is not a record.</p>
+</div>
+</section>
+
+<section class="section" id="owner-loop" aria-labelledby="loop-title">
+<div class="wrap">
+<div class="section-head">
+<h2 id="loop-title">How the owner stays in the loop</h2>
+</div>
+<div class="grid grid-2">
+<article class="card">
+<h3>One voice</h3>
+<p>Only the coordinator speaks to you, on whichever channel you use. Subagents report to it, and it sums up. Its reports describe substance, not activity: which flag, file or test changed and why, with numbers and where they came from.</p>
+</article>
+<article class="card">
+<h3>References you can follow</h3>
+<p>Work is cited as <code>#&lt;number&gt; &lt;slug&gt;</code>, never a bare number. Text an agent publishes, such as a commit body or an issue comment, says which agent wrote it. "Done" means delivered and checked, and anything unverified is named.</p>
+</article>
+<article class="card">
+<h3>Eyes on every agent</h3>
+<p>Each agent is a real terminal interface in a Herdr tab. Attach to any of them, read along, or pause automation and type. Nothing hides in a background process.</p>
+</article>
+<article class="card">
+<h3>Policy stays yours</h3>
+<p>Launch profiles, the herdr-run allowlist, the skills and the harness <code>AGENTS.md</code> change only when you ask. Later changes, such as "turn on the sandbox for subagents", are requests to the coordinator, which records each one.</p>
+</article>
+</div>
+<p class="small"><a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agent-utils-coordinator/SKILL.md#reporting-to-the-owner">Reporting to the owner</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/QUICKSTART.md#9-later">Changing the setup later</a></p>
+</div>
+</section>
+
+<section class="section" id="limits" aria-labelledby="limits-title">
+<div class="wrap">
+<div class="section-head">
+<h2 id="limits-title">Boundaries and limits</h2>
+</div>
+<ul class="prose">
+<li><strong>Linux only for the harness tools.</strong> wrkslots needs <code>/proc</code>; slot limits, boxes and dagrun need a user systemd manager and cgroup v2; herdr-run needs a systemd user manager. agent-usage also runs on macOS, and Herdr itself also installs there.</li>
+<li><strong>Not a security boundary.</strong> The slot sandbox is "an accident boundary, not a security boundary", the herdr-run allowlist is "a cooperative safety rail", and a chat plugin's process group is for cleanup, not containment. They help cooperative agents avoid mistakes; they do not contain a hostile one.</li>
+<li><strong>Readiness is not completion.</strong> agentctl can tell you an agent is waiting for input and that a prompt was delivered. Only the agent's reply says the task is done.</li>
+<li><strong>External terminal server.</strong> Herdr is a separate project. The suite was last tested with Herdr 0.8.</li>
+<li><strong>One working chat transport.</strong> Google Chat through the Python edition's polling bridge, once an hour by default unless you set a shorter interval, plus operator-supplied adapters. The subscription-plugin protocol has no provider yet.</li>
+<li><strong>Beta and pre-1.0.</strong> agentctl calls itself beta software, and every package version is below 1.0.</li>
+</ul>
+</div>
+</section>
+
+</main>
+<footer class="site-footer">
+<div class="wrap">
+<div class="footer-grid">
+<div>
+<h2>Project</h2>
+<ul>
+<li><a href="https://github.com/rrnewton/agent-utils">Source on GitHub</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/issues">Issues</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/LICENSE">License (MIT)</a></li>
+</ul>
+</div>
+<div>
+<h2>Documentation</h2>
+<ul>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/README.md">README</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/QUICKSTART.md">Quickstart</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/skills/README.md">Skills</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/README.md">Tool documentation</a></li>
+</ul>
+</div>
+<div>
+<h2>This site</h2>
+<ul>
+<li><a href="index.html">Overview</a></li>
+<li><a href="architecture.html">Architecture</a></li>
+<li><a href="tools.html">Tools</a></li>
+<li><a href="vibe-talk.html">vibe-talk demo</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/tree/main/site">Page source (site/)</a></li>
+</ul>
+</div>
+</div>
+<p class="footer-note">agent-utils is MIT-licensed, pre-1.0 software for Linux. Herdr is a separate project. This site is hand-written HTML and CSS with no external resources; its only script remembers your color theme.</p>
+</div>
+</footer>
+</body>
+</html>

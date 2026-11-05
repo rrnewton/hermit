@@ -1,0 +1,69 @@
+description: Tool-owned offline Rust build-and-install smoke checks
+
+resource_caps:
+  rust-package: 3
+
+steps:
+  - group: rust
+    job: agentctl
+    desc: package and smoke the agentctl and chat-subscription Rust crates once
+    cmd: >-
+      python3 scripts/check_rust_packages.py
+      --crate chat-subscription
+      --crate chat-subscription-plugin
+      --crate agentctl
+    jobs_flag: ""
+    jobs_env: CARGO_BUILD_JOBS
+    labels: [validation-packages, validation-rust-packages, component-agentctl]
+    timeout: 900
+    cpu_timeout: 1800
+    hint: &rust_package_hint
+      resources: {rust-package: 1}
+      est_duration_s: 30
+      classification: cpu-bound
+      preferred_inner_jobs: 8
+      rss_baseline_bytes: 3221225472
+
+  - group: rust
+    job: dagrun
+    desc: package and smoke the dagrun Rust crate
+    cmd: python3 scripts/check_rust_packages.py --crate dagrun
+    jobs_flag: ""
+    jobs_env: CARGO_BUILD_JOBS
+    labels: [validation-packages, validation-rust-packages, component-dagrun]
+    timeout: 600
+    cpu_timeout: 1200
+    hint: *rust_package_hint
+
+  - group: rust
+    job: herdr-run
+    desc: package and smoke the herdr-run Rust crate
+    cmd: python3 scripts/check_rust_packages.py --crate herdr-run
+    jobs_flag: ""
+    jobs_env: CARGO_BUILD_JOBS
+    labels: [validation-packages, validation-rust-packages, component-herdr-run]
+    timeout: 600
+    cpu_timeout: 1200
+    hint: *rust_package_hint
+
+  - group: rust
+    job: planner
+    desc: package and smoke the planner Rust crate
+    cmd: python3 scripts/check_rust_packages.py --crate pr-landing-planner
+    jobs_flag: ""
+    jobs_env: CARGO_BUILD_JOBS
+    labels: [validation-packages, validation-rust-packages, component-planner]
+    timeout: 600
+    cpu_timeout: 1200
+    hint: *rust_package_hint
+
+  - group: rust
+    job: tick-hub
+    desc: package and smoke the tick-hub Rust crate
+    cmd: python3 scripts/check_rust_packages.py --crate tick-hub
+    jobs_flag: ""
+    jobs_env: CARGO_BUILD_JOBS
+    labels: [validation-packages, validation-rust-packages, component-tick-hub]
+    timeout: 600
+    cpu_timeout: 1200
+    hint: *rust_package_hint

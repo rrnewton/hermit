@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-188-c1ea644967b",
+    "issue_id": "agent-utils-188",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Closed: landed in 4a63ae8f, deployed on devbig014; the real-Chromium touch check passes. Unverified on a physical phone.",
+    "created_at": "2026-10-04T12:59:39.913452412Z",
+    "updated_at": "2026-10-04T12:59:39.913452412Z"
+  }
+]

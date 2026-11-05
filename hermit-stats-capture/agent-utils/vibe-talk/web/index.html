@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark light" />
+    <title>vibe-talk</title>
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/icons/icon-192.png" />
+    <link rel="icon" type="image/svg+xml" sizes="any" href="/icons/icon.svg" />
+    <link rel="apple-touch-icon" href="/icons/icon-192.png" />
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <header>
+      <h1>vibe-talk</h1>
+      <span id="channel-name" class="muted">not connected</span>
+    </header>
+
+    <nav id="tabs" role="tablist">
+      <button role="tab" data-tab="talk" class="active">Talk</button>
+      <button role="tab" data-tab="text">Text</button>
+      <button role="tab" data-tab="settings">Settings</button>
+    </nav>
+
+    <main>
+      <section id="tab-talk" class="tab active">
+        <div class="row">
+          <select id="talk-channel" aria-label="channel"></select>
+          <button id="refresh-digest">Catch me up</button>
+        </div>
+        <div id="voice-agent" class="panel">
+          <p class="muted">Voice agent not configured.</p>
+        </div>
+        <p class="hint">
+          Agent authentication on? The hosted widget above cannot start a conversation on its own.
+          Use <a href="/voice">the signed-URL voice page</a> instead.
+        </p>
+        <div class="row">
+          <button id="speak-digest">Read the digest aloud</button>
+          <button id="stop-speaking" class="secondary">Stop</button>
+        </div>
+        <p class="hint">
+          Tap a line to hear that one message in full. Or type what you remember of it below —
+          that is the point of this thing.
+        </p>
+        <form id="find-form" class="row">
+          <input
+            id="find-query"
+            type="search"
+            placeholder="the one about the mac runner"
+            aria-label="find a message by description"
+          />
+          <button type="submit">Find</button>
+        </form>
+        <div id="find-result"></div>
+        <ol id="digest" class="messages"></ol>
+      </section>
+
+      <section id="tab-text" class="tab">
+        <div class="row">
+          <select id="text-channel" aria-label="channel"></select>
+          <button id="refresh-text">Refresh</button>
+        </div>
+        <p class="hint">
+          Full scrollback, oldest first. Message text is written by other people and bots: it is
+          shown as plain text and is never executed or treated as an instruction.
+        </p>
+        <ol id="scrollback" class="messages"></ol>
+      </section>
+
+      <section id="tab-settings" class="tab">
+        <label for="api-token">vibe-talk API token</label>
+        <p class="hint">
+          <strong>This deployment's own token</strong> — <code>VIBE_TALK_READ_TOKEN</code> or
+          <code>VIBE_TALK_WRITE_TOKEN</code> from the configuration it was started with. It is not
+          your ElevenLabs key and not your chat provider's bot token; neither of those is ever
+          entered here. Read scope is enough to read, search and listen; the write-scope one is
+          what replying from this page needs. Sent to this server as a bearer token, and stored per
+          browser <em>and per hostname</em> — so another URL for this same deployment will ask you
+          again.
+        </p>
+        <input id="api-token" type="password" autocomplete="off" placeholder="paste the token" />
+        <div class="row">
+          <button id="save-token">Save</button>
+          <button id="forget-token" class="secondary">Forget</button>
+        </div>
+        <div id="server-info" class="panel muted"></div>
+      </section>
+    </main>
+
+    <div id="status" role="status" aria-live="polite"></div>
+    <script src="/app.js"></script>
+  </body>
+</html>

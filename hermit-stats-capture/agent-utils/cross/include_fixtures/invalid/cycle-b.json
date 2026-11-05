@@ -1,0 +1,4 @@
+{
+  "include": [{"path": "cycle-a.json", "namespace": "a"}],
+  "steps": []
+}

@@ -1,0 +1,18 @@
+[
+  {
+    "id": "agent-utils-200-c274ed92da4",
+    "issue_id": "agent-utils-200",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Speech preparation, checked. The page prepares no spoken text of its own: device speech, Read new and the call relay all read the server's spoken_content, falling back to the raw content. The server's preparation (vibe-talk/src/speakable.rs, strip_inline) has the broader form of the same bug: it drops EVERY underscore, inside a word or not, so a SCREAMING_SNAKE_CASE identifier is spoken as one run-together word. This change is page-only and the host forbids cargo for it, so the server is unchanged. Follow-up: an underscore between two letters or digits should become a space in spoken text (or stay), and only a flanking underscore should be dropped as an emphasis marker, with a speakable.rs unit test for each shape.",
+    "created_at": "2026-10-04T13:07:26.144982380Z",
+    "updated_at": "2026-10-04T13:07:26.144982380Z"
+  },
+  {
+    "id": "agent-utils-200-c1ac381bbbf",
+    "issue_id": "agent-utils-200",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Closed: d29645c9 + a7b19d7b (speech) + 0382d175, pushed and deployed on devbig014. Unverified on the phone.",
+    "created_at": "2026-10-04T16:03:06.913133235Z",
+    "updated_at": "2026-10-04T16:03:06.913133235Z"
+  }
+]

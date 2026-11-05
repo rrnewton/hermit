@@ -1,0 +1,38 @@
+#!/bin/sh
+# Run one tick-hub tick from the harness root and deliver its ACTION lines to the coordinator.
+#
+# Usage: bin/tick-deliver [AGENT]      (default AGENT: coordinator)
+#
+# A user systemd timer (or cron) runs this every few minutes. tick-hub only prints lines; this
+# script is the delivery: it sends the tick's output to the coordinator's agentctl queue, the
+# same queue the owner's messages and the coordinator's own follow-ups use. A message that waits
+# because the coordinator is busy (agentctl exit 75) stays safely queued, and the next run
+# delivers it first.
+set -u
+H=$(cd "$(dirname "$0")/.." && pwd)
+AU="$H/agent-utils/bin"
+AGENT="${1:-coordinator}"
+cd "$H" || exit 2
+mkdir -p .tick-hub
+out=.tick-hub/last-tick.txt
+msg=.tick-hub/message.txt
+
+"$AU/agentctl" drain "$AGENT" --ready-timeout 0 >/dev/null 2>&1
+
+"$AU/tick-hub" tick --config ops.yaml --flush --no-header > "$out" 2> .tick-hub/last-tick.err
+rc=$?
+if [ "$rc" -ne 0 ]; then
+    echo "tick-hub failed (exit $rc):" >&2
+    cat .tick-hub/last-tick.err "$out" >&2
+    exit "$rc"
+fi
+grep -q '^ACTION:' "$out" || exit 0
+
+{
+    echo "tick-hub (from $(basename "$H")-tick-hub.timer):"
+    cat "$out"
+} > "$msg"
+"$AU/agentctl" send "$AGENT" --file "$msg" --ready-timeout 0
+rc=$?
+[ "$rc" -eq 75 ] && exit 0      # queued; the next run's drain delivers it
+exit "$rc"

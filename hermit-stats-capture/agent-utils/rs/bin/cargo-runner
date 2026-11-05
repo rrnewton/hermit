@@ -1,0 +1,295 @@
+#!/usr/bin/env bash
+# Tracked, source-current launcher for repository-local Rust commands.
+#
+# Every public link beside this file points here. Cargo checks the real workspace dependency graph
+# on every invocation, using rs/target as its normal incremental cache. A provenance stamp beside
+# the resulting target binary detects an absent, malformed, or replaced cached artifact before it
+# can execute. This is deliberately not rust-script: rust-script 0.36 invalidates its executable
+# cache from the entrypoint script, but these entrypoints delegate into library crates whose source
+# can change without main.rs changing.
+set -euo pipefail
+
+CALLER_CWD="$PWD"
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"
+TOOL="$(basename "$0")"
+cd "$ROOT"
+
+case "$TOOL" in
+  dagrun|cpuset-alloc)
+    PACKAGE="dagrun"
+    PACKAGE_TOOLS=(dagrun cpuset-alloc)
+    ;;
+  tick-hub)
+    PACKAGE="tick-hub"
+    PACKAGE_TOOLS=(tick-hub)
+    ;;
+  pr-landing-planner)
+    PACKAGE="pr-landing-planner"
+    PACKAGE_TOOLS=(pr-landing-planner)
+    ;;
+  herdr-run)
+    PACKAGE="herdr-run"
+    PACKAGE_TOOLS=(herdr-run)
+    ;;
+  agentctl|herdr-agent)
+    PACKAGE="agentctl"
+    PACKAGE_TOOLS=(agentctl herdr-agent)
+    ;;
+  cargo-runner)
+    echo "cargo-runner: invoke through an rs/bin tool symlink" >&2
+    exit 2
+    ;;
+  *)
+    echo "cargo-runner: unsupported Rust tool '$TOOL'" >&2
+    exit 2
+    ;;
+esac
+
+for required in cargo cp flock mktemp sha256sum; do
+  if ! command -v "$required" >/dev/null 2>&1; then
+    echo "[$TOOL] Rust source launcher requires '$required'" >&2
+    exit 127
+  fi
+done
+
+absolute_command_path() {
+  local requested="$1"
+  local resolved
+  resolved="$(command -v "$requested" 2>/dev/null)" || return 1
+  if [[ "$resolved" != /* ]]; then
+    resolved="$(cd "$(dirname "$resolved")" && pwd -P)/$(basename "$resolved")"
+  fi
+  if [[ ! -f "$resolved" || ! -x "$resolved" ]]; then
+    return 1
+  fi
+  printf '%s\n' "$resolved"
+}
+
+CARGO_BIN="$(absolute_command_path cargo)" || {
+  echo "[$TOOL] Rust source launcher could not resolve the Cargo executable" >&2
+  exit 127
+}
+RUSTC_REQUESTED="${RUSTC:-rustc}"
+RUSTC_BIN="$(absolute_command_path "$RUSTC_REQUESTED")" || {
+  echo "[$TOOL] Rust source launcher requires Rust compiler '$RUSTC_REQUESTED'" >&2
+  exit 127
+}
+if [[ -n "${RUSTC:-}" ]]; then
+  # A caller may provide a checkout-relative compiler wrapper. Cargo itself runs from / below, so
+  # freeze that explicit choice to the absolute path resolved while still in the checkout.
+  RUSTC="$RUSTC_BIN"
+  export RUSTC
+fi
+# Match Cargo's neutral configuration/toolchain discovery below. Otherwise an enclosing consumer
+# rust-toolchain.toml could select one compiler for this target path while Cargo, launched from /,
+# selects another. Explicit RUSTC/RUSTUP_TOOLCHAIN environment choices remain authoritative.
+HOST_TARGET="$(cd / && "$RUSTC_BIN" -vV | sed -n 's/^host: //p')"
+if [[ ! "$HOST_TARGET" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+  echo "[$TOOL] could not determine a safe host target from '$RUSTC_BIN -vV'" >&2
+  exit 3
+fi
+
+MANIFEST="$ROOT/rs/Cargo.toml"
+TARGET_ROOT="$ROOT/rs/target"
+TARGET_RELEASE="$TARGET_ROOT/$HOST_TARGET/release"
+TARGET="$TARGET_RELEASE/$TOOL"
+PROVENANCE="$TARGET.provenance"
+FINGERPRINT="$ROOT/common/bin/rs-source-fingerprint"
+LOCK_ROOT="$ROOT/rs/.agent-utils-locks"
+
+if [[ ! -x "$FINGERPRINT" ]]; then
+  echo "[$TOOL] missing tracked Rust source fingerprint helper: $FINGERPRINT" >&2
+  exit 3
+fi
+
+mkdir -p "$LOCK_ROOT"
+# One lock serializes validation, destructive refreshes, stamping, and launch snapshots. It lives
+# outside rs/target so a coordinated clean cannot unlink the inode while a launcher holds it.
+exec 9>"$LOCK_ROOT/cache.lock"
+flock 9
+
+run_cargo() {
+  # Cargo discovers configuration by walking upward from its PROCESS cwd, not from
+  # --manifest-path.  agent-utils is often checked out inside a consumer repository, whose
+  # .cargo/config.toml may require a different nightly feature, linker, target, or rustc.  Run the
+  # frontend from filesystem root so only system/root and the caller's normal CARGO_HOME settings
+  # apply; every workspace and output path below is absolute.  The built utility still starts in
+  # CALLER_CWD, preserving its public cwd behavior.
+  (
+    cd /
+    env -u AGENT_UTILS_RS_ENSURE_ONLY -u CARGO_BUILD_TARGET -u CARGO_TARGET_DIR \
+      "$CARGO_BIN" "$@"
+  )
+}
+
+cache_state="missing"
+before_binary=""
+source_before="$("$FINGERPRINT")"
+if [[ -f "$TARGET" && -x "$TARGET" && -f "$PROVENANCE" ]]; then
+  stamped_source="$(sed -n 's/^source_fp=//p' "$PROVENANCE")"
+  stamped_binary="$(sed -n 's/^binary_sha256=//p' "$PROVENANCE")"
+  before_binary="$(sha256sum -- "$TARGET" | cut -d' ' -f1)"
+  if [[ -n "$stamped_source" && -n "$stamped_binary" && "$before_binary" == "$stamped_binary" ]]; then
+    if [[ "$stamped_source" == "$source_before" ]]; then
+      cache_state="verified"
+    else
+      cache_state="source-changed"
+    fi
+  else
+    cache_state="unverified"
+  fi
+elif [[ -e "$TARGET" || -e "$PROVENANCE" ]]; then
+  cache_state="unverified"
+fi
+
+force_refresh=0
+refresh_package() {
+  # Cargo freshness is timestamp-based. A content-fingerprint change must force a clean rebuild:
+  # an editor or archive can change bytes while preserving an older mtime.
+  for package_tool in "${PACKAGE_TOOLS[@]}"; do
+    rm -f -- "$TARGET_RELEASE/$package_tool" \
+      "$TARGET_RELEASE/$package_tool.provenance"
+  done
+  if ! run_cargo clean --quiet --release \
+      --manifest-path "$MANIFEST" --package "$PACKAGE" \
+      --target-dir "$TARGET_ROOT" --target "$HOST_TARGET"; then
+    echo "[$TOOL] Cargo clean failed; no cached Rust artifact was executed" >&2
+    exit 3
+  fi
+  force_refresh=1
+  before_binary=""
+}
+
+# Never let Cargo's timestamp cache bless absent, replaced, non-executable, or source-stale bytes.
+if [[ "$cache_state" != "verified" ]]; then
+  echo "[$TOOL] discarding $cache_state cached Rust artifact(s) for $PACKAGE" >&2
+  refresh_package
+fi
+
+attempt=1
+while ((attempt <= 3)); do
+  source_before="$("$FINGERPRINT")"
+  build_targets=(--bin "$TOOL")
+  if [[ "$force_refresh" == "1" ]]; then
+    build_targets=(--bins)
+  fi
+  if ! run_cargo build --quiet --locked --release \
+      --manifest-path "$MANIFEST" --package "$PACKAGE" \
+      --target-dir "$TARGET_ROOT" --target "$HOST_TARGET" "${build_targets[@]}"; then
+    echo "[$TOOL] Cargo build failed; no cached Rust artifact was executed" >&2
+    exit 3
+  fi
+  source_after="$("$FINGERPRINT")"
+  if [[ "$source_before" != "$source_after" ]]; then
+    echo "[$TOOL] Rust source changed during build; retrying ($attempt/3)" >&2
+    refresh_package
+    attempt=$((attempt + 1))
+    continue
+  fi
+  stamp_tools=("$TOOL")
+  if [[ "$force_refresh" == "1" ]]; then
+    stamp_tools=("${PACKAGE_TOOLS[@]}")
+  fi
+  stamped_current_sha=""
+  for stamp_tool in "${stamp_tools[@]}"; do
+    stamp_target="$TARGET_RELEASE/$stamp_tool"
+    stamp_provenance="$stamp_target.provenance"
+    if [[ ! -x "$stamp_target" ]]; then
+      echo "[$TOOL] Cargo succeeded but produced no executable at $stamp_target" >&2
+      exit 3
+    fi
+    stamp_binary_sha="$(sha256sum -- "$stamp_target" | cut -d' ' -f1)"
+    if [[ "$stamp_tool" == "$TOOL" ]]; then
+      stamped_current_sha="$stamp_binary_sha"
+    fi
+    provenance_tmp="$(mktemp "$TARGET_RELEASE/.${stamp_tool}.provenance.XXXXXX")"
+    printf 'source_fp=%s\nbinary_sha256=%s\n' \
+      "$source_after" "$stamp_binary_sha" >"$provenance_tmp"
+    mv -f -- "$provenance_tmp" "$stamp_provenance"
+  done
+  binary_sha="$(sha256sum -- "$TARGET" | cut -d' ' -f1)"
+  if [[ -z "$stamped_current_sha" || "$binary_sha" != "$stamped_current_sha" ]]; then
+    echo "[$TOOL] Rust artifact changed while stamping; retrying ($attempt/3)" >&2
+    refresh_package
+    attempt=$((attempt + 1))
+    continue
+  fi
+
+  # Close the source-change window before publishing this executable to the caller.
+  if [[ "$("$FINGERPRINT")" != "$source_after" ]]; then
+    refresh_package
+    echo "[$TOOL] Rust source changed while stamping; retrying ($attempt/3)" >&2
+    attempt=$((attempt + 1))
+    continue
+  fi
+
+  if [[ "${AGENT_UTILS_RS_ENSURE_ONLY:-}" != "1" ]]; then
+    # Publish a named, content-addressed copy outside the deletable Cargo target. The stable name is
+    # required because dagrun and cpuset-alloc use current_exe() for containment re-exec.
+    # Existing snapshots are rehashed and never overwritten when valid.
+    SNAPSHOT_DIR="$ROOT/rs/.agent-utils-snapshots/$TOOL/$binary_sha"
+    SNAPSHOT="$SNAPSHOT_DIR/$TOOL"
+    mkdir -p "$SNAPSHOT_DIR"
+    snapshot_ok=0
+    if [[ -f "$SNAPSHOT" && -x "$SNAPSHOT" ]]; then
+      snapshot_sha="$(sha256sum -- "$SNAPSHOT" | cut -d' ' -f1)"
+      if [[ "$snapshot_sha" == "$binary_sha" ]]; then
+        snapshot_ok=1
+      fi
+    fi
+    if [[ "$snapshot_ok" == "0" ]]; then
+      launch_tmp="$(mktemp "$SNAPSHOT_DIR/.${TOOL}.XXXXXX")"
+      if ! cp --reflink=auto --preserve=mode -- "$TARGET" "$launch_tmp"; then
+        rm -f -- "$launch_tmp"
+        echo "[$TOOL] could not snapshot the verified Rust artifact" >&2
+        exit 3
+      fi
+      launch_sha="$(sha256sum -- "$launch_tmp" | cut -d' ' -f1)"
+      if [[ "$launch_sha" != "$binary_sha" || ! -x "$launch_tmp" ]]; then
+        rm -f -- "$launch_tmp"
+        echo "[$TOOL] verified Rust artifact changed while preparing execution" >&2
+        exit 3
+      fi
+      mv -f -- "$launch_tmp" "$SNAPSHOT"
+    fi
+    if [[ ! -x "$SNAPSHOT" ]]; then
+      echo "[$TOOL] verified Rust snapshot is not executable: $SNAPSHOT" >&2
+      exit 3
+    fi
+
+    # Snapshotting may take long enough for an editor to advance source after the earlier check.
+    if [[ "$("$FINGERPRINT")" != "$source_after" ]]; then
+      refresh_package
+      echo "[$TOOL] Rust source changed while snapshotting; retrying ($attempt/3)" >&2
+      attempt=$((attempt + 1))
+      continue
+    fi
+  fi
+
+  if [[ "$cache_state" == "verified" && "$before_binary" == "$binary_sha" ]]; then
+    echo "[$TOOL] rust cache=verified source=${source_after:0:12} binary=${binary_sha:0:12}" >&2
+  else
+    echo "[$TOOL] rust cache=refreshed source=${source_after:0:12} binary=${binary_sha:0:12}" >&2
+  fi
+  break
+done
+
+if ((attempt > 3)); then
+  echo "[$TOOL] Rust source did not remain stable long enough to launch" >&2
+  exit 3
+fi
+
+if [[ "${AGENT_UTILS_RS_ENSURE_ONLY:-}" == "1" ]]; then
+  flock -u 9
+  exec 9>&-
+  cd "$CALLER_CWD"
+  printf '%s\n' "$TARGET"
+  exit 0
+fi
+
+flock -u 9
+exec 9>&-
+cd "$CALLER_CWD"
+unset AGENT_UTILS_RS_ENSURE_ONLY
+exec "$SNAPSHOT" "$@"

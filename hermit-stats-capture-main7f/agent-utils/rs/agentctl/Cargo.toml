@@ -1,0 +1,38 @@
+[package]
+name = "agentctl"
+version = "0.1.0"
+description = "Manage persistent coding-agent sessions with durable delivery and human access"
+readme = "README.md"
+keywords = ["agents", "terminal", "codex", "claude", "muse"]
+categories = ["command-line-utilities", "development-tools"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+chat-subscription = { version = "0.1.0", path = "../chat-subscription" }
+chat-subscription-plugin = { version = "0.1.0", path = "../chat-subscription-plugin" }
+clap = { version = "4.5", features = ["derive"] }
+fs2 = "0.4"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+sha2 = "0.10"
+signal-hook = "0.4.4"
+unicode-width = { version = "0.2", default-features = false }
+
+[dev-dependencies]
+regex = "1"
+
+[[bin]]
+name = "agentctl"
+path = "src/main.rs"
+
+[[bin]]
+name = "herdr-agent"
+path = "src/legacy_main.rs"
+
+[lints]
+workspace = true

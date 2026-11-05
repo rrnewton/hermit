@@ -1,0 +1,50 @@
+{
+  "captured_at": "2026-10-14T12:01:20.066909+00:00",
+  "H": "342daf53c1691da42ae7067850540a06bec504b4",
+  "R": "ff30c5bac6040c14122d33d60f5dfb91953c7099",
+  "cmake": [
+    "CMAKE_BUILD_TYPE:STRING=Release",
+    "DynamoRIO_DIR:UNINITIALIZED=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit/validate/reverie-dbt-native-cache/dynamorio-install-ff4576416a64218bcbccb4528cee86e5fc4da7119267d963751b37c39f68e542/cmake",
+    "REVERIE_DBT_RUNTIME:UNINITIALIZED=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit/validate/deps/libdetcore_dbt.so",
+    "CMAKE_HOME_DIRECTORY:INTERNAL=/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-pty-main885-v1/cargo-home/git/checkouts/reverie-2fc770f7a9c80803/ff30c5b/reverie-dbt/native"
+  ],
+  "files": [
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit/validate/hermit",
+      "size": 54635392,
+      "sha256": "fb8098764535e2f3e1b4ebbb6edd9277840b75b0db1340326362543c2ecd21d7"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit/validate/deps/libdetcore_dbt.so",
+      "size": 15185328,
+      "sha256": "15e18279e8934a9d3df35c02dd739dede87da63b6ba642e686f89f210e841f42"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit/validate/deps/detcore-dbt-native-ff30c5b-2bf31ec6a18fe946/libreverie_dbt_client.so",
+      "size": 129208,
+      "sha256": "ca17dbb6c8eca55a134cf56715fe49dcf438fbabf67fecd63c2a24aa46092790"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit/validate/deps/detcore-dbt-native-ff30c5b-2bf31ec6a18fe946/CMakeCache.txt",
+      "size": 14204,
+      "sha256": "4294c4c22ad68f3d9cb29acc2e3224e883318b6cebe24cfc80b36fee2e57f005"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit/validate/deps/detcore-dbt-native-ff30c5b-2bf31ec6a18fe946/CMakeFiles/reverie_dbt_client.dir/link.txt",
+      "size": 3389,
+      "sha256": "6bd3e7e6002924850d54b4047278fa85a9726dbecf164c83a43e2f46a052002c"
+    }
+  ],
+  "client_dynamic": [
+    " 0x0000000000000001 (NEEDED)             Shared library: [libdrx.so]",
+    " 0x0000000000000001 (NEEDED)             Shared library: [libdrwrap.so]",
+    " 0x0000000000000001 (NEEDED)             Shared library: [libdetcore_dbt.so]",
+    " 0x0000000000000001 (NEEDED)             Shared library: [libdrreg.so]",
+    " 0x0000000000000001 (NEEDED)             Shared library: [libdrmgr.so]",
+    " 0x0000000000000001 (NEEDED)             Shared library: [libdynamorio.so]",
+    " 0x0000000000000001 (NEEDED)             Shared library: [libc.so.6]",
+    " 0x0000000000000001 (NEEDED)             Shared library: [ld-linux-x86-64.so.2]",
+    " 0x000000000000000f (RPATH)              Library rpath: [/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit/validate/deps:/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit/validate/reverie-dbt-native-cache/dynamorio-install-ff4576416a64218bcbccb4528cee86e5fc4da7119267d963751b37c39f68e542/ext/lib64/release:/home/newton/work/dev-hermit/worktrees/slots/dbt-lane-20261010/ignored/dbt-baseline/fork-tree-278-vs452/runtime-capture-substrate/owned-publication-run/target-hermit/validate/reverie-dbt-native-cache/dynamorio-install-ff4576416a64218bcbccb4528cee86e5fc4da7119267d963751b37c39f68e542/lib64/release]"
+  ],
+  "qualification": "Captured after current CLI11 passed. Production native client Release; libdetcore_dbt.so from current H/R compilation. Shared unchanged SDK cache reuse is not a fresh SDK build claim."
+}

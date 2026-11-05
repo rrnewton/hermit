@@ -1,0 +1,3 @@
+source `dirname $0`/util.sh
+record block$bitness
+debug_gdb_only break_block

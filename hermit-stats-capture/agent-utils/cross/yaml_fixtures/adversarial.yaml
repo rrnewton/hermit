@@ -1,0 +1,49 @@
+# Adversarial YAML fixture for cross/differential.py.
+#
+# Proves the Python (PyYAML) and Rust (serde_norway) YAML parsers AGREE on the tricky cases, by
+# loading this file in BOTH builds, re-emitting canonical JSON, and asserting the bytes match:
+#   * literal (|) and folded (>) block scalars, and their strip (-) chomping variants
+#   * the "Norway problem": QUOTED no/yes/on/off must stay the STRINGS, never booleans
+#   * a quoted number-like string must stay a string
+#   * a literal backslash in a block scalar (no escape processing there)
+#   * unicode (accents, a snowman, an emoji, an em dash)
+#
+# It is a valid DAG (it parses/loads) but is never executed by the harness.
+
+# Literal (|-) block scalar: newlines preserved, trailing newline stripped by `-`.
+description: |-
+  Adversarial fixture.
+  Second line, with unicode é ☃ 😀, "quotes", and a\literal-backslash.
+
+resource_caps:
+  browser: 1
+
+steps:
+  - group: norway
+    job: literal
+    desc: literal block scalar (clip chomping keeps one trailing newline)
+    description: |
+      line A
+      line B
+    cmd: "true"          # QUOTED so it is the string "true", not the boolean
+    hint:
+      classification: cpu-bound
+
+  - group: norway
+    job: folded
+    desc: folded block scalar (newlines fold to spaces)
+    description: >
+      this folded text
+      becomes one line
+    cmd: "true"
+
+  - group: norway
+    job: tokens
+    # QUOTED Norway-problem tokens: must be the STRINGS, never booleans.
+    desc: "no"
+    description: "yes on off — and a quoted number: \"12345\""
+    cmd: "true"
+    deps: [norway.literal, norway.folded]
+    hint:
+      resources:
+        browser: 1

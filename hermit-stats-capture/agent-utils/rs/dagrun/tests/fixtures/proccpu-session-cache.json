@@ -1,0 +1,165 @@
+[
+  {
+    "name": "first-snapshot-reads-every-pid",
+    "pid_max": 4194304,
+    "steps": [
+      {
+        "allocator": {"last_pid": 5000, "tasks": 400, "forks": 90000},
+        "group_sessions": [100],
+        "processes": [{"pid": 100, "session": 100}, {"pid": 101, "session": 100}, {"pid": 700, "session": 700}],
+        "read": [100, 101, 700]
+      }
+    ]
+  },
+  {
+    "name": "steady-state-skips-other-sessions-and-reads-new-pids",
+    "pid_max": 4194304,
+    "steps": [
+      {
+        "allocator": {"last_pid": 5000, "tasks": 400, "forks": 90000},
+        "group_sessions": [100],
+        "processes": [{"pid": 100, "session": 100}, {"pid": 700, "session": 700}, {"pid": 800, "session": 800}],
+        "read": [100, 700, 800]
+      },
+      {
+        "allocator": {"last_pid": 5010, "tasks": 402, "forks": 90010},
+        "group_sessions": [100],
+        "processes": [{"pid": 100, "session": 100}, {"pid": 700, "session": 700}, {"pid": 800, "session": 800}, {"pid": 5005, "session": 100}],
+        "read": [100, 5005]
+      }
+    ]
+  },
+  {
+    "name": "pid-reused-across-an-allocator-wrap-is-read-again",
+    "pid_max": 1000,
+    "steps": [
+      {
+        "allocator": {"last_pid": 990, "tasks": 100, "forks": 5000},
+        "group_sessions": [100],
+        "processes": [{"pid": 100, "session": 100}, {"pid": 350, "session": 350}, {"pid": 500, "session": 500}],
+        "read": [100, 350, 500]
+      },
+      {
+        "allocator": {"last_pid": 360, "tasks": 100, "forks": 5070},
+        "group_sessions": [100],
+        "processes": [{"pid": 100, "session": 100}, {"pid": 350, "session": 100}, {"pid": 500, "session": 500}],
+        "read": [100, 350]
+      }
+    ]
+  },
+  {
+    "name": "a-possible-full-lap-empties-the-cache",
+    "pid_max": 1000,
+    "steps": [
+      {
+        "allocator": {"last_pid": 400, "tasks": 100, "forks": 5000},
+        "group_sessions": [100],
+        "processes": [{"pid": 100, "session": 100}, {"pid": 500, "session": 500}],
+        "read": [100, 500]
+      },
+      {
+        "allocator": {"last_pid": 401, "tasks": 100, "forks": 5601},
+        "group_sessions": [100],
+        "processes": [{"pid": 100, "session": 100}, {"pid": 500, "session": 500}],
+        "read": [100, 500]
+      }
+    ]
+  },
+  {
+    "name": "a-member-that-calls-setsid-is-read-then-skipped",
+    "pid_max": 4194304,
+    "steps": [
+      {
+        "allocator": {"last_pid": 5000, "tasks": 400, "forks": 90000},
+        "group_sessions": [100],
+        "processes": [{"pid": 100, "session": 100}, {"pid": 120, "session": 100}],
+        "read": [100, 120]
+      },
+      {
+        "allocator": {"last_pid": 5000, "tasks": 400, "forks": 90000},
+        "group_sessions": [100],
+        "processes": [{"pid": 100, "session": 100}, {"pid": 120, "session": 120}],
+        "read": [100, 120]
+      },
+      {
+        "allocator": {"last_pid": 5000, "tasks": 400, "forks": 90000},
+        "group_sessions": [100],
+        "processes": [{"pid": 100, "session": 100}, {"pid": 120, "session": 120}],
+        "read": [100]
+      }
+    ]
+  },
+  {
+    "name": "a-group-registered-later-re-evaluates-cached-pids",
+    "pid_max": 4194304,
+    "steps": [
+      {
+        "allocator": {"last_pid": 5000, "tasks": 400, "forks": 90000},
+        "group_sessions": [100],
+        "processes": [{"pid": 100, "session": 100}, {"pid": 700, "session": 700}, {"pid": 701, "session": 700}],
+        "read": [100, 700, 701]
+      },
+      {
+        "allocator": {"last_pid": 5000, "tasks": 400, "forks": 90000},
+        "group_sessions": [100, 700],
+        "processes": [{"pid": 100, "session": 100}, {"pid": 700, "session": 700}, {"pid": 701, "session": 700}],
+        "read": [100, 700, 701]
+      }
+    ]
+  },
+  {
+    "name": "a-child-read-before-setsid-that-leads-a-registered-group-is-read",
+    "pid_max": 4194304,
+    "steps": [
+      {
+        "allocator": {"last_pid": 5000, "tasks": 400, "forks": 90000},
+        "group_sessions": [100],
+        "processes": [{"pid": 100, "session": 100}, {"pid": 5003, "session": 50}],
+        "read": [100, 5003]
+      },
+      {
+        "allocator": {"last_pid": 5000, "tasks": 400, "forks": 90000},
+        "group_sessions": [100, 5003],
+        "processes": [{"pid": 100, "session": 100}, {"pid": 5003, "session": 5003}],
+        "read": [100, 5003]
+      }
+    ]
+  },
+  {
+    "name": "a-skipped-pid-reused-during-the-snapshot-is-read",
+    "pid_max": 4194304,
+    "steps": [
+      {
+        "allocator": {"last_pid": 5000, "tasks": 400, "forks": 90000},
+        "group_sessions": [100],
+        "processes": [{"pid": 100, "session": 100}, {"pid": 5003, "session": 5003}, {"pid": 9000, "session": 9000}],
+        "read": [100, 5003, 9000]
+      },
+      {
+        "allocator": {"last_pid": 5001, "tasks": 400, "forks": 90001},
+        "end": {"last_pid": 5004, "tasks": 401, "forks": 90004},
+        "group_sessions": [100],
+        "processes": [{"pid": 100, "session": 100}, {"pid": 5003, "session": 100}, {"pid": 9000, "session": 9000}],
+        "read": [100, 5003]
+      }
+    ]
+  },
+  {
+    "name": "an-unknown-allocator-position-reads-every-pid",
+    "pid_max": 4194304,
+    "steps": [
+      {
+        "allocator": {"last_pid": 5000, "tasks": 400, "forks": 90000},
+        "group_sessions": [100],
+        "processes": [{"pid": 100, "session": 100}, {"pid": 700, "session": 700}],
+        "read": [100, 700]
+      },
+      {
+        "allocator": null,
+        "group_sessions": [100],
+        "processes": [{"pid": 100, "session": 100}, {"pid": 700, "session": 700}],
+        "read": [100, 700]
+      }
+    ]
+  }
+]

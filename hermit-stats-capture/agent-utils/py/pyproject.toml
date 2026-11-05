@@ -1,0 +1,28 @@
+# Shared repository-development configuration.
+#
+# This file intentionally has no [build-system] or [project] table: py/ is a
+# source workspace, not a mixed publishable distribution. Each public
+# tool has its own pyproject.toml beside its import package.
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+disallow_any_explicit = true
+disallow_any_decorated = true
+warn_unreachable = true
+show_error_codes = true
+
+[tool.pytest.ini_options]
+markers = [
+    "ordinary_environment: requires host-visible process identities or the initial identity user namespace",
+    "mapped_root_namespace: requires uid 0 in a nonidentity user namespace",
+    "validation_run_evidence: supplies its own validation-run process and user-systemd evidence instead of the idle-host default",
+]
+
+# The test suite imports pytest, whose pytest.approx support pulls in numpy's
+# type stubs transitively. Some numpy releases use syntax newer than our 3.10
+# target. This project does not import numpy, so do not follow those stubs.
+[[tool.mypy.overrides]]
+module = "numpy.*"
+follow_imports = "skip"
+follow_imports_for_stubs = true

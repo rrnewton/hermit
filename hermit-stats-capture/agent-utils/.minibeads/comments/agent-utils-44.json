@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-44-c72262c7814",
+    "issue_id": "agent-utils-44",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Delivered in cd25081 (vibe-talk: draw a single-conversation channel's whole conversation on Main), on top of #43 replay-burst-double-read.\n\nThe page now records the scope a main, flat or threads page names (never a thread page), keeps a reply in that scope on Main for a page, a live arrival and a projection alike, and saves the scope with the channel on the device, so a reload paints the whole conversation before any read. Neither the scope's root nor a pending reply's receipt offers the scope as a thread. Channels with child threads and unthreaded channels are unchanged. TimelinePage.thread's doc says what it means outside the thread view, and the contract is regenerated.\n\nEvidence:\n- seven page tests compare the drawn ids with the page served: initial paint, pending-reply receipt, offline reload with 0 reads, a live reply once (checked before its read lands), walking back with before, an unthreaded control, and a threaded control including after visiting a thread and after a live reply. On the final base all seven fail with the #44 voice.js reverted (658 pass, 7 fail) and pass with it.\n- six mutations of the change each fail at least one test.\n- full JS suite 687/687, contract check and typecheck clean on the rebased tree.\n- independent review: its one finding, the receipt's thread button, is fixed. It confirmed no scope leaks between channels (a threaded channel reusing the scope's thread id stays root-only), and that an entry saved before the scope existed paints its root offline and heals on the next read. It noted the scope's summary still sits in the channel's threads list; that is pre-existing and unreachable, because a scoped channel has no Threads tab, so it is left unchanged.\n\nUnverified here: the live route itself. That is pM's acceptance on the combined deploy.",
+    "created_at": "2026-09-26T04:20:40.960105283Z",
+    "updated_at": "2026-09-26T04:20:40.960105283Z"
+  }
+]

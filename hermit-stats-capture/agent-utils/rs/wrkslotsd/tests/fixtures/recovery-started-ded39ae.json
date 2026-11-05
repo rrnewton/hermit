@@ -1,0 +1,20 @@
+{
+  "slot": "slot-a",
+  "operation": "finish",
+  "actor": {
+    "pid": 12,
+    "start_ticks": 112,
+    "boot_id": "11111111-2222-3333-4444-555555555555",
+    "host_id": "neutral-host",
+    "cgroup_path": "/neutral.slice/worker.scope"
+  },
+  "runner": {
+    "pid": 13,
+    "start_ticks": 113,
+    "boot_id": "11111111-2222-3333-4444-555555555555",
+    "host_id": "neutral-host",
+    "cgroup_path": "/neutral.slice/worker.scope"
+  },
+  "handoff_writer": null,
+  "coordinator_authorized": true
+}

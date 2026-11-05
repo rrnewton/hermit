@@ -1,0 +1,57 @@
+{
+  "sealed_at": "2026-10-14T11:54:48.091455+00:00",
+  "head": "ff30c5bac6040c14122d33d60f5dfb91953c7099",
+  "status": "",
+  "lock_sha256": "fa0c9f049cc98e31cc082a4d44e5d9f93f03fe5f30b352661176a9b54f3f81e6",
+  "rows": [
+    {
+      "stem": "r-metadata",
+      "result": "2026-10-14T11:43:56Z\nexit=0\n2026-10-14T11:43:56Z\n",
+      "test_summary": []
+    },
+    {
+      "stem": "r-capture-focused",
+      "result": "2026-10-14T11:44:06Z\nexit=0\n2026-10-14T11:44:22Z\n",
+      "test_summary": [
+        "test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 153 filtered out; finished in 0.02s"
+      ]
+    },
+    {
+      "stem": "r-core-full",
+      "result": "2026-10-14T11:45:09Z\nexit=0\n2026-10-14T11:45:15Z\n",
+      "test_summary": [
+        "test result: ok. 112 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.28s"
+      ]
+    },
+    {
+      "stem": "r-dbt-default",
+      "result": "2026-10-14T11:45:16Z\nexit=0\n2026-10-14T11:45:22Z\n",
+      "test_summary": [
+        "test result: ok. 144 passed; 0 failed; 15 ignored; 0 measured; 0 filtered out; finished in 5.59s"
+      ]
+    },
+    {
+      "stem": "r-dbt-no-default",
+      "result": "2026-10-14T11:45:22Z\nexit=0\n2026-10-14T11:45:38Z\n",
+      "test_summary": [
+        "test result: ok. 137 passed; 0 failed; 15 ignored; 0 measured; 0 filtered out; finished in 5.48s"
+      ]
+    },
+    {
+      "stem": "r-clippy",
+      "result": "2026-10-14T11:45:51Z\nexit=0\n2026-10-14T11:46:02Z\n",
+      "test_summary": []
+    },
+    {
+      "stem": "r-doc",
+      "result": "2026-10-14T11:46:03Z\nexit=0\n2026-10-14T11:46:10Z\n",
+      "test_summary": []
+    },
+    {
+      "stem": "r-fmt",
+      "result": "2026-10-14T11:46:10Z\nexit=0\n2026-10-14T11:46:18Z\n",
+      "test_summary": []
+    }
+  ],
+  "qualification": "Host component and fake-launcher suites. Existing ignored cases uncredited; no native DR/canonical claim from these tests."
+}

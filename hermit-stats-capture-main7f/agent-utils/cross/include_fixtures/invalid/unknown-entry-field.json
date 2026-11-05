@@ -1,0 +1,10 @@
+{
+  "include": [
+    {
+      "path": "empty.json",
+      "namespace": "child",
+      "future": true
+    }
+  ],
+  "steps": []
+}

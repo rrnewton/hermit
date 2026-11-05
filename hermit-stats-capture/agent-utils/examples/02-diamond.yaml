@@ -1,0 +1,60 @@
+# 02-diamond (literate YAML edition)
+#
+# This file is ISOMORPHIC to examples/02-diamond.json: both load to the EXACT same DAG (the
+# cross/differential.py harness asserts it). YAML buys us two things a JSON DAG cannot have:
+#   1. comments (like this block), and
+#   2. multi-line block-scalar descriptions,
+# so the pipeline can document itself inline ("literate" DAGs).
+#
+# build.app fans out to two checks (test.unit + test.lint) that run at the same time; deploy.staging
+# waits for BOTH. test.unit carries the larger est_duration_s, so it is dispatched first.
+
+# Top-level description as a literal (|-) block scalar: newlines are preserved, and `-` strips the
+# trailing newline so it matches the JSON string exactly.
+description: |-
+  Diamond pipeline: one build fans out to two parallel checks that then rejoin at a deploy.
+  The two middle steps overlap in time; deploy waits for both.
+
+steps:
+  - group: build
+    job: app
+    desc: compile the app (fans out to two checks)   # short label shown by `list`/`run`
+    # A multi-line literal block scalar documents WHY this step exists.
+    description: |-
+      Compile the application once.
+      Both downstream checks depend on this single build artifact.
+    cmd: echo '[build] compiling app' && sleep 2
+    hint:
+      est_duration_s: 2
+      classification: cpu-bound
+
+  - group: test
+    job: unit
+    desc: unit tests (longer branch, dispatched first)
+    # A folded (>-) block scalar: source newlines fold to single spaces, producing one line.
+    description: >-
+      Unit tests. Larger est_duration_s, so LPT
+      dispatches this branch first.
+    cmd: echo '[test] unit tests' && sleep 4
+    deps: [build.app]
+    hint:
+      est_duration_s: 4
+
+  - group: test
+    job: lint
+    desc: lint (shorter branch, runs alongside unit)
+    description: >-
+      Lint. Runs concurrently with
+      the unit branch.
+    cmd: echo '[test] lint' && sleep 2
+    deps: [build.app]
+    hint:
+      est_duration_s: 2
+
+  - group: deploy
+    job: staging
+    desc: deploy once BOTH checks pass
+    description: |-
+      Deploy to staging. Waits for BOTH checks; skipped if either fails.
+    cmd: echo '[deploy] to staging' && sleep 2
+    deps: [test.unit, test.lint]

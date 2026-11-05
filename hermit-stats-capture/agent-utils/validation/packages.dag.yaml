@@ -1,0 +1,82 @@
+description: Tool-owned offline Python build-and-install smoke checks
+
+resource_caps:
+  python-package: 4
+
+steps:
+  - group: python
+    job: agentctl
+    desc: build and smoke-install the agentctl Python distribution
+    cmd: python3 scripts/check_python_packages.py --project agentctl
+    jobs_flag: ""
+    labels: [validation-packages, validation-python-packages, component-agentctl]
+    timeout: 600
+    hint: &python_package_hint
+      resources: {python-package: 1}
+      est_duration_s: 8
+      classification: cpu-bound
+      preferred_inner_jobs: 1
+      rss_baseline_bytes: 1073741824
+
+  - group: python
+    job: dagrun
+    desc: build and smoke-install the dagrun Python distribution
+    cmd: python3 scripts/check_python_packages.py --project dagrun
+    jobs_flag: ""
+    labels: [validation-packages, validation-python-packages, component-dagrun]
+    timeout: 600
+    hint: *python_package_hint
+
+  - group: python
+    job: experiment-runner
+    desc: build and smoke-install the experiment runner Python distribution
+    cmd: python3 scripts/check_python_packages.py --project parallel-experiment-runner
+    jobs_flag: ""
+    labels: [validation-packages, validation-python-packages, component-experiment-runner]
+    timeout: 600
+    hint: *python_package_hint
+
+  - group: python
+    job: herdr-run
+    desc: build and smoke-install the herdr-run Python distribution
+    cmd: python3 scripts/check_python_packages.py --project herdr-run
+    jobs_flag: ""
+    labels: [validation-packages, validation-python-packages, component-herdr-run]
+    timeout: 600
+    hint: *python_package_hint
+
+  - group: python
+    job: planner
+    desc: build and smoke-install the planner Python distribution
+    cmd: python3 scripts/check_python_packages.py --project pr-landing-planner
+    jobs_flag: ""
+    labels: [validation-packages, validation-python-packages, component-planner]
+    timeout: 600
+    hint: *python_package_hint
+
+  - group: python
+    job: tick-hub
+    desc: build and smoke-install the tick-hub Python distribution
+    cmd: python3 scripts/check_python_packages.py --project tick-hub
+    jobs_flag: ""
+    labels: [validation-packages, validation-python-packages, component-tick-hub]
+    timeout: 600
+    hint: *python_package_hint
+
+  - group: python
+    job: wrkslots
+    desc: build and smoke-install the wrkslots Python distribution
+    cmd: python3 scripts/check_python_packages.py --project wrkslots
+    jobs_flag: ""
+    labels: [validation-packages, validation-python-packages, component-wrkslots]
+    timeout: 600
+    hint: *python_package_hint
+
+  - group: python
+    job: wrkviz
+    desc: build and smoke-install the wrkviz Python distribution
+    cmd: python3 scripts/check_python_packages.py --project wrkviz
+    jobs_flag: ""
+    labels: [validation-packages, validation-python-packages, component-wrkviz]
+    timeout: 600
+    hint: *python_package_hint

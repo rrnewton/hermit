@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-3-c97c28ef10e",
+    "issue_id": "agent-utils-3",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Re-closing after the successor rollout. My claim reopened this for the Google Chat deployment handoff. Candidate 57c1160 (the hermetic test fix, the wrkslots fixture fix, the public baseline and #8) was fully validated, deployed at its exact head, passed the read-only mobile proof, and only then landed on main. The runtime space and thread registrations and the restored tracking state were preserved across the restarts. Private adapter, unit and runbook changes are in the private draft stack and are not part of this tree.",
+    "created_at": "2026-09-25T06:46:14.447956530Z",
+    "updated_at": "2026-09-25T06:46:14.447956530Z"
+  }
+]

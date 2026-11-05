@@ -1,0 +1,314 @@
+{
+  "_about": "Golden cases for readiness (readiness.py / readiness.rs): the prompt-line verdict for rendered pane text, and the prompt tail inferred from a shell rc file. Both unit-test suites load this file.",
+  "prompt": [
+    [
+      "host\n$\n",
+      "$ ",
+      "clean",
+      "last line ends with prompt tail \"$\"",
+      "$"
+    ],
+    [
+      "host\n$ git status\n",
+      "$ ",
+      "dirty",
+      "text typed after prompt tail \"$\": \"$ git status\"",
+      "$ git status"
+    ],
+    [
+      "$ echo $\n",
+      "$ ",
+      "dirty",
+      "prompt tail \"$\" occurs 2 times; possible text follows an earlier prompt: \"$ echo $\"",
+      "$ echo $"
+    ],
+    [
+      "$ echo a\u2028b\n",
+      "$ ",
+      "dirty",
+      "text typed after prompt tail \"$\": \"$ echo a\\u{2028}b\"",
+      "$ echo a\u2028b"
+    ],
+    [
+      "$ typed\rmore\r\n$ ",
+      "$ ",
+      "clean",
+      "last line ends with prompt tail \"$\"",
+      "$ "
+    ],
+    [
+      "$ x\u0085y\n",
+      "$ ",
+      "dirty",
+      "text typed after prompt tail \"$\": \"$ x\\u{85}y\"",
+      "$ x\u0085y"
+    ],
+    [
+      "",
+      "$ ",
+      "abstain",
+      "pane has no rendered output yet",
+      null
+    ],
+    [
+      "   \n\t\n",
+      "$ ",
+      "abstain",
+      "pane has no rendered output yet",
+      null
+    ],
+    [
+      "x\n",
+      "   ",
+      "abstain",
+      "prompt tail is whitespace only",
+      "x"
+    ],
+    [
+      "user@host:~$\n",
+      null,
+      "abstain",
+      "no prompt tail configured or inferable",
+      null
+    ],
+    [
+      "output\nno prompt here\n",
+      "$ ",
+      "abstain",
+      "prompt tail \"$\" not found in last line",
+      "no prompt here"
+    ],
+    [
+      "$ \u00a0\n",
+      "$ ",
+      "clean",
+      "last line ends with prompt tail \"$\"",
+      "$ \u00a0"
+    ],
+    [
+      "> \u001c\n",
+      "> ",
+      "dirty",
+      "text typed after prompt tail \">\": \"> \\u{1c}\"",
+      "> \u001c"
+    ],
+    [
+      "% yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy\n",
+      "% ",
+      "dirty",
+      "text typed after prompt tail \"%\": \"yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy\"",
+      "% yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+    ],
+    [
+      "it's $\n",
+      "$ ",
+      "clean",
+      "last line ends with prompt tail \"$\"",
+      "it's $"
+    ],
+    [
+      "a\n\u3000\n",
+      "$ ",
+      "abstain",
+      "prompt tail \"$\" not found in last line",
+      "a"
+    ]
+  ],
+  "rc_files": [
+    [
+      [
+        80,
+        83,
+        49,
+        61,
+        39,
+        92,
+        117,
+        64,
+        92,
+        104,
+        92,
+        36,
+        32,
+        39,
+        13,
+        10
+      ],
+      "$ "
+    ],
+    [
+      [
+        80,
+        83,
+        49,
+        61,
+        39,
+        92,
+        117,
+        64,
+        92,
+        104,
+        92,
+        36,
+        32,
+        39,
+        13
+      ],
+      "$ "
+    ],
+    [
+      [
+        35,
+        32,
+        80,
+        83,
+        49,
+        61,
+        39,
+        120,
+        62,
+        32,
+        39,
+        10,
+        80,
+        83,
+        49,
+        61,
+        34,
+        92,
+        119,
+        62,
+        32,
+        34,
+        10
+      ],
+      "> "
+    ],
+    [
+      [
+        101,
+        120,
+        112,
+        111,
+        114,
+        116,
+        32,
+        80,
+        83,
+        49,
+        61,
+        39,
+        91,
+        92,
+        117,
+        64,
+        92,
+        104,
+        32,
+        92,
+        87,
+        93,
+        92,
+        36,
+        32,
+        39,
+        10
+      ],
+      "$ "
+    ],
+    [
+      [
+        80,
+        83,
+        49,
+        61,
+        112,
+        108,
+        97,
+        105,
+        110,
+        62,
+        194,
+        160,
+        35,
+        32,
+        99,
+        10
+      ],
+      null
+    ],
+    [
+      [
+        80,
+        83,
+        49,
+        61,
+        39,
+        255,
+        36,
+        32,
+        39,
+        10
+      ],
+      "\ufffd$ "
+    ],
+    [
+      [
+        80,
+        82,
+        79,
+        77,
+        80,
+        84,
+        61,
+        39,
+        37,
+        110,
+        32,
+        37,
+        35,
+        32,
+        39,
+        10
+      ],
+      "%n %# "
+    ],
+    [
+      [
+        110,
+        111,
+        32,
+        112,
+        114,
+        111,
+        109,
+        112,
+        116,
+        32,
+        104,
+        101,
+        114,
+        101,
+        10
+      ],
+      null
+    ],
+    [
+      [
+        80,
+        83,
+        49,
+        61,
+        39,
+        92,
+        117,
+        64,
+        92,
+        104,
+        39,
+        10
+      ],
+      null
+    ]
+  ]
+}

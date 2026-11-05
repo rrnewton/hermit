@@ -1,0 +1,18 @@
+[
+  {
+    "id": "agent-utils-37-727732fc873",
+    "issue_id": "agent-utils-37",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Cause found; fix approved for implementation, not yet built or deployed.\n\nThe short reads after a cut are caused by the history the voice service re-seeds into the fresh backend session. After a few cuts that history holds several read requests, each paired with an assistant reply of only a few words, and the model imitates those replies on the next read. Neither the prompt nor any other session state is responsible.\n\nControlled probe against the deployed backend, with neutral stand-in text, the production instructions and the production read-prompt template. 3 trials per variant; every response ended normally.\n- Current seed: 1/3 full, in both a fresh-message set and a set that re-reads the seeded message as production does.\n- Seed without any assistant items: 6/6 full (3/3 exact in the re-read set).\n- Only the last pair or two seeded: 6/6 full.\n- No seed: 3/3 full.\n- Cut replies marked as interrupted: 1/3. Cut replies reworded as a description: 0/3, because the model copied the description.\n- A seed that also held a completed few-word reply: 2/3. A completed short read can trigger this as well as a cut one, so skipping only cut replies is not enough.\n\nFix approved for implementation: after a renewal, seed only the user's turns. Known limit: a renewed session keeps the user's earlier turns but not the assistant's own earlier replies. Continuity questions about a message still work, because the message text is part of the user's read request; the deploy acceptance re-checks this.\n\nRemaining: implement with tests, review, a single rollout, then a live re-check of reads after a cut plus the full latency and continuity suite.",
+    "created_at": "2026-09-25T20:48:54.555603Z",
+    "updated_at": "2026-09-25T20:48:54.555603Z"
+  },
+  {
+    "id": "agent-utils-37-c55307d1290",
+    "issue_id": "agent-utils-37",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Acceptance met, closing. Live rerun on 2026-09-26 against the deployed internal provider bridge carrying the voice-service fix. Direct HTTP and real-browser page reads, read-only credential, content-free measurements.\n\n- Re-answer probe, two cuts and then a full read of a different message:\n  - 0 of 2 post-cut reads read the cut message again.\n  - Coverage of the requested message was 1.00 and 0.92, against 0.86 for a fresh-session control.\n  - Both reads ended naturally at about 69 s.\n  - On the previous deployment, 2 of 2 re-read the cut message, with coverage 0.03 each.\n- Live matrix, 12 of 12 cases passed, 29 turns, no retries, one backend session opened per cut:\n  - Reads immediately after an interrupt played in full. So did reads after a 3 s-delayed switch and after an interrupt followed by 80 s idle.\n  - A six-iteration interrupt loop gave first audio in 341-750 ms on every follow-up read, with no watchdog and no reconnect.\n- Idle resume: first audio in 62 ms after 30 s idle and 27 ms after 80 s.\n- History across the cut is kept. The bridge-level continuity probe answered about the cut message (11 hits) and the fresh-session control did not (0).\n\nUnverified here, and filed separately as #47 read-aloud-overlong: full reads of long messages can now run well past 120 s. That is a different defect, and it predates this fix. Until now a 120 s whole-response limit in the provider bridge cut those reads off without reporting it. The fix turned that limit into an idle timeout.",
+    "created_at": "2026-09-26T09:35:28.955283349Z",
+    "updated_at": "2026-09-26T09:35:28.955283349Z"
+  }
+]

@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-187-c2815c0be54",
+    "issue_id": "agent-utils-187",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Seen in the #190 voice-agent-tools live re-run (2026-10-07): an author with no display name had its numeric id spoken as the name (twice), a commit hash was spelled out digit by digit, a dev hostname from message text was read in 4 answers, and Markdown bold markers reached 3 spoken summaries.",
+    "created_at": "2026-10-07T09:51:50.421955842Z",
+    "updated_at": "2026-10-07T09:51:50.421955842Z"
+  }
+]

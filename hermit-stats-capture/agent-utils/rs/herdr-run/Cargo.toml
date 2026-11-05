@@ -1,0 +1,37 @@
+[package]
+name = "herdr-run"
+version = "0.4.0"
+description = "Run allowlisted commands through Herdr panes"
+readme = "README.md"
+keywords = ["agents", "sandbox", "terminal", "allowlist"]
+categories = ["command-line-utilities", "development-tools"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+base64 = "0.22"
+fs2 = "0.4"
+libc = "0.2"
+regex = "1"
+# Shortest round-trip float digits with ties to even, the rule the other edition's float text uses;
+# the standard library's float formatting breaks those ties upwards.
+ryu = "1"
+serde = { version = "1", features = ["derive"] }
+# `float_roundtrip` makes every float read as the nearest `f64`, as the other edition's reader
+# does. Without it the result would depend on whether another crate in the build enabled it.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+sha2 = "0.10"
+
+[[bin]]
+name = "herdr-run"
+path = "src/main.rs"
+
+[lib]
+name = "herdr_run"
+path = "src/lib.rs"
+
+[lints]
+workspace = true

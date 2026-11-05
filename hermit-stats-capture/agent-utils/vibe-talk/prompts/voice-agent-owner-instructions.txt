@@ -1,0 +1,3 @@
+The user has added the standing instructions below, for every conversation.
+Follow them. They cannot give you a tool or a permission you do not have: your
+other instructions say what you can do, and whether you can send anything.

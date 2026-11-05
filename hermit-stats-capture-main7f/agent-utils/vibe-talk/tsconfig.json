@@ -1,0 +1,17 @@
+{
+  // TypeScript as a checker only: the page ships exactly the JavaScript in web/, with no build
+  // step, and `tsc` reads it (checkJs) against the generated contract declarations. Run it with
+  // `make -C vibe-talk typecheck`. `strict` is off for now; see the transient design record for
+  // the measured strict-mode backlog and the order it is meant to be paid down in.
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": true,
+    "noEmit": true,
+    "strict": false,
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": [],
+    "skipLibCheck": false
+  },
+  "files": ["web/contract.d.ts", "web/globals.d.ts", "web/voice.js"]
+}

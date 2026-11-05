@@ -1,0 +1,24 @@
+# Reproducible cold-build sweep for choosing the repository graph's Cargo inner width. Each trial
+# cleans only this dedicated /tmp target directory, so width N never benefits from width N-1.
+
+description: Validation audit cold Cargo width sweep
+
+steps:
+  - group: build
+    job: workspace
+    desc: cold release build of the complete Rust workspace
+    cmd: >-
+      host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
+      cargo clean --manifest-path rs/Cargo.toml
+      --target-dir /tmp/agent-utils-cargo-width-sweep >/dev/null &&
+      cargo build --locked --release --workspace --manifest-path rs/Cargo.toml
+      --target "$host_target" --target-dir /tmp/agent-utils-cargo-width-sweep
+    jobs_flag: ""
+    jobs_env: CARGO_BUILD_JOBS
+    timeout: 1200
+    cpu_timeout: 2400
+    hint:
+      est_duration_s: 120
+      classification: cpu-bound
+      preferred_inner_jobs: 8
+      rss_baseline_bytes: 4294967296

@@ -1,0 +1,18 @@
+{
+  "slot": "slot-a",
+  "generation": 1,
+  "actor": {
+    "pid": 10,
+    "start_ticks": 110,
+    "boot_id": "11111111-2222-3333-4444-555555555555",
+    "host_id": "neutral-host",
+    "cgroup_path": "/neutral.slice/worker.scope"
+  },
+  "coordinator_authorized": true,
+  "owner_state": "dead",
+  "registered_liveness": "dead",
+  "heartbeat_age_seconds": 601,
+  "heartbeat_ttl_seconds": 600,
+  "validate_complete": false,
+  "live_validate_owner": false
+}

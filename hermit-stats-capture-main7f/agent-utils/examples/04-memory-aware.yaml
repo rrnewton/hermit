@@ -1,0 +1,52 @@
+# 04-memory-aware (literate YAML edition)
+#
+# ISOMORPHIC to examples/04-memory-aware.json (the cross harness asserts identical loading).
+# Each step carries a memory hint; with them, `--max-mem` picks the largest --max-steps whose
+# modeled worst-case footprint fits a RAM budget. This example pins mem_cap_factor /
+# mem_cap_floor_bytes / outer_mem_safety_factor so the modeled numbers are exactly the byte values
+# below.
+#
+# Try:
+#   dagrun run --dag examples/04-memory-aware.yaml --max-mem 4G --allow-cgroup-failure
+#   dagrun run --dag examples/04-memory-aware.yaml --max-mem 8G --allow-cgroup-failure
+
+description: |-
+  Memory-aware sizing: per-step RSS hints let --max-mem pick the largest --max-steps whose modeled worst-case footprint fits a RAM budget.
+
+# No headroom multipliers, no floor — so the modeled footprint is exactly the summed byte values.
+mem_cap_factor: 1.0
+mem_cap_floor_bytes: 0
+outer_mem_safety_factor: 1.0
+
+steps:
+  - group: build
+    job: compile
+    desc: compile (~2 GiB peak RSS)
+    description: |-
+      Compile step, ~2 GiB peak RSS.
+      Counts toward the modeled worst-case co-running footprint.
+    cmd: echo '[build] compile' && sleep 2
+    hint:
+      classification: cpu-bound
+      rss_baseline_bytes: 2147483648   # 2 GiB
+
+  - group: test
+    job: integration
+    desc: integration suite (~3 GiB peak RSS)
+    description: >-
+      Integration suite, ~3 GiB peak RSS.
+      The heaviest step in the graph.
+    cmd: echo '[test] integration' && sleep 2
+    hint:
+      rss_baseline_bytes: 3221225472   # 3 GiB
+
+  - group: test
+    job: fuzz
+    desc: fuzzer (~2 GiB baseline, hard-capped at 4 GiB)
+    description: >-
+      Fuzzer. Baseline ~2 GiB, but an explicit
+      hard_mem_max_bytes caps it at 4 GiB.
+    cmd: echo '[test] fuzz' && sleep 2
+    hint:
+      rss_baseline_bytes: 2147483648   # 2 GiB
+      hard_mem_max_bytes: 4294967296   # 4 GiB

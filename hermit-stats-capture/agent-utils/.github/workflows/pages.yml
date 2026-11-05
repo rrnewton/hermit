@@ -1,0 +1,71 @@
+name: pages
+
+# Publish the hand-written website under site/ to GitHub Pages, at
+# https://rrnewton.github.io/agent-utils/. There is no build step: the job checks the pages with
+# the same standard-library checker the validation graph runs on every change
+# (scripts/check_site.py), which then stages exactly the files it checked: everything under site/
+# except site/demos/ and site/README.md, the repository source beside the pages. That staged copy
+# is what is uploaded.
+#
+# ONE-TIME REPOSITORY SETTING, which no workflow token can change: Settings -> Pages -> Build and
+# deployment -> Source must be "GitHub Actions". Until it is, the configure-pages step fails
+# ("Get Pages site failed ... Not Found"); that failure is the setting, not the site. After
+# changing the setting, run this workflow once by hand (Actions -> pages -> Run workflow, or
+# `gh workflow run pages.yml`), because nothing else re-runs a push that already failed.
+
+on:
+  push:
+    branches: [main]
+    # Only a change to the pages, to the checker (which decides what is published: its --stage
+    # copies the published set), or to this workflow changes what is published. A renamed
+    # document elsewhere can still break a link the site makes, but that is caught before it
+    # lands: the hygiene group of `make validate` runs the same checker for every path.
+    paths:
+      - 'site/**'
+      - 'scripts/check_site.py'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+# The narrowest grant that deploys: read the checkout, write the Pages site, and mint the OIDC
+# token deploy-pages uses to prove the artifact came from this workflow. `contents: read` is
+# stated rather than inherited so that adding a write later has to be deliberate.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time. A newer push waits for a running deployment instead of cancelling
+# it: a deployment cancelled half-way can leave the previous site unpublished.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # Checking and uploading a few megabytes takes well under a minute. This bounds a
+    # hang, not a slow run.
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      # The same gate as the validation graph's repository.hygiene.site node, so a page that
+      # would fail `make validate` is never published. --stage copies nothing unless the check
+      # passes, so a failed check leaves nothing to upload. This is the one graph command run
+      # here, because it also produces the upload; the checker's --self-test is not repeated,
+      # since repository CI runs the whole graph, that node included, on every push.
+      - name: check and stage the site
+        run: python3 scripts/check_site.py --stage "$RUNNER_TEMP/pages"
+
+      - uses: actions/configure-pages@v6
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: ${{ runner.temp }}/pages
+      - id: deployment
+        uses: actions/deploy-pages@v5

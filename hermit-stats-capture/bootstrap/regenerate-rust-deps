@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+repo_root=$(cd -- "$script_dir/.." && pwd)
+third_party_dir=$repo_root/shim/third-party/rust
+
+cd "$repo_root"
+
+if [[ ! -f Cargo.lock ]] || ! git ls-files --error-unmatch Cargo.lock >/dev/null 2>&1; then
+  echo "Cargo.lock must exist and be tracked before Buck dependencies are generated" >&2
+  exit 1
+fi
+
+if [[ ! -f reverie/BUCK ]]; then
+  echo "initialize the pinned reverie submodule before generating Buck dependencies" >&2
+  exit 1
+fi
+
+cargo metadata --locked --format-version 1 --no-deps >/dev/null
+# A Buck target feature Reindeer does not resolve leaves its crates without a
+# target; refuse before the slow vendor step rather than at the alias step.
+"$repo_root/scripts/check-buck-reindeer-features.rs"
+
+# A fresh checkout has none of these generated paths. Removing only paths that
+# Git confirms are excluded makes repeated local use take the same path, which
+# then either restores them from the cache or generates them.
+for generated in \
+  "$third_party_dir/.cargo" \
+  "$third_party_dir/BUCK" \
+  "$third_party_dir/vendor"
+do
+  relative=${generated#"$repo_root/"}
+  if [[ -e $generated ]] && ! git check-ignore -q "$relative"; then
+    echo "refusing to remove non-ignored path: $relative" >&2
+    exit 1
+  fi
+done
+# Opt-in: fetch Cargo.lock's git dependencies from local mirrors (docs/BUCK2_OSS.md).
+# Checked before anything is removed, so a refusal leaves the previous output in place.
+if [[ -n ${HERMIT_GIT_DEP_MIRRORS:-} ]]; then
+  # shellcheck source=bootstrap/git-dep-mirrors.sh
+  source "$script_dir/git-dep-mirrors.sh"
+  git_dep_mirrors_apply Cargo.lock "$HERMIT_GIT_DEP_MIRRORS"
+fi
+
+rm -rf -- \
+  "$third_party_dir/.cargo" \
+  "$third_party_dir/BUCK" \
+  "$third_party_dir/vendor"
+
+reindeer_args=(
+  --third-party-dir "$third_party_dir"
+  --manifest-path "$repo_root/Cargo.toml"
+)
+
+first_output=$(mktemp)
+trap 'rm -f -- "$first_output"' EXIT
+
+# What Reindeer generates is restored from a cache entry named by its inputs
+# when an earlier run produced it (bootstrap/rust-deps-cache.sh).
+# shellcheck source=bootstrap/rust-deps-cache.sh
+source "$script_dir/rust-deps-cache.sh"
+cache_root=$(rust_deps_cache_root)
+cache_key=
+restored=1
+if [[ -n $cache_root ]]; then
+  # A checkout the key cannot cover, or a key that cannot be computed, is
+  # generated without the cache: nothing restored, nothing stored.
+  key_status=0
+  cache_key=$(rust_deps_cache_key "$repo_root") || key_status=$?
+  if [[ $key_status -eq 3 ]]; then
+    echo "warning: not using the rust-deps cache: $cache_key" >&2
+  elif [[ $key_status -ne 0 ]]; then
+    echo "warning: not using the rust-deps cache: its key could not be computed (above)" >&2
+  fi
+  [[ $key_status -eq 0 ]] || cache_key=
+fi
+if [[ -n $cache_key ]]; then
+  restored=0
+  rust_deps_cache_restore "$cache_root" "$cache_key" "$third_party_dir" "$first_output" || restored=$?
+  if [[ $restored -eq 2 ]]; then
+    # A damaged entry would otherwise fail every later run with these inputs.
+    echo "warning: restoring $cache_root/$cache_key failed (above); discarding it and generating" >&2
+    rm -rf -- "$third_party_dir/.cargo" "$third_party_dir/vendor"
+    rust_deps_cache_discard "$cache_root" "$cache_key"
+  fi
+fi
+if [[ $restored -eq 0 ]]; then
+  cp -- "$first_output" "$third_party_dir/BUCK"
+  echo "restored the vendored crates and Reindeer's BUCK from $cache_root/$cache_key" >&2
+else
+  "$script_dir/reindeer" "${reindeer_args[@]}" vendor
+  "$script_dir/reindeer" "${reindeer_args[@]}" buckify --stdout >"$first_output"
+  "$script_dir/reindeer" "${reindeer_args[@]}" buckify
+  cmp --silent "$first_output" "$third_party_dir/BUCK" || {
+    echo "Reindeer produced different BUCK output across consecutive invocations" >&2
+    exit 1
+  }
+  # Cargo's download caches (about 870 MB) are not output; only the
+  # vendored-sources configuration is. Removing them gives a generated and a
+  # restored checkout the same tree.
+  find "$third_party_dir/.cargo" -mindepth 1 -maxdepth 1 ! -name config.toml -exec rm -rf -- {} +
+  # Reindeer resolves the lock itself and can rewrite it. Output a refused run
+  # generated is never stored, and neither is output whose inputs moved during
+  # generation, which a later run with the original inputs would restore.
+  git diff --exit-code -- Cargo.lock
+  if [[ -n $cache_key ]]; then
+    if recheck_key=$(rust_deps_cache_key "$repo_root") && [[ $recheck_key == "$cache_key" ]]; then
+      rust_deps_cache_publish "$cache_root" "$cache_key" "$third_party_dir" "$first_output"
+    else
+      echo "warning: the rust-deps cache inputs changed while Reindeer ran, or could not be read again; not storing its output" >&2
+    fi
+  fi
+fi
+
+# Prelude normally assembles a Cargo manifest directory from symlinks. The
+# pinned reverie-dbt build installs native headers and preserves those links,
+# which would leave dangling paths after installation. Patch both independently
+# generated graphs with the same declared copied-directory target, then keep
+# comparing them through every deterministic postprocessing step below.
+materialize_reverie_dbt=$repo_root/scripts/patch-reverie-dbt-buck.rs
+"$materialize_reverie_dbt" "$first_output"
+"$materialize_reverie_dbt" "$third_party_dir/BUCK"
+
+git diff --exit-code -- Cargo.lock
+
+# One third-party cell serves both Hermit and Reverie: .buckconfig maps the
+# `reverie_shim` cell onto this one, so Reverie's BUCK files resolve their
+# third-party crates here and only one copy of each crate is compiled. Reverie
+# names those crates without a version suffix, and Reindeer only emits such an
+# alias for the manifest's own direct dependencies, so the aliases Reverie
+# needs are appended here. Each is resolved against the BUCK just generated, so
+# a version bump cannot silently strand one.
+append_shared_cell_aliases() {
+  local buck=$1
+  local list=$third_party_dir/shared-cell-aliases.txt
+  [[ -f $list ]] || { echo "missing $list" >&2; exit 1; }
+  {
+    echo
+    echo "# Aliases for crates the Reverie cell names without a version suffix."
+    echo "# Appended by bootstrap/regenerate-rust-deps from shared-cell-aliases.txt."
+  } >>"$buck"
+  local crate actual
+  while read -r crate; do
+    [[ -n $crate && ${crate:0:1} != "#" ]] || continue
+    if grep -qE "^    name = \"$crate\",$" "$buck"; then
+      echo "shared-cell alias '$crate' already exists in the generated BUCK" >&2
+      exit 1
+    fi
+    # grep exits 1 when it finds nothing, as for a crate with no target; under
+    # pipefail that would end the script here without a word, so that status
+    # is tolerated and the empty result is tested below. A read error (exit 2)
+    # still ends the script here, with grep's own message.
+    actual=$({ grep -oE "^    name = \"$crate-[0-9][0-9a-zA-Z.]*\",$" "$buck" || [[ $? -eq 1 ]]; } \
+      | sed -E 's/^    name = "(.*)",$/\1/' | sort -V | tail -1)
+    if [[ -z $actual ]]; then
+      echo "no versioned target for shared-cell alias '$crate' in $buck:" \
+        "no workspace member reaches $crate with the features" \
+        "shim/third-party/rust/reindeer.toml resolves them with" \
+        "(see scripts/check-buck-reindeer-features.rs)" >&2
+      exit 1
+    fi
+    cat >>"$buck" <<EOT
+
+third_party_rust_alias(
+    name = "$crate",
+    actual = ":$actual",
+    platforms = [
+        "linux-arm64",
+        "linux-x86_64",
+        "macos-arm64",
+        "macos-x86_64",
+        "windows-gnu",
+        "windows-msvc",
+    ],
+    visibility = ["PUBLIC"],
+)
+EOT
+  done <"$list"
+}
+append_shared_cell_aliases "$first_output"
+append_shared_cell_aliases "$third_party_dir/BUCK"
+
+cmp --silent "$first_output" "$third_party_dir/BUCK" || {
+  echo "complete Buck generation was not byte-identical across consecutive invocations" >&2
+  exit 1
+}
+
+sha256sum \
+  Cargo.lock \
+  "$third_party_dir/BUCK"

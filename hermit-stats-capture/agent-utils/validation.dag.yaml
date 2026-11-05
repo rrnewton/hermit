@@ -1,0 +1,40 @@
+# The complete portable, current-toolchain repository contract. Supplemental compatibility,
+# container, and deployment lanes remain focused workflows. Includes are expanded once at load
+# time into one namespaced graph with one scheduler and one resource model. The only nested
+# schedulers are explicit `delegated_children` self-tests whose cgroup subtree remains owned by
+# this outer run.
+
+description: Complete portable, current-toolchain agent-utils validation contract
+
+include:
+  - path: validation/repository.dag.yaml
+    namespace: repository
+  - path: validation/python-components.dag.yaml
+    namespace: python
+  - path: validation/python-lifecycle.dag.yaml
+    namespace: python-lifecycle
+  - path: validation/rust.dag.yaml
+    namespace: rust
+    after: [repository.build.rust-launchers]
+  - path: validation/cross.dag.yaml
+    namespace: cross
+    after: [repository.build.rust-launchers]
+  - path: validation/examples.dag.yaml
+    namespace: examples
+    after: [repository.build.rust-launchers]
+  - path: validation/packages.dag.yaml
+    namespace: packages
+    # Package inspection reads generated guides. Prove they are current before any package job
+    # starts, and avoid racing `setup rs`, which refreshes those same tracked outputs.
+    after: [repository.docs.embedded-userguides]
+  - path: validation/rust-packages.dag.yaml
+    namespace: rust-packages
+    # Rust package verification is offline. The setup node both proves the launchers and warms the
+    # clean Cargo cache, so package nodes cannot race ahead and fail on an unfetched dependency.
+    after: [repository.build.rust-launchers]
+  - path: validation/timeline.dag.yaml
+    namespace: timeline
+  - path: vibe-talk/tests.dag.yaml
+    namespace: vibe-talk
+
+steps: []

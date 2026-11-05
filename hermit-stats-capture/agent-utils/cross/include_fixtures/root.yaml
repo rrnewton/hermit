@@ -1,0 +1,15 @@
+description: composed parity fixture
+include:
+  - path: fragments/component.yaml
+    namespace: component
+    after: [setup.ready]
+resource_caps:
+  browser: 1
+steps:
+  - group: setup
+    job: ready
+    cmd: "true"
+  - group: publish
+    job: all
+    cmd: "true"
+    deps: [component.test.unit]

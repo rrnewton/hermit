@@ -1,0 +1,12 @@
+{
+  "hermit": {
+    "hermit-cli/src/bin/hermit/backends.rs": "9acbc80343ba74f2743f0b10b21b5841bb3857e108f4f35ab277fbd1630397ed",
+    "hermit-cli/src/bin/hermit/verify_run.rs": "bebed62f5e580653f38010a9ecec7c3e77d4fa6309dbba67ab90246b7f5cd667"
+  },
+  "reverie": {
+    "reverie-dbt/src/backend_stats.rs": "27e9590dac6c6d259e4ff09f51ce93643b6c4521c80cb69b7e29e418908383e4",
+    "reverie-dbt/src/launcher.rs": "7fd27e21aa875299f8436388481d2a9a8ee152513ef2580eb53b79239056d6e5",
+    "reverie-dbt/src/lib.rs": "1efed130db3f6621c9632a25a90d7bdb0346c20b10d3df970ead8b80c0c646fb",
+    "reverie-dbt/src/launcher/tests/stats_capture.rs": "356d8851de910f60c6b91b76fe1d5a78d57e01a00c752c2658b55fdd380cd4f7"
+  }
+}

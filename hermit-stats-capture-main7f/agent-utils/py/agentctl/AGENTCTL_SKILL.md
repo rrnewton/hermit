@@ -1,0 +1,1 @@
+../../skills/agentctl/SKILL.md

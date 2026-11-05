@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Install one directory's pinned npm packages, once per pin.
+#
+# A validation step that needs npm packages must bring them, not find them: a check that fails
+# because an earlier, unrelated setup was never run reports the machine, not the code. This is
+# the step that brings them, named so a failed download reads as a failed download.
+#
+# The pin is the directory's package-lock.json when it tracks one (installed with `npm ci`, which
+# verifies every package's integrity), else its package.json, whose versions must then be exact
+# (installed with `npm install --no-package-lock`, so no untracked lockfile is left behind). The
+# sha256 of that file is stamped into node_modules after a successful install, and a later run
+# with the same pin does nothing; a changed pin reinstalls from scratch.
+#
+# npm is "npm" from PATH unless AGENT_UTILS_NPM names another binary, and it honours npm's normal
+# registry configuration, so a host that reaches packages through a mirror sets that up once,
+# outside this repository.
+set -euo pipefail
+
+if [ "$#" -ne 1 ]; then
+  echo "usage: scripts/provision-node-packages DIRECTORY" >&2
+  exit 2
+fi
+
+dir="${1%/}"
+if [ ! -f "$dir/package.json" ]; then
+  echo "provision-node-packages: $dir has no package.json" >&2
+  exit 2
+fi
+
+npm_bin="${AGENT_UTILS_NPM:-npm}"
+if [ -f "$dir/package-lock.json" ]; then
+  pin="$dir/package-lock.json"
+  install=(ci --no-audit --no-fund)
+else
+  pin="$dir/package.json"
+  install=(install --no-package-lock --no-audit --no-fund)
+fi
+want="$(sha256sum -- "$pin" | cut -d' ' -f1)"
+stamp="$dir/node_modules/.provisioned-sha256"
+
+# Two steps provisioning the same directory must not interleave one install with another.
+mkdir -p -- "$dir/node_modules"
+exec 9>"$dir/node_modules/.provision.lock"
+flock 9
+
+if [ -f "$stamp" ] && [ "$(cat -- "$stamp")" = "$want" ]; then
+  echo "provision-node-packages: $dir is current (${pin##*/} sha256 ${want:0:12})"
+  exit 0
+fi
+
+rm -f -- "$stamp"
+echo "provision-node-packages: installing $dir from ${pin##*/} (sha256 ${want:0:12}) with $npm_bin"
+if ! "$npm_bin" "${install[@]}" --prefix "$dir"; then
+  echo "provision-node-packages: $npm_bin ${install[0]} failed for $dir; nothing was stamped" >&2
+  exit 1
+fi
+printf '%s\n' "$want" >"$stamp"

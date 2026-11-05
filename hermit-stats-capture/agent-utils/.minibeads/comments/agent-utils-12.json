@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-12-c94c8dff78ae",
+    "issue_id": "agent-utils-12",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Final live acceptance, 2026-09-25 23:48\u201323:51Z. One sequential, read-only session on the deployed 1a9baed build. The served voice.js matched the landed hash. The front-door sign-in hop was bypassed: the page and websocket went through the local ingress, with the websocket path and read-scope credential unchanged. The front-door hop is covered by the owner's signed-in phone test. #12 live-transcript-latency: PASS. There were two spoken turns of 2368 ms each. User text first appeared 1803 and 1432 ms after speech start, which is 565 and 936 ms before speech end. The user final arrived 2848 and 2730 ms after speech end. The assistant was first audible 812 and 676 ms after speech end. Assistant text led its audio by 123 and 65 ms. The page rendered each frame within 1.1 ms at most. The audio_end turn_complete acks were consumed separately (3). Closing.",
+    "created_at": "2026-09-25T23:54:35.158742000Z",
+    "updated_at": "2026-09-25T23:54:35.158742000Z"
+  }
+]

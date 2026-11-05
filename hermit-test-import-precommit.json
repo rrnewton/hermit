@@ -1,0 +1,9 @@
+{
+  "parent": "e7307c2c2aa7f97d0f4aa209ea47122d0915cfc5",
+  "status": "M  hermit-cli/src/bin/hermit/backends.rs\n",
+  "paths": [
+    "hermit-cli/src/bin/hermit/backends.rs"
+  ],
+  "numstat": "1\t0\thermit-cli/src/bin/hermit/backends.rs\n",
+  "patch": "diff --git a/hermit-cli/src/bin/hermit/backends.rs b/hermit-cli/src/bin/hermit/backends.rs\nindex bad4438096..e5e20aacb4 100644\n--- a/hermit-cli/src/bin/hermit/backends.rs\n+++ b/hermit-cli/src/bin/hermit/backends.rs\n@@ -2350,6 +2350,7 @@ mod tests {\n         stdin_reads: u64,\n         memory_hash: u64,\n     ) -> DbtBackendStatsSnapshot {\n+        use reverie_dbt::backend_stats::DbtBackendStatsAggregator;\n         use reverie_dbt::backend_stats::DbtProcessRecord;\n \n         let record = DbtProcessRecord {\n"
+}

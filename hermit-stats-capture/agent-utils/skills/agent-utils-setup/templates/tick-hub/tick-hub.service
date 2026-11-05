@@ -1,0 +1,9 @@
+[Unit]
+Description={{PROJECT}} harness: one tick-hub tick, ACTION lines delivered to the coordinator
+
+[Service]
+Type=oneshot
+# A user service does not inherit an interactive PATH; agentctl needs herdr and the harness.
+Environment=PATH={{PATH}}
+WorkingDirectory={{HARNESS}}
+ExecStart={{HARNESS}}/bin/tick-deliver coordinator

@@ -1,0 +1,9 @@
+{
+  "sampled_at": "2026-10-14T13:40:21.163962+00:00",
+  "available_bytes": 773270581248,
+  "build_floor_bytes": 650000000000,
+  "floor_satisfied": true,
+  "actual_incremental_footprint": "unmeasured",
+  "peak_usage": "unmeasured",
+  "qualification": "Host free-space boundary only; host change cannot be attributed to this task, reflinks, or other lanes separately."
+}

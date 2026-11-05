@@ -1,0 +1,112 @@
+[
+  {
+    "author": "alice",
+    "content": "Is the release branch green yet?"
+  },
+  {
+    "author": "build-bot",
+    "content": "[build-bot coordinator] Backup check, 10:52 PM ET. All 4 shards are synced, the queue is empty, and nothing needed fixing.",
+    "heading": {
+      "cut": 51,
+      "tag": "build-bot coordinator",
+      "time": "10:52 PM ET",
+      "title": "Backup check"
+    }
+  },
+  {
+    "author": "build-bot",
+    "content": "[build-bot coordinator] Report (11:58 AM ET):\nThe nightly run finished. Two jobs were retried and both came back green.",
+    "heading": {
+      "cut": 45,
+      "tag": "build-bot coordinator",
+      "time": "11:58 AM ET",
+      "title": "Report"
+    }
+  },
+  {
+    "author": "build-bot",
+    "content": "[build-bot coordinator] Cache warm-up and cold starts, first figures (3:40 PM ET).\n\n- shard one: 412 ms\n- shard two: 388 ms\n- shard three: 405 ms",
+    "content_html": "<p class=\"rh-src\">[build-bot coordinator] Cache warm-up and cold starts, first figures (3:40 PM ET).</p>\n<ul>\n<li>shard one: 412 ms</li>\n<li>shard two: 388 ms</li>\n<li>shard three: 405 ms</li>\n</ul>\n",
+    "heading": {
+      "cut": 82,
+      "tag": "build-bot coordinator",
+      "time": "3:40 PM ET",
+      "title": "Cache warm-up and cold starts, first figures"
+    }
+  },
+  {
+    "author": "build-bot",
+    "content": "(ops2) Midday summary, 15:05Z.\nNothing is stuck; the backlog cleared by 06:10Z.",
+    "heading": {
+      "cut": 30,
+      "tag": "ops2",
+      "time": "15:05Z",
+      "title": "Midday summary"
+    }
+  },
+  {
+    "author": "build-bot",
+    "content": "(ops2) Weekly tally, 11:45Z (plan filed 02:57Z; expect 3-5 merges).\n**Three** merged, and one is still in review.",
+    "content_html": "<p><span class=\"rh-src\">(ops2) Weekly tally, 11:45Z (plan filed 02:57Z; expect 3-5 merges).<br>\n</span><strong>Three</strong> merged, and one is still in review.</p>\n",
+    "heading": {
+      "cut": 67,
+      "tag": "ops2",
+      "time": "11:45Z",
+      "title": "Weekly tally (plan filed 02:57Z; expect 3-5 merges)"
+    }
+  },
+  {
+    "author": "build-bot",
+    "content": "[build-bot coordinator] 3:20 PM ET:\nAll shards idle.",
+    "heading": {
+      "cut": 35,
+      "tag": "build-bot coordinator",
+      "time": "3:20 PM ET"
+    }
+  },
+  {
+    "author": "build-bot",
+    "content": "[build-bot coordinator] Yes. The run is green and the tag is pushed.",
+    "heading": {
+      "cut": 24,
+      "tag": "build-bot coordinator"
+    }
+  },
+  {
+    "author": "build-bot",
+    "content": "[build-bot coordinator] Release notes, 4:05 PM ET: three fixes",
+    "heading": {
+      "cut": 51,
+      "tag": "build-bot coordinator",
+      "time": "4:05 PM ET",
+      "title": "Release notes"
+    }
+  },
+  {
+    "author": "build-bot",
+    "content": "[build-bot coordinator] Follow-up: and one new flag.",
+    "heading": {
+      "cut": 35,
+      "tag": "build-bot coordinator",
+      "title": "Follow-up"
+    }
+  },
+  {
+    "author": "build-bot",
+    "content": "[build-bot coordinator] Merged 2c94a99229cf0cb59720f5094fd658b6d3cbfb34432720925fe692db30e41e4d.\nNext merge is queued.",
+    "heading": {
+      "cut": 96,
+      "tag": "build-bot coordinator",
+      "title": "Merged 2c94a99229cf0cb59720f5094fd658b6d3cbfb34432720925fe692db30e41e4d"
+    }
+  },
+  {
+    "author": "owner",
+    "content": "[human] Thanks, ship it.",
+    "heading": {
+      "cut": 24,
+      "tag": "human",
+      "title": "Thanks, ship it"
+    }
+  }
+]

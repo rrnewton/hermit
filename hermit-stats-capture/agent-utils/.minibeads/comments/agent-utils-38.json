@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-38-aad410d3465",
+    "issue_id": "agent-utils-38",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Closing #38 read-token-conversation-probe: fixed by 5d71e46 and verified deployed. Before landing: bare make validate exit code 0 (25/25) and make mypy clean. The real-Chromium read-token step in tests/offline_cache_browser.py passes at 412x915, 360x800 and 1280x800, and fails with '403 GET /api/v1/conversations' when the client change is removed; the fake-DOM guard test fails the same way. The deployer reviewed the change independently (PASS) and redeployed; client-config now reports token_scope \"read\" for the read credential. Live read-only check at 412x915 under the read credential, with non-GET requests aborted (none were attempted): before, 3 API GETs, 1 refused (403 on the conversation listing) and 1 console error; after, 2 API GETs, 0 refused, 0 console errors, 0 page errors, no error panel, and Settings says stored conversations need the write-scope token. The conversation routes still refuse a read token.",
+    "created_at": "2026-09-25T20:18:38.669380000+00:00",
+    "updated_at": "2026-09-25T20:18:38.669380000+00:00"
+  }
+]

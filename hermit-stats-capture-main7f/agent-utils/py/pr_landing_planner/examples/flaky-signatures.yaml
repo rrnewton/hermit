@@ -1,0 +1,11 @@
+# Caller-supplied flaky signatures. A red check is reclassified as flaky (=> refire-ci, not
+# hold-fix) when its NAME matches name_regex AND its message matches text_regex (either may be
+# omitted; at least one is required). Keep this list curated — a stale signature silently masks a
+# real regression, so ownership + freshness of this file matters.
+signatures:
+  - name_regex: "wasm-core"
+    note: "known-flaky WASM browser test (headless Chromium timing)"
+  - name_regex: "bwrap|user-namespace"
+    note: "sandbox/user-namespace flake on shared runners"
+  - text_regex: "font.*abort|equivalence seed=315"
+    note: "font-abort and the seed=315 equivalence divergence are known flakes"

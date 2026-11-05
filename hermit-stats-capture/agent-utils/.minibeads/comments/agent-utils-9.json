@@ -1,0 +1,18 @@
+[
+  {
+    "id": "agent-utils-9-cf41df06268",
+    "issue_id": "agent-utils-9",
+    "author": "gpt-5.6-sol",
+    "body": "[gpt-5.6-sol] The promised owner UX specification is not present in the task, parent, or tracker comments. Leaving #agent-utils-9 gchat-thread-selector open and unimplemented until that specification arrives.",
+    "created_at": "2026-09-25T04:12:43.551516725Z",
+    "updated_at": "2026-09-25T04:12:43.551516725Z"
+  },
+  {
+    "id": "agent-utils-9-15dbbfb539b",
+    "issue_id": "agent-utils-9",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Closing #9 gchat-thread-selector: the shipped selector already meets the concrete requirement that each expected linked conversation is visible and selectable. No UI was changed for this close, and no selector design was invented. Live, read-only (every non-GET API request aborted), 390x844 mobile, served voice.js byte-identical to main 3082a20: the whole-space source's Threads view lists both expected linked conversations by title. Tapping either one opens it (21 and 40 rows); each tap target is 340x112 CSS px; Back restores the same five cards in the same order. The narrowed one-conversation source offers no Threads control, so it cannot list itself as an unrelated entry (65abb76). Focused checks on main 3082a20: node --test on voice_page.test.mjs and app_page.test.mjs pass, including 'linked conversation sources stay in the channel picker when thread timelines are off' (81c7a84); cargo tests a_registration_scoped_to_one_thread_offers_no_child_threads and restored_managed_sources_remain_distinct_ordered_app_channels pass. Not covered: nothing marks which linked conversation is the current one beyond its title, and the owner UX specification has still not arrived. If that specification asks for more, it is a new issue under the same slug, not a reason to keep this one open.",
+    "created_at": "2026-09-25T18:26:00.918304000Z",
+    "updated_at": "2026-09-25T18:26:00.918304000Z"
+  }
+]

@@ -1,0 +1,2271 @@
+{
+  "$defs": {
+    "ApiErrorBody": {
+      "description": "A JSON error body.",
+      "properties": {
+        "detail": {
+          "description": "Human-readable detail. Never contains a secret.",
+          "type": "string"
+        },
+        "error": {
+          "description": "Stable machine-readable code.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "error",
+        "detail"
+      ],
+      "type": "object"
+    },
+    "Bookmark": {
+      "description": "One channel's bookmark and the revision it is at. `#240 reading-bookmark`.\n\n`anchor` is `null` when no bookmark is set, which is a different answer from the field being\nabsent on a read: absent means the server could not say. The revision is `0` for a channel that\nnever had one, and otherwise only grows (through [`next_pin_revision`]), so a page can send it\nback as `if_revision` and be refused when another device moved the bookmark since.",
+      "properties": {
+        "anchor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BookmarkAnchor"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Where it is, or `null` when there is none."
+        },
+        "revision": {
+          "description": "Moves on every change. See [`StateStore::set_bookmark`].",
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "revision",
+        "anchor"
+      ],
+      "type": "object"
+    },
+    "BookmarkAnchor": {
+      "description": "Where one channel's bookmark is: next to which message, on which side, and enough about that\nmessage to draw the line in a list that does not hold it. `#240 reading-bookmark`.\n\n`timestamp` and `thread_id` are copied from the message as the page was served it, so Main can\nplace the line for a thread reply it never shows, by time. Ids and an instant, and no text: a\nbookmark is not a second copy of anybody's words.",
+      "properties": {
+        "message_id": {
+          "$ref": "#/$defs/MessageId",
+          "description": "The message the line is drawn next to, in the provider-neutral namespace it was served in."
+        },
+        "place": {
+          "$ref": "#/$defs/BookmarkPlace",
+          "description": "Which side of that message the line is on."
+        },
+        "thread_id": {
+          "description": "The thread that message is in, when it is in one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timestamp": {
+          "description": "When that message was sent, ISO-8601, exactly as the provider reported it.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "message_id",
+        "place",
+        "timestamp"
+      ],
+      "type": "object"
+    },
+    "BookmarkPlace": {
+      "description": "Which side of its message a bookmark is on. `#240 reading-bookmark`.",
+      "oneOf": [
+        {
+          "const": "above",
+          "description": "Just above the message: \"start reading here\". The usual case, and what setting one makes.",
+          "type": "string"
+        },
+        {
+          "const": "below",
+          "description": "Just below it. Only when the newest message has been marked Done with the line on it, so the\nline ends up under every message there is and above whatever arrives next.",
+          "type": "string"
+        }
+      ]
+    },
+    "BookmarkResponse": {
+      "description": "One channel's bookmark, read or written: `GET`, `PUT` and `DELETE /api/v1/channels/{id}/bookmark`.\n`#240 reading-bookmark`.\n\nA conditional write that lost to a move made elsewhere answers 409 with this same body and an\n[`ApiErrorBody`]'s two fields beside it, so the page takes where the bookmark is now from the\nrefusal itself.",
+      "properties": {
+        "bookmark": {
+          "$ref": "#/$defs/Bookmark",
+          "description": "The bookmark as stored after the call."
+        },
+        "bookmark_notice": {
+          "description": "The standing statement that the bookmark is this server's own and marks nothing read.",
+          "type": "string"
+        },
+        "changed": {
+          "description": "Whether the call changed what is stored: false for a read, a repeat, and a refusal.",
+          "type": "boolean"
+        },
+        "channel": {
+          "$ref": "#/$defs/ChannelInfo",
+          "description": "The channel, as configured here."
+        }
+      },
+      "required": [
+        "channel",
+        "bookmark",
+        "changed",
+        "bookmark_notice"
+      ],
+      "type": "object"
+    },
+    "ChannelId": {
+      "description": "A Discord channel snowflake, as a string, exactly as Discord renders it.",
+      "type": "string"
+    },
+    "ChannelInfo": {
+      "description": "A channel this server is configured to read.",
+      "properties": {
+        "added": {
+          "default": false,
+          "description": "Whether this channel was added from inside the app rather than named in the configuration\nfile.\n\nThe page needs it to say what Remove will do. Removing an added channel forgets it. A\nconfigured one comes from a file this server reads and never writes, so removing it HIDES\nit instead — the file still names it, and Settings can show it again. `#199\nremovable-config-channels`.",
+          "type": "boolean"
+        },
+        "alias": {
+          "default": null,
+          "description": "The operator's own local name for this channel, when he has set one. `#39 channel-alias`.\n\n**Local, and only ours.** It lives in this server's store, exactly as read state does; it\nis never sent to Discord, renames nothing there, and no one outside this deployment sees\nit. It is set by the OPERATOR through the web app — never by the voice agent, which would\notherwise be renaming the things it is also reporting on.\n\n`None` means \"no alias\", which is not the same as an empty one: an empty alias is refused\nat the door, and clearing an alias is a separate act that puts [`ChannelInfo::label`] back.\n\nIt is `None` on a channel that came straight from [`crate::config::Config`]; the store\noverlay in [`crate::ops`] is what fills it in, so anything reading configuration directly\n— the startup banner, the preflight probe — still names the label the operator wrote.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "$ref": "#/$defs/ChannelId",
+          "description": "Snowflake of the channel."
+        },
+        "label": {
+          "description": "Human label used in speech and in the web app (\"acme lead team\").\n\nThis one comes from the operator's CONFIGURATION file and cannot be changed at runtime.\nWhat a person actually hears is [`ChannelInfo::display_name`], because `#39 channel-alias`\nlets him rename a channel from inside the app without editing a file or redeploying.",
+          "type": "string"
+        },
+        "provider": {
+          "description": "Key of the configured chat provider this channel is read through.\n\nA deployment may serve several providers at once, and the page needs to know which one a\nchannel belongs to in order to describe it and to use only that provider's capabilities.\nAbsent only from an older server, which had exactly one provider.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "writable": {
+          "description": "Whether posting into this channel is permitted at all.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "writable",
+        "alias",
+        "added"
+      ],
+      "type": "object"
+    },
+    "ClientConfigResponse": {
+      "description": "What the web app needs to know at startup.",
+      "properties": {
+        "channel_discovery_supported": {
+          "description": "Whether the selected provider can list its channels for browsing. `#19 channel-browser`.",
+          "type": "boolean"
+        },
+        "channel_registration_supported": {
+          "description": "Whether the selected provider accepts channel links or references and manages registration.",
+          "type": "boolean"
+        },
+        "channels": {
+          "description": "Configured channels.",
+          "items": {
+            "$ref": "#/$defs/ChannelInfo"
+          },
+          "type": "array"
+        },
+        "chat_provider_name": {
+          "description": "Source chat service's human-readable name, supplied by the selected backend.",
+          "type": "string"
+        },
+        "conversational_voice": {
+          "$ref": "#/$defs/VoiceDescription",
+          "description": "Selected conversational voice provider, named by its implementation."
+        },
+        "elevenlabs_agent_id": {
+          "description": "ElevenLabs agent id, when the deployment has one. Not a secret: it identifies a public\nwidget. The API key never leaves the server.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hidden_channels": {
+          "description": "Channels from the configuration file the owner took off his list, in configuration order.\n`#199 removable-config-channels`.\n\nSettings lists them so each can be shown again; `channels` above already leaves them out.\nSent only to a write-scope caller, because showing one again takes that scope and a\nread-scope credential has no use for the names of channels the owner put away. Absent when\nnone are hidden, and from an older server, which could not hide one.",
+          "items": {
+            "$ref": "#/$defs/ChannelInfo"
+          },
+          "type": "array"
+        },
+        "idempotent_posts_supported": {
+          "description": "Whether a post sent again under the same `idempotency_key` is posted at most once.\n\n`#195 send-resilience`. The page retries a send whose answer it lost — a timeout, a 502 —\non its own only when this is true, because only then can the retry not post the message\ntwice. Sent only when true: absent, from this server or an older one, means false.",
+          "type": "boolean"
+        },
+        "live_delivery": {
+          "$ref": "#/$defs/LiveDelivery",
+          "description": "How changes reach the SSE hub."
+        },
+        "live_poll_seconds": {
+          "description": "Seconds between live ingestion ticks, or `0` when live ingestion is OFF.\n\nThe page needs this to tell the truth about its own channel view. With ingestion off the\nSSE stream attaches and delivers nothing, which is indistinguishable from a quiet channel;\na page that showed a \"live\" indicator on that basis would be claiming a freshness it does\nnot have. Not a secret: it is a property of this deployment, and the caller already holds\na token.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "noise_rules": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NoiseRules"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The rules that decide which messages are read automatically. `#196 auto-read-noise`.\n\nHere rather than behind a route of its own because the page needs them at startup, for the\nSettings editor, and every device and the voice agent share one list. Absent from an older\nserver — the page then hides the editor — and also when this one cannot read its store, so\na broken store makes the editor disappear rather than show a list that is not in force."
+        },
+        "owner_author_id": {
+          "description": "The READER's own Discord account, when the operator has said what it is.\n\nDistinct from `self_author_id`, which is the BRIDGE's account and is read out of the bot\ntoken. This one cannot be derived from anything the server holds — a bot's account has no\nrelationship to the human reading the channel — so it is absent unless configured. The page\ndraws both as the owner's own words, because they are: one typed into Discord, one dictated\nthrough this bridge.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "providers": {
+          "description": "Each configured chat provider and what it can do, in configuration order.\n\nEvery channel names its provider by key ([`ChannelInfo::provider`]). The deployment-wide\nflags above say whether ANY provider can do something; a page showing one channel uses\nthat channel's provider entry here instead, so a channel read through a provider without\nthreads is never offered a thread view because some other provider has one.\n\nSent only when there are several providers. With one, and from an older server, it is\nabsent and the deployment-wide flags are that provider's.",
+          "items": {
+            "$ref": "#/$defs/ProviderDescription"
+          },
+          "type": "array"
+        },
+        "read_aloud": {
+          "$ref": "#/$defs/Description",
+          "description": "Selected read-aloud backend and the playback interface the browser should use."
+        },
+        "replay_enabled": {
+          "description": "Whether a new call will be handed the earlier transcript: the operator allowed it AND the\nvoice backend can carry it (a `vibe-talk-v1` socket cannot; see `replay::offered`).\n\nThe page needs it BEFORE it has anything to replay: the Settings screen has to describe\nwhat resuming will do, and the control's own note has to say what the next call will be —\nboth of which are questions asked while there is no conversation to fetch.",
+          "type": "boolean"
+        },
+        "replies_in_thread": {
+          "description": "Whether a reply to a main-channel message is posted in that message's thread, starting one\nwhen it has none, because the provider has no reply pointer of its own (Slack).\n\n`#252 thread-button-state`. Such a reply already starts the message's thread, so the reply\nscreen offers no separate \"start a new thread\" choice when this is true. Sent only when\ntrue: absent, from this server or an older one, means false.",
+          "type": "boolean"
+        },
+        "self_author_id": {
+          "description": "The Discord account this bridge posts as, when it can be known.\n\nNOT a secret: a bot's user id is visible on every message it has ever sent. It is here so\nthe channel view can tell the owner's own words -- posted on his behalf by this bridge --\nfrom everybody else's, on the FIRST render rather than only after he has replied from the\napp. `None` when the token is not in the shape ids can be read from; the page then falls\nback to learning it the old way.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "speech_prep_enabled": {
+          "description": "Whether this server rewrites message bodies for speech before anything says them.\n\nHere for the same reason as `replay_enabled`: Settings has to be able to describe what this\ndeployment does, and the page cannot infer this one from any message it holds. An empty\n`spoken_content` means \"the rewrite changed nothing\" just as often as it means \"the pass is\noff\" — deliberately, see [`crate::model::Message::spoken_content`] — so a page guessing from\nthe data would tell the operator the feature was off every time the channel was plain prose.\nThey are flipping this switch to compare two runs; guessing is exactly what they cannot do.",
+          "type": "boolean"
+        },
+        "summaries_unavailable": {
+          "description": "Why message summaries cannot work on this deployment at all, when the server knows.\n\nPresent means the page disables the summaries control and says this instead of letting\nevery long row fail one request at a time. Absent means summaries may work.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "threading_supported": {
+          "description": "Whether the backend supports channel, thread-list, and flattened timelines.",
+          "type": "boolean"
+        },
+        "token_scope": {
+          "$ref": "#/$defs/TokenScope",
+          "description": "The scope of the token that asked.\n\nThe caller's own scope, so it discloses nothing it did not already hold. The page needs it\nto avoid asking for what this token cannot have: stored conversations are write-only (see\nthe conversation routes), and a read-scope page that probed them anyway got a 403 and a\nconsole error on every load. `#38 read-token-conversation-probe`."
+        },
+        "upstream_clear_supported": {
+          "description": "Whether the selected provider can clear its own unread state as this server ingests\nmessages, for a channel the owner turns that on for. `#232 upstream-mark-read`.\n\nSettings offers the per-channel control only when this is true. Sent only when true:\nabsent, from this server or an older one, means false.",
+          "type": "boolean"
+        },
+        "upstream_read_mark_supported": {
+          "description": "Whether the selected provider exposes a write-through read cursor.",
+          "type": "boolean"
+        },
+        "version": {
+          "description": "Server version, so a stale cached page is visible.",
+          "type": "string"
+        },
+        "voice_prompt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VoicePromptSettings"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The owner's own words for the voice agent, as Settings shows them. `#272\nvoice-agent-instructions`.\n\nHere so the Instructions editor is drawn at sign-in, as the send setting is. Readable at\nread scope — the assembled prompt is served there too, to a bridge holding the read token —\nand changed only by a write-scope `PUT /api/v1/voice-prompt`. Absent from an older server;\nthe page then hides the editor."
+        },
+        "voice_settings": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VoiceSettings"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "\"Ask me before the voice agent sends\", as Settings shows it. `#264 voice-send-approval`.\n\nHere so the checkbox is drawn at sign-in, as the noise rules are. Readable at read scope —\nit says how the voice agent behaves, which a reader of the channels may know — and changed\nonly by a write-scope `PUT /api/v1/voice-settings`. Absent from an older server, which\nalways asked; the page then hides the checkbox."
+        }
+      },
+      "required": [
+        "chat_provider_name",
+        "channels",
+        "elevenlabs_agent_id",
+        "conversational_voice",
+        "read_aloud",
+        "version",
+        "replay_enabled",
+        "self_author_id",
+        "owner_author_id",
+        "live_poll_seconds",
+        "live_delivery",
+        "channel_registration_supported",
+        "channel_discovery_supported",
+        "upstream_read_mark_supported",
+        "threading_supported",
+        "speech_prep_enabled",
+        "token_scope"
+      ],
+      "type": "object"
+    },
+    "CommittedPostResponse": {
+      "description": "A confirmed proposal, posted.",
+      "properties": {
+        "parts": {
+          "description": "Every part, in order. One element for a message that fitted.",
+          "items": {
+            "$ref": "#/$defs/Message"
+          },
+          "type": "array"
+        },
+        "posted": {
+          "$ref": "#/$defs/Message",
+          "description": "The FIRST message as the chat service accepted it."
+        },
+        "serial": {
+          "description": "Which proposal this was.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "serial",
+        "posted",
+        "parts"
+      ],
+      "type": "object"
+    },
+    "Description": {
+      "description": "Public capabilities of the selected read-aloud provider; never contains credentials.",
+      "properties": {
+        "backend": {
+          "description": "Stable provider identifier.",
+          "type": "string"
+        },
+        "label": {
+          "description": "Human-readable provider name.",
+          "type": "string"
+        },
+        "local_only": {
+          "description": "Whether browser speech must select a voice advertised as running locally.\nThis is the browser's `localService` flag; the device engine controls actual networking.",
+          "type": "boolean"
+        },
+        "playback": {
+          "$ref": "#/$defs/Playback",
+          "description": "Which playback interface the browser should use."
+        }
+      },
+      "required": [
+        "backend",
+        "label",
+        "playback",
+        "local_only"
+      ],
+      "type": "object"
+    },
+    "Heading": {
+      "description": "What a message's first line says about it, lifted out for the row's header. `#242\nrich-headers`.\n\nEvery piece is UNTRUSTED plain text out of `content`, to be drawn as text. Flat and optional\nthroughout, so the contract can grow without an older page refusing the row.",
+      "properties": {
+        "cut": {
+          "description": "How much of `content`, from its start, the heading restates, in UTF-16 code units: the\nlength a page's string indexes by. Always within the first line.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tag": {
+          "description": "Who the message says wrote it: `build-bot coordinator`, `ops2`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time": {
+          "description": "The clock time the message states, exactly as written: `10:52 PM ET`, `15:05Z`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "description": "The short title it opens with, emphasis markers removed.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "cut"
+      ],
+      "type": "object"
+    },
+    "LiveDeleteEvent": {
+      "description": "The data of a live stream `message_delete` event: only the ids, never the removed text.",
+      "properties": {
+        "channel_id": {
+          "$ref": "#/$defs/ChannelId",
+          "description": "Channel the message was removed from."
+        },
+        "from_tail": {
+          "description": "Whether it was published before this stream attached; see [`LiveMessageEvent::from_tail`].",
+          "type": "boolean"
+        },
+        "message_id": {
+          "$ref": "#/$defs/MessageId",
+          "description": "The message that was removed."
+        },
+        "replayed": {
+          "description": "Whether it was classified as history rather than news.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "channel_id",
+        "message_id",
+        "replayed",
+        "from_tail"
+      ],
+      "type": "object"
+    },
+    "LiveDelivery": {
+      "description": "How channel changes reach the live stream.",
+      "oneOf": [
+        {
+          "const": "off",
+          "description": "Live ingestion is off; the stream attaches and delivers nothing.",
+          "type": "string"
+        },
+        {
+          "const": "poll",
+          "description": "The server polls the chat provider on an interval.",
+          "type": "string"
+        },
+        {
+          "const": "push",
+          "description": "A provider-neutral adapter pushes changes to the ingest route.",
+          "type": "string"
+        }
+      ]
+    },
+    "LiveMessageEvent": {
+      "description": "The data of a live stream `message` or `message_update` event.",
+      "properties": {
+        "from_tail": {
+          "description": "Whether it was published before this stream attached and is re-sent from the replay tail.\nAny channel read begun after the stream's response arrived has already seen it. An\nadapter's catch-up arriving after the attach is `replayed` but not from the tail: it may be\nnewer than every read the page has made.",
+          "type": "boolean"
+        },
+        "message": {
+          "$ref": "#/$defs/Message",
+          "description": "The message as it now stands. UNTRUSTED: written by whoever is in the channel."
+        },
+        "replayed": {
+          "description": "Whether it was classified as history — a replay or a catch-up — rather than news. The page\nmay render such a message but must not announce it to a live conversation.",
+          "type": "boolean"
+        },
+        "self_posted": {
+          "description": "Whether THIS SERVER posted it; the page must not relay these into a live conversation.",
+          "type": "boolean"
+        },
+        "untrusted_content_notice": {
+          "description": "Standing reminder that the content is third-party text.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "message",
+        "replayed",
+        "from_tail",
+        "self_posted",
+        "untrusted_content_notice"
+      ],
+      "type": "object"
+    },
+    "LiveResetEvent": {
+      "description": "The data of a live stream `reset` event: the subscriber fell behind the replay tail.",
+      "properties": {
+        "detail": {
+          "description": "What the subscriber should do instead of resuming.",
+          "type": "string"
+        },
+        "missed": {
+          "description": "Events this subscriber missed, or `0` when the count is unknown.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "missed",
+        "detail"
+      ],
+      "type": "object"
+    },
+    "Message": {
+      "description": "One chat message as the rest of the server sees it.",
+      "properties": {
+        "author": {
+          "description": "Display name of the author, as reported by the chat provider.",
+          "type": "string"
+        },
+        "author_id": {
+          "$ref": "#/$defs/UserId",
+          "description": "Snowflake of the author.\n\nThis travels with every rendered message ON PURPOSE, and the alternative — a\n\"look up this display name\" tool — was rejected. Two reasons, in order of importance:\n\n1. **No lookup step, so nothing to guess.** The id arrives ATTACHED to the very message\n   being replied to, so a caller that wants to mention its author already holds the exact\n   snowflake. A lookup tool would put a fuzzy name match between the agent and a real\n   notification, and a hallucinated id pings a stranger.\n2. **It bounds who can be mentioned.** The only ids a caller ever sees are those of people\n   and bots that have actually spoken in an allowlisted channel. A general user-lookup tool\n   would let the agent ping anyone in the server, which is a strictly larger capability\n   than this project wants to hand a voice model.\n\nBots have ids too and they are included: addressing another coding agent by mention is a\nlegitimate thing to want."
+        },
+        "author_is_bot": {
+          "description": "Whether the chat provider flagged the author as a bot.",
+          "type": "boolean"
+        },
+        "channel_id": {
+          "$ref": "#/$defs/ChannelId",
+          "description": "Channel the message was read from, in the provider-neutral application namespace."
+        },
+        "content": {
+          "description": "Raw message body. UNTRUSTED: written by whoever is in the channel.",
+          "type": "string"
+        },
+        "content_html": {
+          "description": "The body as the page draws it: `content` rendered from Markdown and SANITIZED, by\n[`crate::render`]. `#217 markdown-blocks`.\n\nA third field for the same body, and it answers a third question: not what was written\n(`content`, which a copy keeps and the speech path falls back to) nor what a voice should\nsay (`spoken_content`), but what the reader should SEE — lists with bullets, paragraphs with\nspace between them, a link that is a link. HTML the server's sanitizer has already cut to a\nsmall allowlist, so the page inserts it as it stands and builds no markup of its own from\nchannel text.\n\nEMPTY means \"draw `content` as plain paragraphs\", by the convention `spoken_content`\nfollows: it is what a message carries before anything renders it — on every path toward a\nmodel, which has no use for HTML — and what it carries when rendering changed nothing,\nwhich is most chat. Filled only on the routes the page reads.",
+          "type": "string"
+        },
+        "heading": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Heading"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The tag, time and title the message's first line states, for the page to show in the row's\nheader. `#242 rich-headers`; see [`crate::heading`].\n\nFilled where `content_html` is, on the routes only the page reads, and absent everywhere\nelse, including from a message nothing could be read from. When it is set, the part of the\nfirst line it restates is marked in `content_html` (or, for a plain body, is\n`content[..cut]`), so the page can hide those words while it shows the heading and draw them\nexactly as before when it does not."
+        },
+        "id": {
+          "$ref": "#/$defs/MessageId",
+          "description": "Snowflake of this message."
+        },
+        "noise": {
+          "description": "Whether the owner's noise rules call this message read already. `#196 auto-read-noise`.\n\nDECIDED BY THIS SERVER EVERY TIME the message is served, from its current text, by\n[`crate::noise::NoiseFilter::mark`]; it is never stored and never trusted from whoever\nsent the message. That is what lets an edited placeholder come back as unread, and a\nremoved rule un-hide everything it caught, without a single record having to change.\n\nThe page reads this flag rather than matching the text itself, so there is one predicate\nand it is the server's. Absent means `false`, which is also what an older server meant.",
+          "type": "boolean"
+        },
+        "reactions": {
+          "description": "The emoji people reacted to this message with, and how many of each. `#219\nemoji-reactions`.\n\nABSENT AND EMPTY ARE DIFFERENT ANSWERS. Absent (`None`) means this copy came by a path that\ncannot see reactions: a provider that does not report them, or a live echo of a message,\nwhich carries none. Empty means the source looked and there are none. So a live copy\nwithout reactions never overwrites a held copy that has them — the echo of a message\narrives after the read that brought its acknowledgements — while a read replaces them, as\nit replaces the rest of the message. Discord omits the array when there are none, so on\nthat provider absent from a read means none.\n\nCounts only, never who reacted: that is a separate question for each emoji, and asking it\nwould hand this server identities it has no use for. UNTRUSTED: a custom emoji's name is\nwritten by whoever made it.",
+          "items": {
+            "$ref": "#/$defs/Reaction"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "reply_to": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MessageId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The message this one is a reply to, when it is one.\n\nDiscord records a reply on the REPLYING message, as `message_reference.message_id`, and\nnowhere else — there is no \"replies\" field on the message being answered. So \"has this been\nreplied to?\" is not a fact a single message carries; it is derived by looking at what else\nis loaded. That derivation belongs to the reader, which is why this field is the raw pointer\nand not a `has_replies` boolean:\n\n1. **A boolean computed here would be a lie about scope.** The server answers a read with a\n   WINDOW of a channel, so it could only ever mean \"replied to within this window\", and a\n   field named `has_replies` would be believed to mean more than that.\n2. **The pointer is the durable fact.** It is true of the message forever, independently of\n   what else happens to be loaded beside it.\n\n`None` for an ordinary message, and also for a reply whose reference Discord did not\ninclude. Absent is not \"not a reply\"; it is \"no pointer was reported\", and nothing should\npresent the two differently."
+        },
+        "spoken_content": {
+          "description": "The same body rewritten for speech by [`crate::speakable`]: markdown off, instants said the\nway a listener places them, long ids and hashes named. READ THIS ONE ALOUD.\n\nTwo fields for the same reason there are two time fields — they answer different questions.\n`content` is what was written and is what the SCREEN must show, character for character;\nthis is what a voice should say, and saying it costs the reader none of the seconds that\nspelling a nineteen-digit snowflake costs. Neither is a substitute for the other, and a\nrenderer that picked one for both jobs would be wrong in one of them.\n\nUNTRUSTED, exactly as much as `content` is: rewriting a body for speech is not sanitizing it\nfor a prompt, and it still goes through [`crate::untrusted`] on the way to a model.\n\nEMPTY means \"the body to say is the raw body\". That covers two cases on purpose: nothing has\nprepared this message yet — the chat adapters hold no configuration, so [`crate::ops`] is the\nonly filler, the same convention as [`Message::spoken_time`] — and the prepared form came\nback identical, which is the common case for ordinary chat with no markdown and no ids in\nit. One value can mean both because [`Message::spoken_body`] answers them the same way, and\ncollapsing them is what keeps a window of a hundred messages from carrying a hundred\nnear-copies of itself down a phone's connection. When the field IS set, something was\ngenuinely rewritten.",
+          "type": "string"
+        },
+        "spoken_time": {
+          "default": "",
+          "description": "The same instant in the operator's configured zone, already formatted for speech: `09:51`.\nREAD THIS ONE ALOUD.\n\nTwo fields rather than one because they answer different questions, and because a single\nfield would force whoever renders it to choose — which is exactly the choice that produced\nthe bug. Handed an ISO string in UTC, the assistant said \"thirteen fifty-one Eastern Time\":\nit kept the digits and relabelled them. A value that is already correct when read verbatim\nrequires no conversion and admits no such mistake.\n\nNo seconds and no zone label: see [`crate::clock::spoken`], which explains what carrying\nthem cost a listener and what dropping them trades away.\n\nEMPTY means \"not yet stamped\". The Discord layer constructs it empty because it holds no\nconfiguration and therefore does not know the operator's zone; [`crate::ops`] is the only\nfiller. Use [`Message::spoken`] to read it, which falls back to the exact instant rather\nthan to a blank.",
+          "type": "string"
+        },
+        "thread": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MessageThread"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Thread membership supplied by the backend; independent of a reply-to message reference."
+        },
+        "timestamp": {
+          "description": "The exact instant, ISO-8601, as reported by the chat provider. Compute with this one.\n\nUnrounded on purpose: sub-second precision is ordering information, and anything that has\nto decide which of two messages came first needs it. This field is never spoken; see\n[`Message::spoken_time`] for the one that is.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "channel_id",
+        "author",
+        "author_id",
+        "author_is_bot",
+        "timestamp",
+        "spoken_time",
+        "reply_to",
+        "content"
+      ],
+      "type": "object"
+    },
+    "MessageId": {
+      "description": "A Discord message snowflake, as a string.",
+      "type": "string"
+    },
+    "MessageThread": {
+      "description": "Thread membership attached to a message without conflating it with a reply reference.",
+      "properties": {
+        "id": {
+          "description": "Opaque thread identifier, scoped to the configured channel.",
+          "type": "string"
+        },
+        "is_root": {
+          "description": "Whether this message is the original thread root.",
+          "type": "boolean"
+        },
+        "reply_count": {
+          "description": "Number of replies, when the provider can supply it.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "reply_count_exact": {
+          "description": "Whether the reply count is exact rather than a provider estimate.",
+          "type": "boolean"
+        },
+        "root_message_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MessageId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The original channel message, if this provider exposes one."
+        }
+      },
+      "required": [
+        "id",
+        "root_message_id",
+        "is_root",
+        "reply_count",
+        "reply_count_exact"
+      ],
+      "type": "object"
+    },
+    "MessagesResponse": {
+      "description": "`GET /api/v1/channels/{id}/messages`: a channel's most recent messages, the window the classic\npage draws.\n\n`#208 persistent-cache` made it a contract root, appended below, when it gained `as_of`.",
+      "properties": {
+        "as_of": {
+          "description": "The instant, RFC 3339, up to which the provider knows `messages` is complete, when it\nserved a copy it could not bring up to date just now: a bridge reading its Flat view says\nso. Absent means now, and from an older server. The same field as\n[`crate::threads::TimelinePage::as_of`].",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "channel": {
+          "$ref": "#/$defs/ChannelInfo",
+          "description": "Channel that was read."
+        },
+        "complete": {
+          "description": "Whether the fetch came back short, so `messages.len()` counts the CHANNEL rather than the\nwindow this server asked for.\n\nA client may show a message count only when this is true. Discord gives no message count\nfor a guild text channel, so a full window means \"at least this many\" and nothing more.",
+          "type": "boolean"
+        },
+        "dismissed": {
+          "description": "Which of `messages` the reader has ARCHIVED, so the view can dim them.\n\nThe ordinary channel view shows archived rows greyed rather than hidden -- hiding is what\nthe To do filter is for -- and it can only do that if the payload says which they are.",
+          "items": {
+            "$ref": "#/$defs/MessageId"
+          },
+          "type": "array"
+        },
+        "messages": {
+          "description": "Messages, oldest first.",
+          "items": {
+            "$ref": "#/$defs/Message"
+          },
+          "type": "array"
+        },
+        "untrusted_content_notice": {
+          "description": "Standing reminder that the content is third-party text.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "channel",
+        "messages",
+        "complete",
+        "dismissed",
+        "untrusted_content_notice"
+      ],
+      "type": "object"
+    },
+    "NoiseRules": {
+      "description": "The owner's noise rules, as the Settings editor shows them. `#196 auto-read-noise`.\n\nAlso the body `PUT /api/v1/noise-rules` answers with, so the editor redraws from what the\nserver STORED — trimmed and de-duplicated — rather than from what was typed.",
+      "properties": {
+        "matching": {
+          "description": "One sentence saying how a rule matches, written beside the matcher and quoted by the page\nwhere the rules are edited, so the description cannot drift from what the server does.",
+          "type": "string"
+        },
+        "rules": {
+          "description": "The rules in force, in the owner's order and his own spelling. Until he saves a list this\nis the shipped default.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "rules",
+        "matching"
+      ],
+      "type": "object"
+    },
+    "PendingPost": {
+      "description": "A post waiting for the owner's confirmation. `#34 voice-chat-write-confirm`.\n\nEverything the confirmation has to show — the exact text, where it goes, what it answers — and\nthe handle that commits exactly this. The handle is a capability: it is handed only to a\nwrite-scope caller of the proposal routes, never to a model, and a commit must restate the\nchannel, text, and reply target it was issued for.",
+      "properties": {
+        "channel_id": {
+          "$ref": "#/$defs/ChannelId",
+          "description": "The channel it would be posted to."
+        },
+        "channel_name": {
+          "description": "That channel's name as the owner knows it, alias included.",
+          "type": "string"
+        },
+        "expires_in_ms": {
+          "description": "Milliseconds until the handle expires.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "handle": {
+          "description": "The single-use confirmation handle.",
+          "type": "string"
+        },
+        "reply_to": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MessageId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The message it would reply to, when any."
+        },
+        "serial": {
+          "description": "Correlates this proposal's steps in the access log. Increases with every proposal.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "text": {
+          "description": "The exact text that would be posted.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "serial",
+        "handle",
+        "channel_id",
+        "channel_name",
+        "text",
+        "reply_to",
+        "expires_in_ms"
+      ],
+      "type": "object"
+    },
+    "PendingPostResponse": {
+      "description": "The post waiting for confirmation, or `null` when none is.",
+      "properties": {
+        "proposal": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PendingPost"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The pending proposal. At most one exists: a new proposal supersedes the old."
+        }
+      },
+      "required": [
+        "proposal"
+      ],
+      "type": "object"
+    },
+    "Pin": {
+      "description": "One pin, as the store holds it.",
+      "properties": {
+        "author": {
+          "description": "Its author's display name when it was pinned. UNTRUSTED.",
+          "type": "string"
+        },
+        "author_id": {
+          "$ref": "#/$defs/UserId",
+          "description": "Its author's id, so the row is drawn in its speaker's colour like every other row."
+        },
+        "author_is_bot": {
+          "description": "Whether the chat provider flagged the author as a bot.",
+          "type": "boolean"
+        },
+        "content": {
+          "description": "Its text when it was pinned, at most [`MAX_PIN_TEXT_CHARS`] characters. UNTRUSTED.",
+          "type": "string"
+        },
+        "content_html": {
+          "description": "The snapshot's text as the page draws it, rendered and sanitized when the pin is SERVED,\nnever stored. It follows [`crate::model::Message::content_html`]'s convention: empty means\n\"draw the text as plain paragraphs\". `#217 markdown-blocks`.",
+          "type": "string"
+        },
+        "heading": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Heading"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The snapshot's heading, found when the pin is SERVED and never stored, by\n[`crate::model::Message::heading`]'s rules. `#242 rich-headers`."
+        },
+        "message_id": {
+          "$ref": "#/$defs/MessageId",
+          "description": "The message pinned, in the provider-neutral namespace the page was served it in."
+        },
+        "pinned_at_ms": {
+          "description": "When it was pinned, in milliseconds since the Unix epoch, by this server's clock. The order\nthe bound drops pins in.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "thread_id": {
+          "description": "The thread the message is in, when it is in one — what opens it in its thread.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "thread_root": {
+          "description": "Whether the message is that thread's root.",
+          "type": "boolean"
+        },
+        "timestamp": {
+          "description": "When the message was sent, ISO-8601, exactly as the provider reported it. What the page\norders pins by, among themselves and among the messages it has loaded.",
+          "type": "string"
+        },
+        "truncated": {
+          "description": "Whether `content` was cut to fit.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "message_id",
+        "author",
+        "author_id",
+        "author_is_bot",
+        "content",
+        "truncated",
+        "timestamp",
+        "thread_id",
+        "thread_root",
+        "pinned_at_ms"
+      ],
+      "type": "object"
+    },
+    "PinChangeResponse": {
+      "description": "What one pin or unpin did: `PUT` and `DELETE /api/v1/channels/{id}/pins/{message_id}`.",
+      "properties": {
+        "changed": {
+          "description": "Whether the call changed anything; false when it repeated what was already so.",
+          "type": "boolean"
+        },
+        "channel": {
+          "$ref": "#/$defs/ChannelInfo",
+          "description": "The channel, as configured here."
+        },
+        "message_id": {
+          "$ref": "#/$defs/MessageId",
+          "description": "The message the call named."
+        },
+        "pin": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Pin"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The pin exactly as stored — its text cut to the bound — or absent after an unpin."
+        },
+        "pinned": {
+          "description": "Whether it is pinned now.",
+          "type": "boolean"
+        },
+        "pins_notice": {
+          "description": "The standing statement that these pins are this server's own.",
+          "type": "string"
+        },
+        "revision": {
+          "description": "The channel's pin revision after the call, so the page that made it need not read the list\nagain to stay current.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "unpinned": {
+          "description": "Pins the bound dropped to make room for this one, oldest first. Empty except at the bound,\nand the page says so when it is not.",
+          "items": {
+            "$ref": "#/$defs/MessageId"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "channel",
+        "message_id",
+        "pinned",
+        "changed",
+        "unpinned",
+        "revision",
+        "pins_notice"
+      ],
+      "type": "object"
+    },
+    "PinsResponse": {
+      "description": "One channel's pins: `GET /api/v1/channels/{id}/pins`. `#206 pin-message`.",
+      "properties": {
+        "channel": {
+          "$ref": "#/$defs/ChannelInfo",
+          "description": "The channel, as configured here."
+        },
+        "limit": {
+          "description": "How many pins a channel keeps before the oldest is unpinned to make room.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pins": {
+          "description": "Every pin, in the order their messages were sent, oldest first, each with the snapshot that\nlets the page draw it when its message is not loaded.",
+          "items": {
+            "$ref": "#/$defs/Pin"
+          },
+          "type": "array"
+        },
+        "pins_notice": {
+          "description": "The standing statement that these pins are this server's own.",
+          "type": "string"
+        },
+        "revision": {
+          "description": "The revision this list is at; see [`TimelineResponse::pins_revision`].",
+          "format": "int64",
+          "type": "integer"
+        },
+        "untrusted_content_notice": {
+          "description": "A snapshot is channel content, and untrusted, like every other.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "channel",
+        "pins",
+        "revision",
+        "limit",
+        "pins_notice",
+        "untrusted_content_notice"
+      ],
+      "type": "object"
+    },
+    "Playback": {
+      "description": "How the web app plays messages with the selected provider.",
+      "oneOf": [
+        {
+          "const": "browser",
+          "description": "The browser speaks text using the device's speech engine.",
+          "type": "string"
+        },
+        {
+          "const": "audio",
+          "description": "The server returns encoded audio.",
+          "type": "string"
+        }
+      ]
+    },
+    "PromptDelivery": {
+      "description": "How the owner's words reach the voice agent. `#272 voice-agent-instructions`.",
+      "oneOf": [
+        {
+          "const": "profile",
+          "description": "A deployment-managed bridge fetches the assembled prompt from `GET /api/v1/voice-agent` as\neach call opens, so both texts reach its next call.",
+          "type": "string"
+        },
+        {
+          "const": "page",
+          "description": "The page hands them to a hosted agent as each call opens: the whole assembled prompt when\nthe agent allows its prompt to be replaced, otherwise the instructions alone, as a note at\nthe start. The voice session says which ([`SessionPrompt`]).",
+          "type": "string"
+        }
+      ]
+    },
+    "PromptTransport": {
+      "description": "How the page hands the owner's words to a hosted agent. `#272 voice-agent-instructions`.",
+      "oneOf": [
+        {
+          "const": "prompt_override",
+          "description": "As the system prompt itself, in the initiation frame's\n`conversation_config_override.agent.prompt.prompt`. Only when the agent allows it: an\noverride it does not allow is believed to end the conversation.",
+          "type": "string"
+        },
+        {
+          "const": "contextual_update",
+          "description": "As a `contextual_update` sent right after the initiation frame. The agent keeps its own\nprompt; only the instructions reach it.",
+          "type": "string"
+        },
+        {
+          "const": "not_sent",
+          "description": "Nothing: the agent does not allow its prompt to be replaced (or its configuration did not\nsay, or could not be read), and the owner has no instructions saved — he saved nothing, or\nedited only the base prompt. The initiation frame is exactly what it always was, and the\nagent keeps the prompt in its provider's console.",
+          "type": "string"
+        }
+      ]
+    },
+    "ProviderDescription": {
+      "description": "One configured chat provider, as the page needs to know it.",
+      "properties": {
+        "channel_discovery_supported": {
+          "description": "Whether this provider can list its channels for browsing.",
+          "type": "boolean"
+        },
+        "channel_registration_supported": {
+          "description": "Whether this provider accepts pasted links and references when adding a channel.",
+          "type": "boolean"
+        },
+        "idempotent_posts_supported": {
+          "description": "Whether this provider posts a message sent again under the same key at most once. Sent\nonly when true.",
+          "type": "boolean"
+        },
+        "key": {
+          "description": "The key channels name this provider by.",
+          "type": "string"
+        },
+        "live_delivery": {
+          "$ref": "#/$defs/LiveDelivery",
+          "description": "How changes in this provider's channels reach the live stream."
+        },
+        "live_poll_seconds": {
+          "description": "Seconds between this provider's live polls, or `0` when it is not polled.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "name": {
+          "description": "Human-readable name of the source chat service.",
+          "type": "string"
+        },
+        "owner_author_id": {
+          "description": "The owner's own account at this provider, when configured.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "replies_in_thread": {
+          "description": "Whether a reply to a main-channel message is posted in that message's thread, starting one\nwhen it has none, because this provider has no reply pointer of its own (Slack).\n`#252 thread-button-state`. Sent only when true.",
+          "type": "boolean"
+        },
+        "self_author_id": {
+          "description": "The account this server posts as at this provider, when known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "threading_supported": {
+          "description": "Whether this provider supports channel, thread-list, and flattened timelines.",
+          "type": "boolean"
+        },
+        "upstream_clear_supported": {
+          "description": "Whether this provider can clear its own unread state as this server ingests messages.\n`#232 upstream-mark-read`. Sent only when true.",
+          "type": "boolean"
+        },
+        "upstream_read_mark_supported": {
+          "description": "Whether this provider exposes a write-through read cursor.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "key",
+        "name",
+        "channel_registration_supported",
+        "channel_discovery_supported",
+        "upstream_read_mark_supported",
+        "threading_supported",
+        "live_delivery",
+        "live_poll_seconds",
+        "self_author_id",
+        "owner_author_id"
+      ],
+      "type": "object"
+    },
+    "Reaction": {
+      "description": "One emoji's tally on one message. `#219 emoji-reactions`.\n\nFlat, with optional fields, rather than a union of standard and custom emoji: the contract\ngrows by optional fields without an older page refusing the row, and a union's new variant\nwould be refused (see [`crate::contract`]).",
+      "properties": {
+        "count": {
+          "description": "How many reacted with it. At least one: an emoji nobody reacted with is not listed.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "custom": {
+          "description": "Whether `emoji` is a custom emoji's name rather than the emoji itself. A page draws a name\nas `:name:`, so it reads as an emoji's name and not as a word somebody wrote.",
+          "type": "boolean"
+        },
+        "custom_id": {
+          "description": "The provider's own id of a custom emoji: a Discord snowflake, a Google Chat uid. Opaque,\nnever a URL and never shown; it keeps two custom emoji of the same name apart.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "emoji": {
+          "description": "What to show: the emoji itself for a standard one (\"👀\"), or a custom emoji's name without\ncolons (\"party-parrot\"), which is all of it a page can draw without fetching an image.\nUNTRUSTED, and never empty.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "emoji",
+        "count"
+      ],
+      "type": "object"
+    },
+    "ReplyDismissals": {
+      "description": "Every message marked Done at or after one position in a channel. `#222 unread-replies`.\n\nCOMPLETE FROM `from` UP, which is the whole of its use: a message at or after `from` that is\nnot in `messages` is not Done, so a reply put back on another device leaves the list as surely\nas one marked Done joins it. Below `from` it says nothing. A position is a message id read as a\nnumber, which every provider here orders by time, so a reply is never before its thread's root\nand every reply to a root at or after `from` is covered.\n\n`from` is the page's oldest row, raised to the oldest mark kept when more than\n[`crate::ops::MAX_REPLY_DISMISSALS`] marks lie above it: the newest are kept, because unread\nreplies are the recent ones. Ids and no text, as `dismissed` is.",
+      "properties": {
+        "from": {
+          "$ref": "#/$defs/MessageId",
+          "description": "The position the list is complete from: a message id, compared as a number."
+        },
+        "messages": {
+          "description": "Every message at or after `from` that is marked Done, newest first.",
+          "items": {
+            "$ref": "#/$defs/MessageId"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "from",
+        "messages"
+      ],
+      "type": "object"
+    },
+    "SessionPrompt": {
+      "description": "What the page hands a hosted agent as a call opens, so the call carries the owner's words.\n`#272 voice-agent-instructions`.\n\nOn every voice session whose provider is one the page configures, whatever the owner has saved.\nAn agent that allows its prompt to be replaced is handed the assembled prompt on every call, so\nits send rules follow the Sending switch; one that does not is told `not_sent` when nothing of\nthe owner's can reach it, so the page learns that the agent keeps the prompt in its provider's\nconsole. Absent for a provider that reads the profile instead (a deployment-managed bridge), and\nfrom an older server; the page then sends exactly what it always sent.",
+      "properties": {
+        "instructions_applied": {
+          "description": "Whether the owner's additional instructions are in what is sent.",
+          "type": "boolean"
+        },
+        "override_allowed": {
+          "description": "What the agent's configuration said about replacing its prompt; absent when it could not\nbe read or did not say, which is treated as not allowed.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "system_prompt_applied": {
+          "description": "Whether the owner's edited base prompt is in what is sent.",
+          "type": "boolean"
+        },
+        "text": {
+          "description": "What to send: the whole assembled prompt for `prompt_override` — the shipped one when the\nowner saved nothing — the heading and the instructions for `contextual_update`; absent for\n`not_sent`.",
+          "type": "string"
+        },
+        "transport": {
+          "$ref": "#/$defs/PromptTransport",
+          "description": "How to hand `text` over."
+        }
+      },
+      "required": [
+        "transport",
+        "system_prompt_applied",
+        "instructions_applied"
+      ],
+      "type": "object"
+    },
+    "ThreadSummary": {
+      "description": "One thread in the thread list, independent of the underlying provider's channel model.",
+      "properties": {
+        "display_name": {
+          "description": "A short hyphenated name for the thread, chosen once by a summariser and then kept even if\nthe thread drifts, so the reader always finds it under the same name. Absent until named.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "Opaque identifier used for reading or posting to this thread.",
+          "type": "string"
+        },
+        "reply_count": {
+          "description": "Number of replies when known.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "reply_count_exact": {
+          "description": "Whether the reported count is exact.",
+          "type": "boolean"
+        },
+        "root": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Message"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The original message, when available and readable."
+        },
+        "summary": {
+          "description": "One sentence on what the thread is about now, re-summarised as it grows. Absent until\nsummarised. See [`thread_summary_due`] for when it is refreshed.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "description": "Provider-supplied title, or a neutral fallback.",
+          "type": "string"
+        },
+        "updated_at": {
+          "description": "Latest message activity, as an RFC 3339 timestamp.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "root",
+        "title",
+        "reply_count",
+        "reply_count_exact",
+        "updated_at"
+      ],
+      "type": "object"
+    },
+    "TimelineDelta": {
+      "description": "What a forward read says about the changes it carries. `#203 incremental-refresh`.",
+      "properties": {
+        "complete": {
+          "description": "True when this delta carries EVERY creation, edit, deletion and summary change in the view\nsince the cursor. False when it carries additions only: a read filtered by creation time\ncannot see an edit or a deletion, which then reach the caller through live events or its\nnext full read.",
+          "type": "boolean"
+        },
+        "deleted": {
+          "default": [],
+          "description": "Messages removed since the cursor, channel-wide in every view. Always empty when\n`complete` is false.",
+          "items": {
+            "$ref": "#/$defs/MessageId"
+          },
+          "type": "array"
+        },
+        "more": {
+          "description": "More changes remain past this page: ask again with `next_after` straight away.",
+          "type": "boolean"
+        },
+        "removed_threads": {
+          "default": [],
+          "description": "Threads that left the thread list since the cursor. Threads view only; empty elsewhere.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "more",
+        "complete",
+        "deleted",
+        "removed_threads"
+      ],
+      "type": "object"
+    },
+    "TimelineResponse": {
+      "description": "A provider-neutral timeline plus this application's channel and read-state metadata.",
+      "properties": {
+        "as_of": {
+          "description": "The instant, RFC 3339, up to which the backend knows this page is complete, when it is\nserving data it could not bring up to date just now. Absent means now.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "bookmark": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Bookmark"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "This channel's bookmark and its revision. `#240 reading-bookmark`.\n\nOn every read, newest page and delta alike, as `pins_revision` is, and for its reason: a\nrefresh that already happens is how a page learns the owner moved the bookmark on his other\ndevice. ONE small row, so it rides inline rather than as a revision and a second read.\nAbsent when the store cannot say, and the page keeps what it has; `anchor: null` inside it\nis the different answer that no bookmark is set."
+        },
+        "channel": {
+          "$ref": "#/$defs/ChannelInfo",
+          "description": "Configured parent channel, including its local alias and write policy."
+        },
+        "delta": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimelineDelta"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Present exactly on an answer to `after`: the page then carries only what is new or changed\nsince that cursor, and rows absent from it are UNCHANGED, never deleted."
+        },
+        "dismissed": {
+          "description": "Messages on this page that the reader has archived locally.",
+          "items": {
+            "$ref": "#/$defs/MessageId"
+          },
+          "type": "array"
+        },
+        "has_more": {
+          "description": "Whether another backward page exists.",
+          "type": "boolean"
+        },
+        "has_threads": {
+          "description": "Whether accessible threads exist in this channel.",
+          "type": "boolean"
+        },
+        "limit": {
+          "description": "Page size actually requested.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "messages": {
+          "description": "Messages for main, flat, or thread views, ordered oldest first.",
+          "items": {
+            "$ref": "#/$defs/Message"
+          },
+          "type": "array"
+        },
+        "next_after": {
+          "description": "Forward cursor for this view: what to pass as `after` to learn what changed since this\npage. `#203 incremental-refresh`.\n\nFrom a backend, present only when that backend answers `after` itself. Above the backend\nvibe-talk always fills it on a newest page or a delta — with its own generic cursor when\nthe backend left it empty — and removes it from a `before` page, which says nothing about\nthe newest end. Absent from an older bridge's answer, which therefore still parses.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "next_before": {
+          "description": "Opaque continuation, present exactly when another page exists.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "notice": {
+          "description": "Relevant provider limitation or scope information, if any.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pins_revision": {
+          "description": "The revision this channel's pins are at. `#206 pin-message`.\n\nOn every read, newest page and delta alike, so a refresh that already happens is what tells\na page another device pinned or unpinned something; the page reads `/pins` again only when\nthis differs from the revision of the list it holds. Absent when the store cannot say — no\nstorage configured, or a failing one — and from an older server.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "reply_dismissals": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReplyDismissals"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`#222 unread-replies`. On the newest page of Main, or a delta of it, in a channel with\nthreads: every message marked Done from a position on, the replies in Main's threads\nincluded. Absent everywhere else.\n\n`dismissed` names only the rows on the page, and Main shows a thread's root but none of its\nreplies, so without this a page in Main could not learn that a reply it holds from All was\nmarked Done, or put back, on another device. See [`ReplyDismissals`]."
+        },
+        "returned": {
+          "description": "Entries on this page, never a channel-wide total.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "thread": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ThreadSummary"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The selected thread, for the thread view. Outside it, the one thread a channel registered as\na single conversation is scoped to: that channel has no child threads (`has_threads` is\nfalse), and its main view carries the conversation's replies as well as its root."
+        },
+        "threads": {
+          "description": "Summaries for the threads view, ordered by last activity oldest first.",
+          "items": {
+            "$ref": "#/$defs/ThreadSummary"
+          },
+          "type": "array"
+        },
+        "untrusted_content_notice": {
+          "description": "Channel content remains untrusted data in every view.",
+          "type": "string"
+        },
+        "view": {
+          "$ref": "#/$defs/TimelineView",
+          "description": "View represented by this page."
+        }
+      },
+      "required": [
+        "channel",
+        "view",
+        "limit",
+        "returned",
+        "messages",
+        "threads",
+        "thread",
+        "has_threads",
+        "has_more",
+        "next_before",
+        "notice",
+        "dismissed",
+        "untrusted_content_notice"
+      ],
+      "type": "object"
+    },
+    "TimelineView": {
+      "description": "A view of one configured channel.",
+      "oneOf": [
+        {
+          "const": "main",
+          "description": "Messages posted directly to the channel, including thread roots.",
+          "type": "string"
+        },
+        {
+          "const": "threads",
+          "description": "Thread summaries, ordered by their latest message activity.",
+          "type": "string"
+        },
+        {
+          "const": "flat",
+          "description": "Channel messages and all accessible thread messages in one chronological history.",
+          "type": "string"
+        },
+        {
+          "const": "thread",
+          "description": "The history of one explicitly selected thread.",
+          "type": "string"
+        }
+      ]
+    },
+    "TokenScope": {
+      "description": "The scope of the credential that made a request.",
+      "oneOf": [
+        {
+          "const": "read",
+          "description": "May read channel history and summaries.",
+          "type": "string"
+        },
+        {
+          "const": "write",
+          "description": "May also post, and may use the write-only conversation routes.",
+          "type": "string"
+        }
+      ]
+    },
+    "TranscriptRole": {
+      "description": "Who spoke a `vibe-talk-v1` transcript line.",
+      "oneOf": [
+        {
+          "const": "user",
+          "description": "The person on the call.",
+          "type": "string"
+        },
+        {
+          "const": "assistant",
+          "description": "The voice agent.",
+          "type": "string"
+        }
+      ]
+    },
+    "UpstreamClearAttemptView": {
+      "description": "One push, as Settings shows it. `#232 upstream-mark-read`.",
+      "properties": {
+        "at_ms": {
+          "description": "When it was made, in milliseconds since the Unix epoch.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "error": {
+          "description": "Why it failed, in words.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message_at_ms": {
+          "description": "That message's instant, in milliseconds since the Unix epoch.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "message_id": {
+          "$ref": "#/$defs/MessageId",
+          "description": "The newest ingested message it was for."
+        },
+        "previous": {
+          "description": "The provider's cursor before it, as the provider wrote it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "result": {
+          "$ref": "#/$defs/UpstreamClearResult",
+          "description": "What it came to."
+        },
+        "target": {
+          "description": "Where the provider's cursor was moved to, or would have been, as the provider wrote it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "at_ms",
+        "message_id",
+        "message_at_ms",
+        "result"
+      ],
+      "type": "object"
+    },
+    "UpstreamClearMode": {
+      "description": "Whether the server clears one channel's unread state at its chat provider as it ingests\nmessages. `#232 upstream-mark-read`.\n\nThe ONE exception to \"read state is ours\" above, and it is one-way and opt-in per channel: with\nit on, every message this server receives in that channel is also marked read in the provider's\nown client, so a channel the owner reads here stops crowding his unread list there. Nothing is\never read back, and this server's own read marks and Done state are not touched.",
+      "oneOf": [
+        {
+          "const": "off",
+          "description": "Nothing is written to the provider. The default, and what no row means.",
+          "type": "string"
+        },
+        {
+          "const": "dry_run",
+          "description": "Everything is decided and logged as if it were on, and nothing is written to the provider.",
+          "type": "string"
+        },
+        {
+          "const": "on",
+          "description": "The provider's read cursor is moved through each newest ingested message.",
+          "type": "string"
+        }
+      ]
+    },
+    "UpstreamClearNowOutcome": {
+      "description": "What happened to a press of \"Mark read now\". `#253 upstream-clear-polish`.",
+      "oneOf": [
+        {
+          "const": "pushed",
+          "description": "The press's push was made and the provider took it: `attempt` says whether its marker\nmoved, was already there, or, in a dry run, what a real push would have done.",
+          "type": "string"
+        },
+        {
+          "const": "failed",
+          "description": "The press's push was made and failed; `attempt.error` says why. It is retried by itself, at\n`state.retry_at_ms`.",
+          "type": "string"
+        },
+        {
+          "const": "skipped",
+          "description": "The bridge no longer holds the message the push named, so nothing was marked; the next\nmessage that arrives is pushed.",
+          "type": "string"
+        },
+        {
+          "const": "covered",
+          "description": "An earlier push, or an earlier dry run, already covers the newest message. Nothing was sent.",
+          "type": "string"
+        },
+        {
+          "const": "no_message",
+          "description": "The channel has no message that can be marked.",
+          "type": "string"
+        },
+        {
+          "const": "retry_waiting",
+          "description": "The channel is waiting out a failure, from before the press or of an older push that was\nalready on its way, and the newest message goes when the retry is due, at\n`state.retry_at_ms`. Nothing was sent for the press.",
+          "type": "string"
+        },
+        {
+          "const": "waiting",
+          "description": "The push is queued or on its way, and had not been recorded when the server stopped\nwaiting, at most 45 seconds after the press. The server keeps going without the page.",
+          "type": "string"
+        },
+        {
+          "const": "changed",
+          "description": "The channel's setting changed while the press waited (turned off, set to the other mode,\nor every setting erased), or the channel stopped being one this server can clear, so the\npush was not made as asked. `state` says what holds now.",
+          "type": "string"
+        },
+        {
+          "const": "unavailable",
+          "description": "The provider refused this channel; `state.unavailable` says why.",
+          "type": "string"
+        }
+      ]
+    },
+    "UpstreamClearNowResponse": {
+      "description": "What Settings' \"Mark read now\" came to: `POST /api/v1/channels/{id}/upstream-clear/now`.\n`#253 upstream-clear-polish`.",
+      "properties": {
+        "attempt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UpstreamClearAttemptView"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The recorded push that answered the press, with `pushed`, `failed` and `skipped`, and with\n`unavailable` when the push itself was refused: the pressed message's own, or a newer\nmessage's, which covers it. What the press came to is said from this, never from\n`state.last`, which a later push may already have replaced."
+        },
+        "message_at_ms": {
+          "description": "That message's own instant, in milliseconds since the Unix epoch, when it can be read. An\nattempt recorded later whose `message_at_ms` is at or after it answers the press, which is\nhow a page told `waiting` recognises the answer when it reads the state again.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "message_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MessageId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The channel's newest message, the one the press asked to push. Absent with `no_message`."
+        },
+        "outcome": {
+          "$ref": "#/$defs/UpstreamClearNowOutcome",
+          "description": "What happened to the press."
+        },
+        "state": {
+          "$ref": "#/$defs/UpstreamClearState",
+          "description": "The channel's state after it, as `GET .../upstream-clear` would answer now."
+        }
+      },
+      "required": [
+        "outcome",
+        "state"
+      ],
+      "type": "object"
+    },
+    "UpstreamClearResult": {
+      "description": "What one automatic upstream clear came to. `#232 upstream-mark-read`.",
+      "oneOf": [
+        {
+          "const": "advanced",
+          "description": "The provider's cursor moved forward to the message.",
+          "type": "string"
+        },
+        {
+          "const": "already_read",
+          "description": "The provider's cursor was already at or past the message, so nothing moved.",
+          "type": "string"
+        },
+        {
+          "const": "dry_run",
+          "description": "A dry run: the server worked out where the cursor would move and wrote nothing.",
+          "type": "string"
+        },
+        {
+          "const": "failed",
+          "description": "The provider or the bridge failed; the server retries with a growing wait.",
+          "type": "string"
+        },
+        {
+          "const": "skipped",
+          "description": "The bridge no longer holds that message; the server waits for a newer one.",
+          "type": "string"
+        },
+        {
+          "const": "unavailable",
+          "description": "The provider cannot clear this channel at all, such as one thread of a larger space.",
+          "type": "string"
+        }
+      ]
+    },
+    "UpstreamClearState": {
+      "description": "Whether this server clears one channel's unread state at its chat provider, and what it last\ndid: `GET` and `PUT /api/v1/channels/{id}/upstream-clear`. `#232 upstream-mark-read`.\n\nEverything here is the server's own record. The provider's cursor is never read back except\nas the answer to a push, so `pushed` and `last` say what this server did, not what the owner\nhas since read in the provider's own client.",
+      "properties": {
+        "channel": {
+          "$ref": "#/$defs/ChannelInfo",
+          "description": "The channel it is about."
+        },
+        "enabled_at_ms": {
+          "description": "When it was turned on or to a dry run, in milliseconds since the Unix epoch, while it is.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "failures": {
+          "description": "Failed attempts in a row.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "last": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UpstreamClearAttemptView"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The most recent attempt of any kind."
+        },
+        "mode": {
+          "$ref": "#/$defs/UpstreamClearMode",
+          "description": "What the owner chose. Off unless set."
+        },
+        "pending": {
+          "description": "Whether a message is waiting to be pushed.",
+          "type": "boolean"
+        },
+        "previous_cursor": {
+          "description": "The provider's cursor before this server first moved it, for a manual undo.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider_name": {
+          "description": "The name of the channel's chat provider, for the words on the control.",
+          "type": "string"
+        },
+        "pushed": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UpstreamClearAttemptView"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The newest push the provider's cursor is known to cover because of this server."
+        },
+        "retry_at_ms": {
+          "description": "When the next retry is due, in milliseconds since the Unix epoch, after a failure.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "supported": {
+          "description": "Whether the channel's provider can do this at all. When false the mode is always off.",
+          "type": "boolean"
+        },
+        "unavailable": {
+          "description": "Why the provider cannot do this for this channel, once it has said so.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "channel",
+        "provider_name",
+        "supported",
+        "mode",
+        "failures",
+        "pending"
+      ],
+      "type": "object"
+    },
+    "UserId": {
+      "description": "A Discord user snowflake, as a string.\n\nKept distinct from [`MessageId`] and [`ChannelId`] so the three cannot be passed for one\nanother: they are all decimal snowflakes, and a wrong one is silently plausible.",
+      "type": "string"
+    },
+    "VibeTalkV1ClientFrame": {
+      "description": "A JSON control frame a `vibe-talk-v1` client sends. Microphone audio travels separately, as\nbinary PCM at the session's input rate.",
+      "oneOf": [
+        {
+          "description": "Microphone frames follow.",
+          "properties": {
+            "type": {
+              "const": "audio_start",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The open microphone segment is over; the server answers with `turn_complete`.",
+          "properties": {
+            "type": {
+              "const": "audio_end",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "One typed turn.",
+          "properties": {
+            "text": {
+              "description": "What the person typed.",
+              "type": "string"
+            },
+            "type": {
+              "const": "prompt",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Stop the running turn. The server answers with exactly one interrupted `turn_complete`, or\nignores this when nothing is running.",
+          "properties": {
+            "type": {
+              "const": "interrupt",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "End the session.",
+          "properties": {
+            "type": {
+              "const": "quit",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "VibeTalkV1ServerFrame": {
+      "description": "A JSON control frame a `vibe-talk-v1` server sends. Audio travels separately, as binary frames\nof 24 kHz, 16-bit little-endian mono PCM.\n\nA client ignores a `type` it does not know, so a new frame type is backward compatible; a\nchanged field of a known type is not.",
+      "oneOf": [
+        {
+          "description": "The session is ready. Always the first frame.",
+          "properties": {
+            "greeting": {
+              "description": "Whether the agent speaks first. When true, a voice client withholds microphone frames\nuntil the first `turn_complete`. Absent means false.",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "session_id": {
+              "description": "Provider session identifier, for connection details only.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "session_started",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Recognised or generated speech text.",
+          "properties": {
+            "final": {
+              "description": "False for a streaming hypothesis the provider may still correct. Absent means true, so\na provider that only sends finished text needs no change.",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "role": {
+              "$ref": "#/$defs/TranscriptRole",
+              "description": "Who said it."
+            },
+            "text": {
+              "description": "The words, or the current hypothesis of them.",
+              "type": "string"
+            },
+            "turn": {
+              "description": "The turn this text belongs to. A frame without one cannot be matched and is treated as\nits own turn.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "transcript",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "role",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Every accepted prompt, and every closed audio segment, ends with exactly one of these.",
+          "properties": {
+            "interrupted": {
+              "description": "True when an `interrupt` cut the turn short.",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "turn": {
+              "description": "The turn that ended.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "turn_complete",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The provider failed. No `turn_complete` follows, so a client treats this as the end of the\nsession.",
+          "properties": {
+            "detail": {
+              "description": "Additional detail, when the provider has any.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "message": {
+              "description": "What went wrong, in words.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "error",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "VoiceDescription": {
+      "description": "Stable provider details that can be shown before a session is opened.",
+      "properties": {
+        "instance_id": {
+          "description": "Provider instance identifier, when one exists.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Human-readable provider name.",
+          "type": "string"
+        },
+        "settings_url": {
+          "description": "Provider console for the configured agent, when one exists.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "VoicePromptSettings": {
+      "description": "The owner's own words for the voice agent, as Settings shows them. `#272\nvoice-agent-instructions`.\n\nThe body of `GET` and `PUT /api/v1/voice-prompt`, and `voice_prompt` in client-config. Both\ntexts join only the scope-neutral part of the prompt: what the agent can do — read, send, or\nask first — is added by the server from the caller's token and the send setting, after them.",
+      "properties": {
+        "changeable": {
+          "description": "Whether this server can keep a change. False with no store configured, and when the store\ncannot be read — the agent then gets the shipped prompt.",
+          "type": "boolean"
+        },
+        "delivery": {
+          "$ref": "#/$defs/PromptDelivery",
+          "description": "How these words reach this deployment's voice agent."
+        },
+        "edited_from_version": {
+          "description": "The prompt version shipped when he last saved his copy; present exactly when he has one.\nBehind `prompt_version` means the shipped prompt has changed since.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "instructions": {
+          "description": "Additional instructions, added to every call. Empty for none.",
+          "type": "string"
+        },
+        "max_instructions_chars": {
+          "description": "The longest `instructions` a save may carry, in characters.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_system_prompt_chars": {
+          "description": "The longest `system_prompt` a save may carry, in characters.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "prompt_version": {
+          "description": "The version of the prompt this server ships.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "system_prompt": {
+          "description": "The base prompt in force: the owner's edited copy when `system_prompt_edited`, otherwise\nthe shipped one, so the editor always opens on what the agent is actually given.",
+          "type": "string"
+        },
+        "system_prompt_edited": {
+          "description": "Whether `system_prompt` is the owner's edited copy.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "instructions",
+        "system_prompt",
+        "system_prompt_edited",
+        "prompt_version",
+        "max_instructions_chars",
+        "max_system_prompt_chars",
+        "changeable",
+        "delivery"
+      ],
+      "type": "object"
+    },
+    "VoiceSession": {
+      "description": "A browser-ready conversational voice session.",
+      "properties": {
+        "agent_prompt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionPrompt"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The owner's words for the agent, for the page to hand over as the socket opens. `#272\nvoice-agent-instructions`.\n\nFilled in by `GET /api/v1/voice-session` on every session of a hosted agent the page\nconfigures, whatever the owner has saved — `not_sent` when none of his words can reach it —\nso the page always learns what the call was given; a provider never sets it. A\ndeployment-managed bridge reads the same words from `GET /api/v1/voice-agent` instead, and\nits sessions carry none."
+        },
+        "input_sample_rate": {
+          "description": "Microphone PCM sample rate expected by the provider.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "output_sample_rate": {
+          "description": "Speaker PCM sample rate emitted by the provider.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "protocol": {
+          "description": "Wire protocol spoken on the socket.",
+          "type": "string"
+        },
+        "provider": {
+          "description": "Human-readable provider label for connection details.",
+          "type": "string"
+        },
+        "valid_for_seconds": {
+          "description": "Endpoint validity when the provider issues expiring URLs.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "websocket_url": {
+          "description": "WebSocket endpoint for this conversation.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "websocket_url",
+        "protocol",
+        "provider",
+        "input_sample_rate",
+        "output_sample_rate"
+      ],
+      "type": "object"
+    },
+    "VoiceSettings": {
+      "description": "Whether the voice agent must ask before it sends. `#264 voice-send-approval`.\n\nThe body of `GET` and `PUT /api/v1/voice-settings`, and `voice_settings` in client-config.",
+      "properties": {
+        "ask_before_send": {
+          "description": "The value in force: true means `post_reply` proposes and the owner confirms, by a tap or by\na plain yes the voice page hears; false means `post_reply` posts at once. The owner's saved\nchoice, or the configured default until he makes one.",
+          "type": "boolean"
+        },
+        "changeable": {
+          "description": "Whether this server can keep a change. False with no store configured, and when the store\ncannot be read — the server then asks, whatever the configured default says.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "ask_before_send",
+        "changeable"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://github.com/rrnewton/agent-utils/vibe-talk/contract/vibe-talk.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "anyOf": [
+    {
+      "$ref": "#/$defs/ApiErrorBody"
+    },
+    {
+      "$ref": "#/$defs/ClientConfigResponse"
+    },
+    {
+      "$ref": "#/$defs/VoiceSession"
+    },
+    {
+      "$ref": "#/$defs/TimelineResponse"
+    },
+    {
+      "$ref": "#/$defs/PendingPostResponse"
+    },
+    {
+      "$ref": "#/$defs/CommittedPostResponse"
+    },
+    {
+      "$ref": "#/$defs/LiveMessageEvent"
+    },
+    {
+      "$ref": "#/$defs/LiveDeleteEvent"
+    },
+    {
+      "$ref": "#/$defs/LiveResetEvent"
+    },
+    {
+      "$ref": "#/$defs/VibeTalkV1ServerFrame"
+    },
+    {
+      "$ref": "#/$defs/VibeTalkV1ClientFrame"
+    },
+    {
+      "$ref": "#/$defs/Message"
+    },
+    {
+      "$ref": "#/$defs/ThreadSummary"
+    },
+    {
+      "$ref": "#/$defs/PinsResponse"
+    },
+    {
+      "$ref": "#/$defs/PinChangeResponse"
+    },
+    {
+      "$ref": "#/$defs/UpstreamClearState"
+    },
+    {
+      "$ref": "#/$defs/BookmarkResponse"
+    },
+    {
+      "$ref": "#/$defs/UpstreamClearNowResponse"
+    },
+    {
+      "$ref": "#/$defs/VoiceSettings"
+    },
+    {
+      "$ref": "#/$defs/MessagesResponse"
+    },
+    {
+      "$ref": "#/$defs/VoicePromptSettings"
+    }
+  ],
+  "description": "Generated from vibe-talk/src/contract.rs by `make -C vibe-talk contract`. Do not edit.",
+  "title": "vibe-talk wire contract"
+}

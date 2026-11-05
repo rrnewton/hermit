@@ -1,0 +1,36 @@
+description: Shipped DAG examples under both implementations
+
+steps:
+  - group: run
+    job: python
+    desc: every shipped example behaves as documented under Python dagrun
+    cmd: python3 scripts/check_dagrun_examples.py --engine python
+    jobs_flag: ""
+    jobs_env: AGENT_UTILS_VALIDATION_JOBS
+    labels: [validation-cross, component-dagrun]
+    delegated_children: true
+    timeout: 600
+    cpu_timeout: 900
+    hint: &examples_hint
+      est_duration_s: 30
+      classification: latency-bound
+      # Eight permits every example to run. On a narrower runner jobs_env tells this harness the
+      # honest budget, and example 05 proves its documented fixed-width refusal instead.
+      preferred_inner_jobs: 8
+      rss_baseline_bytes: 1073741824
+      # Example 08 explicitly models a 16 GiB clean-build worker. The parent must delegate that
+      # advertised envelope rather than letting an inner scheduler plan against memory it cannot
+      # physically use. An explicit hard cap avoids multiplying this contract by 1.25.
+      hard_mem_max_bytes: 17179869184
+
+  - group: run
+    job: rust
+    desc: every shipped example behaves as documented under Rust dagrun
+    cmd: python3 scripts/check_dagrun_examples.py --engine rust
+    jobs_flag: ""
+    jobs_env: AGENT_UTILS_VALIDATION_JOBS
+    labels: [validation-cross, component-dagrun]
+    delegated_children: true
+    timeout: 600
+    cpu_timeout: 900
+    hint: *examples_hint

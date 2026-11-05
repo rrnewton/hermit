@@ -1,0 +1,59 @@
+[package]
+name = "dagrun"
+version = "0.15.0"
+description = "Run a DAG of CI/build steps with independent step and total-CPU limits, nested cgroup boxing, and resource profiling."
+readme = "README.md"
+keywords = ["ci", "dag", "cgroup", "scheduler"]
+categories = ["command-line-utilities", "development-tools"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+# JSON parsing only (no `#[derive(Deserialize)]`): the strict reader in io.rs applies the format's
+# exact type narrowing by hand, and serialization is hand-rolled to preserve the public wire
+# contract byte-for-byte (key order, 2-space indent, and float formatting), which a derive plus
+# default serde_json round-trip cannot guarantee. (serde_json still transitively depends on
+# serde_core/serde_derive via Cargo.lock; this crate simply does not use the derive macro.)
+# `float_roundtrip` makes serde_json's float PARSER correctly rounded, so a float literal loads to
+# the exact f64 represented by the input — a prerequisite for byte-identical re-emission.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+# A manual Deserialize visitor rejects duplicate structured-result keys before
+# serde_json::Value could overwrite their original evidence. No derive macros.
+serde = "1"
+# YAML interchange (FEATURE: YAML is isomorphic to the JSON schema). serde_yaml is ARCHIVED;
+# serde_norway is its maintained, actively-updated fork keeping the same serde API and YAML 1.2
+# core-schema semantics. We deserialize YAML directly into `serde_json::Value` so the YAML path
+# funnels into the EXACT same strict narrowing (`dag_from_value`) as JSON — identical model
+# construction, one code path. (serde_yml is a deprecated/unmaintained shim; yaml-rust2 is a bare
+# parser with no serde-Value integration.) NOTE: serde_norway pulls in unsafe-libyaml-norway
+# (libyaml transpiled to Rust), so the YAML parser contains `unsafe` internally; this project's own
+# code stays 100% safe Rust. This is inherent to the serde-YAML ecosystem (the archived serde_yaml
+# used unsafe-libyaml the same way); the only pure-safe alternative, yaml-rust2, lacks serde-Value
+# integration.
+serde_norway = "0.9"
+# Safe (no-`unsafe`) SIGINT/SIGTERM registration for the cgroup scope-teardown handler: on
+# Ctrl-C the whole outer scope is torn down so no setsid-escapee orphans survive. std has no
+# signal API, and this project is safe-rust; signal-hook encapsulates the unsafe internally.
+signal-hook = "0.4.4"
+# CPU affinity for the opt-in `--cores K` core box (whole-tree size-K cpuset fallback). std has no
+# sched_getaffinity/sched_setaffinity binding; the two calls are the ONLY `unsafe` this crate's own
+# code performs and are wrapped + documented in cgroup.rs. libc is already in the dependency tree.
+libc = "0.2"
+
+[[bin]]
+name = "dagrun"
+path = "src/main.rs"
+
+[[bin]]
+name = "cpuset-alloc"
+path = "src/bin/cpuset_alloc.rs"
+
+[lib]
+name = "dagrun"
+path = "src/lib.rs"
+
+[lints]
+workspace = true

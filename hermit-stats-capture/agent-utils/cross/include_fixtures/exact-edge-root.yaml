@@ -1,0 +1,12 @@
+include:
+  - path: exact-edge-child.yaml
+    namespace: child
+steps:
+  - group: outer
+    job: exact
+    cmd: 'touch "$INCLUDE_EXACT_MARKER"'
+    deps: [child.work.midpoint]
+    hint:
+      # With one active slot, this must run before the shorter child terminal once the midpoint
+      # succeeds. A synthetic whole-fragment completion edge would force the terminal first.
+      est_duration_s: 10
