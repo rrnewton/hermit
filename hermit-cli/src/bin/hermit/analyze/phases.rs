@@ -64,7 +64,6 @@ use crate::app::analyze::types::ExitStatusConstraint;
 use crate::app::analyze::types::PartialReport;
 use crate::app::analyze::types::Report;
 use crate::app::analyze::types::ReportCriticalEvent;
-use crate::app::analyze::types::TrialTimeout;
 use crate::app::analyze::verdict::AlternativeTiming;
 use crate::app::analyze::verdict::AnalyzeFailure;
 use crate::app::analyze::verdict::AnalyzePrecondition;
@@ -526,7 +525,7 @@ impl IntervalFiles {
             let path = &self.paths[slot];
             let aside = path.with_extension("partial");
             let written = opts
-                .write_trial_schedule(events.to_vec(), &aside)
+                .write_trial_schedule_from(events.to_vec(), &[], &aside)
                 .and_then(|()| Ok(std::fs::rename(&aside, path)?));
             match written {
                 Ok(()) => self.written[slot] = Some(hash),
@@ -9450,7 +9449,7 @@ mod tests {
         // So does one whose file no longer holds what the interval names.
         let recorded = options.progress.snapshot().interval.unwrap();
         options
-            .write_trial_schedule(events(&[5, 3, 3, 5]), &recorded.passing)
+            .write_trial_schedule_from(events(&[5, 3, 3, 5]), &[], &recorded.passing)
             .unwrap();
         assert!(options.resumable_interval(&endpoints).is_none());
         // And one recorded before the search's first pass, which has no state.
