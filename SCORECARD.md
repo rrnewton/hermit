@@ -2,31 +2,31 @@
 
 This table is derived from the manifest, not from a separately maintained parent-workspace CSV. `./ci/compat-envelope/scorecard.rs check` verifies it.
 
-The count table includes all **11856** cells in the manifest; no row is omitted. A cell is **Selected by full** exactly when it appears in `ci/expected-e2e-plan.json`. A cell is **Not selected by full** when it is in the manifest but absent from that plan. Selection is not a test result: a cell not selected by full may have passed, failed, produced no verdict, or never run. Of these cells, **2412** are selected by full, **1095** are not selected by full, and **8349** are **Not applicable**.
+The count table includes all **14668** cells in the manifest; no row is omitted. A cell is **Selected by full** exactly when it appears in `ci/expected-e2e-plan.json`. A cell is **Not selected by full** when it is in the manifest but absent from that plan. Selection is not a test result: a cell not selected by full may have passed, failed, produced no verdict, or never run. Of these cells, **2412** are selected by full, **1243** are not selected by full, and **11013** are **Not applicable**.
 
 Every selected `verify` cell that does not declare the stripped comparator, and every seed in a selected `chaos` cell, runs the same backend twice. The manifest runner adds `--verify-strict` when the selected Hermit binary supports it, and accepts a result only when the typed report says `verified=true`, `verdict=matched`, `bitwise_parity=true`, `strictness=canonical`, `compare_logs=true`, a named canonical `record_envelope`, and both INFO-message counts are nonzero. Bare `--verify` remains a Stripped comparison when invoked directly and does not satisfy this regression plan. None of the **1841** selected `verify` cells declares the stripped comparator. These same-backend results do not establish cross-backend parity.
 
 | Backend | Selected by full | Not selected by full | Not applicable | In the manifest |
 | --- | ---: | ---: | ---: | ---: |
-| `ptrace` | 1182 | 18 | 672 | 1872 |
-| `dbt` | 0 | 561 | 1311 | 1872 |
-| `kvm` | 599 | 5 | 1268 | 1872 |
-| `sabre` | 0 | 478 | 1394 | 1872 |
-| `liteinst` | 316 | 0 | 1556 | 1872 |
-| `in-guest-trap` | 315 | 0 | 1557 | 1872 |
-| `native` | 0 | 33 | 591 | 624 |
-| **Total** | **2412** | **1095** | **8349** | **11856** |
+| `ptrace` | 1182 | 166 | 968 | 2316 |
+| `dbt` | 0 | 561 | 1755 | 2316 |
+| `kvm` | 599 | 5 | 1712 | 2316 |
+| `sabre` | 0 | 478 | 1838 | 2316 |
+| `liteinst` | 316 | 0 | 2000 | 2316 |
+| `in-guest-trap` | 315 | 0 | 2001 | 2316 |
+| `native` | 0 | 33 | 739 | 772 |
+| **Total** | **2412** | **1243** | **11013** | **14668** |
 
 **Archived:** `sabre` (backend, archived 2026-10-25, nightly only) and `e9patch` (preprocessing with ptrace, not a backend, archived 2026-10-25, nightly only). They get no feature work and their tests left per-commit validation. An archived backend's cells that would be selected by full belong to the `archived-nightly` run type instead, so the table counts them as not selected by full, and the nightly pressure sweep runs them as red cells. `ci/manifest-plan/src/archived.rs` records what still runs per commit.
 
 ## Denominator, and why the percentage is not comparable across changes to it
 
-Selected by full is **2412 of 11856**, which is **20.34%** — over THIS population and no other. The population is every combination the manifest declares, and it is composed of:
+Selected by full is **2412 of 14668**, which is **16.44%** — over THIS population and no other. The population is every combination the manifest declares, and it is composed of:
 
 - backends: `ptrace`, `dbt`, `kvm`, `sabre`, `liteinst`, `in-guest-trap`, `native`
 - modes: `chaos`, `naked`, `replay`, `verify`
 
-⚠️ **8349 of those 11856 cells are NOT APPLICABLE** — their backend is not applicable for their mode, so they were never asked to run and cannot pass or fail. Over the 3507 cells that CAN run, selected by full is **68.78%**.
+⚠️ **11013 of those 14668 cells are NOT APPLICABLE** — their backend is not applicable for their mode, so they were never asked to run and cannot pass or fail. Over the 3655 cells that CAN run, selected by full is **65.99%**.
 
 ⚠️ **DO NOT QUOTE THAT SECOND FIGURE AS PROGRESS.** It is the same 2412 cells selected by full measured against a smaller denominator. Nothing was fixed to produce it; it is what the first figure always meant once the cells that cannot run are excluded. Quote both or neither, and never compare one against the other as though something moved.
 
@@ -36,11 +36,11 @@ The mode view makes the current order of work explicit: expand `verify` first, t
 
 | Mode | `ptrace` | `dbt` | `kvm` | `sabre` | `liteinst` | `in-guest-trap` | `native` | Selected by full | Not selected by full | Not applicable | In the manifest |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `verify` | 611 / 624 | 0 / 624 | 599 / 624 | 0 / 624 | 316 / 624 | 315 / 624 | — | 1841 | 1056 | 847 | 3744 |
-| `replay` | 564 / 624 | 0 / 624 | 0 / 624 | 0 / 624 | 0 / 624 | 0 / 624 | — | 564 | 6 | 3174 | 3744 |
-| `chaos` | 7 / 624 | 0 / 624 | 0 / 624 | 0 / 624 | 0 / 624 | 0 / 624 | — | 7 | 0 | 3737 | 3744 |
-| `naked` | — | — | — | — | — | — | 0 / 624 | 0 | 33 | 591 | 624 |
-| **Total** | | | | | | | | **2412** | **1095** | **8349** | **11856** |
+| `verify` | 611 / 772 | 0 / 772 | 599 / 772 | 0 / 772 | 316 / 772 | 315 / 772 | — | 1841 | 1204 | 1587 | 4632 |
+| `replay` | 564 / 772 | 0 / 772 | 0 / 772 | 0 / 772 | 0 / 772 | 0 / 772 | — | 564 | 6 | 4062 | 4632 |
+| `chaos` | 7 / 772 | 0 / 772 | 0 / 772 | 0 / 772 | 0 / 772 | 0 / 772 | — | 7 | 0 | 4625 | 4632 |
+| `naked` | — | — | — | — | — | — | 0 / 772 | 0 | 33 | 739 | 772 |
+| **Total** | | | | | | | | **2412** | **1243** | **11013** | **14668** |
 
 ## Ptrace by manifest category
 
@@ -57,6 +57,7 @@ This view uses the same Basic Sanity Milestone 1 contracts as the tables above, 
 | `debugger-c` | 1 / 1 | 1 / 1 | 0 / 1 | 2 | 3 |
 | `determinism-stress` | 6 / 6 | 6 / 6 | 2 / 6 | 14 | 18 |
 | `determinism-stress-c` | 11 / 11 | 11 / 11 | 1 / 11 | 23 | 33 |
+| `gvisor` | 0 / 148 | 0 / 148 | 0 / 148 | 0 | 444 |
 | `language-runtimes` | 21 / 22 | 19 / 22 | 0 / 22 | 40 | 66 |
 | `shared-futex-c` | 1 / 4 | 0 / 4 | 0 / 4 | 1 | 12 |
 | `system-utils` | 41 / 41 | 40 / 41 | 0 / 41 | 81 | 123 |
