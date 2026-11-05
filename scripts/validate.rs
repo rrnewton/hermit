@@ -928,8 +928,9 @@ struct Args {
     verbosity: i64,
     jobs: Option<i64>,
     keep_going: bool,
-    /// Queue-candidate mode: the first confirmed red eager-cancels
-    /// everything else. Adds no dependency edges. See [`apply_fail_fast`].
+    /// Explicit spelling of the early-exit default: the first confirmed
+    /// red eager-cancels everything else. `-k` opts out. Adds no
+    /// dependency edges. See [`apply_fail_fast`].
     fail_fast: bool,
     allow_cgroup_failure: bool,
     /// Wall budget for the whole validate invocation, across lanes and retries.
@@ -1353,9 +1354,10 @@ fn usage() -> &'static str {
      \x20                  retries). On breach, in-flight nodes are cut and the run still\n\
      \x20                  reports instead of being killed externally. Also sets a later\n\
      \x20                  systemd-scope backstop. Env: HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS.\n\
-     \x20 -k, --keep-going Do not eager-exit on the first failure.\n\
-     \x20 --fail-fast    Queue-candidate mode: eager-exit the whole graph on the\n\
-     \x20                first confirmed red. Adds no dependency edges.\n\
+     \x20 -k, --keep-going Run everything: no eager-exit at graph or test level.\n\
+     \x20                The opt-in for a full failure list (nightly, audits).\n\
+     \x20 --fail-fast    Early exit (the default): eager-exit the whole graph on\n\
+     \x20                the first confirmed red. Adds no dependency edges.\n\
      \x20 --allow-cgroup-failure  Downgrade to an UNBOXED run instead of failing closed.\n\
      \x20 --show-plan      Print the outer boxed DAG nodes, caps, and dependencies and exit.\n\
      \x20                  It does not enumerate Rust test IDs or E2E cells.\n\
@@ -13445,15 +13447,16 @@ fn frozen_run_withheld_lines(withheld: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Queue-candidate fail-fast, applied to the selected graph before it is
-/// sealed as the committed scheduler input.
+/// Early-exit graph shape, applied to the selected graph before it is
+/// sealed as the committed scheduler input. This is the DEFAULT shape;
+/// only a keep-going run skips it.
 ///
 /// The committed DAG isolates every step in its own `fail_fast_family`, so
-/// one red node cancels nothing but itself and a queue candidate still pays
-/// for the whole matrix (4742: a 7 s static-check red known at t+309 s,
-/// then 542 s of unrelated nodes). In fail-fast mode every family collapses
-/// to the scheduler's global eager-exit scope (`None`): the first confirmed
-/// failure stops launches and cancels in-flight peers.
+/// one red node cancels nothing but itself and a run still pays for the
+/// whole matrix (4742: a 7 s static-check red known at t+309 s, then 542 s
+/// of unrelated nodes). Collapsed, every family shares the scheduler's
+/// global eager-exit scope (`None`): the first confirmed failure stops
+/// launches and cancels in-flight peers.
 ///
 /// Nothing else changes. No dependency edge is added, removed, or
 /// reordered: the owner forbids artificial sequential dependencies, so
@@ -13468,8 +13471,30 @@ fn apply_fail_fast(plan: &mut Plan) {
     }
 }
 
+/// Record the run-everything opt-in on every step: the counted nextest
+/// wrapper reads `HERMIT_NEXTEST_FAIL_FAST=0` and keeps its batch running
+/// past the first failing test. Harmless on steps that never read it, and
+/// inserted before the selection is sealed so the committed bytes carry it.
+fn apply_keep_going_nextest_env(plan: &mut Plan) {
+    for cfg in std::iter::once(&mut plan.cfg).chain(plan.second.iter_mut()) {
+        for step in &mut cfg.steps {
+            step.env
+                .insert("HERMIT_NEXTEST_FAIL_FAST".to_string(), "0".to_string());
+        }
+    }
+}
+
 /// [`finish_committed_selection`] for this invocation: `--frozen-run` nodes are
-/// withheld first, then the fail-fast queue shape is applied.
+/// withheld first, then the early-exit shape is applied.
+///
+/// Early exit is the default (owner directive 2026-11-04): unless the run
+/// opted in to running everything (`-k`/`--keep-going`, or a profile that
+/// forces it, such as the envelope measurement), every fail-fast family
+/// collapses so the first confirmed red stops the graph. `--fail-fast`
+/// remains accepted as the explicit spelling of that default. Keep-going
+/// instead keeps the committed families and marks every step so nextest
+/// also runs its whole batch. Neither mode adds, removes, or reorders a
+/// dependency edge.
 fn finish_selection_for(
     args: &Args,
     mut plan: Plan,
@@ -13479,7 +13504,9 @@ fn finish_selection_for(
     if args.frozen_run {
         withhold_frozen_run_nodes(&mut plan)?;
     }
-    if args.fail_fast {
+    if args.keep_going || plan.force_keep_going {
+        apply_keep_going_nextest_env(&mut plan);
+    } else {
         apply_fail_fast(&mut plan);
     }
     Ok(finish_committed_selection(plan, source_path, source_bytes))
@@ -37851,17 +37878,29 @@ mod fail_fast_tests {
     use super::*;
 
     fn full_plan() -> Plan {
+        full_plan_with_source().0
+    }
+
+    fn full_plan_with_source() -> (Plan, PathBuf, Vec<u8>) {
         let root = test_source_root();
-        let (committed, _path, _bytes) = load_committed_validation_dag(&root).unwrap();
+        let (committed, path, bytes) = load_committed_validation_dag(&root).unwrap();
         let cfg = dagrun::select_steps_by_labels(&committed, &["full".into()]).unwrap();
-        Plan {
+        let plan = Plan {
             planned_test_nodes: test_nodes_of(&cfg),
             cfg,
             profile: "full".into(),
             selection_mode: "full",
             suite_complete: true,
             ..Plan::default()
-        }
+        };
+        (plan, path, bytes)
+    }
+
+    fn deps_of(cfg: &DagConfig) -> BTreeMap<String, Vec<String>> {
+        cfg.steps
+            .iter()
+            .map(|step| (step.tag(), step.deps.clone()))
+            .collect()
     }
 
     #[test]
@@ -37917,17 +37956,56 @@ mod fail_fast_tests {
         );
     }
 
+    /// Owner directive 2026-11-04: early exit is the DEFAULT at graph
+    /// level. A plain invocation (no --fail-fast, no -k) must already
+    /// collapse every family; deps stay byte-identical (no new edges).
     #[test]
-    fn without_the_flag_the_plan_is_untouched() {
-        let plan = full_plan();
-        let before = dag_to_json(&plan.cfg);
+    fn by_default_the_graph_collapses_without_new_edges() {
+        let (plan, path, bytes) = full_plan_with_source();
+        let before = deps_of(&plan.cfg);
         let args = parse_argv(&["full".into(), "--no-label-pr".into()]).unwrap();
-        assert!(!args.fail_fast);
-        assert_eq!(dag_to_json(&plan.cfg), before);
+        assert!(!args.fail_fast && !args.keep_going);
+        let finished = finish_selection_for(&args, plan, path, bytes).unwrap();
         assert!(
-            plan.cfg.steps.iter().any(|step| step.fail_fast_family.is_some()),
-            "the committed full plan must keep its per-step families"
+            finished
+                .cfg
+                .steps
+                .iter()
+                .all(|step| step.fail_fast_family.is_none()),
+            "default mode must share the global eager-exit scope"
         );
+        assert_eq!(deps_of(&finished.cfg), before);
+    }
+
+    /// The opt-in to run everything: -k/--keep-going keeps the committed
+    /// per-step families and tells every nextest step to keep going too
+    /// (HERMIT_NEXTEST_FAIL_FAST=0), still without touching any edge.
+    #[test]
+    fn keep_going_keeps_families_and_marks_every_step() {
+        let (plan, path, bytes) = full_plan_with_source();
+        let before = deps_of(&plan.cfg);
+        let args = parse_argv(&["full".into(), "--no-label-pr".into(), "-k".into()]).unwrap();
+        assert!(args.keep_going);
+        let finished = finish_selection_for(&args, plan, path, bytes).unwrap();
+        assert!(
+            finished
+                .cfg
+                .steps
+                .iter()
+                .any(|step| step.fail_fast_family.is_some()),
+            "keep-going must keep the committed per-step families"
+        );
+        for cfg in std::iter::once(&finished.cfg).chain(finished.second.iter()) {
+            for step in &cfg.steps {
+                assert_eq!(
+                    step.env.get("HERMIT_NEXTEST_FAIL_FAST").map(String::as_str),
+                    Some("0"),
+                    "{} must carry the keep-going nextest marker",
+                    step.tag()
+                );
+            }
+        }
+        assert_eq!(deps_of(&finished.cfg), before);
     }
 }
 
