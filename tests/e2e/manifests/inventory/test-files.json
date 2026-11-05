@@ -2018,6 +2018,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/proc_other_process_links.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/proc_other_process_links.c is owned by hermit-cli/tests/cli.rs: another_processs_exe_cwd_and_root_links_answer_as_linux runs it on ptrace and run_kvm_another_processs_exe_cwd_and_root_links_answer_as_linux on KVM, each under run --strict --verify --verify-strict at bitwise parity, and requires its transcript of other processes' /proc/<pid>/exe, cwd and root links (a forked child by number, below its task directory, relative to a directory descriptor, cut short, followed past the link, after fchdir; an inherited working directory; an exec'd copy whose image is renamed and unlinked; a second thread; a zombie; a non-dumpable child read without capabilities) to equal the same guest's native run line for line (package K item 2b slice 2b-4); run_kvm_a_renamed_working_directory_of_another_process_is_refused_by_name runs its --renamed-cwd mode on KVM and requires the named refusal. The test checks the native transcript against fixed lines first, so a host that answers otherwise fails before the comparison."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/proc_other_process_stat.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/proc_other_process_stat.c is owned by hermit-cli/tests/cli.rs: another_processs_stat_and_comm_answer_as_linux runs it on ptrace and run_kvm_another_processs_stat_and_comm_answer_as_linux on KVM, each under run --strict --verify --verify-strict at bitwise parity, and requires its transcript of another process's /proc/<pid>/stat, task/<tid>/stat and comm (a live child named by PR_SET_NAME with a named second thread and the CPU time it used, read by path and relative to a descriptor of its directory, whose listing it checks; the parent's stat read by the child before the parent opened its own; a zombie's, with its exit code) to equal the same guest's native run line for line (package K item 2b slice 2b-1). A generic manifest cannot compare a backend's transcript with a native run whose pids and CPU time differ from run to run, so the guest prints those as comparisons and the test compares the transcripts."

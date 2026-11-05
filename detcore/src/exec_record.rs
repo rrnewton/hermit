@@ -23,6 +23,10 @@
 //! Only the path is recorded. Where the image ends, which a program-break
 //! model would need, is known only once the image is loaded, and nothing
 //! reads it yet.
+//!
+//! Where Detcore renders another process's links (KVM), the record also
+//! answers that process's `exe` link while it names the image exactly
+//! (package K item 2b slice 2b-4), and a [`DirectoryRecord`] its `cwd` link.
 
 use std::fs;
 use std::io::Read;
@@ -194,6 +198,72 @@ impl ExecRecord {
                 .and_then(|path| directory_chain(root, &path))
                 .is_some_and(|now| now == self.directories)
     }
+}
+
+/// A task's working directory, which its `/proc/<pid>/cwd` link names, as
+/// Detcore records it where it renders another process's link (package K
+/// item 2b slice 2b-4; `ProcessAuxvTable`'s filesystem groups in
+/// `tool_global`).
+///
+/// Linux's link renders the directory's dentry with `d_path`
+/// (`proc_cwd_link`, fs/proc/base.c:221 at v6.17), so its text follows a
+/// rename of the directory or of any directory above it, and ends in
+/// " (deleted)" once the directory is removed. The record keeps the path and
+/// each directory's device and inode, from the working directory itself up to
+/// the root, so that it names its path only while that path still leads
+/// through the same directories ([`Self::names_path_exactly`]); otherwise
+/// the caller refuses the link by name rather than show a path Linux's link
+/// would not.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectoryRecord {
+    /// The directory's canonical path, as the task's root directory shows it.
+    pub path: PathBuf,
+    /// The device and inode of the directory and of each directory above it,
+    /// up to the root, when it was recorded.
+    directories: Vec<(u64, u64)>,
+}
+
+impl DirectoryRecord {
+    /// The record of the directory at `path`, a canonical absolute path the
+    /// caller sees below `root`, as it is now: `None` where `path` is not
+    /// absolute or not below `root`, or where it or a directory above it
+    /// cannot be read or is no directory (a symbolic link at any of them
+    /// included, which a canonical path does not hold).
+    pub fn at(root: &Path, path: &Path) -> Option<Self> {
+        let found = below(root, path)?;
+        Some(Self {
+            path: path.to_path_buf(),
+            directories: directory_chain_from(root, &found)?,
+        })
+    }
+
+    /// Whether the recorded path still names exactly the directory recorded,
+    /// as Linux's `cwd` link renders it (`d_path` of the directory's dentry),
+    /// for a task whose root directory the caller sees at `root`: every
+    /// directory from the recorded one up to the root is the one that was
+    /// there (its device and inode, not following a symbolic link). A
+    /// directory has one dentry, so the same directory inode at each step of
+    /// the path is that path's chain of dentries: a rename or removal of the
+    /// directory or of a directory above it, and another directory or a
+    /// symbolic link put in its place, all read as not exact. (Mounts are
+    /// refused in the guest.)
+    pub fn names_path_exactly(&self, root: &Path) -> bool {
+        below(root, &self.path)
+            .and_then(|found| directory_chain_from(root, &found))
+            .is_some_and(|now| now == self.directories)
+    }
+}
+
+/// The device and inode of `directory`, a path below `root`, and of each
+/// directory above it up to `root`, not following a symbolic link at any of
+/// them ([`directory_sample`]): `None` where one cannot be read or is no
+/// directory.
+fn directory_chain_from(root: &Path, directory: &Path) -> Option<Vec<(u64, u64)>> {
+    directory
+        .ancestors()
+        .take_while(|step| step.starts_with(root))
+        .map(|step| directory_sample(&crate::util::raw_lstat(step).ok()?))
+        .collect()
 }
 
 /// What decides where Linux starts a process's program break after it execs
@@ -2110,5 +2180,47 @@ mod tests {
         let script = directory.path().join("script");
         fs::write(&script, "#!/bin/sh\n").unwrap();
         assert!(program_interpreter(&script).is_err());
+    }
+
+    /// A working directory's record names its path while the path leads
+    /// through the same directories, as Linux's `cwd` link (`d_path`) would
+    /// name it, and not once it or a directory above it is renamed or
+    /// removed, or a symbolic link stands in its place.
+    #[test]
+    fn a_directory_record_names_its_path_while_it_leads_there() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::util::canonicalize(directory.path()).unwrap();
+        fs::create_dir_all(root.join("a/sub")).unwrap();
+        let record = DirectoryRecord::at(&root, Path::new("/a/sub")).unwrap();
+        assert_eq!(record.path, Path::new("/a/sub"));
+        assert!(record.names_path_exactly(&root));
+        // The directory renamed: Linux's link names /a/moved.
+        fs::rename(root.join("a/sub"), root.join("a/moved")).unwrap();
+        assert!(!record.names_path_exactly(&root));
+        // Another directory put at its path.
+        fs::create_dir(root.join("a/sub")).unwrap();
+        assert!(!record.names_path_exactly(&root));
+        fs::remove_dir(root.join("a/sub")).unwrap();
+        // Back where it was: the same directories at the same path.
+        fs::rename(root.join("a/moved"), root.join("a/sub")).unwrap();
+        assert!(record.names_path_exactly(&root));
+        // A directory above it renamed, and a symbolic link in its place.
+        fs::rename(root.join("a"), root.join("away")).unwrap();
+        std::os::unix::fs::symlink("away", root.join("a")).unwrap();
+        assert!(!record.names_path_exactly(&root));
+        fs::remove_file(root.join("a")).unwrap();
+        fs::rename(root.join("away"), root.join("a")).unwrap();
+        assert!(record.names_path_exactly(&root));
+        // Removed: Linux's link ends in " (deleted)".
+        fs::remove_dir(root.join("a/sub")).unwrap();
+        assert!(!record.names_path_exactly(&root));
+        // No record of a path that is not a directory, not absolute, or
+        // leads through a symbolic link.
+        fs::write(root.join("a/file"), b"").unwrap();
+        assert_eq!(DirectoryRecord::at(&root, Path::new("/a/file")), None);
+        assert_eq!(DirectoryRecord::at(&root, Path::new("a")), None);
+        std::os::unix::fs::symlink("a", root.join("link")).unwrap();
+        assert_eq!(DirectoryRecord::at(&root, Path::new("/link")), None);
+        assert!(DirectoryRecord::at(&root, Path::new("/")).is_some());
     }
 }

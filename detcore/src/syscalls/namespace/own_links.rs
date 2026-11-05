@@ -14,8 +14,9 @@
 //! procfs is not the guest's kernel procfs (KVM), from the exec record
 //! Detcore keeps for the process ([`crate::exec_record`]) while it still
 //! names exactly the image the process executes. No backend's `/proc` is
-//! read for them, so on KVM the executor's readlink answers for these links
-//! are reached only where Detcore cannot render one exactly.
+//! read for them. On KVM the executor no longer answers any of these links
+//! (package K item 2b slice 2b-4 removed its last, `exe`, arm): a link
+//! Detcore cannot render exactly there is refused by name.
 //!
 //! Linux (v6.17) answers each from the task the spelling names
 //! (`proc_exe_link`, `proc_cwd_link`, `proc_root_link`, fs/proc/base.c), as
@@ -29,11 +30,10 @@
 //! Elsewhere the call takes the path it took before this slice, so that every
 //! backend answers as it did: the kernel on ptrace, LiteInst and
 //! in-guest-trap, the launcher runs' own `exe` handling on DBT and SaBRe
-//! (`Detcore::launched_exe`), and the executor's existing readlink on KVM.
+//! (`Detcore::launched_exe`), and the executor's procfs refusal on KVM.
 //! That is: `exe` on a backend whose procfs is the guest's kernel procfs (the
-//! kernel names the image's dentry exactly, which no record can prove), and
-//! on KVM an image without a record or no longer exactly at its recorded
-//! path; a removed working directory, which `getcwd` refuses with `ENOENT`;
+//! kernel names the image's dentry exactly, which no record can prove); a
+//! removed working directory, which `getcwd` refuses with `ENOENT`;
 //! a leader or another thread whose filesystem information the caller does
 //! not share; and a spelling that looks a name up past the link (a `.` after
 //! it), where Linux checks search permission (on KVM, see below).
@@ -68,8 +68,33 @@
 //!   root (`/.`), each an injected lookup whose search permission the kernel
 //!   beneath checks, and `ENOTDIR` past the image.
 //!
-//! Another process's links still take the sources above and then the
-//! backend's readlink, as before.
+//! Another process's links (package K item 2b slice 2b-4, F5 of the 2b
+//! design) are the kernel's wherever the backend's procfs is the guest's
+//! kernel procfs (ptrace), as before. On KVM Detcore renders them
+//! ([`Detcore::readlink_other_task_link`]), with Linux's order of answers
+//! (`proc_pid_readlink`, `proc_pid_get_link`): no such task is `ENOENT`; the
+//! access check (`proc_fd_access_allowed`, `PTRACE_MODE_READ_FSCREDS`,
+//! modelled as for `auxv` and `environ`) refuses with `EACCES`; a task
+//! without an address space or filesystem information (a zombie) has no link
+//! (`ENOENT`); then:
+//! - `exe` is the exec record's path while it names the image exactly, and
+//!   otherwise the backend's `link_path` fact for that process's image, which
+//!   follows a rename and ends in " (deleted)" once the image is unlinked, as
+//!   Linux's link does;
+//! - `cwd` is the working directory Detcore records for each filesystem
+//!   group (`clone(CLONE_FS)` shares one, a clone without it copies it), at
+//!   each successful `chdir` and `fchdir` and at each image's first stop,
+//!   while its path still leads through the same directories
+//!   ([`crate::exec_record::DirectoryRecord`]);
+//! - `root` is `/` while the task's root is unchanged.
+//!
+//! What Detcore cannot render exactly (a working directory renamed or removed
+//! since it was recorded, an image the backend names no file for, a changed
+//! root, a `.` looked up past another process's working directory, whose
+//! search permission only that directory's own lookup would check) is
+//! refused by name. Both backends then give one semantics, Linux's: ptrace's
+//! kernel renders it, KVM's Detcore renders it from records of the same
+//! state.
 
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::ffi::OsStringExt;
@@ -345,6 +370,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         let described = match self.own_link_task(guest, spelled.task, (pid, tid)).await {
             Resolved::Described(described) => described,
             Resolved::Missing => return Err(Errno::ENOENT.into()),
+            // Another process's link: the kernel's where the backend's procfs
+            // is the guest's kernel procfs, Detcore's otherwise.
+            Resolved::Elsewhere if self.reads_link_facts() => {
+                return Box::pin(self.readlink_other_task_link(
+                    guest,
+                    sysno,
+                    path,
+                    spelled,
+                    (buffer, size),
+                ))
+                .await
+                .map(Some);
+            }
             Resolved::Elsewhere => return Ok(None),
         };
         if spelled.past == Past::Slash {
@@ -399,6 +437,24 @@ impl<T: RecordOrReplay> Detcore<T> {
             },
             OwnLink::Root => Some(b"/".to_vec()),
         };
+        // The process's image, where the backend names no file for it and the
+        // exec record no longer names it exactly: Linux's link names it
+        // still (a new path, or " (deleted)"), which nothing here can, and
+        // the backend's own readlink has no answer of its own any more.
+        if target.is_none() && spelled.link == OwnLink::Exe && self.reads_link_facts() {
+            return self
+                .refuse_unrendered_link(
+                    guest,
+                    sysno,
+                    &format!(
+                        "unsupported: readlink of {}, the caller's own image, which the backend \
+                         names no file for and Detcore's exec record no longer names exactly",
+                        path.display()
+                    ),
+                )
+                .await
+                .map(Some);
+        }
         // Where Detcore cannot render the link exactly, the call takes its
         // previous path (the module's documentation).
         let Some(target) = target else {
@@ -948,6 +1004,225 @@ impl<T: RecordOrReplay> Detcore<T> {
         let answered = getcwd_at(guest, page, PATH_MAX).await;
         crate::syscalls::files::procfs_levels::unmap_transient(guest, page, PATH_MAX).await;
         answered
+    }
+
+    /// Answer `readlink` of another process's `exe`, `cwd` or `root` link,
+    /// `spelled` at the guest's absolute spelling `path`, where Detcore
+    /// reads links from the backend's facts ([`Self::reads_link_facts`]: KVM,
+    /// whose own `/proc` is not the guest's), into the guest's `buffer` of
+    /// `size` bytes (package K item 2b slice 2b-4).
+    ///
+    /// Linux (v6.17, fs/proc/base.c) answers in this order: a task its
+    /// lookup does not find has no link (`ENOENT`; below `task/`, a thread
+    /// of another thread group is not found either); `proc_pid_readlink` and
+    /// `proc_pid_get_link` then ask `proc_fd_access_allowed`
+    /// (`ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS)`, `EACCES`;
+    /// [`Self::link_read_allowed`]); `proc_exe_link`, `proc_cwd_link` and
+    /// `proc_root_link` find no image (`get_task_exe_file`: no `mm`) or no
+    /// directory (`task->fs` is gone) for a task that has exited and is not
+    /// reaped (`ENOENT`); and `do_proc_readlink` renders the target with
+    /// `d_path` into a `PATH_MAX` buffer (`ENAMETOOLONG` past it) and copies
+    /// at most `size` bytes of it, without a NUL. A spelling followed past
+    /// the link with slashes alone is `ENOTDIR` for the image and `EINVAL`
+    /// for a directory, which is no link; with a `.` after it, `ENOTDIR` past
+    /// the image, and for the root the lookup of `.` in `/` the caller's own
+    /// `/.` makes ([`Self::inject_dot_lookup`]: the same directory, its
+    /// search permission checked for the same caller, since neither root
+    /// changed).
+    ///
+    /// The targets, from Detcore's records of the guest's own state:
+    /// - `exe`: the exec record of the task's process while it names the
+    ///   image exactly ([`crate::exec_record::ExecRecord::names_path_exactly`]),
+    ///   and otherwise the backend's `link_path` fact for that process's
+    ///   image, the name the backend's handle of the file has now: its new
+    ///   path after a rename, " (deleted)" once it is unlinked, as Linux's
+    ///   link renders the image's dentry;
+    /// - `cwd`: the working directory recorded for the task's filesystem
+    ///   group ([`Self::record_working_directory`]) while its path still leads
+    ///   through the same directories
+    ///   ([`crate::exec_record::DirectoryRecord::names_path_exactly`]);
+    /// - `root`: `/`, the task's root while it is unchanged, which is also
+    ///   the caller's (a caller that changed its root never reaches here).
+    ///
+    /// Whatever Detcore cannot render exactly is refused by name: an image
+    /// the backend names no file for once the record no longer names it, a
+    /// working directory renamed or removed since it was recorded (or never
+    /// recorded), a changed root, and a `.` looked up past another process's
+    /// working directory, whose search permission only that directory's own
+    /// lookup would check. Where the backend's procfs is the guest's kernel
+    /// procfs (ptrace), the kernel answers these links itself, so every
+    /// backend gives Linux's one semantics.
+    async fn readlink_other_task_link<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: Sysno,
+        path: &Path,
+        spelled: OwnTaskLink,
+        (buffer, size): (Option<AddrMut<'_, libc::c_char>>, usize),
+    ) -> Result<i64, Error> {
+        let task = match spelled.task {
+            NamedTask::Numbered(process) => crate::procfs::BoundTask {
+                process,
+                thread: None,
+            },
+            NamedTask::NumberedThread(process, thread) => crate::procfs::BoundTask {
+                process,
+                thread: Some(thread),
+            },
+            // The caller's own process resolves before this.
+            NamedTask::Caller | NamedTask::Leader | NamedTask::GroupThread(_) => {
+                return Err(Errno::ENOENT.into());
+            }
+        };
+        let found = crate::tool_global::procfs_task(guest, task).await;
+        if !found.exists {
+            return Err(Errno::ENOENT.into());
+        }
+        Self::link_read_allowed(guest, task).await??;
+        if found.without_mm {
+            return Err(Errno::ENOENT.into());
+        }
+        let named = task.thread.unwrap_or(task.process);
+        let detpid = crate::types::DetPid::from_raw(named);
+        match (spelled.past, spelled.link) {
+            (Past::Nothing, _) => {}
+            (Past::Slash | Past::Walk, OwnLink::Exe) => return Err(Errno::ENOTDIR.into()),
+            (Past::Slash, OwnLink::Cwd | OwnLink::Root) => return Err(Errno::EINVAL.into()),
+            (Past::Walk, OwnLink::Root)
+                if !crate::tool_global::root_changed(guest, detpid).await =>
+            {
+                return self
+                    .inject_dot_lookup(guest, libc::AT_FDCWD, b"/.", (buffer, size))
+                    .await;
+            }
+            (Past::Walk, OwnLink::Cwd | OwnLink::Root) => {
+                return self
+                    .refuse_unrendered_link(
+                        guest,
+                        sysno,
+                        &format!(
+                            "unsupported: readlink of {}, a lookup past another process's \
+                             {} link, whose search permission only that directory's own \
+                             lookup would check",
+                            path.display(),
+                            spelled.link.name()
+                        ),
+                    )
+                    .await;
+            }
+        }
+        let root = Path::new("/");
+        let (target, why) = match spelled.link {
+            OwnLink::Exe => match crate::tool_global::process_image(guest, detpid).await {
+                Some(exe) if exe.names_path_exactly(root) => {
+                    (Some(exe.exe.into_os_string().into_vec()), "")
+                }
+                _ => (
+                    self.other_process_image_fact(guest, named).await,
+                    "the backend names no file for its image and Detcore's exec record no \
+                     longer names it exactly",
+                ),
+            },
+            OwnLink::Cwd => (
+                crate::tool_global::task_working_directory(guest, detpid)
+                    .await
+                    .filter(|directory| directory.names_path_exactly(root))
+                    .map(|directory| directory.path.into_os_string().into_vec()),
+                "Detcore recorded no working directory for it, or the one it recorded has \
+                 been renamed or removed since",
+            ),
+            OwnLink::Root => (
+                (!crate::tool_global::root_changed(guest, detpid).await).then(|| b"/".to_vec()),
+                "its root changed",
+            ),
+        };
+        let Some(target) = target else {
+            return self
+                .refuse_unrendered_link(
+                    guest,
+                    sysno,
+                    &format!(
+                        "unsupported: readlink of {}, another process's {} link: {why}",
+                        path.display(),
+                        spelled.link.name()
+                    ),
+                )
+                .await;
+        };
+        let target = fits_d_path(&target)?;
+        let copied = &target[..target.len().min(size)];
+        let address = buffer.ok_or(Errno::EFAULT)?;
+        match copy_link_out(guest, address.cast::<u8>(), copied)? {
+            Some(copied) => Ok(copied),
+            None => guest
+                .memory()
+                .write_exact(address.cast::<u8>(), copied)
+                .map(|()| copied.len() as i64)
+                .map_err(|_| Errno::EFAULT.into()),
+        }
+    }
+
+    /// The backend's `link_path` fact for the image of the process thread
+    /// `named` (in the guest's numbering) belongs to: Linux's readlink text
+    /// for its `exe` link, or `None` where the backend does not provide it.
+    async fn other_process_image_fact<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        named: i32,
+    ) -> Option<Vec<u8>> {
+        let backend = Self::kernel_procfs_number(guest, named).await?;
+        guest
+            .link_path(reverie::Pid::from_raw(backend), PathLink::Executable)
+            .ok()
+            .map(|text| text.as_bytes().to_vec())
+    }
+
+    /// Whether Detcore records each filesystem group's working directory,
+    /// which another process's `cwd` link renders from
+    /// ([`Self::readlink_other_task_link`]): where it reads links from the
+    /// backend's facts ([`Self::reads_link_facts`]), and only where it sees
+    /// every `chdir` and `fchdir` (not under `--passthru-opt`, whose partial
+    /// subscription leaves both to the backend unseen).
+    fn keeps_working_directories(&self) -> bool {
+        self.reads_link_facts() && !self.cfg.passthru_opt
+    }
+
+    /// Record the calling task's working directory for its filesystem group
+    /// in the global state (`tool_global::record_working_directory`), after
+    /// a successful `chdir` or `fchdir` and at each image's first stop,
+    /// where Detcore keeps those records ([`Self::keeps_working_directories`],
+    /// package K item 2b slice 2b-4). The backend's `link_path` fact names
+    /// the directory (`d_path` of the task's own working directory), and the
+    /// record is that path with the directories it leads through as the
+    /// tool sees them now ([`crate::exec_record::DirectoryRecord::at`], in
+    /// the caller's view, [`Self::exec_record_root`]). Nothing is recorded,
+    /// and another process's read of the link is refused by name, where the
+    /// fact is not provided or names nothing Detcore can record: a path that
+    /// does not start with `/` (a directory outside the task's root), one
+    /// that ends in " (deleted)" (a removed directory, or one whose name ends
+    /// so, which reads the same), or one the tool cannot walk.
+    ///
+    /// Each record is made in the caller's turn, after the call that changed
+    /// the directory, so the records change in guest order (sequentialized
+    /// threads), as the directories do.
+    pub(crate) async fn record_working_directory<G: Guest<Self>>(&self, guest: &mut G) {
+        if !self.keeps_working_directories() {
+            return;
+        }
+        let directory = self.exec_record_root(guest).and_then(|root| {
+            let text = guest
+                .link_path(guest.tid(), PathLink::WorkingDirectory)
+                .ok()?;
+            let text = text.as_bytes();
+            if !text.starts_with(b"/") || text.ends_with(b" (deleted)") {
+                return None;
+            }
+            crate::exec_record::DirectoryRecord::at(
+                &root,
+                Path::new(std::ffi::OsStr::from_bytes(text)),
+            )
+        });
+        crate::tool_global::record_working_directory(guest, directory).await;
     }
 }
 
