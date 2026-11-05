@@ -126,6 +126,8 @@ struct InfoRecord {
     post_crash_timeslice: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     post_crash: Option<Vec<crate::post_crash::PostCrashSwitch>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    uncapped_slices: Option<u64>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     callback_checkpoints: BTreeMap<DetTid, Vec<callback_history::Checkpoint>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -148,6 +150,10 @@ struct InfoRecord {
     background_starts: Vec<BackgroundStart>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     rewrite_exclusives_in_memory: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    rows_alone: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    background_starts_unnoted: bool,
 }
 
 struct InfoLegacyFields<'a>(&'a PreemptionRecord);

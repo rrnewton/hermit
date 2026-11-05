@@ -6231,6 +6231,9 @@ impl PreemptionWriter {
         // below are the record's either way.
         self.flushed = true;
         self.finalize()?;
+        // The write paths mark uncapped slices before serializing; the
+        // summary digest must describe the same finalized record.
+        self.mark_uncapped_slices();
         let digest = if let Some(records) = &self.boundary_records {
             let output = boundary_recording::BorrowedInfoEnvelope::new(&self.inner, records)
                 .map_err(|error| error.to_string())?;
