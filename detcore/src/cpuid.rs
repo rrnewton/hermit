@@ -840,6 +840,14 @@ const fn cpuid_result(eax: u32, ebx: u32, ecx: u32, edx: u32) -> CpuIdResult {
     CpuIdResult { eax, ebx, ecx, edx }
 }
 
+// These flags are required for x86-64-v2 support. Found via https://www.felixcloutier.com/x86/cpuid
+const X86_64_V2_LEAF1_ECX: u32 =
+    (1 << 0) | (1 << 9) | (1 << 13) | (1 << 19) | (1 << 20) | (1 << 23);
+
+const X86_64_V3_LEAF1_ECX: u32 = (1 << 12) | (1 << 22) | (1 << 26) | (1 << 27) | (1 << 29);
+
+const X86_64_V3_EXTENDED_LEAF1_ECX: u32 = 1 << 5;
+
 // CPUID output from older CPU (broadwell?), with some features like RDRAND
 // masked off to prevent non-determinism.
 const CPUIDS: &[CpuIdResult] = &[
@@ -847,8 +855,7 @@ const CPUIDS: &[CpuIdResult] = &[
     cpuid_result(
         0x00000663,
         0x00000800,
-        // These flags are required for x86-64-v2 support. Found via https://www.felixcloutier.com/x86/cpuid
-        0x90202001 | (1 << 0) | (1 << 9) | (1 << 13) | (1 << 19) | (1 << 20) | (1 << 23),
+        0x90202001 | X86_64_V2_LEAF1_ECX | X86_64_V3_LEAF1_ECX,
         0x078BFBFD,
     ),
     cpuid_result(0x00000001, 0x00000000, 0x0000004D, 0x002C307D),
@@ -874,7 +881,12 @@ const CPUIDS: &[CpuIdResult] = &[
 
 const EXTENDED_CPUIDS: &[CpuIdResult] = &[
     cpuid_result(0x8000000A, 0x756E6547, 0x6C65746E, 0x49656E69),
-    cpuid_result(0x00000663, 0x00000000, 0x00000001, 0x20100800),
+    cpuid_result(
+        0x00000663,
+        0x00000000,
+        0x00000001 | X86_64_V3_EXTENDED_LEAF1_ECX,
+        0x20100800,
+    ),
     cpuid_result(0x554D4551, 0x72695620, 0x6C617574, 0x55504320),
     cpuid_result(0x72657620, 0x6E6F6973, 0x352E3220, 0x0000002B),
     cpuid_result(0x00000000, 0x00000000, 0x00000000, 0x00000000),
@@ -1012,8 +1024,9 @@ mod tests {
     #[test]
     fn cpuinfo_describes_the_virtual_cpu() {
         // Each line is derived from the table above as Linux derives it; see
-        // `InterceptedCpuid::cpuinfo`. The flags include `avx` without
-        // `xsave` and `hle`/`rtm` because the table advertises them
+        // `InterceptedCpuid::cpuinfo`. The flags include the x86-64-v3 set
+        // (`fma`, `movbe`, `xsave`, `f16c`, `abm`) and `hle`/`rtm` because the
+        // table advertises them
         // (https://github.com/rrnewton/hermit/issues/4251,
         // https://github.com/rrnewton/hermit/issues/4252); Linux shows them too.
         let expected = "processor\t: 0\n\
@@ -1035,8 +1048,8 @@ mod tests {
             cpuid level\t: 13\n\
             wp\t\t: yes\n\
             flags\t\t: fpu de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pse36 \
-            clflush mmx fxsr sse sse2 syscall nx lm pni ssse3 cx16 sse4_1 sse4_2 x2apic popcnt \
-            avx hypervisor lahf_lm fsgsbase bmi1 hle avx2 smep bmi2 erms invpcid rtm adx smap\n\
+            clflush mmx fxsr sse sse2 syscall nx lm pni ssse3 fma cx16 sse4_1 sse4_2 x2apic movbe popcnt \
+            xsave avx f16c hypervisor lahf_lm abm fsgsbase bmi1 hle avx2 smep bmi2 erms invpcid rtm adx smap\n\
             bugs\t\t: cpu_meltdown spectre_v1 spectre_v2 spec_store_bypass l1tf mds swapgs taa \
             itlb_multihit bhi spectre_v2_user its\n\
             bogomips\t: 2000.00\n\
