@@ -1,0 +1,4595 @@
+//! Shared serialized type for `stress-series` rows.
+//!
+//! Hermit owns the artifact consumed by the compatibility scorecard. The
+//! parent writer imports this module and checks every proposed row against the
+//! same type before appending it, so the Python projection is not a second
+//! schema authority.
+
+use std::collections::BTreeMap;
+
+use serde::Deserialize;
+use serde::Serialize;
+
+use crate::canonical_verdict::LogCompareStrictness;
+use crate::canonical_verdict::Verdict;
+pub use crate::host_capability::CapabilityVerdict as HostCapabilityVerdict;
+pub use crate::host_capability::HostCapabilities;
+pub use crate::host_capability::HostCapability;
+use crate::runner::ExpectedGuestExit;
+use crate::runner::FailureClass;
+use crate::runner::ObservedResult;
+use crate::runner::parse_expected_output_failure_reason;
+use crate::runner::validate_expected_guest_exit;
+
+pub const STRESS_SERIES_SCHEMA_V1: &str = "stress-series/v1";
+pub const STRESS_SERIES_SCHEMA_V2: &str = "stress-series/v2";
+pub const STRESS_SERIES_SCHEMA_V3: &str = "stress-series/v3";
+// Frozen when introduced in v2 and retained by v3: extending the machine
+// vocabulary must not retroactively make already-written rows unreadable. A
+// new capability therefore requires a new stress-series schema before
+// producers may emit it.
+const STRESS_SERIES_V2_HOST_CAPABILITIES: [HostCapability; 2] =
+    [HostCapability::CpuidFaulting, HostCapability::Kvm];
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum SeriesSchema {
+    #[serde(rename = "stress-series/v1")]
+    V1,
+    #[serde(rename = "stress-series/v2")]
+    V2,
+    #[serde(rename = "stress-series/v3")]
+    V3,
+}
+
+impl SeriesSchema {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::V1 => STRESS_SERIES_SCHEMA_V1,
+            Self::V2 => STRESS_SERIES_SCHEMA_V2,
+            Self::V3 => STRESS_SERIES_SCHEMA_V3,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum SeriesProducer {
+    #[serde(rename = "validate")]
+    Validate,
+    #[serde(rename = "pressure-test")]
+    PressureTest,
+    #[serde(rename = "hermit-repeat")]
+    HermitRepeat,
+}
+
+impl SeriesProducer {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Validate => "validate",
+            Self::PressureTest => "pressure-test",
+            Self::HermitRepeat => "hermit-repeat",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeriesOutcome {
+    Passed,
+    Diverged,
+    NoResult,
+    Timeout,
+    Errored,
+    Skipped,
+}
+
+impl SeriesOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Diverged => "diverged",
+            Self::NoResult => "no_result",
+            Self::Timeout => "timeout",
+            Self::Errored => "errored",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceDepth {
+    pub commits: u64,
+    pub first_parent: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesCoordinates {
+    #[serde(default)]
+    pub first_divergent_scheduler_turn: Option<u64>,
+    #[serde(default)]
+    pub first_divergent_virtual_nanoseconds: Option<u64>,
+    #[serde(default)]
+    pub first_divergent_record: Option<u64>,
+    #[serde(default)]
+    pub first_divergent_syscall: Option<u64>,
+}
+
+impl SeriesCoordinates {
+    fn has_position(&self) -> bool {
+        self.first_divergent_scheduler_turn.is_some()
+            || self.first_divergent_virtual_nanoseconds.is_some()
+            || self.first_divergent_record.is_some()
+            || self.first_divergent_syscall.is_some()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FirstDivergentMessages {
+    #[serde(deserialize_with = "deserialize_nullable_string")]
+    pub left: Option<String>,
+    #[serde(deserialize_with = "deserialize_nullable_string")]
+    pub right: Option<String>,
+}
+
+fn deserialize_nullable_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesRuntimeMeasurement {
+    #[serde(default)]
+    pub scheduler_turns: Option<u64>,
+    #[serde(default)]
+    pub virtual_nanoseconds: Option<u64>,
+    #[serde(default)]
+    pub syscalls: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesRuntime {
+    #[serde(default)]
+    pub run1: Option<SeriesRuntimeMeasurement>,
+    #[serde(default)]
+    pub run2: Option<SeriesRuntimeMeasurement>,
+    #[serde(default)]
+    pub wall_time_min_ms: Option<f64>,
+    #[serde(default)]
+    pub wall_time_max_ms: Option<f64>,
+}
+
+/// Producer-owned evidence for one inner invocation that did not produce a
+/// canonical comparison. The containing series row identifies the outer cell
+/// attempt; this retains the typed process disposition used to distinguish a
+/// timeout from an unavailable result without inferring from duration or
+/// backend.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeriesNoVerdictKind {
+    Unspecified,
+    ComparisonRefused,
+    NotRun,
+    FirstRunRejected,
+    ContainerFailed,
+    /// Hermit started a verification run and a typed failure of it stopped the
+    /// run (`run_failed`: a backend failure, a recorded determinism loss or a
+    /// policy refusal of the guest). The runner types the attempt FAIL, a
+    /// crash-error red, exactly as for `first_run_rejected`.
+    RunFailed,
+    InfrastructureError,
+    MissingReportTimeout,
+    NoncanonicalMatch,
+    NoncanonicalDivergence,
+    /// A canonical match whose attempt the runner failed: the process did
+    /// not end as its row allows (a declared verify cell that ended
+    /// differently, or an undeclared verify or replay that exited nonzero),
+    /// or the two agreeing runs of a verify cell printed other stdout than the
+    /// cell declares. The latter carries the runner's reason as `detail`,
+    /// which is the only record of it. It earns no credit; it is the
+    /// crash-error red, retained beside its siblings instead of refusing the
+    /// whole run.
+    FailedMatch,
+    /// A matched comparison report from an attempt the runner timed out. The
+    /// guest process ran to completion and its two runs agreed, but its CPU
+    /// charge reached the cell's remaining budget at the final wait, or the
+    /// wall deadline killed it after the report was written, so the runner
+    /// typed the attempt as a timeout. The timeout is the result, or the row
+    /// has none when a non-product cell error kind decides it. The match is
+    /// retained by its report digest and earns no credit; without this kind
+    /// the row, and every sibling attempt with it, would be refused.
+    TimedOutMatch,
+    /// A canonical match from a SaBRe verify attempt whose run did not stay
+    /// on SaBRe's own path: its execution-path evidence is incomplete, or the
+    /// run used ptrace fallback or trusted native sites. The attempt passed,
+    /// but the runner then fails the passed cell
+    /// (`runner::execution_path_ineligible`) and types it a crash-error,
+    /// although nothing crashed. Hermit's readers give such a row no verdict,
+    /// so the match is retained by its report digest, earns no credit and
+    /// projects without a result; without this kind the row would be
+    /// refused.
+    IneligibleExecutionPath,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesAttemptDisposition {
+    pub index: String,
+    pub kind: SeriesNoVerdictKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    pub attempt_outcome: String,
+    pub disposition: SeriesOutcome,
+    #[serde(default)]
+    pub error_kind: Option<String>,
+    #[serde(default)]
+    pub status: Option<i32>,
+    #[serde(default)]
+    pub signal: Option<i32>,
+    pub timed_out: bool,
+    #[serde(default)]
+    pub verification_report_sha256: Option<String>,
+}
+
+/// Exact source-row identity and its non-comparison dispositions.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesNoVerdictEvidence {
+    pub evidence_sha256: String,
+    pub attempts: Vec<SeriesAttemptDisposition>,
+}
+
+/// Complete compact inner history for one pressure CellResult. The digest uses
+/// the same normalized source identity as no_verdict_evidence. The projection
+/// validates original reports before constructing this record; a digest alone
+/// does not authenticate source bytes that a reader does not possess.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesPressureEvidence {
+    pub evidence_sha256: String,
+    pub attempts: Vec<SeriesPressureAttempt>,
+}
+
+/// The comparison a non-canonical verify verdict was reached under.
+///
+/// The series writer records it only on a `verify` row whose cell declares
+/// the manifest's stripped comparator and whose passed, diverged or errored
+/// outcome came from a stripped comparison attempt. Such a match is a real
+/// determinism result, but it is below canonical bitwise parity, so the row
+/// says so instead of reading like a canonical one. Canonical rows, and rows
+/// whose verdict no comparison supports, omit the object, so the only value
+/// a reader accepts is `{"strictness": "stripped", "bitwise_parity": false}`.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesComparison {
+    pub strictness: LogCompareStrictness,
+    pub bitwise_parity: bool,
+}
+
+/// Whether `value` is `<16 lowercase hex digits>:<decimal bytes>`.
+fn is_output_digest(value: &str) -> bool {
+    let Some((hash, bytes)) = value.split_once(':') else {
+        return false;
+    };
+    hash.len() == 16
+        && hash
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        && !bytes.is_empty()
+        && bytes.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// The longest first-difference message a cell row carries; a longer one is
+/// cut to this many characters, the last of them an ellipsis.
+pub const DIVERGENCE_MESSAGE_MAX_CHARS: usize = 240;
+
+/// A verify cell observation's first divergence in all three senses, in the
+/// one cell row (owner request, 2026-10-20; dev-hermit
+/// ai_docs/2026-10-21-cell-row-first-divergence-design.md): its two runs'
+/// log lengths (L1; the raw self-divergence position stays in
+/// [`SeriesCoordinates`]), the guest's outputs and whether they equal the
+/// ptrace row's from the same run (L2), and its parity against the ptrace
+/// reference from the same run's `parity.jsonl` (L3). The series writer fills
+/// what the run recorded; an absent part was not recorded, never "equal".
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesDivergence {
+    /// Both runs' compared log lengths (`compared_log_messages`).
+    #[serde(rename = "self", default, skip_serializing_if = "Option::is_none")]
+    pub self_lengths: Option<SeriesLogLengths>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outputs: Option<SeriesOutputs>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vs_ptrace: Option<SeriesVsPtrace>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesLogLengths {
+    pub left_len: u64,
+    pub right_len: u64,
+}
+
+/// One run's guest outputs: exit code, signal, and each stream as
+/// `<first 16 hex digits of its sha256>:<bytes>`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesGuestOutputs {
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// How a cell's run 1 outputs compare with run 1 of the same test's ptrace
+/// verify row in the same run.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SeriesOutputsVsPtrace {
+    Equal,
+    Differs,
+    /// This row is the ptrace reference itself.
+    Reference,
+    /// The run has no ptrace verify row for the test, or that row recorded
+    /// no outputs.
+    NoReference,
+}
+
+/// L2: the guest's outputs, both runs' agreement and the comparison with
+/// ptrace's.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesOutputs {
+    pub run1: SeriesGuestOutputs,
+    pub runs_equal: bool,
+    /// Present exactly when `runs_equal` is false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run2: Option<SeriesGuestOutputs>,
+    pub vs_ptrace: SeriesOutputsVsPtrace,
+    /// The fields of `run1` that differ from ptrace's, present exactly when
+    /// `vs_ptrace` is `differs`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vs_ptrace_fields: Vec<String>,
+}
+
+/// L3: the same run's parity record for this cell (`parity::ParityRecord`),
+/// without its temporary log paths and with each message cut to
+/// [`DIVERGENCE_MESSAGE_MAX_CHARS`].
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesVsPtrace {
+    pub verdict: crate::parity::ParityVerdict,
+    pub unavailable_class: Option<crate::parity::UnavailableClass>,
+    pub credit: Option<f64>,
+    pub unequalized_credit: Option<f64>,
+    pub matched_prefix: Option<u64>,
+    pub left_len: Option<u64>,
+    pub right_len: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_difference: Option<SeriesFirstDifference>,
+    /// A `nondeterministic` candidate's own runs against the ptrace golden
+    /// (`parity::ParityRunComparison`), never credited; empty when none was
+    /// compared.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runs: Vec<SeriesRunVsPtrace>,
+}
+
+/// One run of a red candidate against the ptrace golden.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesRunVsPtrace {
+    /// 1 or 2.
+    pub run: u8,
+    /// `matched` or `diverged`.
+    pub verdict: crate::parity::ParityVerdict,
+    pub matched_prefix: Option<u64>,
+    pub left_len: u64,
+    pub right_len: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_difference: Option<SeriesFirstDifference>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesFirstDifference {
+    pub record: Option<u64>,
+    pub syscall: Option<u64>,
+    pub scheduler_turn: Option<u64>,
+    pub virtual_nanoseconds: Option<u64>,
+    pub reference: Option<String>,
+    pub candidate: Option<String>,
+}
+
+/// The manifest declaration under which a verify cell may pass although its
+/// guest ended with one exact nonzero code or signal.
+///
+/// A matched attempt with a nonzero guest exit is otherwise refused, so the
+/// declaration is an authorization rather than commentary. The writer binds
+/// the complete checked declaration into the source row's evidence identity:
+/// removing or changing it changes `evidence_sha256`. The attempts retain the
+/// process dispositions a later reader needs to audit why the row passed.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesDeclaredGuestExit {
+    pub code: Option<i32>,
+    pub signal: Option<i32>,
+    pub reason: String,
+    pub evidence_sha256: String,
+    pub attempts: Vec<SeriesDeclaredGuestExitAttempt>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesDeclaredGuestExitAttempt {
+    pub index: String,
+    pub outcome: String,
+    pub status: Option<i32>,
+    pub signal: Option<i32>,
+    pub timed_out: bool,
+    pub verification_report_sha256: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesPressureAttempt {
+    pub index: String,
+    pub outcome: String,
+    pub error_kind: Option<String>,
+    pub status: Option<i32>,
+    pub signal: Option<i32>,
+    pub timed_out: bool,
+    pub comparison: Option<SeriesPressureComparison>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesPressureComparison {
+    pub verdict: Verdict,
+    pub canonical: bool,
+    pub report_sha256: String,
+    pub no_result_kind: Option<SeriesNoVerdictKind>,
+}
+
+impl SeriesPressureAttempt {
+    /// A timed-out attempt never passes and never decides a product verdict.
+    /// Hermit's runner types a CellResult that retains one as a timeout, or
+    /// leaves it without a result when a non-product error kind decides the
+    /// cell (`runner::observed_result_from_typed_evidence`), and refines
+    /// either to sandbox-denied or infrastructure-error when an attempt's
+    /// output shows an environmental block (`runner::observed_result`).
+    /// `validate_pressure_evidence`, `validate_declared_guest_exit` and
+    /// pressure-test.rs's `checked_inner_pressure_history` hold the attempts
+    /// they judge to this one rule, whatever a timed-out attempt's report says
+    /// and whether it wrote one. Other readers of retained attempts do not
+    /// apply it yet.
+    pub fn require_result_supported_by_timeouts(
+        attempts: &[SeriesPressureAttempt],
+        result: Option<ObservedResult>,
+    ) -> Result<(), String> {
+        require_result_supported_by_timeout(
+            attempts.iter().any(|attempt| attempt.timed_out),
+            result,
+        )
+    }
+
+    /// Validate one retained invocation without changing its framework outcome.
+    /// Callers that have original report bytes must additionally validate their
+    /// digest and report semantics before constructing these compact facts.
+    ///
+    /// `declared` is the cell's `expected_guest_exit`, if it has one. A matched
+    /// verify invocation may then also end with exactly that disposition as
+    /// Hermit reports it ([`ExpectedGuestExit::hermit_status_matches`]). A
+    /// declaration the runner itself would refuse accepts nothing more.
+    pub fn validate_for_mode(
+        &self,
+        mode: &str,
+        declared: Option<&ExpectedGuestExit>,
+    ) -> Result<(), String> {
+        let comparison_mode = matches!(mode, "verify" | "replay" | "chaos");
+        if !matches!(self.outcome.as_str(), "PASS" | "FAIL" | "ERROR") {
+            return Err("pressure_evidence has an unsupported inner outcome".into());
+        }
+        if self
+            .error_kind
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty())
+            || self.status.is_some_and(|status| status < 0)
+            || self.signal.is_some_and(|signal| signal <= 0)
+            || (self.status.is_some() && self.signal.is_some())
+        {
+            return Err("pressure_evidence has an invalid process disposition".into());
+        }
+        let nonzero_process = self.status.is_some_and(|status| status > 0) || self.signal.is_some();
+        let completed_pass = self.outcome == "PASS" && !self.timed_out && self.error_kind.is_none();
+        if self.outcome == "PASS"
+            && (!completed_pass || (self.status.is_none() && self.signal.is_none()))
+        {
+            return Err(
+                "pressure_evidence passing invocation lacks a completed process disposition".into(),
+            );
+        }
+        let Some(comparison) = &self.comparison else {
+            let prelaunch_timeout = self.outcome == "ERROR"
+                && self.timed_out
+                && matches!(
+                    self.error_kind.as_deref(),
+                    Some("incomplete-verification-evidence" | "cpu-timeout" | "wall-timeout")
+                );
+            if !comparison_mode
+                && self.status.is_none()
+                && self.signal.is_none()
+                && !prelaunch_timeout
+            {
+                return Err(
+                    "pressure_evidence noncomparison invocation lacks a process disposition".into(),
+                );
+            }
+            if comparison_mode
+                && !(self.outcome == "ERROR"
+                    && self.timed_out
+                    && self.error_kind.is_some()
+                    && nonzero_process)
+            {
+                return Err("pressure_evidence comparison invocation omitted its report without a typed timeout".into());
+            }
+            return Ok(());
+        };
+        if !comparison_mode {
+            return Err("pressure_evidence comparison appears on a noncomparison mode".into());
+        }
+        if !is_sha256(&comparison.report_sha256) {
+            return Err(
+                "pressure_evidence comparison report_sha256 must be lowercase 64-hex".into(),
+            );
+        }
+        if comparison.canonical
+            && !matches!(comparison.verdict, Verdict::Matched | Verdict::Diverged)
+        {
+            return Err("pressure_evidence non-verdict cannot claim a canonical comparison".into());
+        }
+        if comparison.verdict != Verdict::NoResult && comparison.no_result_kind.is_some() {
+            return Err("pressure_evidence comparison carries an unrelated no_result_kind".into());
+        }
+        // A match from an attempt the runner timed out is that timeout, never
+        // a canonical pass: see `SeriesNoVerdictKind::TimedOutMatch`.
+        let timed_out_match = !comparison.canonical
+            && self.timed_out
+            && matches!(self.outcome.as_str(), "FAIL" | "ERROR")
+            && matches!(
+                self.error_kind.as_deref(),
+                Some("cpu-timeout" | "wall-timeout")
+            )
+            && self.status.is_some() != self.signal.is_some();
+        let valid = match comparison.verdict {
+            Verdict::Matched => {
+                let ordinary_exit = self.signal.is_none()
+                    && self
+                        .status
+                        .is_some_and(|status| mode == "chaos" || status == 0);
+                let declared_exit = declared.is_some_and(|declared| {
+                    validate_expected_guest_exit("declared_guest_exit", mode, Some(declared))
+                        .is_ok()
+                        && declared.hermit_status_matches(self.status, self.signal)
+                });
+                // A match the runner failed by its declared exit or stdout
+                // (`SeriesNoVerdictKind::FailedMatch`): the crash-error red,
+                // retained as a non-canonical match, never a pass.
+                let failed_match = !comparison.canonical
+                    && self.outcome == "FAIL"
+                    && !self.timed_out
+                    && self.error_kind.is_none()
+                    && self.status.is_some() != self.signal.is_some();
+                timed_out_match
+                    || failed_match
+                    || (completed_pass && (ordinary_exit || declared_exit))
+            }
+            Verdict::Diverged => {
+                self.outcome == "FAIL"
+                    && !self.timed_out
+                    && self.error_kind.is_none()
+                    && nonzero_process
+            }
+            Verdict::InfrastructureError => {
+                self.outcome == "ERROR" && !self.timed_out && nonzero_process
+            }
+            Verdict::NoResult => match comparison.no_result_kind {
+                Some(SeriesNoVerdictKind::Unspecified) => {
+                    self.outcome == "ERROR"
+                        && !self.timed_out
+                        && self.error_kind.is_some()
+                        && nonzero_process
+                }
+                Some(SeriesNoVerdictKind::ComparisonRefused) => {
+                    self.outcome == "ERROR"
+                        && !self.timed_out
+                        && self.error_kind.as_deref() == Some("incomplete-verification-evidence")
+                        && nonzero_process
+                }
+                Some(SeriesNoVerdictKind::NotRun) => {
+                    let prelaunch_timeout = self.timed_out
+                        && self.status.is_none()
+                        && self.signal.is_none()
+                        && matches!(
+                            self.error_kind.as_deref(),
+                            Some(
+                                "incomplete-verification-evidence" | "cpu-timeout" | "wall-timeout"
+                            )
+                        );
+                    self.outcome == "ERROR"
+                        && self.error_kind.is_some()
+                        && (nonzero_process || prelaunch_timeout)
+                }
+                Some(SeriesNoVerdictKind::FirstRunRejected) => {
+                    self.outcome == "FAIL"
+                        && !self.timed_out
+                        && self.error_kind.is_none()
+                        && self.status.is_some_and(|status| status > 0)
+                        && self.signal.is_none()
+                }
+                Some(SeriesNoVerdictKind::ContainerFailed) => {
+                    self.outcome == "FAIL"
+                        && !self.timed_out
+                        && self.error_kind.is_none()
+                        && self.status == Some(125)
+                        && self.signal.is_none()
+                }
+                Some(SeriesNoVerdictKind::RunFailed) => {
+                    self.outcome == "FAIL"
+                        && !self.timed_out
+                        && self.error_kind.is_none()
+                        && self.status.is_some_and(|status| status > 0)
+                        && self.signal.is_none()
+                }
+                _ => false,
+            },
+        };
+        if !valid {
+            return Err(format!(
+                "pressure_evidence {} report contradicts its inner process disposition",
+                comparison.verdict
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The rule behind [`SeriesPressureAttempt::require_result_supported_by_timeouts`],
+/// shared by every retained attempt list a row carries. It needs only
+/// whether any retained attempt timed out, so a reader can apply it before
+/// it has read the rest of those attempts.
+pub fn require_result_supported_by_timeout(
+    any_timed_out: bool,
+    result: Option<ObservedResult>,
+) -> Result<(), String> {
+    let supported = matches!(
+        result,
+        None | Some(
+            ObservedResult::Timeout
+                | ObservedResult::SandboxDenied
+                | ObservedResult::InfrastructureError
+        )
+    );
+    if any_timed_out && !supported {
+        return Err(format!(
+            "retains a timed-out attempt, which contradicts result {result:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn is_prelaunch_timeout_disposition(disposition: &SeriesAttemptDisposition) -> bool {
+    disposition.timed_out
+        && disposition.status.is_none()
+        && disposition.signal.is_none()
+        && matches!(
+            disposition.error_kind.as_deref(),
+            Some("incomplete-verification-evidence" | "cpu-timeout" | "wall-timeout")
+        )
+}
+
+fn one_run() -> u64 {
+    1
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct SeriesPayload {
+    pub cell: String,
+    pub tree: String,
+    #[serde(default)]
+    pub detcore_tree: Option<String>,
+    pub outcome: SeriesOutcome,
+    /// The exact framework-written result. Required by `stress-series/v3`;
+    /// absent only on retained v1/v2 rows.
+    #[serde(default)]
+    pub result: Option<ObservedResult>,
+    /// Attribution for a non-pass. Required by `stress-series/v3` whenever the
+    /// exact result is not `pass`; absent only for passes and retained v1/v2
+    /// rows.
+    #[serde(default)]
+    pub failure_class: Option<FailureClass>,
+    /// Present on newly emitted comparison-mode rows that produced no complete
+    /// canonical product verdict. Historical v3 rows predate this optional
+    /// evidence and remain readable, but consumers must not infer the missing
+    /// facts from duration, backend, or exit status alone.
+    #[serde(default)]
+    pub no_verdict_evidence: Option<SeriesNoVerdictEvidence>,
+    /// Additive pressure history. Old rows remain readable, but its absence
+    /// cannot establish a clean first attempt for sample promotion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pressure_evidence: Option<SeriesPressureEvidence>,
+    /// Present on every row written from a verify cell that declares an
+    /// expected nonzero guest exit. Rows without a declaration omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_guest_exit: Option<SeriesDeclaredGuestExit>,
+    /// Present only on a verify row whose verdict came from the declared
+    /// stripped comparator (see [`SeriesComparison`]). Canonical rows and
+    /// every row written before the field existed omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comparison: Option<SeriesComparison>,
+    pub run_index: u64,
+    #[serde(default)]
+    pub attempt: Option<u64>,
+    #[serde(default = "one_run")]
+    pub num_runs: u64,
+    #[serde(default)]
+    pub last_run_index: Option<u64>,
+    #[serde(default)]
+    pub main_ancestry: Option<bool>,
+    #[serde(default)]
+    pub runtime: Option<SeriesRuntime>,
+    #[serde(default)]
+    pub source_tree_dirty: bool,
+    #[serde(default)]
+    pub depth: BTreeMap<String, SourceDepth>,
+    #[serde(default)]
+    pub coordinates: Option<SeriesCoordinates>,
+    #[serde(default)]
+    pub first_divergent_messages: Option<FirstDivergentMessages>,
+    /// Required by `stress-series/v2`. This is the measurement authority; the
+    /// parent shard path is only a storage index derived from the envelope host.
+    /// Absent only on retained v1 rows.
+    #[serde(default)]
+    pub machine_shortname: Option<String>,
+    /// Required by `stress-series/v2`. Absent only on retained v1 rows.
+    #[serde(default)]
+    pub kernel_version: Option<String>,
+    /// Required by `stress-series/v2`. This is the complete set of capability
+    /// verdicts that determined which population could execute. It is not
+    /// derivable from the machine name or kernel version.
+    #[serde(default)]
+    pub host_capabilities: Option<HostCapabilities>,
+    /// How the observed cell ran: its strictness level and Hermit settings
+    /// (`runner::CellResult::strictness`). Absent means not recorded, never
+    /// "strict": a reader must not infer it from the host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strictness: Option<crate::runner::CellStrictness>,
+    /// First divergence in all three senses ([`SeriesDivergence`]), on verify
+    /// rows written since 2026-10-21; absent means not recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub divergence: Option<SeriesDivergence>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct SeriesRow {
+    /// Filled by readers after deserialization; never part of the artifact.
+    #[serde(skip)]
+    pub source: String,
+    pub schema: SeriesSchema,
+    pub event_id: String,
+    pub event_type: String,
+    pub emitted_at: String,
+    pub team: String,
+    pub host: String,
+    pub producer: SeriesProducer,
+    pub run_id: String,
+    pub series: SeriesPayload,
+}
+
+impl SeriesRow {
+    pub fn cell(&self) -> &str {
+        &self.series.cell
+    }
+
+    pub fn label(&self) -> String {
+        format!(
+            "{}:{}: {} from {} run {} repetition {} @ {}",
+            self.source,
+            self.event_id,
+            self.series.cell,
+            self.producer.as_str(),
+            self.run_id,
+            self.series.run_index,
+            self.series.tree
+        )
+    }
+
+    /// Validate a newly written row. Historical v1/v2 rows remain
+    /// deserializable, but no new row may omit the framework's exact result and
+    /// attribution.
+    pub fn validate_for_write(&self) -> Result<(), String> {
+        if self.schema != SeriesSchema::V3 {
+            return Err(format!(
+                "new rows must use {STRESS_SERIES_SCHEMA_V3}, got {}",
+                self.schema.as_str()
+            ));
+        }
+        self.validate_common()?;
+        self.validate_host_facts()?;
+        self.validate_classification()?;
+        self.require_current_no_verdict_evidence()
+    }
+
+    /// Validate a stored row before a reader uses its contents.
+    ///
+    /// Retained v1/v2 rows remain readable. Every v2/v3 row must carry the
+    /// complete host facts that its schema promises, and every v3 row must
+    /// carry the exact result classification.
+    pub fn validate_for_read(&self) -> Result<(), String> {
+        self.validate_common()?;
+        if matches!(self.schema, SeriesSchema::V2 | SeriesSchema::V3) {
+            self.validate_host_facts()?;
+        }
+        if self.schema == SeriesSchema::V3 {
+            self.validate_classification()?;
+        }
+        Ok(())
+    }
+
+    /// Validate a row before treating it as measurement evidence.
+    ///
+    /// Retained v1 rows still parse and can be reported, but they cannot safely
+    /// compare runs across the same machine name after a kernel change.
+    pub fn validate_for_projection(&self) -> Result<(), String> {
+        self.validate_common()?;
+        if self.schema == SeriesSchema::V1 {
+            return Err(format!(
+                "{} does not record machine_shortname, kernel_version, and host_capabilities",
+                self.schema.as_str()
+            ));
+        }
+        self.validate_host_facts()?;
+        if self.schema == SeriesSchema::V3 {
+            self.validate_classification()?;
+        }
+        if self.series.source_tree_dirty {
+            return Err(
+                "source_tree_dirty is true; dirty source is not checked-in evidence".into(),
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_common(&self) -> Result<(), String> {
+        for (name, value) in [
+            ("event_id", self.event_id.as_str()),
+            ("emitted_at", self.emitted_at.as_str()),
+            ("host", self.host.as_str()),
+            ("run_id", self.run_id.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(format!("{name} must be nonempty"));
+            }
+        }
+        if self.event_type != "series.observation" {
+            return Err(format!(
+                "event_type must be series.observation, got {:?}",
+                self.event_type
+            ));
+        }
+        if self.team != "hermit" {
+            return Err(format!("team must be hermit, got {:?}", self.team));
+        }
+        if !valid_cell(&self.series.cell) {
+            return Err(format!(
+                "cell must be '<test>/<mode>/<backend>' with the test's own slashes allowed, got {:?}",
+                self.series.cell
+            ));
+        }
+        if !is_object_id(&self.series.tree) {
+            return Err(format!(
+                "tree must be a 40-hex commit sha, got {:?}",
+                self.series.tree
+            ));
+        }
+        if let Some(tree) = &self.series.detcore_tree {
+            if !is_object_id(tree) {
+                return Err(format!(
+                    "detcore_tree must be a 40-hex object id when present, got {tree:?}"
+                ));
+            }
+        }
+        if self.series.attempt == Some(0) {
+            return Err("attempt must be a positive int when present".into());
+        }
+        if self.series.num_runs == 0 {
+            return Err("num_runs must be a positive int".into());
+        }
+        if let Some(last) = self.series.last_run_index {
+            if last < self.series.run_index {
+                return Err("last_run_index must be at least run_index".into());
+            }
+            if last - self.series.run_index + 1 < self.series.num_runs {
+                return Err(
+                    "last_run_index span must contain at least num_runs observations".into(),
+                );
+            }
+        }
+        if let Some(runtime) = &self.series.runtime {
+            for (name, value) in [
+                ("wall_time_min_ms", runtime.wall_time_min_ms),
+                ("wall_time_max_ms", runtime.wall_time_max_ms),
+            ] {
+                if value.is_some_and(|value| !value.is_finite() || value < 0.0) {
+                    return Err(format!(
+                        "runtime {name} must be a non-negative number or null"
+                    ));
+                }
+            }
+            if let (Some(minimum), Some(maximum)) =
+                (runtime.wall_time_min_ms, runtime.wall_time_max_ms)
+            {
+                if minimum > maximum {
+                    return Err("runtime wall_time_min_ms must not exceed wall_time_max_ms".into());
+                }
+            }
+        }
+        for (repository, depth) in &self.series.depth {
+            if repository.is_empty() {
+                return Err("depth repository keys must be nonempty strings".into());
+            }
+            if depth.commits == 0 || depth.first_parent == 0 {
+                return Err(format!(
+                    "depth {repository}.commits and first_parent must be positive"
+                ));
+            }
+        }
+        if self.series.outcome != SeriesOutcome::Diverged
+            && (self
+                .series
+                .coordinates
+                .as_ref()
+                .is_some_and(SeriesCoordinates::has_position)
+                || self.series.first_divergent_messages.is_some())
+        {
+            return Err(format!(
+                "outcome {:?} must not carry divergence evidence; only diverged may",
+                self.series.outcome.as_str()
+            ));
+        }
+        if let Some(messages) = &self.series.first_divergent_messages {
+            for (side, value) in [("left", &messages.left), ("right", &messages.right)] {
+                if value.as_ref().is_some_and(|value| value.is_empty()) {
+                    return Err(format!(
+                        "first_divergent_messages.{side} must be a nonempty string or null"
+                    ));
+                }
+            }
+            if messages.left.is_none() && messages.right.is_none() {
+                return Err("first_divergent_messages must contain at least one message".into());
+            }
+        }
+        if let Some(evidence) = &self.series.no_verdict_evidence {
+            self.validate_no_verdict_evidence(evidence)?;
+        }
+        if let Some(evidence) = &self.series.pressure_evidence {
+            self.validate_pressure_evidence(evidence)?;
+        }
+        if let Some(declared) = &self.series.declared_guest_exit {
+            self.validate_declared_guest_exit(declared)?;
+        }
+        if let Some(comparison) = &self.series.comparison {
+            self.validate_comparison(comparison)?;
+        }
+        if let Some(divergence) = &self.series.divergence {
+            self.validate_divergence(divergence)?;
+        }
+        Ok(())
+    }
+
+    /// Refuse a divergence object the series writer cannot produce: it is
+    /// written only on a verify row of a `stress-series/v3` envelope, its
+    /// output hashes are 16 hex digits and a byte count, run 2 appears exactly
+    /// when the runs' outputs differ, `reference` only on a ptrace row, and
+    /// an L3 record never on one; its credits are in [0, 1], its matched
+    /// prefix fits both logs, and its messages are nonempty and at most
+    /// [`DIVERGENCE_MESSAGE_MAX_CHARS`] characters.
+    fn validate_divergence(&self, divergence: &SeriesDivergence) -> Result<(), String> {
+        if self.schema != SeriesSchema::V3 {
+            return Err("divergence is supported only by stress-series/v3".into());
+        }
+        let mut parts = self.series.cell.rsplit('/');
+        let backend = parts.next().unwrap_or_default();
+        let mode = parts.next().unwrap_or_default();
+        if mode != "verify" {
+            return Err(format!(
+                "divergence is written only on verify rows, not {mode:?}"
+            ));
+        }
+        if divergence.self_lengths.is_none()
+            && divergence.outputs.is_none()
+            && divergence.vs_ptrace.is_none()
+        {
+            return Err(
+                "divergence must record at least one of self, outputs and vs_ptrace".into(),
+            );
+        }
+        if let Some(outputs) = &divergence.outputs {
+            for (name, run) in std::iter::once(("run1", &outputs.run1))
+                .chain(outputs.run2.as_ref().map(|run| ("run2", run)))
+            {
+                for (stream, value) in [("stdout", &run.stdout), ("stderr", &run.stderr)] {
+                    if !is_output_digest(value) {
+                        return Err(format!(
+                            "divergence.outputs.{name}.{stream} must be `<16 hex digits>:<bytes>`, got {value:?}"
+                        ));
+                    }
+                }
+            }
+            if outputs.runs_equal == outputs.run2.is_some() {
+                return Err(
+                    "divergence.outputs.run2 must be present exactly when runs_equal is false"
+                        .into(),
+                );
+            }
+            if outputs
+                .run2
+                .as_ref()
+                .is_some_and(|run| run == &outputs.run1)
+            {
+                return Err("divergence.outputs.run2 equal to run1 contradicts runs_equal".into());
+            }
+            if (outputs.vs_ptrace == SeriesOutputsVsPtrace::Differs)
+                == outputs.vs_ptrace_fields.is_empty()
+            {
+                return Err("divergence.outputs.vs_ptrace_fields must be nonempty exactly when vs_ptrace is differs".into());
+            }
+            if let Some(field) = outputs.vs_ptrace_fields.iter().find(|field| {
+                !matches!(field.as_str(), "exit_code" | "signal" | "stdout" | "stderr")
+            }) {
+                return Err(format!(
+                    "divergence.outputs.vs_ptrace_fields names unknown field {field:?}"
+                ));
+            }
+            if (outputs.vs_ptrace == SeriesOutputsVsPtrace::Reference) != (backend == "ptrace") {
+                return Err(
+                    "divergence.outputs.vs_ptrace is reference exactly on a ptrace row".into(),
+                );
+            }
+        }
+        if let Some(parity) = &divergence.vs_ptrace {
+            if backend == "ptrace" {
+                return Err(
+                    "divergence.vs_ptrace is a candidate's parity; a ptrace row has none".into(),
+                );
+            }
+            for (name, value) in [
+                ("credit", parity.credit),
+                ("unequalized_credit", parity.unequalized_credit),
+            ] {
+                if value.is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value)) {
+                    return Err(format!(
+                        "divergence.vs_ptrace.{name} must be in [0, 1] or null"
+                    ));
+                }
+            }
+            if let (Some(prefix), Some(left), Some(right)) =
+                (parity.matched_prefix, parity.left_len, parity.right_len)
+            {
+                if prefix > left.min(right) {
+                    return Err(format!(
+                        "divergence.vs_ptrace.matched_prefix {prefix} exceeds the shorter log ({left}, {right})"
+                    ));
+                }
+            }
+            let messages = |at: &str, difference: &Option<SeriesFirstDifference>| {
+                let Some(difference) = difference else {
+                    return Ok(());
+                };
+                for (side, value) in [
+                    ("reference", &difference.reference),
+                    ("candidate", &difference.candidate),
+                ] {
+                    if let Some(value) = value {
+                        let chars = value.chars().count();
+                        if chars == 0 || chars > DIVERGENCE_MESSAGE_MAX_CHARS {
+                            return Err(format!(
+                                "{at}.first_difference.{side} must be 1 to {DIVERGENCE_MESSAGE_MAX_CHARS} characters, got {chars}"
+                            ));
+                        }
+                    }
+                }
+                Ok(())
+            };
+            messages("divergence.vs_ptrace", &parity.first_difference)?;
+            if !parity.runs.is_empty() {
+                if parity.verdict != crate::parity::ParityVerdict::Nondeterministic {
+                    return Err(
+                        "divergence.vs_ptrace.runs belongs to a nondeterministic candidate only"
+                            .into(),
+                    );
+                }
+                let order = parity.runs.iter().map(|run| run.run).collect::<Vec<_>>();
+                if !matches!(order.as_slice(), [1] | [2] | [1, 2]) {
+                    return Err(format!(
+                        "divergence.vs_ptrace.runs names runs {order:?}; expected 1 and 2 at most once, in order"
+                    ));
+                }
+                for run in &parity.runs {
+                    let at = format!("divergence.vs_ptrace.runs[run {}]", run.run);
+                    if !run.verdict.is_measured() {
+                        return Err(format!("{at} must be matched or diverged"));
+                    }
+                    if run
+                        .matched_prefix
+                        .is_some_and(|prefix| prefix > run.left_len.min(run.right_len))
+                    {
+                        return Err(format!("{at}.matched_prefix exceeds the shorter log"));
+                    }
+                    if (run.verdict == crate::parity::ParityVerdict::Diverged)
+                        != run.first_difference.is_some()
+                    {
+                        return Err(format!(
+                            "{at}.first_difference is present exactly when it diverged"
+                        ));
+                    }
+                    messages(&at, &run.first_difference)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuse a comparison object the series writer cannot produce. The
+    /// writer records only the stripped, non-bitwise comparison, only for a
+    /// verify cell, and only when a comparison decided a passed, diverged or
+    /// errored outcome. A canonical comparison carries no object, so a row
+    /// claiming one, or claiming bitwise parity here, is refused rather than
+    /// read as a stronger result.
+    fn validate_comparison(&self, comparison: &SeriesComparison) -> Result<(), String> {
+        if self.schema != SeriesSchema::V3 {
+            return Err("comparison is supported only by stress-series/v3".into());
+        }
+        if comparison.strictness != LogCompareStrictness::Stripped || comparison.bitwise_parity {
+            return Err(format!(
+                "comparison must be strictness stripped with bitwise_parity false, got strictness {} with bitwise_parity {}; canonical rows carry no comparison",
+                comparison.strictness, comparison.bitwise_parity
+            ));
+        }
+        let mode = self.series.cell.rsplit('/').nth(1).unwrap_or_default();
+        if mode != "verify" {
+            return Err(format!(
+                "comparison is recorded only for verify cells, got mode {mode:?}"
+            ));
+        }
+        if !matches!(
+            self.series.outcome,
+            SeriesOutcome::Passed | SeriesOutcome::Diverged | SeriesOutcome::Errored
+        ) {
+            return Err(format!(
+                "outcome {:?} reached no comparison and must not carry one",
+                self.series.outcome.as_str()
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_declared_guest_exit(
+        &self,
+        declared: &SeriesDeclaredGuestExit,
+    ) -> Result<(), String> {
+        if self.schema != SeriesSchema::V3 {
+            return Err("declared_guest_exit is supported only by stress-series/v3".into());
+        }
+        let mode = self.series.cell.rsplit('/').nth(1).unwrap_or_default();
+        let expected = ExpectedGuestExit {
+            code: declared.code,
+            signal: declared.signal,
+            reason: declared.reason.clone(),
+        };
+        validate_expected_guest_exit("declared_guest_exit", mode, Some(&expected))?;
+        if !is_sha256(&declared.evidence_sha256) {
+            return Err(format!(
+                "declared_guest_exit.evidence_sha256 must be lowercase 64-hex, got {:?}",
+                declared.evidence_sha256
+            ));
+        }
+        // The evidence identity names one outer attempt, so the row must too;
+        // a collapsed row would attach one attempt's audit to several.
+        let attempt = self
+            .series
+            .attempt
+            .ok_or("declared_guest_exit requires an explicit outer attempt")?;
+        if self.series.num_runs != 1 || self.series.last_run_index.is_some() {
+            return Err("declared_guest_exit must identify one uncollapsed outer attempt".into());
+        }
+        if self.producer == SeriesProducer::Validate && attempt != self.series.run_index {
+            return Err("validate declared_guest_exit outer attempt must equal run_index".into());
+        }
+        for (name, other) in [
+            (
+                "no_verdict_evidence",
+                self.series
+                    .no_verdict_evidence
+                    .as_ref()
+                    .map(|evidence| &evidence.evidence_sha256),
+            ),
+            (
+                "pressure_evidence",
+                self.series
+                    .pressure_evidence
+                    .as_ref()
+                    .map(|evidence| &evidence.evidence_sha256),
+            ),
+        ] {
+            if other.is_some_and(|sha| sha != &declared.evidence_sha256) {
+                return Err(format!(
+                    "declared_guest_exit and {name} name different source evidence"
+                ));
+            }
+        }
+        if declared.attempts.is_empty() {
+            return Err("declared_guest_exit.attempts must be nonempty".into());
+        }
+        let mut indices = std::collections::BTreeSet::new();
+        let mut declared_passes = 0;
+        for attempt in &declared.attempts {
+            if attempt.index.trim().is_empty() || !indices.insert(&attempt.index) {
+                return Err(
+                    "declared_guest_exit attempt indices must be nonempty and unique".into(),
+                );
+            }
+            if attempt.outcome.trim().is_empty() {
+                return Err("declared_guest_exit attempt outcome must be nonempty".into());
+            }
+            if attempt.status.is_some_and(|status| status < 0)
+                || attempt.signal.is_some_and(|signal| signal <= 0)
+                || (attempt.status.is_some() && attempt.signal.is_some())
+            {
+                return Err("declared_guest_exit attempt status/signal is invalid".into());
+            }
+            if attempt
+                .verification_report_sha256
+                .as_ref()
+                .is_some_and(|sha| !is_sha256(sha))
+            {
+                return Err(
+                    "declared_guest_exit verification_report_sha256 must be lowercase 64-hex"
+                        .into(),
+                );
+            }
+            // The runner passes a declared attempt only when Hermit's status,
+            // the report and both compared outputs show the declaration. The
+            // report was checked before this row was written; Hermit's status
+            // is retained here so a reader can see what was admitted.
+            if attempt.outcome == "PASS" {
+                if attempt.timed_out
+                    || attempt.verification_report_sha256.is_none()
+                    || !expected.hermit_status_matches(attempt.status, attempt.signal)
+                {
+                    return Err(format!(
+                        "declared_guest_exit attempt {} passed without Hermit reporting the declared {}",
+                        attempt.index,
+                        match (declared.code, declared.signal) {
+                            (Some(code), _) => format!("exit code {code}"),
+                            (_, signal) => format!("signal {}", signal.unwrap_or_default()),
+                        }
+                    ));
+                }
+                declared_passes += 1;
+            }
+        }
+        if self.series.outcome == SeriesOutcome::Passed && declared_passes == 0 {
+            return Err(
+                "a passed declared_guest_exit row has no attempt that passed under the declaration"
+                    .into(),
+            );
+        }
+        // A timed-out sibling of a declared pass is still a timed-out attempt
+        // of this cell, whatever its outcome label says.
+        require_result_supported_by_timeout(
+            declared.attempts.iter().any(|attempt| attempt.timed_out),
+            self.series.result,
+        )
+        .map_err(|error| format!("declared_guest_exit {error}"))
+    }
+
+    fn validate_pressure_evidence(&self, evidence: &SeriesPressureEvidence) -> Result<(), String> {
+        if self.schema != SeriesSchema::V3 || self.producer != SeriesProducer::PressureTest {
+            return Err("pressure_evidence requires a pressure-test stress-series/v3 row".into());
+        }
+        if self.series.attempt.is_none_or(|attempt| attempt == 0)
+            || self.series.num_runs != 1
+            || self.series.last_run_index.is_some()
+        {
+            return Err(
+                "pressure_evidence requires one uncompressed explicit positive outer attempt"
+                    .into(),
+            );
+        }
+        if !is_sha256(&evidence.evidence_sha256) {
+            return Err("pressure_evidence.evidence_sha256 must be lowercase 64-hex".into());
+        }
+        if self
+            .series
+            .no_verdict_evidence
+            .as_ref()
+            .is_some_and(|other| other.evidence_sha256 != evidence.evidence_sha256)
+        {
+            return Err(
+                "pressure_evidence and no_verdict_evidence identify different CellResults".into(),
+            );
+        }
+        if evidence.attempts.is_empty() {
+            return Err("pressure_evidence.attempts must retain a nonempty inner history".into());
+        }
+        let mode = self.series.cell.rsplit('/').nth(1).unwrap_or_default();
+        let declared = self
+            .series
+            .declared_guest_exit
+            .as_ref()
+            .map(|declared| ExpectedGuestExit {
+                code: declared.code,
+                signal: declared.signal,
+                reason: declared.reason.clone(),
+            });
+        let mut indices = std::collections::BTreeSet::new();
+        for attempt in &evidence.attempts {
+            if attempt.index.trim().is_empty() || !indices.insert(&attempt.index) {
+                return Err("pressure_evidence attempt indices must be nonempty and unique".into());
+            }
+            attempt.validate_for_mode(mode, declared.as_ref())?;
+        }
+        // The same rule as the no-verdict timeout dispositions below, also
+        // when the row carries no no_verdict_evidence to cross-check.
+        SeriesPressureAttempt::require_result_supported_by_timeouts(
+            &evidence.attempts,
+            self.series.result,
+        )
+        .map_err(|error| format!("pressure_evidence {error}"))?;
+        if let Some(other) = &self.series.no_verdict_evidence {
+            for disposition in &other.attempts {
+                let retained = evidence
+                    .attempts
+                    .iter()
+                    .find(|attempt| attempt.index == disposition.index)
+                    .ok_or("pressure_evidence omitted a no_verdict_evidence invocation")?;
+                let same_comparison = match (disposition.kind, &retained.comparison) {
+                    (SeriesNoVerdictKind::MissingReportTimeout, None) => true,
+                    (kind, Some(comparison)) => {
+                        let (verdict, no_result_kind) = match kind {
+                            SeriesNoVerdictKind::Unspecified | SeriesNoVerdictKind::ComparisonRefused
+                            | SeriesNoVerdictKind::NotRun | SeriesNoVerdictKind::FirstRunRejected
+                            | SeriesNoVerdictKind::ContainerFailed
+                            | SeriesNoVerdictKind::RunFailed =>
+                                (Verdict::NoResult, Some(kind)),
+                            SeriesNoVerdictKind::InfrastructureError => (Verdict::InfrastructureError, None),
+                            SeriesNoVerdictKind::NoncanonicalMatch
+                            | SeriesNoVerdictKind::FailedMatch
+                            | SeriesNoVerdictKind::TimedOutMatch
+                            | SeriesNoVerdictKind::IneligibleExecutionPath => (Verdict::Matched, None),
+                            SeriesNoVerdictKind::NoncanonicalDivergence => (Verdict::Diverged, None),
+                            SeriesNoVerdictKind::MissingReportTimeout =>
+                                return Err("pressure_evidence supplied a report for a missing-report disposition".into()),
+                        };
+                        !comparison.canonical
+                            && comparison.verdict == verdict
+                            && comparison.no_result_kind == no_result_kind
+                            && Some(&comparison.report_sha256)
+                                == disposition.verification_report_sha256.as_ref()
+                    }
+                    _ => false,
+                };
+                if retained.outcome != disposition.attempt_outcome
+                    || retained.error_kind != disposition.error_kind
+                    || retained.status != disposition.status
+                    || retained.signal != disposition.signal
+                    || retained.timed_out != disposition.timed_out
+                    || !same_comparison
+                {
+                    return Err(
+                        "pressure_evidence contradicts the same no_verdict_evidence invocation"
+                            .into(),
+                    );
+                }
+            }
+        }
+        // Inner history explains qualification; it never rewrites the exact
+        // framework result, including a retained PASS with an adverse subrun.
+        // The timed-out-attempt rule above rewrites nothing: it refuses a result
+        // the runner cannot type for the CellResult it retains.
+        Ok(())
+    }
+
+    fn validate_no_verdict_evidence(
+        &self,
+        evidence: &SeriesNoVerdictEvidence,
+    ) -> Result<(), String> {
+        if !is_sha256(&evidence.evidence_sha256) {
+            return Err(format!(
+                "no_verdict_evidence.evidence_sha256 must be lowercase 64-hex, got {:?}",
+                evidence.evidence_sha256
+            ));
+        }
+        if self.schema != SeriesSchema::V3 {
+            return Err("no_verdict_evidence is supported only by stress-series/v3".into());
+        }
+        let attempt = self
+            .series
+            .attempt
+            .ok_or("no_verdict_evidence requires an explicit outer attempt")?;
+        let mode = self.series.cell.rsplit('/').nth(1).unwrap_or_default();
+        if !matches!(mode, "verify" | "replay" | "chaos") {
+            return Err("no_verdict_evidence is valid only for comparison modes".into());
+        }
+        if attempt == 0 || self.series.num_runs != 1 || self.series.last_run_index.is_some() {
+            return Err(
+                "no_verdict_evidence must identify one uncollapsed positive outer attempt".into(),
+            );
+        }
+        if self.producer == SeriesProducer::Validate && attempt != self.series.run_index {
+            return Err("validate no_verdict_evidence outer attempt must equal run_index".into());
+        }
+        if matches!(
+            self.series.outcome,
+            SeriesOutcome::Passed | SeriesOutcome::Diverged | SeriesOutcome::Skipped
+        ) {
+            return Err(format!(
+                "outcome {} cannot carry no_verdict_evidence",
+                self.series.outcome.as_str()
+            ));
+        }
+        if evidence.attempts.is_empty() {
+            return Err("no_verdict_evidence.attempts must be nonempty".into());
+        }
+        let mut indices = std::collections::BTreeSet::new();
+        let mut saw_timeout = false;
+        for disposition in &evidence.attempts {
+            if disposition.index.trim().is_empty() || !indices.insert(&disposition.index) {
+                return Err(
+                    "no_verdict_evidence attempt indices must be nonempty and unique".into(),
+                );
+            }
+            if disposition
+                .detail
+                .as_ref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                return Err("no_verdict_evidence detail must be nonempty when present".into());
+            }
+            if disposition.detail.is_some()
+                && !matches!(
+                    disposition.kind,
+                    SeriesNoVerdictKind::ComparisonRefused | SeriesNoVerdictKind::FailedMatch
+                )
+            {
+                return Err(
+                    "only comparison_refused and failed_match evidence may carry detail".into(),
+                );
+            }
+            if disposition
+                .error_kind
+                .as_ref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                return Err("no_verdict_evidence error_kind must be nonempty when present".into());
+            }
+            if disposition.status.is_some_and(|status| status < 0)
+                || disposition.signal.is_some_and(|signal| signal <= 0)
+                || (disposition.status.is_some() && disposition.signal.is_some())
+            {
+                return Err("no_verdict_evidence status/signal disposition is invalid".into());
+            }
+            if disposition
+                .verification_report_sha256
+                .as_ref()
+                .is_some_and(|sha| !is_sha256(sha))
+            {
+                return Err(
+                    "no_verdict_evidence verification_report_sha256 must be lowercase 64-hex"
+                        .into(),
+                );
+            }
+            let has_nonzero_process_disposition = matches!(
+                (disposition.status, disposition.signal),
+                (Some(status), None) if status > 0
+            ) || matches!(
+                (disposition.status, disposition.signal),
+                (None, Some(signal)) if signal > 0
+            );
+            match disposition.kind {
+                SeriesNoVerdictKind::Unspecified => {
+                    if disposition.attempt_outcome != "ERROR"
+                        || disposition.disposition != SeriesOutcome::NoResult
+                        || disposition.timed_out
+                        || disposition
+                            .error_kind
+                            .as_ref()
+                            .is_none_or(|value| value.trim().is_empty())
+                        || !has_nonzero_process_disposition
+                        || disposition.verification_report_sha256.is_none()
+                    {
+                        return Err(
+                            "unspecified evidence must carry attempt outcome ERROR, an error_kind, a verification report, exactly one nonzero status or signal, timed_out=false, and no_result disposition"
+                                .into(),
+                        );
+                    }
+                }
+                SeriesNoVerdictKind::ComparisonRefused => {
+                    if disposition.attempt_outcome != "ERROR"
+                        || disposition.disposition != SeriesOutcome::NoResult
+                        || disposition
+                            .detail
+                            .as_ref()
+                            .is_none_or(|value| value.trim().is_empty())
+                        || disposition.timed_out
+                        || disposition.error_kind.as_deref()
+                            != Some("incomplete-verification-evidence")
+                        || !has_nonzero_process_disposition
+                        || disposition.verification_report_sha256.is_none()
+                    {
+                        return Err(
+                            "comparison_refused evidence must carry nonempty detail, attempt outcome ERROR, error_kind incomplete-verification-evidence, a verification report, exactly one nonzero status or signal, timed_out=false, and no_result disposition"
+                                .into(),
+                        );
+                    }
+                }
+                SeriesNoVerdictKind::NotRun => {
+                    let expected = if disposition.timed_out {
+                        SeriesOutcome::Timeout
+                    } else {
+                        SeriesOutcome::NoResult
+                    };
+                    let no_process_timeout = is_prelaunch_timeout_disposition(disposition);
+                    if disposition.attempt_outcome != "ERROR"
+                        || disposition.disposition != expected
+                        || disposition
+                            .error_kind
+                            .as_ref()
+                            .is_none_or(|value| value.trim().is_empty())
+                        || !(has_nonzero_process_disposition || no_process_timeout)
+                        || disposition.verification_report_sha256.is_none()
+                    {
+                        return Err(
+                            "not_run evidence must carry attempt outcome ERROR, an error_kind, a verification report, either one nonzero process disposition or an explicit pre-launch timeout, and a matching typed disposition"
+                                .into(),
+                        );
+                    }
+                    saw_timeout |= disposition.timed_out;
+                }
+                SeriesNoVerdictKind::FirstRunRejected => {
+                    if disposition.attempt_outcome != "FAIL"
+                        || disposition.disposition != SeriesOutcome::NoResult
+                        || disposition.timed_out
+                        || disposition.error_kind.is_some()
+                        || disposition.status.is_none_or(|status| status <= 0)
+                        || disposition.signal.is_some()
+                        || disposition.verification_report_sha256.is_none()
+                    {
+                        return Err(
+                            "first_run_rejected evidence must carry attempt outcome FAIL, no error_kind, a nonzero status without signal, timed_out=false, a verification report, and no_result disposition"
+                                .into(),
+                        );
+                    }
+                }
+                SeriesNoVerdictKind::RunFailed => {
+                    if disposition.attempt_outcome != "FAIL"
+                        || disposition.disposition != SeriesOutcome::NoResult
+                        || disposition.timed_out
+                        || disposition.error_kind.is_some()
+                        || disposition.status.is_none_or(|status| status <= 0)
+                        || disposition.signal.is_some()
+                        || disposition.verification_report_sha256.is_none()
+                    {
+                        return Err(
+                            "run_failed evidence must carry attempt outcome FAIL, no error_kind, a nonzero status without signal, timed_out=false, a verification report, and no_result disposition"
+                                .into(),
+                        );
+                    }
+                }
+                SeriesNoVerdictKind::ContainerFailed => {
+                    if disposition.attempt_outcome != "FAIL"
+                        || disposition.disposition != SeriesOutcome::NoResult
+                        || disposition.timed_out
+                        || disposition.error_kind.is_some()
+                        || disposition.status != Some(125)
+                        || disposition.signal.is_some()
+                        || disposition.verification_report_sha256.is_none()
+                    {
+                        return Err("container_failed evidence must carry FAIL, exit 125 without signal or timeout, no error_kind, a report, and no_result comparison disposition".into());
+                    }
+                }
+                SeriesNoVerdictKind::NoncanonicalMatch => {
+                    let status_is_valid = disposition
+                        .status
+                        .is_some_and(|status| status >= 0 && (mode == "chaos" || status == 0));
+                    if disposition.attempt_outcome != "PASS"
+                        || disposition.disposition != SeriesOutcome::NoResult
+                        || disposition.timed_out
+                        || disposition.error_kind.is_some()
+                        || !status_is_valid
+                        || disposition.signal.is_some()
+                        || disposition.verification_report_sha256.is_none()
+                    {
+                        return Err(
+                            "noncanonical_match evidence must carry attempt outcome PASS, no error_kind, a valid status without signal, timed_out=false, a verification report, and no_result disposition"
+                                .into(),
+                        );
+                    }
+                }
+                SeriesNoVerdictKind::NoncanonicalDivergence => {
+                    if disposition.attempt_outcome != "FAIL"
+                        || disposition.disposition != SeriesOutcome::NoResult
+                        || disposition.timed_out
+                        || disposition.error_kind.is_some()
+                        || !has_nonzero_process_disposition
+                        || disposition.verification_report_sha256.is_none()
+                    {
+                        return Err(
+                            "noncanonical_divergence evidence must carry attempt outcome FAIL, no error_kind, exactly one nonzero status or signal, timed_out=false, a verification report, and no_result disposition"
+                                .into(),
+                        );
+                    }
+                }
+                SeriesNoVerdictKind::FailedMatch => {
+                    // The runner writes exactly this for the disposition: a
+                    // FAIL with neither a timeout nor an error kind, a
+                    // completed process, and a crash-error row. Chaos
+                    // admits any reproduced status, so it has no such red.
+                    if disposition.attempt_outcome != "FAIL"
+                        || disposition.disposition != SeriesOutcome::Errored
+                        || disposition.timed_out
+                        || disposition.error_kind.is_some()
+                        || (disposition.status.is_none() && disposition.signal.is_none())
+                        || disposition.verification_report_sha256.is_none()
+                        || !matches!(mode, "verify" | "replay")
+                        || self.series.result != Some(ObservedResult::CrashError)
+                    {
+                        return Err(
+                            "failed_match evidence must carry attempt outcome FAIL, no error_kind, a completed status or signal, timed_out=false, a verification report, errored disposition, a verify or replay cell, and a crash-error result"
+                                .into(),
+                        );
+                    }
+                    // A detail is the runner's reason for a failed declared
+                    // stdout, the only record of that failure. The runner
+                    // checks declared stdout before the guest's exit, so the
+                    // attempt may have ended any way at all. The series row
+                    // does not carry the report, so the writer verifies the
+                    // reason against it; this checks what the reason alone
+                    // can show.
+                    let failed_expected_output = match disposition.detail.as_deref() {
+                        None => false,
+                        Some(detail) => {
+                            let reason = parse_expected_output_failure_reason(detail).ok_or(
+                                "failed_match detail must be the runner's reason for a failed declared expected output",
+                            )?;
+                            if let Some(why) = reason.contradiction() {
+                                return Err(format!(
+                                    "failed_match detail contradicts a matched comparison: {why}"
+                                ));
+                            }
+                            if mode != "verify" {
+                                return Err(
+                                    "failed_match detail names a declared expected output, which only a verify cell has"
+                                        .into(),
+                                );
+                            }
+                            true
+                        }
+                    };
+                    // Undeclared, only a nonzero exit or a failed declared
+                    // stdout fails a match.
+                    if self.series.declared_guest_exit.is_none()
+                        && disposition.status == Some(0)
+                        && !failed_expected_output
+                    {
+                        return Err(
+                            "failed_match evidence without a declared guest exit or a failed declared expected output must record a nonzero status or a signal"
+                                .into(),
+                        );
+                    }
+                    // Declared, Hermit's status alone does not decide a pass:
+                    // the runner also requires the report's guest disposition
+                    // to equal the declaration (ExpectedGuestExit::check). A
+                    // status that matches can still be a runner FAIL, for
+                    // example declared signal 11 with status 139 but a report
+                    // that says the guest exited with code 139. The row does
+                    // not carry the report's disposition, so this writer
+                    // cannot tell the two apart and retains the red.
+                }
+                SeriesNoVerdictKind::InfrastructureError => {
+                    if disposition.attempt_outcome != "ERROR"
+                        || disposition.disposition != SeriesOutcome::Errored
+                        || disposition.timed_out
+                        || !has_nonzero_process_disposition
+                        || disposition.verification_report_sha256.is_none()
+                    {
+                        return Err(
+                            "infrastructure_error evidence must carry attempt outcome ERROR, a verification report, exactly one nonzero status or signal, timed_out=false, and errored disposition"
+                                .into(),
+                        );
+                    }
+                }
+                SeriesNoVerdictKind::MissingReportTimeout => {
+                    if disposition.attempt_outcome != "ERROR"
+                        || disposition.disposition != SeriesOutcome::Timeout
+                        || !disposition.timed_out
+                        || disposition
+                            .error_kind
+                            .as_ref()
+                            .is_none_or(|value| value.trim().is_empty())
+                        || !has_nonzero_process_disposition
+                        || disposition.verification_report_sha256.is_some()
+                    {
+                        return Err(
+                            "missing_report_timeout evidence must carry attempt outcome ERROR, an error_kind, no verification report, exactly one nonzero status or signal, timed_out=true, and timeout disposition"
+                                .into(),
+                        );
+                    }
+                    saw_timeout = true;
+                }
+                SeriesNoVerdictKind::TimedOutMatch => {
+                    // A timeout never lets the runner pass an attempt, so a
+                    // timed-out match is a FAIL, or an ERROR when the runner
+                    // also refused the report's comparison policy; the
+                    // timeout then replaces the error kind. The process ended
+                    // and was reaped, so exactly one status or signal is
+                    // known, and a status of 0 is the ordinary case.
+                    if !matches!(disposition.attempt_outcome.as_str(), "FAIL" | "ERROR")
+                        || disposition.disposition != SeriesOutcome::Timeout
+                        || !disposition.timed_out
+                        || !matches!(
+                            disposition.error_kind.as_deref(),
+                            Some("cpu-timeout" | "wall-timeout")
+                        )
+                        || disposition.status.is_some() == disposition.signal.is_some()
+                        || disposition.verification_report_sha256.is_none()
+                    {
+                        return Err(
+                            "timed_out_match evidence must carry attempt outcome FAIL or ERROR, error_kind cpu-timeout or wall-timeout, exactly one status or signal, timed_out=true, a verification report, and timeout disposition"
+                                .into(),
+                        );
+                    }
+                    saw_timeout = true;
+                }
+                SeriesNoVerdictKind::IneligibleExecutionPath => {
+                    // The runner judges the execution path only after a cell
+                    // passed, so the attempt is a completed pass: exit 0, or
+                    // the declared guest exit as Hermit reports it. Only a
+                    // SaBRe run writes path evidence, and these rows are
+                    // verify cells, which a crash-error result then records.
+                    let backend = self.series.cell.rsplit('/').next().unwrap_or_default();
+                    let passed_exit = match &self.series.declared_guest_exit {
+                        None => disposition.status == Some(0) && disposition.signal.is_none(),
+                        Some(declared) => {
+                            // This runs before validate_declared_guest_exit,
+                            // so check the declaration before matching: a
+                            // declaration the runner itself would refuse
+                            // accepts nothing, and an out-of-range signal
+                            // would overflow the match's `128 + signal`.
+                            let expected = ExpectedGuestExit {
+                                code: declared.code,
+                                signal: declared.signal,
+                                reason: declared.reason.clone(),
+                            };
+                            validate_expected_guest_exit(
+                                "declared_guest_exit",
+                                mode,
+                                Some(&expected),
+                            )
+                            .is_ok()
+                                && expected
+                                    .hermit_status_matches(disposition.status, disposition.signal)
+                        }
+                    };
+                    if disposition.attempt_outcome != "PASS"
+                        || disposition.disposition != SeriesOutcome::Errored
+                        || disposition.timed_out
+                        || disposition.error_kind.is_some()
+                        || !passed_exit
+                        || disposition.verification_report_sha256.is_none()
+                        || mode != "verify"
+                        || backend != "sabre"
+                        || self.series.result != Some(ObservedResult::CrashError)
+                    {
+                        return Err(
+                            "ineligible_execution_path evidence must carry attempt outcome PASS, no error_kind, exit 0 or the declared guest exit, timed_out=false, a verification report, errored disposition, a SaBRe verify cell, and a crash-error result"
+                                .into(),
+                        );
+                    }
+                }
+            }
+        }
+        if self.series.result == Some(ObservedResult::Timeout) && !saw_timeout {
+            return Err("timeout result has no timed-out attempt disposition".into());
+        }
+        if saw_timeout
+            && self.series.result.is_some()
+            && self.series.result != Some(ObservedResult::Timeout)
+        {
+            return Err(format!(
+                "timed-out attempt disposition contradicts result {:?}",
+                self.series.result
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_current_no_verdict_evidence(&self) -> Result<(), String> {
+        let mode = self.series.cell.rsplit('/').nth(1).unwrap_or_default();
+        let requires_evidence = matches!(
+            self.series.outcome,
+            SeriesOutcome::NoResult | SeriesOutcome::Timeout | SeriesOutcome::Errored
+        );
+        if matches!(mode, "verify" | "replay" | "chaos")
+            && requires_evidence
+            && self.series.no_verdict_evidence.is_none()
+        {
+            return Err(format!(
+                "new comparison-mode {} row must carry no_verdict_evidence",
+                self.series.outcome.as_str()
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_host_facts(&self) -> Result<(), String> {
+        let machine = self
+            .series
+            .machine_shortname
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or("series missing machine_shortname")?;
+        if machine.contains('/') || machine.contains('.') {
+            return Err(format!(
+                "machine_shortname must be a short hostname, got {machine:?}"
+            ));
+        }
+        if self.host != machine {
+            return Err(format!(
+                "envelope host {:?} does not match machine_shortname {machine:?}",
+                self.host
+            ));
+        }
+        self.series
+            .kernel_version
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "series missing kernel_version".to_string())?;
+        let capabilities = self
+            .series
+            .host_capabilities
+            .as_ref()
+            .ok_or_else(|| "series missing host_capabilities".to_string())?;
+        for capability in STRESS_SERIES_V2_HOST_CAPABILITIES {
+            let verdict = capabilities.get(&capability).ok_or_else(|| {
+                format!(
+                    "host_capabilities missing required capability {:?}",
+                    capability.value()
+                )
+            })?;
+            if verdict.evidence.trim().is_empty() {
+                return Err(format!(
+                    "host_capabilities.{:?}.evidence must be nonempty",
+                    capability.value()
+                ));
+            }
+        }
+        if capabilities.len() != STRESS_SERIES_V2_HOST_CAPABILITIES.len() {
+            return Err("host_capabilities must contain the complete closed capability set".into());
+        }
+        Ok(())
+    }
+
+    fn validate_classification(&self) -> Result<(), String> {
+        let valid = matches!(
+            (
+                self.series.outcome,
+                self.series.result,
+                self.series.failure_class,
+            ),
+            (SeriesOutcome::Passed, Some(ObservedResult::Pass), None)
+                | (
+                    SeriesOutcome::Diverged,
+                    Some(
+                        ObservedResult::DeterminismFailure
+                            | ObservedResult::ParityFailure
+                            | ObservedResult::ReplayFailure
+                    ),
+                    Some(FailureClass::ProductFailure)
+                )
+                | (
+                    SeriesOutcome::Errored,
+                    Some(ObservedResult::CrashError),
+                    Some(FailureClass::ProductFailure)
+                )
+                | (
+                    SeriesOutcome::Timeout,
+                    Some(ObservedResult::Timeout),
+                    Some(FailureClass::NoResult)
+                )
+                | (
+                    SeriesOutcome::NoResult,
+                    Some(ObservedResult::Oom),
+                    Some(FailureClass::NoResult)
+                )
+                | (
+                    SeriesOutcome::Errored,
+                    Some(ObservedResult::SandboxDenied | ObservedResult::InfrastructureError)
+                        | None,
+                    Some(FailureClass::UnderstoodInfrastructureFailure)
+                )
+                | (
+                    SeriesOutcome::Skipped,
+                    None,
+                    Some(FailureClass::UnderstoodPrerequisiteFailure)
+                )
+                | (SeriesOutcome::NoResult, None, Some(FailureClass::NoResult))
+        );
+        if valid {
+            Ok(())
+        } else {
+            Err(format!(
+                "stress-series/v3 classification mismatch: outcome={} result={:?} failure_class={:?}",
+                self.series.outcome.as_str(),
+                self.series.result,
+                self.series.failure_class
+            ))
+        }
+    }
+}
+
+fn is_object_id(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_cell(value: &str) -> bool {
+    let mut parts = value.rsplitn(3, '/');
+    let backend = parts.next().unwrap_or_default();
+    let mode = parts.next().unwrap_or_default();
+    let test = parts.next().unwrap_or_default();
+    !test.is_empty()
+        && !mode.is_empty()
+        && !backend.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'/' | b'-'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(schema: SeriesSchema) -> SeriesRow {
+        SeriesRow {
+            source: String::new(),
+            schema,
+            event_id: "event".into(),
+            event_type: "series.observation".into(),
+            emitted_at: "2026-08-27T00:00:00Z".into(),
+            team: "hermit".into(),
+            host: "fixture-host".into(),
+            producer: SeriesProducer::Validate,
+            run_id: "run".into(),
+            series: SeriesPayload {
+                cell: "fixture/test/verify/ptrace".into(),
+                tree: "a".repeat(40),
+                detcore_tree: None,
+                outcome: SeriesOutcome::Passed,
+                result: Some(ObservedResult::Pass),
+                failure_class: None,
+                no_verdict_evidence: None,
+                pressure_evidence: None,
+                declared_guest_exit: None,
+                comparison: None,
+                run_index: 1,
+                attempt: None,
+                num_runs: 1,
+                last_run_index: None,
+                main_ancestry: Some(true),
+                runtime: None,
+                source_tree_dirty: false,
+                depth: BTreeMap::new(),
+                coordinates: None,
+                first_divergent_messages: None,
+                machine_shortname: Some("fixture-host".into()),
+                kernel_version: Some("7.1.3-test".into()),
+                host_capabilities: Some(BTreeMap::from([
+                    (
+                        HostCapability::CpuidFaulting,
+                        HostCapabilityVerdict {
+                            present: true,
+                            evidence: "fixture cpuid probe".into(),
+                        },
+                    ),
+                    (
+                        HostCapability::Kvm,
+                        HostCapabilityVerdict {
+                            present: false,
+                            evidence: "fixture kvm probe".into(),
+                        },
+                    ),
+                ])),
+                strictness: None,
+                divergence: None,
+            },
+        }
+    }
+
+    fn no_verdict_row() -> SeriesRow {
+        let mut fixture = row(SeriesSchema::V3);
+        fixture.series.outcome = SeriesOutcome::NoResult;
+        fixture.series.result = None;
+        fixture.series.failure_class = Some(FailureClass::NoResult);
+        fixture.series.attempt = Some(1);
+        fixture.series.no_verdict_evidence = Some(SeriesNoVerdictEvidence {
+            evidence_sha256: "b".repeat(64),
+            attempts: vec![SeriesAttemptDisposition {
+                index: "1".into(),
+                kind: SeriesNoVerdictKind::NotRun,
+                detail: None,
+                attempt_outcome: "ERROR".into(),
+                disposition: SeriesOutcome::NoResult,
+                error_kind: Some("incomplete-verification-evidence".into()),
+                status: Some(125),
+                signal: None,
+                timed_out: false,
+                verification_report_sha256: Some("c".repeat(64)),
+            }],
+        });
+        fixture
+    }
+
+    fn declared_exit_row(
+        code: Option<i32>,
+        signal: Option<i32>,
+        status: Option<i32>,
+        observed_signal: Option<i32>,
+    ) -> SeriesRow {
+        let mut fixture = row(SeriesSchema::V3);
+        fixture.series.attempt = Some(1);
+        fixture.series.declared_guest_exit = Some(SeriesDeclaredGuestExit {
+            code,
+            signal,
+            reason: "the fixture guest fails on purpose".into(),
+            evidence_sha256: "b".repeat(64),
+            attempts: vec![SeriesDeclaredGuestExitAttempt {
+                index: "1".into(),
+                outcome: "PASS".into(),
+                status,
+                signal: observed_signal,
+                timed_out: false,
+                verification_report_sha256: Some("c".repeat(64)),
+            }],
+        });
+        fixture
+    }
+
+    #[test]
+    fn declared_guest_exit_admits_each_declared_disposition() {
+        for (label, fixture) in [
+            ("exit 7", declared_exit_row(Some(7), None, Some(7), None)),
+            (
+                "signal 11",
+                declared_exit_row(None, Some(11), None, Some(11)),
+            ),
+            (
+                "signal 11 as 139",
+                declared_exit_row(None, Some(11), Some(139), None),
+            ),
+        ] {
+            fixture
+                .validate_for_write()
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+            let encoded = serde_json::to_string(&fixture).unwrap();
+            let decoded: SeriesRow = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(
+                decoded.series.declared_guest_exit,
+                fixture.series.declared_guest_exit
+            );
+            decoded.validate_for_read().unwrap();
+        }
+        // Rows without a declaration are unchanged on the wire.
+        let plain = serde_json::to_string(&row(SeriesSchema::V3)).unwrap();
+        assert!(!plain.contains("declared_guest_exit"));
+    }
+
+    fn declared(fixture: &mut SeriesRow) -> &mut SeriesDeclaredGuestExit {
+        fixture.series.declared_guest_exit.as_mut().unwrap()
+    }
+
+    #[test]
+    fn declared_guest_exit_refuses_unauditable_or_contradicted_admission() {
+        let base = || declared_exit_row(Some(7), None, Some(7), None);
+        let mut cases: Vec<(&str, SeriesRow, &str)> = Vec::new();
+        let mut other = base();
+        declared(&mut other).attempts[0].status = Some(3);
+        cases.push((
+            "hermit status disagrees",
+            other,
+            "without Hermit reporting the declared exit code 7",
+        ));
+        let mut other = declared_exit_row(None, Some(6), None, Some(11));
+        other.series.attempt = Some(1);
+        cases.push(("hermit signal disagrees", other, "declared signal 6"));
+        let mut other = base();
+        declared(&mut other).attempts[0].status = Some(0);
+        cases.push(("guest succeeded", other, "without Hermit reporting"));
+        let mut other = base();
+        declared(&mut other).attempts[0].verification_report_sha256 = None;
+        cases.push(("no report", other, "without Hermit reporting"));
+        let mut other = base();
+        declared(&mut other).attempts[0].timed_out = true;
+        cases.push(("timed out", other, "without Hermit reporting"));
+        let mut other = base();
+        declared(&mut other).attempts[0].outcome = "FAIL".into();
+        cases.push((
+            "no declared pass",
+            other,
+            "no attempt that passed under the declaration",
+        ));
+        let mut other = base();
+        declared(&mut other).attempts.clear();
+        cases.push(("no attempts", other, "attempts must be nonempty"));
+        let mut other = base();
+        declared(&mut other).code = Some(0);
+        cases.push(("code 0", other, "code must be a nonzero exit status"));
+        let mut other = base();
+        declared(&mut other).signal = Some(11);
+        cases.push(("code and signal", other, "exactly one of code or signal"));
+        let mut other = base();
+        declared(&mut other).code = None;
+        cases.push(("neither", other, "exactly one of code or signal"));
+        let mut other = declared_exit_row(None, Some(65), None, Some(65));
+        other.series.attempt = Some(1);
+        cases.push(("signal 65", other, "signal must be a signal number"));
+        let mut other = base();
+        declared(&mut other).reason = " ".into();
+        cases.push(("blank reason", other, "reason must be substantive"));
+        let mut other = base();
+        declared(&mut other).evidence_sha256 = "B".repeat(64);
+        cases.push((
+            "bad evidence digest",
+            other,
+            "evidence_sha256 must be lowercase 64-hex",
+        ));
+        let mut other = base();
+        other.series.cell = "fixture/test/chaos/ptrace".into();
+        cases.push(("chaos mode", other, "supported only by verify mode"));
+        let mut other = base();
+        other.series.attempt = None;
+        cases.push((
+            "no outer attempt",
+            other,
+            "requires an explicit outer attempt",
+        ));
+        let mut other = base();
+        other.series.num_runs = 2;
+        other.series.last_run_index = Some(2);
+        cases.push(("collapsed", other, "one uncollapsed outer attempt"));
+        let mut other = base();
+        other.series.attempt = Some(2);
+        cases.push((
+            "attempt differs from run_index",
+            other,
+            "must equal run_index",
+        ));
+        let mut other = base();
+        declared(&mut other)
+            .attempts
+            .push(declared(&mut base()).attempts[0].clone());
+        cases.push(("duplicate index", other, "nonempty and unique"));
+        let mut other = base();
+        other.series.outcome = SeriesOutcome::NoResult;
+        other.series.result = None;
+        other.series.failure_class = Some(FailureClass::NoResult);
+        other.series.no_verdict_evidence = no_verdict_row().series.no_verdict_evidence;
+        other
+            .series
+            .no_verdict_evidence
+            .as_mut()
+            .unwrap()
+            .evidence_sha256 = "d".repeat(64);
+        cases.push((
+            "different source evidence",
+            other,
+            "name different source evidence",
+        ));
+        for (label, fixture, message) in cases {
+            let error = fixture
+                .validate_for_write()
+                .expect_err(&format!("{label} was accepted"));
+            assert!(error.contains(message), "{label}: {error}");
+            let error = fixture
+                .validate_for_read()
+                .expect_err(&format!("{label} was readable"));
+            assert!(error.contains(message), "{label}: {error}");
+        }
+        // A retained v2 row cannot carry the v3-only audit either.
+        let mut v2 = base();
+        v2.schema = SeriesSchema::V2;
+        let error = v2.validate_for_read().unwrap_err();
+        assert!(
+            error.contains("supported only by stress-series/v3"),
+            "{error}"
+        );
+        // Unknown audit fields are refused rather than ignored.
+        let mut encoded = serde_json::to_value(base()).unwrap();
+        encoded["series"]["declared_guest_exit"]["note"] = "x".into();
+        assert!(serde_json::from_value::<SeriesRow>(encoded).is_err());
+    }
+
+    /// A kvm verify row with all three parts of its first divergence, as the
+    /// series writer fills them from the cell's result row and the run's
+    /// parity.jsonl.
+    fn divergence_row() -> SeriesRow {
+        let mut fixture = row(SeriesSchema::V3);
+        fixture.series.cell = "fixture/test/verify/kvm".into();
+        let outputs = SeriesGuestOutputs {
+            exit_code: Some(0),
+            signal: None,
+            stdout: "fb9a253ff29ae72a:16".into(),
+            stderr: "e3b0c44298fc1c14:0".into(),
+        };
+        fixture.series.divergence = Some(SeriesDivergence {
+            self_lengths: Some(SeriesLogLengths {
+                left_len: 103,
+                right_len: 103,
+            }),
+            outputs: Some(SeriesOutputs {
+                run1: outputs,
+                runs_equal: true,
+                run2: None,
+                vs_ptrace: SeriesOutputsVsPtrace::Equal,
+                vs_ptrace_fields: Vec::new(),
+            }),
+            vs_ptrace: Some(SeriesVsPtrace {
+                verdict: crate::parity::ParityVerdict::Diverged,
+                unavailable_class: None,
+                credit: Some(0.0348),
+                unequalized_credit: None,
+                matched_prefix: Some(4),
+                left_len: Some(115),
+                right_len: Some(101),
+                first_difference: Some(SeriesFirstDifference {
+                    record: Some(5),
+                    syscall: None,
+                    scheduler_turn: None,
+                    virtual_nanoseconds: None,
+                    reference: Some("INFO detcore::scheduler: guest in queue".into()),
+                    candidate: Some("INFO detcore::random: DETLOG init auxv".into()),
+                }),
+                runs: Vec::new(),
+            }),
+        });
+        fixture
+    }
+
+    /// [`divergence_row`] for a red candidate: no credit, both runs measured.
+    fn red_divergence_row() -> SeriesRow {
+        let mut fixture = divergence_row();
+        let parity = fixture
+            .series
+            .divergence
+            .as_mut()
+            .unwrap()
+            .vs_ptrace
+            .as_mut()
+            .unwrap();
+        let difference = parity.first_difference.take();
+        *parity = SeriesVsPtrace {
+            verdict: crate::parity::ParityVerdict::Nondeterministic,
+            unavailable_class: Some(crate::parity::UnavailableClass::DeterminismMismatch),
+            credit: None,
+            unequalized_credit: None,
+            matched_prefix: None,
+            left_len: None,
+            right_len: None,
+            first_difference: None,
+            runs: vec![
+                SeriesRunVsPtrace {
+                    run: 1,
+                    verdict: crate::parity::ParityVerdict::Matched,
+                    matched_prefix: Some(115),
+                    left_len: 115,
+                    right_len: 115,
+                    first_difference: None,
+                },
+                SeriesRunVsPtrace {
+                    run: 2,
+                    verdict: crate::parity::ParityVerdict::Diverged,
+                    matched_prefix: Some(4),
+                    left_len: 115,
+                    right_len: 101,
+                    first_difference: difference,
+                },
+            ],
+        };
+        fixture
+    }
+
+    #[test]
+    fn a_verify_rows_divergence_is_admitted_and_its_impossible_forms_refused() {
+        let fixture = divergence_row();
+        fixture.validate_for_write().unwrap();
+        fixture.validate_for_read().unwrap();
+        let encoded = serde_json::to_value(&fixture).unwrap();
+        assert_eq!(encoded["series"]["divergence"]["self"]["left_len"], 103);
+        assert_eq!(
+            serde_json::from_value::<SeriesRow>(encoded).unwrap(),
+            fixture
+        );
+        // A red candidate's runs against the golden round-trip too.
+        let red = red_divergence_row();
+        red.validate_for_write().unwrap();
+        let encoded = serde_json::to_value(&red).unwrap();
+        assert_eq!(
+            encoded["series"]["divergence"]["vs_ptrace"]["runs"][1]["matched_prefix"],
+            4
+        );
+        assert_eq!(serde_json::from_value::<SeriesRow>(encoded).unwrap(), red);
+        // A row written before the field existed stays readable without it.
+        let mut without = divergence_row();
+        without.series.divergence = None;
+        without.validate_for_write().unwrap();
+        let divergence =
+            |fixture: &mut SeriesRow| fixture.series.divergence.as_mut().unwrap().clone();
+        let mut cases: Vec<(&str, SeriesRow, &str)> = Vec::new();
+        let mut other = divergence_row();
+        other.series.cell = "fixture/test/replay/ptrace".into();
+        cases.push(("replay row", other, "only on verify rows"));
+        let mut other = divergence_row();
+        other.series.divergence = Some(SeriesDivergence {
+            self_lengths: None,
+            outputs: None,
+            vs_ptrace: None,
+        });
+        cases.push(("empty", other, "at least one of"));
+        let mut other = divergence_row();
+        let mut changed = divergence(&mut other);
+        changed.outputs.as_mut().unwrap().run1.stdout = "fb9a253ff29ae72ad120:16".into();
+        other.series.divergence = Some(changed);
+        cases.push(("long hash", other, "<16 hex digits>:<bytes>"));
+        let mut other = divergence_row();
+        let mut changed = divergence(&mut other);
+        changed.outputs.as_mut().unwrap().runs_equal = false;
+        other.series.divergence = Some(changed);
+        cases.push((
+            "unequal without run2",
+            other,
+            "exactly when runs_equal is false",
+        ));
+        let mut other = divergence_row();
+        let mut changed = divergence(&mut other);
+        let outputs = changed.outputs.as_mut().unwrap();
+        outputs.runs_equal = false;
+        outputs.run2 = Some(outputs.run1.clone());
+        other.series.divergence = Some(changed);
+        cases.push(("equal run2", other, "contradicts runs_equal"));
+        let mut other = divergence_row();
+        let mut changed = divergence(&mut other);
+        changed.outputs.as_mut().unwrap().vs_ptrace = SeriesOutputsVsPtrace::Differs;
+        other.series.divergence = Some(changed);
+        cases.push((
+            "differs without fields",
+            other,
+            "vs_ptrace_fields must be nonempty",
+        ));
+        let mut other = divergence_row();
+        let mut changed = divergence(&mut other);
+        let outputs = changed.outputs.as_mut().unwrap();
+        outputs.vs_ptrace = SeriesOutputsVsPtrace::Differs;
+        outputs.vs_ptrace_fields = vec!["status".into()];
+        other.series.divergence = Some(changed);
+        cases.push(("unknown field", other, "unknown field"));
+        let mut other = divergence_row();
+        let mut changed = divergence(&mut other);
+        changed.outputs.as_mut().unwrap().vs_ptrace = SeriesOutputsVsPtrace::Reference;
+        other.series.divergence = Some(changed);
+        cases.push((
+            "reference on kvm",
+            other,
+            "reference exactly on a ptrace row",
+        ));
+        let mut other = divergence_row();
+        other.series.cell = "fixture/test/verify/ptrace".into();
+        let mut changed = divergence(&mut other);
+        changed.outputs.as_mut().unwrap().vs_ptrace = SeriesOutputsVsPtrace::Reference;
+        other.series.divergence = Some(changed);
+        cases.push(("parity on ptrace", other, "a ptrace row has none"));
+        let mut other = divergence_row();
+        let mut changed = divergence(&mut other);
+        changed.vs_ptrace.as_mut().unwrap().credit = Some(1.5);
+        other.series.divergence = Some(changed);
+        cases.push(("credit above 1", other, "credit must be in [0, 1]"));
+        let mut other = divergence_row();
+        let mut changed = divergence(&mut other);
+        changed.vs_ptrace.as_mut().unwrap().matched_prefix = Some(102);
+        other.series.divergence = Some(changed);
+        cases.push((
+            "prefix past the shorter log",
+            other,
+            "exceeds the shorter log",
+        ));
+        let mut other = divergence_row();
+        let mut changed = divergence(&mut other);
+        changed
+            .vs_ptrace
+            .as_mut()
+            .unwrap()
+            .first_difference
+            .as_mut()
+            .unwrap()
+            .candidate = Some("x".repeat(DIVERGENCE_MESSAGE_MAX_CHARS + 1));
+        other.series.divergence = Some(changed);
+        cases.push(("long message", other, "must be 1 to 240 characters"));
+        let mut other = divergence_row();
+        let mut changed = divergence(&mut other);
+        changed.vs_ptrace.as_mut().unwrap().runs = divergence(&mut red_divergence_row())
+            .vs_ptrace
+            .unwrap()
+            .runs;
+        other.series.divergence = Some(changed);
+        cases.push((
+            "runs on a measured cell",
+            other,
+            "nondeterministic candidate only",
+        ));
+        let mut other = red_divergence_row();
+        let mut changed = divergence(&mut other);
+        changed.vs_ptrace.as_mut().unwrap().runs.reverse();
+        other.series.divergence = Some(changed);
+        cases.push(("runs out of order", other, "at most once, in order"));
+        let mut other = red_divergence_row();
+        let mut changed = divergence(&mut other);
+        changed.vs_ptrace.as_mut().unwrap().runs[0].first_difference =
+            changed.vs_ptrace.as_ref().unwrap().runs[1]
+                .first_difference
+                .clone();
+        other.series.divergence = Some(changed);
+        cases.push((
+            "a matched run with a difference",
+            other,
+            "exactly when it diverged",
+        ));
+        let mut other = red_divergence_row();
+        let mut changed = divergence(&mut other);
+        changed.vs_ptrace.as_mut().unwrap().runs[1].matched_prefix = Some(102);
+        other.series.divergence = Some(changed);
+        cases.push((
+            "a run's prefix past its shorter log",
+            other,
+            "exceeds the shorter log",
+        ));
+        for (label, fixture, message) in cases {
+            let error = fixture
+                .validate_for_write()
+                .expect_err(&format!("{label} was accepted"));
+            assert!(error.contains(message), "{label}: {error}");
+        }
+        // A retained v2 row cannot carry it either.
+        let mut v2 = divergence_row();
+        v2.schema = SeriesSchema::V2;
+        let error = v2.validate_for_read().unwrap_err();
+        assert!(
+            error.contains("supported only by stress-series/v3"),
+            "{error}"
+        );
+        // Unknown fields inside the object are refused rather than ignored.
+        let mut encoded = serde_json::to_value(divergence_row()).unwrap();
+        encoded["series"]["divergence"]["outputs"]["note"] = "x".into();
+        assert!(serde_json::from_value::<SeriesRow>(encoded).is_err());
+    }
+
+    #[test]
+    fn declared_guest_exit_holds_a_timed_out_sibling_to_the_timeout_rule() {
+        // The runner never passes a timed-out attempt and types the cell as a
+        // timeout, so a declared pass beside a timed-out sibling cannot make
+        // the row a pass or a red, whichever order the attempts ran in.
+        for sibling_outcome in ["FAIL", "ERROR"] {
+            for sibling_first in [false, true] {
+                let with_sibling = |mut fixture: SeriesRow| {
+                    let sibling = SeriesDeclaredGuestExitAttempt {
+                        index: "2".into(),
+                        outcome: sibling_outcome.into(),
+                        status: None,
+                        signal: Some(9),
+                        timed_out: true,
+                        verification_report_sha256: Some("e".repeat(64)),
+                    };
+                    let attempts = &mut declared(&mut fixture).attempts;
+                    if sibling_first {
+                        attempts.insert(0, sibling);
+                    } else {
+                        attempts.push(sibling);
+                    }
+                    fixture
+                };
+                let label = format!("{sibling_outcome} sibling, first={sibling_first}");
+
+                let passed = with_sibling(declared_exit_row(Some(7), None, Some(7), None));
+                let mut diverged = with_sibling(declared_exit_row(Some(7), None, Some(7), None));
+                diverged.series.outcome = SeriesOutcome::Diverged;
+                diverged.series.result = Some(ObservedResult::DeterminismFailure);
+                diverged.series.failure_class = Some(FailureClass::ProductFailure);
+                for (fixture, result) in [
+                    (&passed, "Some(Pass)"),
+                    (&diverged, "Some(DeterminismFailure)"),
+                ] {
+                    let message = format!(
+                        "declared_guest_exit retains a timed-out attempt, which contradicts result {result}"
+                    );
+                    for error in [
+                        fixture.validate_for_write(),
+                        fixture.validate_for_read(),
+                        fixture.validate_for_projection(),
+                    ] {
+                        let error = error.expect_err(&format!("{label}, {result} was admitted"));
+                        assert!(error.contains(&message), "{label}: {error}");
+                    }
+                }
+
+                // The same attempts under the runner's timeout are admitted.
+                let mut timeout = with_sibling(declared_exit_row(Some(7), None, Some(7), None));
+                timeout.series.outcome = SeriesOutcome::Timeout;
+                timeout.series.result = Some(ObservedResult::Timeout);
+                timeout.series.failure_class = Some(FailureClass::NoResult);
+                let mut evidence = no_verdict_row().series.no_verdict_evidence.unwrap();
+                let disposition = &mut evidence.attempts[0];
+                disposition.index = "2".into();
+                disposition.kind = SeriesNoVerdictKind::TimedOutMatch;
+                disposition.attempt_outcome = sibling_outcome.into();
+                disposition.disposition = SeriesOutcome::Timeout;
+                disposition.error_kind = Some("wall-timeout".into());
+                disposition.status = None;
+                disposition.signal = Some(9);
+                disposition.timed_out = true;
+                disposition.verification_report_sha256 = Some("e".repeat(64));
+                timeout.series.no_verdict_evidence = Some(evidence);
+                for admitted in [
+                    timeout.validate_for_write(),
+                    timeout.validate_for_read(),
+                    timeout.validate_for_projection(),
+                ] {
+                    admitted.unwrap_or_else(|error| panic!("{label}: {error}"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn v3_requires_matching_machine_and_kernel() {
+        let mut fixture = row(SeriesSchema::V3);
+        fixture.validate_for_write().unwrap();
+        fixture.series.kernel_version = None;
+        assert_eq!(
+            fixture.validate_for_write().unwrap_err(),
+            "series missing kernel_version"
+        );
+        fixture.series.kernel_version = Some("7.1.3-test".into());
+        fixture.series.machine_shortname = Some("other-host".into());
+        assert!(
+            fixture
+                .validate_for_write()
+                .unwrap_err()
+                .contains("does not match machine_shortname")
+        );
+    }
+
+    #[test]
+    fn v1_is_readable_but_not_new_measurement_evidence() {
+        let mut fixture = row(SeriesSchema::V1);
+        fixture.series.machine_shortname = None;
+        fixture.series.kernel_version = None;
+        fixture.series.host_capabilities = None;
+        let encoded = serde_json::to_string(&fixture).unwrap();
+        let decoded: SeriesRow = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.schema, SeriesSchema::V1);
+        assert!(decoded.validate_for_write().is_err());
+        assert!(decoded.validate_for_projection().is_err());
+    }
+
+    #[test]
+    fn v3_requires_every_capability_verdict_with_evidence() {
+        let mut fixture = row(SeriesSchema::V3);
+        fixture.series.host_capabilities = None;
+        assert_eq!(
+            fixture.validate_for_write().unwrap_err(),
+            "series missing host_capabilities"
+        );
+
+        for capability in STRESS_SERIES_V2_HOST_CAPABILITIES {
+            let mut fixture = row(SeriesSchema::V3);
+            fixture
+                .series
+                .host_capabilities
+                .as_mut()
+                .unwrap()
+                .remove(&capability);
+            assert!(
+                fixture
+                    .validate_for_write()
+                    .unwrap_err()
+                    .contains(capability.value()),
+                "missing {} was not named",
+                capability.value()
+            );
+        }
+
+        let mut fixture = row(SeriesSchema::V3);
+        fixture
+            .series
+            .host_capabilities
+            .as_mut()
+            .unwrap()
+            .get_mut(&HostCapability::Kvm)
+            .unwrap()
+            .evidence
+            .clear();
+        assert!(fixture.validate_for_write().unwrap_err().contains("kvm"));
+    }
+
+    #[test]
+    fn read_validation_keeps_v1_readable_and_refuses_incomplete_v2_by_name() {
+        let mut legacy = row(SeriesSchema::V1);
+        legacy.series.machine_shortname = None;
+        legacy.series.kernel_version = None;
+        legacy.series.host_capabilities = None;
+        legacy.validate_for_read().unwrap();
+
+        for schema in [SeriesSchema::V2, SeriesSchema::V3] {
+            let mut current = row(schema);
+            current.series.host_capabilities = None;
+            assert_eq!(
+                current.validate_for_read().unwrap_err(),
+                "series missing host_capabilities"
+            );
+
+            let mut current = row(schema);
+            current
+                .series
+                .host_capabilities
+                .as_mut()
+                .unwrap()
+                .remove(&HostCapability::Kvm);
+            assert!(current.validate_for_read().unwrap_err().contains("kvm"));
+        }
+    }
+
+    #[test]
+    fn non_diverged_rows_cannot_carry_divergence_evidence() {
+        let mut fixture = row(SeriesSchema::V3);
+        fixture.series.coordinates = Some(SeriesCoordinates {
+            first_divergent_record: Some(9),
+            ..SeriesCoordinates::default()
+        });
+        assert!(
+            fixture
+                .validate_for_write()
+                .unwrap_err()
+                .contains("must not carry divergence evidence")
+        );
+    }
+
+    #[test]
+    fn v2_refuses_error_and_accepts_errored() {
+        let mut value = serde_json::to_value(row(SeriesSchema::V2)).unwrap();
+        value["series"]["outcome"] = serde_json::json!("errored");
+        let accepted: SeriesRow = serde_json::from_value(value.clone())
+            .expect("errored remains a supported non-verdict outcome");
+        accepted.validate_for_read().unwrap();
+
+        value["series"]["outcome"] = serde_json::json!("error");
+        let error = serde_json::from_value::<SeriesRow>(value)
+            .expect_err("schema-v2 must refuse the unsupported error spelling");
+        assert!(error.to_string().contains("unknown variant `error`"));
+    }
+
+    #[test]
+    fn v3_refuses_missing_or_mismatched_classification_by_name() {
+        let mut missing_result = row(SeriesSchema::V3);
+        missing_result.series.result = None;
+        for error in [
+            missing_result.validate_for_read().unwrap_err(),
+            missing_result.validate_for_write().unwrap_err(),
+        ] {
+            assert!(error.contains("result=None"));
+        }
+
+        let mut missing_class = row(SeriesSchema::V3);
+        missing_class.series.outcome = SeriesOutcome::Diverged;
+        missing_class.series.result = Some(ObservedResult::DeterminismFailure);
+        assert!(
+            missing_class
+                .validate_for_write()
+                .unwrap_err()
+                .contains("failure_class=None")
+        );
+
+        let mut wrong_result = row(SeriesSchema::V3);
+        wrong_result.series.outcome = SeriesOutcome::Diverged;
+        wrong_result.series.result = Some(ObservedResult::CrashError);
+        wrong_result.series.failure_class = Some(FailureClass::ProductFailure);
+        assert!(
+            wrong_result
+                .validate_for_write()
+                .unwrap_err()
+                .contains("result=Some(CrashError)")
+        );
+
+        let mut retained_v2 = row(SeriesSchema::V2);
+        retained_v2.series.result = None;
+        retained_v2.series.failure_class = None;
+        retained_v2.validate_for_read().unwrap();
+        retained_v2.validate_for_projection().unwrap();
+        assert_eq!(
+            retained_v2.validate_for_write().unwrap_err(),
+            "new rows must use stress-series/v3, got stress-series/v2"
+        );
+    }
+
+    #[test]
+    fn container_failure_series_retains_crash_and_no_comparison_separately() {
+        let mut fixture = no_verdict_row();
+        fixture.series.outcome = SeriesOutcome::Errored;
+        fixture.series.result = Some(ObservedResult::CrashError);
+        fixture.series.failure_class = Some(FailureClass::ProductFailure);
+        let disposition = &mut fixture
+            .series
+            .no_verdict_evidence
+            .as_mut()
+            .unwrap()
+            .attempts[0];
+        disposition.kind = SeriesNoVerdictKind::ContainerFailed;
+        disposition.attempt_outcome = "FAIL".into();
+        disposition.disposition = SeriesOutcome::NoResult;
+        disposition.error_kind = None;
+        disposition.status = Some(125);
+        disposition.signal = None;
+        disposition.timed_out = false;
+        fixture.validate_for_write().unwrap();
+        let encoded = serde_json::to_vec(&fixture).unwrap();
+        let decoded: SeriesRow = serde_json::from_slice(&encoded).unwrap();
+        decoded.validate_for_read().unwrap();
+        assert_eq!(decoded.series.result, Some(ObservedResult::CrashError));
+        for mutation in ["zero", "timeout", "signal", "pass", "canonical-credit"] {
+            let mut bad = fixture.clone();
+            let disposition = &mut bad.series.no_verdict_evidence.as_mut().unwrap().attempts[0];
+            match mutation {
+                "zero" => disposition.status = Some(0),
+                "timeout" => disposition.timed_out = true,
+                "signal" => {
+                    disposition.status = None;
+                    disposition.signal = Some(14);
+                }
+                "pass" => disposition.attempt_outcome = "PASS".into(),
+                "canonical-credit" => disposition.disposition = SeriesOutcome::Diverged,
+                _ => unreachable!(),
+            }
+            assert!(bad.validate_for_write().is_err(), "{mutation}");
+        }
+    }
+
+    #[test]
+    fn current_no_verdict_rows_require_exact_uncollapsed_evidence() {
+        let fixture = no_verdict_row();
+        fixture.validate_for_read().unwrap();
+        fixture.validate_for_write().unwrap();
+
+        let mut legacy = fixture.clone();
+        legacy.series.no_verdict_evidence = None;
+        legacy.validate_for_read().unwrap();
+        assert!(
+            legacy
+                .validate_for_write()
+                .unwrap_err()
+                .contains("must carry no_verdict_evidence")
+        );
+
+        let mut collapsed = fixture.clone();
+        collapsed.series.num_runs = 2;
+        collapsed.series.last_run_index = Some(2);
+        assert!(
+            collapsed
+                .validate_for_read()
+                .unwrap_err()
+                .contains("one uncollapsed positive outer attempt")
+        );
+
+        let mut missing_attempt = fixture;
+        missing_attempt.series.attempt = None;
+        assert!(
+            missing_attempt
+                .validate_for_read()
+                .unwrap_err()
+                .contains("explicit outer attempt")
+        );
+
+        let mut mismatched_attempt = no_verdict_row();
+        mismatched_attempt.series.attempt = Some(2);
+        assert!(
+            mismatched_attempt
+                .validate_for_read()
+                .unwrap_err()
+                .contains("outer attempt must equal run_index")
+        );
+
+        let mut v2 = no_verdict_row();
+        v2.schema = SeriesSchema::V2;
+        assert!(
+            v2.validate_for_read()
+                .unwrap_err()
+                .contains("supported only by stress-series/v3")
+        );
+    }
+
+    #[test]
+    fn current_prelaunch_timeouts_remain_failed_typed_evidence() {
+        for error_kind in ["cpu-timeout", "wall-timeout"] {
+            let mut fixture = no_verdict_row();
+            fixture.series.outcome = SeriesOutcome::Timeout;
+            fixture.series.result = Some(ObservedResult::Timeout);
+            let disposition = &mut fixture
+                .series
+                .no_verdict_evidence
+                .as_mut()
+                .unwrap()
+                .attempts[0];
+            disposition.error_kind = Some(error_kind.into());
+            disposition.disposition = SeriesOutcome::Timeout;
+            disposition.status = None;
+            disposition.signal = None;
+            disposition.timed_out = true;
+            for mode in ["verify", "replay", "chaos"] {
+                fixture.series.cell = format!("fixture/test/{mode}/ptrace");
+                fixture.validate_for_read().unwrap_or_else(|error| {
+                    panic!("current {mode} prelaunch {error_kind} was refused: {error}")
+                });
+                fixture.validate_for_write().unwrap();
+                fixture.validate_for_projection().unwrap();
+            }
+
+            for mutation in [
+                "missing error kind",
+                "unrelated error kind",
+                "empty error kind",
+                "not timed out",
+                "successful attempt",
+                "non-timeout disposition",
+                "zero status",
+                "zero signal",
+                "status and signal",
+                "missing report",
+                "invalid report hash",
+                "successful series",
+                "missing exact result",
+                "product failure classification",
+            ] {
+                let mut invalid = fixture.clone();
+                let disposition = &mut invalid
+                    .series
+                    .no_verdict_evidence
+                    .as_mut()
+                    .unwrap()
+                    .attempts[0];
+                match mutation {
+                    "missing error kind" => disposition.error_kind = None,
+                    "unrelated error kind" => {
+                        disposition.error_kind = Some("infrastructure".into())
+                    }
+                    "empty error kind" => disposition.error_kind = Some(String::new()),
+                    "not timed out" => disposition.timed_out = false,
+                    "successful attempt" => disposition.attempt_outcome = "PASS".into(),
+                    "non-timeout disposition" => disposition.disposition = SeriesOutcome::NoResult,
+                    "zero status" => disposition.status = Some(0),
+                    "zero signal" => disposition.signal = Some(0),
+                    "status and signal" => {
+                        disposition.status = Some(1);
+                        disposition.signal = Some(15);
+                    }
+                    "missing report" => disposition.verification_report_sha256 = None,
+                    "invalid report hash" => {
+                        disposition.verification_report_sha256 = Some("bad".into())
+                    }
+                    "successful series" => {
+                        invalid.series.outcome = SeriesOutcome::Passed;
+                        invalid.series.result = Some(ObservedResult::Pass);
+                        invalid.series.failure_class = None;
+                    }
+                    "missing exact result" => invalid.series.result = None,
+                    "product failure classification" => {
+                        invalid.series.failure_class = Some(FailureClass::ProductFailure);
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(
+                    invalid.validate_for_read().is_err(),
+                    "{error_kind}: accepted {mutation} on read"
+                );
+                assert!(
+                    invalid.validate_for_write().is_err(),
+                    "{error_kind}: accepted {mutation} on write"
+                );
+                assert!(
+                    invalid.validate_for_projection().is_err(),
+                    "{error_kind}: accepted {mutation} on projection"
+                );
+            }
+        }
+    }
+
+    /// The retained red of a matched attempt the runner failed: admitted in
+    /// exactly the runner's shape, refused in every other.
+    #[test]
+    fn failed_match_evidence_is_the_crash_error_red_and_nothing_else() {
+        let failed_match = || {
+            let mut fixture = no_verdict_row();
+            fixture.series.outcome = SeriesOutcome::Errored;
+            fixture.series.result = Some(ObservedResult::CrashError);
+            fixture.series.failure_class = Some(FailureClass::ProductFailure);
+            let disposition = &mut fixture
+                .series
+                .no_verdict_evidence
+                .as_mut()
+                .unwrap()
+                .attempts[0];
+            disposition.kind = SeriesNoVerdictKind::FailedMatch;
+            disposition.attempt_outcome = "FAIL".into();
+            disposition.disposition = SeriesOutcome::Errored;
+            disposition.error_kind = None;
+            disposition.status = Some(3);
+            fixture
+        };
+        failed_match().validate_for_write().unwrap();
+        let mut signalled = failed_match();
+        let disposition = &mut signalled
+            .series
+            .no_verdict_evidence
+            .as_mut()
+            .unwrap()
+            .attempts[0];
+        disposition.status = None;
+        disposition.signal = Some(11);
+        signalled.validate_for_write().unwrap();
+        let mut replay = failed_match();
+        replay.series.cell = "fixture/test/replay/ptrace".into();
+        replay.validate_for_write().unwrap();
+
+        const SHAPE: &str = "failed_match evidence must carry";
+        type Edit = fn(&mut SeriesRow);
+        let edits: [(&str, Edit, &str); 10] = [
+            (
+                "attempt PASS",
+                |row| attempt(row).attempt_outcome = "PASS".into(),
+                SHAPE,
+            ),
+            (
+                "attempt ERROR",
+                |row| attempt(row).attempt_outcome = "ERROR".into(),
+                SHAPE,
+            ),
+            ("timed out", |row| attempt(row).timed_out = true, SHAPE),
+            (
+                "error kind",
+                |row| attempt(row).error_kind = Some("wall-timeout".into()),
+                SHAPE,
+            ),
+            (
+                "no process disposition",
+                |row| attempt(row).status = None,
+                SHAPE,
+            ),
+            (
+                "no verification report",
+                |row| attempt(row).verification_report_sha256 = None,
+                SHAPE,
+            ),
+            (
+                "no_result disposition",
+                |row| attempt(row).disposition = SeriesOutcome::NoResult,
+                SHAPE,
+            ),
+            (
+                "chaos cell",
+                |row| row.series.cell = "fixture/test/chaos/ptrace".into(),
+                SHAPE,
+            ),
+            (
+                "infrastructure row",
+                |row| {
+                    row.series.result = None;
+                    row.series.failure_class = Some(FailureClass::UnderstoodInfrastructureFailure);
+                },
+                SHAPE,
+            ),
+            (
+                "undeclared exit 0",
+                |row| attempt(row).status = Some(0),
+                "without a declared guest exit or a failed declared expected output must record a nonzero status",
+            ),
+        ];
+        fn attempt(row: &mut SeriesRow) -> &mut SeriesAttemptDisposition {
+            &mut row.series.no_verdict_evidence.as_mut().unwrap().attempts[0]
+        }
+        for (label, edit, expected) in edits {
+            let mut row = failed_match();
+            edit(&mut row);
+            let error = row
+                .validate_for_write()
+                .expect_err(&format!("{label}: admitted"));
+            assert!(error.contains(expected), "{label}: {error}");
+        }
+
+        // A verify attempt whose two runs matched but printed other stdout
+        // than the cell declares is also a failed match. The runner checks the
+        // declared stdout before the guest's exit, so the attempt may have
+        // exited 0, and the runner's reason, carried as detail, is the only
+        // record of the failure.
+        let (observed, declared) = ("a".repeat(64), "d".repeat(64));
+        let exact =
+            crate::runner::expected_stdout_mismatch_reason("first", 22, &observed, 22, &declared);
+        let contains =
+            crate::runner::expected_stdout_contains_mismatch_reason(22, &observed, "vdso\t\"ok\"");
+        let with_detail = |detail: &str, status: Option<i32>| {
+            let mut row = failed_match();
+            let disposition = attempt(&mut row);
+            disposition.detail = Some(detail.into());
+            disposition.status = status;
+            row
+        };
+        for (label, row) in [
+            ("exact stdout, exit 0", with_detail(&exact, Some(0))),
+            ("contained text, exit 0", with_detail(&contains, Some(0))),
+            ("exact stdout, exit 3", with_detail(&exact, Some(3))),
+        ] {
+            row.validate_for_write()
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+            row.validate_for_read()
+                .unwrap_or_else(|error| panic!("{label}: read: {error}"));
+        }
+        let mut replay_detail = with_detail(&exact, Some(0));
+        replay_detail.series.cell = "fixture/test/replay/ptrace".into();
+        let mut not_run_detail = no_verdict_row();
+        attempt(&mut not_run_detail).detail = Some(exact.clone());
+        for (label, row, expected) in [
+            (
+                "a reason the runner does not write",
+                with_detail("verify stdout differs", Some(0)),
+                "must be the runner's reason for a failed declared expected output",
+            ),
+            (
+                "a reason with trailing text",
+                with_detail(&format!("{exact}; and more"), Some(0)),
+                "must be the runner's reason for a failed declared expected output",
+            ),
+            (
+                "the later run of a matched pair",
+                with_detail(
+                    &crate::runner::expected_stdout_mismatch_reason(
+                        "second", 22, &observed, 22, &declared,
+                    ),
+                    Some(0),
+                ),
+                "contradicts a matched comparison: it names a later run",
+            ),
+            (
+                "declared stdout that is the observed stdout",
+                with_detail(
+                    &crate::runner::expected_stdout_mismatch_reason(
+                        "first", 22, &observed, 22, &observed,
+                    ),
+                    Some(0),
+                ),
+                "contradicts a matched comparison: the declared stdout is the observed stdout",
+            ),
+            (
+                "a digest that is not SHA-256",
+                with_detail(
+                    &crate::runner::expected_stdout_mismatch_reason(
+                        "first", 22, "abc", 22, &declared,
+                    ),
+                    Some(0),
+                ),
+                "contradicts a matched comparison: a stdout digest is not SHA-256",
+            ),
+            (
+                "an empty declared text",
+                with_detail(
+                    &crate::runner::expected_stdout_contains_mismatch_reason(22, &observed, ""),
+                    Some(0),
+                ),
+                "contradicts a matched comparison: the runner finds an empty declared text",
+            ),
+            (
+                "a replay cell",
+                replay_detail,
+                "which only a verify cell has",
+            ),
+            (
+                "another kind",
+                not_run_detail,
+                "only comparison_refused and failed_match evidence may carry detail",
+            ),
+        ] {
+            let error = row
+                .validate_for_write()
+                .expect_err(&format!("{label}: admitted"));
+            assert!(error.contains(expected), "{label}: {error}");
+        }
+
+        // Declared, a failed match is retained whatever its Hermit status:
+        // the runner also fails a declared cell whose report disposition
+        // differs from the declaration, and the row does not record that
+        // disposition. A status equal to the declaration is therefore not
+        // proof of a pass, and refusing it would drop real red evidence.
+        let declared_failed_match = |code: Option<i32>, signal: Option<i32>, status, observed| {
+            let mut row = failed_match();
+            let mut declaration = declared_exit_row(code, signal, status, observed)
+                .series
+                .declared_guest_exit
+                .unwrap();
+            declaration.evidence_sha256 = row
+                .series
+                .no_verdict_evidence
+                .as_ref()
+                .unwrap()
+                .evidence_sha256
+                .clone();
+            declaration.attempts[0].outcome = "FAIL".into();
+            row.series.declared_guest_exit = Some(declaration);
+            let disposition = attempt(&mut row);
+            disposition.status = status;
+            disposition.signal = observed;
+            row
+        };
+        for (label, row) in [
+            (
+                "declared 7, exit 3",
+                declared_failed_match(Some(7), None, Some(3), None),
+            ),
+            (
+                "declared 7, exit 0",
+                declared_failed_match(Some(7), None, Some(0), None),
+            ),
+            (
+                "declared signal 11, exit 3",
+                declared_failed_match(None, Some(11), Some(3), None),
+            ),
+            // Status matches the declaration; the report may still disagree.
+            (
+                "declared 7, exit 7",
+                declared_failed_match(Some(7), None, Some(7), None),
+            ),
+            (
+                "declared signal 11, signal 11",
+                declared_failed_match(None, Some(11), None, Some(11)),
+            ),
+            (
+                "declared signal 11, exit 139",
+                declared_failed_match(None, Some(11), Some(139), None),
+            ),
+        ] {
+            row.validate_for_write()
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+            row.validate_for_read()
+                .unwrap_or_else(|error| panic!("{label}: read: {error}"));
+        }
+    }
+
+    /// A matched report from an attempt the runner failed by its declared
+    /// exit or stdout (a failed match) is retained in pressure evidence as a
+    /// match that is not canonical, from a FAIL attempt with no error kind and
+    /// one process disposition; it never stands for a pass.
+    #[test]
+    fn failed_match_pressure_evidence_is_a_non_canonical_failed_attempt() {
+        let failed = SeriesPressureAttempt {
+            index: "1".into(),
+            outcome: "FAIL".into(),
+            error_kind: None,
+            status: Some(0),
+            signal: None,
+            timed_out: false,
+            comparison: Some(SeriesPressureComparison {
+                verdict: Verdict::Matched,
+                canonical: false,
+                report_sha256: "c".repeat(64),
+                no_result_kind: None,
+            }),
+        };
+        for mode in ["verify", "replay", "chaos"] {
+            failed.validate_for_mode(mode, None).unwrap();
+        }
+        let mut nonzero = failed.clone();
+        nonzero.status = Some(3);
+        nonzero.validate_for_mode("verify", None).unwrap();
+        type InnerEdit = fn(&mut SeriesPressureAttempt);
+        let refused: [(&str, InnerEdit); 5] = [
+            ("canonical", |a| {
+                a.comparison.as_mut().unwrap().canonical = true
+            }),
+            ("error kind", |a| {
+                a.error_kind = Some("infrastructure".into())
+            }),
+            ("no process disposition", |a| a.status = None),
+            ("status and signal", |a| a.signal = Some(9)),
+            ("attempt ERROR", |a| a.outcome = "ERROR".into()),
+        ];
+        for (label, edit) in refused {
+            let mut bad = failed.clone();
+            edit(&mut bad);
+            assert!(
+                bad.validate_for_mode("verify", None).is_err(),
+                "{label}: admitted"
+            );
+        }
+    }
+
+    /// A matched report from an attempt the runner timed out, as in a chaos
+    /// cell whose last seed exited 0 just as the cell's CPU budget ran out:
+    /// admitted as the timeout in exactly the runner's shape, refused in
+    /// every other.
+    #[test]
+    fn timed_out_match_evidence_is_the_timeout_and_nothing_else() {
+        let timed_out_match = || {
+            let mut fixture = no_verdict_row();
+            fixture.series.cell = "fixture/test/chaos/ptrace".into();
+            fixture.series.outcome = SeriesOutcome::Timeout;
+            fixture.series.result = Some(ObservedResult::Timeout);
+            let disposition = attempt(&mut fixture);
+            disposition.kind = SeriesNoVerdictKind::TimedOutMatch;
+            disposition.attempt_outcome = "FAIL".into();
+            disposition.disposition = SeriesOutcome::Timeout;
+            disposition.error_kind = Some("cpu-timeout".into());
+            disposition.status = Some(0);
+            disposition.timed_out = true;
+            fixture
+        };
+        fn attempt(row: &mut SeriesRow) -> &mut SeriesAttemptDisposition {
+            &mut row.series.no_verdict_evidence.as_mut().unwrap().attempts[0]
+        }
+        type Edit = fn(&mut SeriesRow);
+        fn no_result(row: &mut SeriesRow) {
+            row.series.outcome = SeriesOutcome::NoResult;
+            row.series.result = None;
+            row.series.failure_class = Some(FailureClass::NoResult);
+        }
+        let admitted: [(&str, Edit); 8] = [
+            ("chaos, exit 0, cpu-timeout", |_| {}),
+            // The runner leaves a cell without a result when a non-product
+            // error kind decides it, timed-out attempts or not.
+            ("no-result row", no_result),
+            ("verify cell", |row| {
+                row.series.cell = "fixture/test/verify/ptrace".into()
+            }),
+            ("replay cell", |row| {
+                row.series.cell = "fixture/test/replay/ptrace".into()
+            }),
+            ("wall-timeout", |row| {
+                attempt(row).error_kind = Some("wall-timeout".into())
+            }),
+            ("killed after the report", |row| {
+                let disposition = attempt(row);
+                disposition.error_kind = Some("wall-timeout".into());
+                disposition.status = None;
+                disposition.signal = Some(9);
+            }),
+            ("refused comparison policy", |row| {
+                attempt(row).attempt_outcome = "ERROR".into()
+            }),
+            ("nonzero chaos status", |row| attempt(row).status = Some(3)),
+        ];
+        for (label, edit) in admitted {
+            let mut row = timed_out_match();
+            edit(&mut row);
+            row.validate_for_write()
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+            let raw = serde_json::to_value(&row).unwrap();
+            assert_eq!(
+                raw["series"]["no_verdict_evidence"]["attempts"][0]["kind"], "timed_out_match",
+                "{label}"
+            );
+            let decoded: SeriesRow = serde_json::from_value(raw).unwrap();
+            decoded
+                .validate_for_read()
+                .unwrap_or_else(|error| panic!("{label}: read: {error}"));
+        }
+
+        const SHAPE: &str = "timed_out_match evidence must carry";
+        let refused: [(&str, Edit, &str); 12] = [
+            (
+                "attempt PASS",
+                |row| attempt(row).attempt_outcome = "PASS".into(),
+                SHAPE,
+            ),
+            ("not timed out", |row| attempt(row).timed_out = false, SHAPE),
+            ("no error kind", |row| attempt(row).error_kind = None, SHAPE),
+            (
+                "infrastructure error kind",
+                |row| attempt(row).error_kind = Some("infrastructure".into()),
+                SHAPE,
+            ),
+            (
+                "refused-evidence error kind",
+                |row| attempt(row).error_kind = Some("incomplete-verification-evidence".into()),
+                SHAPE,
+            ),
+            (
+                "no process disposition",
+                |row| attempt(row).status = None,
+                SHAPE,
+            ),
+            (
+                "no verification report",
+                |row| attempt(row).verification_report_sha256 = None,
+                SHAPE,
+            ),
+            (
+                "no_result disposition",
+                |row| attempt(row).disposition = SeriesOutcome::NoResult,
+                SHAPE,
+            ),
+            (
+                "errored disposition",
+                |row| attempt(row).disposition = SeriesOutcome::Errored,
+                SHAPE,
+            ),
+            (
+                "status and signal",
+                |row| attempt(row).signal = Some(9),
+                "status/signal disposition is invalid",
+            ),
+            (
+                "detail",
+                |row| attempt(row).detail = Some("cell exceeded 46 CPU s".into()),
+                "only comparison_refused and failed_match evidence may carry detail",
+            ),
+            (
+                "crash-error row",
+                |row| {
+                    row.series.outcome = SeriesOutcome::Errored;
+                    row.series.result = Some(ObservedResult::CrashError);
+                    row.series.failure_class = Some(FailureClass::ProductFailure);
+                },
+                "timed-out attempt disposition contradicts result",
+            ),
+        ];
+        for (label, edit, expected) in refused {
+            let mut row = timed_out_match();
+            edit(&mut row);
+            let error = row
+                .validate_for_write()
+                .expect_err(&format!("{label}: admitted"));
+            assert!(error.contains(expected), "{label}: {error}");
+        }
+
+        // The same attempt in a pressure row's inner history is a match that
+        // is not canonical, and nothing else.
+        let mut pressure = timed_out_match();
+        pressure.producer = SeriesProducer::PressureTest;
+        let inner = SeriesPressureAttempt {
+            index: "1".into(),
+            outcome: "FAIL".into(),
+            error_kind: Some("cpu-timeout".into()),
+            status: Some(0),
+            signal: None,
+            timed_out: true,
+            comparison: Some(SeriesPressureComparison {
+                verdict: Verdict::Matched,
+                canonical: false,
+                report_sha256: "c".repeat(64),
+                no_result_kind: None,
+            }),
+        };
+        pressure.series.pressure_evidence = Some(SeriesPressureEvidence {
+            evidence_sha256: "b".repeat(64),
+            attempts: vec![inner.clone()],
+        });
+        pressure.validate_for_write().unwrap();
+        pressure.validate_for_read().unwrap();
+        let mut no_result_pressure = pressure.clone();
+        no_result(&mut no_result_pressure);
+        no_result_pressure.validate_for_write().unwrap();
+        // A timed-out attempt never passes, so no CellResult that retains one
+        // is a pass, and a pressure row cannot claim one even when it carries
+        // no no_verdict_evidence to cross-check.
+        let mut passed = pressure_row();
+        passed.series.cell = "fixture/test/chaos/ptrace".into();
+        passed.validate_for_write().unwrap();
+        let mut timed_out_second = inner.clone();
+        timed_out_second.index = "2".into();
+        passed
+            .series
+            .pressure_evidence
+            .as_mut()
+            .unwrap()
+            .attempts
+            .push(timed_out_second);
+        assert_eq!(passed.series.result, Some(ObservedResult::Pass));
+        assert!(passed.series.no_verdict_evidence.is_none());
+        for error in [passed.validate_for_write(), passed.validate_for_read()] {
+            assert!(
+                error
+                    .unwrap_err()
+                    .contains("pressure_evidence retains a timed-out attempt"),
+                "pass row admitted"
+            );
+        }
+        // The same holds for a timed-out attempt that wrote no report: the
+        // runner killed it, and its matched sibling cannot make the row a
+        // pass. The inner attempt alone is well formed.
+        let mut killed_second = pressure_row();
+        killed_second.series.cell = "fixture/test/chaos/ptrace".into();
+        let killed = SeriesPressureAttempt {
+            index: "2".into(),
+            outcome: "ERROR".into(),
+            error_kind: Some("cpu-timeout".into()),
+            status: None,
+            signal: Some(9),
+            timed_out: true,
+            comparison: None,
+        };
+        killed.validate_for_mode("chaos", None).unwrap();
+        killed_second
+            .series
+            .pressure_evidence
+            .as_mut()
+            .unwrap()
+            .attempts
+            .push(killed);
+        assert!(killed_second.series.no_verdict_evidence.is_none());
+        for error in [
+            killed_second.validate_for_write(),
+            killed_second.validate_for_read(),
+        ] {
+            assert!(
+                error
+                    .unwrap_err()
+                    .contains("pressure_evidence retains a timed-out attempt"),
+                "pass row with a killed attempt admitted"
+            );
+        }
+        for mode in ["verify", "replay", "chaos"] {
+            inner.validate_for_mode(mode, None).unwrap();
+        }
+        type InnerEdit = fn(&mut SeriesPressureAttempt);
+        let refused_inner: [(&str, InnerEdit); 6] = [
+            ("canonical", |a| {
+                a.comparison.as_mut().unwrap().canonical = true
+            }),
+            ("not timed out", |a| a.timed_out = false),
+            ("no error kind", |a| a.error_kind = None),
+            ("infrastructure error kind", |a| {
+                a.error_kind = Some("infrastructure".into())
+            }),
+            ("attempt PASS", |a| a.outcome = "PASS".into()),
+            ("no process disposition", |a| a.status = None),
+        ];
+        for (label, edit) in refused_inner {
+            let mut bad = inner.clone();
+            edit(&mut bad);
+            assert!(
+                bad.validate_for_mode("chaos", None).is_err(),
+                "{label}: admitted"
+            );
+            let mut row = pressure.clone();
+            row.series.pressure_evidence.as_mut().unwrap().attempts[0] = bad;
+            assert!(row.validate_for_write().is_err(), "{label}: row admitted");
+        }
+        let mut other_report = pressure.clone();
+        other_report
+            .series
+            .pressure_evidence
+            .as_mut()
+            .unwrap()
+            .attempts[0]
+            .comparison
+            .as_mut()
+            .unwrap()
+            .report_sha256 = "d".repeat(64);
+        assert!(
+            other_report
+                .validate_for_write()
+                .unwrap_err()
+                .contains("contradicts the same no_verdict_evidence invocation")
+        );
+    }
+
+    /// A SaBRe verify attempt that passed, in a cell the runner then failed
+    /// because the run left SaBRe's own path: admitted in exactly the
+    /// runner's shape, refused in every other, and in a pressure row's inner
+    /// history a match that is not canonical.
+    #[test]
+    fn ineligible_execution_path_evidence_is_the_passed_sabre_attempt_and_nothing_else() {
+        let ineligible = || {
+            let mut fixture = no_verdict_row();
+            fixture.series.cell = "fixture/test/verify/sabre".into();
+            fixture.series.outcome = SeriesOutcome::Errored;
+            fixture.series.result = Some(ObservedResult::CrashError);
+            fixture.series.failure_class = Some(FailureClass::ProductFailure);
+            let disposition = attempt(&mut fixture);
+            disposition.kind = SeriesNoVerdictKind::IneligibleExecutionPath;
+            disposition.attempt_outcome = "PASS".into();
+            disposition.disposition = SeriesOutcome::Errored;
+            disposition.error_kind = None;
+            disposition.status = Some(0);
+            fixture
+        };
+        fn attempt(row: &mut SeriesRow) -> &mut SeriesAttemptDisposition {
+            &mut row.series.no_verdict_evidence.as_mut().unwrap().attempts[0]
+        }
+        let row = ineligible();
+        row.validate_for_write().unwrap();
+        let raw = serde_json::to_value(&row).unwrap();
+        assert_eq!(
+            raw["series"]["no_verdict_evidence"]["attempts"][0]["kind"],
+            "ineligible_execution_path"
+        );
+        let decoded: SeriesRow = serde_json::from_value(raw).unwrap();
+        decoded.validate_for_read().unwrap();
+        decoded.validate_for_projection().unwrap();
+
+        // A declared cell passes only with its declared exit, as Hermit
+        // reports it, and never with exit 0. Both fixtures name the same
+        // source evidence.
+        let declared_cell = |code: Option<i32>, signal: Option<i32>, status, observed| {
+            let mut row = ineligible();
+            row.series.declared_guest_exit = declared_exit_row(code, signal, status, observed)
+                .series
+                .declared_guest_exit;
+            let disposition = attempt(&mut row);
+            disposition.status = status;
+            disposition.signal = observed;
+            row
+        };
+        for (label, row) in [
+            (
+                "declared 7, exit 7",
+                declared_cell(Some(7), None, Some(7), None),
+            ),
+            (
+                "declared signal 11, signal 11",
+                declared_cell(None, Some(11), None, Some(11)),
+            ),
+            (
+                "declared signal 11, exit 139",
+                declared_cell(None, Some(11), Some(139), None),
+            ),
+        ] {
+            row.validate_for_write()
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+            row.validate_for_read()
+                .unwrap_or_else(|error| panic!("{label}: read: {error}"));
+        }
+
+        const SHAPE: &str = "ineligible_execution_path evidence must carry";
+        for (label, row) in [
+            (
+                "declared 7, exit 0",
+                declared_cell(Some(7), None, Some(0), None),
+            ),
+            (
+                "declared 7, exit 3",
+                declared_cell(Some(7), None, Some(3), None),
+            ),
+            (
+                "declared signal 11, signal 6",
+                declared_cell(None, Some(11), None, Some(6)),
+            ),
+            // A declaration the runner would refuse admits nothing. This
+            // check runs before the declaration's own, so it must refuse
+            // rather than panic: matching exit 0 against this signal would
+            // overflow `128 + signal`.
+            (
+                "declared signal i32::MAX, exit 0",
+                declared_cell(None, Some(i32::MAX), Some(0), None),
+            ),
+        ] {
+            for (path, error) in [
+                ("write", row.validate_for_write()),
+                ("read", row.validate_for_read()),
+                ("projection", row.validate_for_projection()),
+            ] {
+                let error = error.expect_err(&format!("{label}: admitted on {path}"));
+                assert!(error.contains(SHAPE), "{label}: {path}: {error}");
+            }
+        }
+        type Edit = fn(&mut SeriesRow);
+        let refused: [(&str, Edit, &str); 16] = [
+            (
+                "attempt FAIL",
+                |row| attempt(row).attempt_outcome = "FAIL".into(),
+                SHAPE,
+            ),
+            (
+                "attempt ERROR",
+                |row| attempt(row).attempt_outcome = "ERROR".into(),
+                SHAPE,
+            ),
+            (
+                "no_result disposition",
+                |row| attempt(row).disposition = SeriesOutcome::NoResult,
+                SHAPE,
+            ),
+            ("timed out", |row| attempt(row).timed_out = true, SHAPE),
+            (
+                "error kind",
+                |row| attempt(row).error_kind = Some("invalid-backend-evidence".into()),
+                SHAPE,
+            ),
+            (
+                "undeclared nonzero exit",
+                |row| attempt(row).status = Some(3),
+                SHAPE,
+            ),
+            (
+                "undeclared signal",
+                |row| {
+                    let disposition = attempt(row);
+                    disposition.status = None;
+                    disposition.signal = Some(11);
+                },
+                SHAPE,
+            ),
+            (
+                "no process disposition",
+                |row| attempt(row).status = None,
+                SHAPE,
+            ),
+            (
+                "no verification report",
+                |row| attempt(row).verification_report_sha256 = None,
+                SHAPE,
+            ),
+            (
+                "replay cell",
+                |row| row.series.cell = "fixture/test/replay/sabre".into(),
+                SHAPE,
+            ),
+            (
+                "chaos cell",
+                |row| row.series.cell = "fixture/test/chaos/sabre".into(),
+                SHAPE,
+            ),
+            (
+                "ptrace cell",
+                |row| row.series.cell = "fixture/test/verify/ptrace".into(),
+                SHAPE,
+            ),
+            (
+                "liteinst cell",
+                |row| row.series.cell = "fixture/test/verify/liteinst".into(),
+                SHAPE,
+            ),
+            (
+                "no-result row",
+                |row| {
+                    row.series.outcome = SeriesOutcome::NoResult;
+                    row.series.result = None;
+                    row.series.failure_class = Some(FailureClass::NoResult);
+                },
+                SHAPE,
+            ),
+            (
+                "detail",
+                |row| {
+                    attempt(row).detail = Some(
+                        "SaBRe execution path is incomplete or used fallback/native sites".into(),
+                    )
+                },
+                "only comparison_refused and failed_match evidence may carry detail",
+            ),
+            (
+                "status and signal",
+                |row| attempt(row).signal = Some(11),
+                "status/signal disposition is invalid",
+            ),
+        ];
+        for (label, edit, expected) in refused {
+            let mut row = ineligible();
+            edit(&mut row);
+            for (path, error) in [
+                ("write", row.validate_for_write()),
+                ("read", row.validate_for_read()),
+                ("projection", row.validate_for_projection()),
+            ] {
+                let error = error.expect_err(&format!("{label}: admitted on {path}"));
+                assert!(error.contains(expected), "{label}: {path}: {error}");
+            }
+        }
+
+        // The same attempt in a pressure row's inner history is a match that
+        // is not canonical, and nothing else.
+        let mut pressure = ineligible();
+        pressure.producer = SeriesProducer::PressureTest;
+        let inner = SeriesPressureAttempt {
+            index: "1".into(),
+            outcome: "PASS".into(),
+            error_kind: None,
+            status: Some(0),
+            signal: None,
+            timed_out: false,
+            comparison: Some(SeriesPressureComparison {
+                verdict: Verdict::Matched,
+                canonical: false,
+                report_sha256: "c".repeat(64),
+                no_result_kind: None,
+            }),
+        };
+        pressure.series.pressure_evidence = Some(SeriesPressureEvidence {
+            evidence_sha256: "b".repeat(64),
+            attempts: vec![inner],
+        });
+        pressure.validate_for_write().unwrap();
+        pressure.validate_for_read().unwrap();
+        const CONTRADICTS: &str = "contradicts the same no_verdict_evidence invocation";
+        type InnerEdit = fn(&mut SeriesPressureAttempt);
+        let refused_inner: [(&str, InnerEdit, &str); 4] = [
+            (
+                "canonical",
+                |a| a.comparison.as_mut().unwrap().canonical = true,
+                CONTRADICTS,
+            ),
+            (
+                "other report",
+                |a| a.comparison.as_mut().unwrap().report_sha256 = "d".repeat(64),
+                CONTRADICTS,
+            ),
+            (
+                "noncanonical divergence",
+                |a| {
+                    a.outcome = "FAIL".into();
+                    a.status = Some(1);
+                    a.comparison.as_mut().unwrap().verdict = Verdict::Diverged;
+                },
+                CONTRADICTS,
+            ),
+            // An undeclared verify match exits 0, inner history included.
+            (
+                "nonzero exit",
+                |a| a.status = Some(2),
+                "matched report contradicts its inner process disposition",
+            ),
+        ];
+        for (label, edit, expected) in refused_inner {
+            let mut row = pressure.clone();
+            edit(&mut row.series.pressure_evidence.as_mut().unwrap().attempts[0]);
+            let error = row
+                .validate_for_write()
+                .expect_err(&format!("{label}: admitted"));
+            assert!(error.contains(expected), "{label}: {error}");
+        }
+    }
+
+    #[test]
+    fn no_verdict_timeout_disposition_is_typed_and_contradictions_refuse() {
+        let mut timeout = no_verdict_row();
+        timeout.series.outcome = SeriesOutcome::Timeout;
+        timeout.series.result = Some(ObservedResult::Timeout);
+        let disposition = &mut timeout
+            .series
+            .no_verdict_evidence
+            .as_mut()
+            .unwrap()
+            .attempts[0];
+        disposition.disposition = SeriesOutcome::Timeout;
+        disposition.status = None;
+        disposition.signal = Some(15);
+        disposition.timed_out = true;
+        timeout.validate_for_write().unwrap();
+
+        let mut missing_timeout = timeout.clone();
+        missing_timeout
+            .series
+            .no_verdict_evidence
+            .as_mut()
+            .unwrap()
+            .attempts[0]
+            .timed_out = false;
+        assert!(
+            missing_timeout
+                .validate_for_read()
+                .unwrap_err()
+                .contains("not_run evidence must carry")
+        );
+
+        let mut invented_result = no_verdict_row();
+        invented_result.series.result = Some(ObservedResult::CrashError);
+        assert!(
+            invented_result
+                .validate_for_read()
+                .unwrap_err()
+                .contains("result=Some(CrashError)")
+        );
+
+        for status in [Some(0), None] {
+            let mut incomplete = no_verdict_row();
+            let disposition = &mut incomplete
+                .series
+                .no_verdict_evidence
+                .as_mut()
+                .unwrap()
+                .attempts[0];
+            disposition.status = status;
+            disposition.signal = None;
+            assert!(incomplete.validate_for_read().unwrap_err().contains(
+                "either one nonzero process disposition or an explicit pre-launch timeout"
+            ));
+        }
+
+        let mut prelaunch_timeout = no_verdict_row();
+        let disposition = &mut prelaunch_timeout
+            .series
+            .no_verdict_evidence
+            .as_mut()
+            .unwrap()
+            .attempts[0];
+        disposition.disposition = SeriesOutcome::Timeout;
+        disposition.status = None;
+        disposition.signal = None;
+        disposition.timed_out = true;
+        prelaunch_timeout.validate_for_write().unwrap();
+
+        let mut wrong_prelaunch_kind = prelaunch_timeout;
+        wrong_prelaunch_kind
+            .series
+            .no_verdict_evidence
+            .as_mut()
+            .unwrap()
+            .attempts[0]
+            .error_kind = Some("infrastructure".into());
+        assert!(
+            wrong_prelaunch_kind
+                .validate_for_write()
+                .unwrap_err()
+                .contains("explicit pre-launch timeout")
+        );
+
+        let mut historical_errored = row(SeriesSchema::V3);
+        historical_errored.series.outcome = SeriesOutcome::Errored;
+        historical_errored.series.result = Some(ObservedResult::CrashError);
+        historical_errored.series.failure_class = Some(FailureClass::ProductFailure);
+        historical_errored.validate_for_read().unwrap();
+        assert!(
+            historical_errored
+                .validate_for_write()
+                .unwrap_err()
+                .contains("must carry no_verdict_evidence")
+        );
+
+        historical_errored.series.attempt = Some(1);
+        historical_errored.series.no_verdict_evidence = Some(SeriesNoVerdictEvidence {
+            evidence_sha256: "e".repeat(64),
+            attempts: vec![SeriesAttemptDisposition {
+                index: "1".into(),
+                kind: SeriesNoVerdictKind::FirstRunRejected,
+                detail: None,
+                attempt_outcome: "FAIL".into(),
+                disposition: SeriesOutcome::NoResult,
+                error_kind: None,
+                status: Some(125),
+                signal: None,
+                timed_out: false,
+                verification_report_sha256: Some("f".repeat(64)),
+            }],
+        });
+        historical_errored.validate_for_write().unwrap();
+
+        let mut unspecified = no_verdict_row();
+        unspecified
+            .series
+            .no_verdict_evidence
+            .as_mut()
+            .unwrap()
+            .attempts[0]
+            .kind = SeriesNoVerdictKind::Unspecified;
+        unspecified.validate_for_write().unwrap();
+
+        let mut refused = no_verdict_row();
+        let refusal_detail = "the second log was truncated at the configured size bound";
+        let refused_disposition = &mut refused
+            .series
+            .no_verdict_evidence
+            .as_mut()
+            .unwrap()
+            .attempts[0];
+        refused_disposition.kind = SeriesNoVerdictKind::ComparisonRefused;
+        refused_disposition.detail = Some(refusal_detail.into());
+        refused.validate_for_write().unwrap();
+        let serialized = serde_json::to_value(&refused).unwrap();
+        assert_eq!(
+            serialized["series"]["no_verdict_evidence"]["attempts"][0]["detail"],
+            refusal_detail
+        );
+
+        let mut refused_without_detail = refused.clone();
+        refused_without_detail
+            .series
+            .no_verdict_evidence
+            .as_mut()
+            .unwrap()
+            .attempts[0]
+            .detail = None;
+        assert!(
+            refused_without_detail
+                .validate_for_write()
+                .unwrap_err()
+                .contains("must carry nonempty detail")
+        );
+
+        let mut refused_without_typed_error = refused;
+        refused_without_typed_error
+            .series
+            .no_verdict_evidence
+            .as_mut()
+            .unwrap()
+            .attempts[0]
+            .error_kind = Some("cli-error".into());
+        assert!(
+            refused_without_typed_error
+                .validate_for_write()
+                .unwrap_err()
+                .contains("comparison_refused evidence")
+        );
+
+        let mut noncanonical = no_verdict_row();
+        let disposition = &mut noncanonical
+            .series
+            .no_verdict_evidence
+            .as_mut()
+            .unwrap()
+            .attempts[0];
+        disposition.kind = SeriesNoVerdictKind::NoncanonicalMatch;
+        disposition.attempt_outcome = "PASS".into();
+        disposition.error_kind = None;
+        disposition.status = Some(0);
+        noncanonical.validate_for_write().unwrap();
+
+        let mut noncanonical_nonzero = noncanonical;
+        noncanonical_nonzero
+            .series
+            .no_verdict_evidence
+            .as_mut()
+            .unwrap()
+            .attempts[0]
+            .status = Some(1);
+        assert!(
+            noncanonical_nonzero
+                .validate_for_read()
+                .unwrap_err()
+                .contains("noncanonical_match evidence")
+        );
+    }
+
+    fn pressure_row() -> SeriesRow {
+        let mut value = row(SeriesSchema::V3);
+        value.producer = SeriesProducer::PressureTest;
+        value.series.attempt = Some(1);
+        value.series.pressure_evidence = Some(SeriesPressureEvidence {
+            evidence_sha256: "b".repeat(64),
+            attempts: vec![SeriesPressureAttempt {
+                index: "1".into(),
+                outcome: "PASS".into(),
+                error_kind: None,
+                status: Some(0),
+                signal: None,
+                timed_out: false,
+                comparison: Some(SeriesPressureComparison {
+                    verdict: Verdict::Matched,
+                    canonical: true,
+                    report_sha256: "c".repeat(64),
+                    no_result_kind: None,
+                }),
+            }],
+        });
+        value
+    }
+
+    #[test]
+    fn pressure_history_preserves_framework_result_and_declared_subruns() {
+        let mut value = pressure_row();
+        value.validate_for_write().unwrap();
+        let mut second = value.series.pressure_evidence.as_ref().unwrap().attempts[0].clone();
+        second.index = "2".into();
+        value
+            .series
+            .pressure_evidence
+            .as_mut()
+            .unwrap()
+            .attempts
+            .push(second);
+        value.validate_for_write().unwrap();
+        // Retain the producer's PASS while exposing its earlier adverse subrun.
+        let earlier = &mut value.series.pressure_evidence.as_mut().unwrap().attempts[0];
+        earlier.outcome = "FAIL".into();
+        earlier.status = Some(1);
+        earlier.comparison.as_mut().unwrap().verdict = Verdict::Diverged;
+        value.validate_for_write().unwrap();
+        assert_eq!(value.series.result, Some(ObservedResult::Pass));
+        let raw = serde_json::to_vec(&value).unwrap();
+        let decoded: SeriesRow = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(decoded, value);
+        // Chaos may accept an intentionally nonzero guest status.
+        let mut chaos = pressure_row();
+        chaos.series.cell = "fixture/test/chaos/ptrace".into();
+        chaos.series.pressure_evidence.as_mut().unwrap().attempts[0].status = Some(17);
+        chaos.validate_for_write().unwrap();
+        let mut custom = pressure_row();
+        custom.series.cell = "fixture/test/custom/ptrace".into();
+        let inner = &mut custom.series.pressure_evidence.as_mut().unwrap().attempts[0];
+        inner.comparison = None;
+        inner.status = None;
+        inner.signal = Some(11);
+        custom.validate_for_write().unwrap();
+    }
+
+    #[test]
+    fn pressure_history_binds_schema_producer_outer_attempt_and_source() {
+        let good = pressure_row();
+        for schema in [SeriesSchema::V1, SeriesSchema::V2] {
+            let mut bad = good.clone();
+            bad.schema = schema;
+            assert!(
+                bad.validate_for_read()
+                    .unwrap_err()
+                    .contains("pressure_evidence")
+            );
+        }
+        for producer in [SeriesProducer::Validate, SeriesProducer::HermitRepeat] {
+            let mut bad = good.clone();
+            bad.producer = producer;
+            assert!(
+                bad.validate_for_read()
+                    .unwrap_err()
+                    .contains("pressure_evidence")
+            );
+        }
+        for attempt in [None, Some(0)] {
+            let mut bad = good.clone();
+            bad.series.attempt = attempt;
+            assert!(bad.validate_for_read().is_err());
+        }
+        let mut collapsed = good.clone();
+        collapsed.series.num_runs = 2;
+        assert!(
+            collapsed
+                .validate_for_read()
+                .unwrap_err()
+                .contains("uncompressed")
+        );
+        collapsed = good.clone();
+        collapsed.series.last_run_index = Some(1);
+        assert!(
+            collapsed
+                .validate_for_read()
+                .unwrap_err()
+                .contains("uncompressed")
+        );
+        for digest in [
+            "",
+            "ABCDEF",
+            &"B".repeat(64),
+            &"0".repeat(63),
+            &"g".repeat(64),
+        ] {
+            let mut bad = good.clone();
+            bad.series
+                .pressure_evidence
+                .as_mut()
+                .unwrap()
+                .evidence_sha256 = digest.into();
+            assert!(
+                bad.validate_for_read()
+                    .unwrap_err()
+                    .contains("evidence_sha256")
+            );
+            let mut bad = good.clone();
+            bad.series.pressure_evidence.as_mut().unwrap().attempts[0]
+                .comparison
+                .as_mut()
+                .unwrap()
+                .report_sha256 = digest.into();
+            assert!(
+                bad.validate_for_read()
+                    .unwrap_err()
+                    .contains("report_sha256")
+            );
+        }
+    }
+
+    #[test]
+    fn pressure_history_refuses_missing_duplicate_and_contradictory_inner_facts() {
+        let good = pressure_row();
+        let mutate = |edit: fn(&mut SeriesPressureAttempt)| {
+            let mut bad = good.clone();
+            edit(&mut bad.series.pressure_evidence.as_mut().unwrap().attempts[0]);
+            assert!(
+                bad.validate_for_read().is_err(),
+                "accepted {:?}",
+                bad.series.pressure_evidence
+            );
+        };
+        for edit in [
+            (|a: &mut SeriesPressureAttempt| a.index.clear()) as fn(&mut SeriesPressureAttempt),
+            |a| a.outcome = "UNKNOWN".into(),
+            |a| a.status = Some(-1),
+            |a| a.signal = Some(0),
+            |a| a.signal = Some(9),
+            |a| a.error_kind = Some("".into()),
+            |a| a.error_kind = Some("infrastructure".into()),
+            |a| a.timed_out = true,
+            |a| a.comparison = None,
+            |a| a.status = None,
+            |a| a.status = Some(7),
+            |a| a.comparison.as_mut().unwrap().no_result_kind = Some(SeriesNoVerdictKind::NotRun),
+            |a| a.comparison.as_mut().unwrap().verdict = Verdict::NoResult,
+            |a| a.comparison.as_mut().unwrap().verdict = Verdict::InfrastructureError,
+        ] {
+            mutate(edit);
+        }
+        let mut bad = good.clone();
+        bad.series
+            .pressure_evidence
+            .as_mut()
+            .unwrap()
+            .attempts
+            .clear();
+        assert!(bad.validate_for_read().is_err());
+        let mut bad = good.clone();
+        let inner = bad.series.pressure_evidence.as_ref().unwrap().attempts[0].clone();
+        bad.series
+            .pressure_evidence
+            .as_mut()
+            .unwrap()
+            .attempts
+            .push(inner);
+        assert!(bad.validate_for_read().unwrap_err().contains("unique"));
+        for (field, unknown) in [("verdict", "invented"), ("no_result_kind", "invented")] {
+            let mut raw = serde_json::to_value(&good).unwrap();
+            raw["series"]["pressure_evidence"]["attempts"][0]["comparison"][field] =
+                serde_json::json!(unknown);
+            assert!(serde_json::from_value::<SeriesRow>(raw).is_err());
+        }
+        for outcome in ["PASS", "FAIL", "ERROR"] {
+            let mut native = good.clone();
+            native.series.cell = "fixture/test/naked/native".into();
+            let inner = &mut native.series.pressure_evidence.as_mut().unwrap().attempts[0];
+            inner.outcome = outcome.into();
+            inner.comparison = None;
+            inner.status = None;
+            assert!(
+                native.validate_for_read().is_err(),
+                "missing {outcome} process"
+            );
+        }
+        let mut native = good.clone();
+        native.series.cell = "fixture/test/naked/native".into();
+        let inner = &mut native.series.pressure_evidence.as_mut().unwrap().attempts[0];
+        inner.outcome = "ERROR".into();
+        inner.comparison = None;
+        inner.status = None;
+        inner.timed_out = true;
+        inner.error_kind = Some("cpu-timeout".into());
+        inner.validate_for_mode("naked", None).unwrap();
+        // The prelaunch timeout is a well-formed attempt, but the runner
+        // never types a cell that retains a timed-out attempt as a pass, so
+        // the row is admitted only as the timeout it is.
+        assert!(
+            native
+                .validate_for_read()
+                .unwrap_err()
+                .contains("pressure_evidence retains a timed-out attempt")
+        );
+        native.series.outcome = SeriesOutcome::Timeout;
+        native.series.result = Some(ObservedResult::Timeout);
+        native.series.failure_class = Some(FailureClass::NoResult);
+        native.validate_for_read().unwrap();
+        // `runner::observed_result` refines that timeout to sandbox-denied or
+        // infrastructure-error when an attempt's output shows an environmental
+        // block. Neither claims a product verdict, so both are admitted; a
+        // crash-error or an OOM over the same timeout is not.
+        for (outcome, result, failure_class, admitted) in [
+            (
+                SeriesOutcome::Errored,
+                ObservedResult::SandboxDenied,
+                FailureClass::UnderstoodInfrastructureFailure,
+                true,
+            ),
+            (
+                SeriesOutcome::Errored,
+                ObservedResult::InfrastructureError,
+                FailureClass::UnderstoodInfrastructureFailure,
+                true,
+            ),
+            (
+                SeriesOutcome::Errored,
+                ObservedResult::CrashError,
+                FailureClass::ProductFailure,
+                false,
+            ),
+            (
+                SeriesOutcome::NoResult,
+                ObservedResult::Oom,
+                FailureClass::NoResult,
+                false,
+            ),
+        ] {
+            let mut refined = native.clone();
+            refined.series.outcome = outcome;
+            refined.series.result = Some(result);
+            refined.series.failure_class = Some(failure_class);
+            let checked = refined.validate_for_read();
+            if admitted {
+                checked.unwrap_or_else(|error| panic!("{result:?}: {error}"));
+            } else {
+                assert!(
+                    checked
+                        .unwrap_err()
+                        .contains("pressure_evidence retains a timed-out attempt"),
+                    "{result:?} admitted"
+                );
+            }
+        }
+        let mut raw = serde_json::to_value(&good).unwrap();
+        raw["series"]["pressure_evidence"]["attempts"][0]["timed_out"] = serde_json::json!("false");
+        assert!(serde_json::from_value::<SeriesRow>(raw).is_err());
+    }
+
+    /// `pressure_row` for a cell that declares exit `code` or `signal`, whose
+    /// one inner invocation Hermit ended with `status` or `observed_signal`.
+    /// The declaration's own audit shows the declared disposition, so the
+    /// inner invocation is the only thing that varies.
+    fn declared_pressure_row(
+        code: Option<i32>,
+        signal: Option<i32>,
+        status: Option<i32>,
+        observed_signal: Option<i32>,
+    ) -> SeriesRow {
+        let mut value = pressure_row();
+        value.series.declared_guest_exit = declared_exit_row(code, signal, code, signal)
+            .series
+            .declared_guest_exit;
+        let inner = &mut value.series.pressure_evidence.as_mut().unwrap().attempts[0];
+        inner.status = status;
+        inner.signal = observed_signal;
+        value
+    }
+
+    #[test]
+    fn pressure_history_admits_a_nonzero_match_only_as_declared() {
+        for (label, value) in [
+            ("status 0 without a declaration", pressure_row()),
+            (
+                "status 0 with a declaration",
+                declared_pressure_row(Some(23), None, Some(0), None),
+            ),
+            (
+                "the declared code",
+                declared_pressure_row(Some(23), None, Some(23), None),
+            ),
+            (
+                "the declared signal",
+                declared_pressure_row(None, Some(11), None, Some(11)),
+            ),
+            (
+                "the declared signal as 128 + 11",
+                declared_pressure_row(None, Some(11), Some(139), None),
+            ),
+        ] {
+            value
+                .validate_for_write()
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+        }
+        let mut undeclared = declared_pressure_row(Some(23), None, Some(23), None);
+        undeclared.series.declared_guest_exit = None;
+        let mut blank_reason = declared_pressure_row(Some(23), None, Some(23), None);
+        declared(&mut blank_reason).reason = " ".into();
+        let mut replay = declared_pressure_row(Some(23), None, Some(23), None);
+        replay.series.cell = "fixture/test/replay/ptrace".into();
+        let mut failed = declared_pressure_row(Some(23), None, Some(23), None);
+        let inner = &mut failed.series.pressure_evidence.as_mut().unwrap().attempts[0];
+        inner.outcome = "FAIL".into();
+        for (label, value) in [
+            ("status 23 without a declaration", undeclared),
+            (
+                "another code",
+                declared_pressure_row(Some(23), None, Some(22), None),
+            ),
+            (
+                "a signal for a declared code",
+                declared_pressure_row(Some(23), None, None, Some(23)),
+            ),
+            (
+                "128 + the declared code",
+                declared_pressure_row(Some(23), None, Some(151), None),
+            ),
+            (
+                "the declared signal's number as a code",
+                declared_pressure_row(None, Some(11), Some(11), None),
+            ),
+            (
+                "another signal",
+                declared_pressure_row(None, Some(11), None, Some(9)),
+            ),
+            (
+                "128 + another signal",
+                declared_pressure_row(None, Some(11), Some(137), None),
+            ),
+            // A declaration the runner itself refuses accepts nothing more.
+            ("a blank reason", blank_reason),
+            (
+                "a code out of range",
+                declared_pressure_row(Some(300), None, Some(300), None),
+            ),
+            (
+                "both a code and a signal",
+                declared_pressure_row(Some(23), Some(23), Some(23), None),
+            ),
+            ("a replay cell", replay),
+            ("an invocation that did not pass", failed),
+        ] {
+            let error = value.validate_for_read().unwrap_err();
+            assert!(
+                error.contains(
+                    "pressure_evidence matched report contradicts its inner process disposition"
+                ),
+                "{label}: {error}"
+            );
+        }
+        // The declaration admits an exit, never a verdict: every other verdict
+        // keeps its own rule for an invocation that ended as declared.
+        for verdict in [
+            Verdict::Diverged,
+            Verdict::InfrastructureError,
+            Verdict::NoResult,
+        ] {
+            let mut value = declared_pressure_row(Some(23), None, Some(23), None);
+            let comparison = value.series.pressure_evidence.as_mut().unwrap().attempts[0]
+                .comparison
+                .as_mut()
+                .unwrap();
+            comparison.verdict = verdict;
+            comparison.canonical = verdict == Verdict::Diverged;
+            let error = value.validate_for_read().unwrap_err();
+            assert!(
+                error.contains(&format!(
+                    "pressure_evidence {verdict} report contradicts its inner process disposition"
+                )),
+                "{verdict}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn pressure_history_cross_checks_no_verdict_facts_without_replacing_them() {
+        let mut value = no_verdict_row();
+        value.producer = SeriesProducer::PressureTest;
+        value.series.pressure_evidence = Some(SeriesPressureEvidence {
+            evidence_sha256: "b".repeat(64),
+            attempts: vec![SeriesPressureAttempt {
+                index: "1".into(),
+                outcome: "ERROR".into(),
+                error_kind: Some("incomplete-verification-evidence".into()),
+                status: Some(125),
+                signal: None,
+                timed_out: false,
+                comparison: Some(SeriesPressureComparison {
+                    verdict: Verdict::NoResult,
+                    canonical: false,
+                    report_sha256: "c".repeat(64),
+                    no_result_kind: Some(SeriesNoVerdictKind::NotRun),
+                }),
+            }],
+        });
+        value.validate_for_write().unwrap();
+        let mut mismatch = value.clone();
+        mismatch
+            .series
+            .pressure_evidence
+            .as_mut()
+            .unwrap()
+            .evidence_sha256 = "d".repeat(64);
+        assert!(
+            mismatch
+                .validate_for_read()
+                .unwrap_err()
+                .contains("different CellResults")
+        );
+        for edit in [
+            (|a: &mut SeriesPressureAttempt| a.index = "2".into())
+                as fn(&mut SeriesPressureAttempt),
+            |a| a.status = Some(126),
+            |a| a.error_kind = Some("cpu-timeout".into()),
+            |a| a.comparison.as_mut().unwrap().report_sha256 = "d".repeat(64),
+        ] {
+            let mut bad = value.clone();
+            edit(&mut bad.series.pressure_evidence.as_mut().unwrap().attempts[0]);
+            assert!(bad.validate_for_read().is_err());
+        }
+        // Current prelaunch CPU and wall timeouts retain the lack of a process.
+        for kind in ["cpu-timeout", "wall-timeout"] {
+            let mut timed = value.clone();
+            timed.series.outcome = SeriesOutcome::Timeout;
+            timed.series.result = Some(ObservedResult::Timeout);
+            let inner = &mut timed.series.pressure_evidence.as_mut().unwrap().attempts[0];
+            inner.timed_out = true;
+            inner.status = None;
+            inner.error_kind = Some(kind.into());
+            let inner = &mut timed.series.no_verdict_evidence.as_mut().unwrap().attempts[0];
+            inner.timed_out = true;
+            inner.status = None;
+            inner.error_kind = Some(kind.into());
+            inner.disposition = SeriesOutcome::Timeout;
+            timed.validate_for_write().unwrap();
+        }
+    }
+
+    #[test]
+    fn pressure_history_retains_unspecified_and_refused_comparison_contracts() {
+        for kind in [
+            SeriesNoVerdictKind::Unspecified,
+            SeriesNoVerdictKind::ComparisonRefused,
+        ] {
+            for mode in ["verify", "replay", "chaos"] {
+                let mut value = no_verdict_row();
+                value.producer = SeriesProducer::PressureTest;
+                value.series.cell = format!("fixture/test/{mode}/ptrace");
+                let evidence = value.series.no_verdict_evidence.as_mut().unwrap();
+                let disposition = &mut evidence.attempts[0];
+                disposition.kind = kind;
+                disposition.detail = (kind == SeriesNoVerdictKind::ComparisonRefused)
+                    .then(|| "the second log was truncated at its size bound".into());
+                value.series.pressure_evidence = Some(SeriesPressureEvidence {
+                    evidence_sha256: evidence.evidence_sha256.clone(),
+                    attempts: vec![SeriesPressureAttempt {
+                        index: disposition.index.clone(),
+                        outcome: disposition.attempt_outcome.clone(),
+                        error_kind: disposition.error_kind.clone(),
+                        status: disposition.status,
+                        signal: disposition.signal,
+                        timed_out: disposition.timed_out,
+                        comparison: Some(SeriesPressureComparison {
+                            verdict: Verdict::NoResult,
+                            canonical: false,
+                            report_sha256: disposition.verification_report_sha256.clone().unwrap(),
+                            no_result_kind: Some(kind),
+                        }),
+                    }],
+                });
+                value.validate_for_write().unwrap();
+                let serialized = serde_json::to_value(&value).unwrap();
+                let decoded: SeriesRow = serde_json::from_value(serialized.clone()).unwrap();
+                decoded.validate_for_read().unwrap();
+                assert_eq!(serde_json::to_value(decoded).unwrap(), serialized);
+
+                let mut signaled = value.clone();
+                let disposition = &mut signaled
+                    .series
+                    .no_verdict_evidence
+                    .as_mut()
+                    .unwrap()
+                    .attempts[0];
+                disposition.status = None;
+                disposition.signal = Some(11);
+                let inner = &mut signaled.series.pressure_evidence.as_mut().unwrap().attempts[0];
+                inner.status = None;
+                inner.signal = Some(11);
+                signaled.validate_for_write().unwrap();
+
+                for edit in [
+                    (|a: &mut SeriesPressureAttempt| a.outcome = "PASS".into())
+                        as fn(&mut SeriesPressureAttempt),
+                    |a| a.outcome = "FAIL".into(),
+                    |a| a.error_kind = None,
+                    |a| a.error_kind = Some(" ".into()),
+                    |a| a.status = Some(0),
+                    |a| a.status = None,
+                    |a| a.signal = Some(11),
+                    |a| a.timed_out = true,
+                    |a| a.comparison.as_mut().unwrap().canonical = true,
+                    |a| a.comparison.as_mut().unwrap().no_result_kind = None,
+                    |a| a.comparison.as_mut().unwrap().report_sha256 = "d".repeat(64),
+                ] {
+                    let mut bad = value.clone();
+                    edit(&mut bad.series.pressure_evidence.as_mut().unwrap().attempts[0]);
+                    assert!(bad.validate_for_read().is_err(), "{kind:?} {mode}");
+                }
+                let mut wrong_kind = value.clone();
+                wrong_kind
+                    .series
+                    .pressure_evidence
+                    .as_mut()
+                    .unwrap()
+                    .attempts[0]
+                    .comparison
+                    .as_mut()
+                    .unwrap()
+                    .no_result_kind = Some(if kind == SeriesNoVerdictKind::Unspecified {
+                    SeriesNoVerdictKind::ComparisonRefused
+                } else {
+                    SeriesNoVerdictKind::Unspecified
+                });
+                assert!(
+                    wrong_kind
+                        .validate_for_read()
+                        .unwrap_err()
+                        .contains("contradicts the same no_verdict_evidence")
+                );
+
+                let mut different_error = value;
+                different_error
+                    .series
+                    .no_verdict_evidence
+                    .as_mut()
+                    .unwrap()
+                    .attempts[0]
+                    .error_kind = Some("cli-error".into());
+                different_error
+                    .series
+                    .pressure_evidence
+                    .as_mut()
+                    .unwrap()
+                    .attempts[0]
+                    .error_kind = Some("cli-error".into());
+                if kind == SeriesNoVerdictKind::Unspecified {
+                    different_error.validate_for_write().unwrap();
+                } else {
+                    assert!(different_error.validate_for_read().is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn historical_pressure_rows_without_inner_history_remain_readable() {
+        for schema in [SeriesSchema::V1, SeriesSchema::V2, SeriesSchema::V3] {
+            let mut historical = row(schema);
+            historical.producer = SeriesProducer::PressureTest;
+            historical.series.attempt = Some(1);
+            historical.validate_for_read().unwrap();
+            let raw = serde_json::to_value(&historical).unwrap();
+            assert!(raw["series"].get("pressure_evidence").is_none());
+            let decoded: SeriesRow = serde_json::from_value(raw).unwrap();
+            assert!(decoded.series.pressure_evidence.is_none());
+        }
+    }
+
+    #[test]
+    fn v3_accepts_only_matching_typed_infrastructure_classifications() {
+        for result in [
+            ObservedResult::SandboxDenied,
+            ObservedResult::InfrastructureError,
+        ] {
+            let mut fixture = no_verdict_row();
+            fixture.series.outcome = SeriesOutcome::Errored;
+            fixture.series.result = Some(result);
+            fixture.series.failure_class = Some(FailureClass::UnderstoodInfrastructureFailure);
+            fixture.validate_for_read().unwrap();
+            fixture.validate_for_write().unwrap();
+            fixture.validate_for_projection().unwrap();
+
+            let encoded = serde_json::to_string(&fixture).unwrap();
+            let decoded: SeriesRow = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded.series.result, Some(result));
+            decoded.validate_for_read().unwrap();
+
+            fixture.series.failure_class = Some(FailureClass::ProductFailure);
+            let error = fixture.validate_for_write().unwrap_err();
+            assert!(error.contains(&format!("{result:?}")), "{error}");
+            assert!(error.contains("ProductFailure"), "{error}");
+        }
+    }
+}

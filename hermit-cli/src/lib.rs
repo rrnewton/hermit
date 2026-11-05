@@ -1,0 +1,10162 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+// Treat all Clippy warnings as errors.
+#![doc = include_str!("../README.md")]
+#![deny(clippy::all)]
+#![allow(clippy::uninlined_format_args)]
+
+// This host library retains LiteInst code without becoming an in-guest Tool
+// image. Declare its historical backing explicitly and keep the host allocator;
+// LiteInst's allocation preflight still refuses non-Tool allocations.
+#[cfg(feature = "liteinst")]
+reverie_liteinst::declare_legacy_tool_backing!();
+
+mod backend_stats;
+pub mod build_info;
+pub mod canonical_verdict;
+mod chroot;
+use hermit_record_format::consts;
+pub mod logdiff_report;
+// TODO-HUMAN-REVIEW(PR-594): Review the public e9patch preprocessing API.
+pub mod cpu_profile_admission;
+pub mod e9patch;
+mod error;
+use hermit_record_format::event;
+use hermit_record_format::event_stream;
+pub mod happens_before;
+pub mod host_input_change;
+mod id;
+#[cfg(feature = "liteinst")]
+pub mod in_guest_exits;
+pub mod instruction_map;
+#[cfg(feature = "liteinst")]
+use hermit_record_format::interp;
+pub mod liteinst_bootstrap;
+mod liteinst_constructor;
+pub mod liteinst_record;
+mod metadata;
+pub mod xstate_probe;
+/// Diagnostic writes that never wait for a reader; they live in detcore, whose
+/// own stderr writer reads the same flag.
+pub use detcore::nonwaiting_write;
+pub mod physical_exit_watch;
+pub mod preemption_admission;
+pub mod proc_mount;
+mod ptrace_completion;
+
+pub use canonical_verdict::Verdict;
+
+/// Whether record/replay verification hashes syscall output buffers, and
+/// therefore whether its log comparison can see buffer CONTENT at all.
+///
+/// ONE CONSTANT BECAUSE TWO INDEPENDENT SWITCHES HAD TO AGREE AND SILENTLY DID
+/// NOT MATTER. Record/replay carried this decision twice: `metadata.rs`'s
+/// `record_or_replay_config` decided whether the recorder EMITS the hash, and
+/// `record_start.rs`'s `ComparisonOptions` decided whether the comparator READS
+/// it. Both were hard-coded `false`, neither was reachable from the command
+/// line, and nothing related them. Setting either alone achieves nothing: hash
+/// without compare is dead weight, compare without hash finds nothing. Naming
+/// the decision once makes the pair impossible to desynchronize, and makes
+/// changing it a one-line edit in a place a reader can find.
+pub const RECORD_REPLAY_HASHES_IO_BUFFERS: bool = true;
+
+/// Whether record/replay virtualizes time. FALSE, DELIBERATELY, AND THAT IS WHY
+/// A GREEN RECORD/REPLAY VERDICT IS NOT A DETERMINISM RESULT.
+///
+/// Named for the same reason as [`RECORD_REPLAY_HASHES_IO_BUFFERS`] directly
+/// above: the decision was about to be carried twice. `metadata.rs`'s
+/// `record_or_replay_config` sets the config the recorder and replayer run
+/// under, and `record_start.rs`'s `ComparisonOptions` now discloses that setting
+/// in the verdict. If those two disagreed, the report would describe a time
+/// policy the run did not use — which is precisely the class of defect the
+/// disclosure exists to close, reintroduced one layer up.
+///
+/// `hermit run --verify` reads its value from the live `det_config` instead,
+/// because `--no-virtualize-time` makes it a genuine runtime choice there. Only
+/// the record/replay path is a fixed decision, so only it gets a constant.
+pub const RECORD_REPLAY_VIRTUALIZES_TIME: bool = false;
+
+/// Exit status for a completed comparison that found a divergence.
+///
+/// This is the conventional `diff` result: zero means equal and one means
+/// different. The verification JSON distinguishes it from a guest that exits
+/// one of its own accord.
+pub const HERMIT_VERIFICATION_DIVERGENCE_EXIT: i32 = 1;
+
+/// Exit status for a failure of HERMIT ITSELF, as distinct from the guest's.
+///
+/// ⚠️ EVERY CLI ERROR USED TO BE `Exited(1)`, WHICH IS THE SINGLE MOST COMMON
+/// GUEST FAILURE CODE. A tracer panic and a guest that exited 1 of its own
+/// accord were therefore INDISTINGUISHABLE from `$?` alone — and every harness,
+/// gate and script on this project decides pass/fail from exactly that value.
+/// The information was not missing, only discarded: reverie's container reports
+/// the child's real status as a typed `ExitStatus`, and hermit collapsed it to
+/// prose and then to `1`.
+///
+/// WHY THIS DOES NOT BREAK THE "hermit's exit IS the guest's exit" CONTRACT.
+/// That contract describes the case where the guest RAN AND EXITED, and it is
+/// untouched: a guest status still flows through `raise_or_exit` unchanged, and
+/// only the `Err` arm — where there is NO guest exit code, because hermit failed
+/// before or instead of producing one — uses this value. The contract did not
+/// cover that case; it does now.
+///
+/// WHY 125. It is the established convention for "the wrapper tool itself
+/// failed" — GNU `env`, `chroot` and `timeout` all reserve 125 for exactly this,
+/// leaving 126/127 for exec-level problems. It is not a value hermit emits
+/// anywhere else.
+///
+/// ⚠️ THIS REDUCES A COLLISION, IT DOES NOT REMOVE ONE. A guest is free to exit
+/// 125 deliberately, and every value in 0..=255 is a legal guest status, so no
+/// code can be reserved outright. What it removes is the GUARANTEED collision
+/// with the most common failure code. For an unambiguous signal, read the
+/// `HERMIT_TASK_PANIC` marker on stderr or the verification JSON; this makes the
+/// cheap check — `$?` — stop actively lying.
+///
+/// ⚠️ IT LIVES IN THE LIBRARY, NOT IN `main.rs`, AND THAT PLACEMENT IS THE FIX
+/// FOR HOW IT WENT STALE. It was a private `const` inside the binary, so
+/// `tests/cli.rs` — the only thing that asserts on it — could not name it and
+/// wrote the number out by hand instead. When hermit#2558 moved the value from
+/// `1` to `125`, the definition moved and the sixteen copies did not: eight cli
+/// tests went red on main and stayed red, each failing an assertion about the
+/// exit code rather than about the behaviour it exists to check. Same shape as
+/// [`RECORD_REPLAY_HASHES_IO_BUFFERS`] above — a decision carried in two places
+/// that had to agree and had no way to. Exported here, the tests move with it.
+///
+/// ⚠️ DO NOT FLIP EVERY `Some(1)` YOU FIND. `tests/stress_suite.rs`
+/// asserts `Some(1)` as THE GUEST'S OWN SIGNAL, not as a stale copy of this
+/// constant: there `Some(1) => GuestOutcome::Exposed`, and
+/// `status.code() == Some(1)` IS the `exposes_bug` predicate. It is
+/// pattern-identical to the tests that DID go stale, and it is the OPPOSITE
+/// case -- the assertion is CORRECT and must not move with this constant.
+///
+/// ⚠️ ITS FAILURE MODE IS SILENT SUCCESS. Changing it to 125 would not
+/// turn the stress suite red; it would make `exposes_bug` NEVER FIRE, so the
+/// suite would report no bug exposed forever and pass while blind. A red is
+/// recoverable; a green that cannot fail is not.
+///
+/// REVIEWER RULE: a change to `tests/stress_suite.rs` inside an exit-code head
+/// SHOULD BE REFUSED ON SIGHT AND QUESTIONED.
+pub const HERMIT_INTERNAL_FAILURE_EXIT: i32 = 125;
+
+/// A deadline hermit itself was asked to enforce expired: **124**.
+///
+/// The status the container init exits with when a hermit-owned bound ends the
+/// run -- `run --timeout`'s SIGALRM fallback here, and `record --record-timeout`'s
+/// handler in `record_start.rs`, which has always used this value. 124 is the
+/// established code for "a deadline fired" across GNU `timeout`, `safehermit`'s
+/// wall bound and both hermit spellings, so this names an existing convention
+/// rather than claiming a new number.
+///
+/// ⚠️ IT MUST BE READ AT THE CONTAINER BOUNDARY OR IT IS SILENTLY REWRITTEN TO
+/// 125. Found only by forcing the fallback to fire, 2026-08-26: the init exited
+/// 124, `classify_container_result` had no arm for it, and it fell through to
+/// `ContainerChildExit` -- so the run reported `exit 125` and
+/// `class=container-child-exit`, "the child died with a status it did not
+/// pick", for a deadline hermit chose to enforce. Identical in shape to the
+/// refusal that arrives as 122 and needs its own arm for the same reason.
+pub const HERMIT_DEADLINE_EXIT: i32 = 124;
+
+/// Hermit's own log output exceeded `--max-log-bytes`: **123**.
+///
+/// The status hermit exits with when the byte budget on its tracing output
+/// (stderr, or `--log-file`) is exhausted and it deliberately tears the run
+/// down. 123 was already reserved below for "a LOG BYTE CAP fired" on behalf of
+/// dev-hermit's `bin/safehermit`; this is the same event enforced one layer
+/// lower, exactly as 124 is shared by hermit's `--timeout` and safehermit's wall
+/// deadline. It is not 125 because the cap working is not hermit breaking, and
+/// not 122 because no fail-closed determinism policy was involved: the remedy
+/// is "lower the log level or raise the cap", not "change the program".
+///
+/// Like 124, it must be read at the container boundary
+/// (`classify_container_result`) or it is rewritten to 125.
+pub const HERMIT_LOG_CAP_EXIT: i32 = 123;
+
+/// The guest program could not be found at all: **127**.
+///
+/// Exported for the same reason as [`HERMIT_INTERNAL_FAILURE_EXIT`] and with the
+/// same history one step behind it. `GuestProgramFault::exit_code` wrote `127`
+/// and `126` as bare literals, and `tests/cli.rs` had no way to name either, so
+/// a test meaning "not found" and a test meaning "hermit refused" were asserted
+/// with the same helper and the same number until the values diverged.
+///
+/// ⚠️ THIS IS NOT A SUBDIVISION OF HERMIT'S OWN FAILURE, AND THAT IS THE WHOLE
+/// DISTINCTION. 125 says *hermit* broke; 127 and 126 say *the guest program* was
+/// unusable and hermit correctly declined to start it. A caller that cannot tell
+/// those apart cannot tell "fix my tooling" from "fix my command line".
+pub const GUEST_PROGRAM_NOT_FOUND_EXIT: i32 = 127;
+
+/// The guest program exists but cannot be executed as given: **126**.
+///
+/// See [`GUEST_PROGRAM_NOT_FOUND_EXIT`]. 127/126 are the GNU `env`/`chroot`/
+/// `timeout` convention that 125 itself came from, so the three sit in one
+/// scheme rather than being three unrelated numbers.
+pub const GUEST_PROGRAM_NOT_EXECUTABLE_EXIT: i32 = 126;
+
+// ⚠️ THE VALUES THEMSELVES ARE PINNED, NOT ONLY THEIR NAMES.
+//
+// Naming a constant makes every consumer agree with the definition; it does not
+// make the definition right. Once `tests/cli.rs` asserts `Some(THE_CONSTANT)`
+// everywhere, the whole suite is self-consistent and completely unanchored -- a
+// one-character edit here would move all sixteen assertions with it and nothing
+// would fail. That is the exact shape of the defect this scheme exists to close,
+// displaced one level up, and it is why these are compile-time assertions rather
+// than a comment: a deliberate edit "would be noticed" is the argument that
+// already failed once, when hermit#2558 moved 1 -> 125 and sixteen copies went
+// stale.
+//
+// WHY EACH VALUE AND NOT ANOTHER. GNU `env`, `chroot` and `timeout` reserve 125
+// for "the wrapper itself failed", 127 for "command not found" and 126 for
+// "found but not executable". Borrowing the whole scheme rather than one number
+// is what keeps the three answers distinguishable from each other.
+//
+// ⚠️ THE EXIT-CODE ALLOCATION FOR THE `hermit` BINARY. ONE TABLE, HERE.
+//
+// Five separate exit-code defects were found in one evening and every one of
+// them came from a value being chosen, copied or rewritten somewhere that could
+// not see the others. This is the single place the space is allocated; anything
+// that emits or rewrites a hermit exit status is a consumer OF this table and
+// must not invent its own reading of it.
+//
+//   0          success.
+//   1          HERMIT_VERIFICATION_DIVERGENCE_EXIT, matching `diff`; also a
+//              legal guest status. Read the verification JSON to distinguish.
+//   2 ..= 121  THE GUEST'S OWN STATUS, passed through untouched. (The range
+//              stops at 121 because 122 is reserved below; a guest may still
+//              CHOOSE any value, see the caveat at the end.)
+//   122        HERMIT_POLICY_REFUSAL_EXIT -- hermit REFUSED the run under a
+//              fail-closed policy. Hermit WORKED; the run was stopped on
+//              purpose and the reason was printed. Distinct from 125 because
+//              "hermit refused" and "hermit broke" demand opposite responses:
+//              read the refusal and change your program or flags, versus file a
+//              bug. Defined in `detcore-model` because `detcore` emits it and
+//              this crate recognises it, and that is the only crate both
+//              depend on.
+//   123        HERMIT_LOG_CAP_EXIT -- a LOG BYTE CAP fired. Hermit's own
+//              `--max-log-bytes` budget on its tracing output, and the value
+//              reserved for dev-hermit's `bin/safehermit` log-cap kill (which,
+//              as of 2026-09-26, still exits 125 -- see the 125 note below).
+//              Hermit's spelling prints `HERMIT_LOG_CAP class=log-cap`.
+//   124        DO NOT USE. GNU `timeout`'s deadline, and dev-hermit's
+//              `bin/safehermit` WALL DEADLINE kill. `tests/cli.rs` asserts
+//              `assert_ne!(code, Some(124))` on the awk-mincore probe.
+//   125        HERMIT_INTERNAL_FAILURE_EXIT -- hermit itself failed, no guest
+//              ran. NOT YET THE SOLE MEANING through dev-hermit's
+//              `bin/safehermit`: that wrapper has exited 125 for its
+//              log-byte-cap kill since it was created on 2026-08-20 and still
+//              did on 2026-10-05, so a run through it produces one number for
+//              two faults with opposite remedies (see "125 ⚠️ NOT FREE" below).
+//              An earlier version of this table said safehermit had already
+//              moved off 125; it never did. The intended fix is that SAFEHERMIT
+//              MOVES -- to the 123 reserved for it above -- NOT HERMIT, because
+//              that wrapper is the only layer that knows which happened (it
+//              relays hermit's status otherwise) and because 125/126/127 is one
+//              GNU scheme that cannot be broken up. Tracked as
+//              `hermit_s_125_collides`.
+//   126        GUEST_PROGRAM_NOT_EXECUTABLE_EXIT.
+//   127        GUEST_PROGRAM_NOT_FOUND_EXIT -- the ABSOLUTE-PATH form. The
+//              bare-name-on-guest-PATH form currently exits 125 instead, which
+//              is an inconsistency tracked as `hermit_reports_a_missing`, not a
+//              second meaning for 127.
+//   128 + N    killed by signal N (shell convention). Hermit does not emit these
+//              deliberately; a wrapper reporting a signal death must use them
+//              rather than borrow a code that already means something.
+//
+// ⚠️ NO CODE IS EXCLUSIVELY HERMIT'S. Every value in 0..=255 is a legal guest
+// status, so a guest may return 125 or 127 of its own accord and this table
+// cannot stop it. The table removes GUARANTEED collisions, not possible ones.
+// The only unambiguous discriminator is the `HERMIT_INTERNAL_FAILURE` marker on
+// stderr, present exactly when hermit itself failed. Any consumer deciding on
+// `$?` alone is guessing, and should say so.
+//
+// ⚠️ THE SAME ARGUMENT APPLIES TO 124, AND MORE SHARPLY, BECAUSE FIVE
+// MECHANISMS PRODUCE IT. `hermit run --timeout`, its unwind fallback, `hermit
+// record --record-timeout`, the `timeout(1)` wrapped around a manifest cell, and
+// `safehermit`'s wall deadline all exit 124, and GNU `timeout` uses it for the
+// same event. They demand different responses -- a slow guest, a wedged
+// teardown inside hermit, a cell bound set too low, a run that escaped every
+// inner bound -- so `$?` cannot route the reader to any of them.
+//
+// The discriminator is again the marker on stderr, and it is a CONTRACT rather
+// than a diagnostic nicety: `class=run-timeout` for hermit's own bound (which
+// also states the bound in seconds), `HERMIT_RUN_TIMEOUT_FALLBACK` for the
+// unwind failing to complete, `safehermit: bound.wall=` for the cgroup reap.
+// EXIT 124 WITH NO MARKER AT ALL MEANS NO INNER BOUND FIRED -- something outside
+// hermit killed the run -- which is a configuration error and not a slow guest.
+// The full picture, including which rung bounds which quantity and the
+// strict-inequality invariant between them, is docs/TIMEOUT_LADDER.md.
+//
+// ⚠️ DO NOT CLAMP INTO THIS RANGE. `scripts/hermit-code-coverage.rs` used
+// `clamp(1, 125)` and so rewrote 127 and 126 into 125 -- turning "your program is
+// missing" into "hermit broke" and pointing the reader at the wrong project.
+// Truncating a status does not lose information here, it MANUFACTURES a false
+// attribution, because the ceiling is itself a meaning.
+//
+// ⚠️ WHAT EACH VALUE MUST NOT COLLIDE WITH -- AND 125 ALREADY DOES.
+//
+//   0    success. Never a failure code; see the nonzero pin below.
+//   1    the commonest guest exit status. Sharing it is the collision
+//        hermit#2558 introduced 125 to escape, so 125 must never drift back.
+//   124  GNU `timeout`'s "deadline fired", and dev-hermit's `bin/safehermit`
+//        uses it for its WALL DEADLINE kill. `tests/cli.rs` asserts
+//        `assert_ne!(code, Some(124))` on the awk-mincore probe for that reason.
+//   126  hermit's own GUEST_PROGRAM_NOT_EXECUTABLE_EXIT.
+//   127  hermit's own GUEST_PROGRAM_NOT_FOUND_EXIT -- already in use for the
+//        ABSOLUTE-PATH form of a missing guest program. Note the bare-name form
+//        resolved against the guest PATH exits 125 instead, which is an
+//        inconsistency filed separately, not a licence to reuse 127.
+//
+//   125  ⚠️ NOT FREE. dev-hermit's `bin/safehermit` exits 125 to mean "the LOG
+//        BYTE CAP fired: safehermit killed the run through its cgroup"
+//        (`demos/lib/demo_common.py`'s SAFEHERMIT_EXIT_REASON). Any hermit run
+//        launched through that wrapper -- which is how the demos and the repeat
+//        harness run it -- can therefore produce 125 for two unrelated reasons:
+//        hermit refused, or the wrapper killed it for log volume. They demand
+//        opposite responses (fix the invocation vs raise the cap), and `$?`
+//        cannot tell them apart. This is a LIVE ambiguity, not a hypothetical:
+//        demo 5 has been observed reporting `exited with status 125` when the
+//        cap fired. It is recorded here rather than resolved because changing
+//        either value is a cross-repository decision.
+//
+//        The discriminator meanwhile is the same one that separates hermit's 125
+//        from a guest's own 125: the `HERMIT_INTERNAL_FAILURE` marker on stderr,
+//        present only when hermit itself failed. safehermit writes its verdict
+//        to its `--sh-report` file instead. Read one of those, never the number
+//        alone.
+//
+// ⚠️ 0 IS THE DANGEROUS DRIFT, NOT 126 OR 127. Every one of these is asserted as
+// `assert_eq!(code, Some(CONST))`. At 0 those assertions would stop demanding a
+// FAILURE and start demanding a SUCCESS, and would still pass -- sixteen tests
+// silently inverted. `tests/cli.rs` also asserts `!status.success()` beside the
+// code for that reason; this pin is the second of the two locks.
+const _: () = assert!(
+    HERMIT_VERIFICATION_DIVERGENCE_EXIT == 1,
+    "1 is the established diff-style result for a completed comparison that diverged"
+);
+const _: () = assert!(
+    HERMIT_INTERNAL_FAILURE_EXIT == 125,
+    "125 is the GNU wrapper-failed convention; 1 is the commonest guest status and 0 is success"
+);
+const _: () = assert!(
+    GUEST_PROGRAM_NOT_FOUND_EXIT == 127,
+    "127 is the GNU command-not-found convention and must stay distinct from 125 and 126"
+);
+const _: () = assert!(
+    GUEST_PROGRAM_NOT_EXECUTABLE_EXIT == 126,
+    "126 is the GNU found-but-not-executable convention and must stay distinct from 125 and 127"
+);
+const _: () = assert!(
+    HERMIT_LOG_CAP_EXIT == 123,
+    "123 is Hermit's log-cap code, reserved for bin/safehermit's log-cap kill as well; see the allocation table"
+);
+const _: () = assert!(
+    HERMIT_LOG_CAP_EXIT != 0
+        && HERMIT_VERIFICATION_DIVERGENCE_EXIT != 0
+        && HERMIT_INTERNAL_FAILURE_EXIT != 0
+        && GUEST_PROGRAM_NOT_FOUND_EXIT != 0
+        && GUEST_PROGRAM_NOT_EXECUTABLE_EXIT != 0,
+    "a failure code of 0 would invert every assert_eq!(code, Some(CONST)) into demanding success"
+);
+mod record;
+use hermit_record_format::record_replay_path;
+mod replay;
+#[cfg(feature = "sabre")]
+mod sabre_bootstrap;
+#[cfg(feature = "sabre")]
+mod sabre_ptrace;
+use hermit_record_format::script;
+mod tracer_thread;
+
+#[cfg(feature = "sabre")]
+use std::ffi::OsStr;
+use std::fs;
+use std::io;
+use std::io::Seek;
+use std::io::SeekFrom;
+use std::io::Write;
+#[cfg(feature = "dbt")]
+use std::os::fd::AsFd;
+use std::os::fd::AsRawFd;
+use std::os::fd::FromRawFd;
+#[cfg(any(feature = "sabre", all(test, feature = "liteinst")))]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(feature = "sabre")]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(any(feature = "sabre", feature = "liteinst"))]
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+use std::path::PathBuf;
+#[cfg(feature = "sabre")]
+use std::sync::Arc;
+use std::sync::Mutex;
+#[cfg(feature = "sabre")]
+use std::sync::atomic::AtomicBool;
+use std::time::Duration;
+use std::time::Instant;
+
+use anyhow::anyhow;
+use clap::ValueEnum;
+pub use consts::LAST;
+pub use consts::LAST_RUN;
+use consts::MANIFEST_NAME as RUN_MANIFEST_NAME;
+pub use consts::MANIFEST_NAME;
+use consts::METADATA_NAME;
+pub use consts::METADATA_NAME as RECORDING_METADATA_NAME;
+pub use detcore::Config as DetConfig;
+pub use detcore::Detcore;
+pub use detcore::RecordOrReplay;
+#[doc(hidden)]
+#[cfg(feature = "dbt")]
+pub use detcore_dbt::reverie_dbt_runtime_background_init_v2;
+#[doc(hidden)]
+#[cfg(feature = "dbt")]
+pub use detcore_dbt::reverie_dbt_runtime_background_init_v3;
+#[doc(hidden)]
+#[cfg(feature = "dbt")]
+pub use detcore_dbt::reverie_dbt_runtime_name;
+#[doc(hidden)]
+#[cfg(feature = "dbt")]
+pub use detcore_dbt::reverie_dbt_runtime_pre_syscall;
+#[doc(hidden)]
+#[cfg(feature = "dbt")]
+pub use detcore_dbt::reverie_dbt_runtime_ready;
+#[doc(hidden)]
+#[cfg(feature = "dbt")]
+pub use detcore_dbt::reverie_dbt_runtime_thread_exit;
+#[doc(hidden)]
+#[cfg(feature = "dbt")]
+pub use detcore_dbt::reverie_dbt_runtime_thread_init;
+#[doc(hidden)]
+#[cfg(feature = "dbt")]
+pub use detcore_dbt::reverie_dbt_runtime_totals;
+pub use error::Context;
+pub use error::Error;
+pub use error::FailureKind;
+pub use error::SerializableError;
+use goblin::elf::Elf;
+use goblin::elf::header;
+use goblin::elf::section_header;
+pub use id::Id;
+use metadata::Metadata;
+pub use ptrace_completion::HermitCleanupStage;
+pub use ptrace_completion::HermitCleanupUnconfirmed;
+pub use ptrace_completion::HermitPtraceFailure;
+pub use ptrace_completion::RecoveryRefusal;
+use record::Record;
+use replay::Replay;
+pub use reverie::ExitStatus;
+#[cfg(feature = "sabre")]
+use reverie::GlobalTool;
+pub use reverie::process;
+pub use reverie::process::Command;
+pub use reverie::process::Mount;
+pub use reverie::process::Namespace;
+pub use reverie::process::Output;
+pub use reverie::process::Stdio;
+pub use script::Shebang;
+use serde::Deserialize;
+use serde::Serialize;
+pub use tracer_thread::launch_on_calling_thread;
+
+enum KvmStdinReservation {
+    Open(fs::File),
+    Closed,
+}
+
+static KVM_STDIN_RESERVATION: Mutex<Option<KvmStdinReservation>> = Mutex::new(None);
+
+/// Saves stdin captured before Rust's process startup can reuse a closed fd 0.
+pub fn reserve_kvm_stdin(stdin: Option<fs::File>) -> io::Result<()> {
+    let mut reservation = KVM_STDIN_RESERVATION
+        .lock()
+        .map_err(|_| io::Error::other("KVM stdin reservation lock is poisoned"))?;
+    if reservation.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "KVM stdin is already reserved",
+        ));
+    }
+    *reservation = Some(match stdin {
+        Some(file) => KvmStdinReservation::Open(file),
+        None => KvmStdinReservation::Closed,
+    });
+    Ok(())
+}
+
+fn duplicate_current_stdin() -> io::Result<Option<fs::File>> {
+    // SAFETY: F_DUPFD_CLOEXEC duplicates fd 0 without taking ownership of it.
+    let duplicate = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
+    if duplicate >= 0 {
+        // SAFETY: F_DUPFD_CLOEXEC returned a new owned descriptor.
+        return Ok(Some(unsafe { fs::File::from_raw_fd(duplicate) }));
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EBADF) {
+        Ok(None)
+    } else {
+        Err(error)
+    }
+}
+
+fn ensure_kvm_stdin_reserved() -> io::Result<()> {
+    let mut reservation = KVM_STDIN_RESERVATION
+        .lock()
+        .map_err(|_| io::Error::other("KVM stdin reservation lock is poisoned"))?;
+    if reservation.is_none() {
+        *reservation = Some(match duplicate_current_stdin()? {
+            Some(file) => KvmStdinReservation::Open(file),
+            None => KvmStdinReservation::Closed,
+        });
+    }
+    Ok(())
+}
+
+fn reserved_kvm_stdin() -> Result<Option<fs::File>, Error> {
+    ensure_kvm_stdin_reserved()?;
+    let reservation = KVM_STDIN_RESERVATION
+        .lock()
+        .map_err(|_| io::Error::other("KVM stdin reservation lock is poisoned"))?;
+    match reservation.as_ref() {
+        Some(KvmStdinReservation::Open(file)) => Ok(Some(file.try_clone()?)),
+        Some(KvmStdinReservation::Closed) => Ok(None),
+        None => unreachable!("stdin reservation was initialized above"),
+    }
+}
+
+/// A replayable snapshot of the guest's stdin for the output-capturing backends.
+///
+/// `hermit run --verify` executes the guest twice and compares the two runs. The
+/// output-capturing backends historically fed the guest `Stdio::null()`, so any
+/// data piped into hermit (`echo prog | hermit run --strict --verify -- ...`)
+/// was silently dropped. Both runs then saw identical *empty* input and hermit
+/// reported a false "deterministic" success even though the guest never received
+/// its input. `Seekable` holds a read-only, rewindable file so both runs receive
+/// the exact same bytes without being able to modify the caller's input; `None`
+/// means stdin should be `/dev/null` (nothing to replay, or a terminal that
+/// cannot be replayed identically to two runs).
+enum StdinSnapshot {
+    Seekable(fs::File),
+    None,
+}
+
+static OUTPUT_STDIN_SNAPSHOT: Mutex<Option<StdinSnapshot>> = Mutex::new(None);
+
+/// Records a rewindable snapshot of the process stdin so the output-capturing
+/// backends can replay identical input to each run of `hermit run --verify`.
+///
+/// `stdin` is the descriptor captured before Rust startup could reuse a closed
+/// fd 0 (see the binary's `startup_stdin`). A regular-file redirect is reopened
+/// read-only; a pipe/fifo/socket is drained once into a seekable temporary file
+/// and that file is reopened read-only. A terminal (or absent stdin) is treated
+/// as `/dev/null` because a live terminal cannot be replayed identically to two
+/// runs.
+pub fn reserve_output_stdin_snapshot(stdin: Option<fs::File>) -> io::Result<()> {
+    let snapshot = match stdin {
+        None => StdinSnapshot::None,
+        Some(mut file) => {
+            // SAFETY: as_raw_fd borrows the descriptor without taking ownership.
+            let is_tty = unsafe { libc::isatty(file.as_raw_fd()) } == 1;
+            if is_tty {
+                StdinSnapshot::None
+            } else {
+                let replay = if file.stream_position().is_ok() {
+                    // Already seekable (e.g. `< file`): retain it below through
+                    // a read-only descriptor with an independent file offset.
+                    file
+                } else {
+                    // Non-seekable (pipe/fifo/socket): buffer once into a
+                    // seekable temporary file so both --verify runs receive
+                    // identical input.
+                    //
+                    // NAME THE WAIT BEFORE ENTERING IT. This `io::copy` reads to
+                    // EOF, so a stdin that never reaches EOF -- an inherited socket,
+                    // a fifo whose writer stays open -- blocks here FOREVER, before
+                    // the guest has started. Measured: the process wedges with ZERO
+                    // bytes on stdout and stderr and is only cleared by killing it,
+                    // which is indistinguishable from a slow run. That
+                    // indistinguishability is the whole harm; an unbounded wait that
+                    // says what it is waiting for is merely slow, and a reader can
+                    // act on it.
+                    //
+                    // Deliberately UNCONDITIONAL rather than emitted after a delay:
+                    // a message that appears only once N seconds have passed makes
+                    // hermit's own stderr depend on timing, and this project does
+                    // not accept timing-dependent output. Deliberately NOT a
+                    // deadline either -- a 12s slow producer is legitimate and
+                    // delivers, and nothing can separate "slow" from "never" except
+                    // by waiting. This changes no control flow: every input that
+                    // worked before still works, byte for byte, on stdout.
+                    const BUFFERING_NOTE: &str = "hermit: --verify is buffering stdin from a non-seekable stream so both \
+                         runs receive identical input. If this appears to hang, stdin has not \
+                         reached end-of-file; pass `< /dev/null` when the guest needs no input.";
+                    if nonwaiting_write::diagnostics_must_not_wait() {
+                        // Under --max-log-bytes, termination must not depend
+                        // on this write; see `nonwaiting_write`.
+                        nonwaiting_write::write_without_waiting(
+                            libc::STDERR_FILENO,
+                            format!("{BUFFERING_NOTE}\n").as_bytes(),
+                        );
+                    } else {
+                        eprintln!("{BUFFERING_NOTE}");
+                    }
+                    let mut buffered = tempfile::tempfile()?;
+                    io::copy(&mut file, &mut buffered)?;
+                    buffered.seek(SeekFrom::Start(0))?;
+                    buffered
+                };
+
+                // A duplicate would keep the original access mode. Reopen the
+                // reserved descriptor read-only so neither verification run
+                // can modify the caller's stdin or the next run's input.
+                let replay_path = format!("/proc/self/fd/{}", replay.as_raw_fd());
+                StdinSnapshot::Seekable(fs::File::open(replay_path)?)
+            }
+        }
+    };
+    let mut reservation = OUTPUT_STDIN_SNAPSHOT
+        .lock()
+        .map_err(|_| io::Error::other("output stdin snapshot lock is poisoned"))?;
+    if reservation.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "output stdin snapshot is already reserved",
+        ));
+    }
+    *reservation = Some(snapshot);
+    Ok(())
+}
+
+/// Returns a rewound descriptor for the reserved stdin snapshot, if any.
+///
+/// Each call rewinds the snapshot and hands back a fresh descriptor, so
+/// repeated `--verify` runs read identical input from the start. Returns `None`
+/// when no snapshot was reserved or the reserved stdin is a terminal/absent
+/// (nothing to replay). Runs are sequential (each executes in its own forked
+/// container child), so resetting the shared open file description's offset here
+/// is safe.
+fn output_backend_stdin_reservation() -> Result<(bool, Option<fs::File>), Error> {
+    let mut reservation = OUTPUT_STDIN_SNAPSHOT
+        .lock()
+        .map_err(|_| io::Error::other("output stdin snapshot lock is poisoned"))?;
+    match reservation.as_mut() {
+        Some(StdinSnapshot::Seekable(file)) => {
+            file.seek(SeekFrom::Start(0))?;
+            Ok((true, Some(file.try_clone()?)))
+        }
+        Some(StdinSnapshot::None) => Ok((true, None)),
+        None => Ok((false, None)),
+    }
+}
+
+fn output_backend_stdin_file() -> Result<Option<fs::File>, Error> {
+    Ok(output_backend_stdin_reservation()?.1)
+}
+
+/// Returns the stdin to hand a guest run in an output-capturing backend.
+///
+/// When [`reserve_output_stdin_snapshot`] has stored a replayable snapshot the
+/// file is rewound and a fresh descriptor handed to the guest, so each
+/// `--verify` run reads identical input. Otherwise (no snapshot reserved, or a
+/// terminal/absent stdin) the guest gets `/dev/null`, matching the previous
+/// behavior for callers that do not reserve a snapshot.
+pub fn output_backend_stdin() -> Result<Stdio, Error> {
+    match output_backend_stdin_file()? {
+        Some(file) => Ok(Stdio::from(file)),
+        None => Ok(Stdio::null()),
+    }
+}
+
+/// The result of recording a command.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Recording {
+    /// The unique ID of the recording.
+    pub id: Id,
+
+    /// The exit code of the command.
+    pub exit_status: ExitStatus,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CapabilityProbe {
+    Namespaces,
+    Ptrace,
+    Seccomp,
+}
+
+fn run_capability_probe(probe: CapabilityProbe) -> Result<bool, Error> {
+    // SAFETY: The child calls only async-signal-safe syscalls and exits immediately.
+    let pid = unsafe { libc::fork() };
+    if pid == -1 {
+        return Err(std::io::Error::last_os_error()).context("Failed to fork capability probe");
+    }
+    if pid == 0 {
+        let supported = match probe {
+            CapabilityProbe::Namespaces => unsafe {
+                libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWPID) == 0
+            },
+            CapabilityProbe::Ptrace => {
+                // SAFETY: PTRACE_TRACEME ignores the pid and address arguments.
+                unsafe {
+                    libc::ptrace(
+                        libc::PTRACE_TRACEME,
+                        0,
+                        std::ptr::null_mut::<libc::c_void>(),
+                        std::ptr::null_mut::<libc::c_void>(),
+                    ) != -1
+                }
+            }
+            CapabilityProbe::Seccomp => {
+                let mut filter = libc::sock_filter {
+                    code: 0x06, // BPF_RET | BPF_K
+                    jt: 0,
+                    jf: 0,
+                    k: 0x7fff0000, // SECCOMP_RET_ALLOW
+                };
+                let program = libc::sock_fprog {
+                    len: 1,
+                    filter: &mut filter,
+                };
+                // SAFETY: The filter is an allow-all program with a valid one-element lifetime.
+                unsafe {
+                    libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0
+                        && libc::syscall(
+                            libc::SYS_seccomp,
+                            1, // SECCOMP_SET_MODE_FILTER
+                            0,
+                            &program,
+                        ) == 0
+                }
+            }
+        };
+        // SAFETY: Avoid running Rust destructors after fork.
+        unsafe { libc::_exit(i32::from(!supported)) }
+    }
+
+    let mut status = 0;
+    loop {
+        // SAFETY: pid is the child created above and status points to valid storage.
+        let result = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if result == pid {
+            return Ok(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+        }
+        if result == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error).context("Failed to wait for capability probe");
+        }
+    }
+}
+
+/// Whether a run creates Hermit's user and PID namespaces. A `--no-namespace`
+/// run starts the guest as a plain child and never calls `unshare`, so the
+/// namespace probe says nothing about whether it can run
+/// (<https://github.com/rrnewton/hermit/issues/4515>).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NamespaceUse {
+    /// The run unshares its user and PID namespaces (the default).
+    Creates,
+    /// The run creates no namespace (`--no-namespace`).
+    None,
+}
+
+/// Check the host mechanisms needed by a retained exec-stop launcher or a
+/// ptrace run, without assuming which runtime artifact the launcher uses.
+pub fn validate_tracing_environment(namespaces: NamespaceUse) -> Result<(), Error> {
+    check_tracing_environment(namespaces, run_capability_probe)
+}
+
+/// Refuses a ptrace run that `probe` says this environment cannot host: the
+/// namespace probe for a run that creates namespaces, then the ptrace and
+/// seccomp probes for every run, which a `--no-namespace` run needs too.
+fn check_tracing_environment(
+    namespaces: NamespaceUse,
+    mut probe: impl FnMut(CapabilityProbe) -> Result<bool, Error>,
+) -> Result<(), Error> {
+    if namespaces == NamespaceUse::Creates && !probe(CapabilityProbe::Namespaces)? {
+        anyhow::bail!(
+            "Hermit cannot create its required user and PID namespaces: \
+             unshare(CLONE_NEWUSER | CLONE_NEWPID) was denied. Allow unprivileged user namespaces \
+             and the unshare syscall in the host/container policy."
+        );
+    }
+    if !probe(CapabilityProbe::Ptrace)? {
+        anyhow::bail!(
+            "Hermit cannot use ptrace in this environment: a child PTRACE_TRACEME probe was \
+             denied. Allow same-UID parent-child ptrace in the container seccomp and host \
+             Yama/LSM policy; CAP_SYS_PTRACE is normally not required. Use --namespace-only for \
+             a sandbox smoke test without ptrace (it intercepts only kill, through a seccomp \
+             filter)."
+        );
+    }
+    if !probe(CapabilityProbe::Seccomp)? {
+        anyhow::bail!(
+            "Hermit cannot install its tracee seccomp filter: \
+             seccomp(SECCOMP_SET_MODE_FILTER) was denied. Allow seccomp and \
+             prctl(PR_SET_NO_NEW_PRIVS) in the container policy. --namespace-only also \
+             installs a seccomp filter (on kill), so it cannot run here either."
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "dbt")]
+fn is_dynamorio_sdk(path: &Path) -> bool {
+    path.join("include/dr_api.h").is_file()
+        || path.join("DynamoRIOConfig.cmake").is_file()
+        || path.join("cmake/DynamoRIOConfig.cmake").is_file()
+}
+
+#[cfg(feature = "dbt")]
+fn dynamorio_sdk_available() -> bool {
+    if hermit_resources::resource("dynamorio/bin64/drrun")
+        .is_ok_and(|path| path.is_some_and(|path| path.is_file()))
+    {
+        return true;
+    }
+    if reverie_dbt::bundled_drrun_path().is_file() {
+        return true;
+    }
+    const DEFAULT_ROOTS: [&str; 3] = [
+        "/usr/lib/cmake/DynamoRIO",
+        "/usr/local/lib/cmake/DynamoRIO",
+        "/opt/dynamorio",
+    ];
+
+    ["DYNAMORIO_HOME", "DynamoRIO_DIR"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from)
+        .chain(DEFAULT_ROOTS.into_iter().map(PathBuf::from))
+        .any(|path| is_dynamorio_sdk(&path))
+}
+
+#[cfg(feature = "dbt")]
+fn dbt_runtime_unavailable_reason() -> Option<String> {
+    dbt_runtime_unavailable_reason_from(detcore_dbt::runtime_library_path())
+}
+
+#[cfg(feature = "dbt")]
+fn dbt_runtime_unavailable_reason_from(runtime: io::Result<PathBuf>) -> Option<String> {
+    runtime.err().map(|error| {
+        format!(
+            "the Detcore DBT runtime is unavailable: {error}; build the hermit binary and \
+             cdylib in the same target directory"
+        )
+    })
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#688): Review LiteInst runtime discovery.
+/// Checks that `path` is an x86-64 shared object that exports every name in
+/// `required` and registers `initializer_name` in its constructor array, so
+/// that preloading it runs that initializer. `label` names the library in every
+/// error message. Returns the canonical path.
+/// Detcore requires its protected root and sole local RELATIVE registration;
+/// this is minimal discovery, separate from complete artifact qualification.
+fn validate_preload_constructor_library(
+    path: &Path,
+    label: &str,
+    required: &[&str],
+    initializer_name: &str,
+) -> io::Result<PathBuf> {
+    let bytes = fs::read(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("failed to read {label} {}: {error}", path.display()),
+        )
+    })?;
+    let elf = Elf::parse(&bytes).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{label} {} is not an ELF DSO: {error}", path.display()),
+        )
+    })?;
+    if elf.header.e_type != header::ET_DYN || elf.header.e_machine != header::EM_X86_64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{label} {} is not an x86-64 shared object", path.display()),
+        ));
+    }
+
+    for &name in required {
+        if !elf
+            .dynsyms
+            .iter()
+            .any(|symbol| elf.dynstrtab.get_at(symbol.st_name) == Some(name))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{label} {} is missing required export {name}",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    if initializer_name == liteinst_constructor::ROOT {
+        liteinst_constructor::validate(&bytes, &elf).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "{label} {} has invalid Detcore constructor binding: {error}",
+                    path.display()
+                ),
+            )
+        })?;
+        return path.canonicalize();
+    }
+    let (initializer_index, initializer) = elf
+        .dynsyms
+        .iter()
+        .enumerate()
+        .find(|(_, symbol)| elf.dynstrtab.get_at(symbol.st_name) == Some(initializer_name))
+        .ok_or_else(|| {
+            io::Error::other(format!(
+                "checked {label} initializer {initializer_name} disappeared"
+            ))
+        })?;
+    let init_array = elf
+        .section_headers
+        .iter()
+        .find(|section| section.sh_type == section_header::SHT_INIT_ARRAY)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{label} {} has no constructor array", path.display()),
+            )
+        })?;
+    let init_start = init_array.sh_addr;
+    let init_end = init_start.saturating_add(init_array.sh_size);
+    let relocated_initializer = elf
+        .dynrelas
+        .iter()
+        .chain(elf.dynrels.iter())
+        .any(|relocation| {
+            (init_start..init_end).contains(&relocation.r_offset)
+                && relocation.r_sym == initializer_index
+        });
+    let init_bytes = usize::try_from(init_array.sh_offset)
+        .ok()
+        .and_then(|start| {
+            usize::try_from(init_array.sh_size)
+                .ok()
+                .and_then(|size| bytes.get(start..start.checked_add(size)?))
+        })
+        .unwrap_or_default();
+    let direct_initializer = init_bytes
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .any(|entry| u64::from_le_bytes(*entry) == initializer.st_value);
+    if !relocated_initializer && !direct_initializer {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{label} {} does not register {initializer_name} as a preload constructor",
+                path.display()
+            ),
+        ));
+    }
+    path.canonicalize()
+}
+
+/// Environment variable naming the in-guest Detcore preload
+/// (`libdetcore_liteinst.so`) explicitly.
+pub const LITEINST_TOOL_RUNTIME_ENV: &str = "HERMIT_LITEINST_TOOL_RUNTIME";
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-3635): Review in-guest Detcore runtime discovery.
+/// Returns the in-guest Detcore preload: the one [`LITEINST_TOOL_RUNTIME_ENV`]
+/// names; otherwise the packaged `rsrcs/libdetcore_liteinst.so` of the selected
+/// Hermit installation (`hermit-install` stages it, as it stages the DBT and
+/// SaBRe Detcore runtimes, and a standalone installation or published bundle
+/// carries it). A selected installation missing that resource is incomplete
+/// and is refused. When no installation is selected, the development fallback
+/// is the one `cargo build -p detcore-liteinst` built beside the Hermit binary
+/// or in its `deps/` directory.
+///
+/// A runtime built from another tree is refused when it starts: Hermit passes
+/// it [`detcore::config_wire_fingerprint`], which it compares with its own
+/// before decoding anything (<https://github.com/rrnewton/hermit/issues/3986>).
+#[doc(hidden)]
+pub fn liteinst_tool_runtime_library_path() -> io::Result<PathBuf> {
+    if let Some(path) = std::env::var_os(LITEINST_TOOL_RUNTIME_ENV) {
+        let path = PathBuf::from(path);
+        if !path.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{LITEINST_TOOL_RUNTIME_ENV} does not name a regular file"),
+            ));
+        }
+        return validate_liteinst_tool_runtime_library(&path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("{LITEINST_TOOL_RUNTIME_ENV} is invalid: {error}"),
+            )
+        });
+    }
+
+    if let Some(path) = hermit_resources::resource("libdetcore_liteinst.so")? {
+        if !path.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "selected Hermit installation has no finalized in-guest Detcore runtime; \
+                 run `make install-deps` to build and stage the qualified LiteInst runtime",
+            ));
+        }
+        return validate_liteinst_tool_runtime_library(&path);
+    }
+
+    let executable = std::env::current_exe()?;
+    let directory = executable.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "Hermit executable has no parent directory",
+        )
+    })?;
+    if let Some(path) = [
+        directory.join("libdetcore_liteinst.so"),
+        directory.join("deps/libdetcore_liteinst.so"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+    {
+        return validate_liteinst_tool_runtime_library(&path);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!(
+            "libdetcore_liteinst.so was not built beside {} or staged as an installed resource",
+            executable.display()
+        ),
+    ))
+}
+
+fn validate_liteinst_tool_runtime_library(path: &Path) -> io::Result<PathBuf> {
+    validate_preload_constructor_library(
+        path,
+        "in-guest Detcore runtime",
+        &["detcore_liteinst_initialize"],
+        "detcore_liteinst_initialize",
+    )
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-3635): Review the in-guest LiteInst library refusals.
+/// In-guest LiteInst refused a run before starting its guest, because the
+/// runtime cannot honour the request or could not monitor the program.
+///
+/// A type rather than a message, because it crosses the container error
+/// boundary as [`error::FailureKind::PolicyRefusal`] (exit 122).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiteinstInGuestRefusal {
+    backend: Backend,
+    reason: String,
+}
+
+impl LiteinstInGuestRefusal {
+    /// A refusal of a `--backend=liteinst` run.
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self::for_backend(Backend::Liteinst, reason)
+    }
+
+    /// A refusal of a run of `backend`, one of the in-guest LiteInst backends
+    /// ([`Backend::is_in_guest_liteinst`]), so the message names the backend
+    /// the caller selected.
+    pub fn for_backend(backend: Backend, reason: impl Into<String>) -> Self {
+        debug_assert!(backend.is_in_guest_liteinst(), "{backend:?}");
+        Self {
+            backend,
+            reason: reason.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for LiteinstInGuestRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let runtime = match self.backend {
+            Backend::InGuestTrap => "in-guest LiteInst, site patching off",
+            _ => "in-guest LiteInst",
+        };
+        write!(
+            f,
+            "--backend={} ({runtime}) refuses this run: {}",
+            self.backend.as_str(),
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for LiteinstInGuestRefusal {}
+
+/// Refuses, before the guest starts, an in-guest LiteInst run that the runtime
+/// cannot honour or could not monitor.
+///
+/// - A maximum timeslice. Reverie's in-guest Tool host has no preemption timer:
+///   its `set_timer` refuses with `ENOSYS`, and Detcore treats a failed
+///   `set_timer` as fatal (`.expect("Failed to set timer")`), so the guest
+///   would panic at its first scheduling point. The CLI refuses
+///   `--max-timeslice` earlier; this covers library callers.
+/// - A kernel older than Linux 6.5 ([`in_guest_liteinst_kernel_gap`]).
+/// - A guest program that would run code before, or without, the runtime's
+///   constructor ([`in_guest_liteinst_program_gap`]).
+/// - For `in-guest-trap`, a guest environment that sets
+///   `REVERIE_LITEINST_SITE_PATCHING` to anything but `0`
+///   ([`in_guest_trap_site_patching_conflict`]).
+///
+/// This runs where the guest is spawned (inside the container for the CLI),
+/// so it resolves the program in the filesystem the guest sees. It pins the
+/// resolved program on `command` ([`pin_spawn_program`]), so the launch
+/// executes the same path this check inspected. For `in-guest-trap` it then
+/// sets `REVERIE_LITEINST_SITE_PATCHING=0` on `command`
+/// ([`force_in_guest_site_patching`]).
+#[cfg(feature = "liteinst")]
+fn refuse_in_guest_liteinst_run(
+    command: &mut Command,
+    config: &DetConfig,
+    backend: Backend,
+) -> Result<(), Error> {
+    let reason = if let Some(conflict) = in_guest_trap_site_patching_conflict(command, backend) {
+        Some(conflict)
+    } else if config.max_timeslice.is_some() {
+        Some(
+            "it cannot deliver Detcore's preemption timer yet (the in-guest Tool host refuses \
+             set_timer with ENOSYS), so the run would fail at its first timeslice; pass \
+             --max-timeslice=disabled"
+                .to_owned(),
+        )
+    } else if let Some(gap) = in_guest_liteinst_kernel_gap(&running_kernel_release()) {
+        Some(gap)
+    } else {
+        in_guest_liteinst_program_gap(command)?
+    };
+    match reason {
+        Some(reason) => Err(Error::new(LiteinstInGuestRefusal::for_backend(
+            backend, reason,
+        ))),
+        None => {
+            force_in_guest_site_patching(command, backend);
+            Ok(())
+        }
+    }
+}
+
+/// The value of `REVERIE_LITEINST_SITE_PATCHING` (`reverie_liteinst::SITE_PATCHING_ENV`)
+/// that the guest sees under `backend`, when Hermit decides it: `0` for
+/// `in-guest-trap`, which exists to run with no syscall site patched, and
+/// `None` for `liteinst`, which leaves the variable to the guest environment
+/// (unset means patching on).
+pub fn forced_site_patching_value(backend: Backend) -> Option<&'static str> {
+    match backend {
+        Backend::InGuestTrap => Some("0"),
+        _ => None,
+    }
+}
+
+/// Whether LiteInst's SIGTRAP guard router can be installed in the in-guest
+/// Tool images of a default-route run of `backend` configured by `config`:
+/// on an in-guest backend, unless every image runs with syscall site
+/// patching off (`config.in_guest_site_patching_off`, set for
+/// `--backend=in-guest-trap`).
+///
+/// At the pinned Reverie, the shared Tool host's preparation
+/// (`LiteinstPatchHost::prepare_patcher`, reverie-liteinst `src/runtime.rs`)
+/// installs the router only when the site-patching setting its runtime
+/// captured is on: the router takes the breakpoints LiteInst plants while it
+/// publishes a patched site, and with patching off it publishes none
+/// (A5 step 3c slice 0c). Every in-guest-trap image checks that its runtime
+/// captured patching off and refuses to run otherwise
+/// (`detcore::in_guest_site_patching`), so no image of such a run executes
+/// guest code with the router. On `--backend=liteinst` Hermit leaves the setting to the guest's
+/// environment, so an image can run with patching off and no router; the
+/// answer is then `true` all the same, which reserves SIGTRAP where it is
+/// not needed: a refusal Linux would not make, never a missed one. The
+/// loader route (Reverie's private-image installer) keeps the router
+/// whatever its setting, and never calls this (D26).
+pub const fn in_guest_guard_router_installed(config: &DetConfig, backend: Backend) -> bool {
+    backend.is_in_guest_liteinst() && !config.in_guest_site_patching_off
+}
+
+/// The signals the in-guest runtime keeps for itself in a run of `backend`
+/// configured by `config` (`detcore::Config::in_guest_reserved_signals`), bit
+/// `n - 1` for signal `n`, for Hermit's default in-guest route: SIGSYS, its
+/// syscall trap, always; SIGSEGV while it subscribes instructions, when it
+/// installs its instruction-fault handler for SIGSEGV; and SIGTRAP while
+/// LiteInst's guard router can be installed, which is site patching on
+/// ([`in_guest_guard_router_installed`]): never on `in-guest-trap`, whose
+/// `config.in_guest_site_patching_off` the caller has set first.
+/// The subscription is Detcore's own decision from the same configuration
+/// (`Tool::subscriptions`), which each in-guest Tool image reads to choose
+/// its instruction subscriptions (reverie-inguest `tool_install.rs:191-195`).
+/// Empty (0) for every other backend. The in-guest loader route never calls
+/// this, so its set stays empty: today's behaviour there (D13(a)).
+pub fn in_guest_reserved_signals(config: &DetConfig, backend: Backend) -> u64 {
+    if !backend.is_in_guest_liteinst() {
+        return 0;
+    }
+    let bit = |signal: libc::c_int| 1_u64 << (signal - 1);
+    let subscription = <Detcore as reverie::Tool>::subscriptions(config);
+    let mut reserved = bit(libc::SIGSYS);
+    if subscription.has_rdtsc() || subscription.has_cpuid() {
+        reserved |= bit(libc::SIGSEGV);
+    }
+    if in_guest_guard_router_installed(config, backend) {
+        reserved |= bit(libc::SIGTRAP);
+    }
+    reserved
+}
+
+/// Whether Detcore refuses host-timed signal producers in a run of `backend`
+/// (`detcore::Config::in_guest_refuses_host_timed_producers`, A5 step 3c
+/// slice 0b): on Hermit's default in-guest route, for both in-guest backends,
+/// and never on another backend. The in-guest loader route never calls this,
+/// so the setting stays off there: today's behaviour (D13(a), D26).
+pub const fn in_guest_refuses_host_timed_producers(backend: Backend) -> bool {
+    backend.is_in_guest_liteinst()
+}
+
+/// Whether this process, which runs the scheduler of the in-guest run it
+/// launches, owns the guests' PID namespace (A5 step 3c.1, D51 and D52): it
+/// is PID 1 of its PID namespace, and every guest it launches descends from
+/// it, so is a member of that namespace. When a PID namespace's init exits,
+/// the kernel sends SIGKILL to every task with a PID in the namespace and
+/// waits for them (`zap_pid_ns_processes`, kernel/pid_namespace.c v6.12
+/// lines 170-222). That covers a guest in a nested PID namespace too: a task
+/// has a PID in its own namespace and in every ancestor (`alloc_pid`,
+/// kernel/pid.c v6.12 lines 194-253), and `setns` enters only the caller's
+/// namespace or a descendant of it (`pidns_install`, kernel/pid_namespace.c
+/// lines 390-397), so no guest leaves the namespace. So a refusal that exits
+/// the scheduler (`GlobalRequest::StoppingRefusal`) then leaves no guest
+/// process running; the in-guest delivery gate requires that
+/// ([`in_guest_signal_delivery_gate`]).
+///
+/// A fact read from the process, never a setting a caller supplies, so the
+/// run-wide-exit claim cannot be forged: `hermit run`'s container launch,
+/// which runs the scheduler as the init of the namespace it creates, owns it,
+/// and `hermit run --no-namespace` does not (its scheduler is a plain
+/// child). A library caller owns it exactly when it really is that init.
+pub fn scheduler_owns_guest_pid_namespace() -> bool {
+    // SAFETY: getpid has no preconditions.
+    unsafe { libc::getpid() == 1 }
+}
+
+/// Whether the pinned in-guest runtime delivers the guest's signals itself
+/// under the gate (its runtime mask, final-read loop and predicted deaths,
+/// A5 step 3c.1e). Not yet: until the flip (3c.1f), the gate stays off on
+/// every route, whatever [`in_guest_signal_delivery_gate`] answers.
+#[cfg(feature = "liteinst")]
+const IN_GUEST_RUNTIME_DELIVERS_SIGNALS: bool = false;
+
+/// The in-guest delivery gate (`detcore::Config::in_guest_signal_delivery`,
+/// D35 of the A5 step 3c design) for a run of `backend` on Hermit's default
+/// in-guest route, from its final prepared configuration and the launcher's
+/// PID-namespace ownership: an in-guest backend, site patching off,
+/// sequentialized threads, no configuration in which the two-phase delivery
+/// protocol cannot be kept (`detcore::two_phase_refusal`: a timeslice, a
+/// recorded or replayed schedule, an in-effect pipe hand-off, and the rows no
+/// in-guest backend reaches), and a scheduler that owns the guest's PID
+/// namespace (`owns_guest_pid_namespace`, which the launch sites compute
+/// with [`scheduler_owns_guest_pid_namespace`]). The in-guest loader route
+/// never asks (D26, D43): its configuration keeps the gate off.
+pub fn in_guest_signal_delivery_gate(
+    config: &DetConfig,
+    backend: Backend,
+    owns_guest_pid_namespace: bool,
+) -> bool {
+    backend.is_in_guest_liteinst()
+        && config.in_guest_site_patching_off
+        && config.sequentialize_threads
+        && detcore::two_phase_refusal(config).is_none()
+        && owns_guest_pid_namespace
+}
+
+/// `RLIMIT_CPU`'s value as Hermit's log and refusal print it: `unlimited`, or
+/// a number of seconds.
+#[cfg(feature = "liteinst")]
+fn rlimit_seconds(value: libc::rlim_t) -> String {
+    if value == libc::RLIM_INFINITY {
+        "unlimited".to_owned()
+    } else {
+        format!("{value}s")
+    }
+}
+
+/// The INFO line for the physical `RLIMIT_CPU` the guest's own check found,
+/// `old`, just before its program started, and set to unlimited, the value
+/// Detcore reports (`syscalls/sysinfo.rs`): D25 of A5 step 3c.
+#[cfg(feature = "liteinst")]
+fn rlimit_cpu_report_line(old: libc::rlimit) -> String {
+    if old.rlim_cur == libc::RLIM_INFINITY && old.rlim_max == libc::RLIM_INFINITY {
+        format!(
+            "HERMIT_IN_GUEST_RLIMIT_CPU: the guest's physical RLIMIT_CPU was soft {} hard {}, the \
+             value Detcore reports; the guest starts with it unchanged (A5 step 3c, D25)",
+            rlimit_seconds(old.rlim_cur),
+            rlimit_seconds(old.rlim_max),
+        )
+    } else {
+        format!(
+            "HERMIT_IN_GUEST_RLIMIT_CPU: the guest's physical RLIMIT_CPU was soft {} hard {}; \
+             Hermit sets it to soft unlimited hard unlimited as the guest starts, the value \
+             Detcore reports, so the kernel never sends SIGXCPU at a moment host CPU time decides \
+             (A5 step 3c, D25)",
+            rlimit_seconds(old.rlim_cur),
+            rlimit_seconds(old.rlim_max),
+        )
+    }
+}
+
+/// Why the guest cannot start with the finite physical `RLIMIT_CPU` its own
+/// check found, `old`, which it could not raise to unlimited (`errno`; raising
+/// a hard limit needs `CAP_SYS_RESOURCE` in the initial user namespace,
+/// `do_prlimit`, which Hermit's container never has). A finite limit would
+/// make the kernel send SIGXCPU at the soft limit and SIGKILL at the hard
+/// one, at moments host CPU time decides.
+#[cfg(feature = "liteinst")]
+fn rlimit_cpu_refusal(old: libc::rlimit, errno: nix::errno::Errno) -> String {
+    format!(
+        "the guest would inherit a finite physical RLIMIT_CPU (soft {}, hard {}), and Hermit \
+         cannot raise it ({errno}), so the kernel would send SIGXCPU or SIGKILL at a moment host \
+         CPU time decides; run Hermit with an unlimited hard CPU-time limit \
+         (A5 step 3c, D25, https://github.com/rrnewton/hermit/issues/4485)",
+        rlimit_seconds(old.rlim_cur),
+        rlimit_seconds(old.rlim_max),
+    )
+}
+
+/// Why descriptor `fd`, which the guest would inherit, cannot be inherited by
+/// an in-guest guest: it is already a complete host-timed signal producer
+/// (`state`, D25 of A5 step 3c), holds a lease (`lease`), or has an owner
+/// without `O_ASYNC` on a file that is not a socket. A directory
+/// notification (`F_NOTIFY`) sets such an owner and signals it for its
+/// events, and cannot be read back (there is no `F_GETNOTIFY`, and fdinfo
+/// does not show dnotify), so any owner fails closed. `None` when it has
+/// none of these.
+#[cfg(feature = "liteinst")]
+fn inherited_producer_refusal(
+    fd: std::os::fd::RawFd,
+    state: detcore::host_timed_producers::ProducerState,
+    lease: bool,
+) -> Option<String> {
+    let what = if lease {
+        "it holds a lease, whose owner Linux sends SIGIO when another process opens the file"
+    } else if state.is_complete() && state.o_async {
+        "it has O_ASYNC and an owner, which Linux sends SIGIO when it becomes ready"
+    } else if state.is_complete() {
+        "it is a socket with an owner, which Linux sends SIGURG when out-of-band data arrives"
+    } else if state.owner {
+        "it has an owner, which a directory notification (F_NOTIFY) on it would make Linux send \
+         SIGIO for the directory's changes, and Hermit cannot tell whether one is set"
+    } else {
+        return None;
+    };
+    Some(format!(
+        "the guest would inherit descriptor {fd}, which is already a signal producer: {what}, at \
+         a moment host timing decides; close it, or clear its owner and O_ASYNC, before running \
+         Hermit (A5 step 3c, D25, https://github.com/rrnewton/hermit/issues/4485)"
+    ))
+}
+
+/// Why descriptor `fd`, which the guest would inherit and whose state cannot
+/// be read (`errno`), is not inherited unchecked.
+#[cfg(feature = "liteinst")]
+fn unreadable_descriptor_refusal(fd: std::os::fd::RawFd, errno: nix::errno::Errno) -> String {
+    format!(
+        "the guest would inherit descriptor {fd}, whose signal owner and flags cannot be read \
+         ({errno}), so Hermit cannot tell whether it is a signal producer \
+         (A5 step 3c, D25, https://github.com/rrnewton/hermit/issues/4485)"
+    )
+}
+
+/// Why the guest's descriptor table could not be listed (`errno`), so is not
+/// inherited unchecked.
+#[cfg(feature = "liteinst")]
+fn unlisted_descriptors_refusal(errno: nix::errno::Errno) -> String {
+    format!(
+        "the guest's descriptor table could not be listed from /proc/self/fd ({errno}), so \
+         Hermit cannot tell whether a descriptor it would inherit is a signal producer \
+         (A5 step 3c, D25, https://github.com/rrnewton/hermit/issues/4485)"
+    )
+}
+
+/// The guest's own check, in its process just before its program starts
+/// (D25 of A5 step 3c): a `pre_exec` callback Hermit installs after every
+/// other one that can change what it checks, so after
+/// the spawner has put the command's configured standard streams in place
+/// (whatever descriptor each came from, close-on-exec or not) and after every
+/// callback the caller installed (one of which could clear close-on-exec on a
+/// descriptor of its own, or change a limit). Hermit's own process cannot see
+/// that state. The callback
+/// - lists the whole descriptor table from `/proc/self/fd`, and fails the
+///   launch, by name, when it cannot ([`audit_inherited_descriptors`]);
+/// - reads each descriptor without close-on-exec, and fails the launch for a
+///   complete producer, a lease or any owner, or one it cannot read
+///   ([`check_inherited_descriptor`]);
+/// - reads `RLIMIT_CPU` and sets it to unlimited, and fails the launch when it
+///   cannot.
+///
+/// Every outcome is written to a pipe this process reads ([`LaunchReport`]):
+/// a failure's reason, from which the caller makes the named refusal, or the
+/// limit the check found, which is logged at INFO at the end of the run, on
+/// every exit path (`detcore::host_timed_producers::defer_run_end_log`).
+#[cfg(feature = "liteinst")]
+struct LaunchAudit {
+    pipe: std::sync::Arc<LaunchPipe>,
+}
+
+/// The pipe the guest's check reports through, and its report once read.
+#[cfg(feature = "liteinst")]
+struct LaunchPipe {
+    read: std::os::fd::OwnedFd,
+    _write: std::os::fd::OwnedFd,
+    report: std::sync::OnceLock<Option<LaunchReport>>,
+}
+
+#[cfg(feature = "liteinst")]
+impl LaunchPipe {
+    /// The next report in the pipe, if the check wrote one.
+    fn read_report(&self) -> Option<LaunchReport> {
+        let mut bytes = [0u8; LaunchReport::SIZE];
+        let read = nix::unistd::read(&self.read, &mut bytes).ok()?;
+        (read == bytes.len()).then(|| LaunchReport::decode(bytes))
+    }
+
+    /// The launch's report, read once.
+    fn report(&self) -> Option<LaunchReport> {
+        *self.report.get_or_init(|| self.read_report())
+    }
+
+    /// Logs at INFO the `RLIMIT_CPU` a check that passed found and set to
+    /// unlimited (D25); nothing for a check that failed or never ran.
+    fn log_rlimit(&self) {
+        match self.report() {
+            Some(report) if report.kind == audit_bits::PASSED => {
+                tracing::info!("{}", rlimit_cpu_report_line(report.limit()));
+            }
+            // A refusal is reported where the launch fails, not here.
+            Some(_) => {}
+            None => tracing::warn!(
+                "HERMIT_IN_GUEST_RLIMIT_CPU: the guest's launch check reported nothing \
+                 (A5 step 3c, D25)"
+            ),
+        }
+    }
+}
+
+/// The report's kinds and state bits.
+#[cfg(feature = "liteinst")]
+mod audit_bits {
+    /// The check passed; the report carries the limit it found.
+    pub const PASSED: u8 = 0;
+    /// A descriptor is a complete producer; the bits say what it holds.
+    pub const PRODUCER: u8 = 1;
+    /// A descriptor's state cannot be read; the errno says why.
+    pub const UNREADABLE: u8 = 2;
+    /// The descriptor table cannot be listed; the errno says why.
+    pub const UNLISTED: u8 = 3;
+    /// `RLIMIT_CPU` cannot be raised; the report carries the limit and errno.
+    pub const RLIMIT_CPU: u8 = 4;
+
+    pub const O_ASYNC: u8 = 1;
+    pub const OWNER: u8 = 2;
+    pub const SOCKET: u8 = 4;
+    pub const LEASE: u8 = 8;
+}
+
+/// What the guest's check reports ([`LaunchAudit`]): its kind
+/// ([`audit_bits`]), state bits, errno, descriptor, and the `RLIMIT_CPU` it
+/// found, in 24 native-endian bytes.
+#[cfg(feature = "liteinst")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LaunchReport {
+    kind: u8,
+    bits: u8,
+    errno: u8,
+    fd: libc::c_int,
+    rlimit: (libc::rlim_t, libc::rlim_t),
+}
+
+#[cfg(feature = "liteinst")]
+impl LaunchReport {
+    const SIZE: usize = 24;
+
+    fn encode(self) -> [u8; Self::SIZE] {
+        let mut bytes = [0u8; Self::SIZE];
+        bytes[0] = self.kind;
+        bytes[1] = self.bits;
+        bytes[2] = self.errno;
+        bytes[4..8].copy_from_slice(&self.fd.to_ne_bytes());
+        bytes[8..16].copy_from_slice(&self.rlimit.0.to_ne_bytes());
+        bytes[16..24].copy_from_slice(&self.rlimit.1.to_ne_bytes());
+        bytes
+    }
+
+    fn decode(bytes: [u8; Self::SIZE]) -> Self {
+        let word = |range: std::ops::Range<usize>| {
+            libc::rlim_t::from_ne_bytes(bytes[range].try_into().expect("eight bytes"))
+        };
+        Self {
+            kind: bytes[0],
+            bits: bytes[1],
+            errno: bytes[2],
+            fd: libc::c_int::from_ne_bytes(bytes[4..8].try_into().expect("four bytes")),
+            rlimit: (word(8..16), word(16..24)),
+        }
+    }
+
+    fn errno(self) -> nix::errno::Errno {
+        nix::errno::Errno::from_raw(self.errno.into())
+    }
+
+    fn limit(self) -> libc::rlimit {
+        libc::rlimit {
+            rlim_cur: self.rlimit.0,
+            rlim_max: self.rlimit.1,
+        }
+    }
+
+    /// The refusal this report names, `None` for a check that passed.
+    fn refusal(self) -> Option<String> {
+        match self.kind {
+            audit_bits::PRODUCER => {
+                let state = detcore::host_timed_producers::ProducerState {
+                    o_async: self.bits & audit_bits::O_ASYNC != 0,
+                    owner: self.bits & audit_bits::OWNER != 0,
+                    socket: self.bits & audit_bits::SOCKET != 0,
+                };
+                inherited_producer_refusal(self.fd, state, self.bits & audit_bits::LEASE != 0)
+            }
+            audit_bits::UNREADABLE => Some(unreadable_descriptor_refusal(self.fd, self.errno())),
+            audit_bits::UNLISTED => Some(unlisted_descriptors_refusal(self.errno())),
+            audit_bits::RLIMIT_CPU => Some(rlimit_cpu_refusal(self.limit(), self.errno())),
+            _ => None,
+        }
+    }
+}
+
+/// The report for descriptor `fd` of the calling process if the guest must
+/// not inherit it, `None` if it may: one with close-on-exec, which it does
+/// not inherit, or `report`, the audit's own pipe, are skipped.
+/// Async-signal-safe: fcntl and fstat only, no allocation.
+#[cfg(feature = "liteinst")]
+fn check_inherited_descriptor(fd: libc::c_int, report: libc::c_int) -> Option<LaunchReport> {
+    // SAFETY: F_GETFD reads a descriptor flag and writes no memory.
+    let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if fd == report || fd_flags < 0 || fd_flags & libc::FD_CLOEXEC != 0 {
+        return None;
+    }
+    let (kind, bits, errno) = match detcore::host_timed_producers::host_descriptor_state(fd) {
+        Ok((state, lease)) if lease || state.owner || state.is_complete() => (
+            audit_bits::PRODUCER,
+            (if state.o_async {
+                audit_bits::O_ASYNC
+            } else {
+                0
+            }) | (if state.owner { audit_bits::OWNER } else { 0 })
+                | (if state.socket { audit_bits::SOCKET } else { 0 })
+                | (if lease { audit_bits::LEASE } else { 0 }),
+            0,
+        ),
+        Ok(_) | Err(nix::errno::Errno::EBADF) => return None,
+        Err(errno) => (audit_bits::UNREADABLE, 0, errno as i32 as u8),
+    };
+    Some(LaunchReport {
+        kind,
+        bits,
+        errno,
+        fd,
+        rlimit: (0, 0),
+    })
+}
+
+/// The first report [`check_inherited_descriptor`] makes for the calling
+/// process's descriptors, every one `/proc/self/fd` lists, read with
+/// `getdents64` into a stack buffer. Where that directory cannot be listed
+/// (its open or a read fails, for example with EMFILE after a caller lowered
+/// `RLIMIT_NOFILE` below its open descriptors), the report says so
+/// (`UNLISTED`, with the errno): no number-range scan stands in for it, since
+/// no bound below the largest open descriptor is sure. Async-signal-safe:
+/// open, getdents64, close, fcntl and fstat only, no allocation.
+#[cfg(feature = "liteinst")]
+fn audit_inherited_descriptors(report: libc::c_int) -> Option<LaunchReport> {
+    let unlisted = || LaunchReport {
+        kind: audit_bits::UNLISTED,
+        bits: 0,
+        errno: nix::errno::Errno::last_raw() as u8,
+        fd: -1,
+        rlimit: (0, 0),
+    };
+    // SAFETY: plain system calls on this process's descriptor table, writing
+    // only into the local buffer.
+    unsafe {
+        let directory = libc::open(
+            c"/proc/self/fd".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        );
+        if directory < 0 {
+            return Some(unlisted());
+        }
+        let mut buffer = [0u8; 4096];
+        loop {
+            let read = libc::syscall(
+                libc::SYS_getdents64,
+                directory,
+                buffer.as_mut_ptr(),
+                buffer.len(),
+            );
+            if read < 0 {
+                let failed = unlisted();
+                libc::close(directory);
+                return Some(failed);
+            }
+            if read == 0 {
+                break;
+            }
+            let mut offset = 0;
+            while offset + 19 < read as usize {
+                // struct linux_dirent64: d_ino (8), d_off (8), d_reclen (2),
+                // d_type (1), d_name.
+                let length =
+                    u16::from_ne_bytes([buffer[offset + 16], buffer[offset + 17]]) as usize;
+                if length == 0 {
+                    break;
+                }
+                let mut fd: libc::c_int = 0;
+                let mut digits = 0;
+                for &byte in &buffer[offset + 19..offset + length] {
+                    if !byte.is_ascii_digit() {
+                        break;
+                    }
+                    fd = fd
+                        .saturating_mul(10)
+                        .saturating_add((byte - b'0') as libc::c_int);
+                    digits += 1;
+                }
+                if digits > 0
+                    && fd != directory
+                    && let Some(found) = check_inherited_descriptor(fd, report)
+                {
+                    libc::close(directory);
+                    return Some(found);
+                }
+                offset += length;
+            }
+        }
+        libc::close(directory);
+        None
+    }
+}
+
+/// The guest's whole check ([`LaunchAudit`]), in its process: the descriptor
+/// table, then `RLIMIT_CPU`, which it sets to unlimited. Every outcome is a
+/// report; a failing one fails the launch. Async-signal-safe.
+#[cfg(feature = "liteinst")]
+fn launch_check(report: libc::c_int) -> LaunchReport {
+    if let Some(failed) = audit_inherited_descriptors(report) {
+        return failed;
+    }
+    // SAFETY: getrlimit and setrlimit read and write only the local limits.
+    unsafe {
+        let mut old: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_CPU, &mut old) != 0 {
+            return LaunchReport {
+                kind: audit_bits::RLIMIT_CPU,
+                bits: 0,
+                errno: nix::errno::Errno::last_raw() as u8,
+                fd: -1,
+                rlimit: (0, 0),
+            };
+        }
+        let mut found = LaunchReport {
+            kind: audit_bits::PASSED,
+            bits: 0,
+            errno: 0,
+            fd: -1,
+            rlimit: (old.rlim_cur, old.rlim_max),
+        };
+        if old.rlim_cur != libc::RLIM_INFINITY || old.rlim_max != libc::RLIM_INFINITY {
+            let unlimited = libc::rlimit {
+                rlim_cur: libc::RLIM_INFINITY,
+                rlim_max: libc::RLIM_INFINITY,
+            };
+            if libc::setrlimit(libc::RLIMIT_CPU, &unlimited) != 0 {
+                found.kind = audit_bits::RLIMIT_CPU;
+                found.errno = nix::errno::Errno::last_raw() as u8;
+            }
+        }
+        found
+    }
+}
+
+#[cfg(feature = "liteinst")]
+impl LaunchAudit {
+    /// Installs the check on `command`, after every `pre_exec` callback
+    /// already installed on it, so a library caller's own run first. It is
+    /// the last callback that can change what it checks: Reverie's in-guest
+    /// launcher then adds two of its own (reverie-inguest
+    /// `src/launcher/mod.rs` at a214eb85): `personality(ADDR_NO_RANDOMIZE)`
+    /// (`:619`, called at `:1048` and `:1092`), and clearing close-on-exec on
+    /// its own sealed bootstrap memfd (`:1061-1068`, `bootstrap.rs`). Neither
+    /// touches `RLIMIT_CPU` or creates a signal producer.
+    /// Also keeps the INFO line of the limit it finds to log at the end of
+    /// the run, on every exit path (`detcore::host_timed_producers`).
+    fn install(command: &mut Command) -> Result<Self, Error> {
+        use std::os::fd::AsRawFd;
+        let (read, write) =
+            nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC | nix::fcntl::OFlag::O_NONBLOCK)?;
+        let report = write.as_raw_fd();
+        // SAFETY: the callback is async-signal-safe (see `launch_check`) and
+        // allocates nothing.
+        unsafe {
+            command.pre_exec(move || {
+                let found = launch_check(report);
+                let bytes = found.encode();
+                libc::write(report, bytes.as_ptr().cast(), bytes.len());
+                if found.kind == audit_bits::PASSED {
+                    Ok(())
+                } else {
+                    Err(reverie::Errno::EPERM)
+                }
+            });
+        }
+        let pipe = std::sync::Arc::new(LaunchPipe {
+            read,
+            _write: write,
+            report: std::sync::OnceLock::new(),
+        });
+        let logged = pipe.clone();
+        detcore::host_timed_producers::defer_run_end_log(move || logged.log_rlimit());
+        Ok(Self { pipe })
+    }
+
+    /// `error`, the launch's, or the named refusal the guest's check reported
+    /// for `backend`, which is why the launch failed. A check that passed
+    /// before the backend failed has its limit logged first, as on every
+    /// other exit path.
+    fn launch_error(&self, backend: Backend, error: reverie::Error) -> Error {
+        match self.pipe.report().and_then(LaunchReport::refusal) {
+            Some(reason) => Error::new(LiteinstInGuestRefusal::for_backend(backend, reason)),
+            None => {
+                detcore::host_timed_producers::emit_run_end_log();
+                Error::from(error)
+            }
+        }
+    }
+}
+
+/// Before an in-guest launch on the default route, installs the guest's own
+/// check of what it inherits (D25 of A5 step 3c, design section 16.32,
+/// [`LaunchAudit`]): it refuses the launch by name for an inherited
+/// descriptor that is already a host-timed signal producer, a descriptor
+/// table it cannot list, or a finite `RLIMIT_CPU` it cannot raise, and
+/// otherwise sets the guest's physical `RLIMIT_CPU` to unlimited as the guest
+/// starts. The caller turns a failed launch's report into the refusal; a
+/// passed one's limit is logged at INFO at the end of the run, on every exit
+/// path. `None` for a backend
+/// that does not refuse host-timed producers.
+#[cfg(feature = "liteinst")]
+fn neutralize_inherited_signal_producers(
+    command: &mut Command,
+    backend: Backend,
+) -> Result<Option<LaunchAudit>, Error> {
+    if !in_guest_refuses_host_timed_producers(backend) {
+        return Ok(None);
+    }
+    Ok(Some(LaunchAudit::install(command)?))
+}
+
+/// Why an `in-guest-trap` run cannot start with the guest environment of
+/// `command`: the environment (explicit or inherited) sets
+/// `REVERIE_LITEINST_SITE_PATCHING` to a value other than the one Hermit
+/// forces. Hermit refuses such a run rather than overriding the value
+/// silently, because the caller asked for two contradictory things: site
+/// patching (or a value the runtime would reject) and the backend that exists
+/// to run without it. A value equal to the forced one is accepted. `None`
+/// for every other backend.
+#[cfg(feature = "liteinst")]
+fn in_guest_trap_site_patching_conflict(command: &Command, backend: Backend) -> Option<String> {
+    let forced = forced_site_patching_value(backend)?;
+    let name = reverie_liteinst::SITE_PATCHING_ENV;
+    let value = command.get_env(name)?;
+    (*value != *std::ffi::OsStr::new(forced)).then(|| {
+        format!(
+            "the guest environment sets {name}={}, but --backend={} runs with syscall site \
+             patching off and sets {name}={forced} itself; drop the variable, or select \
+             --backend=liteinst to patch syscall sites",
+            value.to_string_lossy(),
+            backend.as_str()
+        )
+    })
+}
+
+/// Sets the guest's `REVERIE_LITEINST_SITE_PATCHING` to the value Hermit
+/// forces for `backend` ([`forced_site_patching_value`]), leaving the
+/// environment unchanged for a backend that forces none. The guest's
+/// descendants inherit it unless the guest changes its own environment; a
+/// descendant that turns patching back on shows in the run's dispatch record
+/// as patched sites.
+#[cfg(feature = "liteinst")]
+fn force_in_guest_site_patching(command: &mut Command, backend: Backend) {
+    if let Some(value) = forced_site_patching_value(backend) {
+        command.env(reverie_liteinst::SITE_PATCHING_ENV, value);
+    }
+}
+
+/// Whether every in-guest Tool image of a `backend` run checks that its runtime
+/// captured site patching off and statistics on
+/// (`detcore::Config::in_guest_site_patching_off`): true for `in-guest-trap`.
+#[cfg(feature = "liteinst")]
+fn in_guest_site_patching_off(backend: Backend) -> bool {
+    forced_site_patching_value(backend) == Some("0")
+}
+
+/// Whether an in-guest run of `backend` collects LiteInst's statistics: when
+/// something reads them ([`backend_stats::request`]), and on every
+/// `in-guest-trap` run, whose result is checked against them
+/// ([`in_guest_trap_patching_evidence`]).
+#[cfg(feature = "liteinst")]
+fn in_guest_stats_request(
+    backend: Backend,
+    summary_json: &Option<PathBuf>,
+) -> reverie::BackendStatsRequest {
+    if backend == Backend::InGuestTrap {
+        reverie::BackendStatsRequest::ENABLED
+    } else {
+        backend_stats::request(summary_json)
+    }
+}
+
+/// Reports a refusal the fail-closed policy decided inside the guest as
+/// Hermit's own refusal. The in-guest Detcore that refuses tells the
+/// coordinator why (`GlobalState::policy_refusal`) and exits with
+/// `HERMIT_POLICY_REFUSAL_EXIT`, which ends only the guest process. Without
+/// this the run ended with that as the guest's exit status and no reason, or
+/// with whatever postcondition the early exit then tripped (an unregistered
+/// exit, or in-guest-trap's missing statistics). Checked before those.
+#[cfg(feature = "liteinst")]
+fn refuse_in_guest_policy(backend: Backend, refusal: Option<String>) -> Result<(), Error> {
+    match refusal {
+        Some(reason) => Err(Error::new(LiteinstInGuestRefusal::for_backend(
+            backend,
+            format!("{reason}; --backend=ptrace runs this program"),
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Why a finished `in-guest-trap` run did not show that it ran with syscall
+/// site patching off, from its dispatch record and the number of guest
+/// processes that reported LiteInst statistics: a site the runtime patched or
+/// considered patching (with patching off it considers none), no record, or no
+/// process report at all, in which case the record's zeros are not
+/// measurements (a run whose guests collected no statistics still yields an
+/// empty record). `None` for every other backend.
+///
+/// This is the coordinator's postcondition. Each Tool image also refuses to
+/// run its program when the runtime started it with patching on
+/// (`detcore::in_guest_site_patching`), which holds for every image whatever
+/// it reports; this one sees only the images that report, because an image
+/// reports its statistics when it exits (`exit` or `exit_group`), so an image
+/// that `execve`s, or is killed by a signal, sends none, and the coordinator
+/// cannot tell that from a report that was suppressed. It refuses a run in
+/// which no process reported; it does not detect a run in which some did and
+/// others did not. Each image's own check covers that: an image whose runtime
+/// is not collecting statistics refuses to run its program.
+#[cfg(feature = "liteinst")]
+fn in_guest_trap_patching_evidence(
+    backend: Backend,
+    dispatch: Option<&reverie::DispatchStats>,
+    process_reports: u64,
+) -> Option<String> {
+    if backend != Backend::InGuestTrap {
+        return None;
+    }
+    let Some(record) = dispatch else {
+        return Some(
+            "the run produced no LiteInst dispatch record, so it cannot show that no syscall \
+             site was patched"
+                .to_owned(),
+        );
+    };
+    if process_reports == 0 {
+        return Some(
+            "no guest process reported LiteInst statistics, so the run's zero patched sites \
+             are not a measurement and it cannot show that no syscall site was patched"
+                .to_owned(),
+        );
+    }
+    let shown =
+        |count: Option<u64>| count.map_or_else(|| "unmeasured".to_owned(), |n| n.to_string());
+    (record.sites.patched != Some(0) || record.sites.candidates != Some(0)).then(|| {
+        format!(
+            "its guests' LiteInst statistics report {} patched and {} candidate syscall sites, \
+             so it did not run with syscall site patching off and its result is not an \
+             in-guest-trap result",
+            shown(record.sites.patched),
+            shown(record.sites.candidates)
+        )
+    })
+}
+
+/// Refuses a finished `in-guest-trap` run whose dispatch record shows site
+/// patching ([`in_guest_trap_patching_evidence`]): records a determinism loss,
+/// so verification refuses to compare it, and returns the typed in-guest
+/// refusal (exit 122).
+#[cfg(feature = "liteinst")]
+fn refuse_in_guest_trap_patching(backend: Backend, evidence: Option<String>) -> Result<(), Error> {
+    match evidence {
+        Some(reason) => {
+            detcore::detlog::record_determinism_loss(&reason);
+            Err(Error::new(LiteinstInGuestRefusal::for_backend(
+                backend, reason,
+            )))
+        }
+        None => Ok(()),
+    }
+}
+
+/// Use the existing actual subscriber-derived forwarding policy for the
+/// shared native path. Call inside the same verification tracing scope.
+#[cfg(any(
+    feature = "native-exec",
+    all(feature = "exec-stop-launcher", feature = "liteinst")
+))]
+#[doc(hidden)]
+pub fn in_guest_detlog_forward_policy_for_native() -> detcore::detlog::ForwardPolicy {
+    in_guest_detlog_forward_policy()
+}
+
+/// Report the shared native trap runtime through the existing statistics
+/// comparator and require a real guest report with site patching disabled.
+/// This never converts a patching-off execution into LiteInst evidence.
+#[cfg(feature = "liteinst")]
+#[doc(hidden)]
+pub fn native_trap_dispatch_stats(
+    source: &reverie_liteinst::LiteinstBackendStatsSource,
+) -> Result<Option<reverie::DispatchStats>, Error> {
+    let backend = Backend::InGuestTrap;
+    let record = backend_stats::report(backend, reverie::BackendStatsRequest::ENABLED, source);
+    let evidence = in_guest_trap_patching_evidence(
+        backend,
+        record.as_ref(),
+        source.snapshot().process_reports(),
+    );
+    refuse_in_guest_trap_patching(backend, evidence)?;
+    Ok(record)
+}
+
+/// The oldest kernel in-guest LiteInst runs on, as (major, minor). Linux 6.5
+/// added `SO_PEERPIDFD`: the coordinator admits each guest process through the
+/// pidfd of the socket's peer and watches that pidfd for the process's exit
+/// (`in_guest_exits`). On an older kernel every admission would fail.
+#[cfg(feature = "liteinst")]
+const IN_GUEST_LITEINST_KERNEL_FLOOR: (u32, u32) = (6, 5);
+
+/// The running kernel's release string (`uname -r`), or empty if unreadable.
+#[cfg(feature = "liteinst")]
+fn running_kernel_release() -> String {
+    let mut name: libc::utsname = unsafe { std::mem::zeroed() };
+    // SAFETY: uname fills the struct it is given.
+    if unsafe { libc::uname(&mut name) } != 0 {
+        return String::new();
+    }
+    // SAFETY: uname NUL-terminates each field.
+    unsafe { std::ffi::CStr::from_ptr(name.release.as_ptr()) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Why kernel `release` cannot run in-guest LiteInst, or `None` when it is at
+/// least [`IN_GUEST_LITEINST_KERNEL_FLOOR`]. A release whose version cannot be
+/// read is refused.
+#[cfg(feature = "liteinst")]
+fn in_guest_liteinst_kernel_gap(release: &str) -> Option<String> {
+    let mut numbers = release
+        .split(|c: char| !c.is_ascii_digit())
+        .map(|part| part.parse::<u32>().ok());
+    let (floor_major, floor_minor) = IN_GUEST_LITEINST_KERNEL_FLOOR;
+    match (numbers.next().flatten(), numbers.next().flatten()) {
+        (Some(major), Some(minor)) if (major, minor) >= IN_GUEST_LITEINST_KERNEL_FLOOR => None,
+        (Some(_), Some(_)) => Some(format!(
+            "it needs Linux {floor_major}.{floor_minor} or later (SO_PEERPIDFD, which it uses to \
+             admit each guest process and observe its exit); this kernel is {release}"
+        )),
+        _ => Some(format!(
+            "it needs Linux {floor_major}.{floor_minor} or later (SO_PEERPIDFD), and the kernel \
+             release {release:?} does not say which version this is"
+        )),
+    }
+}
+
+/// How many `#!` interpreters [`in_guest_liteinst_program_gap`] follows before
+/// it refuses the program. The kernel has its own small limit (`exec_binprm` in
+/// `fs/exec.c`); a chain this check stops following is refused, not run, so the
+/// check fails closed whichever limit is lower.
+#[cfg(feature = "liteinst")]
+const MAX_INTERPRETER_DEPTH: usize = 4;
+
+/// Why the guest program would run code before, or without, the in-guest
+/// runtime, or `None` when it would not.
+///
+/// The runtime is an `LD_PRELOAD` library whose constructor installs Detcore.
+/// The dynamic loader never loads it into a statically linked image or an image
+/// of another architecture, and ignores `LD_PRELOAD` in secure-execution mode
+/// (set-user-ID, set-group-ID, or file capabilities). An executable's
+/// `DT_PREINIT_ARRAY` runs before every library constructor. Each of those
+/// would run guest code unmonitored, so each is refused. `#!` scripts are
+/// checked through their interpreter, read as the kernel's script handler
+/// reads it ([`script::KernelScript`]). A program or interpreter that is not a
+/// regular file is refused before it is opened: the kernel executes only
+/// regular files, opening a device can act on it, opening a socket fails, and
+/// reading a FIFO that has no writer would block the check.
+///
+/// Every fact about one file (its type, header, ELF headers, mode bits and
+/// capabilities) is read through one open descriptor, so they all describe
+/// the same file. The check is still advisory, not containment: the `execve`
+/// opens the path again, and a file replaced at that path in between is not
+/// checked again.
+///
+/// Not covered, and recorded on
+/// <https://github.com/rrnewton/hermit/issues/3520>:
+/// - The loader itself, the C library's initialization, the executable's
+///   `IFUNC` resolvers and the constructors of the executable's own shared
+///   libraries all run before the runtime's constructor in every guest.
+/// - Secure-execution mode that a security module or a parent with differing
+///   real and effective IDs imposes; only the file's own mode bits and
+///   capabilities are checked.
+/// - Whether the `PT_INTERP` loader honours `LD_PRELOAD` at all.
+/// - A `binfmt_misc` rule, which the kernel consults before its ELF and script
+///   handlers, and which can hand a file this check accepted to another
+///   interpreter (for example an emulator).
+/// - A runtime library the loader fails to load: the loader continues without
+///   it, and only the launch's check that the guest connected before it exited
+///   reports the failure, after the guest ran.
+/// - A `pre_exec` callback on `command` that changes the working directory or
+///   the root directory: the check resolves paths against the working
+///   directory `command` is configured with, in Hermit's root, before any
+///   such callback runs.
+#[cfg(feature = "liteinst")]
+fn in_guest_liteinst_program_gap(command: &mut Command) -> Result<Option<String>, Error> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    use script::KernelScript;
+
+    let mut path = pin_spawn_program(command)?;
+    for _ in 0..=MAX_INTERPRETER_DEPTH {
+        let shown = path.display().to_string();
+        let not_regular = || {
+            Ok(Some(format!(
+                "{shown} is not a regular file, and the kernel executes only regular files"
+            )))
+        };
+        if !fs::metadata(&path)
+            .with_context(|| format!("cannot read guest program {shown}"))?
+            .is_file()
+        {
+            return not_regular();
+        }
+        // The path can change type after the check above. O_NONBLOCK then keeps
+        // the open of a FIFO that has no writer from blocking, and O_NOCTTY
+        // keeps a terminal from becoming Hermit's controlling terminal; neither
+        // changes how a regular file is read. The descriptor's own type is
+        // checked again below.
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+            .open(&path)
+            .with_context(|| format!("cannot read guest program {shown}"))?;
+        if !file
+            .metadata()
+            .with_context(|| format!("cannot read guest program {shown}"))?
+            .is_file()
+        {
+            return not_regular();
+        }
+        let mut header = Vec::new();
+        (&file)
+            .take(256)
+            .read_to_end(&mut header)
+            .with_context(|| format!("cannot read guest program {shown}"))?;
+        match KernelScript::from_buf(&header) {
+            KernelScript::Interpreter(interpreter) => {
+                // The kernel opens a relative interpreter against the working
+                // directory of the process calling execve.
+                path = match command.get_current_dir() {
+                    Some(directory) => directory.join(interpreter),
+                    None => interpreter,
+                };
+                continue;
+            }
+            KernelScript::Declined => {
+                return Ok(Some(format!(
+                    "{shown} starts with #! but the kernel's script handler declines it (it \
+                     names no interpreter, or the interpreter path fills the first 256 bytes), \
+                     so the kernel would fail the execve or hand the file to another handler \
+                     that need not load the runtime"
+                )));
+            }
+            KernelScript::NotScript => {}
+        }
+        let Some(startup) = interp::elf_startup(&mut file)
+            .with_context(|| format!("cannot read the ELF headers of guest program {shown}"))?
+        else {
+            return Ok(Some(format!(
+                "{shown} is neither an ELF executable nor a #! script, so the kernel would hand \
+                 it to a handler that need not load the runtime"
+            )));
+        };
+        let reason = if !startup.x86_64 {
+            "is not a 64-bit x86-64 ELF image, so the dynamic loader cannot load the 64-bit \
+             runtime into it"
+        } else if !startup.has_interp {
+            "is statically linked (it has no PT_INTERP), so no dynamic loader runs to load the \
+             runtime"
+        } else if is_secure_execution_image(&file, &shown)? {
+            "is set-user-ID, set-group-ID or has file capabilities, so the kernel runs it in \
+             secure-execution mode, where the dynamic loader ignores LD_PRELOAD"
+        } else if startup.has_preinit_array {
+            "has a DT_PREINIT_ARRAY, whose functions run before the runtime's constructor"
+        } else {
+            return Ok(None);
+        };
+        return Ok(Some(format!(
+            "guest program {shown} {reason}, so it would run unmonitored if Hermit launched it"
+        )));
+    }
+    Ok(Some(format!(
+        "the #! interpreters of guest program {} nest more than {MAX_INTERPRETER_DEPTH} deep",
+        Path::new(command.get_program()).display()
+    )))
+}
+
+/// Resolves the program `command` executes with Reverie's
+/// [`Command::find_program`], the call the in-guest launch makes, and pins the
+/// result on `command`, keeping `argv[0]`.
+///
+/// The result is absolute, so the launch's own `find_program` returns it
+/// unchanged and the launch executes the same path the check inspected,
+/// whatever `PATH` or working directory either side would otherwise use. The
+/// path, not its contents: a file replaced at that path in between is not
+/// checked again (see [`in_guest_liteinst_program_gap`]). A program the launch
+/// could not find is an error here, as it would be at launch.
+#[cfg(feature = "liteinst")]
+fn pin_spawn_program(command: &mut Command) -> Result<PathBuf, Error> {
+    let arg0 = command.get_arg0().to_owned();
+    let program = command.find_program().with_context(|| {
+        format!(
+            "cannot find guest program {}",
+            Path::new(command.get_program()).display()
+        )
+    })?;
+    command.program(&program).arg0(arg0);
+    Ok(program)
+}
+
+/// Whether executing `file` (shown as `shown`) puts the kernel in
+/// secure-execution mode (`AT_SECURE`): set-user-ID, set-group-ID (with group
+/// execute, as the kernel requires), or a `security.capability` attribute.
+#[cfg(feature = "liteinst")]
+fn is_secure_execution_image(file: &fs::File, shown: &str) -> Result<bool, Error> {
+    let mode = file
+        .metadata()
+        .with_context(|| format!("cannot stat guest program {shown}"))?
+        .permissions()
+        .mode();
+    if mode & 0o4000 != 0 || mode & 0o2010 == 0o2010 {
+        return Ok(true);
+    }
+    // SAFETY: the descriptor is open for the call, the name is NUL-terminated,
+    // and a zero-sized query writes no value.
+    let size = unsafe {
+        libc::fgetxattr(
+            file.as_raw_fd(),
+            c"security.capability".as_ptr(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if size >= 0 {
+        return Ok(true);
+    }
+    match io::Error::last_os_error().raw_os_error() {
+        Some(libc::ENODATA) | Some(libc::ENOTSUP) => Ok(false),
+        _ => Err(Error::new(io::Error::last_os_error()).context(format!(
+            "cannot read the file capabilities of guest program {shown}"
+        ))),
+    }
+}
+
+/// Refuses a wall-clock bound on an in-guest LiteInst run. The bound drops the
+/// run's future, and dropping it neither kills the guest nor stops the
+/// blocking task that waits for it.
+#[cfg(feature = "liteinst")]
+fn refuse_in_guest_liteinst_timeout(
+    backend: Backend,
+    timeout: Option<Duration>,
+) -> Result<(), Error> {
+    if backend.is_in_guest_liteinst() && timeout.is_some() {
+        return Err(Error::new(LiteinstInGuestRefusal::for_backend(
+            backend,
+            "a wall-clock timeout has not been qualified for the in-guest runtime, whose run \
+             future does not kill the guest when it is dropped",
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "liteinst"))]
+fn refuse_in_guest_liteinst_timeout(
+    _backend: Backend,
+    _timeout: Option<Duration>,
+) -> Result<(), Error> {
+    Ok(())
+}
+
+#[cfg(feature = "liteinst")]
+fn liteinst_unavailable_reason() -> Option<String> {
+    liteinst_runtime_unavailable_reason()
+}
+
+// LiteInst is an experimental backend whose architecture is not settled, so the
+// published crate leaves it out: `reverie-liteinst` (and through it `liteinst2`)
+// is an optional dependency behind the `liteinst` feature, which
+// `third-party-backends` enables for every validation build.
+#[cfg(not(feature = "liteinst"))]
+fn liteinst_unavailable_reason() -> Option<String> {
+    Some("this build was compiled without the liteinst backend: the `liteinst` feature is not enabled; rebuild with `--features liteinst` (or `--features third-party-backends`). This says nothing about whether LiteInst works on this machine -- it has not been checked".to_owned())
+}
+
+#[cfg(feature = "liteinst")]
+fn liteinst_runtime_unavailable_reason() -> Option<String> {
+    liteinst_tool_runtime_library_path().err().map(|error| {
+        format!(
+            "the in-guest Detcore runtime is unavailable: {error}; build it with `cargo build -p detcore-liteinst` in the target directory of this hermit binary, install it as rsrcs/libdetcore_liteinst.so, or name it with {LITEINST_TOOL_RUNTIME_ENV}"
+        )
+    })
+}
+
+fn kvm_device_unavailable_reason(path: &Path) -> Option<String> {
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .err()
+        .map(|error| {
+            format!(
+                "cannot open {} read-write: {error}; grant access through the device owner/group \
+                 or root",
+                path.display()
+            )
+        })
+}
+
+/// Process instrumentation backend used to run a Hermit guest.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, ValueEnum)]
+pub enum Backend {
+    /// Use Reverie's ptrace backend.
+    #[default]
+    Ptrace,
+    /// Use the DynamoRIO backend.
+    Dbt,
+    /// Use LiteInst, with Detcore's Tool running inside the guest.
+    Liteinst,
+    /// Use in-guest LiteInst with syscall site patching off: the same
+    /// in-guest Detcore host as `liteinst`, but every trapped syscall reaches
+    /// the Tool through the seccomp `SIGSYS` fallback and no syscall site is
+    /// rewritten. Hermit sets `REVERIE_LITEINST_SITE_PATCHING=0` in the
+    /// guest's environment and refuses a run whose environment asks for any
+    /// other value.
+    InGuestTrap,
+    /// Use the SaBRe static binary rewriting backend.
+    Sabre,
+    /// Use the KVM backend.
+    Kvm,
+    /// Preprocess the main ELF with e9patch, then use the ptrace runtime.
+    // TODO-HUMAN-REVIEW(PR-594): Review the CLI-only hybrid backend selection.
+    E9patch,
+}
+
+/// A requested backend could not start because its required runtime support is absent.
+///
+/// Keep this as a typed error until the top-level command records its failure class.
+/// The human-readable message is for the operator; consumers must use the class line
+/// emitted by the command rather than matching this prose.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct BackendUnavailable {
+    backend: Backend,
+    reason: String,
+}
+
+impl BackendUnavailable {
+    pub fn new(backend: Backend, reason: impl Into<String>) -> Self {
+        Self {
+            backend,
+            reason: reason.into(),
+        }
+    }
+
+    pub fn backend(&self) -> Backend {
+        self.backend
+    }
+
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+impl std::fmt::Display for BackendUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "backend `{}` is unavailable: {}",
+            self.backend.as_str(),
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for BackendUnavailable {}
+
+impl Backend {
+    const ALL: [Self; 7] = [
+        Self::Ptrace,
+        Self::Dbt,
+        Self::Liteinst,
+        Self::InGuestTrap,
+        Self::Sabre,
+        Self::Kvm,
+        Self::E9patch,
+    ];
+
+    /// Returns the command-line spelling for this backend.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ptrace => "ptrace",
+            Self::Dbt => "dbt",
+            Self::Liteinst => "liteinst",
+            Self::InGuestTrap => "in-guest-trap",
+            Self::Sabre => "sabre",
+            Self::Kvm => "kvm",
+            Self::E9patch => "e9patch",
+        }
+    }
+
+    /// Whether this backend hosts Detcore's Tool inside each guest process
+    /// through the in-guest LiteInst preload runtime: `liteinst` and
+    /// `in-guest-trap`, which differ only in whether syscall sites are patched.
+    /// Every refusal, capability and launch step of in-guest LiteInst applies to
+    /// both.
+    pub const fn is_in_guest_liteinst(self) -> bool {
+        matches!(self, Self::Liteinst | Self::InGuestTrap)
+    }
+
+    /// The name of the backend runtime that executes this backend's guest, as
+    /// its statistics source names itself (`BackendStatsSnapshot::BACKEND_NAME`).
+    /// `in-guest-trap` runs the in-guest LiteInst runtime, so its statistics come
+    /// from that runtime's source, which is named `liteinst`.
+    pub const fn runtime_name(self) -> &'static str {
+        match self {
+            Self::InGuestTrap => Self::Liteinst.as_str(),
+            other => other.as_str(),
+        }
+    }
+
+    fn uses_ptrace_pmu_timers(self) -> bool {
+        match self {
+            Self::Ptrace | Self::E9patch => true,
+            // In-guest Detcore has no ptrace tracer to arm the PMU timer from.
+            Self::Liteinst | Self::InGuestTrap | Self::Dbt | Self::Sabre | Self::Kvm => false,
+        }
+    }
+
+    /// Returns backends whose Hermit integration prerequisites are met.
+    ///
+    /// Some integrations use CLI launch adapters rather than direct
+    /// [`run_with_backend`] dispatch.
+    pub fn available() -> impl Iterator<Item = Self> {
+        Self::ALL
+            .into_iter()
+            .filter(|backend| backend.is_available())
+    }
+
+    /// Returns whether this backend's integration prerequisites are met.
+    pub fn is_available(self) -> bool {
+        self.unavailable_reason().is_none()
+    }
+
+    /// Returns an actionable error when this backend's prerequisites are not met.
+    pub fn ensure_available(self) -> Result<(), Error> {
+        self.ensure_available_for(NamespaceUse::Creates)
+    }
+
+    /// [`Backend::ensure_available`] for a run that creates `namespaces`: a
+    /// `--no-namespace` ptrace run is not refused where only `unshare` of a
+    /// user namespace is denied, since it never makes that call; the ptrace
+    /// and seccomp probes still apply.
+    pub fn ensure_available_for(self, namespaces: NamespaceUse) -> Result<(), Error> {
+        if let Some(reason) = self.unavailable_reason_for(namespaces) {
+            Err(Error::new(BackendUnavailable::new(self, reason)))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn unavailable_reason(self) -> Option<String> {
+        self.unavailable_reason_for(NamespaceUse::Creates)
+    }
+
+    fn unavailable_reason_for(self, namespaces: NamespaceUse) -> Option<String> {
+        match self {
+            Self::Ptrace => validate_tracing_environment(namespaces)
+                .err()
+                .map(|error| error.to_string()),
+            Self::Dbt => dbt_unavailable_reason(),
+            // The same runtime, so the same prerequisites and the same reason.
+            Self::Liteinst | Self::InGuestTrap => liteinst_unavailable_reason(),
+            // TODO-HUMAN-REVIEW(#589): Review SaBRe backend availability reporting.
+            Self::Sabre => sabre_unavailable_reason(),
+            Self::Kvm => kvm_device_unavailable_reason(Path::new("/dev/kvm")),
+            Self::E9patch => e9patch_unavailable_reason(),
+        }
+    }
+}
+
+struct SkidOvershootReport {
+    enabled: bool,
+}
+
+/// The backend failed while running the guest, after Hermit launched it: the
+/// DBT evidence check, a KVM execution failure, a SaBRe guest that never
+/// reached Detcore. `run --verify` records it as `run_failed` with
+/// `backend_failure` instead of leaving the `not_run` stamp.
+///
+/// It sits in the chain below the message that names the failure, so the
+/// first `Error:` line is unchanged; it crosses the container error boundary
+/// as [`error::FailureKind::BackendRunFailure`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackendRunFailure;
+
+impl std::fmt::Display for BackendRunFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the backend failed while running the guest")
+    }
+}
+
+impl std::error::Error for BackendRunFailure {}
+
+/// A ptrace-backed run observed late precise-timer delivery, so Hermit refuses
+/// to treat the completed execution as deterministic evidence.
+///
+/// This is a type rather than a message match because it crosses the container
+/// error boundary as [`error::FailureKind::PolicyRefusal`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SkidOvershootError {
+    count: u64,
+}
+
+impl SkidOvershootError {
+    pub fn new(count: u64) -> Self {
+        assert!(
+            count > 0,
+            "a skid-overshoot refusal requires a positive count"
+        );
+        Self { count }
+    }
+
+    pub fn count(&self) -> u64 {
+        self.count
+    }
+}
+
+impl std::fmt::Display for SkidOvershootError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "observed {} {} report(s); refusing the result because precise PMU timer \
+             delivery passed its target and deterministic execution was not established",
+            self.count,
+            reverie::SKID_OVERSHOOT_MARKER
+        )
+    }
+}
+
+impl std::error::Error for SkidOvershootError {}
+
+fn take_skid_overshoot_error() -> Option<SkidOvershootError> {
+    let count = reverie::take_skid_overshoot_count();
+    (count > 0).then(|| SkidOvershootError::new(count))
+}
+
+impl SkidOvershootReport {
+    fn begin(enabled: bool) -> Self {
+        if enabled {
+            // A previous invocation in this process must not qualify this one.
+            let _ = reverie::take_skid_overshoot_count();
+        }
+        Self { enabled }
+    }
+
+    fn finish<T>(self, result: Result<T, Error>) -> Result<T, Error> {
+        if !self.enabled {
+            return result;
+        }
+
+        let Some(overshoot) = take_skid_overshoot_error() else {
+            return result;
+        };
+        match result {
+            Ok(_) => Err(Error::new(overshoot)),
+            Err(error) => Err(error.context(overshoot)),
+        }
+    }
+
+    fn finish_with_count<T>(self, result: Result<T, Error>) -> Result<(T, u64), Error> {
+        if !self.enabled {
+            return result.map(|value| (value, 0));
+        }
+
+        let count = reverie::take_skid_overshoot_count();
+        match result {
+            Ok(value) => Ok((value, count)),
+            Err(error) if count > 0 => Err(error.context(SkidOvershootError::new(count))),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+// SaBRe's statistics and RPC support are selected only by `sabre`; the external
+// loader and Detcore plugin must also be supplied. e9patch preprocessing requires
+// external `e9tool`/`e9patch` artifacts. Neither path is enabled by default.
+#[cfg(feature = "sabre")]
+fn sabre_unavailable_reason() -> Option<String> {
+    sabre_runtime_unavailable_reason()
+}
+
+#[cfg(not(feature = "sabre"))]
+fn sabre_unavailable_reason() -> Option<String> {
+    Some("the `sabre` feature is not enabled in this build; rebuild with `--features sabre` (or `--features third-party-backends`). This says nothing about whether SaBRe works on this machine -- it has not been checked".to_owned())
+}
+
+#[cfg(feature = "e9patch")]
+fn e9patch_unavailable_reason() -> Option<String> {
+    // e9patch overlays the rewritten ELF in a mount namespace, so it always
+    // creates namespaces (run refuses `--backend=e9patch --no-namespace`).
+    validate_tracing_environment(NamespaceUse::Creates)
+        .err()
+        .map(|error| error.to_string())
+        .or_else(e9patch::unavailable_reason)
+}
+
+#[cfg(not(feature = "e9patch"))]
+fn e9patch_unavailable_reason() -> Option<String> {
+    Some("the `e9patch` feature is not enabled in this build; rebuild with `--features e9patch` (or `--features third-party-backends`). This says nothing about whether e9patch works on this machine -- it has not been checked".to_owned())
+}
+
+#[cfg(feature = "dbt")]
+fn dbt_unavailable_reason() -> Option<String> {
+    if !dynamorio_sdk_available() {
+        return Some(
+            "the DynamoRIO runtime was not found; build target/install_pkg, set HERMIT_INSTALL_DIR, or set DYNAMORIO_HOME/DynamoRIO_DIR to a valid SDK"
+                .to_owned(),
+        );
+    }
+    dbt_runtime_unavailable_reason()
+}
+
+#[cfg(not(feature = "dbt"))]
+// TODO-HUMAN-REVIEW(PR-1150): Review the default-on DBT compile-time feature boundary.
+fn dbt_unavailable_reason() -> Option<String> {
+    Some(dbt_disabled_build_reason(cfg!(hermit_registry_build)))
+}
+
+/// `registry_build`: this crate was built from a manifest that declares no
+/// `dbt` feature, as the crates.io projection of `hermit-run` does
+/// (`cfg(hermit_registry_build)`, set by build.rs). A source build of main
+/// declares one, and only needs to enable it. The package name cannot tell
+/// them apart: both are `hermit-run`.
+#[cfg(not(feature = "dbt"))]
+fn dbt_disabled_build_reason(registry_build: bool) -> String {
+    if registry_build {
+        "the dbt backend is not included in this registry release; use a source build from https://github.com/rrnewton/hermit with `--features dbt`. The registry's `third-party-backends` feature does not include DBT. DynamoRIO availability on this machine has not been checked".to_owned()
+    } else {
+        "the `dbt` feature is not enabled in this source build; rebuild with `--features dbt` (or `--features third-party-backends`). DynamoRIO availability on this machine has not been checked".to_owned()
+    }
+}
+
+#[cfg(feature = "sabre")]
+const SABRE_BINARY_ENV: &str = "HERMIT_SABRE_BINARY";
+
+#[cfg(feature = "sabre")]
+fn is_executable_file(path: &Path) -> bool {
+    fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+// TODO-HUMAN-REVIEW(PR-739): Review SaBRe loader discovery and executable validation.
+#[cfg(feature = "sabre")]
+fn resolve_sabre_binary_from(
+    override_path: Option<&OsStr>,
+    packaged_path: Option<&Path>,
+    executable: &Path,
+    path_env: &OsStr,
+) -> Result<PathBuf, Error> {
+    if let Some(requested) = override_path {
+        if requested.is_empty() {
+            return Err(anyhow!("{SABRE_BINARY_ENV} is empty"));
+        }
+        let path = PathBuf::from(requested);
+        return is_executable_file(&path)
+            .then_some(path.clone())
+            .ok_or_else(|| {
+                anyhow!(
+                    "{SABRE_BINARY_ENV}={} is not an executable file",
+                    path.display()
+                )
+            });
+    }
+
+    if let Some(path) = packaged_path
+        && is_executable_file(path)
+    {
+        return Ok(path.to_path_buf());
+    }
+
+    let directory = executable
+        .parent()
+        .ok_or_else(|| anyhow!("Hermit executable has no parent directory"))?;
+    let sibling = directory.join("sabre");
+    let target_build = directory.parent().map(|target| target.join("sabre/sabre"));
+
+    if is_executable_file(&sibling) {
+        return Ok(sibling);
+    }
+    if let Some(candidate) = &target_build
+        && is_executable_file(candidate)
+    {
+        return Ok(candidate.clone());
+    }
+    if !path_env.is_empty()
+        && let Some(candidate) = std::env::split_paths(path_env)
+            .map(|directory| directory.join("sabre"))
+            .find(|candidate| is_executable_file(candidate))
+    {
+        return Ok(candidate);
+    }
+
+    Err(anyhow!(
+        "SaBRe executable was not found in the Hermit installation, beside {}, or in PATH; set {} or {SABRE_BINARY_ENV}",
+        executable.display(),
+        hermit_resources::INSTALL_DIR_ENV
+    ))
+}
+
+#[cfg(feature = "sabre")]
+fn resolve_sabre_binary() -> Result<PathBuf, Error> {
+    let executable =
+        std::env::current_exe().context("failed to locate running Hermit executable")?;
+    let override_path = std::env::var_os(SABRE_BINARY_ENV);
+    let packaged_path = hermit_resources::resource("sabre")?;
+    let path_env = std::env::var_os("PATH").unwrap_or_default();
+    resolve_sabre_binary_from(
+        override_path.as_deref(),
+        packaged_path.as_deref(),
+        &executable,
+        &path_env,
+    )
+}
+
+#[cfg(feature = "sabre")]
+const SABRE_RPC_SOCKET_ENV: &str = "REVERIE_SABRE_HERMIT_RPC_SOCKET";
+#[cfg(feature = "sabre")]
+const SABRE_DETLOG_FORWARD_ENV: &str = "REVERIE_SABRE_HERMIT_FORWARD_DETLOG";
+/// `reverie_sabre::TOOL_OUTPUT_ENV`: the descriptor reverie-sabre protects
+/// for the in-guest tool's own output. Hermit does not link reverie-sabre.
+#[cfg(feature = "sabre")]
+const SABRE_TOOL_OUTPUT_ENV: &str = "REVERIE_SABRE_TOOL_OUTPUT_FD";
+/// `detcore_liteinst::DETLOG_FORWARD_ENV`; that crate is a preload `cdylib`, so
+/// Hermit cannot import the constant.
+#[cfg(feature = "liteinst")]
+const LITEINST_DETLOG_FORWARD_ENV: &str = "HERMIT_LITEINST_FORWARD_DETLOG";
+/// `detcore_liteinst::DETLOG_FORWARD_POLICY_ENV`, for the same reason.
+#[cfg(feature = "liteinst")]
+const LITEINST_DETLOG_FORWARD_POLICY_ENV: &str = "HERMIT_LITEINST_FORWARD_DETLOG_POLICY";
+
+/// Where in-guest LiteInst and SaBRe runs in this process forward Detcore's
+/// DETLOG records; see [`forward_in_guest_detlogs_to`].
+static IN_GUEST_DETLOG_SINK: Mutex<Option<std::os::fd::OwnedFd>> = Mutex::new(None);
+
+/// Makes the in-guest LiteInst and SaBRe runs this process starts forward the
+/// DETLOG records Detcore logs inside the guest to `socket`, the sending end of a Unix
+/// `SOCK_SEQPACKET` pair. `hermit run --verify` gives each run its own pair and
+/// reads the records from the other end into that run's log. Each record is one
+/// message, one line (`detcore::detlog::forwarded_line`).
+/// A record is forwarded when the CLI's filter logs INFO for its module (see
+/// [`in_guest_detlog_forward_policy`]); without a socket none are forwarded.
+#[doc(hidden)]
+pub fn forward_in_guest_detlogs_to(socket: std::os::fd::OwnedFd) {
+    *IN_GUEST_DETLOG_SINK.lock().unwrap() = Some(socket);
+}
+
+/// What Hermit tells the in-guest LiteInst runtime, which travels in the
+/// sealed preload bootstrap rather than the guest's environment
+/// ([`detcore::in_guest_launch`]), so none of it lands on the guest's initial
+/// stack or in `/proc/self/environ`:
+/// - this build's [`detcore::config_wire_fingerprint`], which the runtime
+///   compares with its own before it decodes the configuration the
+///   coordinator sends. A runtime built from another tree then fails naming
+///   both fingerprints and its own path, not with a bare decoding error
+///   (<https://github.com/rrnewton/hermit/issues/3986>);
+/// - when `policy` forwards any record, the socket chosen with
+///   [`forward_in_guest_detlogs_to`] (an inheritable duplicate, which the
+///   runtime moves to a descriptor Reverie reserves and protects from the
+///   guest) and the encoded policy, which the guest's Detcore applies to each
+///   record by its module as each in-process `detlog!` callsite asks tracing.
+///
+/// The caller keeps the returned duplicate open until the guest has started.
+/// Hermit's own variable names are removed from `command`, so a stale value
+/// cannot reach a runtime that falls back to the environment.
+#[cfg(feature = "liteinst")]
+fn in_guest_liteinst_launch(
+    command: &mut Command,
+    policy: &detcore::detlog::ForwardPolicy,
+) -> Result<
+    (
+        detcore::in_guest_launch::InGuestLaunch,
+        Option<std::os::fd::OwnedFd>,
+    ),
+    Error,
+> {
+    command.env_remove(LITEINST_DETLOG_FORWARD_ENV);
+    command.env_remove(LITEINST_DETLOG_FORWARD_POLICY_ENV);
+    command.env_remove(detcore::LITEINST_CONFIG_FINGERPRINT_ENV);
+    let mut launch = detcore::in_guest_launch::InGuestLaunch {
+        coordinator_fingerprint: Some(detcore::config_wire_fingerprint()),
+        ..Default::default()
+    };
+    // Asking only whether INFO is on for `detcore`, and then forwarding
+    // everything, kept records a target-scoped filter drops under ptrace
+    // (info,detcore::random=warn) and could forward nothing where it keeps
+    // some (warn,detcore::random=info).
+    if !policy.forwards_any() {
+        return Ok((launch, None));
+    }
+    let Some(duplicate) = inheritable_in_guest_detlog_socket()? else {
+        return Ok((launch, None));
+    };
+    launch.forward_request = Some(detcore::detlog::tool_output_env_value(
+        duplicate.as_raw_fd(),
+    )?);
+    launch.forward_policy = Some(policy.encode());
+    Ok((launch, Some(duplicate)))
+}
+
+/// An inheritable duplicate of the socket chosen with
+/// [`forward_in_guest_detlogs_to`], or `None` when none was chosen. The
+/// caller passes its number to the guest and keeps it open until the guest
+/// has started.
+#[cfg(any(feature = "sabre", feature = "liteinst"))]
+fn inheritable_in_guest_detlog_socket() -> Result<Option<std::os::fd::OwnedFd>, Error> {
+    let sink = IN_GUEST_DETLOG_SINK.lock().unwrap();
+    let Some(socket) = sink.as_ref() else {
+        return Ok(None);
+    };
+    // SAFETY: F_DUPFD on an open descriptor returns a new descriptor or -1.
+    let duplicate = unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_DUPFD, 3) };
+    if duplicate < 0 {
+        return Err(Error::new(std::io::Error::last_os_error())
+            .context("duplicating the in-guest DETLOG forwarding socket"));
+    }
+    // SAFETY: fcntl returned a new descriptor this function now owns.
+    Ok(Some(unsafe {
+        std::os::fd::OwnedFd::from_raw_fd(duplicate)
+    }))
+}
+#[cfg(feature = "sabre")]
+const SABRE_PATH_EVIDENCE_ENV: &str = "HERMIT_SABRE_PATH_EVIDENCE";
+
+/// The INFO policy for DETLOG records an in-guest Detcore (SaBRe's plugin,
+/// in-guest LiteInst) forwards: the current subscriber's answer for every
+/// target the CLI's `RUST_LOG` names (the text
+/// `EffectiveFilter::from_default_env` builds every CLI subscriber from) and
+/// for any other target.
+#[cfg(any(feature = "sabre", feature = "liteinst"))]
+fn in_guest_detlog_forward_policy() -> detcore::detlog::ForwardPolicy {
+    let directives = std::env::var(tracing_subscriber::EnvFilter::DEFAULT_ENV).unwrap_or_default();
+    detcore::detlog::ForwardPolicy::from_current_subscriber(&directives)
+}
+#[cfg(feature = "sabre")]
+const SABRE_STAGING_DIRECTORY: &str = "/dev/shm";
+
+#[cfg(feature = "sabre")]
+struct StagedSabreProgram {
+    path: PathBuf,
+}
+
+#[cfg(feature = "sabre")]
+impl Drop for StagedSabreProgram {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(feature = "sabre")]
+fn sabre_program_needs_neutral_name(program: &Path) -> bool {
+    program
+        .file_name()
+        .is_some_and(|name| name.as_bytes().starts_with(b"ld"))
+}
+
+// TODO-HUMAN-REVIEW(PR-845): Review the neutral-name workaround for SaBRe's
+// dynamic-loader prefix collision.
+#[cfg(feature = "sabre")]
+fn stage_sabre_program_in(
+    program: &Path,
+    staging_directory: &Path,
+) -> Result<Option<StagedSabreProgram>, Error> {
+    if !sabre_program_needs_neutral_name(program) {
+        return Ok(None);
+    }
+
+    let path = staging_directory.join(format!("hermit-sabre-program-{}", std::process::id()));
+    let mut source = fs::File::open(program).map_err(|error| {
+        anyhow!(
+            "failed to open SaBRe guest executable {} for neutral-name staging: {error}",
+            program.display()
+        )
+    })?;
+    let mut staged = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .open(&path)
+        .map_err(|error| {
+            anyhow!(
+                "failed to stage SaBRe guest executable {} as {}: {error}",
+                program.display(),
+                path.display()
+            )
+        })?;
+    if let Err(error) = io::copy(&mut source, &mut staged) {
+        let _ = fs::remove_file(&path);
+        return Err(anyhow!(
+            "failed to stage SaBRe guest executable {} as {}: {error}",
+            program.display(),
+            path.display()
+        ));
+    }
+    drop(staged);
+
+    Ok(Some(StagedSabreProgram { path }))
+}
+
+// TODO-HUMAN-REVIEW(PR-738): Review controller/plugin artifact separation.
+#[cfg(feature = "sabre")]
+fn sabre_runtime_library_path() -> io::Result<PathBuf> {
+    if let Some(path) = hermit_resources::resource("libdetcore_sabre.so")?
+        && path.is_file()
+    {
+        return Ok(path);
+    }
+
+    let executable = std::env::current_exe()?;
+    let directory = executable.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "Hermit executable has no parent directory",
+        )
+    })?;
+    [
+        directory.join("libdetcore_sabre.so"),
+        directory.join("deps/libdetcore_sabre.so"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+    .ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "libdetcore_sabre.so was not built beside {}",
+                executable.display()
+            ),
+        )
+    })
+}
+
+#[cfg(feature = "sabre")]
+fn sabre_runtime_unavailable_reason() -> Option<String> {
+    if let Err(error) = resolve_sabre_binary() {
+        return Some(error.to_string());
+    }
+    sabre_runtime_library_path().err().map(|error| {
+        format!(
+            "the Detcore SaBRe plugin is unavailable: {error}; build detcore-sabre and hermit in the same target directory"
+        )
+    })
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-774): Review the bounded SaBRe RPC disconnect drain.
+#[cfg(feature = "sabre")]
+const SABRE_RPC_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+
+#[cfg(feature = "sabre")]
+async fn wait_for_sabre_rpc_disconnects<T>(
+    global: &Arc<T>,
+    timeout: Duration,
+) -> Result<(), usize> {
+    let disconnected = tokio::time::timeout(timeout, async {
+        while Arc::strong_count(global) > 1 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+
+    if disconnected.is_ok() {
+        return Ok(());
+    }
+
+    let live_references = Arc::strong_count(global).saturating_sub(1);
+    if live_references == 0 {
+        Ok(())
+    } else {
+        Err(live_references)
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-782): Review SaBRe RPC server shutdown errors.
+#[cfg(feature = "sabre")]
+async fn stop_sabre_rpc_server<E>(
+    server_task: tokio::task::JoinHandle<Result<(), E>>,
+) -> Result<(), Error>
+where
+    E: std::fmt::Display,
+{
+    server_task.abort();
+    match server_task.await {
+        Err(error) if error.is_cancelled() => Ok(()),
+        Err(error) => Err(anyhow!("SaBRe coordinator task failed: {error}")),
+        Ok(Err(error)) => Err(anyhow!("SaBRe coordinator server failed: {error}")),
+        Ok(Ok(())) => Err(anyhow!("SaBRe coordinator server stopped unexpectedly")),
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-789): Review complete SaBRe RPC shutdown ordering.
+#[cfg(feature = "sabre")]
+async fn shutdown_sabre_rpc<T, E>(
+    server_task: tokio::task::JoinHandle<Result<(), E>>,
+    global: &Arc<T>,
+    timeout: Duration,
+) -> Result<(), Error>
+where
+    E: std::fmt::Display,
+{
+    let server_result = stop_sabre_rpc_server(server_task).await;
+    let disconnect_result = wait_for_sabre_rpc_disconnects(global, timeout).await;
+
+    server_result?;
+    disconnect_result.map_err(|live_references| {
+        anyhow!("SaBRe coordinator stopped with {live_references} live RPC reference(s)")
+    })
+}
+
+fn ensure_backend_dispatch(backend: Backend) -> Result<(), Error> {
+    // The CLI probes ptrace readiness before entering its container; repeating
+    // the namespace probe here would test nested namespaces instead of the host.
+    if backend == Backend::Ptrace {
+        return Ok(());
+    }
+    if backend == Backend::E9patch {
+        return Err(anyhow!(
+            "backend `e9patch` requires CLI preprocessing; library callers must use \
+             e9patch::prepare and then select `ptrace`"
+        ));
+    }
+    // KVM and DBT have dedicated dispatches (`run_kvm` and `run_dbt`); neither
+    // must reach this generic rejection path.
+    backend.ensure_available()?;
+    Err(anyhow!(
+        "backend `{}` has no Hermit dispatch implementation",
+        backend.as_str()
+    ))
+}
+
+/// Run one command with the Detcore tool executing inside a SaBRe plugin and
+/// the single GlobalState held by this Hermit coordinator process.
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-738): Review SaBRe coordinator lifetime and artifact loading.
+#[cfg(feature = "sabre")]
+async fn run_sabre(
+    mut command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    capture_output: bool,
+) -> Result<Output, Error> {
+    let path_evidence_file = std::env::var_os(SABRE_PATH_EVIDENCE_ENV).map(PathBuf::from);
+    // Whether this run passes the plugin a DETLOG socket (below), in which case
+    // every Tool image must forward on it; see
+    // detcore::Config::in_guest_detlog_forward_policy.
+    let mut config = config;
+    let policy = in_guest_detlog_forward_policy();
+    config.in_guest_detlog_forward_policy = (policy.forwards_any()
+        && IN_GUEST_DETLOG_SINK.lock().unwrap().is_some())
+    .then(|| policy.encode());
+    let sabre = resolve_sabre_binary()?;
+    // The kernel execs SaBRe's loader, which loads the guest itself, so the
+    // kernel's `exe` link names the loader (`detcore::LaunchImage::launcher`).
+    // Declared even where the first image could not be resolved, so that a
+    // link Detcore cannot answer is refused rather than named the loader.
+    config
+        .launch_image
+        .get_or_insert(detcore::LaunchImage {
+            exe: None,
+            launcher: None,
+        })
+        .launcher = Some(PathBuf::from(&sabre));
+    let plugin = sabre_runtime_library_path()
+        .map_err(|error| anyhow!("failed to locate the Detcore SaBRe plugin: {error}"))?;
+    let program = command.find_program().map_err(|error| {
+        anyhow!(
+            "failed to resolve SaBRe guest executable {:?}: {error}",
+            command.get_program()
+        )
+    })?;
+    let staged_program = stage_sabre_program_in(&program, Path::new(SABRE_STAGING_DIRECTORY))?;
+    let launch_program = staged_program
+        .as_ref()
+        .map_or(program.as_path(), |staged| staged.path.as_path());
+
+    let bootstrap_launch =
+        sabre_bootstrap::Launch::new(Path::new(&sabre), launch_program, &config)?;
+
+    // This runs after Hermit enters the guest mount namespace, where `/tmp`
+    // names the container-visible temporary filesystem. Do not inherit a
+    // host-side nested TMPDIR: validation commonly sets TMPDIR=/tmp/<run>/tmp,
+    // but that parent path is hidden once the private `/tmp` mount is active.
+    // The SaBRe plugin and coordinator must name the socket through the same
+    // namespace-visible path.
+    let socket_dir = tempfile::Builder::new()
+        .prefix("hermit-sabre-rpc-")
+        .tempdir_in(Path::new("/tmp"))?;
+    let socket_path = socket_dir.path().join("coordinator.sock");
+    let fallback_ready = Arc::new(AtomicBool::new(false));
+    let global = Arc::new(detcore::GlobalState::init_global_state(&config).await);
+    let server = reverie_rpc_transport::RpcServer::bind_with_readiness(
+        &socket_path,
+        global.clone(),
+        config.clone(),
+        fallback_ready.clone(),
+    )
+    .map_err(|error| anyhow!("failed to start SaBRe coordinator RPC: {error}"))?;
+    let server_task = tokio::spawn(async move { server.serve().await });
+
+    // SaBRe runs with the guest's own argv and environment, so the kernel
+    // builds the guest's initial stack, /proc/self/cmdline and
+    // /proc/self/environ from them, as for an exec of the guest itself. The
+    // plugin and image paths and the plugin's settings go in a sealed launch
+    // specification instead (reverie_sabre_stats::launch), which SaBRe's loader
+    // reads and closes before the guest starts. A script runs as its
+    // interpreter, with the argv the kernel would give it.
+    let mut first_bytes = vec![0u8; 256];
+    let read = std::fs::File::open(launch_program)
+        .and_then(|mut file| std::io::Read::read(&mut file, &mut first_bytes))
+        .map_err(|error| {
+            anyhow!(
+                "failed to read SaBRe guest executable {}: {error}",
+                launch_program.display()
+            )
+        })?;
+    first_bytes.truncate(read);
+    let arg0 = command.get_arg0().to_owned();
+    let client = match reverie_sabre_stats::launch::shebang(&first_bytes) {
+        Some((interpreter, argument)) => {
+            command.program(&sabre);
+            command.arg0(OsStr::from_bytes(&interpreter));
+            let mut words: Vec<&OsStr> = argument
+                .iter()
+                .map(|word| OsStr::from_bytes(word))
+                .collect();
+            words.push(launch_program.as_os_str());
+            command.prepend_args(words);
+            PathBuf::from(OsStr::from_bytes(&interpreter))
+        }
+        None => {
+            command.program(&sabre);
+            command.arg0(&arg0);
+            launch_program.to_path_buf()
+        }
+    };
+    let mut launch_settings: Vec<Vec<u8>> = Vec::new();
+    let mut setting = |name: &str, value: &OsStr| {
+        let mut entry = name.as_bytes().to_vec();
+        entry.push(b'=');
+        entry.extend_from_slice(value.as_bytes());
+        launch_settings.push(entry);
+    };
+    setting(SABRE_RPC_SOCKET_ENV, socket_path.as_os_str());
+    command.env_remove(SABRE_RPC_SOCKET_ENV);
+    command.env_remove(sabre_bootstrap::ENVIRONMENT);
+    if bootstrap_launch.initializes_random() {
+        setting(sabre_bootstrap::ENVIRONMENT, OsStr::new("1"));
+    }
+    // Publish the configuration and clock RPC fingerprint for this coordinator.
+    // The plugin is a separate artifact in the same target directory, so it can
+    // be stale without looking it. Its check before connecting names the mismatch
+    // instead of failing to decode Config or a later DetTime request field.
+    // See detcore_model::config_wire_fingerprint.
+    setting(
+        detcore::CONFIG_FINGERPRINT_ENV,
+        OsStr::new(&detcore::config_wire_fingerprint()),
+    );
+    command.env_remove(detcore::CONFIG_FINGERPRINT_ENV);
+    command.env_remove(SABRE_PATH_EVIDENCE_ENV);
+    command.env_remove(SABRE_DETLOG_FORWARD_ENV);
+    // Per emitting module, as each in-process `detlog!` callsite asks tracing:
+    // asking only about `detcore` dropped every record a target-scoped
+    // RUST_LOG (warn,detcore::random=info) keeps under ptrace.
+    command.env_remove(SABRE_TOOL_OUTPUT_ENV);
+    let detlog_policy = in_guest_detlog_forward_policy();
+    // Kept open until the guest has started (it inherits its own copy).
+    let mut _detlog_descriptor = None;
+    if detlog_policy.forwards_any() {
+        setting(
+            SABRE_DETLOG_FORWARD_ENV,
+            OsStr::new(&detlog_policy.encode()),
+        );
+        // With a socket (`hermit run --verify`), the plugin sends each record
+        // on it from a descriptor reverie-sabre protects from the guest, and
+        // the coordinator writes each thread's records into the log at that
+        // thread's scheduler turns, as for in-guest LiteInst. Without one it
+        // writes them to the guest's standard error.
+        if let Some(socket) = inheritable_in_guest_detlog_socket()? {
+            setting(
+                SABRE_TOOL_OUTPUT_ENV,
+                OsStr::new(&detcore::detlog::tool_output_env_value(socket.as_raw_fd())?),
+            );
+            _detlog_descriptor = Some(socket);
+        }
+    }
+    command.env_remove("SABRE_BINARY");
+    command.env_remove("SABRE_PLUGIN");
+    // Always collect: the statistics page is a descriptor the guest can see,
+    // so creating it only when a summary or DEBUG log is requested would make
+    // those flags change the guest's view. Its number travels in the launch
+    // specification, and the descriptor sits above the plugin's fixed RPC
+    // socket.
+    let stats = reverie_sabre_stats::SabreStats::create(reverie::BackendStatsRequest::ENABLED)
+        .map_err(|error| anyhow!("failed to create the SaBRe statistics page: {error}"))?
+        .expect("an enabled request creates the statistics page");
+    setting(
+        reverie_sabre_stats::BACKEND_STATS_ENV,
+        OsStr::new(&stats.raw_fd().to_string()),
+    );
+    command.env_remove(reverie_sabre_stats::BACKEND_STATS_ENV);
+    let launch_settings: Vec<&[u8]> = launch_settings.iter().map(Vec::as_slice).collect();
+    let launch_spec = reverie_sabre_stats::launch::spec_bytes(
+        plugin.as_os_str().as_bytes(),
+        client.as_os_str().as_bytes(),
+        &launch_settings,
+    )
+    .ok_or_else(|| anyhow!("the SaBRe launch specification is malformed or too large"))?;
+    // Kept open until the guest has started (it inherits its own copy, which
+    // SaBRe's loader closes).
+    let _launch_spec = reverie_sabre_stats::launch::spec_fd(&launch_spec)
+        .map_err(|error| anyhow!("failed to create the SaBRe launch specification: {error}"))?;
+
+    // THE SOCKET PATH IS DELIBERATELY RANDOM AND MUST NOT BE COMPARED.
+    //
+    // `tempfile` appends a random 6-character suffix to the directory above, so
+    // the absolute path differs on every launch by design -- that is what keeps
+    // concurrent hermit invocations on a shared host from binding the same
+    // coordinator socket. Emitting it at INFO put per-launch randomness into the
+    // INFO stream, which `--verify-strict` compares:
+    //
+    //   Mismatch at log messages 2 (run 1) and 2 (run 2):
+    //   < socket=/tmp/hermit-sabre-rpc-Gw6tUi/coordinator.sock
+    //   > socket=/tmp/hermit-sabre-rpc-7SZ94p/coordinator.sock
+    //
+    // That fails EVERY SaBRe verify cell before the guest executes an
+    // instruction, for a host-side value with no guest-visible content. The
+    // defect was in the oracle, not the backend.
+    //
+    // WHY THE VALUE IS DROPPED FROM INFO RATHER THAN MADE DETERMINISTIC: the two
+    // `--verify` runs execute in SEPARATE CHILD PROCESSES, so any path stable
+    // across both would have to be derived from state shared between them. That
+    // trades `tempfile`'s guaranteed-fresh directory for a reused one, and a
+    // run1 that dies holding the socket would then make run2 fail to bind -- a
+    // real new failure mode in exchange for a cosmetic field. The path keeps its
+    // randomness; only the compared stream stops carrying it.
+    //
+    // This is NOT a comparator relaxation. No normalization envelope is widened,
+    // so any future randomness leaking into this banner still fails the
+    // comparison. The full path remains available one level down.
+    tracing::debug!(
+        target: "hermit::sabre",
+        socket = %socket_path.display(),
+        "SaBRe coordinator RPC socket (per-launch temp path, deliberately not at INFO)",
+    );
+    tracing::info!(
+        target: "hermit::sabre",
+        guest = %program.display(),
+        plugin = %plugin.display(),
+        "launching Detcore guest through SaBRe with coordinator RPC",
+    );
+
+    let supervised = match sabre_ptrace::run(
+        command.into_std_lossy(),
+        PathBuf::from(&sabre),
+        plugin.clone(),
+        fallback_ready,
+        global.clone(),
+        bootstrap_launch,
+        stats.clone(),
+        capture_output,
+    )
+    .await
+    {
+        Ok(supervised) => supervised,
+        Err(error) => {
+            global.release_all_physical_process_exits();
+            global.force_shutdown_with_error();
+            let _ = shutdown_sabre_rpc(server_task, &global, SABRE_RPC_DISCONNECT_TIMEOUT).await;
+            return Err(error);
+        }
+    };
+    // The supervisor returns only after every tracee reached a final kernel wait status. Release
+    // the root process's barrier (and any intentionally unreaped child barriers) before scheduler
+    // shutdown; no guest thread remains that could race timer fast-forward here.
+    global.release_all_physical_process_exits();
+    // A SaBRe execution in which no guest thread ever reached the coordinator
+    // is an execution in which Detcore was never loaded as a Reverie tool: the
+    // guest ran on bare Linux. Treat it exactly like a failed run so the
+    // scheduler is torn down here instead of blocking forever in `clean_up`
+    // below, waiting for a guest thread that will never register.
+    let detcore_never_engaged = !supervised.path_evidence.guest_rpc_observed;
+    let requires_forced_shutdown = !supervised.status.success() || detcore_never_engaged;
+    if requires_forced_shutdown {
+        global.force_shutdown_with_error();
+    }
+    // Emit one unconditional, machine-readable per-run fact instead of a
+    // free-form warning. SaBRe loads the guest interpreter before the Detcore
+    // plugin, so pre-plugin loader syscalls are structurally absent from its
+    // observation envelope. Versioning that fact lets scorecard consumers
+    // reject old or incomplete records rather than infer coverage from silence.
+    //
+    // Keep this in the controller-diagnostic stream rather than writing
+    // directly to the process stderr that also carries captured guest stderr.
+    // WARN is Hermit's default tracing level, and `--log-file` can therefore
+    // separate the unconditional controller fact from guest output without a
+    // comparator exception. A missing record remains distinct from a record
+    // whose counters are zero.
+    let backend_evidence = sabre_backend_evidence_line(&supervised.path_evidence);
+    tracing::warn!(target: "hermit::sabre", "{backend_evidence}");
+    if let Some(path) = path_evidence_file {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|error| {
+                anyhow!(
+                    "failed to open SaBRe path evidence {}: {error}",
+                    path.display()
+                )
+            })?;
+        serde_json::to_writer(&mut file, &supervised.path_evidence)?;
+        writeln!(file)?;
+    }
+    let output = Output {
+        status: supervised.status.into(),
+        stdout: supervised.stdout,
+        stderr: supervised.stderr,
+    };
+
+    shutdown_sabre_rpc(server_task, &global, SABRE_RPC_DISCONNECT_TIMEOUT).await?;
+    let mut global = Arc::try_unwrap(global).map_err(|global| {
+        anyhow!(
+            "SaBRe coordinator stopped with {} live RPC reference(s)",
+            Arc::strong_count(&global) - 1
+        )
+    })?;
+    if requires_forced_shutdown {
+        global.cancel_internal_scheduler().await;
+    }
+    let dispatch_stats = backend_stats::report(
+        Backend::Sabre,
+        backend_stats::request(print_summary_to_json_file),
+        &stats,
+    );
+    let finalized = global
+        .clean_up_with_dispatch_stats(print_summary, print_summary_to_json_file, dispatch_stats)
+        .await;
+    tracing::info!(
+        target: "hermit::sabre::fallback",
+        ptrace_fallback_sites = supervised.path_evidence.ptrace_fallback_sites,
+        trusted_shared_object_sites = supervised.path_evidence.trusted_shared_object_sites,
+        guest_rpc_observed = supervised.path_evidence.guest_rpc_observed,
+        "SaBRe ptrace fallback completed",
+    );
+    if detcore_never_engaged {
+        return detcore::combine_finalization(
+            Err(Error::new(BackendRunFailure)
+                .context(sabre_uninstrumented_guest_message(&output.status))),
+            finalized,
+        );
+    }
+    detcore::combine_finalization(Ok(output), finalized)
+}
+
+#[cfg(not(feature = "sabre"))]
+async fn run_sabre(
+    _command: Command,
+    _config: DetConfig,
+    _print_summary: bool,
+    _print_summary_to_json_file: &Option<PathBuf>,
+    _capture_output: bool,
+) -> Result<Output, Error> {
+    Backend::Sabre.ensure_available()?;
+    unreachable!("SaBRe availability must fail when the feature is disabled");
+}
+
+/// Classify the existing SaBRe reach evidence without collapsing "never
+/// engaged" into the same zero-valued state as a fully exercised run.
+#[cfg(feature = "sabre")]
+fn sabre_reach_state(guest_rpc_observed: bool, ptrace_fallback_sites: usize) -> &'static str {
+    match (guest_rpc_observed, ptrace_fallback_sites) {
+        (false, _) => "no-detcore-reached",
+        (true, 1..) => "degraded-ptrace-fallback",
+        (true, 0) => "sabre-exercised",
+    }
+}
+
+/// Produce the versioned SaBRe backend fact consumed by compatibility reports.
+///
+/// `preplugin_coverage=absent` is a property of SaBRe's launch order: the guest
+/// interpreter runs before the Detcore plugin is loaded. It is recorded rather
+/// than inferred from counters because the ptrace fallback cannot observe that
+/// interval either.
+///
+/// Preserve the originating #1725 measurement as provenance for that field:
+/// on its measurement host, `/bin/true` produced 3 COMMITs under SaBRe versus
+/// 14 under ptrace; the 11 absent records were the loader's libc.so.6 path
+/// resolution. The launch-order fact, not that host-specific count, is the
+/// runtime contract.
+#[cfg(feature = "sabre")]
+fn sabre_backend_evidence_line(evidence: &sabre_ptrace::PathEvidence) -> String {
+    format!(
+        ":: Backend: sabre static rewriting + ptrace runtime; run_mode=run; \
+         evidence_schema={}; preplugin_coverage=absent; ptrace_fallback_sites={}; \
+         trusted_shared_object_sites={}; guest_rpc_observed={}; reach_state={}",
+        evidence.schema,
+        evidence.ptrace_fallback_sites,
+        evidence.trusted_shared_object_sites,
+        evidence.guest_rpc_observed,
+        sabre_reach_state(evidence.guest_rpc_observed, evidence.ptrace_fallback_sites),
+    )
+}
+
+/// Explain a SaBRe run whose guest never reached the Detcore coordinator.
+///
+/// `guest_rpc_observed` is set by the coordinator RPC listener the first time a
+/// SaBRe-loaded guest connects. When it stays false the guest completed without
+/// Detcore intercepting anything, so the run carries no determinism guarantee
+/// whatsoever -- its timing, scheduling, PIDs, and clock reads all came from the
+/// host. Reporting that as a successful `hermit run` would be a fail-open
+/// determinism hole, so the caller turns it into a hard error and this function
+/// supplies the diagnosis.
+///
+/// The dominant cause is a guest whose syscall sites SaBRe never rewrote. A
+/// statically linked ELF is the sharp edge: it has no dynamic loader and no
+/// shared library through which SaBRe could regain control, so an unrewritten
+/// static client runs entirely on bare Linux with no second chance.
+#[cfg(feature = "sabre")]
+fn sabre_uninstrumented_guest_message(status: &ExitStatus) -> String {
+    format!(
+        "the SaBRe backend finished ({status:?}) without the guest ever reaching the Detcore \
+         coordinator: no syscall was intercepted, so this run applied no determinization at all \
+         and its result is not a Hermit guarantee. This means SaBRe rewrote no syscall site in \
+         the guest -- most often a statically linked ELF, whose syscall sites SaBRe must patch \
+         in the client image itself because there is no dynamic loader to intercept."
+    )
+}
+
+/// Guest-physical memory available to the single-process KVM personality.
+// The KVM personality is a sparse MAP_NORESERVE address space. QEMU needs room
+// for its own ELF mappings in addition to the nested machine's RAM mapping.
+// reverie-kvm places every guest mapping in this window, even a PROT_NONE
+// reservation, so a runtime that reserves address space up front needs room
+// here: node's V8 reserves 256, 128 and then 512 MiB twice, which 1 GiB could
+// not hold (https://github.com/rrnewton/hermit/issues/4366). 3 GiB is the
+// largest window reverie-kvm's bootstrap identity-maps. The window costs the
+// host only the pages a guest touches, and mmap and munmap discard ranges of
+// 2 MiB or more rather than writing zeros over them
+// (https://github.com/rrnewton/reverie/pull/1059). madvise(MADV_DONTNEED)
+// still writes zeros over every page, and node calls it over its 512 MiB
+// reservation, so a node run peaks near 880 MB of host memory until that is
+// made lazy too (https://github.com/rrnewton/hermit/issues/4366).
+const KVM_GUEST_MEMORY_BYTES: usize = 3 * 1024 * 1024 * 1024;
+
+/// Maximum `#!` interpreter indirection levels, matching the Linux kernel's
+/// `BINPRM_MAX_RECURSION` limit for chained script interpreters.
+const MAX_SHEBANG_DEPTH: usize = 4;
+
+/// Resolve `#!` interpreter scripts before the reverie-kvm ELF loader runs.
+///
+/// The KVM ELF loader can only map ELF images, so a guest program that is
+/// actually a `#!`-script (for example `/usr/local/bin/file` -> `#!/bin/bash`,
+/// or `/usr/bin/pkg-config` -> `#!/usr/bin/sh`) must be rewritten to launch its
+/// interpreter, exactly as the kernel's `execve(2)` `binfmt_script` handler
+/// does. On success the returned image is an ELF and `argv` has the interpreter,
+/// its shebang arguments, and the script path prepended in kernel order:
+/// `[interp, shebang_args.., script_path, <original argv[1..]>]`.
+///
+/// The interpreter line is parsed with hermit's shared [`Shebang`] so the KVM
+/// backend matches how the ptrace backend and recorder treat `#!`-scripts.
+fn resolve_kvm_shebang(
+    resolved_program: &Path,
+    mut argv: Vec<String>,
+) -> Result<(PathBuf, Vec<String>, Vec<u8>), Error> {
+    let mut load_path = resolved_program.to_path_buf();
+    let mut image = fs::read(&load_path)
+        .map_err(|error| anyhow!("failed to read KVM guest executable {load_path:?}: {error}"))?;
+
+    let mut depth = 0;
+    while image.starts_with(b"#!") {
+        depth += 1;
+        if depth > MAX_SHEBANG_DEPTH {
+            return Err(anyhow!(
+                "too many levels of `#!` interpreter indirection loading {resolved_program:?}"
+            ));
+        }
+        let (interpreter, shebang_args) = Shebang::from_buf(&image)
+            .ok_or_else(|| anyhow!("malformed `#!` interpreter line in {load_path:?}"))?
+            .into_parts();
+        let interpreter_str = interpreter
+            .to_str()
+            .ok_or_else(|| anyhow!("non-UTF-8 `#!` interpreter path in {load_path:?}"))?
+            .to_owned();
+
+        // Rewrite argv in kernel order. The prior argv[0] (the script's own
+        // name) is dropped on the first level; on deeper levels the previous
+        // interpreter path is preserved as a positional argument, matching
+        // `binfmt_script`.
+        let mut rewritten = Vec::with_capacity(argv.len() + shebang_args.len() + 2);
+        rewritten.push(interpreter_str);
+        for arg in &shebang_args {
+            rewritten.push(
+                arg.to_str()
+                    .ok_or_else(|| anyhow!("non-UTF-8 `#!` interpreter argument in {load_path:?}"))?
+                    .to_owned(),
+            );
+        }
+        rewritten.push(load_path.to_string_lossy().into_owned());
+        rewritten.extend_from_slice(&argv[1..]);
+        argv = rewritten;
+
+        load_path = interpreter;
+        image = fs::read(&load_path).map_err(|error| {
+            anyhow!(
+                "failed to read `#!` interpreter {load_path:?} for {resolved_program:?}: {error}"
+            )
+        })?;
+    }
+
+    Ok((load_path, argv, image))
+}
+
+/// The container replaces this host directory with a private, empty tmpfs, so
+/// nothing beneath it is visible to the guest. Kept next to the diagnostic that
+/// depends on it; `run.rs` has its own `TMP_DIR` for the mount itself.
+const CONTAINER_REPLACED_TMP: &str = "/tmp";
+
+/// Explain why a working directory that plainly exists on the host could not be
+/// resolved for the guest.
+///
+/// ⚠️ THIS FUNCTION EXISTS BECAUSE THE BARE ERROR CAUSED A MISDIAGNOSIS, not to
+/// be tidy. `fs::canonicalize` runs after the container's mounts are applied, and
+/// the container bind-mounts a fresh empty tmpfs over `/tmp`
+/// (`bin/hermit/container.rs`). So a cwd beneath `/tmp` is genuinely absent from
+/// the guest's mount namespace and `canonicalize` returns a perfectly correct
+/// `NotFound` -- for a directory the user can `ls`.
+///
+/// Reported 2026-08-25 as "run_kvm_ cli tests fail from a git worktree". They do
+/// not. Measured across five working directories with one binary: a PLAIN
+/// directory under `/tmp` with no git in it FAILS, and a linked git worktree
+/// under `/home` WORKS. The only property that tracks the failure is "the cwd is
+/// under /tmp"; `/tmp` itself resolves because the mount POINT exists. The git
+/// hypothesis cost real investigation time, and it came from this message saying
+/// only "No such file or directory".
+///
+/// It mattered more than a stray report because the historical landing recipe
+/// placed detached worktrees below `/tmp`, exactly where this fires. Current
+/// dev-hermit worktrees are created through wrkslots below `worktrees/`, but the
+/// diagnostic remains necessary for arbitrary callers and older checkouts.
+///
+/// The message names the mechanism and both ways out. It deliberately does NOT
+/// silently fall back to `/`: changing the guest's working directory out from
+/// under a caller who asked for a specific one would trade a loud, correct
+/// failure for a quiet, wrong success.
+fn kvm_cwd_resolution_error(requested_cwd: &Path, error: &std::io::Error) -> Error {
+    let under_replaced_tmp = requested_cwd.starts_with(CONTAINER_REPLACED_TMP)
+        && requested_cwd != Path::new(CONTAINER_REPLACED_TMP);
+    if error.kind() == std::io::ErrorKind::NotFound && under_replaced_tmp {
+        anyhow!(
+            "failed to resolve KVM guest working directory {:?}: {error}\n\
+             \n\
+             This directory may well exist on the host. The container replaces \
+             {CONTAINER_REPLACED_TMP} with a private, empty tmpfs, so nothing beneath \
+             {CONTAINER_REPLACED_TMP} is visible to the guest, and resolving the working \
+             directory happens inside that mount namespace.\n\
+             Either run from a directory outside {CONTAINER_REPLACED_TMP}, or pass \
+             --workdir with a path that exists inside the guest.",
+            requested_cwd
+        )
+    } else {
+        anyhow!(
+            "failed to resolve KVM guest working directory {:?}: {error}",
+            requested_cwd
+        )
+    }
+}
+
+/// Bind KVM's raw mountinfo and fdinfo to the same filesystem namespace.
+///
+/// The CLI supplies IdentityGuard provenance from the completed container: the
+/// namespace's row/parent order and the namespace it was captured in
+/// ([`detcore_model::config::MountNamespaceIdentity`], whose kernel ID Linux
+/// never reuses during a boot). The backend requires its own mount namespace
+/// to be that one and keeps the producer's order, the same snapshot the
+/// container mount table was built from; it does not take a second one, and
+/// it refuses provenance that is not well formed (a duplicate ID, an empty
+/// order, an assignment Detcore's pool would refuse, a root rewrite or table
+/// row outside the order).
+///
+/// Two captures of one private namespace need not agree. When a host process
+/// removes the directory a host mount was on, Linux detaches the mounts on that
+/// dentry in every mount namespace (`vfs_rmdir`, `vfs_unlink` and rename call
+/// `detach_mounts`, and `__detach_mounts` in fs/namespace.c unmounts each
+/// mount on the dentry with `umount_tree`), so a copied host row can leave the
+/// container between two reads although nothing propagates into it. The
+/// snapshot keeps naming that row. A detached mount stays usable through what
+/// still holds it (an open descriptor, a working directory, a directory
+/// descriptor), and fdinfo `mnt_id` and STATX_MNT_ID still number it through
+/// the order; later mountinfo views lack it and stay ordered subsets of the
+/// snapshot, which Detcore's validation accepts. A kernel automount (an autofs
+/// trigger reached by an ordinary path lookup) can add a row after the
+/// snapshot despite the private propagation: fdinfo and statx number its new
+/// ID on first observation, and a later kernel-view mountinfo that shows it is
+/// not an ordered subset and is refused. The container mount table never shows
+/// it.
+/// A library caller that built no container and supplies no provenance gets
+/// this capture; `--no-namespace` runs supply it from Hermit's own namespace
+/// (`complete_container_config`). Either way Detcore renders the guest's mount
+/// files from the container mount table. KVM does not permit guest namespace
+/// changes.
+fn prepare_kvm_mountinfo_config(
+    config: &mut DetConfig,
+    namespace: impl FnOnce() -> Result<detcore_model::config::MountNamespaceIdentity, Error>,
+    capture: impl FnOnce() -> Result<Vec<u64>, Error>,
+) -> Result<(), Error> {
+    if !config.mountinfo_mount_ids_captured
+        && (!config.mountinfo_mount_ids.is_empty()
+            || !config.mount_id_assignment_order.is_empty()
+            || config.mountinfo_mount_namespace.is_some())
+    {
+        anyhow::bail!("KVM mount identities have no producer-captured namespace");
+    }
+    if config.mountinfo_mount_ids_captured {
+        let Some(producer) = config.mountinfo_mount_namespace else {
+            anyhow::bail!(
+                "KVM producer-captured mount identities do not name their mount namespace"
+            );
+        };
+        // Every mount namespace has its root, so a real one never yields an
+        // empty order; and Detcore's pool refuses a malformed one.
+        if config.mountinfo_mount_ids.is_empty()
+            || !detcore_model::procfs::mount_identity_provenance_is_well_formed(
+                &config.mountinfo_mount_ids,
+                &config.mount_id_assignment_order,
+            )
+        {
+            anyhow::bail!(
+                "KVM producer-captured mount identities are malformed ({} listed, {} assigned)",
+                config.mountinfo_mount_ids.len(),
+                config.mount_id_assignment_order.len()
+            );
+        }
+        if let Some(missing) = config
+            .mountinfo_root_rewrites
+            .iter()
+            .map(|rewrite| rewrite.raw_mount_id)
+            .find(|id| !config.mountinfo_mount_ids.contains(id))
+        {
+            anyhow::bail!(
+                "KVM mount root rewrite names mount {missing}, which the producer's snapshot does \
+                 not have"
+            );
+        }
+        let backend = namespace().context("failed to identify the KVM backend mount namespace")?;
+        if producer != backend {
+            anyhow::bail!(
+                "KVM producer-captured mount identities name another mount namespace \
+                 (captured in {producer:?}, backend in {backend:?})"
+            );
+        }
+    } else {
+        let order = capture().context("failed to capture the KVM backend mount namespace")?;
+        config.mountinfo_mount_ids = order;
+        config.mountinfo_mount_ids_captured = true;
+    }
+    // The container mount table Detcore renders on KVM too names mounts of
+    // this same namespace: refuse one built in another.
+    if let Some(table) = &config.container_mount_table
+        && let Some(missing) = table
+            .mounts
+            .iter()
+            .map(|row| row.raw_mount_id)
+            .find(|id| !config.mountinfo_mount_ids.contains(id))
+    {
+        anyhow::bail!(
+            "KVM container mount table names mount {missing}, which the backend namespace does \
+             not have"
+        );
+    }
+    // The backend now exposes the actual namespace's devices. There is no
+    // synthetic 0:1 root device to translate; stat and mountinfo use the same
+    // raw identities before entering Detcore's shared DevicePool.
+    config.mountinfo_device_rewrites.clear();
+    Ok(())
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/3695): Review
+// host metadata timestamps for KVM runs.
+/// Whether a KVM run declares to the backend that Detcore rewrites every
+/// metadata timestamp (`set_host_metadata_timestamps`).
+///
+/// The backend reports the kernel's timestamps for host files in every run;
+/// Detcore decides what the guest sees, and with virtual metadata it rewrites
+/// every timestamp that a stat call returns and reads the stored host values
+/// for its own checks (`set_file_times` confirms that `utimensat` stored the
+/// requested mtime). The setting additionally makes the backend classify the
+/// carriers it makes for its own data (virtual files, `/proc` snapshots, the
+/// virtual signalfd's eventfd, the self-pidfd proxy) so that they keep fixed
+/// timestamps through every alias; without it they report the carrier's
+/// kernel timestamps. The backend refuses the setting unless Detcore owns
+/// every guest thread, which `run_kvm` never opts out of. It is enabled only
+/// with virtual metadata, so that something rewrites the timestamps, and with
+/// sequentialized threads. The setting no longer decides whether another
+/// guest thread can read a host file's kernel timestamps before Detcore
+/// rewrites them: the backend reports them either way, and sequentialization
+/// alone closes that window.
+fn kvm_reports_stored_metadata_timestamps(config: &DetConfig) -> bool {
+    config.virtualize_metadata && config.sequentialize_threads
+}
+
+/// Dispatch a command onto the real reverie-kvm Tool runtime.
+async fn run_kvm(
+    command: &Command,
+    mut config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    capture_output: bool,
+) -> Result<Output, Error> {
+    let dispatch_started = Instant::now();
+    // A caller that built no container (a library caller): the KVM guest's
+    // host file operations run in this process's namespace, whatever its
+    // command asks (the backend applies no chroot or mount of the command),
+    // so its table is this namespace's. A caller with no provenance at all
+    // takes the order from the same read; malformed provenance is still
+    // refused below.
+    if config.container_mount_table.is_none() {
+        let launch_cwd = command
+            .get_current_dir()
+            .map_or_else(|| Path::new(".").to_owned(), Path::to_owned);
+        let (table, order) = unplanned_container_mount_table(&launch_cwd)?;
+        if !config.mountinfo_mount_ids_captured
+            && config.mountinfo_mount_ids.is_empty()
+            && config.mount_id_assignment_order.is_empty()
+            && config.mountinfo_mount_namespace.is_none()
+        {
+            config.mountinfo_mount_namespace = Some(current_mount_namespace()?);
+            config.mountinfo_mount_ids = order;
+            config.mountinfo_mount_ids_captured = true;
+        }
+        config.container_mount_table = Some(table);
+    }
+    let keep = config
+        .container_mount_table
+        .as_ref()
+        .map(detcore_model::container_mounts::ContainerMountTable::shown_mount_ids)
+        .unwrap_or_default();
+    prepare_kvm_mountinfo_config(&mut config, current_mount_namespace, || {
+        capture_mountinfo_identity_order_keeping(&keep)
+    })?;
+    let stdin = if capture_output {
+        let (snapshot_reserved, snapshot) = output_backend_stdin_reservation()?;
+        if snapshot_reserved {
+            snapshot
+        } else {
+            // Public KVM output-capture callers do not pass through the CLI's
+            // verify setup. Preserve their existing stdin behavior instead of
+            // silently replacing it with /dev/null merely because output is
+            // captured.
+            reserved_kvm_stdin()?
+        }
+    } else {
+        reserved_kvm_stdin()?
+    };
+    let requested_cwd = command
+        .get_current_dir()
+        .map(Path::to_owned)
+        .unwrap_or(std::env::current_dir()?);
+    let cwd = fs::canonicalize(&requested_cwd)
+        .map_err(|error| kvm_cwd_resolution_error(&requested_cwd, &error))?;
+    let program = command
+        .get_program()
+        .to_str()
+        .ok_or_else(|| anyhow!("KVM guest executable path is not valid UTF-8"))?
+        .to_owned();
+    if !cwd.is_dir() {
+        return Err(anyhow!(
+            "KVM guest working directory is not a directory: {:?}",
+            cwd
+        ));
+    }
+    let resolved_program = command.find_program().map_err(|error| {
+        anyhow!("failed to resolve KVM guest executable {program:?} in the guest PATH: {error}")
+    })?;
+    let mut argv = Vec::with_capacity(1 + command.get_args().count());
+    argv.push(program.clone());
+    for argument in command.get_args() {
+        argv.push(
+            argument
+                .to_str()
+                .ok_or_else(|| anyhow!("KVM guest argument is not valid UTF-8"))?
+                .to_owned(),
+        );
+    }
+
+    // Rewrite `#!`-scripts to their interpreter before the ELF loader sees them.
+    let (_interpreter_path, argv, image) = resolve_kvm_shebang(&resolved_program, argv)?;
+    // After shebang resolution the executable is the interpreter (argv[0]).
+    let program = argv.first().cloned().unwrap_or(program);
+    let envp = command
+        .get_captured_envs()
+        .into_iter()
+        .map(|(key, value)| {
+            let key = key
+                .to_str()
+                .ok_or_else(|| anyhow!("KVM guest environment key is not valid UTF-8"))?;
+            let value = value
+                .to_str()
+                .ok_or_else(|| anyhow!("KVM guest environment value is not valid UTF-8"))?;
+            Ok(format!("{key}={value}"))
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    tracing::info!(
+        target: "hermit::kvm",
+        program = %program,
+        argv = ?argv,
+        cwd = %cwd.display(),
+        env_count = envp.len(),
+        "launching guest through reverie-kvm",
+    );
+    let argv = argv.iter().map(String::as_str).collect::<Vec<_>>();
+    let envp = envp.iter().map(String::as_str).collect::<Vec<_>>();
+
+    let setup_started = Instant::now();
+    // `prepare_backend_config` already copied `KvmBackend::capabilities()`,
+    // which reports the backend's own CPUID table and that, of the madvise
+    // advice with guest-visible semantics, it implements only MADV_DONTNEED.
+    // KVM does not enter Hermit's UTS namespace, so Detcore must provide the
+    // same synthetic identity that the namespace-backed ptrace path exposes.
+    // TODO-HUMAN-REVIEW(PR-998): Review KVM UTS namespace parity.
+    config.has_uts_namespace = false;
+    let mut backend = reverie_kvm::KvmBackend::new_with_stdin(KVM_GUEST_MEMORY_BYTES, stdin)
+        .map_err(|error| anyhow!("failed to initialize reverie-kvm: {error}"))?;
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1120): Review KVM's canonical Detcore root identity.
+    backend
+        .set_root_pid(detcore::ROOT_DETPID.as_raw())
+        .map_err(|error| anyhow!("failed to configure KVM root PID: {error}"))?;
+    // Guests see their task IDs, so number them as the ptrace reference does
+    // (one extra ID per task for its tracer thread; see reverie::task_ids).
+    backend
+        .set_ids_per_task(reverie::task_ids::HERMIT_PTRACE_IDS_PER_TASK)
+        .map_err(|error| anyhow!("failed to configure KVM task IDs: {error}"))?;
+    // The ptrace launcher execs the path `find_program` resolved, so that is
+    // the filename Linux records in AT_EXECFN and copies to the top of the
+    // stack, including for a `#!` script whose argv now starts with the
+    // interpreter.
+    backend
+        .install_static_elf_with_exec_context(
+            &image,
+            resolved_program.as_os_str(),
+            &argv,
+            &envp,
+            &cwd,
+        )
+        .map_err(|error| anyhow!("failed to load KVM guest executable {program:?}: {error}"))?;
+    // The loader has copied the image's segments into guest memory, so the
+    // file's bytes are no longer needed. Holding them until the run ends kept
+    // a second copy of the program in host memory for the whole run: 75 MB
+    // for node (https://github.com/rrnewton/reverie/issues/1063).
+    drop(image);
+    // The KVM backend defaults to Tool-owned guest threads: CLONE_THREAD
+    // workers are driven through the Detcore tool loop and their futex/CLEARTID
+    // synchronization routes to Detcore, matching the golden ptrace model
+    // ("follow children"). Detcore registers every cloned thread as a tool
+    // thread (detcore/src/syscalls/threads.rs), so the backend must stay in
+    // that mode: host-owned threads would split worker execution and futex
+    // ownership across two synchronization domains, which deadlocks
+    // pthread_join.
+    if kvm_reports_stored_metadata_timestamps(&config) {
+        backend
+            .set_host_metadata_timestamps(true)
+            .map_err(|error| anyhow!("failed to configure KVM metadata timestamps: {error}"))?;
+    }
+
+    let execution_started = Instant::now();
+    let completion = hermit_run_kvm::run_detcore(&mut backend, config, capture_output)
+        .await
+        .map_err(|error| kvm_execution_error(error, None))?;
+    let cleanup_started = Instant::now();
+    let result =
+        finish_kvm_tool_completion(completion, print_summary, print_summary_to_json_file).await;
+    let teardown_started = Instant::now();
+    // Drop explicitly so the host's KVM VM teardown cost remains observable.
+    drop(backend);
+    let teardown_finished = Instant::now();
+    let (status, stdout, stderr) = result?;
+
+    // Every field below is a host wall-clock duration. Keep this diagnostic at
+    // DEBUG so it remains available for backend profiling without entering the
+    // INFO stream exposed to canonical comparison. KVM's built-in verification
+    // is still output/status-only; this classification does not claim KVM L2.
+    tracing::debug!(
+        target: "hermit::kvm",
+        prepare_us = setup_started.duration_since(dispatch_started).as_micros() as u64,
+        setup_us = execution_started.duration_since(setup_started).as_micros() as u64,
+        execution_us = cleanup_started.duration_since(execution_started).as_micros() as u64,
+        cleanup_us = teardown_started.duration_since(cleanup_started).as_micros() as u64,
+        teardown_us = teardown_finished.duration_since(teardown_started).as_micros() as u64,
+        lifecycle_us = teardown_finished.duration_since(dispatch_started).as_micros() as u64,
+        "reverie-kvm lifecycle phase timings",
+    );
+
+    if !capture_output {
+        std::io::stdout().write_all(&stdout)?;
+        std::io::stderr().write_all(&stderr)?;
+    }
+
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+// A runtime error still owns GlobalState. Finish its terminal daemon before
+// returning the typed cause to the CLI's error classifier.
+async fn finish_kvm_tool_completion(
+    completion: reverie_kvm::ToolRunCompletion<detcore::GlobalState>,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+) -> Result<(ExitStatus, Vec<u8>, Vec<u8>), Error> {
+    match completion.result {
+        Ok(output) => {
+            completion
+                .global_state
+                .clean_up(print_summary, print_summary_to_json_file)
+                .await?;
+            Ok(output)
+        }
+        Err(error) => {
+            let cleanup = completion
+                .global_state
+                .clean_up_after_backend_failure()
+                .await;
+            Err(kvm_execution_error(error, Some(cleanup)))
+        }
+    }
+}
+
+fn kvm_execution_error(
+    primary: reverie_kvm::Error,
+    cleanup: Option<detcore::BackendFailureCleanup>,
+) -> Error {
+    // The manifest runner retains the first Error line. Keep the cause there,
+    // as well as the typed backend and optional scheduler errors in the chain.
+    let message = format!("KVM guest execution failed: {primary}");
+    let mut error = Error::new(primary).context(BackendRunFailure);
+    if let Some(cleanup) = cleanup {
+        if let Err(recording) = cleanup.preemption_recording {
+            error = error.context(format!("partial preemption recording failed: {recording}"));
+        }
+        if let Err(scheduler) = cleanup.scheduler {
+            error = error.context(scheduler);
+        }
+    }
+    error.context(message)
+}
+
+#[cfg(test)]
+mod kvm_failure_tests;
+
+#[cfg(all(test, feature = "kvm-execution-tests"))]
+mod kvm_execution_tests;
+
+// TODO-HUMAN-REVIEW(PR-743): Review bounded relaunch before DBT guest execution.
+#[cfg(feature = "dbt")]
+fn dbt_client_thread_start_failed(status: &std::process::ExitStatus) -> bool {
+    status.code() == Some(reverie_dbt::CLIENT_THREAD_START_FAILURE_EXIT_CODE)
+}
+
+/// The program a DBT launch runs and the working directory it runs from, as
+/// reverie-dbt's launcher finds them: a name without a `/` through `path`,
+/// whose relative entries are taken from the guest's working directory;
+/// `cwd` relative to `current` (the launcher's own directory) when it is
+/// relative, and `current` when there is none. `None` where the search finds
+/// no executable file.
+#[cfg(feature = "dbt")]
+fn dbt_launched_program(
+    program: &std::path::Path,
+    cwd: Option<&std::path::Path>,
+    path: Option<&std::ffi::OsStr>,
+    current: &std::path::Path,
+) -> Option<(PathBuf, PathBuf)> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+    let cwd = cwd.map_or_else(|| current.to_owned(), |cwd| current.join(cwd));
+    let spelled = if program.as_os_str().as_bytes().contains(&b'/') {
+        program.to_owned()
+    } else {
+        std::env::split_paths(path?)
+            .map(|directory| cwd.join(directory).join(program))
+            .find(|candidate| {
+                candidate.metadata().is_ok_and(|metadata| {
+                    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+                })
+            })?
+    };
+    Some((spelled, cwd))
+}
+
+#[cfg(all(test, feature = "dbt"))]
+mod dbt_launched_program_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    fn executable(path: &std::path::Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn a_relative_path_entry_is_taken_from_the_guests_directory_not_the_launchers() {
+        let root = tempfile::tempdir().unwrap();
+        let launcher_dir = root.path().join("launcher");
+        // A decoy where the launcher's own directory would find it, and the
+        // program where the guest's directory does.
+        executable(&launcher_dir.join("bin/prog"));
+        executable(&root.path().join("guest/bin/prog"));
+        std::fs::write(root.path().join("guest/plain"), b"").unwrap();
+        let path = std::ffi::OsStr::new("bin");
+        let found = |program: &str, cwd: Option<&str>| {
+            dbt_launched_program(
+                std::path::Path::new(program),
+                cwd.map(std::path::Path::new),
+                Some(path),
+                &launcher_dir,
+            )
+        };
+        let guest = root.path().join("guest");
+        // An absolute and a relative working directory find the same file.
+        let expected = Some((guest.join("bin/prog"), guest.clone()));
+        assert_eq!(found("prog", Some(guest.to_str().unwrap())), expected);
+        assert_eq!(
+            found("prog", Some("../guest")),
+            Some((
+                launcher_dir.join("../guest/bin/prog"),
+                launcher_dir.join("../guest")
+            ))
+        );
+        // Without a working directory, the launcher's own is the guest's.
+        assert_eq!(
+            found("prog", None),
+            Some((launcher_dir.join("bin/prog"), launcher_dir.clone()))
+        );
+        // A name with a `/` is not searched for.
+        assert_eq!(
+            found("./plain", Some(guest.to_str().unwrap())),
+            Some((std::path::PathBuf::from("./plain"), guest.clone()))
+        );
+        // A file that is not executable is not found.
+        assert_eq!(found("plain", Some(guest.to_str().unwrap())), None);
+    }
+}
+
+/// Records, for a DBT run, the guest's first image: `program`, found and
+/// run from `cwd` with the guest's `PATH`, `path`, as the launch finds it
+/// (`dbt_launched_program`), then resolved as the kernel resolves an
+/// `execve`. Both DBT launch paths call it in the container, whose root is
+/// the guest's, in place of `launched_image`'s search, which takes a
+/// relative `PATH` entry from the coordinator's directory rather than the
+/// guest's. Where nothing is found the record stays unset, and the image's
+/// own `AT_EXECFN` gives it after the exec.
+#[cfg(feature = "dbt")]
+pub fn record_dbt_launched_image(
+    config: &mut DetConfig,
+    program: &std::path::Path,
+    cwd: Option<&std::path::Path>,
+    path: Option<&std::ffi::OsStr>,
+) {
+    let exe = std::env::current_dir()
+        .ok()
+        .and_then(|current| dbt_launched_program(program, cwd, path, &current))
+        .and_then(|(spelled, cwd)| {
+            detcore::exec_record::ExecRecord::resolve(std::path::Path::new("/"), &cwd, &spelled)
+        })
+        .map(|record| record.exe);
+    config
+        .launch_image
+        .get_or_insert(detcore::LaunchImage {
+            exe: None,
+            launcher: None,
+        })
+        .exe = exe;
+}
+
+/// Declares, for a DBT run through `drrun`, the image the kernel execs in the
+/// guest's place: DynamoRIO's library (`lib64/release/libdynamorio.so` beside
+/// `drrun`'s `bin64`), which loads the guest itself. So the kernel's `exe`
+/// link and program break are DynamoRIO's (`detcore::LaunchImage::launcher`),
+/// and Detcore answers the guest's brk from its own model; the runner tells
+/// DynamoRIO to reserve nothing for the break
+/// (`reverie_dbt::DbtRunner::tool_answers_brk`).
+/// An error where that library is missing: the run would otherwise
+/// declare a launcher the kernel never execs, and refuse every brk for want
+/// of a record the launcher check can accept.
+#[cfg(feature = "dbt")]
+pub fn declare_dbt_launcher(config: &mut DetConfig, drrun: &std::path::Path) -> Result<(), Error> {
+    let library = drrun
+        .parent()
+        .and_then(std::path::Path::parent)
+        .unwrap_or(std::path::Path::new("/"))
+        .join("lib64/release/libdynamorio.so");
+    if !library.is_file() {
+        return Err(anyhow!(
+            "DynamoRIO's library is not at {} beside drrun {}",
+            library.display(),
+            drrun.display()
+        ));
+    }
+    config
+        .launch_image
+        .get_or_insert(detcore::LaunchImage {
+            exe: None,
+            launcher: None,
+        })
+        .launcher = Some(library);
+    Ok(())
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-737): Review public DBT dispatch and child environment ownership.
+/// Dispatch a command onto the Detcore-linked reverie-dbt runtime.
+#[cfg(feature = "dbt")]
+async fn run_dbt(
+    command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    capture_output: bool,
+) -> Result<Output, Error> {
+    if !config.sequentialize_threads {
+        return Err(anyhow!(
+            "the dbt backend requires sequentialized threads; remove \
+             --no-sequentialize-threads (or --strace-only) to run under --backend dbt"
+        ));
+    }
+    // Strict schedule boundaries have never run on this backend: the
+    // configuration form that once carried Detcore's configuration to the DBT
+    // runtime could not express them, which refused such a run. They stay
+    // refused, by name.
+    if config.strict_schedule_boundaries {
+        return Err(anyhow!(
+            "the dbt backend does not run --strict-schedule-boundaries"
+        ));
+    }
+
+    // The DBT runtime receives this configuration through the coordinator's
+    // first RPC frame (`detcore_dbt::initial_dbt_config`), never through the
+    // guest's environment, which carries only what the guest was given.
+    let (drrun, client) = detcore_dbt::prepare_native_client()
+        .map_err(|error| anyhow!("failed to prepare the Detcore DynamoRIO client: {error}"))?;
+    let mut config = config;
+    declare_dbt_launcher(&mut config, &drrun)?;
+    record_dbt_launched_image(
+        &mut config,
+        std::path::Path::new(command.get_program()),
+        command.get_current_dir(),
+        command
+            .get_captured_envs()
+            .get(std::ffi::OsStr::new("PATH"))
+            .map(std::ffi::OsString::as_os_str),
+    );
+    // The coordinator's first RPC frame carries this configuration to the
+    // runtime. One that cannot be serialized (a path option that is not
+    // UTF-8, say) is refused here, before any guest runs.
+    serde_json::to_vec(&config)
+        .map_err(|error| anyhow!("failed to serialize the Detcore config for DBT: {error}"))?;
+    let panic_on_unsupported_syscalls = config.panic_on_unsupported_syscalls;
+    // Bind native diagnostics to the controller before guest output capture.
+    let diagnostics = std::fs::File::from(
+        std::io::stderr()
+            .as_fd()
+            .try_clone_to_owned()
+            .map_err(|error| anyhow!("failed to retain DBT diagnostic stderr: {error}"))?,
+    );
+    let mut runner = reverie_dbt::DbtRunner::new(&drrun, &client)
+        .map_err(|error| {
+            anyhow!(
+                "failed to configure the DynamoRIO DBT runner (drrun={}, client={}): {error}",
+                drrun.display(),
+                client.display()
+            )
+        })?
+        .private_environment_prefix(detcore_dbt::PRIVATE_ENV_PREFIX)?
+        .summary(print_summary)
+        .isolated_process_group(panic_on_unsupported_syscalls)
+        .tool_answers_brk(true)
+        .diagnostic_file(&diagnostics)
+        .map_err(|error| anyhow!("failed to configure DBT diagnostic stderr: {error}"))?;
+    drop(diagnostics);
+    if panic_on_unsupported_syscalls {
+        runner = runner.client_argument("-panic-on-unsupported-syscalls");
+    }
+
+    let program = command.get_program().to_owned();
+    let environment = command.get_captured_envs();
+    let guest = command.into_std_lossy();
+    tracing::info!(
+        target: "hermit::dbt",
+        program = ?program,
+        drrun = %drrun.display(),
+        client = %client.display(),
+        "launching guest through reverie-dbt with Detcore<DbtGuest>",
+    );
+
+    let (status, stdout, stderr, mut global) = if capture_output {
+        let launch = || {
+            runner.output_with_environment_and_global::<detcore::GlobalState>(
+                &guest,
+                &environment,
+                config.clone(),
+            )
+        };
+        let (mut output, mut global) = launch()
+            .await
+            .map_err(|error| anyhow!("failed to launch drrun ({}): {error}", drrun.display()))?;
+        if dbt_client_thread_start_failed(&output.status) {
+            tracing::warn!(
+                target: "hermit::dbt",
+                "DynamoRIO client thread failed before guest start; retrying once",
+            );
+            global.force_shutdown_with_error();
+            global.cancel_internal_scheduler().await;
+            global.clean_up(false, &None).await.map_err(|error| {
+                error.context(format!(
+                    "DBT cleanup after observed guest status {:?}",
+                    output.status
+                ))
+            })?;
+            (output, global) = launch().await.map_err(|error| {
+                anyhow!("failed to launch drrun ({}): {error}", drrun.display())
+            })?;
+        }
+        (output.status, output.stdout, output.stderr, global)
+    } else {
+        let launch = || {
+            runner.status_with_environment_and_global::<detcore::GlobalState>(
+                &guest,
+                &environment,
+                config.clone(),
+            )
+        };
+        let (mut status, mut global) = launch()
+            .await
+            .map_err(|error| anyhow!("failed to launch drrun ({}): {error}", drrun.display()))?;
+        if dbt_client_thread_start_failed(&status) {
+            tracing::warn!(
+                target: "hermit::dbt",
+                "DynamoRIO client thread failed before guest start; retrying once",
+            );
+            global.force_shutdown_with_error();
+            global.cancel_internal_scheduler().await;
+            global.clean_up(false, &None).await.map_err(|error| {
+                error.context(format!(
+                    "DBT cleanup after observed guest status {status:?}"
+                ))
+            })?;
+            (status, global) = launch().await.map_err(|error| {
+                anyhow!("failed to launch drrun ({}): {error}", drrun.display())
+            })?;
+        }
+        (status, Vec::new(), Vec::new(), global)
+    };
+
+    if !status.success() {
+        global.force_shutdown_with_error();
+        global.cancel_internal_scheduler().await;
+    }
+    global
+        .clean_up(print_summary, &None)
+        .await
+        .map_err(|error| {
+            error.context(format!(
+                "DBT cleanup after observed guest status {status:?}"
+            ))
+        })?;
+    Ok(Output {
+        status: status.into(),
+        stdout,
+        stderr,
+    })
+}
+
+// NOTE: A single-threaded executor is used here so that the tokio threads
+// themselves wouldn't contribute non-determinism to the PID namespace. This
+// could also be changed to a specific number of threads and that would be
+// deterministic, but it shouldn't be based on the number of cores. When the
+// thread count is based off of the number of cores in the machine, then two
+// runs on different machines with a different number of cores will not be the
+// same.
+/// Run the given command as deterministically as possible.
+///
+/// # Stack size
+///
+/// On the ptrace backend this and the other launch functions (`run*`,
+/// `record*`, `replay*`, [`HermitData::record`]) run the whole ptrace session
+/// on a tracer thread of their own, with an 8 MiB stack (the main thread's
+/// usual size, the default `ulimit -s`), so the calling thread needs no
+/// particular stack: a recording through the library returned on a 95 KiB
+/// caller thread. One tracer thread serves each calling thread for the
+/// caller's lifetime, so an operation kept at a [`HermitCleanupUnconfirmed`]
+/// checkpoint is resumed from the same caller. That thread stays, idle, until
+/// the caller exits, and a tracing subscriber set for the calling thread only
+/// does not see the session's events (a global subscriber does). The session itself, in a debug
+/// build, needs about 2 MiB, mostly Detcore's syscall handler, which at
+/// opt-level 0 keeps every syscall arm's temporaries in one frame
+/// (<https://github.com/rrnewton/hermit/issues/4389>).
+///
+/// The other backends still run on the calling thread, which then needs that
+/// stack itself: launching from a thread spawned with 4 MiB
+/// (`std::thread::Builder::stack_size`) is recommended for them, and Rust's
+/// default 2 MiB for a spawned thread or a test is not enough in a debug build
+/// with the `third-party-backends` feature. Optimised builds need much less:
+/// in the `validate` profile a 512 KiB thread was enough.
+pub fn run(
+    command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+) -> Result<ExitStatus, Error> {
+    run_with_backend(
+        command,
+        config,
+        print_summary,
+        print_summary_to_json_file,
+        Backend::Ptrace,
+    )
+}
+
+/// Run the given command using the selected instrumentation backend.
+///
+/// On ptrace it needs no particular stack from the calling thread; see [`run`].
+pub fn run_with_backend(
+    command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    backend: Backend,
+) -> Result<ExitStatus, Error> {
+    run_with_backend_timeout(
+        command,
+        config,
+        print_summary,
+        print_summary_to_json_file,
+        backend,
+        None,
+    )
+}
+
+/// [`run_with_backend`] with a hermit-enforced wall-clock bound on the guest.
+///
+/// On ptrace it needs no particular stack from the calling thread; see [`run`].
+///
+/// This library never installs a process alarm. Ordinary ptrace keeps the
+/// original runtime, operation, failed GlobalState and backing guards when a
+/// finite cleanup attempt is unconfirmed; downcast [`HermitCleanupUnconfirmed`]
+/// and recover it on the original process/thread. A timeout is measured before
+/// startup and is not a certificate of cleanup. `None` leaves execution
+/// unbounded, but fatal cleanup attempts remain finite. Nonordinary backends
+/// retain their existing cooperative timeout/drop semantics. Synchronous stalls
+/// require caller-owned supervision; only the CLI owns its hard alarm fallback.
+///
+/// ⚠️ NOT PART OF `DetConfig`, DELIBERATELY. A wall-clock bound is host state,
+/// and `DetConfig` is the determinism configuration that is serialized to disk
+/// and reasoned about as guest-visible. Threading a real-time deadline through
+/// it would put a nondeterministic quantity inside the structure whose entire
+/// job is to exclude them.
+pub fn run_with_backend_timeout(
+    command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    backend: Backend,
+    timeout: Option<Duration>,
+) -> Result<ExitStatus, Error> {
+    if backend == Backend::Ptrace {
+        let summary_path = print_summary_to_json_file.clone();
+        let command = tracer_thread::SendCommand::new(command);
+        return ptrace_completion::run_on_tracer_thread(timeout, move |control| async move {
+            let command = command.into_inner();
+            let report = SkidOvershootReport::begin(true);
+            let config = prepare_backend_config(config, backend);
+            let result = dispatch_backend(
+                command,
+                config,
+                print_summary,
+                &summary_path,
+                backend,
+                Some(control),
+            )
+            .await;
+            report.finish(result)
+        });
+    }
+    let skid_overshoot_report = SkidOvershootReport::begin(backend.uses_ptrace_pmu_timers());
+    if backend == Backend::Kvm {
+        ensure_kvm_stdin_reserved()?;
+    }
+    let config = prepare_backend_config(config, backend);
+    let result = run_with_backend_inner(
+        command,
+        config,
+        print_summary,
+        print_summary_to_json_file,
+        backend,
+        timeout,
+    );
+    skid_overshoot_report.finish(result)
+}
+
+// TODO-HUMAN-REVIEW(PR-749): Review LiteInst backend configuration normalization.
+#[doc(hidden)]
+pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetConfig {
+    // Detcore reads what the selected backend can do, never which backend it is.
+    // Each backend states its own facts in `Backend::capabilities()`.
+    //
+    // Three properties hold on every backend, so they are not capabilities:
+    // - Guest-visible wall and monotonic clocks stay in the same global
+    //   virtual-time domain as timers, sleeps, and timeout deadlines. SaBRe's
+    //   per-thread execution clock does not advance when the scheduler skips
+    //   global time while a thread is blocked.
+    // - A forked process child runs concurrently with its parent. Detcore
+    //   blocks the parent only for CLONE_VFORK.
+    // - Detcore dispatches every cloned thread's syscalls through its tool.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-845): Review backend-local guest clock observations.
+    // TODO-HUMAN-REVIEW(PR-1013): Review backend child process execution ordering.
+    // TODO-HUMAN-REVIEW(PR-1013): Review backend thread callback coverage.
+    // TODO-HUMAN-REVIEW(PR-1122): Review concurrent KVM process-child scheduling.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3635): Review in-guest LiteInst killed-thread RPC cancellation.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1152): KVM defers the vfork child spawn, so the child
+    // registers its vfork barrier only after the parent posts BlockedExternalContinue. ptrace keeps
+    // the parent kernel-blocked until the child registers.
+    config.backend = backend_capabilities(backend);
+    // Whether the run's process signals are tool-controlled is not decided
+    // here: Detcore installs the backend's process signal control when the
+    // backend offers it and threads are sequentialized, and reads the installed
+    // control from then on.
+    // Whether blocked waits decide signal interruption from the kernel's
+    // signal state (https://github.com/rrnewton/hermit/issues/3146), whether a
+    // `--max-timeslice` really preempts (https://github.com/rrnewton/hermit/issues/4068)
+    // and whether guest code can run between two injected calls are the
+    // backend's own stated facts in `config.backend`
+    // (`supports_blocked_wait_signal_interruption`,
+    // `delivers_preemption_timer_events`, `runs_guest_code_between_injections`),
+    // not derived from its name here (audit step A9 of
+    // https://github.com/rrnewton/hermit/issues/4485).
+    // Only backends where Detcore treats a terminal's signals as reaching the
+    // guest from the host read it (`Config::guest_may_inherit_a_terminal`, and
+    // `BackendCapabilities::host_timed_signals_are_physical`), so the host is
+    // asked only for them.
+    config.guest_may_inherit_a_terminal =
+        config.backend.host_timed_signals_are_physical && launcher_may_pass_a_terminal();
+    // The in-guest runtime's reserved signals are set only for the default
+    // in-guest route, after this preparation (`in_guest_reserved_signals`),
+    // so whatever a caller's configuration carried, every backend and every
+    // other route starts from the empty set (A5 step 3c, D13(a)).
+    config.in_guest_reserved_signals = 0;
+    // So is the refusal of host-timed signal producers
+    // (`in_guest_refuses_host_timed_producers`, A5 step 3c slice 0b).
+    config.in_guest_refuses_host_timed_producers = false;
+    // And the in-guest delivery gate, which only the default route's launch
+    // sets, from the final configuration and the process's PID-namespace
+    // ownership (`in_guest_signal_delivery_gate`, A5 step 3c.1, D35 and D52).
+    config.in_guest_signal_delivery = false;
+    config
+}
+
+/// The configuration of an in-guest run on the loader route (the exec-stop,
+/// native-exec and mapped-first-admission launchers of `hermit run`): the
+/// `in-guest-trap` backend's preparation with site patching off. It keeps
+/// today's behaviour on that route (D13(a), and D26 of the A5 step 3c design:
+/// the route's own comparison gates any change), so the in-guest runtime's
+/// reserved-signal set stays empty here whatever `config` carried; only the
+/// default route sets it (`in_guest_reserved_signals`).
+pub fn prepare_in_guest_loader_route_config(config: DetConfig) -> DetConfig {
+    let mut config = prepare_backend_config(config, Backend::InGuestTrap);
+    config.in_guest_site_patching_off = true;
+    config
+}
+
+/// Whether the guest may start with a terminal, which can make Linux send the
+/// guest signals at moments the host sets, such as SIGHUP when the terminal
+/// hangs up and SIGWINCH when it is resized
+/// (`Config::guest_may_inherit_a_terminal`): one of this process's standard
+/// descriptors, which the guest inherits, is a terminal, or this process has a
+/// controlling terminal, which the guest inherits with its session because
+/// neither Hermit nor Reverie starts a new session for it. When the
+/// controlling terminal cannot be read, the answer is yes.
+fn launcher_may_pass_a_terminal() -> bool {
+    // SAFETY: isatty only inspects the descriptor.
+    let standard_terminal = (0..=2).any(|fd| unsafe { libc::isatty(fd) } == 1);
+    may_pass_a_terminal(standard_terminal, controlling_terminal_device())
+}
+
+/// The rule of `launcher_may_pass_a_terminal`: a terminal standard descriptor,
+/// a controlling terminal (a nonzero device number), or an unknown one.
+fn may_pass_a_terminal(standard_terminal: bool, controlling_terminal: Option<i64>) -> bool {
+    standard_terminal || controlling_terminal != Some(0)
+}
+
+/// This process's controlling terminal as `/proc/self/stat` reports it: field
+/// 7, `tty_nr`, the terminal's device number, or 0 when there is none. `None`
+/// when it cannot be read.
+fn controlling_terminal_device() -> Option<i64> {
+    parse_controlling_terminal_device(&std::fs::read_to_string("/proc/self/stat").ok()?)
+}
+
+/// `tty_nr` from the text of a `/proc/<pid>/stat` file. The command name in
+/// field 2 is parenthesized and may hold spaces and parentheses, so the fields
+/// after it are counted from its last `)`: state, ppid, pgrp, session, tty_nr.
+fn parse_controlling_terminal_device(stat: &str) -> Option<i64> {
+    let after_command = stat.get(stat.rfind(')')? + 1..)?;
+    after_command.split_ascii_whitespace().nth(4)?.parse().ok()
+}
+
+/// What the selected backend can do, as Detcore consumes it.
+///
+/// Backends whose crate is always linked are asked directly. The LiteInst and
+/// DBT constants are checked against their crates by tests built with those
+/// features; the SaBRe value has no such check. e9patch takes ptrace's.
+#[doc(hidden)]
+pub fn backend_capabilities(backend: Backend) -> reverie::BackendCapabilities {
+    match backend {
+        // e9patch is binary-rewriting preprocessing whose guest runs on the
+        // ptrace backend (`hermit run --backend=e9patch` configures its run as
+        // `Backend::Ptrace`), so it has ptrace's capabilities. A direct caller
+        // used to get two of them turned off by this name.
+        Backend::Ptrace | Backend::E9patch => {
+            <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities()
+        }
+        Backend::Kvm => reverie_kvm::KvmBackend::capabilities(),
+        // Site patching changes how a syscall reaches the Tool, not what the
+        // Tool host can do, so in-guest-trap has in-guest LiteInst's capabilities.
+        Backend::Liteinst | Backend::InGuestTrap => reverie::BackendCapabilities::LITEINST_IN_GUEST,
+        Backend::Sabre => reverie::BackendCapabilities::SABRE,
+        Backend::Dbt => reverie::BackendCapabilities::DBT,
+    }
+}
+
+/// Whether `backend`'s runtime arms Reverie ptrace's PMU timer and delivers its
+/// events, so `--max-timeslice` really preempts a thread that makes no syscall:
+/// the backend's stated `delivers_preemption_timer_events`. Only ptrace does
+/// (e9patch preprocessing runs on it). SaBRe and KVM accept a timer request and
+/// deliver nothing; DBT and in-guest LiteInst refuse it.
+pub fn backend_delivers_preemption_timer(backend: Backend) -> bool {
+    backend_capabilities(backend).delivers_preemption_timer_events
+}
+
+/// After an in-guest LiteInst run, waits (bounded) until the watcher has
+/// reported every admitted process's physical exit, then releases any exit
+/// barrier still recorded. Release comes only after that drain: an exit still
+/// in flight is reported first.
+///
+/// Every report is applied again to the run's returned state. The backend
+/// lets go of its own reference to that state when the run ends, and a report
+/// that arrived afterwards reached nothing; applying a report twice consumes
+/// nothing the second time.
+///
+/// A failed drain, a fired watchdog or a refused admission fails the run:
+/// it records a determinism loss, so verification refuses to compare it, and
+/// returns the failure, after the barriers are released.
+#[cfg(feature = "liteinst")]
+async fn settle_in_guest_exits(
+    exits: &in_guest_exits::InGuestExitAdmission,
+    global_state: &detcore::GlobalState,
+) -> Result<(), Error> {
+    let drained = exits.drain(std::time::Duration::from_secs(10)).await;
+    for pid in exits.reported_exits() {
+        global_state.complete_physical_process_exit(pid);
+    }
+    global_state.release_all_physical_process_exits();
+    let failure = exits.failure().or_else(|| {
+        drained
+            .err()
+            .map(|error| format!("not every in-guest LiteInst guest exit was reported: {error:?}"))
+    });
+    match failure {
+        Some(reason) => {
+            detcore::detlog::record_determinism_loss(&reason);
+            Err(Error::msg(reason))
+        }
+        None => Ok(()),
+    }
+}
+
+// TODO-HUMAN-REVIEW(PR-736): Review reserved LiteInst runtime failure statuses.
+//
+// ⚠️ THIS PREDICATE AND THE CLASSIFIER MUST AGREE ABOUT THE SIGNAL BAND, AND A
+// HARD-CODED RANGE CANNOT. They do NOT cover the same statuses and are not meant
+// to -- see the table below for what each covers. It is the SIGNAL half that has
+// to move together, because both readers derive it from the same fact. When the reserved set grew to include the signal
+// band, `Exited(130)` fell outside `122..=127` and is NOT `Signaled(_, _)` --
+// it is a status hermit CHOSE, not an actual signal death -- so LiteInst
+// skipped the forced shutdown and `clean_up` could wait forever on
+// `handle.await` (detcore/src/tool_global.rs). The reserved set had grown past
+// the range this hard-coded, and nothing connected the two.
+//
+// Keying the SIGNAL HALF on `signal_from_exit_status` -- the same predicate
+// `classify_container_result` uses -- is what stops that half drifting again: a
+// change to the band moves both readers or neither.
+//
+// ⚠️ THE TWO PREDICATES ARE NOT THE SAME SET, AND AN EARLIER VERSION OF THIS
+// COMMENT SAID THEY WERE. agent(hermit-007)'s codex lane caught the overclaim.
+// They deliberately differ:
+//
+//   this predicate            122..=127        +  signal band  +  real Signaled
+//   classify_container_result 122 + 123 + 124  +  signal band
+//
+// 123..=127 force a LiteInst shutdown and are classified as NEITHER a refusal
+// nor a signal death. The classifier gives 123 and 124 arms of their own -- 123
+// is the log byte cap (hermit's `--max-log-bytes`, and the value reserved for
+// safehermit's log-cap kill, which still exits 125), 124 a deadline hermit
+// enforced -- while 125 (hermit itself) and 126/127 (exec-level) have none, and
+// each has a different producer. Only the signal half is shared, and only the
+// signal half is protected from drift. Do not "simplify" this by assuming the
+// two agree; the `122..=127` bound here is still hard-coded and still needs a
+// human to widen it if the reserved set grows again.
+#[cfg(feature = "liteinst")]
+fn liteinst_requires_forced_shutdown(status: ExitStatus) -> bool {
+    match status {
+        // A real signal death: the process never chose a status at all.
+        ExitStatus::Signaled(_, _) | ExitStatus::SignaledRaw(_, _) => true,
+        ExitStatus::Exited(code) => {
+            // The 122..=127 reserved band, plus any status hermit emits to mean
+            // "killed by signal N".
+            (122..=127).contains(&code) || detcore_model::signal_from_exit_status(code).is_some()
+        }
+    }
+}
+
+/// The guest outlived the wall-clock bound the caller asked hermit to enforce.
+///
+/// A DISTINCT TYPE, NOT A STRING, because `failure_exit_code` and
+/// `classify_failure` both have to recognise it and a prose match would break
+/// silently the first time the wording changed.
+#[derive(Debug)]
+pub struct GuestTimedOut {
+    /// The bound that was exceeded, as the caller spelled it.
+    pub limit: Duration,
+}
+
+impl std::fmt::Display for GuestTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Guest exceeded the --timeout bound of {} seconds",
+            self.limit.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for GuestTimedOut {}
+
+/// Nonordinary backends retain their existing cooperative timeout behavior.
+/// There is no process-wide alarm in this library. A caller needing a bound on
+/// synchronous stalls must own external supervision; the CLI arms its own
+/// separate init-process fallback before invoking the library. Ordinary ptrace
+/// uses the retained whole-operation driver instead of cancelling this future.
+async fn with_run_deadline<F>(timeout: Option<Duration>, guest: F) -> Result<ExitStatus, Error>
+where
+    F: std::future::Future<Output = Result<ExitStatus, Error>>,
+{
+    match timeout {
+        None => guest.await,
+        Some(limit) => match tokio::time::timeout(limit, guest).await {
+            Ok(result) => result,
+            Err(_) => Err(Error::new(GuestTimedOut { limit })),
+        },
+    }
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn run_with_backend_inner(
+    command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    backend: Backend,
+    timeout: Option<Duration>,
+) -> Result<ExitStatus, Error> {
+    refuse_in_guest_liteinst_timeout(backend, timeout)?;
+    // Keep the large backend future off the container supervisor's stack
+    // before the deadline and Tokio wrappers capture it. Polling and dropping
+    // stay inline, including the backend teardown on timeout.
+    let guest = Box::pin(dispatch_backend(
+        command,
+        config,
+        print_summary,
+        print_summary_to_json_file,
+        backend,
+        None,
+    ));
+    with_run_deadline(timeout, guest).await
+}
+
+/// The guest's first image, as its `/proc/self/exe` link names it
+/// (`detcore::Config::launch_image`): the program the launch executes, found
+/// as the launch finds it, then resolved as the kernel resolves an `execve`
+/// (`detcore::exec_record::ExecRecord::resolve`). Read in the container,
+/// whose root is the guest's. A launch through a launcher names it itself
+/// (`run_sabre`). `None` when it cannot be found, which leaves the link to the
+/// kernel, and the launch reports the missing program itself.
+fn launched_image(command: &Command) -> Option<detcore::LaunchImage> {
+    let program = command.find_program().ok()?;
+    let cwd = match command.get_current_dir() {
+        Some(cwd) => cwd.to_owned(),
+        None => std::env::current_dir().ok()?,
+    };
+    let record = detcore::exec_record::ExecRecord::resolve(Path::new("/"), &cwd, &program)?;
+    Some(detcore::LaunchImage {
+        exe: Some(record.exe),
+        launcher: None,
+    })
+}
+
+async fn dispatch_backend(
+    command: Command,
+    mut config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    backend: Backend,
+    control: Option<std::rc::Rc<ptrace_completion::Control>>,
+) -> Result<ExitStatus, Error> {
+    // Every launch path, ptrace's included, reaches the guest through here.
+    crate::cpu_profile_admission::refuse_unadmitted_launch(&config, backend == Backend::Ptrace)?;
+    config.launch_image = launched_image(&command);
+    if backend == Backend::Kvm {
+        return Ok(run_kvm(
+            &command,
+            config,
+            print_summary,
+            print_summary_to_json_file,
+            false,
+        )
+        .await?
+        .status);
+    }
+    if backend == Backend::Dbt {
+        #[cfg(feature = "dbt")]
+        {
+            return Ok(run_dbt(command, config, print_summary, false).await?.status);
+        }
+        #[cfg(not(feature = "dbt"))]
+        {
+            backend.ensure_available()?;
+            unreachable!("DBT availability must fail when the feature is disabled");
+        }
+    }
+    if backend == Backend::Sabre {
+        return Ok(run_sabre(
+            command,
+            config,
+            print_summary,
+            print_summary_to_json_file,
+            false,
+        )
+        .await?
+        .status);
+    }
+    if backend.is_in_guest_liteinst() {
+        #[cfg(feature = "liteinst")]
+        {
+            let stats_request = in_guest_stats_request(backend, print_summary_to_json_file);
+            let mut command = command;
+            refuse_in_guest_liteinst_run(&mut command, &config, backend)?;
+            let (launch, _detlog_descriptor) =
+                in_guest_liteinst_launch(&mut command, &in_guest_detlog_forward_policy())?;
+            // After Hermit's other callbacks, so the guest's own check is the
+            // last one that can change what it checks (`LaunchAudit::install`).
+            let audit = neutralize_inherited_signal_producers(&mut command, backend)?;
+            let tool_data = launch.encode();
+            // Every Tool image must forward on that socket, by that policy;
+            // see detcore::Config::in_guest_detlog_forward_policy.
+            let mut config = config;
+            config.in_guest_detlog_forward_policy = _detlog_descriptor
+                .is_some()
+                .then(|| in_guest_detlog_forward_policy().encode());
+            config.in_guest_site_patching_off = in_guest_site_patching_off(backend);
+            config.in_guest_refuses_host_timed_producers =
+                in_guest_refuses_host_timed_producers(backend);
+            // Last, from the configuration every Tool image receives.
+            config.in_guest_reserved_signals = in_guest_reserved_signals(&config, backend);
+            // The delivery gate, from the final configuration and whether
+            // this process owns the guests' PID namespace; off until the
+            // runtime takes it (A5 step 3c.1, D35, D52).
+            config.in_guest_signal_delivery = IN_GUEST_RUNTIME_DELIVERS_SIGNALS
+                && in_guest_signal_delivery_gate(
+                    &config,
+                    backend,
+                    scheduler_owns_guest_pid_namespace(),
+                );
+            let preload = liteinst_tool_runtime_library_path()?;
+            let exits = std::sync::Arc::new(in_guest_exits::InGuestExitAdmission::default());
+            let (exit_status, mut global_state, dispatch_stats, process_reports) =
+                reverie_liteinst::LiteinstBackend::with_connection_admission(
+                    exits.clone(),
+                    async {
+                        if stats_request.is_enabled() {
+                            let (exit_status, global_state, source) =
+                                reverie_liteinst::LiteinstBackend::run_with_preload_data_and_stats::<
+                                    Detcore,
+                                >(command, config, preload, tool_data)
+                                .await?;
+                            let dispatch_stats =
+                                backend_stats::report(backend, stats_request, &source);
+                            let process_reports = source.snapshot().process_reports();
+                            Ok::<_, reverie::Error>((
+                                exit_status,
+                                global_state,
+                                dispatch_stats,
+                                process_reports,
+                            ))
+                        } else {
+                            let (exit_status, global_state) =
+                                reverie_liteinst::LiteinstBackend::run_with_preload_data::<Detcore>(
+                                    command, config, preload, tool_data,
+                                )
+                                .await?;
+                            Ok((exit_status, global_state, None, 0))
+                        }
+                    },
+                )
+                .await
+                .inspect_err(|error| exits.fail_launch(error))
+                // A standard descriptor the guest's own check refused
+                // (D25) fails the launch; name it.
+                .map_err(|error| match &audit {
+                    Some(audit) => audit.launch_error(backend, error),
+                    None => Error::from(error),
+                })?;
+            let patched =
+                in_guest_trap_patching_evidence(backend, dispatch_stats.as_ref(), process_reports);
+            let settled = settle_in_guest_exits(&exits, &global_state).await;
+            let policy_refusal = global_state.policy_refusal();
+            if settled.is_err() || liteinst_requires_forced_shutdown(exit_status) {
+                global_state.force_shutdown_with_error();
+                global_state.cancel_internal_scheduler().await;
+            }
+            let finalized = global_state
+                .clean_up_with_dispatch_stats(
+                    print_summary,
+                    print_summary_to_json_file,
+                    dispatch_stats,
+                )
+                .await;
+            // After the scheduler has shut down, so the line's place among
+            // the run's INFO lines is fixed (D25); a stopping refusal logs it
+            // just before it exits instead.
+            detcore::host_timed_producers::emit_run_end_log();
+            let result = (|| {
+                refuse_in_guest_policy(backend, policy_refusal)?;
+                settled?;
+                refuse_in_guest_trap_patching(backend, patched)
+            })();
+            detcore::combine_finalization(result, finalized)?;
+            return Ok(exit_status);
+        }
+        #[cfg(not(feature = "liteinst"))]
+        {
+            backend.ensure_available()?;
+            unreachable!("LiteInst availability must fail when the feature is disabled");
+        }
+    }
+    ensure_backend_dispatch(backend)?;
+
+    let stats_request = backend_stats::request(print_summary_to_json_file);
+    let control = control
+        .ok_or_else(|| Error::msg("ordinary ptrace requires its retained operation owner"))?;
+    // A sequentialized guest tells gdbserver not to serialize its threads;
+    // see hermit_run_ptrace::spawn_tracer.
+    let tracer = hermit_run_ptrace::spawn_tracer(
+        command,
+        config.clone(),
+        config.gdbserver.then_some(config.gdbserver_port),
+        config.sequentialize_threads,
+        stats_request,
+    )
+    .await?;
+    let stats_source = tracer.backend_stats();
+    let (exit_status, global_state) = ptrace_completion::wait(tracer, control).await?;
+    let dispatch_stats =
+        backend_stats::report_if_collected(backend, stats_request, stats_source.as_ref());
+    global_state
+        .clean_up_with_dispatch_stats(print_summary, print_summary_to_json_file, dispatch_stats)
+        .await
+        .map_err(|error| {
+            error.context(format!(
+                "ptrace cleanup after observed guest status {exit_status:?}"
+            ))
+        })?; // Before it's dropped by this function.
+    Ok(exit_status)
+}
+
+/// Variant of `run` that also captures stdout/stderr.
+///
+/// On ptrace it needs no particular stack from the calling thread; see [`run`].
+pub fn run_with_output(
+    command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+) -> Result<Output, Error> {
+    run_with_output_backend(
+        command,
+        config,
+        print_summary,
+        print_summary_to_json_file,
+        Backend::Ptrace,
+    )
+}
+
+/// Variant of [`run_with_backend`] that also captures stdout/stderr.
+///
+/// On ptrace it needs no particular stack from the calling thread; see [`run`].
+pub fn run_with_output_backend(
+    command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    backend: Backend,
+) -> Result<Output, Error> {
+    if backend == Backend::Kvm {
+        ensure_kvm_stdin_reserved()?;
+    }
+    run_with_output_backend_timeout(
+        command,
+        config,
+        print_summary,
+        print_summary_to_json_file,
+        backend,
+        None,
+    )
+}
+
+/// [`run_with_output_backend`] with a hermit-enforced wall-clock bound.
+///
+/// See [`run_with_backend_timeout`]; the teardown semantics are identical. On
+/// ptrace it needs no particular stack from the calling thread; see [`run`].
+pub fn run_with_output_backend_timeout(
+    command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    backend: Backend,
+    timeout: Option<Duration>,
+) -> Result<Output, Error> {
+    if backend == Backend::Ptrace {
+        let summary_path = print_summary_to_json_file.clone();
+        let command = tracer_thread::SendCommand::new(command);
+        return ptrace_completion::run_on_tracer_thread(timeout, move |control| async move {
+            let command = command.into_inner();
+            let report = SkidOvershootReport::begin(true);
+            // Box before the retained operation captures the backend state;
+            // constructing and polling it still happen after admission here.
+            let result = Box::pin(dispatch_output_backend(
+                command,
+                prepare_backend_config(config, backend),
+                print_summary,
+                &summary_path,
+                backend,
+                Some(control),
+            ))
+            .await;
+            report.finish(result)
+        });
+    }
+    let (output, skid_overshoots) = run_with_output_backend_timeout_and_skid_overshoots(
+        command,
+        config,
+        print_summary,
+        print_summary_to_json_file,
+        backend,
+        timeout,
+    )?;
+    if skid_overshoots > 0 {
+        return Err(Error::new(SkidOvershootError::new(skid_overshoots)));
+    }
+    Ok(output)
+}
+
+/// Run with captured output and return the number of precise PMU timer
+/// overshoots alongside it instead of refusing before a caller can inspect the
+/// completed output. The `--verify` path uses this to finish and publish its
+/// comparison before it refuses the overshoot-tainted result.
+#[doc(hidden)]
+pub fn run_with_output_backend_timeout_and_skid_overshoots(
+    command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    backend: Backend,
+    timeout: Option<Duration>,
+) -> Result<(Output, u64), Error> {
+    if backend == Backend::Ptrace {
+        let summary_path = print_summary_to_json_file.clone();
+        let command = tracer_thread::SendCommand::new(command);
+        return ptrace_completion::run_on_tracer_thread(timeout, move |control| async move {
+            let command = command.into_inner();
+            let report = SkidOvershootReport::begin(true);
+            let result = Box::pin(dispatch_output_backend(
+                command,
+                prepare_backend_config(config, backend),
+                print_summary,
+                &summary_path,
+                backend,
+                Some(control),
+            ))
+            .await;
+            report.finish_with_count(result)
+        });
+    }
+    let skid_overshoot_report = SkidOvershootReport::begin(backend.uses_ptrace_pmu_timers());
+    if backend == Backend::Kvm {
+        // Reserve before the Tokio runtime can reuse a closed fd 0. KVM
+        // verification consumes the explicit output snapshot in `run_kvm`;
+        // public output-capture callers without one retain this reservation.
+        ensure_kvm_stdin_reserved()?;
+    }
+    let config = prepare_backend_config(config, backend);
+    let result = run_with_output_backend_inner(
+        command,
+        config,
+        print_summary,
+        print_summary_to_json_file,
+        backend,
+        timeout,
+    );
+    skid_overshoot_report.finish_with_count(result)
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn run_with_output_backend_inner(
+    command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    backend: Backend,
+    timeout: Option<Duration>,
+) -> Result<Output, Error> {
+    refuse_in_guest_liteinst_timeout(backend, timeout)?;
+    // Keep the backend state off the caller's stack before Tokio and the
+    // deadline future capture it. Polling and teardown stay on this thread.
+    let guest = Box::pin(dispatch_output_backend(
+        command,
+        config,
+        print_summary,
+        print_summary_to_json_file,
+        backend,
+        None,
+    ));
+    match timeout {
+        None => guest.await,
+        Some(limit) => match tokio::time::timeout(limit, guest).await {
+            Ok(result) => result,
+            Err(_elapsed) => Err(Error::new(GuestTimedOut { limit })),
+        },
+    }
+}
+
+async fn dispatch_output_backend(
+    mut command: Command,
+    mut config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    backend: Backend,
+    control: Option<std::rc::Rc<ptrace_completion::Control>>,
+) -> Result<Output, Error> {
+    // Every launch path, ptrace's included, reaches the guest through here.
+    crate::cpu_profile_admission::refuse_unadmitted_launch(&config, backend == Backend::Ptrace)?;
+    config.launch_image = launched_image(&command);
+    if backend == Backend::Kvm {
+        return run_kvm(
+            &command,
+            config,
+            print_summary,
+            print_summary_to_json_file,
+            true,
+        )
+        .await;
+    }
+    if backend == Backend::Dbt {
+        #[cfg(feature = "dbt")]
+        {
+            return run_dbt(command, config, print_summary, true).await;
+        }
+        #[cfg(not(feature = "dbt"))]
+        {
+            backend.ensure_available()?;
+            unreachable!("DBT availability must fail when the feature is disabled");
+        }
+    }
+    if backend == Backend::Sabre {
+        #[cfg(not(feature = "sabre"))]
+        backend.ensure_available()?;
+        command.stdin(output_backend_stdin()?);
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+        return run_sabre(
+            command,
+            config,
+            print_summary,
+            print_summary_to_json_file,
+            true,
+        )
+        .await;
+    }
+    if backend.is_in_guest_liteinst() {
+        #[cfg(feature = "liteinst")]
+        {
+            command.stdin(output_backend_stdin()?);
+            let stats_request = in_guest_stats_request(backend, print_summary_to_json_file);
+            refuse_in_guest_liteinst_run(&mut command, &config, backend)?;
+            let (launch, _detlog_descriptor) =
+                in_guest_liteinst_launch(&mut command, &in_guest_detlog_forward_policy())?;
+            // After Hermit's other callbacks, so the guest's own check is the
+            // last one that can change what it checks (`LaunchAudit::install`).
+            let audit = neutralize_inherited_signal_producers(&mut command, backend)?;
+            let tool_data = launch.encode();
+            // Every Tool image must forward on that socket, by that policy;
+            // see detcore::Config::in_guest_detlog_forward_policy.
+            let mut config = config;
+            config.in_guest_detlog_forward_policy = _detlog_descriptor
+                .is_some()
+                .then(|| in_guest_detlog_forward_policy().encode());
+            config.in_guest_site_patching_off = in_guest_site_patching_off(backend);
+            config.in_guest_refuses_host_timed_producers =
+                in_guest_refuses_host_timed_producers(backend);
+            // Last, from the configuration every Tool image receives.
+            config.in_guest_reserved_signals = in_guest_reserved_signals(&config, backend);
+            // The delivery gate, from the final configuration and whether
+            // this process owns the guests' PID namespace; off until the
+            // runtime takes it (A5 step 3c.1, D35, D52).
+            config.in_guest_signal_delivery = IN_GUEST_RUNTIME_DELIVERS_SIGNALS
+                && in_guest_signal_delivery_gate(
+                    &config,
+                    backend,
+                    scheduler_owns_guest_pid_namespace(),
+                );
+            let preload = liteinst_tool_runtime_library_path()?;
+            let exits = std::sync::Arc::new(in_guest_exits::InGuestExitAdmission::default());
+            let (output, mut global_state, dispatch_stats, process_reports) =
+                reverie_liteinst::LiteinstBackend::with_connection_admission(exits.clone(), async {
+                    if stats_request.is_enabled() {
+                        let (output, global_state, source) =
+                            reverie_liteinst::LiteinstBackend::run_with_output_and_preload_data_and_stats::<
+                                Detcore,
+                            >(command, config, preload, tool_data)
+                            .await?;
+                        let dispatch_stats = backend_stats::report(backend, stats_request, &source);
+                        let process_reports = source.snapshot().process_reports();
+                        Ok::<_, reverie::Error>((output, global_state, dispatch_stats, process_reports))
+                    } else {
+                        let (output, global_state) =
+                            reverie_liteinst::LiteinstBackend::run_with_output_and_preload_data::<
+                                Detcore,
+                            >(command, config, preload, tool_data)
+                            .await?;
+                        Ok((output, global_state, None, 0))
+                    }
+                })
+                .await
+                .inspect_err(|error| exits.fail_launch(error))
+                // A standard descriptor the guest's own check refused
+                // (D25) fails the launch; name it.
+                .map_err(|error| match &audit {
+                    Some(audit) => audit.launch_error(backend, error),
+                    None => Error::from(error),
+                })?;
+            let patched =
+                in_guest_trap_patching_evidence(backend, dispatch_stats.as_ref(), process_reports);
+            let settled = settle_in_guest_exits(&exits, &global_state).await;
+            let policy_refusal = global_state.policy_refusal();
+            let output = Output {
+                status: output.status.into(),
+                stdout: output.stdout,
+                stderr: output.stderr,
+            };
+            let status = output.status;
+            if settled.is_err() || liteinst_requires_forced_shutdown(status) {
+                global_state.force_shutdown_with_error();
+                global_state.cancel_internal_scheduler().await;
+            }
+            let finalized = global_state
+                .clean_up_with_dispatch_stats(
+                    print_summary,
+                    print_summary_to_json_file,
+                    dispatch_stats,
+                )
+                .await;
+            // After the scheduler has shut down, so the line's place among
+            // the run's INFO lines is fixed (D25); a stopping refusal logs it
+            // just before it exits instead.
+            detcore::host_timed_producers::emit_run_end_log();
+            let result = (|| {
+                refuse_in_guest_policy(backend, policy_refusal)?;
+                settled?;
+                refuse_in_guest_trap_patching(backend, patched)
+            })();
+            detcore::combine_finalization(result, finalized)?;
+            return Ok(Output {
+                status,
+                stdout: output.stdout,
+                stderr: output.stderr,
+            });
+        }
+        #[cfg(not(feature = "liteinst"))]
+        {
+            backend.ensure_available()?;
+            unreachable!("LiteInst availability must fail when the feature is disabled");
+        }
+    }
+    ensure_backend_dispatch(backend)?;
+
+    let stats_request = backend_stats::request(print_summary_to_json_file);
+    command.stdin(output_backend_stdin()?);
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    let control = control
+        .ok_or_else(|| Error::msg("ordinary ptrace requires its retained operation owner"))?;
+    // A sequentialized guest tells gdbserver not to serialize its threads;
+    // see hermit_run_ptrace::spawn_tracer.
+    let tracer = hermit_run_ptrace::spawn_tracer(
+        command,
+        config.clone(),
+        config.gdbserver.then_some(config.gdbserver_port),
+        config.sequentialize_threads,
+        stats_request,
+    )
+    .await?;
+    let stats_source = tracer.backend_stats();
+    let (output, global_state) = ptrace_completion::wait_with_output(tracer, control).await?;
+    let dispatch_stats =
+        backend_stats::report_if_collected(backend, stats_request, stats_source.as_ref());
+    global_state
+        .clean_up_with_dispatch_stats(print_summary, print_summary_to_json_file, dispatch_stats)
+        .await
+        .map_err(|error| {
+            error.context(format!(
+                "ptrace cleanup after observed guest status {:?}",
+                output.status
+            ))
+        })?;
+    Ok(output)
+}
+
+/// Holds the context necessary to run high-level hermit functions.
+pub struct HermitData {
+    // The data directory. Defaults to `~/.cache/hermit`. Note that we shouldn't
+    // expect this to exist in any of the functions that are called.
+    data_dir: PathBuf,
+}
+
+fn collect_recording_ids(
+    entries: impl IntoIterator<Item = io::Result<fs::DirEntry>>,
+    data_dir: &Path,
+    mut file_type: impl FnMut(&fs::DirEntry) -> io::Result<fs::FileType>,
+) -> Result<Vec<Id>, Error> {
+    let mut recordings = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| {
+            format!(
+                "Failed to read an entry in recording inventory {}",
+                data_dir.display()
+            )
+        })?;
+        let path = entry.path();
+        if file_type(&entry)
+            .with_context(|| {
+                format!(
+                    "Failed to inspect recording inventory entry {}",
+                    path.display()
+                )
+            })?
+            .is_dir()
+            && let Some(id) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<Id>().ok())
+        {
+            recordings.push(id);
+        }
+    }
+    Ok(recordings)
+}
+
+impl Default for HermitData {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HermitData {
+    /// Creates an instance of `HermitData` using `~/.cache/hermit` as the data
+    /// directory.
+    pub fn new() -> Self {
+        Self::with_dir(
+            dirs::cache_dir()
+                .map_or_else(|| PathBuf::from("/tmp/hermit"), |dir| dir.join("hermit")),
+        )
+    }
+
+    /// Creates a `HermitData` using the given directory as the base path for
+    /// storing recording data.
+    pub fn with_dir<P>(data_dir: P) -> Self
+    where
+        P: Into<PathBuf>,
+    {
+        Self {
+            data_dir: data_dir.into(),
+        }
+    }
+
+    /// Returns the path to the data directory where recordings are stored.
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    /// Records the execution of the given command, returning its `Recording`.
+    ///
+    /// If recording failed, then an error is returned. Note that if the command
+    /// itself failed, then we still return a successful recording, but its exit
+    /// status will be non-zero.
+    ///
+    /// This low-level API does not create a Hermit container, so it has no
+    /// authenticated private-mount provenance to supply. Detcore derives mount
+    /// identities from the completed guest namespace. CLI container callers
+    /// with producer-owned root provenance must use
+    /// [`Self::record_with_mountinfo`].
+    ///
+    /// The ptrace session runs on a tracer thread, so the calling thread needs no
+    /// particular stack; see [`run`].
+    pub fn record(&self, command: Command) -> Result<Recording, Error> {
+        let store = Self {
+            data_dir: self.data_dir.clone(),
+        };
+        let command = tracer_thread::SendCommand::new(command);
+        ptrace_completion::run_on_tracer_thread(None, move |control| async move {
+            let command = command.into_inner();
+            let data = store.create_recording_dir()?;
+            let exit_status = record_to_async(
+                command,
+                data.path(),
+                MountProvenance::default(),
+                None,
+                None,
+                None,
+                detcore_model::cpu_profile::CpuProfile::default(),
+                control,
+            )
+            .await?;
+            store.commit_recording(data, exit_status)
+        })
+    }
+
+    /// Records with mountinfo provenance captured from the active container.
+    ///
+    /// The ptrace session runs on a tracer thread, so the calling thread needs no
+    /// particular stack; see [`run`].
+    pub fn record_with_mountinfo(
+        &self,
+        command: Command,
+        mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
+    ) -> Result<Recording, Error> {
+        let store = Self {
+            data_dir: self.data_dir.clone(),
+        };
+        let command = tracer_thread::SendCommand::new(command);
+        ptrace_completion::run_on_tracer_thread(None, move |control| async move {
+            let command = command.into_inner();
+            let data = store.create_recording_dir()?;
+            let mount_ids = capture_mountinfo_identity_order()?;
+            let exit_status = record_to_async(
+                command,
+                data.path(),
+                MountProvenance {
+                    root_rewrites: mountinfo_root_rewrites,
+                    container_mount_table: None,
+                    mount_ids: None,
+                },
+                Some(mount_ids),
+                None,
+                None,
+                detcore_model::cpu_profile::CpuProfile::default(),
+                control,
+            )
+            .await?;
+            store.commit_recording(data, exit_status)
+        })
+    }
+
+    /// Creates a temporary directory for a recording that has not been committed yet.
+    pub fn create_recording_dir(&self) -> Result<tempfile::TempDir, Error> {
+        let tmp_data_dir = self.data_dir.join("tmp");
+
+        fs::create_dir_all(&tmp_data_dir).with_context(|| {
+            format!(
+                "Failed to create recording directory: {}",
+                self.data_dir.display()
+            )
+        })?;
+
+        Ok(tempfile::TempDir::new_in(tmp_data_dir)?)
+    }
+
+    /// Commits a completed temporary recording to the recording store.
+    pub fn commit_recording(
+        &self,
+        data: tempfile::TempDir,
+        exit_status: ExitStatus,
+    ) -> Result<Recording, Error> {
+        let id = Id::unique();
+
+        // Atomically move the temporary recording to its final location.
+        fs::rename(data.keep(), self.data_dir.join(id.to_string()))?;
+
+        self.note_latest(&id, true)
+            .with_context(|| format!("Failed to update {:?}", self.data_dir.join(LAST)))?;
+
+        Ok(Recording { id, exit_status })
+    }
+
+    /// Replays the given recording ID.
+    ///
+    /// The ptrace session runs on a tracer thread, so the calling thread needs no
+    /// particular stack; see [`run`].
+    pub fn replay(&self, id: Id) -> Result<ExitStatus, Error> {
+        let data = self.data_dir.join(id.to_string());
+        replay_from(&data)
+    }
+
+    /// Replays the given recording ID with a gdbserver available to attach to.
+    ///
+    /// The ptrace session runs on a tracer thread, so the calling thread needs no
+    /// particular stack; see [`run`].
+    pub fn replay_with_gdbserver(&self, id: Id, port: u16) -> Result<ExitStatus, Error> {
+        let data = self.data_dir.join(id.to_string());
+        replay_with_gdbserver(&data, port)
+    }
+
+    /// Returns an iterator over the recordings.
+    ///
+    /// Use [`Self::recording_metadata`] to get more information about a recording.
+    pub fn recordings(&self) -> impl Iterator<Item = Id> + use<> {
+        fs::read_dir(&self.data_dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+
+                if entry.file_type().ok()?.is_dir() {
+                    Some(entry.file_name().to_str()?.parse::<Id>().ok()?)
+                } else {
+                    None
+                }
+            })
+    }
+
+    /// Returns all recordings, or an error if the data directory cannot be
+    /// enumerated completely.
+    ///
+    /// A missing data directory has no recordings. Other filesystem errors are
+    /// returned rather than being mistaken for an empty or partial inventory.
+    pub fn try_recordings(&self) -> Result<Vec<Id>, Error> {
+        let entries = match fs::read_dir(&self.data_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Failed to read recording inventory in {}",
+                        self.data_dir.display()
+                    )
+                });
+            }
+        };
+
+        collect_recording_ids(entries, &self.data_dir, fs::DirEntry::file_type)
+    }
+
+    /// Returns the metadata of a recording.
+    pub fn recording_metadata(&self, id: Id) -> Result<Metadata, Error> {
+        Metadata::load(&self.data_dir.join(id.to_string()))
+    }
+
+    /// Deletes a recording.
+    pub fn remove(&self, id: Id) -> Result<(), Error> {
+        let path = self.data_dir.join(id.to_string());
+
+        // Before deleting anything, make sure this file exists. This may not be a
+        // recording if this file does not exist. A run manifest marks a
+        // recording too: a run that drew an input from the host leaves only
+        // that (https://github.com/rrnewton/hermit/issues/4271).
+        let metadata_path = [METADATA_NAME, RUN_MANIFEST_NAME]
+            .into_iter()
+            .map(|name| path.join(name))
+            .find(|marker| marker.exists())
+            .unwrap_or_else(|| path.join(METADATA_NAME));
+        let metadata = fs::metadata(&metadata_path)
+            .with_context(|| format!("Failed to find {:?}", metadata_path))?;
+
+        if !metadata.is_file() {
+            return Err(anyhow!("{:?} is not a file", metadata_path));
+        }
+
+        // Do a recursive delete on the directory. Note that this does not follow
+        // symlinks.
+        fs::remove_dir_all(path)?;
+
+        Ok(())
+    }
+
+    /// Returns the last recorded ID.
+    pub fn last_id(&self) -> Result<Id, Error> {
+        Ok(fs::read_to_string(self.data_dir.join(LAST))?.parse()?)
+    }
+
+    /// Atomically names `id` as the newest recording: `last-run` always,
+    /// and `last`, which a bare `hermit replay` replays, when the user
+    /// `asked` for the recording (`hermit record`, `hermit run
+    /// --record-networking`) rather than a run leaving its manifest; see
+    /// <https://github.com/rrnewton/hermit/issues/4271>.
+    pub fn note_latest(&self, id: &Id, asked: bool) -> Result<(), Error> {
+        let tmp = self.data_dir.join("tmp");
+        fs::create_dir_all(&tmp)?;
+        let names = if asked {
+            &[LAST_RUN, LAST][..]
+        } else {
+            &[LAST_RUN][..]
+        };
+        for name in names {
+            let mut file = tempfile::NamedTempFile::new_in(&tmp)?;
+            write!(file, "{}", id)?;
+            file.persist(self.data_dir.join(name))?;
+        }
+        Ok(())
+    }
+}
+
+/// What a recording takes from the completed recording container's mount
+/// namespace, which a caller without a Hermit container leaves empty.
+#[derive(Clone, Debug, Default)]
+pub struct MountProvenance {
+    /// The proven roots of Hermit's own mounts
+    /// (`detcore::Config::mountinfo_root_rewrites`).
+    pub root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
+    /// The guest's container mount table
+    /// (`detcore::Config::container_mount_table`), which the recording carries
+    /// for its replay.
+    pub container_mount_table: Option<detcore_model::container_mounts::ContainerMountTable>,
+    /// The namespace's identity order, read with the table
+    /// (`detcore::Config::mountinfo_mount_ids`). `None` asks the recorder to
+    /// capture it. A table and an order from two reads need not agree: a host
+    /// process that removes a host mount's directory detaches the copy of that
+    /// mount from the container too, so a row the table shows can be gone
+    /// from a later read.
+    pub mount_ids: Option<Vec<u64>>,
+}
+
+/// `NS_GET_MNTNS_ID`, `_IOR(NSIO, 5, __u64)` in Linux's uapi/linux/nsfs.h.
+const NS_GET_MNTNS_ID: libc::c_ulong = (2 << 30) | (8 << 16) | (0xb7 << 8) | 5;
+
+/// The calling thread's mount namespace (`DetConfig::mountinfo_mount_namespace`):
+/// the kernel's namespace ID from `ioctl(NS_GET_MNTNS_ID)` on
+/// `/proc/thread-self/ns/mnt`, and the descriptor's device and inode numbers.
+/// The calling thread's, not the thread group leader's: a library caller's
+/// thread can have a mount namespace of its own, and every capture here
+/// (`/proc/thread-self/mountinfo` and `fdinfo`) reads that same thread's. A
+/// kernel without the ioctl (ENOTTY or EINVAL) yields no ID; any other failure
+/// is an error.
+pub fn current_mount_namespace() -> Result<detcore_model::config::MountNamespaceIdentity, Error> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+    let file = fs::File::open("/proc/thread-self/ns/mnt")
+        .context("failed to open this thread's mount namespace")?;
+    let metadata = file
+        .metadata()
+        .context("failed to read this process's mount namespace")?;
+    let mut id: u64 = 0;
+    // SAFETY: NS_GET_MNTNS_ID writes one u64 through the pointer, which
+    // points at `id` for the duration of the call.
+    let id =
+        if unsafe { libc::ioctl(file.as_raw_fd(), NS_GET_MNTNS_ID, &mut id as *mut u64) } == 0 {
+            Some(id)
+        } else {
+            let error = std::io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(libc::ENOTTY | libc::EINVAL) => None,
+                _ => {
+                    return Err(Error::new(error)
+                        .context("failed to read this process's mount namespace ID"));
+                }
+            }
+        };
+    Ok(detcore_model::config::MountNamespaceIdentity {
+        id,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+/// The calling thread's mount table (`/proc/thread-self/mountinfo`): the rows
+/// of the namespace [`current_mount_namespace`] names.
+pub fn thread_mountinfo() -> Result<Vec<u8>, Error> {
+    fs::read("/proc/thread-self/mountinfo")
+        .context("Failed to read this thread's mount table (/proc/thread-self/mountinfo)")
+}
+
+/// The raw mount ID of the mount `path` reaches in the calling thread's
+/// namespace, from the `fdinfo` of an `O_PATH` descriptor held on it; `None`
+/// where it cannot be opened. O_PATH pins the object without read
+/// permission.
+fn thread_mount_id_of(path: &Path) -> Option<u64> {
+    held_mount_id(&hold_path(path, false).ok()?)
+}
+
+/// An `O_PATH` descriptor held on `path` (a directory, with `directory`),
+/// resolved as `chdir` and `open` resolve it: following symbolic links, and
+/// a relative path from the calling thread's working directory, whose name is
+/// never asked for. Holding it pins the mount it reaches, and the lookup has
+/// already triggered any automount on the way.
+fn hold_path(path: &Path, directory: bool) -> nix::Result<std::os::fd::OwnedFd> {
+    use nix::fcntl::OFlag;
+    let flags = OFlag::O_PATH
+        | OFlag::O_CLOEXEC
+        | if directory {
+            OFlag::O_DIRECTORY
+        } else {
+            OFlag::empty()
+        };
+    nix::fcntl::open(path, flags, nix::sys::stat::Mode::empty())
+}
+
+/// The raw mount ID of the mount `held` reaches, from its
+/// `/proc/thread-self/fdinfo`.
+fn held_mount_id(held: &std::os::fd::OwnedFd) -> Option<u64> {
+    let fdinfo = fs::read(format!("/proc/thread-self/fdinfo/{}", held.as_raw_fd())).ok()?;
+    detcore_model::procfs::parse_fdinfo_mount_id(&fdinfo)
+}
+
+/// Capture the calling thread's mount namespace's raw IDs in the exact
+/// row/parent order used by Detcore's canonical mountinfo mapping.
+pub fn capture_mountinfo_identity_order() -> Result<Vec<u64>, Error> {
+    mountinfo_identity_order_from_raw(&thread_mountinfo()?)
+}
+
+/// [`capture_mountinfo_identity_order`], keeping every row whose mount ID is
+/// in `keep` (the rows a container mount table shows) whatever its name: a
+/// mount Hermit installed is never dropped by the seed filter, so a table
+/// showing it validates against the captured order.
+pub fn capture_mountinfo_identity_order_keeping(
+    keep: &std::collections::BTreeSet<u64>,
+) -> Result<Vec<u64>, Error> {
+    mountinfo_identity_order_keeping_from_raw(&thread_mountinfo()?, keep)
+}
+
+/// Each of [`BASE_MOUNTPOINTS`](detcore_model::container_mounts::BASE_MOUNTPOINTS)
+/// that the calling thread can open, as the kernel escapes it in `mountinfo`,
+/// with the mount ID of a descriptor held on it: rule 2's proof of
+/// `ContainerMountTable::select`. The base mountpoints hold no byte the kernel
+/// escapes (space, tab, newline or backslash), so each is its own escaped form.
+pub fn base_mountpoint_mount_ids() -> Vec<(Vec<u8>, u64)> {
+    detcore_model::container_mounts::BASE_MOUNTPOINTS
+        .iter()
+        .filter_map(|mountpoint| {
+            let id = thread_mount_id_of(Path::new(mountpoint))?;
+            Some((mountpoint.as_bytes().to_vec(), id))
+        })
+        .collect()
+}
+
+/// A container mount table and the raw identity order Detcore validates it
+/// against ([`unplanned_container_mount_table`]).
+pub type UnplannedMountTable = (
+    detcore_model::container_mounts::ContainerMountTable,
+    Vec<u64>,
+);
+
+// TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/4213): Review
+// the container mount table of a run in a namespace Hermit did not make: the
+// membership rule of K3a with the launch mounts in place of Hermit's
+// installations.
+/// The container mount table of a run whose guest runs in the calling
+/// thread's own mount namespace, in which Hermit installed no mount
+/// (`--no-namespace`, or a library caller that built no container, on KVM),
+/// and the raw identity order Detcore validates it against, both from one
+/// read of the namespace's rows. Shown are:
+/// - the launch mounts: the mount holding `launch_cwd`, the guest's working
+///   directory at launch, and the mount holding the host's `/tmp`, which the
+///   guest shares, with their ancestors (rules 1 and 3 of
+///   `ContainerMountTable::select`, as for Hermit's installations), so that
+///   `df .` and `findmnt -T .` from a checkout find their row;
+/// - the base mountpoints mounted here (rule 2).
+///
+/// Both are facts of the launch, fixed before the guest starts, as the base
+/// mountpoints are. No other host mount is shown; a file on one reports its
+/// nearest shown ancestor. A shown row's parent is its nearest shown
+/// ancestor, as for every table.
+///
+/// `launch_cwd` may be relative (`.` for the inherited working directory):
+/// it is resolved from the calling thread's working directory as the guest's
+/// `chdir` will resolve it, without asking that directory for its name, so a
+/// removed working directory does not stop a launch with an absolute
+/// `--workdir`.
+pub fn unplanned_container_mount_table(launch_cwd: &Path) -> Result<UnplannedMountTable, Error> {
+    unplanned_container_mount_table_with(launch_cwd, thread_mountinfo)
+}
+
+/// [`unplanned_container_mount_table`], reading the mount table with `read`.
+/// The launch directories and the base mountpoints are resolved and held
+/// first, then the table is read, then the mount IDs are taken from the held
+/// descriptors: a mount that resolving a launch directory creates (an
+/// automount on its path) is already in the rows read, and one that leaves
+/// afterwards is still named by them. A launch mount the read does not list
+/// is refused, never dropped.
+fn unplanned_container_mount_table_with(
+    launch_cwd: &Path,
+    read: impl FnOnce() -> Result<Vec<u8>, Error>,
+) -> Result<UnplannedMountTable, Error> {
+    let working = hold_path(launch_cwd, true).with_context(|| {
+        format!(
+            "the guest's working directory {} cannot be opened for its mount table",
+            launch_cwd.display()
+        )
+    })?;
+    // The host /tmp, which the guest shares, if there is one.
+    let tmp = hold_path(Path::new("/tmp"), true).ok();
+    let base = detcore_model::container_mounts::BASE_MOUNTPOINTS
+        .iter()
+        .filter_map(|mountpoint| Some((*mountpoint, hold_path(Path::new(mountpoint), false).ok()?)))
+        .collect::<Vec<_>>();
+    let raw = read()?;
+    let launch = std::iter::once(&working)
+        .chain(tmp.as_ref())
+        .map(|held| {
+            held_mount_id(held)
+                .ok_or_else(|| anyhow!("a launch directory's mount ID cannot be read"))
+        })
+        .collect::<Result<std::collections::BTreeSet<_>, Error>>()?;
+    let base = base
+        .iter()
+        .filter_map(|(mountpoint, held)| {
+            Some((mountpoint.as_bytes().to_vec(), held_mount_id(held)?))
+        })
+        .collect::<Vec<_>>();
+    unplanned_container_mount_table_from(&raw, &launch, &base)
+}
+
+fn unplanned_container_mount_table_from(
+    raw: &[u8],
+    launch: &std::collections::BTreeSet<u64>,
+    base: &[(Vec<u8>, u64)],
+) -> Result<UnplannedMountTable, Error> {
+    use detcore_model::container_mounts::ContainerMountTable;
+    let rows = detcore_model::container_mounts::parse_container_mounts(raw)
+        .ok_or_else(|| anyhow!("this thread's mount table has a malformed row"))?;
+    if let Some(missing) = launch
+        .iter()
+        .find(|id| !rows.iter().any(|row| row.raw_mount_id == **id))
+    {
+        anyhow::bail!(
+            "the launch mount {missing} (holding the guest's working directory or /tmp) is not in \
+             this thread's mount table, read after it was resolved; refusing a table that would \
+             omit the mount the guest starts on"
+        );
+    }
+    let never = rows
+        .iter()
+        .filter(|row| row.is_ephemeral_host_seed())
+        .map(|row| row.raw_mount_id)
+        .collect();
+    let table = ContainerMountTable::select(&rows, launch, base, &never);
+    let order = mountinfo_identity_order_keeping_from_raw(raw, &table.shown_mount_ids())?;
+    Ok((table, order))
+}
+
+/// Producer provenance follows the guest mount model: ephemeral host seed rows
+/// (other processes' squashfuse mounts) are not namespace members and must not
+/// enter the captured identity order. Detcore drops the same rows with the same
+/// filter when it captures the guest's mountinfo.
+fn mountinfo_identity_order_from_raw(raw: &[u8]) -> Result<Vec<u64>, Error> {
+    mountinfo_identity_order_keeping_from_raw(raw, &std::collections::BTreeSet::new())
+}
+
+/// The identity order of the mountinfo contents `raw` (seed rows dropped, as
+/// `mountinfo_identity_order_from_raw` drops them), keeping a seed row whose
+/// mount ID is in `keep`.
+pub fn mountinfo_identity_order_keeping_from_raw(
+    raw: &[u8],
+    keep: &std::collections::BTreeSet<u64>,
+) -> Result<Vec<u64>, Error> {
+    let mut kept = Vec::with_capacity(raw.len());
+    for line in raw.split_inclusive(|byte| *byte == b'\n') {
+        let body = line.strip_suffix(b"\n").unwrap_or(line);
+        let id = body
+            .split(|byte| *byte == b' ')
+            .next()
+            .and_then(|field| std::str::from_utf8(field).ok()?.parse::<u64>().ok());
+        if !detcore_model::procfs::is_ephemeral_host_seed_mount(body)
+            || id.is_some_and(|id| keep.contains(&id))
+        {
+            kept.extend_from_slice(line);
+        }
+    }
+    mountinfo_identity_order_from(&kept)
+}
+
+fn mountinfo_identity_order_from(contents: &[u8]) -> Result<Vec<u64>, Error> {
+    use std::collections::BTreeSet;
+
+    let rows = detcore_model::procfs::parse_mountinfo(contents)
+        .ok_or_else(|| anyhow!("malformed mountinfo"))?;
+    let mut visible = Vec::new();
+    let mut parents = Vec::new();
+    let mut seen = BTreeSet::new();
+    for row in rows {
+        seen.insert(row.raw_mount_id);
+        visible.push(row.raw_mount_id);
+        parents.push(row.raw_parent_id);
+    }
+    for parent in parents {
+        if seen.insert(parent) {
+            visible.push(parent);
+        }
+    }
+    Ok(visible)
+}
+
+impl<'a> From<Option<&'a PathBuf>> for HermitData {
+    fn from(data_dir: Option<&'a PathBuf>) -> Self {
+        data_dir.map_or_else(Self::new, Self::with_dir)
+    }
+}
+
+/// Records to an existing directory. The caller must keep its backing resources
+/// alive through any [`HermitCleanupUnconfirmed`] recovery. [`HermitData::record`]
+/// owns its temporary recording directory inside the retained operation.
+///
+/// The ptrace session runs on a tracer thread, so the calling thread needs no
+/// particular stack; see [`run`].
+pub fn record_to(command: Command, dir: &Path) -> Result<ExitStatus, Error> {
+    let dir = dir.to_owned();
+    let command = tracer_thread::SendCommand::new(command);
+    ptrace_completion::run_on_tracer_thread(None, move |control| async move {
+        let command = command.into_inner();
+        record_to_async(
+            command,
+            &dir,
+            MountProvenance::default(),
+            None,
+            None,
+            None,
+            detcore_model::cpu_profile::CpuProfile::default(),
+            control,
+        )
+        .await
+    })
+}
+
+/// Records with producer-owned mountinfo provenance. The directory-lifetime
+/// obligation is the same as [`record_to`]. `local_networking` and
+/// `proc_level` are stored in the recording's `metadata.json`, and a replay
+/// uses that network and that `/proc` level.
+///
+/// The ptrace session runs on a tracer thread, so the calling thread needs no
+/// particular stack; see [`run`].
+pub fn record_to_with_mountinfo(
+    command: Command,
+    dir: &Path,
+    mountinfo: MountProvenance,
+    local_networking: bool,
+    proc_level: detcore_model::config::ProcLevel,
+    cpu_profile: detcore_model::cpu_profile::CpuProfile,
+) -> Result<ExitStatus, Error> {
+    let dir = dir.to_owned();
+    let command = tracer_thread::SendCommand::new(command);
+    ptrace_completion::run_on_tracer_thread(None, move |control| async move {
+        let command = command.into_inner();
+        let mut mountinfo = mountinfo;
+        let mount_ids = match mountinfo.mount_ids.take() {
+            Some(mount_ids) => mount_ids,
+            None => capture_mountinfo_identity_order_keeping(
+                &mountinfo
+                    .container_mount_table
+                    .as_ref()
+                    .map(detcore_model::container_mounts::ContainerMountTable::shown_mount_ids)
+                    .unwrap_or_default(),
+            )?,
+        };
+        record_to_async(
+            command,
+            &dir,
+            mountinfo,
+            Some(mount_ids),
+            Some(local_networking),
+            Some(proc_level),
+            cpu_profile,
+            control,
+        )
+        .await
+    })
+}
+
+// Private plumbing: Record::spawn_with_mountinfo's parameters plus the
+// ptrace completion control.
+#[allow(clippy::too_many_arguments)]
+async fn record_to_async(
+    command: Command,
+    dir: &Path,
+    mountinfo: MountProvenance,
+    mountinfo_mount_ids: Option<Vec<u64>>,
+    local_networking: Option<bool>,
+    proc_level: Option<detcore_model::config::ProcLevel>,
+    cpu_profile: detcore_model::cpu_profile::CpuProfile,
+    control: std::rc::Rc<ptrace_completion::Control>,
+) -> Result<ExitStatus, Error> {
+    let report = SkidOvershootReport::begin(true);
+    let result = async {
+        Record::spawn_with_mountinfo(
+            command,
+            dir,
+            mountinfo,
+            mountinfo_mount_ids,
+            local_networking,
+            proc_level,
+            cpu_profile,
+        )
+        .await?
+        .wait(control)
+        .await
+    }
+    .await;
+    report.finish(result)
+}
+
+/// Records and captures output. Keep the directory's backing resources alive
+/// through any cleanup checkpoint, as for [`record_to`].
+///
+/// The ptrace session runs on a tracer thread, so the calling thread needs no
+/// particular stack; see [`run`].
+pub fn record_with_output(command: Command, dir: &Path) -> Result<Output, Error> {
+    let dir = dir.to_owned();
+    let command = tracer_thread::SendCommand::new(command);
+    ptrace_completion::run_on_tracer_thread(None, move |control| async move {
+        let command = command.into_inner();
+        record_with_output_async(
+            command,
+            &dir,
+            MountProvenance::default(),
+            None,
+            None,
+            None,
+            detcore_model::cpu_profile::CpuProfile::default(),
+            control,
+        )
+        .await
+    })
+}
+
+/// Records with captured output and exact mountinfo provenance.
+/// `local_networking` and `proc_level` are as for [`record_to_with_mountinfo`].
+///
+/// The ptrace session runs on a tracer thread, so the calling thread needs no
+/// particular stack; see [`run`].
+pub fn record_with_output_with_mountinfo(
+    command: Command,
+    dir: &Path,
+    mountinfo: MountProvenance,
+    local_networking: bool,
+    proc_level: detcore_model::config::ProcLevel,
+    cpu_profile: detcore_model::cpu_profile::CpuProfile,
+) -> Result<Output, Error> {
+    let dir = dir.to_owned();
+    let command = tracer_thread::SendCommand::new(command);
+    ptrace_completion::run_on_tracer_thread(None, move |control| async move {
+        let command = command.into_inner();
+        let mut mountinfo = mountinfo;
+        let mount_ids = match mountinfo.mount_ids.take() {
+            Some(mount_ids) => mount_ids,
+            None => capture_mountinfo_identity_order_keeping(
+                &mountinfo
+                    .container_mount_table
+                    .as_ref()
+                    .map(detcore_model::container_mounts::ContainerMountTable::shown_mount_ids)
+                    .unwrap_or_default(),
+            )?,
+        };
+        record_with_output_async(
+            command,
+            &dir,
+            mountinfo,
+            Some(mount_ids),
+            Some(local_networking),
+            Some(proc_level),
+            cpu_profile,
+            control,
+        )
+        .await
+    })
+}
+
+// Private plumbing: Record::spawn_with_mountinfo's parameters plus the
+// ptrace completion control.
+#[allow(clippy::too_many_arguments)]
+async fn record_with_output_async(
+    mut command: Command,
+    dir: &Path,
+    mountinfo: MountProvenance,
+    mountinfo_mount_ids: Option<Vec<u64>>,
+    local_networking: Option<bool>,
+    proc_level: Option<detcore_model::config::ProcLevel>,
+    cpu_profile: detcore_model::cpu_profile::CpuProfile,
+    control: std::rc::Rc<ptrace_completion::Control>,
+) -> Result<Output, Error> {
+    let report = SkidOvershootReport::begin(true);
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    let result = async {
+        Record::spawn_with_mountinfo(
+            command,
+            dir,
+            mountinfo,
+            mountinfo_mount_ids,
+            local_networking,
+            proc_level,
+            cpu_profile,
+        )
+        .await?
+        .wait_with_output(control)
+        .await
+    }
+    .await;
+    report.finish(result)
+}
+
+/// Replays an existing recording. Materialization and chroot guards remain with
+/// the original runtime through any cleanup checkpoint.
+///
+/// The ptrace session runs on a tracer thread, so the calling thread needs no
+/// particular stack; see [`run`].
+pub fn replay_from(dir: &Path) -> Result<ExitStatus, Error> {
+    replay_plain(dir, None, &[])
+}
+
+/// Replays with a gdb server.
+///
+/// The ptrace session runs on a tracer thread, so the calling thread needs no
+/// particular stack; see [`run`].
+pub fn replay_with_gdbserver(dir: &Path, port: u16) -> Result<ExitStatus, Error> {
+    replay_plain(dir, Some(port), &[])
+}
+
+/// Replays with a gdb server and mounts inside the replay chroot.
+///
+/// The ptrace session runs on a tracer thread, so the calling thread needs no
+/// particular stack; see [`run`].
+pub fn replay_with_gdbserver_and_mounts(
+    dir: &Path,
+    port: u16,
+    mounts: &[Mount],
+) -> Result<ExitStatus, Error> {
+    replay_plain(dir, Some(port), mounts)
+}
+
+fn replay_plain(dir: &Path, port: Option<u16>, mounts: &[Mount]) -> Result<ExitStatus, Error> {
+    let dir = dir.to_owned();
+    let mounts = mounts.to_vec();
+    ptrace_completion::run_on_tracer_thread(None, move |control| async move {
+        let report = SkidOvershootReport::begin(true);
+        let result = async {
+            Replay::spawn(&dir, false, port, &mounts)
+                .await?
+                .wait(control)
+                .await
+        }
+        .await;
+        report.finish(result)
+    })
+}
+
+/// Replays with captured output.
+///
+/// The ptrace session runs on a tracer thread, so the calling thread needs no
+/// particular stack; see [`run`].
+pub fn replay_with_output(dir: &Path) -> Result<Output, Error> {
+    replay_with_output_and_mounts(dir, &[])
+}
+
+/// Replays with captured output and mounts inside the replay chroot.
+///
+/// The ptrace session runs on a tracer thread, so the calling thread needs no
+/// particular stack; see [`run`].
+pub fn replay_with_output_and_mounts(dir: &Path, mounts: &[Mount]) -> Result<Output, Error> {
+    let dir = dir.to_owned();
+    let mounts = mounts.to_vec();
+    ptrace_completion::run_on_tracer_thread(None, move |control| async move {
+        let report = SkidOvershootReport::begin(true);
+        let result = async {
+            Replay::spawn(&dir, true, None, &mounts)
+                .await?
+                .wait_with_output(control)
+                .await
+        }
+        .await;
+        report.finish(result)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static SKID_OVERSHOOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Runs `check_tracing_environment` against probes that report `denied`
+    /// as unavailable and every other probe as available; returns the refusal,
+    /// if any, and the probes in the order they ran.
+    fn check_with_denied(
+        namespaces: NamespaceUse,
+        denied: &[CapabilityProbe],
+    ) -> (Option<String>, Vec<CapabilityProbe>) {
+        let mut ran = Vec::new();
+        let result = check_tracing_environment(namespaces, |probe| {
+            ran.push(probe);
+            Ok(!denied.contains(&probe))
+        });
+        (result.err().map(|error| error.to_string()), ran)
+    }
+
+    /// Where unprivileged user namespaces are denied, a run that creates them
+    /// is refused at the namespace probe, and a `--no-namespace` run, which
+    /// never calls unshare, is not: it still passes the ptrace and seccomp
+    /// probes (https://github.com/rrnewton/hermit/issues/4515).
+    #[test]
+    fn denied_namespaces_refuse_only_a_run_that_creates_them() {
+        let denied = [CapabilityProbe::Namespaces];
+        let (refusal, ran) = check_with_denied(NamespaceUse::Creates, &denied);
+        assert!(
+            refusal
+                .as_deref()
+                .is_some_and(|refusal| refusal.contains("unshare(CLONE_NEWUSER | CLONE_NEWPID)")),
+            "{refusal:?}"
+        );
+        assert_eq!(ran, [CapabilityProbe::Namespaces]);
+        let (refusal, ran) = check_with_denied(NamespaceUse::None, &denied);
+        assert_eq!(refusal, None);
+        assert_eq!(ran, [CapabilityProbe::Ptrace, CapabilityProbe::Seccomp]);
+    }
+
+    /// A `--no-namespace` run is still refused where ptrace or seccomp is
+    /// denied: skipping the namespace probe skips nothing else.
+    #[test]
+    fn a_run_without_namespaces_still_needs_ptrace_and_seccomp() {
+        for denied in [CapabilityProbe::Ptrace, CapabilityProbe::Seccomp] {
+            let (refusal, _) = check_with_denied(NamespaceUse::None, &[denied]);
+            let expected = match denied {
+                CapabilityProbe::Ptrace => "PTRACE_TRACEME",
+                _ => "SECCOMP_SET_MODE_FILTER",
+            };
+            assert!(
+                refusal
+                    .as_deref()
+                    .is_some_and(|refusal| refusal.contains(expected)),
+                "{denied:?}: {refusal:?}"
+            );
+        }
+        let (refusal, ran) = check_with_denied(NamespaceUse::Creates, &[]);
+        assert_eq!(refusal, None);
+        assert_eq!(
+            ran,
+            [
+                CapabilityProbe::Namespaces,
+                CapabilityProbe::Ptrace,
+                CapabilityProbe::Seccomp
+            ]
+        );
+    }
+
+    /// A run that drew an input from the host leaves a recording directory
+    /// holding only `manifest.json`; `record rm` and `record clean` remove it
+    /// as they remove a syscall recording, and still refuse a directory with
+    /// neither marker (https://github.com/rrnewton/hermit/issues/4271).
+    #[test]
+    fn a_manifest_only_recording_can_be_removed() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = HermitData::with_dir(directory.path());
+        let id = Id::unique();
+        let recording = directory.path().join(id.to_string());
+        fs::create_dir_all(&recording).unwrap();
+        assert!(data.remove(id).is_err());
+        fs::write(recording.join(MANIFEST_NAME), "{}").unwrap();
+        data.remove(id).unwrap();
+        assert!(!recording.exists());
+    }
+
+    /// The launch-time capture drops ephemeral host seed rows before ordering,
+    /// so a seed's raw ID never enters the provenance Detcore checks guest
+    /// views against, and every retained row keeps its place.
+    #[test]
+    fn identity_capture_excludes_host_seed_mounts_and_keeps_order() {
+        let raw = b"10 1 8:1 / / rw - ext4 /dev/root rw\n\
+                    76 10 0:50 / /mnt/xarfuse/uid-1/e62a203d-seed-nspid4026531836_cgpid16161-ns-4026531832 rw - fuse.squashfuse_ll squashfuse_ll rw\n\
+                    20 10 0:7 / /test rw - tmpfs tmpfs rw\n\
+                    30 10 0:51 / /mnt/xarfuse/stable-release rw - fuse.squashfuse_ll squashfuse_ll rw\n";
+        let order = mountinfo_identity_order_from_raw(raw).unwrap();
+        assert!(!order.contains(&76), "seed mount ID captured: {order:?}");
+        assert_eq!(order, [10, 20, 30, 1]);
+        assert_eq!(
+            mountinfo_identity_order_from(raw).unwrap(),
+            [10, 76, 20, 30, 1],
+            "control: without the filter the seed ID is captured"
+        );
+    }
+
+    /// The namespace a test's captured provenance names.
+    const NAMESPACE: detcore_model::config::MountNamespaceIdentity =
+        detcore_model::config::MountNamespaceIdentity {
+            id: Some(9001),
+            device: 4,
+            inode: 4026531840,
+        };
+
+    #[test]
+    fn kvm_mountinfo_config_preserves_captured_provenance() {
+        let rewrite = detcore_model::config::MountInfoRootRewrite {
+            raw_mount_id: 20,
+            deterministic_root: b"/".to_vec(),
+            raw_root_prefix: Some(b"/private-source".to_vec()),
+            deterministic_root_prefix: Some(b"/tmp".to_vec()),
+            raw_mountpoint_prefix: Some(b"/private-source".to_vec()),
+            deterministic_mountpoint_prefix: Some(b"/tmp".to_vec()),
+        };
+        let mut config = DetConfig {
+            mountinfo_mount_ids: vec![10, 20, 30],
+            mountinfo_mount_ids_captured: true,
+            mountinfo_mount_namespace: Some(NAMESPACE),
+            mount_id_assignment_order: vec![700, 701],
+            mountinfo_root_rewrites: vec![rewrite],
+            mountinfo_device_rewrites: vec![(libc::makedev(0, 1), libc::makedev(8, 1))],
+            ..DetConfig::default()
+        };
+        let mut expected = config.clone();
+        expected.mountinfo_device_rewrites.clear();
+        let (mut namespaces, mut captures) = (0, 0);
+        prepare_kvm_mountinfo_config(
+            &mut config,
+            || {
+                namespaces += 1;
+                Ok(NAMESPACE)
+            },
+            || {
+                captures += 1;
+                Ok(vec![10, 30])
+            },
+        )
+        .unwrap();
+        assert_eq!(namespaces, 1, "the backend's namespace must be checked");
+        assert_eq!(
+            captures, 0,
+            "the producer's snapshot is kept; the namespace is not read again"
+        );
+        assert_eq!(
+            serde_json::to_value(&config).unwrap(),
+            serde_json::to_value(&expected).unwrap(),
+            "root rewrites, listed and assignment orders and every other setting must remain intact"
+        );
+    }
+
+    /// Provenance the backend keeps without reading the namespace again must
+    /// be well formed by itself: these are the refusals a second, live capture
+    /// used to supply (Codex post-facto review of dh-dt0n).
+    #[test]
+    fn kvm_mountinfo_config_refuses_malformed_captured_provenance() {
+        let rewrite = |raw_mount_id| detcore_model::config::MountInfoRootRewrite {
+            raw_mount_id,
+            deterministic_root: b"/".to_vec(),
+            raw_root_prefix: None,
+            deterministic_root_prefix: None,
+            raw_mountpoint_prefix: None,
+            deterministic_mountpoint_prefix: None,
+        };
+        let valid = DetConfig {
+            mountinfo_mount_ids: vec![10, 20, 1],
+            mountinfo_mount_ids_captured: true,
+            mountinfo_mount_namespace: Some(NAMESPACE),
+            mount_id_assignment_order: vec![20],
+            mountinfo_root_rewrites: vec![rewrite(20)],
+            ..DetConfig::default()
+        };
+        prepare_kvm_mountinfo_config(
+            &mut valid.clone(),
+            || Ok(NAMESPACE),
+            || panic!("captured provenance is not read again"),
+        )
+        .unwrap();
+        let cases = [
+            (
+                "duplicate",
+                DetConfig {
+                    mountinfo_mount_ids: vec![10, 10],
+                    ..valid.clone()
+                },
+                "malformed",
+            ),
+            (
+                "empty",
+                DetConfig {
+                    mountinfo_mount_ids: vec![],
+                    ..valid.clone()
+                },
+                "malformed",
+            ),
+            (
+                "assigned twice",
+                DetConfig {
+                    mount_id_assignment_order: vec![20, 20],
+                    ..valid.clone()
+                },
+                "malformed",
+            ),
+            (
+                "zero assigned, unlisted",
+                DetConfig {
+                    mount_id_assignment_order: vec![0],
+                    ..valid.clone()
+                },
+                "malformed",
+            ),
+            (
+                "rewrite outside",
+                DetConfig {
+                    mountinfo_root_rewrites: vec![rewrite(30)],
+                    ..valid.clone()
+                },
+                "root rewrite names mount 30",
+            ),
+        ];
+        for (name, mut config, expected) in cases {
+            let before = serde_json::to_value(&config).unwrap();
+            let error = prepare_kvm_mountinfo_config(
+                &mut config,
+                || panic!("{name}: malformed provenance is refused before any read"),
+                || panic!("{name}: captured provenance is not read again"),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(expected), "{name}: {error:#}");
+            assert_eq!(serde_json::to_value(&config).unwrap(), before, "{name}");
+        }
+    }
+
+    /// Two reads of this process's namespace name it identically, and a
+    /// kernel that reports a namespace ID reports a nonzero one.
+    #[test]
+    fn current_mount_namespace_is_stable_and_names_a_kernel_id_where_reported() {
+        let first = current_mount_namespace().unwrap();
+        assert_eq!(current_mount_namespace().unwrap(), first);
+        assert_ne!(first.inode, 0);
+        assert_ne!(first.id, Some(0));
+    }
+
+    /// A host mount copied into the container can leave it between the
+    /// producer's capture and the backend's start: Linux detaches the mounts on
+    /// a dentry in every mount namespace when a host process removes that
+    /// directory (`__detach_mounts`). The backend keeps the producer's order,
+    /// which still names the row, and does not refuse; the order Detcore later
+    /// validates guest views against is the producer's
+    /// (minibeads dh-dt0n).
+    #[test]
+    fn kvm_mountinfo_config_keeps_a_snapshot_whose_host_row_left_the_namespace() {
+        let producer = b"10 1 8:1 / / rw - ext4 /dev/root rw\n\
+                         20 10 0:22 / /proc rw - proc proc rw\n\
+                         30 10 0:50 / /data/a rw - tmpfs tmpfs rw\n";
+        let now = b"10 1 8:1 / / rw - ext4 /dev/root rw\n\
+                    20 10 0:22 / /proc rw - proc proc rw\n";
+        let order = mountinfo_identity_order_from(producer).unwrap();
+        let mut config = DetConfig {
+            mountinfo_mount_ids: order.clone(),
+            mountinfo_mount_ids_captured: true,
+            mountinfo_mount_namespace: Some(NAMESPACE),
+            ..DetConfig::default()
+        };
+        prepare_kvm_mountinfo_config(
+            &mut config,
+            || Ok(NAMESPACE),
+            || mountinfo_identity_order_from(now),
+        )
+        .unwrap();
+        assert_eq!(config.mountinfo_mount_ids, order);
+        assert_eq!(config.mountinfo_mount_ids, [10, 20, 30, 1]);
+        assert!(detcore_model::procfs::mount_ids_are_ordered_subset(
+            &mountinfo_identity_order_from(now).unwrap(),
+            &config.mountinfo_mount_ids
+        ));
+    }
+
+    #[test]
+    fn kvm_mountinfo_config_refuses_provenance_of_another_namespace() {
+        let config = DetConfig {
+            mountinfo_mount_ids: vec![10, 20, 1],
+            mountinfo_mount_ids_captured: true,
+            mountinfo_mount_namespace: Some(NAMESPACE),
+            mountinfo_device_rewrites: vec![(libc::makedev(0, 1), libc::makedev(8, 1))],
+            ..DetConfig::default()
+        };
+        // The first is a recycled nsfs inode: device and inode match, the
+        // kernel's never-reused namespace ID does not.
+        for backend in [
+            detcore_model::config::MountNamespaceIdentity {
+                id: Some(9002),
+                ..NAMESPACE
+            },
+            detcore_model::config::MountNamespaceIdentity {
+                inode: NAMESPACE.inode + 1,
+                ..NAMESPACE
+            },
+            detcore_model::config::MountNamespaceIdentity {
+                device: NAMESPACE.device + 1,
+                ..NAMESPACE
+            },
+            detcore_model::config::MountNamespaceIdentity {
+                id: None,
+                ..NAMESPACE
+            },
+        ] {
+            let mut stale = config.clone();
+            let before = serde_json::to_value(&stale).unwrap();
+            let error = prepare_kvm_mountinfo_config(
+                &mut stale,
+                || Ok(backend),
+                || panic!("captured provenance is not read again"),
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("name another mount namespace"),
+                "{error:#}"
+            );
+            assert_eq!(serde_json::to_value(&stale).unwrap(), before);
+        }
+        let mut unnamed = DetConfig {
+            mountinfo_mount_namespace: None,
+            ..config.clone()
+        };
+        let before = serde_json::to_value(&unnamed).unwrap();
+        let error = prepare_kvm_mountinfo_config(
+            &mut unnamed,
+            || panic!("provenance without a namespace is refused before any read"),
+            || panic!("provenance without a namespace is refused before any read"),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("do not name their mount namespace"),
+            "{error:#}"
+        );
+        assert_eq!(serde_json::to_value(&unnamed).unwrap(), before);
+        let mut unreadable = config;
+        let before = serde_json::to_value(&unreadable).unwrap();
+        let error = prepare_kvm_mountinfo_config(
+            &mut unreadable,
+            || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into()),
+            || panic!("captured provenance is not read again"),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+        );
+        assert_eq!(serde_json::to_value(&unreadable).unwrap(), before);
+    }
+
+    #[test]
+    fn kvm_mountinfo_config_captures_validated_ambient_namespace() {
+        let contents = b"80 20 8:1 / / rw - ext4 /dev/root rw\n\
+                         10 80 0:7 / /test rw - tmpfs tmpfs rw\n";
+        let mut config = DetConfig::default();
+        let mut expected = config.clone();
+        expected.mountinfo_mount_ids = vec![80, 10, 20];
+        expected.mountinfo_mount_ids_captured = true;
+        prepare_kvm_mountinfo_config(
+            &mut config,
+            || panic!("an ambient capture has no producer namespace to compare"),
+            || mountinfo_identity_order_from(contents),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&config).unwrap(),
+            serde_json::to_value(&expected).unwrap(),
+            "visible rows precede parent-only IDs and no guest setting changes"
+        );
+        assert!(detcore_model::procfs::mount_ids_are_ordered_subset(
+            &[80, 10],
+            &config.mountinfo_mount_ids
+        ));
+        assert!(!detcore_model::procfs::mount_ids_are_ordered_subset(
+            &[10, 80],
+            &config.mountinfo_mount_ids
+        ));
+        assert!(!detcore_model::procfs::mount_ids_are_ordered_subset(
+            &[80, 99],
+            &config.mountinfo_mount_ids
+        ));
+        assert!(!detcore_model::procfs::mount_ids_are_ordered_subset(
+            &[80, 80],
+            &config.mountinfo_mount_ids
+        ));
+
+        let mut empty = DetConfig::default();
+        prepare_kvm_mountinfo_config(
+            &mut empty,
+            || panic!("an ambient capture has no producer namespace to compare"),
+            || mountinfo_identity_order_from(b""),
+        )
+        .unwrap();
+        assert!(empty.mountinfo_mount_ids.is_empty());
+        assert!(empty.mountinfo_mount_ids_captured);
+    }
+
+    #[test]
+    fn kvm_mountinfo_config_refuses_missing_or_malformed_capture() {
+        let valid = b"10 20 8:1 / / rw - ext4 /dev/root rw\n";
+        let config = DetConfig {
+            mountinfo_device_rewrites: vec![(libc::makedev(0, 1), libc::makedev(8, 1))],
+            ..DetConfig::default()
+        };
+        for contents in [
+            b"malformed".as_slice(),
+            b"10 20 8:1 / / rw - ext4 /dev/root rw\n10 20 8:1 / / rw - ext4 /dev/root rw\n",
+            b"10 20 8:1 / / rw unknown:7 - ext4 /dev/root rw\n",
+        ] {
+            let mut candidate = config.clone();
+            let before = serde_json::to_value(&candidate).unwrap();
+            let error = prepare_kvm_mountinfo_config(
+                &mut candidate,
+                || panic!("an ambient capture has no producer namespace to compare"),
+                || mountinfo_identity_order_from(contents),
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("malformed mountinfo"));
+            assert_eq!(serde_json::to_value(&candidate).unwrap(), before);
+        }
+        let mut candidate = config;
+        let before = serde_json::to_value(&candidate).unwrap();
+        let error = prepare_kvm_mountinfo_config(
+            &mut candidate,
+            || panic!("an ambient capture has no producer namespace to compare"),
+            || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into()),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+        );
+        assert_eq!(serde_json::to_value(&candidate).unwrap(), before);
+        assert_eq!(mountinfo_identity_order_from(valid).unwrap(), [10, 20]);
+    }
+
+    #[test]
+    fn kvm_mountinfo_config_refuses_uncaptured_provenance_vectors() {
+        for (listed, assigned, namespace) in [
+            (vec![10], vec![], None),
+            (vec![], vec![700], None),
+            (vec![], vec![], Some(NAMESPACE)),
+        ] {
+            let mut config = DetConfig {
+                mountinfo_mount_ids: listed,
+                mount_id_assignment_order: assigned,
+                mountinfo_mount_namespace: namespace,
+                ..DetConfig::default()
+            };
+            let before = serde_json::to_value(&config).unwrap();
+            let error = prepare_kvm_mountinfo_config(
+                &mut config,
+                || panic!("must not overwrite incomplete provenance"),
+                || panic!("must not overwrite incomplete provenance"),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("no producer-captured namespace"));
+            assert_eq!(serde_json::to_value(&config).unwrap(), before);
+        }
+    }
+
+    /// The container mount table Detcore renders on KVM must name mounts of
+    /// the namespace the backend captured
+    /// (https://github.com/rrnewton/hermit/issues/4213, K3a).
+    #[test]
+    fn kvm_mountinfo_config_refuses_a_mount_table_of_another_namespace() {
+        let namespace = b"10 1 8:1 / / rw - ext4 /dev/root rw\n\
+                          20 10 0:22 / /proc rw - proc proc rw\n\
+                          40 10 0:23 / /elsewhere rw - tmpfs tmpfs rw\n";
+        let rows = detcore_model::container_mounts::parse_container_mounts(namespace).unwrap();
+        let table = |installed: &[u64]| {
+            detcore_model::container_mounts::ContainerMountTable::select(
+                &rows,
+                &installed.iter().copied().collect(),
+                &[],
+                &std::collections::BTreeSet::new(),
+            )
+        };
+        let config = |table| DetConfig {
+            mountinfo_mount_ids: vec![10, 20, 1],
+            mountinfo_mount_ids_captured: true,
+            mountinfo_mount_namespace: Some(NAMESPACE),
+            container_mount_table: Some(table),
+            ..DetConfig::default()
+        };
+        let snapshot = || -> Result<Vec<u64>, Error> { panic!("the snapshot is kept") };
+        let mut matching = config(table(&[20]));
+        prepare_kvm_mountinfo_config(&mut matching, || Ok(NAMESPACE), snapshot).unwrap();
+        let mut stale = config(table(&[40]));
+        let error =
+            prepare_kvm_mountinfo_config(&mut stale, || Ok(NAMESPACE), snapshot).unwrap_err();
+        assert!(error.to_string().contains("names mount 40"), "{error:#}");
+    }
+
+    /// A run in a namespace Hermit made no mount in shows only the base
+    /// mountpoints mounted at their very paths, maps a file on any other
+    /// mount to its nearest shown ancestor, and validates against an order
+    /// read from the same bytes (https://github.com/rrnewton/hermit/issues/4213).
+    #[test]
+    fn an_unplanned_table_shows_only_the_base_mountpoints() {
+        let namespace = b"10 1 8:1 / / rw - ext4 /dev/root rw\n\
+                          20 10 0:22 / /proc rw - proc proc rw\n\
+                          30 10 0:23 / /dev rw - devtmpfs dev rw\n\
+                          40 10 0:24 / /data/eden rw - fuse.edenfs eden rw\n\
+                          41 30 0:25 / /dev/shm rw - tmpfs tmpfs rw\n\
+                          50 10 0:26 / /run/user/1000 rw - tmpfs tmpfs rw\n";
+        // /run is no mount here: its descriptor reaches the root mount.
+        let base = [
+            (b"/".to_vec(), 10),
+            (b"/proc".to_vec(), 20),
+            (b"/dev".to_vec(), 30),
+            (b"/dev/shm".to_vec(), 41),
+            (b"/run".to_vec(), 10),
+        ];
+        for mountpoint in detcore_model::container_mounts::BASE_MOUNTPOINTS {
+            assert!(
+                !mountpoint.bytes().any(|byte| b" \t\n\\".contains(&byte)),
+                "{mountpoint} needs mountinfo escaping"
+            );
+        }
+        let no_launch = std::collections::BTreeSet::new();
+        let (table, order) =
+            unplanned_container_mount_table_from(namespace, &no_launch, &base).unwrap();
+        assert_eq!(table.shown_mount_ids(), [10, 20, 30, 41].into());
+        assert_eq!(table.shown_mount_id(40), 10);
+        assert_eq!(table.shown_mount_id(50), 10);
+        assert_eq!(order, [10, 20, 30, 40, 41, 50, 1]);
+        let rendered = String::from_utf8(table.mountinfo()).unwrap();
+        assert!(!rendered.contains("/data/eden") && !rendered.contains("/run/user"));
+        // A launch from a checkout on /data/eden shows that mount too; a
+        // file on the still hidden /run/user/1000 reports the root.
+        let launch = [40].into();
+        let (table, order) =
+            unplanned_container_mount_table_from(namespace, &launch, &base).unwrap();
+        assert_eq!(table.shown_mount_ids(), [10, 20, 30, 40, 41].into());
+        assert_eq!(table.shown_mount_id(40), 40);
+        assert_eq!(table.shown_mount_id(50), 10);
+        assert_eq!(order, [10, 20, 30, 40, 41, 50, 1]);
+    }
+
+    /// Runs test `name` again under `unshare --user --map-root-user
+    /// --mount`, where it may mount, and returns true in this process, which
+    /// then has nothing more to check; returns false in that child, which runs
+    /// the test's body. `unshare(CLONE_NEWUSER)` refuses a multithreaded
+    /// process, so the test cannot enter one itself. Where user namespaces
+    /// are unavailable the test is skipped, saying why.
+    fn rerun_in_user_namespace(name: &str) -> bool {
+        const CHILD: &str = "HERMIT_TEST_USER_NAMESPACE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            return false;
+        }
+        let probe = std::process::Command::new("unshare")
+            .args(["--user", "--map-root-user", "--mount", "true"])
+            .output();
+        if !probe.as_ref().is_ok_and(|probe| probe.status.success()) {
+            eprintln!("SKIPPED {name}: user namespaces are unavailable here: {probe:?}");
+            return true;
+        }
+        let output = std::process::Command::new("unshare")
+            .args(["--user", "--map-root-user", "--mount", "--"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .output()
+            .expect("run the test under unshare");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "the child failed or ran no test:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
+    /// A library caller's thread with a mount namespace of its own captures
+    /// its own namespace's rows, identity and mount IDs (all through
+    /// `/proc/thread-self`), not the thread group leader's: otherwise the
+    /// leader's rows and the thread's descriptor mount IDs never meet, and
+    /// the table shows nothing, not even `/`. A thread may unshare its mount
+    /// namespace only with CAP_SYS_ADMIN, which an unprivileged test gets in
+    /// a user namespace of its own (`rerun_in_user_namespace`); there the test
+    /// thread, not the leader, unshares the mount namespace.
+    #[test]
+    fn a_thread_with_its_own_mount_namespace_captures_its_own_view() {
+        use std::os::unix::fs::MetadataExt;
+        if rerun_in_user_namespace(
+            "tests::a_thread_with_its_own_mount_namespace_captures_its_own_view",
+        ) {
+            return;
+        }
+        let checked = std::thread::spawn(|| {
+            // SAFETY: unshare takes no pointer.
+            assert_eq!(
+                unsafe { libc::unshare(libc::CLONE_NEWNS) },
+                0,
+                "unshare(CLONE_NEWNS): {}",
+                io::Error::last_os_error()
+            );
+            let own = current_mount_namespace().unwrap();
+            let leader = fs::metadata("/proc/self/ns/mnt").unwrap();
+            assert_ne!(
+                own.inode,
+                leader.ino(),
+                "the thread kept the leader's namespace"
+            );
+            let (table, order) = unplanned_container_mount_table(Path::new(".")).unwrap();
+            assert!(
+                table
+                    .mounts
+                    .iter()
+                    .any(|row| row.mountpoint.as_slice() == b"/"),
+                "the thread's table shows no /: {table:?}"
+            );
+            let root = thread_mount_id_of(Path::new("/")).unwrap();
+            assert!(table.shown_mount_ids().contains(&root));
+            assert!(table.shown_mount_ids().iter().all(|id| order.contains(id)));
+        })
+        .join();
+        assert!(checked.is_ok(), "the thread's checks failed");
+    }
+
+    /// The launch directory is resolved and held before the mount table is
+    /// read: a mount made on it between the two (here a tmpfs over it, in a
+    /// user and mount namespace of the test's own) is not the launch mount,
+    /// because the held directory is below it; the mount the directory was
+    /// on is, and it is in the rows read. Had the directory been resolved
+    /// after the read, it would have reached the new tmpfs. The same order
+    /// puts a mount that resolving the directory triggers (an automount on
+    /// its path) in the rows read.
+    #[test]
+    fn launch_directories_are_held_before_the_mount_table_is_read() {
+        if rerun_in_user_namespace(
+            "tests::launch_directories_are_held_before_the_mount_table_is_read",
+        ) {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let launch = directory.path().join("launch");
+        fs::create_dir(&launch).unwrap();
+        let before = thread_mount_id_of(&launch).unwrap();
+        let target = launch.clone();
+        let (table, _) = unplanned_container_mount_table_with(&launch, move || {
+            let status = std::process::Command::new("mount")
+                .args(["-t", "tmpfs", "none"])
+                .arg(&target)
+                .status()
+                .expect("run mount");
+            assert!(status.success(), "mount a tmpfs over the launch directory");
+            thread_mountinfo()
+        })
+        .unwrap();
+        let over = thread_mount_id_of(&launch).unwrap();
+        assert_ne!(over, before, "the tmpfs did not cover the launch directory");
+        assert!(table.shown_mount_ids().contains(&before));
+        assert!(!table.shown_mount_ids().contains(&over));
+        let _ = std::process::Command::new("umount").arg(&launch).status();
+    }
+
+    /// A launch mount the mount table read does not list is refused, not
+    /// dropped from the table.
+    #[test]
+    fn a_launch_mount_missing_from_the_read_is_refused() {
+        let namespace = b"10 1 8:1 / / rw - ext4 /dev/root rw\n";
+        let error = unplanned_container_mount_table_from(namespace, &[99].into(), &[])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("launch mount 99"), "{error}");
+    }
+
+    #[test]
+    fn skid_overshoot_report_covers_success_error_and_disabled_backends() {
+        let _lock = SKID_OVERSHOOT_TEST_LOCK.lock().unwrap();
+        let _ = reverie::take_skid_overshoot_count();
+
+        reverie::record_skid_overshoot();
+        let empty_run = SkidOvershootReport::begin(true);
+        assert_eq!(
+            reverie::take_skid_overshoot_count(),
+            0,
+            "begin must clear evidence from a previous invocation"
+        );
+        empty_run.finish(Ok::<_, Error>(())).unwrap();
+
+        let success = SkidOvershootReport::begin(true);
+        reverie::record_skid_overshoot();
+        reverie::record_skid_overshoot();
+        let error = success.finish(Ok::<_, Error>(7)).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<SkidOvershootError>()
+                .expect("skid refusal must remain typed")
+                .count(),
+            2
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("observed 2 HERMIT_SKID_OVERSHOOT report(s)"),
+            "{error:#}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("deterministic execution was not established"),
+            "{error:#}"
+        );
+        assert_eq!(reverie::take_skid_overshoot_count(), 0);
+
+        let error = SkidOvershootReport::begin(true);
+        reverie::record_skid_overshoot();
+        let error = error
+            .finish(Err::<(), _>(anyhow!("guest failed")))
+            .unwrap_err();
+        assert!(error.downcast_ref::<SkidOvershootError>().is_some());
+        let error = format!("{error:#}");
+        assert!(error.contains("guest failed"), "{error}");
+        assert!(
+            error.contains("observed 1 HERMIT_SKID_OVERSHOOT report(s)"),
+            "{error}"
+        );
+        assert_eq!(reverie::take_skid_overshoot_count(), 0);
+
+        reverie::record_skid_overshoot();
+        let disabled = SkidOvershootReport::begin(false);
+        disabled.finish(Ok::<_, Error>(())).unwrap();
+        assert_eq!(
+            reverie::take_skid_overshoot_count(),
+            1,
+            "a backend that cannot produce ptrace PMU overshoots must not consume another run's evidence"
+        );
+    }
+
+    #[test]
+    fn only_ptrace_hosted_backends_consume_skid_overshoot_reports() {
+        for backend in [Backend::Ptrace, Backend::E9patch] {
+            assert!(backend.uses_ptrace_pmu_timers(), "{backend:?}");
+        }
+        for backend in [Backend::Dbt, Backend::Sabre, Backend::Kvm] {
+            assert!(!backend.uses_ptrace_pmu_timers(), "{backend:?}");
+        }
+        // In-guest Detcore has no ptrace tracer to arm the PMU timer from.
+        assert!(!Backend::Liteinst.uses_ptrace_pmu_timers());
+        assert!(!Backend::InGuestTrap.uses_ptrace_pmu_timers());
+    }
+
+    #[cfg(feature = "liteinst")]
+    fn write_guest_program(directory: &Path, name: &str, bytes: &[u8], mode: u32) -> PathBuf {
+        let path = directory.join(name);
+        fs::write(&path, bytes).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        // The kernel may clear a set-group-ID bit that this user cannot set;
+        // a test that silently lost its bit would test nothing.
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            mode,
+            "{}",
+            path.display()
+        );
+        path
+    }
+
+    #[cfg(feature = "liteinst")]
+    fn shebang_to(interpreter: &Path) -> Vec<u8> {
+        let mut script = b"#!".to_vec();
+        script.extend_from_slice(interpreter.as_os_str().as_bytes());
+        script.extend_from_slice(b" -e\necho script\n");
+        script
+    }
+
+    #[test]
+    #[cfg(feature = "liteinst")]
+    fn in_guest_liteinst_runs_a_dynamically_linked_x86_64_program() {
+        use interp::startup_fixtures::dynamic_executable;
+
+        let directory = tempfile::tempdir().unwrap();
+        let program = write_guest_program(
+            directory.path(),
+            "dynamic",
+            &dynamic_executable(false),
+            0o755,
+        );
+        assert_eq!(
+            in_guest_liteinst_program_gap(&mut Command::new(&program)).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "liteinst")]
+    fn in_guest_liteinst_refuses_programs_that_start_before_the_runtime() {
+        use interp::startup_fixtures::*;
+
+        let directory = tempfile::tempdir().unwrap();
+        let cases: [(&str, Vec<u8>, &str); 4] = [
+            (
+                "static",
+                elf(EM_X86_64, &[(PT_LOAD, b"code")]),
+                "is statically linked",
+            ),
+            (
+                "preinit",
+                dynamic_executable(true),
+                "has a DT_PREINIT_ARRAY",
+            ),
+            (
+                "aarch64",
+                elf(EM_AARCH64, &[(PT_INTERP, INTERP)]),
+                "is not a 64-bit x86-64 ELF image",
+            ),
+            (
+                "text",
+                b"plain text, no #! line\n".to_vec(),
+                "is neither an ELF executable nor a #! script",
+            ),
+        ];
+        for (name, bytes, reason) in cases {
+            let program = write_guest_program(directory.path(), name, &bytes, 0o755);
+            let gap = in_guest_liteinst_program_gap(&mut Command::new(&program))
+                .unwrap()
+                .unwrap_or_else(|| panic!("{name} was not refused"));
+            assert!(
+                gap.contains(reason) && gap.contains(&program.display().to_string()),
+                "{name}: {gap}"
+            );
+        }
+    }
+
+    /// A failure recorded during an in-guest run fails the settle step and
+    /// latches a determinism loss, so verification refuses the run (Codex
+    /// implementation review, HIGH 3 and 4).
+    #[tokio::test]
+    #[cfg(feature = "liteinst")]
+    async fn a_recorded_in_guest_failure_fails_the_run_and_latches_a_loss() {
+        use std::os::fd::FromRawFd;
+
+        use reverie::GlobalTool;
+        use reverie_rpc_transport::ConnectionAdmission;
+
+        let config = DetConfig::default().with_backend(|backend| {
+            backend.process_exits_complete_asynchronously = true;
+        });
+        let global_state = detcore::GlobalState::init_global_state(&config).await;
+        let exits = in_guest_exits::InGuestExitAdmission::default();
+        // Admitting before any reporter is attached is refused and recorded.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, std::process::id() as i32, 0) };
+        assert!(fd >= 0);
+        let pidfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) };
+        assert!(exits.admit(pidfd).is_err());
+        let error = settle_in_guest_exits(&exits, &global_state)
+            .await
+            .expect_err("a recorded failure must fail the run");
+        assert!(
+            error
+                .to_string()
+                .starts_with("in-guest LiteInst refused a guest connection:"),
+            "{error}"
+        );
+        assert!(detcore::detlog::determinism_loss().is_some());
+    }
+
+    #[test]
+    fn in_guest_trap_is_in_guest_liteinst_and_forces_site_patching_off() {
+        assert!(Backend::Liteinst.is_in_guest_liteinst());
+        assert!(Backend::InGuestTrap.is_in_guest_liteinst());
+        for backend in [
+            Backend::Ptrace,
+            Backend::Dbt,
+            Backend::Sabre,
+            Backend::Kvm,
+            Backend::E9patch,
+        ] {
+            assert!(!backend.is_in_guest_liteinst(), "{backend:?}");
+            assert_eq!(backend.runtime_name(), backend.as_str(), "{backend:?}");
+            assert_eq!(forced_site_patching_value(backend), None, "{backend:?}");
+        }
+        assert_eq!(Backend::InGuestTrap.as_str(), "in-guest-trap");
+        assert_eq!(Backend::InGuestTrap.runtime_name(), "liteinst");
+        assert_eq!(Backend::Liteinst.runtime_name(), "liteinst");
+        // liteinst leaves the variable to the guest environment.
+        assert_eq!(forced_site_patching_value(Backend::Liteinst), None);
+        assert_eq!(forced_site_patching_value(Backend::InGuestTrap), Some("0"));
+        // The CLI spelling parses to the variant and back.
+        assert_eq!(
+            <Backend as ValueEnum>::from_str("in-guest-trap", false),
+            Ok(Backend::InGuestTrap)
+        );
+        assert!(Backend::ALL.contains(&Backend::InGuestTrap));
+        for backend in Backend::ALL {
+            let name = backend
+                .to_possible_value()
+                .expect("every backend is a visible CLI value");
+            assert_eq!(name.get_name(), backend.as_str(), "{backend:?}");
+        }
+    }
+
+    /// in-guest-trap sets `REVERIE_LITEINST_SITE_PATCHING=0` on the guest
+    /// command when the guest environment leaves it unset or already `0`, and
+    /// refuses, before anything starts, an environment that sets any other
+    /// value; the refusal names the value and both ways out. liteinst neither
+    /// refuses nor changes the variable.
+    #[test]
+    #[cfg(feature = "liteinst")]
+    fn in_guest_trap_refuses_a_guest_environment_that_turns_site_patching_on() {
+        use std::ffi::OsStr;
+
+        let name = reverie_liteinst::SITE_PATCHING_ENV;
+        let mut unset = Command::new("/bin/true");
+        unset.env_remove(name);
+        assert_eq!(
+            in_guest_trap_site_patching_conflict(&unset, Backend::InGuestTrap),
+            None
+        );
+        force_in_guest_site_patching(&mut unset, Backend::InGuestTrap);
+        assert_eq!(unset.get_env(name).as_deref(), Some(OsStr::new("0")));
+
+        let mut zero = Command::new("/bin/true");
+        zero.env(name, "0");
+        assert_eq!(
+            in_guest_trap_site_patching_conflict(&zero, Backend::InGuestTrap),
+            None
+        );
+
+        for value in ["1", "", "yes", " 0"] {
+            let mut command = Command::new("/bin/true");
+            command.env(name, value);
+            let conflict = in_guest_trap_site_patching_conflict(&command, Backend::InGuestTrap)
+                .unwrap_or_else(|| panic!("{value:?} was accepted"));
+            assert!(conflict.contains(&format!("{name}={value},")), "{conflict}");
+            assert!(conflict.contains("--backend=liteinst"), "{conflict}");
+            assert!(conflict.contains("drop the variable"), "{conflict}");
+            // The whole refusal path stops on it first, before the program,
+            // kernel or timeslice checks, and leaves the value untouched.
+            let error = refuse_in_guest_liteinst_run(
+                &mut command,
+                &DetConfig::default(),
+                Backend::InGuestTrap,
+            )
+            .unwrap_err();
+            let refusal = error
+                .downcast_ref::<LiteinstInGuestRefusal>()
+                .expect("a typed in-guest refusal, which the CLI reports as exit 122");
+            assert!(
+                refusal.to_string().starts_with(
+                    "--backend=in-guest-trap (in-guest LiteInst, site patching off) refuses \
+                     this run: the guest environment sets"
+                ),
+                "{refusal}"
+            );
+            assert_eq!(command.get_env(name).as_deref(), Some(OsStr::new(value)));
+
+            // liteinst takes the variable from the guest environment as it is.
+            let mut liteinst = Command::new("/bin/true");
+            liteinst.env(name, value);
+            assert_eq!(
+                in_guest_trap_site_patching_conflict(&liteinst, Backend::Liteinst),
+                None
+            );
+            force_in_guest_site_patching(&mut liteinst, Backend::Liteinst);
+            assert_eq!(liteinst.get_env(name).as_deref(), Some(OsStr::new(value)));
+        }
+    }
+
+    /// The coordinator's postcondition for an in-guest-trap run: a record
+    /// with no patched and no candidate site passes; a patched site, a
+    /// candidate, an unmeasured count or a missing record is refused, with a
+    /// typed in-guest refusal and a determinism loss. Other backends are not
+    /// held to it.
+    #[test]
+    #[cfg(feature = "liteinst")]
+    fn an_in_guest_trap_run_that_patched_a_site_is_refused_after_it_ends() {
+        let record = |candidates: Option<u64>, patched: Option<u64>| {
+            reverie::DispatchStats::new(
+                "in-guest-trap",
+                reverie::DispatchCounters::ZERO,
+                reverie::SiteCounters {
+                    candidates,
+                    patched,
+                    fell_back: Some(0),
+                },
+            )
+        };
+        let clean = record(Some(0), Some(0));
+        assert_eq!(
+            in_guest_trap_patching_evidence(Backend::InGuestTrap, Some(&clean), 1),
+            None
+        );
+        for (candidates, patched, shown) in [
+            (Some(3), Some(3), "3 patched and 3 candidate"),
+            (Some(1), Some(0), "0 patched and 1 candidate"),
+            (Some(0), None, "unmeasured patched and 0 candidate"),
+        ] {
+            let reason = in_guest_trap_patching_evidence(
+                Backend::InGuestTrap,
+                Some(&record(candidates, patched)),
+                1,
+            )
+            .unwrap_or_else(|| panic!("{candidates:?} {patched:?} was accepted"));
+            assert!(reason.contains(shown), "{reason}");
+        }
+        assert!(
+            in_guest_trap_patching_evidence(Backend::InGuestTrap, None, 1)
+                .is_some_and(|reason| reason.contains("no LiteInst dispatch record"))
+        );
+        // An empty record from guests that collected nothing is not zero.
+        assert!(
+            in_guest_trap_patching_evidence(Backend::InGuestTrap, Some(&clean), 0)
+                .is_some_and(|reason| reason.contains("no guest process reported"))
+        );
+        let patched = record(Some(3), Some(3));
+        assert_eq!(
+            in_guest_trap_patching_evidence(Backend::Liteinst, Some(&patched), 1),
+            None
+        );
+        assert_eq!(
+            in_guest_trap_patching_evidence(Backend::Liteinst, None, 0),
+            None
+        );
+
+        refuse_in_guest_trap_patching(Backend::InGuestTrap, None).unwrap();
+        let error = refuse_in_guest_trap_patching(
+            Backend::InGuestTrap,
+            in_guest_trap_patching_evidence(Backend::InGuestTrap, Some(&patched), 1),
+        )
+        .unwrap_err();
+        assert!(
+            error.downcast_ref::<LiteinstInGuestRefusal>().is_some(),
+            "{error:#}"
+        );
+        assert!(
+            error
+                .to_string()
+                .starts_with("--backend=in-guest-trap (in-guest LiteInst, site patching off)"),
+            "{error:#}"
+        );
+        assert!(
+            detcore::detlog::determinism_loss().is_some_and(|loss| loss.contains("3 patched")),
+            "the refusal must record a determinism loss"
+        );
+    }
+
+    /// Only an in-guest-trap run tells every Tool image to check the settings
+    /// its runtime captured, and that run always collects the statistics the
+    /// check requires.
+    #[test]
+    #[cfg(feature = "liteinst")]
+    fn only_in_guest_trap_asks_tool_images_to_check_their_runtime() {
+        for backend in Backend::ALL {
+            let checks = in_guest_site_patching_off(backend);
+            assert_eq!(checks, backend == Backend::InGuestTrap, "{backend:?}");
+            if checks {
+                assert!(in_guest_stats_request(backend, &None).is_enabled());
+            }
+        }
+        assert!(!in_guest_stats_request(Backend::Liteinst, &None).is_enabled());
+    }
+
+    /// A configuration that already carries a reserved-signal set (it is a
+    /// public, serialized field) never keeps it through Hermit's preparation:
+    /// every backend's preparation, the loader route's
+    /// (`prepare_in_guest_loader_route_config`, which `hermit run`'s
+    /// exec-stop, native-exec and mapped-first-admission launchers use) and
+    /// the native-exec verify route's leave it empty. Only the default
+    /// in-guest route sets it afterwards, from the backend and the
+    /// subscription alone, never from the input.
+    #[test]
+    fn a_poisoned_reserved_signal_set_never_survives_preparation() {
+        let poisoned = DetConfig {
+            in_guest_reserved_signals: u64::MAX,
+            ..DetConfig::default()
+        };
+        for backend in Backend::ALL {
+            let prepared = prepare_backend_config(poisoned.clone(), backend);
+            assert_eq!(prepared.in_guest_reserved_signals, 0, "{backend:?}");
+            let expected = if backend.is_in_guest_liteinst() {
+                in_guest_reserved_signals(
+                    &prepare_backend_config(DetConfig::default(), backend),
+                    backend,
+                )
+            } else {
+                0
+            };
+            assert_eq!(
+                in_guest_reserved_signals(&prepared, backend),
+                expected,
+                "{backend:?}"
+            );
+        }
+        let loader = prepare_in_guest_loader_route_config(poisoned);
+        assert_eq!(loader.in_guest_reserved_signals, 0);
+        assert!(loader.in_guest_site_patching_off);
+        assert_eq!(loader.backend, backend_capabilities(Backend::InGuestTrap));
+    }
+
+    /// A configuration that already asks for the refusal of host-timed signal
+    /// producers (a public, serialized field) never keeps it through Hermit's
+    /// preparation: every backend's preparation and the loader route's (the
+    /// exec-stop, native-exec and mapped-first-admission launchers, and the
+    /// native-exec verify route) turn it off. Only the default in-guest route
+    /// turns it on afterwards, from the backend alone: both in-guest backends
+    /// and no other (A5 step 3c slice 0b).
+    #[test]
+    fn a_poisoned_producer_refusal_never_survives_preparation() {
+        let poisoned = DetConfig {
+            in_guest_refuses_host_timed_producers: true,
+            ..DetConfig::default()
+        };
+        for backend in Backend::ALL {
+            let prepared = prepare_backend_config(poisoned.clone(), backend);
+            assert!(
+                !prepared.in_guest_refuses_host_timed_producers,
+                "{backend:?}"
+            );
+            assert_eq!(
+                in_guest_refuses_host_timed_producers(backend),
+                matches!(backend, Backend::Liteinst | Backend::InGuestTrap),
+                "{backend:?}"
+            );
+        }
+        let loader = prepare_in_guest_loader_route_config(poisoned);
+        assert!(!loader.in_guest_refuses_host_timed_producers);
+        assert!(loader.in_guest_site_patching_off);
+    }
+
+    /// A configuration that every condition of the in-guest delivery gate
+    /// holds for, on `backend`, as the default route's launch leaves it
+    /// before it sets the gate: prepared, with site patching off.
+    fn gate_ready(backend: Backend) -> DetConfig {
+        let mut config = prepare_backend_config(
+            DetConfig {
+                sequentialize_threads: true,
+                max_timeslice: None,
+                ..DetConfig::default()
+            },
+            backend,
+        );
+        config.in_guest_site_patching_off = true;
+        config
+    }
+
+    /// A configuration that already turns the in-guest delivery gate on (a
+    /// public, serialized field) never keeps it through Hermit's
+    /// preparation: every backend's preparation and the loader route's (the
+    /// exec-stop, native-exec and mapped-first-admission launchers, and the
+    /// native-exec verify route) turn it off, also where every other
+    /// condition holds (A5 step 3c.1, D35, D43, D52). Only the default
+    /// route's launch sets it afterwards. Mutation it catches: the reset in
+    /// `prepare_backend_config` removed.
+    #[test]
+    fn a_poisoned_signal_delivery_gate_never_survives_preparation() {
+        let poisoned = DetConfig {
+            in_guest_signal_delivery: true,
+            sequentialize_threads: true,
+            max_timeslice: None,
+            in_guest_site_patching_off: true,
+            ..DetConfig::default()
+        };
+        for backend in Backend::ALL {
+            let prepared = prepare_backend_config(poisoned.clone(), backend);
+            assert!(!prepared.in_guest_signal_delivery, "{backend:?}");
+        }
+        let loader = prepare_in_guest_loader_route_config(poisoned);
+        assert!(!loader.in_guest_signal_delivery);
+        assert!(loader.in_guest_site_patching_off);
+        assert_eq!(loader.backend, backend_capabilities(Backend::InGuestTrap));
+    }
+
+    /// D35's gate holds only for an in-guest backend with site patching off,
+    /// sequentialized threads, none of the configurations in which Detcore
+    /// cannot keep the two-phase protocol (D33: each one alone turns the gate
+    /// off), and a launcher that owns the guest's PID namespace (D51).
+    #[test]
+    fn the_signal_delivery_gate_needs_every_condition() {
+        let owned = true;
+        for backend in Backend::ALL {
+            let ready = gate_ready(backend);
+            assert_eq!(
+                in_guest_signal_delivery_gate(&ready, backend, owned),
+                backend.is_in_guest_liteinst(),
+                "{backend:?}"
+            );
+        }
+        for backend in [Backend::Liteinst, Backend::InGuestTrap] {
+            let ready = gate_ready(backend);
+            assert!(detcore::two_phase_refusal(&ready).is_none(), "{backend:?}");
+            let off = |change: &dyn Fn(&mut DetConfig)| {
+                let mut config = ready.clone();
+                change(&mut config);
+                !in_guest_signal_delivery_gate(&config, backend, owned)
+            };
+            assert!(
+                off(&|c| c.in_guest_site_patching_off = false),
+                "{backend:?}"
+            );
+            assert!(off(&|c| c.sequentialize_threads = false), "{backend:?}");
+            // D33's flags, each refused by `two_phase_refusal`.
+            assert!(
+                off(&|c| c.target_timeslice = std::num::NonZeroU64::new(1_000)),
+                "{backend:?}"
+            );
+            assert!(
+                off(&|c| c.max_timeslice = std::num::NonZeroU64::new(1_000)),
+                "{backend:?}"
+            );
+            assert!(off(&|c| c.record_preemptions = true), "{backend:?}");
+            assert!(
+                off(&|c| c.replay_schedule_from = Some(PathBuf::from("schedule.json"))),
+                "{backend:?}"
+            );
+            let mut pipe = ready.clone();
+            pipe.pipe_wake_latency = Some(1_000);
+            assert!(pipe.pipe_wake_latency_in_effect().is_some());
+            assert!(
+                !in_guest_signal_delivery_gate(&pipe, backend, owned),
+                "{backend:?}"
+            );
+            // D51: no PID namespace the launcher owns.
+            assert!(
+                !in_guest_signal_delivery_gate(&ready, backend, false),
+                "{backend:?}"
+            );
+        }
+    }
+
+    /// `scheduler_owns_guest_pid_namespace` in a forked process, plain or
+    /// the first process of a new user and PID namespace, as its exit status
+    /// (1 owned, 0 not, 2 when a step failed).
+    fn ownership_in_child(new_pid_namespace: bool) -> i32 {
+        let observe = || i32::from(scheduler_owns_guest_pid_namespace());
+        // SAFETY: plain process calls; each forked process calls only getpid,
+        // unshare, fork, waitpid and _exit before it exits.
+        unsafe {
+            let launcher = libc::fork();
+            assert!(launcher >= 0, "fork failed");
+            if launcher == 0 {
+                if !new_pid_namespace {
+                    libc::_exit(observe());
+                }
+                if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWPID) != 0 {
+                    libc::_exit(2);
+                }
+                let init = libc::fork();
+                if init == 0 {
+                    libc::_exit(observe());
+                }
+                let mut status = 0;
+                if init < 0
+                    || libc::waitpid(init, &mut status, 0) != init
+                    || !libc::WIFEXITED(status)
+                {
+                    libc::_exit(2);
+                }
+                libc::_exit(libc::WEXITSTATUS(status));
+            }
+            let mut status = 0;
+            assert_eq!(libc::waitpid(launcher, &mut status, 0), launcher);
+            assert!(libc::WIFEXITED(status), "wait status {status:#x}");
+            libc::WEXITSTATUS(status)
+        }
+    }
+
+    /// D52: ownership of the guests' PID namespace is derived from the
+    /// process, not supplied. The first process of a new user and PID
+    /// namespace (PID 1 there, as `hermit run`'s container init is) owns it;
+    /// a plain child, as under `--no-namespace`, does not, and neither does
+    /// this test process. Mutation it catches: ownership forced true.
+    #[test]
+    fn only_a_pid_namespace_init_owns_the_guests_namespace() {
+        assert!(!scheduler_owns_guest_pid_namespace());
+        assert_eq!(
+            ownership_in_child(false),
+            0,
+            "a plain child owns no namespace"
+        );
+        assert_eq!(
+            ownership_in_child(true),
+            1,
+            "the init of a new PID namespace owns it (2: no user and PID namespace)"
+        );
+    }
+
+    /// D52: a public-API launch from a process that is not the init of a new
+    /// PID namespace, like this test, never has the gate on, however ready
+    /// the configuration; and until the in-guest runtime takes the gate
+    /// (3c.1f), no launch sets it at all, owned or not.
+    #[test]
+    #[cfg(feature = "liteinst")]
+    fn no_launch_outside_a_new_pid_namespace_and_no_3c1a_launch_turns_the_gate_on() {
+        for backend in Backend::ALL {
+            let ready = gate_ready(backend);
+            assert!(
+                !in_guest_signal_delivery_gate(
+                    &ready,
+                    backend,
+                    scheduler_owns_guest_pid_namespace()
+                ),
+                "{backend:?}"
+            );
+            for owned in [false, true] {
+                assert!(
+                    !(IN_GUEST_RUNTIME_DELIVERS_SIGNALS
+                        && in_guest_signal_delivery_gate(&ready, backend, owned)),
+                    "{backend:?} {owned}"
+                );
+            }
+        }
+    }
+
+    /// D25: the guest's check logs the limit it found, unchanged when
+    /// already unlimited and raised otherwise, and a limit it could not raise
+    /// refuses the run, naming both values and the errno.
+    #[test]
+    #[cfg(feature = "liteinst")]
+    fn an_in_guest_launch_logs_the_cpu_limit_it_found_and_refuses_one_it_cannot_raise() {
+        let limit = |rlim_cur, rlim_max| libc::rlimit { rlim_cur, rlim_max };
+        let unchanged = rlimit_cpu_report_line(limit(libc::RLIM_INFINITY, libc::RLIM_INFINITY));
+        assert!(
+            unchanged.contains(
+                "was soft unlimited hard unlimited, the value Detcore reports; the guest starts \
+                 with it unchanged"
+            ),
+            "{unchanged}"
+        );
+        let raised = rlimit_cpu_report_line(limit(1, libc::RLIM_INFINITY));
+        assert!(
+            raised.contains(
+                "was soft 1s hard unlimited; Hermit sets it to soft unlimited hard unlimited"
+            ),
+            "{raised}"
+        );
+        let refused = rlimit_cpu_refusal(limit(3600, 7200), nix::errno::Errno::EPERM);
+        assert!(
+            refused.starts_with(
+                "the guest would inherit a finite physical RLIMIT_CPU (soft 3600s, hard 7200s), \
+                 and Hermit cannot raise it (EPERM: "
+            ),
+            "{refused}"
+        );
+        assert!(refused.contains("D25"), "{refused}");
+    }
+
+    /// D25: what the guest's own check reports through its pipe becomes the
+    /// refusal naming the descriptor and why (an unreadable one, or a table
+    /// that cannot be listed, with its errno; an unraisable `RLIMIT_CPU` with
+    /// its values), or, for a check that passed, the limit to log; an empty
+    /// pipe (the check never ran) names nothing.
+    #[test]
+    #[cfg(feature = "liteinst")]
+    fn the_launch_audit_reports_what_the_guest_check_found() {
+        use std::os::fd::AsRawFd;
+        let mut command = Command::new("/bin/true");
+        let audit = LaunchAudit::install(&mut command).unwrap();
+        let pipe = &audit.pipe;
+        assert_eq!(pipe.read_report(), None);
+        let write = |report: LaunchReport| {
+            let bytes = report.encode();
+            // SAFETY: a write of a local array.
+            let written =
+                unsafe { libc::write(pipe._write.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) };
+            assert_eq!(written, bytes.len() as isize);
+        };
+        let report = |kind, bits, errno: i32, fd, rlimit| LaunchReport {
+            kind,
+            bits,
+            errno: errno as u8,
+            fd,
+            rlimit,
+        };
+        for (sent, what) in [
+            (
+                report(
+                    audit_bits::PRODUCER,
+                    audit_bits::O_ASYNC | audit_bits::OWNER,
+                    0,
+                    0,
+                    (0, 0),
+                ),
+                "the guest would inherit descriptor 0, which is already a signal producer: it has \
+                 O_ASYNC and an owner",
+            ),
+            (
+                report(
+                    audit_bits::PRODUCER,
+                    audit_bits::SOCKET | audit_bits::OWNER,
+                    0,
+                    1,
+                    (0, 0),
+                ),
+                "descriptor 1, which is already a signal producer: it is a socket with an owner",
+            ),
+            (
+                report(audit_bits::PRODUCER, audit_bits::LEASE, 0, 300, (0, 0)),
+                "descriptor 300, which is already a signal producer: it holds a lease",
+            ),
+            (
+                report(audit_bits::UNREADABLE, 0, libc::EACCES, 7, (0, 0)),
+                "descriptor 7, whose signal owner and flags cannot be read (EACCES",
+            ),
+            (
+                report(audit_bits::UNLISTED, 0, libc::EMFILE, -1, (0, 0)),
+                "descriptor table could not be listed from /proc/self/fd (EMFILE",
+            ),
+            (
+                report(audit_bits::RLIMIT_CPU, 0, libc::EPERM, -1, (3600, 3600)),
+                "finite physical RLIMIT_CPU (soft 3600s, hard 3600s), and Hermit cannot raise it \
+                 (EPERM",
+            ),
+        ] {
+            write(sent);
+            let received = pipe.read_report().unwrap();
+            assert_eq!(received, sent);
+            let reason = received.refusal().unwrap();
+            assert!(reason.contains(what), "{reason}");
+        }
+        let passed = report(audit_bits::PASSED, 0, 0, -1, (1, libc::RLIM_INFINITY));
+        write(passed);
+        let received = pipe.read_report().unwrap();
+        assert_eq!(received.refusal(), None);
+        assert_eq!(
+            rlimit_cpu_report_line(received.limit()),
+            rlimit_cpu_report_line(libc::rlimit {
+                rlim_cur: 1,
+                rlim_max: libc::RLIM_INFINITY
+            })
+        );
+        assert_eq!(pipe.read_report(), None);
+    }
+
+    /// D25: the guest's check reads its whole descriptor table and skips
+    /// close-on-exec descriptors and its own pipe: in this process, a pipe
+    /// with O_ASYNC and an owner is reported only once its close-on-exec is
+    /// cleared, by number and state, and the table scan reports exactly it.
+    #[test]
+    #[cfg(feature = "liteinst")]
+    fn the_inherited_descriptor_scan_finds_a_producer_without_close_on_exec() {
+        use std::os::fd::AsRawFd;
+        let (read, write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).unwrap();
+        drop(write);
+        let fd = read.as_raw_fd();
+        // SAFETY: plain fcntl calls on a descriptor this test owns; no SIGIO
+        // can be sent for a pipe with no writer.
+        unsafe {
+            assert_eq!(libc::fcntl(fd, libc::F_SETOWN, libc::getpid()), 0);
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            assert_eq!(libc::fcntl(fd, libc::F_SETFL, flags | libc::O_ASYNC), 0);
+        }
+        assert_eq!(check_inherited_descriptor(fd, -1), None);
+        // SAFETY: as above.
+        unsafe { assert_eq!(libc::fcntl(fd, libc::F_SETFD, 0), 0) };
+        let expected = LaunchReport {
+            kind: audit_bits::PRODUCER,
+            bits: audit_bits::O_ASYNC | audit_bits::OWNER,
+            errno: 0,
+            fd,
+            rlimit: (0, 0),
+        };
+        assert_eq!(check_inherited_descriptor(fd, -1), Some(expected));
+        assert_eq!(
+            check_inherited_descriptor(fd, fd),
+            None,
+            "the audit's own pipe"
+        );
+        // No other descriptor of this test process is a producer, so the
+        // table scan reports exactly this one.
+        assert_eq!(audit_inherited_descriptors(-1), Some(expected));
+        // SAFETY: as above.
+        unsafe { assert_eq!(libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC), 0) };
+    }
+
+    /// D25: an inherited descriptor that is already a producer (O_ASYNC with
+    /// an owner, a socket with an owner, a lease) refuses the run, naming the
+    /// descriptor, and so does one with only an owner (a directory
+    /// notification, which cannot be read back, would signal it); one with
+    /// only O_ASYNC, or an unowned socket, does not.
+    #[test]
+    #[cfg(feature = "liteinst")]
+    fn an_inherited_signal_producer_is_refused_by_descriptor() {
+        use detcore::host_timed_producers::ProducerState;
+        let state = |o_async, owner, socket| ProducerState {
+            o_async,
+            owner,
+            socket,
+        };
+        for (producer, lease, what) in [
+            (state(true, true, false), false, "O_ASYNC and an owner"),
+            (state(false, true, true), false, "a socket with an owner"),
+            (state(false, false, false), true, "holds a lease"),
+            (
+                state(false, true, false),
+                false,
+                "it has an owner, which a directory",
+            ),
+        ] {
+            let reason = inherited_producer_refusal(7, producer, lease).unwrap();
+            assert!(
+                reason.starts_with("the guest would inherit descriptor 7, "),
+                "{reason}"
+            );
+            assert!(reason.contains(what), "{reason}");
+        }
+        for state in [
+            state(true, false, false),
+            state(false, false, true),
+            state(true, false, true),
+        ] {
+            assert_eq!(
+                inherited_producer_refusal(7, state, false),
+                None,
+                "{state:?}"
+            );
+        }
+    }
+
+    /// Hermit's default in-guest route reserves SIGSYS always, SIGSEGV while
+    /// Detcore's subscription traps an instruction, and SIGTRAP only while the
+    /// guard router can be installed: with site patching on
+    /// (`in_guest_site_patching_off` false), never with it off, on either
+    /// in-guest backend (A5 step 3c slice 0c). Every other backend gets an
+    /// empty set and no router whatever the setting, and so does the in-guest
+    /// loader route, whose configuration is `prepare_backend_config`'s with no
+    /// reserved set (A5 step 3c, design section 16.30).
+    #[test]
+    fn in_guest_reserved_signals_follow_the_backend_the_subscription_and_site_patching() {
+        let bit = |signal: libc::c_int| 1_u64 << (signal - 1);
+        for backend in Backend::ALL {
+            for patching_off in [false, true] {
+                let mut config = prepare_backend_config(DetConfig::default(), backend);
+                assert_eq!(config.in_guest_reserved_signals, 0, "{backend:?}");
+                config.in_guest_site_patching_off = patching_off;
+                let router = in_guest_guard_router_installed(&config, backend);
+                let reserved = in_guest_reserved_signals(&config, backend);
+                let label = format!("{backend:?} patching_off={patching_off}");
+                if !backend.is_in_guest_liteinst() {
+                    assert!(!router, "{label}");
+                    assert_eq!(reserved, 0, "{label}");
+                    continue;
+                }
+                assert_eq!(router, !patching_off, "{label}");
+                let trap = if patching_off { 0 } else { bit(libc::SIGTRAP) };
+                // Without --passthru-opt Detcore always subscribes RDTSC.
+                assert!(<Detcore as reverie::Tool>::subscriptions(&config).has_rdtsc());
+                assert_eq!(
+                    reserved,
+                    bit(libc::SIGSYS) | bit(libc::SIGSEGV) | trap,
+                    "{label}"
+                );
+
+                // --passthru-opt with time and CPUID virtualization off traps
+                // no instruction, so the runtime installs no SIGSEGV handler.
+                let mut unsubscribed = config.clone();
+                unsubscribed.passthru_opt = true;
+                unsubscribed.virtualize_time = false;
+                unsubscribed.virtualize_cpuid = false;
+                let subscription = <Detcore as reverie::Tool>::subscriptions(&unsubscribed);
+                assert!(!subscription.has_rdtsc() && !subscription.has_cpuid());
+                assert_eq!(
+                    in_guest_reserved_signals(&unsubscribed, backend),
+                    bit(libc::SIGSYS) | trap,
+                    "{label}"
+                );
+                for (time, cpuid) in [(true, false), (false, true)] {
+                    let mut subscribed = unsubscribed.clone();
+                    subscribed.virtualize_time = time;
+                    subscribed.virtualize_cpuid = cpuid;
+                    assert_eq!(
+                        in_guest_reserved_signals(&subscribed, backend),
+                        bit(libc::SIGSYS) | bit(libc::SIGSEGV) | trap,
+                        "{label} time={time} cpuid={cpuid}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The default in-guest route sets every Tool image's site-patching check
+    /// from the backend and only then the reserved set, so SIGTRAP is
+    /// reserved on `liteinst` (patching on, router installed) and not on
+    /// `in-guest-trap` (patching off, no router): a SIGTRAP another process
+    /// sends to an in-guest-trap guest is delivered as on Linux, while SIGSYS
+    /// and SIGSEGV stay reserved on both (A5 step 3c slice 0c).
+    #[test]
+    #[cfg(feature = "liteinst")]
+    fn the_default_route_reserves_sigtrap_only_with_site_patching_on() {
+        let bit = |signal: libc::c_int| 1_u64 << (signal - 1);
+        for backend in Backend::ALL {
+            let mut config = prepare_backend_config(DetConfig::default(), backend);
+            config.in_guest_site_patching_off = in_guest_site_patching_off(backend);
+            let reserved = in_guest_reserved_signals(&config, backend);
+            let expected = match backend {
+                Backend::Liteinst => bit(libc::SIGSYS) | bit(libc::SIGSEGV) | bit(libc::SIGTRAP),
+                Backend::InGuestTrap => bit(libc::SIGSYS) | bit(libc::SIGSEGV),
+                _ => 0,
+            };
+            assert_eq!(reserved, expected, "{backend:?}");
+            assert_eq!(
+                in_guest_guard_router_installed(&config, backend),
+                backend == Backend::Liteinst,
+                "{backend:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "liteinst")]
+    fn in_guest_liteinst_refuses_a_kernel_older_than_6_5() {
+        for release in [
+            "6.5.0",
+            "6.5",
+            "6.10.3-200.fc40.x86_64",
+            "7.1.3-0_fbk0_rc18",
+            "10.0",
+        ] {
+            assert_eq!(in_guest_liteinst_kernel_gap(release), None, "{release}");
+        }
+        for release in ["6.4.16", "5.15.0-91-generic", "4.19"] {
+            let gap = in_guest_liteinst_kernel_gap(release)
+                .unwrap_or_else(|| panic!("{release} was not refused"));
+            assert!(gap.contains("Linux 6.5 or later"), "{gap}");
+            assert!(gap.contains(release), "{gap}");
+        }
+        for release in ["", "unknown", "6"] {
+            assert!(
+                in_guest_liteinst_kernel_gap(release).is_some(),
+                "{release:?}"
+            );
+        }
+        // No assertion about the kernel running the tests: that would make
+        // the test's result depend on the host, and the releases above
+        // already test both sides of the floor.
+    }
+
+    #[test]
+    #[cfg(feature = "liteinst")]
+    fn in_guest_liteinst_refuses_secure_execution_images() {
+        use interp::startup_fixtures::dynamic_executable;
+
+        let directory = tempfile::tempdir().unwrap();
+        let bytes = dynamic_executable(false);
+        let gap = |name: &str, mode: u32| {
+            let program = write_guest_program(directory.path(), name, &bytes, mode);
+            in_guest_liteinst_program_gap(&mut Command::new(&program)).unwrap()
+        };
+        for (name, mode) in [("setuid", 0o4755), ("setgid", 0o2755)] {
+            let refusal = gap(name, mode).unwrap_or_else(|| panic!("{name} was not refused"));
+            assert!(refusal.contains("secure-execution mode"), "{refusal}");
+        }
+        // Without group execute the kernel treats set-group-ID as mandatory
+        // locking, not a credential change, so the loader honours LD_PRELOAD.
+        assert_eq!(gap("setgid-no-group-exec", 0o2744), None);
+    }
+
+    #[test]
+    #[cfg(feature = "liteinst")]
+    fn in_guest_liteinst_checks_scripts_through_their_interpreter() {
+        use interp::startup_fixtures::*;
+
+        let directory = tempfile::tempdir().unwrap();
+        let dynamic = write_guest_program(
+            directory.path(),
+            "dynamic",
+            &dynamic_executable(false),
+            0o755,
+        );
+        let static_elf = write_guest_program(
+            directory.path(),
+            "static",
+            &elf(EM_X86_64, &[(PT_LOAD, b"code")]),
+            0o755,
+        );
+
+        let script = write_guest_program(
+            directory.path(),
+            "to-static",
+            &shebang_to(&static_elf),
+            0o755,
+        );
+        let gap = in_guest_liteinst_program_gap(&mut Command::new(&script))
+            .unwrap()
+            .expect("a script run by a static interpreter was not refused");
+        assert!(
+            gap.contains(&static_elf.display().to_string()) && gap.contains("statically linked"),
+            "{gap}"
+        );
+
+        // A relative interpreter resolves against the guest's working directory.
+        let relative = write_guest_program(directory.path(), "relative", b"#!static\n", 0o755);
+        let gap =
+            in_guest_liteinst_program_gap(Command::new(&relative).current_dir(directory.path()))
+                .unwrap()
+                .expect("a relative static interpreter was not refused");
+        assert!(gap.contains("statically linked"), "{gap}");
+
+        // The kernel keeps a carriage return in the interpreter path, so a
+        // script with CRLF line endings runs `interp\r`, not `interp`.
+        write_guest_program(
+            directory.path(),
+            "interp",
+            &dynamic_executable(false),
+            0o755,
+        );
+        let interp_cr = write_guest_program(
+            directory.path(),
+            "interp\r",
+            &elf(EM_X86_64, &[(PT_LOAD, b"code")]),
+            0o755,
+        );
+        let mut crlf = b"#!".to_vec();
+        crlf.extend_from_slice(directory.path().join("interp").as_os_str().as_bytes());
+        crlf.extend_from_slice(b"\r\necho script\r\n");
+        let crlf = write_guest_program(directory.path(), "crlf", &crlf, 0o755);
+        let gap = in_guest_liteinst_program_gap(&mut Command::new(&crlf))
+            .unwrap()
+            .expect("a CRLF script run by a static interp\\r was not refused");
+        assert!(
+            gap.contains(&interp_cr.display().to_string()) && gap.contains("statically linked"),
+            "{gap}"
+        );
+
+        // A #! line the kernel's script handler declines runs no interpreter:
+        // the kernel fails the execve or tries another handler, so it is
+        // refused.
+        let mut truncated = b"#!/".to_vec();
+        truncated.resize(256, b'a');
+        for (name, bytes) in [
+            ("empty", b"#! \t\nbody\n".to_vec()),
+            ("truncated", truncated),
+        ] {
+            let program = write_guest_program(directory.path(), name, &bytes, 0o755);
+            let gap = in_guest_liteinst_program_gap(&mut Command::new(&program))
+                .unwrap()
+                .unwrap_or_else(|| panic!("{name} was not refused"));
+            assert!(
+                gap.contains("the kernel's script handler declines it"),
+                "{name}: {gap}"
+            );
+        }
+
+        // Four nested scripts are followed to the ELF image; a fifth is refused.
+        let mut target = dynamic;
+        for level in 1..=5 {
+            target = write_guest_program(
+                directory.path(),
+                &format!("level-{level}"),
+                &shebang_to(&target),
+                0o755,
+            );
+            let gap = in_guest_liteinst_program_gap(&mut Command::new(&target)).unwrap();
+            if level <= MAX_INTERPRETER_DEPTH {
+                assert_eq!(gap, None, "level {level}");
+            } else {
+                let gap = gap.expect("five nested scripts were not refused");
+                assert!(gap.contains("nest more than 4 deep"), "{gap}");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "liteinst")]
+    fn in_guest_liteinst_refuses_a_fifo_without_blocking() {
+        let directory = tempfile::tempdir().unwrap();
+        let fifo = directory.path().join("fifo");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o700) }, 0);
+        let script = write_guest_program(directory.path(), "to-fifo", &shebang_to(&fifo), 0o755);
+        // A socket cannot be opened at all (ENXIO), and opening a device can
+        // act on it; both must be refused, not reported as unreadable.
+        let socket = directory.path().join("socket");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let to_socket =
+            write_guest_program(directory.path(), "to-socket", &shebang_to(&socket), 0o755);
+        let device = PathBuf::from("/dev/null");
+        let to_device =
+            write_guest_program(directory.path(), "to-device", &shebang_to(&device), 0o755);
+        // `./fifo` reaches the check through find_program's working-directory
+        // branch, which does not require a regular file; the scripts reach the
+        // FIFO, the socket and the device as their interpreters. Nothing opens
+        // the FIFO for writing, so a blocking open or read would never return:
+        // each check runs on its own thread and must answer within 10 s.
+        let cases = [
+            (
+                "program",
+                PathBuf::from("./fifo"),
+                Some(directory.path().to_owned()),
+                fs::canonicalize(&fifo).unwrap(),
+            ),
+            ("interpreter", script, None, fifo.clone()),
+            ("socket interpreter", to_socket, None, socket.clone()),
+            ("device interpreter", to_device, None, device),
+        ];
+        for (name, program, current_dir, shown) in cases {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut command = Command::new(&program);
+                if let Some(directory) = current_dir {
+                    command.current_dir(directory);
+                }
+                let gap = in_guest_liteinst_program_gap(&mut command)
+                    .map_err(|error| format!("{error:#}"));
+                let _ = sender.send(gap);
+            });
+            let gap = receiver
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap_or_else(|_| panic!("{name}: the check blocked on the FIFO"))
+                .unwrap()
+                .unwrap_or_else(|| panic!("{name}: the FIFO was not refused"));
+            assert!(
+                gap.contains(&format!("{} is not a regular file", shown.display())),
+                "{name}: {gap}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "liteinst")]
+    fn in_guest_liteinst_pins_the_program_the_launch_resolves() {
+        use interp::startup_fixtures::*;
+
+        let directory = tempfile::tempdir().unwrap();
+        // A name that no host PATH directory holds.
+        let name = "hermit-3520-static";
+        let static_elf = write_guest_program(
+            directory.path(),
+            name,
+            &elf(EM_X86_64, &[(PT_LOAD, b"code")]),
+            0o755,
+        );
+        let search = format!("/nonexistent-directory:{}", directory.path().display());
+        // The launch resolves the program with `find_program` on the command it
+        // is given. Builds the command twice: once for the launch's own
+        // resolution, once for the check, which must agree with it.
+        let check = |build: &dyn Fn() -> Command| {
+            let launch = build().find_program();
+            let mut command = build();
+            let arg0 = command.get_arg0().to_owned();
+            let gap = in_guest_liteinst_program_gap(&mut command);
+            match launch {
+                Ok(program) => {
+                    let gap = gap.unwrap().expect("the static image was not refused");
+                    assert!(gap.contains("is statically linked"), "{gap}");
+                    assert_eq!(Path::new(command.get_program()), program);
+                    assert_eq!(command.get_arg0(), arg0);
+                    // Pinned: the launch's own resolution returns it unchanged.
+                    assert_eq!(command.find_program().unwrap(), program);
+                    assert_eq!(
+                        fs::canonicalize(&program).unwrap(),
+                        fs::canonicalize(&static_elf).unwrap()
+                    );
+                    true
+                }
+                Err(_) => {
+                    let error = gap.expect_err("the check found what the launch cannot");
+                    assert!(
+                        format!("{error:#}").contains("cannot find guest program"),
+                        "{error:#}"
+                    );
+                    false
+                }
+            }
+        };
+
+        // A path with a slash resolves against the guest's working directory.
+        assert!(check(&|| {
+            let mut command = Command::new(format!("./{name}"));
+            command.current_dir(directory.path());
+            command
+        }));
+        // A bare name is searched for in the command's PATH once the base
+        // environment is cleared, skipping entries without such a file.
+        assert!(check(&|| {
+            let mut command = Command::new(name);
+            command.env_clear().env("PATH", &search);
+            command
+        }));
+        // Without a cleared environment the launch searches Hermit's own PATH,
+        // not the command's, so the static image is not found by either.
+        assert!(!check(&|| {
+            let mut command = Command::new(name);
+            command.env("PATH", &search);
+            command
+        }));
+        // A cleared environment without PATH (`--base-env=empty`) searches
+        // Hermit's working directory, not the guest's and not /bin:/usr/bin.
+        assert!(!check(&|| {
+            let mut command = Command::new(name);
+            command.env_clear().current_dir(directory.path());
+            command
+        }));
+        // Not executable, or missing: the launch cannot run it, and neither
+        // resolution finds it.
+        fs::set_permissions(&static_elf, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!check(&|| {
+            let mut command = Command::new(name);
+            command.env_clear().env("PATH", &search);
+            command
+        }));
+        assert!(!check(&|| Command::new(&static_elf)));
+        assert!(!check(&|| Command::new("hermit-no-such-program-3520")));
+    }
+
+    #[test]
+    fn skid_overshoot_error_refuses_a_successful_result() {
+        let _lock = SKID_OVERSHOOT_TEST_LOCK.lock().unwrap();
+        let _ = reverie::take_skid_overshoot_count();
+        assert!(take_skid_overshoot_error().is_none());
+
+        reverie::record_skid_overshoot();
+        let error = take_skid_overshoot_error().expect("recorded overshoot must be reported");
+        assert!(
+            error
+                .to_string()
+                .contains("observed 1 HERMIT_SKID_OVERSHOOT report(s)")
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("deterministic execution was not established")
+        );
+        assert_eq!(reverie::take_skid_overshoot_count(), 0);
+    }
+
+    #[test]
+    fn skid_overshoot_report_preserves_success_without_an_overshoot() {
+        let _lock = SKID_OVERSHOOT_TEST_LOCK.lock().unwrap();
+        let _ = reverie::take_skid_overshoot_count();
+
+        let report = SkidOvershootReport::begin(true);
+        assert_eq!(report.finish(Ok::<_, Error>(7)).unwrap(), 7);
+        assert_eq!(reverie::take_skid_overshoot_count(), 0);
+    }
+
+    #[test]
+    fn skid_overshoot_count_can_cross_the_verify_boundary_with_the_output() {
+        let _lock = SKID_OVERSHOOT_TEST_LOCK.lock().unwrap();
+        let _ = reverie::take_skid_overshoot_count();
+
+        let report = SkidOvershootReport::begin(true);
+        reverie::record_skid_overshoot();
+        let (value, count) = report.finish_with_count(Ok::<_, Error>(7)).unwrap();
+        assert_eq!(value, 7);
+        assert_eq!(count, 1);
+        assert_eq!(reverie::take_skid_overshoot_count(), 0);
+    }
+
+    /// ⚠️ THE REGRESSION agent(hermit-007)'s CODEX LANE CAUGHT, PINNED FOR THE
+    /// SIGNAL BAND. This test fails if the signal half stops being covered; it
+    /// does NOT prove the predicate can never drift again, because the
+    /// `122..=127` half is still a hard-coded literal that a future reserved
+    /// value would fall outside exactly as 130 did.
+    /// `liteinst_requires_forced_shutdown` hard-coded
+    /// `Exited(122..=127)`. When the reserved set grew to include the signal
+    /// band, `Exited(130)` fell outside it and is not `Signaled(_, _)` -- it is a
+    /// status hermit CHOSE -- so LiteInst skipped the forced shutdown and
+    /// `clean_up` could wait forever on `handle.await`. A reachable hang,
+    /// introduced by widening the reserved set in one place and not the other.
+    ///
+    /// The 130 and 143 rows are the ones with teeth: revert the predicate to the
+    /// bare range and they fail.
+    #[test]
+    #[cfg(feature = "liteinst")]
+    fn liteinst_forced_shutdown_covers_every_status_hermit_reserves() {
+        // The signal band. Not `Signaled`: hermit CHOSE these codes, because a
+        // namespace init cannot produce a genuine signalled wait status.
+        assert!(
+            liteinst_requires_forced_shutdown(ExitStatus::Exited(130)),
+            "128+SIGINT"
+        );
+        assert!(
+            liteinst_requires_forced_shutdown(ExitStatus::Exited(143)),
+            "128+SIGTERM"
+        );
+        assert!(
+            liteinst_requires_forced_shutdown(ExitStatus::Exited(129)),
+            "128+SIGHUP"
+        );
+
+        // The pre-existing reserved band, unchanged.
+        assert!(liteinst_requires_forced_shutdown(ExitStatus::Exited(122)));
+        assert!(liteinst_requires_forced_shutdown(ExitStatus::Exited(125)));
+        assert!(liteinst_requires_forced_shutdown(ExitStatus::Exited(127)));
+
+        // A real signal death still forces shutdown.
+        assert!(liteinst_requires_forced_shutdown(ExitStatus::Signaled(
+            nix::sys::signal::Signal::SIGKILL,
+            false
+        )));
+
+        // ⚠️ CONTROLS, so a predicate that simply returned `true` would fail
+        // this test rather than pass it. An ordinary guest exit must NOT force a
+        // shutdown; 128 is excluded because there is no signal 0, and 200 is
+        // above SIGRTMAX so it is a guest's own number.
+        assert!(!liteinst_requires_forced_shutdown(ExitStatus::Exited(0)));
+        assert!(!liteinst_requires_forced_shutdown(ExitStatus::Exited(1)));
+        assert!(!liteinst_requires_forced_shutdown(ExitStatus::Exited(121)));
+        assert!(!liteinst_requires_forced_shutdown(ExitStatus::Exited(128)));
+        assert!(!liteinst_requires_forced_shutdown(ExitStatus::Exited(200)));
+        // ⚠️ THE BAND EDGES, WHICH THIS TEST STOPPED SHORT OF. It went up to 143
+        // and then jumped to 200, so `MAX_SIGNO` could shrink from 64 to 15 with
+        // every row still green -- proved vacuous by agent(hermit-005)'s codex
+        // lane. 192 is `128 + SIGRTMAX`, the last status in the band; 193 is the
+        // first outside it. Testing a range in the middle pins nothing at either end.
+        assert!(
+            liteinst_requires_forced_shutdown(ExitStatus::Exited(192)),
+            "128 + SIGRTMAX is still a signal death and must force shutdown"
+        );
+        assert!(
+            !liteinst_requires_forced_shutdown(ExitStatus::Exited(193)),
+            "above SIGRTMAX the status is the guest's own and must NOT force shutdown"
+        );
+    }
+
+    /// ⚠️ The bare `NotFound` here was read as a git-worktree bug and cost real
+    /// investigation time. The message must name the mount namespace, because
+    /// the directory it is complaining about usually exists on the host.
+    #[test]
+    fn a_cwd_under_tmp_is_explained_by_the_container_tmpfs_not_by_a_missing_directory() {
+        let error = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let rendered = format!(
+            "{}",
+            super::kvm_cwd_resolution_error(std::path::Path::new("/tmp/agent-checkout"), &error)
+        );
+        assert!(
+            rendered.contains("private, empty tmpfs"),
+            "must name the mechanism: {rendered}"
+        );
+        assert!(
+            rendered.contains("--workdir"),
+            "must name a way out: {rendered}"
+        );
+        assert!(
+            rendered.contains("/tmp/agent-checkout"),
+            "must still name the path asked for: {rendered}"
+        );
+    }
+
+    /// The explanation must NOT be attached to failures it does not explain --
+    /// an error that volunteers the wrong cause is what produced the original
+    /// misdiagnosis, in the other direction.
+    #[test]
+    fn the_tmpfs_explanation_is_withheld_where_it_does_not_apply() {
+        let not_found = std::io::Error::from(std::io::ErrorKind::NotFound);
+        // ⚠️ A CONSTANT ABSOLUTE PATH, NOT ONE READ FROM THE ENVIRONMENT. The only
+        // property this arm needs is "outside /tmp", and a literal that is outside
+        // /tmp by construction supplies it without asking the runner anything.
+        //
+        // The earlier form wrote a developer-specific home path, which made
+        // `scripts/check-portable-paths.sh` red on main -- correctly: that gate
+        // rejects such a path anywhere in a tracked build or run file, tests and
+        // COMMENTS included, so spelling one out even to explain this would trip
+        // it. Replacing it by reading $HOME then made the test depend on the
+        // runner instead: measured by `agent(codex-rev-2641)`, HOME unset, empty,
+        // relative and /tmp-rooted gave three different fixtures and one failure.
+        // A unit test that consults the environment is answering a question about
+        // the environment.
+        //
+        // ⚠️ AND NO GUARD IS NEEDED HERE, WHICH IS THE POINT OF USING A CONSTANT.
+        // The $HOME form carried `assert!(!outside_path.starts_with("/tmp"))` to
+        // stop a /tmp-rooted HOME making this vacuous. That assertion could never
+        // fire: the `!outside.contains("tmpfs")` check below sits ABOVE it in
+        // source order and panics first in exactly that case. It was decorative,
+        // and an assertion over a compile-time constant would be too, so there is
+        // none. The fixture cannot drift into /tmp because nothing computes it.
+        let outside_path = std::path::Path::new("/nonexistent-home/wt");
+        let outside = format!(
+            "{}",
+            super::kvm_cwd_resolution_error(outside_path, &not_found)
+        );
+        assert!(!outside.contains("tmpfs"), "not a /tmp path: {outside}");
+
+        // `/tmp` itself resolves in the guest -- the mount POINT exists -- so a
+        // failure there is something else and must not be mislabelled.
+        let tmp_itself = format!(
+            "{}",
+            super::kvm_cwd_resolution_error(std::path::Path::new("/tmp"), &not_found)
+        );
+        assert!(!tmp_itself.contains("tmpfs"), "/tmp itself: {tmp_itself}");
+
+        // A different errno under /tmp is a different fault (permissions, say).
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let other = format!(
+            "{}",
+            super::kvm_cwd_resolution_error(std::path::Path::new("/tmp/x"), &denied)
+        );
+        assert!(!other.contains("tmpfs"), "not NotFound: {other}");
+    }
+
+    /// A build-flag message must not assert a machine condition it never tested.
+    ///
+    /// ⚠️ THIS IS THE FOURTH DIAGNOSTIC TONIGHT THAT NAMED AN UNESTABLISHED CAUSE,
+    /// after the sigpipe checker, the manifest gate and the LiteInst pidfd error.
+    /// "DBT support was not included in this build" reads as "this machine cannot
+    /// run DBT", and cost four or five unnecessary abstentions across the fleet --
+    /// agents declined to make DBT claims on a box where DynamoRIO is installed
+    /// and `--features dbt` builds and runs. The absence is a build flag, and the
+    /// message must say which flag and admit what it did not check.
+    #[test]
+    fn an_unbuilt_backend_names_the_flag_and_claims_nothing_about_the_machine() {
+        let feature_disabled_backends: &[(Backend, &str)] = &[
+            #[cfg(not(feature = "dbt"))]
+            (Backend::Dbt, "dbt"),
+            #[cfg(not(feature = "sabre"))]
+            (Backend::Sabre, "sabre"),
+            #[cfg(not(feature = "e9patch"))]
+            (Backend::E9patch, "e9patch"),
+            #[cfg(not(feature = "liteinst"))]
+            (Backend::Liteinst, "liteinst"),
+            // in-guest-trap is the same runtime behind the same feature.
+            #[cfg(not(feature = "liteinst"))]
+            (Backend::InGuestTrap, "liteinst"),
+        ];
+
+        for &(backend, feature) in feature_disabled_backends {
+            let reason = backend
+                .unavailable_reason()
+                .expect("a feature-disabled backend must report why it is unavailable");
+            assert!(
+                reason.contains(feature),
+                "{backend:?}: a build-flag message must name the flag to rebuild with, got: {reason}"
+            );
+            assert!(
+                reason.contains("has not been checked"),
+                "{backend:?}: a build-flag message must not imply the machine was tested, got: {reason}"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "dbt"))]
+    #[test]
+    fn dbt_registry_diagnostic_redirects_to_a_source_build() {
+        let reason = super::dbt_disabled_build_reason(true);
+        assert!(reason.contains("not included in this registry release"));
+        assert!(reason.contains("source build from https://github.com/rrnewton/hermit"));
+        assert!(reason.contains("`third-party-backends` feature does not include DBT"));
+        assert!(reason.contains("has not been checked"));
+
+        let source_reason = super::dbt_disabled_build_reason(false);
+        assert!(source_reason.contains("rebuild with `--features dbt`"));
+        assert!(!source_reason.contains("not included in this registry release"));
+        // This tree's manifest declares `dbt`, so build.rs must have judged it
+        // a source build, whatever the package is called.
+        const { assert!(!cfg!(hermit_registry_build)) };
+    }
+
+    #[cfg(not(feature = "sabre"))]
+    #[tokio::test]
+    async fn disabled_sabre_dispatch_refuses_before_resolving_the_program() {
+        let program = "/hermit-missing-disabled-sabre-program";
+        let error = super::dispatch_backend(
+            super::Command::new(program),
+            super::DetConfig::default(),
+            false,
+            &None,
+            Backend::Sabre,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("the `sabre` feature is not enabled")
+        );
+        let error = super::dispatch_output_backend(
+            super::Command::new(program),
+            super::DetConfig::default(),
+            false,
+            &None,
+            Backend::Sabre,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("the `sabre` feature is not enabled")
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn a_cold_dbt_runtime_diagnostic_is_not_feature_absence() {
+        let reason = dbt_runtime_unavailable_reason_from(Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "Hermit DBT runtime was not built beside /cold-target/hermit or in its deps directory",
+        )))
+        .expect("a missing cold-target runtime must remain unavailable");
+
+        assert!(reason.contains("was not built beside"));
+        assert!(reason.contains("build the hermit binary and cdylib"));
+        assert!(!reason.contains("not enabled in this build"));
+        assert!(!reason.contains("has not been checked"));
+    }
+    #[cfg(feature = "sabre")]
+    use std::ffi::OsStr;
+    use std::fs;
+    #[cfg(feature = "sabre")]
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    #[cfg(feature = "sabre")]
+    use std::sync::Arc;
+    #[cfg(feature = "sabre")]
+    use std::time::Duration;
+
+    use super::Backend;
+    #[cfg(any(feature = "sabre", feature = "liteinst"))]
+    use super::ExitStatus;
+    use super::HermitData;
+    use super::Id;
+    #[cfg(feature = "sabre")]
+    use super::SABRE_RPC_SOCKET_ENV;
+    use super::collect_recording_ids;
+    #[cfg(feature = "dbt")]
+    use super::dbt_runtime_unavailable_reason;
+    #[cfg(feature = "dbt")]
+    use super::dbt_runtime_unavailable_reason_from;
+    #[cfg(feature = "dbt")]
+    use super::dynamorio_sdk_available;
+    use super::ensure_backend_dispatch;
+    #[cfg(feature = "dbt")]
+    use super::is_dynamorio_sdk;
+    use super::kvm_device_unavailable_reason;
+    #[cfg(feature = "liteinst")]
+    use super::liteinst_requires_forced_shutdown;
+    #[cfg(feature = "dbt")]
+    use super::liteinst_unavailable_reason;
+    use super::output_backend_stdin_file;
+    use super::prepare_backend_config;
+    use super::reserve_output_stdin_snapshot;
+    use super::resolve_kvm_shebang;
+    #[cfg(feature = "sabre")]
+    use super::resolve_sabre_binary_from;
+    #[cfg(feature = "sabre")]
+    use super::sabre_backend_evidence_line;
+    #[cfg(feature = "sabre")]
+    use super::sabre_program_needs_neutral_name;
+    #[cfg(feature = "sabre")]
+    use super::sabre_reach_state;
+    #[cfg(feature = "sabre")]
+    use super::sabre_uninstrumented_guest_message;
+    #[cfg(feature = "sabre")]
+    use super::shutdown_sabre_rpc;
+    #[cfg(feature = "sabre")]
+    use super::stage_sabre_program_in;
+    #[cfg(feature = "sabre")]
+    use super::stop_sabre_rpc_server;
+    #[cfg(feature = "sabre")]
+    use super::wait_for_sabre_rpc_disconnects;
+
+    #[test]
+    fn recording_inventory_preserves_missing_and_non_recording_cases() {
+        let parent = tempfile::tempdir().expect("failed to create recording inventory parent");
+        let missing = parent.path().join("missing");
+        assert!(
+            HermitData::with_dir(&missing)
+                .try_recordings()
+                .expect("a missing data directory should be empty")
+                .is_empty()
+        );
+
+        let inventory = parent.path().join("inventory");
+        fs::create_dir(&inventory).expect("failed to create recording inventory");
+        let recording: Id = "0123456789abcdef0123456789abcdef"
+            .parse()
+            .expect("valid recording ID");
+        fs::create_dir(inventory.join(recording.to_string()))
+            .expect("failed to create recording directory");
+        fs::create_dir(inventory.join("not-a-recording"))
+            .expect("failed to create invalid-name directory");
+        fs::write(
+            inventory.join("fedcba9876543210fedcba9876543210"),
+            b"not a directory",
+        )
+        .expect("failed to create valid-looking non-directory");
+
+        assert_eq!(
+            HermitData::with_dir(&inventory)
+                .try_recordings()
+                .expect("recording inventory should be readable"),
+            vec![recording]
+        );
+        assert_eq!(
+            HermitData::with_dir(&inventory)
+                .recordings()
+                .collect::<Vec<_>>(),
+            vec![recording]
+        );
+    }
+
+    #[test]
+    fn recording_inventory_rejects_an_error_after_a_valid_entry() {
+        let inventory = tempfile::tempdir().expect("failed to create recording inventory");
+        let recording: Id = "0123456789abcdef0123456789abcdef"
+            .parse()
+            .expect("valid recording ID");
+        fs::create_dir(inventory.path().join(recording.to_string()))
+            .expect("failed to create recording directory");
+        let valid_entry = fs::read_dir(inventory.path())
+            .expect("failed to open recording inventory")
+            .next()
+            .expect("missing recording entry")
+            .expect("failed to read recording entry");
+
+        let entries = vec![
+            Ok(valid_entry),
+            Err(std::io::Error::other("injected entry failure")),
+        ];
+        let error = collect_recording_ids(entries, inventory.path(), fs::DirEntry::file_type)
+            .expect_err("a partial inventory must not be returned");
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to read an entry in recording inventory"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn recording_inventory_rejects_an_entry_inspection_error() {
+        let inventory = tempfile::tempdir().expect("failed to create recording inventory");
+        let recording = inventory.path().join("0123456789abcdef0123456789abcdef");
+        fs::create_dir(&recording).expect("failed to create recording directory");
+        let entry = fs::read_dir(inventory.path())
+            .expect("failed to open recording inventory")
+            .next()
+            .expect("missing recording entry")
+            .expect("failed to read recording entry");
+
+        let error = collect_recording_ids([Ok(entry)], inventory.path(), |_| {
+            Err(std::io::Error::other("injected inspection failure"))
+        })
+        .expect_err("an uninspectable entry must fail the inventory");
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to inspect recording inventory entry"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    /// Regression test for the `hermit run --verify` empty-stdin bug: a pipe
+    /// (non-seekable) fed to hermit must be buffered and replayed *identically*
+    /// to every run of `--verify`. Before the fix the output-capturing backend
+    /// used `Stdio::null()`, so piped input was silently dropped and both runs
+    /// saw empty input (a false "deterministic" pass, e.g. `gcc -x c -`
+    /// compiling nothing). This asserts the reserved snapshot replays the exact
+    /// bytes twice.
+    #[test]
+    fn output_stdin_snapshot_replays_pipe_to_repeated_runs() {
+        use std::io::Read;
+        use std::io::Write;
+        use std::os::fd::FromRawFd;
+
+        // A pipe is non-seekable, exercising the buffer-into-tempfile path that
+        // matches the real `echo prog | hermit run --verify` scenario.
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: pipe(2) just returned two fresh owned descriptors.
+        let read_end = unsafe { fs::File::from_raw_fd(fds[0]) };
+        let mut write_end = unsafe { fs::File::from_raw_fd(fds[1]) };
+
+        let payload = b"int main(){return 0;}\n";
+        write_end.write_all(payload).unwrap();
+        // Close the write end so draining the pipe hits EOF.
+        drop(write_end);
+
+        reserve_output_stdin_snapshot(Some(read_end)).unwrap();
+
+        // Two successive runs (as `--verify` performs) must each read the full
+        // payload from the start.
+        for run in 0..2 {
+            let mut file = output_backend_stdin_file()
+                .unwrap()
+                .unwrap_or_else(|| panic!("run {run}: expected a replayable stdin snapshot"));
+            let mut got = Vec::new();
+            file.read_to_end(&mut got).unwrap();
+            assert_eq!(got, payload, "run {run} stdin replay mismatch");
+        }
+
+        let mut file = output_backend_stdin_file().unwrap().unwrap();
+        let error = file
+            .write_all(b"guest-must-not-change-the-snapshot")
+            .expect_err("the replayed stdin must be read-only");
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+    }
+
+    #[test]
+    #[cfg(feature = "liteinst")]
+    fn liteinst_reserved_failures_require_scheduler_cancellation() {
+        for status in 122..=127 {
+            assert!(liteinst_requires_forced_shutdown(ExitStatus::Exited(
+                status
+            )));
+        }
+        assert!(!liteinst_requires_forced_shutdown(ExitStatus::Exited(121)));
+        assert!(!liteinst_requires_forced_shutdown(ExitStatus::Exited(128)));
+    }
+
+    /// A SaBRe guest that never reaches the coordinator ran with no Detcore in
+    /// the loop at all. The diagnosis must say so in those terms -- a
+    /// zero-syscall SaBRe run is not a weak result, it is *no* result -- and it
+    /// must name the statically linked ELF case, which is the shape that
+    /// reaches this path in practice because a static client has no dynamic
+    /// loader through which SaBRe could regain control.
+    #[test]
+    #[cfg(feature = "sabre")]
+    fn uninstrumented_sabre_guest_is_reported_as_no_determinization() {
+        let message = sabre_uninstrumented_guest_message(&ExitStatus::Exited(0));
+        assert!(
+            message.contains("no determinization at all"),
+            "must not present an uninstrumented run as a weaker guarantee: {message}"
+        );
+        assert!(
+            message.contains("Detcore coordinator"),
+            "must name the authority that was never reached: {message}"
+        );
+        assert!(
+            message.contains("statically linked ELF"),
+            "must name the dominant cause so the reader can act: {message}"
+        );
+        // The exit status is carried because a successful-looking status is
+        // exactly what makes this failure mode dangerous.
+        assert!(
+            message.contains("Exited(0)"),
+            "must carry the observed status: {message}"
+        );
+        assert!(
+            sabre_uninstrumented_guest_message(&ExitStatus::Exited(139)).contains("Exited(139)"),
+            "must carry a failing status too"
+        );
+    }
+
+    /// The old two-way banner treated both `guest_rpc_observed=false` and an
+    /// engaged zero-fallback run as `sabre-exercised`. Assert the three states
+    /// together so no pair can collapse back onto one value.
+    #[test]
+    #[cfg(feature = "sabre")]
+    fn sabre_reach_states_are_pairwise_distinct() {
+        let no_detcore = sabre_reach_state(false, 0);
+        let degraded = sabre_reach_state(true, 1);
+        let exercised = sabre_reach_state(true, 0);
+
+        assert_eq!(no_detcore, "no-detcore-reached");
+        assert_eq!(degraded, "degraded-ptrace-fallback");
+        assert_eq!(exercised, "sabre-exercised");
+        assert_ne!(no_detcore, degraded);
+        assert_ne!(no_detcore, exercised);
+        assert_ne!(degraded, exercised);
+        assert_eq!(
+            sabre_reach_state(false, 9),
+            "no-detcore-reached",
+            "absence of a guest RPC must dominate any fallback count"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "sabre")]
+    fn sabre_backend_fact_is_versioned_and_names_preplugin_coverage() {
+        let exercised = super::sabre_ptrace::PathEvidence {
+            schema: 1,
+            guest_rpc_observed: true,
+            ptrace_fallback_sites: 0,
+            trusted_shared_object_sites: 2,
+            trusted_shared_objects: vec!["/usr/lib/libc.so.6".to_owned()],
+        };
+        assert_eq!(
+            sabre_backend_evidence_line(&exercised),
+            ":: Backend: sabre static rewriting + ptrace runtime; run_mode=run; \
+             evidence_schema=1; preplugin_coverage=absent; ptrace_fallback_sites=0; \
+             trusted_shared_object_sites=2; guest_rpc_observed=true; \
+             reach_state=sabre-exercised"
+        );
+
+        let unengaged = super::sabre_ptrace::PathEvidence {
+            guest_rpc_observed: false,
+            ..exercised
+        };
+        let fact = sabre_backend_evidence_line(&unengaged);
+        assert!(fact.contains("preplugin_coverage=absent"));
+        assert!(fact.contains("reach_state=no-detcore-reached"));
+        assert!(!fact.contains("reach_state=sabre-exercised"));
+    }
+
+    #[test]
+    fn liteinst_backend_config_preserves_the_requested_timeslice() {
+        // Configuration must not silently clear a requested timeslice: the
+        // in-guest LiteInst refusal relies on seeing it.
+        let config = super::DetConfig::default();
+        assert!(config.max_timeslice.is_some());
+        for backend in [Backend::Liteinst, Backend::InGuestTrap] {
+            assert!(
+                prepare_backend_config(config.clone(), backend)
+                    .max_timeslice
+                    .is_some(),
+                "{backend:?}"
+            );
+        }
+        assert!(
+            prepare_backend_config(config, Backend::Ptrace)
+                .max_timeslice
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn in_guest_liteinst_cancels_killed_thread_rpcs() {
+        let config = super::DetConfig::default();
+        for backend in [Backend::Liteinst, Backend::InGuestTrap] {
+            assert!(
+                prepare_backend_config(config.clone(), backend)
+                    .backend
+                    .needs_killed_thread_rpc_cancellation,
+                "{backend:?}"
+            );
+        }
+        // LiteInst's cancellation changes no other backend.
+        assert!(
+            !prepare_backend_config(config, Backend::Ptrace)
+                .backend
+                .needs_killed_thread_rpc_cancellation
+        );
+    }
+
+    #[test]
+    fn sabre_backend_configures_process_local_capabilities() {
+        let config = super::DetConfig::default();
+        let sabre = prepare_backend_config(config.clone(), Backend::Sabre).backend;
+        assert!(sabre.tool_shares_guest_descriptor_table);
+        assert!(sabre.rediscovers_descriptors_after_exec);
+        assert!(sabre.loopback_pollers_yield_to_peers);
+        assert!(sabre.guest_clock_reads_bypass_backend);
+        assert!(sabre.virtualizes_syscall_clobbers);
+        assert!(sabre.needs_killed_thread_rpc_cancellation);
+        assert!(sabre.reports_physical_process_exits);
+        assert!(sabre.tracks_process_children);
+        assert!(!sabre.runs_exit_robust_list);
+        assert!(!sabre.requires_thread_directed_process_signals);
+        assert!(!sabre.defers_vfork_child_registration);
+        let ptrace = prepare_backend_config(config, Backend::Ptrace).backend;
+        assert!(!ptrace.tool_shares_guest_descriptor_table);
+        assert!(!ptrace.rediscovers_descriptors_after_exec);
+        assert!(!ptrace.loopback_pollers_yield_to_peers);
+        assert!(!ptrace.guest_clock_reads_bypass_backend);
+        assert!(!ptrace.virtualizes_syscall_clobbers);
+        assert!(!ptrace.needs_killed_thread_rpc_cancellation);
+        assert!(!ptrace.reports_physical_process_exits);
+        assert!(ptrace.tracks_process_children);
+        assert!(ptrace.runs_exit_robust_list);
+        assert!(!ptrace.requires_thread_directed_process_signals);
+        assert!(!ptrace.defers_vfork_child_registration);
+    }
+
+    #[test]
+    fn kvm_reports_stored_metadata_timestamps_only_for_sequential_tool_threads() {
+        let sequential = prepare_backend_config(
+            super::DetConfig {
+                sequentialize_threads: true,
+                virtualize_metadata: true,
+                ..super::DetConfig::default()
+            },
+            Backend::Kvm,
+        );
+        assert!(super::kvm_reports_stored_metadata_timestamps(&sequential));
+
+        // Without sequentialized threads the setting stays off; the
+        // backend reports host files' kernel timestamps either way.
+        let concurrent = super::DetConfig {
+            sequentialize_threads: false,
+            ..sequential.clone()
+        };
+        assert!(!super::kvm_reports_stored_metadata_timestamps(&concurrent));
+
+        // Nothing rewrites the stored values.
+        let host_metadata = super::DetConfig {
+            virtualize_metadata: false,
+            ..sequential
+        };
+        assert!(!super::kvm_reports_stored_metadata_timestamps(
+            &host_metadata
+        ));
+    }
+
+    #[test]
+    fn kvm_backend_config_marks_concurrent_process_children() {
+        let defaults = super::DetConfig::default();
+        assert!(!defaults.sequentialize_threads);
+        let nonsequential = prepare_backend_config(defaults, Backend::Kvm);
+        assert!(nonsequential.backend.provides_process_signal_control);
+        assert!(nonsequential.backend.emulates_child_waits);
+        assert!(!may_observe_signal_dequeues(&nonsequential));
+        assert!(!requires_signal_control(&nonsequential));
+
+        let config = super::DetConfig {
+            sequentialize_threads: true,
+            ..super::DetConfig::default()
+        };
+        let kvm = prepare_backend_config(config, Backend::Kvm);
+        assert!(may_observe_signal_dequeues(&kvm));
+        assert!(requires_signal_control(&kvm));
+        assert!(kvm.backend.needs_killed_thread_rpc_cancellation);
+        assert!(kvm.backend.tracks_process_children);
+        assert!(!kvm.backend.runs_exit_robust_list);
+        assert!(!kvm.backend.requires_thread_directed_process_signals);
+        assert!(kvm.backend.defers_vfork_child_registration);
+
+        // A controlled run needs both the backend's process-signal control and
+        // sequentialized threads; neither alone admits one.
+        for backend in [
+            Backend::Ptrace,
+            Backend::Dbt,
+            Backend::Sabre,
+            Backend::Liteinst,
+            Backend::InGuestTrap,
+            Backend::E9patch,
+        ] {
+            let config = super::DetConfig {
+                sequentialize_threads: true,
+                ..super::DetConfig::default()
+            };
+            let prepared = prepare_backend_config(config, backend);
+            assert!(!may_observe_signal_dequeues(&prepared), "{backend:?}");
+            assert!(!requires_signal_control(&prepared), "{backend:?}");
+        }
+    }
+
+    /// Whether Detcore asks the backend to install process signal control for
+    /// `config`: the bound Reverie checks before it offers the control.
+    fn may_observe_signal_dequeues(config: &DetConfig) -> bool {
+        <super::Detcore as reverie::Tool>::may_observe_signal_dequeues(config)
+    }
+
+    /// Whether Reverie must refuse `config` on a runner that offers no
+    /// process signal control, as Detcore's installation did before.
+    fn requires_signal_control(config: &DetConfig) -> bool {
+        <super::Detcore as reverie::Tool>::requires_signal_control(config)
+    }
+
+    /// The values the hand-written assignments in `prepare_backend_config` and
+    /// `run_kvm` gave each backend before Detcore read
+    /// [`reverie::BackendCapabilities`], transcribed field by field. A backend
+    /// identity check became the capability it selected:
+    /// `discover_live_file_metadata` split into the first four fields, the old
+    /// `backend_reports_physical_process_exits` became two, and
+    /// `backend_is_kvm` became five, of which the last two remain here:
+    /// `refuses_nonleader_exec_with_enosys` became the backend's typed exec
+    /// refusal (Reverie d78f770f), `failed_gettimeofday_may_store_host_time`
+    /// the guest's storable-memory report (Reverie 8bfb450e) and
+    /// `user_address_limit` the guest's user address limit query (Reverie
+    /// 6f75cc4c). Three fields are newer than that transcription:
+    /// `process_exits_complete_asynchronously` (Reverie 056c8cac), true only
+    /// for in-guest LiteInst, whose process exits complete some time after the
+    /// tool grants them, `reports_child_exit_publication` (Reverie 9cb6f7b7),
+    /// true for ptrace and e9patch, whose tracer reports when the kernel
+    /// publishes a process's exit to its parent, and
+    /// `virtualizes_guest_sigalrm` (Reverie 7142ff8c), true only for in-guest
+    /// LiteInst, whose runtime keeps a guest SIGALRM handler virtual (signal
+    /// phase 1). `in-guest-trap` is in-guest LiteInst with site patching off,
+    /// which changes how a syscall reaches the Tool and nothing the Tool host
+    /// can do, so it has exactly in-guest LiteInst's row.
+    /// DBT now also shares the guest descriptor table and rediscovers it after
+    /// exec (Reverie 15374907); its poller-yield capability remains false. `reports_sigreturns` (A5 step 2) is true
+    /// for ptrace, and so for e9patch preprocessing, whose guest Hermit runs
+    /// on ptrace. `reports_kernel_child_exit_signals` is true for ptrace,
+    /// e9patch and SaBRe, whose signal callbacks see the kernel's child-exit
+    /// SIGCHLD with its siginfo and can suppress or rewrite it.
+    /// `virtualizes_syscall_clobbers` is true for KVM too since Reverie's
+    /// per-call slice 6: its Tool register snapshot at a syscall has RCX ==
+    /// RIP and R11 == RFLAGS, and it offers no register write, so Detcore's
+    /// canonicalization could change nothing there.
+    fn golden_backend_capabilities(backend: Backend) -> serde_json::Value {
+        let sabre = backend == Backend::Sabre;
+        let kvm = backend == Backend::Kvm;
+        let dbt = backend == Backend::Dbt;
+        // LiteInst runs only through its in-guest runtime.
+        let in_guest_liteinst = matches!(backend, Backend::Liteinst | Backend::InGuestTrap);
+        serde_json::json!({
+            "tool_shares_guest_descriptor_table": sabre || dbt,
+            "rediscovers_descriptors_after_exec": sabre || dbt,
+            "loopback_pollers_yield_to_peers": sabre,
+            "guest_clock_reads_bypass_backend": sabre,
+            "virtualizes_syscall_clobbers": sabre || kvm,
+            "needs_killed_thread_rpc_cancellation": in_guest_liteinst || sabre || dbt || kvm,
+            "reports_physical_process_exits": sabre,
+            "process_exits_complete_asynchronously": in_guest_liteinst,
+            "virtualizes_guest_sigalrm": in_guest_liteinst,
+            "tracks_process_children": !dbt,
+            "runs_exit_robust_list": matches!(backend, Backend::Ptrace | Backend::E9patch),
+            "requires_thread_directed_process_signals": dbt,
+            "supports_parked_write_signal_interruption":
+                matches!(backend, Backend::Ptrace | Backend::E9patch | Backend::Kvm),
+            "defers_vfork_child_registration": kvm,
+            "supports_madvise": !kvm,
+            "reports_child_exit_publication":
+                matches!(backend, Backend::Ptrace | Backend::E9patch),
+            "reports_kernel_child_exit_signals":
+                matches!(backend, Backend::Ptrace | Backend::E9patch | Backend::Sabre),
+            "provides_process_signal_control": kvm,
+            "emulates_child_waits": kvm,
+            // A Config field Hermit set from the backend's name before it was
+            // a stated capability. e9patch runs on ptrace and has its value.
+            "supports_blocked_wait_signal_interruption":
+                matches!(backend, Backend::Ptrace | Backend::E9patch),
+            // Readings of the field above until A5 step 3c.0 split them out,
+            // with its value on every backend.
+            "kernel_signal_state_is_guests": matches!(backend, Backend::Ptrace | Backend::E9patch),
+            "kernel_signal_targets_are_predictable":
+                matches!(backend, Backend::Ptrace | Backend::E9patch),
+            "host_task_reads_reach_guest_threads":
+                matches!(backend, Backend::Ptrace | Backend::E9patch),
+            "host_timed_signals_are_physical":
+                matches!(backend, Backend::Ptrace | Backend::E9patch),
+            "delivers_preemption_timer_events":
+                matches!(backend, Backend::Ptrace | Backend::E9patch),
+            "runs_guest_code_between_injections": sabre || in_guest_liteinst,
+            "promotes_open_files_before_native_lifecycle": dbt || in_guest_liteinst,
+            // Hermit runs e9patch preprocessing as a ptrace run (empty
+            // trampolines keep the original syscall instruction), whose
+            // rt_sigreturns reach the seccomp stop that reports them.
+            "reports_sigreturns": matches!(backend, Backend::Ptrace | Backend::E9patch),
+        })
+    }
+
+    #[test]
+    fn backend_capabilities_match_the_golden_table() {
+        for backend in [
+            Backend::Ptrace,
+            Backend::Kvm,
+            Backend::E9patch,
+            Backend::Liteinst,
+            Backend::InGuestTrap,
+            Backend::Sabre,
+            Backend::Dbt,
+        ] {
+            let config = prepare_backend_config(super::DetConfig::default(), backend);
+            assert_eq!(
+                serde_json::to_value(config.backend).unwrap(),
+                golden_backend_capabilities(backend),
+                "{backend:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn backend_capabilities_are_the_ones_each_backend_reports() {
+        assert_eq!(
+            super::backend_capabilities(Backend::Ptrace),
+            <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities()
+        );
+        assert_eq!(
+            super::backend_capabilities(Backend::Kvm),
+            reverie_kvm::KvmBackend::capabilities()
+        );
+        #[cfg(feature = "liteinst")]
+        {
+            // SAFETY: the strong immutable declaration above has the public
+            // repr(C), two-u64 descriptor ABI. This reads the real linked
+            // object, so changing the host declaration to Fixed fails here.
+            let backing = unsafe {
+                std::ptr::addr_of!(super::reverie_liteinst_allocator_backing_v1)
+                    .cast::<[u64; 2]>()
+                    .read_volatile()
+            };
+            assert_eq!(backing, [1, 1], "host Hermit must declare Legacy backing");
+            assert_eq!(
+                super::backend_capabilities(Backend::Liteinst),
+                <reverie_liteinst::LiteinstBackend as reverie::Backend>::capabilities()
+            );
+            // in-guest-trap runs the same Reverie backend.
+            assert_eq!(
+                super::backend_capabilities(Backend::InGuestTrap),
+                <reverie_liteinst::LiteinstBackend as reverie::Backend>::capabilities()
+            );
+        }
+        #[cfg(feature = "dbt")]
+        {
+            assert_eq!(
+                super::backend_capabilities(Backend::Dbt),
+                reverie_dbt::DbtRunner::capabilities()
+            );
+            // The DBT runtime re-asserts the same value when it loads the
+            // configuration this crate serializes for it.
+            assert_eq!(
+                super::backend_capabilities(Backend::Dbt),
+                detcore_dbt::backend_capabilities()
+            );
+        }
+    }
+
+    /// `Config` with its three environment-backed fields (`HERMIT_EPOCH`,
+    /// `HERMIT_PRNG`, `HERMIT_SCHED_SEED`) pinned, so the encoding does not
+    /// depend on the test process's environment.
+    fn env_free_detconfig(epoch: &str, seed: &str) -> DetConfig {
+        use clap::Parser;
+        let mut config = DetConfig::parse_from(["hermit", epoch, seed, "--sched-seed=0"]);
+        config.sched_seed = None;
+        config
+    }
+
+    /// Non-default values in fields that serialize as strings, floats,
+    /// options and nested arrays. The path contains legacy key names, so an
+    /// encoder that edited text would put a key inside a string value.
+    fn rich_detconfig() -> DetConfig {
+        let mut config = env_free_detconfig("--epoch=2000-12-31T23:59:59Z", "--seed=7");
+        config.rng_seed = Some(13);
+        config.sched_seed = Some(11);
+        config.clock_multiplier = Some(1.5);
+        config.chaos = true;
+        config.record_preemptions_to = Some(std::path::PathBuf::from(
+            "/tmp/a,\"detect_host_clock_futex_timeouts\":true,\"backend_tracks_process_children\":{",
+        ));
+        config.mountinfo_root_rewrites = vec![detcore_model::config::MountInfoRootRewrite {
+            raw_mount_id: 41,
+            deterministic_root: b"/".to_vec(),
+            raw_root_prefix: Some(b"/tmp/x".to_vec()),
+            deterministic_root_prefix: Some(b"/tmp".to_vec()),
+            raw_mountpoint_prefix: None,
+            deterministic_mountpoint_prefix: None,
+        }];
+        config.stacktrace_event = vec![(3, Some(std::path::PathBuf::from("/s")))];
+        config
+    }
+
+    /// The legacy configuration form, which a standalone DBT run's
+    /// `HERMIT_DBT_DETCONFIG` may still carry, reads and writes these bytes.
+    /// These fixtures are the output of `serde_json::to_string` on the same
+    /// configs, captured from a build of the commit before Detcore read
+    /// [`reverie::BackendCapabilities`], when `Config` still had one boolean
+    /// field per backend switch. Every DBT run sequentializes threads, so the
+    /// DBT cases do too. The fixtures carry one deliberate later change, the
+    /// `fdinfo_unlisted_mount_ids` -> `mount_id_assignment_order` key rename.
+    /// Preserve the historical DBT descriptor capabilities here as well as the
+    /// historical bytes. Current DBT's independent descriptor facts require
+    /// the typed envelope, whose round trip detcore-dbt's tests check.
+    #[test]
+    fn historical_dbt_capabilities_preserve_legacy_detconfig_bytes() {
+        let sequential = |mut config: DetConfig| {
+            config.sequentialize_threads = true;
+            config
+        };
+        let default_config = || env_free_detconfig("--epoch=2026-01-01T00:00:00Z", "--seed=0");
+        for (name, mut config, before) in [
+            (
+                "default",
+                default_config(),
+                include_str!("../tests/fixtures/dbt/detconfig-before-capabilities-default.json"),
+            ),
+            (
+                "dbt",
+                prepare_backend_config(sequential(default_config()), Backend::Dbt),
+                include_str!("../tests/fixtures/dbt/detconfig-before-capabilities-dbt.json"),
+            ),
+            (
+                "rich_dbt",
+                prepare_backend_config(sequential(rich_detconfig()), Backend::Dbt),
+                include_str!("../tests/fixtures/dbt/detconfig-before-capabilities-rich_dbt.json"),
+            ),
+        ] {
+            config.backend.tool_shares_guest_descriptor_table = false;
+            config.backend.rediscovers_descriptors_after_exec = false;
+            // Read back as false, as the `Config` fields they replace were.
+            config.backend.supports_blocked_wait_signal_interruption = false;
+            config.backend.delivers_preemption_timer_events = false;
+            config.backend.runs_guest_code_between_injections = false;
+            assert_eq!(
+                detcore::to_legacy_backend_json(&config).unwrap(),
+                before,
+                "the legacy form of the {name} config changed"
+            );
+            // A reader of the earlier bytes recovers the capabilities.
+            let decoded = detcore::from_legacy_backend_json(before).unwrap();
+            assert_eq!(decoded.backend, config.backend, "{name}");
+            assert_eq!(
+                decoded.sequentialize_threads, config.sequentialize_threads,
+                "{name}"
+            );
+            assert_eq!(
+                detcore::to_legacy_backend_json(&decoded).unwrap(),
+                before,
+                "{name}"
+            );
+        }
+    }
+
+    /// The fifteen per-backend keys, in the order the encoding has always
+    /// carried them.
+    const LEGACY_BACKEND_KEYS: [&str; 15] = [
+        "cpuid_virtualized_by_backend",
+        "backend_supports_madvise",
+        "discover_live_file_metadata",
+        "detect_host_clock_futex_timeouts",
+        "syscall_clobbers_virtualized_by_backend",
+        "cancel_killed_thread_rpcs",
+        "backend_reports_physical_process_exits",
+        "backend_tracks_process_children",
+        "backend_runs_exit_robust_list",
+        "backend_requires_thread_directed_process_signals",
+        "backend_is_kvm",
+        "kvm_shared_dequeue_timers",
+        "backend_supports_parked_write_signal_interruption",
+        "backend_virtualizes_capability_prctls",
+        "backend_defers_vfork_child_registration",
+    ];
+
+    /// Pin the current projection onto all fifteen legacy backend keys, once
+    /// without and once with sequentialized threads. DBT's two descriptor
+    /// facts project to `discover_live_file_metadata=true`; that legacy bit
+    /// cannot retain their independence from the host-timed capabilities.
+    /// Current DBT therefore uses the separately checked typed envelope, not
+    /// this lossy projection. LiteInst's row is its in-guest runtime. KVM's
+    /// first two digits are the capabilities `run_kvm` formerly set itself; the
+    /// first, `cpuid_virtualized_by_backend`, is written false for every
+    /// backend now that no backend installs a CPUID profile of its own, and so
+    /// is the fourteenth, `backend_virtualizes_capability_prctls`, now that
+    /// the capability prctls reach the kernel on every backend. KVM's fifth,
+    /// `syscall_clobbers_virtualized_by_backend`, is set since Reverie's
+    /// per-call slice 6 declared `virtualizes_syscall_clobbers`.
+    #[test]
+    fn every_backend_encodes_its_current_legacy_projection() {
+        for (backend, unsequenced, sequential) in [
+            (Backend::Ptrace, "010000011000100", "010000011000100"),
+            (Backend::E9patch, "010000011000100", "010000011000100"),
+            (Backend::Liteinst, "010001010000000", "010001010000000"),
+            (Backend::InGuestTrap, "010001010000000", "010001010000000"),
+            (Backend::Sabre, "011111110000000", "011111110000000"),
+            (Backend::Dbt, "011001000100000", "011001000100000"),
+            (Backend::Kvm, "000011010010101", "000011010011101"),
+        ] {
+            for (sequentialize_threads, expected) in [(false, unsequenced), (true, sequential)] {
+                let config = prepare_backend_config(
+                    DetConfig {
+                        sequentialize_threads,
+                        ..DetConfig::default()
+                    },
+                    backend,
+                );
+                let encoded: serde_json::Map<String, serde_json::Value> =
+                    serde_json::from_str(&detcore::to_legacy_backend_json(&config).unwrap())
+                        .unwrap();
+                let digits: String = LEGACY_BACKEND_KEYS
+                    .iter()
+                    .map(|key| match encoded.get(*key) {
+                        Some(serde_json::Value::Bool(true)) => '1',
+                        Some(serde_json::Value::Bool(false)) => '0',
+                        other => panic!("{key} encoded as {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(
+                    digits, expected,
+                    "{backend:?}, sequentialize_threads={sequentialize_threads}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dbt_backend_config_translates_process_signals_to_host_threads() {
+        let config = prepare_backend_config(super::DetConfig::default(), Backend::Dbt);
+        assert!(config.backend.needs_killed_thread_rpc_cancellation);
+        assert!(!config.backend.tracks_process_children);
+        assert!(!config.backend.runs_exit_robust_list);
+        assert!(config.backend.requires_thread_directed_process_signals);
+        assert!(!config.backend.defers_vfork_child_registration);
+    }
+
+    #[test]
+    fn backend_write_signal_contract_is_explicit() {
+        for (backend, supports_interruption) in [
+            (Backend::Ptrace, true),
+            (Backend::Dbt, false),
+            (Backend::Kvm, true),
+            (Backend::Sabre, false),
+            (Backend::Liteinst, false),
+            (Backend::InGuestTrap, false),
+            (Backend::E9patch, true),
+        ] {
+            let config = prepare_backend_config(super::DetConfig::default(), backend);
+            assert_eq!(
+                config.backend.supports_parked_write_signal_interruption, supports_interruption,
+                "unexpected parked-write signal support for {backend:?}"
+            );
+        }
+    }
+
+    /// Only ptrace delivers the preemption timer, so only it lets a chaos
+    /// `sched_yield` hand its turn to a thread that may never make a syscall
+    /// (https://github.com/rrnewton/hermit/issues/4068).
+    #[test]
+    fn backend_timer_delivery_is_explicit() {
+        for (backend, delivers) in [
+            (Backend::Ptrace, true),
+            (Backend::Dbt, false),
+            (Backend::Kvm, false),
+            (Backend::Sabre, false),
+            (Backend::Liteinst, false),
+            (Backend::InGuestTrap, false),
+            (Backend::E9patch, true),
+        ] {
+            let config = prepare_backend_config(super::DetConfig::default(), backend);
+            assert_eq!(
+                config.backend.delivers_preemption_timer_events, delivers,
+                "unexpected timer delivery for {backend:?}"
+            );
+        }
+    }
+
+    /// Only SaBRe and in-guest LiteInst run guest code inside a Tool handler,
+    /// between two injected calls.
+    #[test]
+    fn backend_guest_code_between_injections_is_explicit() {
+        for (backend, runs) in [
+            (Backend::Ptrace, false),
+            (Backend::Dbt, false),
+            (Backend::Kvm, false),
+            (Backend::Sabre, true),
+            (Backend::Liteinst, true),
+            (Backend::InGuestTrap, true),
+            (Backend::E9patch, false),
+        ] {
+            let config = prepare_backend_config(super::DetConfig::default(), backend);
+            assert_eq!(
+                config.backend.runs_guest_code_between_injections, runs,
+                "unexpected guest code between injections for {backend:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn backend_blocked_wait_signal_contract_is_explicit() {
+        for (backend, supports_interruption) in [
+            (Backend::Ptrace, true),
+            (Backend::Dbt, false),
+            (Backend::Kvm, false),
+            (Backend::Sabre, false),
+            (Backend::Liteinst, false),
+            (Backend::InGuestTrap, false),
+            (Backend::E9patch, true),
+        ] {
+            let config = prepare_backend_config(super::DetConfig::default(), backend);
+            assert_eq!(
+                config.backend.supports_blocked_wait_signal_interruption, supports_interruption,
+                "unexpected blocked-wait signal support for {backend:?}"
+            );
+        }
+    }
+
+    /// A launch may pass the guest a terminal when a standard descriptor is
+    /// one, when the launcher has a controlling terminal, or when that cannot
+    /// be read; only a launch with neither is known not to. The device number
+    /// is read past a command name that holds spaces and parentheses.
+    #[test]
+    fn a_launch_may_pass_a_terminal_unless_it_proves_it_has_none() {
+        assert!(!super::may_pass_a_terminal(false, Some(0)));
+        assert!(super::may_pass_a_terminal(true, Some(0)));
+        assert!(super::may_pass_a_terminal(false, Some(34817)));
+        assert!(super::may_pass_a_terminal(false, None));
+
+        let stat = "4242 (a) b (c)) S 1 4242 4242 34817 4242 4194560 0 0 0 0";
+        assert_eq!(super::parse_controlling_terminal_device(stat), Some(34817));
+        let stat = "4242 (hermit) S 1 4242 4242 0 -1 4194560 0 0 0 0";
+        assert_eq!(super::parse_controlling_terminal_device(stat), Some(0));
+        assert_eq!(
+            super::parse_controlling_terminal_device("4242 (hermit"),
+            None
+        );
+        assert_eq!(
+            super::parse_controlling_terminal_device("4242 (hermit) S 1"),
+            None
+        );
+        assert!(super::controlling_terminal_device().is_some());
+    }
+
+    /// Only a backend whose blocked waits decide interruption from the kernel's
+    /// signal state asks whether the launch may pass the guest a terminal.
+    #[test]
+    fn only_gated_backends_record_an_inherited_terminal() {
+        for backend in [
+            Backend::Dbt,
+            Backend::Kvm,
+            Backend::Sabre,
+            Backend::Liteinst,
+            Backend::InGuestTrap,
+            Backend::E9patch,
+        ] {
+            let config = prepare_backend_config(super::DetConfig::default(), backend);
+            assert!(
+                !config.guest_may_inherit_a_terminal,
+                "unexpected terminal record for {backend:?}"
+            );
+        }
+        let config = prepare_backend_config(super::DetConfig::default(), Backend::Ptrace);
+        assert_eq!(
+            config.guest_may_inherit_a_terminal,
+            super::launcher_may_pass_a_terminal()
+        );
+    }
+
+    #[test]
+    fn liteinst_public_dispatch_runs_in_guest_detcore() {
+        if Backend::Liteinst.ensure_available().is_err() {
+            return;
+        }
+
+        // In-guest LiteInst has no preemption timer and refuses a maximum
+        // timeslice, so this run disables preemption; preemption is not what
+        // this test checks.
+        let config = super::DetConfig {
+            max_timeslice: None,
+            ..super::DetConfig::default()
+        };
+        let mut command = super::Command::new("/bin/echo");
+        command.arg("hello");
+        let output = super::run_with_output_backend(
+            command,
+            config.clone(),
+            false,
+            &None,
+            Backend::Liteinst,
+        )
+        .expect("run /bin/echo through in-guest LiteInst");
+        // Include captured output so a failed backend launch reports its diagnostics.
+        assert_eq!(
+            output.status,
+            super::ExitStatus::Exited(0),
+            "guest did not exit 0.\n--- guest stderr ---\n{}\n--- guest stdout ---\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout),
+        );
+        assert_eq!(output.stdout, b"hello\n");
+
+        let status = super::run_with_backend(
+            super::Command::new("/bin/true"),
+            config,
+            false,
+            &None,
+            Backend::Liteinst,
+        )
+        .expect("run /bin/true through in-guest LiteInst");
+        assert_eq!(status, super::ExitStatus::Exited(0));
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn default_and_available_backends_reflect_host_probes() {
+        assert_eq!(Backend::default(), Backend::Ptrace);
+        let available = Backend::available().collect::<Vec<_>>();
+        assert_eq!(
+            available.contains(&Backend::Ptrace),
+            Backend::Ptrace.is_available()
+        );
+        assert_eq!(
+            available.contains(&Backend::Dbt),
+            dynamorio_sdk_available() && dbt_runtime_unavailable_reason().is_none()
+        );
+        assert_eq!(
+            available.contains(&Backend::Liteinst),
+            liteinst_unavailable_reason().is_none()
+        );
+        // The same runtime, so available exactly when liteinst is.
+        assert_eq!(
+            available.contains(&Backend::InGuestTrap),
+            available.contains(&Backend::Liteinst)
+        );
+        assert_eq!(
+            available.contains(&Backend::Sabre),
+            Backend::Sabre.is_available()
+        );
+        assert_eq!(
+            available.contains(&Backend::Kvm),
+            kvm_device_unavailable_reason(std::path::Path::new("/dev/kvm")).is_none(),
+        );
+        assert_eq!(
+            available.contains(&Backend::E9patch),
+            Backend::E9patch.is_available()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn dependency_probes_require_usable_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(!is_dynamorio_sdk(temp.path()));
+        fs::create_dir(temp.path().join("include")).unwrap();
+        fs::write(temp.path().join("include/dr_api.h"), b"/* marker */").unwrap();
+        assert!(is_dynamorio_sdk(temp.path()));
+
+        let reason = kvm_device_unavailable_reason(temp.path())
+            .expect("a directory must not pass the read-write KVM device probe");
+        assert!(reason.contains("read-write"));
+    }
+
+    #[cfg(feature = "sabre")]
+    fn write_test_executable(path: &std::path::Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"test loader").unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "sabre")]
+    fn sabre_rpc_socket_uses_private_exec_environment() {
+        assert!(SABRE_RPC_SOCKET_ENV.starts_with("REVERIE_SABRE_"));
+    }
+
+    #[test]
+    #[cfg(feature = "sabre")]
+    fn sabre_stages_program_names_that_collide_with_loader_prefix() {
+        assert!(sabre_program_needs_neutral_name(
+            PathBuf::from("/usr/bin/ld").as_path()
+        ));
+        assert!(sabre_program_needs_neutral_name(
+            PathBuf::from("/usr/bin/ld.bfd").as_path()
+        ));
+        assert!(!sabre_program_needs_neutral_name(
+            PathBuf::from("/usr/bin/gold").as_path()
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "sabre")]
+    fn sabre_neutral_name_staging_preserves_program_bytes_and_cleans_up() {
+        let temp = tempfile::tempdir().unwrap();
+        let program = temp.path().join("ld.test");
+        fs::write(&program, b"linker image").unwrap();
+
+        let staged = stage_sabre_program_in(&program, temp.path())
+            .unwrap()
+            .expect("ld-prefixed program should be staged");
+        let staged_path = staged.path.clone();
+        assert_eq!(fs::read(&staged_path).unwrap(), b"linker image");
+        assert!(
+            staged_path
+                .file_name()
+                .unwrap()
+                .as_encoded_bytes()
+                .starts_with(b"hermit-sabre-program-")
+        );
+
+        drop(staged);
+        assert!(!staged_path.exists());
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[cfg(feature = "sabre")]
+    async fn sabre_rpc_disconnect_wait_observes_delayed_release() {
+        let global = Arc::new(());
+        let connection = global.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            drop(connection);
+        });
+
+        assert_eq!(
+            wait_for_sabre_rpc_disconnects(&global, Duration::from_millis(50)).await,
+            Ok(())
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[cfg(feature = "sabre")]
+    async fn sabre_rpc_disconnect_wait_reports_stuck_connection() {
+        let global = Arc::new(());
+        let _connection = global.clone();
+
+        assert_eq!(
+            wait_for_sabre_rpc_disconnects(&global, Duration::from_millis(10)).await,
+            Err(1)
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "sabre")]
+    async fn sabre_rpc_server_intentional_abort_is_clean() {
+        let server_task = tokio::spawn(std::future::pending::<Result<(), &'static str>>());
+
+        assert!(stop_sabre_rpc_server(server_task).await.is_ok());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "sabre")]
+    async fn sabre_rpc_server_failure_is_reported() {
+        let server_task = tokio::spawn(async { Err::<(), _>("accept failed") });
+        while !server_task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+
+        let error = stop_sabre_rpc_server(server_task).await.unwrap_err();
+        assert!(error.to_string().contains("accept failed"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[cfg(feature = "sabre")]
+    async fn sabre_rpc_shutdown_drains_connections_after_server_failure() {
+        let global = Arc::new(());
+        let connection = global.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            drop(connection);
+        });
+        let server_task = tokio::spawn(async { Err::<(), _>("accept failed") });
+        while !server_task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+
+        let error = shutdown_sabre_rpc(server_task, &global, Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("accept failed"));
+        assert_eq!(Arc::strong_count(&global), 1);
+    }
+
+    #[test]
+    #[cfg(feature = "sabre")]
+    fn sabre_binary_resolver_finds_cargo_target_build() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("target/release/hermit");
+        let loader = temp.path().join("target/sabre/sabre");
+        write_test_executable(&loader);
+
+        assert_eq!(
+            resolve_sabre_binary_from(None, None, &executable, OsStr::new("")).unwrap(),
+            loader
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "sabre")]
+    fn sabre_binary_resolver_uses_packaged_loader() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("target/release/hermit");
+        let packaged = temp.path().join("install_pkg/rsrcs/sabre");
+        write_test_executable(&packaged);
+
+        assert_eq!(
+            resolve_sabre_binary_from(None, Some(&packaged), &executable, OsStr::new("")).unwrap(),
+            packaged
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "sabre")]
+    fn sabre_binary_resolver_prefers_and_validates_override() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("target/release/hermit");
+        let discovered = temp.path().join("target/sabre/sabre");
+        let requested = temp.path().join("requested-sabre");
+        write_test_executable(&discovered);
+        write_test_executable(&requested);
+
+        assert_eq!(
+            resolve_sabre_binary_from(
+                Some(requested.as_os_str()),
+                Some(&discovered),
+                &executable,
+                OsStr::new(""),
+            )
+            .unwrap(),
+            requested
+        );
+
+        let mut permissions = fs::metadata(&requested).unwrap().permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(&requested, permissions).unwrap();
+        let error = resolve_sabre_binary_from(
+            Some(requested.as_os_str()),
+            Some(&discovered),
+            &executable,
+            OsStr::new(""),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("is not an executable file"));
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn optional_backends_report_accurate_availability() {
+        match Backend::Dbt.ensure_available() {
+            Ok(()) => assert!(
+                dynamorio_sdk_available() && dbt_runtime_unavailable_reason().is_none(),
+                "DBT reported available without its SDK and runtime"
+            ),
+            Err(dbt_error) => {
+                let message = dbt_error.to_string();
+                assert!(
+                    message.contains("DynamoRIO runtime")
+                        || message.contains("Detcore DBT runtime"),
+                    "unexpected DBT availability error: {message}"
+                );
+            }
+        }
+        assert_eq!(
+            Backend::Liteinst.ensure_available().is_ok(),
+            liteinst_unavailable_reason().is_none()
+        );
+        assert_eq!(
+            Backend::InGuestTrap.ensure_available().is_ok(),
+            liteinst_unavailable_reason().is_none()
+        );
+
+        match Backend::Kvm.ensure_available() {
+            Ok(()) => assert!(
+                kvm_device_unavailable_reason(std::path::Path::new("/dev/kvm")).is_none(),
+                "KVM reported available without a usable /dev/kvm",
+            ),
+            Err(kvm_error) => {
+                let message = kvm_error.to_string();
+                assert!(
+                    message.contains("/dev/kvm"),
+                    "unexpected KVM availability error: {message}",
+                );
+                assert!(!message.contains("requires root privileges"));
+            }
+        }
+    }
+
+    #[test]
+    fn public_backend_dispatch_rejects_unprepared_e9patch() {
+        let error = ensure_backend_dispatch(Backend::E9patch).unwrap_err();
+        assert!(
+            error.to_string().contains("requires CLI preprocessing"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn dbt_retries_only_the_pre_guest_bootstrap_failure() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let failure = std::process::ExitStatus::from_raw(
+            reverie_dbt::CLIENT_THREAD_START_FAILURE_EXIT_CODE << 8,
+        );
+        assert!(super::dbt_client_thread_start_failed(&failure));
+        assert!(!super::dbt_client_thread_start_failed(
+            &std::process::ExitStatus::from_raw(1 << 8)
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn dbt_public_dispatch_refuses_strict_schedule_boundaries() {
+        let command = super::Command::new("/bin/true");
+        let config = super::DetConfig {
+            sequentialize_threads: true,
+            strict_schedule_boundaries: true,
+            ..Default::default()
+        };
+
+        let error = super::run_with_output_backend(command, config, false, &None, Backend::Dbt)
+            .expect_err("DBT must refuse strict schedule boundaries");
+        assert!(
+            error
+                .to_string()
+                .contains("dbt backend does not run --strict-schedule-boundaries"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn dbt_public_dispatch_requires_sequentialized_threads() {
+        let command = super::Command::new("/bin/true");
+        let config = super::DetConfig {
+            sequentialize_threads: false,
+            ..Default::default()
+        };
+
+        let error = super::run_with_output_backend(command, config, false, &None, Backend::Dbt)
+            .expect_err("DBT must reject non-sequentialized execution");
+        assert!(
+            error
+                .to_string()
+                .contains("dbt backend requires sequentialized threads"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dbt_library_environment_privacy_is_caller_selected() {
+        #[cfg(not(feature = "dbt"))]
+        {
+            assert!(
+                std::env::var_os("HERMIT_REQUIRE_DBT").is_none(),
+                "HERMIT_REQUIRE_DBT is set, but this test binary was built WITHOUT \
+                 the `dbt` feature; rebuild with --features dbt to exercise the \
+                 library's environment-privacy policy",
+            );
+            eprintln!(
+                "skipping dbt_library_environment_privacy_is_caller_selected: \
+                 built without the `dbt` feature",
+            );
+        }
+        #[cfg(feature = "dbt")]
+        {
+            let mut command = super::Command::new("/usr/bin/env");
+            command
+                .env_clear()
+                .env("HERMIT_DBT_PRIVACY_SENTINEL", "known")
+                .env("HERMIT_APP_VISIBLE", "known");
+            let mut config = env_free_detconfig("--epoch=2026-01-01T00:00:00Z", "--seed=0");
+            config.sequentialize_threads = true;
+            config.deterministic_io = true;
+            config.panic_on_unsupported_syscalls = true;
+            config.validate();
+            let config = super::prepare_backend_config(config, Backend::Dbt);
+            let output = super::run_dbt(command, config, false, true)
+                .await
+                .expect("run /usr/bin/env through the real DBT library constructor");
+            assert_eq!(
+                output.status,
+                super::ExitStatus::Exited(0),
+                "guest did not exit 0.\n--- guest stderr ---\n{}\n--- guest stdout ---\n{}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout),
+            );
+            let printed = String::from_utf8(output.stdout).expect("synthetic environment is UTF-8");
+            assert_eq!(
+                printed
+                    .lines()
+                    .filter(|line| *line == "HERMIT_APP_VISIBLE=known")
+                    .count(),
+                1,
+                "public sentinel missing or duplicated: {printed}",
+            );
+            assert!(
+                !printed.contains("HERMIT_DBT_PRIVACY_SENTINEL="),
+                "Hermit private environment sentinel leaked to guest: {printed}",
+            );
+            assert_eq!(printed, "HERMIT_APP_VISIBLE=known\n");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn dbt_public_dispatch_runs_echo_through_detcore() {
+        use clap::Parser;
+
+        if Backend::Dbt.ensure_available().is_err() {
+            return;
+        }
+
+        // Isolate the controller's fd 2 in a subprocess, without redirecting a
+        // descriptor shared by other tests in this process.
+        const CHILD: &str = "HERMIT_TEST_DBT_LIBRARY_DIAGNOSTICS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::dbt_public_dispatch_runs_echo_through_detcore",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .expect("run isolated DBT library output checks");
+            let diagnostics = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{output:?}");
+            assert!(
+                diagnostics
+                    .lines()
+                    .filter(|line| line.starts_with("reverie-dbt: tool=Detcore "))
+                    .count()
+                    >= 2,
+                "DBT native summaries did not prove both Detcore dispatches: {diagnostics}"
+            );
+            assert!(!diagnostics.contains("guest-stderr"), "{diagnostics}");
+            return;
+        }
+
+        let mut command = super::Command::new("/bin/echo");
+        command.arg("hello");
+        let mut config = super::DetConfig::parse_from(["hermit-dbt-test"]);
+        config.sequentialize_threads = true;
+        config.validate();
+        let output = super::run_with_output_backend(command, config, true, &None, Backend::Dbt)
+            .expect("run /bin/echo through DbtGuest<Detcore>");
+
+        // Include captured output so a failed backend launch reports its diagnostics.
+        assert_eq!(
+            output.status,
+            super::ExitStatus::Exited(0),
+            "guest did not exit 0.\n--- guest stderr ---\n{}\n--- guest stdout ---\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout),
+        );
+        assert_eq!(output.stdout, b"hello\n");
+        assert_eq!(output.stderr, b"");
+
+        let mut command = super::Command::new("/bin/sh");
+        command.args(["-c", "printf 'guest-stderr\\n' >&2"]);
+        let mut config = super::DetConfig::parse_from(["hermit-dbt-test"]);
+        config.sequentialize_threads = true;
+        config.validate();
+        let output = super::run_with_output_backend(command, config, true, &None, Backend::Dbt)
+            .expect("capture nonempty guest stderr through DbtGuest<Detcore>");
+        assert_eq!(output.status, super::ExitStatus::Exited(0), "{output:?}");
+        assert_eq!(output.stdout, b"");
+        assert_eq!(output.stderr, b"guest-stderr\n");
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn dbt_public_status_dispatch_runs_true_through_detcore() {
+        use clap::Parser;
+
+        if Backend::Dbt.ensure_available().is_err() {
+            return;
+        }
+
+        let command = super::Command::new("/bin/true");
+        let mut config = super::DetConfig::parse_from(["hermit-dbt-test"]);
+        config.sequentialize_threads = true;
+        config.validate();
+        let status = super::run_with_backend(command, config, true, &None, Backend::Dbt)
+            .expect("run /bin/true through DbtGuest<Detcore>");
+
+        assert_eq!(status, super::ExitStatus::Exited(0));
+    }
+
+    #[test]
+    fn kvm_runs_dynamic_echo_through_detcore() {
+        use clap::Parser;
+
+        if kvm_device_unavailable_reason(std::path::Path::new("/dev/kvm")).is_some() {
+            return;
+        }
+
+        let mut command = super::Command::new("/bin/echo");
+        command.arg("hello");
+        let mut config = super::DetConfig::parse_from(["hermit-kvm-test"]);
+        config.validate();
+        let output = super::run_with_output_backend(command, config, false, &None, Backend::Kvm)
+            .expect("run dynamic /bin/echo through KvmGuest<Detcore>");
+
+        // Include captured output so a failed backend launch reports its diagnostics.
+        assert_eq!(
+            output.status,
+            super::ExitStatus::Exited(0),
+            "guest did not exit 0.\n--- guest stderr ---\n{}\n--- guest stdout ---\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout),
+        );
+        assert_eq!(output.stdout, b"hello\n");
+        assert!(output.stderr.is_empty());
+    }
+
+    // Keep the low-level vmcall transport covered independently from the ELF
+    // process personality. Requires /dev/kvm; skips cleanly otherwise.
+    #[test]
+    fn detcore_drives_kvm_guest_for_synthetic_syscall() {
+        use clap::Parser;
+
+        const MEMORY_SIZE: usize = 0x10_000;
+        const ENTRY_POINT: u64 = 0x1000;
+        const FRAME_ADDRESS: u64 = 0x2000;
+
+        let mut backend = match reverie_kvm::KvmBackend::new(MEMORY_SIZE) {
+            Ok(backend) => backend,
+            Err(error) => {
+                eprintln!("skipping KVM Detcore experiment: cannot init VM: {error}");
+                return;
+            }
+        };
+
+        // A guest that issues one `getpid` through the vmcall transport, then HLTs.
+        backend
+            .install_syscall(
+                ENTRY_POINT,
+                FRAME_ADDRESS,
+                reverie_kvm::SyscallRequest::new(libc::SYS_getpid as u64, [0; 6]),
+            )
+            .expect("install synthetic getpid guest");
+
+        // Minimal deterministic Detcore config with RCB preemption disabled.
+        let mut config =
+            super::DetConfig::parse_from(["hermit-kvm-test", "--max-timeslice=disabled"]);
+        config.validate();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+
+        let outcome = runtime.block_on(async {
+            backend
+                .run_with_tool::<super::Detcore, _>(
+                    config,
+                    // Executor: forward anything Detcore injects to the host.
+                    |request: &reverie_kvm::SyscallRequest, _memory: &reverie_kvm::GuestMemory| {
+                        // SAFETY: forwarding a register-only syscall (getpid) to the
+                        // host; no guest pointers are dereferenced by the kernel.
+                        unsafe {
+                            libc::syscall(
+                                request.number() as libc::c_long,
+                                request.args()[0],
+                                request.args()[1],
+                                request.args()[2],
+                                request.args()[3],
+                                request.args()[4],
+                                request.args()[5],
+                            ) as i64
+                        }
+                    },
+                )
+                .await
+        });
+
+        // The point of the experiment is to observe whether Detcore can be driven
+        // to completion over KvmGuest at all; assert it did not error.
+        outcome.expect("Detcore drove the synthetic KVM guest to completion");
+    }
+
+    // Minimal fake ELF payload: the loader only needs the image to NOT start
+    // with `#!`, and a real ELF magic makes the intent obvious.
+    const FAKE_ELF: &[u8] = b"\x7fELF\x02\x01\x01\x00 fake elf body";
+
+    fn shebang_tmpdir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "hermit-shebang-test-{}-{}",
+            std::process::id(),
+            tag
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn resolve_shebang_plain_elf_is_unchanged() {
+        let dir = shebang_tmpdir("plain");
+        let prog = dir.join("prog");
+        fs::write(&prog, FAKE_ELF).unwrap();
+
+        let argv = vec!["prog".to_owned(), "-a".to_owned()];
+        let (path, out_argv, image) = resolve_kvm_shebang(&prog, argv).unwrap();
+        assert_eq!(path, prog);
+        assert_eq!(out_argv, vec!["prog".to_owned(), "-a".to_owned()]);
+        assert_eq!(image, FAKE_ELF);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_shebang_single_level_kernel_order() {
+        let dir = shebang_tmpdir("single");
+        let interp = dir.join("fakebash");
+        fs::write(&interp, FAKE_ELF).unwrap();
+        let script = dir.join("script");
+        // Interpreter with a single optional argument.
+        fs::write(&script, format!("#!{} -x\necho hi\n", interp.display())).unwrap();
+
+        let argv = vec!["script".to_owned(), "arg1".to_owned()];
+        let (path, out_argv, image) = resolve_kvm_shebang(&script, argv).unwrap();
+        assert_eq!(path, interp);
+        // Kernel order: [interp, optarg, script_path, original args after argv[0]].
+        assert_eq!(
+            out_argv,
+            vec![
+                interp.to_string_lossy().into_owned(),
+                "-x".to_owned(),
+                script.to_string_lossy().into_owned(),
+                "arg1".to_owned(),
+            ]
+        );
+        assert_eq!(image, FAKE_ELF);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_shebang_nested_accumulates_like_binfmt_script() {
+        let dir = shebang_tmpdir("nested");
+        let interp = dir.join("fakebash");
+        fs::write(&interp, FAKE_ELF).unwrap();
+        let mid = dir.join("mid"); // a #!-interpreter that is itself a script
+        fs::write(&mid, format!("#!{}\n", interp.display())).unwrap();
+        let script = dir.join("script");
+        fs::write(&script, format!("#!{} -e\n", mid.display())).unwrap();
+
+        let argv = vec!["script".to_owned(), "arg1".to_owned()];
+        let (path, out_argv, image) = resolve_kvm_shebang(&script, argv).unwrap();
+        assert_eq!(path, interp);
+        // Level 1: [mid, -e, script, arg1]; level 2 prepends [interp, mid].
+        assert_eq!(
+            out_argv,
+            vec![
+                interp.to_string_lossy().into_owned(),
+                mid.to_string_lossy().into_owned(),
+                "-e".to_owned(),
+                script.to_string_lossy().into_owned(),
+                "arg1".to_owned(),
+            ]
+        );
+        assert_eq!(image, FAKE_ELF);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_shebang_rejects_infinite_recursion() {
+        let dir = shebang_tmpdir("loop");
+        let a = dir.join("a");
+        let b = dir.join("b");
+        fs::write(&a, format!("#!{}\n", b.display())).unwrap();
+        fs::write(&b, format!("#!{}\n", a.display())).unwrap();
+
+        let argv = vec!["a".to_owned()];
+        assert!(resolve_kvm_shebang(&a, argv).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The build scripts' pin reader, bracketed against the inputs that
+    /// first-match-wins got wrong. Included rather than imported because the
+    /// reader is build-script code with no library home.
+    mod reverie_pin_reader {
+        include!("../reverie_pin.rs");
+
+        const A: &str = "1111111111111111111111111111111111111111";
+        const B: &str = "2222222222222222222222222222222222222222";
+
+        fn dep(rev: &str) -> String {
+            format!(
+                "reverie = {{ git = \"https://github.com/rrnewton/reverie.git\", rev = \"{rev}\" }}\n"
+            )
+        }
+
+        #[test]
+        fn a_single_revision_is_read() {
+            assert_eq!(parse_reverie_pin(&dep(A)).as_deref(), Some(A));
+        }
+
+        #[test]
+        fn agreeing_revisions_are_read_once() {
+            let text = format!("{}{}", dep(A), dep(A));
+            assert_eq!(parse_reverie_pin(&text).as_deref(), Some(A));
+        }
+
+        /// A manifest halfway through a bump names two revisions. First-match-wins
+        /// silently returned the first; the canonical rule refuses to resolve it.
+        #[test]
+        fn disagreeing_revisions_are_refused() {
+            let text = format!("{}{}", dep(A), dep(B));
+            assert_eq!(parse_reverie_pin(&text), None);
+        }
+
+        /// The reported reproduction: ONE commented line above the live pin made
+        /// the binary embed the comment's revision, so a correctly staged runtime
+        /// would be refused by a guard naming a revision that was never the pin.
+        #[test]
+        fn a_commented_out_dependency_is_not_the_pin() {
+            let text = format!("# {}{}", dep(B), dep(A));
+            assert_eq!(
+                parse_reverie_pin(&text).as_deref(),
+                Some(A),
+                "a commented-out revision must not win"
+            );
+        }
+
+        #[test]
+        fn a_manifest_naming_no_revision_yields_none() {
+            assert_eq!(parse_reverie_pin("[dependencies]\nlibc = \"0.2\"\n"), None);
+        }
+
+        /// An unparseable Reverie line could be hiding a disagreement, so it makes
+        /// the manifest ambiguous rather than being skipped as absent.
+        #[test]
+        fn an_unparseable_revision_is_ambiguous() {
+            let text = format!(
+                "{}reverie-x = {{ git = \"https://github.com/rrnewton/reverie.git\", rev = \"beef\" }}\n",
+                dep(A)
+            );
+            assert_eq!(parse_reverie_pin(&text), None);
+        }
+    }
+
+    /// SaBRe's guest plugin has no subscriber, so it forwards DETLOG records by
+    /// the policy the CLI hands it. For each filter the CLI builds, that policy
+    /// must answer every emitting module as the CLI's own subscriber does,
+    /// which is what each in-process `detlog!` callsite asks under ptrace.
+    /// `warn,detcore::random=info` once yielded no forwarding at all, because
+    /// only the generic `detcore` target was asked, so SaBRe dropped the
+    /// AT_RANDOM and early getrandom records ptrace prints.
+    #[cfg(feature = "sabre")]
+    #[test]
+    fn sabre_detlog_forwarding_answers_each_target_as_the_cli_filter_does() {
+        use detcore::detlog::ForwardPolicy;
+        use detcore::detlog::info_enabled_for_target;
+        use tracing::level_filters::LevelFilter;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        use crate::liteinst_bootstrap::EffectiveFilter;
+
+        let targets = [
+            "",
+            "detcore",
+            "detcore::random",
+            "detcore::randomness",
+            "detcore::tool_local",
+            "detcore::scheduler",
+            "detcore::scheduler::runqueue",
+            "detcore::syscalls::files",
+            "hermit",
+            "warn",
+        ];
+        let policy_under = |raw: &str, level: LevelFilter| {
+            let subscriber = tracing_subscriber::registry()
+                .with(EffectiveFilter::from_directives_lossy(raw, level).into_filter());
+            tracing::subscriber::with_default(subscriber, || {
+                let policy = ForwardPolicy::from_current_subscriber(raw);
+                let subscriber_says: Vec<bool> = targets
+                    .iter()
+                    .map(|target| info_enabled_for_target(target))
+                    .collect();
+                (policy, subscriber_says)
+            })
+        };
+        for (raw, level) in [
+            ("warn,detcore::random=info", LevelFilter::WARN),
+            ("detcore::random=info", LevelFilter::WARN),
+            ("detcore::random=warn", LevelFilter::INFO),
+            (
+                "warn,detcore=info,detcore::scheduler=off",
+                LevelFilter::WARN,
+            ),
+            (
+                "warn,detcore[work]=info,detcore::random=info",
+                LevelFilter::WARN,
+            ),
+            ("", LevelFilter::INFO),
+            ("", LevelFilter::WARN),
+        ] {
+            let (policy, subscriber_says) = policy_under(raw, level);
+            for (target, enabled) in targets.iter().zip(subscriber_says) {
+                assert_eq!(
+                    policy.forwards(target),
+                    enabled,
+                    "RUST_LOG={raw:?} --log={level}: policy {policy:?} disagrees on {target:?}"
+                );
+            }
+        }
+
+        let (scoped, subscriber_says) =
+            policy_under("warn,detcore::random=info", LevelFilter::WARN);
+        assert!(!subscriber_says[1], "the generic detcore target is off");
+        assert!(scoped.forwards_any());
+        assert!(scoped.forwards("detcore::random"));
+        assert!(!scoped.forwards("detcore::tool_local"));
+        assert_eq!(policy_under("", LevelFilter::INFO).0, ForwardPolicy::all());
+        assert!(!policy_under("", LevelFilter::WARN).0.forwards_any());
+    }
+
+    /// In-guest LiteInst gets the per-target policy it is given next to the
+    /// forwarding descriptor, and this build's fingerprint, in the launch
+    /// record, with none of Hermit's variables left on the command; a policy
+    /// that forwards nothing requests no forwarding.
+    #[cfg(feature = "liteinst")]
+    #[test]
+    fn liteinst_launch_hands_the_guest_its_per_target_policy() {
+        use std::os::fd::AsRawFd;
+
+        use detcore::detlog::ForwardPolicy;
+        use detcore::in_guest_launch::InGuestLaunch;
+        use reverie::process::Command;
+
+        use super::LITEINST_DETLOG_FORWARD_ENV;
+        use super::LITEINST_DETLOG_FORWARD_POLICY_ENV;
+        use super::forward_in_guest_detlogs_to;
+        use super::in_guest_liteinst_launch;
+
+        let (sink, _peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        forward_in_guest_detlogs_to(sink.into());
+        let removed = |command: &Command| {
+            [
+                LITEINST_DETLOG_FORWARD_ENV,
+                LITEINST_DETLOG_FORWARD_POLICY_ENV,
+                detcore::LITEINST_CONFIG_FINGERPRINT_ENV,
+            ]
+            .into_iter()
+            .all(|key| {
+                command
+                    .get_envs()
+                    .any(|(name, value)| name == std::ffi::OsStr::new(key) && value.is_none())
+            })
+        };
+
+        let scoped = ForwardPolicy::decode("0,detcore::random=1").unwrap();
+        let mut command = Command::new("/bin/true");
+        let (launch, duplicate) = in_guest_liteinst_launch(&mut command, &scoped).unwrap();
+        let duplicate = duplicate.expect("a policy that forwards a target requests forwarding");
+        assert!(removed(&command));
+        let launch = InGuestLaunch::decode(&launch.encode()).unwrap();
+        let passed = launch.forward_request.expect("the descriptor is passed");
+        assert_eq!(
+            detcore::detlog::tool_output_env_target(&passed),
+            Some(duplicate.as_raw_fd()),
+            "{passed}"
+        );
+        let sent =
+            ForwardPolicy::decode(&launch.forward_policy.expect("the policy goes too")).unwrap();
+        assert_eq!(sent, scoped);
+        assert!(sent.forwards("detcore::random"));
+        assert!(!sent.forwards("detcore::tool_local"));
+        assert_eq!(
+            launch.coordinator_fingerprint,
+            Some(detcore::config_wire_fingerprint())
+        );
+
+        let nothing = ForwardPolicy::decode("0").unwrap();
+        let mut command = Command::new("/bin/true");
+        command
+            .env(LITEINST_DETLOG_FORWARD_ENV, "9")
+            .env(LITEINST_DETLOG_FORWARD_POLICY_ENV, "1")
+            .env(detcore::LITEINST_CONFIG_FINGERPRINT_ENV, "0000000000000000");
+        let (launch, duplicate) = in_guest_liteinst_launch(&mut command, &nothing).unwrap();
+        assert!(duplicate.is_none());
+        assert!(removed(&command));
+        assert_eq!(launch.forward_request, None);
+        assert_eq!(launch.forward_policy, None);
+    }
+
+    /// The forwarding policy answers as a real in-process `detlog!` record
+    /// behaves under the CLI's filter: a record is logged only when both its
+    /// `tracing::enabled!` hint and its event pass, and a directive with a
+    /// field filter applies to the hint whatever its fields but to the event
+    /// only when the event has that field. `info,<module>[{unused}]=warn`
+    /// suppresses the record; the policy once forwarded it, because it probed
+    /// only the event.
+    #[test]
+    fn detlog_forward_policy_matches_real_detlog_emission_under_field_filters() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+
+        use detcore::detlog::ForwardPolicy;
+        use tracing::level_filters::LevelFilter;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        use crate::liteinst_bootstrap::EffectiveFilter;
+
+        struct Count(Arc<AtomicUsize>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Count {
+            fn on_event(
+                &self,
+                _event: &tracing::Event<'_>,
+                _context: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let module = module_path!();
+        for (raw, level) in [
+            (format!("info,{module}[{{unused}}]=warn"), LevelFilter::INFO),
+            (
+                format!("warn,{module}[{{unused}}]=trace"),
+                LevelFilter::WARN,
+            ),
+            (
+                format!("info,{module}[{{message}}]=warn"),
+                LevelFilter::INFO,
+            ),
+            (format!("info,{module}=warn"), LevelFilter::INFO),
+            (format!("warn,{module}=info"), LevelFilter::WARN),
+            ("info".to_owned(), LevelFilter::INFO),
+            ("warn".to_owned(), LevelFilter::WARN),
+        ] {
+            let emitted = Arc::new(AtomicUsize::new(0));
+            let subscriber = tracing_subscriber::registry()
+                .with(EffectiveFilter::from_directives_lossy(&raw, level).into_filter())
+                .with(Count(emitted.clone()));
+            let forwards = tracing::subscriber::with_default(subscriber, || {
+                detcore::detlog!("probe record");
+                ForwardPolicy::from_current_subscriber(&raw).forwards(module)
+            });
+            assert_eq!(
+                forwards,
+                emitted.load(Ordering::Relaxed) == 1,
+                "RUST_LOG={raw:?} --log={level}: the policy and a real detlog! disagree"
+            );
+        }
+    }
+}
+
+/// Producer-owned record and raw streams for one retained verification run.
+pub mod verify_run_record;
