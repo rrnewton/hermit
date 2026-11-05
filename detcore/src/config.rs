@@ -355,6 +355,12 @@ mod tests {
         // 41 to 46; digest re-measured on the combined tree at
         // regeneration).
         (47, "05097a2f4152ff09", "f013e36743d8d9e6"),
+        // The combined integration tree (integration/drain-20261105):
+        // rows 41 to 47 in merge order compose enum tails and digest
+        // domains no single change's tree had, so the combined
+        // definitions measure a new digest, recorded here as measured on
+        // the combined tree at regeneration.
+        (48, "f33b9b217fa438ea", "f013e36743d8d9e6"),
 
     ];
 
