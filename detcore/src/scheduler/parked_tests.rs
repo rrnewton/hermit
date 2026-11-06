@@ -8697,7 +8697,8 @@ fn kvm_fixture() -> (Scheduler, Arc<Backend>) {
         max_timeslice: None,
         ..Config::default().with_backend(|backend| *backend = reverie::BackendCapabilities::KVM)
     });
-    assert!(!s.models_signal_targets);
+    // SIGSHARE S3b: KVM's kernel signal targets are predictable.
+    assert!(s.models_signal_targets);
     let backend = Arc::new(Backend::default());
     assert_eq!(
         s.install_signal_control(
@@ -8710,6 +8711,86 @@ fn kvm_fixture() -> (Scheduler, Arc<Backend>) {
         BackendSignalControlMode::ToolControlled
     );
     (s, backend)
+}
+
+/// SIGSHARE S3b, fix 2 (`Scheduler::signal_sleep`): where the backend owns
+/// signal delivery (KVM's installed control) and the scheduler models signal
+/// targets, a filed `pause` or `nanosleep` is not a sleep the drain ends: the
+/// backend's observation of the parked call ends it and takes the signal in
+/// the same pass (`select_parked_alarm`,
+/// `observe_parked_thread_woken_by_its_own_signal`). A drain wake as well
+/// took the thread out of the park first, and a process signal published in
+/// that pass then went to another thread. Without an installed control, the
+/// drain still ends both sleeps.
+#[test]
+fn a_parked_sleep_is_left_to_the_parked_observation_where_the_backend_owns_delivery() {
+    for installed in [true, false] {
+        let (mut s, _backend) = if installed {
+            kvm_fixture()
+        } else {
+            fixture_with_control(false)
+        };
+        s.models_signal_targets = true;
+        let (tid, _, _) = add(&mut s, 100, 100);
+        for (fyi, deadline, sleep) in [
+            (
+                crate::resources::PAUSE_FYI,
+                LogicalTime::INDEFINITE,
+                sleep_signal::SignalSleep::Pause,
+            ),
+            (
+                crate::resources::NANOSLEEP_FYI,
+                at(50),
+                sleep_signal::SignalSleep::Nanosleep { deadline: at(50) },
+            ),
+        ] {
+            let mut request = Resources::new(tid);
+            request.insert(ResourceID::SleepUntil(deadline), Permission::W);
+            request.fyi(fyi);
+            s.next_turns.get_mut(&tid).unwrap().req = Ivar::full(Ok(request));
+            assert_eq!(
+                s.signal_sleep(tid),
+                (!installed).then_some(sleep),
+                "{fyi}, control installed: {installed}"
+            );
+        }
+    }
+}
+
+/// SIGSHARE S3b, fix 5 (`Scheduler::sigchld_delivery_placed_by_control`):
+/// where the backend's signal control is installed and the scheduler models
+/// signal targets, a thread's `SIGCHLD` delivery is granted at its turn even
+/// with other work runnable: it takes the signal only with the permit the
+/// scheduler reserved, so its turn is fixed by the schedule. Without an
+/// installed control the delivery is host-timed there, and is deferred
+/// behind the runnable work (`sigchld_deferred`), as on ptrace.
+#[test]
+fn a_controlled_sigchld_delivery_is_not_deferred_behind_runnable_work() {
+    for installed in [true, false] {
+        let (mut s, _backend) = fixture_with_control(installed);
+        s.models_signal_targets = true;
+        let (busy, _, _) = add(&mut s, 100, 100);
+        let (signaled, _, _) = add(&mut s, 200, 200);
+        s.runqueue_push_back(busy);
+        s.runqueue_push_back(signaled);
+        assert_eq!(s.run_queue.tentative_pop_tid(signaled), Some(signaled));
+        let granted = s
+            .block_for_one_resource(
+                signaled,
+                &ResourceID::InboundSignal(SigWrapper::from(Signal::SIGCHLD)),
+                &Permission::RW,
+                None,
+                None,
+                &Ivar::new(),
+            )
+            .is_ok();
+        assert_eq!(granted, installed, "control installed: {installed}");
+        assert_eq!(
+            s.blocked.sigchld_deferred.contains(&signaled),
+            !installed,
+            "control installed: {installed}"
+        );
+    }
 }
 
 /// The parent's SIGCHLD state: blocked, explicitly ignored, caught.
@@ -8821,12 +8902,14 @@ fn a_controlled_exit_to_a_one_thread_parent_is_classified_at_its_grant() {
             false,
             Some(N::Undecided),
         ),
+        // SIGSHARE S3b: KVM models signal targets, so a parent with another
+        // live thread is decided too, as on ptrace.
         (
             "two threads",
             sigchld_sets(false, false, true),
             true,
             true,
-            None,
+            Some(N::Deliver),
         ),
     ] {
         let (mut s, backend) = kvm_fixture();
@@ -8859,6 +8942,25 @@ fn a_controlled_exit_to_a_one_thread_parent_is_classified_at_its_grant() {
         // No hold waits for a kernel publication report on this backend.
         assert!(s.child_exit_publications_pending.is_empty(), "{name}");
     }
+    // Where the scheduler does not model signal targets (before S3b), a
+    // parent with another live thread keeps the backend's decision.
+    let (mut s, backend) = kvm_fixture();
+    s.models_signal_targets = false;
+    let (parent, _, _) = add(&mut s, 100, 100);
+    let _ = add(&mut s, 100, 101);
+    let (child, child_mm, _) = add_process_child(&mut s, 100, 200);
+    backend
+        .signal_sets
+        .lock()
+        .unwrap()
+        .insert(100, sigchld_sets(false, false, true));
+    file_restartable_read(&mut s, parent);
+    grant_group_exit(&mut s, child, child_mm);
+    assert_eq!(
+        s.controlled_child_exits_decision(DetPid::from_raw(200)),
+        None
+    );
+    assert!(child_exit_timers(&s).is_empty());
 }
 
 /// The cross-check table (design S4 and S0 correction 2): the only allowed
@@ -9118,7 +9220,10 @@ const SIGALRM_BIT: u64 = 1 << (libc::SIGALRM - 1);
 /// Reports `sets` for task (`pid`, `tid`) through the fake control's
 /// `signal_sets`.
 fn report_signal_sets(b: &Backend, pid: i32, tid: i32, sets: reverie::SignalSets) {
-    b.task_signal_sets.lock().unwrap().push((task(pid, tid), sets));
+    b.task_signal_sets
+        .lock()
+        .unwrap()
+        .push((task(pid, tid), sets));
 }
 
 /// Files an ordinary request for `tid`, one that has nothing to do with
