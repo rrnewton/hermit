@@ -14005,27 +14005,6 @@
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/pkg-config",
-          "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/pkg-config",
-          "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/pkg-config",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
           "test": "compat/pkill",
           "mode": "replay",
           "backend": "ptrace"
@@ -18910,27 +18889,6 @@
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/pkg-config",
-          "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/pkg-config",
-          "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/pkg-config",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
           "test": "compat/pkill",
           "mode": "replay",
           "backend": "ptrace"
@@ -21579,13 +21537,6 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/pinky",
-          "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/pkg-config",
           "mode": "replay",
           "backend": "ptrace"
         },
@@ -39630,20 +39581,6 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/pinky",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/pkg-config",
-          "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/pkg-config",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -57785,27 +57722,6 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/pinky",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/pkg-config",
-          "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/pkg-config",
-          "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/pkg-config",
           "mode": "verify",
           "backend": "ptrace"
         },
