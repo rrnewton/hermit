@@ -187,6 +187,7 @@ static PAUSE_SIGCHLD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGCHLD_BUSY_SIBLING_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGKILL_ROBUST_PSHARED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static GUEST_SIGCHLD_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static PROCESS_SIGNAL_TARGET_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static GUEST_DISCARD_AT_SEND_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static POLL_RECHECK_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static POLL_RECHECK_PARTIAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -26009,6 +26010,185 @@ fn an_ignored_posix_timer_signal_moves_no_receiver_walk_natively_and_on_ptrace()
             "{mode}: natively"
         );
         let ptrace = alarm_receiver_reach_at_l2(&[], mode);
+        match divergence {
+            None => assert_eq!(ptrace, linux, "{mode}: ptrace"),
+            Some(KnownDivergence { issue, line }) => {
+                eprintln!(
+                    "{mode}: KNOWN DIVERGENCE on ptrace ({issue}): it prints {line:?} where Linux prints {linux:?}"
+                );
+                assert_ne!(
+                    ptrace, linux,
+                    "{mode}: the KNOWN DIVERGENCE {issue} has closed: ptrace prints Linux's line; drop its record and require Linux's line"
+                );
+                assert_eq!(
+                    ptrace, line,
+                    "{mode}: ptrace prints neither Linux's line nor the line the KNOWN DIVERGENCE {issue} records"
+                );
+            }
+        }
+    }
+}
+
+/// tests/c/process_signal_target.c's modes, the line Linux prints for each (20
+/// of 20 native runs each, 2026-11-05), and ptrace's line where it differs.
+/// Each mode is a process-directed signal the kernel itself generates for a
+/// three-thread process (main thread M, workers W1 and W2): a child's exit
+/// `SIGCHLD`, an ITIMER_REAL expiry or a POSIX timer's `SIGEV_SIGNAL`.
+/// Linux's `complete_signal` gives it to the thread it names (the child's
+/// parent thread, or the leader for a timer) if that thread wants it, and
+/// otherwise to the first that does, walking from the process's
+/// `curr_target`; with none, the signal waits for a thread to unblock it.
+///
+/// ptrace's KNOWN DIVERGENCES are the scheduler's process-directed sends that
+/// it leaves to the host kernel, which finds every guest thread stopped: in
+/// `chld-creator` and `alrm-leader` the copy is taken by W1, which a drain
+/// resumes before M, polling, takes it
+/// (https://github.com/rrnewton/hermit/issues/4991's class); and in
+/// `alrm-ignored-unblocked` the kernel queues the ignored expiry for the
+/// tracer instead of discarding it, so W2 takes it once a handler is
+/// installed (https://github.com/rrnewton/hermit/issues/5014's class).
+const PROCESS_SIGNAL_TARGET_CASES: [(&str, &str, Option<KnownDivergence>); 10] = [
+    (
+        "chld-creator",
+        "receiver=M interrupted=M\n",
+        Some(KnownDivergence {
+            issue: "https://github.com/rrnewton/hermit/issues/4991",
+            line: "receiver=W1 interrupted=W1\n",
+        }),
+    ),
+    ("chld-walk", "receiver=W2 interrupted=W2\n", None),
+    ("chld-worker", "receiver=W1 interrupted=W1\n", None),
+    ("chld-queued", "pending=1 receiver=W2\n", None),
+    (
+        "alrm-leader",
+        "receiver=M interrupted=M\n",
+        Some(KnownDivergence {
+            issue: "https://github.com/rrnewton/hermit/issues/4991",
+            line: "receiver=W1 interrupted=W1\n",
+        }),
+    ),
+    ("alrm-walk", "receiver=W2 interrupted=W2\n", None),
+    ("alrm-queued", "pending=1 receiver=W1\n", None),
+    ("posix-walk", "receiver=W2 interrupted=W2\n", None),
+    ("alrm-ignored-blocked", "pending=1 receiver=W2\n", None),
+    (
+        "alrm-ignored-unblocked",
+        "pending=0 receiver=none\n",
+        Some(KnownDivergence {
+            issue: "https://github.com/rrnewton/hermit/issues/5014",
+            line: "pending=1 receiver=W2\n",
+        }),
+    ),
+];
+
+fn process_signal_target_guest() -> &'static Path {
+    PROCESS_SIGNAL_TARGET_GUEST.get_or_init(|| compile_c_guest("process_signal_target"))
+}
+
+/// What tests/c/process_signal_target.c prints for `mode`, run natively: the
+/// first of up to three runs that prints `expected`, or else the last.
+fn native_process_signal_target(mode: &str, expected: &str) -> String {
+    let mut printed = String::new();
+    for _ in 0..3 {
+        let output = Command::new(process_signal_target_guest())
+            .arg(mode)
+            .stdin(Stdio::null())
+            .output()
+            .expect("failed to run the process-signal-target guest natively");
+        assert!(output.status.success(), "{mode}: natively: {output:?}");
+        printed = String::from_utf8(output.stdout).expect("guest stdout should be UTF-8");
+        if printed == expected {
+            break;
+        }
+    }
+    printed
+}
+
+/// `mode` of tests/c/process_signal_target.c under `backend` (empty for
+/// ptrace) at L2: `--strict --verify --verify-strict`, bitwise parity over
+/// nonzero INFO counts. Returns its stdout.
+fn process_signal_target_at_l2(backend: &[&str], mode: &str) -> String {
+    let _guard = hermit_run_guard();
+    let guest = process_signal_target_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let report = directory.path().join("verify.json");
+    let report_arg = report.to_str().expect("report path should be UTF-8");
+    let mut args: Vec<&str> = backend.to_vec();
+    args.extend([
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        report_arg,
+        "--",
+        guest,
+        mode,
+    ]);
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    let verdict: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).expect("strict verification wrote no verdict"))
+            .expect("strict verification verdict is valid JSON");
+    assert_eq!(verdict["bitwise_parity"], true, "{mode}: {verdict}");
+    for side in ["left", "right"] {
+        assert!(
+            verdict["compared_log_messages"][side].as_u64().unwrap_or(0) > 0,
+            "{mode}: no INFO messages compared: {verdict}"
+        );
+    }
+    stdout(&output)
+}
+
+/// SIGSHARE S3b: on KVM the scheduler models signal targets
+/// (`kernel_signal_targets_are_predictable`), so a process-directed signal the
+/// kernel generates for a multithreaded process reaches the thread Linux's
+/// `complete_signal` chooses: the scheduler chooses it from each thread's mask
+/// and wait, as on ptrace, and the backend's delivery permit follows the
+/// choice. Each mode of [`PROCESS_SIGNAL_TARGET_CASES`] must print Linux's
+/// line natively and on KVM at bitwise parity. Before S3b KVM printed
+/// `receiver=M interrupted=none` for `chld-creator` and `chld-worker` (the
+/// backend's own choice, M, outside its wait), and `receiver=none` for
+/// `chld-walk` and `posix-walk`, whose copy no thread took.
+#[test]
+fn run_kvm_a_kernel_sent_process_signal_reaches_the_thread_linux_chooses() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM process-signal-target cases: /dev/kvm is unavailable");
+        return;
+    }
+    for (mode, linux, _) in PROCESS_SIGNAL_TARGET_CASES {
+        assert_eq!(
+            native_process_signal_target(mode, linux),
+            linux,
+            "{mode}: natively"
+        );
+        assert_eq!(
+            process_signal_target_at_l2(&["--backend=kvm"], mode),
+            linux,
+            "{mode}: KVM"
+        );
+    }
+}
+
+/// The native and ptrace halves of
+/// `run_kvm_a_kernel_sent_process_signal_reaches_the_thread_linux_chooses`:
+/// each mode must print Linux's line natively, and on ptrace, at bitwise
+/// parity, Linux's line or, where a KNOWN DIVERGENCE is recorded, the line it
+/// records. A recorded divergence that has closed fails, so its record is
+/// dropped rather than left stale.
+#[test]
+fn a_kernel_sent_process_signal_reaches_the_thread_linux_chooses_natively_and_on_ptrace() {
+    for (mode, linux, divergence) in PROCESS_SIGNAL_TARGET_CASES {
+        assert_eq!(
+            native_process_signal_target(mode, linux),
+            linux,
+            "{mode}: natively"
+        );
+        let ptrace = process_signal_target_at_l2(&[], mode);
         match divergence {
             None => assert_eq!(ptrace, linux, "{mode}: ptrace"),
             Some(KnownDivergence { issue, line }) => {
