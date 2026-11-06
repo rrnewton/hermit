@@ -8801,12 +8801,21 @@ sys.exit(1 if failed else 0)
         // 10 + 1 for language-runtimes/go-os-exec-output@kvm: its verify
         // cells are enabled on ptrace and KVM but stay out of full until the
         // pinned validation root carries a Go toolchain.
-        assert_eq!(unreported.len(), 11, "{unreported:?}");
+        // 11 - 6 for the 2026-11-05 sweep flip (PR #5183): promoting the
+        // compat/logger, compat/pkg-config and
+        // language-runtimes/go-os-exec-output verify cells to required puts
+        // their ptrace side in full, so a full node reports their parity
+        // cells. That removes logger@dbt, logger@sabre, pkg-config@dbt,
+        // pkg-config@kvm, pkg-config@sabre and go-os-exec-output@kvm.
+        // The 5 left are the SaBRe-run-type-only rows above. The flip's
+        // other cells (replay ptrace, shred/sysctl-random-uuid/top@kvm)
+        // were already reported and add nothing here.
+        assert_eq!(unreported.len(), 5, "{unreported:?}");
         let sabre_only = unreported
             .iter()
             .filter(|cell| cell.starts_with("compat/") && cell.ends_with("@sabre"))
             .count();
-        assert_eq!(sabre_only, 7, "{unreported:?}");
+        assert_eq!(sabre_only, 5, "{unreported:?}");
     }
 
     #[test]

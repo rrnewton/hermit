@@ -20099,8 +20099,9 @@ mod nextest_timeout_tests {
                 // 2974 with package K slice K10's three KVM verify cells
                 // (c-programs/thread-self-procfs-handoff,
                 // c-programs/proc-fd-link-aliases and compat/ps). 2976 with R1108's
-                // c-programs/shared-file-threads on ptrace and KVM.
-                assert_eq!(all.len(), 2976, "the original all-owner population is retained");
+                // c-programs/shared-file-threads on ptrace and KVM. 2990 with the
+                // 2026-11-05 sweep flip's fourteen required cells (2976 + 14).
+                assert_eq!(all.len(), 2990, "the original all-owner population is retained");
             }
             let expected = all.iter().map(|cell| cell.id.clone()).collect::<BTreeSet<_>>();
             assert_eq!(expected.len(), all.len(), "duplicate all-owner cell identity");
