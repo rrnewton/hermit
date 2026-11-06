@@ -71,6 +71,7 @@ pub const POST_SPLIT_CORE_NODES: &[ExtensionNode] = &[
         tag: "check.gvisor_vendoring",
         labels: &["full", "hosted-portable", "portable"],
         deps: &[],
+        populations: &[],
     },
     ExtensionNode {
         tag: "e2e.manifest_gvisor",
