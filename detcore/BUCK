@@ -109,6 +109,10 @@ rust_library(
         "cargo_toml_dir": "tests/testutils/",
     },
     features = ["nightly"],
+    # The fbcode basic toolchain is nightly; Cargo builds detect the same
+    # channel in tests/testutils/build.rs. Without this cfg the capture
+    # clearing compiles out, as it does on stable Rust.
+    rustc_flags = ["--cfg=detcore_testutils_nightly"],
     deps = [
         "fbsource//third-party/rust:libc",
         "fbsource//third-party/rust:pretty_assertions",
