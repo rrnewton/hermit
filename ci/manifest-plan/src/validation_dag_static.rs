@@ -3307,7 +3307,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // backend_signal_waits_tests and suspend_decline_tests (17) and S4's
     // controlled child-exit parked_tests (5): 3534 + 62 = 3596. And S4's
     // parked-sleep unit (the revastra2 review of PR 5192, F1): 3597.
-    ("test.detcore_unit", 3597),
+    // And SIGSHARE S3a-1's reader units (three in
+    // scheduler::signal_state_reader_tests, one in
+    // syscalls::helpers::kernel_signal_wait_failures): 3597 + 4 = 3601.
+    ("test.detcore_unit", 3601),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5976,7 +5979,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR #4751: the same twelve units (same growth as test.detcore_unit): 3482.
     // And the same two replayed-switch wake units: 3492 + 2 = 3494.
     // The same 63 units: 3534 + 63 = 3597.
-    ("test.detcore_unit_on_host", 3597),
+    // And the same four SIGSHARE S3a-1 reader units: 3597 + 4 = 3601.
+    ("test.detcore_unit_on_host", 3601),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

@@ -145,7 +145,6 @@ use crate::syscalls::KernelSignalState;
 use crate::syscalls::pi_futex::PiFutexState;
 use crate::syscalls::pi_futex::PiHandOver;
 use crate::syscalls::read_kernel_signal_state;
-use crate::syscalls::thread_is_gone;
 use crate::types::ChildWaitExitClass;
 use crate::types::ChildWaitSelector;
 use crate::types::ChildWaitSpec;
@@ -10011,6 +10010,13 @@ impl Scheduler {
         tid: Option<DetTid>,
         field: &'static str,
     ) -> Option<u64> {
+        // Where Detcore reads signal state from the backend, the thread's own
+        // sets answer, or the leader's for a process-wide field, as
+        // `/proc/<pid>/status` shows the leader's (SIGSHARE S3a).
+        let thread = tid.unwrap_or_else(|| DetTid::from_raw(pid.as_raw()));
+        if let Some(read) = self.backend_signal_state(thread) {
+            return read.ok().and_then(|state| state.status_field(field));
+        }
         #[cfg(test)]
         {
             self.test_signal_masks.get(&(pid, tid, field)).copied()
@@ -11193,8 +11199,7 @@ impl Scheduler {
                 }
                 Ok(state) => format!("its state is {state}"),
                 Err(errno) => {
-                    let pid = reverie::Pid::from_raw(leader.as_raw());
-                    if thread_is_gone(pid, pid) {
+                    if self.guest_thread_is_gone(*leader, leader.as_raw(), leader.as_raw()) {
                         settled.push(*leader);
                         continue;
                     }
@@ -11291,10 +11296,7 @@ impl Scheduler {
                 Ok(blocked) => format!("its mask is {blocked:#x}"),
                 Err(errno) => {
                     let process = self.sigchld_process(*thread);
-                    if thread_is_gone(
-                        reverie::Pid::from_raw(process.as_raw()),
-                        reverie::Pid::from_raw(thread.as_raw()),
-                    ) {
+                    if self.guest_thread_is_gone(*thread, process.as_raw(), thread.as_raw()) {
                         entered.push(*thread);
                         continue;
                     }
@@ -14389,10 +14391,7 @@ impl Scheduler {
         let Some(thread) = self.process_signal_targets(process).into_iter().next() else {
             return answer;
         };
-        match crate::syscalls::read_kernel_signal_state(
-            reverie::Pid::from_raw(process.as_raw()),
-            reverie::Pid::from_raw(thread.as_raw()),
-        ) {
+        match self.guest_signal_state(thread, process.as_raw(), thread.as_raw()) {
             Ok(state) => GuestPidAnswer::Task {
                 task,
                 own_init_caught: Some(state.caught),
@@ -15676,10 +15675,7 @@ impl Scheduler {
                 ));
             }
             return Some(
-                match read_kernel_signal_state(
-                    reverie::Pid::from_raw(watch.pid),
-                    reverie::Pid::from_raw(watch.tid),
-                ) {
+                match self.guest_signal_state(dettid, watch.pid, watch.tid) {
                     Ok(state) => crate::wait_signal_end::deliverable(
                         &state,
                         mask,
@@ -15698,10 +15694,7 @@ impl Scheduler {
                 state.interrupting_wait(!watch.unblocked, watch.defers_default_stops) & !held,
             );
         }
-        match read_kernel_signal_state(
-            reverie::Pid::from_raw(watch.pid),
-            reverie::Pid::from_raw(watch.tid),
-        ) {
+        match self.guest_signal_state(dettid, watch.pid, watch.tid) {
             Ok(state) => {
                 Some(state.interrupting_wait(!watch.unblocked, watch.defers_default_stops) & !held)
             }
@@ -16317,8 +16310,9 @@ impl Scheduler {
     /// The signals pending in the shared queue of `thread`'s process
     /// (`ShdPnd`), or `None` when it cannot be read.
     fn read_shared_pending(&self, thread: DetTid) -> Option<u64> {
-        // Unit tests script the queue; they never read a host task's.
-        if cfg!(test) {
+        // Unit tests script the queue; they never read a host task's. A
+        // backend's answer (`guest_signal_state`) is no host task's either.
+        if cfg!(test) && !crate::syscalls::reads_signal_state_from_backend(&self.backend) {
             #[cfg(test)]
             return self
                 .test_kernel_signal_states
@@ -16326,12 +16320,9 @@ impl Scheduler {
                 .map(|state| state.shared_pending);
         }
         let process = self.sigchld_process(thread);
-        read_kernel_signal_state(
-            reverie::Pid::from_raw(process.as_raw()),
-            reverie::Pid::from_raw(thread.as_raw()),
-        )
-        .ok()
-        .map(|state| state.shared_pending)
+        self.guest_signal_state(thread, process.as_raw(), thread.as_raw())
+            .ok()
+            .map(|state| state.shared_pending)
     }
 
     /// `read_thread_blocked_mask`, keeping the error, which says nothing about
@@ -16358,11 +16349,8 @@ impl Scheduler {
             return Ok(state.blocked);
         }
         let process = self.sigchld_process(thread);
-        read_kernel_signal_state(
-            reverie::Pid::from_raw(process.as_raw()),
-            reverie::Pid::from_raw(thread.as_raw()),
-        )
-        .map(|state| state.blocked)
+        self.guest_signal_state(thread, process.as_raw(), thread.as_raw())
+            .map(|state| state.blocked)
     }
 
     /// Record an unambiguous cross-task signal that was physically queued while
@@ -16445,7 +16433,7 @@ impl Scheduler {
                 Some(watch) => (watch.pid, watch.tid),
                 None => (self.sigchld_process(dettid).as_raw(), dettid.as_raw()),
             };
-            read_kernel_signal_state(reverie::Pid::from_raw(pid), reverie::Pid::from_raw(tid)).ok()
+            self.guest_signal_state(dettid, pid, tid).ok()
         });
         let Some(state) = state else {
             return false;
@@ -20274,11 +20262,7 @@ impl Scheduler {
             self.test_kernel_signal_states.get(&tid).copied()
         };
         #[cfg(not(test))]
-        let state = read_kernel_signal_state(
-            reverie::Pid::from_raw(pid),
-            reverie::Pid::from_raw(host_tid),
-        )
-        .ok();
+        let state = self.guest_signal_state(tid, pid, host_tid).ok();
         let Some(state) = state else {
             return true;
         };
@@ -23671,6 +23655,7 @@ mod test {
     use crate::DetTime;
     use crate::resources::NANOSLEEP_FYI;
     use crate::resources::PAUSE_FYI;
+    use crate::syscalls::thread_is_gone;
     use crate::tool_local::RobustListExit;
     use crate::tool_local::RobustListWake;
     use crate::tool_local::ThreadState;
