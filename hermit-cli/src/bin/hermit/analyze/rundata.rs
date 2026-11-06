@@ -1871,6 +1871,52 @@ impl AnalyzeOpts {
         RunData::get_raw_runopts(self).ensure_timeout_supported()
     }
 
+    /// Refuses (exit 122) `--chaos-instruction-offset` in the run arguments,
+    /// and any of `recordings` (or a record the run arguments replay) whose
+    /// timeslices it delivered past their branch targets. The searches edit
+    /// preemption records and schedule traces row by row and replay them by
+    /// logical time and branch count, which cannot carry an instruction
+    /// offset, so their trials would not reproduce the run they started from.
+    pub fn refuse_instruction_offsets(&self, recordings: &[(&str, &Path)]) -> anyhow::Result<()> {
+        let trial = RunData::get_raw_runopts(self);
+        let config = &trial.det_opts.det_config;
+        let refuse = |what: String| {
+            Err(
+                anyhow::Error::new(crate::app::container::PolicyRefusal).context(format!(
+                    "`hermit analyze` and `hermit bisect` cannot search {what}: their edited \
+                     records do not carry --chaos-instruction-offset's instruction offsets, so \
+                     a trial would not reproduce the run. Search without the option, or replay \
+                     the record with `hermit run --replay-preemptions-from`."
+                )),
+            )
+        };
+        if config.chaos_instruction_offset > 0 {
+            return refuse("runs with --chaos-instruction-offset".to_owned());
+        }
+        let in_run_arguments = [
+            (
+                "--replay-schedule-from",
+                config.replay_schedule_from.as_deref(),
+            ),
+            (
+                "--replay-preemptions-from",
+                config.replay_preemptions_from.as_deref(),
+            ),
+        ];
+        for (option, path) in recordings.iter().copied().chain(
+            in_run_arguments
+                .into_iter()
+                .filter_map(|(option, path)| Some((option, path?))),
+        ) {
+            if detcore::preemptions::read_recorded_instruction_offsets(path)
+                .map_err(anyhow::Error::msg)?
+            {
+                return refuse(format!("{option} {}", path.display()));
+            }
+        }
+        Ok(())
+    }
+
     /// Refuses (exit 122) run arguments that a trial would accept and run
     /// without (`RunOpts::options_only_main_applies`), before any workspace,
     /// schedule read or trial exists. Accepting them would run every trial
@@ -1943,6 +1989,109 @@ mod tests {
     use clap::Parser;
 
     use super::*;
+
+    /// A prefix trial of a recording whose rows hold an instruction offset,
+    /// written by the real trial writer (`write_trial_record`) and read
+    /// back, keeps the recording's format 6 and its timing at every length:
+    /// with no event, with some and with all, with and without a jump of
+    /// global time at event zero, it lists its jumps (the one at event zero
+    /// included) and charges replayed switch-ins, as a schedule of that
+    /// format does. A prefix of no events is a complete, empty schedule, not
+    /// rows alone. Rows copied alone (`clone_preemptions_only`) are the
+    /// control: format 6 with format 1's timing.
+    #[test]
+    fn a_prefix_trial_of_offset_rows_keeps_its_timing_at_every_length() {
+        use detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT;
+        use detcore::preemptions::InstructionOffset;
+        use detcore::preemptions::PreemptionWriter;
+        use detcore::preemptions::TimeSkip;
+        use detcore::preemptions::TimeSkipReason;
+        use detcore::types::DetTid;
+        use detcore::types::LogicalTime;
+        use detcore::types::SchedEvent;
+
+        let tid = DetTid::from_raw(3);
+        let offset = InstructionOffset {
+            rcb_target: 18,
+            instructions: 4,
+        };
+        let jump = TimeSkip {
+            event: 0,
+            target: LogicalTime::from_nanos(5_000),
+            reason: TimeSkipReason::IdleGuestPollers,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("prefix.json");
+        for with_jump in [false, true] {
+            let mut writer = PreemptionWriter::new(None)
+                .with_format(Some(detcore::preemptions::PREEMPTION_RECORD_FORMAT_MAX));
+            writer.register_thread(tid, detcore::DEFAULT_PRIORITY);
+            writer.insert_reprioritization(
+                tid,
+                LogicalTime::from_nanos(10),
+                18,
+                detcore::DEFAULT_PRIORITY,
+                5,
+                Some(offset),
+            );
+            if with_jump {
+                writer.insert_time_skip(jump);
+            }
+            writer.insert_schedevent(SchedEvent::branches(tid, 20));
+            writer.insert_schedevent(SchedEvent::branches(tid, 3));
+            let source: PreemptionRecord = serde_json::from_str(&writer.into_string()).unwrap();
+            source.validate().unwrap();
+            assert_eq!(
+                source.format_version(),
+                Some(INSTRUCTION_OFFSET_ROWS_FORMAT)
+            );
+
+            let args =
+                crate::app::Args::try_parse_from(["hermit", "analyze", "--", "/bin/true"]).unwrap();
+            let crate::app::Subcommand::Analyze(mut options) = args.command else {
+                panic!("not analyze")
+            };
+            options.apply_global(&args.global);
+            options.time_skip_sources.lock().unwrap().remember(&source);
+            for len in [0, 1, source.schedevents().len()] {
+                let what = format!("prefix of {len} events, jump at event 0: {with_jump}");
+                options
+                    .write_trial_record(source.schedule_prefix(len), &output)
+                    .unwrap_or_else(|error| panic!("{what}: {error:#}"));
+                let written: PreemptionRecord =
+                    serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+                written.validate().unwrap();
+                assert_eq!(written.schedevents().len(), len, "{what}");
+                assert_eq!(
+                    written.format_version(),
+                    Some(INSTRUCTION_OFFSET_ROWS_FORMAT),
+                    "{what}"
+                );
+                assert_eq!(
+                    written.timing_format(),
+                    Some(INSTRUCTION_OFFSET_ROWS_FORMAT),
+                    "{what}"
+                );
+                assert!(written.lists_its_time_skips(), "{what}");
+                assert!(written.charges_replayed_switch_ins(), "{what}");
+                assert_eq!(
+                    written.time_skips(),
+                    with_jump.then_some(&[jump][..]),
+                    "{what}"
+                );
+            }
+            let rows = source.clone_preemptions_only();
+            assert_eq!(rows.format_version(), Some(INSTRUCTION_OFFSET_ROWS_FORMAT));
+            assert_eq!(
+                (
+                    rows.timing_format(),
+                    rows.lists_its_time_skips(),
+                    rows.charges_replayed_switch_ins()
+                ),
+                (None, false, false)
+            );
+        }
+    }
 
     /// The records analyze edited (minimization's and the baseline search's)
     /// replay with `--replay-edited-preemptions`, and so do the repro
@@ -2170,7 +2319,7 @@ mod tests {
         // A source of a format this Hermit does not read keeps it as a source,
         // so a trial from it states it too and is refused by name, not
         // lowered into a format this Hermit reads.
-        let newer = detcore::preemptions::PREEMPTION_RECORD_FORMAT + 1;
+        let newer = detcore::preemptions::PREEMPTION_RECORD_FORMAT_MAX + 1;
         *options.time_skip_sources.lock().unwrap() = Default::default();
         options.time_skip_sources.lock().unwrap().remember(
             &PreemptionRecord::from_sched_events(events.clone()).with_format(Some(newer)),

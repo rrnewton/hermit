@@ -541,15 +541,28 @@ impl Recording {
     }
 
     /// Whether the recording lists every jump of global time its run made
-    /// (`PreemptionRecord::lists_its_time_skips`).
+    /// (`PreemptionRecord::lists_its_time_skips`), by its timing format
+    /// ([`Self::timing_format`]).
     pub fn lists_its_time_skips(&self) -> bool {
-        self.metadata().lists_its_time_skips()
+        super::lists_time_skips_in(self.timing_format())
     }
 
     /// Whether a replay of this recording charges a replayed switch-in under
-    /// which guest code runs (`PreemptionRecord::charges_replayed_switch_ins`).
+    /// which guest code runs (`PreemptionRecord::charges_replayed_switch_ins`),
+    /// by its timing format ([`Self::timing_format`]).
     pub fn charges_replayed_switch_ins(&self) -> bool {
-        self.metadata().charges_replayed_switch_ins()
+        super::charges_replayed_switch_ins_in(self.timing_format())
+    }
+
+    /// The format whose timing rules the recording follows
+    /// (`PreemptionRecord::timing_format`). A slice-boundary recording keeps
+    /// its schedule trace in its boundary stream, not in its rows' record, so
+    /// it follows its stated format whatever that record says of its rows.
+    pub fn timing_format(&self) -> Option<u32> {
+        match self {
+            Self::Legacy(record) => record.timing_format(),
+            Self::Boundaries(record) => record.preemptions.format_version(),
+        }
     }
 
     /// The recording's format (`PreemptionRecord::format_version`).
@@ -1091,7 +1104,7 @@ mod tests {
     fn a_boundary_recording_with_background_starts_is_refused_by_name() {
         use crate::preemptions::BACKGROUND_STARTS_FORMAT;
         use crate::preemptions::BackgroundStart;
-        use crate::preemptions::PREEMPTION_RECORD_FORMAT;
+        use crate::preemptions::PREEMPTION_RECORD_FORMAT_MAX;
         use crate::preemptions::format_without_background_starts;
         let Recording::Boundaries(valid) = sample(true) else {
             unreachable!()
@@ -1134,7 +1147,11 @@ mod tests {
             );
         }
         let boundary_format = |writer: PreemptionWriter| writer.inner.format_version;
-        for format in [BACKGROUND_STARTS_FORMAT, PREEMPTION_RECORD_FORMAT + 1, 0] {
+        for format in [
+            BACKGROUND_STARTS_FORMAT,
+            PREEMPTION_RECORD_FORMAT_MAX + 1,
+            0,
+        ] {
             let expected = format_without_background_starts(Some(format));
             let before = PreemptionWriter::new(None)
                 .with_format(Some(format))
@@ -1153,7 +1170,7 @@ mod tests {
             .noting_background_starts();
         assert_eq!(
             boundary_format(noting),
-            format_without_background_starts(Some(PREEMPTION_RECORD_FORMAT))
+            format_without_background_starts(Some(PREEMPTION_RECORD_FORMAT_MAX))
         );
         let mut noted = PreemptionWriter::new(None).noting_background_starts();
         noted.insert_background_start(DetTid::from_raw(3), 1);
