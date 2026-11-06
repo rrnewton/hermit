@@ -2001,7 +2001,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the five concurrent-probe xstate_probe tests (dh-jqhfx, PR 5182;
     // xstate_probe tests in mod.rs 11 -> 16): 1268 + 5 = 1273, composed as
     // main + (head - base).
-    ("test.hermit_unit", 1273),
+    // And SIGSHARE S3a-2's
+    // app::run::stacktrace_signal_is_refused_where_guest_threads_are_not_host_tasks
+    // (https://github.com/rrnewton/hermit/issues/4950): 1273 + 1 = 1274.
+    ("test.hermit_unit", 1274),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3310,7 +3313,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And SIGSHARE S3a-1's reader units (three in
     // scheduler::signal_state_reader_tests, one in
     // syscalls::helpers::kernel_signal_wait_failures): 3597 + 4 = 3601.
-    ("test.detcore_unit", 3601),
+    // And S3a-2's send-latch unit
+    // (syscalls::threads::tests::a_latched_refusal_refuses_every_host_signal_send):
+    // 3601 + 1 = 3602.
+    ("test.detcore_unit", 3602),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5980,7 +5986,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two replayed-switch wake units: 3492 + 2 = 3494.
     // The same 63 units: 3534 + 63 = 3597.
     // And the same four SIGSHARE S3a-1 reader units: 3597 + 4 = 3601.
-    ("test.detcore_unit_on_host", 3601),
+    // And the same S3a-2 send-latch unit: 3601 + 1 = 3602.
+    ("test.detcore_unit_on_host", 3602),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -6406,7 +6413,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // bisection-checkpoint, workspace-source and guest-log units): +8.
     // And the same five concurrent-probe xstate_probe tests as
     // test.hermit_unit (dh-jqhfx, PR 5182): 1262 + 5 = 1267.
-    ("test.hermit_unit_on_host", 1267),
+    // And the same SIGSHARE S3a-2 --stacktrace-signal unit: 1267 + 1 = 1268.
+    ("test.hermit_unit_on_host", 1268),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
