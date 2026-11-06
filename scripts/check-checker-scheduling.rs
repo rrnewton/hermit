@@ -96,6 +96,26 @@ const ALLOWLIST: &[(&str, &str)] = &[
          product failure in a lint node. Waived rather than scheduled for that \
          reason, not because nothing should run it.",
     ),
+    (
+        "ci/run-with-reverie-dbt-budget-test.sh",
+        "DBT budget self-test imported with the facebookexperimental ancestry. It \
+         fails by design on the core tree: the recorded Reverie pin is 1ed8f151, \
+         while ci/run-with-reverie-dbt-budget.sh is calibrated for 3df91c9c, so \
+         every wrapped command declines with exit 75 (nine checks failed when run \
+         by hand on 2026-11-06). Recalibrating that pin is a DBT change, which the \
+         owner holds until the third-party cutover; schedule it only with that \
+         cutover.",
+    ),
+    (
+        "scripts/check-dbt-runtime-abi.rs",
+        "DBT runtime-ABI checker imported with the facebookexperimental ancestry. \
+         It needs the built DBT client at \
+         target/install_pkg/rsrcs/libreverie_dbt_client.so and exits 2 (cannot \
+         determine) when that artifact is absent. Core does not build or carry the \
+         DBT client before the third-party cutover, so scheduling it in \
+         lint-checks would make a missing upstream artifact read as a tree \
+         failure. Schedule it with that cutover.",
+    ),
 ];
 
 /// Is this tracked path a checker entrypoint?
