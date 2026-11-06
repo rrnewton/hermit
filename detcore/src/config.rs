@@ -322,7 +322,7 @@ mod tests {
         // 25 on its own base after main's 24, assigned 47 at its rebase
         // onto 46, skipping 33 to 39 reserved for pending changes; digest
         // measured at this head).
-        (47, "0000000000000000", "f013e36743d8d9e6"),
+        (47, "dc130f48394e5528", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
