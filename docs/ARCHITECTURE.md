@@ -137,6 +137,18 @@ exceptions above, until the owner decides:
   no choice reaches it, and the wait runs to the child's exit where Linux ends
   it with `EINTR`; that pre-existing KVM gap is
   https://github.com/rrnewton/hermit/issues/4985.
+  Not part of D1 either, and pre-existing: KVM steers a timer's
+  process-directed signal only when it is SIGALRM. A `timer_create`
+  SIGEV_SIGNAL timer whose signal is another one goes to whichever poller's
+  turn comes next after the expiry, not to the thread Linux's
+  `complete_signal` chooses, so neither a thread waiting for it in
+  `rt_sigtimedwait`, nor the walk from `curr_target`, nor a busy thread is
+  honoured for it. tests/c/process_signal_target.c's `posix-sigwait` pins it
+  as a KNOWN DIVERGENCE in
+  `run_kvm_a_kernel_sent_process_signal_reaches_the_thread_linux_chooses`;
+  the generalisation of the SIGALRM receiver choice to every timer signal is
+  dh-ly7rb
+  (https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-ly7rb.md).
   `run_kvm_a_futex_waiting_main_thread_is_passed_over_until_n8a` pins the
   pass-over and `run_kvm_a_fatal_alarm_that_d1_passes_over_is_refused_by_name`
   the refusal; `kvm_alarm_reaches_a_futex_waiting_main_thread_after_n8a`,
