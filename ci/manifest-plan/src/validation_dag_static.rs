@@ -3364,9 +3364,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And exec_teardown_tests
     // a_transferred_exec_gives_the_leader_the_survivors_own_cpu_time and
     // a_pre_exec_cpu_publication_after_a_transferred_exec_is_dropped: 3665.
-    // And SIGSHARE S2b's scheduler::backend_signal_waits_tests (13 rows):
-    // 3665 + 13 = 3678, listed.
-    ("test.detcore_unit", 3678),
+    // And SIGSHARE S2b's scheduler::backend_signal_waits_tests (14 rows) and
+    // syscalls::signal::suspend_decline_tests (1): 3665 + 15 = 3680, listed.
+    ("test.detcore_unit", 3680),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -6088,8 +6088,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR #4764: the same three detcore untrap units: 3653 + 3 = 3656.
     // merge-queue recount after #5219: 3659.
     // The same six 2b-1 units: 3659 + 6 = 3665.
-    // And the same thirteen SIGSHARE S2b units: 3665 + 13 = 3678, listed.
-    ("test.detcore_unit_on_host", 3678),
+    // And the same fifteen SIGSHARE S2b units: 3665 + 15 = 3680, listed.
+    ("test.detcore_unit_on_host", 3680),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

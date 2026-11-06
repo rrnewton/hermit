@@ -6297,6 +6297,11 @@ impl GlobalState {
                     .await
                     .signal_target_process(named),
             ),
+            GlobalRequest::SuspendHoldsDiscarded(process, signal) => R::SuspendHoldsDiscarded(
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .suspend_holds_discarded(process, signal),
+            ),
             GlobalRequest::CpuClockProcess(named) => R::CpuClockProcess(
                 self.lock_rpc_scheduler(false)
                     .await
@@ -8310,14 +8315,17 @@ pub enum SignalScope {
 /// landed 46). 48 adds `WithCpuTime` and `RecordExitCode` (package K item
 /// 2b slice 2b-1, allocated 39, renumbered 41 at its rebase onto 40, 42 at
 /// its rebase onto 41, 46 at its rebase onto 45, then mechanically to 48
-/// at its rebase onto 47) and is the current revision.
+/// at its rebase onto 47).
 /// From https://github.com/rrnewton/hermit/pull/5222, merged at landing by the merge queue (its
 /// revision 48 is 49):
 /// `Rewrite::unmarked` to the `StoreExclusive` payload (numbered 42 at
 /// this change's rebase onto main's 41, renumbered to 47, the next
 /// revision after the landed 46). 48 adds `Rewrite::not_written` to the
-/// `StoreExclusive` payload and is current.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 49;
+/// `StoreExclusive` payload.
+/// The next revision, 50, appends `SuspendHoldsDiscarded` (SIGSHARE S2b;
+/// 48 on its old base, renumbered mechanically to 49 at its rebase onto 48
+/// and to 50 at its rebase onto 49) and is the current revision.
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 50;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
@@ -9316,8 +9324,13 @@ pub enum GlobalRequest {
     /// part of the global state sees it. Appended last.
     WithCpuTime(Box<CpuPublication>, Box<GlobalRequest>),
     /// Record `.1` as the exit code of process `.0`, in wait(2) encoding, in
-    /// the turn that ends it (`Scheduler::record_exit_code`). Appended last.
+    /// the turn that ends it (`Scheduler::record_exit_code`).
     RecordExitCode(DetPid, i32),
+    /// Whether a parked `rt_sigsuspend` of the process still holds the signal
+    /// pending although Linux discarded it when it was sent
+    /// (`Scheduler::suspend_holds_discarded`), asked by a call that would stop
+    /// ignoring it (SIGSHARE S2b). Appended last.
+    SuspendHoldsDiscarded(DetPid, i32),
 }
 
 /// What a guest thread publishes of its CPU accounting with a request
@@ -9742,8 +9755,10 @@ pub enum GlobalResponse {
     /// Whether the scheduler took the offset (it takes nothing from a thread
     /// it does not know, one killed, or a retired incarnation).
     PublishInstructionOffset(bool),
-    /// The answer to `GlobalRequest::RecordExitCode`. Appended last.
+    /// The answer to `GlobalRequest::RecordExitCode`.
     RecordExitCode(()),
+    /// The answer to `GlobalRequest::SuspendHoldsDiscarded`. Appended last.
+    SuspendHoldsDiscarded(bool),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -14138,6 +14153,26 @@ where
     let response = send_and_update_time(guest, GlobalRequest::CpuClockProcess(named)).await;
     match response.1 {
         GlobalResponse::CpuClockProcess(process) => process,
+        _ => unreachable!(),
+    }
+}
+
+/// Whether a parked `rt_sigsuspend` of `process` still holds `signal` pending
+/// although Linux discarded it when it was sent
+/// (`Scheduler::suspend_holds_discarded`).
+pub(crate) async fn suspend_holds_discarded<G, T>(
+    guest: &mut G,
+    process: DetPid,
+    signal: i32,
+) -> bool
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response =
+        send_and_update_time(guest, GlobalRequest::SuspendHoldsDiscarded(process, signal)).await;
+    match response.1 {
+        GlobalResponse::SuspendHoldsDiscarded(holds) => holds,
         _ => unreachable!(),
     }
 }
