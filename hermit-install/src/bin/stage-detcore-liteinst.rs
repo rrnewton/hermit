@@ -25,6 +25,25 @@ fn close<T>(result: proof::Result<T>, closing: proof::Result<()>) -> proof::Resu
     }
 }
 
+/// Whether an existing receipt already qualifies the installed bytes for
+/// exactly these compiled sources. The receipt is per-run provenance
+/// (evidence paths, elapsed times, build environment), so restaging
+/// rewrites it even when the qualified runtime is unchanged; reusing a
+/// qualifying receipt keeps one staging run's bytes stable for any later
+/// consumer that snapshots the install tree.
+fn receipt_reusable(
+    record: &serde_json::Value,
+    installed_sha256: &str,
+    compiled_sources: &serde_json::Value,
+    compiled_qualifier_sha256: &str,
+) -> bool {
+    record["qualification"]["artifact"]["sha256"].as_str() == Some(installed_sha256)
+        && record["installed"]["sha256"].as_str() == Some(installed_sha256)
+        && &record["compiled_sources"] == compiled_sources
+        && record["compiled_qualifier_sha256"].as_str() == Some(compiled_qualifier_sha256)
+        && record["source_close_completed"].as_bool() == Some(true)
+}
+
 fn run() -> proof::Result<()> {
     let mut args = std::env::args().skip(1);
     let authority = args.next().ok_or("expected --git or --source-copy")?;
@@ -47,14 +66,18 @@ fn run() -> proof::Result<()> {
     )?;
     let installed = resources.join("libdetcore_liteinst.so");
     let receipt = resources.join("libdetcore_liteinst.package.json");
-    // A failed finalization must not advertise a previous successful preload.
-    for file in [&installed, &receipt] {
-        match fs::remove_file(file) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.to_string()),
+    // A failed finalization must not advertise a previous successful preload:
+    // every non-reuse path below deletes both files before it can fail.
+    let remove_staged = |installed: &Path, receipt: &Path| -> proof::Result<()> {
+        for file in [installed, receipt] {
+            match fs::remove_file(file) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.to_string()),
+            }
         }
-    }
+        Ok(())
+    };
     let serial = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| e.to_string())?
@@ -79,10 +102,45 @@ fn run() -> proof::Result<()> {
     };
     // Explicit authority; a failed Git resolution never downgrades to content.
     let sources = if authority == "--git" {
-        proof::VerifiedCompiledSources::resolve(&expectation, &mut runner)?
+        proof::VerifiedCompiledSources::resolve(&expectation, &mut runner)
     } else {
-        proof::VerifiedCompiledSources::resolve_content(&expectation, &mut runner)?
+        proof::VerifiedCompiledSources::resolve_content(&expectation, &mut runner)
     };
+    let sources = match sources {
+        Ok(sources) => sources,
+        Err(error) => {
+            let _ = remove_staged(&installed, &receipt);
+            return Err(error);
+        }
+    };
+    // Reuse a receipt that already qualifies these exact sources and bytes:
+    // restaging would rebuild the same runtime and rewrite only per-run
+    // provenance. Anything less than an exact match falls through to the
+    // full restage below, which deletes the old pair first.
+    let reusable = (|| -> proof::Result<bool> {
+        let record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&receipt).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+        let installed_identity = proof::FileIdentity::read(&installed)?;
+        let compiled_sources = serde_json::to_value(sources.record()).map_err(|e| e.to_string())?;
+        if !receipt_reusable(
+            &record,
+            &installed_identity.sha256,
+            &compiled_sources,
+            &proof::qualifier_source_sha256(),
+        ) {
+            return Ok(false);
+        }
+        installed_identity.verify()?;
+        sources.verify_unchanged(&mut runner)?;
+        Ok(true)
+    })()
+    .unwrap_or(false);
+    if reusable {
+        println!("qualified packaged Detcore: {}", installed.display());
+        return Ok(());
+    }
+    remove_staged(&installed, &receipt)?;
     let pending = resources.join(format!(".libdetcore_liteinst.so.{serial}"));
     let result = (|| {
         let profile_inputs = proof::FileIdentity::read(&manifest)?;
@@ -255,6 +313,28 @@ fn main() -> std::process::ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn receipt_reuse_requires_exact_sources_and_bytes() {
+        let sources = json!({"layout": "HermitGit"});
+        let record = json!({"qualification": {"artifact": {"sha256": "abc"}},
+            "installed": {"sha256": "abc"}, "compiled_sources": sources,
+            "compiled_qualifier_sha256": "q", "source_close_completed": true});
+        assert!(receipt_reusable(&record, "abc", &sources, "q"));
+        // Any single mismatch disqualifies reuse and forces a restage.
+        assert!(!receipt_reusable(&record, "other", &sources, "q"));
+        assert!(!receipt_reusable(
+            &record,
+            "abc",
+            &json!({"layout": "Other"}),
+            "q"
+        ));
+        assert!(!receipt_reusable(&record, "abc", &sources, "other"));
+        let mut open = record.clone();
+        open["source_close_completed"] = json!(false);
+        assert!(!receipt_reusable(&open, "abc", &sources, "q"));
+        assert!(!receipt_reusable(&json!({}), "abc", &sources, "q"));
+    }
+
     #[test]
     fn source_close_preserves_both_failures_and_never_publishes_success() {
         assert_eq!(
