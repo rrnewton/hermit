@@ -6923,6 +6923,8 @@ impl StaticStepSpec {
             fail_fast_family: PMU_MEMORY_FAILURE_FAMILY_MEMBERS
                 .contains(&tag.as_str())
                 .then(|| PMU_MEMORY_FAILURE_FAMILY.into()),
+            publishes: Vec::new(),
+            artifact_deps: Vec::new(),
         }
     }
 }
