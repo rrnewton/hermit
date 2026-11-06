@@ -193,6 +193,7 @@ static PAUSE_SIGCHLD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGCHLD_BUSY_SIBLING_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGKILL_ROBUST_PSHARED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static GUEST_SIGCHLD_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static PROCESS_SIGNAL_TARGET_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static GUEST_DISCARD_AT_SEND_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static POLL_RECHECK_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static POLL_RECHECK_PARTIAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -26208,6 +26209,7 @@ fn run_kvm_a_paused_leader_takes_its_own_signal_as_linux_wakes_it() {
 
 /// A line a backend prints where Linux prints another, recorded with the
 /// issue that tracks the difference.
+#[derive(Clone, Copy)]
 struct KnownDivergence {
     issue: &'static str,
     line: &'static str,
@@ -26296,6 +26298,376 @@ fn an_ignored_posix_timer_signal_moves_no_receiver_walk_natively_and_on_ptrace()
                 );
             }
         }
+    }
+}
+
+/// How one backend's run of a mode of tests/c/process_signal_target.c is
+/// judged (`judge_process_signal_target`).
+#[derive(Clone, Copy)]
+enum TargetExpectation {
+    /// Linux's line, as evidence that the backend gives the copy to the thread
+    /// Linux's `complete_signal` chooses.
+    Linux,
+    /// A KNOWN DIVERGENCE: the line it records, until it closes.
+    Diverges(KnownDivergence),
+}
+
+use TargetExpectation::Diverges;
+use TargetExpectation::Linux;
+
+/// A mode of tests/c/process_signal_target.c, the line Linux prints for it,
+/// and how ptrace's and KVM's runs are judged.
+struct ProcessSignalTargetCase {
+    mode: &'static str,
+    linux: &'static str,
+    ptrace: TargetExpectation,
+    kvm: TargetExpectation,
+}
+
+const fn target_case(
+    mode: &'static str,
+    linux: &'static str,
+    ptrace: TargetExpectation,
+    kvm: TargetExpectation,
+) -> ProcessSignalTargetCase {
+    ProcessSignalTargetCase {
+        mode,
+        linux,
+        ptrace,
+        kvm,
+    }
+}
+
+/// ptrace's KNOWN DIVERGENCE of the #4991 class
+/// (`PROCESS_SIGNAL_TARGET_CASES`).
+const PTRACE_POLLER_PASSED_OVER: TargetExpectation = Diverges(KnownDivergence {
+    issue: "https://github.com/rrnewton/hermit/issues/4991",
+    line: "receiver=W1 interrupted=W1\n",
+});
+
+/// tests/c/process_signal_target.c's modes and the line Linux prints for each:
+/// every boundary the line depends on is reached causally and required (the
+/// guest ends unconfirmed, with no line, past a bound), so each mode has one
+/// native outcome (200 of 200 runs each, and 50 of 50 with four spinners on
+/// its two CPUs, 2026-11-06), and the native half of each test runs it once. Each mode is a process-directed signal the kernel itself
+/// generates for a three-thread process (main thread M, workers W1 and W2): a
+/// child's exit `SIGCHLD`, an ITIMER_REAL expiry or a POSIX timer's
+/// `SIGEV_SIGNAL` (SIGUSR1). Linux's `complete_signal` gives it to the thread
+/// it names (the child's parent thread, or the leader for a timer) if that
+/// thread wants it, and otherwise to the first that does, walking from the
+/// process's `curr_target` and leaving `curr_target` there; with none, the
+/// signal waits for a thread to unblock it. A thread waiting in
+/// `sigtimedwait` for it wants it whatever its mask, and one with another
+/// signal pending that is not running does not; a signal Linux discarded as
+/// it was sent is not pending. A standard signal already pending reaches no
+/// `complete_signal` and moves no `curr_target`. The `*-curr-target` modes are
+/// revastra2's curr-target-child witness and its timer twins, the `*-sigwait`
+/// modes its sigwait-child-creator witness and twins, the `*-busy` modes
+/// musereviewa's busy-thread case, `coalesced-child-curr` and
+/// `ignored-busy` revastra2's witnesses of the review round's fixes, and
+/// `suppressed-child-curr` its witness of the second round's, with
+/// `default-child-curr` its positive control from the third round's: a
+/// default-ignored `SIGCHLD` a blocked creator leaves queued still moves
+/// `curr_target`, though its receiver discards it (the reviews of SIGSHARE
+/// S3b; KVM ended final=W2 at b198041ece8). `coalesced-child-curr` holds on ptrace only while no thread
+/// of the process has waited outside the schedule with SIGCHLD unblocked: an
+/// earlier such wait (an `rt_sigsuspend`) turns ptrace's send window off, and
+/// the merge is then not seen, before S3b as after it (dh-yvwnk,
+/// https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-yvwnk.md).
+///
+/// ptrace's KNOWN DIVERGENCES are the scheduler's process-directed sends that
+/// it leaves to the host kernel, which finds every guest thread stopped: in
+/// `chld-creator` and `alrm-leader` the copy is taken by W1, which a drain
+/// resumes before M, polling (its poll blocks every signal in place, so the
+/// choice passes it over), takes it
+/// (https://github.com/rrnewton/hermit/issues/4991's class).
+/// `alrm-ignored-unblocked` holds W2 in a vfork wait, so that the guest sees
+/// the ignored expiry generated, and W2 takes and discards it on its return
+/// from the wait, as Linux does; the #5014 class, a queued ignored expiry
+/// that a thread takes once a handler is installed, stays pinned by
+/// tests/c/alarm_receiver_reach.c's `ignmoveblocked`. ptrace's
+/// `suppressed-child-curr` differs too: the traced parent keeps the
+/// scheduler's `SIGCHLD` for an explicitly ignored child queued (pending=1),
+/// which Linux never sends, and W1 takes it once a handler is installed; it
+/// printed the same at b198041ece8 (dh-90p9w,
+/// https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-90p9w.md).
+///
+/// KVM's KNOWN DIVERGENCES are its POSIX-timer modes but `posix-sigwait`: KVM
+/// steers a timer's process-directed signal only when it is SIGALRM
+/// (https://github.com/rrnewton/hermit/issues/4929), and a `timer_create`
+/// `SIGEV_SIGNAL` timer whose signal is another one (SIGUSR1 here) is
+/// published to the process with no receiver chosen, so no handler runs for
+/// it where Linux's walk or busy rule picks a thread. Each diverged at
+/// b198041ece8, before SIGSHARE S3b, too: `posix-walk` and `posix-busy` with
+/// the same line, and `posix-curr-target` at its setup (no thread took the
+/// steering `SIGCHLD`), which S3b's child-exit choice now completes. The
+/// generalisation to every timer signal is dh-ly7rb, and each record flips
+/// once it lands. `posix-sigwait`, where M waits for the signal, prints
+/// Linux's line on KVM, as it did at b198041ece8. In `chld-busy` KVM gives the
+/// child's `SIGCHLD` to W2, as Linux does, but its backend also queues a
+/// `SIGCHLD` for W1's vfork child, whose exit signal is 0 and for which Linux
+/// sends nothing (https://github.com/rrnewton/reverie/issues/1300), and W1 takes it once released; busy=
+/// names it. Before SIGSHARE S3b that copy merged into the child's, which no
+/// thread had taken, and was not seen.
+const PROCESS_SIGNAL_TARGET_CASES: [ProcessSignalTargetCase; 23] = [
+    target_case(
+        "chld-creator",
+        "receiver=M interrupted=M\n",
+        PTRACE_POLLER_PASSED_OVER,
+        Linux,
+    ),
+    target_case("chld-walk", "receiver=W2 interrupted=W2\n", Linux, Linux),
+    target_case("chld-worker", "receiver=W1 interrupted=W1\n", Linux, Linux),
+    target_case("chld-queued", "pending=1 receiver=W2\n", Linux, Linux),
+    target_case(
+        "alrm-leader",
+        "receiver=M interrupted=M\n",
+        PTRACE_POLLER_PASSED_OVER,
+        Linux,
+    ),
+    target_case("alrm-walk", "receiver=W2 interrupted=W2\n", Linux, Linux),
+    target_case("alrm-queued", "pending=1 receiver=W1\n", Linux, Linux),
+    target_case(
+        "posix-walk",
+        "receiver=W2 interrupted=W2\n",
+        Linux,
+        kvm_unsteered_timer_signal("receiver=none interrupted=none\n"),
+    ),
+    target_case(
+        "alrm-ignored-blocked",
+        "pending=1 receiver=W2\n",
+        Linux,
+        Linux,
+    ),
+    target_case(
+        "alrm-ignored-unblocked",
+        "generated=1 pending=0 receiver=none\n",
+        Linux,
+        Linux,
+    ),
+    target_case(
+        "chld-curr-target",
+        "receiver=W2 interrupted=W2\n",
+        Linux,
+        Linux,
+    ),
+    target_case(
+        "alrm-curr-target",
+        "receiver=W2 interrupted=W2\n",
+        Linux,
+        Linux,
+    ),
+    target_case(
+        "posix-curr-target",
+        "receiver=W2 interrupted=W2\n",
+        Linux,
+        kvm_unsteered_timer_signal("receiver=none interrupted=none\n"),
+    ),
+    target_case(
+        "chld-sigwait",
+        "waited=1 receiver=none interrupted=none\n",
+        Linux,
+        Linux,
+    ),
+    target_case(
+        "alrm-sigwait",
+        "waited=1 receiver=none interrupted=none\n",
+        Linux,
+        Linux,
+    ),
+    target_case(
+        "posix-sigwait",
+        "waited=1 receiver=none interrupted=none\n",
+        Linux,
+        Linux,
+    ),
+    target_case(
+        "chld-busy",
+        "receiver=W2 interrupted=W2 busy=W1\n",
+        Linux,
+        Diverges(KnownDivergence {
+            issue: "https://github.com/rrnewton/reverie/issues/1300",
+            line: "receiver=W2 interrupted=W2 busy=W1+W1\n",
+        }),
+    ),
+    target_case(
+        "alrm-busy",
+        "receiver=W2 interrupted=W2 busy=W1\n",
+        Linux,
+        Linux,
+    ),
+    target_case(
+        "posix-busy",
+        "receiver=W2 interrupted=W2 busy=W1\n",
+        Linux,
+        kvm_unsteered_timer_signal("receiver=none interrupted=none busy=W1+W1\n"),
+    ),
+    target_case(
+        "coalesced-child-curr",
+        "steer=W2 chld=W1 final=W2\n",
+        Linux,
+        Linux,
+    ),
+    target_case(
+        "ignored-busy",
+        "receiver=none interrupted=none busy=W1\n",
+        Linux,
+        Linux,
+    ),
+    target_case(
+        "suppressed-child-curr",
+        "steer=W2 pending=0 final=W2\n",
+        Diverges(KnownDivergence {
+            issue: "https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-90p9w.md",
+            line: "steer=W2 pending=1 final=W1\n",
+        }),
+        Linux,
+    ),
+    target_case(
+        "default-child-curr",
+        "steer=W2 pending=0 final=W1\n",
+        Linux,
+        Linux,
+    ),
+];
+
+/// KVM's KNOWN DIVERGENCE for a POSIX timer whose signal is not SIGALRM
+/// (dh-ly7rb; `PROCESS_SIGNAL_TARGET_CASES`): `line`.
+const fn kvm_unsteered_timer_signal(line: &'static str) -> TargetExpectation {
+    Diverges(KnownDivergence {
+        issue: "https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-ly7rb.md",
+        line,
+    })
+}
+
+fn process_signal_target_guest() -> &'static Path {
+    PROCESS_SIGNAL_TARGET_GUEST.get_or_init(|| compile_c_guest("process_signal_target"))
+}
+
+/// What tests/c/process_signal_target.c prints for `mode`, run natively once.
+fn native_process_signal_target(mode: &str) -> String {
+    let output = Command::new(process_signal_target_guest())
+        .arg(mode)
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run the process-signal-target guest natively");
+    assert!(output.status.success(), "{mode}: natively: {output:?}");
+    String::from_utf8(output.stdout).expect("guest stdout should be UTF-8")
+}
+
+/// `mode` of tests/c/process_signal_target.c under `backend` (empty for
+/// ptrace) at L2: `--strict --verify --verify-strict`, bitwise parity over
+/// nonzero INFO counts. Returns its stdout.
+fn process_signal_target_at_l2(backend: &[&str], mode: &str) -> String {
+    let _guard = hermit_run_guard();
+    let guest = process_signal_target_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let report = directory.path().join("verify.json");
+    let report_arg = report.to_str().expect("report path should be UTF-8");
+    let mut args: Vec<&str> = backend.to_vec();
+    args.extend([
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        report_arg,
+        "--",
+        guest,
+        mode,
+    ]);
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    let verdict: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).expect("strict verification wrote no verdict"))
+            .expect("strict verification verdict is valid JSON");
+    assert_eq!(verdict["bitwise_parity"], true, "{mode}: {verdict}");
+    for side in ["left", "right"] {
+        assert!(
+            verdict["compared_log_messages"][side].as_u64().unwrap_or(0) > 0,
+            "{mode}: no INFO messages compared: {verdict}"
+        );
+    }
+    stdout(&output)
+}
+
+/// Judge what `backend` printed for `mode` against `expectation`, where
+/// Linux prints `linux`. A recorded divergence that has closed fails, so its
+/// record is dropped rather than left stale.
+fn judge_process_signal_target(
+    backend: &str,
+    mode: &str,
+    linux: &str,
+    expectation: TargetExpectation,
+    printed: &str,
+) {
+    match expectation {
+        Linux => assert_eq!(printed, linux, "{mode}: {backend}"),
+        Diverges(KnownDivergence { issue, line }) => {
+            eprintln!(
+                "{mode}: KNOWN DIVERGENCE on {backend} ({issue}): it prints {line:?} where Linux prints {linux:?}"
+            );
+            assert_ne!(
+                printed, linux,
+                "{mode}: the KNOWN DIVERGENCE {issue} has closed: {backend} prints Linux's line; drop its record and require Linux's line"
+            );
+            assert_eq!(
+                printed, line,
+                "{mode}: {backend} prints neither Linux's line nor the line the KNOWN DIVERGENCE {issue} records"
+            );
+        }
+    }
+}
+
+/// SIGSHARE S3b: on KVM the scheduler models signal targets
+/// (`kernel_signal_targets_are_predictable`), so a process-directed signal the
+/// kernel generates for a multithreaded process reaches the thread Linux's
+/// `complete_signal` chooses, where the scheduler steers it: a child's exit
+/// `SIGCHLD`, and a timer whose signal is SIGALRM. The scheduler chooses the
+/// thread from each thread's mask, wait and pending signals, as on ptrace,
+/// and the backend's delivery permit follows the choice. Each mode of
+/// [`PROCESS_SIGNAL_TARGET_CASES`] must print Linux's line natively, and on
+/// KVM at bitwise parity as its KVM expectation says. Before S3b KVM printed
+/// `receiver=M interrupted=none` for `chld-creator` and `chld-worker` (the
+/// backend's own choice, M, outside its wait), and `receiver=none` for
+/// `chld-walk` and `posix-walk`, whose copy no thread took.
+#[test]
+fn run_kvm_a_kernel_sent_process_signal_reaches_the_thread_linux_chooses() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM process-signal-target cases: /dev/kvm is unavailable");
+        return;
+    }
+    for case in PROCESS_SIGNAL_TARGET_CASES {
+        assert_eq!(
+            native_process_signal_target(case.mode),
+            case.linux,
+            "{}: natively",
+            case.mode
+        );
+        let kvm = process_signal_target_at_l2(&["--backend=kvm"], case.mode);
+        judge_process_signal_target("KVM", case.mode, case.linux, case.kvm, &kvm);
+    }
+}
+
+/// The native and ptrace halves of
+/// `run_kvm_a_kernel_sent_process_signal_reaches_the_thread_linux_chooses`:
+/// each mode must print Linux's line natively, and on ptrace, at bitwise
+/// parity, as its ptrace expectation says.
+#[test]
+fn a_kernel_sent_process_signal_reaches_the_thread_linux_chooses_natively_and_on_ptrace() {
+    for case in PROCESS_SIGNAL_TARGET_CASES {
+        assert_eq!(
+            native_process_signal_target(case.mode),
+            case.linux,
+            "{}: natively",
+            case.mode
+        );
+        let ptrace = process_signal_target_at_l2(&[], case.mode);
+        judge_process_signal_target("ptrace", case.mode, case.linux, case.ptrace, &ptrace);
     }
 }
 

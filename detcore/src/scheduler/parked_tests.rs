@@ -8697,7 +8697,8 @@ fn kvm_fixture() -> (Scheduler, Arc<Backend>) {
         max_timeslice: None,
         ..Config::default().with_backend(|backend| *backend = reverie::BackendCapabilities::KVM)
     });
-    assert!(!s.models_signal_targets);
+    // SIGSHARE S3b: KVM's kernel signal targets are predictable.
+    assert!(s.models_signal_targets);
     let backend = Arc::new(Backend::default());
     assert_eq!(
         s.install_signal_control(
@@ -8710,6 +8711,86 @@ fn kvm_fixture() -> (Scheduler, Arc<Backend>) {
         BackendSignalControlMode::ToolControlled
     );
     (s, backend)
+}
+
+/// SIGSHARE S3b, fix 2 (`Scheduler::signal_sleep`): where the backend owns
+/// signal delivery (KVM's installed control) and the scheduler models signal
+/// targets, a filed `pause` or `nanosleep` is not a sleep the drain ends: the
+/// backend's observation of the parked call ends it and takes the signal in
+/// the same pass (`select_parked_alarm`,
+/// `observe_parked_thread_woken_by_its_own_signal`). A drain wake as well
+/// took the thread out of the park first, and a process signal published in
+/// that pass then went to another thread. Without an installed control, the
+/// drain still ends both sleeps.
+#[test]
+fn a_parked_sleep_is_left_to_the_parked_observation_where_the_backend_owns_delivery() {
+    for installed in [true, false] {
+        let (mut s, _backend) = if installed {
+            kvm_fixture()
+        } else {
+            fixture_with_control(false)
+        };
+        s.models_signal_targets = true;
+        let (tid, _, _) = add(&mut s, 100, 100);
+        for (fyi, deadline, sleep) in [
+            (
+                crate::resources::PAUSE_FYI,
+                LogicalTime::INDEFINITE,
+                sleep_signal::SignalSleep::Pause,
+            ),
+            (
+                crate::resources::NANOSLEEP_FYI,
+                at(50),
+                sleep_signal::SignalSleep::Nanosleep { deadline: at(50) },
+            ),
+        ] {
+            let mut request = Resources::new(tid);
+            request.insert(ResourceID::SleepUntil(deadline), Permission::W);
+            request.fyi(fyi);
+            s.next_turns.get_mut(&tid).unwrap().req = Ivar::full(Ok(request));
+            assert_eq!(
+                s.signal_sleep(tid),
+                (!installed).then_some(sleep),
+                "{fyi}, control installed: {installed}"
+            );
+        }
+    }
+}
+
+/// SIGSHARE S3b, fix 5 (`Scheduler::sigchld_delivery_placed_by_control`):
+/// where the backend's signal control is installed and the scheduler models
+/// signal targets, a thread's `SIGCHLD` delivery is granted at its turn even
+/// with other work runnable: it takes the signal only with the permit the
+/// scheduler reserved, so its turn is fixed by the schedule. Without an
+/// installed control the delivery is host-timed there, and is deferred
+/// behind the runnable work (`sigchld_deferred`), as on ptrace.
+#[test]
+fn a_controlled_sigchld_delivery_is_not_deferred_behind_runnable_work() {
+    for installed in [true, false] {
+        let (mut s, _backend) = fixture_with_control(installed);
+        s.models_signal_targets = true;
+        let (busy, _, _) = add(&mut s, 100, 100);
+        let (signaled, _, _) = add(&mut s, 200, 200);
+        s.runqueue_push_back(busy);
+        s.runqueue_push_back(signaled);
+        assert_eq!(s.run_queue.tentative_pop_tid(signaled), Some(signaled));
+        let granted = s
+            .block_for_one_resource(
+                signaled,
+                &ResourceID::InboundSignal(SigWrapper::from(Signal::SIGCHLD)),
+                &Permission::RW,
+                None,
+                None,
+                &Ivar::new(),
+            )
+            .is_ok();
+        assert_eq!(granted, installed, "control installed: {installed}");
+        assert_eq!(
+            s.blocked.sigchld_deferred.contains(&signaled),
+            !installed,
+            "control installed: {installed}"
+        );
+    }
 }
 
 /// The parent's SIGCHLD state: blocked, explicitly ignored, caught.
@@ -8821,12 +8902,14 @@ fn a_controlled_exit_to_a_one_thread_parent_is_classified_at_its_grant() {
             false,
             Some(N::Undecided),
         ),
+        // SIGSHARE S3b: KVM models signal targets, so a parent with another
+        // live thread is decided too, as on ptrace.
         (
             "two threads",
             sigchld_sets(false, false, true),
             true,
             true,
-            None,
+            Some(N::Deliver),
         ),
     ] {
         let (mut s, backend) = kvm_fixture();
@@ -8859,6 +8942,25 @@ fn a_controlled_exit_to_a_one_thread_parent_is_classified_at_its_grant() {
         // No hold waits for a kernel publication report on this backend.
         assert!(s.child_exit_publications_pending.is_empty(), "{name}");
     }
+    // Where the scheduler does not model signal targets (before S3b), a
+    // parent with another live thread keeps the backend's decision.
+    let (mut s, backend) = kvm_fixture();
+    s.models_signal_targets = false;
+    let (parent, _, _) = add(&mut s, 100, 100);
+    let _ = add(&mut s, 100, 101);
+    let (child, child_mm, _) = add_process_child(&mut s, 100, 200);
+    backend
+        .signal_sets
+        .lock()
+        .unwrap()
+        .insert(100, sigchld_sets(false, false, true));
+    file_restartable_read(&mut s, parent);
+    grant_group_exit(&mut s, child, child_mm);
+    assert_eq!(
+        s.controlled_child_exits_decision(DetPid::from_raw(200)),
+        None
+    );
+    assert!(child_exit_timers(&s).is_empty());
 }
 
 /// The cross-check table (design S4 and S0 correction 2): the only allowed
@@ -8970,6 +9072,111 @@ fn controlled_child_exit_to_pop_from(
     let clock = committed_clock(&s);
     s.step2b_process_timed(&clock);
     (s, backend, parent)
+}
+
+/// Revastra2's round-2 review of SIGSHARE S3b, F1: a child-exit SIGCHLD that
+/// KVM's publication sends nothing for moves no `curr_target`. The parent's
+/// leader (the creator) blocks SIGCHLD and sleeps in a wait the grant leaves
+/// Undecided (a `nanosleep`, as a futex wait is), and its second thread 101
+/// leaves SIGCHLD unblocked, so the walk from the leader chooses 101. Queued
+/// (caught), the copy reaches `complete_signal` and `curr_target` moves to
+/// 101; suppressed (explicit SIG_IGN: `do_notify_parent` sends nothing,
+/// whatever the masks) or coalesced, it reaches none and `curr_target`
+/// stays. Before, every effect committed the walk. Mutation "commit for
+/// every landed publication". Left SIG_DFL (ignored by default), the copy
+/// the blocked creator has queued still reaches `complete_signal`, so
+/// `curr_target` moves to 101, which discards it as it dequeues it: the
+/// receiver's discard is not one at generation by the named thread (the
+/// round-3 reviews, P1; `default-child-curr`). Mutation "a receiver's
+/// discard marks no walk".
+#[test]
+fn a_child_exit_kvm_published_no_copy_for_moves_no_curr_target() {
+    let bit = kernel_signal_bit(libc::SIGCHLD);
+    let caught = reverie::SignalSets::new(0, 0, bit, 0, bit);
+    let ignored = reverie::SignalSets::new(0, 0, bit, bit, 0);
+    let defaulted = reverie::SignalSets::new(0, 0, bit, 0, 0);
+    for (name, leader, worker_sets, effect, waitable, moved) in [
+        (
+            "queued",
+            caught,
+            sigchld_sets(false, false, true),
+            ChildExitPublicationEffect::Queued,
+            true,
+            true,
+        ),
+        (
+            "coalesced",
+            caught,
+            sigchld_sets(false, false, true),
+            ChildExitPublicationEffect::Coalesced,
+            true,
+            false,
+        ),
+        (
+            "suppressed",
+            ignored,
+            sigchld_sets(false, true, false),
+            ChildExitPublicationEffect::SuppressedExplicitIgnore,
+            false,
+            false,
+        ),
+        (
+            "default, discarded by its receiver",
+            defaulted,
+            sigchld_sets(false, false, false),
+            ChildExitPublicationEffect::Queued,
+            true,
+            true,
+        ),
+    ] {
+        let (mut s, backend) = kvm_fixture();
+        let (parent, _, _) = add(&mut s, 100, 100);
+        let (worker, _, _) = add(&mut s, 100, 101);
+        let (child, child_mm, _) = add_process_child(&mut s, 100, 200);
+        backend.signal_sets.lock().unwrap().insert(100, leader);
+        backend.signal_sets.lock().unwrap().insert(101, worker_sets);
+        *backend.child_effect.lock().unwrap() = Some(effect);
+        park_nanosleep(&mut s, parent);
+        file_restartable_read(&mut s, worker);
+        grant_group_exit(&mut s, child, child_mm);
+        let permit = s.parked.exit_fences[&child].permit;
+        s.consume_signal_boundary(SignalBoundaryReceipt {
+            permit,
+            outcome: SignalBoundaryOutcome::Terminated {
+                group: true,
+                wait_status: 7 << 8,
+            },
+        })
+        .unwrap();
+        let event = child_exit_event(
+            task(100, 100).process,
+            task(200, 200).process,
+            ExitStatus::Exited(7),
+            waitable,
+        );
+        let scheduler = Arc::new(Mutex::new(s));
+        let mut publication = Box::pin(super::signal_control::ChildExitPublicationFuture::new(
+            scheduler.clone(),
+            event,
+        ));
+        assert!(matches!(poll_child_exit(&mut publication), Poll::Pending));
+        assert!(matches!(
+            poll_child_exit(&mut publication),
+            Poll::Ready(Ok(()))
+        ));
+        drop(publication);
+        let mut s = Arc::try_unwrap(scheduler).unwrap().into_inner().unwrap();
+        s.committed_time = s.committed_time + LogicalTime::from_nanos(1);
+        let clock = committed_clock(&s);
+        s.step2b_process_timed(&clock);
+        assert!(child_exit_timers(&s).is_empty(), "{name}: the timer popped");
+        assert_eq!(s.controlled_child_exits.refusal_for_test(), None, "{name}");
+        assert_eq!(
+            s.signal_curr_targets.get(&DetPid::from_raw(100)),
+            moved.then_some(&worker),
+            "{name}"
+        );
+    }
 }
 
 /// Mutations "Queued wakes nobody" (design G5: the parent's read is never
@@ -9118,7 +9325,10 @@ const SIGALRM_BIT: u64 = 1 << (libc::SIGALRM - 1);
 /// Reports `sets` for task (`pid`, `tid`) through the fake control's
 /// `signal_sets`.
 fn report_signal_sets(b: &Backend, pid: i32, tid: i32, sets: reverie::SignalSets) {
-    b.task_signal_sets.lock().unwrap().push((task(pid, tid), sets));
+    b.task_signal_sets
+        .lock()
+        .unwrap()
+        .push((task(pid, tid), sets));
 }
 
 /// Files an ordinary request for `tid`, one that has nothing to do with
