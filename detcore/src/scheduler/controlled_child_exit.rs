@@ -48,9 +48,11 @@
 //! Linux discards at generation (`Discard`), is queued by the backend
 //! (design G8; S0 correction 2).
 //!
-//! A parent with more than one live thread keeps the backend's decision, as
-//! before: choosing which of its threads takes the signal needs the scheduler
-//! to model signal targets on this backend (SIGSHARE S3b).
+//! A parent with more than one live thread takes the same path where the
+//! scheduler models signal targets (SIGSHARE S3b): the timer's send goes to
+//! the thread Linux's `complete_signal` chooses (`kernel_sigchld_target`),
+//! which is woken and resumed first (`sigchld_takers`). Elsewhere it keeps the
+//! backend's decision, as before.
 
 use std::collections::BTreeMap;
 
@@ -152,7 +154,10 @@ impl Scheduler {
     /// exit (`reserve_mode`) of `child` to `parent`: on a backend whose signal
     /// state Detcore reads from the backend, outside the in-guest delivery
     /// gate, for a child whose exit reserved its publication (the parent is
-    /// live), when the parent has exactly one live thread.
+    /// live), when the parent has exactly one live thread, or when the
+    /// scheduler models signal targets (`models_signal_targets`, SIGSHARE
+    /// S3b), so that it chooses which of the parent's threads takes the
+    /// signal as Linux's `complete_signal` does (`kernel_sigchld_target`).
     pub(super) fn decides_controlled_child_exit(
         &self,
         reserve_mode: ExitReserveMode,
@@ -163,7 +168,7 @@ impl Scheduler {
             && reads_signal_state_from_backend(&self.backend)
             && !self.in_guest_signal_delivery
             && self.child_exit_reserved(child)
-            && self.process_signal_targets(parent).len() == 1
+            && (self.models_signal_targets || self.process_signal_targets(parent).len() == 1)
     }
 
     /// Record the scheduler's decision at the controlled `Exit` grant of
@@ -264,10 +269,16 @@ impl Scheduler {
         match self.backend_signal_state(dettid) {
             Some(Ok(state)) => {
                 let state = self.under_published_mask(dettid, state);
-                if super::poll_wake_signals(&state, self.models_signal_targets) & bit != 0 {
-                    QueuedSigchld::Interrupts
-                } else if state.discarded_at_generation() & bit != 0 {
+                // The pop is the copy's generation, so its discard is decided
+                // here, from the dispositions read now, before the wake: where
+                // the scheduler models signal targets the drain's filter
+                // (`poll_wake_signals`) admits every unblocked standard signal,
+                // since an ordinary send's discard was already decided in its
+                // sender's turn, and this copy has had no such turn.
+                if state.discarded_at_generation() & bit != 0 {
                     QueuedSigchld::DiscardedAtGeneration
+                } else if super::poll_wake_signals(&state, self.models_signal_targets) & bit != 0 {
+                    QueuedSigchld::Interrupts
                 } else {
                     QueuedSigchld::StaysPending
                 }
@@ -351,6 +362,7 @@ impl Scheduler {
                 }
             },
             ChildExitPublicationEffect::Coalesced => {
+                self.guest_send_coalesced = true;
                 info!(
                     target: "detcore::scheduler",
                     "[dtid {}] SIGCHLD coalesced into the one pending in its process's shared queue; waking no thread.",
