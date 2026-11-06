@@ -402,7 +402,7 @@ impl Scheduler {
 
     /// `process`'s `curr_target`: the thread the walk of `complete_signal` last
     /// chose, or the leader, where Linux starts it.
-    fn signal_curr_target(&self, process: DetPid) -> DetTid {
+    pub(super) fn signal_curr_target(&self, process: DetPid) -> DetTid {
         self.signal_curr_targets
             .get(&process)
             .copied()
@@ -593,6 +593,58 @@ impl Scheduler {
             Some(0) => Wants::Yes,
             Some(_) => Wants::Busy,
             None => Wants::Unknown,
+        }
+    }
+
+    /// Whether `thread` `wants_signal` for a signal the kernel itself generates
+    /// for its process between turns (a child's exit `SIGCHLD`, a timer's
+    /// expiry; `Scheduler::kernel_signal_choice`), where `mask` is the mask
+    /// Linux's `blocked` holds for it now (`None`: unreadable, so it is no
+    /// target), already less any set a `rt_sigtimedwait` waits for. The rule
+    /// is `wants_signal`'s, as for a guest's send, with no running sender:
+    /// not exiting, not blocking the signal, and, but for SIGKILL, no other
+    /// unblocked signal pending for it alone (`task_sigpending`) and not
+    /// already woken for another copy in the shared queue. A thread sleeping
+    /// outside the schedule is read only for its wake (`signaled_background`),
+    /// since host timing can post it a signal, except a vfork parent.
+    pub(super) fn kernel_sent_wants(&self, thread: DetTid, mask: Option<u64>, bit: u64) -> Wants {
+        if self.parked.exit_fences.contains_key(&thread)
+            || self.logically_killed_threads.contains(&thread)
+            || self.filed_exit_request(thread)
+        {
+            return Wants::No;
+        }
+        let Some(mask) = mask else {
+            return Wants::No;
+        };
+        if mask & bit != 0 {
+            return Wants::No;
+        }
+        if bit == kernel_signal_bit(libc::SIGKILL) {
+            return Wants::Yes;
+        }
+        // A vfork parent sleeps outside the schedule too, but no host timing
+        // ends its call (the child's exec or exit, which the schedule fixes,
+        // does) or posts it a signal, so its pending set is read like a
+        // stopped thread's: one with a signal pending is busy, which a caught
+        // signal does not wake there (`wait_for_vfork_done` sleeps killable).
+        if self.out_of_schedule(thread) && !self.vfork_barriers.contains_key(&thread) {
+            return if self.blocked.signaled_background.contains(&thread) {
+                Wants::Busy
+            } else {
+                Wants::Yes
+            };
+        }
+        if self
+            .process_signal_takers
+            .get(&thread)
+            .is_some_and(|signals| *signals != 0)
+        {
+            return Wants::Busy;
+        }
+        match self.reliable_pending(thread) {
+            Some(pending) if pending != 0 => Wants::Busy,
+            _ => Wants::Yes,
         }
     }
 
