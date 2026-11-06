@@ -1840,7 +1840,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             // Reject the blocking form until Detcore can retain that identity.
             return Err(Errno::EOPNOTSUPP.into());
         }
-        let info = call.info().expect("waitid infop checked above");
+        // Re-derive infop at each use: AddrMut<siginfo_t> is not Send either.
+        let info = || call.info().expect("waitid infop checked above");
 
         // Unlike wait4, waitid returns zero both when it reports a child event and
         // when WNOHANG finds nothing. Polling must inspect si_pid to distinguish
@@ -1849,8 +1850,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         // non-null infop faults on the first physical poll rather than after a
         // child becomes waitable.
         // siginfo_t has no portable initializer. An all-zero value is the
-        // waitid WNOHANG sentinel defined by POSIX and Linux.
-        let empty_info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // waitid WNOHANG sentinel defined by POSIX and Linux. Build it at each
+        // write: libc 0.2.190 gives siginfo_t a raw-pointer field, so a value
+        // held across an await makes this syscall future not Send.
+        let empty_info = || -> libc::siginfo_t { unsafe { std::mem::zeroed() } };
 
         // The lifecycle scheduler currently models terminal child events for
         // exact and any-child selectors. Group membership and stop/continue
@@ -1896,7 +1899,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let selected = if let Some(spec) = terminal_spec {
                     let (ready, has_child) = ready_child_wait(guest, spec).await;
                     if ready.is_none() && has_child {
-                        guest.memory().write_value(info, &empty_info)?;
+                        guest.memory().write_value(info(), &empty_info())?;
                         return Ok(0);
                     }
                     if ready.is_none() && complete_lineage {
@@ -1913,7 +1916,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     call.with_which(libc::P_PID as i32).with_pid(child.as_raw())
                 });
                 loop {
-                    guest.memory().write_value(info, &empty_info)?;
+                    guest.memory().write_value(info(), &empty_info())?;
                     let value = match guest.inject_with_retry(effective_call).await {
                         Ok(value) => value,
                         Err(Errno::ECHILD) if selected.is_some() => {
@@ -1926,16 +1929,25 @@ impl<T: RecordOrReplay> Detcore<T> {
                         }
                         Err(errno) => return Err(errno.into()),
                     };
-                    let info_value: libc::siginfo_t = guest.memory().read_value(info)?;
-                    let child_pid = unsafe { info_value.si_pid() };
-                    if child_pid == 0 && selected.is_some() {
+                    // Keep the siginfo_t out of scope at every await below; see
+                    // empty_info above.
+                    let waited = {
+                        let info_value: libc::siginfo_t = guest.memory().read_value(info())?;
+                        let child_pid = unsafe { info_value.si_pid() };
+                        if child_pid == 0 && selected.is_some() {
+                            None
+                        } else {
+                            let consumed = child_pid != 0
+                                && call.options() & libc::WNOWAIT == 0
+                                && waitid_code_is_termination(info_value.si_code);
+                            let result = finish_waitid_result(guest, call, value, info_value)?;
+                            Some((child_pid, consumed, result))
+                        }
+                    };
+                    let Some((child_pid, consumed, result)) = waited else {
                         yield_once().await;
                         continue;
-                    }
-                    let consumed = child_pid != 0
-                        && call.options() & libc::WNOWAIT == 0
-                        && waitid_code_is_termination(info_value.si_code);
-                    let result = finish_waitid_result(guest, call, value, info_value)?;
+                    };
                     if consumed {
                         let _ = consume_child_wait(guest, DetPid::from_raw(child_pid)).await;
                     }
@@ -2003,13 +2015,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                 };
                 if let Some(child) = ready {
                     let _ = await_exact_child_physical_exit(guest, child).await;
-                    if let Err(error) = guest.memory().write_value(info, &empty_info) {
+                    if let Err(error) = guest.memory().write_value(info(), &empty_info()) {
                         break Err(error.into());
                     }
                     let exact_call = call.with_which(libc::P_PID as i32).with_pid(child.as_raw());
                     match guest.inject_with_retry(exact_call).await {
                         Ok(value) => {
-                            let info_value = match guest.memory().read_value(info) {
+                            let info_value = match guest.memory().read_value(info()) {
                                 Ok(value) => value,
                                 Err(error) => break Err(error.into()),
                             };
@@ -2043,26 +2055,35 @@ impl<T: RecordOrReplay> Detcore<T> {
                     break Err(Errno::ECHILD.into());
                 }
 
-                if let Err(error) = guest.memory().write_value(info, &empty_info) {
+                if let Err(error) = guest.memory().write_value(info(), &empty_info()) {
                     break Err(error.into());
                 }
                 let result = guest.inject(poll_call).await;
                 match result {
                     Ok(value) => {
-                        let info_value: libc::siginfo_t = match guest.memory().read_value(info) {
-                            Ok(value) => value,
-                            Err(error) => break Err(error.into()),
+                        // Keep the siginfo_t out of scope at the awaits below; see
+                        // empty_info above.
+                        let (decision, ready) = {
+                            let info_value: libc::siginfo_t =
+                                match guest.memory().read_value(info()) {
+                                    Ok(value) => value,
+                                    Err(error) => break Err(error.into()),
+                                };
+                            // waitid writes the SIGCHLD variant of siginfo_t. A zeroed
+                            // structure is used only for the no-event WNOHANG result.
+                            let child_pid = unsafe { info_value.si_pid() };
+                            let decision = exact_wait_poll_decision(
+                                child_pid != 0,
+                                pending_signal.is_some(),
+                                None,
+                            );
+                            let ready = matches!(decision, ExactWaitPollDecision::ChildReady)
+                                .then(|| finish_waitid_result(guest, call, value, info_value));
+                            (decision, ready)
                         };
-                        // waitid writes the SIGCHLD variant of siginfo_t. A zeroed
-                        // structure is used only for the no-event WNOHANG result.
-                        let child_pid = unsafe { info_value.si_pid() };
-                        match exact_wait_poll_decision(
-                            child_pid != 0,
-                            pending_signal.is_some(),
-                            None,
-                        ) {
+                        match decision {
                             ExactWaitPollDecision::ChildReady => {
-                                break finish_waitid_result(guest, call, value, info_value);
+                                break ready.expect("ChildReady computed its result");
                             }
                             ExactWaitPollDecision::Interrupted => {
                                 break interrupted_child_wait_result(
@@ -2098,9 +2119,12 @@ impl<T: RecordOrReplay> Detcore<T> {
 
             restore_signals_after_disposition(guest, old_mask_addr).await?;
             if result.is_ok() && call.options() & libc::WNOWAIT == 0 {
-                let info_value: libc::siginfo_t = guest.memory().read_value(info)?;
-                let child_pid = unsafe { info_value.si_pid() };
-                if child_pid != 0 && waitid_code_is_termination(info_value.si_code) {
+                let (child_pid, terminated) = {
+                    let info_value: libc::siginfo_t = guest.memory().read_value(info())?;
+                    let child_pid = unsafe { info_value.si_pid() };
+                    (child_pid, waitid_code_is_termination(info_value.si_code))
+                };
+                if child_pid != 0 && terminated {
                     let _ = consume_child_wait(guest, DetPid::from_raw(child_pid)).await;
                 }
             }
