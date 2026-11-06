@@ -6561,6 +6561,7 @@ impl Scheduler {
     #[cfg(test)]
     pub(crate) fn retire_test_exited_leader(&mut self, leader: DetTid, mm: MmId) -> bool {
         self.models_signal_targets = true;
+        self.backend.host_task_reads_reach_guest_threads = true;
         self.committed_exits.insert(leader);
         self.retire_exited_leader(leader, mm)
     }
@@ -9335,10 +9336,15 @@ impl Scheduler {
     /// Whether `retire_exited_leader` retires `leader`: on a backend whose
     /// `/proc` view is the scheduler's, a thread-group leader, of this
     /// incarnation, whose `Exit` was granted, while another thread of its
-    /// group is registered.
+    /// group is registered. The scheduler then waits for the kernel to show
+    /// the leader a zombie (`step2a_wait_for_exited_leaders`), so the guest's
+    /// threads must be host tasks (`host_task_reads_reach_guest_threads`):
+    /// KVM models signal targets too, but its leader is no host task, and its
+    /// backend reports the leader's exit only when the last sibling leaves.
     fn leader_retires_at_exit(&self, leader: DetTid, mm: MmId) -> bool {
         let process = DetPid::from_raw(leader.as_raw());
         self.models_signal_targets
+            && self.backend.host_task_reads_reach_guest_threads
             && self.thread_tree.thread_group_leaders.contains(&process)
             && self.committed_exits.contains(&leader)
             && self.rpc_incarnation_matches(leader, mm)
@@ -19448,8 +19454,11 @@ impl Scheduler {
                 // or a delivery the scheduler already placed; grant it now rather
                 // than deferring it (a second time). Where the scheduler models
                 // signal targets, a delivery of a copy it sent is marked for the
-                // very thread that took it (`dequeue_sigchld`).
-                let already_readmitted = self.blocked.sigchld_ready.remove(&dettid);
+                // very thread that took it (`dequeue_sigchld`). Under the
+                // backend's signal control every delivery is placed
+                // (`sigchld_delivery_placed_by_control`).
+                let already_readmitted = self.blocked.sigchld_ready.remove(&dettid)
+                    || self.sigchld_delivery_placed_by_control();
                 // Whether this delivery's copy was raised at a point the
                 // schedule fixes (`sigchld_fenced`): taken by a SIGCHLD
                 // delivery filed after the mark. One filed before it leaves
@@ -19485,6 +19494,24 @@ impl Scheduler {
                 }
             }
         }
+    }
+
+    /// Whether a `SIGCHLD` delivery is placed by the backend's signal control,
+    /// so that it is never deferred behind runnable work (`sigchld_deferred`):
+    /// where the scheduler models signal targets and the control is installed
+    /// (KVM). There a thread takes a signal only with the delivery permit the
+    /// scheduler reserved for it, at a boundary of the thread holding the
+    /// serial grant (`authorize_signal_boundary`), so the delivery's turn is
+    /// fixed by the schedule; no SIGCHLD arrives at a host-timed moment, which
+    /// is what the deferral exists for. On ptrace the thread that takes the
+    /// scheduler's copy is marked when the kernel's dequeue is reported
+    /// (`dequeue_sigchld`, `reports_kernel_child_exit_signals`); KVM reports no
+    /// dequeue, and before KVM modelled signal targets the `ChildExit` timer
+    /// marked the process instead. Without this, a delivery the scheduler had
+    /// placed waited behind a polling sibling and ran later than on ptrace
+    /// (SIGSHARE S3b, fix 5).
+    fn sigchld_delivery_placed_by_control(&self) -> bool {
+        self.models_signal_targets && self.signal_control_installed()
     }
 
     /// Whether a host-async `SIGCHLD` delivery to `dettid` is deferred behind
@@ -51450,7 +51477,9 @@ mod test {
     #[test]
     fn an_exited_leader_with_a_live_sibling_leaves_the_scheduler_at_its_exit() {
         let mut scheduler = Scheduler::new(&Config::default());
+        // ptrace's facts: signal targets modelled, guest threads host tasks.
         scheduler.models_signal_targets = true;
+        scheduler.backend.host_task_reads_reach_guest_threads = true;
         let leader = DetTid::from_raw(3);
         let worker = DetTid::from_raw(5);
         let process = DetPid::from_raw(3);
@@ -51473,6 +51502,11 @@ mod test {
         scheduler.models_signal_targets = false;
         assert!(!scheduler.retire_exited_leader(leader, mm));
         scheduler.models_signal_targets = true;
+        // Nor where it does but guest threads are no host tasks (KVM since
+        // SIGSHARE S3b): no kernel would show the leader a zombie.
+        scheduler.backend.host_task_reads_reach_guest_threads = false;
+        assert!(!scheduler.retire_exited_leader(leader, mm));
+        scheduler.backend.host_task_reads_reach_guest_threads = true;
         // Not from another incarnation of the leader's tid.
         let other_image = mm.for_exec(leader);
         scheduler.exec_incarnations.insert(leader, other_image);
@@ -51583,6 +51617,7 @@ mod test {
     fn an_exec_after_the_leader_was_retired_at_exit_admits_the_new_leader() {
         let mut sched = Scheduler::new(&Config::default());
         sched.models_signal_targets = true;
+        sched.backend.host_task_reads_reach_guest_threads = true;
         let leader = DetTid::from_raw(17);
         let caller = DetTid::from_raw(18);
         let (detpid, pre_exec_mm, _) = install_runnable_exec_group(&mut sched, leader, caller);
@@ -51626,6 +51661,7 @@ mod test {
     fn a_retired_leaders_late_deregistration_does_not_end_its_process_again() {
         let mut scheduler = Scheduler::new(&Config::default());
         scheduler.models_signal_targets = true;
+        scheduler.backend.host_task_reads_reach_guest_threads = true;
         let parent = DetTid::from_raw(2);
         let leader = DetTid::from_raw(3);
         let worker = DetTid::from_raw(5);
