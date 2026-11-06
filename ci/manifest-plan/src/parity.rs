@@ -6319,7 +6319,9 @@ mod tests {
         // c-programs/madvise-guard-fault and c-programs/madvise-guard-regions
         // (madvise guard regions, https://github.com/rrnewton/hermit/issues/5154)
         // add one row each per candidate backend: 3140.
-        assert_eq!(parsed.cells.len(), 3140);
+        // The gvisor bucket's 148 vendored cases add one row per candidate
+        // backend each (148 x 5) on top of main's 3140: 3880.
+        assert_eq!(parsed.cells.len(), 3880);
         assert_eq!(parsed.schema, PARITY_CELLS_SCHEMA);
         // The repository's limit for a text file is 2 MiB. This bound was
         // 1 MiB until fold 5 of https://github.com/rrnewton/hermit/issues/3448
