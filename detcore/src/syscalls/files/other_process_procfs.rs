@@ -320,6 +320,9 @@ pub(crate) fn task_entry(path: &Path) -> Option<(BoundTask, TaskFile)> {
         {
             TaskFile::Rendered
         }
+        // Another process's `maps`, which Detcore renders from the backend's
+        // memory map of that process (package K item 2b slice 2b-6).
+        _ if name == crate::procfs::RENDERED_MAPS_NAME.as_bytes() => TaskFile::Rendered,
         _ => TaskFile::Unrendered,
     };
     Some((task, file))
@@ -1558,7 +1561,8 @@ mod tests {
             ("/proc/5/status", (task(5, None), Rendered)),
             ("/proc/5/mountinfo", (task(5, None), Rendered)),
             ("/proc/5/status/x", (task(5, None), Rendered)),
-            ("/proc/5/maps", (task(5, None), Unrendered)),
+            ("/proc/5/maps", (task(5, None), Rendered)),
+            ("/proc/5/task/7/maps", (task(5, Some(7)), Rendered)),
             ("/proc/5/limits", (task(5, None), Unrendered)),
             ("/proc/5/ns/net", (task(5, None), Unrendered)),
             ("/proc/5/attr/current", (task(5, None), Unrendered)),
@@ -1613,12 +1617,12 @@ mod tests {
     /// and the issue, with the same text on every run.
     #[test]
     fn an_unrendered_task_entry_is_refused_by_name() {
-        let (errno, reason) = unrendered_task_entry_answer(Path::new("/proc/5/maps"));
+        let (errno, reason) = unrendered_task_entry_answer(Path::new("/proc/5/limits"));
         assert_eq!(errno, Errno::EACCES);
         let reason = reason.expect("refused by name");
         assert!(
             reason.starts_with(
-                "another guest process's /proc/5/maps cannot be served: Detcore does not \
+                "another guest process's /proc/5/limits cannot be served: Detcore does not \
                  render it for another process yet"
             ),
             "{reason}"

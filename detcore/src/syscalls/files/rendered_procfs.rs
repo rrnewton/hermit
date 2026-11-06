@@ -1361,6 +1361,9 @@ enum CapabilityRefusal {
     /// Another process's `exe`, `cwd` and `root` links, at a readlink
     /// (package K item 2b slice 2b-4).
     Links,
+    /// Another process's `/proc/<pid>/maps`, at its open (package K item 2b
+    /// slice 2b-6).
+    Maps,
 }
 
 /// Whether the run has warned that the reader's own capabilities refused
@@ -1375,6 +1378,8 @@ static CAPABILITY_REFUSAL_WARNED_IO: std::sync::atomic::AtomicBool =
 static CAPABILITY_REFUSAL_WARNED_ENVIRON: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static CAPABILITY_REFUSAL_WARNED_LINKS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static CAPABILITY_REFUSAL_WARNED_MAPS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Whether the run has warned that another process's `cmdline` or `environ`
@@ -2112,6 +2117,24 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             ProcfsFile::from_path(path)
         };
+        // Another process's `maps` (package K item 2b slice 2b-6): rendered
+        // from the backend's memory map of that process where Detcore renders
+        // the other address-space files, so that every other backend's opens
+        // of one stay the kernel's, as before. The caller's own, by any
+        // spelling, stays the backend's file, which its reads render
+        // (`Detcore::maps_from_memory_map`).
+        let classified = match classified {
+            Some(file)
+                if file.is_maps()
+                    && self.renders_address_space_files()
+                    && let Some(rendered) = ProcfsFile::rendered_maps_at(path)
+                    && let Some(task) = rendered.task_spelling()
+                    && !self.names_own_process_spelling(guest, task).await =>
+            {
+                Some(rendered)
+            }
+            classified => classified,
+        };
         if let Some(mut procfs) = classified {
             // A per-process file belongs to the task its path names, which
             // Detcore's process table decides exists, as Linux's lookup of
@@ -2754,7 +2777,33 @@ impl<T: RecordOrReplay> Detcore<T> {
         // reads render (`Detcore::render_address_space_file`), as a `maps`
         // the kernel opened binds one (`memory_map::Binding`). A task of
         // another process, or one that holds no address space, binds none.
-        let procfs = if procfs.lists_rendered_address_space() && !flags.contains(OFlag::O_PATH) {
+        //
+        // Another process's `maps` (package K item 2b slice 2b-6) takes, at
+        // its open, the address space the task holds now, which its reads
+        // render from the backend's memory map of that process
+        // (`proc_maps_open` calls `proc_mem_open` with `PTRACE_MODE_READ`,
+        // to which it adds FSCREDS). Linux's `mm_access` asks the access
+        // check only of a task that holds an address space, and not when it
+        // is the opener's own: a task that holds none (it exited) opens with
+        // none, and its reads give nothing (`m_start`).
+        let procfs = if procfs.is_rendered_maps() && !flags.contains(OFlag::O_PATH) {
+            let mut procfs = procfs;
+            if let Some(task) = procfs.bound_task() {
+                let answer = crate::tool_global::procfs_task(guest, task).await;
+                if let Some(binding) = crate::procfs::memory_map::Binding::of_task(task, &answer) {
+                    if answer.mm != Some(guest.thread_state().mm_id) {
+                        Box::pin(Self::ptrace_read_allowed_for(
+                            guest,
+                            task,
+                            CapabilityRefusal::Maps,
+                        ))
+                        .await??;
+                    }
+                    procfs.bind_memory_map(binding);
+                }
+            }
+            procfs
+        } else if procfs.lists_rendered_address_space() && !flags.contains(OFlag::O_PATH) {
             let mut procfs = procfs;
             if let Some(task) = procfs.bound_task()
                 && let Some((pid, _)) = self.procfs_caller_ids(guest)
@@ -3447,6 +3496,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                 reverie::syscalls::Sysno::readlinkat,
                 &CAPABILITY_REFUSAL_WARNED_LINKS,
             ),
+            CapabilityRefusal::Maps => (
+                "maps",
+                reverie::syscalls::Sysno::openat,
+                &CAPABILITY_REFUSAL_WARNED_MAPS,
+            ),
         };
         match Self::inject_capget(guest, CapabilitySet::Effective).await? {
             Some(effective) if effective & (1 << CAP_SYS_PTRACE) != 0 => Ok(Ok(())),
@@ -3943,8 +3997,20 @@ impl<T: RecordOrReplay> Detcore<T> {
         if self.cfg.recordreplay_modes {
             return Ok(None);
         }
-        if let Some(path) = inodes.entry_procfs_path(name)
-            && let Some(mut file) = ProcfsFile::from_path(&path)
+        let path = inodes.entry_procfs_path(name);
+        let mut classified = path.as_deref().and_then(ProcfsFile::from_path);
+        // Another process's `maps`, listed with the number its rendered file
+        // reports (package K item 2b slice 2b-6, `Self::rendered_procfs_at`).
+        if let Some(path) = path.as_deref()
+            && classified.as_ref().is_some_and(ProcfsFile::is_maps)
+            && self.renders_address_space_files()
+            && let Some(rendered) = ProcfsFile::rendered_maps_at(path)
+            && let Some(task) = rendered.task_spelling()
+            && !self.names_own_process_spelling(guest, task).await
+        {
+            classified = Some(rendered);
+        }
+        if let Some(mut file) = classified
             && file.per_process_name().is_some()
         {
             if !self.renders_procfs(guest)
@@ -7864,6 +7930,7 @@ fn could_name_rendered(path: &Path, files: RenderedFiles, renders_comm: bool) ->
             .filter(|name| renders_comm || **name != "comm")
             .filter(|name| files.address_space || !address_space_names.contains(*name))
             .any(|name| name.as_bytes() == last)
+        || (files.address_space && last == crate::procfs::RENDERED_MAPS_NAME.as_bytes())
         || (!last.is_empty() && last.iter().all(u8::is_ascii_digit))
 }
 
@@ -8170,6 +8237,13 @@ mod tests {
                     );
                 }
             }
+            // Another process's `maps` (slice 2b-6) goes with them.
+            let maps = ProcfsFile::rendered_maps_at(Path::new("/proc/3/maps")).unwrap();
+            assert_eq!(tool.kernel_serves_every_address_space_file(&maps), kernels);
+            assert_eq!(
+                could_name_rendered(Path::new("maps"), files, false),
+                !kernels
+            );
             let statm = ProcfsFile::from_path(Path::new("/proc/self/statm")).unwrap();
             assert!(!tool.kernel_serves_every_address_space_file(&statm));
             assert!(could_name_rendered(Path::new("statm"), files, false));

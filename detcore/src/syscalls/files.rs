@@ -8218,6 +8218,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         let (binding, path) = guest.thread_state().with_detfd(fd, |detfd| {
             (detfd.procfs_memory_map(), detfd.procfs_rendered_path())
         })?;
+        if file == AddressSpaceFile::Maps {
+            return self
+                .render_other_process_maps(guest, fd, binding, path)
+                .await;
+        }
         let Some(binding) = binding else {
             let task = path
                 .and_then(crate::procfs::per_process_name)
@@ -8289,6 +8294,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             AddressSpaceFile::NumaMaps => {
                 smaps::render_numa_maps(&map, guest.thread_state().pages_may_have_been_discarded())
             }
+            AddressSpaceFile::Maps => unreachable!("another process's maps is rendered above"),
         };
         match rendered {
             Ok(rendered) => {
@@ -8300,6 +8306,79 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             Err(refusal) => Err(self.refuse_address_space_file(guest, refusal).await),
         }
+    }
+
+    /// The text of another process's `maps` that Detcore opened as rendered
+    /// (package K item 2b slice 2b-6,
+    /// <https://github.com/rrnewton/hermit/issues/5038>) at a read that takes
+    /// its snapshot: the address space its open bound (`binding`), as the
+    /// backend's memory map of that process lists it now, as Linux prints it
+    /// (`procfs::memory_map::render`).
+    ///
+    /// Linux's read first finds the task the open found (`m_start`): ESRCH
+    /// once it is reaped, whichever task holds its number by then. It then
+    /// reads the memory map the open took, while any task still uses it
+    /// (`mmget_not_zero`): nothing for a task that held none at the open (it
+    /// had exited), or once the task's process ran `exec` or exited. A memory
+    /// map the backend cannot give, or gives incomplete, is refused by name
+    /// through the unsupported-operation policy, never answered with a list
+    /// Linux would not print ([`Self::refuse_address_space_file`]).
+    async fn render_other_process_maps<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        binding: Option<crate::procfs::memory_map::Binding>,
+        path: Option<&'static std::path::Path>,
+    ) -> Result<Vec<u8>, Error> {
+        let Some(binding) = binding else {
+            let current = match path {
+                Some(path) => self
+                    .rendered_task_state(guest, path)
+                    .await
+                    .is_some_and(|(_, current)| current),
+                None => false,
+            };
+            if !current {
+                return Err(Errno::ESRCH.into());
+            }
+            return Ok(Vec::new());
+        };
+        let answer = crate::tool_global::procfs_task(guest, binding.task()).await;
+        if !binding.finds_its_task(&answer) {
+            return Err(Errno::ESRCH.into());
+        }
+        if !binding.still_held_by_task(&answer) {
+            return Ok(Vec::new());
+        }
+        let task = binding.task();
+        let named = task.thread.unwrap_or(task.process);
+        let map = match Self::kernel_procfs_number(guest, named).await {
+            Some(backend) => guest.memory_map(reverie::Pid::from_raw(backend)),
+            None => Err(reverie::FactError::Errno(reverie::Errno::ESRCH)),
+        };
+        let refusal = match map {
+            Ok(map) if map.complete => match crate::procfs::memory_map::render(&map) {
+                Some(rendered) => {
+                    trace!(
+                        "maps of fd {fd} rendered from the memory map of task {named}: {} bytes",
+                        rendered.len()
+                    );
+                    return Ok(rendered);
+                }
+                None => "which gave an empty incomplete list".to_owned(),
+            },
+            Ok(_) => "which lists only some of its mappings".to_owned(),
+            Err(error) => format!("which gave no answer ({error:?})"),
+        };
+        Err(self
+            .refuse_address_space_file(
+                guest,
+                format!(
+                    "Detcore renders another process's maps from the backend's memory map of \
+                     that process, {refusal}"
+                ),
+            )
+            .await)
     }
 
     /// What a rendered `smaps` derives its fields from beside the memory map

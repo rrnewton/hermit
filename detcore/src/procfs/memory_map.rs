@@ -200,6 +200,31 @@ impl Binding {
         })
     }
 
+    /// The binding of another process's `maps` whose path named `task`,
+    /// where the process table answered `answer` about that task at the open
+    /// (package K item 2b slice 2b-6): the address space the task holds then,
+    /// which only that process's threads hold. `None` where the task holds
+    /// none, having exited (Linux's file then reads empty while the task is
+    /// there).
+    pub(crate) fn of_task(task: BoundTask, answer: &ProcfsTaskAnswer) -> Option<Self> {
+        if !answer.exists || answer.without_mm {
+            return None;
+        }
+        Some(Self {
+            task,
+            incarnation: answer.incarnation(),
+            mm: answer.mm?,
+        })
+    }
+
+    /// Whether `answer`, the process table's answer about the bound task at a
+    /// read, says the task still holds the bound address space, which Linux's
+    /// read then lists (`m_start`, `mmget_not_zero`): not after the task's
+    /// process ran `exec` or exited, which leave the address space no user.
+    pub(crate) fn still_held_by_task(&self, answer: &ProcfsTaskAnswer) -> bool {
+        !answer.without_mm && answer.mm == Some(self.mm)
+    }
+
     /// The task the path named, which a read asks the process table about.
     pub(crate) fn task(&self) -> BoundTask {
         self.task

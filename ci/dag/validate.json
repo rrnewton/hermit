@@ -24821,7 +24821,7 @@
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_NEXTEST_RESULTS_SCHEMA": "5",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "3598",
+        "NEXTEST_EXPECTED_EXECUTED": "3599",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -25931,7 +25931,7 @@
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
         "HERMIT_REQUIRE_DAP": "1",
         "HERMIT_REQUIRE_DAP_GDB": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "826",
+        "NEXTEST_EXPECTED_EXECUTED": "827",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"liteinst\",\"--test\",\"cli\"]"
       },
       "networkonly": false,
@@ -25984,7 +25984,7 @@
         "HERMIT_NEXTEST_RESULTS_SCHEMA": "5",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
         "HERMIT_REQUIRE_DAP": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "745",
+        "NEXTEST_EXPECTED_EXECUTED": "746",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"liteinst\",\"--test\",\"cli\"]"
       },
       "networkonly": false,
@@ -27508,7 +27508,7 @@
         "HERMIT_FORBID_SKIPS": "1",
         "HERMIT_NEXTEST_RESULTS_SCHEMA": "5",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "141",
+        "NEXTEST_EXPECTED_EXECUTED": "142",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"liteinst,kvm-execution-tests\",\"--lib\",\"--test\",\"cli\"]"
       },
       "networkonly": false,
@@ -32260,7 +32260,7 @@
         "HERMIT_FORBID_SKIPS": "1",
         "HERMIT_NEXTEST_RESULTS_SCHEMA": "5",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "141",
+        "NEXTEST_EXPECTED_EXECUTED": "142",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"liteinst,kvm-execution-tests\",\"--lib\",\"--test\",\"cli\"]"
       },
       "networkonly": false,
@@ -42442,7 +42442,7 @@
         "HERMIT_FORBID_SKIPS": "1",
         "HERMIT_NEXTEST_RESULTS_SCHEMA": "5",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "141",
+        "NEXTEST_EXPECTED_EXECUTED": "142",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"liteinst,kvm-execution-tests\",\"--lib\",\"--test\",\"cli\"]"
       },
       "networkonly": false,
@@ -43403,7 +43403,7 @@
       "env": {
         "HERMIT_NEXTEST_RESULTS_SCHEMA": "5",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "3598",
+        "NEXTEST_EXPECTED_EXECUTED": "3599",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,

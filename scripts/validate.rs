@@ -21100,9 +21100,10 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // And slice 2b-3's
         // run_kvm_another_processs_cmdline_and_environ_answer_as_linux: 136.
         // And slice 2b-4's two other-process links tests: 138.
-        // And slice 2b-5's three other-process descriptors tests: 141, matching
-        // the DAG pin in validation_dag_static.
-        ("privileged-only-test.cli_kvm", 141usize),
+        // And slice 2b-5's three other-process descriptors tests: 141.
+        // And slice 2b-6's other-process maps test: 142, matching the DAG pin
+        // in validation_dag_static.
+        ("privileged-only-test.cli_kvm", 142usize),
     ] {
         let step = privileged
             .steps

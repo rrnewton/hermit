@@ -208,6 +208,12 @@ pub(crate) fn per_process_inode(name: crate::procfs::PerProcessName) -> u64 {
     if let Some(fd) = name.filename.strip_prefix("fdinfo/") {
         return fdinfo_inode(name, fd);
     }
+    // Another process's `maps` (package K item 2b slice 2b-6), which has no
+    // tag left in this layout: numbered as an fdinfo is, from its name, which
+    // no descriptor's digits equal.
+    if name.filename == crate::procfs::RENDERED_MAPS_NAME {
+        return fdinfo_inode(name, crate::procfs::RENDERED_MAPS_NAME);
+    }
     let index = crate::procfs::ProcfsFile::PER_PROCESS_NAMES
         .iter()
         .position(|candidate| *candidate == name.filename)
@@ -245,7 +251,8 @@ pub(crate) fn per_process_inode(name: crate::procfs::PerProcessName) -> u64 {
 }
 
 /// The inode number of the fdinfo of descriptor `fd` (its name's digits) of
-/// the task `name` describes (package K slice K8-h), on every backend that
+/// the task `name` describes (package K slice K8-h), and of its `maps` with
+/// `fd` the name `maps` (package K item 2b slice 2b-6), on every backend that
 /// renders one: bit 63 set and the file-index field 0, which no other
 /// per-process file takes ([`per_process_inode`] numbers those from 1), then
 /// the 64-bit FNV-1a hash of the task's numbers, their incarnations and the
@@ -1191,6 +1198,23 @@ mod tests {
             assert!(inode >> 63 == 0 || index(inode) != 0, "{filename}");
             assert_ne!(inode, fdinfo, "{filename}");
         }
+        // Another process's `maps` (slice 2b-6) is numbered as an fdinfo is,
+        // from its name, which no descriptor's digits equal: none of theirs,
+        // nor of any other per-process file's, and per task.
+        let maps = per_process_inode(name(3, None, 1, crate::procfs::RENDERED_MAPS_NAME));
+        assert_eq!(maps >> 63, 1);
+        assert_eq!(index(maps), 0);
+        assert!(others.iter().all(|other| *other != maps));
+        assert_ne!(maps, fdinfo);
+        for filename in crate::procfs::ProcfsFile::PER_PROCESS_NAMES {
+            assert_ne!(
+                per_process_inode(name(3, None, 1, filename)),
+                maps,
+                "{filename}"
+            );
+        }
+        assert_ne!(per_process_inode(name(4, None, 1, "maps")), maps);
+        assert_ne!(per_process_inode(name(3, Some(3), 1, "maps")), maps);
         // The same file is the same number.
         assert_eq!(per_process_inode(name(3, None, 1, "fdinfo/3")), fdinfo);
     }

@@ -954,7 +954,9 @@ pub(crate) fn placeholder_link(
     // (`ProcfsFile::rendered_fdinfo_at`), which its placeholder's identity
     // says.
     let mut file = match identity {
-        Some(_) => ProcfsFile::rendered_fdinfo_at(path).or_else(|| ProcfsFile::from_path(path))?,
+        Some(_) => ProcfsFile::rendered_fdinfo_at(path)
+            .or_else(|| ProcfsFile::rendered_maps_at(path))
+            .or_else(|| ProcfsFile::from_path(path))?,
         None => ProcfsFile::from_path(path)?,
     };
     match (file.per_process_name().is_some(), identity) {
@@ -1068,11 +1070,20 @@ impl RenderedFiles {
     }
 }
 
-/// A process's files that list its address space beside `maps`, which
-/// Detcore renders from the backend's memory map where the guest's procfs is
-/// not the kernel's ([`RenderedFiles::address_space`], `memory_map::smaps`).
+/// The name of a process's `maps` in its directory.
+pub(crate) const RENDERED_MAPS_NAME: &str = "maps";
+
+/// A process's files that list its address space, which Detcore renders
+/// from the backend's memory map where the guest's procfs is not the
+/// kernel's ([`RenderedFiles::address_space`], `memory_map::smaps`): `smaps`,
+/// `smaps_rollup` and `numa_maps`, and another process's `maps`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AddressSpaceFile {
+    /// Another process's `/proc/<pid>/maps`, which Detcore renders where it
+    /// renders the others ([`ProcfsFile::rendered_maps_at`]); the caller's own
+    /// `maps` stays the backend's file, rendered at its read
+    /// (`Detcore::maps_from_memory_map`).
+    Maps,
     /// `/proc/<pid>/smaps`.
     Smaps,
     /// `/proc/<pid>/smaps_rollup`.
@@ -1085,6 +1096,7 @@ impl AddressSpaceFile {
     /// The file's name in a process's directory.
     pub(crate) fn name(self) -> &'static str {
         match self {
+            Self::Maps => RENDERED_MAPS_NAME,
             Self::Smaps => "smaps",
             Self::SmapsRollup => "smaps_rollup",
             Self::NumaMaps => "numa_maps",
@@ -2188,8 +2200,40 @@ impl ProcfsFile {
             // Detcore's fdinfo of a descriptor, which only the rendering
             // path binds to a task ([`Self::rendered_fdinfo_at`]).
             ProcfsKind::Fdinfo => self.target_fd.map(fdinfo_name),
+            // Another process's `maps`, which only the rendering path binds
+            // to a task ([`Self::rendered_maps_at`]).
+            ProcfsKind::Maps => Some(RENDERED_MAPS_NAME),
             ref kind => Self::per_process_name_of(kind),
         }
+    }
+
+    /// Another process's `maps` at `path`, `/proc/<pid>/maps` or
+    /// `/proc/<pid>/task/<tid>/maps` (package K item 2b slice 2b-6,
+    /// <https://github.com/rrnewton/hermit/issues/5038>), as a per-process
+    /// file Detcore renders from the backend's memory map of that process
+    /// (`Detcore::render_address_space_file`): the task its path names, for
+    /// the caller to bind. [`Self::from_path`] keeps a `maps` bound to no
+    /// task, so that every one the kernel or the backend opens, the caller's
+    /// own included, is classified and rendered as before; only where Detcore
+    /// renders the address-space files, and for another process, does it
+    /// build the file here (`Detcore::rendered_procfs_at`). `None` for any
+    /// other path, and for the `self` and `thread-self` spellings.
+    pub(crate) fn rendered_maps_at(path: &Path) -> Option<Self> {
+        let normalized = normalize_observed_path(path)?;
+        let task = ProcfsTask::parse(normalized.to_str()?, RENDERED_MAPS_NAME)?;
+        task.bound()?;
+        let mut file = Self::from_path(&normalized)?;
+        if file.kind != ProcfsKind::Maps {
+            return None;
+        }
+        file.task = Some(task);
+        Some(file)
+    }
+
+    /// Whether this is another process's `maps` Detcore renders
+    /// ([`Self::rendered_maps_at`]).
+    pub(crate) fn is_rendered_maps(&self) -> bool {
+        self.is_maps() && self.task.is_some()
     }
 
     /// The descriptor fdinfo at `path`, `/proc/<pid>[/task/<tid>]/fdinfo/<fd>`
@@ -2412,6 +2456,7 @@ impl ProcfsFile {
     /// if it is one.
     pub(crate) fn address_space_file(&self) -> Option<AddressSpaceFile> {
         match self.kind {
+            ProcfsKind::Maps if self.is_rendered_maps() => Some(AddressSpaceFile::Maps),
             ProcfsKind::Smaps => Some(AddressSpaceFile::Smaps),
             ProcfsKind::SmapsRollup => Some(AddressSpaceFile::SmapsRollup),
             ProcfsKind::NumaMaps => Some(AddressSpaceFile::NumaMaps),
@@ -2625,6 +2670,11 @@ impl ProcfsFile {
         }
     }
 
+    /// The task a per-process file's path names, as spelled.
+    pub(crate) fn task_spelling(&self) -> Option<ProcfsTask> {
+        self.task
+    }
+
     /// The task a per-process file belongs to, once bound to numbers.
     pub(crate) fn bound_task(&self) -> Option<BoundTask> {
         self.task.as_ref().and_then(ProcfsTask::bound)
@@ -2649,6 +2699,7 @@ impl ProcfsFile {
         let name = per_process_name(path);
         let mut file = match name {
             Some(name) if name.filename.starts_with("fdinfo/") => Self::rendered_fdinfo_at(path)?,
+            Some(name) if name.filename == RENDERED_MAPS_NAME => Self::rendered_maps_at(path)?,
             _ => Self::from_path(path)?,
         };
         if let Some(name) = name {
@@ -2696,6 +2747,12 @@ impl ProcfsFile {
                 fdinfo_name(self.rendered_fdinfo_target()?),
                 self.incarnation,
             )),
+            // Another process's `maps`, rendered from the backend's memory map
+            // of that process where Detcore renders the other address-space
+            // files ([`Self::rendered_maps_at`]).
+            ProcfsKind::Maps if files.address_space && self.is_rendered_maps() => Some(
+                per_process_path(self.bound_task()?, RENDERED_MAPS_NAME, self.incarnation),
+            ),
             _ if let Some(name) = Self::per_process_name_of(&self.kind) => {
                 Some(per_process_path(self.bound_task()?, name, self.incarnation))
             }
@@ -2900,6 +2957,7 @@ impl ProcfsFile {
             // memory map lists them at the first read
             // (`Detcore::render_address_space_file`).
             ProcfsKind::Smaps | ProcfsKind::SmapsRollup | ProcfsKind::NumaMaps => b"",
+            ProcfsKind::Maps if self.is_rendered_maps() => b"",
             _ => unreachable!("{:?} has no rendered path", self.kind),
         }
     }
@@ -11880,6 +11938,97 @@ total_commit_ms 0\n"
             let link = format!("/memfd:{} (deleted)", placeholder_name(opened, b""));
             assert_eq!(
                 placeholder_link_path(link.as_bytes(), RenderedFiles::WITHOUT_CPUINFO),
+                Some(opened),
+                "{spelling}"
+            );
+        }
+    }
+
+    /// Another process's `maps` is a per-process file only as Detcore renders
+    /// it (package K item 2b slice 2b-6): `from_path` binds no spelling of a
+    /// `maps` to a task, so every one the kernel or the backend opens, the
+    /// caller's own included, is classified and sanitized as before;
+    /// `rendered_maps_at` names the task of a numbered spelling, never of
+    /// `self` or `thread-self`. Bound and rendered where Detcore renders the
+    /// address-space files, its path is the task's `maps`, read at its first
+    /// read from the memory map its open bound, and its path and its
+    /// placeholder's name both name it again; elsewhere it has no rendered
+    /// path.
+    #[test]
+    fn another_processs_maps_is_a_per_process_file_only_where_detcore_renders_it() {
+        for spelling in [
+            "/proc/self/maps",
+            "/proc/thread-self/maps",
+            "/proc/7/maps",
+            "/proc/7/task/8/maps",
+        ] {
+            let kernel = ProcfsFile::from_path(Path::new(spelling)).unwrap();
+            assert!(kernel.is_maps(), "{spelling}");
+            assert!(!kernel.is_rendered_maps(), "{spelling}");
+            assert_eq!(kernel.per_process_name(), None, "{spelling}");
+            assert_eq!(kernel.address_space_file(), None, "{spelling}");
+            assert_eq!(kernel.rendered_path(RenderedFiles::ALL), None, "{spelling}");
+        }
+        for other in [
+            "/proc/self/maps",
+            "/proc/thread-self/maps",
+            "/proc/self/task/8/maps",
+            "/proc/7/smaps",
+            "/proc/7/maps/x",
+            "/proc/7/task/maps",
+            "/proc/maps",
+        ] {
+            assert!(
+                ProcfsFile::rendered_maps_at(Path::new(other)).is_none(),
+                "{other}"
+            );
+        }
+        for (spelling, process, thread, path) in [
+            ("/proc/7/maps", 7, None, "/proc/7/maps"),
+            ("/proc/7/task/8/maps", 7, Some(8), "/proc/7/task/8/maps"),
+        ] {
+            let mut file = ProcfsFile::rendered_maps_at(Path::new(spelling)).unwrap();
+            assert!(file.is_rendered_maps(), "{spelling}");
+            assert_eq!(
+                file.per_process_name(),
+                Some(RENDERED_MAPS_NAME),
+                "{spelling}"
+            );
+            assert_eq!(
+                file.address_space_file(),
+                Some(AddressSpaceFile::Maps),
+                "{spelling}"
+            );
+            assert_eq!(
+                file.bound_task(),
+                Some(BoundTask { process, thread }),
+                "{spelling}"
+            );
+            assert!(!file.shows_at_read(), "{spelling}");
+            assert!(file.snapshot_at_first_read(), "{spelling}");
+            file.set_task_incarnation(TaskIncarnation {
+                process: 1,
+                thread: thread.map(|_| 1),
+            });
+            assert_eq!(
+                file.rendered_path(RenderedFiles::WITHOUT_CPUINFO),
+                None,
+                "{spelling}"
+            );
+            let rendered = file.into_rendered();
+            let opened = rendered.opened_path().unwrap();
+            assert_eq!(opened, Path::new(path), "{spelling}");
+            assert!(rendered.rendering_template().is_empty(), "{spelling}");
+            let again = ProcfsFile::from_rendered_path(opened).unwrap();
+            assert!(again.is_rendered_maps(), "{spelling}");
+            assert_eq!(
+                again.rendered_path(RenderedFiles::ALL),
+                Some(opened),
+                "{spelling}"
+            );
+            let link = format!("/memfd:{} (deleted)", placeholder_name(opened, b""));
+            assert_eq!(
+                placeholder_link_path(link.as_bytes(), RenderedFiles::ALL),
                 Some(opened),
                 "{spelling}"
             );

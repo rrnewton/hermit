@@ -866,9 +866,12 @@ async fn the_callers_own_process_and_other_files_are_left_to_their_handlers() {
 /// here, never left to the backend's procfs (ruling 2 of package K item 2b
 /// slice 2b-5), once the kernel beneath lets the call reach its walk: a name
 /// Linux's task directory lacks, or a non-number below `fd`, is ENOENT; a
-/// name Linux has that Detcore does not render for another process (`maps`,
-/// a path below `ns`, and `status` where this configuration does not render
-/// it) is refused by name.
+/// name Linux has that Detcore does not render for another process
+/// (`limits`, a path below `ns`, and `status` where this configuration does
+/// not render it) is refused by name. Another process's `maps`, which
+/// Detcore renders where it renders the address-space files (slice 2b-6),
+/// is no longer refused: it is left to the rendered open, with nothing
+/// given to the kernel.
 #[tokio::test]
 async fn another_processs_other_names_are_decided_here() {
     let other = OTHER.as_raw();
@@ -885,7 +888,7 @@ async fn another_processs_other_names_are_decided_here() {
         assert_eq!(reached.len(), 1, "{path}: {reached:?}");
     }
     for path in [
-        format!("/proc/{other}/maps"),
+        format!("/proc/{other}/limits"),
         format!("/proc/{other}/ns/net"),
         format!("/proc/{other}/status"),
         format!("/proc/{other}/exe"),
@@ -894,8 +897,16 @@ async fn another_processs_other_names_are_decided_here() {
         assert_refused(&answer, Sysno::openat, &path);
         assert_eq!(reached.len(), 1, "{path}: {reached:?}");
     }
+    for path in [
+        format!("/proc/{other}/maps"),
+        format!("/proc/{other}/task/{other}/maps"),
+    ] {
+        let (answer, reached) = open(&path, Err(Errno::ENOENT)).await;
+        assert!(answer.is_none(), "{path}: {answer:?}");
+        assert!(reached.is_empty(), "{path}: {reached:?}");
+    }
     // The kernel's own answer to the call's arguments stands.
-    let path = format!("/proc/{other}/maps");
+    let path = format!("/proc/{other}/limits");
     let (answer, _) = open(&path, Err(Errno::EINVAL)).await;
     assert!(
         matches!(answer, Some(Err(Error::Errno(Errno::EINVAL)))),

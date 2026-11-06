@@ -3367,7 +3367,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///   Detcore renders in this session (`ProcfsFile::rendered_path`),
     ///   `smaps_rollup` among them only while the backend's memory map of the
     ///   reader's address space is complete, without which its read refuses
-    ///   (`smaps::smaps_rollup_refusal`, dh-62azc), the
+    ///   (`smaps::smaps_rollup_refusal`, dh-62azc), and `smaps` and
+    ///   `numa_maps` only while it lists nothing but the stack, without which
+    ///   theirs do (`smaps::smaps_mapping_refusal`), the
     ///   `fd` directory it serves (`descriptor_directory`: a process's to
     ///   every thread of it, a thread's to that thread alone, which is the
     ///   reader taking the listing), and a process's `task`, which it serves
@@ -3406,15 +3408,23 @@ impl<T: RecordOrReplay> Detcore<T> {
         // alone (`fd_directory::classify`).
         let reader = guest.thread_state().dettid.as_raw();
         let others = binding.pid != self.own_detpid(guest).as_raw();
-        // `smaps_rollup` only where its read can render it: the backend's
-        // memory map of the reader's address space, the one the read renders,
-        // is complete (`smaps::smaps_rollup_refusal`, the read's own rule).
-        // On KVM today it is never complete
-        // (https://github.com/rrnewton/reverie/issues/1211), so the name
-        // comes back once the backend reports a complete map (dh-62azc).
-        let rollup_readable = guest.memory_map(guest.tid()).is_ok_and(|map| {
-            crate::procfs::memory_map::smaps::smaps_rollup_refusal(&map).is_none()
-        });
+        // `smaps_rollup`, `smaps` and `numa_maps` only where their reads can
+        // render them from the backend's memory map of the reader's address
+        // space, the one the reads render, by each read's own rule
+        // (`smaps::smaps_rollup_refusal`, dh-62azc: the map is complete;
+        // `smaps::smaps_mapping_refusal` and `numa_maps_mapping_refusal`: it
+        // lists nothing but the stack). On KVM the map has listed every
+        // mapping since package K item 2b slice 2b-6, so `smaps_rollup` is
+        // listed and `smaps` and `numa_maps`, whose other mappings' flags and
+        // residency the map does not give, are not.
+        let map = guest.memory_map(guest.tid());
+        let readable = |refusal: fn(&reverie::MemoryMap) -> Option<String>| {
+            map.as_ref().is_ok_and(|map| refusal(map).is_none())
+        };
+        use crate::procfs::memory_map::smaps;
+        let rollup_readable = readable(smaps::smaps_rollup_refusal);
+        let smaps_readable = readable(smaps::smaps_mapping_refusal);
+        let numa_readable = readable(smaps::numa_maps_mapping_refusal);
         let kept = |name: &[u8]| match name {
             b"." | b".." => true,
             _ if binding.kind == TaskDirectoryKind::Tasks => true,
@@ -3426,6 +3436,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             b"fd" => binding.kind == TaskDirectoryKind::Process || binding.tid == reader,
             b"task" => binding.kind == TaskDirectoryKind::Process,
             b"smaps_rollup" if !rollup_readable => false,
+            b"smaps" if !smaps_readable => false,
+            b"numa_maps" if !numa_readable => false,
             name => {
                 let path = proc
                     .join(within.strip_prefix("/").unwrap_or(&within))

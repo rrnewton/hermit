@@ -9622,154 +9622,18 @@ fn address_space_listing_with(
     (code, stdout, log)
 }
 
-/// The part of `smaps_and_numa_maps.c`'s output about the stack: from its
-/// line `blocks ok` on, the stack's field labels, `numa_maps` row without
-/// page counts, and `smaps` block without its range and size, which the
-/// backend's layout decides (KVM's stack window is LinuxEmu's 8188 kB one,
-/// a native stack about 132 kB), as are the spaces that pad the name to its
-/// column. The guest prints the range on a line before `blocks ok`.
-fn stack_listing(output: &str) -> String {
-    let from = output
-        .find("blocks ok\n")
-        .unwrap_or_else(|| panic!("no checked listing:\n{output}"));
-    output[from..]
-        .lines()
-        .map(|line| format!("{line}\n"))
-        .collect()
-}
+/// Why KVM refuses a process's `smaps` (package K item 2b slice 2b-6): the
+/// backend's memory map lists every mapping, and Linux's smaps prints the
+/// flags it keeps on each one (`VmFlags`), which the map gives for no
+/// mapping but the stack.
+const KVM_SMAPS_MAPPING_REFUSAL: &str =
+    "Linux's smaps prints the flags it keeps on each mapping, and for ";
 
-/// A [`stack_listing`] without its `ProtectionKey` line and label, which
-/// Linux prints only where the kernel serving the process enables protection
-/// keys (`arch_pkeys_enabled`).
-fn without_protection_key(listing: &str) -> String {
-    listing
-        .lines()
-        .filter(|line| !line.starts_with("ProtectionKey:"))
-        .map(|line| match line.strip_prefix("stack labels ") {
-            Some(labels) => format!(
-                "stack labels {}\n",
-                labels
-                    .split(' ')
-                    .filter(|label| *label != "ProtectionKey")
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            ),
-            None => format!("{line}\n"),
-        })
-        .collect()
-}
-
-/// A [`stack_listing`] without its `THPeligible` line, and that line's value.
-fn without_thp_eligible(listing: &str) -> (String, Option<String>) {
-    let mut value = None;
-    let rest = listing
-        .lines()
-        .filter(|line| match line.strip_prefix("THPeligible:") {
-            Some(eligible) => {
-                value = Some(eligible.trim().to_string());
-                false
-            }
-            None => true,
-        })
-        .map(|line| format!("{line}\n"))
-        .collect();
-    (rest, value)
-}
-
-/// The orders of transparent huge page this host lets an anonymous mapping
-/// that no `MADV_HUGEPAGE` marked have (`thp_vma_allowable_orders` with
-/// `TVA_ENFORCE_SYSFS`): each per-size setting `always`, and each `inherit`
-/// where the global one is `always` (the PMD order alone, 9, where the
-/// kernel has no per-size settings).
-fn host_anonymous_thp_orders() -> u64 {
-    let root = Path::new("/sys/kernel/mm/transparent_hugepage");
-    let selected = |path: &Path| -> Option<String> {
-        let text = fs::read_to_string(path).ok()?;
-        text.split_whitespace()
-            .find_map(|word| word.strip_prefix('[')?.strip_suffix(']'))
-            .map(str::to_owned)
-    };
-    let global_always = selected(&root.join("enabled")).as_deref() == Some("always");
-    let mut orders = 0;
-    let mut per_size = false;
-    for entry in fs::read_dir(root).into_iter().flatten().flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(kilobytes) = name
-            .strip_prefix("hugepages-")
-            .and_then(|size| size.strip_suffix("kB"))
-            .and_then(|size| size.parse::<u64>().ok())
-        else {
-            continue;
-        };
-        let Some(setting) = selected(&entry.path().join("enabled")) else {
-            continue;
-        };
-        per_size = true;
-        let order = (kilobytes / 4).trailing_zeros();
-        if setting == "always" || (setting == "inherit" && global_always) {
-            orders |= 1 << order;
-        }
-    }
-    if !per_size && global_always {
-        orders |= 1 << 9;
-    }
-    // `THP_ORDERS_ALL_ANON`: orders 2 to `PMD_ORDER`.
-    orders & 0x3fc
-}
-
-/// Linux's `THPeligible` for an anonymous mapping `[start, end)` that no
-/// `MADV_HUGEPAGE` marked, in an address space that did not disable huge
-/// pages, on this host (`__thp_vma_allowable_orders` for smaps): whether it
-/// holds a naturally aligned block of an allowed order, tried from the
-/// largest (`thp_vma_suitable_order` at `vm_end` less the block).
-fn host_thp_eligible(start: u64, end: u64) -> &'static str {
-    let orders = host_anonymous_thp_orders();
-    let eligible = (2..=9)
-        .rev()
-        .filter(|order| orders & (1 << order) != 0)
-        .any(|order| {
-            let size = 4096u64 << order;
-            end.checked_sub(size).is_some_and(|address| {
-                let aligned = address & !(size - 1);
-                aligned >= start && aligned + size <= end
-            })
-        });
-    if eligible { "1" } else { "0" }
-}
-
-/// The stack range `smaps_and_numa_maps.c` printed (`stack range S-E`).
-fn printed_stack_range(output: &str) -> (u64, u64) {
-    let range = output
-        .lines()
-        .find_map(|line| line.strip_prefix("stack range "))
-        .unwrap_or_else(|| panic!("no stack range:\n{output}"));
-    let (start, end) = range.split_once('-').unwrap();
-    (
-        u64::from_str_radix(start, 16).unwrap(),
-        u64::from_str_radix(end, 16).unwrap(),
-    )
-}
-
-/// Why KVM refuses a process's `smaps_rollup` (package K slice N4): its
-/// header spans the whole address space, and KVM's memory map lists only the
-/// stack window.
-const KVM_ROLLUP_REFUSAL: &str = "Linux's smaps_rollup gives the range from the address space's \
-    first mapping to its last one, and the backend's memory map lists only some of its mappings";
-
-/// Why KVM refuses a process's `smaps` that lists a part of the stack window
-/// a split left: its flags are not in the memory map.
-const KVM_SPLIT_SMAPS_REFUSAL: &str = "they are not in the backend's memory map";
-
-/// Why KVM refuses a process's `smaps` once access-pattern advice reached
-/// LinuxEmu for the stack: the flag it sets (`rr`) is not in the memory map.
-const KVM_ADVISED_SMAPS_REFUSAL: &str = "madvise advice or mlock that reached the backend may have \
-    set flags on";
-
-/// Why KVM refuses a process's `numa_maps` once advice that discards pages
-/// reached LinuxEmu for the stack: whether it still holds a resident page,
-/// which decides `kernelpagesize_kB`, is not a fact.
-const KVM_DISCARDED_NUMA_MAPS_REFUSAL: &str = "madvise advice that discards pages reached the \
-    backend for";
+/// Why KVM refuses a process's `numa_maps` (slice 2b-6): each row says
+/// whether its mapping holds a resident page, which for a mapping other than
+/// the stack is the host's residency.
+const KVM_NUMA_MAPS_MAPPING_REFUSAL: &str =
+    "Linux's numa_maps says of each mapping whether it holds a resident page, and for ";
 
 /// A process's `smaps`, `smaps_rollup` and `numa_maps`, as
 /// `tests/c/smaps_and_numa_maps.c` checks them against what Linux prints
@@ -9785,70 +9649,25 @@ const KVM_DISCARDED_NUMA_MAPS_REFUSAL: &str = "madvise advice that discards page
 ///
 /// On KVM, where Detcore renders the files from the backend's memory map
 /// (package K slice N4 of <https://github.com/rrnewton/hermit/issues/4213>),
-/// the stack alone is listed, as in `maps` (the memory map lists the stack
-/// window only, <https://github.com/rrnewton/reverie/issues/1211>). Its
-/// block and row are compared with ptrace's, each exemption named:
-/// - the range and `Size` are left out by the guest, and the name's padding,
-///   all of which LinuxEmu's stack window decides;
-/// - `ProtectionKey` is left out of ptrace's: KVM's kernel enables no
-///   protection keys, so Linux prints none there (with and without
-///   `--no-virtualize-cpuid`, which shows the guest the vCPU's own CPUID),
-///   where the host kernel beneath ptrace prints one;
-/// - where the host lets an anonymous mapping have huge pages without
-///   `MADV_HUGEPAGE`, `THPeligible` follows the mapping's size and
-///   alignment, so KVM's is checked against Linux's rule for KVM's own
-///   window rather than against ptrace's, which is for a native-sized
-///   stack; elsewhere it is 0 on both and compared with the rest.
-///
-/// What the memory map cannot tell is refused by name: the rollup's range,
-/// the flags of a part a split left of the stack, the flags advice set on
-/// the stack, and the residency of a stack whose pages were discarded.
-/// Advice on a mapping the memory map does not list changes nothing KVM's
-/// files show, and refuses nothing.
+/// the map has listed every mapping since package K item 2b slice 2b-6, so
+/// the rollup, whose range and sums the map gives, renders at L2 as on
+/// ptrace, while `smaps` and `numa_maps` are refused by name: Linux prints
+/// for each mapping the flags it keeps (`VmFlags`) and whether it holds a
+/// resident page, which the map gives for the stack alone. (Before 2b-6 the
+/// map listed only the stack window, so these two rendered the stack and the
+/// rollup was refused.)
 fn list_the_address_space_in_smaps_and_numa_maps(backend: &str) {
-    let kvm = backend == "kvm";
-    let (_, files, _) = address_space_listing(backend, "files", true);
-    let listed = |kind: &str| files.contains(&format!("kind {kind} listed\n"));
-    for kind in ["anonymous", "file", "heap", "vdso"] {
-        assert_eq!(listed(kind), !kvm, "{kind}:\n{files}");
-    }
-    assert!(listed("stack"), "{files}");
-    assert!(
-        files.contains("blocks ok\nnuma ok\naccounting nonzero 0\nnuma counts 0\n"),
-        "{files}"
-    );
-    if kvm {
-        assert!(!files.contains("ProtectionKey"), "{files}");
-        let (_, ptrace, _) = address_space_listing("ptrace", "files", true);
-        let (kvm_listing, kvm_thp) = without_thp_eligible(&stack_listing(&files));
-        let (ptrace_listing, ptrace_thp) =
-            without_thp_eligible(&without_protection_key(&stack_listing(&ptrace)));
-        assert_eq!(kvm_listing, ptrace_listing);
-        let (start, end) = printed_stack_range(&files);
-        assert_eq!(
-            kvm_thp.as_deref(),
-            Some(host_thp_eligible(start, end)),
-            "KVM's THPeligible for its window {start:#x}-{end:#x}"
-        );
-        if host_anonymous_thp_orders() == 0 {
-            assert_eq!(kvm_thp, ptrace_thp);
-        }
-        // The guest shown the vCPU's own CPUID (OSPKE clear, PKU set) reads
-        // the same block: the kernel serving it decides, not the CPUID.
-        let (code, nocpuid, stderr) =
-            address_space_listing_with(backend, "files", false, &["--no-virtualize-cpuid"]);
-        assert_eq!(code, Some(0), "--no-virtualize-cpuid:\n{nocpuid}\n{stderr}");
-        assert!(!nocpuid.contains("ProtectionKey"), "{nocpuid}");
-        assert_eq!(stack_listing(&nocpuid), stack_listing(&files));
-        // Advice on the anonymous mapping, which the memory map does not
-        // list, leaves the stack's block and row as they were.
-        let (_, other, _) = address_space_listing(backend, "other", true);
-        assert_eq!(stack_listing(&other), stack_listing(&files));
+    if backend == "kvm" {
+        // The rollup renders at L2 as on ptrace: its range and the sums of
+        // a complete map, every page count zero.
+        let (_, rollup, _) = address_space_listing(backend, "rollup", true);
+        assert_eq!(rollup, "rollup ok\naccounting nonzero 0\n");
         for (mode, refusal) in [
-            ("rollup", KVM_ROLLUP_REFUSAL),
-            ("split", KVM_SPLIT_SMAPS_REFUSAL),
-            ("advise", KVM_ADVISED_SMAPS_REFUSAL),
-            ("discard", KVM_DISCARDED_NUMA_MAPS_REFUSAL),
+            ("files", KVM_SMAPS_MAPPING_REFUSAL),
+            ("split", KVM_SMAPS_MAPPING_REFUSAL),
+            ("advise", KVM_SMAPS_MAPPING_REFUSAL),
+            ("other", KVM_SMAPS_MAPPING_REFUSAL),
+            ("discard", KVM_NUMA_MAPS_MAPPING_REFUSAL),
         ] {
             let (code, stdout, stderr) = address_space_listing(backend, mode, false);
             // EXIT-CLASS: hermit
@@ -9867,40 +9686,50 @@ fn list_the_address_space_in_smaps_and_numa_maps(backend: &str) {
                 "{mode}: {stderr}"
             );
         }
-    } else {
-        let guest = smaps_and_numa_maps_guest().to_str().unwrap().to_owned();
-        let native = native_main_stack_output(&guest, &["files"]);
-        let derived = |output: &str| -> Vec<String> {
-            output
-                .lines()
-                .filter(|line| {
-                    line.starts_with("stack labels ")
-                        || line.starts_with("stack numa ")
-                        || line.starts_with("THPeligible:")
-                        || line.starts_with("ProtectionKey:")
-                        || line.starts_with("VmFlags:")
-                })
-                .map(str::to_owned)
-                .collect()
-        };
-        assert_eq!(derived(&files), derived(&native), "{native}");
-        assert!(!native.contains("accounting nonzero 0\n"), "{native}");
-        let (_, rollup, _) = address_space_listing(backend, "rollup", true);
-        assert_eq!(rollup, "rollup ok\naccounting nonzero 0\n");
-        for mode in ["split", "advise", "other"] {
-            let (_, output, _) = address_space_listing(backend, mode, true);
-            assert!(
-                output.contains("blocks ok\nnuma ok\naccounting nonzero 0\nnuma counts 0\n"),
-                "{mode}:\n{output}"
-            );
-        }
-        // Every page of the initial stack discarded: no kernelpagesize_kB,
-        // natively and through the sanitizer.
-        let native_discard = native_main_stack_output(&guest, &["discard"]);
-        assert_eq!(native_discard, "discard ok\nstack numa default stack\n");
-        let (_, discard, _) = address_space_listing(backend, "discard", true);
-        assert_eq!(discard, native_discard);
+        return;
     }
+    let (_, files, _) = address_space_listing(backend, "files", true);
+    let listed = |kind: &str| files.contains(&format!("kind {kind} listed\n"));
+    for kind in ["anonymous", "file", "heap", "vdso"] {
+        assert!(listed(kind), "{kind}:\n{files}");
+    }
+    assert!(listed("stack"), "{files}");
+    assert!(
+        files.contains("blocks ok\nnuma ok\naccounting nonzero 0\nnuma counts 0\n"),
+        "{files}"
+    );
+    let guest = smaps_and_numa_maps_guest().to_str().unwrap().to_owned();
+    let native = native_main_stack_output(&guest, &["files"]);
+    let derived = |output: &str| -> Vec<String> {
+        output
+            .lines()
+            .filter(|line| {
+                line.starts_with("stack labels ")
+                    || line.starts_with("stack numa ")
+                    || line.starts_with("THPeligible:")
+                    || line.starts_with("ProtectionKey:")
+                    || line.starts_with("VmFlags:")
+            })
+            .map(str::to_owned)
+            .collect()
+    };
+    assert_eq!(derived(&files), derived(&native), "{native}");
+    assert!(!native.contains("accounting nonzero 0\n"), "{native}");
+    let (_, rollup, _) = address_space_listing(backend, "rollup", true);
+    assert_eq!(rollup, "rollup ok\naccounting nonzero 0\n");
+    for mode in ["split", "advise", "other"] {
+        let (_, output, _) = address_space_listing(backend, mode, true);
+        assert!(
+            output.contains("blocks ok\nnuma ok\naccounting nonzero 0\nnuma counts 0\n"),
+            "{mode}:\n{output}"
+        );
+    }
+    // Every page of the initial stack discarded: no kernelpagesize_kB,
+    // natively and through the sanitizer.
+    let native_discard = native_main_stack_output(&guest, &["discard"]);
+    assert_eq!(native_discard, "discard ok\nstack numa default stack\n");
+    let (_, discard, _) = address_space_listing(backend, "discard", true);
+    assert_eq!(discard, native_discard);
 }
 
 /// [`list_the_address_space_in_smaps_and_numa_maps`] on ptrace.
@@ -9909,7 +9738,8 @@ fn smaps_numa_maps_and_the_rollup_list_the_address_space_as_on_linux() {
     list_the_address_space_in_smaps_and_numa_maps("ptrace");
 }
 
-/// [`list_the_address_space_in_smaps_and_numa_maps`] on KVM.
+/// [`list_the_address_space_in_smaps_and_numa_maps`] on KVM. (The name is
+/// from before slice 2b-6, when the map listed the stack alone.)
 #[test]
 fn run_kvm_smaps_and_numa_maps_render_the_stack_from_the_memory_map() {
     let test = "run_kvm_smaps_and_numa_maps_render_the_stack_from_the_memory_map";
@@ -69619,10 +69449,11 @@ fn the_callers_own_proc_directories_answer_as_linux() {
 /// thread's directory held while it exits (the guest's held-thread mode),
 /// which Detcore answers from the directory's binding, at L2, as natively.
 /// Every name those listings give opens and reads without a refusal (the
-/// guest's read-listed mode), so `smaps_rollup`, whose read Detcore refuses
-/// while the backend's memory map is incomplete, is listed only when its read
-/// can render it (dh-62azc; KVM's map is incomplete today,
-/// https://github.com/rrnewton/reverie/issues/1211).
+/// guest's read-listed mode), so each of `smaps_rollup`, `smaps` and
+/// `numa_maps` is listed only when its read can render it (dh-62azc): since
+/// package K item 2b slice 2b-6 KVM's memory map lists every mapping, so
+/// `smaps_rollup` is listed, and `smaps` and `numa_maps`, whose reads refuse
+/// a mapping other than the stack, are not.
 /// Then the guest's other modes ([`OWN_DIRECTORY_MODES`]): the open of
 /// `/proc/self` itself (`O_PATH|O_NOFOLLOW`), by its plain spelling and
 /// through `..`, which opens the link on Linux and for which this backend has
@@ -69652,10 +69483,9 @@ fn run_kvm_the_callers_own_proc_directories_answer_as_linux() {
         "cmdline/r",
         "stat/r",
         "statm/r",
-        "numa_maps/r",
         "mounts/r",
         "mountinfo/r",
-        "smaps/r",
+        "smaps_rollup/r",
         "cgroup/r",
         "io/r",
         "arch_status/r",
@@ -70694,13 +70524,12 @@ const UNRENDERED_TASK_ENTRY_ANSWER: UnrenderedTaskEntryAnswer =
     UnrenderedTaskEntryAnswer::NamedRefusal;
 
 /// Names Linux's task directory has that Detcore does not render for another
-/// process, with the guest's native line for each: a file (`maps`) and a
-/// path below one of its directories (`ns/net`, which an open follows to the
-/// namespace file, whose read fails).
-const UNRENDERED_TASK_ENTRIES: &[(&str, &str)] = &[
-    ("maps", "entry maps: read"),
-    ("ns/net", "entry ns/net: EINVAL"),
-];
+/// process at the run's default `--proc` level, with the guest's native line
+/// for each: a path below one of its directories (`ns/net`, which an open
+/// follows to the namespace file, whose read fails). `maps` was a file here
+/// until slice 2b-6 rendered it; every other file of that level is rendered,
+/// and a file of a higher level (`limits`) is ENOENT at this one.
+const UNRENDERED_TASK_ENTRIES: &[(&str, &str)] = &[("ns/net", "entry ns/net: EINVAL")];
 
 /// Another process's `/proc/<pid>/<name>` for names Linux has that Detcore
 /// does not render for another process yet (`tests/c/proc_other_process_fds.c
@@ -70746,6 +70575,133 @@ fn run_kvm_another_processs_unrendered_task_entries_are_refused_by_name() {
             }
         }
     }
+}
+
+static PROC_MAPS_OTHER_PROCESS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+
+/// `tests/c/proc_maps_other_process.c`, compiled once per test process.
+fn proc_maps_other_process_guest() -> &'static Path {
+    compiled_c_guest(&PROC_MAPS_OTHER_PROCESS_GUEST, "proc_maps_other_process")
+}
+
+/// The maps guest's checks, as Linux answers them (fs/proc/task_mmu.c
+/// `show_map_vma`, `proc_maps_open`): its own `/proc/self/maps` lists a
+/// shared memfd view, a private file view (each from its offset, with the
+/// inode fstat gives) and an anonymous range `mprotect` split in three; a
+/// forked child's `/proc/<pid>/maps` read by its parent is the text the
+/// child reads as its own, with the child's page and the inherited view,
+/// without the parent's later page. The guest's `MAP` lines, its own map's
+/// shape, depend on the host's libraries and are not compared here. Where
+/// the work directory's file system gives a file a device of its own that is
+/// not its superblock's (a btrfs subvolume), the file view's inode is printed
+/// rather than checked (a `KNOWN:` line): 36 checks there, 37 elsewhere.
+const PROC_MAPS_OTHER_PROCESS_CHECKS: [usize; 2] = [36, 37];
+
+/// The file view's `KNOWN:` line where the work directory's file system
+/// gives the file a device that is not its superblock's: natively its maps
+/// inode is fstat's (`yes`). Under Hermit it is not (`no`), on every
+/// backend: Detcore numbers an inode by its device and number together, and
+/// the device `maps` prints (the superblock's) is not the one `stat` prints,
+/// so the two routes get two numbers (a known difference, pinned here, which
+/// procfs_identity_agreement.c avoids by mapping a memfd).
+const PROC_MAPS_KNOWN_NATIVE: &str =
+    "KNOWN: file view inode agrees with fstat, its device not fstat's: yes";
+const PROC_MAPS_KNOWN_UNDER_HERMIT: &str =
+    "KNOWN: file view inode agrees with fstat, its device not fstat's: no";
+
+/// The maps guest's check lines (`PASS:`/`FAIL:` and its verdict) in
+/// `transcript`, with the work directory `work` as `<dir>`.
+fn proc_maps_other_process_checks(transcript: &str, work: &str) -> Vec<String> {
+    transcript
+        .lines()
+        .filter(|line| !line.starts_with("MAP "))
+        .map(|line| line.replace(work, "<dir>"))
+        .collect()
+}
+
+/// The maps guest on `backend`, at L2, in a fresh work directory both
+/// verified runs share (the guest removes its file before it exits), whose
+/// checks must equal its native run's, which must all pass first.
+fn assert_proc_maps_other_process_at_l2(backend: &str) {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let work = directory.path().to_str().expect("work directory is UTF-8");
+    let output = Command::new(proc_maps_other_process_guest())
+        .arg(work)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the maps guest natively");
+    assert!(output.status.success(), "native: {output:?}");
+    let native = proc_maps_other_process_checks(&stdout(&output), work);
+    let known = native.iter().any(|line| line == PROC_MAPS_KNOWN_NATIVE);
+    assert_eq!(
+        native
+            .iter()
+            .filter(|line| line.starts_with("PASS: "))
+            .count(),
+        PROC_MAPS_OTHER_PROCESS_CHECKS[usize::from(!known)],
+        "native: {native:#?}"
+    );
+    assert_eq!(
+        native.last().map(String::as_str),
+        Some("ALL PASS"),
+        "native"
+    );
+    let expected: Vec<String> = native
+        .iter()
+        .map(|line| {
+            if line == PROC_MAPS_KNOWN_NATIVE {
+                PROC_MAPS_KNOWN_UNDER_HERMIT.to_owned()
+            } else {
+                line.clone()
+            }
+        })
+        .collect();
+    let transcript = guest_transcript_at_l2(backend, proc_maps_other_process_guest(), &[work]);
+    assert_eq!(
+        proc_maps_other_process_checks(&transcript, work),
+        expected,
+        "{backend}"
+    );
+}
+
+/// Another process's `/proc/<pid>/maps`, and the caller's own, on the
+/// ptrace backend at L2 (`tests/c/proc_maps_other_process.c`): the kernel's
+/// files, sanitized, answer as Linux's do.
+#[test]
+fn another_processs_maps_answers_as_linux() {
+    assert_proc_maps_other_process_at_l2("ptrace");
+}
+
+/// Another process's `/proc/<pid>/maps`, and the caller's own, on a strict
+/// KVM run at L2 (package K item 2b slice 2b-6,
+/// <https://github.com/rrnewton/hermit/issues/5038>): Detcore renders
+/// another process's from the backend's memory map of that process, after
+/// Linux's access check at the open, and the backend's own `maps` the
+/// caller's; both answer as Linux's do. The descriptors guest's `--entry
+/// maps` read of a child's, which was refused by name before, now reads.
+#[test]
+fn run_kvm_another_processs_maps_answers_as_linux() {
+    let test = "run_kvm_another_processs_maps_answers_as_linux";
+    if kvm_unavailable(test) {
+        return;
+    }
+    assert_proc_maps_other_process_at_l2("kvm");
+    assert_eq!(
+        proc_other_process_fds_native(&["--entry", "maps"]),
+        "entry maps: read\nfailures=0\n",
+        "native"
+    );
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let work = directory.path().to_str().expect("work directory is UTF-8");
+    assert_eq!(
+        guest_transcript_at_l2(
+            "kvm",
+            proc_other_process_fds_guest(),
+            &["--entry", "maps", work]
+        ),
+        "entry maps: read\nfailures=0\n",
+        "kvm"
+    );
 }
 
 /// The link-targets guest's `--directory-links` transcript, line by line:

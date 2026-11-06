@@ -402,20 +402,57 @@ fn is_gate_area(mapping: &MappingFact) -> bool {
     mapping.start >= 1 << 63
 }
 
+/// Why Detcore cannot render a process's `smaps` from `map`, whatever else
+/// it learns: a mapping other than the stack, whose flags (`VmFlags`, which
+/// Linux keeps on the mapping, such as `VM_ACCOUNT` and the advice madvise
+/// set) the backend's memory map does not give. The one rule
+/// [`render_smaps`] refuses such a mapping by, and the one a listing of the
+/// process's directory leaves the name out by
+/// (`Detcore::task_placeholder_snapshot`), so that a listing never names an
+/// `smaps` its read refuses for this reason. KVM's memory map lists every
+/// mapping since Reverie's complete list (package K item 2b slice 2b-6), so
+/// there it holds for every process.
+pub(crate) fn smaps_mapping_refusal(map: &MemoryMap) -> Option<Refusal> {
+    map.mappings
+        .iter()
+        .find(|mapping| !matches!(mapping.backing, MappingBacking::Stack))
+        .map(|mapping| {
+            format!(
+                "Linux's smaps prints the flags it keeps on each mapping, and for {} \
+                 they are not in the backend's memory map",
+                named(mapping)
+            )
+        })
+}
+
+/// Why Detcore cannot render a process's `numa_maps` from `map`, whatever
+/// else it learns: a mapping other than the stack (and the gate area, which
+/// has no row), whether it holds a resident page being the host's residency.
+/// The one rule [`render_numa_maps`] refuses such a mapping by, and the one a
+/// listing leaves the name out by ([`smaps_mapping_refusal`]).
+pub(crate) fn numa_maps_mapping_refusal(map: &MemoryMap) -> Option<Refusal> {
+    map.mappings
+        .iter()
+        .find(|mapping| !is_gate_area(mapping) && !matches!(mapping.backing, MappingBacking::Stack))
+        .map(|mapping| {
+            format!(
+                "Linux's numa_maps says of each mapping whether it holds a resident page, \
+                 and for {} that is the host's residency, not in the backend's memory map",
+                named(mapping)
+            )
+        })
+}
+
 /// The text of a process's `smaps` for `map`, as Linux prints it
 /// (`show_smap`), with the fields the memory map does not list derived from
 /// `facts`, or the refusal that names why Detcore cannot give one of them.
 pub(crate) fn render_smaps(map: &MemoryMap, facts: &SmapsFacts) -> Result<Vec<u8>, Refusal> {
     refuse_empty_incomplete(map, "smaps")?;
+    if let Some(refusal) = smaps_mapping_refusal(map) {
+        return Err(refusal);
+    }
     let mut out = Vec::new();
     for mapping in &map.mappings {
-        if !matches!(mapping.backing, MappingBacking::Stack) {
-            return Err(format!(
-                "Linux's smaps prints the flags it keeps on each mapping, and for {} \
-                 they are not in the backend's memory map",
-                named(mapping)
-            ));
-        }
         if facts.mapping_flags_changed {
             return Err(format!(
                 "Linux's smaps prints the flags it keeps on each mapping, and madvise \
@@ -543,18 +580,14 @@ pub(crate) fn render_smaps_rollup(map: &MemoryMap) -> Result<Vec<u8>, Refusal> {
 /// page, which decides `kernelpagesize_kB`, is not a fact.
 pub(crate) fn render_numa_maps(map: &MemoryMap, pages_discarded: bool) -> Result<Vec<u8>, Refusal> {
     refuse_empty_incomplete(map, "numa_maps")?;
+    if let Some(refusal) = numa_maps_mapping_refusal(map) {
+        return Err(refusal);
+    }
     let mut out = Vec::new();
     for mapping in &map.mappings {
         // The gate area has no memory map of its own: no row (`if (!mm)`).
         if is_gate_area(mapping) {
             continue;
-        }
-        if !matches!(mapping.backing, MappingBacking::Stack) {
-            return Err(format!(
-                "Linux's numa_maps says of each mapping whether it holds a resident page, \
-                 and for {} that is the host's residency, not in the backend's memory map",
-                named(mapping)
-            ));
         }
         if pages_discarded {
             return Err(format!(
