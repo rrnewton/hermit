@@ -415,11 +415,23 @@ pub fn source_profile(
     closure: bool,
 ) -> Result<BTreeSet<String>, String> {
     let source = contract();
+    // Post-split extension nodes join core profiles only; the original
+    // (non-core-only) lineage stays exactly the frozen source.
+    let extension: BTreeMap<&str, &ExtensionNode> = if core_only {
+        validate_extension_registry(&source, POST_SPLIT_CORE_NODES)?;
+        POST_SPLIT_CORE_NODES
+            .iter()
+            .map(|node| (node.tag, node))
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
     let admitted = |tag: &str| {
-        source
-            .nodes
-            .get(tag)
-            .is_some_and(|node| !core_only || node.owner == "core")
+        extension.contains_key(tag)
+            || source
+                .nodes
+                .get(tag)
+                .is_some_and(|node| !core_only || node.owner == "core")
     };
     let mut selected = source
         .nodes
@@ -428,15 +440,26 @@ pub fn source_profile(
             (admitted(tag) && node.labels.iter().any(|value| value == label)).then_some(tag.clone())
         })
         .collect::<BTreeSet<_>>();
+    selected.extend(
+        extension
+            .values()
+            .filter(|node| node.labels.contains(&label))
+            .map(|node| node.tag.to_string()),
+    );
     if closure {
         let mut pending = selected.iter().cloned().collect::<Vec<_>>();
         while let Some(tag) = pending.pop() {
-            let node = source
-                .nodes
-                .get(&tag)
-                .ok_or_else(|| format!("unknown source owner {tag}"))?;
-            for dependency in &node.deps {
-                if !source.nodes.contains_key(dependency) {
+            let deps: Vec<String> = if let Some(node) = source.nodes.get(&tag) {
+                node.deps.clone()
+            } else if let Some(node) = extension.get(tag.as_str()) {
+                node.deps.iter().map(|dep| dep.to_string()).collect()
+            } else {
+                return Err(format!("unknown source owner {tag}"));
+            };
+            for dependency in &deps {
+                if !source.nodes.contains_key(dependency)
+                    && !extension.contains_key(dependency.as_str())
+                {
                     return Err(format!("unprovided original dependency {dependency}"));
                 }
                 if admitted(dependency) && selected.insert(dependency.clone()) {
