@@ -1218,6 +1218,16 @@ mod tests {
             .is_err()
         );
         assert!(FormatProbe::is_boundary_recording(b"{\"global\": [").is_err());
+        let identity_probe = |text: &str| FormatProbe::has_rcb_history(text.as_bytes()).unwrap();
+        assert!(!identity_probe(r#"{"per_thread": {}, "global": []}"#));
+        assert!(identity_probe(r#"{"rcb_history": {"format": 2}}"#));
+        assert!(identity_probe(r#"{"rcb_history": null}"#));
+        assert!(!identity_probe(
+            r#"{"per_thread": {"3": {"rcb_history": 1}}, "global": []}"#
+        ));
+        assert!(
+            FormatProbe::has_rcb_history(br#"{"rcb_history": null, "rcb_history": null}"#).is_err()
+        );
     }
 
     #[test]
@@ -1752,7 +1762,14 @@ mod identity_tests {
         writer.register_thread(tid, DEFAULT_PRIORITY);
         writer.insert_schedevent(SchedEvent::branches(tid, 2_459_579));
         let first = LogicalTime::from_nanos(1_792_852_217_000_000_000);
-        writer.insert_reprioritization(tid, first, 2_459_579, DEFAULT_PRIORITY, DEFAULT_PRIORITY, None);
+        writer.insert_reprioritization(
+            tid,
+            first,
+            2_459_579,
+            DEFAULT_PRIORITY,
+            DEFAULT_PRIORITY,
+            None,
+        );
         writer.insert_schedevent(SchedEvent::branches(tid, 8_299_750));
         // Progress counts events, so the write prehook's endpoint is 154
         // past the raw RCB count.
@@ -1762,7 +1779,14 @@ mod identity_tests {
             ..SchedEvent::branches(tid, 0)
         });
         let second = LogicalTime::from_nanos(1_792_852_217_684_087_955);
-        writer.insert_reprioritization(tid, second, 10_759_329, DEFAULT_PRIORITY, DEFAULT_PRIORITY, None);
+        writer.insert_reprioritization(
+            tid,
+            second,
+            10_759_329,
+            DEFAULT_PRIORITY,
+            DEFAULT_PRIORITY,
+            None,
+        );
         writer.insert_callback_checkpoint(
             tid,
             Origin {
