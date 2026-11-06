@@ -13419,3 +13419,42 @@ mod backend_refusal_tests {
         })
     }
 }
+
+#[cfg(test)]
+mod turn_decision_tests {
+    use super::turn_decides_interruption;
+    use crate::config::Config;
+
+    /// A poller decides interruption at its turn only where the pending sets
+    /// it reads are the kernel's (ptrace). KVM keeps the discarded-at-send
+    /// record since SIGSHARE S3b, but its shared queue goes to the thread the
+    /// tool reserves a permit for, so the backend's polled-read observation
+    /// keeps deciding there; otherwise the first poller after a POSIX timer's
+    /// expiry takes the SIGUSR1 Linux leaves to a `sigtimedwait` waiter
+    /// (revastra2 delta F3, `posix-sigwait`).
+    #[test]
+    fn only_a_backend_whose_kernel_state_is_the_guests_decides_at_the_turn() {
+        for (name, backend, sequentialize_threads, expected) in [
+            ("ptrace", reverie::BackendCapabilities::PTRACE, true, true),
+            (
+                "ptrace unsequentialized",
+                reverie::BackendCapabilities::PTRACE,
+                false,
+                false,
+            ),
+            ("kvm", reverie::BackendCapabilities::KVM, true, false),
+        ] {
+            let cfg = Config {
+                sequentialize_threads,
+                ..Config::default().with_backend(|b| *b = backend)
+            };
+            if name == "kvm" {
+                assert!(
+                    crate::scheduler::discarded_at_send::records(&cfg),
+                    "KVM keeps the record since S3b"
+                );
+            }
+            assert_eq!(turn_decides_interruption(&cfg), expected, "{name}");
+        }
+    }
+}
