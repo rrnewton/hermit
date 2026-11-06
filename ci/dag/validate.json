@@ -14742,13 +14742,6 @@
           "category": "compat",
           "test": "compat/shred",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/shred",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -19466,13 +19459,6 @@
           "test": "compat/shred",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/shred",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -58459,13 +58445,6 @@
           "test": "compat/shred",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/shred",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
