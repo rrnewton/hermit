@@ -21721,7 +21721,8 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // And run_kvm_hermit_init_stat_and_comm_answer_as_on_ptrace: 160.
         // Less the two dh-9j8ue disables (smaps, own-proc): 158, matching
         // the DAG pin in validation_dag_static.
-        ("privileged-only-test.cli_kvm", 158usize),
+        // And S3b-2's KVM receiver test: 159.
+        ("privileged-only-test.cli_kvm", 159usize),
     ] {
         let step = privileged
             .steps
