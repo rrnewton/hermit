@@ -11231,3 +11231,81 @@ fn a_kvm_copy_linux_discarded_at_send_is_never_taken_by_a_later_handler() {
         );
     }
 }
+
+/// The announcement-level twin of
+/// `a_kvm_copy_linux_discarded_at_send_is_never_taken_by_a_later_handler`:
+/// a reported delivery stop (`DiscardedSignalControl::Dequeue`, as
+/// `Detcore::handle_signal` announces it) that dequeued a SIGURG copy Linux
+/// discarded as it was sent delivers nothing
+/// (`DeliveryAnswer::Suppress`), though no scheduler take ran first. The
+/// admission layer (`own_signals_to_take`) keeps the parked observation from
+/// taking such a copy, but a delivery stop the backend reports anyway reaches
+/// `inbound_dequeued` with only the Dequeue arm between it and the guest's
+/// late handler (musereviewc's review of
+/// <https://github.com/rrnewton/hermit/pull/5259>, R-1). A copy that was
+/// blocked when sent, and one the process still ignores, are delivered as
+/// they are. Mutation "the arm's call disabled"
+/// (`DeliveryAnswer::AsIs if false && delivers_a_copy_linux_discarded(..)`):
+/// the first row answers `AsIs`.
+#[test]
+fn a_kvm_delivery_stop_of_a_copy_linux_discarded_at_send_delivers_nothing() {
+    use super::discarded_at_send::DiscardedSignalAnswer;
+    use super::discarded_at_send::DiscardedSignalControl;
+    use super::posix_timer_coalesce::DeliveryAnswer;
+    let urg = kernel_signal_bit(libc::SIGURG);
+    for (name, blocked_at_send, caught_now, expected) in [
+        (
+            "unblocked at send, caught now",
+            false,
+            true,
+            DeliveryAnswer::Suppress,
+        ),
+        (
+            "blocked at send, caught now",
+            true,
+            true,
+            DeliveryAnswer::AsIs,
+        ),
+        (
+            "unblocked at send, still ignored",
+            false,
+            false,
+            DeliveryAnswer::AsIs,
+        ),
+    ] {
+        let (mut s, backend) = kvm_fixture();
+        let (_, _, _) = add(&mut s, 100, 100);
+        let (waiter, _, _) = add(&mut s, 100, 101);
+        file_restartable_read(&mut s, waiter);
+        let at_send = if blocked_at_send { urg } else { 0 };
+        backend
+            .signal_sets
+            .lock()
+            .unwrap()
+            .insert(101, reverie::SignalSets::new(0, 0, at_send, 0, 0));
+        // The sibling's send, as the guest hooks record it.
+        let token = s.discard_pre_send(
+            waiter,
+            discarded_at_send::QueueId::Thread(waiter),
+            libc::SIGURG,
+            None,
+        );
+        assert_eq!(token.discarded, !blocked_at_send, "{name}");
+        s.discard_note_send(token, None, None);
+        // The backend reports a delivery stop that dequeued the copy, with no
+        // scheduler take before it: nothing is pending after, and a handler
+        // may have been installed since the send.
+        backend.signal_sets.lock().unwrap().insert(
+            101,
+            reverie::SignalSets::new(0, 0, 0, 0, if caught_now { urg } else { 0 }),
+        );
+        let answer = s.discarded_signal_control(
+            waiter,
+            DiscardedSignalControl::Dequeue {
+                signal: libc::SIGURG,
+                at: LogicalTime::from_nanos(1_000),
+            },
+        );
+        assert_eq!(answer, DiscardedSignalAnswer::Delivery(expected), "{name}");
+    }
+}
