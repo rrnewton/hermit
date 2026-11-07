@@ -676,6 +676,8 @@ const PINNED_ROOT_FORWARDED_ENV: &[&str] = &[
     "HERMIT_NEXTEST_FILTER_EXPR",
     "HERMIT_VALIDATE_RELEASE_BUILD_MODE",
     "HERMIT_VALIDATE_BUCK_DOTSLASH",
+    "HERMIT_VALIDATE_BUILD_MODE",
+    "HERMIT_VALIDATE_BUCK2",
     "L4_REPS",
     "NEXTEST_TEST_THREADS",
     "PR_NUMBER",
@@ -1701,7 +1703,7 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
         .iter_mut()
         .find(|step| step.tag() == "build.workspace_on_host")
         .ok_or("hosted workspace producer is absent")?;
-    let local_prepare = "./ci/nextest-binaries.rs prepare full";
+    let local_prepare = "./ci/nextest-binaries.rs prepare full --build-mode \"${HERMIT_VALIDATE_BUILD_MODE:-cargo}\"";
     if hosted_workspace.cmd.matches(local_prepare).count() != 1 {
         return Err("hosted workspace producer lost the exact local preparation command".into());
     }
@@ -1720,7 +1722,7 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
         .find(|step| step.tag() == "build.workspace_on_host")
         .ok_or("hosted workspace producer is absent")?;
     let local_prebuild = local_prebuild.replace(
-        "./ci/nextest-binaries.rs prepare full",
+        "./ci/nextest-binaries.rs prepare full --build-mode \"${HERMIT_VALIDATE_BUILD_MODE:-cargo}\"",
         "./ci/nextest-binaries.rs prepare hosted-portable",
     );
     if hosted_workspace.cmd.matches(&local_prebuild).count() != 1 {
@@ -2108,13 +2110,11 @@ fn is_buck_import_twin(step: &Step) -> bool {
 pub fn buck_e2e_selection(committed: &DagConfig) -> Result<DagConfig, String> {
     let replaced = buck_replaced_tags(committed)?;
     let mut pruned = committed.clone();
-    // Post-split extension brackets (build.reverie_buck, M2) are not part of
-    // the Buck E2E replacement composition: they carry the `full` label for
-    // the ordinary full profile, and selecting them here would keep the
-    // bracket inside the very mode whose selection it brackets. Exclude
-    // extension tags explicitly; the frozen population is unchanged.
-    let extension = crate::dag_source_ownership::extension_tags();
-    pruned.steps.retain(|step| !extension.contains(&step.tag()));
+    // Post-split extension nodes named *_buck (the rr twins and
+    // build.reverie_buck) are part of this selection's population per the
+    // registry contract; no exclusion is applied here. The bracket is
+    // accounted for explicitly in validate.rs's runner plan and in
+    // assert_buck_e2e_selection's dropped-set derivation below.
     for step in &mut pruned.steps {
         if replaced.contains(&step.tag()) {
             step.labels.retain(|label| label != "full");
@@ -3820,6 +3820,23 @@ fn expected_for_label<'a>(label: &str, cells: &'a [DagManifest]) -> Vec<&'a DagM
         .collect()
 }
 
+/// The extension tags the Buck E2E selection drops, pinned by name.
+/// Independent of any selection: a same-count swap must fail here.
+const BUCK_E2E_EXTENSION_DROPPED: [&str; 2] = ["e2e.manifest_gvisor", "e2e.manifest_rr"];
+
+fn check_buck_e2e_extension_dropped(actual: &BTreeSet<String>) -> Result<(), String> {
+    let expected = BUCK_E2E_EXTENSION_DROPPED
+        .iter()
+        .map(|tag| (*tag).to_string())
+        .collect::<BTreeSet<_>>();
+    if *actual != expected {
+        return Err(format!(
+            "the Buck E2E selection drops extension tags {actual:?}, expected exactly {expected:?}"
+        ));
+    }
+    Ok(())
+}
+
 /// The Buck full selection replaces exactly the cargo E2E path and reports
 /// the same cells, each owned by exactly one node.
 fn assert_buck_e2e_selection(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), String> {
@@ -3850,12 +3867,6 @@ fn assert_buck_e2e_selection(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(
     }
     for category in ["applications", "c_programs", "system_utils"] {
         expected_replaced.insert(format!("privileged-e2e.manifest_{category}"));
-    }
-    if replaced != expected_replaced {
-        return Err(format!(
-            "the Buck E2E selection replaces {:?}, expected {:?}",
-            replaced, expected_replaced
-        ));
     }
     let selected = buck_e2e_selection(cfg)?;
     let full = select_steps_by_labels(cfg, &["full".to_string()])?;
@@ -3902,13 +3913,23 @@ fn assert_buck_e2e_selection(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(
             "the Buck E2E selection still selects replaced node(s) {kept_replaced:?}"
         ));
     }
-    // Post-split extension brackets (build.reverie_buck, M2) are excluded
-    // from the Buck E2E selection by buck_e2e_selection itself, so they are
-    // dropped without being replaced; they are the only such nodes.
+    // Extension tags present in full but absent from the selection are
+    // dropped without being replaced. The expected set is pinned by
+    // name, independently of the selection: deriving it from the
+    // selection itself (as this code briefly did) cannot catch a swap
+    // that drops a different extension tag at the same count.
     let extension_dropped = crate::dag_source_ownership::extension_tags()
-        .intersection(&full_tags)
+        .iter()
+        .filter(|tag| full_tags.contains(*tag) && !selected_tags.contains(*tag))
         .cloned()
         .collect::<BTreeSet<_>>();
+    check_buck_e2e_extension_dropped(&extension_dropped)?;
+    if replaced != expected_replaced {
+        return Err(format!(
+            "the Buck E2E selection replaces {:?}, expected {:?}",
+            replaced, expected_replaced
+        ));
+    }
     let mut expected_dropped = replaced
         .intersection(&full_tags)
         .cloned()
@@ -7950,6 +7971,68 @@ sys.exit(37)
     }
 
     #[test]
+    fn buck_e2e_extension_dropped_check_refuses_a_same_count_swap() {
+        let exact: BTreeSet<String> = BUCK_E2E_EXTENSION_DROPPED
+            .iter()
+            .map(|tag| (*tag).to_string())
+            .collect();
+        check_buck_e2e_extension_dropped(&exact).unwrap();
+        // Same count, one tag swapped for another extension tag: the
+        // selection-derived check this replaces could not see this.
+        let mut swapped = exact.clone();
+        swapped.remove("e2e.manifest_rr");
+        swapped.insert("build.reverie_buck".to_string());
+        assert_eq!(swapped.len(), exact.len());
+        let error = check_buck_e2e_extension_dropped(&swapped).unwrap_err();
+        assert!(error.contains("e2e.manifest_rr"), "{error}");
+        // A missing tag (smaller set) refuses too.
+        let mut subset = exact.clone();
+        subset.remove("e2e.manifest_gvisor");
+        assert!(check_buck_e2e_extension_dropped(&subset).is_err());
+    }
+
+    #[test]
+    fn buck_e2e_selection_refuses_a_planted_same_count_extension_swap() {
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let cells = expected_cells(&crate::git_environment::checkout_root()).unwrap();
+        assert_buck_e2e_selection(&committed, &cells).unwrap();
+        // Plant: keep e2e.manifest_rr selected (remove its Buck twin so
+        // it is not replaced) and drop a different extension tag,
+        // build.reverie_buck, instead (a fake twin makes it replaced).
+        // The dropped extension count is unchanged at two; the pinned
+        // named set must refuse, naming the expected set.
+        let mut planted = committed.clone();
+        let mut fake_twin = planted
+            .steps
+            .iter()
+            .find(|step| step.tag() == "e2e.manifest_rr_buck")
+            .unwrap()
+            .clone();
+        planted
+            .steps
+            .retain(|step| step.tag() != "e2e.manifest_rr_buck");
+        // A kept cargo bucket must not still need the replaced
+        // producers, or the selection derivation itself refuses first.
+        let rr = planted
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == "e2e.manifest_rr")
+            .unwrap();
+        rr.deps.retain(|dep| {
+            dep != "build.manifest_guests_in_pinned_root"
+                && dep != "setup.manifest_plan_in_pinned_root"
+        });
+        fake_twin.group = "build".into();
+        fake_twin.job = "reverie_buck_buck".into();
+        planted.steps.push(fake_twin);
+        let error = assert_buck_e2e_selection(&planted, &cells).unwrap_err();
+        assert!(
+            error.contains("expected exactly {\"e2e.manifest_gvisor\", \"e2e.manifest_rr\"}"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn committed_buck_e2e_selection_replaces_22_nodes_with_18() {
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
         let cells = expected_cells(&crate::git_environment::checkout_root()).unwrap();
@@ -9010,7 +9093,7 @@ sys.exit(37)
         let compile_payload = crate::nextest_build_selections::execution_command(&compile).unwrap();
         let prepare_payload = crate::nextest_build_selections::execution_command(&prepare).unwrap();
         assert!(prepare_payload.ends_with(&format!(
-            "./ci/nextest-binaries.rs prepare full && target/validate/stage-detcore-liteinst --git target{EARLY_ARTIFACT_GATE_SUFFIX}"
+            "./ci/nextest-binaries.rs prepare full --build-mode \"${{HERMIT_VALIDATE_BUILD_MODE:-cargo}}\" && target/validate/stage-detcore-liteinst --git target{EARLY_ARTIFACT_GATE_SUFFIX}"
         )));
         assert!(!compile_payload.contains("nextest-binaries.rs"));
         assert!(compile_payload.ends_with(HERMIT_BIN_SIGNAL_SUFFIX));

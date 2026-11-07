@@ -222,8 +222,7 @@ const INTEGRATION_ARTIFACT_WRAPPER: &str =
 // a profile this producer had stopped preparing, so the bracket refused a graph
 // that was correct. Renamed as well as retargeted: a constant whose name says
 // portable while its value says full is the same defect one layer down.
-const NEXTEST_FULL_PREPARE_COMMAND: &str =
-    "./ci/nextest-binaries.rs prepare full && target/validate/stage-detcore-liteinst --git target";
+const NEXTEST_FULL_PREPARE_COMMAND: &str = "./ci/nextest-binaries.rs prepare full --build-mode \"${HERMIT_VALIDATE_BUILD_MODE:-cargo}\" && target/validate/stage-detcore-liteinst --git target";
 const NEXTEST_PRIVILEGED_ASSERT_COMMAND: &str =
     "./ci/nextest-binaries.rs assert privileged --prepared-by full";
 const TESTS_MISC_EXECUTABLE_READ_COMMAND: &str = r#"tests_misc="$(./ci/nextest-binaries.rs executable hermit-detcore-tests tests_misc)" || exit 1"#;
@@ -638,6 +637,25 @@ fn release_artifact_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Route (ii) staging bracket: prepare runs inside the pinned root,
+/// whose /src/target mount (ignored/hermetic/split/target) shadows the
+/// checkout's target/, so the host harvest must mirror its declared
+/// input there or prepare cannot read the manifest at all.
+#[cfg(test)]
+fn harvest_staging_bracket(root: &std::path::Path) -> Result<(), String> {
+    let script = std::fs::read_to_string(root.join("ci/harvest-reverie-buck.sh"))
+        .map_err(|error| format!("harvest staging bracket: cannot read harvest script: {error}"))?;
+    if !script.contains("ignored/hermetic/split/target/validate")
+        || !script.contains("cp -- \"$MANIFEST\" \"$PINNED_VALIDATE/harvested-files.json\"")
+        || !script.contains("target/validate/buck-harvest/*")
+    {
+        return Err(
+            "harvest staging bracket: harvest does not mirror the manifest and buck-harvest into the pinned prepare's declared input location".into(),
+        );
+    }
+    Ok(())
+}
+
 fn reverie_buck_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
     let reverie_buck = cfg
         .steps
@@ -657,7 +675,7 @@ fn reverie_buck_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
             .deps
             .iter()
             .any(|dep| dep == "gate.manifest")
-        || !reverie_buck
+        || reverie_buck
             .deps
             .iter()
             .any(|dep| dep == "build.workspace_in_pinned_root")
@@ -669,15 +687,94 @@ fn reverie_buck_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Route (ii) ordering for the constructed full Buck plan: the host
+/// harvest must complete before the pinned prepare consumes its declared
+/// manifest. The committed graph carries no such edge (it would enter
+/// the portable frozen closure), so only a constructed Buck plan gets
+/// the step and the dependency.
+fn apply_buck_build_ordering(cfg: &mut DagConfig, committed: &DagConfig) -> Result<(), String> {
+    if !cfg.steps.iter().any(|step| step.tag() == "build.reverie_buck") {
+        let bracket = committed
+            .steps
+            .iter()
+            .find(|step| step.tag() == "build.reverie_buck")
+            .ok_or("buck build plan: build.reverie_buck disappeared")?;
+        cfg.steps.push(bracket.clone());
+    }
+    let prepare = cfg
+        .steps
+        .iter_mut()
+        .find(|step| step.tag() == "build.workspace_in_pinned_root")
+        .ok_or("buck build plan: pinned workspace prepare disappeared")?;
+    if !prepare.deps.iter().any(|dep| dep == "build.reverie_buck") {
+        prepare.deps.push("build.reverie_buck".into());
+        prepare.deps.sort();
+        prepare.deps.dedup();
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod artifact_plan_tests {
     use super::*;
+
+    #[test]
+    fn buck_build_ordering_orders_the_pinned_prepare_after_the_host_harvest() {
+        let committed = validate_plan::validation_config(&test_source_root()).unwrap();
+        // The committed graph must not carry the edge: it would enter
+        // the portable frozen closure.
+        let committed_prepare = committed
+            .steps
+            .iter()
+            .find(|step| step.tag() == "build.workspace_in_pinned_root")
+            .unwrap();
+        assert!(
+            !committed_prepare
+                .deps
+                .iter()
+                .any(|dep| dep == "build.reverie_buck"),
+            "committed pinned prepare must not depend on build.reverie_buck"
+        );
+        let mut cfg = committed.clone();
+        cfg.steps
+            .retain(|step| step.tag() != "build.reverie_buck");
+        apply_buck_build_ordering(&mut cfg, &committed).unwrap();
+        assert!(
+            cfg.steps.iter().any(|step| step.tag() == "build.reverie_buck"),
+            "constructed Buck plan must contain the host harvest"
+        );
+        let prepare = cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == "build.workspace_in_pinned_root")
+            .unwrap();
+        assert!(
+            prepare.deps.iter().any(|dep| dep == "build.reverie_buck"),
+            "constructed Buck plan must order the pinned prepare after the harvest"
+        );
+        // Idempotent: a second application adds no duplicate edge.
+        apply_buck_build_ordering(&mut cfg, &committed).unwrap();
+        let prepare = cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == "build.workspace_in_pinned_root")
+            .unwrap();
+        assert_eq!(
+            prepare
+                .deps
+                .iter()
+                .filter(|dep| *dep == "build.reverie_buck")
+                .count(),
+            1
+        );
+    }
 
     #[test]
     fn actual_host_and_pinned_consumers_require_their_artifact_and_resource_producers() {
         let cfg = validate_plan::validation_config(&test_source_root()).unwrap();
         release_artifact_plan_bracket(&cfg).unwrap();
         reverie_buck_plan_bracket(&cfg).unwrap();
+        harvest_staging_bracket(&test_source_root()).unwrap();
         let mut tags = hermit_manifest_plan::validation_dag::hermit_integration_shard_tags();
         tags.push("test.hermit_integration_on_host".into());
         for tag in tags {
@@ -1023,6 +1120,11 @@ struct Args {
     /// Explicit phase-two opt-in. Cargo remains the default; the committed DAG
     /// carries the closed mode branch and exact-artifact propagation.
     buck_release_dotslash: Option<PathBuf>,
+    /// Explicit Reverie build-mode selector (--build-mode cargo|buck), the
+    /// CLI form of HERMIT_VALIDATE_BUILD_MODE for admission paths (ci-hub)
+    /// that forward no undeclared environment. Wins over the ambient value;
+    /// an unsupported ambient value still refuses.
+    build_mode: Option<String>,
     /// Who runs the full level's E2E cells: [`E2E_RUNNER_CARGO`] (the manifest
     /// buckets) or a Buck mode (`e2e.buck_cells` and the `_buck` import twins).
     e2e_runner: &'static str,
@@ -1051,10 +1153,9 @@ const FROZEN_RUN_WITHHELD_ISSUE: &str = "https://github.com/rrnewton/dev-hermit/
 /// The selection mode of a plan that `--frozen-run` withheld a node from.
 const FROZEN_RUN_SELECTION_MODE: &str = "frozen";
 const RELEASE_BUILD_MODE_ENV: &str = "HERMIT_VALIDATE_RELEASE_BUILD_MODE";
-/// How the Reverie test set is compiled: `cargo` (today's nextest-binaries
-/// staging) or `buck` (buck2 build, harvested into the same staging paths).
-/// Cut 1 only establishes the name and the cargo default; the buck arm is
-/// Cut 2/3 and nothing reads this yet.
+/// How tests are compiled: `cargo` (today's nextest-binaries staging).
+/// `buck` is refused by name: no prepared Nextest selection consumes
+/// Buck-built executables yet (follow-up dh-iz46e).
 const BUILD_MODE_ENV: &str = "HERMIT_VALIDATE_BUILD_MODE";
 const BUILD_MODE_CARGO: &str = "cargo";
 const BUILD_MODE_BUCK: &str = "buck";
@@ -1335,24 +1436,28 @@ fn ambient_mode_value(
                 )
             } else {
                 format!(
-                    "{name} has a non-UTF-8 value: supported modes are cargo (default) and buck"
+                    "{name} has a non-UTF-8 value: cargo is the only supported build mode (buck is refused by name, follow-up dh-iz46e)"
                 )
             }
         }),
     }
 }
 
-/// Refuse an ambient build/run mode this cut cannot honour. Cut 1 has no
-/// CLI selector and only cargo works: buck and any unknown value are a
-/// refusal, never a silent fallback to cargo.
+/// Refuse an ambient build/run mode this cut cannot honour: buck is
+/// refused by name (no prepared Nextest selection consumes Buck-built
+/// executables yet, follow-up dh-iz46e), any unknown value is refused,
+/// and neither is ever a silent fallback to cargo.
 fn check_ambient_build_modes(
     ambient_build: Option<&str>,
     ambient_run: Option<&str>,
 ) -> Result<(), String> {
     if let Some(value) = ambient_build {
-        if value != BUILD_MODE_CARGO && value != BUILD_MODE_BUCK {
+        if value == BUILD_MODE_BUCK {
+            return Err(hermit_manifest_plan::nextest_binaries::BUCK_BUILD_REFUSAL.to_string());
+        }
+        if value != BUILD_MODE_CARGO {
             return Err(format!(
-                "unknown {BUILD_MODE_ENV} {value:?}: supported modes are cargo (default) and buck (M2 Cut 3 harvest)"
+                "unknown {BUILD_MODE_ENV} {value:?}: cargo is the only supported build mode (buck is refused by name, follow-up dh-iz46e)"
             ));
         }
     }
@@ -1396,17 +1501,21 @@ mod build_mode_environment_tests {
             assert_eq!(std::env::var(BUILD_MODE_ENV).unwrap(), BUILD_MODE_CARGO);
             assert_eq!(std::env::var(RUN_MODE_ENV).unwrap(), RUN_MODE_CARGO);
         }
-        // Buck build mode establishes buck (M2 Cut 3 harvest).
-        establish_build_mode_environment(Some(BUILD_MODE_BUCK.into()), None).unwrap();
-        assert_eq!(std::env::var(BUILD_MODE_ENV).unwrap(), BUILD_MODE_BUCK);
-        assert_eq!(std::env::var(RUN_MODE_ENV).unwrap(), RUN_MODE_CARGO);
-        // An unknown build mode is refused by name, with the supported
-        // modes pinned in the message.
+        // Buck build mode is refused by name: no prepared Nextest
+        // selection consumes Buck-built executables yet (dh-iz46e).
+        let error =
+            establish_build_mode_environment(Some(BUILD_MODE_BUCK.into()), None).unwrap_err();
+        assert!(
+            error.contains("HERMIT_VALIDATE_BUILD_MODE=buck is refused"),
+            "{error}"
+        );
+        assert!(error.contains("dh-iz46e"), "{error}");
+        // An unknown build mode is refused by name too.
         let error =
             establish_build_mode_environment(Some("banana".into()), None).unwrap_err();
         assert!(error.contains(BUILD_MODE_ENV), "{error}");
         assert!(
-            error.contains("supported modes are cargo (default) and buck"),
+            error.contains("cargo is the only supported build mode"),
             "{error}"
         );
         // An unsupported run mode is refused too.
@@ -1416,6 +1525,12 @@ mod build_mode_environment_tests {
         let error =
             establish_build_mode_environment(None, Some("banana".into())).unwrap_err();
         assert!(error.contains(RUN_MODE_ENV), "{error}");
+        // Restore the process environment: these variables are global, and
+        // other tests in this process read them (prepare reads
+        // HERMIT_VALIDATE_BUILD_MODE). Leaving buck established here leaked
+        // buck mode into unrelated fixture prepares.
+        establish_build_mode_environment(None, None).unwrap();
+        assert_eq!(std::env::var(BUILD_MODE_ENV).unwrap(), BUILD_MODE_CARGO);
         // A non-UTF-8 ambient value refuses by variable name for both
         // variables, instead of collapsing to unset.
         #[cfg(unix)]
@@ -1435,7 +1550,7 @@ mod build_mode_environment_tests {
                     );
                 } else {
                     assert!(
-                        error.contains("supported modes are cargo (default) and buck"),
+                        error.contains("cargo is the only supported build mode"),
                         "{error}"
                     );
                 }
@@ -1551,17 +1666,21 @@ fn usage() -> &'static str {
      \x20 --label-pr       Publish a receipt and label the PR after a full green (default).\n\
      \x20 --no-label-pr    Disable the non-fatal receipt publication and label update.\n\
      \x20 --ignore-cache   Force a real run even on a tree-keyed cache hit.\n\
+     \x20 --build-mode cargo\n\
+     \x20                  Select how tests are compiled (default cargo, or\n\
+     \x20                  HERMIT_VALIDATE_BUILD_MODE). buck is refused by name:\n\
+     \x20                  no prepared Nextest selection consumes Buck-built\n\
+     \x20                  executables yet (follow-up dh-iz46e). Admission paths\n\
+     \x20                  that forward no environment use this flag.\n\
      \x20 --buck-release DOTSLASH\n\
      \x20                  Build release Hermit with Buck2 through the named absolute\n\
      \x20                  public DotSlash launcher. Cargo remains the default. Buck\n\
      \x20                  mode refuses unsupported plans and never falls back.\n\
-     \x20 HERMIT_VALIDATE_BUILD_MODE=cargo|buck\n\
-     \x20                  How the Reverie test set is compiled (environment only;\n\
-     \x20                  there is no CLI selector yet). cargo (default) stages\n\
-     \x20                  through nextest-binaries; buck runs the M2 Cut 3 harvest\n\
-     \x20                  (ci/harvest-reverie-buck.sh) after the workspace build.\n\
-     \x20                  Any other value is refused with a nonzero exit, never\n\
-     \x20                  silently replaced by cargo.\n\
+     \x20 HERMIT_VALIDATE_BUILD_MODE=cargo\n\
+     \x20                  How tests are compiled. cargo (default) stages through\n\
+     \x20                  nextest-binaries. buck is refused by name (follow-up\n\
+     \x20                  dh-iz46e). Any other value is refused with a nonzero\n\
+     \x20                  exit, never silently replaced by cargo.\n\
      \x20 HERMIT_VALIDATE_RUN_MODE=cargo\n\
      \x20                  Who executes the tests (environment only). cargo is the\n\
      \x20                  only supported run mode until the deferred RUN switch;\n\
@@ -1720,6 +1839,7 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
         selected: None,
         ignore_selected_deps: false,
         buck_release_dotslash: None,
+        build_mode: None,
         e2e_runner: E2E_RUNNER_CARGO,
         buck2: None,
     };
@@ -1863,6 +1983,29 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
                 args.skip_inner_dirty_working_tree_and_rebase_freshness_checks = true
             }
             "--ignore-cache" => args.ignore_cache = true,
+            "--build-mode" => {
+                i += 1;
+                match argv.get(i) {
+                    Some(v) if v == BUILD_MODE_BUCK => {
+                        eprintln!(
+                            "validate: {}",
+                            hermit_manifest_plan::nextest_binaries::BUCK_BUILD_REFUSAL
+                        );
+                        return Err(2);
+                    }
+                    Some(v) if v == BUILD_MODE_CARGO && args.build_mode.is_none() => {
+                        args.build_mode = Some(v.clone());
+                    }
+                    Some(_) if args.build_mode.is_some() => {
+                        eprintln!("validate: --build-mode may be supplied only once");
+                        return Err(2);
+                    }
+                    _ => {
+                        eprintln!("validate: --build-mode needs cargo (buck is refused by name)");
+                        return Err(2);
+                    }
+                }
+            }
             "--buck-release" => {
                 i += 1;
                 match argv.get(i) {
@@ -5189,6 +5332,23 @@ fn self_test() -> Result<(), String> {
         .map_err(|code| format!("release mode: Cargo default refused with exit {code}"))?;
     if cargo_default.buck_release_dotslash.is_some() {
         return Err("release mode: Cargo is not the default".into());
+    }
+    if cargo_default.build_mode.is_some() {
+        return Err("build mode: Cargo is not the default".into());
+    }
+    // Buck build mode is refused by name at parse time (dh-iz46e).
+    if parse_argv(&["full".into(), "--build-mode".into(), "buck".into()]).is_ok()
+        || parse_argv(&["full".into(), "--build-mode".into(), "banana".into()]).is_ok()
+        || parse_argv(&[
+            "full".into(),
+            "--build-mode".into(),
+            "buck".into(),
+            "--build-mode".into(),
+            "cargo".into(),
+        ])
+        .is_ok()
+    {
+        return Err("build mode: opt-in parsing/refusal drifted".into());
     }
     let buck = parse_argv(&[
         "full".into(),
@@ -15070,10 +15230,40 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
             vec![label.into()]
         };
         let mut cfg = if label == "full" && args.e2e_runner != E2E_RUNNER_CARGO {
-            hermit_manifest_plan::validation_dag::buck_e2e_selection(&committed)?
+            let mut buck_cfg =
+                hermit_manifest_plan::validation_dag::buck_e2e_selection(&committed)?;
+            // The Buck E2E composition excludes post-split extension
+            // brackets (build.reverie_buck, M2) by design; the runner plan
+            // is where the Reverie Buck-build bracket belongs, so re-add
+            // the committed step here. Its deps are ordinary full nodes
+            // the composition already selected.
+            if !buck_cfg
+                .steps
+                .iter()
+                .any(|step| step.tag() == "build.reverie_buck")
+            {
+                let bracket = committed
+                    .steps
+                    .iter()
+                    .find(|step| step.tag() == "build.reverie_buck")
+                    .ok_or("buck runner plan: build.reverie_buck disappeared")?;
+                buck_cfg.steps.push(bracket.clone());
+            }
+            buck_cfg
         } else {
             dagrun::select_steps_by_labels(&committed, &selection_labels)?
         };
+        // Route (ii) ordering, constructed-plan only: in Buck build mode
+        // the host harvest (build.reverie_buck) must complete before the
+        // pinned prepare consumes its declared manifest. The committed
+        // graph carries no such edge (it would enter the portable frozen
+        // closure), so the constructed full plan adds the step and the
+        // dependency here, only for a Buck run.
+        if label == "full"
+            && std::env::var(BUILD_MODE_ENV).is_ok_and(|mode| mode == BUILD_MODE_BUCK)
+        {
+            apply_buck_build_ordering(&mut cfg, &committed)?;
+        }
         let suite_complete = label == "full" && args.selected.is_none();
         let mut selection_mode = if suite_complete { "full" } else { "label" };
         if let Some(selected) = args.selected.as_deref() {
@@ -29897,7 +30087,10 @@ fn run(
     if let Err(error) = establish_e2e_runner_environment(&args) {
         return RunSummary::refused(2, args.level.name(), "E2E runner", vec![error]);
     }
-    if let Err(error) = establish_build_mode_environment(ambient_build_mode, ambient_run_mode) {
+    if let Err(error) = establish_build_mode_environment(
+        args.build_mode.clone().or(ambient_build_mode),
+        ambient_run_mode,
+    ) {
         return RunSummary::refused(2, args.level.name(), "build mode", vec![error]);
     }
 
