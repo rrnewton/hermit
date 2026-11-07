@@ -21713,7 +21713,7 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // And PR #5273's run_kvm_procfs_system_directory_links_answer_as_linux
         // and run_kvm_a_user_mount_over_proc_sys_keeps_its_links: 159,
         // matching the DAG pin in validation_dag_static.
-        ("privileged-only-test.cli_kvm", 159usize),
+        ("privileged-only-test.cli_kvm", 157usize),
     ] {
         let step = privileged
             .steps
