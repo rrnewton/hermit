@@ -73,6 +73,11 @@
  * once and listing a directory once, and print `read <dir>/<name>: ok` or
  * the errno of the open or the read; a listing must not name what cannot be
  * read (https://github.com/rrnewton/hermit/issues/5063, dh-62azc).
+ * read-listed-except-numa-maps: the same, but `numa_maps` is not opened
+ * and prints `read <dir>/numa_maps: skipped`, for a backend whose
+ * numa_maps read is a known, named refusal
+ * (https://github.com/rrnewton/hermit/issues/5269). read-numa-maps: open
+ * and read /proc/self/numa_maps alone, as read-listed would.
  */
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -769,7 +774,7 @@ static void show_held_after_exit(void) {
 
 /* Open each entry `path` lists and read it once: a regular file with read,
  * a directory with getdents64. Links are not followed. */
-static void read_listed(const char *path) {
+static void read_listed(const char *path, int skip_numa_maps) {
   static char listing[65536];
   static char contents[65536];
   int dir = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -784,6 +789,10 @@ static void read_listed(const char *path) {
       const char *name = entry->d_name;
       if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0 ||
           (entry->d_type != DT_REG && entry->d_type != DT_DIR)) {
+        continue;
+      }
+      if (skip_numa_maps && strcmp(name, "numa_maps") == 0) {
+        printf("read %s/%s: skipped\n", path, name);
         continue;
       }
       int directory_entry = entry->d_type == DT_DIR;
@@ -810,12 +819,16 @@ int main(int argc, char **argv) {
   int link_mode = strcmp(mode, "link") == 0 || strcmp(mode, "dotdot-link") == 0;
   int held_mode = strcmp(mode, "held-thread") == 0;
   int read_mode = strcmp(mode, "read-listed") == 0;
+  int skip_numa_maps = strcmp(mode, "read-listed-except-numa-maps") == 0;
+  int numa_maps_mode = strcmp(mode, "read-numa-maps") == 0;
+  read_mode = read_mode || skip_numa_maps;
   if (strcmp(mode, "thread-status-dot") == 0) {
     status_spelling = "/proc/thread-self/./status";
   } else if (strcmp(mode, "task-status-dot") == 0) {
     status_spelling = "/proc/self/./task/<tid>/status";
   }
-  CHECK(argc == 2 || (argc == 3 && (link_mode || held_mode || read_mode || status_spelling != NULL)));
+  CHECK(argc == 2 || (argc == 3 && (link_mode || held_mode || read_mode || numa_maps_mode ||
+                                     status_spelling != NULL)));
   CHECK(snprintf(directory, sizeof directory, "%s", argv[1]) < (int)sizeof directory);
   pid = getpid();
   int tid = (int)syscall(SYS_gettid);
@@ -832,8 +845,25 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (read_mode) {
-    read_listed("/proc/self");
-    read_listed("/proc/thread-self");
+    read_listed("/proc/self", skip_numa_maps);
+    read_listed("/proc/thread-self", skip_numa_maps);
+    printf("done\n");
+    return 0;
+  }
+  if (numa_maps_mode) {
+    static char contents[65536];
+    int fd = open("/proc/self/numa_maps", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+      printf("read /proc/self/numa_maps: open %s\n", errno_name(errno));
+    } else {
+      long got = (long)read(fd, contents, sizeof contents);
+      if (got < 0) {
+        printf("read /proc/self/numa_maps: read %s\n", errno_name(errno));
+      } else {
+        printf("read /proc/self/numa_maps: ok\n");
+      }
+      close(fd);
+    }
     printf("done\n");
     return 0;
   }

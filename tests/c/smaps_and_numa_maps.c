@@ -21,8 +21,14 @@
  *   for those mappings.
  *
  * The program makes a mapping of each kind it reports first: anonymous
- * memory, a file (its own executable), the heap (brk), and it has its stack
- * and the vDSO. It reports, per kind, whether maps lists one; the count of
+ * memory, a file (its own executable), the heap (brk), a MAP_STACK mapping
+ * (which Linux gives VM_NOHUGEPAGE, nh), anonymous memory with a guard
+ * installed on its first page (MADV_GUARD_INSTALL, which kernels after 6.17
+ * mark the whole mapping for, gu; skipped where the kernel has no guards),
+ * and a thread's stack (glibc's, whose guard is a guard install on a recent
+ * glibc), and it has its
+ * stack and the vDSO. It reports, per kind, whether maps lists one and, for
+ * each listed one, its smaps VmFlags; the count of
  * accounting values that are not zero (a sanitizer zeroes them all); and the
  * stack's details: its field labels, flags, THPeligible, ProtectionKey and
  * numa_maps row without page counts, then its whole smaps block with the
@@ -45,6 +51,10 @@
  *            without page counts: Linux prints kernelpagesize_kB only for a
  *            mapping with a resident page (show_numa_map), and none is left.
  *
+ * A second argument `smaps-only` makes files, split, advise and other read
+ * no numa_maps (and print `numa skipped` where they would check it), for a
+ * backend that renders smaps but refuses numa_maps.
+ *
  * Everything is read into static buffers before anything is printed, so no
  * allocation (stdio's own included) adds a mapping between the reads.
  */
@@ -53,6 +63,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -61,6 +72,10 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+
+#ifndef MADV_GUARD_INSTALL
+#define MADV_GUARD_INSTALL 102
+#endif
 
 #define FILE_BYTES (1 << 20)
 #define MAX_LINES 4096
@@ -365,6 +380,35 @@ static void print_kind(
       line_holding(lines, count, address) >= 0 ? "listed" : "not-listed");
 }
 
+/* The VmFlags of the smaps block for the mapping that holds `address`, as
+ * `kind <kind> flags <flags>`, where smaps has one. */
+static void print_kind_flags(const char* kind, size_t count, unsigned long address) {
+  long at = line_holding(smaps_lines, count, address);
+  if (at < 0) {
+    return;
+  }
+  for (size_t index = (size_t)at + 1; index < count; ++index) {
+    unsigned long start = 0;
+    unsigned long end = 0;
+    if (range_of(smaps_lines[index], &start, &end)) {
+      break;
+    }
+    if (strncmp(smaps_lines[index], "VmFlags:", 8) == 0) {
+      printf("kind %s flags%s\n", kind, smaps_lines[index] + 8);
+      return;
+    }
+  }
+  fail("smaps block without VmFlags for", kind);
+}
+
+/* A thread that records an address on its stack and returns: its stack
+ * stays mapped (glibc caches it) for the reads after the join. */
+static void* record_stack(void* address) {
+  char here = 0;
+  *(unsigned long*)address = (unsigned long)&here;
+  return NULL;
+}
+
 /* discard mode: the stack it runs on, and the initial stack's range, outside
  * the initial stack, which it discards. */
 static unsigned char alternate_stack[1 << 20] __attribute__((aligned(16)));
@@ -478,8 +522,9 @@ int main(int argc, char** argv) {
   }
   if (strcmp(mode, "files") != 0 && strcmp(mode, "split") != 0 &&
       strcmp(mode, "advise") != 0 && strcmp(mode, "other") != 0) {
-    fail("usage", "files|rollup|split|advise|other|discard");
+    fail("usage", "files|rollup|split|advise|other|discard [smaps-only]");
   }
+  int numa = !(argc > 2 && strcmp(argv[2], "smaps-only") == 0);
   long page = sysconf(_SC_PAGESIZE);
   // Anonymous memory, its first page written.
   char* anonymous = mmap(
@@ -519,6 +564,46 @@ int main(int argc, char** argv) {
     fail("brk", strerror(errno));
   }
   heap[0] = 1;
+  // A MAP_STACK mapping, its first page written.
+  char* map_stack = mmap(
+      NULL,
+      (size_t)(4 * page),
+      PROT_READ | PROT_WRITE,
+      MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK,
+      -1,
+      0);
+  if (map_stack == MAP_FAILED) {
+    fail("mmap MAP_STACK", strerror(errno));
+  }
+  map_stack[0] = 1;
+  // Anonymous memory with a guard on its first page, its last page written;
+  // none where the kernel has no guards (EINVAL).
+  char* guarded = mmap(
+      NULL,
+      (size_t)(4 * page),
+      PROT_READ | PROT_WRITE,
+      MAP_PRIVATE | MAP_ANONYMOUS,
+      -1,
+      0);
+  if (guarded == MAP_FAILED) {
+    fail("mmap guarded", strerror(errno));
+  }
+  if (madvise(guarded, (size_t)page, MADV_GUARD_INSTALL) != 0) {
+    if (errno != EINVAL) {
+      fail("madvise MADV_GUARD_INSTALL", strerror(errno));
+    }
+    munmap(guarded, (size_t)(4 * page));
+    guarded = NULL;
+  } else {
+    guarded[3 * page] = 1;
+  }
+  // A thread's stack.
+  unsigned long thread_stack = 0;
+  pthread_t thread;
+  int error = pthread_create(&thread, NULL, record_stack, &thread_stack);
+  if (error != 0 || (error = pthread_join(thread, NULL)) != 0) {
+    fail("thread", strerror(error));
+  }
   // The stack, and a page of it below the stack pointer for split and advise.
   char here = 0;
   unsigned long stack = (unsigned long)&here;
@@ -545,16 +630,33 @@ int main(int argc, char** argv) {
 
   slurp("/proc/self/maps", maps_text, sizeof(maps_text));
   slurp("/proc/self/smaps", smaps_text, sizeof(smaps_text));
-  slurp("/proc/self/numa_maps", numa_text, sizeof(numa_text));
+  if (numa) {
+    slurp("/proc/self/numa_maps", numa_text, sizeof(numa_text));
+  }
   size_t maps_count = split_lines(maps_text, maps_lines);
   size_t smaps_count = split_lines(smaps_text, smaps_lines);
-  size_t numa_count = split_lines(numa_text, numa_lines);
+  size_t numa_count = numa ? split_lines(numa_text, numa_lines) : 0;
 
   print_kind("anonymous", maps_lines, maps_count, (unsigned long)anonymous);
   print_kind("file", maps_lines, maps_count, (unsigned long)file);
   print_kind("stack", maps_lines, maps_count, stack);
   print_kind("heap", maps_lines, maps_count, (unsigned long)heap);
   print_kind("vdso", maps_lines, maps_count, vdso);
+  print_kind("map-stack", maps_lines, maps_count, (unsigned long)map_stack);
+  print_kind("thread-stack", maps_lines, maps_count, thread_stack);
+  if (guarded != NULL) {
+    print_kind("guarded", maps_lines, maps_count, (unsigned long)guarded + 3 * (unsigned long)page);
+  }
+  print_kind_flags("anonymous", smaps_count, (unsigned long)anonymous);
+  print_kind_flags("file", smaps_count, (unsigned long)file);
+  print_kind_flags("stack", smaps_count, stack);
+  print_kind_flags("heap", smaps_count, (unsigned long)heap);
+  print_kind_flags("vdso", smaps_count, vdso);
+  print_kind_flags("map-stack", smaps_count, (unsigned long)map_stack);
+  print_kind_flags("thread-stack", smaps_count, thread_stack);
+  if (guarded != NULL) {
+    print_kind_flags("guarded", smaps_count, (unsigned long)guarded + 3 * (unsigned long)page);
+  }
   long stack_at = line_holding(maps_lines, maps_count, stack);
   unsigned long stack_start = 0;
   unsigned long stack_end = 0;
@@ -579,8 +681,8 @@ int main(int argc, char** argv) {
     }
     size_t next =
         check_block(at, smaps_count, maps_lines[index], &protection_key, labels, sizeof(labels));
-    char kept[512];
-    if (!is_gate(maps_lines[index])) {
+    char kept[512] = "";
+    if (numa && !is_gate(maps_lines[index])) {
       if (numa_at >= numa_count) {
         fail("numa_maps lacks a row for", maps_lines[index]);
       }
@@ -606,10 +708,12 @@ int main(int argc, char** argv) {
   if (numa_at != numa_count) {
     fail("numa_maps has a row maps does not list", numa_lines[numa_at]);
   }
-  printf("blocks ok\nnuma ok\n");
+  printf("blocks ok\n%s\n", numa ? "numa ok" : "numa skipped");
   printf("accounting nonzero %lu\nnuma counts %lu\n", accounting_nonzero, numa_counts);
   printf("stack labels %s\n", stack_labels);
-  printf("stack numa %s\n", stack_numa);
+  if (numa) {
+    printf("stack numa %s\n", stack_numa);
+  }
   printf("stack block begin\n");
   for (size_t index = stack_block; index < stack_block_end; ++index) {
     const char* line = smaps_lines[index];

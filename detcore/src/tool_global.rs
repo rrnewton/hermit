@@ -3138,6 +3138,13 @@ impl GlobalTool for GlobalState {
         if cfg.guest_ids != detcore_model::pid::GuestIds::Namespace {
             info!("[detcore] guest process IDs: {}", cfg.guest_ids);
         }
+        // Where Detcore renders a process's `smaps` from the backend's memory
+        // map, the host facts it derives fields from are read now, before the
+        // guest's first instruction, and logged once at INFO; no render reads
+        // the host.
+        if !crate::procfs_inode::tool_can_name_guest_descriptors(&cfg.backend) {
+            crate::procfs::memory_map::smaps::init_host_smaps_facts();
+        }
         GlobalState::initialize(cfg, true)
     }
 

@@ -87,18 +87,18 @@ const fn madvise_action(advice: i32) -> MadviseAction {
 /// Whether `advice`, once the backend runs it, may set or clear a flag Linux
 /// keeps on the mappings it covers (`madvise_vma_behavior`, mm/madvise.c in
 /// v6.17), which `smaps` prints (`VmFlags`) and the backend's memory map does
-/// not list (`MemoryMetadata::mapping_flags_changed`): the access-pattern
-/// advice (VM_SEQ_READ, VM_RAND_READ) and the fork and dump advice
-/// (VM_DONTCOPY, VM_DONTDUMP, VM_WIPEONFORK). The huge-page and KSM advice
-/// change flags too, but Detcore answers it itself and never passes it on
+/// not list (`MemoryMetadata::mapping_flags_changed`): the fork and dump
+/// advice (VM_DONTCOPY, VM_DONTDUMP, VM_WIPEONFORK). The access-pattern
+/// advice (`MADV_NORMAL`, `MADV_RANDOM`, `MADV_SEQUENTIAL`: VM_SEQ_READ,
+/// VM_RAND_READ) changes flags the backend reports in the memory map
+/// (`reverie::MappingFact::vm_flags`), and so does `MADV_GUARD_INSTALL`
+/// (VM_MAYBE_GUARD). The huge-page and KSM advice change flags too, but
+/// Detcore answers it itself and never passes it on
 /// ([`MadviseAction::Ignore`]); the rest acts on pages, not on flags.
 const fn advice_changes_mapping_flags(advice: i32) -> bool {
     matches!(
         advice,
-        libc::MADV_NORMAL
-            | libc::MADV_RANDOM
-            | libc::MADV_SEQUENTIAL
-            | libc::MADV_DONTFORK
+        libc::MADV_DONTFORK
             | libc::MADV_DOFORK
             | libc::MADV_DONTDUMP
             | libc::MADV_DODUMP
@@ -999,7 +999,12 @@ VmFlags: rd wr mr mw me gd ac
                 MadviseAction::ForwardHint | MadviseAction::ForwardSemantic
             )
         });
+        // Advice that acts on pages alone, and advice whose flags the
+        // backend reports in its memory map.
         let pages_alone = [
+            libc::MADV_NORMAL,
+            libc::MADV_RANDOM,
+            libc::MADV_SEQUENTIAL,
             libc::MADV_WILLNEED,
             libc::MADV_DONTNEED,
             libc::MADV_DONTNEED_LOCKED,
@@ -1070,10 +1075,10 @@ VmFlags: rd wr mr mw me gd ac
         futures::executor::block_on(async {
             let page = crate::page::page_size() as usize;
             for (advice, reply, flags, discarded) in [
-                (libc::MADV_RANDOM, Ok(0), true, false),
-                (libc::MADV_SEQUENTIAL, Err(Errno::ENOMEM), true, false),
+                (libc::MADV_RANDOM, Ok(0), false, false),
+                (libc::MADV_SEQUENTIAL, Err(Errno::ENOMEM), false, false),
                 (libc::MADV_DONTFORK, Err(Errno::EINVAL), true, false),
-                (libc::MADV_NORMAL, Ok(0), true, false),
+                (libc::MADV_NORMAL, Ok(0), false, false),
                 (libc::MADV_WIPEONFORK, Ok(0), true, true),
                 (libc::MADV_DONTDUMP, Err(Errno::ENOSYS), false, false),
                 (libc::MADV_WILLNEED, Ok(0), false, false),

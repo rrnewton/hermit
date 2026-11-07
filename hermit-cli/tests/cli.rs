@@ -9825,7 +9825,8 @@ fn smaps_and_numa_maps_guest() -> &'static Path {
     compiled_c_guest(&SMAPS_AND_NUMA_MAPS_GUEST, "smaps_and_numa_maps")
 }
 
-/// What `smaps_and_numa_maps.c` prints in `mode` under Hermit on `backend`
+/// What `smaps_and_numa_maps.c` prints in `mode` (its arguments, separated
+/// by spaces) under Hermit on `backend`
 /// at `--proc=standard`, which lists `numa_maps` and `smaps_rollup`: at L2
 /// where `l2` (two runs at bitwise parity under `--verify-strict`, with the
 /// same nonzero number of INFO records compared, exit 0), else in one run.
@@ -9858,7 +9859,8 @@ fn address_space_listing_with(
     if l2 {
         hermit_args.extend(["--verify", "--verify-strict", "--verify-json", report]);
     }
-    hermit_args.extend(["--", guest, mode]);
+    hermit_args.extend(["--", guest]);
+    hermit_args.extend(mode.split(' '));
     let (status, log) = run_with_deadline(
         hermit_command(&hermit_args),
         directory.path(),
@@ -10007,44 +10009,101 @@ fn printed_stack_range(output: &str) -> (u64, u64) {
     )
 }
 
-/// Why KVM refuses a process's `smaps_rollup` (package K slice N4): its
-/// header spans the whole address space, and KVM's memory map lists only the
-/// stack window.
-const KVM_ROLLUP_REFUSAL: &str = "Linux's smaps_rollup gives the range from the address space's \
-    first mapping to its last one, and the backend's memory map lists only some of its mappings";
+/// The start of why KVM refuses a process's `numa_maps` (package K slice
+/// N4): whether a mapping holds a resident page, which decides
+/// `kernelpagesize_kB`, is the host's residency for any mapping but the
+/// initial stack. The refusal names the first such mapping, its line of
+/// `maps`, between this and [`KVM_RESIDENCY_REFUSAL_END`].
+const KVM_RESIDENCY_REFUSAL_START: &str = "read refused: Linux's numa_maps says of each mapping \
+    whether it holds a resident page, and for ";
 
-/// Why KVM refuses a process's `smaps` that lists a part of the stack window
-/// a split left: its flags are not in the memory map.
-const KVM_SPLIT_SMAPS_REFUSAL: &str = "they are not in the backend's memory map";
+/// The end of that refusal.
+const KVM_RESIDENCY_REFUSAL_END: &str =
+    " that is the host's residency, not in the backend's memory map";
 
-/// Why KVM refuses a process's `smaps` once access-pattern advice reached
-/// LinuxEmu for the stack: the flag it sets (`rr`) is not in the memory map.
-const KVM_ADVISED_SMAPS_REFUSAL: &str = "madvise advice or mlock that reached the backend may have \
-    set flags on";
+/// The `kind <kind> ...` lines `smaps_and_numa_maps.c` printed: whether
+/// `maps` lists a mapping of each kind, and each listed one's `VmFlags`,
+/// but for the vDSO's where `vdso` is false.
+fn kind_lines(output: &str, vdso: bool) -> Vec<String> {
+    output
+        .lines()
+        .filter(|line| line.starts_with("kind ") && (vdso || !line.starts_with("kind vdso ")))
+        .map(str::to_owned)
+        .collect()
+}
 
-/// Why KVM refuses a process's `numa_maps` once advice that discards pages
-/// reached LinuxEmu for the stack: whether it still holds a resident page,
-/// which decides `kernelpagesize_kB`, is not a fact.
-const KVM_DISCARDED_NUMA_MAPS_REFUSAL: &str = "madvise advice that discards pages reached the \
-    backend for";
+/// Assert that `stderr` is Hermit's refusal of KVM's `numa_maps` for the
+/// first mapping of `guest`, its executable's first page, in `mode`: the
+/// refusal's text exactly, but for that mapping's range, device and inode,
+/// which the layout and the host decide, and the padding to the name column.
+fn assert_kvm_residency_refusal(
+    mode: &str,
+    guest: &str,
+    code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) {
+    // EXIT-CLASS: hermit
+    assert_eq!(
+        code,
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{mode}:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal")
+            && !stderr.contains("HERMIT_INTERNAL_FAILURE"),
+        "{mode}: {stderr}"
+    );
+    let refusal = stderr
+        .lines()
+        .find_map(|line| {
+            line.split_once(KVM_RESIDENCY_REFUSAL_START)
+                .map(|(_, rest)| rest)
+        })
+        .and_then(|rest| rest.strip_suffix(KVM_RESIDENCY_REFUSAL_END))
+        .unwrap_or_else(|| panic!("{mode}: no residency refusal: {stderr}"));
+    let fields: Vec<&str> = refusal.split_whitespace().collect();
+    let hex = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_hexdigit());
+    assert!(
+        fields.len() == 6
+            && fields[0]
+                .split_once('-')
+                .is_some_and(|(start, end)| hex(start) && hex(end))
+            && fields[1] == "r--p"
+            && fields[2] == "00000000"
+            && fields[3]
+                .split_once(':')
+                .is_some_and(|(major, minor)| hex(major) && hex(minor))
+            && fields[4].bytes().all(|byte| byte.is_ascii_digit())
+            && fields[5] == guest
+            && refusal.ends_with(&format!(" {guest}")),
+        "{mode}: {refusal}"
+    );
+}
 
 /// A process's `smaps`, `smaps_rollup` and `numa_maps`, as
 /// `tests/c/smaps_and_numa_maps.c` checks them against what Linux prints
 /// (fs/proc/task_mmu.c), for a mapping of each kind: anonymous memory, a
-/// file, the stack, the heap and the vDSO.
+/// file, the stack, the heap, the vDSO, a `MAP_STACK` mapping (`nh`),
+/// anonymous memory with a guard installed (`gu`, where the host kernel has
+/// guards) and a thread's stack.
 ///
-/// On ptrace the kernel's files, sanitized: every kind is listed, the
-/// stack's flags, `THPeligible`, `ProtectionKey` and `numa_maps` row are the
-/// native run's, and every page count is zero; the rollup, a split stack,
-/// access-pattern advice and advice on another mapping read too, and after
-/// the guest discards every page of its initial stack, the row lacks
-/// `kernelpagesize_kB`, as natively.
+/// On ptrace the kernel's files, sanitized: every kind is listed, each
+/// kind's flags but the vDSO's (Reverie maps a canonical vDSO there, as
+/// anonymous memory, `ac` where the kernel's has `de`, `canonicalize_new_image`)
+/// and the stack's `THPeligible`, `ProtectionKey` and
+/// `numa_maps` row are the native run's, and every page count is zero; the
+/// rollup, a split stack, access-pattern advice and advice on another
+/// mapping read too, and after the guest discards every page of its initial
+/// stack, the row lacks `kernelpagesize_kB`, as natively.
 ///
 /// On KVM, where Detcore renders the files from the backend's memory map
 /// (package K slice N4 of <https://github.com/rrnewton/hermit/issues/4213>),
-/// the stack alone is listed, as in `maps` (the memory map lists the stack
-/// window only, <https://github.com/rrnewton/reverie/issues/1211>). Its
-/// block and row are compared with ptrace's, each exemption named:
+/// which is complete and gives each mapping's flags
+/// (`reverie::MappingFact::vm_flags`, dh-9j8ue), `smaps` lists every kind
+/// but the vDSO, which KVM does not give the guest, read without
+/// `numa_maps` (`smaps-only`). Each kind's flags are ptrace's and the native
+/// run's, and the stack's block is ptrace's, each exemption named:
 /// - the range and `Size` are left out by the guest, and the name's padding,
 ///   all of which LinuxEmu's stack window decides;
 /// - `ProtectionKey` is left out of ptrace's: KVM's kernel enables no
@@ -10057,26 +10116,42 @@ const KVM_DISCARDED_NUMA_MAPS_REFUSAL: &str = "madvise advice that discards page
 ///   window rather than against ptrace's, which is for a native-sized
 ///   stack; elsewhere it is 0 on both and compared with the rest.
 ///
-/// What the memory map cannot tell is refused by name: the rollup's range,
-/// the flags of a part a split left of the stack, the flags advice set on
-/// the stack, and the residency of a stack whose pages were discarded.
-/// Advice on a mapping the memory map does not list changes nothing KVM's
-/// files show, and refuses nothing.
+/// A split stack and access-pattern advice on the stack or on another
+/// mapping give ptrace's blocks and flags; the rollup reads as Linux's.
+/// `numa_maps`, whose `kernelpagesize_kB` follows the host's residency for
+/// every mapping but the initial stack, is refused by name, with and without
+/// discarded stack pages: a KNOWN DIVERGENCE ([`KVM_NUMA_MAPS_DIVERGENCE`]).
 fn list_the_address_space_in_smaps_and_numa_maps(backend: &str) {
     let kvm = backend == "kvm";
-    let (_, files, _) = address_space_listing(backend, "files", true);
-    let listed = |kind: &str| files.contains(&format!("kind {kind} listed\n"));
-    for kind in ["anonymous", "file", "heap", "vdso"] {
-        assert_eq!(listed(kind), !kvm, "{kind}:\n{files}");
-    }
-    assert!(listed("stack"), "{files}");
-    assert!(
-        files.contains("blocks ok\nnuma ok\naccounting nonzero 0\nnuma counts 0\n"),
-        "{files}"
-    );
+    let guest = smaps_and_numa_maps_guest().to_str().unwrap().to_owned();
+    let native = native_main_stack_output(&guest, &["files"]);
     if kvm {
+        let (_, files, _) = address_space_listing(backend, "files smaps-only", true);
+        let listed = |kind: &str| files.contains(&format!("kind {kind} listed\n"));
+        for kind in [
+            "anonymous",
+            "file",
+            "heap",
+            "stack",
+            "map-stack",
+            "thread-stack",
+        ] {
+            assert!(listed(kind), "{kind}:\n{files}");
+        }
+        assert!(!listed("vdso"), "{files}");
+        assert_eq!(
+            listed("guarded"),
+            native.contains("kind guarded listed\n"),
+            "{files}\n{native}"
+        );
+        assert!(
+            files.contains("blocks ok\nnuma skipped\naccounting nonzero 0\nnuma counts 0\n"),
+            "{files}"
+        );
         assert!(!files.contains("ProtectionKey"), "{files}");
-        let (_, ptrace, _) = address_space_listing("ptrace", "files", true);
+        let (_, ptrace, _) = address_space_listing("ptrace", "files smaps-only", true);
+        assert_eq!(kind_lines(&files, false), kind_lines(&ptrace, false));
+        assert_eq!(kind_lines(&files, false), kind_lines(&native, false));
         let (kvm_listing, kvm_thp) = without_thp_eligible(&stack_listing(&files));
         let (ptrace_listing, ptrace_thp) =
             without_thp_eligible(&without_protection_key(&stack_listing(&ptrace)));
@@ -10092,46 +10167,74 @@ fn list_the_address_space_in_smaps_and_numa_maps(backend: &str) {
         }
         // The guest shown the vCPU's own CPUID (OSPKE clear, PKU set) reads
         // the same block: the kernel serving it decides, not the CPUID.
-        let (code, nocpuid, stderr) =
-            address_space_listing_with(backend, "files", false, &["--no-virtualize-cpuid"]);
+        let (code, nocpuid, stderr) = address_space_listing_with(
+            backend,
+            "files smaps-only",
+            false,
+            &["--no-virtualize-cpuid"],
+        );
         assert_eq!(code, Some(0), "--no-virtualize-cpuid:\n{nocpuid}\n{stderr}");
         assert!(!nocpuid.contains("ProtectionKey"), "{nocpuid}");
         assert_eq!(stack_listing(&nocpuid), stack_listing(&files));
-        // Advice on the anonymous mapping, which the memory map does not
-        // list, leaves the stack's block and row as they were.
-        let (_, other, _) = address_space_listing(backend, "other", true);
-        assert_eq!(stack_listing(&other), stack_listing(&files));
-        for (mode, refusal) in [
-            ("rollup", KVM_ROLLUP_REFUSAL),
-            ("split", KVM_SPLIT_SMAPS_REFUSAL),
-            ("advise", KVM_ADVISED_SMAPS_REFUSAL),
-            ("discard", KVM_DISCARDED_NUMA_MAPS_REFUSAL),
-        ] {
-            let (code, stdout, stderr) = address_space_listing(backend, mode, false);
-            // EXIT-CLASS: hermit
+        // A split stack, access-pattern advice on the whole stack (`rr`), and
+        // advice on the anonymous mapping (`rr` there, the stack as it was):
+        // ptrace's blocks and flags.
+        for mode in ["split smaps-only", "advise smaps-only", "other smaps-only"] {
+            let (_, output, _) = address_space_listing(backend, mode, true);
+            let (_, ptrace, _) = address_space_listing("ptrace", mode, true);
             assert_eq!(
+                kind_lines(&output, false),
+                kind_lines(&ptrace, false),
+                "{mode}"
+            );
+            assert_eq!(
+                without_thp_eligible(&stack_listing(&output)).0,
+                without_thp_eligible(&without_protection_key(&stack_listing(&ptrace))).0,
+                "{mode}"
+            );
+        }
+        let (_, other, _) = address_space_listing(backend, "other smaps-only", true);
+        assert_eq!(stack_listing(&other), stack_listing(&files));
+        assert!(
+            other.contains("kind anonymous flags rd wr mr mw me rr ac \n"),
+            "{other}"
+        );
+        let (_, rollup, _) = address_space_listing(backend, "rollup", true);
+        assert_eq!(rollup, "rollup ok\naccounting nonzero 0\n");
+        for mode in ["files", "discard"] {
+            let (code, stdout, stderr) = address_space_listing(backend, mode, false);
+            assert_kvm_residency_refusal(
+                &format!("{mode}, KNOWN DIVERGENCE {KVM_NUMA_MAPS_DIVERGENCE}"),
+                &guest,
                 code,
-                Some(HERMIT_POLICY_REFUSAL_EXIT),
-                "{mode}:\nstdout:\n{stdout}\nstderr:\n{stderr}"
-            );
-            assert!(
-                stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal")
-                    && !stderr.contains("HERMIT_INTERNAL_FAILURE"),
-                "{mode}: {stderr}"
-            );
-            assert!(
-                stderr.contains("read refused: ") && stderr.contains(refusal),
-                "{mode}: {stderr}"
+                &stdout,
+                &stderr,
             );
         }
     } else {
-        let guest = smaps_and_numa_maps_guest().to_str().unwrap().to_owned();
-        let native = native_main_stack_output(&guest, &["files"]);
+        let (_, files, _) = address_space_listing(backend, "files", true);
+        let listed = |kind: &str| files.contains(&format!("kind {kind} listed\n"));
+        for kind in [
+            "anonymous",
+            "file",
+            "heap",
+            "stack",
+            "vdso",
+            "map-stack",
+            "thread-stack",
+        ] {
+            assert!(listed(kind), "{kind}:\n{files}");
+        }
+        assert!(
+            files.contains("blocks ok\nnuma ok\naccounting nonzero 0\nnuma counts 0\n"),
+            "{files}"
+        );
         let derived = |output: &str| -> Vec<String> {
             output
                 .lines()
                 .filter(|line| {
-                    line.starts_with("stack labels ")
+                    (line.starts_with("kind ") && !line.starts_with("kind vdso flags "))
+                        || line.starts_with("stack labels ")
                         || line.starts_with("stack numa ")
                         || line.starts_with("THPeligible:")
                         || line.starts_with("ProtectionKey:")
@@ -10149,6 +10252,12 @@ fn list_the_address_space_in_smaps_and_numa_maps(backend: &str) {
             assert!(
                 output.contains("blocks ok\nnuma ok\naccounting nonzero 0\nnuma counts 0\n"),
                 "{mode}:\n{output}"
+            );
+            let native_mode = native_main_stack_output(&guest, &[mode]);
+            assert_eq!(
+                kind_lines(&output, false),
+                kind_lines(&native_mode, false),
+                "{mode}"
             );
         }
         // Every page of the initial stack discarded: no kernelpagesize_kB,
@@ -10168,7 +10277,6 @@ fn smaps_numa_maps_and_the_rollup_list_the_address_space_as_on_linux() {
 
 /// [`list_the_address_space_in_smaps_and_numa_maps`] on KVM.
 #[test]
-#[ignore = "known failure: Detcore refuses smaps flags it cannot source for non-stack mappings (capability gap, minibeads dh-9j8ue, kvm lane re-enables); Reverie #1319 made the KVM memory map complete, so the old stack-only pass was not Linux-faithful"]
 fn run_kvm_smaps_and_numa_maps_render_the_stack_from_the_memory_map() {
     let test = "run_kvm_smaps_and_numa_maps_render_the_stack_from_the_memory_map";
     if kvm_unavailable(test) {
@@ -72471,17 +72579,28 @@ fn the_callers_own_proc_directories_answer_as_linux() {
     }
 }
 
+/// A KNOWN DIVERGENCE, pinned until
+/// https://github.com/rrnewton/hermit/issues/5269 is fixed: Linux lists and
+/// reads a process's `numa_maps`; on KVM Detcore lists it but refuses its
+/// read by name, because whether each mapping but the initial stack holds a
+/// resident page, which decides `kernelpagesize_kB`, is the host's
+/// residency and not in the backend's memory map. Its read is asserted to
+/// stop with the policy's exit and exactly that refusal, so a fix of 5269
+/// fails [`run_kvm_the_callers_own_proc_directories_answer_as_linux`], which
+/// must then require the read.
+const KVM_NUMA_MAPS_DIVERGENCE: &str = "https://github.com/rrnewton/hermit/issues/5269";
+
 /// [`read_the_callers_own_proc_directories`] on KVM, where each process or
 /// thread directory lists exactly what Detcore serves in it (the files it
 /// renders, `fd`, and a process's `task`), in Linux's order; and a second
 /// thread's directory held while it exits (the guest's held-thread mode),
 /// which Detcore answers from the directory's binding, at L2, as natively.
 /// Every name those listings give opens and reads without a refusal (the
-/// guest's read-listed mode). Since Reverie #1319 the backend's memory
-/// map is complete and `smaps_rollup` is listed (and native Linux lists
-/// it too); the whole test is nevertheless disabled under dh-9j8ue
-/// because `numa_maps` refuses for file mappings while `MappingFact`
-/// carries no residency.
+/// guest's read-listed mode), but `numa_maps`: since Reverie #1319 the
+/// backend's memory map is complete, so `smaps_rollup` reads and is listed,
+/// as natively, and `numa_maps`, which Linux lists and reads, is a KNOWN
+/// DIVERGENCE ([`KVM_NUMA_MAPS_DIVERGENCE`]): its read stops the run with the
+/// policy's exit and Detcore's named residency refusal, asserted exactly.
 /// Then the guest's other modes ([`OWN_DIRECTORY_MODES`]): the open of
 /// `/proc/self` itself (`O_PATH|O_NOFOLLOW`), by its plain spelling and
 /// through `..`, which opens the link on Linux and for which this backend has
@@ -72494,7 +72613,6 @@ fn the_callers_own_proc_directories_answer_as_linux() {
 /// slice 2b-3 serves `environ` from Detcore's record of the exec strings,
 /// `environ`, which Linux lists before `auxv`.
 #[test]
-#[ignore = "known failure: numa_maps under KVM refuses for file mappings because the backend's MappingFact carries no residency (capability gap, minibeads dh-9j8ue, kvm lane re-enables); Reverie #1319 made the KVM memory map complete, so read-listed now reaches mappings Detcore cannot render"]
 fn run_kvm_the_callers_own_proc_directories_answer_as_linux() {
     let test = "run_kvm_the_callers_own_proc_directories_answer_as_linux";
     if kvm_unavailable(test) {
@@ -72543,8 +72661,9 @@ fn run_kvm_the_callers_own_proc_directories_answer_as_linux() {
     // listing never advertises a file whose read refuses
     // (https://github.com/rrnewton/hermit/issues/5063, dh-62azc): the
     // guest's read-listed mode reads each entry of /proc/self and
-    // /proc/thread-self once, at L2, and reads exactly the names listed.
-    let read = procfs_own_directory_at_l2("kvm", "standard", &["read-listed"]);
+    // /proc/thread-self once, at L2, and reads exactly the names listed, but
+    // `numa_maps`, the KNOWN DIVERGENCE below, which it lists and skips.
+    let read = procfs_own_directory_at_l2("kvm", "standard", &["read-listed-except-numa-maps"]);
     let mut lines = read.lines().collect::<Vec<_>>();
     assert_eq!(lines.pop(), Some("done"), "kvm read-listed: {read}");
     let expected = |directory: &str, thread: bool| {
@@ -72553,12 +72672,48 @@ fn run_kvm_the_callers_own_proc_directories_answer_as_linux() {
             .filter_map(|entry| entry.split_once('/'))
             .filter(|(name, _)| !matches!(*name, "." | ".."))
             .filter(|(name, _)| !thread || *name != "task")
-            .map(|(name, _)| format!("read {directory}/{name}: ok"))
+            .map(|(name, _)| match name {
+                "numa_maps" => format!("read {directory}/{name}: skipped"),
+                _ => format!("read {directory}/{name}: ok"),
+            })
             .collect::<Vec<_>>()
     };
     let mut wanted = expected("/proc/self", false);
     wanted.extend(expected("/proc/thread-self", true));
     assert_eq!(lines, wanted, "kvm read-listed: every listed name reads");
+    // The KNOWN DIVERGENCE: Linux reads `numa_maps`; KVM's read stops with
+    // the policy's exit and exactly Detcore's residency refusal. A render, or
+    // a refusal for another reason, fails here.
+    assert_eq!(
+        procfs_own_directory_native(&["read-numa-maps"]),
+        "read /proc/self/numa_maps: ok\ndone\n",
+        "native read-numa-maps"
+    );
+    let guest = procfs_own_directory_guest()
+        .to_str()
+        .expect("guest path is UTF-8");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let args = [
+        "--backend",
+        "kvm",
+        "run",
+        "--strict",
+        "--proc=standard",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--base-env=minimal",
+        "--",
+        guest,
+        directory.path().to_str().expect("directory path is UTF-8"),
+        "read-numa-maps",
+    ];
+    let output = hermit(&args);
+    assert_kvm_residency_refusal(
+        &format!("kvm read-numa-maps, KNOWN DIVERGENCE {KVM_NUMA_MAPS_DIVERGENCE}"),
+        guest,
+        output.status.code(),
+        &stdout(&output),
+        &stderr(&output),
+    );
     // A second thread's status, by a spelling with a `.`, as natively.
     for (mode, line) in &OWN_DIRECTORY_MODES[2..] {
         let native = procfs_own_directory_native(&[mode]);

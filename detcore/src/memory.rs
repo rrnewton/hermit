@@ -78,18 +78,18 @@ pub(crate) struct MemoryMetadata {
     #[serde(default)]
     pub(crate) protection_keys: bool,
     /// Whether a call that sets flags on a mapping that the backend's memory
-    /// map (`reverie::MemoryMap`) does not list reached the backend for a
-    /// range overlapping a mapping that map lists, in a session that renders
-    /// a process's `smaps` from it (`procfs::RenderedFiles::address_space`):
-    /// `madvise(2)` access-pattern, fork and dump advice (VM_SEQ_READ,
-    /// VM_RAND_READ, VM_DONTCOPY, VM_DONTDUMP, VM_WIPEONFORK), and `mlock(2)`
-    /// or `mlock2(2)` (VM_LOCKED, VM_LOCKONFAULT), or any `mlockall(2)`. A
+    /// map (`reverie::MemoryMap`, `reverie::MappingFact::vm_flags`) does not
+    /// list reached the backend for a range overlapping a mapping that map
+    /// lists, in a session that renders a process's `smaps` from it
+    /// (`procfs::RenderedFiles::address_space`): `madvise(2)` fork and dump
+    /// advice (VM_DONTCOPY, VM_DONTDUMP, VM_WIPEONFORK), and `mlock(2)` or
+    /// `mlock2(2)` (VM_LOCKED, VM_LOCKONFAULT), or any `mlockall(2)`. A
     /// rendered `smaps` cannot then derive a listed mapping's `VmFlags`, and
     /// is refused (`procfs::memory_map::smaps`); a call on a mapping the map
     /// does not list changes nothing such a file shows. A fork copies the
     /// address space, flags included; an exec replaces it. Never cleared
-    /// otherwise: advice that clears a flag (`MADV_NORMAL`, `MADV_DOFORK`)
-    /// changes flags too.
+    /// otherwise: advice that clears a flag (`MADV_DOFORK`) changes flags
+    /// too.
     #[serde(default)]
     pub(crate) mapping_flags_changed: bool,
     /// Whether a call that discards a mapping's pages reached the backend for
