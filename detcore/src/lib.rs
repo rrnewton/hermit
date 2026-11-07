@@ -1904,7 +1904,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         end_rip: None,
                         end_time: None,
                         stopless: false,
-                       instruction_offset: None,
+                        instruction_offset: None,
                     },
                 );
                 let ev = with_guest_rip(guest, ev).await;
@@ -2210,7 +2210,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                             end_rip: None,
                             end_time: None,
                             stopless: false,
-                           instruction_offset: None,
+                            instruction_offset: None,
                         },
                     );
                     // Fill in end_rip because current rip represents the end of this event.
@@ -2578,7 +2578,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     end_rip: None,
                     end_time: Some(nanos),
                     stopless: false,
-                   instruction_offset: None,
+                    instruction_offset: None,
                 },
                 true,
                 access,
@@ -2674,7 +2674,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     end_rip: None,
                     end_time: Some(nanos),
                     stopless: false,
-                   instruction_offset: None,
+                    instruction_offset: None,
                 },
                 true,
                 access,
@@ -5050,7 +5050,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         end_rip: None,
                         end_time: Some(nanos),
                         stopless: false,
-                       instruction_offset: None,
+                        instruction_offset: None,
                     },
                     true,
                 )
@@ -5142,7 +5142,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         end_rip: None,
                         end_time: None,
                         stopless: false,
-                       instruction_offset: None,
+                        instruction_offset: None,
                     },
                 );
                 trace_schedevent(guest, ev, true).await;
