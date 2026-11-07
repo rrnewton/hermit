@@ -386,8 +386,19 @@ fn reverie_build_files(root: &Path) -> Result<Vec<String>, Outcome> {
             let path = entry.path();
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if path.is_dir() {
-                if !name.starts_with('.') && name.as_ref() != "buck-out" {
+            // Do not follow symlinks (a linked tree can loop, as DynamoRIO's
+            // man7 does) and do not descend into nested submodules (they carry
+            // a .git marker): their build files are not Reverie's, and one
+            // third-party cell serves both checkouts from Reverie's own files.
+            let is_real_dir = entry
+                .file_type()
+                .map(|kind| kind.is_dir())
+                .unwrap_or(false);
+            if is_real_dir {
+                if !name.starts_with('.')
+                    && name.as_ref() != "buck-out"
+                    && !path.join(".git").exists()
+                {
                     stack.push(path);
                 }
             } else if name.as_ref() == "BUCK" || name.ends_with(".bzl") {
