@@ -3383,7 +3383,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the restart predicate's capability table (residual R1 of the musereviewc
     // review of #5221): 3727 + 1 = 3728.
     // Carried onto main's recount 3732: 3732 + 1 = 3733.
-    ("test.detcore_unit", 3733),
+    // And S3b-1's receiver units carried from 556a8abc for #5221's second
+    // coord7 review (J1): fixes 2, 5 and 6-14: 3733 + 11 = 3744 (nextest list
+    // --profile ci on the node's selection at b08b707f, 3949, and at this head, 3960).
+    ("test.detcore_unit", 3744),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4788,7 +4791,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (the ptrace twin of the KVM other-process stat test): 821 + 1 = 822.
     // And #4929 slice 2's ten ptrace/native CLI tests (alarm receivers, poll
     // and receive restarts, and the recorded socketpair receive): 822 + 10 = 832 (head - base, nextest list --profile ci on the node's selection at rb22 base 414dbe51d1 and at this head).
-    ("test.cli", 832),
+    // And S3b-1's ptrace/native process_signal_target test (J1): 832 + 1 = 833
+    // (listed 835 at b08b707f, 836 at this head).
+    ("test.cli", 833),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5504,7 +5509,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // exact name as in test.cli: 742 - 2 = 740, listed.
     // The same 2b-1 other-process stat ptrace twin: 740 + 1 = 741.
     // And the same ten #4929 slice 2 CLI tests: 741 + 10 = 751.
-    ("test.cli_on_host", 751),
+    // And the same process_signal_target test (J1): 751 + 1 = 752.
+    ("test.cli_on_host", 752),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
@@ -6130,7 +6136,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Carried onto main's recount 3725: 3725 + 7 = 3732.
     // And the same restart-predicate table (R1): 3727 + 1 = 3728.
     // Carried onto main's recount 3732: 3732 + 1 = 3733.
-    ("test.detcore_unit_on_host", 3733),
+    // And the same eleven S3b-1 receiver units (J1): 3733 + 11 = 3744.
+    ("test.detcore_unit_on_host", 3744),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
