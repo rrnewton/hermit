@@ -1747,7 +1747,9 @@ mod tests {
             0
         );
         // SAFETY: ownership of each open pipe descriptor transfers exactly once.
-        let input = AsyncFd::new(unsafe { OwnedFd::from_raw_fd(pipe[0]) }).unwrap();
+        // SAFETY: pipe[0] ownership transfers exactly once into the OwnedFd,
+        // which the AsyncFd keeps open for its whole lifetime.
+        let input = unsafe { AsyncFd::register(OwnedFd::from_raw_fd(pipe[0])) }.unwrap();
         let output = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
         // AsyncFd readers must use a nonblocking descriptor. The write end
         // deliberately remains blocking to exercise temporary flag handling.
