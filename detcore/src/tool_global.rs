@@ -8334,13 +8334,14 @@ pub enum SignalScope {
 /// at its rebase onto 47). 49 adds `Rewrite::not_written` to the
 /// `StoreExclusive` payload (https://github.com/rrnewton/hermit/pull/5222;
 /// numbered 48 on its source base, renumbered to 49 at landing). 50 adds
-/// `Found::unverified_pairs` to the `StoreExclusive` payload (source
-/// revision 44, carried after main's landed 49). Revision 50 is
-/// provisional; the merge queue assigns the final number at landing.
-/// From https://github.com/rrnewton/hermit/pull/5175, merged at landing by the merge queue: 51 is
-/// its revision, renumbered from 50, and is current; the revisions called current above precede it.
-/// From https://github.com/rrnewton/hermit/pull/4759, merged at landing by the merge queue: 52 is
-/// its revision, renumbered from 49, and is current; the revisions called current above precede it.
+/// `Found::unverified_pairs` to the `StoreExclusive` payload
+/// (https://github.com/rrnewton/hermit/pull/5230; source revision 44,
+/// carried and landed as 50). 51 adds `SuspendHoldsDiscarded` and its
+/// response (https://github.com/rrnewton/hermit/pull/5175; carried as 50,
+/// renumbered to 51 at landing). 52 adds `TraceSchedEventResponse::backstop`
+/// to the `GlobalResponse::TraceSchedEvent` replay reply
+/// (https://github.com/rrnewton/hermit/pull/4759; carried as 49,
+/// renumbered to 52 at landing), and is current.
 pub(crate) const GLOBAL_RPC_REVISION: u32 = 52;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
