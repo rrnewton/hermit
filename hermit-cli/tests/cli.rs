@@ -27919,6 +27919,7 @@ fn branch_free_race_lost(seed: u64, extra: &[&str]) -> u64 {
     branch_free_race_lost_iterations(seed, extra, "100000")
 }
 
+#[cfg(target_arch = "x86_64")]
 fn branch_free_race_lost_iterations(seed: u64, extra: &[&str], iterations: &str) -> u64 {
     let guest = branch_free_race_guest()
         .to_str()
