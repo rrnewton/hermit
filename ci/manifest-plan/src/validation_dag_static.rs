@@ -2043,7 +2043,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And run::untrap_passthrough_syscalls_refuses_preemption_records_by_every_route: 1383 + 1 = 1384.
     // And tests::the_library_entry_points_refuse_untrapping_without_its_prerequisites
     // (the same pull request's post-facto review): 1384 + 1 = 1385.
-    ("test.hermit_unit", 1386),
+    // One portable all-rewrite summary oracle: 1386 + 1 = 1387.
+    ("test.hermit_unit", 1387),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6524,7 +6525,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 1323 + 4 = 1327.
     // PR #4746: the same 37 hermit-run units: 1327 + 37 = 1364.
     // PR #4764: the same three hermit-run untrap units: 1376 + 3 = 1379.
-    ("test.hermit_unit_on_host", 1380),
+    // One portable all-rewrite summary oracle: 1380 + 1 = 1381.
+    ("test.hermit_unit_on_host", 1381),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
