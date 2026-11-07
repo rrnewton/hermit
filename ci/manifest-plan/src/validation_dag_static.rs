@@ -3380,7 +3380,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // trap (2), and the unignore re-queue refusal (1): 3720 + 7 = 3727
     // (head - base, nextest list --profile ci on the node's selection at the stack's recount commit and at this head).
     // Carried onto main's recount 3725: 3725 + 7 = 3732.
-    ("test.detcore_unit", 3732),
+    // And the restart predicate's capability table (residual R1 of the musereviewc
+    // review of #5221): 3727 + 1 = 3728.
+    // Carried onto main's recount 3732: 3732 + 1 = 3733.
+    ("test.detcore_unit", 3733),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -6125,7 +6128,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Carried onto main's recount 3687: 3687 + 38 = 3725.
     // And the same seven coord7 review-round units: 3720 + 7 = 3727.
     // Carried onto main's recount 3725: 3725 + 7 = 3732.
-    ("test.detcore_unit_on_host", 3732),
+    // And the same restart-predicate table (R1): 3727 + 1 = 3728.
+    // Carried onto main's recount 3732: 3732 + 1 = 3733.
+    ("test.detcore_unit_on_host", 3733),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
