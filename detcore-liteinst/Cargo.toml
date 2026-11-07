@@ -18,6 +18,9 @@ test = false
 doctest = false
 
 [features]
+default = ["liteinst"]
+# Keep the preload, RPC and native entry paths when site patching is omitted.
+liteinst = ["reverie-liteinst/liteinst"]
 # Real-runtime allocation regression; never selects a different allocator.
 allocator-fixture = ["reverie-liteinst/allocator-fixture"]
 # Private InitialImage entry; ordinary builds retain the loader constructor.
