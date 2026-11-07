@@ -9,7 +9,6 @@ compat/logger replay ptrace
 compat/logger verify dbt
 compat/logger verify ptrace
 compat/lsof replay ptrace
-compat/mountpoint replay ptrace
 compat/pkg-config replay ptrace
 compat/pkg-config verify dbt
 compat/pkg-config verify kvm
@@ -79,8 +78,6 @@ gvisor/tkill-tkilltest-validtidandrealsignal verify ptrace
 language-runtimes/bash-random naked -
 language-runtimes/cpp-stl-determinism naked -
 language-runtimes/gawk-random naked -
-language-runtimes/go-os-exec-output verify kvm
-language-runtimes/go-os-exec-output verify ptrace
 language-runtimes/lua-random naked -
 language-runtimes/m4-macro-mkstemp naked -
 language-runtimes/node-v8-jit naked -

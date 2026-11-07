@@ -15867,10 +15867,18 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
     // The full run's compat rows: the 193 of the portable strict corpus
     // extracted from validate.sh, the 25 of
     // https://github.com/rrnewton/hermit/issues/4269, less the 4 heavy rows
-    // the super run type runs (218 - 4), less the logger and pkg-config
-    // rows deselected with the pinned-image move (214 - 2). The cargo and
-    // gcov rows deselected 2026-10-31 under issue 4997 came back the same
-    // day once the fixture race was fixed (271ec81bd4).
+    // the super run type runs (218 - 4 = 214). The pkg-config row
+    // deselected with the pinned-image move was promoted to Required by
+    // the 2026-11-05 sweep flip, so it no longer subtracts; logger was
+    // promoted by the same flip but re-measured red in the pinned root
+    // on 2026-11-06 (no /dev/log socket; sweep CLEAN was host-contaminated),
+    // so it subtracts again (214 - 1 = 213). Pkg-config left again the
+    // same day under dh-jn0hh part 2 (pkg-config 0.29.2 in the pinned
+    // root emits -D before -I), so it subtracts again too
+    // (213 - 1 = 212).
+    // The cargo and gcov rows deselected 2026-10-31 under issue 4997
+    // came back the same day once the fixture race was fixed
+    // (271ec81bd4).
     let expected = 212;
     if rows.len() != expected {
         return Err(format!(
@@ -20196,8 +20204,21 @@ mod nextest_timeout_tests {
                 // and c-programs/madvise-guard-regions, verify and replay on
                 // ptrace, and madvise-guard-regions verify on KVM. 2984 with
                 // SIGSHARE S2b's KVM verify of
-                // c-programs/sigsuspend-sibling-signal-wake.
-                assert_eq!(all.len(), 2984, "the original all-owner population is retained");
+                // c-programs/sigsuspend-sibling-signal-wake. 2998 with the
+                // 2026-11-05 sweep flip's fourteen required cells (PR #5183,
+                // 2984 + 14, disjoint from the guard/SIGSHARE cells),
+                // recounted by enumeration at the rebase head. 2996 after
+                // logger's two ptrace cells (verify, replay) left again on
+                // 2026-11-06, re-measured red in the merge-queue pinned root
+                // (no /dev/log socket; sweep CLEAN was host-contaminated).
+                // 2993 after pkg-config's three cells (verify ptrace, replay
+                // ptrace, verify KVM) left under dh-jn0hh part 2 (pkg-config
+                // 0.29.2 in the pinned root emits -D before -I).
+                // 2992 after compat/shred verify/KVM left under DROP-6
+                // (unsupported KVM zero-count read on guest fd 3).
+                // 2990 after compat/sysctl-random-uuid and compat/top
+                // verify/KVM left under DROP-7.
+                assert_eq!(all.len(), 2990, "the original all-owner population is retained");
             }
             let expected = all.iter().map(|cell| cell.id.clone()).collect::<BTreeSet<_>>();
             assert_eq!(expected.len(), all.len(), "duplicate all-owner cell identity");

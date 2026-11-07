@@ -1358,11 +1358,13 @@ mod tests {
     /// three-run survey on 2026-10-09, 76 of the 77 rows the rr lane never
     /// listed as passing. Each is the replay cell of its row's own test,
     /// carrying the full and rr run types (the full validation selects them
-    /// since 2026-10-20) and none of the verify cell's settings. 217 are
+    /// since 2026-10-20) and none of the verify cell's settings. 215 are
     /// selected (214 plus compat/df, compat/lua and compat/perl, whose
     /// replay cells the 338-cell flip of 2026-10-30 made required; the
-    /// java/javac compile+run split of 2026-11-05 took 215 to 217), and the
-    /// 3 seen to fail stay enabled with `ci: false` and the
+    /// java/javac compile+run split of 2026-11-05 took 215 to 217, logger's
+    /// 2026-11-06 pinned-root re-measurement took it to 216, and
+    /// pkg-config's 2026-11-06 drop under dh-jn0hh part 2 took it to 215),
+    /// and the 5 seen to fail stay enabled with `ci: false` and the
     /// issue of their failure (`UNSELECTED_REPLAY`).
     /// A row moved into or out of the run type, a second test for a program,
     /// the rr run type reaching a verify cell, or a cell quietly unselected or
@@ -1431,13 +1433,23 @@ mod tests {
                 }
             }
         }
-        // 215 gated on the flip-fixed base, minus the three replay cells
-        // deselected with the pinned-image move (logger, pkg-config,
-        // mountpoint) = 212. The cargo, gcov and rustc replay cells came
-        // back the day they left, once the issue-4997 fixture race was
-        // fixed (271ec81bd4). The java/javac compile+run split of
-        // 2026-11-05 adds two net rows: 214.
-        assert_eq!((gated, refused), (214, UNSELECTED_REPLAY.len()));
+        // 214 gated and 6 refused on #5199 main: 212 on the pre-split base
+        // (215 on the flip-fixed base minus the three replay cells
+        // deselected with the pinned-image move: logger, pkg-config,
+        // mountpoint), plus two net rows from the java/javac compile+run
+        // split. The 2026-11-05 sweep flip (PR #5183) promoted the
+        // compat/logger, compat/pkg-config and compat/mountpoint replay
+        // cells to required, so gated is 214 + 3 = 217 and refused is
+        // 6 - 3 = 3. The cargo, gcov and rustc replay cells came back the
+        // day they left, once the issue-4997 fixture race was fixed
+        // (271ec81bd4). Logger's replay cell left again on 2026-11-06:
+        // re-measured red in the merge-queue pinned root (no /dev/log
+        // socket; sweep CLEAN was host-contaminated), so gated is
+        // 217 - 1 = 216 and refused is 3 + 1 = 4. Pkg-config's replay
+        // cell left the same day under dh-jn0hh part 2 (pkg-config 0.29.2
+        // in the pinned root emits -D before -I), so gated is
+        // 216 - 1 = 215 and refused is 4 + 1 = 5.
+        assert_eq!((gated, refused), (215, UNSELECTED_REPLAY.len()));
     }
 
     /// The replay cells seen to fail, each with its issue: lsof in the
@@ -1446,7 +1458,15 @@ mod tests {
     /// shared /tmp. compat/flex and compat/timeout are selected since their
     /// replay stall (https://github.com/rrnewton/hermit/issues/3964) and false
     /// deadlock (https://github.com/rrnewton/hermit/issues/3963) were fixed.
-    const UNSELECTED_REPLAY: [(&str, &str); 6] = [
+    const UNSELECTED_REPLAY: [(&str, &str); 5] = [
+        (
+            "compat/logger",
+            "https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-jn0hh.md",
+        ),
+        (
+            "compat/pkg-config",
+            "https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-jn0hh.md",
+        ),
         (
             "compat/lsof",
             "https://github.com/rrnewton/hermit/issues/3966",
@@ -1458,22 +1478,6 @@ mod tests {
         (
             "compat/zip-unzip",
             "https://github.com/rrnewton/hermit/issues/4536",
-        ),
-        // Deselected 2026-10-30 when the corpus moved into the pinned
-        // hermetic image: logger and pkg-config measure the pinned
-        // implementations (tracked in the bead), mountpoint's replay
-        // diverges on statmount (the issue).
-        (
-            "compat/logger",
-            "https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-jn0hh.md",
-        ),
-        (
-            "compat/pkg-config",
-            "https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-jn0hh.md",
-        ),
-        (
-            "compat/mountpoint",
-            "https://github.com/rrnewton/hermit/issues/4979",
         ),
     ];
 

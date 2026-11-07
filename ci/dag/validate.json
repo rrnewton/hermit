@@ -928,6 +928,13 @@
           "lane": "portable",
           "category": "applications",
           "test": "applications/cc-compile-and-run",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "applications",
+          "test": "applications/cc-compile-and-run",
           "mode": "verify",
           "backend": "kvm"
         },
@@ -5175,6 +5182,13 @@
           "category": "c-programs",
           "test": "c-programs/nanosleep-threads-nocrash",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/nanosleep-threads-simple",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -10361,6 +10375,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/vfork-shares-memory",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/vfork-shares-memory",
           "mode": "verify",
           "backend": "kvm"
         },
@@ -13279,6 +13300,13 @@
           "category": "compat",
           "test": "compat/mktemp",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/mountpoint",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -18253,6 +18281,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/mountpoint",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/mountpoint",
           "mode": "verify",
           "backend": "kvm"
         },
@@ -21270,6 +21305,13 @@
         {
           "lane": "portable",
           "category": "compat",
+          "test": "compat/mountpoint",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
           "test": "compat/mpstat-softirqs",
           "mode": "replay",
           "backend": "ptrace"
@@ -23089,6 +23131,20 @@
           "lane": "portable",
           "category": "language-runtimes",
           "test": "language-runtimes/gawk-random",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
+          "test": "language-runtimes/go-os-exec-output",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
+          "test": "language-runtimes/go-os-exec-output",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -30454,6 +30510,13 @@
         {
           "lane": "portable",
           "category": "language-runtimes",
+          "test": "language-runtimes/go-os-exec-output",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
           "test": "language-runtimes/lua-random",
           "mode": "verify",
           "backend": "ptrace"
@@ -33239,6 +33302,13 @@
           "lane": "portable",
           "category": "applications",
           "test": "applications/cc-compile-and-run",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "applications",
+          "test": "applications/cc-compile-and-run",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -35130,6 +35200,13 @@
           "category": "c-programs",
           "test": "c-programs/nanosleep-threads-nocrash",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/nanosleep-threads-simple",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -37390,6 +37467,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/vfork-shares-memory",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/vfork-shares-memory",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -39064,6 +39148,13 @@
           "category": "compat",
           "test": "compat/mktemp",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/mountpoint",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -41220,6 +41311,13 @@
           "lane": "portable",
           "category": "language-runtimes",
           "test": "language-runtimes/gawk-random",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
+          "test": "language-runtimes/go-os-exec-output",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -44580,6 +44678,13 @@
           "category": "applications",
           "test": "applications/c-toolchain-workflow",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "applications",
+          "test": "applications/cc-compile-and-run",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -48780,6 +48885,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/nanosleep-threads-simple",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/nanosleep-threads-simple",
           "mode": "verify",
           "backend": "kvm"
         },
@@ -53960,6 +54072,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/vfork-shares-memory",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/vfork-shares-memory",
           "mode": "verify",
           "backend": "kvm"
         },
@@ -56862,6 +56981,13 @@
           "category": "compat",
           "test": "compat/mktemp",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/mountpoint",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -60484,6 +60610,20 @@
           "lane": "portable",
           "category": "language-runtimes",
           "test": "language-runtimes/gawk-random",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
+          "test": "language-runtimes/go-os-exec-output",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
+          "test": "language-runtimes/go-os-exec-output",
           "mode": "verify",
           "backend": "ptrace"
         },

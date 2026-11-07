@@ -8880,14 +8880,40 @@ sys.exit(1 if failed else 0)
         // 10 + 1 for language-runtimes/go-os-exec-output@kvm: its verify
         // cells are enabled on ptrace and KVM but stay out of full until the
         // pinned validation root carries a Go toolchain.
-        // 11 + 2 with the java/javac compile+run split of 2026-11-05: each
-        // combined row became two rows, so their two SaBRe parity cells
+        // 11 + 2 with the java/javac compile+run split of 2026-11-05 (#5199):
+        // each combined row became two rows, so their two SaBRe parity cells
         // became four; full still plans neither side of any of them.
-        assert_eq!(unreported.len(), 13, "{unreported:?}");
+        // 13 - 6 for the 2026-11-05 sweep flip (PR #5183): promoting the
+        // compat/logger, compat/pkg-config and
+        // language-runtimes/go-os-exec-output verify cells to required puts
+        // their ptrace side in full, so a full node reports their parity
+        // cells. That removes logger@dbt, logger@sabre, pkg-config@dbt,
+        // pkg-config@kvm, pkg-config@sabre and go-os-exec-output@kvm.
+        // The 7 left are the SaBRe-run-type-only rows above. The flip's
+        // other cells (replay ptrace, shred/sysctl-random-uuid/top@kvm)
+        // were already reported and add nothing here.
+        // 7 + 2 on 2026-11-06: logger's ptrace verify cell left full again
+        // (re-measured red in the merge-queue pinned root: no /dev/log
+        // socket; the sweep CLEAN was host-contaminated), so logger@dbt
+        // and logger@sabre are unreported again. pkg-config stays
+        // promoted and reported.
+        // 9 + 3 the same day: pkg-config's ptrace and KVM verify cells
+        // left full under dh-jn0hh part 2 (pkg-config 0.29.2 in the
+        // pinned root emits -D before -I), so pkg-config@dbt,
+        // pkg-config@kvm and pkg-config@sabre are unreported again.
+        assert_eq!(unreported.len(), 12, "{unreported:?}");
         let sabre_only = unreported
             .iter()
             .filter(|cell| cell.starts_with("compat/") && cell.ends_with("@sabre"))
             .count();
+        // 9 on #5199 main (7 + 2 for the split's extra SaBRe cells),
+        // minus logger@sabre and pkg-config@sabre promoted by the flip,
+        // plus logger@sabre again when logger's ptrace verify cell left
+        // full on 2026-11-06 (7 - 2 + 1 = 6 on the flip's own terms;
+        // enumerated here as 8: the seven SaBRe-run-type-only rows'
+        // sabre cells plus logger@sabre), plus pkg-config@sabre again
+        // when its verify cells left full under dh-jn0hh part 2 the same
+        // day (enumerated here as 9).
         assert_eq!(sabre_only, 9, "{unreported:?}");
     }
 
