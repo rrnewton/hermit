@@ -368,6 +368,13 @@ mod tests {
         // (renumbered from 49 to 52 at landing by the merge queue; digests measured on the combined
         // tree)
         (52, "18b49ae6affb5c77", "f013e36743d8d9e6"),
+        // Adds `GlobalResponse::WithReplayInstructionOffset` and
+        // `SchedEvent::instruction_offset`, which the event's bincode always
+        // writes and domain 4 covers (#4845; 23 on its own base, renumbered
+        // to 27 in the PR stack, and renumbered mechanically to 53 at this
+        // rebase onto main's 52 (4759's backstop), skipping reserved 33 to
+        // 39 and 42 to 44; digest measured at this head).
+        (53, "13e87b8c8d8f9a42", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
