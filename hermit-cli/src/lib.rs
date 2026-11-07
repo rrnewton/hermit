@@ -51,7 +51,7 @@ pub mod happens_before;
 pub mod host_input_change;
 mod host_qualification;
 mod id;
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 pub mod in_guest_exits;
 pub mod instruction_map;
 pub mod kvm_address_space;
@@ -1406,7 +1406,7 @@ pub fn scheduler_owns_guest_pid_namespace() -> bool {
 /// under the gate (its runtime mask, final-read loop and predicted deaths,
 /// A5 step 3c.1e). Not yet: until the flip (3c.1f), the gate stays off on
 /// every route, whatever [`in_guest_signal_delivery_gate`] answers.
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 const IN_GUEST_RUNTIME_DELIVERS_SIGNALS: bool = false;
 
 /// Set only in a test child that re-executed this test binary as PID 1 of its
@@ -2076,7 +2076,7 @@ fn refuse_in_guest_policy(backend: Backend, refusal: Option<String>) -> Result<(
 /// which no process reported; it does not detect a run in which some did and
 /// others did not. Each image's own check covers that: an image whose runtime
 /// is not collecting statistics refuses to run its program.
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 fn in_guest_trap_patching_evidence(
     backend: Backend,
     dispatch: Option<&reverie::DispatchStats>,
@@ -2116,7 +2116,7 @@ fn in_guest_trap_patching_evidence(
 /// patching ([`in_guest_trap_patching_evidence`]): records a determinism loss,
 /// so verification refuses to compare it, and returns the typed in-guest
 /// refusal (exit 122).
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 fn refuse_in_guest_trap_patching(backend: Backend, evidence: Option<String>) -> Result<(), Error> {
     match evidence {
         Some(reason) => {
@@ -2151,7 +2151,7 @@ pub fn in_guest_detlog_forward_policy_for_native() -> detcore::detlog::ForwardPo
 /// Report the shared native trap runtime through the existing statistics
 /// comparator and require a real guest report with site patching disabled.
 /// This never converts a patching-off execution into LiteInst evidence.
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 #[doc(hidden)]
 pub fn native_trap_dispatch_stats(
     source: &reverie_liteinst::LiteinstBackendStatsSource,
@@ -2449,11 +2449,26 @@ fn liteinst_unavailable_reason() -> Option<String> {
     Some("this build was compiled without the liteinst backend: the `liteinst` feature is not enabled; rebuild with `--features liteinst` (or `--features third-party-backends`). This says nothing about whether LiteInst works on this machine -- it has not been checked".to_owned())
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
+fn in_guest_trap_unavailable_reason() -> Option<String> {
+    liteinst_runtime_unavailable_reason()
+}
+
+#[cfg(not(feature = "in-guest-trap"))]
+fn in_guest_trap_unavailable_reason() -> Option<String> {
+    Some("this build was compiled without the in-guest-trap backend: the `in-guest-trap` feature is not enabled; rebuild with `--features in-guest-trap`. This says nothing about whether the in-guest runtime works on this machine -- it has not been checked".to_owned())
+}
+
+#[cfg(feature = "in-guest-trap")]
 fn liteinst_runtime_unavailable_reason() -> Option<String> {
     liteinst_tool_runtime_library_path().err().map(|error| {
+        let build = if cfg!(feature = "liteinst") {
+            "cargo build -p detcore-liteinst"
+        } else {
+            "cargo build -p detcore-liteinst --no-default-features"
+        };
         format!(
-            "the in-guest Detcore runtime is unavailable: {error}; build it with `cargo build -p detcore-liteinst` in the target directory of this hermit binary, install it as rsrcs/libdetcore_liteinst.so, or name it with {LITEINST_TOOL_RUNTIME_ENV}"
+            "the in-guest Detcore runtime is unavailable: {error}; build it with `{build}` in the target directory of this hermit binary, install it as rsrcs/libdetcore_liteinst.so, or name it with {LITEINST_TOOL_RUNTIME_ENV}"
         )
     })
 }
@@ -2617,7 +2632,8 @@ impl Backend {
                 .err()
                 .map(|error| error.to_string()),
             // The same runtime, so the same prerequisites and the same reason.
-            Self::Liteinst | Self::InGuestTrap => liteinst_unavailable_reason(),
+            Self::Liteinst => liteinst_unavailable_reason(),
+            Self::InGuestTrap => in_guest_trap_unavailable_reason(),
             Self::Kvm => kvm_device_unavailable_reason(Path::new("/dev/kvm")),
         }
     }
