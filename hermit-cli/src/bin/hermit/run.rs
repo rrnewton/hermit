@@ -443,10 +443,59 @@ fn disposable_dir_is_ignored(root: &Path) -> bool {
 /// importable from another crate, so that whole test surface could not reach
 /// the code it was written for, even in principle. Taking the directory as an
 /// argument lets the unit tests below drive every branch.
+/// The work-tree root containing START, as git itself resolves it, or
+/// None when START is in no work tree (or git cannot say). An empty
+/// `.git` directory a fixture made does not resolve, which is what
+/// keeps the stray-`.git` behaviour below intact.
+fn work_tree_root(start: &Path) -> Option<PathBuf> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(start)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let root = text.trim();
+    (!root.is_empty()).then(|| PathBuf::from(root))
+}
+
+/// Whether git ignores PATH under TOP: the summary written there is
+/// excluded from the very enumeration (`git ls-files --others
+/// --exclude-standard`) whose poisoning the refusal below exists to
+/// prevent, so it needs no disposable home. A checkout's `target/`
+/// directory is the common case - hermit's own test fixtures run there.
+fn path_is_ignored(top: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(top) else {
+        return false;
+    };
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(top)
+        .args(["check-ignore", "-q", "--"])
+        .arg(relative)
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
 fn summary_dir_under(start: &Path) -> Result<PathBuf, Error> {
     // The enumeration is rooted at the work tree, not at the process cwd, so a
     // summary in ANY tracked subdirectory still trips it. Resolve the work-tree
     // root rather than assuming this runs from it.
+    //
+    // The NEAREST `.git` ancestor decides, in this order:
+    // - it ignores `ignored/`: the summary goes in that disposable
+    //   directory (a test fixture's own fake work tree counts here, even
+    //   nested inside a real checkout);
+    // - it is a real work tree (git resolves it as its own top level)
+    //   with no such rule: a cargo git checkout is such a tree, and a
+    //   summary written in it is counted as prepared source - refuse,
+    //   unless git already ignores the start itself (a checkout's
+    //   `target/`), which enumeration never counts;
+    // - it is a stray `.git` git cannot resolve: not a work tree, keep
+    //   walking up.
     let mut root = start;
     loop {
         if root.join(".git").exists() && disposable_dir_is_ignored(root) {
@@ -472,6 +521,25 @@ fn summary_dir_under(start: &Path) -> Result<PathBuf, Error> {
                 )
             })?;
             return Ok(disposable);
+        }
+        if root.join(".git").exists()
+            && work_tree_root(root).is_some_and(|top| {
+                top.canonicalize().unwrap_or(top)
+                    == root.canonicalize().unwrap_or_else(|_| root.to_path_buf())
+            })
+        {
+            // A real work tree with no disposable rule. A start git
+            // already ignores is never enumerated, so it stays in
+            // place; anything else would be counted as prepared
+            // source, so refuse rather than write it.
+            if path_is_ignored(root, start) {
+                return Ok(start.to_path_buf());
+            }
+            return Err(Error::msg(format!(
+                "run summary has no disposable home: work tree {} does not ignore ignored/; \
+                 refusing to write it into the work tree, where it would be counted as prepared source",
+                root.display()
+            )));
         }
         match root.parent() {
             Some(parent) => root = parent,
@@ -21787,6 +21855,90 @@ mod tests {
                 parent.display()
             );
         }
+    }
+
+    /// A real work tree with no `ignored/` rule (a Cargo git checkout
+    /// of reverie or rust-shed is one) must refuse rather than write
+    /// the summary at its root, where prepared source identity counts
+    /// it. Before this, the walk fell back to the start directory.
+    #[test]
+    fn summary_dir_refuses_in_a_real_work_tree_without_a_disposable_rule() {
+        let tmp = tempfile::tempdir().expect("fixture root");
+        let root = tmp.path();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(root)
+            .output()
+            .expect("git init fixture");
+        assert!(init.status.success(), "git init failed: {init:?}");
+        // No .gitignore at all: no disposable rule.
+        let nested = root.join("guest");
+        std::fs::create_dir(&nested).expect("fixture subdirectory");
+        let error = summary_dir_under(&nested)
+            .expect_err("a work tree with no disposable rule must refuse");
+        assert!(
+            format!("{error:#}").contains("no disposable home"),
+            "the refusal did not say why: {error:#}"
+        );
+        assert!(
+            !root.join(".hermit-verify-summary-fixture").exists(),
+            "a summary was written into the work tree"
+        );
+    }
+
+    /// The cli fixture's exact shape (dh-f3tm1): an EMPTY `.git`
+    /// directory - not a git repository - inside a real checkout's
+    /// `target/`, with its own `ignored/` rule. The fixture root is the
+    /// nearest `.git` ancestor and its rule must win over the enclosing
+    /// real tree, whose root the first version of this change wrongly
+    /// resolved to.
+    #[test]
+    fn summary_dir_prefers_a_fixture_git_dir_inside_target() {
+        let tmp = tempfile::tempdir().expect("fixture root");
+        let outer = tmp.path();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(outer)
+            .output()
+            .expect("git init fixture");
+        assert!(init.status.success(), "git init failed: {init:?}");
+        std::fs::write(outer.join(".gitignore"), "target/\n").expect("outer ignore rule");
+        let fixture = outer.join("target").join("tmp").join("fixture");
+        std::fs::create_dir_all(&fixture).expect("fixture directory");
+        std::fs::create_dir(fixture.join(".git")).expect("fixture empty git dir");
+        std::fs::write(fixture.join(".gitignore"), "ignored/\n").expect("fixture ignore rule");
+        let nested = fixture.join("guest");
+        std::fs::create_dir(&nested).expect("fixture subdirectory");
+        assert_eq!(
+            summary_dir_under(&nested).expect("resolving under a fixture git dir"),
+            fixture.join("ignored"),
+            "the fixture's own disposable directory must win over the enclosing tree"
+        );
+    }
+
+    /// A start git itself ignores is never enumerated as prepared
+    /// source, so it keeps the in-place location even in a work tree
+    /// with no `ignored/` rule. Hermit's own cli fixtures run under a
+    /// checkout's `target/` and rely on this (PR 5223's first head
+    /// refused there and broke max_log_bytes_verify_exits_promptly).
+    #[test]
+    fn summary_dir_in_a_git_ignored_directory_stays_in_place() {
+        let tmp = tempfile::tempdir().expect("fixture root");
+        let root = tmp.path();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(root)
+            .output()
+            .expect("git init fixture");
+        assert!(init.status.success(), "git init failed: {init:?}");
+        std::fs::write(root.join(".gitignore"), "target/\n").expect("fixture ignore rule");
+        let nested = root.join("target").join("tmp").join("fixture");
+        std::fs::create_dir_all(&nested).expect("fixture subdirectory");
+        assert_eq!(
+            summary_dir_under(&nested).expect("an ignored start keeps its place"),
+            nested,
+            "a git-ignored start must not be refused or relocated"
+        );
     }
 
     /// The control, and the reviewer's own case: a regular FILE named `ignored`.

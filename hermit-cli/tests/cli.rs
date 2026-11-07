@@ -247,6 +247,7 @@ static KILL_MULTITHREADED_PROCESS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PROCESS_SIGNAL_RECEIVER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static REALTIME_SIGNALS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PIPE_READ_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static BACKEND_SIGNAL_WAITS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static INOTIFY_BLOCKING_READ_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static OWN_PROCESS_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VDSO_SYMBOL_VERSIONS_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1645,6 +1646,32 @@ fn pipe_read_signal_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "pipe-read-signal guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn backend_signal_waits_guest() -> &'static Path {
+    BACKEND_SIGNAL_WAITS_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("backend-signal-waits");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create backend-signal-waits guest directory");
+        let guest = build_root.join("backend_signal_waits");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("hermit-cli/tests/fixtures/backend_signal_waits.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile backend-signal-waits guest");
+        assert!(
+            output.status.success(),
+            "backend-signal-waits guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -23912,10 +23939,11 @@ fn masked_ppoll_pending_guest() -> PathBuf {
 /// 0. On KVM the caught ppoll used to hang: Detcore retried the backend's
 /// EINTR, and each retry found the signal still pending. The ignored ones got
 /// a bare ENOSYS. Now the backend's EINTR is the answer, and Detcore removes
-/// the ignored signal, as Linux discards it, and probes again. KVM cannot keep
-/// a ppoll's mask in place across a wait, so the ignored signal with a
-/// timeout ends there as the named refusal of that wait, after the removal; a
-/// pselect6 waits there by probing in each turn. The zero-timeout cases also
+/// the ignored signal, as Linux discards it, and probes again. A ppoll or a
+/// pselect6 that then waits polls with the backend's own probes, each of which
+/// carries the temporary mask, so the ignored signal with a timeout times out
+/// with 0, as on Linux (the ppoll was refused by name there before SIGSHARE
+/// S2b). The zero-timeout cases also
 /// hold at L2 on both backends (strict comparison, bitwise parity, INFO
 /// messages compared). Without sequentialized threads the kernel beneath runs
 /// a ppoll that would wait: the same answers, where KVM's wait used to reach
@@ -23968,7 +23996,6 @@ fn run_kvm_masked_ppoll_with_a_pending_signal_answers_as_linux() {
     ] {
         let case = format!("{call} {mode} {milliseconds}");
         for &backend in backends {
-            let refused = backend == "--backend=kvm" && case == "ppoll ignored 100";
             // Each zero-timeout case also runs twice under the strict
             // comparison, which must report bitwise parity.
             let report = directory.path().join(format!(
@@ -23976,7 +24003,7 @@ fn run_kvm_masked_ppoll_with_a_pending_signal_answers_as_linux() {
                 &backend[10..]
             ));
             let report_arg = report.to_str().expect("report path should be UTF-8");
-            let verify = milliseconds == "0" && !refused;
+            let verify = milliseconds == "0";
             let mut args = vec![backend, "run", "--strict", "--base-env=minimal"];
             if verify {
                 args.extend(["--verify", "--verify-strict", "--verify-json", report_arg]);
@@ -23985,26 +24012,6 @@ fn run_kvm_masked_ppoll_with_a_pending_signal_answers_as_linux() {
             let output = hermit(&args);
             let stdout = stdout(&output);
             let stderr = stderr(&output);
-            if refused {
-                assert_eq!(
-                    output.status.code(),
-                    Some(HERMIT_POLICY_REFUSAL_EXIT),
-                    "{case} {backend}: a wait under the mask must end the strict run as a \
-                     policy refusal\nstdout:\n{stdout}\nstderr:\n{stderr}"
-                );
-                assert!(
-                    stderr.contains(
-                        "ppoll refused: a ppoll with a temporary signal mask that would wait \
-                         cannot be served on this backend"
-                    ),
-                    "{case} {backend}: the refusal is not named\nstderr:\n{stderr}"
-                );
-                assert!(
-                    !stdout.contains("ppoll"),
-                    "{case} {backend}: the guest went on past the refused wait\nstdout:\n{stdout}"
-                );
-                continue;
-            }
             assert_success(&output, &args);
             assert_eq!(stdout, linux(call, mode, milliseconds), "{case} {backend}");
             assert!(
@@ -47391,6 +47398,208 @@ fn run_kvm_the_drain_decides_a_polled_call_from_the_backends_signal_state() {
                     "{backend} {mode}: no poll request names its signal-state task:\n{text}"
                 );
             }
+        }
+    }
+}
+
+/// SIGSHARE S2b: on KVM, whose own `rt_sigsuspend` never sleeps and whose
+/// masked `ppoll` was refused when it would wait, both waits now end the ways
+/// Linux ends them (a parked suspend at the step-2 drain, from the signal
+/// state the backend reports, `Scheduler::wake_backend_signal_waits`; a
+/// masked ppoll at its own probes): a sibling's
+/// signal, a timer's, a process-directed POSIX timer's with two waiters (one
+/// handler run), a default-fatal signal, a signal the temporary mask blocks
+/// (it does not end the wait), a pending ignored signal the mask lets in
+/// (discarded, and the wait goes on), and a child's exit SIGCHLD, which keeps
+/// the path it had before S2b (SIGSHARE S4). Each mode runs on ptrace and on
+/// KVM: the output is the native line, and each run verifies at bitwise
+/// parity with nonzero compared INFO counts, except `ignored-let-in` on
+/// ptrace, which is one `--strict` run: ptrace's kernel call returns at once
+/// to discard the ignored signal, and where the scheduler first sees that
+/// return is host timing (https://github.com/rrnewton/hermit/issues/5172).
+/// Before S2b every KVM line but `sigchld`'s differed (the suspend returned
+/// ENOSYS at once, and the masked ppoll was refused by name).
+///
+/// Ignored signals follow Linux's dequeue order and its discard at send
+/// (review of https://github.com/rrnewton/hermit/pull/5175). `mixed` queues a
+/// caught SIGUSR1 and an ignored SIGWINCH that its handler's mask blocks:
+/// Linux runs the handler first and SIGWINCH stays pending (the native line,
+/// which ptrace matches at L2). KVM refuses it by name, before it removes
+/// anything: which ignored signals Linux discards behind a delivery depends
+/// on the handler's mask, which the backend's state does not report; at
+/// c1c6342f it removed SIGWINCH first. `ignored-first` is the control: Linux
+/// reaches SIGWINCH first and discards it. `late-ignored` sends SIGWINCH
+/// during the wait and later installs a handler: Linux discarded it at send,
+/// and at c1c6342f KVM ran the new handler. `late-ignored-same-turn` installs
+/// the handler at once, which the call's settle-before-unignore covers; it
+/// runs on KVM alone, since ptrace keeps a traced thread's ignored signal
+/// for its delivery stop and runs the handler
+/// (https://github.com/rrnewton/hermit/issues/5179).
+#[test]
+fn run_kvm_a_wait_under_a_temporary_mask_ends_as_on_linux() {
+    if kvm_unavailable("run_kvm_a_wait_under_a_temporary_mask_ends_as_on_linux") {
+        return;
+    }
+    let guest = backend_signal_waits_guest().to_str().unwrap().to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let both = ["ptrace", "kvm"].as_slice();
+    // https://github.com/rrnewton/hermit/issues/5179 (see above).
+    let kvm_only = ["kvm"].as_slice();
+    for (mode, expected, backends) in [
+        ("timer", "timer eintr=1 alarm_runs=1\n", both),
+        ("posix-timer", "posix-timer eintr=1 usr1_runs=1\n", both),
+        ("two-waiters", "two-waiters eintr=1,1 usr1_runs=1\n", both),
+        (
+            "ignored-let-in",
+            "ignored-let-in before=1 eintr=1 usr1_runs=1 winch_after=0\n",
+            both,
+        ),
+        (
+            "blocked-by-mask",
+            "blocked-by-mask eintr=1 usr1_in_wait=1 usr2_in_wait=1 usr1_runs=1\n",
+            both,
+        ),
+        ("fatal", "fatal signaled=1 termsig=15\n", both),
+        ("sigchld", "sigchld exited=1 status=7\n", both),
+        ("ppoll-timer", "ppoll-timer rc=-4 alarm_runs=1\n", both),
+        ("ppoll-sibling", "ppoll-sibling rc=-4 usr1_runs=1\n", both),
+        (
+            "ppoll-ignored",
+            "ppoll-ignored before=1 rc=0 winch_after=0\n",
+            both,
+        ),
+        (
+            "mixed",
+            "mixed before=1 eintr=1 winch_in_handler=1 winch_blocked_in_handler=1 \
+             winch_after=1 mask_restored=1\n",
+            both,
+        ),
+        (
+            "ignored-first",
+            "ignored-first before=1 eintr=1 winch_in_handler=0 winch_blocked_in_handler=1 \
+             winch_after=0 mask_restored=1\n",
+            both,
+        ),
+        (
+            "late-ignored",
+            "late-ignored eintr=1 usr1_runs=1 winch_runs=0 winch_after=0\n",
+            both,
+        ),
+        (
+            "late-ignored-same-turn",
+            "late-ignored-same-turn eintr=1 usr1_runs=1 winch_runs=0 winch_after=0\n",
+            kvm_only,
+        ),
+    ] {
+        for &backend in backends {
+            let backend_arg = format!("--backend={backend}");
+            let report = directory.path().join(format!("{mode}-{backend}.json"));
+            let report_arg = report.to_str().unwrap().to_owned();
+            // https://github.com/rrnewton/hermit/issues/5172 (see above).
+            let refused = backend == "kvm" && mode == "mixed";
+            let verify = !(backend == "ptrace" && mode == "ignored-let-in") && !refused;
+            let mut args = vec![backend_arg.as_str(), "run", "--strict"];
+            if verify {
+                args.extend(["--verify", "--verify-strict", "--verify-json", &report_arg]);
+            }
+            args.extend([
+                "--base-env=minimal",
+                "--epoch=2026-01-01T00:00:00Z",
+                "--",
+                guest.as_str(),
+                mode,
+            ]);
+            let output = hermit(&args);
+            if refused {
+                let stderr = stderr(&output);
+                assert_eq!(
+                    output.status.code(),
+                    Some(HERMIT_POLICY_REFUSAL_EXIT),
+                    "{backend} {mode}: the mixed set must be refused\nstderr:\n{stderr}"
+                );
+                assert!(
+                    stderr.contains(
+                        "rt_sigsuspend refused: an rt_sigsuspend whose temporary signal mask \
+                         lets in an ignored or stopping signal behind a signal Linux delivers \
+                         first"
+                    ),
+                    "{backend} {mode}: the refusal is not named\nstderr:\n{stderr}"
+                );
+                assert_eq!(stdout(&output), "", "{backend} {mode}: the guest went on");
+                continue;
+            }
+            assert_success(&output, &args);
+            assert_eq!(stdout(&output), expected, "{backend} {mode}");
+            if !verify {
+                continue;
+            }
+            let verdict: serde_json::Value =
+                serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+            assert_eq!(
+                verdict["bitwise_parity"], true,
+                "{backend} {mode}: {verdict}"
+            );
+            let compared = &verdict["compared_log_messages"];
+            assert!(
+                compared["left"].as_u64().is_some_and(|count| count > 0)
+                    && compared["left"] == compared["right"],
+                "{backend} {mode} compared no INFO messages: {verdict}"
+            );
+        }
+    }
+    // Review of https://github.com/rrnewton/hermit/pull/5175 at 048870af: the
+    // roles swapped (`root-sender`: the main thread sends SIGWINCH to a
+    // suspended thread, then installs a handler at once) under targeted
+    // chaos, which can place the woken waiter behind the setter's yield. At
+    // 048870af seeds 1, 3 and 4 of these (and 5, 7, 8) ran the stale handler
+    // (`winch_runs=1`): the guard saw only the park, not the woken but
+    // unserved waiter. Linux discarded SIGWINCH at send. KVM only
+    // (https://github.com/rrnewton/hermit/issues/5179).
+    for (mode, expected, seeds) in [
+        (
+            "root-sender",
+            "root-sender eintr=1 usr1_runs=1 winch_runs=0 mask_ok=1 winch_after=0\n",
+            1..=4,
+        ),
+        (
+            "late-ignored-same-turn",
+            "late-ignored-same-turn eintr=1 usr1_runs=1 winch_runs=0 winch_after=0\n",
+            1..=2,
+        ),
+    ] {
+        for seed in seeds {
+            let seed_arg = format!("--seed={seed}");
+            let fuzz_arg = format!("--fuzz-seed={seed}");
+            let report = directory.path().join(format!("{mode}-chaos-{seed}.json"));
+            let report_arg = report.to_str().unwrap().to_owned();
+            let args = [
+                "--backend=kvm",
+                "run",
+                "--strict",
+                "--verify",
+                "--verify-strict",
+                "--verify-json",
+                report_arg.as_str(),
+                "--base-env=minimal",
+                "--epoch=2026-01-01T00:00:00Z",
+                "--chaos",
+                seed_arg.as_str(),
+                "--max-timeslice=0",
+                "--chaos-target-races",
+                fuzz_arg.as_str(),
+                "--",
+                guest.as_str(),
+                mode,
+            ];
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            assert_eq!(stdout(&output), expected, "kvm {mode} chaos seed {seed}");
+            let verdict: serde_json::Value =
+                serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+            assert_eq!(
+                verdict["bitwise_parity"], true,
+                "kvm {mode} chaos seed {seed}: {verdict}"
+            );
         }
     }
 }

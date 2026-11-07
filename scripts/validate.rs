@@ -20194,8 +20194,10 @@ mod nextest_timeout_tests {
                 // cells in this default population).
                 // 2983 with #5154's guard cells: c-programs/madvise-guard-fault
                 // and c-programs/madvise-guard-regions, verify and replay on
-                // ptrace, and madvise-guard-regions verify on KVM.
-                assert_eq!(all.len(), 2983, "the original all-owner population is retained");
+                // ptrace, and madvise-guard-regions verify on KVM. 2984 with
+                // SIGSHARE S2b's KVM verify of
+                // c-programs/sigsuspend-sibling-signal-wake.
+                assert_eq!(all.len(), 2984, "the original all-owner population is retained");
             }
             let expected = all.iter().map(|cell| cell.id.clone()).collect::<BTreeSet<_>>();
             assert_eq!(expected.len(), all.len(), "duplicate all-owner cell identity");
@@ -21197,9 +21199,11 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // 132. And SIGSHARE S2a's
         // run_kvm_the_drain_decides_a_polled_call_from_the_backends_signal_state:
         // 133. And package K item 2b slice 2b-1's
-        // run_kvm_another_processs_stat_and_comm_answer_as_linux: 134, matching
+        // run_kvm_another_processs_stat_and_comm_answer_as_linux: 134. And
+        // SIGSHARE S2b's
+        // run_kvm_a_wait_under_a_temporary_mask_ends_as_on_linux: 135, matching
         // the DAG pin in validation_dag_static.
-        ("privileged-only-test.cli_kvm", 134usize),
+        ("privileged-only-test.cli_kvm", 135usize),
     ] {
         let step = privileged
             .steps
@@ -33102,6 +33106,51 @@ mod dispatch_order_tests {
                 "test.long_leaf",
                 "test.unestimated",
             ]
+        );
+    }
+
+    /// dh-nmfzx, decision (a): with families collapsed to the one global
+    /// eager-exit scope (validate's fail-fast shape), a deliberately failing
+    /// node cancels a slow running sibling and the run reports long before
+    /// the sibling's natural end. Without the collapse the sibling sits in
+    /// its own family and runs to completion, so this test discriminates.
+    #[test]
+    fn fail_fast_cancels_a_running_sibling_and_reports_before_its_natural_end() {
+        let committed = committed();
+        let template = &committed.steps[0];
+        let mut fail = step(template, "check.fail", 100.0, &[]);
+        fail.cmd = "sleep 0.2; exit 1".into();
+        fail.fail_fast_family = Some("check.fail".into());
+        let mut slow = step(template, "test.slow", 90.0, &[]);
+        slow.cmd = "sleep 30".into();
+        slow.timeout = 120;
+        slow.fail_fast_family = Some("test.slow".into());
+        let mut dependent = step(template, "test.dependent", 80.0, &["check.fail"]);
+        dependent.cmd = "true".into();
+        dependent.fail_fast_family = Some("test.dependent".into());
+        let mut cfg = DagConfig {
+            steps: vec![fail, slow, dependent],
+            ..committed.clone()
+        };
+        collapse_fail_fast_families(&mut cfg);
+        let started = std::time::Instant::now();
+        let res = dagrun::scheduler::run_dag(&cfg, 2, false, 0);
+        let elapsed = started.elapsed();
+        assert!(!res.ok);
+        let outcomes: std::collections::HashMap<String, dagrun::model::StepOutcome> = res
+            .outcomes
+            .iter()
+            .map(|outcome| (outcome.tag.clone(), outcome.clone()))
+            .collect();
+        assert!(!outcomes["check.fail"].ok);
+        assert!(
+            outcomes["test.slow"].aborted,
+            "the slow sibling was not cancelled: {outcomes:?}"
+        );
+        assert_eq!(res.skipped, vec!["test.dependent"]);
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "the run took {elapsed:?}, so the verdict did not precede the sibling's 30 s natural end"
         );
     }
 
