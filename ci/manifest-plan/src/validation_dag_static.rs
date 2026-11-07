@@ -3394,7 +3394,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And SIGSHARE S3b-2's carried
     // a_child_exit_kvm_published_no_copy_for_moves_no_curr_target and
     // with_the_record_a_kvm_poll_is_decided_in_the_senders_turn: 3791 + 2 = 3793.
-    ("test.detcore_unit", 3793),
+    // And the #5259 review fixes' nine flag-on reader counterparts
+    // (with_the_record_*) and two parked tests
+    // (a_kvm_child_exit_receiver_is_chosen_by_the_temporary_mask_its_call_installs,
+    // a_kvm_copy_linux_discarded_at_send_is_never_taken_by_a_later_handler):
+    // 3793 + 11 = 3804.
+    ("test.detcore_unit", 3804),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -6218,7 +6223,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same hermit_init_is_rendered_from_its_model_where_the_record_names_tasks
     // unit: 3790 + 1 = 3791.
     // And the same two S3b-2 units: 3791 + 2 = 3793.
-    ("test.detcore_unit_on_host", 3793),
+    // And the same eleven #5259 review-fix units: 3793 + 11 = 3804.
+    ("test.detcore_unit_on_host", 3804),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
