@@ -638,6 +638,37 @@ fn release_artifact_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
     Ok(())
 }
 
+fn reverie_buck_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
+    let reverie_buck = cfg
+        .steps
+        .iter()
+        .find(|step| step.tag() == "build.reverie_buck")
+        .ok_or("reverie-buck bracket: build.reverie_buck is absent")?;
+    if !reverie_buck
+        .cmd
+        .contains("${HERMIT_VALIDATE_BUILD_MODE:-cargo}")
+        || !reverie_buck.cmd.contains("cargo) : ;;")
+        || !reverie_buck.cmd.contains("buck) ./ci/harvest-reverie-buck.sh ;;")
+        || !reverie_buck
+            .cmd
+            .contains("*) echo \"unknown Hermit build mode:")
+        || reverie_buck.cmd.contains("not wired yet")
+        || !reverie_buck
+            .deps
+            .iter()
+            .any(|dep| dep == "gate.manifest")
+        || !reverie_buck
+            .deps
+            .iter()
+            .any(|dep| dep == "build.workspace_in_pinned_root")
+    {
+        return Err(
+            "reverie-buck bracket: Reverie Buck producer lost its closed mode branch".into(),
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod artifact_plan_tests {
     use super::*;
@@ -646,6 +677,7 @@ mod artifact_plan_tests {
     fn actual_host_and_pinned_consumers_require_their_artifact_and_resource_producers() {
         let cfg = validate_plan::validation_config(&test_source_root()).unwrap();
         release_artifact_plan_bracket(&cfg).unwrap();
+        reverie_buck_plan_bracket(&cfg).unwrap();
         let mut tags = hermit_manifest_plan::validation_dag::hermit_integration_shard_tags();
         tags.push("test.hermit_integration_on_host".into());
         for tag in tags {
@@ -1019,6 +1051,19 @@ const FROZEN_RUN_WITHHELD_ISSUE: &str = "https://github.com/rrnewton/dev-hermit/
 /// The selection mode of a plan that `--frozen-run` withheld a node from.
 const FROZEN_RUN_SELECTION_MODE: &str = "frozen";
 const RELEASE_BUILD_MODE_ENV: &str = "HERMIT_VALIDATE_RELEASE_BUILD_MODE";
+/// How the Reverie test set is compiled: `cargo` (today's nextest-binaries
+/// staging) or `buck` (buck2 build, harvested into the same staging paths).
+/// Cut 1 only establishes the name and the cargo default; the buck arm is
+/// Cut 2/3 and nothing reads this yet.
+const BUILD_MODE_ENV: &str = "HERMIT_VALIDATE_BUILD_MODE";
+const BUILD_MODE_CARGO: &str = "cargo";
+const BUILD_MODE_BUCK: &str = "buck";
+const BUILD_MODES: [&str; 2] = [BUILD_MODE_CARGO, BUILD_MODE_BUCK];
+/// Who executes the tests: today always the cargo/nextest runner. The name
+/// is reserved for the deferred RUN switch (after the BUILD switch proves
+/// node-by-node equality); nothing reads this yet.
+const RUN_MODE_ENV: &str = "HERMIT_VALIDATE_RUN_MODE";
+const RUN_MODE_CARGO: &str = "cargo";
 const RELEASE_BUILDER_CARGO: &str = validate_receipt::RELEASE_BUILDER_CARGO;
 const RELEASE_BUILDER_BUCK: &str = "buck";
 const E2E_RUNNER_ENV: &str = "HERMIT_VALIDATE_E2E_RUNNER";
@@ -1274,6 +1319,131 @@ fn establish_release_build_environment(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
+/// Decode one ambient mode value captured with `env::var_os`. A non-UTF-8
+/// value refuses by variable name: `env::var` would collapse it to unset
+/// and silently establish cargo, the fallback this cut exists to remove.
+fn ambient_mode_value(
+    name: &str,
+    raw: Option<std::ffi::OsString>,
+) -> Result<Option<String>, String> {
+    match raw {
+        None => Ok(None),
+        Some(value) => value.into_string().map(Some).map_err(|_| {
+            if name == RUN_MODE_ENV {
+                format!(
+                    "{name} has a non-UTF-8 value: cargo is the only supported run mode until the deferred RUN switch"
+                )
+            } else {
+                format!(
+                    "{name} has a non-UTF-8 value: supported modes are cargo (default) and buck"
+                )
+            }
+        }),
+    }
+}
+
+/// Refuse an ambient build/run mode this cut cannot honour. Cut 1 has no
+/// CLI selector and only cargo works: buck and any unknown value are a
+/// refusal, never a silent fallback to cargo.
+fn check_ambient_build_modes(
+    ambient_build: Option<&str>,
+    ambient_run: Option<&str>,
+) -> Result<(), String> {
+    if let Some(value) = ambient_build {
+        if value != BUILD_MODE_CARGO && value != BUILD_MODE_BUCK {
+            return Err(format!(
+                "unknown {BUILD_MODE_ENV} {value:?}: supported modes are cargo (default) and buck (M2 Cut 3 harvest)"
+            ));
+        }
+    }
+    if let Some(value) = ambient_run {
+        if value != RUN_MODE_CARGO {
+            return Err(format!(
+                "unknown {RUN_MODE_ENV} {value:?}: cargo is the only supported run mode until the deferred RUN switch"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Establish the Reverie build/run modes, like
+/// [`establish_release_build_environment`]: ambient values never survive.
+/// The ambient values are captured by the caller before stripping and are
+/// refused here when unsupported (see [`check_ambient_build_modes`]); a
+/// supported or unset ambient value establishes cargo.
+fn establish_build_mode_environment(
+    ambient_build: Option<String>,
+    ambient_run: Option<String>,
+) -> Result<(), String> {
+    check_ambient_build_modes(ambient_build.as_deref(), ambient_run.as_deref())?;
+    let build_mode = ambient_build.as_deref().unwrap_or(BUILD_MODES[0]);
+    std::env::remove_var(BUILD_MODE_ENV);
+    std::env::remove_var(RUN_MODE_ENV);
+    std::env::set_var(BUILD_MODE_ENV, build_mode);
+    std::env::set_var(RUN_MODE_ENV, RUN_MODE_CARGO);
+    Ok(())
+}
+
+#[cfg(test)]
+mod build_mode_environment_tests {
+    use super::*;
+
+    #[test]
+    fn build_and_run_modes_default_to_cargo_over_ambient_values() {
+        // Unset and explicit cargo both establish cargo.
+        for ambient in [None, Some(BUILD_MODE_CARGO.to_string())] {
+            establish_build_mode_environment(ambient, None).unwrap();
+            assert_eq!(std::env::var(BUILD_MODE_ENV).unwrap(), BUILD_MODE_CARGO);
+            assert_eq!(std::env::var(RUN_MODE_ENV).unwrap(), RUN_MODE_CARGO);
+        }
+        // Buck build mode establishes buck (M2 Cut 3 harvest).
+        establish_build_mode_environment(Some(BUILD_MODE_BUCK.into()), None).unwrap();
+        assert_eq!(std::env::var(BUILD_MODE_ENV).unwrap(), BUILD_MODE_BUCK);
+        assert_eq!(std::env::var(RUN_MODE_ENV).unwrap(), RUN_MODE_CARGO);
+        // An unknown build mode is refused by name, with the supported
+        // modes pinned in the message.
+        let error =
+            establish_build_mode_environment(Some("banana".into()), None).unwrap_err();
+        assert!(error.contains(BUILD_MODE_ENV), "{error}");
+        assert!(
+            error.contains("supported modes are cargo (default) and buck"),
+            "{error}"
+        );
+        // An unsupported run mode is refused too.
+        let error =
+            establish_build_mode_environment(None, Some(BUILD_MODE_BUCK.into())).unwrap_err();
+        assert!(error.contains(RUN_MODE_ENV), "{error}");
+        let error =
+            establish_build_mode_environment(None, Some("banana".into())).unwrap_err();
+        assert!(error.contains(RUN_MODE_ENV), "{error}");
+        // A non-UTF-8 ambient value refuses by variable name for both
+        // variables, instead of collapsing to unset.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            for name in [BUILD_MODE_ENV, RUN_MODE_ENV] {
+                let error = ambient_mode_value(
+                    name,
+                    Some(std::ffi::OsString::from_vec(vec![0xff])),
+                )
+                .unwrap_err();
+                assert!(error.contains(name), "{error}");
+                if name == RUN_MODE_ENV {
+                    assert!(
+                        error.contains("cargo is the only supported run mode"),
+                        "{error}"
+                    );
+                } else {
+                    assert!(
+                        error.contains("supported modes are cargo (default) and buck"),
+                        "{error}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Hand the E2E runner to the nodes that read it (`e2e.buck_cells`), like
 /// [`establish_release_build_environment`]: ambient values never survive.
 fn establish_e2e_runner_environment(args: &Args) -> Result<(), String> {
@@ -1385,6 +1555,17 @@ fn usage() -> &'static str {
      \x20                  Build release Hermit with Buck2 through the named absolute\n\
      \x20                  public DotSlash launcher. Cargo remains the default. Buck\n\
      \x20                  mode refuses unsupported plans and never falls back.\n\
+     \x20 HERMIT_VALIDATE_BUILD_MODE=cargo|buck\n\
+     \x20                  How the Reverie test set is compiled (environment only;\n\
+     \x20                  there is no CLI selector yet). cargo (default) stages\n\
+     \x20                  through nextest-binaries; buck runs the M2 Cut 3 harvest\n\
+     \x20                  (ci/harvest-reverie-buck.sh) after the workspace build.\n\
+     \x20                  Any other value is refused with a nonzero exit, never\n\
+     \x20                  silently replaced by cargo.\n\
+     \x20 HERMIT_VALIDATE_RUN_MODE=cargo\n\
+     \x20                  Who executes the tests (environment only). cargo is the\n\
+     \x20                  only supported run mode until the deferred RUN switch;\n\
+     \x20                  any other value is refused, never silently replaced.\n\
      \x20 --e2e-runner cargo|buck-local|buck-hybrid\n\
      \x20                  Who runs the full level's E2E cells (default cargo). A Buck\n\
      \x20                  runner swaps the manifest buckets for e2e.buck_stage (the\n\
@@ -5512,6 +5693,7 @@ cleared-caps refusal names {} starved step(s)",
             );
         }
         release_artifact_plan_bracket(&full.cfg)?;
+        reverie_buck_plan_bracket(&full.cfg)?;
         // The local Hermit integration node runs as shards; each must consume
         // the published artifact.
         for shard in hermit_manifest_plan::validation_dag::hermit_integration_shard_tags() {
@@ -29573,6 +29755,38 @@ fn run(
     std::env::remove_var(BUCK_DOTSLASH_ENV);
     std::env::remove_var(E2E_RUNNER_ENV);
     std::env::remove_var(E2E_BUCK2_ENV);
+    // Capture the ambient build/run modes before stripping: an unsupported
+    // value is refused (even for --help), never silently replaced by cargo.
+    // var_os, not var: a non-UTF-8 value refuses by name instead of
+    // collapsing to unset.
+    let ambient_build_mode =
+        match ambient_mode_value(BUILD_MODE_ENV, std::env::var_os(BUILD_MODE_ENV)) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("validate: {error}");
+                return RunSummary::refused(
+                    2,
+                    "(arguments not parsed)",
+                    "build mode",
+                    vec![error],
+                );
+            }
+        };
+    let ambient_run_mode = match ambient_mode_value(RUN_MODE_ENV, std::env::var_os(RUN_MODE_ENV)) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("validate: {error}");
+            return RunSummary::refused(2, "(arguments not parsed)", "build mode", vec![error]);
+        }
+    };
+    std::env::remove_var(BUILD_MODE_ENV);
+    std::env::remove_var(RUN_MODE_ENV);
+    if let Err(error) =
+        check_ambient_build_modes(ambient_build_mode.as_deref(), ambient_run_mode.as_deref())
+    {
+        eprintln!("validate: {error}");
+        return RunSummary::refused(2, "(arguments not parsed)", "build mode", vec![error]);
+    }
     let args = match parse_args() {
         Ok(a) => a,
         // `parse_args` returns 0 only for `--help`, whose usage text is the
@@ -29682,6 +29896,9 @@ fn run(
     }
     if let Err(error) = establish_e2e_runner_environment(&args) {
         return RunSummary::refused(2, args.level.name(), "E2E runner", vec![error]);
+    }
+    if let Err(error) = establish_build_mode_environment(ambient_build_mode, ambient_run_mode) {
+        return RunSummary::refused(2, args.level.name(), "build mode", vec![error]);
     }
 
     let level_name = args.level.name().to_string();

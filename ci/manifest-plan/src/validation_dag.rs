@@ -776,6 +776,9 @@ const PROFILES: [Profile; 11] = [
         // privileged-test.deadline_slice_cap_kvm, the deadline_slice_cap suite
         // on KVM held to its gap ledger, adds one full-only node: 102/103
         // before.
+        // build.reverie_buck (M2) is a post-split extension node: these
+        // counts stay the frozen lineage (103/104); the node joins through
+        // POST_SPLIT_CORE_NODES, not this table.
         label: "full",
         direct_steps: 103,
         selected_steps: 104,
@@ -2105,6 +2108,13 @@ fn is_buck_import_twin(step: &Step) -> bool {
 pub fn buck_e2e_selection(committed: &DagConfig) -> Result<DagConfig, String> {
     let replaced = buck_replaced_tags(committed)?;
     let mut pruned = committed.clone();
+    // Post-split extension brackets (build.reverie_buck, M2) are not part of
+    // the Buck E2E replacement composition: they carry the `full` label for
+    // the ordinary full profile, and selecting them here would keep the
+    // bracket inside the very mode whose selection it brackets. Exclude
+    // extension tags explicitly; the frozen population is unchanged.
+    let extension = crate::dag_source_ownership::extension_tags();
+    pruned.steps.retain(|step| !extension.contains(&step.tag()));
     for step in &mut pruned.steps {
         if replaced.contains(&step.tag()) {
             step.labels.retain(|label| label != "full");
@@ -3892,10 +3902,18 @@ fn assert_buck_e2e_selection(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(
             "the Buck E2E selection still selects replaced node(s) {kept_replaced:?}"
         ));
     }
-    let expected_dropped = replaced
+    // Post-split extension brackets (build.reverie_buck, M2) are excluded
+    // from the Buck E2E selection by buck_e2e_selection itself, so they are
+    // dropped without being replaced; they are the only such nodes.
+    let extension_dropped = crate::dag_source_ownership::extension_tags()
         .intersection(&full_tags)
         .cloned()
         .collect::<BTreeSet<_>>();
+    let mut expected_dropped = replaced
+        .intersection(&full_tags)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    expected_dropped.extend(extension_dropped);
     if dropped != expected_dropped {
         return Err(format!(
             "the Buck E2E selection drops {dropped:?}, but replaces {replaced:?} (of which full had {expected_dropped:?})"
@@ -4929,6 +4947,8 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     // outside the per-commit smoke pair, in the SaBRe run type (442 + 1).
     // 446 with the rr bucket (e2e.manifest_rr and its on-host/Buck twins),
     // the first post-split extension nodes (443 + 3).
+    // build.reverie_buck (M2 Cut 2/3) is admitted post-split through
+    // POST_SPLIT_CORE_NODES, so the admitted population is frozen core + 1.
     let actual_tags = cfg.steps.iter().map(Step::tag).collect::<BTreeSet<_>>();
     let expected_tags = crate::dag_source_ownership::admitted_core_tags();
     if actual_tags != expected_tags || actual_tags.len() != cfg.steps.len() {
@@ -5313,10 +5333,8 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
                 profile.label
             ));
         }
-        let source_direct =
-            crate::dag_source_ownership::source_profile(profile.label, true, false)?;
-        let source_selected =
-            crate::dag_source_ownership::source_profile(profile.label, true, true)?;
+        let source_direct = crate::dag_source_ownership::admitted_profile(profile.label, false)?;
+        let source_selected = crate::dag_source_ownership::admitted_profile(profile.label, true)?;
         let direct = cfg
             .steps
             .iter()
@@ -7964,6 +7982,9 @@ sys.exit(37)
         // and 101 since the host fixtures route through build.host_hermit_link
         // and the retired base producers stay retired (104 full nodes), and
         // 102 with privileged-test.deadline_slice_cap_kvm (105 full nodes).
+        // build.reverie_buck (M2) is a post-split extension node, not a
+        // frozen core tag, so it is filtered from `expected` by is_core and
+        // must not appear in the Buck selection population either.
         // The Buck profile composes the full profile with Cargo owners replaced,
         // rather than selecting the Buck label alone.
         let original_full =
