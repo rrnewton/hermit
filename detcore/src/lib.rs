@@ -3531,12 +3531,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                     (
                         checkpoint.origin.rcbs,
                         checkpoint.origin.callback == slice_boundary::callbacks::Callback::PmuTimer,
+                        checkpoint.origin.progress,
                     )
                 })
             } else {
                 None
             };
-            let pending_checkpoint_rcbs = pending_checkpoint.map(|(rcbs, _)| rcbs);
+            let pending_checkpoint_rcbs = pending_checkpoint.map(|(rcbs, _, _)| rcbs);
             if let Some(replay_rcb_end) = replay_rcb_end
                 && self.cfg.annotated_priority_replay
                 && guest.thread_state().own_signal_turn_hold.is_some()
@@ -3562,7 +3563,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             // neither does a faithful replay. This is a physical arm target
             // only; the recorded endpoint is unchanged.
             let replay_rcb_end = match (replay_rcb_end, pending_checkpoint) {
-                (Some(end), Some((endpoint, timer_endpoint)))
+                (Some(end), Some((endpoint, timer_endpoint, _)))
                     if !timer_endpoint || endpoint == current_pmu_rcbs =>
                 {
                     assert_eq!(end, endpoint, "a checkpoint's RCBs are its row's");
@@ -3581,8 +3582,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             // committed RCBs means the thread is already past the recorded
             // endpoint: refuse that by name. The assertion below still guards
             // every other path.
-            if let (Some(target), Some((endpoint, _))) = (replay_rcb_end, pending_checkpoint)
+            if let (Some(target), Some((endpoint, _, endpoint_progress))) =
+                (replay_rcb_end, pending_checkpoint)
                 && target <= current_pmu_rcbs
+                && guest.thread_state().callback_history.progress().count >= endpoint_progress
             {
                 crate::scheduler::exit_on_scheduler_refusal(&format!(
                     "{}: dtid {} is at RCB {}, past its recorded endpoint {}",
@@ -3615,18 +3618,22 @@ impl<T: RecordOrReplay> Detcore<T> {
                             current_pmu_rcbs + 1
                         }
                     };
-                assert!(
-                    target > current_pmu_rcbs,
-                    "recorded PMU RCB deadline {} is not ahead of current {}",
-                    target,
-                    current_pmu_rcbs
-                );
                 let logical_remaining = if max_timeslice_end > current_time {
                     max_timeslice_end - current_time
                 } else {
                     LogicalTime::ZERO
                 };
-                (logical_remaining, target - current_pmu_rcbs)
+                // A target already reached in RCBs while the endpoint's
+                // event is still ahead in progress (a skid branch retired
+                // early): arm for the next branch instead, whose check-in
+                // decides the row; the refusal above covers a thread past
+                // the endpoint in progress as well.
+                let remaining = if target > current_pmu_rcbs {
+                    target - current_pmu_rcbs
+                } else {
+                    1
+                };
+                (logical_remaining, remaining)
             } else {
                 let logical_remaining = max_timeslice_end - current_time;
                 (
