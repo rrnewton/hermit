@@ -58,7 +58,8 @@ use super::insn::{self};
 /// The loop shapes this rewriter recognises.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Idiom {
-    /// `LDxXR; <alu>; STxXR; CBNZ` - read-modify-write.
+    /// `LDxXR; <alu>; STxXR; CBNZ` - read-modify-write, the ALU operation
+    /// possibly setting the flags (`SUBS` in Rust's `Arc` drop).
     Rmw,
     /// `LDxXR; STxXR; CBNZ` - unconditional store, that is, a swap.
     Swap,
@@ -298,6 +299,16 @@ pub fn plan_section(
                             report.patched.push(site);
                         }
                     }
+                    // A compare loop the matcher does not reach is named
+                    // for what it is, as the canonical ones are.
+                    Err(Refusal::NotCanonical | Refusal::NoPairedLoad)
+                        if closes_a_compare_loop(&decoded, index) =>
+                    {
+                        report.refused.push(RefusedSite {
+                            addr: addr(index),
+                            reason: Refusal::CompareExit,
+                        })
+                    }
                     Err(reason) => report.refused.push(RefusedSite {
                         addr: addr(index),
                         reason,
@@ -432,6 +443,36 @@ fn direct_branches(decoded: &[Insn], base: u64) -> Vec<(usize, u64)> {
         branches.push((index, here.wrapping_add(offset as u64)));
     }
     branches
+}
+
+/// Whether the store-exclusive `store` closes a compare loop the matcher
+/// does not reach: a load-exclusive on the same base at most four
+/// instructions before it, and between them a compare followed by a B.NE,
+/// or a CBNZ on the loaded value. Rust's `fetch_update` retries its weak
+/// compare-exchange at a block before the loop, and its `futex_rwlock`
+/// read path computes the new value after the compare; neither is a
+/// canonical idiom, and both are compare loops, which are left alone as
+/// `compare-exit` like the canonical ones.
+fn closes_a_compare_loop(decoded: &[Insn], store: usize) -> bool {
+    let Insn::StoreExcl { rn, .. } = decoded[store] else {
+        return false;
+    };
+    let Some(load) = (store.saturating_sub(4)..store)
+        .rev()
+        .find(|&i| matches!(decoded[i], Insn::LoadExcl { rn: load_rn, .. } if load_rn == rn))
+    else {
+        return false;
+    };
+    let Insn::LoadExcl { rt: loaded, .. } = decoded[load] else {
+        unreachable!("found a load-exclusive")
+    };
+    let window = &decoded[load + 1..store];
+    window
+        .windows(2)
+        .any(|pair| matches!(pair, [Insn::Cmp { .. }, Insn::CondBranch { cond: 1, .. }]))
+        || window.iter().any(
+            |insn| matches!(insn, Insn::CompareBranch { nonzero: true, rt, .. } if *rt == loaded),
+        )
 }
 
 /// Match the sequence ending at the store-exclusive `store`, returning the
@@ -652,9 +693,16 @@ fn rmw(
     sf: bool,
     zero_status: u32,
 ) -> Result<Vec<u32>, Refusal> {
+    // A flag-setting ADDS or SUBS sets the flags from the loaded value. The
+    // replacement runs the same instruction on the value the atomic returns,
+    // which is the value the original's successful store-exclusive replaced,
+    // and nothing after it in the replacement or the original sets flags, so
+    // the flags at the exit are the original's. The materialising move and
+    // the atomic set none either, and the original sets them before any read.
     let (op, alu_sf, rd, alu_rn, operand) = match alu {
         Insn::Alu {
             op,
+            sets_flags: _,
             sf,
             rd,
             rn,
@@ -866,6 +914,17 @@ mod tests {
             &[0x085ffc20, 0x08027c23, 0x35ffffc2],
             &[0x38a38020, 0x2a1f03e2, 0xd503201f],
         ),
+        // An Android linker's own words (Rust's std, linked into it), and
+        // its replacement is llvm-mc's encoding.
+        // `Arc` drop: ldxr x9,[x8]; subs x9,x9,#1; stlxr w10,x9,[x8]; cbnz w10,
+        // whose flags a `b.ne` after the loop reads. It becomes
+        // mov x10,#-1; ldaddl x10,x9,[x8]; subs x9,x9,#1; mov w10,wzr.
+        (
+            "rmw_subs_x_release_arc_drop",
+            Idiom::Rmw,
+            &[0xc85f7d09, 0xf1000529, 0xc80afd09, 0x35ffffaa],
+            &[0x9280000a, 0xf86a0109, 0xf1000529, 0x2a1f03ea],
+        ),
     ];
 
     /// Sequences that must survive untouched, with the reason they do.
@@ -918,6 +977,49 @@ mod tests {
         (
             "cas_zero_is_left_alone_compare_exit",
             &[0xc85ffc20, 0xb5000080, 0xc802fc23, 0x35ffffa2],
+            Refusal::CompareExit,
+        ),
+        // `ThreadId::new`'s weak compare-exchange, an Android linker's own
+        // words (Rust's std, linked into it): ldxr x10,[x9]; cmp x10,x11;
+        // b.ne out; stxr w11,x8,[x9]; cbnz w11,<recompute>, retrying at a
+        // block before the load. A compare loop, left alone wherever it
+        // retries.
+        (
+            "cas_compare_retry_elsewhere_status_is_expected",
+            &[0xc85f7d2a, 0xeb0b015f, 0x54ffff01, 0xc80b7d28, 0x35fffeeb],
+            Refusal::CompareExit,
+        ),
+        // The same with its retry at the CMP (cbnz w11,.-12).
+        (
+            "cas_compare_retry_into_the_sequence",
+            &[0xc85f7d2a, 0xeb0b015f, 0x54ffff01, 0xc80b7d28, 0x35ffffab],
+            Refusal::CompareExit,
+        ),
+        // The linker's `futex_rwlock::read_contended`: ldaxr w9,[x19];
+        // cmp w9,w8; b.ne out; add w8,w8,#1; stxr w10,w8,[x19]; cbnz w10,.-52.
+        (
+            "new_value_after_the_compare",
+            &[
+                0x885f_fe69,
+                0x6b08_013f,
+                0x54ff_fe81,
+                0x1100_0508,
+                0x880a_7e68,
+                0x35ff_fe6a,
+            ],
+            Refusal::CompareExit,
+        ),
+        // The same loop retrying at its own load (cbnz w10,.-16).
+        (
+            "new_value_after_the_compare_retrying_at_the_load",
+            &[
+                0x885f_fe69,
+                0x6b08_013f,
+                0x54ff_fe81,
+                0x1100_0508,
+                0x880a_7e68,
+                0x35ff_ff8a,
+            ],
             Refusal::CompareExit,
         ),
     ];
@@ -1416,6 +1518,197 @@ mod tests {
                 .iter()
                 .any(|r| r.reason == Refusal::CompareExit),
             "{report:?}"
+        );
+    }
+
+    #[test]
+    fn a_register_operand_that_is_the_stored_value_is_rewritten_as_the_first_attempt() {
+        // The zero-failed-store native path is valid: Rs takes the entry Rm
+        // before the atomic, and the copied ALU still reads that entry Rm
+        // before writing Rv. Pin all four emitted words for Rm == Rv, for
+        // the existing plain operations as well as ADDS and SUBS.
+        // Literal W/X materialisers and release-only LSE words keep this
+        // oracle independent of the encoder helpers used by the rewriter.
+        let operations = [
+            (
+                "add",
+                AluOp::Add,
+                false,
+                0x8b0b_012b,
+                [0x2a0b_03ea, 0xaa0b_03ea],
+                [0xb86a_0109, 0xf86a_0109],
+            ),
+            (
+                "adds",
+                AluOp::Add,
+                true,
+                0xab0b_012b,
+                [0x2a0b_03ea, 0xaa0b_03ea],
+                [0xb86a_0109, 0xf86a_0109],
+            ),
+            (
+                "sub",
+                AluOp::Sub,
+                false,
+                0xcb0b_012b,
+                [0x4b0b_03ea, 0xcb0b_03ea],
+                [0xb86a_0109, 0xf86a_0109],
+            ),
+            (
+                "subs",
+                AluOp::Sub,
+                true,
+                0xeb0b_012b,
+                [0x4b0b_03ea, 0xcb0b_03ea],
+                [0xb86a_0109, 0xf86a_0109],
+            ),
+            (
+                "orr",
+                AluOp::Orr,
+                false,
+                0xaa0b_012b,
+                [0x2a0b_03ea, 0xaa0b_03ea],
+                [0xb86a_3109, 0xf86a_3109],
+            ),
+            (
+                "eor",
+                AluOp::Eor,
+                false,
+                0xca0b_012b,
+                [0x2a0b_03ea, 0xaa0b_03ea],
+                [0xb86a_2109, 0xf86a_2109],
+            ),
+            (
+                "bic",
+                AluOp::Bic,
+                false,
+                0x8a2b_012b,
+                [0x2a0b_03ea, 0xaa0b_03ea],
+                [0xb86a_1109, 0xf86a_1109],
+            ),
+            (
+                "and",
+                AluOp::And,
+                false,
+                0x8a0b_012b,
+                [0x2a2b_03ea, 0xaa2b_03ea],
+                [0xb86a_1109, 0xf86a_1109],
+            ),
+        ];
+        for (index, (width, sf, load, store)) in [
+            ("w", false, 0x885f_7d09, 0x880a_fd0b),
+            ("x", true, 0xc85f_7d09, 0xc80a_fd0b),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (name, op, sets_flags, xword, materialise, atomic) in operations {
+                let alu = if sf { xword } else { xword & !(1 << 31) };
+                assert_eq!(
+                    decode(alu),
+                    Insn::Alu {
+                        op,
+                        sets_flags,
+                        sf,
+                        rd: 11,
+                        rn: 9,
+                        operand: Operand::Reg(11),
+                    },
+                    "{width} {name} fixture"
+                );
+                let words = [load, alu, store, 0x35ff_ffaa];
+                let expected = [materialise[index], atomic[index], alu, 0x2a1f_03ea];
+                let report = plan(&words, BASE);
+                assert_eq!(report.refused, vec![], "{width} {name}: {report:?}");
+                assert_eq!(
+                    report.patched,
+                    vec![Site {
+                        addr: BASE,
+                        idiom: Idiom::Rmw,
+                        words: expected.to_vec(),
+                    }],
+                    "{width} {name} first attempt"
+                );
+                let mut rewritten = words;
+                apply(&mut rewritten, BASE, &report);
+                assert_eq!(rewritten, expected, "{width} {name} exact rewrite");
+
+                // Only Rm changes, to a register the loop never writes.
+                let distinct = (alu & !(0x1f << 16)) | (12 << 16);
+                let control = [load, distinct, store, 0x35ff_ffaa];
+                let report = plan(&control, BASE);
+                assert_eq!(report.refused, vec![], "{width} {name} distinct operand");
+                assert_eq!(report.patched.len(), 1, "{width} {name}: {report:?}");
+                assert_eq!(report.patched[0].idiom, Idiom::Rmw);
+                assert_eq!(report.patched[0].addr, BASE);
+                assert_eq!(report.patched[0].words.len(), 4);
+                assert_eq!(report.patched[0].words[2], distinct);
+            }
+        }
+
+        // The immediate operand in Rust's Arc drop keeps its exact rewrite.
+        let arc_drop = [0xc85f_7d09, 0xf100_0529, 0xc80a_fd09, 0x35ff_ffaa];
+        let report = plan(&arc_drop, BASE);
+        assert_eq!(report.refused, vec![], "{report:?}");
+        assert_eq!(
+            report.patched,
+            vec![Site {
+                addr: BASE,
+                idiom: Idiom::Rmw,
+                words: vec![0x9280_000a, 0xf86a_0109, 0xf100_0529, 0x2a1f_03ea],
+            }]
+        );
+    }
+
+    #[test]
+    fn the_flags_an_arc_drop_leaves_are_kept_for_the_branch_after_it() {
+        // The linker's `Arc` drop and the `b.ne` after it that reads the flags
+        // the loop's SUBS set: only the loop is replaced, and the replacement's
+        // SUBS is the original instruction, so the branch reads the same flags.
+        let words = [
+            0xc85f_7d09,
+            0xf100_0529,
+            0xc80a_fd09,
+            0x35ff_ffaa,
+            0x5400_00a1,
+        ];
+        let report = plan(&words, BASE);
+        assert_eq!(report.refused, vec![], "{report:?}");
+        assert_eq!(report.patched.len(), 1);
+        let site = &report.patched[0];
+        assert_eq!(site.words.len(), 4);
+        assert_eq!(site.words[2], words[1], "the SUBS runs again, unchanged");
+        let mut rewritten = words;
+        apply(&mut rewritten, BASE, &report);
+        assert_eq!(rewritten[4], words[4], "the flag consumer is untouched");
+    }
+
+    #[test]
+    fn a_compare_exchange_that_retries_elsewhere_stays_native() {
+        // `ThreadId::new`'s loop in a region with its recompute block before
+        // it, as the linker lays it out:
+        // mov w12,wzr; mov x11,x10; adds x8,x11,#1; <the loop>; mov w12,#1.
+        // A compare loop is left alone wherever it retries, and the region
+        // keeps its words.
+        let mut words = vec![0x2a1f_03ecu32, 0xaa0a_03eb, 0xb100_0568];
+        // ldxr x10,[x9]; cmp x10,x11; b.ne <before the region>;
+        // stxr w11,x8,[x9]; cbnz w11,<the recompute block's first instruction>.
+        words.extend_from_slice(&[
+            0xc85f_7d2a,
+            0xeb0b_015f,
+            0x54ff_ff41,
+            0xc80b_7d28,
+            0x35ff_ff2b,
+        ]);
+        words.push(0x5280_002c);
+        let report = plan(&words, BASE);
+        assert_eq!(report.patched, vec![], "{report:?}");
+        assert_eq!(
+            report.refused,
+            vec![RefusedSite {
+                addr: BASE + 24,
+                reason: Refusal::CompareExit,
+            }]
         );
     }
 
