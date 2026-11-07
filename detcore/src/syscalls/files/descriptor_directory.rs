@@ -1145,10 +1145,15 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// (`/proc/thread-self/status` from such a thread,
     /// `/proc/self/task/<tid>/status`), where Detcore serves the caller's own
     /// task directories ([`Self::serves_task_directories`], package K slice
-    /// K10): Detcore renders no task's `status`, and the KVM executor's
-    /// `/proc` renders its process's alone, which on Linux is the leader's,
-    /// not the thread's (`Pid`, `Name`, its signal and context-switch lines,
-    /// `proc_pid_status`). The leader's own is its process's, which the
+    /// K10), and only where Detcore does not render that thread's `status`
+    /// itself: the KVM executor's `/proc` renders its process's alone, which
+    /// on Linux is the leader's, not the thread's (`Pid`, `Name`, its signal
+    /// and context-switch lines, `proc_pid_status`). Whether Detcore renders
+    /// it is the open's own decision (`Detcore::kept_by_kernel`):
+    /// `Detcore::renders_any_status` and
+    /// `procfs::task_status::renders_task_status` for the thread, which since
+    /// package K item 2b slice 2b-2 holds for every thread with a recorded
+    /// name on KVM. The leader's own is its process's, which the
     /// backend answers ([`Self::own_task_backend_spelling`]). The call's path
     /// is classified as the backend would be given it, by that same
     /// respelling (`..` resolved, empty and `.` components left out:
@@ -1239,6 +1244,20 @@ impl<T: RecordOrReplay> Detcore<T> {
             if !Self::named_tasks_exist(guest, &[status_thread]).await {
                 continue;
             }
+            // A thread whose `status` Detcore renders is served on the
+            // rendered path, by the same predicate as its open
+            // (`Detcore::kept_by_kernel`).
+            if self.renders_any_status() {
+                let task = crate::procfs::BoundTask {
+                    process: own.0,
+                    thread: Some(thread),
+                };
+                let facts = crate::tool_global::task_stat_facts(guest, task).await;
+                if crate::procfs::task_status::renders_task_status(&facts, self.comm_source(), true)
+                {
+                    continue;
+                }
+            }
             return Some(
                 self.refuse_placeholder_call(
                     guest,
@@ -1246,8 +1265,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                     Errno::EACCES,
                     &format!(
                         "{}, the status of thread {thread} of this process, which is not its \
-                         thread group leader, cannot be served: Detcore renders no task's status \
-                         on this backend, and its procfs renders the process's alone, which \
+                         thread group leader, cannot be served: Detcore renders no status of this \
+                         thread here, and the backend's procfs renders the process's alone, which \
                          Linux gives the leader (https://github.com/rrnewton/hermit/issues/5039)",
                         observed.display()
                     ),
@@ -3145,6 +3164,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                 )
                 .is_some_and(|file| {
                     !self.kernel_serves_every_comm(&file)
+                        && !self.kernel_serves_every_status(&file)
+                        && !self.kernel_serves_every_environ(&file)
                         && file.rendered_path(session_files).is_some()
                 });
                 let ino = match looked_up {
@@ -3184,10 +3205,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///   `fd` directory it serves (`descriptor_directory`: a process's to
     ///   every thread of it, a thread's to that thread alone, which is the
     ///   reader taking the listing), and a process's `task`, which it serves
-    ///   too; in another process's directory, neither its `fd` directory
-    ///   nor its `cmdline`, which Detcore refuses by name there
-    ///   (`other_process_procfs`, until package K item 2b slices 2b-3 and
-    ///   2b-5 serve them);
+    ///   too; in another process's directory, not its `fd` directory, which
+    ///   Detcore refuses by name there (`other_process_procfs`, until package
+    ///   K item 2b slice 2b-5 serves it), while its `cmdline` and `environ`
+    ///   are listed (slice 2b-3 serves them from the strings its `execve`
+    ///   passed);
     /// - in `task`, every thread of the process.
     ///
     /// Every other name in Linux's table is left out, deliberately: on this
@@ -3230,7 +3252,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         let kept = |name: &[u8]| match name {
             b"." | b".." => true,
             _ if binding.kind == TaskDirectoryKind::Tasks => true,
-            b"fd" | b"cmdline" if others => false,
+            // Another process's `cmdline` and `environ` are served from the
+            // strings its `execve` passed (package K item 2b slice 2b-3,
+            // `Detcore::serves_exec_strings`), so they are listed as Linux
+            // lists them, below.
+            b"fd" if others => false,
             b"fd" => binding.kind == TaskDirectoryKind::Process || binding.tid == reader,
             b"task" => binding.kind == TaskDirectoryKind::Process,
             b"smaps_rollup" if !rollup_readable => false,
@@ -3241,6 +3267,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                 crate::procfs::ProcfsFile::from_path(&path).is_some_and(|file| {
                     file.per_process_name().is_some()
                         && !self.kernel_serves_every_comm(&file)
+                        && !self.kernel_serves_every_status(&file)
+                        && !self.kernel_serves_every_environ(&file)
                         && file.rendered_path(session_files).is_some()
                 })
             }

@@ -70153,13 +70153,17 @@ fn the_callers_own_proc_directories_answer_as_linux() {
 /// while the backend's memory map is incomplete, is listed only when its read
 /// can render it (dh-62azc; KVM's map is incomplete today,
 /// https://github.com/rrnewton/reverie/issues/1211).
-/// Then the guest's other modes ([`OWN_DIRECTORY_MODES`]), each of which stops with
-/// the policy's exit and names why: the open of `/proc/self` itself
-/// (`O_PATH|O_NOFOLLOW`), by its plain spelling and through `..`, which
-/// opens the link on Linux and for which this backend has no object; and a
-/// second thread's `status` by a spelling with a `.` component, which this
-/// backend's procfs would answer with its process's (or not at all), not the
-/// thread's.
+/// Then the guest's other modes ([`OWN_DIRECTORY_MODES`]): the open of
+/// `/proc/self` itself (`O_PATH|O_NOFOLLOW`), by its plain spelling and
+/// through `..`, which opens the link on Linux and for which this backend has
+/// no object, stops with the policy's exit and names why; and a second
+/// thread's `status` by a spelling with a `.` component, which Detcore
+/// renders on KVM since package K item 2b slice 2b-2 (before it, this
+/// backend's procfs would have answered with its process's, so it was
+/// refused by name), answers at L2 as natively. Each process and thread
+/// directory lists `status` too, which Linux lists after `auxv`, and, since
+/// slice 2b-3 serves `environ` from Detcore's record of the exec strings,
+/// `environ`, which Linux lists before `auxv`.
 #[test]
 fn run_kvm_the_callers_own_proc_directories_answer_as_linux() {
     let test = "run_kvm_the_callers_own_proc_directories_answer_as_linux";
@@ -70171,7 +70175,9 @@ fn run_kvm_the_callers_own_proc_directories_answer_as_linux() {
         "../d",
         "task/d",
         "fd/d",
+        "environ/r",
         "auxv/r",
+        "status/r",
         "comm/r",
         "cmdline/r",
         "stat/r",
@@ -70222,18 +70228,26 @@ fn run_kvm_the_callers_own_proc_directories_answer_as_linux() {
     let mut wanted = expected("/proc/self", false);
     wanted.extend(expected("/proc/thread-self", true));
     assert_eq!(lines, wanted, "kvm read-listed: every listed name reads");
+    // A second thread's status, by a spelling with a `.`, as natively.
+    for (mode, line) in &OWN_DIRECTORY_MODES[2..] {
+        let native = procfs_own_directory_native(&[mode]);
+        assert!(
+            native.lines().any(|native| native == *line) && native.ends_with("done\n"),
+            "native {mode}: {native}"
+        );
+        assert_eq!(
+            procfs_own_directory_at_l2("kvm", "standard", &[mode]),
+            native,
+            "kvm {mode}"
+        );
+    }
     let guest = procfs_own_directory_guest();
     let link_reason = ["an O_PATH open of /proc/self that does not follow it"; 2];
-    let status_reason = "which is not its thread group leader, cannot be served";
-    for ((mode, _), reasons) in OWN_DIRECTORY_MODES.into_iter().zip([
-        link_reason,
-        link_reason,
-        [
-            "/proc/thread-self/./status, the status of thread",
-            status_reason,
-        ],
-        ["/proc/self/./task/", status_reason],
-    ]) {
+    for ((mode, _), reasons) in OWN_DIRECTORY_MODES[..2]
+        .iter()
+        .copied()
+        .zip([link_reason, link_reason])
+    {
         let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
         let args = [
             "--backend",
@@ -70574,12 +70588,21 @@ fn without_core_dumps(command: &mut Command) {
 }
 
 /// The other-process stat guest's transcript under Hermit on `backend` at
+/// L2 ([`guest_transcript_at_l2`]).
+fn proc_other_process_stat_at_l2(backend: &str) -> String {
+    guest_transcript_at_l2(
+        backend,
+        proc_other_process_stat_guest(),
+        proc_other_process_stat_args(backend),
+    )
+}
+
+/// `guest`'s transcript, run with `guest_args` under Hermit on `backend` at
 /// L2: two runs at bitwise parity under `--verify-strict`, with the same
 /// nonzero number of INFO records compared. Hermit runs under
 /// [`without_core_dumps`], as the native run does, and its guest processes
 /// inherit that limit.
-fn proc_other_process_stat_at_l2(backend: &str) -> String {
-    let guest = proc_other_process_stat_guest();
+fn guest_transcript_at_l2(backend: &str, guest: &Path, guest_args: &[&str]) -> String {
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let report = directory.path().join(format!("{backend}.json"));
     let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
@@ -70598,7 +70621,7 @@ fn proc_other_process_stat_at_l2(backend: &str) -> String {
         guest.to_str().expect("guest path is UTF-8"),
     ]
     .into_iter()
-    .chain(proc_other_process_stat_args(backend).iter().copied())
+    .chain(guest_args.iter().copied())
     .collect::<Vec<_>>();
     let mut command = hermit_command(&args);
     without_core_dumps(&mut command);
@@ -70651,6 +70674,235 @@ fn run_kvm_another_processs_stat_and_comm_answer_as_linux() {
     }
     let native = proc_other_process_stat_native("kvm");
     assert_eq!(proc_other_process_stat_at_l2("kvm"), native, "kvm");
+}
+
+static PROC_OTHER_PROCESS_STATUS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+
+/// `tests/c/proc_other_process_status.c`'s guest.
+fn proc_other_process_status_guest() -> &'static Path {
+    compiled_c_guest(
+        &PROC_OTHER_PROCESS_STATUS_GUEST,
+        "proc_other_process_status",
+    )
+}
+
+/// The other-process status guest's transcript run natively, checked line by
+/// line first, so a host that answers otherwise fails here rather than in
+/// the comparison. The line lists leave out the lines Hermit never renders
+/// (Detcore's `procfs::task_status::OMITTED_STATUS_LINES`, which the guest
+/// names), the capability lines (checked against `capget` instead) and a
+/// zombie's signal sets.
+fn proc_other_process_status_native() -> String {
+    const LIVE: &str = "Name,State,Tgid,Ngid,Pid,PPid,TracerPid,Uid,Gid,Groups,NStgid,NSpid,\
+        NSpgid,NSsid,Kthread,VmPeak,VmSize,VmLck,VmPin,VmHWM,VmRSS,RssAnon,RssFile,RssShmem,\
+        VmData,VmStk,VmExe,VmLib,VmPTE,VmSwap,HugetlbPages,Threads,SigPnd,ShdPnd,SigBlk,SigIgn,\
+        SigCgt,Cpus_allowed,Cpus_allowed_list,Mems_allowed,Mems_allowed_list,\
+        voluntary_ctxt_switches,nonvoluntary_ctxt_switches";
+    const ZOMBIE: &str = "Name,State,Tgid,Ngid,Pid,PPid,TracerPid,Uid,Gid,Groups,NStgid,NSpid,\
+        NSpgid,NSsid,Kthread,Threads,Cpus_allowed,Cpus_allowed_list,Mems_allowed,\
+        Mems_allowed_list,voluntary_ctxt_switches,nonvoluntary_ctxt_switches";
+    let output = Command::new(proc_other_process_status_guest())
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the other-process status guest natively");
+    assert!(output.status.success(), "native: {output:?}");
+    let native = stdout(&output);
+    let mut expected = Vec::new();
+    for (label, name, threads) in [
+        ("child status", "status-child", 2),
+        ("thread status", "status-thread", 2),
+    ] {
+        expected.push(format!(
+            "{label}: name={name} state=S (sleeping) pid,nspid match=1 tgid,nstgid match=1 \
+             ppid is reader=1 tracerpid=0 threads={threads} (want {threads})"
+        ));
+        expected.push(format!(
+            "{label}: uid,gid as the reader's=1 groups as the reader's=1 \
+             nspgid,nssid as getpgid,getsid=1 ngid,kthread=0,0"
+        ));
+        expected.push(format!(
+            "{label}: capability lines as capget answers=1 cpus as sched_getaffinity=1 \
+             mems as get_mempolicy=1"
+        ));
+        expected.push(format!("{label}: lines={LIVE}"));
+    }
+    expected.extend(
+        [
+            "child status: SIGUSR1 blocked=1 SIGUSR2 ignored=1 SIGTERM caught=1",
+            "child status (relative): lines as by path=1 name=status-child",
+            "thread status: SIGUSR1 blocked=0 SIGUSR2 ignored=1 SIGTERM caught=1",
+            "zombie status: name=proc_other_proc state=Z (zombie) pid,nspid match=1 \
+             tgid,nstgid match=1 ppid is reader=1 tracerpid=0 threads=1 (want 1)",
+            "zombie status: capability lines as capget answers=1 cpus as sched_getaffinity=1 \
+             mems as get_mempolicy=1",
+            "zombie status: name as the reader's=1",
+            "own status: pid,tgid match=1 ppid as getppid=1 threads=1",
+            "own status: uid,gid as getresuid,getresgid=1 groups as getgroups=1",
+            "own status: capability lines as capget answers=1 bounding as PR_CAPBSET_READ=1 \
+             ambient as PR_CAP_AMBIENT=1",
+            "failures=0",
+        ]
+        .map(str::to_owned),
+    );
+    expected.push(format!("zombie status: lines={ZOMBIE}"));
+    expected.push(format!("own status: lines={LIVE}"));
+    assert_eq!(native.lines().count(), 21, "{native}");
+    for line in expected {
+        assert!(
+            native.lines().any(|native| native == line),
+            "{line}: {native}"
+        );
+    }
+    native
+}
+
+/// Another process's `/proc/<pid>/status` and `task/<tid>/status`, and the
+/// reader's own `/proc/self/status` (`tests/c/proc_other_process_status.c`),
+/// on ptrace, at L2, exactly as natively, every line: a live child's (named
+/// by `PR_SET_NAME`, two threads, a blocked, an ignored and a caught
+/// signal), read by path and relative to a descriptor of its directory, its
+/// thread's, and a zombie's (`Z (zombie)`, no memory lines), each line
+/// checked against what the reader's own queries answer. Package K item 2b
+/// slice 2b-2 renders another process's `status` from Detcore's state on
+/// ptrace and KVM; ptrace showed the kernel's, sanitized, before it, which
+/// showed a zombie as `S (sleeping)`. The reader's own stays the kernel's,
+/// sanitized, on ptrace.
+#[test]
+fn another_processs_status_answers_as_linux() {
+    let native = proc_other_process_status_native();
+    assert_eq!(
+        guest_transcript_at_l2("ptrace", proc_other_process_status_guest(), &[]),
+        native,
+        "ptrace"
+    );
+}
+
+/// [`another_processs_status_answers_as_linux`] on KVM, at L2, exactly as
+/// natively, every line. Before package K item 2b slice 2b-2 another
+/// process's `status` failed with EACCES and a zombie's with ENOENT (the KVM
+/// provider's), and the reader's own was the provider's 13 lines, without
+/// the memory, signal, capability and affinity lines; Detcore now renders
+/// both from its own state. KVM's `capget` answers only for the caller, so
+/// another process's status has no capability lines there, as the guest
+/// checks (present exactly where `capget` answers).
+#[test]
+fn run_kvm_another_processs_status_answers_as_linux() {
+    let test = "run_kvm_another_processs_status_answers_as_linux";
+    if kvm_unavailable(test) {
+        return;
+    }
+    let native = proc_other_process_status_native();
+    assert_eq!(
+        guest_transcript_at_l2("kvm", proc_other_process_status_guest(), &[]),
+        native,
+        "kvm"
+    );
+}
+
+static PROC_OTHER_PROCESS_CMDLINE_GUEST: OnceLock<PathBuf> = OnceLock::new();
+
+/// `tests/c/proc_other_process_cmdline.c`'s guest.
+fn proc_other_process_cmdline_guest() -> &'static Path {
+    compiled_c_guest(
+        &PROC_OTHER_PROCESS_CMDLINE_GUEST,
+        "proc_other_process_cmdline",
+    )
+}
+
+/// The other-process cmdline guest's transcript, as Linux answers it to a
+/// reader that is not real root in the initial user namespace (a zombie's
+/// `environ` is then global root's, mode 0400: EACCES). No pid or path is
+/// printed, and no process rewrites its strings after its exec. An
+/// `environ` held open across its process's exec reads nothing (its open
+/// pinned the first image's memory map) and a `cmdline` held so reads the
+/// second image's arguments, another process's and the caller's own alike
+/// (review round 1 of package K item 2b slice 2b-3).
+const PROC_OTHER_PROCESS_CMDLINE_LINES: &[&str] = &[
+    "arguments cmdline: length=22 bytes=kid\\0alpha\\0\\0beta gamma\\0",
+    "arguments environ: length=57 bytes=TWIN_ROLE=wait\\0TWIN_READY=100\\0TWIN_HOLD=101\\0K1=v1\\0EMPTY=\\0",
+    "arguments cmdline: three-byte reads as one read=1",
+    "arguments cmdline: lseek=6",
+    "arguments cmdline from 6: length=16 bytes=pha\\0\\0beta gamma\\0",
+    "arguments cmdline pread 4 at 13: length=4 bytes=ta g",
+    "arguments cmdline: pread past the end=0",
+    "no arguments cmdline: length=1 bytes=\\0",
+    "long argument cmdline: length=5010 as passed=1 checksum=6320097696119153006",
+    "long argument cmdline pread 8 at 4092: length=8 bytes=ghijklmn",
+    "forked child cmdline: as the parent's own=1 nonempty=1",
+    "forked child environ: as the parent's own=1 nonempty=1",
+    "zombie cmdline: length=0 bytes=",
+    "zombie environ: EACCES",
+    "non-dumpable child: environ open=EACCES cmdline length=12",
+    "across exec: kept environ before: length=56 bytes=TWIN_ROLE=reexec\\0TWIN_READY=100\\0TWIN_HOLD=101\\0PHASE=one\\0",
+    "across exec: kept cmdline before: length=11 bytes=before\\0one\\0",
+    "across exec: kept environ after: read=0 errno=ok",
+    "across exec: kept cmdline after: length=10 bytes=after\\0two\\0",
+    "across exec: reopened environ: length=54 bytes=TWIN_ROLE=wait\\0TWIN_READY=100\\0TWIN_HOLD=101\\0PHASE=two\\0",
+    "own across exec: kept environ after: read=0",
+    "own across exec: kept cmdline after: length=8 bytes=own\\0two\\0",
+    "own across exec: fresh environ: length=68 bytes=TWIN_ROLE=own-after-exec\\0TWIN_READY=100\\0TWIN_HOLD=101\\0PHASE=own-two\\0",
+    "failures=0",
+];
+
+/// The other-process cmdline guest's transcript run natively, checked line by
+/// line first ([`PROC_OTHER_PROCESS_CMDLINE_LINES`]), so a host that
+/// answers otherwise fails here rather than in the comparison.
+fn proc_other_process_cmdline_native() -> String {
+    let output = Command::new(proc_other_process_cmdline_guest())
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the other-process cmdline guest natively");
+    assert!(output.status.success(), "native: {output:?}");
+    let native = stdout(&output);
+    assert_eq!(
+        native.lines().collect::<Vec<_>>(),
+        PROC_OTHER_PROCESS_CMDLINE_LINES,
+        "native"
+    );
+    native
+}
+
+/// Another process's `/proc/<pid>/cmdline` and `/proc/<pid>/environ`
+/// (`tests/c/proc_other_process_cmdline.c`) on ptrace, at L2, exactly as
+/// natively, every line: an exec'd child with an empty argument and an empty
+/// environment value, read whole, three bytes at a time, after `lseek` and
+/// with `pread`; a child exec'd with an empty argument vector (Linux gives
+/// it an empty `argv[0]`); one with an argument longer than a page; a
+/// forked child that did not exec (its files are the parent's own); a
+/// zombie (`cmdline` empty, `environ` EACCES); and a non-dumpable child,
+/// whose `environ` a reader without effective capabilities cannot open
+/// while its `cmdline` reads. ptrace keeps the kernel's own files (package
+/// K item 2b slice 2b-3 changes nothing there).
+#[test]
+fn another_processs_cmdline_and_environ_answer_as_linux() {
+    let native = proc_other_process_cmdline_native();
+    assert_eq!(
+        guest_transcript_at_l2("ptrace", proc_other_process_cmdline_guest(), &[]),
+        native,
+        "ptrace"
+    );
+}
+
+/// [`another_processs_cmdline_and_environ_answer_as_linux`] on KVM, at L2,
+/// exactly as natively, every line. Before package K item 2b slice 2b-3 the
+/// run stopped at the first read of another process's `cmdline`, refused by
+/// name (https://github.com/rrnewton/hermit/issues/4564), and every
+/// `environ`, the reader's own included, was the KVM provider's EACCES.
+/// Detcore now serves another process's files from the strings its image's
+/// `execve` passed, recorded before its first instruction, and the reader's
+/// own `environ` from its memory, with Linux's access check at the open.
+#[test]
+fn run_kvm_another_processs_cmdline_and_environ_answer_as_linux() {
+    let test = "run_kvm_another_processs_cmdline_and_environ_answer_as_linux";
+    if kvm_unavailable(test) {
+        return;
+    }
+    let native = proc_other_process_cmdline_native();
+    assert_eq!(
+        guest_transcript_at_l2("kvm", proc_other_process_cmdline_guest(), &[]),
+        native,
+        "kvm"
+    );
 }
 
 /// The link-targets guest's `--directory-links` transcript, line by line:

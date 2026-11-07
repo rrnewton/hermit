@@ -639,10 +639,12 @@ fn rendered_stat(path: &Path, epoch: Timespec, owner: (u32, u32)) -> DetStat {
 }
 
 /// Whether the rendered file `path` is readable by its owner only (0400): a
-/// process's `auxv` (`proc_pid_auxv`'s `S_IRUSR`) and a task's `io`
-/// (`ONE("io", S_IRUSR, ...)`, fs/proc/base.c).
+/// process's `auxv` (`proc_pid_auxv`'s `S_IRUSR`), a task's `io`
+/// (`ONE("io", S_IRUSR, ...)`, fs/proc/base.c) and a process's `environ`
+/// (`REG("environ", S_IRUSR, ...)`).
 pub(super) fn rendered_path_is_owner_only(path: &Path) -> bool {
-    crate::procfs::per_process_name(path).is_some_and(|name| matches!(name.filename, "auxv" | "io"))
+    crate::procfs::per_process_name(path)
+        .is_some_and(|name| matches!(name.filename, "auxv" | "io" | "environ"))
 }
 
 /// Whether the rendered file `path` has Linux's mode 0644: a task's `comm`
@@ -1226,6 +1228,7 @@ pub(super) fn io_access_by_real_credentials(
     let CapabilitySets {
         effective,
         permitted,
+        ..
     } = reader.capabilities;
     let within_effective = task_permitted & !effective == 0;
     let within_permitted = task_permitted & !permitted == 0;
@@ -1352,15 +1355,29 @@ enum CapabilityRefusal {
     Auxv,
     /// Another thread group's `/proc/<pid>/io`, at a read or a seek.
     Io,
+    /// Another process's `/proc/<pid>/environ`, at its open (package K item
+    /// 2b slice 2b-3).
+    Environ,
 }
 
 /// Whether the run has warned that the reader's own capabilities refused
-/// another process's `auxv` (`AUXV`) or `io` (`IO`) where Linux might allow
-/// it: once each per tool process, which is once per run where the kernel
-/// beneath serves no `/proc` (KVM's tool runs in Hermit's process).
+/// another process's `auxv` (`AUXV`), `io` (`IO`) or `environ` (`ENVIRON`)
+/// where Linux might allow it: once each per tool process, which is once per
+/// run where the kernel beneath serves no `/proc` (KVM's tool runs in
+/// Hermit's process).
 static CAPABILITY_REFUSAL_WARNED_AUXV: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static CAPABILITY_REFUSAL_WARNED_IO: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static CAPABILITY_REFUSAL_WARNED_ENVIRON: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the run has warned that another process's `cmdline` or `environ`
+/// was served from the strings its image's `execve` passed rather than from
+/// its memory (`Detcore::read_rendered_cmdline`, the interim of minibeads
+/// dh-ngy9z): once per tool process, which is once per run on the one
+/// backend that serves them (KVM's tool runs in Hermit's process).
+static EXEC_STRINGS_FALLBACK_WARNED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// The owner Linux reports for the rendered file `path`: a per-process file
@@ -1468,12 +1485,13 @@ pub(super) enum CapabilitySet {
     Permitted,
 }
 
-/// A task's effective and permitted capability sets, their low 64 bits, as
-/// `capget` reports them.
+/// A task's effective, permitted and inheritable capability sets, their low
+/// 64 bits, as `capget` reports them.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct CapabilitySets {
     pub(super) effective: u64,
     pub(super) permitted: u64,
+    pub(super) inheritable: u64,
 }
 
 /// The configured epoch as a stat time.
@@ -2101,6 +2119,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             // process table, and its owner's access (FileAccess).
             if procfs.per_process_name().is_some() {
                 if self.kernel_serves_every_comm(&procfs)
+                    || self.kernel_serves_every_status(&procfs)
+                    || self.kernel_serves_every_environ(&procfs)
                     || self.kernel_serves_every_address_space_file(&procfs)
                 {
                     return Ok(None);
@@ -2603,6 +2623,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(Some(Ok(CapabilitySets {
             effective: set(0),
             permitted: set(1),
+            inheritable: set(2),
         })))
     }
 
@@ -2755,6 +2776,40 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             None
         };
+        // A process's `environ`: Linux's open asks the same access check as
+        // `auxv`'s for another thread group (`environ_open`), after the
+        // owner's permission above. Boxed, as above.
+        if procfs.is_process_environ()
+            && !flags.contains(OFlag::O_PATH)
+            && let Some(task) = procfs.bound_task()
+            && !self.names_own_process(guest, task).await
+        {
+            Box::pin(Self::ptrace_read_allowed_for(
+                guest,
+                task,
+                CapabilityRefusal::Environ,
+            ))
+            .await??;
+        }
+        // ... and pins the process's memory map (`__mem_open`), which an exec
+        // replaces: pin the image whose strings Detcore recorded for the
+        // process now, so that a read after the process has exec'd another
+        // image reads nothing (`Self::read_rendered_cmdline`).
+        let procfs = if procfs.is_process_environ() && !flags.contains(OFlag::O_PATH) {
+            let mut procfs = procfs;
+            if let Some(task) = procfs.bound_task()
+                && let (_, Some((image, _))) = crate::tool_global::process_exec_strings(
+                    guest,
+                    detcore_model::pid::DetPid::from_raw(task.process),
+                )
+                .await
+            {
+                procfs.pin_exec_image(image);
+            }
+            procfs
+        } else {
+            procfs
+        };
         GuestProcfs::remember();
         // Read before the placeholder exists, so that a failure leaves the
         // guest nothing open.
@@ -2767,7 +2822,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // (`ProcfsFile::snapshot_at_first_read`).
         let snapshot = match opened {
             Some(bytes) => Some(bytes),
-            None if procfs.is_process_auxv() || procfs.is_process_cmdline() => None,
+            None if procfs.is_process_auxv() || procfs.reads_exec_strings() => None,
             None if procfs.snapshot_at_first_read() => None,
             None => {
                 // `/proc/diskstats` starts from the host's table as the run
@@ -2786,12 +2841,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         // with the open file description (and `PLACEHOLDER_OPENS`). A
         // `cmdline` takes none: its open reads no memory
         // (`proc_pid_cmdline_ops` has no `open`), and every read reads the
-        // memory of the process it names (`Self::read_rendered_cmdline`).
+        // memory of the process it names (`Self::read_rendered_cmdline`). Nor
+        // does an `environ`, whose every read reads that memory too.
         let carried: Vec<u8> = match &snapshot {
             Some(snapshot)
                 if !procfs.snapshot_is_rerendered()
                     && !procfs.is_process_auxv()
-                    && !procfs.is_process_cmdline() =>
+                    && !procfs.reads_exec_strings() =>
             {
                 snapshot.clone()
             }
@@ -2900,6 +2956,22 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         task: crate::procfs::BoundTask,
     ) -> Result<Result<(), Errno>, Error> {
+        Self::ptrace_read_allowed_for(guest, task, CapabilityRefusal::Auxv).await
+    }
+
+    /// [`Self::ptrace_read_allowed`] for the open of another process's
+    /// `refusal` file: `auxv`, or `environ`, whose open makes the same check
+    /// on a file of the same owner and mode (`environ_open` and `auxv_open`
+    /// both call `__mem_open`, fs/proc/base.c:1001-1004 and 1080-1083 in
+    /// 6.17, with `PTRACE_MODE_READ`, to which `proc_mem_open` adds FSCREDS,
+    /// :845), so the kernel's answer to an open of the task's `auxv` is the
+    /// answer for its `environ` too. `refusal` names the file in the warning
+    /// where the caller's own capability decides.
+    async fn ptrace_read_allowed_for<G: Guest<Self>>(
+        guest: &mut G,
+        task: crate::procfs::BoundTask,
+        refusal: CapabilityRefusal,
+    ) -> Result<Result<(), Errno>, Error> {
         let named = task.thread.unwrap_or(task.process);
         let target = match Self::kernel_procfs_number(guest, named).await {
             Some(kernel) => Self::probe(guest, format!("/proc/{kernel}/auxv").as_bytes()).await?,
@@ -2911,9 +2983,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let serves = Self::probe(guest, b"/proc/thread-self/stat").await?;
         match auxv_access_answer(target, serves) {
             AuxvAccess::Answer(answer) => Ok(answer),
-            AuxvAccess::CallerCapability => {
-                Self::caller_capability_answer(guest, CapabilityRefusal::Auxv).await
-            }
+            AuxvAccess::CallerCapability => Self::caller_capability_answer(guest, refusal).await,
         }
     }
 
@@ -3347,6 +3417,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                 "io",
                 reverie::syscalls::Sysno::read,
                 &CAPABILITY_REFUSAL_WARNED_IO,
+            ),
+            CapabilityRefusal::Environ => (
+                "environ",
+                reverie::syscalls::Sysno::openat,
+                &CAPABILITY_REFUSAL_WARNED_ENVIRON,
             ),
         };
         match Self::inject_capget(guest, CapabilitySet::Effective).await? {
@@ -3850,6 +3925,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             if !self.renders_procfs(guest)
                 || self.kernel_serves_every_comm(&file)
+                || self.kernel_serves_every_status(&file)
+                || self.kernel_serves_every_environ(&file)
                 || self.kernel_serves_every_address_space_file(&file)
             {
                 return Ok(None);
@@ -3892,11 +3969,13 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// tool forgets an exited process's vector changes nothing the guest
     /// sees.
     ///
-    /// And whether `file` is a process's `cmdline` that the kernel serves:
+    /// And whether `file` is a process's `cmdline` or `environ` that the
+    /// kernel serves: the caller's own where Detcore recorded no argument
+    /// area for its image (the same backends and stacks as for `auxv`), and
     /// another process's, whose memory Detcore cannot read (Linux reads the
-    /// target's memory at each read), or the caller's own where Detcore
-    /// recorded no argument area for its image (the same backends and stacks
-    /// as for `auxv`).
+    /// target's memory at each read), except where Detcore serves it from the
+    /// strings the image's `execve` passed ([`Self::serves_exec_strings`]:
+    /// one it recorded them for, or one that has exited).
     ///
     /// And whether `file` is a process's `stat` that the kernel serves: where
     /// the name's source is Detcore's record (`Self::comm_source`), a task's
@@ -3936,6 +4015,23 @@ impl<T: RecordOrReplay> Detcore<T> {
             let facts = crate::tool_global::task_stat_facts(guest, task).await;
             return !crate::procfs::task_stat::renders_task_comm(&facts, self.comm_source());
         }
+        // A task's `status` (package K item 2b slice 2b-2): where Detcore
+        // renders any (`Self::kernel_serves_every_status`), every task's of
+        // the process table but the reader's own process's where the name's
+        // source is the kernel, whose file stays the kernel's, sanitized, as
+        // before (`procfs::task_status::renders_task_status`).
+        if file.is_task_status() {
+            if self.kernel_serves_every_status(file) {
+                return true;
+            }
+            let facts = crate::tool_global::task_stat_facts(guest, task).await;
+            let own = facts.process == Some(self.own_detpid(guest).as_raw());
+            return !crate::procfs::task_status::renders_task_status(
+                &facts,
+                self.comm_source(),
+                own,
+            );
+        }
         if file.is_task_stat() {
             let facts = crate::tool_global::task_stat_facts(guest, task).await;
             let own = self.own_detpid(guest).as_raw();
@@ -3968,9 +4064,21 @@ impl<T: RecordOrReplay> Detcore<T> {
             return !rendered;
         }
         let process = detcore_model::pid::DetPid::from_raw(task.process);
-        if file.is_process_cmdline() {
+        if file.reads_exec_strings() {
             let (process, area) = crate::tool_global::process_cmdline(guest, process).await;
-            return process != self.own_detpid(guest) || area.is_none();
+            if process == self.own_detpid(guest) {
+                return area.is_none();
+            }
+            // Another process's, where Detcore serves it: from the strings
+            // its image's `execve` passed, or, for a process that has exited,
+            // as a task without memory, which reads nothing
+            // (`Self::read_rendered_cmdline`).
+            return !self.serves_exec_strings()
+                || (!without_mm
+                    && crate::tool_global::process_exec_strings(guest, process)
+                        .await
+                        .1
+                        .is_none());
         }
         if !file.is_process_auxv() || without_mm {
             return false;
@@ -3999,6 +4107,65 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// global tool, so those backends pay nothing for the file.
     pub(super) fn kernel_serves_every_comm(&self, file: &ProcfsFile) -> bool {
         file.is_task_comm() && self.comm_source() == crate::procfs::task_stat::CommSource::Kernel
+    }
+
+    /// Whether Detcore renders any task's `status` on this backend (package
+    /// K item 2b slice 2b-2): where the backend reports every guest task's
+    /// signal sets (`Guest::signal_sets`), which the file shows: where the
+    /// guest's threads are host tasks the tool reads
+    /// (`host_task_reads_reach_guest_threads`: ptrace) and where the
+    /// backend delivers the guest's signals from the state it keeps, which
+    /// is where the name's source is Detcore's record ([`Self::comm_source`]:
+    /// KVM). Decided by the declared capabilities alone, never by which
+    /// backend it is.
+    pub(super) fn renders_any_status(&self) -> bool {
+        self.cfg.backend.host_task_reads_reach_guest_threads
+            || self.comm_source() == crate::procfs::task_stat::CommSource::Record
+    }
+
+    /// Whether `file` is a task's `status` and Detcore renders none on this
+    /// backend ([`Self::renders_any_status`]): then every spelling of every
+    /// task's `status`, its lookup, metadata and listing included, is the
+    /// kernel's, sanitized, exactly as before Detcore rendered any (package
+    /// K item 2b slice 2b-2), decided before any request to the global tool.
+    pub(super) fn kernel_serves_every_status(&self, file: &ProcfsFile) -> bool {
+        file.is_task_status() && !self.renders_any_status()
+    }
+
+    /// Whether Detcore serves another process's `cmdline` and `environ`, and
+    /// the reader's own `environ`, on this backend (package K item 2b slice
+    /// 2b-3): where the tool cannot read another process's host task (the
+    /// declared `tool_can_name_guest_descriptors` capability is false: KVM,
+    /// the capability [`Self::comm_source`] reads), so the kernel beneath
+    /// cannot answer for the guest's process. Decided by the declared
+    /// capability alone, never by which backend it is.
+    ///
+    /// Linux has one semantics for both files: they show the process's
+    /// argument and environment areas as they are in its memory at the read,
+    /// a `setproctitle` or an in-place rewrite included. Reading that memory
+    /// is the target behaviour on every backend. ptrace gets it from the
+    /// kernel's own file, and the reader's own files read the reader's
+    /// memory everywhere Detcore renders them. Another process's, here, are
+    /// served from the strings its image's `execve` passed, recorded before
+    /// the image's first instruction (`tool_global::ExecStrings`): the named
+    /// interim fallback until the backend contract gives the tool a read of
+    /// another guest process's memory
+    /// (minibeads dh-ngy9z). KNOWN LIMIT:
+    /// a process that rewrites its arguments or environment in memory after
+    /// its exec shows the strings its `execve` passed, not the rewritten
+    /// bytes, in another process's read.
+    pub(super) fn serves_exec_strings(&self) -> bool {
+        self.comm_source() == crate::procfs::task_stat::CommSource::Record
+    }
+
+    /// Whether `file` is a process's `environ` and Detcore serves none on
+    /// this backend ([`Self::serves_exec_strings`]): then every spelling of
+    /// every process's `environ`, its lookup, metadata and listing included,
+    /// is the kernel's, unclassified, exactly as before Detcore rendered any
+    /// (package K item 2b slice 2b-3), decided before any request to the
+    /// global tool.
+    pub(super) fn kernel_serves_every_environ(&self, file: &ProcfsFile) -> bool {
+        file.is_process_environ() && !self.serves_exec_strings()
     }
 
     /// Whether `file` is a process's `smaps`, `smaps_rollup` or `numa_maps`
@@ -4309,7 +4476,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(None);
         };
         let Some(file) = ProcfsFile::from_rendered_path(path)
-            .filter(|file| file.is_task_stat() || file.is_task_comm())
+            .filter(|file| file.is_task_stat() || file.is_task_comm() || file.is_task_status())
         else {
             return Ok(None);
         };
@@ -4328,7 +4495,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         let comm = match crate::procfs::task_stat::stat_comm(source, kernel, facts.comm) {
             Ok(comm) => comm,
             Err(why) => {
-                let file_name = if file.is_task_comm() { "comm" } else { "stat" };
+                let file_name = if file.is_task_comm() {
+                    "comm"
+                } else if file.is_task_status() {
+                    "status"
+                } else {
+                    "stat"
+                };
                 let reason = format!(
                     "the /proc/<pid>/{file_name} of task {task:?} has no name to render: {why}"
                 );
@@ -4337,7 +4510,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         let described = task.thread.unwrap_or(task.process);
         let own = facts.process == Some(self.own_detpid(guest).as_raw());
-        // A `comm` shows the name alone.
+        // A `comm` shows the name alone. A `status` shows the parent as a
+        // `stat` does.
         let ppid = if own || file.is_task_comm() {
             ppid
         } else {
@@ -4348,8 +4522,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             facts.cpu
         };
-        let permitted =
-            own || file.is_task_comm() || Self::io_read_allowed(guest, task).await?.is_ok();
+        // `proc_pid_status` asks no permission for any line (fs/proc/array.c
+        // in 6.17), so a `status` never asks the model.
+        let permitted = own
+            || file.is_task_comm()
+            || file.is_task_status()
+            || Self::io_read_allowed(guest, task).await?.is_ok();
         Ok(Some(crate::procfs::task_stat::TaskStat {
             pid: described,
             comm,
@@ -4361,6 +4539,249 @@ impl<T: RecordOrReplay> Detcore<T> {
             cpu,
             permitted,
         }))
+    }
+
+    /// What a rendered `status` of the task `stat` describes shows beyond
+    /// its `stat` (package K item 2b slice 2b-2, `procfs::task_status`), each
+    /// line from the source that answers the guest's own matching query in
+    /// this run, on this backend:
+    ///
+    /// - `Groups`: the reader's own `getgroups`, injected. Detcore makes
+    ///   `setgroups` a no-op, so every guest task keeps the groups the run
+    ///   started with, which every task's `getgroups` answers.
+    /// - The signal sets: the backend's (`Guest::signal_sets`) of the
+    ///   described thread, with the guest mask that thread published in
+    ///   place of Detcore's private one (`syscalls::status_published_sigblk`,
+    ///   as the kernel's `status` is corrected); none for a zombie, for which
+    ///   the backends report none.
+    /// - `CapInh`, `CapPrm`, `CapEff`: `capget` of the described thread,
+    ///   injected (of the reader itself, `capget(0)`); none where it fails
+    ///   (KVM's executor answers ESRCH for any task but the caller).
+    /// - `CapBnd`, `CapAmb`: the reader's own `PR_CAPBSET_READ` and
+    ///   `PR_CAP_AMBIENT_IS_SET`, injected, for the reader's own thread only,
+    ///   since no call answers them for another.
+    /// - The affinity: Detcore's, under `--virtual-cpus`, as
+    ///   `sched_getaffinity` answers.
+    ///
+    /// `Err` where an injection could not be finished cleanly, after the
+    /// failure policy, never an answer with a line made up.
+    pub(super) async fn rendered_task_status<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        stat: crate::procfs::task_stat::TaskStat,
+    ) -> Result<crate::procfs::task_status::TaskStatus, Error> {
+        use crate::procfs::task_status::StatusCapabilities;
+        use crate::procfs::task_status::StatusSignals;
+        let described = stat.pid;
+        let groups = Box::pin(Self::inject_reader_groups(guest)).await?;
+        let signals = if stat.facts.exited {
+            None
+        } else {
+            match guest.signal_sets(reverie::Pid::from_raw(described)) {
+                Ok(sets) => {
+                    let published = super::status_published_sigblk(guest, Some(described))
+                        .await?
+                        .sigblk;
+                    Some(StatusSignals {
+                        pending: sets.pending,
+                        shared_pending: sets.shared_pending,
+                        blocked: published.unwrap_or(sets.blocked),
+                        ignored: sets.ignored,
+                        caught: sets.caught,
+                    })
+                }
+                Err(reverie::FactError::NotProvided | reverie::FactError::Errno(Errno::ESRCH)) => {
+                    None
+                }
+                Err(error) => {
+                    let reason = format!(
+                        "the signal sets of task {described}, which its /proc status shows, \
+                         could not be read: {error:?}"
+                    );
+                    return Err(Self::scratch_failure(guest, Sysno::read, reason).await);
+                }
+            }
+        };
+        let kernel = if stat.reader_is_task {
+            0
+        } else if Self::registered_kernel_ids(guest) {
+            match crate::tool_global::procfs_ids(guest, true, vec![described])
+                .await
+                .into_iter()
+                .next()
+                .flatten()
+            {
+                Some(kernel) => kernel,
+                None => {
+                    let reason = format!(
+                        "task {described}, whose /proc status shows its capability sets, has \
+                         no kernel number to ask capget by"
+                    );
+                    return Err(Self::scratch_failure(guest, Sysno::read, reason).await);
+                }
+            }
+        } else {
+            described
+        };
+        let inheritable_permitted_effective =
+            match Box::pin(Self::inject_capget_of(guest, kernel)).await? {
+                Some(Ok(sets)) => Some((sets.inheritable, sets.permitted, sets.effective)),
+                Some(Err(_)) => None,
+                None => {
+                    let reason = "no guest stack scratch can hold capget's data for a /proc \
+                                  status"
+                        .to_owned();
+                    return Err(Self::scratch_failure(guest, Sysno::capget, reason).await);
+                }
+            };
+        let (bounding, ambient) = if stat.reader_is_task {
+            Self::inject_reader_bounding_and_ambient(guest).await
+        } else {
+            (None, None)
+        };
+        let cpus_allowed = self
+            .cfg
+            .virtual_cpus
+            .map(|cpus| (stat.facts.cpus.allowed(cpus.get()), cpus.get()));
+        Ok(crate::procfs::task_status::TaskStatus {
+            stat,
+            groups,
+            signals,
+            capabilities: StatusCapabilities {
+                inheritable_permitted_effective,
+                bounding,
+                ambient,
+            },
+            cpus_allowed,
+        })
+    }
+
+    /// The reader's supplementary groups, as an injected `getgroups`
+    /// answers: its count first (`getgroups(0, NULL)`, no memory), then the
+    /// groups into borrowed stack scratch, put back on every path. `Err`
+    /// where they cannot be read, after the failure policy.
+    async fn inject_reader_groups<G: Guest<Self>>(guest: &mut G) -> Result<Vec<u32>, Error> {
+        /// The most groups the scratch holds.
+        const MOST: usize = 64;
+        let count = match guest
+            .inject(Syscall::from_raw(
+                Sysno::getgroups,
+                super::procfs_levels::raw_args([0; 6]),
+            ))
+            .await
+        {
+            Ok(count) => count as usize,
+            Err(errno) => {
+                let reason = format!("getgroups for a /proc status failed with {errno}");
+                return Err(Self::scratch_failure(guest, Sysno::getgroups, reason).await);
+            }
+        };
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        if count > MOST {
+            let reason = format!(
+                "the reader has {count} supplementary groups, more than the {MOST} a /proc \
+                 status rendering reads"
+            );
+            return Err(Self::scratch_failure(guest, Sysno::getgroups, reason).await);
+        }
+        let (scratch, original, stack_guard) = match Self::borrow_scratch::<G, { 4 * MOST }>(guest)
+            .await
+        {
+            Ok(Some(borrowed)) => borrowed,
+            Ok(None) => {
+                let reason = "no guest stack scratch can hold getgroups's list for a /proc status"
+                    .to_owned();
+                return Err(Self::scratch_failure(guest, Sysno::getgroups, reason).await);
+            }
+            Err(reason) => {
+                return Err(Self::scratch_failure(guest, Sysno::getgroups, reason).await);
+            }
+        };
+        let answer = guest
+            .inject(Syscall::from_raw(
+                Sysno::getgroups,
+                super::procfs_levels::raw_args([count, scratch.as_raw(), 0, 0, 0, 0]),
+            ))
+            .await;
+        let mut bytes = [0_u8; 4 * MOST];
+        let read = match answer {
+            Ok(written) if written as usize == count => guest
+                .memory()
+                .read_exact(scratch, &mut bytes[..4 * count])
+                .map_err(|errno| format!("its list could not be read back: {errno}")),
+            Ok(written) => Err(format!(
+                "it wrote {written} groups where it counted {count}"
+            )),
+            Err(errno) => Err(format!("it failed with {errno}")),
+        };
+        let restored = guest.memory().write_exact(scratch, &original);
+        drop(stack_guard);
+        if let Err(errno) = restored {
+            let reason = format!(
+                "the guest stack scratch under an injected getgroups could not be restored: \
+                 {errno}"
+            );
+            return Err(Self::scratch_failure(guest, Sysno::getgroups, reason).await);
+        }
+        if let Err(detail) = read {
+            let reason = format!("getgroups for a /proc status: {detail}");
+            return Err(Self::scratch_failure(guest, Sysno::getgroups, reason).await);
+        }
+        Ok(bytes[..4 * count]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|group| u32::from_ne_bytes(*group))
+            .collect())
+    }
+
+    /// The reader's own capability bounding and ambient sets, as injected
+    /// `prctl(PR_CAPBSET_READ, n)` and `prctl(PR_CAP_AMBIENT,
+    /// PR_CAP_AMBIENT_IS_SET, n)` answer for each capability `n` from 0 up to
+    /// the first the kernel beneath does not know (EINVAL), its
+    /// `cap_last_cap`. A set is `None` where a query fails otherwise.
+    async fn inject_reader_bounding_and_ambient<G: Guest<Self>>(
+        guest: &mut G,
+    ) -> (Option<u64>, Option<u64>) {
+        async fn set<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+            guest: &mut G,
+            args: impl Fn(usize) -> [usize; 6],
+        ) -> Option<u64> {
+            let mut bits = 0_u64;
+            for capability in 0..64 {
+                match guest
+                    .inject(Syscall::from_raw(
+                        Sysno::prctl,
+                        super::procfs_levels::raw_args(args(capability)),
+                    ))
+                    .await
+                {
+                    Ok(0) => {}
+                    Ok(_) => bits |= 1 << capability,
+                    Err(Errno::EINVAL) => return Some(bits),
+                    Err(_) => return None,
+                }
+            }
+            Some(bits)
+        }
+        let bounding = set(guest, |capability| {
+            [libc::PR_CAPBSET_READ as usize, capability, 0, 0, 0, 0]
+        })
+        .await;
+        let ambient = set(guest, |capability| {
+            [
+                libc::PR_CAP_AMBIENT as usize,
+                libc::PR_CAP_AMBIENT_IS_SET as usize,
+                capability,
+                0,
+                0,
+                0,
+            ]
+        })
+        .await;
+        (bounding, ambient)
     }
 
     /// The CPU times the `stat` of `task`, a task of the reader's own
@@ -4406,7 +4827,28 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// another process's (a descriptor its owner opened that reached the
     /// caller across `fork` or `SCM_RIGHTS`), the read goes to the kernel
     /// beneath's file of that task ([`Self::kernel_cmdline_read`]), as before
-    /// Detcore rendered it, and never to a copy.
+    /// Detcore rendered it, and never to a copy; except where Detcore serves
+    /// another process's file ([`Self::serves_exec_strings`], package K item
+    /// 2b slice 2b-3), where the same rule reads the strings that process's
+    /// image's `execve` passed, recorded before its first instruction
+    /// (`procfs::RecordedStrings`): the named interim fallback for a read of
+    /// its memory, with the known limit that an in-place rewrite after the
+    /// exec is not shown.
+    ///
+    /// A rendered `environ` is read the same way, by Linux's `environ_read`
+    /// rule (`procfs::read_environ`, fs/proc/base.c:1006-1067): the reader's
+    /// own from its memory, another process's from the record. Its open
+    /// checked access (`Self::ptrace_read_allowed_for`) and pinned the
+    /// memory map in Linux, which Detcore models by the number of the image
+    /// whose strings it recorded at the open (`ProcfsFile::pinned_exec_image`):
+    /// a process that has exited, or has exec'd another image since, reads
+    /// nothing, as a map that is gone does (`mmget_not_zero` fails). A
+    /// `cmdline` pins nothing (`get_task_mm` at each read), so it reads the
+    /// process's current image.
+    ///
+    /// The first read of the run that another process's strings answer from
+    /// the record is named at Hermit's default level (WARN), so that the
+    /// interim's known limit shows in the run's log.
     pub(crate) async fn read_rendered_cmdline<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -4419,10 +4861,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             .thread_state()
             .with_detfd(fd, |detfd| detfd.procfs_rendered_path())?
             .ok_or(Errno::EBADF)?;
-        let task = ProcfsFile::from_rendered_path(path)
+        let file = ProcfsFile::from_rendered_path(path);
+        let environ = file.as_ref().is_some_and(ProcfsFile::is_process_environ);
+        let task = file
             .and_then(|file| file.bound_task())
             .ok_or(Errno::ESRCH)?;
         match self.rendered_task_state(guest, path).await {
+            // `environ_read` reads its pinned map, which outlives the task's
+            // lookup; one that is gone reads nothing.
+            Some((_, false)) | None if environ => return Ok(0),
             Some((_, false)) | None => return Err(Errno::ESRCH.into()),
             Some((answer, true)) if answer.without_mm => return Ok(0),
             Some(_) => {}
@@ -4438,12 +4885,106 @@ impl<T: RecordOrReplay> Detcore<T> {
         if count == 0 {
             return Ok(0);
         }
+        // The image an `environ`'s open pinned, which an exec since has
+        // replaced where the process's current record names another
+        // (`environ_read`'s `mmget_not_zero` of a map nothing uses: 0).
+        let pinned = if environ {
+            guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.procfs_pinned_exec_image())?
+        } else {
+            None
+        };
+        // Another process's file, where Detcore serves it, reads the strings
+        // its image's `execve` passed.
+        if process != self.own_detpid(guest) && self.serves_exec_strings() {
+            let current = crate::tool_global::process_exec_strings(guest, process)
+                .await
+                .1;
+            if let Some(pinned) = pinned
+                && current.as_ref().is_none_or(|(image, _)| *image != pinned)
+            {
+                return Ok(0);
+            }
+            let Some((_, strings)) = current else {
+                // A descriptor kept across the process's exec into an image
+                // whose strings Detcore could not record (every image records
+                // them where the backend reports its initial stack pointer,
+                // as KVM does): refused by name, as an open of the file is
+                // (`other_process_procfs`).
+                return Err(Self::scratch_failure(
+                    guest,
+                    Sysno::read,
+                    format!(
+                        "another guest process's {} cannot be read: Detcore holds no record of \
+                         the strings its current image's execve passed",
+                        path.display()
+                    ),
+                )
+                .await);
+            };
+            let mut memory = guest.memory();
+            let mut adapter = GuestCmdlineMemory {
+                memory: &mut memory,
+                destination,
+                failure: None,
+            };
+            let mut recorded = crate::procfs::RecordedStrings {
+                argv: &strings.argv,
+                envp: &strings.envp,
+                copy_out: |offset: usize, bytes: &[u8]| {
+                    crate::procfs::CmdlineMemory::copy_out(&mut adapter, offset, bytes)
+                },
+            };
+            let area = recorded.area();
+            let read = crate::procfs::read_exec_strings(environ, &area, pos, count, &mut recorded);
+            if let Some(failure) = adapter.failure {
+                return Err(failure.into());
+            }
+            if !EXEC_STRINGS_FALLBACK_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                warn!(
+                    "[detcore] another process's /proc/<pid>/{} is served from the strings its \
+                     image's execve passed, recorded before its first instruction: the tool \
+                     cannot read another guest process's memory on this backend, so an \
+                     in-place rewrite after the exec (setproctitle) is not shown, where Linux \
+                     reads the process's memory (minibeads dh-ngy9z; named once per run)",
+                    if environ { "environ" } else { "cmdline" }
+                );
+            }
+            return Ok(read?);
+        }
+        // The caller's own `environ`, kept across its own exec into another
+        // image, reads nothing, as another process's does.
+        if let Some(pinned) = pinned
+            && crate::tool_global::process_exec_strings(guest, process)
+                .await
+                .1
+                .is_none_or(|(image, _)| image != pinned)
+        {
+            return Ok(0);
+        }
         // Another process's file, or the caller's own where Detcore recorded
         // no argument area for its current image (a stack layout
         // initial_stack_cmdline_area refused, or one it could not read, on a
         // backend that reports the initial stack pointer; a descriptor kept
         // across an exec into such an image), is the kernel beneath's.
         let Some(area) = area.filter(|_| process == self.own_detpid(guest)) else {
+            if environ {
+                // Never on a backend whose kernel serves every `environ`; an
+                // own image without a recorded area keeps the kernel's file
+                // from its open (`kept_by_kernel`), so only a descriptor kept
+                // across an exec into such an image reaches here.
+                return Err(Self::scratch_failure(
+                    guest,
+                    Sysno::read,
+                    format!(
+                        "{} cannot be read: Detcore recorded no environment area for the \
+                         process's current image",
+                        path.display()
+                    ),
+                )
+                .await);
+            }
             return Box::pin(self.kernel_cmdline_read(guest, task, area, destination, count, pos))
                 .await;
         };
@@ -4453,7 +4994,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             destination,
             failure: None,
         };
-        let read = crate::procfs::read_cmdline(&area, pos, count, &mut adapter);
+        let read = crate::procfs::read_exec_strings(environ, &area, pos, count, &mut adapter);
         if let Some(failure) = adapter.failure {
             return Err(failure.into());
         }
@@ -5362,6 +5903,15 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// ([`Self::read_rendered_cmdline`]); without them, the same backends
     /// leave that file to the kernel beneath too. Both go to the global tool
     /// in the one request this callback already makes.
+    ///
+    /// Where Detcore serves another process's `cmdline` and `environ`
+    /// ([`Self::serves_exec_strings`]: KVM), the bytes of both areas go to
+    /// the global tool too, in a second request, before the image's first
+    /// instruction, so they are exactly what its `execve` passed
+    /// (`tool_global::ExecStrings`, package K item 2b slice 2b-3). The record
+    /// is the named interim fallback for reading the process's memory, which
+    /// Linux does at every read: a rewrite of either area after this point is
+    /// not reflected in another process's read (the known limit).
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#4213): Review the auxiliary vector Detcore takes from
     // each new image's initial stack, which its rendered /proc/<pid>/auxv
@@ -5375,7 +5925,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // the file is left to the kernel beneath:
         // the host kernel's file on ptrace and DBT, the provider's refusal on
         // KVM.
-        let (found, cmdline) = match guest.initial_stack_pointer() {
+        let (found, cmdline, strings) = match guest.initial_stack_pointer() {
             Some(stack) => {
                 let memory = guest.memory();
                 let read_word = |at: u64| {
@@ -5383,15 +5933,21 @@ impl<T: RecordOrReplay> Detcore<T> {
                         reverie::syscalls::Addr::<u64>::from_raw(usize::try_from(at).ok()?)?;
                     memory.read_value(address).ok()
                 };
+                let cmdline =
+                    crate::procfs::initial_stack_cmdline_area(stack, read_word, |at, buffer| {
+                        read_prefix(&memory, at, buffer)
+                    });
+                let strings = cmdline
+                    .filter(|_| self.serves_exec_strings())
+                    .and_then(|area| recorded_exec_strings(&memory, &area));
                 (
                     crate::procfs::initial_stack_auxv(stack, read_word)
                         .ok_or(AuxvFromKernel::Implausible),
-                    crate::procfs::initial_stack_cmdline_area(stack, read_word, |at, buffer| {
-                        read_prefix(&memory, at, buffer)
-                    }),
+                    cmdline,
+                    strings,
                 )
             }
-            None => (Err(AuxvFromKernel::NoInitialStackPointer), None),
+            None => (Err(AuxvFromKernel::NoInitialStackPointer), None, None),
         };
         let bytes = match found {
             Ok(bytes) => bytes,
@@ -5413,10 +5969,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                         ),
                     }
                 }
+                if let Some(strings) = strings {
+                    crate::tool_global::record_exec_strings(guest, strings).await;
+                }
                 return;
             }
         };
         crate::tool_global::record_process_auxv(guest, bytes, cmdline).await;
+        // After the request above, which drops the strings of the process's
+        // earlier image or its creator's (`ProcessAuxvTable::record_cmdline`).
+        if let Some(strings) = strings {
+            crate::tool_global::record_exec_strings(guest, strings).await;
+        }
     }
 
     /// Adopt, before `call` runs, each descriptor it names that Detcore has
@@ -7291,6 +7855,26 @@ fn read_prefix<M: MemoryAccess>(memory: &M, at: u64, buffer: &mut [u8]) -> usize
         })
 }
 
+/// The argument and environment strings at `area` in a new image's memory,
+/// before its first instruction (`tool_global::ExecStrings`): the bytes of
+/// `arg_start..arg_end` and `env_start..env_end`, each read whole through
+/// [`read_prefix`]. `None` where either cannot be read whole, as the area,
+/// which `procfs::initial_stack_cmdline_area` found by reading every string,
+/// always can.
+fn recorded_exec_strings<M: MemoryAccess>(
+    memory: &M,
+    area: &crate::procfs::CmdlineArea,
+) -> Option<crate::tool_global::ExecStrings> {
+    let read = |start: u64, end: u64| {
+        let mut bytes = vec![0_u8; usize::try_from(end.checked_sub(start)?).ok()?];
+        (bytes.is_empty() || read_prefix(memory, start, &mut bytes) == bytes.len()).then_some(bytes)
+    };
+    Some(crate::tool_global::ExecStrings {
+        argv: read(area.arg_start, area.arg_end)?,
+        envp: read(area.env_start, area.env_end)?,
+    })
+}
+
 /// The calling process's memory as a read of its own rendered
 /// `/proc/<pid>/cmdline` reads and copies it (`procfs::CmdlineMemory`):
 /// reads through the vectored, protection-respecting copy, as Linux's
@@ -9058,6 +9642,7 @@ mod tests {
             capabilities: CapabilitySets {
                 effective,
                 permitted,
+                inheritable: 0,
             },
         };
         // A refusal stands, whatever the sets.
@@ -9154,6 +9739,7 @@ mod tests {
             capabilities: CapabilitySets {
                 effective: full & !(1 << CAP_SYS_PTRACE),
                 permitted: full,
+                inheritable: 0,
             },
         };
         for owner_may_differ in [false, true] {

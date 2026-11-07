@@ -21201,9 +21201,12 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // 133. And package K item 2b slice 2b-1's
         // run_kvm_another_processs_stat_and_comm_answer_as_linux: 134. And
         // SIGSHARE S2b's
-        // run_kvm_a_wait_under_a_temporary_mask_ends_as_on_linux: 135, matching
-        // the DAG pin in validation_dag_static.
-        ("privileged-only-test.cli_kvm", 135usize),
+        // run_kvm_a_wait_under_a_temporary_mask_ends_as_on_linux: 135. And
+        // slice 2b-2's run_kvm_another_processs_status_answers_as_linux: 136.
+        // And slice 2b-3's
+        // run_kvm_another_processs_cmdline_and_environ_answer_as_linux: 137,
+        // matching the DAG pin in validation_dag_static.
+        ("privileged-only-test.cli_kvm", 137usize),
     ] {
         let step = privileged
             .steps
