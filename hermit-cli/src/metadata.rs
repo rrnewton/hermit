@@ -978,7 +978,22 @@ impl RecordVersion {
 // with that access mode, instead of making separate anonymous copies. An
 // older reader cannot decode the new field, and an older recording has no
 // identity with which to restore sharing, so it is refused here.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x19d);
+// 0x19d -> 0x19e (HIGHEST_SHIPPED+1 at this change's rebase onto main
+// shipping 0x19d; provisionally 0x19b at its earlier rebase onto main
+// shipping 0x19a, since spent on the replayed-MAP_SHARED fix-forward): on
+// seven Intel models (Ice Lake 0x6A, 0x6C, 0x7D and 0x7E, Tiger Lake 0x8D,
+// Sapphire Rapids 0x8F and Emerald Rapids 0xCF) the retired-conditional-
+// branch counter changes from umask 0x01, which counts only taken
+// conditional branches there, to umask 0x11, every conditional branch, the
+// metric every other profile counts. Every RCB coordinate a recording made
+// on those hosts stores (preemption points, branch counts, timer targets)
+// counted the other quantity. A history now states its RCB coordinate
+// identity in the `rcb_history` envelope; replay requires the recording
+// backend and a qualified RCB metric, and a history with no recorded
+// identity is refused before the guest starts. An older recording would
+// place its events elsewhere; it is refused here.
+// https://github.com/rrnewton/hermit/pull/4668
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x19e);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -1003,7 +1018,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x19d);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x19d;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x19e;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1073,6 +1088,13 @@ pub struct Metadata {
     pub envs: BTreeMap<String, String>,
     /// Hermit record/replay version.
     pub version: RecordVersion,
+    /// The RCB coordinate identity the recording's event stream counts, in
+    /// the `rcb_history` envelope's JSON form. A replay admits it only
+    /// under the same identity and refuses pre-guest otherwise. Absent in
+    /// a recording made before identities were recorded, whose replay is
+    /// refused for stating none.
+    #[serde(default)]
+    pub rcb_identity: Option<serde_json::Value>,
     /// Why this recording cannot be replayed faithfully, when the recording
     /// run said so (`detcore::detlog::replay_refusal`): replay refuses before
     /// starting the guest (<https://github.com/rrnewton/hermit/issues/3994>).
@@ -1193,6 +1215,9 @@ impl Metadata {
             envs,
             replay_refused: None,
             version: RECORD_VERSION,
+            // Stamped by the recorder from its validated clock claim
+            // before the metadata is written.
+            rcb_identity: None,
             proc_readonly: None,
             mountinfo_root_rewrites: Vec::new(),
             mountinfo_mount_ids: Vec::new(),
@@ -1343,6 +1368,17 @@ fn record_or_replay_config_with_timer_support(
         cpu_profile_source: None,
         // Record and replay run under the ptrace backend.
         backend: <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities(),
+        // A recording replays no standalone history (`replay_schedule_from`
+        // and `replay_preemptions_from` stay unset below) and writes none,
+        // but its event stream still counts RCB coordinates: prepare the
+        // ptrace clock claim as `hermit run` does, so the recorder can
+        // state the identity in its metadata and the replayer admits only
+        // the same identity.
+        rcb_clock_claim: crate::prepare_backend_config(
+            detcore::Config::default(),
+            crate::Backend::Ptrace,
+        )
+        .rcb_clock_claim,
         // As `hermit run` sets it for ptrace (`prepare_backend_config` in
         // lib.rs). With it off, the scheduler did not model signal targets, so
         // a thread asleep in a backgrounded rt_sigsuspend that a child-exit
@@ -1495,6 +1531,57 @@ fn record_or_replay_config_with_timer_support(
         disable_timeslice_without_a_timer(&mut config, &reason);
     }
     config
+}
+
+/// A full recording in a format this build cannot execute, typed so the
+/// CLI classifies it as the policy refusal (exit 122), not an internal
+/// failure.
+pub(crate) fn record_format_refusal(message: String) -> Error {
+    anyhow::Error::new(detcore::preemptions::RecordFormatRefusal(message))
+}
+
+/// The RCB coordinate identity a recording made under `config` counts,
+/// validated (not pinned) against this host. A contradicted prepared
+/// claim is the named refusal, as at a run's preparation.
+pub(crate) fn record_rcb_identity(
+    config: &detcore::Config,
+) -> Result<detcore::preemptions::HistoryIdentity, Error> {
+    let validated = detcore::clock_identity::validate_run_clock(
+        config,
+        &detcore::clock_identity::ClockSources::process(),
+    )
+    .map_err(record_format_refusal)?;
+    Ok(validated.producer().history_identity())
+}
+
+/// Admit `metadata`'s stated RCB identity under the replay configuration
+/// `config`, before any guest starts: no stated identity, an identity
+/// this build does not know, and any other identity than this run's own
+/// are each the named policy refusal.
+pub(crate) fn admit_recorded_rcb_identity(
+    config: &detcore::Config,
+    metadata: &Metadata,
+    source: &str,
+) -> Result<(), Error> {
+    let Some(raw) = &metadata.rcb_identity else {
+        return Err(record_format_refusal(format!(
+            "hermit refused to replay {source}: it states no RCB coordinate identity, so \
+             the unit of its recorded coordinates is unknown (it was written before \
+             identities were recorded, or by hand). Record it again with this build, or \
+             replay it with the build that made it."
+        )));
+    };
+    let recorded = detcore::preemptions::boundary_recording::history_identity_from_json(raw)
+        .map_err(|error| {
+            record_format_refusal(format!("hermit refused to replay {source}: {error}"))
+        })?;
+    let validated = detcore::clock_identity::validate_run_clock(
+        config,
+        &detcore::clock_identity::ClockSources::process(),
+    )
+    .map_err(record_format_refusal)?;
+    detcore::clock_identity::admit_identity(source, Some(&recorded), validated.producer())
+        .map_err(record_format_refusal)
 }
 
 /// Whether this host can arm Reverie's ptrace timer for a record or replay:
@@ -2505,7 +2592,6 @@ mod tests {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x184)));
     }
 
-    /// A 0x186 recording polled a MSG_DONTWAIT send or receive on a
     /// A 0x187 recording polled a MSG_DONTWAIT send or receive on a
     /// socketpair end until it stopped failing with EAGAIN; this replayer runs
     /// it once, so the version gate must refuse it.
@@ -2515,7 +2601,19 @@ mod tests {
         // was rebased onto, not only the version before the original bump.
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x187)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x186)));
-        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x187)));
+    }
+
+    /// A recording from before the corrected RCB event (0x19a and earlier)
+    /// made on one of the seven corrected Intel models counted only taken
+    /// conditional branches, so every RCB coordinate it stores names another
+    /// point in the guest; the version gate must refuse it on every host, as
+    /// a full recording does not state which counter it used. A recording of
+    /// this version is accepted.
+    #[test]
+    fn record_version_rejects_streams_from_before_the_corrected_rcb_event() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x19a)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x186)));
+        assert!(RECORD_VERSION.compatible_with(&RecordVersion(0x19e)));
     }
 
     #[test]

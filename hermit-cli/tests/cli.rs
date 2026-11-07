@@ -5760,7 +5760,11 @@ fn analyze_replays_a_recorded_target_instead_of_panicking() {
     let _guard = hermit_run_guard();
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let record = directory.path().join("target.preempts");
-    std::fs::write(&record, "{\"per_thread\":{},\"global\":[]}").unwrap();
+    std::fs::write(
+        &record,
+        "{\"rcb_history\":{\"format\":2,\"identity\":\"rcb:cond-retired:user:v1\",\"recording\":{\"per_thread\":{},\"global\":[]}}}",
+    )
+    .unwrap();
     let run1_preemptions = format!("--run1-preemptions={}", record.display());
     let tmp_dir = format!("--tmp-dir={}", directory.path().join("ws").display());
     let analyzed = hermit(&[
@@ -5866,12 +5870,19 @@ fn rewrite_exclusives_picks_memory_without_a_namespace_and_refuses_what_cannot_a
     let records = tempfile::tempdir().unwrap();
     let rewritten = records.path().join("rewritten.json");
     let plain = records.path().join("plain.json");
+    // Each fixture states the qualified RCB identity every current
+    // recording carries, so replay reaches the rewrite-provenance check
+    // this test exercises past identity admission.
     std::fs::write(
         &rewritten,
-        r#"{"per_thread":{},"global":[],"rewrite_exclusives_in_memory":true}"#,
+        r#"{"rcb_history":{"format":2,"identity":"rcb:cond-retired:user:v1","recording":{"per_thread":{},"global":[],"rewrite_exclusives_in_memory":true}}}"#,
     )
     .unwrap();
-    std::fs::write(&plain, r#"{"per_thread":{},"global":[]}"#).unwrap();
+    std::fs::write(
+        &plain,
+        r#"{"rcb_history":{"format":2,"identity":"rcb:cond-retired:user:v1","recording":{"per_thread":{},"global":[]}}}"#,
+    )
+    .unwrap();
     let replay_plain = hermit(&[
         "run",
         &format!("--replay-schedule-from={}", rewritten.display()),
@@ -6643,12 +6654,16 @@ fn timerless_backends_refuse_explicit_preemption_before_starting_the_guest() {
     }
 }
 
-/// A preemption record with one callback checkpoint, for refusals decided
-/// before any guest starts: dtid 3's single row ends at a PMU timer stop at
-/// progress 0. Its epoch is `ANNOTATED_FIXTURE_EPOCH`.
+/// A synthetic callback-annotated priority history with one callback
+/// checkpoint, for refusals decided before any guest starts: dtid 3's
+/// single row ends at a PMU timer stop at progress 0, and its epoch is
+/// `ANNOTATED_FIXTURE_EPOCH`. It states the qualified RCB metric
+/// explicitly in the identity envelope, so a qualified host admits its
+/// identity and the annotated-replay checks that follow decide. It
+/// records no run.
 fn write_annotated_history_fixture(directory: &Path) -> PathBuf {
     let record = directory.join("annotated-history.json");
-    let json = serde_json::json!({
+    let recording = serde_json::json!({
         "global": [],
         "per_thread": {
             "3": {
@@ -6672,6 +6687,13 @@ fn write_annotated_history_fixture(directory: &Path) -> PathBuf {
                     "rcbs": 100
                 }
             }]
+        }
+    });
+    let json = serde_json::json!({
+        "rcb_history": {
+            "format": 2,
+            "identity": "rcb:cond-retired:user:v1",
+            "recording": recording
         }
     });
     fs::write(&record, serde_json::to_vec(&json).unwrap()).unwrap();
@@ -7067,8 +7089,7 @@ fn run_kvm_a_late_timer_event_in_a_replay_refuses_the_run_by_name() {
     let recorded = hermit(&record);
     assert_success(&recorded, &record);
     // The premise: recorded preemption points for the replay to stop at.
-    let json: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&schedule).unwrap()).unwrap();
+    let json = hermit_test::recorded_preemption_json(&schedule);
     assert!(
         json["per_thread"].as_object().is_some_and(|threads| threads
             .values()
@@ -7109,6 +7130,30 @@ fn run_kvm_a_late_timer_event_in_a_replay_refuses_the_run_by_name() {
         .parse()
         .unwrap_or_else(|error| panic!("{refusal}: {error}"));
     assert!(count > 0, "{stderr}");
+
+    // The KVM recording states KVM's own clock identity, so ptrace
+    // refuses it pre-guest by name rather than executing its KVM
+    // coordinates under the ptrace counter.
+    let mut ptrace = chaos.to_vec();
+    ptrace[0] = "--backend=ptrace";
+    ptrace.extend([replay_arg.as_str(), "--", guest]);
+    let ptrace_output = hermit(&ptrace);
+    let ptrace_stderr =
+        String::from_utf8(ptrace_output.stderr.clone()).expect("hermit stderr should be UTF-8");
+    assert_eq!(
+        ptrace_output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{ptrace_stderr}"
+    );
+    assert!(
+        ptrace_stderr.contains("kvm:guest-user-retired-conditional-branches:v1")
+            && ptrace_stderr.contains("rcb:cond-retired:user:v1"),
+        "both identities must be named:\n{ptrace_stderr}"
+    );
+    assert!(
+        ptrace_output.stdout.is_empty(),
+        "the guest ran: {ptrace_output:?}"
+    );
 }
 
 #[test]
@@ -12296,7 +12341,7 @@ fn a_recording_from_before_rendered_io_and_arch_status_is_refused_by_version() {
     let mut metadata: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
     assert_eq!(
-        metadata["version"], 0x19d,
+        metadata["version"], 0x19e,
         "RECORD_VERSION moved; point this test at the current version and the one before"
     );
     metadata["version"] = serde_json::json!(0x197);
@@ -14569,7 +14614,7 @@ fn no_namespace_preserves_guest_chosen_birth_but_refuses_later_unproved_staging(
             "{}",
             stderr(&tolerant)
         );
-        let record: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        let record = hermit_test::recorded_preemption_json(&path);
         assert!(!record["global"].as_array().unwrap().is_empty());
         assert_eq!(record["guest_ids"], "Host");
     }
@@ -14611,7 +14656,7 @@ fn no_namespace_original_clone3_no_child_keeps_later_chosen_ids() {
             "{}",
             stderr(&output)
         );
-        let record: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        let record = hermit_test::recorded_preemption_json(&path);
         assert!(!record["global"].as_array().unwrap().is_empty());
         let recorded_base = record["guest_ids"]["Chosen"]["base"].as_i64().unwrap();
         assert!(recorded_base > 0);
@@ -15408,8 +15453,7 @@ fn no_namespace_preemption_records_replay_under_their_base() {
     assert_success(&replayed, &["replay"]);
     assert_eq!(stdout(&replayed), stdout(&recorded));
     let schedule = |name: &str| {
-        let json: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(path(name)).unwrap()).unwrap();
+        let json = hermit_test::recorded_preemption_json(&directory.path().join(name));
         (
             json["global"].clone(),
             json["per_thread"].clone(),
@@ -15462,7 +15506,13 @@ fn no_namespace_preemption_records_replay_under_their_base() {
     // run's, or one written before the field existed).
     let mut json: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path("recorded.json")).unwrap()).unwrap();
-    json.as_object_mut().unwrap().remove("guest_ids");
+    let inner = match json.get_mut("rcb_history") {
+        Some(envelope) => envelope
+            .get_mut("recording")
+            .expect("an enveloped schedule carries its recording"),
+        None => &mut json,
+    };
+    inner.as_object_mut().unwrap().remove("guest_ids");
     fs::write(path("stripped.json"), json.to_string()).unwrap();
     let stripped_arg = format!("--replay-preemptions-from={}", path("stripped.json"));
     let stripped = no_namespace_in_own_pid_namespace(&[epoch, &stripped_arg], &[]);
@@ -15562,8 +15612,7 @@ fn no_namespace_bisect_replays_the_schedules_it_writes() {
     }
     let good = good.expect("no seed of 40 printed a before b");
     let bad = bad.expect("no seed of 40 printed b before a");
-    let schedule: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&bad).unwrap()).unwrap();
+    let schedule = hermit_test::recorded_preemption_json(Path::new(&bad));
     assert_eq!(schedule["guest_ids"]["Chosen"]["base"], 5000, "{schedule}");
 
     let report = path("report.json");
@@ -20517,7 +20566,11 @@ fn a_replay_past_its_schedule_ends_slices_as_a_run_without_one_does() {
         .expect("deadline guest path should be UTF-8");
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let schedule = dir.path().join("empty.json");
-    fs::write(&schedule, r#"{"per_thread":{},"global":[]}"#).unwrap();
+    fs::write(
+        &schedule,
+        r#"{"rcb_history":{"format":2,"identity":"rcb:cond-retired:user:v1","recording":{"per_thread":{},"global":[]}}}"#,
+    )
+    .unwrap();
     let replay = format!("--replay-schedule-from={}", schedule.display());
     let run = |extra: &[&str]| {
         let mut args = vec!["run", "--strict", "--epoch=2026-01-01T00:00:00Z"];
@@ -25463,8 +25516,7 @@ fn a_bounded_chaos_schedule_replays_as_recorded() {
 
     // Each thread's priorities, in order, and its preemption RCB counts.
     let schedule = |path: &Path| -> Vec<(String, Vec<u64>, serde_json::Value)> {
-        let json: serde_json::Value =
-            serde_json::from_slice(&fs::read(path).expect("no preemption record")).unwrap();
+        let json = hermit_test::recorded_preemption_json(path);
         let threads = json["per_thread"].as_object().expect("per_thread");
         threads
             .iter()
@@ -25555,8 +25607,7 @@ fn a_chaos_timeslice_range_draws_slices_from_the_seed_and_replays() {
     };
     // Each thread's preemption RCB counts, by thread.
     let preemptions = |path: &str| -> Vec<(String, serde_json::Value)> {
-        let json: serde_json::Value =
-            serde_json::from_slice(&fs::read(path).expect("no preemption record")).unwrap();
+        let json = hermit_test::recorded_preemption_json(Path::new(path));
         json["per_thread"]
             .as_object()
             .expect("per_thread")
@@ -25687,7 +25738,7 @@ fn a_run_draw_picks_the_timeslice_and_a_replay_runs_under_it() {
         &path("record.summary.json"),
     );
     assert!((1_000..=200_000_000).contains(&drawn), "{drawn}");
-    let json: serde_json::Value = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+    let json = hermit_test::recorded_preemption_json(Path::new(&record));
     assert_eq!(
         json["chaos_timeslice"], drawn,
         "the record does not state the draw"
@@ -25705,8 +25756,7 @@ fn a_run_draw_picks_the_timeslice_and_a_replay_runs_under_it() {
     assert_eq!(replayed_timeslice, drawn);
     assert_eq!(replayed, recorded);
     let preemptions = |path: &str| -> serde_json::Value {
-        let json: serde_json::Value =
-            serde_json::from_slice(&fs::read(path).expect("no preemption record")).unwrap();
+        let json = hermit_test::recorded_preemption_json(Path::new(path));
         json["per_thread"]
             .as_object()
             .expect("per_thread")
@@ -25715,7 +25765,7 @@ fn a_run_draw_picks_the_timeslice_and_a_replay_runs_under_it() {
             .collect()
     };
     assert_eq!(preemptions(&rerecord), preemptions(&record));
-    let json: serde_json::Value = serde_json::from_slice(&fs::read(&rerecord).unwrap()).unwrap();
+    let json = hermit_test::recorded_preemption_json(Path::new(&rerecord));
     assert_eq!(
         json["chaos_timeslice"], drawn,
         "the re-recorded record lost the draw"
@@ -25768,7 +25818,7 @@ fn a_draw_without_a_range_draws_from_the_recommended_range() {
         (stdout(&output), timeslice)
     };
     let record = |path: &str| -> serde_json::Value {
-        serde_json::from_slice(&fs::read(path).expect("no preemption record")).unwrap()
+        hermit_test::recorded_preemption_json(Path::new(path))
     };
     let range = RECOMMENDED_CHAOS_TIMESLICE_RANGE;
     let explicit_range = format!("--chaos-timeslice-range={range}");
@@ -25916,8 +25966,7 @@ fn a_chaos_instruction_offset_run_verifies_and_replays_at_its_offsets() {
     let record_arg = format!("--record-preemptions-to={}", recorded.display());
     let lost = branch_free_race_lost(seed, &[offset[0], &record_arg]);
     assert!(lost > 0);
-    let json: serde_json::Value =
-        serde_json::from_slice(&fs::read(&recorded).expect("no preemption record")).unwrap();
+    let json = hermit_test::recorded_preemption_json(&recorded);
     let offsets: Vec<&serde_json::Value> = json["per_thread"]
         .as_object()
         .expect("per_thread")
@@ -26561,8 +26610,7 @@ fn run_chaos_preemption_replay_reuses_the_recorded_epoch() {
 
     // The premise: real preemption points, at absolute instants after the epoch.
     let epoch_nanos: u64 = 978_307_199_123_456_789;
-    let json: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
+    let json = hermit_test::recorded_preemption_json(&record);
     assert_eq!(json["epoch"], "2000-12-31T23:59:59.123456789Z", "{json}");
     let ends: Vec<u64> = json["per_thread"]
         .as_object()
@@ -26689,8 +26737,7 @@ fn a_schedule_replay_names_a_host_input_changed_since_the_recording() {
     assert_eq!(out, "input\n");
     // The schedule and the summary carry the same set, which holds `F` with
     // its size and the SHA-256 of its bytes (`printf 'input\n' | sha256sum`).
-    let recorded: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&schedule).unwrap()).unwrap();
+    let recorded = hermit_test::recorded_preemption_json(&schedule);
     assert_eq!(
         recorded["host_inputs"], summary["host_inputs"],
         "{recorded}"
@@ -27257,8 +27304,7 @@ fn a_schedule_replay_names_a_stdio_kind_changed_since_the_recording() {
     assert_eq!(recorded, "fsync(stderr) = 0\n");
     assert!(named(&recorded_stderr).is_empty(), "{recorded_stderr}");
     assert_eq!(recorded_summary["host_inputs"]["stdio"]["stderr"], "file");
-    let record: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&schedule).unwrap()).unwrap();
+    let record = hermit_test::recorded_preemption_json(&schedule);
     assert_eq!(record["host_inputs"]["stdio"]["stderr"], "file");
 
     let (piped, piped_stderr, piped_summary) = run(&replay_arg, "replay-pipe", false);
@@ -28989,8 +29035,7 @@ fn a_schedule_replay_ends_a_new_threads_first_slice_where_the_recording_did() {
 
         // The new thread, the second one the record names, first appears
         // as the branches up to a timer stop, before any syscall.
-        let parsed: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
+        let parsed = hermit_test::recorded_preemption_json(&record);
         let events = parsed["global"].as_array().expect("the record's events");
         assert!(
             !events.is_empty(),
@@ -31258,8 +31303,7 @@ fn run_schedule_replay_ends_check_in_slices_where_the_record_did() {
     assert_success(&recorded, &recording_args);
     // The premise: slices that ended at a check-in, recorded as a thread's
     // branches, then its OtherInstructions, then another thread's event.
-    let json: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
+    let json = hermit_test::recorded_preemption_json(&record);
     let events = json["global"].as_array().expect("recorded schedule");
     let check_in_ends = events
         .windows(3)
@@ -31574,9 +31618,8 @@ fn a_prefix_stack_prints_at_its_schedule_position_whatever_the_retries() {
         .to_owned();
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let common = ["run", "--base-env=minimal", "--epoch=2026-01-01T00:00:00Z"];
-    let schedule_of = |path: &Path| -> serde_json::Value {
-        serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
-    };
+    let schedule_of =
+        |path: &Path| -> serde_json::Value { hermit_test::recorded_preemption_json(path) };
     let recorded = directory.path().join("recorded.json");
     let record_to = format!("--record-preemptions-to={}", recorded.display());
     let mut record_args: Vec<&str> = common.to_vec();
@@ -31585,7 +31628,11 @@ fn a_prefix_stack_prints_at_its_schedule_position_whatever_the_retries() {
     assert_success(&record, &record_args);
     assert_eq!(stdout(&record), "done\n");
 
-    let record = schedule_of(&recorded);
+    // Edited prefixes are written back, so keep the outer envelope and
+    // analyze/edit the record it carries.
+    let mut outer: serde_json::Value =
+        serde_json::from_slice(&fs::read(&recorded).unwrap()).unwrap();
+    let record = hermit_test::recorded_preemption_inner_mut(&mut outer).clone();
     let events = record["global"].as_array().unwrap().clone();
     let syscall = |event: &serde_json::Value, phase: &str| {
         (event["op"]["Syscall"][1].as_str() == Some(phase))
@@ -31656,8 +31703,9 @@ fn a_prefix_stack_prints_at_its_schedule_position_whatever_the_retries() {
         }
         let position = target - retries.len() + recorded_retries;
         assert_eq!(identity(&prefix[position]), identity(&events[target]));
-        let mut edited = record.clone();
-        edited["global"] = serde_json::Value::Array(prefix);
+        let mut edited = outer.clone();
+        hermit_test::recorded_preemption_inner_mut(&mut edited)["global"] =
+            serde_json::Value::Array(prefix);
         let path = directory
             .path()
             .join(format!("prefix{recorded_retries}.json"));
@@ -31749,11 +31797,12 @@ fn a_fatal_time_skip_desync_reports_an_unreached_schedule_position() {
 
     let mut edited: serde_json::Value =
         serde_json::from_slice(&fs::read(&recorded).unwrap()).unwrap();
+    let edited_inner = hermit_test::recorded_preemption_inner_mut(&mut edited);
     assert!(
-        edited["global"].as_array().unwrap().len() > 100,
+        edited_inner["global"].as_array().unwrap().len() > 100,
         "the recording is too short to leave position 100 unreached"
     );
-    edited["time_skips"] = serde_json::json!([{
+    edited_inner["time_skips"] = serde_json::json!([{
         "event": 5,
         "target": 0,
         "reason": "IdleGuestPollers",
@@ -31938,8 +31987,7 @@ fn a_schedule_replay_reads_a_trapped_rdtsc_before_switching_away() {
         );
         // The case under test: a recorded slice ended at a trapped rdtsc and
         // another thread ran next.
-        let recording: serde_json::Value =
-            serde_json::from_slice(&fs::read(&schedule).unwrap()).unwrap();
+        let recording = hermit_test::recorded_preemption_json(&schedule);
         let events = recording["global"].as_array().unwrap();
         assert!(
             events
@@ -32048,7 +32096,14 @@ fn a_fair_continuation_does_not_hand_a_spinner_a_timeslice_per_write() {
     let schedule = directory.path().join("empty.preempts");
     fs::write(
         &schedule,
-        serde_json::json!({"per_thread": {}, "global": []}).to_string(),
+        serde_json::json!({
+            "rcb_history": {
+                "format": 2,
+                "identity": "rcb:cond-retired:user:v1",
+                "recording": {"per_thread": {}, "global": []}
+            }
+        })
+        .to_string(),
     )
     .unwrap();
     let replay = format!("--replay-schedule-from={}", schedule.display());
@@ -48116,7 +48171,7 @@ fn the_4505_signal_guests_get_past_their_handlers_under_record() {
     };
     let mut metadata: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
-    assert_eq!(metadata["version"], 0x19d, "RECORD_VERSION moved");
+    assert_eq!(metadata["version"], 0x19e, "RECORD_VERSION moved");
     metadata["version"] = serde_json::json!(0x17f);
     fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
     let replay_args = ["replay", "--autopilot", "--data-dir", directory];
@@ -59752,7 +59807,11 @@ fn a_new_thread_past_a_replayed_schedule_gets_its_first_turn_within_a_second() {
     };
 
     let empty = directory.path().join("empty.json");
-    fs::write(&empty, r#"{"per_thread":{},"global":[]}"#).unwrap();
+    fs::write(
+        &empty,
+        r#"{"rcb_history":{"format":2,"identity":"rcb:cond-retired:user:v1","recording":{"per_thread":{},"global":[]}}}"#,
+    )
+    .unwrap();
     let replay_empty = format!("--replay-schedule-from={}", empty.display());
     for seed in ["1", "4", "6"] {
         let output = hermit(&[
@@ -59793,8 +59852,7 @@ fn a_new_thread_past_a_replayed_schedule_gets_its_first_turn_within_a_second() {
         &guest,
     ]);
     waited_us(&produced, "the continuation's recording");
-    let observed_record: serde_json::Value =
-        serde_json::from_slice(&fs::read(&observed).unwrap()).unwrap();
+    let observed_record = hermit_test::recorded_preemption_json(&observed);
     assert!(
         observed_record["incomplete_preemption_record"]["replay_departed_at"].is_u64(),
         "a record of a run past the end of its replayed schedule must be marked incomplete"
@@ -59848,7 +59906,8 @@ fn a_new_thread_past_a_replayed_schedule_gets_its_first_turn_within_a_second() {
     );
     let mut record: serde_json::Value =
         serde_json::from_slice(&fs::read(&recording).unwrap()).unwrap();
-    let events = record["global"].as_array().unwrap().clone();
+    let inner = hermit_test::recorded_preemption_inner_mut(&mut record);
+    let events = inner["global"].as_array().unwrap().clone();
     let mut threads: Vec<i64> = Vec::new();
     for event in &events {
         let tid = event["dettid"].as_i64().unwrap();
@@ -59873,7 +59932,7 @@ fn a_new_thread_past_a_replayed_schedule_gets_its_first_turn_within_a_second() {
         .filter(|last| last["count"].as_u64() > Some(0))
         .map(|last| last["dettid"].to_string());
     let mut checkpoints = serde_json::Map::new();
-    if let Some(all) = record["callback_checkpoints"].as_object() {
+    if let Some(all) = inner["callback_checkpoints"].as_object() {
         for (tid, points) in all {
             let Some(reached) = reached.get(tid).copied() else {
                 continue;
@@ -59897,8 +59956,8 @@ fn a_new_thread_past_a_replayed_schedule_gets_its_first_turn_within_a_second() {
             }
         }
     }
-    record["global"] = serde_json::Value::Array(prefix.to_vec());
-    record["callback_checkpoints"] = serde_json::Value::Object(checkpoints);
+    inner["global"] = serde_json::Value::Array(prefix.to_vec());
+    inner["callback_checkpoints"] = serde_json::Value::Object(checkpoints);
     let cut_path = directory.path().join("cut.json");
     fs::write(&cut_path, serde_json::to_vec(&record).unwrap()).unwrap();
     let replay_cut = format!("--replay-schedule-from={}", cut_path.display());
@@ -61911,8 +61970,7 @@ fn a_schedule_recorded_with_the_pipe_wake_latency_replays_only_with_it() {
             recorded.starts_with(&format!("readied at 100, ran at {ran_at}\nreader clock ")),
             "{recorded}"
         );
-        let json: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let json = hermit_test::recorded_preemption_json(&path);
         assert_eq!(json["pipe_wake_latency"], stored, "{json}");
         for kind in ["--replay-preemptions-from", "--replay-schedule-from"] {
             let replay = format!("{kind}={}", path.display());
@@ -63619,9 +63677,7 @@ fn a_preemption_replay_readmits_a_backgrounded_call_where_its_recording_did() {
             })
             .collect()
     };
-    let read = |path: &Path| -> serde_json::Value {
-        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
-    };
+    let read = |path: &Path| -> serde_json::Value { hermit_test::recorded_preemption_json(path) };
 
     // The schedule and priority histories as a host whose branch counter
     // fails Reverie's validation can repeat them: everything but what that
@@ -63803,7 +63859,8 @@ fn a_schedule_replay_that_leaves_its_readmissions_ends_there_under_die_on_desync
     // Name another call of the same thread at the first readmission.
     let mut recording: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
-    let call = &mut recording["rejoins"][0]["calls"][0][1];
+    let inner = hermit_test::recorded_preemption_inner_mut(&mut recording);
+    let call = &mut inner["rejoins"][0]["calls"][0][1];
     assert!(call.is_u64(), "no readmission recorded: {recording}");
     *call = serde_json::json!(999_999);
     let edited = directory.path().join("edited.json");
@@ -63890,7 +63947,8 @@ fn a_preemption_replay_that_leaves_its_readmissions_is_marked_or_ends_under_die_
     )]));
     let mut recording: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
-    let call = &mut recording["rejoins"][0]["calls"][0][1];
+    let inner = hermit_test::recorded_preemption_inner_mut(&mut recording);
+    let call = &mut inner["rejoins"][0]["calls"][0][1];
     assert!(call.is_u64(), "no readmission recorded: {recording}");
     *call = serde_json::json!(999_999);
     let edited = directory.path().join("edited.json");
@@ -63918,8 +63976,7 @@ fn a_preemption_replay_that_leaves_its_readmissions_is_marked_or_ends_under_die_
     ]);
     succeeded(&marked);
     assert!(stderr(&marked.1).contains(left), "{}", stderr(&marked.1));
-    let rerecorded: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&rerecord).unwrap()).unwrap();
+    let rerecorded = hermit_test::recorded_preemption_json(&rerecord);
     assert!(
         rerecorded["incomplete_preemption_record"]["replay_departed_at"].is_u64(),
         "the re-record does not say it departed: {rerecorded}"
@@ -63946,8 +64003,9 @@ fn a_preemption_replay_that_leaves_its_readmissions_is_marked_or_ends_under_die_
     // The readmissions of a format-3 record are followed as a format-4
     // record's are: main's writer stores them there.
     let lower = |mut value: serde_json::Value, name: &str| {
-        value["format_version"] = serde_json::json!(3);
-        value.as_object_mut().unwrap().remove("background_starts");
+        let inner = hermit_test::recorded_preemption_inner_mut(&mut value);
+        inner["format_version"] = serde_json::json!(3);
+        inner.as_object_mut().unwrap().remove("background_starts");
         let path = directory.path().join(name);
         fs::write(&path, value.to_string()).unwrap();
         format!("--replay-preemptions-from={}", path.display())
@@ -64006,7 +64064,8 @@ fn a_strict_preemption_replay_that_leaves_its_readmissions_ends_there() {
     assert_success(&faithful, &["--strict", "faithful replay"]);
     let mut recording: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
-    let call = &mut recording["rejoins"][0]["calls"][0][1];
+    let inner = hermit_test::recorded_preemption_inner_mut(&mut recording);
+    let call = &mut inner["rejoins"][0]["calls"][0][1];
     assert!(call.is_u64(), "no readmission recorded: {recording}");
     *call = serde_json::json!(999_999);
     let edited = directory.path().join("edited.json");
@@ -67595,7 +67654,7 @@ fn chosen_json_provenance_follows_real_target_setup_and_both_replay_loaders() {
     );
     assert_success(&recorded, &["qualified producer"]);
     let recording_bytes = fs::read(&recording).unwrap();
-    let original: serde_json::Value = serde_json::from_slice(&recording_bytes).unwrap();
+    let original = hermit_test::recorded_preemption_json(&recording);
     assert_eq!(
         original["reserved_input"],
         serde_json::json!({
@@ -67697,8 +67756,7 @@ fn chosen_json_provenance_follows_real_target_setup_and_both_replay_loaders() {
             "{route}: {}",
             stderr(&replayed)
         );
-        let actual: serde_json::Value =
-            serde_json::from_slice(&fs::read(&output_record).unwrap()).unwrap();
+        let actual = hermit_test::recorded_preemption_json(&output_record);
         for field in [
             "reserved_input",
             "guest_ids",
@@ -69803,8 +69861,7 @@ fn a_strict_replay_refuses_binder() {
         &[&epoch, &record_flag],
     );
     assert_success(&recorded, &["binder_fd_passing", "ping", "client"]);
-    let json: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
+    let json = hermit_test::recorded_preemption_json(&record);
     if !json["rejoins"]
         .as_array()
         .is_some_and(|rejoins| !rejoins.is_empty())

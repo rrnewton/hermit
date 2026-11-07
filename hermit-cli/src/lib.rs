@@ -3620,10 +3620,26 @@ pub fn run_with_backend_timeout(
     skid_overshoot_report.finish(result)
 }
 
+/// KVM's backend-local RCB clock identity: its guest-only perf counter
+/// counting retired conditional branches in guest user mode, version 1 of
+/// that counting contract. Interim for the typed Reverie contract tracked
+/// in dh-6gve6. Two recordings are comparable only under the same token.
+const KVM_RCB_LOCAL_TOKEN: &str = "kvm:guest-user-retired-conditional-branches:v1";
+
 // TODO-HUMAN-REVIEW(PR-749): Review LiteInst backend configuration normalization.
 #[doc(hidden)]
 pub fn prepare_backend_config(config: DetConfig, backend: Backend) -> DetConfig {
-    prepare_backend_config_with_capabilities(config, backend_capabilities(backend))
+    let mut config =
+        prepare_backend_config_with_capabilities(config, backend_capabilities(backend));
+    // KVM counts its own guest-only RCB clock, not the qualified shared
+    // contract: state that as an opaque backend-local claim. Detcore
+    // compares the token and never interprets it, so a KVM history
+    // replays on KVM and is refused elsewhere.
+    if backend == Backend::Kvm {
+        config.rcb_clock_claim =
+            detcore_model::config::RcbClockClaim::BackendLocal(KVM_RCB_LOCAL_TOKEN);
+    }
+    config
 }
 
 /// Prepare the common Detcore configuration from the physical runtime's
@@ -3687,7 +3703,72 @@ pub fn prepare_backend_config_with_capabilities(
     // sets, from the final configuration and the process's PID-namespace
     // ownership (`in_guest_signal_delivery_gate`, A5 step 3c.1, D35 and D52).
     config.in_guest_signal_delivery = false;
+    // The RCB clock this run is prepared for, which Detcore checks against the
+    // clock it finds before recording or replaying a history.
+    config.rcb_clock_claim = rcb_clock_claim(&config);
     config
+}
+
+/// The qualified RCB clock `config` is prepared for: the backend's clock
+/// contract and this host's qualified profile, whether or not Detcore
+/// consumes the counter. Reads CPUID only; it installs no PMU configuration,
+/// so a `--skid-margin` recorded later still applies.
+fn rcb_clock_claim(config: &DetConfig) -> detcore_model::config::RcbClockClaim {
+    use detcore_model::config::RcbClockClaim;
+    match (
+        config.backend.rcb_clock_contract,
+        reverie::pmu_config::resolve_host_clock(),
+    ) {
+        (Some(_), Ok(host)) => RcbClockClaim::Known(host.key()),
+        _ => RcbClockClaim::Unset,
+    }
+}
+
+/// The RCB clock identity refusal Detcore's replay admission would give a
+/// run prepared with `config` ([`prepare_backend_config`]) for the histories
+/// in `inputs`, each an option and a path, or `None` when its effective RCB
+/// clock admits their identities. An early diagnostic of identity only: it
+/// does not check a history's strict or legacy mode, which Detcore checks
+/// when the run starts, as it checks identity again. It reads CPUID and the
+/// process's PMU state, installs and pins nothing, so a `--skid-margin`
+/// recorded later still applies. A history in a format this build refuses
+/// is a refusal; an otherwise unreadable history is an error, not a
+/// refusal.
+pub fn rcb_history_refusal(
+    config: &DetConfig,
+    inputs: &[(&str, &Path)],
+) -> anyhow::Result<Option<String>> {
+    if inputs.is_empty() {
+        return Ok(None);
+    }
+    let sources = detcore::clock_identity::ClockSources {
+        host: reverie::pmu_config::resolve_host_clock(),
+        state: reverie::pmu_config::pmu_state(),
+    };
+    let validated = match detcore::clock_identity::validate_run_clock(config, &sources) {
+        Ok(validated) => validated,
+        Err(refusal) => return Ok(Some(refusal)),
+    };
+    for (option, path) in inputs {
+        let recording = match detcore::preemptions::boundary_recording::Recording::read(path) {
+            Ok(recording) => recording,
+            Err(error)
+                if error
+                    .chain()
+                    .any(|cause| cause.is::<detcore::preemptions::RecordFormatRefusal>()) =>
+            {
+                return Ok(Some(format!(
+                    "hermit refused to replay {option} {}: {error:#}",
+                    path.display()
+                )));
+            }
+            Err(error) => return Err(error),
+        };
+        if let Err(refusal) = validated.admit(&format!("{option} {}", path.display()), &recording) {
+            return Ok(Some(refusal));
+        }
+    }
+    Ok(None)
 }
 
 /// The configuration of an in-guest run on the loader route (the exec-stop,
@@ -8870,22 +8951,51 @@ mod tests {
     #[test]
     fn run_with_output_admits_the_matching_exclusive_rewrite() {
         let dir = tempfile::tempdir().unwrap();
-        // Records of this Hermit's rewriter, whatever its format version.
+        // Records of this Hermit's rewriter, whatever its format version,
+        // stating this host's qualified RCB identity in the envelope every
+        // current recording carries: admission reaches the rewrite check
+        // this test exercises only past identity admission, as the
+        // refusing sibling above (whose bare records take the earlier
+        // rewrite refusal) does not need to.
+        // This test launches a real guest, so it needs this host's
+        // qualified counter in a way no fixture can supply: skip logged,
+        // as the PMU-timer tests do, and fail under HERMIT_REQUIRE_PMU.
+        let host = match reverie::pmu_config::resolve_host_clock() {
+            Ok(host) => host,
+            Err(reason) => {
+                assert!(
+                    std::env::var_os("HERMIT_REQUIRE_PMU").is_none(),
+                    "HERMIT_REQUIRE_PMU is set, but this host has no qualified RCB clock: \
+                     {reason}"
+                );
+                eprintln!(
+                    "skipping run_with_output_admits_the_matching_exclusive_rewrite: this \
+                     host has no qualified RCB clock ({reason})"
+                );
+                return;
+            }
+        };
+        let enveloped = |json: String| {
+            format!(
+                r#"{{"rcb_history":{{"format":2,"identity":"{}","recording":{json}}}}}"#,
+                host.metric.id()
+            )
+        };
         let current = crate::aarch64_lse::REWRITE_FORMAT_VERSION;
         for (name, json, in_memory, overlay) in [
             (
                 "memory-now.json",
-                format!(
+                enveloped(format!(
                     r#"{{"per_thread":{{}},"global":[],"rewrite_exclusives_in_memory":true,"rewrite_exclusives":{{"mode":"memory","format_version":{current}}}}}"#
-                ),
+                )),
                 true,
                 false,
             ),
             (
                 "overlay-now.json",
-                format!(
+                enveloped(format!(
                     r#"{{"per_thread":{{}},"global":[],"rewrite_exclusives":{{"mode":"overlay","format_version":{current}}}}}"#
-                ),
+                )),
                 false,
                 true,
             ),

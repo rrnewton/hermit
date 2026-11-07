@@ -386,8 +386,11 @@ impl From<SerializableError> for Error {
     }
 }
 
+/// A boundary schedule with one record no run consumes, stating `identity`.
 #[cfg(test)]
-pub(crate) async fn terminal_replay_refusal_for_test() -> Error {
+fn unconsumed_schedule_for_test(
+    identity: Option<detcore::preemptions::HistoryIdentity>,
+) -> detcore::preemptions::boundary_recording::Recording {
     use detcore::preemptions::PreemptionRecord;
     use detcore::preemptions::boundary_recording::BoundaryRecording;
     use detcore::preemptions::boundary_recording::Recording;
@@ -395,9 +398,7 @@ pub(crate) async fn terminal_replay_refusal_for_test() -> Error {
     use detcore_model::schedule::SchedEvent;
     use detcore_model::schedule::boundary::Record;
     use detcore_model::schedule::boundary::Schedule;
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("unconsumed.json");
-    let recording = Recording::Boundaries(
+    Recording::Boundaries(
         BoundaryRecording::new(
             PreemptionRecord::default(),
             Schedule::new(vec![Record::Event(SchedEvent::branches(
@@ -407,18 +408,36 @@ pub(crate) async fn terminal_replay_refusal_for_test() -> Error {
             .unwrap(),
         )
         .unwrap(),
-    );
+    )
+    .with_identity(identity)
+}
+
+#[cfg(test)]
+pub(crate) async fn terminal_replay_refusal_for_test() -> Error {
+    use detcore::preemptions::HistoryIdentity;
+    // The replay reaches its terminal refusal only past identity admission:
+    // the schedule and the run state the same backend-local clock, so the
+    // fixture needs no qualified host counter. Its other capabilities stay
+    // the defaults apart from the stated clock contract.
+    const LOCAL: &str = "test:terminal-replay:v1";
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("unconsumed.json");
+    let recording =
+        unconsumed_schedule_for_test(Some(HistoryIdentity::BackendLocal(LOCAL.to_owned())));
     std::fs::write(&path, recording.encode().unwrap()).unwrap();
-    detcore::GlobalState::init_for_external_scheduler(&detcore::Config {
+    let mut config = detcore::Config {
         sequentialize_threads: true,
         strict_schedule_boundaries: true,
         replay_schedule_from: Some(path),
         record_preemptions: false,
         ..detcore::Config::default()
-    })
-    .clean_up(false, &None)
-    .await
-    .unwrap_err()
+    };
+    config.backend.rcb_clock_contract = None;
+    config.rcb_clock_claim = detcore_model::config::RcbClockClaim::BackendLocal(LOCAL);
+    detcore::GlobalState::init_for_external_scheduler(&config)
+        .clean_up(false, &None)
+        .await
+        .unwrap_err()
 }
 
 #[cfg(test)]
@@ -480,6 +499,66 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn an_unconsumed_schedule_without_identity_is_refused_before_replay() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("unconsumed.json");
+        std::fs::write(&path, unconsumed_schedule_for_test(None).encode().unwrap()).unwrap();
+        let refusal = crate::rcb_history_refusal(
+            &detcore::Config::default(),
+            &[("--replay-schedule-from", path.as_path())],
+        )
+        .unwrap()
+        .expect("an identity-less schedule is refused");
+        assert!(
+            refusal.contains("it states no RCB coordinate identity"),
+            "{refusal}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_rcb_history_is_a_named_refusal_not_a_parse_error() {
+        use detcore::preemptions::HistoryIdentity;
+
+        let directory = tempfile::tempdir().unwrap();
+        let known = HistoryIdentity::Known(
+            reverie::pmu_config::RcbMetric::ConditionalBranchesRetiredUserV1,
+        );
+        type Edit = dyn Fn(&mut serde_json::Value);
+        let cases: [(&str, &Edit, &str); 2] = [
+            (
+                "format3.json",
+                &|v: &mut serde_json::Value| v["rcb_history"]["format"] = 3.into(),
+                "unsupported rcb_history format 3",
+            ),
+            (
+                "unknown.json",
+                &|v: &mut serde_json::Value| {
+                    v["rcb_history"]["identity"] = "rcb:cond-retired:user:v2".into()
+                },
+                "unknown RCB coordinate identity",
+            ),
+        ];
+        for (name, change, cause) in cases {
+            let mut value: serde_json::Value = serde_json::from_slice(
+                &unconsumed_schedule_for_test(Some(known.clone()))
+                    .encode()
+                    .unwrap(),
+            )
+            .unwrap();
+            change(&mut value);
+            let path = directory.path().join(name);
+            std::fs::write(&path, value.to_string()).unwrap();
+            let refusal = crate::rcb_history_refusal(
+                &detcore::Config::default(),
+                &[("--replay-schedule-from", path.as_path())],
+            )
+            .unwrap()
+            .expect("an unknown rcb_history envelope is refused, not a parse error");
+            assert!(refusal.contains(cause), "{refusal}");
         }
     }
 
