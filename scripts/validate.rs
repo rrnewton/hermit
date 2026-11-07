@@ -21602,7 +21602,7 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // And slice 2b-3's
         // run_kvm_another_processs_cmdline_and_environ_answer_as_linux: 157,
         // matching the DAG pin in validation_dag_static.
-        ("privileged-only-test.cli_kvm", 157usize),
+        ("privileged-only-test.cli_kvm", 156usize),
     ] {
         let step = privileged
             .steps
