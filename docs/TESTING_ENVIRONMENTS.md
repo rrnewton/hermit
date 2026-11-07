@@ -493,9 +493,9 @@ The host-limited Detcore mapping tests and `aarch64_exclusive_rewrite` require
 inspect the actual root descriptor, reject tmpfs/ramfs and `noexec`, and never
 fall back to `/tmp`, `/dev/shm` or `/run/user`. Keep generated guests, copied
 libraries, summaries, recordings and caches under the registered on-disk slot.
-The compiler and Hermit launcher receive the owned fixture directory as
-`TMPDIR`, so their temporary output does not fall back to a host temporary
-filesystem.
+The compiler, guest-run launcher and refusal-list launcher receive the owned
+fixture directory as `TMPDIR`, so their temporary output does not fall back to
+a host temporary filesystem.
 Disk storage does not waive mapping proof: the Detcore fixture uses its real
 proc-maps identity and the normal `open_mapped` proof. On btrfs/overlayfs the
 CLI probes its owned guest's actual map_files entry; the guest's complete
@@ -515,10 +515,18 @@ is wiring evidence, not an ARM execution result.
 ### AArch64 test coverage in Cargo and Buck
 
 Cargo discovers `hermit-cli/tests/aarch64_exclusive_rewrite.rs`, whose physical
-ARM test is ignored by default and has no scheduled CI node. Its manual,
+ARM tests are ignored by default and have no scheduled CI node. Their manual,
 host-limited status is recorded in `ci/undeclared-test-binaries.tsv`. The Buck
 library rules do not auto-discover this integration binary: no ARM Buck
 integration target or execution coverage is claimed.
+
+The bare assembly fixture `tests/c/exclusive_loop_bare.S` is compiled by this
+manual Cargo integration, not by a Buck guest target. It proves a single-thread
+rewrite with exact counts `(1, 0, 0)`; the four-thread C-library fixture proves
+the conservative refusal with `(0, 1, 0)` and the sole
+`literal-inside-the-sequence` reason. Both retain exact output and the shared
+all-files `failed == 0` check. This does not claim a contended rewritten-loop
+positive or ARM execution from an x86 build.
 
 The portable CLI library test and the physical integration share
 `tests/common/exclusive_rewrite_summary.rs`. Both Buck library `test_srcs`

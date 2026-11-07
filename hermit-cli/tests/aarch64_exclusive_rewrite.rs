@@ -217,6 +217,7 @@ fn compile(dir: &Path, source: &str, flags: &[&str]) -> PathBuf {
         "{}",
         String::from_utf8_lossy(&compiled.stderr)
     );
+    require_mapping_proof(&output);
     output
 }
 
@@ -229,17 +230,17 @@ fn run_rewriting(dir: &Path, command: &[&Path], expected: &str) -> serde_json::V
     let mut run = hermit_command();
     run.env("TMPDIR", dir);
     run.args([
-            "--log=info",
-            "run",
-            "--no-namespace",
-            "--rewrite-exclusives",
-            "--base-env=minimal",
-            "--preemption-timeout=disabled",
-        ])
-        .arg(format!("--summary-json={}", summary_path.display()))
-        .arg(format!("--record-preemptions-to={}", record.display()))
-        .arg("--")
-        .args(command);
+        "--log=info",
+        "run",
+        "--no-namespace",
+        "--rewrite-exclusives",
+        "--base-env=minimal",
+        "--preemption-timeout=disabled",
+    ])
+    .arg(format!("--summary-json={}", summary_path.display()))
+    .arg(format!("--record-preemptions-to={}", record.display()))
+    .arg("--")
+    .args(command);
     let rendered = format!("{run:?}");
     let output = hermit_test::hermit_output(&rendered, &mut run);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -258,6 +259,8 @@ fn run_rewriting(dir: &Path, command: &[&Path], expected: &str) -> serde_json::V
 /// its loops are all counted as rewritten or left. Returns whether any loop
 /// was left.
 fn every_file_with_loops_is_accounted_for(summary: &serde_json::Value, dir: &Path) -> bool {
+    exclusive_rewrite_summary::check_no_failed_rewrites(summary)
+        .unwrap_or_else(|error| panic!("{error}: {summary:#}"));
     let pairs = summary["exclusive_pairs"]
         .as_object()
         .unwrap_or_else(|| panic!("no exclusive_pairs in {summary:#}"));
@@ -338,22 +341,26 @@ fn a_c_library_guests_loop_is_left_with_its_reason_and_it_still_counts() {
         "exclusive_loop_counter.c",
         &["-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread"],
     );
-    require_mapping_proof(&guest);
     let summary = run_rewriting(
         dir.path(),
         &[&loader, Path::new("--library-path"), dir.path(), &guest],
         EXPECTED,
     );
     assert_eq!(rewrite_of(&summary, &guest), (0, 1, 0), "{summary:#}");
-    exclusive_rewrite_summary::check_no_failed_rewrites(&summary)
-        .unwrap_or_else(|error| panic!("{error}: {summary:#}"));
     every_file_with_loops_is_accounted_for(&summary, dir.path());
 
-    let listed = Command::new(env!("CARGO_BIN_EXE_hermit"))
+    let listed = hermit_command()
+        .env("TMPDIR", dir.path())
         .args(["rewrite-exclusives", "--list-refusals"])
         .arg(&guest)
         .output()
         .unwrap();
+    assert_eq!(
+        listed.status.code(),
+        Some(1),
+        "an incomplete rewrite must exit 1: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
     let listed = String::from_utf8_lossy(&listed.stdout);
     let reasons: Vec<&str> = listed
         .lines()
