@@ -3376,7 +3376,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (a_kvm_child_exit_receiver_is_chosen_by_the_temporary_mask_its_call_installs,
     // a_kvm_copy_linux_discarded_at_send_is_never_taken_by_a_later_handler):
     // 3754 + 11 = 3765.
-    ("test.detcore_unit", 3765),
+    // And the #5259 R-1 announcement-level parked test
+    // (a_kvm_delivery_stop_of_a_copy_linux_discarded_at_send_delivers_nothing):
+    // 3765 + 1 = 3766.
+    ("test.detcore_unit", 3766),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -6124,7 +6127,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Four census provenance units plus the non-PROGBITS control: 3665 + 5.
     // And the same two S3b-2 units: 3752 + 2 = 3754.
     // And the same eleven #5259 review-fix units: 3754 + 11 = 3765.
-    ("test.detcore_unit_on_host", 3765),
+    // And the same #5259 R-1 parked test: 3765 + 1 = 3766.
+    ("test.detcore_unit_on_host", 3766),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

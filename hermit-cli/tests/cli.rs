@@ -26483,7 +26483,7 @@ const PTRACE_POLLER_PASSED_OVER: TargetExpectation = Diverges(KnownDivergence {
 /// is fixed (the Codex review of <https://github.com/rrnewton/hermit/pull/5259>,
 /// P1); ptrace printed the same before it.
 const PTRACE_TEMPORARY_MASK_UNREAD: TargetExpectation = Diverges(KnownDivergence {
-    issue: "https://github.com/rrnewton/hermit/pull/5259",
+    issue: "https://github.com/rrnewton/hermit/issues/5262",
     line: "receiver=M interrupted=none\n",
 });
 
