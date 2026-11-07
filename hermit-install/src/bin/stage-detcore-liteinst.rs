@@ -155,6 +155,17 @@ fn run() -> proof::Result<()> {
             artifact.reported_path == target.join("liteinst-runtime/libdetcore_liteinst.so"),
             "Cargo reported a different ordinary runtime output",
         )?;
+        // The ordinary staged runtime is the liteinst-off image; bind the
+        // actual current build as its no-scope qualification witness. The
+        // retained command is captured immediately after the runtime build,
+        // before any later retained command can replace it. This mirrors
+        // Hermit 4704's stage-detcore-liteinst rebinding.
+        let build_command = runner
+            .commands
+            .last()
+            .ok_or("packaged runtime build command was not retained")?
+            .clone();
+        let sources = sources.with_current_build(&build_command, &artifact.reported_path, &target)?;
         let qualification = proof::qualify_detcore_constructor_with_sources(
             &artifact.reported_path,
             &mut runner,
