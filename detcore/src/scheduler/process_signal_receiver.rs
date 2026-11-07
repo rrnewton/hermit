@@ -118,10 +118,9 @@ use serde::Serialize;
 use super::Scheduler;
 use super::discarded_at_send::STANDARD_SIGNALS;
 use super::kernel_signal_bit;
+use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::syscalls::KernelSignalState;
-#[cfg(not(test))]
-use crate::syscalls::read_kernel_signal_state;
 use crate::types::DetPid;
 use crate::types::DetTid;
 
@@ -404,7 +403,7 @@ impl Scheduler {
 
     /// `process`'s `curr_target`: the thread the walk of `complete_signal` last
     /// chose, or the leader, where Linux starts it.
-    fn signal_curr_target(&self, process: DetPid) -> DetTid {
+    pub(super) fn signal_curr_target(&self, process: DetPid) -> DetTid {
         self.signal_curr_targets
             .get(&process)
             .copied()
@@ -598,6 +597,107 @@ impl Scheduler {
         }
     }
 
+    /// Whether `thread` `wants_signal` for a signal the kernel itself generates
+    /// for its process between turns (a child's exit `SIGCHLD`, a timer's
+    /// expiry; `Scheduler::kernel_signal_choice`), where `mask` is the mask
+    /// Linux's `blocked` holds for it now (`None`: unreadable, so it is no
+    /// target), already less any set a `rt_sigtimedwait` waits for. The rule
+    /// is `wants_signal`'s, as for a guest's send, with no running sender:
+    /// not exiting, not blocking the signal, and, but for SIGKILL, no other
+    /// unblocked signal pending for it alone (`task_sigpending`) and not
+    /// already woken for another copy in the shared queue. A thread sleeping
+    /// outside the schedule is read only for its wake (`signaled_background`),
+    /// since host timing can post it a signal, except a vfork parent. A
+    /// thread the scheduler has woken for signals of its own and queued to
+    /// resume (`committed_own_signal_wake`) is busy only for any other
+    /// signal pending for it alone.
+    pub(super) fn kernel_sent_wants(&self, thread: DetTid, mask: Option<u64>, bit: u64) -> Wants {
+        if self.parked.exit_fences.contains_key(&thread)
+            || self.logically_killed_threads.contains(&thread)
+            || self.filed_exit_request(thread)
+        {
+            return Wants::No;
+        }
+        let Some(mask) = mask else {
+            return Wants::No;
+        };
+        if mask & bit != 0 {
+            return Wants::No;
+        }
+        if bit == kernel_signal_bit(libc::SIGKILL) {
+            return Wants::Yes;
+        }
+        // A vfork parent sleeps outside the schedule too, but no host timing
+        // ends its call (the child's exec or exit, which the schedule fixes,
+        // does) or posts it a signal, so its pending set is read like a
+        // stopped thread's: one with a signal pending is busy, which a caught
+        // signal does not wake there (`wait_for_vfork_done` sleeps killable).
+        if self.out_of_schedule(thread) && !self.vfork_barriers.contains_key(&thread) {
+            return if self.blocked.signaled_background.contains(&thread) {
+                Wants::Busy
+            } else {
+                Wants::Yes
+            };
+        }
+        if self
+            .process_signal_takers
+            .get(&thread)
+            .is_some_and(|signals| *signals != 0)
+        {
+            return Wants::Busy;
+        }
+        // Woken at a committed point for signals pending for it alone, and not
+        // yet resumed. Linux woke it when those signals were sent
+        // (`signal_wake_up`, kernel/signal.c:1027-1033 at v6.17) and, its
+        // wake latency far below the step between a send and the next
+        // expiry, it has dequeued them by the time the kernel generates this
+        // one: `dequeue_signal` takes the private queue first, then the
+        // shared one (lines 618-640), and returns to its interruptible wait
+        // with nothing pending. Here the wake is only committed, at the drain
+        // that also dispatches this expiry, so its private queue still holds
+        // those signals, and reading them as `task_sigpending` gave the copy
+        // to a sibling Linux does not choose (ptrace `busypause`:
+        // alarm_worker=1 worker_eintr=1 where Linux prints 0 and 0, the
+        // coord7 review of https://github.com/rrnewton/hermit/pull/5221,
+        // finding 2). It is busy only for a signal it was not woken for.
+        let woken_for = self.committed_own_signal_wake(thread).unwrap_or(0);
+        match self.reliable_pending(thread) {
+            Some(pending) if pending & !woken_for != 0 => Wants::Busy,
+            _ => Wants::Yes,
+        }
+    }
+
+    /// The signals `thread` is queued to resume for, if the scheduler woke it
+    /// for signals pending for it alone at a committed point and it has not
+    /// run since: its filed request is that wake's one write-only resource,
+    /// the signal set the step-2 drain of cross-task signals files for an
+    /// interrupted `pause`, `nanosleep`, futex wait or poll (`WaitidSignals`,
+    /// `Scheduler::drain_sleep_signals`) or the signal a scheduler send files
+    /// for a sleeper or poller it wakes (`InboundSignal`,
+    /// `Scheduler::wake_signaled_guest_as`), and it waits in the run queue.
+    /// Not a delivery stop's own request, which asks for its signal
+    /// read-write after the kernel dequeued it.
+    fn committed_own_signal_wake(&self, thread: DetTid) -> Option<u64> {
+        if !self.run_queue.contains_tid(thread) {
+            return None;
+        }
+        let request = self.next_turns.get(&thread)?.req.try_read()?.ok()?;
+        if request.resources.len() != 1 {
+            return None;
+        }
+        match request.resources.iter().next()? {
+            (ResourceID::InboundSignal(signal), Permission::W) => {
+                Some(kernel_signal_bit(signal.raw()))
+            }
+            (ResourceID::WaitidSignals(signals), Permission::W) => Some(
+                signals
+                    .iter()
+                    .fold(0, |bits, signal| bits | kernel_signal_bit(signal.raw())),
+            ),
+            _ => None,
+        }
+    }
+
     /// Whether `thread`'s filed request is its own exit, which Linux runs to
     /// completion: `wants_signal` passes over an exiting thread (`PF_EXITING`,
     /// signal.c:951-952).
@@ -630,13 +730,20 @@ impl Scheduler {
     /// The signals in `thread`'s own queue that it does not block, when it is
     /// stopped at a request or parked, without those a host-timed source may
     /// have posted (`host_timed_signals`) and Reverie's preemption marker,
-    /// which the schedule does not fix.
+    /// which the schedule does not fix, and without a copy Linux discarded as
+    /// it was generated (`discarded_bits`), which the kernel or the backend
+    /// still holds (a traced task's ignored signal is queued whatever its
+    /// disposition) but Linux never queued, so it sets no `TIF_SIGPENDING`.
+    /// A copy that was blocked when generated, and so queued although
+    /// ignored, still counts (the revastra2 review of SIGSHARE S3b's fix
+    /// round, delta F2).
     fn reliable_pending(&self, thread: DetTid) -> Option<u64> {
         let mask = self.stopped_thread_mask(thread)?;
         let state = self.stopped_thread_signal_state(thread).ok()?;
         let unreliable =
             self.host_timed_signals(thread) | kernel_signal_bit(reverie::PERF_EVENT_SIGNAL as i32);
-        Some(state.thread_pending & !mask & !unreliable)
+        let discarded = self.discarded_bits(thread).0;
+        Some(state.thread_pending & !mask & !unreliable & !discarded)
     }
 
     /// The kernel's signal state for `thread`, stopped at a request or
@@ -651,9 +758,10 @@ impl Scheduler {
         }
         #[cfg(not(test))]
         {
-            read_kernel_signal_state(
-                reverie::Pid::from_raw(self.sigchld_process(thread).as_raw()),
-                reverie::Pid::from_raw(thread.as_raw()),
+            self.guest_signal_state(
+                thread,
+                self.sigchld_process(thread).as_raw(),
+                thread.as_raw(),
             )
         }
     }

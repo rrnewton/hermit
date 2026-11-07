@@ -804,7 +804,7 @@ where
         return FatalDeliveryObservation::Nonfatal;
     }
     let kernel = (copied.is_none() || may_retire_others)
-        .then(|| read_thread_signal_state(guest.pid(), guest.tid()).ok())
+        .then(|| crate::syscalls::read_guest_thread_signal_state(guest).ok())
         .flatten();
     match copied.or_else(|| kernel.map(|state| state.default_action_ends_process(signal))) {
         Some(true) => FatalDeliveryObservation::Fatal {
@@ -1038,6 +1038,21 @@ pub(crate) struct KernelSignalState {
     pub(crate) ignored: KernelSigset,
     /// Signals with a handler installed (`SigCgt`).
     pub(crate) caught: KernelSigset,
+}
+
+impl KernelSignalState {
+    /// The value of one of the three signal-mask fields of
+    /// `/proc/<pid>/status` that these sets carry (`SigBlk`, `SigIgn` or
+    /// `SigCgt`), for a reader that names the field as it names a `/proc`
+    /// line; `None` for any other name.
+    pub(crate) fn status_field(&self, field: &str) -> Option<KernelSigset> {
+        match field {
+            "SigBlk" => Some(self.blocked),
+            "SigIgn" => Some(self.ignored),
+            "SigCgt" => Some(self.caught),
+            _ => None,
+        }
+    }
 }
 
 /// [`KernelSignalState::default_action_ends_process`] given only the
@@ -1331,6 +1346,54 @@ pub(crate) fn host_signal_state_reads_refused() -> bool {
     {
         HOST_SIGNAL_STATE_READS_REFUSED_FOR_TEST.with(|refused| refused.get())
     }
+}
+
+/// Whether a host signal syscall that `site` would make to guest thread
+/// `tid` of process `pid` (or to the process, where `tid` is its leader) is
+/// refused: exactly where host signal state reads are
+/// ([`host_signal_state_reads_refused`]), because the backend's guest thread
+/// IDs do not name host tasks (KVM). There the number names an unrelated host
+/// task, if any, chosen by host thread-ID allocation, or one of Hermit's own
+/// (https://github.com/rrnewton/hermit/issues/4950), so the send must not
+/// happen. A refusal is logged by name (`host-signal-send`) and the caller
+/// skips the send, as a refused `/proc` read is skipped
+/// ([`read_kernel_signal_state`]). This is the send latch of SIGSHARE's
+/// design (section 7.3): every scheduler send on such a backend goes through
+/// the backend's publication instead, and this backstop catches a path that
+/// misses its gate. Only the test-only fault hooks log and go on; a send whose
+/// signal the guest would see ends the run instead
+/// ([`host_signal_send_refusal`]).
+pub(crate) fn host_signal_send_refused(site: &str, pid: i32, tid: i32, signal: i32) -> bool {
+    match host_signal_send_refusal(site, pid, tid, signal) {
+        Some(refusal) => {
+            error!("{}", refusal);
+            true
+        }
+        None => false,
+    }
+}
+
+/// [`host_signal_send_refused`]'s refusal as the message that ends the run, for
+/// a send whose signal the guest would see: `None` where the send may be made.
+/// Skipping such a send would silently lose a signal Linux delivers, a
+/// different guest result than Linux's, which principle 6 forbids; so the
+/// scheduler ends the run with it (`exit_on_scheduler_refusal`), as it ends
+/// the run for its other refusals (the coord7 review of
+/// <https://github.com/rrnewton/hermit/pull/5221>, finding 6).
+pub(crate) fn host_signal_send_refusal(
+    site: &str,
+    pid: i32,
+    tid: i32,
+    signal: i32,
+) -> Option<String> {
+    host_signal_state_reads_refused().then(|| {
+        format!(
+            "HERMIT_REFUSAL host-signal-send: {} would send host signal {} to guest thread {} \
+             (process {}): this backend's guest thread IDs do not name host tasks, so nothing \
+             was sent",
+            site, signal, tid, pid
+        )
+    })
 }
 
 /// Read `tid`'s signal state from the kernel.
@@ -1662,6 +1725,63 @@ pub(crate) fn reads_signal_state_from_backend(backend: &BackendCapabilities) -> 
     backend.provides_process_signal_control
 }
 
+/// Whether a backend with `backend`'s capabilities restarts a guest call that
+/// a signal woke only by running the call again after `ERESTARTSYS`, and
+/// cannot hand the kernel's signal delivery Linux's other restart codes
+/// (`ERESTARTNOHAND`, `ERESTART_RESTARTBLOCK`): it owns signal delivery
+/// (`provides_process_signal_control`), so no kernel `handle_signal` sees the
+/// call's return, and it does not hand the delivery a restart errno
+/// (`supports_blocked_wait_signal_interruption`, which promises exactly that).
+/// True on KVM alone today.
+///
+/// Linux turns `ERESTARTNOHAND` and `ERESTART_RESTARTBLOCK` into `EINTR`
+/// whenever a handler runs, whatever `SA_RESTART` says, and restarts the call
+/// when none does (`handle_signal`, arch/x86/kernel/signal.c:266-270 at v6.17,
+/// and `arch_do_signal_or_restart`); `ERESTARTSYS` restarts after a handler
+/// with `SA_RESTART`. Where only `ERESTARTSYS` reaches the delivery, Detcore
+/// settles a woken `poll`, unmasked `ppoll` or recorded-socket wait itself at
+/// its return (`woken_poll_errno`) and keeps a `poll`'s end time for its rerun
+/// (`Detcore::keep_deadline_for_rerun`). Every site that decides so reads this
+/// one predicate (the coord7 review of
+/// <https://github.com/rrnewton/hermit/pull/5221>, finding 4). Once KVM can
+/// hand the delivery a restart errno (N8a), it declares
+/// `supports_blocked_wait_signal_interruption` and this turns false there.
+pub(crate) fn restarts_woken_calls_only_through_erestartsys(backend: &BackendCapabilities) -> bool {
+    backend.provides_process_signal_control && !backend.supports_blocked_wait_signal_interruption
+}
+
+#[cfg(test)]
+mod restarts_woken_calls_tests {
+    use crate::config::Config;
+
+    /// Residual R1 of the musereviewc review of
+    /// <https://github.com/rrnewton/hermit/pull/5221>: every row of the
+    /// capability table. A backend that leaves signal delivery to the kernel
+    /// (`provides_process_signal_control` false: ptrace, LiteInst,
+    /// InGuestTrap, SaBRe, DBT) hands `handle_signal` the call's own restart
+    /// code, so it never restarts only through `ERESTARTSYS`, whether or not
+    /// it also declares restart-errno delivery.
+    #[test]
+    fn only_a_backend_owning_delivery_without_restart_codes_restarts_through_erestartsys() {
+        for (owns_delivery, restart_codes, expected) in [
+            (true, false, true),
+            (true, true, false),
+            (false, true, false),
+            (false, false, false),
+        ] {
+            let config = Config::default().with_backend(|backend| {
+                backend.provides_process_signal_control = owns_delivery;
+                backend.supports_blocked_wait_signal_interruption = restart_codes;
+            });
+            assert_eq!(
+                super::restarts_woken_calls_only_through_erestartsys(&config.backend),
+                expected,
+                "owns_delivery={owns_delivery} restart_codes={restart_codes}"
+            );
+        }
+    }
+}
+
 /// The errno for a backend's answer that names no signal sets: the errno it
 /// gave (`ESRCH` for a task that is gone, `EAGAIN` for a read an exec
 /// overlapped), or `ENOSYS` where it does not report the fact, which callers
@@ -1682,12 +1802,80 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
+    backend_signal_state_of(guest, guest.tid())
+}
+
+/// Guest thread `tid`'s signal state, from the backend where Detcore reads
+/// it there ([`reads_signal_state_from_backend`]: `Guest::signal_sets`,
+/// which names any live guest thread of this run, numbered as `Guest::tid`
+/// numbers it), and `None` elsewhere, where the caller keeps its `/proc`
+/// read.
+fn backend_signal_state_of<G, T>(guest: &G, tid: Pid) -> Option<Result<KernelSignalState, Errno>>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
     reads_signal_state_from_backend(&guest.config().backend).then(|| {
         guest
-            .signal_sets(guest.tid())
+            .signal_sets(tid)
             .map(|sets| KernelSignalState::from_backend_sets(&sets))
             .map_err(signal_sets_errno)
     })
+}
+
+/// [`read_thread_signal_state`] of guest thread `tid` (of process `pid`, as
+/// the caller names it), read in a handler of any guest thread: from the
+/// backend where its guest threads are not host tasks
+/// ([`reads_signal_state_from_backend`]), so that no host task's `/proc`
+/// state reaches a decision there, and from `/proc` elsewhere, as before
+/// (SIGSHARE S3a).
+pub(crate) fn read_guest_task_signal_state<G, T>(
+    guest: &G,
+    pid: Pid,
+    tid: Pid,
+) -> Result<KernelSignalState, Errno>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    backend_signal_state_of(guest, tid).unwrap_or_else(|| read_thread_signal_state(pid, tid))
+}
+
+/// [`read_wait_signal_state`] of the calling thread, read from the backend
+/// where its guest threads are not host tasks
+/// ([`reads_signal_state_from_backend`]), with the same errors as
+/// [`read_guest_wait_signal_state`] there. Elsewhere it is exactly
+/// [`read_wait_signal_state`], which, unlike [`read_thread_wait_signal_state`],
+/// reads only `/proc/<pid>/task/<tid>` (SIGSHARE S3a).
+pub(crate) fn read_guest_group_wait_signal_state<G, T>(
+    guest: &G,
+) -> Result<KernelSignalState, Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match backend_signal_state_of_caller(guest) {
+        None => read_wait_signal_state(guest.pid(), guest.tid()),
+        Some(read) => backend_wait_answer(guest.pid(), guest.tid(), read),
+    }
+}
+
+/// A blocked wait's reading of a backend's answer: the state, or
+/// `ERESTARTNOINTR` for a thread the backend no longer knows (`ESRCH`), which
+/// nothing observes, or the end of the run for any other failure, as for the
+/// `/proc` read.
+fn backend_wait_answer(
+    pid: Pid,
+    tid: Pid,
+    read: Result<KernelSignalState, Errno>,
+) -> Result<KernelSignalState, Error> {
+    match read {
+        Ok(state) => Ok(state),
+        Err(Errno::ESRCH) => Err(Errno::ERESTARTNOINTR.into()),
+        Err(errno) => Err(Error::Tool(anyhow::Error::new(
+            BlockedWaitSignalError::StateUnreadable { pid, tid, errno },
+        ))),
+    }
 }
 
 /// [`read_kernel_signal_state`] of the calling thread, read from the backend
@@ -1728,15 +1916,7 @@ where
 {
     match backend_signal_state_of_caller(guest) {
         None => read_thread_wait_signal_state(guest.pid(), guest.tid()),
-        Some(Ok(state)) => Ok(state),
-        Some(Err(Errno::ESRCH)) => Err(Errno::ERESTARTNOINTR.into()),
-        Some(Err(errno)) => Err(Error::Tool(anyhow::Error::new(
-            BlockedWaitSignalError::StateUnreadable {
-                pid: guest.pid(),
-                tid: guest.tid(),
-                errno,
-            },
-        ))),
+        Some(read) => backend_wait_answer(guest.pid(), guest.tid(), read),
     }
 }
 
@@ -1830,13 +2010,12 @@ where
         .with_sigsetsize(KERNEL_SIGSET_SIZE);
     guest.inject_with_retry(block_signals).await?;
     let guest_mask: KernelSigset = guest.memory().read_value(old_mask_addr)?;
-    if crate::scheduler::child_exit_publication(&guest.config().backend).is_ok()
-        || crate::scheduler::discarded_at_send::records(guest.config())
-    {
-        // While the private mask is installed, the kernel reports Detcore's
-        // mask for this thread; the scheduler's child-exit classification and
-        // its record of copies Linux discarded at send must read the guest's
-        // own (the Claude re-check of the R2b-1 design, R4-3).
+    if scheduler_reads_saved_guest_mask(guest.config()) {
+        // While the private mask is installed, the kernel (or, on KVM, the
+        // backend's signal state) reports Detcore's mask for this thread; the
+        // scheduler's child-exit classification and its record of copies
+        // Linux discarded at send must read the guest's own (the Claude
+        // re-check of the R2b-1 design, R4-3; SIGSHARE S4 for KVM).
         crate::tool_global::set_saved_guest_sigmask(guest, Some(guest_mask)).await;
     }
     Ok(guest_mask)
@@ -1859,12 +2038,22 @@ where
             .with_sigsetsize(KERNEL_SIGSET_SIZE);
         guest.inject_with_retry(restore_signals).await?;
     }
-    if crate::scheduler::child_exit_publication(&guest.config().backend).is_ok()
-        || crate::scheduler::discarded_at_send::records(guest.config())
-    {
+    if scheduler_reads_saved_guest_mask(guest.config()) {
         crate::tool_global::set_saved_guest_sigmask(guest, None).await;
     }
     Ok(())
+}
+
+/// Whether the scheduler reads a thread's guest mask while a managed child
+/// wait holds it under Detcore's private mask (`saved_guest_sigmasks`): for
+/// its child-exit classification where publication is reported, or where it
+/// decides a controlled exit's notification from the backend's signal state
+/// (`reads_signal_state_from_backend`, SIGSHARE S4), and for its record of
+/// copies Linux discarded at send.
+fn scheduler_reads_saved_guest_mask(config: &Config) -> bool {
+    crate::scheduler::child_exit_publication(&config.backend).is_ok()
+        || reads_signal_state_from_backend(&config.backend)
+        || crate::scheduler::discarded_at_send::records(config)
 }
 
 async fn interrupted_child_wait_result<G, T, S>(
@@ -4143,7 +4332,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             // the park, or still pending after a wake, ends the
             // wait with the futex's restart errno, its end
             // recorded for the restart checkpoint (D40).
-            let state = read_wait_signal_state(guest.pid(), guest.tid())?;
+            let state = read_guest_group_wait_signal_state(guest)?;
             let mask = super::helpers::gated_own_mask(guest, state.blocked);
             if let Some(end) = crate::wait_signal_end::wait_end(
                 &state,
@@ -4176,7 +4365,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else if signal_interruption {
             // A failed read is never the call's errno
             // (`read_wait_signal_state`).
-            let state = read_wait_signal_state(guest.pid(), guest.tid())?;
+            let state = read_guest_group_wait_signal_state(guest)?;
             // A timed futex wait lets a default job-control stop
             // wait for its deadline (`KernelSignalState::interrupting_wait`).
             let defers_default_stops = call.restart_keeps_deadline();
@@ -7949,6 +8138,22 @@ mod tests {
         assert!(host_signal_state_reads_refused());
         assert_eq!(read_kernel_signal_state(pid, tid), Err(Errno::ENOSYS));
         assert_eq!(read_thread_signal_state(pid, tid), Err(Errno::ENOSYS));
+    }
+
+    /// SIGSHARE S3a-2's send latch: a host signal send to a guest thread ID
+    /// is allowed where guest thread IDs name host tasks, and refused, by
+    /// name, once the refusal is latched for a backend whose do not (KVM,
+    /// https://github.com/rrnewton/hermit/issues/4950). Every guarded send
+    /// (the unignore re-queue, the host-timed parent-death kill,
+    /// `--stacktrace-signal` and the two fault hooks) asks this before it
+    /// sends.
+    #[test]
+    fn a_latched_refusal_refuses_every_host_signal_send() {
+        refuse_host_signal_state_reads(&BackendCapabilities::PTRACE);
+        assert!(!host_signal_send_refused("a test", 1, 1, libc::SIGUSR1));
+        refuse_host_signal_state_reads(&BackendCapabilities::KVM);
+        assert!(host_signal_send_refused("a test", 1, 1, libc::SIGUSR1));
+        assert!(host_signal_send_refused("a test", 1, 2, libc::SIGKILL));
     }
 
     /// A kept status file is read afresh each time: a signal blocked after

@@ -14,6 +14,7 @@ mod backend_signal_waits_tests;
 mod boundary_controller;
 mod boundary_replayer;
 pub(crate) mod child_exit_sigchld;
+pub(crate) mod controlled_child_exit;
 #[cfg(test)]
 mod cpu_affinity_tests;
 pub(crate) mod discarded_at_send;
@@ -144,7 +145,6 @@ use crate::syscalls::KernelSignalState;
 use crate::syscalls::pi_futex::PiFutexState;
 use crate::syscalls::pi_futex::PiHandOver;
 use crate::syscalls::read_kernel_signal_state;
-use crate::syscalls::thread_is_gone;
 use crate::types::ChildWaitExitClass;
 use crate::types::ChildWaitSelector;
 use crate::types::ChildWaitSpec;
@@ -446,6 +446,18 @@ pub struct OwnProcessSignalInputs {
     pub guest_marker_signal: bool,
 }
 
+/// What generated a process-directed signal the kernel sends between turns
+/// (`Scheduler::commit_kernel_signal_walk`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KernelSignalSource {
+    /// A timer's expiry, which the scheduler sends itself, so the shared queue
+    /// holds a copy of it only once the send is made.
+    Timer,
+    /// A child's exit, whose own copy the kernel already posted to the shared
+    /// queue at a moment host timing sets.
+    ChildExit,
+}
+
 /// The one-bit kernel sigset for a 1-based signal number, or 0 when out of range.
 pub(crate) fn kernel_signal_bit(raw_signal: i32) -> u64 {
     if (1..=64).contains(&raw_signal) {
@@ -709,6 +721,18 @@ pub struct BlockedPool {
     /// mask is host-timed; `kernel_sigchld_target` uses this record instead.
     /// An entry lives exactly as long as the thread's blocking-pool entry.
     pub out_of_scheduler_masks: BTreeMap<DetTid, Option<u64>>,
+
+    /// Where a process signal control is installed (KVM), the temporary mask
+    /// of each call in `external_io_blockers` or `rt_sigsuspend_blockers`
+    /// that runs under one, recorded when the scheduler released the call:
+    /// the request's `Resources::blocked_signal_mask`, or `None` where the
+    /// request said the mask is unknown. A call under the thread's own mask
+    /// has no entry. The signal state reader takes the mask from here while
+    /// the thread runs outside the schedule, whose filed request is empty or
+    /// a rejoin host timing filed (`Scheduler::controlled_temporary_mask`,
+    /// <https://github.com/rrnewton/hermit/issues/4929>). An entry lives
+    /// exactly as long as the thread's blocking-pool entry.
+    pub controlled_background_masks: BTreeMap<DetTid, Option<u64>>,
 
     /// The mask a thread readmitted from a blocking pool is stopped under
     /// until its continuation turn is granted, when a signal ended its call:
@@ -2021,6 +2045,14 @@ pub struct Scheduler {
     /// as long as the call blocks.
     kernel_run_signal_refusal: Option<String>,
 
+    /// Set where a scheduler send whose signal the guest would see would make
+    /// a host signal syscall to a guest thread ID that names no host task
+    /// (`crate::syscalls::host_signal_send_refusal`, KVM): the unignore's
+    /// re-queue of a parked timer expiry, and a host-timed parent-death
+    /// signal. The send is not made, and `sched_loop_inner` ends the run with
+    /// it (`exit_on_scheduler_refusal`) rather than lose the signal.
+    host_signal_send_refusal: Option<String>,
+
     /// When the SIGKILL fence started waiting for the current committed
     /// victims, in host time (`sigkill_retirement`).
     sigkill_fence_wait_since: Option<std::time::Instant>,
@@ -2028,6 +2060,10 @@ pub struct Scheduler {
     /// A SIGKILL fence that waited past `SIGKILL_FENCE_VALVE` for a death or
     /// a publication that never arrived: the run is refused.
     sigkill_fence_refusal: Option<sigkill_retirement::SigkillFenceRefusal>,
+
+    /// The scheduler's child-exit `SIGCHLD` decisions for controlled exits
+    /// (SIGSHARE S4), and the run's refusal if a publication disagreed.
+    controlled_child_exits: controlled_child_exit::ControlledChildExits,
 
     /// The bound on the SIGKILL fence and a sender's wait:
     /// `SIGKILL_FENCE_VALVE`, shortened only by tests that expire it.
@@ -2427,6 +2463,23 @@ pub struct Scheduler {
     /// Whether the last `send_guest_signal` landed: `Some(false)` when the
     /// target had already exited (ESRCH). Reset by a caller that needs it.
     guest_send_landed: Option<bool>,
+
+    /// Whether the last `send_guest_signal` was a `SIGCHLD` that reached no
+    /// `complete_signal`, so that no receiver walk ran for it: one that merged
+    /// into the one already pending in its process's shared queue
+    /// (`legacy_queue`; `note_group_send`'s decision, or a backend
+    /// publication's `Coalesced` effect), or a publication that sent nothing
+    /// or had its copy discarded before it was queued (`do_notify_parent`'s
+    /// explicit `SIG_IGN`, a disposition change; `child_exit_sink`). A
+    /// discard at generation by the thread the send names is
+    /// `commit_kernel_signal_walk`'s own check, not this flag.
+    /// Reset by every send.
+    guest_send_reached_no_walk: bool,
+
+    /// Unit tests: a captured send reaches no walk
+    /// (`guest_send_reached_no_walk`).
+    #[cfg(test)]
+    pub(crate) test_sends_reach_no_walk: bool,
 
     /// `ITIMER_REAL` expiries that popped while their process's exec barrier
     /// was up, with the thread and signal to send, decided when the barrier
@@ -4216,10 +4269,22 @@ async fn sched_loop_inner(
         if let Some(refusal) = kernel_run_refusal {
             exit_on_scheduler_refusal(&refusal);
         }
+        // A guest-visible host signal send refused where guest thread IDs name
+        // no host task (`host_signal_send_refusal`).
+        let host_send_refusal = sched.lock().unwrap().host_signal_send_refusal.take();
+        if let Some(refusal) = host_send_refusal {
+            exit_on_scheduler_refusal(&refusal);
+        }
         // A SIGKILL whose victims' deaths or exit publications never arrived
         // (`Scheduler::SIGKILL_FENCE_VALVE`).
         let sigkill_refusal = sched.lock().unwrap().sigkill_fence_refusal.take();
         if let Some(refusal) = sigkill_refusal {
+            exit_on_scheduler_refusal(&refusal);
+        }
+        // A controlled child exit whose publication disagreed with the
+        // scheduler's decision (`check_child_exit_publication`).
+        let sigchld_refusal = sched.lock().unwrap().take_sigchld_decision_refusal();
+        if let Some(refusal) = sigchld_refusal {
             exit_on_scheduler_refusal(&refusal);
         }
 
@@ -6106,8 +6171,10 @@ impl Scheduler {
             vfork_barrier_refusal: None,
             kernel_run_requests: Default::default(),
             kernel_run_signal_refusal: None,
+            host_signal_send_refusal: None,
             sigkill_fence_wait_since: None,
             sigkill_fence_refusal: None,
+            controlled_child_exits: Default::default(),
             sigkill_fence_valve: Self::SIGKILL_FENCE_VALVE,
             group_exit_decider: None,
             rejoin_writer: match &cfg.replay_data {
@@ -6205,6 +6272,9 @@ impl Scheduler {
             background_call_processes: Default::default(),
             alarm_unobservable: Default::default(),
             guest_send_landed: None,
+            guest_send_reached_no_walk: false,
+            #[cfg(test)]
+            test_sends_reach_no_walk: false,
             alarm_exec_deferred: Default::default(),
             #[cfg(test)]
             test_guest_sends_land: false,
@@ -6572,6 +6642,7 @@ impl Scheduler {
     #[cfg(test)]
     pub(crate) fn retire_test_exited_leader(&mut self, leader: DetTid, mm: MmId) -> bool {
         self.models_signal_targets = true;
+        self.backend.host_task_reads_reach_guest_threads = true;
         self.committed_exits.insert(leader);
         self.retire_exited_leader(leader, mm)
     }
@@ -7977,7 +8048,21 @@ impl Scheduler {
                         HostTimedSignalScope::Caller,
                         kernel_signal_bit(signal as libc::c_int),
                     );
-                    let _ = signal::kill(Pid::from_raw(child.as_raw()), signal);
+                    // The guest sees this signal, so a refused send ends the
+                    // run rather than lose it.
+                    match crate::syscalls::host_signal_send_refusal(
+                        "a host-timed parent-death signal",
+                        child.as_raw(),
+                        child.as_raw(),
+                        signal as libc::c_int,
+                    ) {
+                        Some(refusal) => {
+                            self.host_signal_send_refusal.get_or_insert(refusal);
+                        }
+                        None => {
+                            let _ = signal::kill(Pid::from_raw(child.as_raw()), signal);
+                        }
+                    }
                 }
             }
             match heir {
@@ -9340,10 +9425,15 @@ impl Scheduler {
     /// Whether `retire_exited_leader` retires `leader`: on a backend whose
     /// `/proc` view is the scheduler's, a thread-group leader, of this
     /// incarnation, whose `Exit` was granted, while another thread of its
-    /// group is registered.
+    /// group is registered. The scheduler then waits for the kernel to show
+    /// the leader a zombie (`step2a_wait_for_exited_leaders`), so the guest's
+    /// threads must be host tasks (`host_task_reads_reach_guest_threads`):
+    /// KVM models signal targets too, but its leader is no host task, and its
+    /// backend reports the leader's exit only when the last sibling leaves.
     fn leader_retires_at_exit(&self, leader: DetTid, mm: MmId) -> bool {
         let process = DetPid::from_raw(leader.as_raw());
         self.models_signal_targets
+            && self.backend.host_task_reads_reach_guest_threads
             && self.thread_tree.thread_group_leaders.contains(&process)
             && self.committed_exits.contains(&leader)
             && self.rpc_incarnation_matches(leader, mm)
@@ -10000,6 +10090,38 @@ impl Scheduler {
         if !covered {
             return ChildExitNotification::Undecided;
         }
+        // Where the backend reports the guest's signal state (SIGSHARE S4),
+        // the receiving thread's sets stand for the three /proc fields: its
+        // dispositions are its process's. They are read at this grant, where
+        // the exiting child holds the turn, so only a committed event of
+        // another turn has changed them, unless a delivery permit of the
+        // parent's process is outstanding: its holder's host thread may still
+        // be selecting from the queues (`backend_signal_waits`), so that
+        // state is Undecided.
+        if let Some(state) = self.backend_signal_state(receiving) {
+            let permit_held = self
+                .parked
+                .permits
+                .values()
+                .any(|permit| permit.task.process.tgid.as_raw() == parent.as_raw());
+            let Ok(state) = state else {
+                return ChildExitNotification::Undecided;
+            };
+            if permit_held {
+                return ChildExitNotification::Undecided;
+            }
+            let blocked = self
+                .saved_guest_sigmasks
+                .get(&receiving)
+                .copied()
+                .unwrap_or(state.blocked);
+            let bit = 1_u64 << (libc::SIGCHLD - 1);
+            return classify_sigchld_notification(
+                state.ignored & bit != 0,
+                state.caught & bit != 0,
+                blocked & bit != 0,
+            );
+        }
         let Some(ignored) = self.signal_mask_field(parent, None, "SigIgn") else {
             return ChildExitNotification::Undecided;
         };
@@ -10025,6 +10147,13 @@ impl Scheduler {
         tid: Option<DetTid>,
         field: &'static str,
     ) -> Option<u64> {
+        // Where Detcore reads signal state from the backend, the thread's own
+        // sets answer, or the leader's for a process-wide field, as
+        // `/proc/<pid>/status` shows the leader's (SIGSHARE S3a).
+        let thread = tid.unwrap_or_else(|| DetTid::from_raw(pid.as_raw()));
+        if let Some(read) = self.backend_signal_state(thread) {
+            return read.ok().and_then(|state| state.status_field(field));
+        }
         #[cfg(test)]
         {
             self.test_signal_masks.get(&(pid, tid, field)).copied()
@@ -10152,6 +10281,7 @@ impl Scheduler {
         self.blocked.replay_log_served.remove(dtid);
         let _ = self.blocked.rt_sigsuspend_blockers.remove(dtid);
         let _ = self.blocked.out_of_scheduler_masks.remove(dtid);
+        let _ = self.blocked.controlled_background_masks.remove(dtid);
         let _ = self.blocked.continuation_masks.remove(dtid);
         let _ = self.background_entry_barriers.remove(dtid);
         self.blocked.timed_out_futex_waiters.remove(dtid);
@@ -11207,8 +11337,7 @@ impl Scheduler {
                 }
                 Ok(state) => format!("its state is {state}"),
                 Err(errno) => {
-                    let pid = reverie::Pid::from_raw(leader.as_raw());
-                    if thread_is_gone(pid, pid) {
+                    if self.guest_thread_is_gone(*leader, leader.as_raw(), leader.as_raw()) {
                         settled.push(*leader);
                         continue;
                     }
@@ -11305,10 +11434,7 @@ impl Scheduler {
                 Ok(blocked) => format!("its mask is {blocked:#x}"),
                 Err(errno) => {
                     let process = self.sigchld_process(*thread);
-                    if thread_is_gone(
-                        reverie::Pid::from_raw(process.as_raw()),
-                        reverie::Pid::from_raw(thread.as_raw()),
-                    ) {
+                    if self.guest_thread_is_gone(*thread, process.as_raw(), thread.as_raw()) {
                         entered.push(*thread);
                         continue;
                     }
@@ -12720,15 +12846,25 @@ impl Scheduler {
         {
             self.host_signal_attempts += 1;
         }
-        let target = self
+        let choice = self
             .select_signal_target(dpid, Some(dtid))
-            .map(|preferred| self.timer_signal_target(dpid, preferred, sig));
+            .map(|preferred| self.timer_signal_choice(dpid, preferred, sig));
+        let target = choice.map(|(target, _)| target);
         // Decided before the send, whose wake may change pools and masks.
         let every_thread_blocks = self.models_signal_targets
             && target.is_some_and(|target| {
                 self.kernel_signal_target(dpid, target, sig as libc::c_int)
                     .is_none()
             });
+        if let Some((_, moved)) = choice {
+            self.commit_kernel_signal_walk(
+                dpid,
+                DetTid::from_raw(dpid.as_raw()),
+                sig as libc::c_int,
+                moved,
+                KernelSignalSource::Timer,
+            );
+        }
         // Linux classifies the send against the leader, whatever thread
         // takes it: `it_real_fn` sends to the leader's pid, and a
         // `SIGEV_SIGNAL` timer to the leader (`posixtimer_get_target`).
@@ -12971,10 +13107,18 @@ impl Scheduler {
     }
 
     /// The thread of `process` that a timer's process-directed `sig` is sent
-    /// to, given the thread `select_signal_target` drew (`preferred`): the
-    /// thread `kernel_signal_target` gives it (an `rt_sigsuspend` sleeper that
-    /// does not block it, else `preferred` if it does not, else the first
-    /// thread that does not), or `preferred` when every thread blocks it.
+    /// to, given the thread `select_signal_target` drew (`preferred`: the
+    /// thread that armed the timer, or under targeted chaos a random one): the
+    /// thread `kernel_signal_choice` gives it, naming the leader, as Linux
+    /// does (`it_real_fn` sends to `leader_pid`, and a `SIGEV_SIGNAL` timer
+    /// to the leader, `posixtimer_get_target`, no thread of the process
+    /// running between turns), or under targeted chaos the drawn thread (an
+    /// `rt_sigsuspend` sleeper that does not block it, else the named thread
+    /// if it wants it, else the first thread that does, walking from
+    /// `curr_target`), or `preferred` when no thread wants it. Before, the
+    /// drawn thread was named outside chaos too: a worker that armed the timer
+    /// and left its signal unblocked took it ahead of a leader that wanted it,
+    /// and ahead of a leader waiting for it in `rt_sigtimedwait`.
     ///
     /// The send names one thread, and the scheduler wakes that thread
     /// (`wake_signaled_guest`). Linux gives a process-directed signal only to
@@ -12995,20 +13139,38 @@ impl Scheduler {
     /// `kernel_sigchld_target`). Without signal-target modelling no mask is
     /// read, and `preferred` is kept.
     fn timer_signal_target(&self, process: DetPid, preferred: DetTid, sig: Signal) -> DetTid {
+        self.timer_signal_choice(process, preferred, sig).0
+    }
+
+    /// [`Self::timer_signal_target`], with the process's new `curr_target`
+    /// when Linux's walk chose the thread (`kernel_signal_choice`).
+    fn timer_signal_choice(
+        &self,
+        process: DetPid,
+        preferred: DetTid,
+        sig: Signal,
+    ) -> (DetTid, Option<DetTid>) {
         if !self.models_signal_targets {
-            return preferred;
+            return (preferred, None);
         }
-        match self.kernel_signal_target(process, preferred, sig as libc::c_int) {
-            Some(thread) => {
+        // A leader that exited takes nothing (`kernel_sent_wants`), and the
+        // walk decides.
+        let named = if self.chaos_target_races {
+            preferred
+        } else {
+            DetTid::from_raw(process.as_raw())
+        };
+        match self.kernel_signal_choice(process, named, sig as libc::c_int) {
+            (Some(thread), moved) => {
                 if thread != preferred {
                     info!(
                         "[dpid {}] sending {} to thread {} rather than the drawn thread {}.",
                         process, sig, thread, preferred
                     );
                 }
-                thread
+                (thread, moved)
             }
-            None => preferred,
+            (None, _) => (preferred, None),
         }
     }
 
@@ -14403,10 +14565,7 @@ impl Scheduler {
         let Some(thread) = self.process_signal_targets(process).into_iter().next() else {
             return answer;
         };
-        match crate::syscalls::read_kernel_signal_state(
-            reverie::Pid::from_raw(process.as_raw()),
-            reverie::Pid::from_raw(thread.as_raw()),
-        ) {
+        match self.guest_signal_state(thread, process.as_raw(), thread.as_raw()) {
             Ok(state) => GuestPidAnswer::Task {
                 task,
                 own_init_caught: Some(state.caught),
@@ -14592,9 +14751,18 @@ impl Scheduler {
             "[dtid {}] deliver signal {} physically to guest thread.",
             dettid, signal
         );
+        self.guest_send_reached_no_walk = false;
         #[cfg(test)]
         if self.test_guest_sends_land {
             self.guest_send_landed = Some(true);
+            return;
+        }
+        // Where the backend owns signal delivery, a guest thread is no host
+        // task: the only send that reaches here is a controlled child exit's
+        // `SIGCHLD`, which the backend's publication already made
+        // (`child_exit_sink`). Anything else is refused there by name.
+        if self.signal_control_installed() {
+            self.child_exit_sink(dettid, signal, named);
             return;
         }
         // A thread's pidfd sends thread-directed either way.
@@ -14642,6 +14810,7 @@ impl Scheduler {
                 matches!(queue, discarded_at_send::QueueId::Thread(_)),
             );
             self.guest_send_landed = Some(true);
+            self.guest_send_reached_no_walk = self.test_sends_reach_no_walk;
             if self.send_wakes(dettid) {
                 self.test_send_wakes.push(dettid);
             }
@@ -14850,6 +15019,7 @@ impl Scheduler {
                         "[dtid {}] SIGCHLD coalesced into the one pending in its process's shared queue; waking no thread.",
                         dettid
                     );
+                    self.guest_send_reached_no_walk = true;
                     return false;
                 }
             }
@@ -15682,10 +15852,7 @@ impl Scheduler {
                 ));
             }
             return Some(
-                match read_kernel_signal_state(
-                    reverie::Pid::from_raw(watch.pid),
-                    reverie::Pid::from_raw(watch.tid),
-                ) {
+                match self.guest_signal_state(dettid, watch.pid, watch.tid) {
                     Ok(state) => crate::wait_signal_end::deliverable(
                         &state,
                         mask,
@@ -15704,10 +15871,7 @@ impl Scheduler {
                 state.interrupting_wait(!watch.unblocked, watch.defers_default_stops) & !held,
             );
         }
-        match read_kernel_signal_state(
-            reverie::Pid::from_raw(watch.pid),
-            reverie::Pid::from_raw(watch.tid),
-        ) {
+        match self.guest_signal_state(dettid, watch.pid, watch.tid) {
             Ok(state) => {
                 Some(state.interrupting_wait(!watch.unblocked, watch.defers_default_stops) & !held)
             }
@@ -16031,11 +16195,14 @@ impl Scheduler {
     /// runnable set are not preferred: a `ppoll` or `pselect6` that returned
     /// restored the thread's own mask, which may block the signal, and a vfork
     /// parent's killable sleep is not woken. Only when there is no such
-    /// `rt_sigsuspend` does the order below decide, over every thread that
-    /// does not block the signal; when all of them are stopped, the kernel
-    /// leaves the signal pending for whichever resumes first. The order is
-    /// `preferred`, then the rest in thread-ID order, which stands in for the
-    /// kernel's round-robin `curr_target`. Before, a stopped `preferred` was
+    /// `rt_sigsuspend` does `complete_signal` decide (`kernel_signal_choice`):
+    /// `preferred` if it `wants_signal`, otherwise the first thread that does,
+    /// walking the thread list from the process's `curr_target`, which then
+    /// becomes that thread once the send reaches the kernel's
+    /// `complete_signal` (`commit_kernel_signal_walk`). A thread waiting for
+    /// the signal in `rt_sigtimedwait` wants it whatever its own mask says:
+    /// Linux unblocks the waited set for the wait (`do_sigtimedwait`). Before,
+    /// a stopped `preferred` was
     /// named ahead of a `sigsuspend` sibling the kernel woke: the sibling was
     /// not armed, so whether it took the signal before `preferred` resumed
     /// from a sleep that virtual time ended depended on host timing
@@ -16075,31 +16242,132 @@ impl Scheduler {
         self.kernel_signal_target(process, preferred, libc::SIGCHLD)
     }
 
-    /// `kernel_sigchld_target` for any process-directed signal `signo`: an
-    /// `rt_sigsuspend` sleeper that does not block it first, then `preferred`
-    /// if it does not, then the first other thread that does not; `None` when
-    /// every thread blocks it. A timer's signal is chosen with it too
-    /// (`timer_signal_target`).
+    /// `kernel_sigchld_target` for any process-directed signal `signo`
+    /// (`kernel_signal_choice`); `None` when no thread wants it. A timer's
+    /// signal is chosen with it too (`timer_signal_target`).
     fn kernel_signal_target(
         &self,
         process: DetPid,
         preferred: DetTid,
         signo: libc::c_int,
     ) -> Option<DetTid> {
+        self.kernel_signal_choice(process, preferred, signo).0
+    }
+
+    /// The thread of `process` that takes a process-directed `signo` the
+    /// kernel itself generates between turns (a child's exit `SIGCHLD`, a
+    /// timer's expiry), naming `named`, and, when Linux's walk chose it, the
+    /// process's new `curr_target`.
+    ///
+    /// An `rt_sigsuspend` sleeper outside the schedule that does not block it
+    /// comes first: under ptrace the kernel wakes it itself, as every thread
+    /// the scheduler holds is stopped (`kernel_sigchld_target`). Otherwise
+    /// Linux's `complete_signal` (kernel/signal.c:963-997 at v6.17), the rule
+    /// a guest's own process-directed send and a KVM timer's copy follow
+    /// (`process_signal_receiver::complete_signal`): `named` if it
+    /// `wants_signal`, else the first thread that does, walking the thread
+    /// list from `curr_target`. A thread wants it (`kernel_sent_wants`) under
+    /// the mask Linux's `blocked` holds now (`thread_signal_mask_for`) less a
+    /// set it waits for in `rt_sigtimedwait` (`sigtimedwait_sets`), which
+    /// Linux unblocks for the wait (`do_sigtimedwait`, kernel/signal.c:3777),
+    /// when it is not exiting and has no other unblocked signal pending for it
+    /// alone (`task_sigpending`). Before, the order was `named`, then thread-ID
+    /// order, over masks without the waited set, so a second eligible thread
+    /// was chosen over the one `curr_target` reaches first, and a sibling over
+    /// a creator waiting for the signal in `rt_sigtimedwait` (revastra2's
+    /// review of SIGSHARE S3b, F1 and F2).
+    ///
+    /// Every input is the schedule's; call it only where no guest thread
+    /// holds the turn (`kernel_sigchld_target`).
+    fn kernel_signal_choice(
+        &self,
+        process: DetPid,
+        named: DetTid,
+        signo: libc::c_int,
+    ) -> (Option<DetTid>, Option<DetTid>) {
+        use process_signal_receiver::ProcessSignalReceiver;
         let bit = kernel_signal_bit(signo);
-        let mut threads = self.process_signal_targets(process);
-        // Stable, so the rest stay in thread-ID order.
-        threads.sort_by_key(|thread| *thread != preferred);
-        let unblocked = |thread: &DetTid| {
-            self.thread_signal_mask_for(*thread, signo)
-                .is_some_and(|mask| mask & bit == 0)
+        let threads = self.process_signal_targets(process);
+        let mask = |thread: DetTid| {
+            self.thread_signal_mask_for(thread, signo)
+                .map(|mask| mask & !self.sigtimedwait_sets.get(&thread).copied().unwrap_or(0))
         };
-        threads
+        if let Some(sleeper) = threads.iter().copied().find(|thread| {
+            self.blocked.rt_sigsuspend_blockers.contains_key(thread)
+                && mask(*thread).is_some_and(|mask| mask & bit == 0)
+        }) {
+            return (Some(sleeper), None);
+        }
+        let wants: Vec<_> = threads
             .iter()
-            .copied()
-            .filter(|thread| self.blocked.rt_sigsuspend_blockers.contains_key(thread))
-            .find(unblocked)
-            .or_else(|| threads.iter().copied().find(unblocked))
+            .map(|thread| (*thread, self.kernel_sent_wants(*thread, mask(*thread), bit)))
+            .collect();
+        let curr_target = self.signal_curr_target(process);
+        match process_signal_receiver::complete_signal(&wants, named, curr_target) {
+            (ProcessSignalReceiver::Thread { thread, .. }, moved) => (Some(thread), moved),
+            // No thread wants it now, but one that leaves it unblocked has
+            // other signals pending: Linux leaves the copy in the shared
+            // queue, and such a thread takes it once it is done with those.
+            // The send still names a thread to wake, the first such one in
+            // the walk's order, and `curr_target` stays.
+            _ => {
+                let start = wants
+                    .iter()
+                    .position(|(thread, _)| *thread >= curr_target)
+                    .unwrap_or(0);
+                let busy = wants[start..]
+                    .iter()
+                    .chain(&wants[..start])
+                    .find(|(_, wants)| *wants == process_signal_receiver::Wants::Busy)
+                    .map(|(thread, _)| *thread);
+                (busy, None)
+            }
+        }
+    }
+
+    /// The scheduler sends `process` the process-directed `signo` the kernel
+    /// generated, naming `named`, after choosing its receiver with
+    /// `kernel_signal_choice`, whose walk chose `moved`: that thread becomes
+    /// the process's `curr_target`, as Linux's `complete_signal` moves it,
+    /// unless the send reaches no `complete_signal`: a standard signal the
+    /// shared queue already holds (`legacy_queue`), or one Linux discards as
+    /// it is sent (`prepare_signal`). `source` says how the queue is read; a
+    /// child's exit commits only after its send, which alone knows whether it
+    /// merged into a pending copy (`fire_child_exit_alarm`).
+    fn commit_kernel_signal_walk(
+        &mut self,
+        process: DetPid,
+        named: DetTid,
+        signo: libc::c_int,
+        moved: Option<DetTid>,
+        source: KernelSignalSource,
+    ) {
+        let Some(moved) = moved else {
+            return;
+        };
+        let bit = kernel_signal_bit(signo);
+        let already_queued = match source {
+            KernelSignalSource::Timer => self
+                .read_shared_pending(moved)
+                .is_some_and(|pending| pending & bit != 0),
+            // The kernel posted its own copy of this exit to the shared queue
+            // when the child exited, at a moment host timing sets, so the
+            // queue holds the bit whether or not an earlier copy is still
+            // there; the copies the scheduler left there are recorded
+            // (`shared_queue_scheduler_signals`). Reading the queue kept
+            // `curr_target` from ever moving for a child's exit.
+            KernelSignalSource::ChildExit => self
+                .shared_queue_scheduler_signals
+                .get(&process)
+                .is_some_and(|signals| signals & bit != 0),
+        };
+        if bit & discarded_at_send::STANDARD_SIGNALS != 0 && already_queued {
+            return;
+        }
+        if self.discarded_when_sent_to(named, signo, None) {
+            return;
+        }
+        self.signal_curr_targets.insert(process, moved);
     }
 
     /// Send a `ChildExit` timer's `SIGCHLD` to `parent` (`info`: the siginfo
@@ -16156,9 +16424,6 @@ impl Scheduler {
                 )
                 .then_some(target)?;
         }
-        let every_thread_blocks = self.kernel_sigchld_target(parent, creator).is_none();
-        let target = self.child_exit_sigchld_target(parent, creator);
-        let target = self.live_signal_target(parent, Some(target));
         // Linux names the parent task (`do_notify_parent`): the creator, or,
         // once it exited, the first live thread of its process, which took
         // over its children (`forget_original_parent`, `find_alive_thread`).
@@ -16170,6 +16435,10 @@ impl Scheduler {
                 .next()
                 .unwrap_or(creator)
         };
+        let every_thread_blocks = self.kernel_sigchld_target(parent, named).is_none();
+        let (target, moved) = self.child_exit_sigchld_choice(parent, named);
+        let target = self.live_signal_target(parent, Some(target));
+        self.guest_send_landed = None;
         let sent = self.fire_alarm_at(
             parent,
             target,
@@ -16178,6 +16447,33 @@ impl Scheduler {
             named,
             discarded_at_send::SendFate::Classify(None),
         );
+        // The walk moves `curr_target` only for a copy that reached
+        // `complete_signal`, and only the send knows whether it did. A copy
+        // that merged into a `SIGCHLD` already pending in the shared queue did
+        // not (`legacy_queue` returns first): ptrace's `note_group_send`, or
+        // the `Coalesced` effect of KVM's publication. The pending copy may be
+        // one whose receiver has not taken it yet, such as a vfork parent's,
+        // which no ledger of copies every thread blocked records (the
+        // revastra2 review of SIGSHARE S3b's fix round, delta F1). Nor did a
+        // notification KVM's publication sent nothing for or discarded before
+        // queueing it (`child_exit_sink`): Linux's `do_notify_parent` sends
+        // nothing for an explicitly ignored SIGCHLD whatever the masks, so the
+        // generic discard rule (`discarded_when_sent_to`), which a blocked
+        // creator defeats, cannot tell (revastra2's round-2 review, F1). That
+        // rule still decides a discard at generation, by the named thread, in
+        // `commit_kernel_signal_walk`: a copy a blocked creator leaves queued
+        // moves `curr_target` even when its receiver discards it at dequeue
+        // (the round-3 reviews, P1). No guest thread runs between the choice
+        // and the send, so the walk is the same as before it.
+        if sent && self.guest_send_landed != Some(false) && !self.guest_send_reached_no_walk {
+            self.commit_kernel_signal_walk(
+                parent,
+                named,
+                libc::SIGCHLD,
+                moved,
+                KernelSignalSource::ChildExit,
+            );
+        }
         if sent && every_thread_blocks {
             self.note_signal_left_in_shared_queue(parent, libc::SIGCHLD);
         }
@@ -16188,10 +16484,24 @@ impl Scheduler {
     /// where the scheduler models signal targets (`fire_child_exit_alarm`):
     /// the kernel's choice (`kernel_sigchld_target`), trying first `creator`,
     /// or under targeted chaos a random live thread of the process.
+    #[cfg(test)]
     fn child_exit_sigchld_target(&mut self, parent: DetPid, creator: DetTid) -> DetTid {
+        self.child_exit_sigchld_choice(parent, creator).0
+    }
+
+    /// [`Self::child_exit_sigchld_target`], with the process's new
+    /// `curr_target` when Linux's walk chose the thread
+    /// (`kernel_signal_choice`). One chaos draw per call.
+    fn child_exit_sigchld_choice(
+        &mut self,
+        parent: DetPid,
+        creator: DetTid,
+    ) -> (DetTid, Option<DetTid>) {
         let preferred = self.chaos_signal_target(parent).unwrap_or(creator);
-        self.kernel_sigchld_target(parent, preferred)
-            .unwrap_or(preferred)
+        match self.kernel_signal_choice(parent, preferred, libc::SIGCHLD) {
+            (Some(thread), moved) => (thread, moved),
+            (None, _) => (preferred, None),
+        }
     }
 
     /// `thread`'s signal mask: the one its parked futex wait reported, which only
@@ -16263,6 +16573,7 @@ impl Scheduler {
     /// so readers take the kernel's `SigBlk`, which is then the guest's own.
     fn keep_mask_for_continuation(&mut self, dtid: DetTid) {
         let _ = self.blocked.out_of_scheduler_masks.remove(&dtid);
+        let _ = self.blocked.controlled_background_masks.remove(&dtid);
         let filed = self
             .next_turns
             .get(&dtid)
@@ -16323,8 +16634,9 @@ impl Scheduler {
     /// The signals pending in the shared queue of `thread`'s process
     /// (`ShdPnd`), or `None` when it cannot be read.
     fn read_shared_pending(&self, thread: DetTid) -> Option<u64> {
-        // Unit tests script the queue; they never read a host task's.
-        if cfg!(test) {
+        // Unit tests script the queue; they never read a host task's. A
+        // backend's answer (`guest_signal_state`) is no host task's either.
+        if cfg!(test) && !crate::syscalls::reads_signal_state_from_backend(&self.backend) {
             #[cfg(test)]
             return self
                 .test_kernel_signal_states
@@ -16332,12 +16644,9 @@ impl Scheduler {
                 .map(|state| state.shared_pending);
         }
         let process = self.sigchld_process(thread);
-        read_kernel_signal_state(
-            reverie::Pid::from_raw(process.as_raw()),
-            reverie::Pid::from_raw(thread.as_raw()),
-        )
-        .ok()
-        .map(|state| state.shared_pending)
+        self.guest_signal_state(thread, process.as_raw(), thread.as_raw())
+            .ok()
+            .map(|state| state.shared_pending)
     }
 
     /// `read_thread_blocked_mask`, keeping the error, which says nothing about
@@ -16364,11 +16673,8 @@ impl Scheduler {
             return Ok(state.blocked);
         }
         let process = self.sigchld_process(thread);
-        read_kernel_signal_state(
-            reverie::Pid::from_raw(process.as_raw()),
-            reverie::Pid::from_raw(thread.as_raw()),
-        )
-        .map(|state| state.blocked)
+        self.guest_signal_state(thread, process.as_raw(), thread.as_raw())
+            .map(|state| state.blocked)
     }
 
     /// Record an unambiguous cross-task signal that was physically queued while
@@ -16451,7 +16757,7 @@ impl Scheduler {
                 Some(watch) => (watch.pid, watch.tid),
                 None => (self.sigchld_process(dettid).as_raw(), dettid.as_raw()),
             };
-            read_kernel_signal_state(reverie::Pid::from_raw(pid), reverie::Pid::from_raw(tid)).ok()
+            self.guest_signal_state(dettid, pid, tid).ok()
         });
         let Some(state) = state else {
             return false;
@@ -18520,10 +18826,52 @@ impl Scheduler {
             // the shared queue for the first thread that resumes and does not
             // block it (`process_signal_takers`).
             let process_taker = self.first_process_signal_taker();
-            let next_dtid = match self
-                .queued_group_exit_decider()
+            // So does the thread Linux's `complete_signal` chooses for a
+            // SIGALRM pending in its process's shared queue, where a process
+            // signal control is installed (`alarm_takers`,
+            // https://github.com/rrnewton/hermit/issues/4929), with three
+            // bounds. Linux wakes the receiver; it does not run it ahead of
+            // every other runnable thread, nor between another thread's
+            // `rt_sigreturn` and the delivery that return makes. So it never
+            // makes two grants without a choice of the run queue's own
+            // between, for the same process or another
+            // (`alarm_priority_available`): two processes whose recurring
+            // timers fall due again within each other's grants otherwise
+            // alternated their takers for ever, and a process whose POSIX
+            // timer rearms whether or not its copy was taken kept its own
+            // taker first, while a runnable thread never ran (the Codex
+            // reviews of 4929 slice 2, P1). It never serves a delivery that
+            // does not continue its thread's own `rt_sigreturn`, which waits
+            // behind the other runnable threads by design, nor a
+            // `sched_yield` (`takes_alarm_priority`). And it waits while a
+            // delivery continues its thread's own `rt_sigreturn`
+            // (`first_sigreturn_continuation`): run between the two, another
+            // process's grant advanced time far enough that the returning
+            // thread's own timer fell due again before every return, and
+            // neither process ran its own code again
+            // (https://github.com/rrnewton/hermit/issues/4505's livelock,
+            // across processes).
+            // Asked only while a taker exists: a run with no process signal
+            // control (ptrace) never has one, and selects as before.
+            let alarm_taker = if self.parked.alarm_takers.is_empty()
+                || self.first_sigreturn_continuation().is_some()
+            {
+                None
+            } else {
+                self.first_alarm_taker_entry()
+            };
+            let decider = self.queued_group_exit_decider();
+            let by_alarm = decider.is_none() && taker.is_none() && process_taker.is_none();
+            let alarm_taker = alarm_taker.map(|(pid, thread)| {
+                if by_alarm {
+                    self.parked.alarm_priority_served = Some(pid);
+                }
+                thread
+            });
+            let next_dtid = match decider
                 .or(taker)
                 .or(process_taker)
+                .or(alarm_taker)
                 .or(gated_child)
             {
                 Some(child) => self
@@ -18544,10 +18892,15 @@ impl Scheduler {
                         .run_queue
                         .tentative_pop_tid(thread)
                         .expect("selected thread disappeared from run queue"),
-                    None => self.run_queue.tentative_pop_next().expect("impossible"),
+                    None => {
+                        self.parked.alarm_priority_served = None;
+                        self.run_queue.tentative_pop_next().expect("impossible")
+                    }
                 },
             };
             self.replay_prehook_callers.remove(&next_dtid);
+            // A woken poller's substituted delivery is served once.
+            self.parked.alarm_woken.remove(&next_dtid);
             let nextturn = self.next_turns.get(&next_dtid).unwrap_or_else(|| {
                 panic!(
                 "[sched-step3] internal error: dettid {} queued but missing entry in next_turns",
@@ -18695,7 +19048,9 @@ impl Scheduler {
             // The thread is polling and hasn't been "remade" as runnable yet.
             info!(
                 "[scheduler] >>>>>>>\n\n NONCOMMIT turn {}, SKIP dettid {} polling resource {:?}",
-                self.turn, dettid, rs
+                self.turn,
+                dettid,
+                self.logged_polling_request(rs)
             );
             // Requeue the thread as a poller
             let popped = self.run_queue.commit_tentative_pop();
@@ -18966,6 +19321,26 @@ impl Scheduler {
                     .models_signal_targets
                     .then(|| self.read_thread_blocked_mask(dettid))
                     .flatten();
+                // Where a process signal control is installed, a call's temporary
+                // mask, read from its request while the thread is still
+                // stopped at it (`controlled_background_masks`).
+                let controlled_background_mask = self
+                    .signal_control_installed()
+                    .then(|| {
+                        let unknown = self
+                            .next_turns
+                            .get(&dettid)
+                            .and_then(|turn| turn.req.try_read())
+                            .is_some_and(|request| {
+                                request.is_ok_and(|request| request.blocked_signal_mask_unknown)
+                            });
+                        if unknown {
+                            Some(None)
+                        } else {
+                            blocked_signal_mask.map(Some)
+                        }
+                    })
+                    .flatten();
                 let sleeping_mask = if self.models_signal_targets {
                     Some(blocked_signal_mask.or(own_mask))
                 } else if self.in_guest_signal_delivery {
@@ -19007,6 +19382,11 @@ impl Scheduler {
                 assert!(old.is_none(), "thread started a second external operation");
                 self.background_call_processes
                     .insert(self.sigchld_process(dettid));
+                if let Some(mask) = controlled_background_mask {
+                    self.blocked
+                        .controlled_background_masks
+                        .insert(dettid, mask);
+                }
                 if let Some(mask) = sleeping_mask {
                     self.blocked.out_of_scheduler_masks.insert(dettid, mask);
                     let descriptors = !matches!(rid, ResourceID::BlockingRtSigsuspend(_));
@@ -19182,7 +19562,17 @@ impl Scheduler {
                 // own copy, at a host-timed moment, and the empty run queue was
                 // usually reported as a deadlock first
                 // (https://github.com/rrnewton/hermit/issues/3895).
-                if reserve_mode == signal_control::ExitReserveMode::Uncontrolled
+                // A controlled exit's notification is the backend's publication.
+                // Where the scheduler decides it (SIGSHARE S4: a parent with one
+                // live thread, `decides_controlled_child_exit`), it is decided
+                // here as an uncontrolled one is, and its `ChildExit` timer pops
+                // after the publication, whose effect stands for the send
+                // (`child_exit_sink`).
+                let controlled_parent = self.thread_tree.parent_process(process).filter(|parent| {
+                    self.decides_controlled_child_exit(reserve_mode, *process, *parent)
+                });
+                if (reserve_mode == signal_control::ExitReserveMode::Uncontrolled
+                    || controlled_parent.is_some())
                     && ends_process
                     && let Some(parent) = self.thread_tree.parent_process(process)
                     && self.should_synthesize_child_exit_signal(parent)
@@ -19213,11 +19603,18 @@ impl Scheduler {
                         );
                     let notification = if non_sigchld_exit_signal {
                         None
-                    } else if self.child_exit_publication().is_ok() && ends_named_process {
+                    } else if (self.child_exit_publication().is_ok() || controlled_parent.is_some())
+                        && ends_named_process
+                    {
                         Some(self.classify_child_exit_notification(*process, parent))
                     } else {
                         Some(ChildExitNotification::Undecided)
                     };
+                    if controlled_parent.is_some()
+                        && let Some(decision) = notification
+                    {
+                        self.record_controlled_child_exit(*process, decision);
+                    }
                     match notification {
                         None => {}
                         // Linux generates nothing (explicit SIG_IGN) or discards
@@ -19228,6 +19625,10 @@ impl Scheduler {
                         // kernel's own notification, which this hold places at
                         // the first scheduling pass after the backend reports its
                         // publication.
+                        // A controlled exit's publication is the backend's own,
+                        // inside the reservation's barrier: no hold.
+                        Some(ChildExitNotification::None | ChildExitNotification::Discard)
+                            if controlled_parent.is_some() => {}
                         Some(ChildExitNotification::None | ChildExitNotification::Discard) => {
                             // A publication already reported (the process was
                             // consumed before this grant) needs no hold: the
@@ -19350,8 +19751,11 @@ impl Scheduler {
                 // or a delivery the scheduler already placed; grant it now rather
                 // than deferring it (a second time). Where the scheduler models
                 // signal targets, a delivery of a copy it sent is marked for the
-                // very thread that took it (`dequeue_sigchld`).
-                let already_readmitted = self.blocked.sigchld_ready.remove(&dettid);
+                // very thread that took it (`dequeue_sigchld`). Under the
+                // backend's signal control every delivery is placed
+                // (`sigchld_delivery_placed_by_control`).
+                let already_readmitted = self.blocked.sigchld_ready.remove(&dettid)
+                    || self.sigchld_delivery_placed_by_control();
                 // Whether this delivery's copy was raised at a point the
                 // schedule fixes (`sigchld_fenced`): taken by a SIGCHLD
                 // delivery filed after the mark. One filed before it leaves
@@ -19387,6 +19791,24 @@ impl Scheduler {
                 }
             }
         }
+    }
+
+    /// Whether a `SIGCHLD` delivery is placed by the backend's signal control,
+    /// so that it is never deferred behind runnable work (`sigchld_deferred`):
+    /// where the scheduler models signal targets and the control is installed
+    /// (KVM). There a thread takes a signal only with the delivery permit the
+    /// scheduler reserved for it, at a boundary of the thread holding the
+    /// serial grant (`authorize_signal_boundary`), so the delivery's turn is
+    /// fixed by the schedule; no SIGCHLD arrives at a host-timed moment, which
+    /// is what the deferral exists for. On ptrace the thread that takes the
+    /// scheduler's copy is marked when the kernel's dequeue is reported
+    /// (`dequeue_sigchld`, `reports_kernel_child_exit_signals`); KVM reports no
+    /// dequeue, and before KVM modelled signal targets the `ChildExit` timer
+    /// marked the process instead. Without this, a delivery the scheduler had
+    /// placed waited behind a polling sibling and ran later than on ptrace
+    /// (SIGSHARE S3b, fix 5).
+    fn sigchld_delivery_placed_by_control(&self) -> bool {
+        self.models_signal_targets && self.signal_control_installed()
     }
 
     /// Whether a host-async `SIGCHLD` delivery to `dettid` is deferred behind
@@ -20268,11 +20690,7 @@ impl Scheduler {
             self.test_kernel_signal_states.get(&tid).copied()
         };
         #[cfg(not(test))]
-        let state = read_kernel_signal_state(
-            reverie::Pid::from_raw(pid),
-            reverie::Pid::from_raw(host_tid),
-        )
-        .ok();
+        let state = self.guest_signal_state(tid, pid, host_tid).ok();
         let Some(state) = state else {
             return true;
         };
@@ -23732,6 +24150,7 @@ mod test {
     use crate::DetTime;
     use crate::resources::NANOSLEEP_FYI;
     use crate::resources::PAUSE_FYI;
+    use crate::syscalls::thread_is_gone;
     use crate::tool_local::RobustListExit;
     use crate::tool_local::RobustListWake;
     use crate::tool_local::ThreadState;
@@ -43510,11 +43929,100 @@ mod test {
         assert!(scheduler.is_parked_futex_waiter(creator));
     }
 
+    /// A timer's process-directed signal goes to the leader, which Linux
+    /// names, when the scheduler has woken it for a signal of its own and
+    /// queued it to resume: Linux woke it when that signal was sent, and it has
+    /// taken the signal before the expiry, so it is busy only for a signal it
+    /// was not woken for. With the same pending set and an ordinary queued
+    /// request, or woken for SIGUSR1 with SIGUSR2 pending too, or holding a
+    /// delivery stop's own read-write request, it is busy and the copy goes to
+    /// the worker (the coord7 review of
+    /// https://github.com/rrnewton/hermit/pull/5221, finding 2: ptrace
+    /// `busypause` gave a worker the copy where Linux gives the leader every
+    /// one).
+    #[test]
+    fn a_timer_signal_goes_to_a_leader_woken_for_its_own_signal() {
+        let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        let usr2 = kernel_signal_bit(libc::SIGUSR2);
+        let sig = |signal: libc::c_int| crate::types::SigWrapper(signal);
+        let cases = [
+            (
+                "woken by the drain for SIGUSR1",
+                Some((
+                    ResourceID::WaitidSignals(vec![sig(libc::SIGUSR1)]),
+                    Permission::W,
+                )),
+                usr1,
+                true,
+            ),
+            (
+                "woken by a scheduler send of SIGUSR1",
+                Some((ResourceID::InboundSignal(sig(libc::SIGUSR1)), Permission::W)),
+                usr1,
+                true,
+            ),
+            (
+                "woken for SIGUSR1 and SIGUSR2",
+                Some((
+                    ResourceID::WaitidSignals(vec![sig(libc::SIGUSR1), sig(libc::SIGUSR2)]),
+                    Permission::W,
+                )),
+                usr1 | usr2,
+                true,
+            ),
+            ("an ordinary queued request", None, usr1, false),
+            (
+                "woken for SIGUSR1 with SIGUSR2 pending too",
+                Some((
+                    ResourceID::WaitidSignals(vec![sig(libc::SIGUSR1)]),
+                    Permission::W,
+                )),
+                usr1 | usr2,
+                false,
+            ),
+            (
+                "a delivery stop's own request",
+                Some((
+                    ResourceID::InboundSignal(sig(libc::SIGUSR1)),
+                    Permission::RW,
+                )),
+                usr1,
+                false,
+            ),
+        ];
+        for (case, resource, pending, leader_takes) in cases {
+            let (mut scheduler, leader, worker, _child) = sigchld_family(libc::SIGCHLD);
+            assert!(scheduler.models_signal_targets);
+            scheduler.test_kernel_signal_states.insert(
+                leader,
+                KernelSignalState {
+                    pending,
+                    thread_pending: pending,
+                    ..Default::default()
+                },
+            );
+            scheduler
+                .test_kernel_signal_states
+                .insert(worker, KernelSignalState::default());
+            let mut request = Resources::new(leader);
+            if let Some((resource, permission)) = resource {
+                request.insert(resource, permission);
+            }
+            scheduler.next_turns.get_mut(&leader).unwrap().req = Ivar::full(Ok(request));
+            scheduler.runqueue_push_front(leader);
+            assert_eq!(
+                scheduler.timer_signal_target(leader, worker, Signal::SIGALRM),
+                if leader_takes { leader } else { worker },
+                "{case}"
+            );
+        }
+    }
+
     /// A timer's process-directed signal is sent to a thread that does not
     /// block it, since Linux gives it to no other, and the scheduler wakes the
-    /// thread it names. The thread `select_signal_target` drew keeps it if it
-    /// does not block it; when every thread blocks it, the drawn thread is
-    /// kept, and `kill` leaves it in the shared queue. Before, a SIGALRM drawn
+    /// thread it names. The leader, which Linux names, keeps it if it does not
+    /// block it; when every thread blocks it, the thread `select_signal_target`
+    /// drew is kept, and `kill` leaves it in the shared queue. Before, a SIGALRM drawn
     /// under `--chaos-target-races` for a worker that blocks it woke that
     /// worker, and the thread in `pause` slept forever
     /// (https://github.com/rrnewton/hermit/issues/4320).
@@ -43544,8 +44052,9 @@ mod test {
         scheduler.test_kernel_signal_states.insert(worker, state(0));
         assert_eq!(
             scheduler.timer_signal_target(leader, worker, Signal::SIGALRM),
-            worker,
-            "a drawn thread that does not block it keeps it"
+            leader,
+            "a drawn thread that does not block it does not take it from the \
+             leader, which Linux names (`a_timer_signal_names_the_leader_not_the_drawn_thread`)"
         );
 
         scheduler
@@ -51540,7 +52049,9 @@ mod test {
     #[test]
     fn an_exited_leader_with_a_live_sibling_leaves_the_scheduler_at_its_exit() {
         let mut scheduler = Scheduler::new(&Config::default());
+        // ptrace's facts: signal targets modelled, guest threads host tasks.
         scheduler.models_signal_targets = true;
+        scheduler.backend.host_task_reads_reach_guest_threads = true;
         let leader = DetTid::from_raw(3);
         let worker = DetTid::from_raw(5);
         let process = DetPid::from_raw(3);
@@ -51563,6 +52074,11 @@ mod test {
         scheduler.models_signal_targets = false;
         assert!(!scheduler.retire_exited_leader(leader, mm));
         scheduler.models_signal_targets = true;
+        // Nor where it does but guest threads are no host tasks (KVM since
+        // SIGSHARE S3b): no kernel would show the leader a zombie.
+        scheduler.backend.host_task_reads_reach_guest_threads = false;
+        assert!(!scheduler.retire_exited_leader(leader, mm));
+        scheduler.backend.host_task_reads_reach_guest_threads = true;
         // Not from another incarnation of the leader's tid.
         let other_image = mm.for_exec(leader);
         scheduler.exec_incarnations.insert(leader, other_image);
@@ -51673,6 +52189,7 @@ mod test {
     fn an_exec_after_the_leader_was_retired_at_exit_admits_the_new_leader() {
         let mut sched = Scheduler::new(&Config::default());
         sched.models_signal_targets = true;
+        sched.backend.host_task_reads_reach_guest_threads = true;
         let leader = DetTid::from_raw(17);
         let caller = DetTid::from_raw(18);
         let (detpid, pre_exec_mm, _) = install_runnable_exec_group(&mut sched, leader, caller);
@@ -51716,6 +52233,7 @@ mod test {
     fn a_retired_leaders_late_deregistration_does_not_end_its_process_again() {
         let mut scheduler = Scheduler::new(&Config::default());
         scheduler.models_signal_targets = true;
+        scheduler.backend.host_task_reads_reach_guest_threads = true;
         let parent = DetTid::from_raw(2);
         let leader = DetTid::from_raw(3);
         let worker = DetTid::from_raw(5);

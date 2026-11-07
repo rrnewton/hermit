@@ -84,8 +84,6 @@ use crate::syscalls::signal::STACK_RED_ZONE;
 use crate::syscalls::signal::kernel_installed_signal_mask;
 use crate::syscalls::signal::read_kernel_sigset;
 use crate::syscalls::threads::KernelSigset;
-use crate::syscalls::threads::read_thread_signal_state;
-use crate::syscalls::threads::read_thread_wait_signal_state;
 use crate::tool_global::*;
 use crate::tool_local::Detcore;
 use crate::types::DetTid;
@@ -553,7 +551,7 @@ async fn end_replayed_pselect6_under_its_temporary_mask<G, T>(
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    let Ok(state) = read_thread_signal_state(guest.pid(), guest.tid()) else {
+    let Ok(state) = crate::syscalls::read_guest_thread_signal_state(guest) else {
         return;
     };
     if state.pending
@@ -1155,6 +1153,49 @@ fn canonicalize_socket_timestamps(control: &mut [u8], now: LogicalTime) -> usize
     messages.len()
 }
 
+/// [`Detcore::keep_deadline_for_rerun`]'s rule: a `poll` with an end time
+/// (`deadline`) keeps it for its rerun on a backend that restarts a woken call
+/// only through `ERESTARTSYS` (`restarts_only_through_erestartsys`), when a
+/// signal woke it (`woken`) or it ends with `ERESTARTSYS`.
+fn keeps_poll_deadline_for_rerun(
+    restarts_only_through_erestartsys: bool,
+    deadline: Option<LogicalTime>,
+    woken: crate::syscalls::helpers::WokenWait,
+    result: &Result<i64, Error>,
+) -> bool {
+    restarts_only_through_erestartsys
+        && deadline.is_some()
+        && (woken == crate::syscalls::helpers::WokenWait::Poll
+            || matches!(result, Err(Error::Errno(errno)) if *errno == Errno::ERESTARTSYS))
+}
+
+/// The request each turn of a masked ppoll's wait files
+/// (`Detcore::backend_masked_ppoll_wait`), before its guest-dependent poll
+/// fields: a polled call (`InternalIOPolling`) named `ppoll`, with the EINTR
+/// marker, and the call's temporary mask `signal_mask` as Linux installs it.
+/// Linux holds that mask in `blocked` for the whole call (`set_user_sigmask`,
+/// kernel/signal.c:3274 at v6.17, called by `do_sys_ppoll`, fs/select.c:1108),
+/// while this backend's `blocked` between probes is the thread's own. Filed
+/// here, as `pselect6` files its mask (`handle_internal_pselect6`), so the
+/// scheduler decides by the call's mask: a SIGALRM expiry's discard at
+/// generation and the choice of the thread that takes it
+/// (`signal_state_reader`). Before, it filed none, and a masked ppoll whose
+/// mask blocked SIGALRM was chosen for the copy by its own mask, woken, and
+/// never took it (the coord7 review of
+/// <https://github.com/rrnewton/hermit/pull/5221>, finding 5). The
+/// scheduler's polling record leaves the mask out of the request it prints
+/// (`Scheduler::logged_polling_request`), as for `pselect6`.
+fn masked_ppoll_wait_request(dettid: DetTid, signal_mask: KernelSigset) -> Resources {
+    let mut rsrc = Resources::new(dettid);
+    rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
+    rsrc.fyi("ppoll");
+    rsrc.set_signal_interrupt_errno(Errno::EINTR);
+    rsrc.blocked_signal_mask = Some(kernel_installed_signal_mask(sanitize_ppoll_signal_mask(
+        signal_mask,
+    )));
+    rsrc
+}
+
 fn sanitize_ppoll_signal_mask(mask: u64) -> u64 {
     let signal_bit = (reverie::PERF_EVENT_SIGNAL as usize) - 1;
     mask & !(1_u64 << signal_bit)
@@ -1373,13 +1414,18 @@ fn remaining_poll_millis(now: Instant, end: Instant) -> i32 {
 
 impl<T: RecordOrReplay> Detcore<T> {
     /// poll syscall (MAYHANG)
+    ///
+    /// `restart` is the record the thread's previous syscall kept for its
+    /// restart, if any: a woken `poll` that runs again after `ERESTARTSYS`
+    /// keeps its deadline there (`keep_deadline_for_rerun`). Only such a
+    /// rerun record is taken here.
     // TODO-HUMAN-REVIEW(PR-1023): Review zero-timeout poll scheduling across backends.
     #[cfg(target_arch = "x86_64")]
-    pub async fn handle_poll<G: Guest<Self>>(
+    pub(crate) async fn handle_poll<G: Guest<Self>>(
         &self,
         guest: &mut G,
-
         call: syscalls::Poll,
+        restart: Option<crate::syscalls::helpers::RestartBlock>,
     ) -> Result<i64, Error> {
         if self.cfg.sequentialize_threads && call.timeout() == 0 {
             // This cannot block, but still yield a scheduler turn so a polling thread cannot
@@ -1406,6 +1452,17 @@ impl<T: RecordOrReplay> Detcore<T> {
             let deadline = kernel_poll_deadline(&call, self.cfg.recordreplay_modes);
             Ok(self.handle_external_poll(guest, call, deadline).await?)
         } else {
+            // A woken `poll` that runs again after `ERESTARTSYS` waits until the
+            // deadline it kept, not for its whole timeout again. Only that
+            // rerun's record is taken (`RestartBlock::rerun_deadline`): a
+            // record kept for the kernel's `restart_syscall` is not, so a
+            // program's own retry after EINTR waits its whole timeout.
+            if let Some(block) = restart {
+                let rip = crate::arch::instruction_pointer(&guest.regs().await);
+                if let Some(deadline) = block.rerun_deadline(rip, call) {
+                    return self.handle_internal_poll_until(guest, call, deadline).await;
+                }
+            }
             // TODO:
             // if is-external-poll { self.handle_external_poll(guest, call) }
             self.handle_internal_poll(guest, call).await
@@ -2031,6 +2088,20 @@ impl<T: RecordOrReplay> Detcore<T> {
         resources.poll_deadline = poll_deadline_for(guest, deadline);
         if gated {
             resources.blocked_signal_mask = sigmask;
+        } else if self.cfg.backend.provides_process_signal_control && self.cfg.sequentialize_threads
+        {
+            // Where the backend controls the guest's signals (KVM), its
+            // `blocked` set between probes is the thread's own mask, while
+            // Linux's is the call's for the whole call (`set_user_sigmask`).
+            // The scheduler reads the call's from this request where it
+            // decides by the thread's mask: a SIGALRM expiry's discard at
+            // generation and the choice of the thread that takes it
+            // (`signal_state_reader`, https://github.com/rrnewton/hermit/issues/4929).
+            // The scheduler's records leave it out of the request they print,
+            // so the canonical INFO stream reads the same here as on ptrace
+            // (`Scheduler::logged_polling_request`).
+            resources.blocked_signal_mask =
+                sigmask.map(crate::syscalls::signal::kernel_installed_signal_mask);
         }
         // Keep the request metadata accurate, but do not make it eligible for
         // the scheduler's ERESTARTSYS wakeup. A cross-task signal must first be
@@ -2113,9 +2184,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     let pending = pending_real_time_among(guest, REAL_TIME_SIGNALS).await;
                     if pending != 0 {
                         let (observable, discarded) = match (signals.as_ref(), sigmask) {
-                            (Some(signals), _) => (signals.observable_now()?, 0),
+                            (Some(signals), _) => (signals.observable_now(guest)?, 0),
                             (None, Some(mask)) => unblocked_by(
-                                &read_thread_wait_signal_state(guest.pid(), guest.tid())?,
+                                &crate::syscalls::read_guest_wait_signal_state(guest)?,
                                 mask,
                             ),
                             (None, None) => (0, 0),
@@ -2280,7 +2351,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         );
                     }
                     if let Some(signals) = signals.as_ref() {
-                        match signals.interrupted_with_state() {
+                        match signals.interrupted_with_state(guest) {
                             Ok((false, _)) => {}
                             Ok((true, state)) => {
                                 self.write_pselect6_remaining(guest, call, deadline).await?;
@@ -2611,7 +2682,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     if pending != 0
                         && let Some(signals) = signals.as_ref()
                     {
-                        let observable = signals.observable_now()?;
+                        let observable = signals.observable_now(guest)?;
                         act_on_pending_real_time(guest, pending, observable, 0).await;
                     }
                     // Every turn probes before it looks at pending signals, as Linux
@@ -2682,7 +2753,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         }
                     }
                     if let Some(signals) = signals.as_ref() {
-                        match signals.interrupted_with_state() {
+                        match signals.interrupted_with_state(guest) {
                             Ok((false, _)) => {}
                             Ok((true, _)) => {
                                 self.write_select_remaining(guest, call, deadline).await?;
@@ -3437,7 +3508,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             if !probe.syscall_would_have_blocked(injected) {
                 break injected.map_err(Into::into);
             }
-            match signals.interrupted_with_state() {
+            match signals.interrupted_with_state(guest) {
                 Ok((false, _)) => {}
                 // The next probe ends the call for it (see above).
                 Ok((true, state))
@@ -3500,9 +3571,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         deadline: Option<LogicalTime>,
     ) -> Result<i64, Error> {
         let mask = sanitize_ppoll_signal_mask(signal_mask);
-        let mut rsrc = Resources::new(guest.thread_state().dettid);
-        rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
-        rsrc.fyi("ppoll");
+        let mut rsrc = masked_ppoll_wait_request(guest.thread_state().dettid, signal_mask);
         rsrc.poll_deadline = poll_deadline_for(guest, deadline);
         rsrc.relies_on_guest_held_marks = poll_targets_guest_held(
             guest,
@@ -3510,7 +3579,6 @@ impl<T: RecordOrReplay> Detcore<T> {
             call.nfds() as usize,
         );
         rsrc.polls_guest_state_only = rsrc.relies_on_guest_held_marks;
-        rsrc.set_signal_interrupt_errno(Errno::EINTR);
         rsrc.signal_state_task = guest_signal_state_task(guest);
         let mut guest_held = GuestHeldPollProof::capture(guest, call.into(), &mut rsrc);
         loop {
@@ -3641,7 +3709,51 @@ impl<T: RecordOrReplay> Detcore<T> {
         rsrc.polls_guest_state_only = rsrc.relies_on_guest_held_marks;
         let result = retry_nonblocking_syscall_with_timeout(guest, call, rsrc, deadline).await;
         keep_restart_block(guest, &result, RestartCall::Poll(call), deadline).await;
+        Self::keep_deadline_for_rerun(guest, &result, call, deadline).await;
         result
+    }
+
+    /// Where a signal woke this `poll` and no handler ran, Linux restarts it
+    /// through its restart block, which keeps the call's end time
+    /// (`do_restart_poll`; fs/select.c:1076-1090 at v6.17). A backend that
+    /// restarts a woken call only through `ERESTARTSYS`
+    /// (`restarts_woken_calls_only_through_erestartsys`, KVM) restarts it by
+    /// running the guest's own `poll` again (`woken_poll_errno`), with the timeout
+    /// the guest passed, so the deadline is kept here, in the thread's restart
+    /// record, as a rerun record (`RestartCall::PollRerun`), for that next run
+    /// of the same call at the same address ([`Self::handle_poll`], or
+    /// `network_poll` under network recording or replay, which passes the
+    /// record on; neither takes a record of any other kind), which then ends
+    /// when the first would have
+    /// (<https://github.com/rrnewton/hermit/issues/4929>). Any other syscall
+    /// first discards the record, as it discards one kept for
+    /// `restart_syscall`. A call whose errno is settled again at its return
+    /// keeps the record whichever errno it ends with here. The settling drops
+    /// it where it decides EINTR (`syscalls::helpers::settle_woken_wait_at_return`),
+    /// and so does a delivery at that return whose handler the backend fails
+    /// the call with EINTR for, a handler without `SA_RESTART`
+    /// (`syscalls::helpers::check_woken_wait_delivery`): the program's next
+    /// `poll` is then its own, and waits its whole timeout.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) async fn keep_deadline_for_rerun<G: Guest<Self>>(
+        guest: &mut G,
+        result: &Result<i64, Error>,
+        call: syscalls::Poll,
+        deadline: Option<LogicalTime>,
+    ) {
+        if keeps_poll_deadline_for_rerun(
+            crate::syscalls::restarts_woken_calls_only_through_erestartsys(&guest.config().backend),
+            deadline,
+            guest.thread_state().woken_wait,
+            result,
+        ) {
+            let rip = crate::arch::instruction_pointer(&guest.regs().await);
+            guest.thread_state_mut().restart_block = Some(crate::syscalls::helpers::RestartBlock {
+                rip,
+                deadline,
+                call: RestartCall::PollRerun(call),
+            });
+        }
     }
 
     /// Handle a poll syscall that deponds on external, nondeterminstic IO.
@@ -6213,6 +6325,105 @@ fn warn_property_set_not_visible() {
 
 #[cfg(test)]
 mod tests {
+    /// The coord7 review of https://github.com/rrnewton/hermit/pull/5221
+    /// (finding 5): each turn of a masked ppoll's wait files the call's
+    /// temporary mask as Linux installs it for the whole call
+    /// (`set_user_sigmask`, kernel/signal.c:3274 at v6.17): `SIGKILL` and
+    /// `SIGSTOP` dropped (`set_current_blocked`), and Reverie's preemption
+    /// marker too, as the probe drops it. With the EINTR marker and the call's
+    /// name, it reads as a `pselect6`-like wait whose probe takes a signal.
+    #[test]
+    fn a_masked_ppoll_files_its_mask_for_the_scheduler() {
+        use crate::types::DetTid;
+        let bit = |signal: i32| 1u64 << (signal - 1);
+        let tid = DetTid::from_raw(7);
+        for (label, mask, filed) in [
+            ("empty", 0, 0),
+            ("SIGALRM", bit(libc::SIGALRM), bit(libc::SIGALRM)),
+            (
+                "unblockable and the marker",
+                bit(libc::SIGALRM)
+                    | bit(libc::SIGKILL)
+                    | bit(libc::SIGSTOP)
+                    | bit(reverie::PERF_EVENT_SIGNAL as i32),
+                bit(libc::SIGALRM),
+            ),
+        ] {
+            let request = super::masked_ppoll_wait_request(tid, mask);
+            assert_eq!(request.blocked_signal_mask, Some(filed), "{label}");
+            assert!(!request.blocked_signal_mask_unknown, "{label}");
+            assert_eq!(request.fyi.as_str(), "ppoll", "{label}");
+            assert_eq!(
+                request.signal_interrupt_errno(),
+                Some(reverie::Errno::EINTR.into_raw()),
+                "{label}"
+            );
+            assert!(
+                request
+                    .resources
+                    .contains_key(&crate::resources::ResourceID::InternalIOPolling)
+                    && request.resources.len() == 1,
+                "{label}"
+            );
+        }
+    }
+
+    /// Mutation M23 of the coord7 review of
+    /// https://github.com/rrnewton/hermit/pull/5221 (finding 4): a `poll` with
+    /// an end time keeps it for its rerun exactly where the backend restarts a
+    /// woken call only through `ERESTARTSYS`, and only when a signal woke it or
+    /// it ends with `ERESTARTSYS`. Linux's restart block keeps the end time
+    /// (`do_restart_poll`, fs/select.c:1076-1090 at v6.17); a backend that
+    /// hands the delivery a restart errno restarts through that block, and a
+    /// call that ends with `EINTR` is not restarted at all.
+    #[test]
+    fn a_poll_keeps_its_end_time_for_a_rerun_only_through_erestartsys() {
+        use reverie::Errno;
+        use reverie::Error;
+
+        use crate::syscalls::helpers::WokenWait;
+        use crate::types::LogicalTime;
+        let at = Some(LogicalTime::from_nanos(5_000_000));
+        let ready: Result<i64, Error> = Ok(1);
+        let restart: Result<i64, Error> = Err(Error::Errno(Errno::ERESTARTSYS));
+        let eintr: Result<i64, Error> = Err(Error::Errno(Errno::EINTR));
+        for (label, restarts, deadline, woken, result, kept) in [
+            ("woken, then ready", true, at, WokenWait::Poll, &ready, true),
+            (
+                "not woken, ERESTARTSYS",
+                true,
+                at,
+                WokenWait::None,
+                &restart,
+                true,
+            ),
+            (
+                "woken, no end time",
+                true,
+                None,
+                WokenWait::Poll,
+                &restart,
+                false,
+            ),
+            (
+                "a backend with restart codes",
+                false,
+                at,
+                WokenWait::Poll,
+                &restart,
+                false,
+            ),
+            ("not woken, EINTR", true, at, WokenWait::None, &eintr, false),
+            ("not woken, ready", true, at, WokenWait::None, &ready, false),
+        ] {
+            assert_eq!(
+                super::keeps_poll_deadline_for_rerun(restarts, deadline, woken, result),
+                kept,
+                "{label}"
+            );
+        }
+    }
+
     /// Only init's two property service sockets count: an exact `sun_path`, with
     /// or without its terminating NUL, under `AF_UNIX`.
     #[test]
