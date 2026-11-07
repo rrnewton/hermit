@@ -13,6 +13,8 @@ publish = false
 crate-type = ["rlib"]
 
 [features]
+default = ["liteinst"]
+liteinst = []
 # Adds only the nested leaf's diagnostic exports, never allocator selection.
 allocator-fixture = []
 # Build-only actual native runtime; never links a guest constructor into host.
