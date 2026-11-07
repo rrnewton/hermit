@@ -21599,7 +21599,7 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // and the seventeen SIGALRM receiver tests of #4929 slice 2: 153. And the
         // #5221 review round's sigsuspend and masked-ppoll SIGALRM tests: 155,
         // matching the DAG pin in validation_dag_static.
-        ("privileged-only-test.cli_kvm", 155usize),
+        ("privileged-only-test.cli_kvm", 154usize),
     ] {
         let step = privileged
             .steps
