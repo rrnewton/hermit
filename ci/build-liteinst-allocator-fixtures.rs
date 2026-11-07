@@ -342,8 +342,13 @@ fn build_leaf(
         artifact.sha256 == current.sha256,
         "staged/current runtime bytes differ",
     )?;
-    let qualification =
-        m1_artifact::qualify_elf_with_sources(&stage, initializer, &mut runner, &compiled_sources)?;
+    let qualification = m1_artifact::qualify_elf_with_sources(
+        &stage,
+        initializer,
+        &mut runner,
+        &compiled_sources,
+    )
+    .map_err(|e| format!("DEBUG leaf {name}: {e}"))?;
     compiled_sources.verify_unchanged(&mut runner)?;
     // Preserve canonical name and the standalone loader's sidecar contract:
     // immutable unique DSO is present and qualified before the marker appears.
