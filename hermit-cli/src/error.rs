@@ -694,6 +694,9 @@ mod tests {
         assert!(serialized.context.iter().any(|message| {
             message.contains("kvm_address_space_limit") && message.contains("--backend=kvm")
         }));
+    }
+
+    #[test]
     #[cfg(all(feature = "in-guest-trap", not(feature = "liteinst")))]
     fn prior_verification_loss_survives_the_same_image_error_boundary() {
         let reason = "process 7 exited without deregistering";

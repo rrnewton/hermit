@@ -55,7 +55,7 @@ mod id;
 pub mod in_guest_exits;
 pub mod instruction_map;
 pub mod kvm_address_space;
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 use hermit_record_format::interp;
 pub mod liteinst_bootstrap;
 mod liteinst_constructor;
