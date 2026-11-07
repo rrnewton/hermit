@@ -362,11 +362,12 @@ mod tests {
         // package K item 2b slice 2b-3; after(this base's last row),
         // renumbered mechanically at each rebase: 42 on its old base, then
         // 43, 47 and 49 at its rebases onto 2b-1, 51 after SIGSHARE S2b's
-        // provisional 50, and 52 after main's 51). The digest covers that
+        // provisional 50, and 52 after main's 51) and, in
+        // `ProcessExecStrings`'s, the image's number. The digest covers that
         // payload type too (domain 8; domain 7 on its old base, moved to 8
         // because main's 41 took domain 6 and 2b-1's payload types moved to
         // 7). Digest measured at this head.
-        (52, "61b7a102cf79e89f", "f013e36743d8d9e6"),
+        (52, "7bde2d95109130de", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
