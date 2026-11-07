@@ -801,7 +801,7 @@ mod tests {
             .prefix(".bootstrap-rpc-test-")
             .tempdir_in(&test_output)
             .unwrap();
-        let native_inputs = super::native_test_inputs().unwrap();
+        let _native_inputs = super::native_test_inputs().unwrap();
         let declaration = staging.path().join("inputs.json");
         std::fs::write(
             &declaration,

@@ -55,7 +55,7 @@ mod id;
 pub mod in_guest_exits;
 pub mod instruction_map;
 pub mod kvm_address_space;
-#[cfg(feature = "in-guest-trap")]
+#[cfg(feature = "liteinst")]
 use hermit_record_format::interp;
 pub mod liteinst_bootstrap;
 mod liteinst_constructor;
@@ -538,9 +538,9 @@ use std::io::SeekFrom;
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
-#[cfg(all(test, feature = "in-guest-trap"))]
+#[cfg(all(test, feature = "liteinst"))]
 use std::os::unix::ffi::OsStrExt;
-#[cfg(feature = "in-guest-trap")]
+#[cfg(feature = "liteinst")]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -1406,7 +1406,7 @@ pub fn scheduler_owns_guest_pid_namespace() -> bool {
 /// under the gate (its runtime mask, final-read loop and predicted deaths,
 /// A5 step 3c.1e). Not yet: until the flip (3c.1f), the gate stays off on
 /// every route, whatever [`in_guest_signal_delivery_gate`] answers.
-#[cfg(feature = "in-guest-trap")]
+#[cfg(any(feature = "liteinst", all(test, feature = "in-guest-trap")))]
 const IN_GUEST_RUNTIME_DELIVERS_SIGNALS: bool = false;
 
 /// Set only in a test child that re-executed this test binary as PID 1 of its
@@ -1420,7 +1420,7 @@ static FORCE_IN_GUEST_DELIVERY: std::sync::atomic::AtomicBool =
 /// Whether the in-guest runtime delivers signals itself, at the gate's set
 /// points: [`IN_GUEST_RUNTIME_DELIVERS_SIGNALS`], or, in a test child,
 /// [`FORCE_IN_GUEST_DELIVERY`].
-#[cfg(feature = "in-guest-trap")]
+#[cfg(any(feature = "liteinst", all(test, feature = "in-guest-trap")))]
 fn runtime_delivers_signals() -> bool {
     #[cfg(test)]
     if FORCE_IN_GUEST_DELIVERY.load(std::sync::atomic::Ordering::Acquire) {
@@ -1447,7 +1447,7 @@ const GATED_LAUNCH_WITNESS: &str = "IN-GUEST-DELIVERY-GATE-ON";
 
 /// The delivery gate as a set point computed it, recorded in test builds
 /// (`GATED_LAUNCHES`, `GATED_LAUNCH_WITNESS`) when on.
-#[cfg(feature = "in-guest-trap")]
+#[cfg(feature = "liteinst")]
 fn record_delivery_gate(gate: bool) -> bool {
     #[cfg(test)]
     if gate {
@@ -2000,14 +2000,14 @@ fn in_guest_trap_site_patching_conflict(command: &Command, backend: Backend) -> 
 
 /// Forces only the Trap selector. LiteInst preserves the caller's absence or value;
 /// an absent LiteInst selection requires its runtime feature through sealed tool data.
-#[cfg(feature = "in-guest-trap")]
+#[cfg(any(feature = "liteinst", all(test, feature = "in-guest-trap")))]
 fn force_in_guest_site_patching(command: &mut Command, backend: Backend) {
     if let Some(value) = forced_site_patching_value(backend) {
         command.env(reverie_liteinst::SITE_PATCHING_ENV, value);
     }
 }
 
-#[cfg(feature = "in-guest-trap")]
+#[cfg(any(feature = "liteinst", all(test, feature = "in-guest-trap")))]
 fn requires_liteinst_default(command: &Command, backend: Backend) -> bool {
     backend == Backend::Liteinst
         && command

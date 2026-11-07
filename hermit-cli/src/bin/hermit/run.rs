@@ -1215,7 +1215,7 @@ impl std::error::Error for DeterminismLossRecorded {}
 
 /// Give a prior loss its usual verification run name without discarding the
 /// strict refusal, policy class, or cleanup context that crossed the boundary.
-#[cfg(all(feature = "in-guest-trap", not(feature = "liteinst")))]
+#[cfg(all(test, feature = "in-guest-trap", not(feature = "liteinst")))]
 fn name_recorded_verification_loss(error: Error, run: VerificationRun, single_run: bool) -> Error {
     let Some(loss) = error.downcast_ref::<hermit::VerificationDeterminismLoss>() else {
         return error;
