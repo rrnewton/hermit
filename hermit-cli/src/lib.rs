@@ -538,9 +538,9 @@ use std::io::SeekFrom;
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
-#[cfg(all(test, feature = "liteinst"))]
+#[cfg(all(test, feature = "in-guest-trap"))]
 use std::os::unix::ffi::OsStrExt;
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -1413,14 +1413,14 @@ const IN_GUEST_RUNTIME_DELIVERS_SIGNALS: bool = false;
 /// own user and PID namespaces (`in_guest_delivery_harness`, design D60): the
 /// gate's set points then take the runtime as delivering signals, so the dark
 /// 3c.1 mechanisms run end to end before the flip. No shipped build has it.
-#[cfg(all(test, feature = "liteinst"))]
+#[cfg(all(test, feature = "in-guest-trap"))]
 static FORCE_IN_GUEST_DELIVERY: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Whether the in-guest runtime delivers signals itself, at the gate's set
 /// points: [`IN_GUEST_RUNTIME_DELIVERS_SIGNALS`], or, in a test child,
 /// [`FORCE_IN_GUEST_DELIVERY`].
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 fn runtime_delivers_signals() -> bool {
     #[cfg(test)]
     if FORCE_IN_GUEST_DELIVERY.load(std::sync::atomic::Ordering::Acquire) {
@@ -1436,18 +1436,18 @@ fn runtime_delivers_signals() -> bool {
 /// was set: another conjunct of [`in_guest_signal_delivery_gate`] turning
 /// the gate off would otherwise leave a row whose output Linux also prints
 /// passing with the gate off. Test builds only.
-#[cfg(all(test, feature = "liteinst"))]
+#[cfg(all(test, feature = "in-guest-trap"))]
 static GATED_LAUNCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// The line a test child prints when a set point computes the gate on, for a
 /// row whose run ends the process (a stopping refusal) before it can read
 /// [`GATED_LAUNCHES`]. Test builds only.
-#[cfg(all(test, feature = "liteinst"))]
+#[cfg(all(test, feature = "in-guest-trap"))]
 const GATED_LAUNCH_WITNESS: &str = "IN-GUEST-DELIVERY-GATE-ON";
 
 /// The delivery gate as a set point computed it, recorded in test builds
 /// (`GATED_LAUNCHES`, `GATED_LAUNCH_WITNESS`) when on.
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 fn record_delivery_gate(gate: bool) -> bool {
     #[cfg(test)]
     if gate {
@@ -5515,7 +5515,7 @@ pub fn replay_with_output_and_mounts(dir: &Path, mounts: &[Mount]) -> Result<Out
     })
 }
 
-#[cfg(all(test, feature = "liteinst"))]
+#[cfg(all(test, feature = "in-guest-trap"))]
 mod in_guest_delivery_harness;
 
 #[cfg(test)]
