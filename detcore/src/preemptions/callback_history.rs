@@ -377,8 +377,10 @@ impl State {
     ///    skipped; a front for a later row leaves `active` unannotated, as is
     ///    any row before the first is installed. After the last row, any
     ///    remaining checkpoint is incomplete.
-    /// 2. Passed evidence: more progress or more RCBs than the endpoint, or
-    ///    the thread's own callback proving it left the endpoint's site.
+    /// 2. Passed evidence: more progress than the endpoint, or at its
+    ///    progress more RCBs or the thread's own callback proving it left
+    ///    the endpoint's site. More RCBs at less progress is not passed
+    ///    evidence (a timer stop's skid can retire branches early).
     /// 3. At the endpoint's progress and RCBs, the same callback and site end
     ///    the row when its time and last operation agree too, and refuse when
     ///    they do not; another callback or site waits (a timer stop or a
@@ -416,15 +418,21 @@ impl State {
         }
         let expected = front.origin.clone();
         let Some(actual) = actual else {
-            if self.progress.count > expected.progress || rcbs > expected.rcbs {
+            if self.progress.count > expected.progress
+                || (self.progress.count == expected.progress && rcbs > expected.rcbs)
+            {
                 return self.refuse_front(Refusal::Overshot, None);
             }
             return RowDecision::Pending;
         };
+        // RCBs are passed evidence only once progress has reached the
+        // endpoint: a timer stop can retire a skid branch or two before
+        // the endpoint's event, so more RCBs at less progress is a stop
+        // short of the endpoint, not past it.
         let passed = actual.progress > expected.progress
-            || actual.rcbs > expected.rcbs
             || (actual.progress == expected.progress
-                && token.is_some_and(|token| token.proves_passed(&expected, &actual)));
+                && (actual.rcbs > expected.rcbs
+                    || token.is_some_and(|token| token.proves_passed(&expected, &actual))));
         if passed {
             return self.refuse_front(Refusal::Overshot, Some(actual));
         }
@@ -933,6 +941,45 @@ mod tests {
             })
         );
         assert_eq!(state.remaining().count(), 0);
+    }
+
+    /// A timer stop short of a syscall posthook endpoint in progress is
+    /// still ahead of it even when its RCBs run past the endpoint's: the
+    /// PMU skid can retire a branch or two before the endpoint's event
+    /// (issue 5252: expected progress 19266 / rcbs 19092, observed
+    /// progress 19264 / rcbs 19093). The checkpoint is not consumed.
+    #[test]
+    fn a_timer_stop_short_in_progress_waits_despite_more_rcbs() {
+        let expected = Origin {
+            callback: Callback::Syscall(Sysno::getrandom),
+            site: Site::Posthook,
+            progress: 19_266,
+            last_op: Some(Op::Syscall(Sysno::getrandom, SyscallPhase::Posthook)),
+            time: LogicalTime::from_nanos(100),
+            rcbs: 19_092,
+        };
+        let timer_stop = Origin {
+            callback: Callback::PmuTimer,
+            site: Site::Prehook,
+            progress: 19_264,
+            last_op: Some(Op::Branch),
+            time: LogicalTime::from_nanos(99),
+            rcbs: 19_093,
+        };
+        let mut state = rows(&[(4, expected.clone())]);
+        assert_eq!(
+            state.decide_row(ActiveRow::Row(4), Some(timer_stop), None, 19_093),
+            RowDecision::Pending
+        );
+        assert!(state.annotates(4), "the checkpoint was consumed by a wait");
+        // The endpoint itself still matches when it arrives.
+        assert_eq!(
+            state.decide_row(ActiveRow::Row(4), Some(expected.clone()), None, 19_092),
+            RowDecision::Match(Checkpoint {
+                history_index: 4,
+                origin: expected,
+            })
+        );
     }
 
     /// Every way past or beside the recorded endpoint is a named refusal that
