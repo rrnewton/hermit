@@ -340,6 +340,23 @@ const PMU_LONE_REPLAY_ALLOWANCE: MeasuredCpuAllowance = MeasuredCpuAllowance {
     wall_seconds: Some(320),
 };
 
+// hermit-run::cli
+// an_instruction_offset_record_replays_from_its_schedule_and_analyze_verifies_its_endpoints
+// in the validation profile at d005dfbdc512 used 36.780064 CPU seconds for
+// the fixed-seed, 30,000-iteration case. Its PMU CLI node applies a CPU
+// multiplier of 4, so a base allowance of 14 seconds yields an actual
+// 56-second cap: ceil(1.5 * 36.780064) = 56, below the owner's 60-second
+// maximum and below the node's ordinary scaled 88-second cap.
+const PMU_SCHEDULE_OFFSET_WRAPPER_NAME: &str = "hermit-pmu-schedule-offset-cpu";
+const PMU_SCHEDULE_OFFSET_ALLOWANCE: MeasuredCpuAllowance = MeasuredCpuAllowance {
+    wrapper_name: PMU_SCHEDULE_OFFSET_WRAPPER_NAME,
+    package: "hermit-run",
+    binary: "hermit-run::cli",
+    test: "an_instruction_offset_record_replays_from_its_schedule_and_analyze_verifies_its_endpoints",
+    cpu_seconds: 14,
+    wall_seconds: None,
+};
+
 const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 33] = [
     MeasuredCpuAllowance {
         wrapper_name: DETCORE_ALLOCATOR_WRAPPER_NAME,
@@ -1101,6 +1118,9 @@ fn prepared_selected_cpu_allowances(
     if pmu_integration && selected.contains(&PMU_LONE_REPLAY_ALLOWANCE.identity()) {
         allowances.push(PMU_LONE_REPLAY_ALLOWANCE);
     }
+    if pmu_integration && selected.contains(&PMU_SCHEDULE_OFFSET_ALLOWANCE.identity()) {
+        allowances.push(PMU_SCHEDULE_OFFSET_ALLOWANCE);
+    }
     Ok(allowances)
 }
 
@@ -1387,7 +1407,7 @@ fn resolve_budgets(
 fn resolve_config(args: Vec<std::ffi::OsString>) -> Result<(), String> {
     if args == [std::ffi::OsString::from("--help")] || args == [std::ffi::OsString::from("-h")] {
         println!(
-            "usage: nextest-timeout-config.rs --resolve SOURCE MULTIPLIER OUTPUT INVENTORY CONTEXT MAP CALIBRATION -- NEXTEST_ARGS...\n\nGenerate Nextest config OUTPUT from canonical TOML SOURCE and the wall MULTIPLIER. INVENTORY is typed Nextest list JSON; CONTEXT is verified budget-context JSON (or null); MAP is a new absolute output path; CALIBRATION is the optional reviewed JSON table. NEXTEST_ARGS are the actual counted-run arguments, including concurrency and retries. HERMIT_NEXTEST_CPU_WRAPPER_BIN must name the prepared wrapper; HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER defaults to 1.\n\nAbsent/stale regular calibration retains the regular default bounds. Prepared post-inventory selection admits only the exact Detcore allocator ({DETCORE_ALLOCATOR_CPU_SECONDS}s), Detcore constructor ({DETCORE_CONSTRUCTOR_CPU_SECONDS}s), standalone allocator ({STANDALONE_ALLOCATOR_CPU_SECONDS}s), Detcore stack callback ({DETCORE_STACK_CPU_SECONDS}s), rendered-procfs ({RENDERED_PROCFS_CPU_SECONDS}s), CPU-profile v3 host loader ({CPU_PROFILE_V3_LOADER_CPU_SECONDS}s), rr thread stress ({RR_THREAD_STRESS_CPU_SECONDS}s), the four external-signal poll-deadline tests ({ESI_POLL_DEADLINE_CPU_SECONDS}s), lit chaos verify ({LIT_CHAOS_VERIFY_CPU_SECONDS}s), DBT virtual kernel files ({DBT_VIRTUAL_KERNEL_FILES_CPU_SECONDS}s), CPU-profile v3 guest ({CPU_PROFILE_V3_GUEST_CPU_SECONDS}s), parity post-pass ({PARITY_POST_PASS_NO_GUEST_CPU_SECONDS}s), epoll_pwait2 strict ({EPOLL_PWAIT2_STRICT_CPU_SECONDS}s), epoll_pwait temporary mask ({EPOLL_PWAIT_MASK_CPU_SECONDS}s), lone-slice-end backstop ({LONE_BACKSTOP_CPU_SECONDS}s), ptrace signal permits ({SIGNAL_PERMITS_CPU_SECONDS}s), and all 15 measured stacks identities (22 to 55 seconds) base CPU allowances, each scaled once; tests outside those exact identities keep the 22-second base. The PMU integration node alone gives replays_take_recorded_lone_slice_ends_the_same_way 40 CPU seconds and 320 wall seconds; KVM and unscoped invocations keep their prior bounds. Every exact prepared selected liteinst_stacks identity, the Detcore allocator leaf, and the CPU-profile v3 host loader, gets a separate base wall backstop of eight times its base CPU cap, scaled once by the wall multiplier. This is a host-load policy, not measured wall headroom; other wall bounds and cleanup2 are unchanged. See ci/liteinst-fixture-cpu-budgets.md for the complete fixture decisions and censored-observation limits. Unknown context/profile/concurrency produces no regular map or aggregate certification. Malformed input refuses. No test or preparation command is run."
+            "usage: nextest-timeout-config.rs --resolve SOURCE MULTIPLIER OUTPUT INVENTORY CONTEXT MAP CALIBRATION -- NEXTEST_ARGS...\n\nGenerate Nextest config OUTPUT from canonical TOML SOURCE and the wall MULTIPLIER. INVENTORY is typed Nextest list JSON; CONTEXT is verified budget-context JSON (or null); MAP is a new absolute output path; CALIBRATION is the optional reviewed JSON table. NEXTEST_ARGS are the actual counted-run arguments, including concurrency and retries. HERMIT_NEXTEST_CPU_WRAPPER_BIN must name the prepared wrapper; HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER defaults to 1.\n\nAbsent/stale regular calibration retains the regular default bounds. Prepared post-inventory selection admits only the exact Detcore allocator ({DETCORE_ALLOCATOR_CPU_SECONDS}s), Detcore constructor ({DETCORE_CONSTRUCTOR_CPU_SECONDS}s), standalone allocator ({STANDALONE_ALLOCATOR_CPU_SECONDS}s), Detcore stack callback ({DETCORE_STACK_CPU_SECONDS}s), rendered-procfs ({RENDERED_PROCFS_CPU_SECONDS}s), CPU-profile v3 host loader ({CPU_PROFILE_V3_LOADER_CPU_SECONDS}s), rr thread stress ({RR_THREAD_STRESS_CPU_SECONDS}s), the four external-signal poll-deadline tests ({ESI_POLL_DEADLINE_CPU_SECONDS}s), lit chaos verify ({LIT_CHAOS_VERIFY_CPU_SECONDS}s), DBT virtual kernel files ({DBT_VIRTUAL_KERNEL_FILES_CPU_SECONDS}s), CPU-profile v3 guest ({CPU_PROFILE_V3_GUEST_CPU_SECONDS}s), parity post-pass ({PARITY_POST_PASS_NO_GUEST_CPU_SECONDS}s), epoll_pwait2 strict ({EPOLL_PWAIT2_STRICT_CPU_SECONDS}s), epoll_pwait temporary mask ({EPOLL_PWAIT_MASK_CPU_SECONDS}s), lone-slice-end backstop ({LONE_BACKSTOP_CPU_SECONDS}s), ptrace signal permits ({SIGNAL_PERMITS_CPU_SECONDS}s), and all 15 measured stacks identities (22 to 55 seconds) base CPU allowances, each scaled once; tests outside those exact identities keep the 22-second base. The PMU integration node alone gives replays_take_recorded_lone_slice_ends_the_same_way 40 CPU seconds and 320 wall seconds; its CLI node gives the schedule-offset case a 14-second base allowance, which that node's CPU multiplier of 4 scales to an actual 56 CPU seconds; KVM and unscoped invocations keep their prior bounds. Every exact prepared selected liteinst_stacks identity, the Detcore allocator leaf, and the CPU-profile v3 host loader, gets a separate base wall backstop of eight times its base CPU cap, scaled once by the wall multiplier. This is a host-load policy, not measured wall headroom; other wall bounds and cleanup2 are unchanged. See ci/liteinst-fixture-cpu-budgets.md for the complete fixture decisions and censored-observation limits. Unknown context/profile/concurrency produces no regular map or aggregate certification. Malformed input refuses. No test or preparation command is run."
         );
         return Ok(());
     }
@@ -2441,6 +2461,34 @@ mod tests {
                 &selected
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn pmu_schedule_offset_scope_is_exact_and_scoped() {
+        let target = PMU_SCHEDULE_OFFSET_ALLOWANCE.identity();
+        let inventory = measured_inventory(std::slice::from_ref(&target));
+        let bytes = serde_json::to_vec(&inventory).unwrap();
+        assert!(
+            prepared_selected_cpu_allowances(true, false, || Ok(bytes.clone()))
+                .unwrap()
+                .is_empty()
+        );
+        let selected = prepared_selected_cpu_allowances(true, true, || Ok(bytes)).unwrap();
+        assert_eq!(selected, [PMU_SCHEDULE_OFFSET_ALLOWANCE]);
+
+        let source = include_str!("../.config/nextest.toml");
+        let rendered = scaled_config_with_allowances(
+            source,
+            3.0,
+            Some((Path::new("/fixture/wrapper"), 4.0)),
+            &selected,
+        )
+        .unwrap();
+        let document = rendered.parse::<DocumentMut>().unwrap();
+        assert_eq!(
+            wrapper_argv(&document, PMU_SCHEDULE_OFFSET_WRAPPER_NAME)[2],
+            "56000000"
         );
     }
 
