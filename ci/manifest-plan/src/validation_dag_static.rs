@@ -5525,7 +5525,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the 2b-3 other-process cmdline ptrace twin: 754 + 1 = 755.
     // And the same three chaos-follows seeds (PR #4614): 755 + 3 = 758.
     // And the same three slice-once seeds (PR #4614): 758 + 3 - 3 = 758.
-    ("test.cli_on_host", 758),
+    // PR 5275's pipe-wake split adds one ignored case to the suite the
+    // hosted twin selects: 758 - 1 = 757.
+    ("test.cli_on_host", 757),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
