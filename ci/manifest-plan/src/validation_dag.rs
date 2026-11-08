@@ -93,6 +93,20 @@ const PINNED_ROOT_TWIN_SUFFIX: &str = "_in_pinned_root";
 /// finalizer. The preparation needs the prebuilt rust-script tools.
 pub const PINNED_WORKSPACE_COMPILE_TAG: &str = "build.workspace_compile_in_pinned_root";
 pub const PINNED_WORKSPACE_PREPARE_TAG: &str = "build.workspace_in_pinned_root";
+/// The native-exec cohort's pinned producer is the same two-node shape: a
+/// compile node that builds the cohort selection (and the CPU wrapper) into
+/// the cohort target directory with no rust-script need, and a prepare node
+/// that lists, publishes, and asserts the cohort record. Unlike the
+/// workspace pair they are constructed directly in their pinned form
+/// (`materialize_native_exec_producers`): no host node consumes them.
+pub const PINNED_NATIVE_EXEC_COMPILE_TAG: &str = "build.hermit_native_exec_compile_in_pinned_root";
+pub const PINNED_NATIVE_EXEC_PREPARE_TAG: &str = "build.hermit_native_exec_in_pinned_root";
+const PINNED_NATIVE_EXEC_COMPILE_JOB: &str = "hermit_native_exec_compile_in_pinned_root";
+const PINNED_NATIVE_EXEC_PREPARE_JOB: &str = "hermit_native_exec_in_pinned_root";
+const PINNED_NATIVE_EXEC_COMPILE_DESC: &str = "Build the native-exec cohort's hermit-run targets and CPU wrapper in the validate profile, beside the workspace compile";
+const PINNED_NATIVE_EXEC_COMPILE_DESCRIPTION: &str = "The Cargo half of the native-exec cohort producer (dh-10l17): builds exactly the cohort selection, -p hermit-run --features liteinst,kvm-native-test-support,native-exec --lib --bins, in the [profile.validate] profile into the cohort target directory (target/cohort-native-exec, from the cohort declaration in nextest_binaries), then the dev-profile nextest-cpu-wrapper the prepare half records. Nothing in it runs a rust-script, so it starts beside build.rust_scripts_in_pinned_root like the workspace compile; it keeps the rust-script environment so a rust-script added here later fails at once. Its only completion consumer is build.hermit_native_exec_in_pinned_root. Why split: measured 2026-11-08 at hermit d9ac2c5e on the development host in a cgroup box at 32 jobs, the unsplit cold build+list took 471.535 s wall and 3055.371 CPU-s (1.5x wall 707 s, above the 600 s bound, and no ceiling exception was taken); this compile half cold took 298.979 s wall and 2502.180 CPU-s, plus 48.837 s and 162.345 CPU-s for the wrapper, so 4200 CPU-s is the next 300-second bucket above 1.5 times their sum (3996) and the 600-second wall covers 1.5 times their summed wall (522). Memory: the cold cohort build peaked at 14631858176 bytes of cgroup memory.peak in the same measurements, so rss_baseline is 14 GiB and the hard cap 18 GiB. preferred_inner_jobs=32 is the measured width.";
+const PINNED_NATIVE_EXEC_PREPARE_DESC: &str = "List the native-exec cohort's prepared executables and publish and assert its record";
+const PINNED_NATIVE_EXEC_PREPARE_DESCRIPTION: &str = "The preparation half of the native-exec cohort producer (dh-10l17). Once build.hermit_native_exec_compile_in_pinned_root has built the cohort selection and build.rust_scripts_in_pinned_root has published the tools, nextest-binaries.rs prepare full --cohort native-exec lists the test harnesses from that build in the cohort target directory, hashes them, and publishes the one selection at target/ci/nextest-binaries/cohorts/native-exec.json under its own lock; the immediately following assert full --cohort native-exec verifies the published record, so the consumer's ancestry contains the cohort check by construction. It deliberately does not run stage-detcore-liteinst: the assumption, tested by the targeted pinned run in dh-10l17, is that the 81 native-exec cases need the LiteInst runtime only at link time through the embedded native bundle, not the staged artifact. Measured 2026-11-08 at hermit d9ac2c5e on the development host in a cgroup box at 32 jobs: the listing half on the compile node's warm artifacts took 238.299 s wall and 882.438 CPU-s; 1800 CPU-s is the next 300-second bucket above 1.5 times that listing plus prepare's hashing and publication overhead, to be re-derived from this node's first targeted pinned receipt. The 600-second wall covers 1.5 times the measured wall. Memory keeps the compile half's 14-GiB baseline and 18-GiB hard cap from the same cold measurements.";
 pub const PINNED_E2E_ARTIFACT_TAG: &str = "build.e2e_artifact_in_pinned_root";
 pub const HERMIT_BIN_ARTIFACT: &str = "hermit-bin";
 const HERMIT_BIN_SIGNAL_SUFFIX: &str = " --message-format json-render-diagnostics > >(python3 ./ci/cargo-artifact-ready.py hermit-bin)";
@@ -603,6 +617,7 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     "doc.rustdoc",
     "test.regular_crates",
     "test.hermit_unit",
+    "test.hermit_native_exec",
     "test.detcore_unit",
     "test.detcore_misc",
     "test.detcore_parallel",
@@ -1533,6 +1548,101 @@ fn pinned_root_fetch() -> Result<Step, String> {
         .ok_or_else(|| "internal pinned-root fetch node disappeared".to_string())?;
     step.deps = vec!["pre.reverie_pin".into()];
     Ok(step)
+}
+
+/// One directly constructed pinned producer step of the native-exec cohort
+/// pair, in the shape `split_pinned_workspace_twin` leaves its halves:
+/// pinned dependencies and environment set, payload wrapped by
+/// `pinned_root_command`. The cohort environment (slug and target
+/// directory) comes from the one cohort declaration, exactly as
+/// `materialize` attaches it to the authored consumer.
+fn native_exec_pinned_step(
+    job: &str,
+    desc: &str,
+    description: &str,
+    payload: String,
+    deps: &[&str],
+    est_duration_s: f64,
+    timeout: i64,
+    cpu_timeout: i64,
+) -> Result<Step, String> {
+    let cohort = crate::nextest_binaries::NATIVE_EXEC_COHORT;
+    // Dependencies are assigned after the parse, like the fetch node's:
+    // dag_from_json refuses a dependency no step in its own document
+    // declares, and these producers depend on nodes of the full graph.
+    let text = format!(
+        r#"{{"description":"native-exec pinned producer","steps":[{{"group":"build","job":{job},"desc":{desc},"description":{description},"cmd":{cmd},"deps":[],"env":{{"HERMIT_E2E_EMPTY_WORKDIR":"/test",{cohort_env}:{slug},"CARGO_TARGET_DIR":{target_dir}}},"labels":["full","portable"],"result_manifests":[],"timeout":{timeout},"cpu_timeout":{cpu_timeout},"jobs_env":"CARGO_BUILD_JOBS","hint":{{"est_duration_s":{est_duration_s},"rss_baseline_bytes":15032385536,"hard_mem_max_bytes":19327352832,"classification":"cpu-bound","preferred_inner_jobs":32}},"fail_fast_family":{family}}}]}}"#,
+        job = serde_json::to_string(job).expect("constant is serializable"),
+        desc = serde_json::to_string(desc).expect("constant is serializable"),
+        description = serde_json::to_string(description).expect("constant is serializable"),
+        cmd = serde_json::to_string(&payload).expect("constant is serializable"),
+        cohort_env = serde_json::to_string(crate::nextest_binaries::COHORT_ENV)
+            .expect("constant is serializable"),
+        slug = serde_json::to_string(cohort.env_value().expect("native cohort has a slug"))
+            .expect("constant is serializable"),
+        target_dir = serde_json::to_string(
+            cohort.target_dir().expect("native cohort has a target directory")
+        )
+        .expect("constant is serializable"),
+        family = serde_json::to_string(&format!("build.{job}")).expect("constant is serializable"),
+    );
+    let mut step = dag_from_json(&text)
+        .map_err(|error| format!("internal native-exec producer node is invalid: {error}"))?
+        .steps
+        .into_iter()
+        .next()
+        .ok_or_else(|| "internal native-exec producer node disappeared".to_string())?;
+    step.deps = deps.iter().map(|dependency| (*dependency).into()).collect();
+    step.cmd = pinned_root_command(&step);
+    Ok(step)
+}
+
+/// The native-exec cohort's compile and prepare producers, constructed in
+/// their pinned form (no host node consumes them). Called after
+/// `materialize_pinned_root`, whose retention would otherwise drop
+/// authored `_in_pinned_root` jobs; admission is through
+/// `POST_SPLIT_CORE_NODES` like every post-split node.
+fn materialize_native_exec_producers(cfg: &mut DagConfig) -> Result<(), String> {
+    let environment = crate::validation_dag_static::RUST_SCRIPT_ENVIRONMENT;
+    let selection = crate::nextest_build_selections::for_step("test.hermit_native_exec")
+        .ok_or("test.hermit_native_exec has no declared Cargo build selection")?
+        .join(" ");
+    let compile = native_exec_pinned_step(
+        PINNED_NATIVE_EXEC_COMPILE_JOB,
+        PINNED_NATIVE_EXEC_COMPILE_DESC,
+        PINNED_NATIVE_EXEC_COMPILE_DESCRIPTION,
+        format!(
+            "{environment}./ci/run-with-core-build.sh cargo build --locked --profile validate {selection} && ./ci/run-with-core-build.sh cargo build --locked -p hermit-manifest-plan --bin nextest-cpu-wrapper"
+        ),
+        &["pre.reverie_pin", PINNED_ROOT_FETCH_TAG],
+        350.0,
+        600,
+        4200,
+    )?;
+    let prepare = native_exec_pinned_step(
+        PINNED_NATIVE_EXEC_PREPARE_JOB,
+        PINNED_NATIVE_EXEC_PREPARE_DESC,
+        PINNED_NATIVE_EXEC_PREPARE_DESCRIPTION,
+        format!(
+            "{environment}{}",
+            crate::nextest_binaries::cohort_prepare_command(
+                "full",
+                crate::nextest_binaries::NATIVE_EXEC_COHORT
+            )?
+        ),
+        &[
+            PINNED_NATIVE_EXEC_COMPILE_TAG,
+            PINNED_RUST_SCRIPTS_TAG,
+            "pre.reverie_pin",
+            PINNED_ROOT_FETCH_TAG,
+        ],
+        260.0,
+        600,
+        1800,
+    )?;
+    cfg.steps.push(compile);
+    cfg.steps.push(prepare);
+    Ok(())
 }
 
 /// Add the hosted label to the corpus-derived portable compatibility rows.
@@ -3441,9 +3551,11 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // 151 with the rr bucket's three producers (pinned, on-host, Buck
     // twin), the first post-split extension bucket (148 + 3); 154 with
     // the gvisor bucket's three producers.
-    if expected.len() != 154 {
+    // 155 with test.hermit_native_exec, the native-exec cohort's counted
+    // consumer (dh-10l17).
+    if expected.len() != 155 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 154",
+            "structured result producer registry has {} entries, expected 155",
             expected.len()
         ));
     }
@@ -5778,6 +5890,7 @@ pub fn generate(root: &Path) -> Result<DagConfig, String> {
     materialize_hosted_script_unit_tests(&mut refreshed)?;
     materialize_buck_e2e(&mut refreshed)?;
     materialize_pinned_root(&mut refreshed)?;
+    materialize_native_exec_producers(&mut refreshed)?;
     materialize_focused_preflight(&mut refreshed)?;
     materialize_quick_super_budgets(&mut refreshed);
     materialize_pressure_labels(&mut refreshed)?;
@@ -6480,7 +6593,7 @@ sys.exit(37)
             .iter()
             .filter(|step| step.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh "))
             .collect();
-        assert_eq!(pinned.len(), 87, "pinned-root step count changed");
+        assert_eq!(pinned.len(), 90, "pinned-root step count changed");
         for step in pinned {
             for name in ["HERMIT_NEXTEST_FAIL_FAST", "HERMIT_E2E_FAIL_FAST"] {
                 assert!(
