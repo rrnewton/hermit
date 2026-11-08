@@ -1305,9 +1305,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And manifest-plan's a_corpus_row_expands_expected_guest_exits_by_mode and
     // a_replay_recipe_may_override_the_inherited_expected_exit_with_success
     // (no-NUMA utility cells, https://github.com/rrnewton/hermit/pull/5287):
-    // 1976 + 2 = 1978 (manifest-plan lib listed 739 -> 741 executed against
-    // main 35ea84b0).
-    ("test.regular_crates", 1978),
+    // 1976 + 2 = 1978, and expected_stderr_names_the_run_that_differs:
+    // 1979 (manifest-plan lib listed 739 -> 742 executed against main
+    // 35ea84b0).
+    ("test.regular_crates", 1979),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -5577,9 +5578,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR #4764: the same two detcore-model untrap units: 1954 + 2 = 1956.
     // Inherited structural hint + five owned helper tests, not a fresh measured total.
     // Runtime completeness uses the listed identity census.
-    // The same two manifest-plan expectation units as test.regular_crates,
-    // none hosted-excluded: 1962 + 2 = 1964.
-    ("test.regular_crates_on_host", 1964),
+    // The same three manifest-plan expectation units as test.regular_crates,
+    // none hosted-excluded: 1962 + 3 = 1965.
+    ("test.regular_crates_on_host", 1965),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -6897,9 +6898,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR #4764: the same two detcore-model untrap units: 1954 + 2 = 1956.
     // Inherited structural hint + five owned helper tests, not a fresh measured total.
     // Runtime completeness uses the listed identity census.
-    // The same two manifest-plan expectation units as test.regular_crates,
-    // none hosted-excluded: 1962 + 2 = 1964.
-    ("test.regular_crates_on_host", 1964),
+    // The same three manifest-plan expectation units as test.regular_crates,
+    // none hosted-excluded: 1962 + 3 = 1965.
+    ("test.regular_crates_on_host", 1965),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
