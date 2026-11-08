@@ -7,12 +7,82 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 use reverie_liteinst_artifact as proof;
+use serde_json::Value;
 use serde_json::json;
 
 include!("../../../hermit-cli/reverie_pin.rs");
 
 fn require(ok: bool, message: &str) -> proof::Result<()> {
     if ok { Ok(()) } else { Err(message.into()) }
+}
+
+/// The one name the ordinary Detcore Tool image is published under.
+const CANONICAL_TOOL_IMAGE: &str = "libdetcore_liteinst.so";
+
+/// Derive the staged Tool image's site-patching state from the current
+/// Cargo build's own artifact metadata: every `reverie-liteinst` rlib it
+/// compiled must carry the `liteinst` feature. A trap-only (patcher-less)
+/// image is refused by its canonical name, never published under it and
+/// never re-labelled by a receipt field alone; the returned label is the
+/// explicit `site_patching` qualification recorded in the packaged receipt.
+fn site_patching_from_cargo_messages(messages: &str) -> proof::Result<&'static str> {
+    let mut saw_rlib = false;
+    for (index, line) in messages.lines().filter(|line| !line.is_empty()).enumerate() {
+        let message: Value = serde_json::from_str(line)
+            .map_err(|error| format!("invalid Cargo JSON on line {}: {error}", index + 1))?;
+        let target = &message["target"];
+        if message["reason"] != "compiler-artifact" || target["name"] != "reverie_liteinst" {
+            continue;
+        }
+        if target["kind"] != json!(["rlib"]) || target["crate_types"] != json!(["rlib"]) {
+            return Err(format!(
+                "refusing to stage the Detcore Tool image as {CANONICAL_TOOL_IMAGE}: \
+                 reverie-liteinst artifact on line {} has the wrong rlib target",
+                index + 1
+            ));
+        }
+        let features = message["features"].as_array().ok_or_else(|| {
+            format!(
+                "refusing to stage a patcher-less Detcore Tool image as \
+                 {CANONICAL_TOOL_IMAGE}: reverie-liteinst rlib on line {} has \
+                 unexpected features {}",
+                index + 1,
+                message["features"]
+            )
+        })?;
+        let mut has_liteinst = false;
+        for feature in features {
+            match feature.as_str() {
+                Some("liteinst") => has_liteinst = true,
+                Some(_) => {}
+                None => {
+                    return Err(format!(
+                        "refusing to stage a patcher-less Detcore Tool image as \
+                         {CANONICAL_TOOL_IMAGE}: reverie-liteinst rlib on line {} has \
+                         unexpected features {}",
+                        index + 1,
+                        message["features"]
+                    ));
+                }
+            }
+        }
+        saw_rlib = true;
+        if !has_liteinst {
+            return Err(format!(
+                "refusing to stage a trap-only (patcher-less) Detcore Tool image as \
+                 {CANONICAL_TOOL_IMAGE}: reverie-liteinst rlib on line {} was built \
+                 without the liteinst (site_patching) feature: {}",
+                index + 1,
+                message["features"]
+            ));
+        }
+    }
+    require(
+        saw_rlib,
+        "refusing to stage a patcher-less Detcore Tool image as \
+         libdetcore_liteinst.so: no reverie-liteinst rlib in current Cargo output",
+    )?;
+    Ok("liteinst")
 }
 
 fn close<T>(result: proof::Result<T>, closing: proof::Result<()>) -> proof::Result<T> {
@@ -143,21 +213,21 @@ fn run() -> proof::Result<()> {
         let cargo_version = runner.text("cargo", &["--version", "--verbose"], &root)?;
         let rustc_version = runner.text("rustc", &["--version", "--verbose"], &root)?;
         let output = runner.run("cargo", &cargo_args, &root)?;
+        let messages = std::str::from_utf8(&output).map_err(|e| e.to_string())?;
         let expected_profile = json!({"opt_level":"3", "debuginfo":0,
             "debug_assertions":true,"overflow_checks":true,"test":false});
-        let artifact = proof::select_artifact(
-            std::str::from_utf8(&output).map_err(|e| e.to_string())?,
-            package,
-            &[],
-            &expected_profile,
-            &target,
-        )?;
+        let artifact = proof::select_artifact(messages, package, &[], &expected_profile, &target)?;
         require(
             artifact.reported_path == target.join("liteinst-runtime/libdetcore_liteinst.so"),
             "Cargo reported a different ordinary runtime output",
         )?;
-        // The ordinary staged runtime is the liteinst-off image; bind the
-        // actual current build as its no-scope qualification witness. The
+        // The canonical Tool image must be the site-patching (liteinst)
+        // image. Refuse a trap-only build by name here, before constructor
+        // qualification and before anything is published as
+        // libdetcore_liteinst.so; qualification of an unpatching image
+        // must never be read as site_patching evidence.
+        let site_patching = site_patching_from_cargo_messages(messages)?;
+        // Bind the actual current build as its qualification witness. The
         // retained command is captured immediately after the runtime build,
         // before any later retained command can replace it. This mirrors
         // Hermit 4704's stage-detcore-liteinst rebinding.
@@ -195,6 +265,7 @@ fn run() -> proof::Result<()> {
         qualification.artifact.verify()?;
         Ok(
             json!({"schema":"hermit-packaged-detcore/v1", "reverie_pin":pin,
+            "site_patching":site_patching,
             "profile_name":"liteinst-runtime", "profile_inputs":profile_inputs,
             "profile_objects":profile, "cargo_argv":cargo_args,"cargo_version":cargo_version,
             "rustc_version":rustc_version,"cargo_artifact":artifact,
@@ -268,6 +339,67 @@ fn main() -> std::process::ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rlib_message(features: Value) -> String {
+        json!({
+            "reason": "compiler-artifact",
+            "target": {"name": "reverie_liteinst", "kind": ["rlib"], "crate_types": ["rlib"]},
+            "features": features,
+            "filenames": ["/isolated/libreverie_liteinst.rlib"]
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn canonical_tool_image_refuses_trap_only_and_patcher_less_builds_by_name() {
+        // Trap-only: the rlib compiled without the liteinst feature.
+        let trap = site_patching_from_cargo_messages(&rlib_message(json!([]))).unwrap_err();
+        assert!(
+            trap.to_string().contains("libdetcore_liteinst.so")
+                && trap.to_string().contains("trap-only"),
+            "{trap}"
+        );
+        let fixture_only =
+            site_patching_from_cargo_messages(&rlib_message(json!(["allocator-fixture"])))
+                .unwrap_err();
+        assert!(
+            fixture_only.to_string().contains("libdetcore_liteinst.so"),
+            "{fixture_only}"
+        );
+        // Patcher-less evidence: no reverie-liteinst rlib at all, malformed
+        // features, and mixed rlib messages all refuse by the same name.
+        for messages in [
+            String::new(),
+            rlib_message(Value::Null),
+            rlib_message(json!([42])),
+            format!(
+                "{}\n{}\n",
+                rlib_message(json!(["liteinst"])),
+                rlib_message(json!([]))
+            ),
+        ] {
+            let refused = site_patching_from_cargo_messages(&messages).unwrap_err();
+            assert!(
+                refused.to_string().contains("libdetcore_liteinst.so"),
+                "{refused}"
+            );
+        }
+        // The patching image is admitted and labelled explicitly; extra
+        // core features do not refuse (membership, not an exact array).
+        assert_eq!(
+            site_patching_from_cargo_messages(&rlib_message(json!(["liteinst"]))).unwrap(),
+            "liteinst"
+        );
+        assert_eq!(
+            site_patching_from_cargo_messages(&rlib_message(json!([
+                "coordinator-rpc",
+                "liteinst"
+            ])))
+            .unwrap(),
+            "liteinst"
+        );
+    }
+
     #[test]
     fn source_close_preserves_both_failures_and_never_publishes_success() {
         assert_eq!(
