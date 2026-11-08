@@ -3657,6 +3657,24 @@ impl<T: RecordOrReplay> Detcore<T> {
             .thread_state()
             .with_detfd(fd, |detfd| detfd.procfs_has_read_iter())?;
         validate_procfs_vector_flags(flags, read_iter)?;
+        // A kernel sysctl file has a `read_iter`, which Linux calls once
+        // with every vector (`do_iter_readv_writev`): the kernel's own read.
+        if guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.procfs_reads_kernel_at_every_read())?
+        {
+            let destinations = iovecs.iter().map(|iovec| (iovec.base, iovec.len)).collect();
+            return self
+                .read_kernel_sysctl(
+                    guest,
+                    fd,
+                    destinations,
+                    position as u64,
+                    offset.is_none(),
+                    flags,
+                )
+                .await;
+        }
         // A rendered `cmdline` has a plain `read`, which Linux calls once per
         // vector, in order, at the advancing position, stopping at the first
         // short or failed one (`do_loop_readv_writev`, fs/read_write.c), each
@@ -9012,7 +9030,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// count above `SSIZE_MAX` or a position whose end overflows (EINVAL);
     /// then the file's own read, even for a count of zero, which still finds
     /// its task (ESRCH once it is gone), with the count cut to
-    /// `MAX_RW_COUNT` (`Detcore::read_rendered_cmdline`).
+    /// `MAX_RW_COUNT` (`Detcore::read_rendered_cmdline`). So too for a
+    /// kernel sysctl file, whose own read is the kernel's
+    /// (`Detcore::read_kernel_sysctl`).
     async fn read_rendered_cmdline_call<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -9049,6 +9069,21 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Err(Errno::EINVAL.into());
         }
         let destination = buf.map_or(0, |buf| buf.as_raw());
+        if guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.procfs_reads_kernel_at_every_read())?
+        {
+            return self
+                .read_kernel_sysctl(
+                    guest,
+                    fd,
+                    vec![(destination, len)],
+                    pos,
+                    offset.is_none(),
+                    0,
+                )
+                .await;
+        }
         let copied = self
             .read_rendered_cmdline(
                 guest,
@@ -10398,10 +10433,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .read_timer_slack(guest, call.fd(), call.buf(), call.len())
                 .await;
         }
-        // A rendered `cmdline`: every read, of any count, reads memory.
+        // A rendered `cmdline`: every read, of any count, reads memory. A
+        // kernel sysctl file: every read is the kernel's.
         if guest
             .thread_state()
-            .with_detfd(call.fd(), |detfd| detfd.procfs_reads_memory_at_every_read())
+            .with_detfd(call.fd(), |detfd| {
+                detfd.procfs_reads_memory_at_every_read()
+                    || detfd.procfs_reads_kernel_at_every_read()
+            })
             .unwrap_or(false)
         {
             return self
@@ -10831,10 +10870,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await;
         }
         // A rendered `cmdline`: `ksys_pread64` refuses a negative position
-        // first, then every read, of any count, reads memory.
+        // first, then every read, of any count, reads memory. A kernel
+        // sysctl file: every read is the kernel's.
         if guest
             .thread_state()
-            .with_detfd(call.fd(), |detfd| detfd.procfs_reads_memory_at_every_read())
+            .with_detfd(call.fd(), |detfd| {
+                detfd.procfs_reads_memory_at_every_read()
+                    || detfd.procfs_reads_kernel_at_every_read()
+            })
             .unwrap_or(false)
         {
             let offset = u64::try_from(call.offset()).map_err(|_| Errno::EINVAL)?;

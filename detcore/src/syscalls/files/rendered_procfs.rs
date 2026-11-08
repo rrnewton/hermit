@@ -290,7 +290,8 @@ const DYNAMIC_PATHS: [&std::ffi::CStr; 5] = [
 ];
 
 /// The paths of every procfs file a session renders (`files`):
-/// `/proc/cpuinfo` and `/proc/locks` too where it renders them.
+/// `/proc/cpuinfo`, `/proc/locks` and the kernel sysctl files
+/// (`procfs::kernel_sysctl_c_paths`) too where it renders them.
 pub(crate) fn rendered_paths(
     files: RenderedFiles,
 ) -> impl Iterator<Item = &'static std::ffi::CStr> {
@@ -298,6 +299,13 @@ pub(crate) fn rendered_paths(
         .into_iter()
         .chain(files.cpuinfo.then_some(c"/proc/cpuinfo"))
         .chain(files.locks.then_some(c"/proc/locks"))
+        .chain(
+            files
+                .kernel_sysctl
+                .then(crate::procfs::kernel_sysctl_c_paths)
+                .into_iter()
+                .flatten(),
+        )
         .chain(
             FixedProcfsFile::ALL
                 .into_iter()
@@ -1013,6 +1021,532 @@ pub(super) fn kernel_stat(path: &Path, follow: bool) -> Result<libc::stat, Errno
     })?;
     // SAFETY: the call succeeded and initialized the structure.
     Ok(unsafe { stat.assume_init() })
+}
+
+// A level-table `/proc/sys` file that no other kind renders
+// (`ProcfsKind::KernelSysctl`: `net/core/somaxconn` and
+// `net/ipv4/ip_local_port_range`) is served, where Detcore serves `/proc` on
+// placeholders (KVM), by performing the guest's own operation on the
+// kernel's file with the tool's own system calls, with the calling guest
+// thread's credentials ([`SysctlCaller`]). The tool runs in the guest's
+// mount, user and network namespaces ([`GuestProcfs`]); its user and group
+// IDs are every guest thread's, as Detcore's credential setters reach no
+// kernel (`syscall_classification::is_credential_identity_noop_syscall`);
+// and each call takes the guest thread's capability sets on the tool's
+// thread for its length ([`as_caller`]), as a guest may change them
+// (`capset` reaches the kernel for its own thread, which on KVM is not the
+// tool's). So the kernel's answer is the one the guest's own call would get,
+// `sysctl_perm`'s `net_ctl_permissions` and `test_perm` included, and
+// ptrace's guest, whose calls reach the same file, gets the same. Every KVM
+// guest process lives in the container's user and network namespaces: KVM
+// refuses a clone into new ones by name, and Detcore refuses `unshare` and
+// `setns` into them (EPERM). The value is host-kernel-derived, the defaults
+// of the run's network namespace (the host's own values with
+// `--no-namespace`), as on ptrace: Detcore virtualizes none of it.
+
+/// The capability sets (their low 64 bits) of the guest thread whose call
+/// on a kernel sysctl file Detcore performs: what its own call would carry
+/// (`Detcore::kernel_sysctl_caller`, an injected `capget`). Its user and
+/// group IDs need no record: they are the tool's.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SysctlCaller {
+    pub(super) effective: u64,
+    pub(super) permitted: u64,
+}
+
+impl SysctlCaller {
+    /// The calling thread's own capability sets, as the tool's thread holds
+    /// them: a guest that changed none of its own.
+    #[cfg(test)]
+    fn of_this_thread() -> Self {
+        let (effective, permitted, _) = thread_capabilities().expect("capget of this thread");
+        Self {
+            effective,
+            permitted,
+        }
+    }
+
+    /// The effective set `faccessat2` checks with: the caller's own with
+    /// `AT_EACCESS`; without it, the set of the real IDs, which for a real
+    /// user ID of its namespace's root (every guest's, as the tool's is) is
+    /// the permitted set, and otherwise empty (`access_override_creds`,
+    /// fs/open.c in 6.17). The secure bits that would leave the effective set
+    /// alone (`SECURE_NO_SETUID_FIXUP`) are the tool's, which never sets them.
+    fn access_set(self, eaccess: bool) -> u64 {
+        if eaccess {
+            return self.effective;
+        }
+        // SAFETY: `getuid` takes no argument and cannot fail.
+        let ruid = unsafe { raw_syscall(libc::SYS_getuid, [0; 6]) };
+        if ruid == 0 { self.permitted } else { 0 }
+    }
+}
+
+/// The calling thread's effective, permitted and inheritable capability
+/// sets, their low 64 bits (`capget` of the thread, version 3).
+fn thread_capabilities() -> Result<(u64, u64, u64), Errno> {
+    let mut header = [LINUX_CAPABILITY_VERSION_3, 0_u32];
+    let mut data = [0_u32; 6];
+    // SAFETY: `header` and `data` are as large as version 3's structures.
+    raw_errno(unsafe {
+        raw_syscall(
+            libc::SYS_capget,
+            [
+                header.as_mut_ptr() as u64,
+                data.as_mut_ptr() as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        )
+    })?;
+    let set = |index: usize| u64::from(data[index]) | (u64::from(data[index + 3]) << 32);
+    Ok((set(0), set(1), set(2)))
+}
+
+/// Set the calling thread's capability sets (`capset` of the thread,
+/// version 3).
+fn set_thread_capabilities(
+    (effective, permitted, inheritable): (u64, u64, u64),
+) -> Result<(), Errno> {
+    let mut header = [LINUX_CAPABILITY_VERSION_3, 0_u32];
+    let low = |set: u64| set as u32;
+    let high = |set: u64| (set >> 32) as u32;
+    let data = [
+        low(effective),
+        low(permitted),
+        low(inheritable),
+        high(effective),
+        high(permitted),
+        high(inheritable),
+    ];
+    // SAFETY: `header` and `data` are as large as version 3's structures.
+    raw_errno(unsafe {
+        raw_syscall(
+            libc::SYS_capset,
+            [header.as_mut_ptr() as u64, data.as_ptr() as u64, 0, 0, 0, 0],
+        )
+    })
+    .map(|_| ())
+}
+
+/// Whether the tool's thread may take the caller's capability sets for a
+/// call: each within the tool thread's permitted set, which a thread may
+/// lower its effective set within and raise it back to. `Err` with the
+/// reason otherwise, which the caller refuses by name rather than answer
+/// with the tool's credentials.
+fn caller_fits_this_thread(caller: SysctlCaller) -> Result<(), String> {
+    let (_, permitted, _) = thread_capabilities()
+        .map_err(|errno| format!("the tool's own capability sets could not be read: {errno}"))?;
+    let missing = (caller.effective | caller.permitted) & !permitted;
+    if missing != 0 {
+        return Err(format!(
+            "the calling guest thread holds capabilities the tool's thread may not take \
+             (mask {missing:#x}), so the kernel cannot be asked with the guest's credentials"
+        ));
+    }
+    Ok(())
+}
+
+/// Run `call`, a sequence of the tool's own system calls with no await in
+/// it, with `effective` as the tool thread's effective capability set, and
+/// put the thread's own sets back after: so the kernel checks the call with
+/// the guest thread's capabilities, and nothing else ever runs with them.
+///
+/// Nothing else can run on this thread inside the window: `call` is
+/// synchronous and calls back into no Detcore code, so no other future, no
+/// other guest's call and no reentrant use of the window runs on the thread
+/// before it returns (on KVM the thread is the host thread polling this
+/// guest thread's handler with `futures::executor::block_on`, which polls
+/// one future at a time); and every blockable signal is blocked for the
+/// window ([`CallerWindow`]), so no host signal handler runs in it either.
+/// A thread whose effective set is already `effective` opens no window.
+fn as_caller<R>(effective: u64, call: impl FnOnce() -> R) -> R {
+    let own = thread_capabilities()
+        .unwrap_or_else(|errno| caller_window_fatal("read its own capability sets", errno));
+    if own.0 == effective {
+        return call();
+    }
+    let window = CallerWindow::enter(own, effective);
+    let result = call();
+    drop(window);
+    result
+}
+
+/// The window in which the tool's thread holds a guest thread's effective
+/// capability set ([`as_caller`]): every blockable signal blocked first, so
+/// that no host signal handler runs with the guest's capabilities (none
+/// makes a system call today: Reverie-KVM's `kick` does nothing and its
+/// entry `interrupt` only stores to atomics; the window keeps that
+/// independent of any handler added later), then the guest's effective
+/// set. Dropping it, on return or while `call` unwinds, puts the thread's
+/// own sets back, then its signal mask.
+///
+/// A failure to take the guest's set, to put the thread's own back, or to
+/// change the mask ends the process at once ([`caller_window_fatal`]): a
+/// panic would not do, as the backend catches panics in a handler
+/// (Reverie-KVM's `drive_handler_completion`) and the thread would go on
+/// with the guest's capabilities.
+struct CallerWindow {
+    own: (u64, u64, u64),
+    mask: u64,
+}
+
+impl CallerWindow {
+    fn enter(own: (u64, u64, u64), effective: u64) -> Self {
+        let mask = set_thread_signal_mask(!0)
+            .unwrap_or_else(|errno| caller_window_fatal("block its signals", errno));
+        let window = Self { own, mask };
+        if let Err(errno) = set_thread_capabilities((effective, own.1, own.2)) {
+            caller_window_fatal("take the guest thread's effective capability set", errno);
+        }
+        window
+    }
+}
+
+impl Drop for CallerWindow {
+    fn drop(&mut self) {
+        if let Err(errno) = set_thread_capabilities(self.own) {
+            caller_window_fatal("put its own capability sets back", errno);
+        }
+        if let Err(errno) = set_thread_signal_mask(self.mask) {
+            caller_window_fatal("put its signal mask back", errno);
+        }
+    }
+}
+
+/// End the process at once, never by a panic, which the backend may catch
+/// ([`CallerWindow`]): the tool's thread could not `what`, so its
+/// credentials or signal mask are not known to be its own.
+fn caller_window_fatal(what: &str, errno: Errno) -> ! {
+    error!(
+        "Detcore stops the run: the tool's thread could not {what} around a kernel sysctl call \
+         ({errno}), so it may hold a guest thread's capabilities"
+    );
+    std::process::abort()
+}
+
+/// Set the calling thread's signal mask to `mask` (bit `n - 1` for signal
+/// `n`; the kernel never blocks `SIGKILL` and `SIGSTOP`), returning the mask
+/// it had (`rt_sigprocmask(SIG_SETMASK)` of the thread).
+fn set_thread_signal_mask(mask: u64) -> Result<u64, Errno> {
+    let mut old = 0_u64;
+    // SAFETY: both sets are 8 bytes, the kernel's `sigset_t` on x86_64.
+    raw_errno(unsafe {
+        raw_syscall(
+            libc::SYS_rt_sigprocmask,
+            [
+                libc::SIG_SETMASK as u64,
+                std::ptr::addr_of!(mask) as u64,
+                std::ptr::addr_of_mut!(old) as u64,
+                8,
+                0,
+                0,
+            ],
+        )
+    })?;
+    Ok(old)
+}
+
+/// The kernel's answer to the guest's open of the kernel sysctl file `path`
+/// with `flags` (`ProcfsKind::KernelSysctl`): the open itself, with the
+/// guest's flags, on the tool's own descriptor, which is closed at once.
+/// Every check is the kernel's, in its order (`build_open_flags`, the
+/// lookup, `may_open`'s `proc_sys_permission`, which asks the sysctl table's
+/// own permissions, and `do_dentry_open`); opening a sysctl file changes
+/// nothing (`proc_sys_open` only takes the poll event of a table that has
+/// one), nor does `O_TRUNC` (`proc_sys_setattr` keeps no size). Asked with
+/// the guest's capabilities (`caller`): `net_ctl_permissions` gives a
+/// network-namespace tunable its owner's access for `CAP_NET_ADMIN` in the
+/// namespace's owner, so a guest without it opens one for writing with
+/// EACCES.
+pub(super) fn kernel_sysctl_open(
+    path: &Path,
+    flags: OFlag,
+    caller: SysctlCaller,
+) -> Result<(), Errno> {
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| Errno::EINVAL)?;
+    let flags = (flags | OFlag::O_CLOEXEC).bits();
+    // SAFETY: the path is NUL-terminated.
+    let fd = as_caller(caller.effective, || {
+        raw_errno(unsafe {
+            raw_syscall(
+                libc::SYS_openat,
+                [
+                    libc::AT_FDCWD as u64,
+                    path.as_ptr() as u64,
+                    flags as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+        })
+    })?;
+    // SAFETY: closing the descriptor opened above.
+    unsafe { raw_syscall(libc::SYS_close, [fd, 0, 0, 0, 0, 0]) };
+    Ok(())
+}
+
+/// The kernel's answer to `faccessat2(path, mode, flags)` for the kernel
+/// sysctl file `path`, where `flags` keeps only `AT_EACCESS` (the guest's
+/// spelling, with its `AT_SYMLINK_NOFOLLOW` and `AT_EMPTY_PATH`, has been
+/// resolved to `path`): `proc_sys_permission`'s answer, after the mount's
+/// (EROFS for write access on a read-only mount), for the guest's
+/// credentials (`caller`). Asked with `AT_EACCESS` and the set Linux would
+/// check with ([`SysctlCaller::access_set`]): the real IDs are the
+/// effective ones, every guest's as the tool's.
+pub(super) fn kernel_sysctl_faccessat(
+    path: &Path,
+    mode: u64,
+    eaccess: bool,
+    caller: SysctlCaller,
+) -> Result<(), Errno> {
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| Errno::EINVAL)?;
+    as_caller(caller.access_set(eaccess), || {
+        // SAFETY: the path is NUL-terminated.
+        raw_errno(unsafe {
+            raw_syscall(
+                libc::SYS_faccessat2,
+                [
+                    libc::AT_FDCWD as u64,
+                    path.as_ptr() as u64,
+                    mode,
+                    libc::AT_EACCESS as u64,
+                    0,
+                    0,
+                ],
+            )
+        })
+    })
+    .map(|_| ())
+}
+
+/// What decides the answer to a call that asks for access to the kernel
+/// sysctl file `path` other than an open or an access probe (a truncation,
+/// an attribute change or a time change): read and write permission by the
+/// kernel's own probes (`set`, the effective or the real IDs' set, as
+/// `faccessat2` with or without `AT_EACCESS` checks), and ownership by the
+/// kernel's owner of the file. A probe's EACCES, or EROFS for write access,
+/// is "not permitted"; any other errno is the call's answer. For the guest's
+/// credentials (`caller`).
+pub(super) fn kernel_sysctl_access(
+    path: &Path,
+    set: CapabilitySet,
+    caller: SysctlCaller,
+) -> Result<FileAccess, Errno> {
+    let eaccess = set == CapabilitySet::Effective;
+    let permitted = |mode: i32, refusals: &[Errno]| match kernel_sysctl_faccessat(
+        path,
+        mode as u64,
+        eaccess,
+        caller,
+    ) {
+        Ok(()) => Ok(true),
+        Err(errno) if refusals.contains(&errno) => Ok(false),
+        Err(errno) => Err(errno),
+    };
+    let readable = permitted(libc::R_OK, &[Errno::EACCES])?;
+    let writable = permitted(libc::W_OK, &[Errno::EACCES, Errno::EROFS])?;
+    let owner = kernel_stat(path, true)?.st_uid;
+    // SAFETY: `geteuid` takes no argument and cannot fail.
+    let euid = unsafe { raw_syscall(libc::SYS_geteuid, [0; 6]) } as u32;
+    Ok(FileAccess {
+        owner: owner == euid,
+        readable,
+        dac_override: writable,
+        sys_admin: false,
+    })
+}
+
+/// The most bytes Detcore's own buffer takes for one read of a kernel sysctl
+/// file. Linux refuses any count from `KMALLOC_MAX_SIZE` up with ENOMEM
+/// before the table's handler runs (`proc_sys_call_handler`,
+/// fs/proc/proc_sysctl.c:580-582 in 6.17), and `KMALLOC_MAX_SIZE` is 4 MiB on
+/// x86_64 (`MAX_PAGE_ORDER` 10 above 4 KiB pages), so a longer read is passed
+/// to the kernel with its whole count and no buffer, and the kernel's answer
+/// (EPERM, else ENOMEM) is the guest's, with nothing copied.
+const KERNEL_SYSCTL_READ_BUFFER: usize = 4 << 20;
+
+/// The kernel's answer to the guest's read (`write` false, into a buffer of
+/// `len` bytes) or write (of `bytes`, or of `len` bytes Detcore could not read
+/// from the guest when `bytes` is `None`) of the kernel sysctl file `path` at
+/// the file position `position`, with the `preadv2`/`pwritev2` flags
+/// `flags`: the guest's own call on a descriptor of the tool's, opened for
+/// it, moved to `position` (`default_llseek`), and closed. Returns the result
+/// and the position the call leaves (`iocb->ki_pos`, which the table's
+/// handler moves and which `vfs_read` and `vfs_write` keep even where the
+/// call then fails), which a call at the descriptor's position commits.
+///
+/// Linux asks the sysctl table's permission at every read and write
+/// (`sysctl_perm`, proc_sysctl.c:570-572), with the caller's credentials then:
+/// EPERM. The tool's descriptor asks it at its open, with EACCES, which is
+/// that EPERM. A write whose bytes Detcore could not read from the guest is
+/// passed with no buffer: the kernel gives every earlier answer (EPERM,
+/// ENOMEM for a count from `KMALLOC_MAX_SIZE` up, an unsupported flag) and
+/// then EFAULT where it copies nothing (`copy_from_iter_full`), exactly as
+/// the guest's own call. Every call of the sequence is made with the guest's
+/// capabilities (`caller`, [`as_caller`]), so both permission checks are
+/// the guest's.
+pub(super) fn kernel_sysctl_transfer(
+    path: &Path,
+    io: KernelSysctlIo<'_>,
+    position: u64,
+    flags: i32,
+    caller: SysctlCaller,
+) -> (Result<usize, Errno>, u64) {
+    as_caller(caller.effective, || {
+        kernel_sysctl_transfer_as_caller(path, io, position, flags)
+    })
+}
+
+/// [`kernel_sysctl_transfer`], on a thread that holds the guest's
+/// capabilities.
+fn kernel_sysctl_transfer_as_caller(
+    path: &Path,
+    io: KernelSysctlIo<'_>,
+    position: u64,
+    flags: i32,
+) -> (Result<usize, Errno>, u64) {
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return (Err(Errno::EINVAL), position);
+    };
+    let (access, sysno) = match io {
+        KernelSysctlIo::Read(_) | KernelSysctlIo::ReadLong(_) => {
+            (libc::O_RDONLY, libc::SYS_preadv2)
+        }
+        KernelSysctlIo::Write(_) | KernelSysctlIo::WriteUnreadable(_) => {
+            (libc::O_WRONLY, libc::SYS_pwritev2)
+        }
+    };
+    let iovec = match io {
+        KernelSysctlIo::Read(buffer) => libc::iovec {
+            iov_base: buffer.as_mut_ptr().cast(),
+            iov_len: buffer.len(),
+        },
+        KernelSysctlIo::ReadLong(len) | KernelSysctlIo::WriteUnreadable(len) => libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: len,
+        },
+        KernelSysctlIo::Write(bytes) => libc::iovec {
+            iov_base: bytes.as_ptr().cast_mut().cast(),
+            iov_len: bytes.len(),
+        },
+    };
+    // SAFETY: the path is NUL-terminated.
+    let fd = match raw_errno(unsafe {
+        raw_syscall(
+            libc::SYS_openat,
+            [
+                libc::AT_FDCWD as u64,
+                path.as_ptr() as u64,
+                (access | libc::O_CLOEXEC) as u64,
+                0,
+                0,
+                0,
+            ],
+        )
+    }) {
+        Ok(fd) => fd,
+        Err(Errno::EACCES) => return (Err(Errno::EPERM), position),
+        Err(errno) => return (Err(errno), position),
+    };
+    // SAFETY: a seek of the descriptor opened above.
+    let seek = raw_errno(unsafe {
+        raw_syscall(
+            libc::SYS_lseek,
+            [fd, position, libc::SEEK_SET as u64, 0, 0, 0],
+        )
+    });
+    // Without flags, a plain `read` or `write`, which reaches the table's
+    // handler even for a count of 0, as the guest's does (a vectored call of
+    // no bytes returns before it, and its callers answer that themselves).
+    let (sysno, call) = match (flags, sysno) {
+        (0, libc::SYS_preadv2) => (
+            libc::SYS_read,
+            [fd, iovec.iov_base as u64, iovec.iov_len as u64, 0, 0, 0],
+        ),
+        (0, _) => (
+            libc::SYS_write,
+            [fd, iovec.iov_base as u64, iovec.iov_len as u64, 0, 0, 0],
+        ),
+        _ => (
+            sysno,
+            [
+                fd,
+                std::ptr::addr_of!(iovec) as u64,
+                1,
+                u64::MAX,
+                0,
+                flags as u32 as u64,
+            ],
+        ),
+    };
+    let result = match seek {
+        // SAFETY: `iovec` names memory the tool owns for its length, or no
+        // memory (NULL), which the kernel refuses with EFAULT.
+        Ok(_) => raw_errno(unsafe { raw_syscall(sysno, call) }).map(|count| count as usize),
+        Err(errno) => Err(errno),
+    };
+    // SAFETY: a seek of the descriptor opened above.
+    let left =
+        raw_errno(unsafe { raw_syscall(libc::SYS_lseek, [fd, 0, libc::SEEK_CUR as u64, 0, 0, 0]) })
+            .unwrap_or(position);
+    // SAFETY: closing the descriptor opened above.
+    unsafe { raw_syscall(libc::SYS_close, [fd, 0, 0, 0, 0, 0]) };
+    (result, left)
+}
+
+/// The kernel's answer to the guest's read of `len` bytes of the kernel
+/// sysctl file `path` at `position` with the `preadv2` flags `flags`
+/// ([`kernel_sysctl_transfer`]): the bytes read, and the position the read
+/// leaves.
+pub(super) fn kernel_sysctl_read(
+    path: &Path,
+    len: usize,
+    position: u64,
+    flags: i32,
+    caller: SysctlCaller,
+) -> (Result<Vec<u8>, Errno>, u64) {
+    if len >= KERNEL_SYSCTL_READ_BUFFER {
+        let (result, left) =
+            kernel_sysctl_transfer(path, KernelSysctlIo::ReadLong(len), position, flags, caller);
+        // The kernel copies nothing at such a count: ENOMEM, or an earlier
+        // refusal. A count it did copy would have reached the NULL buffer,
+        // EFAULT.
+        return (result.map(|_| Vec::new()), left);
+    }
+    let mut buffer = vec![0_u8; len];
+    let (result, left) = kernel_sysctl_transfer(
+        path,
+        KernelSysctlIo::Read(&mut buffer),
+        position,
+        flags,
+        caller,
+    );
+    (
+        result.map(|count| {
+            buffer.truncate(count);
+            buffer
+        }),
+        left,
+    )
+}
+
+/// What one guest call does with a kernel sysctl file
+/// ([`kernel_sysctl_transfer`]).
+pub(super) enum KernelSysctlIo<'a> {
+    /// A read into this buffer, as long as the guest's count, which is below
+    /// [`KERNEL_SYSCTL_READ_BUFFER`].
+    Read(&'a mut [u8]),
+    /// A read of this many bytes, at least [`KERNEL_SYSCTL_READ_BUFFER`],
+    /// which the kernel refuses before it copies anything.
+    ReadLong(usize),
+    /// A write of these bytes, the guest's.
+    Write(&'a [u8]),
+    /// A write of this many bytes that Detcore could not read from the guest.
+    WriteUnreadable(usize),
 }
 
 /// The rendered file among `paths` that the kernel's procfs inode
@@ -2078,6 +2612,16 @@ impl FileAccess {
         sys_admin: false,
     };
 
+    /// A kernel sysctl file the kernel let the guest open with the flags it
+    /// asked for ([`kernel_sysctl_open`]), which has answered every check
+    /// these fields stand for, `O_NOATIME`'s owner among them.
+    const KERNEL_OPENED: Self = Self {
+        owner: true,
+        readable: true,
+        dac_override: true,
+        sys_admin: false,
+    };
+
     /// The caller's own descriptor directory (mode 0500), which it owns and
     /// may also write as a thread of the directory's task
     /// (`proc_fd_permission`), with `CAP_SYS_ADMIN` from the caller's
@@ -2670,8 +3214,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         path: &Path,
     ) -> Result<DetStat, Error> {
-        let owner = self.rendered_file_owner(guest, path).await?;
         let epoch = epoch_time(guest.config().epoch);
+        // A kernel sysctl file's mode, owner, link count and size are the
+        // kernel's (the table's mode, `proc_sys_make_inode`, and the owner
+        // its `set_ownership` gives, a network namespace's root for its
+        // tunables); its device, inode and times are Detcore's, as for every
+        // rendered file.
+        if crate::procfs::rendered_path_reads_kernel(path) {
+            let kernel = kernel_stat(path, true)?;
+            let mut stat = rendered_stat(path, epoch, (kernel.st_uid, kernel.st_gid));
+            stat.mode = kernel.st_mode;
+            stat.nlink = kernel.st_nlink;
+            stat.size = kernel.st_size;
+            return Ok(stat);
+        }
+        let owner = self.rendered_file_owner(guest, path).await?;
         let mut stat = rendered_stat(path, epoch, owner);
         if crate::procfs::per_process_name(path).is_some() {
             let state = crate::tool_global::rendered_file_state(
@@ -3142,6 +3699,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         needed: bool,
         set: CapabilitySet,
     ) -> Result<FileAccess, Error> {
+        if crate::procfs::rendered_path_reads_kernel(path) {
+            let caller = self.kernel_sysctl_caller(guest, path).await?;
+            return Ok(kernel_sysctl_access(path, set, caller)?);
+        }
         if !crate::procfs::rendered_path_is_per_process(path) {
             return Ok(FileAccess::GLOBAL_ROOT);
         }
@@ -3376,11 +3937,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         if asks_to_write_comm(&procfs, flags) {
             return Err(Errno::EACCES.into());
         }
-        let writes = flags & OFlag::O_ACCMODE != OFlag::O_RDONLY || flags.contains(OFlag::O_TRUNC);
-        let access = self
-            .rendered_file_access(guest, path, writes, CapabilitySet::Effective)
-            .await?;
-        let reopen = rendered_open_flags(flags, access)?;
+        // A kernel sysctl file is opened by the kernel itself, with the
+        // guest's flags, whose answer is the open's ([`kernel_sysctl_open`]);
+        // the placeholder then takes the flags the open kept.
+        let reopen = if crate::procfs::rendered_path_reads_kernel(path) {
+            let caller = self.kernel_sysctl_caller(guest, path).await?;
+            kernel_sysctl_open(path, flags, caller)?;
+            rendered_open_flags(flags, FileAccess::KERNEL_OPENED)?
+        } else {
+            let writes =
+                flags & OFlag::O_ACCMODE != OFlag::O_RDONLY || flags.contains(OFlag::O_TRUNC);
+            let access = self
+                .rendered_file_access(guest, path, writes, CapabilitySet::Effective)
+                .await?;
+            rendered_open_flags(flags, access)?
+        };
         // A process's `mountinfo` or `mounts` takes the task's mount namespace
         // at its open (`mounts_open_common`), which a task that has exited no
         // longer has: EINVAL, after the permission check.
@@ -3473,6 +4044,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             Some(bytes) => Some(bytes),
             None if procfs.is_process_auxv() || procfs.reads_exec_strings() => None,
             None if procfs.snapshot_at_first_read() => None,
+            // Every read of a kernel sysctl file is the kernel's.
+            None if procfs.reads_kernel_at_every_read() => None,
             None => {
                 // `/proc/diskstats` starts from the host's table as the run
                 // first read it, from the coordinator: an open that cannot
@@ -5914,6 +6487,270 @@ impl<T: RecordOrReplay> Detcore<T> {
         .map(|_| ())
     }
 
+    /// The credentials the calling guest thread's own call on the kernel
+    /// sysctl file `path` would carry ([`SysctlCaller`]): its capability
+    /// sets, by an injected `capget`, which the tool's thread may take
+    /// ([`caller_fits_this_thread`]). Where they cannot be read (no stack
+    /// scratch, `capget` refused) or taken, the call is refused by name
+    /// through the failure policy (`scratch_failure`), never answered with
+    /// the tool's own credentials.
+    async fn kernel_sysctl_caller<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        path: &Path,
+    ) -> Result<SysctlCaller, Error> {
+        let reason = match Self::inject_capget_of(guest, 0).await? {
+            Some(Ok(sets)) => {
+                let caller = SysctlCaller {
+                    effective: sets.effective,
+                    permitted: sets.permitted,
+                };
+                match caller_fits_this_thread(caller) {
+                    Ok(()) => return Ok(caller),
+                    Err(reason) => reason,
+                }
+            }
+            Some(Err(errno)) => format!("the calling guest thread's capget failed with {errno}"),
+            None => String::from(
+                "the calling guest thread's capability sets could not be read (no stack scratch \
+                 below the red zone)",
+            ),
+        };
+        let reason = format!(
+            "the kernel sysctl file {} cannot be asked with the calling guest thread's \
+             credentials: {reason}",
+            path.display()
+        );
+        Err(Self::scratch_failure(guest, Sysno::capget, reason).await)
+    }
+
+    /// The guest's read of the kernel sysctl file open as `fd`
+    /// (`ProcfsFile::reads_kernel_at_every_read`) into `destinations`, in
+    /// order, at `position` (the descriptor's position where `at_cursor`,
+    /// which the read then leaves where the kernel's leaves it), with the
+    /// `preadv2` flags `flags`: the kernel's own read
+    /// ([`kernel_sysctl_read`]), then its bytes copied to the guest (EFAULT
+    /// where they cannot be, as `copy_to_iter` fails after the table's
+    /// handler has moved the position). The caller has made `vfs_read`'s
+    /// earlier checks (the access mode, the destinations' range, the
+    /// position's and the flags'); the count is cut to `MAX_RW_COUNT`.
+    pub(super) async fn read_kernel_sysctl<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        destinations: Vec<(usize, usize)>,
+        position: u64,
+        at_cursor: bool,
+        flags: i32,
+    ) -> Result<i64, Error> {
+        let path = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.procfs_rendered_path())?
+            .ok_or(Errno::EBADF)?;
+        let len = destinations
+            .iter()
+            .map(|(_, len)| *len)
+            .sum::<usize>()
+            .min(crate::page::max_rw_count());
+        let caller = self.kernel_sysctl_caller(guest, path).await?;
+        let (result, left) = kernel_sysctl_read(path, len, position, flags, caller);
+        if at_cursor {
+            let left = usize::try_from(left).map_err(|_| Errno::EOVERFLOW)?;
+            guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.set_procfs_offset(left))?;
+            self.sync_rendered_procfs_position(guest, fd).await?;
+        }
+        let bytes = result?;
+        let mut copied = 0;
+        for (base, len) in destinations {
+            if copied == bytes.len() {
+                break;
+            }
+            let part = &bytes[copied..bytes.len().min(copied + len)];
+            if !part.is_empty() {
+                let address = AddrMut::<u8>::from_raw(base).ok_or(Errno::EFAULT)?;
+                guest
+                    .memory()
+                    .write_exact(address, part)
+                    .map_err(|_| Errno::EFAULT)?;
+            }
+            copied += part.len();
+        }
+        Ok(bytes.len() as i64)
+    }
+
+    /// The guest's write (`write`, `writev`, `pwritev2` at the file position,
+    /// at the descriptor's position, which it then leaves where the kernel's
+    /// write leaves it; `pwrite64`, `pwritev`, `pwritev2` at a position) of
+    /// the kernel sysctl file open as `fd` (`ProcfsFile::reads_kernel_at_every_read`):
+    /// the kernel's own write of the guest's bytes ([`kernel_sysctl_transfer`]),
+    /// whose result and errno are the call's. In `vfs_write`'s order
+    /// (fs/read_write.c in 6.17): a negative position of a positioned write
+    /// is EINVAL first (`ksys_pwrite64`, `do_pwritev`), then a description
+    /// that cannot write is EBADF; the vectors are imported (EFAULT, EINVAL),
+    /// and vectors of no bytes write nothing (0); the position and count are
+    /// checked (`rw_verify_area`, EINVAL); then the kernel answers the rest,
+    /// the flags among it. `sendfile` and `splice` into it, which Linux
+    /// writes through the table's handler (`iter_file_splice_write`), are
+    /// refused by name through the unsupported-operation policy. `None` for
+    /// any other call or descriptor, and an `O_PATH` one, whose calls the
+    /// placeholder's description refuses as Linux does.
+    async fn answer_kernel_sysctl_write<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: Sysno,
+        args: &reverie::syscalls::SyscallArgs,
+    ) -> Option<Result<i64, Error>> {
+        let (fd, position, vectored, flags) = match sysno {
+            Sysno::write => (args.arg0, None, false, 0),
+            Sysno::writev => (args.arg0, None, true, 0),
+            Sysno::pwrite64 => (args.arg0, Some(args.arg3 as i64), false, 0),
+            Sysno::pwritev => (args.arg0, Some(args.arg3 as i64), true, 0),
+            Sysno::pwritev2 if args.arg3 as i64 == -1 => (args.arg0, None, true, args.arg5 as i32),
+            Sysno::pwritev2 => (args.arg0, Some(args.arg3 as i64), true, args.arg5 as i32),
+            Sysno::sendfile => (args.arg0, None, false, 0),
+            Sysno::splice => (args.arg2, None, false, 0),
+            _ => return None,
+        };
+        let fd = fd as RawFd;
+        let (path, status) = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| {
+                if !detfd.procfs_reads_kernel_at_every_read() {
+                    return None;
+                }
+                Some((detfd.procfs_rendered_path()?, detfd.status_flags()))
+            })
+            .ok()
+            .flatten()?;
+        if status & libc::O_PATH != 0 {
+            return None;
+        }
+        Some(
+            self.kernel_sysctl_write_answer(
+                guest,
+                sysno,
+                args,
+                (fd, path, status),
+                position,
+                vectored,
+                flags,
+            )
+            .await,
+        )
+    }
+
+    /// [`Self::answer_kernel_sysctl_write`]'s answer for the kernel sysctl
+    /// file `path` open as `fd` with the status flags `status`.
+    #[allow(clippy::too_many_arguments)]
+    async fn kernel_sysctl_write_answer<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: Sysno,
+        args: &reverie::syscalls::SyscallArgs,
+        (fd, path, status): (RawFd, &'static Path, i32),
+        position: Option<i64>,
+        vectored: bool,
+        flags: i32,
+    ) -> Result<i64, Error> {
+        if matches!(sysno, Sysno::sendfile | Sysno::splice) {
+            let reason = format!(
+                "{sysno} into the kernel sysctl file {} is not modeled",
+                path.display()
+            );
+            let panic_on_unsupported = guest.config().panic_on_unsupported_syscalls;
+            return match crate::syscalls::helpers::refuse_unserviceable_operation_with(
+                guest,
+                panic_on_unsupported,
+                sysno,
+                Errno::EOPNOTSUPP,
+                Some(&reason),
+            )
+            .await
+            {
+                Ok(_) => Err(Errno::EOPNOTSUPP.into()),
+                Err(error) => Err(error),
+            };
+        }
+        if position.is_some_and(|position| position < 0) {
+            return Err(Errno::EINVAL.into());
+        }
+        if !matches!(status & libc::O_ACCMODE, libc::O_WRONLY | libc::O_RDWR) {
+            return Err(Errno::EBADF.into());
+        }
+        let sources = if vectored {
+            crate::iovecs::import_read_iovecs(&guest.memory(), args.arg1, args.arg2, || {
+                crate::iovecs::UserAddressLimit::from_query(guest.user_address_limit())
+            })?
+            .iter()
+            .map(|iovec| (iovec.base, iovec.len))
+            .collect::<Vec<_>>()
+        } else {
+            let len = args.arg2.min(crate::page::max_rw_count());
+            let limit = crate::iovecs::UserAddressLimit::from_query(guest.user_address_limit())?;
+            limit.validate(&[crate::iovecs::ImportedIovec {
+                base: args.arg1,
+                len,
+            }])?;
+            vec![(args.arg1, len)]
+        };
+        let len = sources.iter().map(|(_, len)| *len).sum::<usize>();
+        if vectored && len == 0 {
+            return Ok(0);
+        }
+        let at = match position {
+            Some(position) => position as u64,
+            None => {
+                self.adopt_rendered_procfs_position(guest, fd).await?;
+                guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| detfd.procfs_position())?
+                    .map_or(0, |(offset, _)| offset) as u64
+            }
+        };
+        if i64::try_from(len)
+            .ok()
+            .and_then(|len| i64::try_from(at).ok()?.checked_add(len))
+            .is_none()
+        {
+            return Err(Errno::EINVAL.into());
+        }
+        let caller = self.kernel_sysctl_caller(guest, path).await?;
+        // The guest's bytes, or none where any cannot be read, which the
+        // kernel then refuses with EFAULT after its other checks; a count
+        // the kernel refuses whatever its bytes is not read at all.
+        let mut bytes = Vec::with_capacity(len.min(KERNEL_SYSCTL_READ_BUFFER));
+        let readable = len < KERNEL_SYSCTL_READ_BUFFER
+            && sources.iter().all(|(base, len)| {
+                if *len == 0 {
+                    return true;
+                }
+                let start = bytes.len();
+                bytes.resize(start + len, 0);
+                Addr::<u8>::from_raw(*base).is_some_and(|address| {
+                    guest
+                        .memory()
+                        .read_exact(address, &mut bytes[start..])
+                        .is_ok()
+                })
+            });
+        let io = if readable {
+            KernelSysctlIo::Write(&bytes)
+        } else {
+            KernelSysctlIo::WriteUnreadable(len)
+        };
+        let (result, left) = kernel_sysctl_transfer(path, io, at, flags, caller);
+        if position.is_none() {
+            let left = usize::try_from(left).map_err(|_| Errno::EOVERFLOW)?;
+            guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.set_procfs_offset(left))?;
+            self.sync_rendered_procfs_position(guest, fd).await?;
+        }
+        Ok(result? as i64)
+    }
+
     /// Where the tool runs in each guest process, take a placeholder's cursor
     /// from its kernel position, before a read or seek uses it. Processes
     /// that share the open file across `fork` share only that position, which
@@ -7377,6 +8214,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: &Syscall,
     ) -> Option<Result<i64, Error>> {
         let (sysno, args) = call.into_parts();
+        if let Some(answer) = self.answer_kernel_sysctl_write(guest, sysno, &args).await {
+            return Some(answer);
+        }
         if let Some(answer) = self.answer_rendered_procfs_write(guest, sysno, &args).await {
             return Some(answer.map_err(Error::from));
         }
@@ -8059,6 +8899,19 @@ impl<T: RecordOrReplay> Detcore<T> {
             None => (None, None),
         };
         let rendered = rendered.expect("checked above");
+        // An access probe of a kernel sysctl file is the kernel's own, with
+        // the guest's mode, by the set `AT_EACCESS` names
+        // ([`kernel_sysctl_faccessat`]), after Linux's own argument check.
+        if let PathRequest::Access { mode, flags } = request
+            && crate::procfs::rendered_path_reads_kernel(rendered)
+        {
+            if access_arguments_invalid(mode, flags) {
+                return Err(Errno::EINVAL.into());
+            }
+            let eaccess = flags & libc::AT_EACCESS as u64 != 0;
+            let caller = self.kernel_sysctl_caller(guest, rendered).await?;
+            return Ok(kernel_sysctl_faccessat(rendered, mode, eaccess, caller).map(|()| Some(0))?);
+        }
         // A request for write access (an access probe for it, a truncation,
         // an attribute change) asks for the caller's capabilities; `access`
         // and `faccessat` without `AT_EACCESS` check the real IDs' set.
@@ -9216,6 +10069,218 @@ mod tests {
         );
     }
 
+    /// A kernel sysctl file's read is the kernel's own, at the position it
+    /// is given (`kernel_sysctl_read`): the whole file at 0, as a plain read
+    /// of it gives, and, for an integer table like `somaxconn`'s, nothing at
+    /// 1 (`proc_dointvec` reads nothing past 0), with the position the
+    /// table's handler leaves. A count the kernel refuses whatever the file
+    /// (from `KMALLOC_MAX_SIZE` up) copies nothing.
+    #[test]
+    fn kernel_sysctl_reads_are_the_kernels_at_the_position() {
+        let path = Path::new("/proc/sys/net/core/somaxconn");
+        let Ok(plain) = std::fs::read(path) else {
+            return;
+        };
+        let caller = SysctlCaller::of_this_thread();
+        let (read, left) = kernel_sysctl_read(path, 64, 0, 0, caller);
+        assert_eq!(read, Ok(plain.clone()));
+        assert_eq!(left, plain.len() as u64);
+        assert_eq!(
+            kernel_sysctl_read(path, 64, 1, 0, caller),
+            (Ok(Vec::new()), 1)
+        );
+        // One byte at a time: the first, then nothing past it.
+        assert_eq!(
+            kernel_sysctl_read(path, 1, 0, 0, caller),
+            (Ok(plain[..1].to_vec()), 1)
+        );
+        let (long, left) = kernel_sysctl_read(path, KERNEL_SYSCTL_READ_BUFFER, 0, 0, caller);
+        assert_eq!(long, Err(Errno::ENOMEM));
+        assert_eq!(left, 0);
+        // A file Linux does not have is the kernel's ENOENT.
+        let missing = Path::new("/proc/sys/net/core/no_such_tunable");
+        assert_eq!(
+            kernel_sysctl_read(missing, 64, 0, 0, caller),
+            (Err(Errno::ENOENT), 0)
+        );
+    }
+
+    /// A kernel sysctl file's open, access probe and write are the kernel's
+    /// own (`kernel_sysctl_open`, `kernel_sysctl_faccessat`,
+    /// `kernel_sysctl_transfer`): its errno for flags a sysctl file refuses,
+    /// and, where the caller may not write it, the EPERM a write gets from
+    /// `sysctl_perm` at the write, with the bytes unwritten. Whether this
+    /// test's user may write it is the host's: it writes only where it may
+    /// not.
+    #[test]
+    fn kernel_sysctl_opens_probes_and_writes_are_the_kernels() {
+        let path = Path::new("/proc/sys/net/core/somaxconn");
+        if std::fs::metadata(path).is_err() {
+            return;
+        }
+        let caller = SysctlCaller::of_this_thread();
+        assert_eq!(kernel_sysctl_open(path, OFlag::O_RDONLY, caller), Ok(()));
+        assert_eq!(
+            kernel_sysctl_open(path, OFlag::O_RDONLY | OFlag::O_DIRECTORY, caller),
+            Err(Errno::ENOTDIR)
+        );
+        assert_eq!(
+            kernel_sysctl_open(path, OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL, caller),
+            Err(Errno::EEXIST)
+        );
+        assert_eq!(
+            kernel_sysctl_faccessat(path, libc::R_OK as u64, false, caller),
+            Ok(())
+        );
+        assert_eq!(
+            kernel_sysctl_faccessat(path, libc::X_OK as u64, true, caller),
+            Err(Errno::EACCES)
+        );
+        let access = kernel_sysctl_access(path, CapabilitySet::Effective, caller).unwrap();
+        assert!(access.readable);
+        let may_write = kernel_sysctl_faccessat(path, libc::W_OK as u64, true, caller).is_ok();
+        assert_eq!(access.may_write(), may_write);
+        if !may_write {
+            assert_eq!(
+                kernel_sysctl_open(path, OFlag::O_WRONLY, caller),
+                Err(Errno::EACCES)
+            );
+            let before = std::fs::read(path).unwrap();
+            let (written, left) =
+                kernel_sysctl_transfer(path, KernelSysctlIo::Write(b"1\n"), 0, 0, caller);
+            assert_eq!((written, left), (Err(Errno::EPERM), 0));
+            assert_eq!(std::fs::read(path).unwrap(), before);
+        }
+    }
+
+    /// The window in which the tool's thread holds a guest thread's
+    /// capabilities (`CallerWindow`) blocks every blockable signal inside,
+    /// and puts the thread's own capability sets and signal mask back when
+    /// it ends, on return and while the call unwinds. Entered with the
+    /// thread's own effective set, which any environment can take; where
+    /// the thread holds an effective capability, also with a lower set,
+    /// which holds inside the window only.
+    #[test]
+    fn the_caller_window_restores_the_thread_on_return_and_unwind() {
+        /// The thread's signal mask, read by blocking nothing more.
+        fn mask_now() -> u64 {
+            let (none, mut mask) = (0_u64, 0_u64);
+            // SAFETY: both sets are 8 bytes, the kernel's `sigset_t`.
+            raw_errno(unsafe {
+                raw_syscall(
+                    libc::SYS_rt_sigprocmask,
+                    [
+                        libc::SIG_BLOCK as u64,
+                        std::ptr::addr_of!(none) as u64,
+                        std::ptr::addr_of_mut!(mask) as u64,
+                        8,
+                        0,
+                        0,
+                    ],
+                )
+            })
+            .unwrap();
+            mask
+        }
+        // The kernel never blocks SIGKILL and SIGSTOP.
+        let every_blockable = !((1_u64 << (libc::SIGKILL - 1)) | (1_u64 << (libc::SIGSTOP - 1)));
+        let own = thread_capabilities().unwrap();
+        let mask = mask_now();
+        let inside = {
+            let _window = CallerWindow::enter(own, own.0);
+            (mask_now(), thread_capabilities().unwrap())
+        };
+        assert_eq!(inside, (every_blockable, own));
+        assert_eq!((mask_now(), thread_capabilities().unwrap()), (mask, own));
+        // The lowest effective capability dropped, where there is one.
+        let lower = own.0 & own.0.wrapping_sub(1);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _window = CallerWindow::enter(own, lower);
+            assert_eq!(thread_capabilities().unwrap().0, lower);
+            assert_eq!(mask_now(), every_blockable);
+            panic!("a call that unwinds inside the window");
+        }));
+        assert!(unwound.is_err());
+        assert_eq!((mask_now(), thread_capabilities().unwrap()), (mask, own));
+        let returned = as_caller(lower, || thread_capabilities().unwrap().0);
+        assert_eq!(returned, lower);
+        assert_eq!((mask_now(), thread_capabilities().unwrap()), (mask, own));
+    }
+
+    /// A kernel sysctl call carries the guest thread's capabilities, not
+    /// the tool's (`as_caller`): a network-namespace tunable gives its
+    /// owner's access for `CAP_NET_ADMIN` in the namespace's owner
+    /// (`net_ctl_permissions`), so a caller whose effective set lacks it,
+    /// where the user ID alone does not grant write access, opens it for
+    /// writing and probes it with `AT_EACCESS` with EACCES, and writes it
+    /// with EPERM, the value unchanged; `access` without `AT_EACCESS` checks
+    /// the permitted set (`access_override_creds`), which still holds it.
+    /// The thread's own sets are back after each call. A caller holding a
+    /// capability the thread may not take is refused
+    /// (`caller_fits_this_thread`). Which branch runs is the host's: as a
+    /// user without capabilities only the refusal is checked; as root of a
+    /// user and network namespace (`unshare -Urn`, the pinned root) all of
+    /// it.
+    #[test]
+    fn kernel_sysctl_calls_carry_the_guest_threads_capabilities() {
+        const NET_ADMIN: u64 = 1 << 12;
+        let path = Path::new("/proc/sys/net/core/somaxconn");
+        if std::fs::metadata(path).is_err() {
+            return;
+        }
+        let own_sets = thread_capabilities().unwrap();
+        let own = SysctlCaller::of_this_thread();
+        if own.permitted & NET_ADMIN == 0 {
+            let reason = caller_fits_this_thread(SysctlCaller {
+                effective: NET_ADMIN,
+                permitted: NET_ADMIN,
+            })
+            .unwrap_err();
+            assert!(reason.contains("0x1000"), "{reason}");
+            return;
+        }
+        assert_eq!(caller_fits_this_thread(own), Ok(()));
+        let w_ok = libc::W_OK as u64;
+        let by_id_alone = SysctlCaller {
+            effective: 0,
+            permitted: 0,
+        };
+        if kernel_sysctl_faccessat(path, w_ok, true, own).is_err()
+            || kernel_sysctl_faccessat(path, w_ok, true, by_id_alone).is_ok()
+        {
+            // Not writable at all here, or writable by the user ID alone
+            // (global root): no capability decides.
+            return;
+        }
+        let without = SysctlCaller {
+            effective: own.effective & !NET_ADMIN,
+            ..own
+        };
+        assert_eq!(
+            kernel_sysctl_open(path, OFlag::O_WRONLY, without),
+            Err(Errno::EACCES)
+        );
+        assert_eq!(kernel_sysctl_open(path, OFlag::O_WRONLY, own), Ok(()));
+        assert_eq!(
+            kernel_sysctl_faccessat(path, w_ok, true, without),
+            Err(Errno::EACCES)
+        );
+        // SAFETY: `getuid` takes no argument and cannot fail.
+        if unsafe { raw_syscall(libc::SYS_getuid, [0; 6]) } == 0 {
+            assert_eq!(kernel_sysctl_faccessat(path, w_ok, false, without), Ok(()));
+        }
+        let access = kernel_sysctl_access(path, CapabilitySet::Effective, without).unwrap();
+        assert!(access.readable && !access.may_write());
+        let before = std::fs::read(path).unwrap();
+        let (written, left) =
+            kernel_sysctl_transfer(path, KernelSysctlIo::Write(b"1\n"), 0, 0, without);
+        assert_eq!((written, left), (Err(Errno::EPERM), 0));
+        assert_eq!(std::fs::read(path).unwrap(), before);
+        let (read, _) = kernel_sysctl_read(path, 64, 0, 0, without);
+        assert_eq!(read, Ok(before));
+        assert_eq!(thread_capabilities().unwrap(), own_sets);
+    }
+
     /// Every rendered file is one `ProcfsFile` renders, under its own inode,
     /// and the fixed tunables are writable by their owner as on Linux.
     #[test]
@@ -9245,10 +10310,12 @@ mod tests {
                 "{path:?}"
             );
         }
-        // `/proc/cpuinfo` and `/proc/locks` are rendered only in a session
-        // that renders them.
+        // `/proc/cpuinfo`, `/proc/locks` and the two kernel sysctl files are
+        // rendered only in a session that renders them.
         let without = RenderedFiles::WITHOUT_CPUINFO;
-        assert_eq!(rendered_paths(without).count() + 2, paths.len());
+        assert_eq!(rendered_paths(without).count() + 4, paths.len());
+        assert!(paths.contains(&Path::new("/proc/sys/net/core/somaxconn")));
+        assert!(rendered_paths(without).all(|path| path != c"/proc/sys/net/core/somaxconn"));
         assert!(rendered_paths(without).all(|path| path != c"/proc/cpuinfo"));
         assert!(rendered_paths(without).all(|path| path != c"/proc/locks"));
         assert!(!could_name_rendered(

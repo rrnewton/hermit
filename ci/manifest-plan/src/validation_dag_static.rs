@@ -3397,7 +3397,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_bind_mount_is_the_procfs_directory_it_shows: 3795.
     // And syscalls::misc::tests::uname_and_procfs_agree_on_the_host_and_domain_names
     // (kernel/hostname and kernel/domainname rendered from uname's names): 3796.
-    ("test.detcore_unit", 3796),
+    // And the kernel sysctl units
+    // every_level_table_sysctl_file_is_rendered_where_procfs_is_the_backends,
+    // kernel_sysctl_reads_are_the_kernels_at_the_position and
+    // kernel_sysctl_opens_probes_and_writes_are_the_kernels: 3796 + 3 = 3799.
+    // And kernel_sysctl_calls_carry_the_guest_threads_capabilities: 3800.
+    // And the_caller_window_restores_the_thread_on_return_and_unwind: 3801.
+    ("test.detcore_unit", 3801),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -6233,7 +6239,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_bind_mount_is_the_procfs_directory_it_shows: 3795.
     // And syscalls::misc::tests::uname_and_procfs_agree_on_the_host_and_domain_names
     // (kernel/hostname and kernel/domainname rendered from uname's names): 3796.
-    ("test.detcore_unit_on_host", 3796),
+    // And the kernel sysctl units
+    // every_level_table_sysctl_file_is_rendered_where_procfs_is_the_backends,
+    // kernel_sysctl_reads_are_the_kernels_at_the_position and
+    // kernel_sysctl_opens_probes_and_writes_are_the_kernels: 3796 + 3 = 3799.
+    // And kernel_sysctl_calls_carry_the_guest_threads_capabilities: 3800.
+    // And the_caller_window_restores_the_thread_on_return_and_unwind: 3801.
+    ("test.detcore_unit_on_host", 3801),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

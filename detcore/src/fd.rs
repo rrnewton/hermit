@@ -2303,6 +2303,18 @@ impl DetFd {
         self.with_description(|d| d.procfs.as_ref().is_some_and(ProcfsFile::needs_snapshot))
     }
 
+    /// Whether every read and write of this open file description is the
+    /// kernel's, on its own file (`ProcfsFile::reads_kernel_at_every_read`):
+    /// a level-table `/proc/sys` file Detcore opened, which no other kind
+    /// renders.
+    pub(crate) fn procfs_reads_kernel_at_every_read(&self) -> bool {
+        self.with_description(|d| {
+            d.procfs
+                .as_ref()
+                .is_some_and(ProcfsFile::reads_kernel_at_every_read)
+        })
+    }
+
     /// Whether every read of this open file description reads the process's
     /// memory again (`ProcfsFile::reads_memory_at_every_read`): a process's
     /// `cmdline` Detcore opened.

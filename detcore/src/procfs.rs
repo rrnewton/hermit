@@ -222,6 +222,23 @@ enum ProcfsKind {
     /// (`ProcfsFile::kernel_served`), as before. Appended last, so every
     /// other kind keeps its serialized number.
     ProcessComm,
+    /// A `/proc/sys` file of the `--proc` level table that no other kind
+    /// renders (`net/core/somaxconn`, `net/ipv4/ip_local_port_range`), by its
+    /// index among the table's `/proc/sys` files (`levels::sysctl_file`): a
+    /// value of the guest's network namespace that Detcore does not fix, so
+    /// host-kernel-derived, as on ptrace. Where the guest's procfs is not the
+    /// kernel's ([`RenderedFiles::kernel_sysctl`], KVM), Detcore serves it
+    /// from the kernel's own file in the guest's namespaces, which the tool
+    /// shares: every open, access probe, read and write is the tool's own
+    /// call with the guest's arguments and the calling guest thread's
+    /// credentials (`SysctlCaller`), a read or write at the guest's
+    /// position (`Detcore::read_kernel_sysctl`,
+    /// `Detcore::answer_kernel_sysctl_write`), as Linux generates a sysctl's
+    /// text at each read (`proc_sys_call_handler`), so a write is seen by the
+    /// next read. Elsewhere (ptrace) the kernel serves the guest's
+    /// descriptor, unclassified ([`ProcfsFile::kernel_served`]). Appended
+    /// last, as above.
+    KernelSysctl(u16),
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1027,6 +1044,11 @@ pub(crate) struct RenderedFiles {
     /// package K slice N4): exactly where the guest's procfs is not the
     /// kernel's (KVM), so there is no kernel file to sanitize.
     pub(crate) address_space: bool,
+    /// Whether Detcore serves the `/proc/sys` files of the level table it
+    /// does not render otherwise from the kernel's own files
+    /// ([`ProcfsKind::KernelSysctl`]): exactly where the guest's procfs is
+    /// not the kernel's (KVM), whose executor refuses every procfs object.
+    pub(crate) kernel_sysctl: bool,
 }
 
 impl RenderedFiles {
@@ -1037,6 +1059,7 @@ impl RenderedFiles {
         mounts: true,
         locks: true,
         address_space: true,
+        kernel_sysctl: true,
     };
 
     /// The files Detcore renders in every session, without `/proc/cpuinfo`
@@ -1046,6 +1069,7 @@ impl RenderedFiles {
         mounts: false,
         locks: false,
         address_space: false,
+        kernel_sysctl: false,
     };
 
     /// The files a session renders whose configuration virtualizes CPUID
@@ -1064,6 +1088,7 @@ impl RenderedFiles {
             mounts: mount_table,
             locks: backend_procfs,
             address_space: backend_procfs,
+            kernel_sysctl: backend_procfs,
         }
     }
 }
@@ -1407,6 +1432,33 @@ fn canonical_descriptor_name(name: &str) -> Option<i32> {
         && name.bytes().all(|byte| byte.is_ascii_digit())
         && (name == "0" || !name.starts_with('0'));
     canonical.then(|| name.parse::<i32>().ok()).flatten()
+}
+
+/// The level-table `/proc/sys` files that Detcore serves from the kernel's
+/// own files ([`ProcfsKind::KernelSysctl`]), NUL-terminated, in the table's
+/// order: those no other kind renders.
+pub(crate) fn kernel_sysctl_c_paths() -> impl Iterator<Item = &'static std::ffi::CStr> {
+    static PATHS: std::sync::OnceLock<Vec<std::ffi::CString>> = std::sync::OnceLock::new();
+    PATHS
+        .get_or_init(|| {
+            (0_u16..)
+                .map_while(levels::sysctl_file_path)
+                .filter(|path| rendered_path_reads_kernel(path))
+                .map(|path| {
+                    std::ffi::CString::new(path.to_str().expect("a table path is UTF-8"))
+                        .expect("a table path holds no NUL")
+                })
+                .collect()
+        })
+        .iter()
+        .map(std::ffi::CString::as_c_str)
+}
+
+/// Whether `path`, a rendered file's, is a level-table `/proc/sys` file that
+/// Detcore serves from the kernel's own file at every open, read, write and
+/// stat ([`ProcfsFile::reads_kernel_at_every_read`]).
+pub(crate) fn rendered_path_reads_kernel(path: &Path) -> bool {
+    ProcfsFile::from_path(path).is_some_and(|file| file.reads_kernel_at_every_read())
 }
 
 /// Whether `path`, a rendered file's, is a per-process file's, which Linux
@@ -2110,6 +2162,11 @@ impl ProcfsFile {
             _ if is_block_inflight_path(&path) => ProcfsKind::BlockInflight,
             _ if is_btrfs_bytes_may_use_path(&path) => ProcfsKind::BtrfsBytesMayUse,
             _ if is_irq_per_cpu_count_path(&path) => ProcfsKind::IrqPerCpuCount,
+            // Last: a `/proc/sys` file of the level table that no kind above
+            // renders.
+            other if let Some(index) = levels::sysctl_file(other) => {
+                ProcfsKind::KernelSysctl(index)
+            }
             _ => sysfs_rtc_kind(&path)?,
         };
         // `/proc/mounts` is Linux's link to the caller's `self/mounts`.
@@ -2161,6 +2218,7 @@ impl ProcfsFile {
             mounts: self.rendered || files.mounts,
             locks: self.rendered || files.locks,
             address_space: self.rendered || files.address_space,
+            kernel_sysctl: self.rendered || files.kernel_sysctl,
         })
     }
 
@@ -2335,7 +2393,17 @@ impl ProcfsFile {
     /// and DBT every one, on KVM another process's) keeps the kernel's file,
     /// unclassified, as before Detcore rendered it.
     pub(crate) fn kernel_served(&self) -> bool {
-        !self.is_plain_process_file() && !self.is_task_comm()
+        !self.is_plain_process_file() && !self.is_task_comm() && !self.reads_kernel_at_every_read()
+    }
+
+    /// Whether this is a `/proc/sys` file of the level table that Detcore
+    /// serves from the kernel's own file at every read and write
+    /// ([`ProcfsKind::KernelSysctl`]), where it renders it at all
+    /// ([`RenderedFiles::kernel_sysctl`]). A descriptor the kernel opened on
+    /// it (ptrace) keeps the kernel's file, unclassified
+    /// ([`Self::kernel_served`]).
+    pub(crate) fn reads_kernel_at_every_read(&self) -> bool {
+        matches!(self.kind, ProcfsKind::KernelSysctl(_))
     }
 
     /// How Detcore classifies a file the kernel opened at `path`, on a
@@ -2676,6 +2744,9 @@ impl ProcfsFile {
             ProcfsKind::SystemStat => Some(Path::new("/proc/stat")),
             ProcfsKind::Cpuinfo if files.cpuinfo => Some(Path::new("/proc/cpuinfo")),
             ProcfsKind::Locks if files.locks => Some(Path::new("/proc/locks")),
+            ProcfsKind::KernelSysctl(index) if files.kernel_sysctl => {
+                levels::sysctl_file_path(index)
+            }
             ProcfsKind::Diskstats => Some(Path::new("/proc/diskstats")),
             ProcfsKind::Fixed(file) => Some(file.path()),
             ProcfsKind::Mountinfo | ProcfsKind::ProcessMounts if !files.mounts => None,
@@ -3362,6 +3433,9 @@ impl ProcfsFile {
             }
             ProcfsKind::TimerSlack(_) => {
                 unreachable!("timer-slack procfs content is generated from ThreadState")
+            }
+            ProcfsKind::KernelSysctl(_) => {
+                unreachable!("a kernel sysctl file is read from the kernel at every read")
             }
             ProcfsKind::SystemStat => sanitize_system_stat(
                 &contents,
@@ -10625,6 +10699,60 @@ total_commit_ms 0\n"
         assert_eq!(rendered.rendered_snapshot(), None);
         // The name came after the others, so they keep their inode numbers.
         assert_eq!(ProcfsFile::PER_PROCESS_NAMES[4], "cmdline");
+    }
+
+    /// Every `/proc/sys` file of the level table is a file Detcore renders
+    /// where the guest's procfs is not the kernel's (KVM): by its own kind,
+    /// or, where no kind renders it, as [`ProcfsKind::KernelSysctl`], which
+    /// the kernel serves at every read and write. That kind is only ever a
+    /// table file, is rendered only where the session serves the kernel's
+    /// sysctl files, and leaves a descriptor the kernel opened (ptrace)
+    /// unclassified, so the kernel keeps serving it there.
+    #[test]
+    fn every_level_table_sysctl_file_is_rendered_where_procfs_is_the_backends() {
+        let kvm = RenderedFiles::of(true, true, true, true);
+        let ptrace = RenderedFiles::of(true, true, true, false);
+        let mut passed_through = Vec::new();
+        for index in 0_u16.. {
+            let Some(path) = levels::sysctl_file_path(index) else {
+                break;
+            };
+            let file = ProcfsFile::from_path(path).unwrap_or_else(|| panic!("{path:?}"));
+            assert_eq!(file.rendered_path(kvm), Some(path), "{path:?}");
+            if file.reads_kernel_at_every_read() {
+                assert_eq!(file.rendered_path(ptrace), None, "{path:?}");
+                assert!(!file.kernel_served(), "{path:?}");
+                assert!(ProcfsFile::of_kernel_open(path, 1).is_none(), "{path:?}");
+                assert!(!rendered_path_is_seq_file(path), "{path:?}");
+                assert!(file.has_read_iter(), "{path:?}");
+                passed_through.push(path.to_str().unwrap());
+            }
+        }
+        // Exactly the table's files that no other kind renders: the two
+        // network-namespace tunables.
+        assert_eq!(
+            passed_through,
+            [
+                "/proc/sys/net/core/somaxconn",
+                "/proc/sys/net/ipv4/ip_local_port_range",
+            ]
+        );
+        // Nothing outside the table, nor a directory of it.
+        for path in [
+            "/proc/sys/net/core/rmem_max",
+            "/proc/sys/kernel/shmmax",
+            "/proc/sys/net/ipv4/tcp_syncookies",
+            "/proc/sys/net/core",
+            "/proc/sys",
+            "/proc/sysx/net/core/somaxconn",
+            "/proc/self/net/core/somaxconn",
+        ] {
+            assert!(
+                ProcfsFile::from_path(Path::new(path))
+                    .is_none_or(|file| !file.reads_kernel_at_every_read()),
+                "{path}"
+            );
+        }
     }
 
     /// A process's `stat` is a per-process file Detcore renders (package K

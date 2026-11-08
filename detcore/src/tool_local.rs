@@ -2064,6 +2064,7 @@ impl FileMetadata {
             // never rediscovers its descriptors.
             locks: false,
             address_space: false,
+            kernel_sysctl: false,
         };
         let found = self.within_proc_level(
             may_be_placeholder

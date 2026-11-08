@@ -499,6 +499,41 @@ pub(crate) fn system_directory_path(index: u16) -> Option<&'static str> {
     system_directories().get(usize::from(index)).copied()
 }
 
+/// Every file below `/proc/sys` that the table holds at any level, as its
+/// path relative to `/proc` (`sys/net/core/somaxconn`), in the table's order:
+/// [`MINIMAL`]'s, then [`STANDARD`]'s.
+fn sysctl_files() -> impl Iterator<Item = &'static str> {
+    MINIMAL
+        .iter()
+        .chain(STANDARD)
+        .copied()
+        .filter(|entry| entry.starts_with("sys/"))
+}
+
+/// The index in [`sysctl_files`] of the `/proc/sys` file at the absolute
+/// path `path` (`/proc/sys/net/core/somaxconn`), if the table holds it at
+/// any level.
+pub(crate) fn sysctl_file(path: &str) -> Option<u16> {
+    let relative = path.strip_prefix("/proc/")?;
+    sysctl_files()
+        .position(|entry| entry == relative)
+        .and_then(|index| u16::try_from(index).ok())
+}
+
+/// The absolute path of the `/proc/sys` file whose index in
+/// [`sysctl_files`] is `index`.
+pub(crate) fn sysctl_file_path(index: u16) -> Option<&'static Path> {
+    static PATHS: std::sync::OnceLock<Vec<std::path::PathBuf>> = std::sync::OnceLock::new();
+    PATHS
+        .get_or_init(|| {
+            sysctl_files()
+                .map(|entry| Path::new("/proc").join(entry))
+                .collect()
+        })
+        .get(usize::from(index))
+        .map(std::path::PathBuf::as_path)
+}
+
 /// Every system-wide directory below `/proc` that the table holds at any
 /// level, as its path relative to `/proc`, once each, in the table's order:
 /// the directories on the way to each name of [`MINIMAL`], then of

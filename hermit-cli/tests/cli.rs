@@ -64132,11 +64132,26 @@ fn run_kvm_procfs_bind_mounts_are_the_directory_they_show() {
 
 /// The `/proc/sys` files of the `--proc` level table answer on KVM as on
 /// ptrace, by tests/c/procfs_sysctl_files.c's stat, lstat, read, fstat and
-/// access of each, at both levels. `kernel/hostname` and
-/// `kernel/domainname` hold `uname`'s node and domain names on both
-/// backends, as on Linux, where all three read the caller's UTS namespace:
-/// Detcore renders the two from the names `uname` reports. At d2d71407 KVM
-/// refused both with EACCES.
+/// access of each, and its reads a byte at a time and at position 1, at
+/// both levels. `kernel/hostname` and `kernel/domainname` hold `uname`'s
+/// node and domain names on both backends, as on Linux, where all three
+/// read the caller's UTS namespace: Detcore renders the two from the names
+/// `uname` reports. `net/core/somaxconn` and `net/ipv4/ip_local_port_range`
+/// (standard level only) are the kernel's, of the run's network namespace:
+/// at the standard level the run's root writes `somaxconn` and reads the
+/// value back, and a descriptor of `ip_local_port_range` is read on after
+/// an exec, on both backends alike. At d2d71407 KVM refused all four with
+/// EACCES.
+///
+/// The netns tunables' permission is the calling guest thread's: with
+/// `CAP_NET_ADMIN` gone from its effective set (`net_ctl_permissions`), an
+/// open for writing is EACCES and a write through a descriptor opened
+/// before is EPERM, while `access(W_OK)` still passes by the permitted set,
+/// and fails once that loses it too, on both backends as on Linux. Before,
+/// KVM asked the kernel with the tool's own capabilities and allowed all
+/// three. A guest's `setresuid` changes no ID under Detcore on any backend
+/// (`is_credential_identity_noop_syscall`), so the run's root keeps write
+/// access there, on both backends alike.
 #[test]
 fn run_kvm_procfs_sysctl_files_answer_as_on_ptrace() {
     if kvm_unavailable("run_kvm_procfs_sysctl_files_answer_as_on_ptrace") {
@@ -64151,6 +64166,8 @@ fn run_kvm_procfs_sysctl_files_answer_as_on_ptrace() {
         "/proc/sys/kernel/domainname",
         "/proc/sys/kernel/osrelease",
         "/proc/sys/kernel/pid_max",
+        "/proc/sys/net/core/somaxconn",
+        "/proc/sys/net/ipv4/ip_local_port_range",
     ];
     let _guard = hermit_run_guard();
     for level in ["--proc=minimal", "--proc=standard"] {
@@ -64184,6 +64201,82 @@ fn run_kvm_procfs_sysctl_files_answer_as_on_ptrace() {
         }
         assert_eq!(outputs[1], outputs[0], "{level}: KVM against ptrace");
     }
+    let mut outputs = Vec::new();
+    for backend in ["--backend=ptrace", "--backend=kvm"] {
+        let args = [
+            backend,
+            "run",
+            "--strict",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--base-env=minimal",
+            "--proc=standard",
+            "--",
+            guest.as_str(),
+            "--write",
+            "/proc/sys/net/core/somaxconn",
+            "1234",
+            "--inherit",
+            "/proc/sys/net/ipv4/ip_local_port_range",
+        ];
+        let output = hermit(&args);
+        let text = stdout(&output);
+        assert!(
+            text.contains(" open=ok write=4 ") && text.contains(" readback=\"1234|\"\n"),
+            "{backend}:\n{text}"
+        );
+        assert!(
+            text.contains("inherited: pos=1 ") && text.ends_with("RESULT failures=0\n"),
+            "{backend}:\n{text}"
+        );
+        assert_success(&output, &args);
+        outputs.push(text);
+    }
+    assert_eq!(outputs[1], outputs[0], "write and exec: KVM against ptrace");
+    let somaxconn = "/proc/sys/net/core/somaxconn";
+    let range = "/proc/sys/net/ipv4/ip_local_port_range";
+    let mut outputs = Vec::new();
+    for backend in ["--backend=ptrace", "--backend=kvm"] {
+        let args = [
+            backend,
+            "run",
+            "--strict",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--base-env=minimal",
+            "--proc=standard",
+            "--",
+            guest.as_str(),
+            "--as",
+            "65534",
+            somaxconn,
+            "--as",
+            "nocap",
+            somaxconn,
+            "--drop",
+            "nocap",
+            somaxconn,
+            "2345",
+            "--as",
+            "nopermit",
+            range,
+        ];
+        let output = hermit(&args);
+        let text = stdout(&output);
+        for row in [
+            "as 65534 setgroups=ok setresgid=ok setresuid=ok euid=0 egid=0 open(R)=ok",
+            "\" open(W)=ok access(R)=ok access(W)=ok\n",
+            "as nocap capset=ok net_admin=0/1 open(R)=ok",
+            "\" open(W)=EACCES access(R)=ok access(W)=ok\n",
+            "drop nocap open(W)=ok capset=ok net_admin=0/1 write=EPERM pwrite0=EPERM",
+            "as nopermit capset=ok net_admin=0/0 open(R)=ok",
+            "\" open(W)=EACCES access(R)=ok access(W)=EACCES\n",
+        ] {
+            assert!(text.contains(row), "{backend}: {row}:\n{text}");
+        }
+        assert!(text.ends_with("RESULT failures=0\n"), "{backend}:\n{text}");
+        assert_success(&output, &args);
+        outputs.push(text);
+    }
+    assert_eq!(outputs[1], outputs[0], "capabilities: KVM against ptrace");
 }
 
 /// A yield loop beside a call that only the yielder or an alarm can end
