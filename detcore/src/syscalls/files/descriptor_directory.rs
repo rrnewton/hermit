@@ -5844,10 +5844,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let decided = PathBuf::from(std::ffi::OsString::from_vec(decided));
         match super::rendered_procfs::procfs_directory_reached(&decided, links) {
-            // The walk passed `MAXSYMLINKS` counting the links Detcore
-            // replaced, which a lookup of the rest by the backend cannot
-            // count: Linux's ELOOP.
-            Err(errno) if links > 0 => Some(Err(errno.into())),
+            // The whole walk, the links Detcore replaced included, passed
+            // `MAXSYMLINKS` on every attempt: Linux's ELOOP, never left to a
+            // lookup by the backend that cannot count the replaced links,
+            // or that the host's mount traffic could let through.
+            Err(errno) => Some(Err(errno.into())),
             Ok(Some(reached))
                 if crate::procfs::levels::names_system_directory(&reached, self.cfg.proc_level) =>
             {

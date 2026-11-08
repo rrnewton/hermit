@@ -397,7 +397,9 @@ const LINK_BUDGET_ATTEMPTS: usize = 8;
 /// past it, though never succeed when it is. An ELOOP is asked again, up
 /// to [`LINK_BUDGET_ATTEMPTS`] times, and is the answer only when every
 /// attempt gives it, so that the answer is the walk's own count, not the
-/// host's mount and rename traffic.
+/// host's mount and rename traffic. Only an ELOOP is asked again: any other
+/// answer, a success above all, is final. A lookup asked more than once is
+/// logged at DEBUG with its count of attempts.
 pub(super) fn procfs_directory_reached(
     path: &Path,
     links_followed: usize,
@@ -427,11 +429,21 @@ pub(super) fn procfs_directory_reached(
         })
     };
     let mut opened = open();
-    for _ in 1..LINK_BUDGET_ATTEMPTS {
-        if opened != Err(Errno::ELOOP) {
-            break;
-        }
+    let mut attempts = 1;
+    while opened == Err(Errno::ELOOP) && attempts < LINK_BUDGET_ATTEMPTS {
         opened = open();
+        attempts += 1;
+    }
+    if attempts > 1 {
+        // DEBUG, not INFO: how many attempts the host's mount and rename
+        // traffic cost is not a fact of the run, and `--verify-strict`
+        // compares INFO events.
+        tracing::debug!(
+            "procfs object probe: ELOOP asked {} times of at most {}, last {:?}",
+            attempts,
+            LINK_BUDGET_ATTEMPTS,
+            opened.map(|_| ())
+        );
     }
     let fd = match opened {
         Ok(fd) => fd as i32,
