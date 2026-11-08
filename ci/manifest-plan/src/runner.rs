@@ -645,6 +645,12 @@ pub struct ModeRecipe {
     /// prints, so two runs that agree on output lacking it do not pass.
     #[serde(default)]
     pub expected_stdout_contains: BTreeMap<String, String>,
+    /// The exact guest stderr a verify cell requires, per enabled backend,
+    /// as `expected_stdout` is for stdout: a tool whose diagnostic is the
+    /// stderr half of its answer (numastat's, on a machine with no NUMA
+    /// nodes to read) has no stdout to name, and the wording is the test.
+    #[serde(default)]
+    pub expected_stderr: BTreeMap<String, String>,
     /// Hermit `run` flags a verify cell adds after the runner's own, per
     /// enabled backend, for a test whose recorded policy runs a specific
     /// configuration on that backend. Only the flags in ALLOWED_HERMIT_ARGS
@@ -1029,7 +1035,21 @@ fn inherited<'a, T>(
 /// recipe may declare its own guest exit instead (see
 /// [`cell_expected_guest_exit`]).
 fn expectation_recipe(cell: &SelectedCell) -> Option<&ModeRecipe> {
-    matches!(cell.id.mode.as_str(), "verify" | "replay")
+    if cell.id.mode == "replay" {
+        // A replay recipe that declares its own guest exit restates record
+        // mode's expectations whole: its stream declarations (or their
+        // absence) govern, not the verify recipe's.
+        let own = cell
+            .test
+            .modes
+            .get("replay")
+            .filter(|recipe| recipe.expected_guest_exit.is_some());
+        if own.is_some() {
+            return own;
+        }
+        return cell.test.modes.get("verify");
+    }
+    matches!(cell.id.mode.as_str(), "verify")
         .then(|| cell.test.modes.get("verify"))
         .flatten()
 }
@@ -1075,16 +1095,6 @@ fn cell_mode_env(cell: &SelectedCell) -> BTreeMap<String, String> {
 /// requires a failure; without one a replay cell inherits verify's, as
 /// [`expectation_recipe`] chooses for its stdout.
 pub fn cell_expected_guest_exit(cell: &SelectedCell) -> Option<ExpectedGuestExit> {
-    if cell.id.mode == "replay" {
-        let own = cell
-            .test
-            .modes
-            .get("replay")
-            .and_then(|recipe| recipe.expected_guest_exit.clone());
-        if own.is_some() {
-            return own;
-        }
-    }
     expectation_recipe(cell)?.expected_guest_exit.clone()
 }
 
@@ -1106,12 +1116,22 @@ fn cell_expected_stdout_contains(cell: &SelectedCell) -> Option<String> {
         .cloned()
 }
 
+/// The exact stderr a selected verify or replay cell requires, if its backend declares one.
+fn cell_expected_stderr(cell: &SelectedCell) -> Option<String> {
+    let backend = cell.id.backend.as_ref()?;
+    expectation_recipe(cell)?
+        .expected_stderr
+        .get(backend)
+        .cloned()
+}
+
 /// Both stdout assertions a selected verify or replay cell declares for its
 /// backend, in the form a skid attempt records them ([`DeclaredStdout`]).
 pub fn cell_declared_stdout(cell: &SelectedCell) -> DeclaredStdout {
     DeclaredStdout {
         exact: cell_expected_stdout(cell),
         contains: cell_expected_stdout_contains(cell),
+        stderr_exact: cell_expected_stderr(cell),
     }
 }
 
@@ -1207,6 +1227,21 @@ pub fn expected_stdout_mismatch_reason(
 /// both compared runs' stdout, omits the cell's declared
 /// `expected_stdout_contains` text. Shared with the scorecard reader exactly
 /// as [`expected_stdout_mismatch_reason`] is.
+/// The reason a verify attempt FAILs when a compared run's stderr is not the
+/// declared `expected_stderr` bytes. Shared with the scorecard reader exactly
+/// as [`expected_stdout_mismatch_reason`] is.
+pub fn expected_stderr_mismatch_reason(
+    run: &str,
+    observed_bytes: u64,
+    observed_sha256: &str,
+    expected_bytes: u64,
+    expected_sha256: &str,
+) -> String {
+    format!(
+        "verify {run} run stderr ({observed_bytes} bytes, sha256 {observed_sha256}) differs from the declared expected_stderr ({expected_bytes} bytes, sha256 {expected_sha256})"
+    )
+}
+
 pub fn expected_stdout_contains_mismatch_reason(
     captured_bytes: u64,
     captured_sha256: &str,
@@ -1226,6 +1261,14 @@ pub fn expected_stdout_contains_mismatch_reason(
 pub enum ExpectedOutputFailureReason {
     /// The named compared run's stdout is not the declared exact bytes.
     Exact {
+        run: String,
+        observed_bytes: u64,
+        observed_sha256: String,
+        declared_bytes: u64,
+        declared_sha256: String,
+    },
+    /// The named compared run's stderr is not the declared exact bytes.
+    ExactStderr {
         run: String,
         observed_bytes: u64,
         observed_sha256: String,
@@ -1265,6 +1308,25 @@ impl ExpectedOutputFailureReason {
                     )
                 } else if observed_bytes == declared_bytes && observed_sha256 == declared_sha256 {
                     Some("the declared stdout is the observed stdout")
+                } else {
+                    None
+                }
+            }
+            Self::ExactStderr {
+                run,
+                observed_bytes,
+                observed_sha256,
+                declared_bytes,
+                declared_sha256,
+            } => {
+                if !is_lower_sha256(observed_sha256) || !is_lower_sha256(declared_sha256) {
+                    Some("a stderr digest is not SHA-256")
+                } else if run != "first" {
+                    Some(
+                        "it names a later run, but the first run of a matched pair printed the same bytes",
+                    )
+                } else if observed_bytes == declared_bytes && observed_sha256 == declared_sha256 {
+                    Some("the declared stderr is the observed stderr")
                 } else {
                     None
                 }
@@ -1348,6 +1410,28 @@ pub fn parse_expected_output_failure_reason(reason: &str) -> Option<ExpectedOutp
                 captured_sha256: captured_sha256.into(),
                 text,
             })
+    } else if reason.contains(" run stderr (") {
+        let (run, rest) = reason
+            .strip_prefix("verify ")?
+            .split_once(" run stderr (")?;
+        let (observed_bytes, observed_sha256, rest) = split_sized_digest(rest)?;
+        let rest = rest.strip_prefix(" differs from the declared expected_stderr (")?;
+        let (declared_bytes, declared_sha256, rest) = split_sized_digest(rest)?;
+        (rest.is_empty()
+            && expected_stderr_mismatch_reason(
+                run,
+                observed_bytes,
+                observed_sha256,
+                declared_bytes,
+                declared_sha256,
+            ) == reason)
+            .then(|| ExpectedOutputFailureReason::ExactStderr {
+                run: run.into(),
+                observed_bytes,
+                observed_sha256: observed_sha256.into(),
+                declared_bytes,
+                declared_sha256: declared_sha256.into(),
+            })
     } else {
         let (run, rest) = reason
             .strip_prefix("verify ")?
@@ -1396,6 +1480,35 @@ fn check_expected_stdout(
                     run,
                     output.stdout_bytes,
                     &output.stdout_sha256,
+                    expected_bytes,
+                    &expected_sha256,
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Compare both runs a verify report compared with the declared stderr bytes,
+/// as [`check_expected_stdout`] does for stdout.
+fn check_expected_stderr(
+    expected: &str,
+    report: &VerificationReport,
+) -> Result<(), ExpectedStdoutError> {
+    let outputs = report.compared_outputs.as_ref().ok_or_else(|| {
+        ExpectedStdoutError::Unevidenced(
+            "verification report omitted compared_outputs, so the declared expected_stderr cannot be checked".into(),
+        )
+    })?;
+    let expected_sha256 = hex_digest(expected.as_bytes());
+    let expected_bytes = expected.len() as u64;
+    for (run, output) in [("first", &outputs.left), ("second", &outputs.right)] {
+        if output.stderr_sha256 != expected_sha256 || output.stderr_bytes != expected_bytes {
+            return Err(ExpectedStdoutError::Mismatch(
+                expected_stderr_mismatch_reason(
+                    run,
+                    output.stderr_bytes,
+                    &output.stderr_sha256,
                     expected_bytes,
                     &expected_sha256,
                 ),
@@ -1460,6 +1573,13 @@ fn declared_stdout_error(
         .expected_stdout
         .as_deref()
         .map(|expected| check_expected_stdout(expected, report))
+    {
+        return Some(error);
+    }
+    if let Some(Err(error)) = spec
+        .expected_stderr
+        .as_deref()
+        .map(|expected| check_expected_stderr(expected, report))
     {
         return Some(error);
     }
@@ -3020,6 +3140,13 @@ fn validate_mode_with_cpu(
     validate_expected_guest_exit(id, mode, recipe.expected_guest_exit.as_ref())?;
     validate_expected_stdout(id, mode, &recipe.expected_stdout, &enabled)?;
     validate_expected_stdout_contains(id, mode, &recipe.expected_stdout_contains, &enabled)?;
+    validate_verify_stdout_table(
+        id,
+        mode,
+        "expected_stderr",
+        &recipe.expected_stderr,
+        &enabled,
+    )?;
     Ok(())
 }
 
@@ -3288,6 +3415,9 @@ pub struct CellRunSpec {
     /// Text the captured verify stdout must contain, if declared.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_stdout_contains: Option<String>,
+    /// The exact stderr both compared verify runs must print, if declared.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_stderr: Option<String>,
     /// The comparison a verify cell's report must pass; always `Strict` for
     /// every other mode.
     pub comparator: Comparator,
@@ -3524,6 +3654,10 @@ pub struct DeclaredStdout {
     pub exact: Option<String>,
     #[serde(deserialize_with = "deserialize_required_nullable")]
     pub contains: Option<String>,
+    /// The exact stderr bytes declared, where any. Defaulted so a row
+    /// written before the field existed still reads.
+    #[serde(default)]
+    pub stderr_exact: Option<String>,
 }
 
 /// Reads a member that must be present but may be `null`. A field with a
@@ -6220,6 +6354,7 @@ pub fn build_spec(
         expected_guest_exit: cell_expected_guest_exit(cell),
         expected_stdout: cell_expected_stdout(cell),
         expected_stdout_contains: cell_expected_stdout_contains(cell),
+        expected_stderr: cell_expected_stderr(cell),
         comparator: if cell.id.mode == "verify" {
             mode_recipe.comparator.unwrap_or(Comparator::Strict)
         } else {
@@ -17385,6 +17520,7 @@ fi
             expected_guest_exit: None,
             expected_stdout: None,
             expected_stdout_contains: None,
+            expected_stderr: None,
             comparator: Comparator::Strict,
             attempt: "1".into(),
             fixed_workdir_source: root.join("workdir/1"),
@@ -18568,6 +18704,7 @@ fi
             expected_guest_exit: None,
             expected_stdout: None,
             expected_stdout_contains: None,
+            expected_stderr: None,
             comparator: Comparator::Strict,
             attempt: "1".into(),
             fixed_workdir_source: root.join(label).join("workdir/1"),
@@ -24104,6 +24241,7 @@ exit "$(cat "$PWD/exit-status")"
             expected_guest_exit: None,
             expected_stdout: None,
             expected_stdout_contains: None,
+            expected_stderr: None,
             comparator: Comparator::Strict,
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
@@ -24155,6 +24293,7 @@ exit "$(cat "$PWD/exit-status")"
             expected_guest_exit: None,
             expected_stdout: None,
             expected_stdout_contains: None,
+            expected_stderr: None,
             comparator: Comparator::Strict,
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
@@ -25486,6 +25625,7 @@ exit "$(cat "$PWD/exit-status")"
             row.declared_stdout = Some(DeclaredStdout {
                 exact: Some(golden.to_string()),
                 contains: None,
+                stderr_exact: None,
             });
             row
         };
@@ -26664,6 +26804,7 @@ exit "$(cat "$PWD/exit-status")"
             expected_guest_exit: expected,
             expected_stdout: None,
             expected_stdout_contains: None,
+            expected_stderr: None,
             comparator,
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
@@ -27255,10 +27396,12 @@ cp "{}" "$verdict"
         let exact = |text: &str| DeclaredStdout {
             exact: Some(text.into()),
             contains: None,
+            stderr_exact: None,
         };
         let contains = |text: &str| DeclaredStdout {
             exact: None,
             contains: Some(text.into()),
+            stderr_exact: None,
         };
         assert_eq!(
             retained_verify_pass_error(&golden_pass, &exact(golden)),
@@ -27420,7 +27563,7 @@ cp "{}" "$verdict"
         );
         assert_eq!(
             skid_row["declared_stdout"],
-            serde_json::json!({"exact": null, "contains": null}),
+            serde_json::json!({"exact": null, "contains": null, "stderr_exact": null}),
             "{skid_row}"
         );
         assert_eq!(skid_overshoot_only_reports(&skid_result), Some(2));
@@ -27468,6 +27611,7 @@ cp "{}" "$verdict"
             DeclaredStdout {
                 exact: Some("golden\n".into()),
                 contains: Some("gold".into()),
+                stderr_exact: None,
             }
         );
         assert_eq!(
@@ -28114,6 +28258,7 @@ cp "{}" "$verdict"
             expected_guest_exit: None,
             expected_stdout: exact.map(str::to_string),
             expected_stdout_contains: contains.map(str::to_string),
+            expected_stderr: None,
             comparator: Comparator::Strict,
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
@@ -28206,6 +28351,48 @@ cp "{}" "$verdict"
             error.starts_with("verify first run stdout (3 bytes"),
             "{error}"
         );
+    }
+
+    /// The exact stderr check mirrors stdout's: each compared run is
+    /// checked on its own stderr digest, the mismatch reason names the
+    /// run, and the shared parser reads that reason back.
+    #[test]
+    fn expected_stderr_names_the_run_that_differs() {
+        let stderr_report = |left: &str, right: &str| {
+            let mut report = stdout_report("ok\n", "ok\n");
+            let outputs = report.compared_outputs.as_mut().unwrap();
+            outputs.left.stderr_bytes = left.len() as u64;
+            outputs.left.stderr_sha256 = hex_digest(left.as_bytes());
+            outputs.right.stderr_bytes = right.len() as u64;
+            outputs.right.stderr_sha256 = hex_digest(right.as_bytes());
+            report
+        };
+        assert_eq!(
+            check_expected_stderr("err\n", &stderr_report("err\n", "err\n")),
+            Ok(())
+        );
+        let second = stderr_report("err\n", "no\n");
+        let Err(ExpectedStdoutError::Mismatch(error)) = check_expected_stderr("err\n", &second)
+        else {
+            panic!("second-run stderr difference was not a mismatch");
+        };
+        assert!(
+            error.starts_with("verify second run stderr (3 bytes"),
+            "{error}"
+        );
+        assert_eq!(
+            parse_expected_output_failure_reason(&error),
+            Some(ExpectedOutputFailureReason::ExactStderr {
+                run: "second".into(),
+                observed_bytes: 3,
+                observed_sha256: hex_digest(b"no\n"),
+                declared_bytes: 4,
+                declared_sha256: hex_digest(b"err\n"),
+            })
+        );
+        // An empty declaration is a real assertion, not an absent one.
+        assert_eq!(check_expected_stderr("", &stderr_report("", "")), Ok(()));
+        assert!(check_expected_stderr("", &stderr_report("x", "x")).is_err());
     }
 
     /// Matching bytes never rescue a diverged comparison or a failed Hermit
@@ -28395,6 +28582,7 @@ cp "{}" "$verdict"
             row.declared_stdout = Some(DeclaredStdout {
                 exact: exact.map(str::to_string),
                 contains: contains.map(str::to_string),
+                stderr_exact: None,
             });
             row
         };
@@ -29036,6 +29224,7 @@ cp "{}" "$verdict"
             expected_guest_exit: None,
             expected_stdout: None,
             expected_stdout_contains: None,
+            expected_stderr: None,
             comparator: Comparator::Strict,
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
