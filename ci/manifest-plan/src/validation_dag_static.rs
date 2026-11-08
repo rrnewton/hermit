@@ -359,7 +359,6 @@ pub(super) fn structured_result_producer_kind(tag: &str) -> Option<StructuredRes
     None
 }
 
-
 #[derive(Clone, Copy)]
 struct ManifestSpec {
     lane: &'static str,
