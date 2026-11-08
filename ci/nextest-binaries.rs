@@ -35,15 +35,9 @@ fn run() -> Result<i32, String> {
                 let mode_arg = rest.next();
                 match mode_arg.as_deref() {
                     Some("cargo") => build_mode = "cargo",
-                    Some("buck") => {
-                        return Err(
-                            hermit_manifest_plan::nextest_binaries::BUCK_BUILD_REFUSAL.into(),
-                        )
-                    }
+                    Some("buck") => build_mode = "buck",
                     _ => {
-                        return Err(
-                            "prepare --build-mode needs cargo (buck is refused by name)".into(),
-                        )
+                        return Err("prepare --build-mode needs cargo or buck".into());
                     }
                 }
             }

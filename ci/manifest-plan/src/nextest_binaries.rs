@@ -2357,12 +2357,11 @@ fn selection_metadata(unified: &Value, cargo: &Value, args: &[String]) -> Result
     Ok(result)
 }
 
-/// Repoint matched selection binaries at buck-harvested files (M2 Cut 4,
-/// option b). Runs the harvest script, whose default placement is
-/// buck-harvest-only (Cargo's target files are never written; overwriting
-/// a Cargo counterpart exists only behind the script's explicit legacy
-/// opt-in, which apply_harvest refuses), then applies the manifest.
-/// Fails closed when the harvest fails or the manifest is missing.
+/// Repoint matched selection binaries at buck-harvested files. The
+/// harvest script's default placement is buck-harvest-only (Cargo's
+/// target files are never written; overwriting a Cargo counterpart
+/// exists only behind the script's explicit legacy opt-in, which
+/// apply_harvest refuses). Fails closed when the manifest is missing.
 fn substitute_harvested_binaries(
     root: &Path,
     generation: &Path,
@@ -2386,8 +2385,8 @@ fn substitute_harvested_binaries(
 }
 
 /// Verify the declared harvest input against the manifest: every named
-/// file exists with the recorded sha256 (and the shared library when the
-/// manifest names one), and buck-harvest/ contains nothing extra.
+/// file exists with the recorded sha256, and buck-harvest/ contains
+/// nothing extra.
 fn verify_harvest_manifest(manifest: &Value, root: &Path) -> Result<(), PreparationError> {
     let files = manifest
         .get("files")
@@ -2409,9 +2408,6 @@ fn verify_harvest_manifest(manifest: &Value, root: &Path) -> Result<(), Preparat
     };
     for file in files {
         check(string(file, "harvested_to")?, string(file, "sha256")?)?;
-    }
-    if let Some(so) = manifest.get("shared_library") {
-        check(string(so, "harvested_to")?, string(so, "sha256")?)?;
     }
     let mut actual: BTreeSet<PathBuf> = BTreeSet::new();
     for entry in fs::read_dir(&harvest_dir).map_err(|error| error.to_string())? {
@@ -2484,7 +2480,6 @@ fn apply_harvest(
     if harvested.is_empty() {
         return Err("harvest manifest names no files".into());
     }
-    let buck_so = root.join("target/validate/buck-harvest/libreverie_examples.so");
     let mut matched_names: BTreeSet<String> = BTreeSet::new();
     for (key, record) in selections.iter_mut() {
         let metadata_path = generation.join(format!("{key}.json"));
@@ -2528,63 +2523,16 @@ fn apply_harvest(
             patched = true;
         }
         if patched {
-            // Bind the sibling shared library the substituted binaries
-            // load: repoint the recorded libreverie_examples.so runtime
-            // file at the harvested copy in the metadata, so
-            // metadata_binaries rehashes the Buck bytes.
-            if buck_so.is_file() {
-                if let Some(build) = metadata
-                    .get_mut("rust-build-meta")
-                    .and_then(Value::as_object_mut)
-                {
-                    if let Some(non_test) = build
-                        .get_mut("non-test-binaries")
-                        .and_then(Value::as_object_mut)
-                    {
-                        for files in non_test.values_mut() {
-                            if let Some(entries) = files.as_array_mut() {
-                                for entry in entries {
-                                    if entry.get("path").and_then(Value::as_str).is_some_and(
-                                        |path| path.ends_with("libreverie_examples.so"),
-                                    ) {
-                                        entry["path"] =
-                                            Value::String(buck_so.display().to_string());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
             // Repoint the recorded binary identities at the Buck bytes
             // (metadata_binaries in verify_selection recomputes these from
             // the patched metadata, so record and metadata must agree).
+            // Runtime files are untouched: the detcore binaries are
+            // statically linked (static_pic) and load no sibling library.
             for binary in &mut record.binaries {
                 if let Some(buck_path) = harvested.get(&binary.binary_name) {
                     binary.executable = file_identity(buck_path, true)?;
                 }
             }
-            // Bind the sibling .so in the record too: any recorded
-            // libreverie_examples.so runtime file now names the harvested
-            // copy, rehashed. A recorded .so with no harvested copy refuses.
-            for runtime in &mut record.runtime_files {
-                if runtime
-                    .path
-                    .file_name()
-                    .is_some_and(|name| name == "libreverie_examples.so")
-                {
-                    if !buck_so.is_file() {
-                        return Err("recorded libreverie_examples.so has no harvested copy".into());
-                    }
-                    *runtime = file_identity(&buck_so, false)?;
-                }
-            }
-            // metadata_binaries derives runtime files as a sorted,
-            // deduplicated set; keep the record in that same shape.
-            record
-                .runtime_files
-                .sort_by(|left, right| left.path.cmp(&right.path));
-            record.runtime_files.dedup_by(|a, b| a.path == b.path);
             fs::write(
                 &metadata_path,
                 serde_json::to_vec(&metadata).map_err(|e| e.to_string())?,
@@ -2617,13 +2565,11 @@ fn apply_harvest(
     Ok(())
 }
 
-/// Why Buck build mode is refused, by name, until a prepared Nextest
-/// selection really consumes Buck-built executables (follow-up dh-iz46e).
-pub const BUCK_BUILD_REFUSAL: &str = "HERMIT_VALIDATE_BUILD_MODE=buck is refused: no prepared Nextest selection consumes Buck-built executables yet; cargo is the only build mode (follow-up dh-iz46e)";
-
 pub fn prepare(root: &Path, profile: &str, build_mode: &str) -> Result<(), PreparationError> {
-    if build_mode == "buck" {
-        return Err(PreparationError::from(BUCK_BUILD_REFUSAL.to_string()));
+    if !matches!(build_mode, "cargo" | "buck") {
+        return Err(PreparationError::from(format!(
+            "unknown build mode {build_mode:?} in nextest prepare: cargo and buck are the supported build modes"
+        )));
     }
     let root = root.canonicalize().map_err(|e| e.to_string())?;
     let prepared_project = project(&root)?;
@@ -2809,19 +2755,17 @@ pub fn prepare(root: &Path, profile: &str, build_mode: &str) -> Result<(), Prepa
             },
         );
     }
-    // M2 Cut 4 (option b): in buck build mode, prepare consumes the
-    // buck-harvest directly. The harvest script buck-builds the Reverie
-    // integration targets and writes target/validate/harvested-files.json;
-    // matched selection binaries are repointed at the harvested files in
-    // buck-harvest/ (Cargo's target files are never overwritten), their
-    // identities rehashed, and their selection metadata patched so the
-    // listing below enumerates the Buck binaries' own cases.
+    // In buck build mode, prepare consumes the buck-harvest directly. The
+    // harvest script buck-builds Hermit's own detcore test targets and
+    // writes target/validate/harvested-files.json; matched selection
+    // binaries (the test.detcore_* selections) are repointed at the
+    // harvested files in buck-harvest/ (Cargo's target files are never
+    // overwritten), their identities rehashed, and their selection
+    // metadata patched so the listing below enumerates the Buck
+    // binaries' own cases. Exact name-set and Cargo-twin case-set
+    // equality are enforced inside the substitution.
     if build_mode == "buck" {
         substitute_harvested_binaries(&root, &generation, &mut recorded_selections)?;
-    } else if build_mode != "cargo" {
-        return Err(PreparationError::from(format!(
-            "unknown build mode {build_mode:?} in nextest prepare"
-        )));
     }
     // Nextest itself must accept every complete metadata pair after the final
     // build; this enumerates tests and never invokes the compiler.
@@ -3235,13 +3179,13 @@ mod tests {
         ));
         let dir = root.join("target/validate/buck-harvest");
         std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("basics");
+        let file = dir.join("tests_misc");
         std::fs::write(&file, b"buck bytes").unwrap();
         let sha = format!("{:x}", Sha256::digest(b"buck bytes"));
         let manifest = serde_json::json!({
             "files": [{
-                "name": "basics",
-                "harvested_to": "target/validate/buck-harvest/basics",
+                "name": "tests_misc",
+                "harvested_to": "target/validate/buck-harvest/tests_misc",
                 "sha256": sha,
             }]
         });
@@ -3261,6 +3205,79 @@ mod tests {
         let error = verify_harvest_manifest(&manifest, &root).unwrap_err();
         assert!(error.to_string().contains("missing"), "{error}");
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Graph-derived buck-consumer test (dh-iz46e): the harvest target
+    /// set, the authored per-step Cargo selections, and the committed
+    /// full-profile preparation population must name the SAME three
+    /// detcore test binaries. Every fact is read from the committed
+    /// graph, the for_step table, or the harvest script itself, so
+    /// removing the build.reverie_buck node, a test.detcore_* node, or
+    /// a for_step arm fails here instead of silently reverting the buck
+    /// run's detcore selections to Cargo bytes under a buck label.
+    #[test]
+    fn buck_harvest_targets_are_the_committed_detcore_selections() {
+        let root = repository_root();
+        // tag -> (Cargo test target, buck target name). The harvested
+        // name apply_harvest matches on is the Cargo test-binary stem,
+        // which for these targets equals both names.
+        let detcore = [
+            ("test.detcore_misc", "tests_misc"),
+            ("test.detcore_parallel", "tests_parallelism"),
+            ("test.detcore_time", "tests_time"),
+        ];
+        // (1) Each for_step arm still authors the one-test Cargo
+        // selection for its node.
+        for (tag, test) in detcore {
+            let selection = crate::nextest_build_selections::for_step(tag)
+                .unwrap_or_else(|| panic!("{tag} lost its for_step build selection"));
+            assert_eq!(
+                selection,
+                ["-p", "hermit-detcore-tests", "--test", test].as_slice(),
+                "{tag}"
+            );
+        }
+        // (2) The committed full profile prepares exactly those
+        // selections (fails when a test.detcore_* node disappears from
+        // the generated graph).
+        let full = profile_selections(&root, "full").unwrap();
+        for (tag, test) in detcore {
+            let want = args(&format!("-p hermit-detcore-tests --test {test}"));
+            assert!(
+                full.values().any(|selection| *selection == want),
+                "full profile no longer prepares {tag}'s selection {want:?}"
+            );
+        }
+        // (3) The committed graph still carries the host harvest node.
+        let graph = fs::read_to_string(root.join("ci/dag/validate.json")).unwrap();
+        let graph = dagrun::io::dag_from_json(&graph).unwrap();
+        assert!(
+            graph
+                .steps
+                .iter()
+                .any(|step| step.tag() == "build.reverie_buck"),
+            "build.reverie_buck disappeared from the committed graph"
+        );
+        // (4) The harvest script builds exactly the buck twins of those
+        // selections, under the names apply_harvest matches.
+        let script = fs::read_to_string(root.join("ci/harvest-reverie-buck.sh")).unwrap();
+        let mut harvested: BTreeSet<(String, String)> = BTreeSet::new();
+        for line in script.lines() {
+            let line = line.trim().trim_matches('"');
+            if let Some((target, name)) = line.rsplit_once('|') {
+                if target.starts_with("hermit//") {
+                    harvested.insert((target.to_string(), name.to_string()));
+                }
+            }
+        }
+        let want: BTreeSet<(String, String)> = detcore
+            .iter()
+            .map(|(_, test)| (format!("hermit//detcore:{test}"), test.to_string()))
+            .collect();
+        assert_eq!(
+            harvested, want,
+            "harvest TARGETS drifted from the detcore selections"
+        );
     }
 
     #[test]
