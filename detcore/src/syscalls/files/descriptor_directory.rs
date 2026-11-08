@@ -5665,14 +5665,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         if !Self::serves_task_directories(guest) {
             return Ok(None);
         }
-        let (path, hops) = Self::readlink_walk(guest, bytes)?;
+        let (path, hops, _) = Self::readlink_walk(guest, bytes)?;
         Ok((hops > 0).then_some(path))
     }
 
     /// The absolute guest path `bytes` of a `readlink` with each of the
     /// caller's descriptor links to a placeholder directory it walks through
     /// replaced by the directory's canonical spelling (`/proc/<pid>/fd`,
-    /// `/proc/<pid>/task/<tid>/fd`, `/proc`), and how many it replaced.
+    /// `/proc/<pid>/task/<tid>/fd`, `/proc`), how many it replaced, and how
+    /// many symbolic links Linux's walk follows for the part replaced (the
+    /// count below), which the rest of the walk adds to.
     ///
     /// `ELOOP` where the symbolic links Linux follows for the whole lookup
     /// pass `MAXSYMLINKS` (40; `reserve_stack` and `pick_link`, fs/namei.c),
@@ -5691,7 +5693,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Unlike [`Self::decided_path`], which counts the selectors of the
     /// first link only (the stat and open respelling's undercount,
     /// <https://github.com/rrnewton/hermit/issues/5133>).
-    fn readlink_walk<G: Guest<Self>>(guest: &G, bytes: &[u8]) -> Result<(Vec<u8>, usize), Errno> {
+    fn readlink_walk<G: Guest<Self>>(
+        guest: &G,
+        bytes: &[u8],
+    ) -> Result<(Vec<u8>, usize, usize), Errno> {
         let mut path = bytes.to_vec();
         let mut links = 0;
         let mut hops = 0;
@@ -5723,7 +5728,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
             }
         }
-        Ok((path, hops))
+        Ok((path, hops, links))
     }
 
     /// Whether the descriptor link `link` (`/proc/<pid>/fd/N`, spelled as
@@ -5773,7 +5778,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             return None;
         }
         let decided = match Self::readlink_walk(guest, path.as_os_str().as_bytes()) {
-            Ok((decided, _)) => PathBuf::from(std::ffi::OsString::from_vec(decided)),
+            Ok((decided, _, _)) => PathBuf::from(std::ffi::OsString::from_vec(decided)),
             Err(errno) => return Some(Err(errno.into())),
         };
         let target = Self::own_link_directory(guest, &decided)?.canonical();
@@ -5808,9 +5813,13 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///
     /// In the kernel's order: a pathname of `PATH_MAX` bytes or more is
     /// refused (ENAMETOOLONG, `getname_flags`) before any lookup, so it is
-    /// left to the kernel's path. And the answer is decided by the object the
-    /// lookup reaches in the guest's mount namespace, which the tool shares,
-    /// and by the kernel's name for it
+    /// left to the kernel's path; the lookup keeps one `MAXSYMLINKS` budget
+    /// across the descriptor links [`Self::readlink_walk`] replaced and the
+    /// rest of the walk (ELOOP past it); and a spelling that goes on below a
+    /// task's directory (`/proc/self/cwd/...`), which the tool's own `/proc`
+    /// would resolve for the tool, is left to the backend. And the answer is
+    /// decided by the object the lookup reaches in the guest's mount
+    /// namespace, which the tool shares, and by the kernel's name for it
     /// (`rendered_procfs::procfs_directory_reached`), never by the spelling,
     /// as [`Self::own_link_directory`] answers from the descriptor's own
     /// identity: a user mount over part of `/proc` (`--mount
@@ -5828,11 +5837,24 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return None;
         }
-        let (decided, _) = Self::readlink_walk(guest, spelled.as_os_str().as_bytes()).ok()?;
+        let (decided, _, links) =
+            Self::readlink_walk(guest, spelled.as_os_str().as_bytes()).ok()?;
+        if names_a_task_view(&decided) {
+            return None;
+        }
         let decided = PathBuf::from(std::ffi::OsString::from_vec(decided));
-        let reached = super::rendered_procfs::procfs_directory_reached(&decided)?;
-        crate::procfs::levels::names_system_directory(&reached, self.cfg.proc_level)
-            .then(|| Err(Errno::EINVAL.into()))
+        match super::rendered_procfs::procfs_directory_reached(&decided, links) {
+            // The walk passed `MAXSYMLINKS` counting the links Detcore
+            // replaced, which a lookup of the rest by the backend cannot
+            // count: Linux's ELOOP.
+            Err(errno) if links > 0 => Some(Err(errno.into())),
+            Ok(Some(reached))
+                if crate::procfs::levels::names_system_directory(&reached, self.cfg.proc_level) =>
+            {
+                Some(Err(Errno::EINVAL.into()))
+            }
+            _ => None,
+        }
     }
 
     /// Whether the absolute guest path `observed`, followed, names a
@@ -5882,6 +5904,24 @@ impl<T: RecordOrReplay> Detcore<T> {
             path.as_os_str().as_bytes(),
         ))))
     }
+}
+
+/// Whether `bytes`, an absolute guest spelling, goes on below a task's procfs
+/// directory (`/proc/self`, `/proc/thread-self`, `/proc/<n>`) by a name other
+/// than `..`: there the tool's own `/proc` names the tool's task, not the
+/// guest's (`self/cwd`, `self/fd/N`, `self/root`).
+fn names_a_task_view(bytes: &[u8]) -> bool {
+    let names: Vec<&[u8]> = bytes
+        .split(|byte| *byte == b'/')
+        .filter(|name| !name.is_empty() && *name != b".")
+        .collect();
+    names.windows(3).any(|window| {
+        window[0] == b"proc"
+            && (window[1] == b"self"
+                || window[1] == b"thread-self"
+                || window[1].iter().all(u8::is_ascii_digit))
+            && window[2] != b".."
+    })
 }
 
 /// The path of the pathname `AF_UNIX` address at `address`, `length` bytes

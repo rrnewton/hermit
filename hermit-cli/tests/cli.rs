@@ -63529,10 +63529,17 @@ fn procfs_system_directory_links_guest() -> String {
 /// the guest prints: redundant separators and `.` components, a name below
 /// a `/proc` descriptor, a spelling through a symbolic link to `/proc/sys`,
 /// the longest pathname Linux takes (4095 bytes, `EINVAL`), and one longer
-/// (4105 bytes), which Linux refuses with `ENAMETOOLONG` before any lookup.
-/// Each line must match the guest's own native run. Before the fix the
-/// directories were `EACCES`; at 1aa06612 the overlong spelling was `EINVAL`
-/// and the spelling through the link `EACCES`.
+/// (4105 bytes), which Linux refuses with `ENAMETOOLONG` before any lookup,
+/// and one `MAXSYMLINKS` budget across the whole lookup: a chain of 39
+/// symbolic links ending at `/proc/sys`, reached directly, behind
+/// `/proc/self/fd/N/..` (2 more links), behind `/proc/self/../..` (1 each),
+/// or both, is `EINVAL` at 39 and 40 links and `ELOOP` at 41 (the guest
+/// asks an ELOOP there again, as Detcore does, because a mount elsewhere on
+/// the host can restart Linux's walk with its link count kept). Each line
+/// must match the guest's own native run. Before the fix the directories were
+/// `EACCES`; at 1aa06612 the overlong spelling was `EINVAL` and the spelling
+/// through the link `EACCES`; at eaf0feb6 the two 41-link spellings through
+/// the descriptor were `EINVAL`.
 #[test]
 fn run_kvm_procfs_system_directory_links_answer_as_linux() {
     if kvm_unavailable("run_kvm_procfs_system_directory_links_answer_as_linux") {
@@ -63549,6 +63556,11 @@ fn run_kvm_procfs_system_directory_links_answer_as_linux() {
     let native = String::from_utf8(native.stdout).expect("native stdout is UTF-8");
     assert!(
         native.contains("(4105 bytes) /proc/ + slashes + sys: readlink=ENAMETOOLONG"),
+        "natively: {native}"
+    );
+    assert!(
+        native.contains("/proc/self/fd/N/.. + chain, 40 links: readlink=EINVAL")
+            && native.contains("/proc/self/fd/N/.. + chain, 41 links: readlink=ELOOP"),
         "natively: {native}"
     );
     let _guard = hermit_run_guard();

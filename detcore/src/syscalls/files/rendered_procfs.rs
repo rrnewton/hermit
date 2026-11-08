@@ -368,6 +368,10 @@ pub(super) fn proc_device() -> Option<u64> {
     *PROC_DEVICE.get_or_init(|| GuestProcfs::stat(c"/proc").ok().map(|stat| stat.st_dev))
 }
 
+/// How many times [`procfs_directory_reached`] asks a lookup that fails with
+/// ELOOP before it takes that for the answer.
+const LINK_BUDGET_ATTEMPTS: usize = 8;
+
 /// The name of the procfs directory that a lookup of the absolute path `path`
 /// reaches, without following a final symbolic link, if it reaches one: a
 /// directory on the guest's procfs mount ([`proc_device`]), named as the
@@ -376,24 +380,64 @@ pub(super) fn proc_device() -> Option<u64> {
 /// guest's mount namespace ([`GuestProcfs`]), so this is the object, and the
 /// name, the guest's own lookup reaches: a user mount over part of `/proc`
 /// reaches its own objects, on another device, and a symbolic link is no
-/// directory. `None` for any other object, or one the lookup does not reach.
-pub(super) fn procfs_directory_reached(path: &Path) -> Option<PathBuf> {
-    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
-    // SAFETY: the path is NUL-terminated; the descriptor is closed below.
-    let fd = raw_errno(unsafe {
-        raw_syscall(
-            libc::SYS_openat,
-            [
-                libc::AT_FDCWD as u64,
-                path.as_ptr() as u64,
-                (libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC) as u64,
-                0,
-                0,
-                0,
-            ],
-        )
-    })
-    .ok()? as i32;
+/// directory. `Ok(None)` for any other object, or a lookup that fails
+/// otherwise than below.
+///
+/// The lookup starts with `links_followed` of Linux's `MAXSYMLINKS` budget
+/// already spent, by the guest's walk to `path`: one kernel lookup, so that
+/// the kernel counts the whole walk, of `path` behind that many
+/// `/proc/self/../..`, each of which follows one symbolic link (`self`) and
+/// ends at `/`. `Err(ELOOP)` where the whole walk passes the budget. A
+/// lookup whose spelling would then reach `PATH_MAX` is `Ok(None)`.
+///
+/// Linux keeps a lookup's link count across the restart of its RCU walk in
+/// reference mode (`set_nameidata` once, then `path_openat` again,
+/// fs/namei.c), and a mount or rename anywhere on the host can force that
+/// restart. So a lookup near the budget can fail with ELOOP when it is not
+/// past it, though never succeed when it is. An ELOOP is asked again, up
+/// to [`LINK_BUDGET_ATTEMPTS`] times, and is the answer only when every
+/// attempt gives it, so that the answer is the walk's own count, not the
+/// host's mount and rename traffic.
+pub(super) fn procfs_directory_reached(
+    path: &Path,
+    links_followed: usize,
+) -> Result<Option<PathBuf>, Errno> {
+    let mut spelled = b"/proc/self/../..".repeat(links_followed);
+    spelled.extend_from_slice(path.as_os_str().as_bytes());
+    if spelled.len() >= libc::PATH_MAX as usize {
+        return Ok(None);
+    }
+    let Ok(path) = std::ffi::CString::new(spelled) else {
+        return Ok(None);
+    };
+    let open = || {
+        // SAFETY: the path is NUL-terminated; the descriptor is closed below.
+        raw_errno(unsafe {
+            raw_syscall(
+                libc::SYS_openat,
+                [
+                    libc::AT_FDCWD as u64,
+                    path.as_ptr() as u64,
+                    (libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC) as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+        })
+    };
+    let mut opened = open();
+    for _ in 1..LINK_BUDGET_ATTEMPTS {
+        if opened != Err(Errno::ELOOP) {
+            break;
+        }
+        opened = open();
+    }
+    let fd = match opened {
+        Ok(fd) => fd as i32,
+        Err(Errno::ELOOP) => return Err(Errno::ELOOP),
+        Err(_) => return Ok(None),
+    };
     let reached = (|| {
         let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
         // SAFETY: `fd` is open and `stat` is writable.
@@ -432,7 +476,7 @@ pub(super) fn procfs_directory_reached(path: &Path) -> Option<PathBuf> {
     })();
     // SAFETY: `fd` is the descriptor opened above, closed once.
     let _ = unsafe { raw_syscall(libc::SYS_close, [fd as u64, 0, 0, 0, 0, 0]) };
-    reached
+    Ok(reached)
 }
 
 /// The rendered file among `paths` that the kernel's procfs inode
