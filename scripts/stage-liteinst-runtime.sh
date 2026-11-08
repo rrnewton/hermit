@@ -6,10 +6,21 @@
 
 set -euo pipefail
 
-if (( $# != 3 && $# != 4 )) || { (( $# == 4 )) && [[ $4 != --allocator-fixture ]]; }; then
-    echo "Usage: $0 <cargo-profile> <stable-runtime-path> <runtime-target-root> [--allocator-fixture]" >&2
+if (( $# < 3 )); then
+    echo "Usage: $0 <cargo-profile> <stable-runtime-path> <runtime-target-root> [--allocator-fixture] [--liteinst]" >&2
     exit 2
 fi
+stage_features=()
+for flag in "${@:4}"; do
+    case $flag in
+        --allocator-fixture) stage_features+=(allocator-fixture) ;;
+        --liteinst) stage_features+=(liteinst) ;;
+        *)
+            echo "Usage: $0 <cargo-profile> <stable-runtime-path> <runtime-target-root> [--allocator-fixture] [--liteinst]" >&2
+            exit 2
+            ;;
+    esac
+done
 
 root_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 liteinst_profile=$1
@@ -67,6 +78,16 @@ liteinst_target_dir=$(realpath -m -- "$3-${reverie_pin:0:8}")
 liteinst_stage_dir=$(dirname -- "$liteinst_stable_input")
 liteinst_stage_name=$(basename -- "$liteinst_stable_input")
 
+# The canonical basename is the FULL patching-capable runtime's name. Refuse
+# to stage a trap-only build under it, before anything is built: shipping
+# TRAP as libreverie_liteinst.so is exactly the silent downgrade this guard
+# exists to make loud. Trap staging stays available under a distinct name.
+if [[ $liteinst_stage_name == libreverie_liteinst.so ]] \
+    && [[ " ${stage_features[*]} " != *" liteinst "* ]]; then
+    echo "refusing to stage a trap-only runtime as libreverie_liteinst.so; pass --liteinst or choose a distinct destination basename" >&2
+    exit 2
+fi
+
 if [[ -z $liteinst_stable_input || $liteinst_stage_name == . || $liteinst_stage_name == / ]]; then
     echo "Stable LiteInst runtime path must name a file: $liteinst_stable_input" >&2
     exit 2
@@ -95,8 +116,8 @@ cleanup_liteinst_temp_stage() {
 trap cleanup_liteinst_temp_stage EXIT
 
 liteinst_features=()
-if [[ ${4:-} == --allocator-fixture ]]; then
-    liteinst_features=(--features allocator-fixture)
+if (( ${#stage_features[@]} )); then
+    liteinst_features=(--features "$(IFS=,; echo "${stage_features[*]}")")
 fi
 HERMIT_LITEINST_STAGE=$liteinst_temp_stage HERMIT_LITEINST_REVERIE_PIN=$reverie_pin "${CARGO:-cargo}" build \
     --locked \
