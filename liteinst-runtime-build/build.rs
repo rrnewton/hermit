@@ -53,6 +53,10 @@ fn main() {
             env::var_os("CARGO_FEATURE_ALLOCATOR_FIXTURE").is_none(),
             "native runtime cannot use the diagnostic preload producer mode"
         );
+        assert!(
+            !cfg!(feature = "liteinst"),
+            "native runtime cannot use the standalone preload producer mode"
+        );
         artifact::native::build();
         return;
     }
@@ -65,6 +69,10 @@ fn main() {
     println!("cargo:rerun-if-changed=runtime/Cargo.toml");
     println!("cargo:rerun-if-changed=runtime/src/lib.rs");
     let allocator_fixture = env::var_os("CARGO_FEATURE_ALLOCATOR_FIXTURE").is_some();
+    // Read this crate's own feature with cfg!, never the CARGO_FEATURE_LITEINST
+    // env var: hermit-cli's native-exec feature implies its own liteinst
+    // feature and its nested producer launch does not scrub CARGO_FEATURE_*.
+    let liteinst = cfg!(feature = "liteinst");
     let destination = PathBuf::from(
         env::var_os("HERMIT_LITEINST_STAGE")
             .expect("HERMIT_LITEINST_STAGE must name a unique runtime output path"),
@@ -233,14 +241,22 @@ fn main() {
         .arg("--message-format=json-render-diagnostics")
         .current_dir(&manifest_dir)
         .env_remove("HERMIT_LITEINST_STAGE");
+    // Enable exact leaf features through the selected workspace member.
+    // Keep the leaf selected too so current artifact qualification applies.
+    let mut nested_features: Vec<&str> = Vec::new();
     if allocator_fixture {
-        // Enable the exact leaf feature through the selected workspace member.
-        // Keep the leaf selected too so current artifact qualification applies.
+        nested_features.push("allocator-fixture");
+    }
+    if liteinst {
+        nested_features.push("liteinst");
+    }
+    if !nested_features.is_empty() {
+        let joined: String = nested_features.join(",");
         command.args([
             "-p",
             "hermit-liteinst-runtime-artifact",
             "--features",
-            "allocator-fixture",
+            joined.as_str(),
         ]);
     }
     let output = command
@@ -261,6 +277,7 @@ fn main() {
         package_id,
         &package_manifest,
         allocator_fixture,
+        liteinst,
     )
     .unwrap_or_else(|error| panic!("failed to parse isolated Cargo output: {error}"));
     assert!(
@@ -304,6 +321,7 @@ fn main() {
             "compiled_qualifier_source_sha256": qualifier::qualifier_source_sha256(),
             "profile": profile,
             "allocator_fixture": allocator_fixture,
+            "site_patching": artifact::site_patching_label(liteinst),
             "qualification": qualification,
             "compiled_sources": Some(compiled_sources.record()),
             "compiled_source_commands": source_runner.commands,
