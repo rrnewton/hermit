@@ -49103,6 +49103,11 @@ fn a_process_directed_signal_goes_to_the_thread_linux_chooses() {
                 + exited,
             true,
         ),
+        (
+            "segv-pidfd",
+            "child killed by signal 11\n".to_owned(),
+            false,
+        ),
     ];
     for (mode, expected, verify) in cases {
         let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -55915,7 +55920,7 @@ fn a_parents_sigchld_is_not_held_behind_a_sibling_that_never_blocks() {
     let replay = format!("--replay-schedule-from={}", schedule.display());
     for (label, flags) in [
         ("record", vec![record.as_str()]),
-        ("replay", vec![replay.as_str(), "strict replay"]),
+        ("replay", vec![replay.as_str()]),
     ] {
         let run = directory.path().join(label);
         fs::create_dir_all(&run).unwrap();
