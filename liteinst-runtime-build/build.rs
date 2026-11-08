@@ -15,6 +15,13 @@ use serde_json::Value;
 
 mod artifact;
 
+// The native runtime is a different artifact from the standalone preload:
+// a preload-patching marker on that route is meaningless and must refuse,
+// never be silently ignored. Keyed on cfg, never the env var (which can
+// leak from hermit-cli's own liteinst feature through its nested launch).
+#[cfg(all(feature = "native-exec", feature = "liteinst"))]
+compile_error!("native runtime cannot use the standalone preload producer mode");
+
 fn constructor_evidence_directory(out_dir: &Path) -> PathBuf {
     let serial = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -52,10 +59,6 @@ fn main() {
         assert!(
             env::var_os("CARGO_FEATURE_ALLOCATOR_FIXTURE").is_none(),
             "native runtime cannot use the diagnostic preload producer mode"
-        );
-        assert!(
-            !cfg!(feature = "liteinst"),
-            "native runtime cannot use the standalone preload producer mode"
         );
         artifact::native::build();
         return;
