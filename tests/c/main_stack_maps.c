@@ -75,6 +75,9 @@
  *   exec:      last, the program executes itself with a descriptor it opened
  *              before, which reads nothing ("bytes 0"): the address space it
  *              names is gone.
+ * With the argument "whole" alone, the program prints "whole" and then the
+ * whole maps file as it starts, every line, and exits: the image, the
+ * interpreter and libraries, the heap, anonymous memory and the stack.
  * With the argument "no-vfork", the program skips the "vfork" step, which
  * runs in a forked child and so changes nothing a later step prints. KVM runs
  * a vfork child on a copy of its parent's memory, which carries contents back
@@ -357,6 +360,15 @@ int main(int argc, char **argv) {
     int n = snprintf(line, sizeof(line), "step exec\nbytes %zu\n",
                      read_maps(atoi(argv[2])));
     out(line, (size_t)n);
+    return 0;
+  }
+  if (argc == 2 && strcmp(argv[1], "whole") == 0) {
+    /* The whole maps file, every line, as the image starts. */
+    int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    CHECK(fd >= 0);
+    size_t length = read_maps(fd);
+    out("whole\n", 6);
+    out(text, length);
     return 0;
   }
   int descriptors = 0;

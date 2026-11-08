@@ -20696,7 +20696,10 @@ mod nextest_timeout_tests {
                 // 2994 after system-utils/procfs-sanitized-paths verify/KVM
                 // left under dh-9j8ue (this PR; Detcore refuses smaps VmFlags
                 // for file mappings while MappingFact carries none).
-                assert_eq!(all.len(), 2994, "the original all-owner population is retained");
+                // 2995 with c-programs/procfs-identity-agreement verify/KVM
+                // (Reverie #1319 lists every mapping on KVM, so the guest's
+                // memfd has its maps line).
+                assert_eq!(all.len(), 2995, "the original all-owner population is retained");
             }
             let expected = all.iter().map(|cell| cell.id.clone()).collect::<BTreeSet<_>>();
             assert_eq!(expected.len(), all.len(), "duplicate all-owner cell identity");
@@ -21722,7 +21725,9 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // Less the two dh-9j8ue disables (smaps, own-proc): 158, matching
         // the DAG pin in validation_dag_static.
         // And S3b-2's KVM receiver test: 159.
-        ("privileged-only-test.cli_kvm", 159usize),
+        // And run_kvm_smaps_and_numa_maps_render_the_stack_from_the_memory_map,
+        // enabled again to require dh-9j8ue's named smaps refusal: 160.
+        ("privileged-only-test.cli_kvm", 160usize),
     ] {
         let step = privileged
             .steps

@@ -85,10 +85,10 @@ test:
           - ptrace
           - dbt
           - sabre
+          - kvm
           - liteinst
           - in-guest-trap
-        backends_disabled:
-          kvm: 'KVM gap (https://github.com/rrnewton/hermit/issues/5038): KVM''s /proc/self/maps holds only the [stack] line, so no line covers the guest''s memfd mapping and the guest exits 1 (`FAIL: no maps line covers the mapping`) in 3 of 3 KVM verify runs at Hermit 26eb116d; ptrace lists every mapping and passes'
+        backends_disabled: {}
         hermit_args:
           liteinst:
             - --max-timeslice=disabled

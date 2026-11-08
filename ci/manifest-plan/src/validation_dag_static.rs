@@ -5161,7 +5161,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // run_kvm_a_kernel_sent_process_signal_reaches_the_thread_linux_chooses:
     // 158 + 1 = 159 (158 run_kvm_ plus the named setup test) (head - base,
     // nextest list --profile ci on the node's selection at fb648fa9 and at this head).
-    ("privileged-test.cli_kvm", 159),
+    ("privileged-test.cli_kvm", 160),
     // The required tests of hermit-cli/tests/deadline_slice_cap.rs on KVM: the
     // suite's 42 tests less the rows of its known-gap ledger
     // (hermit-cli/tests/deadline_slice_cap.kvm-gaps.tsv), measured on Hermit
@@ -5661,7 +5661,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // run_kvm_a_kernel_sent_process_signal_reaches_the_thread_linux_chooses:
     // 158 + 1 = 159 (158 run_kvm_ plus the named setup test) (head - base,
     // nextest list --profile ci on the node's selection at fb648fa9 and at this head).
-    ("privileged-only-test.cli_kvm", 159),
+    ("privileged-only-test.cli_kvm", 160),
     ("privileged-only-test.pmu_buck_chaos_cases_on_host", 6),
     // And the KVM unreadable futex word test: 56.
     // And run_kvm_a_parked_sleep_carries_the_deadline_cap: 57.
@@ -5738,7 +5738,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // run_kvm_a_kernel_sent_process_signal_reaches_the_thread_linux_chooses:
     // 158 + 1 = 159 (158 run_kvm_ plus the named setup test) (head - base,
     // nextest list --profile ci on the node's selection at fb648fa9 and at this head).
-    ("privileged-only-test.cli_kvm_on_host", 159),
+    ("privileged-only-test.cli_kvm_on_host", 160),
     ("test.app_strict_verify_on_host", 8),
     ("test.arbitrary_binaries_on_host", 4),
     ("test.command_strict_verify_on_host", 9),

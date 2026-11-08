@@ -6833,6 +6833,13 @@
           "category": "c-programs",
           "test": "c-programs/procfs-identity-agreement",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/procfs-identity-agreement",
+          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -27917,7 +27924,7 @@
         "HERMIT_FORBID_SKIPS": "1",
         "HERMIT_NEXTEST_RESULTS_SCHEMA": "5",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "159",
+        "NEXTEST_EXPECTED_EXECUTED": "160",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"liteinst,kvm-execution-tests\",\"--lib\",\"--test\",\"cli\"]"
       },
       "networkonly": false,
@@ -32695,7 +32702,7 @@
         "HERMIT_FORBID_SKIPS": "1",
         "HERMIT_NEXTEST_RESULTS_SCHEMA": "5",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "159",
+        "NEXTEST_EXPECTED_EXECUTED": "160",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"liteinst,kvm-execution-tests\",\"--lib\",\"--test\",\"cli\"]"
       },
       "networkonly": false,
@@ -43054,7 +43061,7 @@
         "HERMIT_FORBID_SKIPS": "1",
         "HERMIT_NEXTEST_RESULTS_SCHEMA": "5",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "159",
+        "NEXTEST_EXPECTED_EXECUTED": "160",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"liteinst,kvm-execution-tests\",\"--lib\",\"--test\",\"cli\"]"
       },
       "networkonly": false,
@@ -50574,6 +50581,13 @@
           "test": "c-programs/procfs-identity-agreement",
           "mode": "verify",
           "backend": "in-guest-trap"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/procfs-identity-agreement",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
