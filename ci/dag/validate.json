@@ -13663,7 +13663,21 @@
           "category": "compat",
           "test": "compat/numactl-hardware",
           "mode": "verify",
+          "backend": "in-guest-trap"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/numactl-hardware",
+          "mode": "verify",
           "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/numactl-hardware",
+          "mode": "verify",
+          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -13684,7 +13698,21 @@
           "category": "compat",
           "test": "compat/numastat",
           "mode": "verify",
+          "backend": "in-guest-trap"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/numastat",
+          "mode": "verify",
           "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/numastat",
+          "mode": "verify",
+          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -24334,13 +24362,6 @@
           "test": "system-utils/ps-proc-table",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/ps-proc-table",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -57374,7 +57395,21 @@
           "category": "compat",
           "test": "compat/numactl-hardware",
           "mode": "verify",
+          "backend": "in-guest-trap"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/numactl-hardware",
+          "mode": "verify",
           "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/numactl-hardware",
+          "mode": "verify",
+          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -57395,7 +57430,21 @@
           "category": "compat",
           "test": "compat/numastat",
           "mode": "verify",
+          "backend": "in-guest-trap"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/numastat",
+          "mode": "verify",
           "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/numastat",
+          "mode": "verify",
+          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -61806,13 +61855,6 @@
           "test": "system-utils/ps-proc-table",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/ps-proc-table",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
