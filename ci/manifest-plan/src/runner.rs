@@ -4729,6 +4729,10 @@ pub fn host_input_change_only(result: &CellResult) -> bool {
                         .exact
                         .as_deref()
                         .is_none_or(|expected| check_expected_stdout(expected, &report).is_ok())
+                    && declared
+                        .stderr_exact
+                        .as_deref()
+                        .is_none_or(|expected| check_expected_stderr(expected, &report).is_ok())
                     && declared.contains.as_deref().is_none_or(|text| {
                         check_expected_stdout_contains(text, attempt.stdout.as_bytes(), &report)
                             .is_ok()
@@ -5016,6 +5020,10 @@ fn attempt_skid_overshoot_reports(
         .exact
         .as_deref()
         .is_some_and(|expected| check_expected_stdout(expected, &report).is_err())
+        || declared
+            .stderr_exact
+            .as_deref()
+            .is_some_and(|expected| check_expected_stderr(expected, &report).is_err())
         || declared.contains.as_deref().is_some_and(|text| {
             check_expected_stdout_contains(text, attempt.stdout.as_bytes(), &report).is_err()
         })
@@ -5088,9 +5096,10 @@ const HERMIT_INTERNAL_FAILURE_CLASS_PREFIX: &str = "HERMIT_INTERNAL_FAILURE clas
 ///   its report's, which the runner copies onto it, and the row's are the
 ///   first runtime and the divergence position its attempts give, so no
 ///   retained copy carries evidence that only a copy, not the report, holds;
-/// - the report satisfies the stdout assertions `declared` (the exact bytes
-///   against both compared runs' digests, and the contained text in the
-///   attempt's captured stdout, which must be both runs' stdout);
+/// - the report satisfies the stream assertions `declared` (the exact
+///   stdout and stderr bytes against both compared runs' digests, and the
+///   contained text in the attempt's captured stdout, which must be both
+///   runs' stdout);
 /// - the attempt ended as the row's recorded `expected_guest_exit` requires
 ///   (that guest disposition and the Hermit status reporting it), or with
 ///   Hermit exit status 0 when the row records none;
@@ -5214,6 +5223,13 @@ pub fn retained_verify_pass_error(
             .as_deref()
             .map(|expected| check_expected_stdout(expected, &report))
             .transpose()
+            .and_then(|_| {
+                declared
+                    .stderr_exact
+                    .as_deref()
+                    .map(|expected| check_expected_stderr(expected, &report))
+                    .transpose()
+            })
             .and_then(|_| {
                 declared
                     .contains
@@ -27385,11 +27401,14 @@ cp "{}" "$verdict"
         // the contained text, from the attempt's captured stdout when it is
         // both compared runs' stdout.
         let golden = "golden\n";
+        let golden_stderr = "diag\n";
         let mut golden_report = expected_exit_report(Some(7), None);
         let outputs = golden_report.compared_outputs.as_mut().unwrap();
         for output in [&mut outputs.left, &mut outputs.right] {
             output.stdout_sha256 = hex_digest(golden.as_bytes());
             output.stdout_bytes = golden.len() as u64;
+            output.stderr_sha256 = hex_digest(golden_stderr.as_bytes());
+            output.stderr_bytes = golden_stderr.len() as u64;
         }
         let mut golden_pass = with_report(&pass, &golden_report);
         golden_pass.attempts[0].stdout = golden.into();
@@ -27403,8 +27422,17 @@ cp "{}" "$verdict"
             contains: Some(text.into()),
             stderr_exact: None,
         };
+        let stderr_exact = |text: &str| DeclaredStdout {
+            exact: None,
+            contains: None,
+            stderr_exact: Some(text.into()),
+        };
         assert_eq!(
             retained_verify_pass_error(&golden_pass, &exact(golden)),
+            None
+        );
+        assert_eq!(
+            retained_verify_pass_error(&golden_pass, &stderr_exact(golden_stderr)),
             None
         );
         assert_eq!(
@@ -27415,6 +27443,12 @@ cp "{}" "$verdict"
             "stdout other than the declared bytes",
             &pass,
             &exact(golden),
+            "declared stdout assertion",
+        );
+        refused(
+            "stderr other than the declared bytes",
+            &golden_pass,
+            &stderr_exact("other diag\n"),
             "declared stdout assertion",
         );
         refused(

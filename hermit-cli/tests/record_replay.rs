@@ -3405,6 +3405,28 @@ fn record_replay_omits_numa_maps_from_task_directory_listings() {
         &guest,
         &[ordinary.as_os_str(), alias.as_os_str()],
     );
+    // The same guest again with the task directory bind-mounted at an
+    // ordinary path: the mount is a record-start option, which the
+    // canonical helper has no slot for, so this run goes through the
+    // policy helper (strict verification and bitwise parity as usual;
+    // the guest's own assertions make its exit status the verdict).
+    let bind_target = ordinary.join("task-bind");
+    fs::create_dir(&bind_target).expect("failed to create the bind mount target");
+    let mount = format!(
+        "--mount=type=bind,source=/proc/1,target={}",
+        bind_target.display()
+    );
+    record_replay_command_with_policy(
+        "procfs task-directory listing through a bind",
+        &guest,
+        &[
+            ordinary.as_os_str(),
+            alias.as_os_str(),
+            bind_target.as_os_str(),
+        ],
+        true,
+        &[&mount],
+    );
     let expected = "self numa_maps=0 stat=1 task=1\n\
         thread-self numa_maps=0 stat=1 task=1\n\
         pid numa_maps=0 stat=1 task=1\n\

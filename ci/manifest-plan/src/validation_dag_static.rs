@@ -3401,7 +3401,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // adds memory_policy_syscalls_are_determinized_and_consistent and removes
     // get_mempolicy_output_faults_are_efault_and_backend_errors_are_tool_errors
     // and the_stack_numa_maps_row_is_linuxs: 3791 + 1 - 2 = 3790.
-    ("test.detcore_unit", 3790),
+    // And a_mount_internal_path_follows_the_mounts_root
+    // (https://github.com/rrnewton/hermit/pull/5287): 3790 + 1 = 3791.
+    ("test.detcore_unit", 3791),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -6214,7 +6216,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same hermit_init_is_rendered_from_its_model_where_the_record_names_tasks
     // unit: 3790 + 1 = 3791.
     // And the same no-NUMA delta as test.detcore_unit (+1 -2): 3790.
-    ("test.detcore_unit_on_host", 3790),
+    // And the same a_mount_internal_path_follows_the_mounts_root unit: 3791.
+    ("test.detcore_unit_on_host", 3791),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

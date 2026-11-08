@@ -79,7 +79,7 @@ static int report_task(const char *label, const char *path, int process) {
 }
 
 int main(int argc, char **argv) {
-  if (argc != 2 && argc != 3) {
+  if (argc < 2 || argc > 4) {
     return 2;
   }
   char path[128];
@@ -109,8 +109,13 @@ int main(int argc, char **argv) {
   // The same task directory reached through an ordinary symlink: the
   // listing is the object's, not the spelling's, so it omits the name
   // exactly as the direct spellings do.
-  if (argc == 3) {
+  if (argc >= 3) {
     failed |= report_task("alias", argv[2], 1);
+  }
+  // And through a bind mount at an ordinary path, whose canonical link
+  // names the bind, not the task: still the task directory's listing.
+  if (argc == 4) {
+    failed |= report_task("bind", argv[3], 1);
   }
 
   errno = 0;
