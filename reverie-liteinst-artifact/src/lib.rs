@@ -27558,7 +27558,20 @@ const DETCORE_VALIDATE_TEMPLATES: &[DetcoreValidateTemplate] = &[
         ],
         transfers: &[(8, 1)],
     },
+    // Closed actual pinned-root Detcore: bd95719ee7b87d52888f88245f4ee446206b16ad14f3fc65edb2c6927840cbbe; complete16B SHA256a2f14b9e9f20c5a82963701eed8710f88059a1d0fd260be1060aa967fc29b97f.
+    DetcoreValidateTemplate {
+        role: "fixed_native_owner_gettid",
+        hex: "bfba00000031f631d231c9e910e8ffff",
+        operands: &[DetcoreValidateOperand {
+            displacement: 12,
+            next: 16,
+            key: "fixed_scalar_syscall",
+            got: false,
+        }],
+        transfers: &[(11, 0)],
+    },
 ];
+
 // Distinct from every historical TLS-bearing241B recipe. Measured in the true
 // Git840 native OFF DSO c4157195: full101B, b62a329a... before address binding.
 // The only masked fields are the six bound RIP operands below.
@@ -61860,6 +61873,46 @@ mod tests {
                 .to_string(),
             why
         );
+    }
+
+    #[test]
+    fn owner_gettid_tail_jmp_template_matches_uniquely() {
+        // The current pinned-root Detcore body of native_owner_gettid is a
+        // 16-byte tail jump into raw_syscall3 (gettid, 186). It must match
+        // exactly one validate template for its role, by shape.
+        let body: [u8; 16] = [
+            0xbf, 0xba, 0x00, 0x00, 0x00, 0x31, 0xf6, 0x31, 0xd2, 0x31, 0xc9, 0xe9, 0x10, 0xe8,
+            0xff, 0xff,
+        ];
+        let matched: Vec<_> = DETCORE_VALIDATE_TEMPLATES
+            .iter()
+            .filter(|t| {
+                t.role == "fixed_native_owner_gettid"
+                    && fixed_template_shape(
+                        &body,
+                        &fixed_hex(t.hex),
+                        t.operands.iter().map(|op| op.displacement),
+                    )
+            })
+            .collect();
+        assert_eq!(matched.len(), 1, "tail-jmp gettid body must match uniquely");
+        assert_eq!(matched[0].operands.len(), 1);
+        assert_eq!(matched[0].operands[0].key, "fixed_scalar_syscall");
+        // A different syscall number is a different body: no template admits it.
+        let mut mutated = body;
+        mutated[1] = 0xbb;
+        let matched: Vec<_> = DETCORE_VALIDATE_TEMPLATES
+            .iter()
+            .filter(|t| {
+                t.role == "fixed_native_owner_gettid"
+                    && fixed_template_shape(
+                        &mutated,
+                        &fixed_hex(t.hex),
+                        t.operands.iter().map(|op| op.displacement),
+                    )
+            })
+            .collect();
+        assert!(matched.is_empty(), "mutated gettid body must be refused");
     }
 
     #[test]
