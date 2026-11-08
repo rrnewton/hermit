@@ -13663,21 +13663,7 @@
           "category": "compat",
           "test": "compat/numactl-hardware",
           "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/numactl-hardware",
-          "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/numactl-hardware",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -57402,21 +57388,7 @@
           "category": "compat",
           "test": "compat/numactl-hardware",
           "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/numactl-hardware",
-          "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/numactl-hardware",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
