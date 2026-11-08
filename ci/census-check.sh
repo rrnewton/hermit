@@ -38,6 +38,23 @@ if [[ -z $base_listed ]]; then
     printf 'census %s: report-only (no base population supplied; queue adapter has not provided HERMIT_CENSUS_BASE_LISTED_IDS)\n' "$suite" >&2
     exit 0
 fi
+# A stamped first base (census_base.py, for a suite with no prior base)
+# names itself with a `# census-first-base:` marker. The candidate's own
+# listing becomes that first base when the landing gate records it, so
+# there is no prior population to disappear from and no diff to run. A
+# base without the marker keeps the full disappearance check below,
+# including an existing suite whose base file is simply missing (the
+# adapter supplies no file for it at all, and the counted wrapper's
+# require-base refusal fires before this script runs).
+if grep -q '^# census-first-base:' "$base_listed"; then
+    marker=$(grep -m1 '^# census-first-base:' "$base_listed")
+    count=0
+    if [[ -n $candidate_listed ]]; then
+        count=$(grep -cv '^#' "$candidate_listed" || true)
+    fi
+    printf 'census %s: first base recorded from candidate (%s; candidate ids=%s; no prior base, no disappearance check)\n' "$suite" "$marker" "$count" >&2
+    exit 0
+fi
 
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
