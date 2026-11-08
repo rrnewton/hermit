@@ -13684,21 +13684,7 @@
           "category": "compat",
           "test": "compat/numastat",
           "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/numastat",
-          "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/numastat",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -57409,21 +57395,7 @@
           "category": "compat",
           "test": "compat/numastat",
           "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/numastat",
-          "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/numastat",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
