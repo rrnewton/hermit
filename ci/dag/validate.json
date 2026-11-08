@@ -24312,13 +24312,6 @@
           "category": "system-utils",
           "test": "system-utils/procfs-sanitized-paths",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/procfs-sanitized-paths",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -61777,13 +61770,6 @@
           "test": "system-utils/procfs-sanitized-paths",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/procfs-sanitized-paths",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
