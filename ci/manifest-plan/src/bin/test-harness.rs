@@ -5744,6 +5744,7 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
                     restated.declared_stdout = Some(hermit_manifest_plan::runner::DeclaredStdout {
                         exact: Some(String::new()),
                         contains: None,
+                        stderr_exact: None,
                     });
                     assert_eq!(
                         super::skid_overshoot_only_reports(&restated),
@@ -5878,6 +5879,7 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
                         Some(hermit_manifest_plan::runner::DeclaredStdout {
                             exact: Some("skid-control-ok\n".into()),
                             contains: None,
+                            stderr_exact: None,
                         }),
                         "{rows:#?}"
                     );
@@ -6183,6 +6185,7 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
                             let redeclared = hermit_manifest_plan::runner::DeclaredStdout {
                                 exact: None,
                                 contains: Some(String::new()),
+                                stderr_exact: None,
                             };
                             assert_ne!(row.declared_stdout.as_ref(), Some(&redeclared));
                             row.declared_stdout = Some(redeclared);
@@ -11546,6 +11549,7 @@ sys.exit(1 if failed else 0)
         redeclared.declared_stdout = Some(hermit_manifest_plan::runner::DeclaredStdout {
             exact: None,
             contains: Some(String::new()),
+            stderr_exact: None,
         });
         let mut relaxed = changed.clone();
         relaxed
