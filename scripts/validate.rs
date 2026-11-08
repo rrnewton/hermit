@@ -20693,7 +20693,12 @@ mod nextest_timeout_tests {
                 // 2995 with system-utils/ps-proc-table verify/KVM (Detcore renders
                 // /proc/1 of Hermit's init; 3 of 3 strict verify runs in the
                 // pinned root).
-                assert_eq!(all.len(), 2995, "the original all-owner population is retained");
+                // 2991 after compat/numactl-hardware and compat/numastat left
+                // liteinst and in-guest-trap (four cells) with the no-NUMA
+                // platform (https://github.com/rrnewton/hermit/issues/5269):
+                // their shell wrappers exec, which the in-guest backends
+                // refuse; ptrace and KVM keep proving the new answers.
+                assert_eq!(all.len(), 2991, "the original all-owner population is retained");
             }
             let expected = all.iter().map(|cell| cell.id.clone()).collect::<BTreeSet<_>>();
             assert_eq!(expected.len(), all.len(), "duplicate all-owner cell identity");
