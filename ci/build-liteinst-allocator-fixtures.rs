@@ -324,11 +324,19 @@ fn build_leaf(
         // never the trap-only leaf the same fixture selection would produce
         // at ef28dfb8 without the liteinst forward; current-artifact
         // selection below still requires only that leaf.
+        // Two --features flags, not one joined value: Reverie's
+        // verify_runtime_receipt at ef28dfb8 requires the exact adjacent
+        // argv pair ("--features", "allocator-fixture") in the receipt's
+        // recorded producer command, and rejects
+        // "--features allocator-fixture,liteinst". The selection is
+        // identical ("allocator-fixture" + "liteinst" both reach the leaf).
         build_arguments.extend([
             "-p".into(),
             "hermit-liteinst-runtime-artifact".into(),
             "--features".into(),
-            "allocator-fixture,liteinst".into(),
+            "allocator-fixture".into(),
+            "--features".into(),
+            "liteinst".into(),
         ]);
     } else {
         build_arguments.extend(["--features".into(), "allocator-fixture".into()]);
