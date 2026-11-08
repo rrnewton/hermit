@@ -36976,10 +36976,15 @@ fn liteinst_runtime_staging_does_not_require_a_git_checkout() {
     // The basename guard, driven against the script directly (the helper
     // above always passes --liteinst): a trap build must never reach cargo
     // when its destination carries the FULL runtime's canonical name, while
-    // the same trap build to a distinct name and a FULL build to the
-    // canonical name both proceed. This trio is the regression test that a
-    // dropped --liteinst at any staging caller fails loudly instead of
-    // silently shipping a trap-only libreverie_liteinst.so.
+    // a FULL build to the canonical name proceeds. The `trap_allowed` leg
+    // below only checks the script's argument routing against the stand-in
+    // cargo (a trap request to a distinct name is passed through with no
+    // --features); it does not prove a plain-TRAP binary stages. With a
+    // real cargo at the pinned Reverie (ef28) the standalone qualifier
+    // refuses plain TRAP ("INSTALLATION_DEPTH TLS cell absent/ambiguous"),
+    // and only TRAP+FIXTURE stages under a distinct name. This trio is the
+    // regression test that a dropped --liteinst at any staging caller fails
+    // loudly instead of silently shipping a trap-only libreverie_liteinst.so.
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
