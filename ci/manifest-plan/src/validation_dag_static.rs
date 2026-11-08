@@ -4790,7 +4790,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And a_schedule_replay_ends_each_recorded_slice_once_at_seed_{1,2,3}
     // (PR #4614): 839 + 3 = 842, skipped by exact name here and run in
     // privileged-test.pmu_cli_cases: 842 - 3 = 839, listed.
-    ("test.cli", 839),
+    // PR 5275 disables two hidden-desync tests as known failures
+    // (dh-ds5i3, dh-9xi44): 839 - 2 = 837.
+    ("test.cli", 837),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
