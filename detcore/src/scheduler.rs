@@ -5657,8 +5657,8 @@ fn notes_background_starts(cfg: &Config) -> bool {
 fn rejoin_desync_ends_the_run(cfg: &Config) -> Option<&'static str> {
     if cfg.strict_binder {
         Some("--strict")
-    } else if cfg.die_on_desync {
-        Some("--die-on-desync")
+    } else if !cfg.lenient_replay {
+        Some("strict replay (the default since dh-mvz7y)")
     } else {
         None
     }
@@ -5852,7 +5852,7 @@ impl Scheduler {
                         let mut replayer = Replayer::new(vec)
                             .with_background_starts(&background_starts, notes_background_starts);
                         replayer.replay_exhausted_panic = cfg.replay_exhausted_panic;
-                        replayer.die_on_desync = cfg.die_on_desync;
+                        replayer.die_on_desync = !cfg.lenient_replay;
                         (Some(replayer), Some(toprint))
                     }
                     Recording::Boundaries(record) => {
@@ -6179,7 +6179,7 @@ impl Scheduler {
             last_guest_commit_at: Default::default(),
             pending_time_skip: None,
             time_skip_mode,
-            die_on_time_skip_desync: cfg.die_on_desync,
+            die_on_time_skip_desync: !cfg.lenient_replay,
             die_on_rejoin_desync: rejoin_desync_ends_the_run(cfg),
             time_skip_desyncs: 0,
             charge_replayed_switch_ins,
@@ -7395,7 +7395,7 @@ impl Scheduler {
             }
         }) {
             let stop_flag = match action {
-                replayer::ReplayAction::Stop(StopReason::FatalDesync) => Some("--die-on-desync"),
+                replayer::ReplayAction::Stop(StopReason::FatalDesync) => Some("strict replay"),
                 replayer::ReplayAction::Stop(StopReason::ReplayExausted) => {
                     Some("--replay-exhausted-panic")
                 }
@@ -7432,7 +7432,19 @@ impl Scheduler {
                         instruction_offset,
                     };
                 }
-                replayer::ReplayAction::Stop(StopReason::FatalDesync) => immediate_fatal_exit(),
+                replayer::ReplayAction::Stop(StopReason::FatalDesync) => {
+                    match self.replayer.as_ref().and_then(|r| r.fatal_desync.clone()) {
+                        Some((thread, event, expected, observed)) => eprintln!(
+                            "ERROR HERMIT_REPLAY_DESYNC thread={thread} event={event} \
+                             expected={expected} observed={observed}"
+                        ),
+                        None => eprintln!(
+                            "ERROR HERMIT_REPLAY_DESYNC thread={mytid} event={ix} \
+                             expected=recorded schedule observed=diverged event"
+                        ),
+                    }
+                    immediate_fatal_exit()
+                }
                 replayer::ReplayAction::Stop(StopReason::ReplayExausted) => immediate_fatal_exit(),
                 replayer::ReplayAction::ContextSwitch(is_now, new_tid, timeslice_remaining) => {
                     self.requeue_with_new_priority(mytid, REPLAY_DEFERRED_PRIORITY);
@@ -12088,8 +12100,12 @@ impl Scheduler {
         self.first_time_skip_desync.get_or_insert(skip);
         warn!("[scheduler] schedule replay desynchronized: {complaint}");
         if self.die_on_time_skip_desync {
+            eprintln!(
+                "ERROR HERMIT_REPLAY_DESYNC event={} expected=recorded time jump observed={complaint}",
+                skip.event
+            );
             eprintln!("Replay mode desynchronized from trace, bailing out: {complaint}");
-            self.report_stacktrace_positions_at_replay_stop("--die-on-desync");
+            self.report_stacktrace_positions_at_replay_stop("strict replay");
             immediate_fatal_exit();
         }
     }
@@ -18118,6 +18134,9 @@ impl Scheduler {
         );
         if let Some(flag) = self.die_on_rejoin_desync {
             eprintln!(
+                "ERROR HERMIT_REPLAY_DESYNC expected=recorded readmissions observed={reason}"
+            );
+            eprintln!(
                 "Replay mode desynchronized from trace, bailing out ({flag}): \
                  HERMIT_REPLAY_LEFT_READMISSIONS: {reason}"
             );
@@ -20165,7 +20184,7 @@ impl Scheduler {
                 );
                 let unrecorded_start_is_fatal = replayer.note_unrecorded_background_start(dettid);
                 if unrecorded_start_is_fatal {
-                    self.report_stacktrace_positions_at_replay_stop("--die-on-desync");
+                    self.report_stacktrace_positions_at_replay_stop("strict replay");
                     immediate_fatal_exit();
                 }
             }
@@ -23429,7 +23448,13 @@ impl Scheduler {
                 .as_ref()
                 .is_some_and(|replayer| replayer.die_on_desync)
         {
-            self.report_stacktrace_events_at_stop(None, "--die-on-desync");
+            eprintln!(
+                "ERROR HERMIT_REPLAY_DESYNC thread={tid} event={} expected={:?} observed={:?}",
+                reported_at.map_or(0, |at| at.event),
+                checkpoint.origin,
+                actual,
+            );
+            self.report_stacktrace_events_at_stop(None, "strict replay");
             immediate_fatal_exit();
         }
     }
@@ -26195,7 +26220,11 @@ mod test {
 
         // One desynced jump, one unconfirmed and one never reached: the note
         // names the earliest place, the desynced jump's.
-        let mut sched = Scheduler::new(&Config::default());
+        // The note is the lenient accounting; strict stops (dh-mvz7y).
+        let mut sched = Scheduler::new(&Config {
+            lenient_replay: true,
+            ..Config::default()
+        });
         sched.replayer = Some(crate::scheduler::replayer::Replayer::new([]));
         sched.time_skip_desync(skip(4, 1_000_000), "made past a known deadline");
         sched.unconfirmed_time_skip = Some(skip(6, 2_000_000));
@@ -26242,7 +26271,11 @@ mod test {
     /// Its own commits request no jump.
     #[test]
     fn a_replay_drives_the_recorded_jumps_and_checks_them() {
-        let config = Config::default();
+        // Counting desyncs is the lenient accounting (dh-mvz7y).
+        let config = Config {
+            lenient_replay: true,
+            ..Config::default()
+        };
         let mut sched = Scheduler::new(&config);
         let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
         let start = global_time.lock().unwrap().as_nanos();
@@ -26324,7 +26357,11 @@ mod test {
     /// a desync, and the jump is made late.
     #[test]
     fn a_recorded_fifo_jump_waits_for_the_opens_poll() {
-        let config = Config::default();
+        // Counting time-skip desyncs is the lenient accounting (dh-mvz7y).
+        let config = Config {
+            lenient_replay: true,
+            ..Config::default()
+        };
         let mut sched = Scheduler::new(&config);
         let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
         let start = global_time.lock().unwrap().as_nanos();
@@ -26370,7 +26407,11 @@ mod test {
     /// one.
     #[test]
     fn a_replay_that_runs_out_of_records_decides_its_own_jumps() {
-        let config = Config::default();
+        // Counting time-skip desyncs is the lenient accounting (dh-mvz7y).
+        let config = Config {
+            lenient_replay: true,
+            ..Config::default()
+        };
         let mut sched = Scheduler::new(&config);
         let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
         let start = global_time.lock().unwrap().as_nanos();
@@ -26423,6 +26464,8 @@ mod test {
             let path = dir.path().join("record.json");
             std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
             Scheduler::new(&Config {
+                // Record-format accounting is studied leniently (dh-mvz7y).
+                lenient_replay: true,
                 replay_schedule_from: Some(path),
                 record_preemptions: true,
                 ..Config::default()
@@ -26527,7 +26570,12 @@ mod test {
                 reason: TimeSkipReason::IdleGuestPollers,
             }]);
         assert!(record.validate_format().is_err());
-        let config = Config::default();
+        // The count below is the lenient accounting; strict replay stops
+        // the process at the skip instead (dh-mvz7y).
+        let config = Config {
+            lenient_replay: true,
+            ..Config::default()
+        };
         let mut sched = Scheduler::new(&config);
         let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
         let start = global_time.lock().unwrap().as_nanos();
@@ -26807,6 +26855,8 @@ mod test {
             let path = dir.path().join("record.json");
             std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
             Scheduler::new(&Config {
+                // Record-format accounting is studied leniently (dh-mvz7y).
+                lenient_replay: true,
                 replay_schedule_from: Some(path),
                 record_preemptions: true,
                 ..Config::default()
@@ -28541,7 +28591,10 @@ mod test {
                 .with_time(at(20_000));
         let third = SchedEvent::syscall(DetTid::from_raw(3), Sysno::getuid, SyscallPhase::Prehook)
             .with_time(at(30_000));
-        sched.replayer = Some(Replayer::new(vec![first.clone(), second, third]));
+        let mut replayer = Replayer::new(vec![first.clone(), second, third]);
+        // Leaving-the-record accounting is studied leniently (dh-mvz7y).
+        replayer.die_on_desync = false;
+        sched.replayer = Some(replayer);
         let _ = sched.consume_schedevent(&first);
         assert!(!sched.replay_left_its_record(), "in step");
         let other = SchedEvent::syscall(DetTid::from_raw(5), Sysno::gettid, SyscallPhase::Prehook)
@@ -28564,7 +28617,10 @@ mod test {
             SchedEvent::syscall(tid, Sysno::getpid, SyscallPhase::Prehook).with_time(at(10_000));
         let second =
             SchedEvent::syscall(tid, Sysno::getpid, SyscallPhase::Posthook).with_time(at(20_000));
-        sched.replayer = Some(Replayer::new(vec![first.clone(), second.clone()]));
+        let mut replayer = Replayer::new(vec![first.clone(), second.clone()]);
+        // Stacktrace-index accounting is studied leniently (dh-mvz7y).
+        replayer.die_on_desync = false;
+        sched.replayer = Some(replayer);
         sched.stacktrace_events = Some(vec![(2, None, None)].into_iter().peekable());
         assert_eq!(sched.consume_schedevent(&first).print_stack, None);
         let extra = SchedEvent::branches(tid, 2).with_time(at(15_000));
@@ -28632,7 +28688,10 @@ mod test {
                 SchedEvent::syscall(tid, sysno, SyscallPhase::Prehook).with_time(at(n * 10_000))
             })
             .collect();
-        sched.replayer = Some(Replayer::new(schedule.clone()));
+        let mut replayer = Replayer::new(schedule.clone());
+        // End-of-run stacktrace reporting is studied leniently (dh-mvz7y).
+        replayer.die_on_desync = false;
+        sched.replayer = Some(replayer);
         let after_release = replayer::UNMATCHED_EVENTS_BEFORE_RELEASE + 1;
         sched.stacktrace_events = Some(
             vec![(after_release, None, None), (1_000_000, None, None)]
@@ -28726,7 +28785,10 @@ mod test {
         for (positions, printed_at) in [(true, 3), (false, 2)] {
             let mut sched = Scheduler::new(&Config::default());
             sched.stacktrace_at_schedule_positions = positions;
-            sched.replayer = Some(Replayer::new(schedule.clone()));
+            let mut replayer = Replayer::new(schedule.clone());
+            // Schedule-position accounting is studied leniently (dh-mvz7y).
+            replayer.die_on_desync = false;
+            sched.replayer = Some(replayer);
             sched.stacktrace_events = Some(vec![(2, None, None)].into_iter().peekable());
             let observed = [
                 schedule[0].clone(),
@@ -28765,7 +28827,10 @@ mod test {
                 SchedEvent::syscall(tid, sysno, SyscallPhase::Prehook).with_time(at(n * 10_000))
             })
             .collect();
-        sched.replayer = Some(Replayer::new(schedule.clone()));
+        let mut replayer = Replayer::new(schedule.clone());
+        // Release-position reporting is studied leniently (dh-mvz7y).
+        replayer.die_on_desync = false;
+        sched.replayer = Some(replayer);
         sched.stacktrace_events = Some(
             vec![(1, None, None), (5, None, None)]
                 .into_iter()
@@ -28808,7 +28873,10 @@ mod test {
                 SchedEvent::syscall(tid, sysno, SyscallPhase::Prehook).with_time(at(n * 10_000))
             })
             .collect();
-        sched.replayer = Some(Replayer::new(schedule.clone()));
+        let mut replayer = Replayer::new(schedule.clone());
+        // Release-position reporting is studied leniently (dh-mvz7y).
+        replayer.die_on_desync = false;
+        sched.replayer = Some(replayer);
         sched.stacktrace_events = Some(vec![(2, None, None)].into_iter().peekable());
         // Consume only position 0; position 2 is never consumed, so no
         // stack prints and the request stays pending until the end-of-run
@@ -29051,7 +29119,10 @@ mod test {
     fn plain_replay_with_writer(events: Vec<SchedEvent>) -> Scheduler {
         let mut sched = Scheduler::new(&Config::default());
         sched.record_logical_replay_priorities = true;
-        sched.replayer = Some(Replayer::new(events));
+        let mut replayer = Replayer::new(events);
+        // Logical-replay accounting is studied leniently (dh-mvz7y).
+        replayer.die_on_desync = false;
+        sched.replayer = Some(replayer);
         sched.preemption_writer = Some(PreemptionWriter::new(None));
         sched
     }
@@ -32457,10 +32528,11 @@ mod test {
             call,
         };
         let mut scheduler = Scheduler::new(&Config::default());
-        scheduler.replayer = Some(
-            crate::scheduler::replayer::Replayer::new(events.clone())
-                .with_background_starts(&[start(1, b, 2), start(2, a, 5), start(3, a, 7)], true),
-        );
+        let mut replayer = crate::scheduler::replayer::Replayer::new(events.clone())
+            .with_background_starts(&[start(1, b, 2), start(2, a, 5), start(3, a, 7)], true);
+        // Summary accounting is studied leniently (dh-mvz7y).
+        replayer.die_on_desync = false;
+        scheduler.replayer = Some(replayer);
         let replayer = scheduler.replayer.as_mut().unwrap();
         replayer.observe_event(&events[0]);
         replayer.observe_event(&events[1]);
@@ -32584,10 +32656,12 @@ mod test {
                 for tid in queued {
                     sched.runqueue_push_back(*tid);
                 }
-                sched.replayer = Some(
-                    Replayer::new(vec![observed.clone(), next_event.clone()])
-                        .with_background_starts(starts, notes),
-                );
+                let mut replayer = Replayer::new(vec![observed.clone(), next_event.clone()])
+                    .with_background_starts(starts, notes);
+                // Background-start accounting is studied leniently here;
+                // strict replay stops at the first mismatch (dh-mvz7y).
+                replayer.die_on_desync = false;
+                sched.replayer = Some(replayer);
                 sched.consume_schedevent(&observed);
                 sched
             };
@@ -32744,8 +32818,11 @@ mod test {
                 sched.runqueue_push_back(tid);
             }
             sched.requeue_with_new_priority(root, REPLAY_FOREGROUND_PRIORITY);
-            sched.replayer =
-                Some(Replayer::new(schedule.clone()).with_background_starts(&[start], true));
+            let mut replayer =
+                Replayer::new(schedule.clone()).with_background_starts(&[start], true);
+            // Released-schedule accounting is studied leniently (dh-mvz7y).
+            replayer.die_on_desync = false;
+            sched.replayer = Some(replayer);
             sched
         };
         let hard = |sched: &Scheduler, tid: DetTid| {
@@ -33180,7 +33257,12 @@ mod test {
     /// A scheduler with vfork parent 3 and its registered child 5, both alive,
     /// for the release-edge tests below.
     fn live_vfork_pair() -> (Scheduler, DetTid, DetTid) {
-        let mut scheduler = Scheduler::new(&Config::default());
+        // These tests study rejoin mechanics after a departure, which the
+        // strict default ends instead (dh-mvz7y).
+        let mut scheduler = Scheduler::new(&Config {
+            lenient_replay: true,
+            ..Config::default()
+        });
         let parent = DetTid::from_raw(3);
         let child = DetTid::from_raw(5);
         for tid in [parent, child] {
@@ -34430,7 +34512,12 @@ mod test {
     /// A record/replay scheduler with `client` backgrounded on call `op_id`,
     /// finished when `finished`, and the poller `server`, if any, queued.
     fn rejoin_fixture(op_id: ExternalOpId, server: Option<DetTid>, finished: bool) -> Scheduler {
-        let mut scheduler = Scheduler::new(&Config::default());
+        // The rejoin cluster studies departures and readmissions, which the
+        // strict default ends instead (dh-mvz7y).
+        let mut scheduler = Scheduler::new(&Config {
+            lenient_replay: true,
+            ..Config::default()
+        });
         scheduler.recordreplay_modes = true;
         let client = op_id.tid;
         scheduler.priorities.insert(client, DEFAULT_PRIORITY);
@@ -35048,22 +35135,26 @@ mod test {
     /// record the loss, and exit 0.
     #[test]
     fn a_strict_replay_ends_where_it_leaves_its_readmissions() {
-        for (strict, die, ends) in [
-            (false, false, None),
-            (false, true, Some("--die-on-desync")),
-            (true, false, Some("--strict")),
+        for (strict, lenient, ends) in [
+            (false, true, None),
+            (
+                false,
+                false,
+                Some("strict replay (the default since dh-mvz7y)"),
+            ),
             (true, true, Some("--strict")),
+            (true, false, Some("--strict")),
         ] {
             let cfg = Config {
                 strict_binder: strict,
-                die_on_desync: die,
+                lenient_replay: lenient,
                 ..Config::default()
             };
-            assert_eq!(rejoin_desync_ends_the_run(&cfg), ends, "{strict} {die}");
+            assert_eq!(rejoin_desync_ends_the_run(&cfg), ends, "{strict} {lenient}");
             assert_eq!(
                 Scheduler::new(&cfg).die_on_rejoin_desync,
                 ends,
-                "{strict} {die}"
+                "{strict} {lenient}"
             );
         }
     }
@@ -40835,6 +40926,8 @@ mod test {
         .unwrap();
         let mut scheduler = Scheduler::new(&Config {
             replay_schedule_from: Some(schedule),
+            // Released-schedule accounting is studied leniently (dh-mvz7y).
+            lenient_replay: true,
             ..Config::default()
         });
         let origin = Origin {
