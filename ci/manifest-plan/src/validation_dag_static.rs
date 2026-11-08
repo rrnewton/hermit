@@ -2046,7 +2046,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And tests::the_library_entry_points_refuse_untrapping_without_its_prerequisites
     // (the same pull request's post-facto review): 1384 + 1 = 1385.
     // The portable all-rewrite summary control adds one native test; main +1 only.
-    ("test.hermit_unit", 1389),
+    // And metadata record_version_rejects_streams_from_before_the_no_numa_platform
+    // (the no-NUMA platform, https://github.com/rrnewton/hermit/issues/5269):
+    // 1389 + 1 = 1390.
+    ("test.hermit_unit", 1390),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3395,7 +3398,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_system_directory_lists_the_levels_names: 3791 + 3 = 3794.
     // And their bind-mount unit
     // a_bind_mount_is_the_procfs_directory_it_shows: 3795.
-    ("test.detcore_unit", 3795),
+    // The no-NUMA platform (https://github.com/rrnewton/hermit/issues/5269)
+    // adds memory_policy_syscalls_are_determinized_and_consistent and removes
+    // get_mempolicy_output_faults_are_efault_and_backend_errors_are_tool_errors
+    // and the_stack_numa_maps_row_is_linuxs: 3795 + 1 - 2 = 3794.
+    ("test.detcore_unit", 3794),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -6223,7 +6230,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_system_directory_lists_the_levels_names: 3791 + 3 = 3794.
     // And their bind-mount unit
     // a_bind_mount_is_the_procfs_directory_it_shows: 3795.
-    ("test.detcore_unit_on_host", 3795),
+    // And the same no-NUMA delta as test.detcore_unit (+1 -2): 3794.
+    ("test.detcore_unit_on_host", 3794),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -6657,7 +6665,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR #4746: the same 37 hermit-run units: 1327 + 37 = 1364.
     // PR #4764: the same three hermit-run untrap units: 1376 + 3 = 1379.
     // The portable all-rewrite summary control adds one native test; main +1 only.
-    ("test.hermit_unit_on_host", 1383),
+    // And the same no-NUMA record-version unit as test.hermit_unit: 1383 + 1 = 1384.
+    ("test.hermit_unit_on_host", 1384),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
