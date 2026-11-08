@@ -1613,7 +1613,6 @@ mod tests {
                 .into_iter()
                 .chain(args.lines().filter(|arg| !arg.is_empty()))
                 .chain(["/bin/true"]);
-            println!();
             match <Cli as clap::Parser>::try_parse_from(argv) {
                 Ok(cli) => println!("cpu-profile={}", cli.start.cpu_profile.name()),
                 Err(error) => println!("refused: {:?}", error.kind()),
@@ -1704,8 +1703,8 @@ mod tests {
         assert!(result.is_ok() && lines.is_empty(), "{lines:?}");
     }
 
-    /// The refusal needs `--strict` and an inexact counter, including the common
-    /// ptrace record path before executable-selected e9patch preprocessing.
+    /// The refusal needs `--strict` and an inexact counter, and covers e9patch
+    /// preprocessing, which records on the same ptrace runtime and counter.
     #[test]
     fn record_refusal_needs_strict_and_an_inexact_counter() {
         #[derive(clap::Parser)]
