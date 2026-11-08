@@ -188,6 +188,7 @@ pub(super) const NEXTEST_RESULT_PRODUCERS: &[&str] = &[
     "test.hermit_modes",
     "test.hermit_modes_on_host",
     "test.hermit_unit",
+    "test.hermit_native_exec",
     "test.ignored_syscall_regressions",
     "test.pmu_integration_cases",
     "test.pmu_integration_cases_2",
@@ -7099,6 +7100,37 @@ impl StaticStepSpec {
                 declaration.ledger.into(),
             );
         }
+        // A non-default prepared cohort is declared once, by tag, in
+        // nextest_binaries::cohort_for_step, and reaches its nodes only
+        // through these variables: the cohort slug the prepared runner
+        // resolves its record by, and the cohort's Cargo target directory
+        // its producer and consumers must share exactly (verify_record
+        // compares the recorded build environment). Hand-authoring either
+        // would let a node consume one cohort's record from another's
+        // target, so both are refused in authored env.
+        assert!(
+            !env.contains_key(crate::nextest_binaries::COHORT_ENV),
+            "{tag} sets {} by hand; declare its cohort in nextest_binaries::cohort_for_step",
+            crate::nextest_binaries::COHORT_ENV
+        );
+        assert!(
+            !env.contains_key("CARGO_TARGET_DIR"),
+            "{tag} sets CARGO_TARGET_DIR by hand; a prepared cohort's target directory comes from its cohort declaration"
+        );
+        let cohort = crate::nextest_binaries::cohort_for_step(&tag);
+        if !cohort.is_default() {
+            env.insert(
+                crate::nextest_binaries::COHORT_ENV.into(),
+                cohort.env_value().expect("non-default cohort has a slug").into(),
+            );
+            env.insert(
+                "CARGO_TARGET_DIR".into(),
+                cohort
+                    .target_dir()
+                    .expect("non-default cohort has a target directory")
+                    .into(),
+            );
+        }
         Step {
             group: self.group.into(),
             job: self.job.into(),
@@ -9380,6 +9412,38 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         engine_only: false,
         timeout: 900,
         cpu_timeout: 7200,
+        jobs_flag: Some(r########""########),
+        jobs_env: Some(r########"CARGO_BUILD_JOBS"########),
+    },
+    StaticStepSpec {
+        group: r########"test"########,
+        job: r########"hermit_native_exec"########,
+        desc: r########"Test Hermit native-exec library cases (-p hermit-run --features native-exec --lib --bins)"########,
+        description: r########"Runs the 81 hermit-run library cases gated by the native-exec feature (67 app::native_exec*, 8 app::container::declared_inputs, 2 app::initial_image_admission, 4 app::run enrollment/observer cases), prepared in the native-exec cohort (build.hermit_native_exec_compile_in_pinned_root + build.hermit_native_exec_in_pinned_root) so the feature never enters the default workspace union or the production binary. Population measured 2026-11-08 at hermit d9ac2c5e by nextest list with the feature off and on (1544 vs 1625 listed IDs in this selection; delta exactly those 81, none lost): the six trailing filters match that delta with zero overmatch at that head, and the counted census owns each listed ID exactly once (no count pin). Triage: coord7 measured the suite in the pinned root at 646a9796 as 70 pass / 9 fail / 2 ignored in 29.4 s wall and 13.7 CPU-s; the 9 failures are disabled by name in the ignores change stacked below this node (the dh-ngn2h libgmp FHS pair, 6 native_exec_consumer child controls that run 0 tests, 1 disconnected-peer case), so the executed set is whatever the stacked typed listing names active. Host run at d9ac2c5e (8-CPU box, -j 1, exact filter): 73 passed, 8 failed in 20.482 s wall and 4.248 CPU-s (the 7 consumer cases plus initial_redemption_preserves_bootstrap_mask_immediate_and_delayed, whose pinned adjudication is recorded in dh-10l17). Budgets: the 300-second wall is the counted-node floor above one 1.5x180 s attempt cap plus grace (272 s, scripts/validate.rs), not a measurement; 40 CPU-s is the 8x-rule minimum for that wall and covers 1.5x the pinned CPU measurement. Memory keeps test.hermit_unit's 5-GiB baseline and 7-GiB hard cap shape until the targeted pinned receipt in dh-10l17. Per-attempt limits stay 22 CPU-s / 180 s. This node deliberately does not depend on the default workspace producer: its executables come only from the native-exec cohort's record."########,
+        labels: &[r########"full"########, r########"portable"########],
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-core-build.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features liteinst,kvm-native-test-support,native-exec --lib --bins -j 1 -- app::native_exec app::container::declared_inputs app::initial_image_admission native_enrollment native_inputs_refuse native_observer_plan"########,
+        cmdtype: CmdType::Unknown,
+        manifest: None,
+        integration_test_binaries: None,
+        deps: &[
+            r########"build.hermit_native_exec_in_pinned_root"########,
+            r########"setup.nextest"########,
+        ],
+        env: &[],
+        hint: HintSpec {
+            resources: &[],
+            est_duration_s: 30.0,
+            rss_baseline_bytes: Some(5368709120),
+            hard_mem_max_bytes: Some(7516192768),
+            classification: StepClass::CpuBound,
+            preferred_inner_jobs: Some(8),
+            measured_effective_cores: None,
+            measured_cpu_utilization: None,
+        },
+        networkonly: false,
+        engine_only: false,
+        timeout: 300,
+        cpu_timeout: 40,
         jobs_flag: Some(r########""########),
         jobs_env: Some(r########"CARGO_BUILD_JOBS"########),
     },
