@@ -85,7 +85,8 @@ fn build_liteinst_runtime(
             .env_remove("HERMIT_LITEINST_REVERIE_PIN")
             .arg("release")
             .arg(&runtime)
-            .arg(&target),
+            .arg(&target)
+            .arg("--liteinst"),
         "build the constructor-enabled LiteInst runtime",
     );
     assert!(

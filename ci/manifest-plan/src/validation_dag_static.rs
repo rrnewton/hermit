@@ -1302,7 +1302,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // untrap_passthrough_syscalls_never_enters_the_legacy_form: 1968 + 2 = 1970, listed.
     // Inherited structural hint + five owned helper tests, not a fresh measured total.
     // Runtime completeness uses the listed identity census.
-    ("test.regular_crates", 1976),
+    // And the stage-detcore-liteinst site-patching guard test
+    // (canonical_tool_image_refuses_trap_only_and_patcher_less_builds_by_name,
+    // dh-md601): 1976 + 1 = 1977.
+    ("test.regular_crates", 1977),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -5562,7 +5565,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR #4764: the same two detcore-model untrap units: 1954 + 2 = 1956.
     // Inherited structural hint + five owned helper tests, not a fresh measured total.
     // Runtime completeness uses the listed identity census.
-    ("test.regular_crates_on_host", 1962),
+    // And the same stage-detcore-liteinst site-patching guard test
+    // (dh-md601), none hosted-excluded: 1962 + 1 = 1963.
+    ("test.regular_crates_on_host", 1963),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -6880,7 +6885,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR #4764: the same two detcore-model untrap units: 1954 + 2 = 1956.
     // Inherited structural hint + five owned helper tests, not a fresh measured total.
     // Runtime completeness uses the listed identity census.
-    ("test.regular_crates_on_host", 1962),
+    // And the same stage-detcore-liteinst site-patching guard test
+    // (dh-md601), none hosted-excluded: 1962 + 1 = 1963.
+    ("test.regular_crates_on_host", 1963),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

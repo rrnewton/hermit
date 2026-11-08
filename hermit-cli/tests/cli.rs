@@ -36854,9 +36854,13 @@ fn log_file_that_cannot_be_opened_is_refused_by_path() {
 fn liteinst_runtime_staging_does_not_require_a_git_checkout() {
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let stand_in_cargo = directory.path().join("cargo");
+    let cargo_args = directory.path().join("cargo-args.txt");
     fs::write(
         &stand_in_cargo,
-        "#!/bin/sh\nprintf 'staged by a stand-in cargo\\n' > \"$HERMIT_LITEINST_STAGE\"\n",
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf 'staged by a stand-in cargo\\n' > \"$HERMIT_LITEINST_STAGE\"\n",
+            cargo_args.display()
+        ),
     )
     .unwrap();
     fs::set_permissions(&stand_in_cargo, fs::Permissions::from_mode(0o755)).unwrap();
@@ -36915,6 +36919,15 @@ fn liteinst_runtime_staging_does_not_require_a_git_checkout() {
         fs::read_to_string(format!("{}.revision", runtime.display())).unwrap(),
         format!("{}\n", env!("HERMIT_REVERIE_PIN"))
     );
+    // The helper stages the FULL runtime: the stand-in cargo was asked for
+    // exactly the liteinst producer feature.
+    let recorded = fs::read_to_string(&cargo_args).unwrap();
+    let recorded_lines: Vec<&str> = recorded.lines().collect();
+    let features_at = recorded_lines
+        .iter()
+        .position(|line| *line == "--features")
+        .expect("stand-in cargo recorded no --features");
+    assert_eq!(recorded_lines[features_at + 1], "liteinst", "{recorded}");
 
     // A supplied pin must be a revision, and must be the one
     // liteinst-runtime-build builds from; either refusal stages nothing.
@@ -36959,6 +36972,123 @@ fn liteinst_runtime_staging_does_not_require_a_git_checkout() {
         fs::read_to_string(format!("{}.revision", derived_runtime.display())).unwrap(),
         format!("{}\n", env!("HERMIT_REVERIE_PIN"))
     );
+
+    // The basename guard, driven against the script directly (the helper
+    // above always passes --liteinst): a trap build must never reach cargo
+    // when its destination carries the FULL runtime's canonical name, while
+    // the same trap build to a distinct name and a FULL build to the
+    // canonical name both proceed. This trio is the regression test that a
+    // dropped --liteinst at any staging caller fails loudly instead of
+    // silently shipping a trap-only libreverie_liteinst.so.
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let recorded_features = |args_file: &Path| -> Option<String> {
+        let text = fs::read_to_string(args_file).ok()?;
+        let lines: Vec<&str> = text.lines().collect();
+        let at = lines.iter().position(|line| *line == "--features")?;
+        lines.get(at + 1).map(|value| (*value).to_owned())
+    };
+    let run_script = |runtime: &Path, flags: &[&str]| {
+        let _ = fs::remove_file(&cargo_args);
+        Command::new(repository.join("scripts/stage-liteinst-runtime.sh"))
+            .current_dir(repository)
+            .env("CARGO", &stand_in_cargo)
+            .env("GIT_DIR", &no_git)
+            .env("PATH", &path)
+            .env("HERMIT_LITEINST_REVERIE_PIN", env!("HERMIT_REVERIE_PIN"))
+            .arg("release")
+            .arg(runtime)
+            .arg(directory.path().join("script-target"))
+            .args(flags)
+            .output()
+            .expect("failed to run stage-liteinst-runtime.sh directly")
+    };
+
+    let guard_runtime = directory.path().join("guard/libreverie_liteinst.so");
+    let trap_refused = run_script(&guard_runtime, &[]);
+    // EXIT-CLASS: hermit (the staging script's usage refusal)
+    assert_eq!(
+        trap_refused.status.code(),
+        Some(2),
+        "{}",
+        stderr(&trap_refused)
+    );
+    assert!(
+        stderr(&trap_refused)
+            .contains("refusing to stage a trap-only runtime as libreverie_liteinst.so"),
+        "{}",
+        stderr(&trap_refused)
+    );
+    assert!(
+        !guard_runtime.exists(),
+        "trap runtime staged under the FULL name"
+    );
+    assert!(
+        !cargo_args.exists(),
+        "guard fired only after invoking cargo"
+    );
+
+    let full_allowed = run_script(&guard_runtime, &["--liteinst"]);
+    assert!(
+        full_allowed.status.success(),
+        "FULL staging to the canonical name failed:\n{}",
+        stderr(&full_allowed)
+    );
+    assert_eq!(recorded_features(&cargo_args).as_deref(), Some("liteinst"));
+
+    let trap_runtime = directory
+        .path()
+        .join("guard-trap/libreverie_liteinst_trap.so");
+    let trap_allowed = run_script(&trap_runtime, &[]);
+    assert!(
+        trap_allowed.status.success(),
+        "trap staging to a distinct name failed:\n{}",
+        stderr(&trap_allowed)
+    );
+    assert_eq!(recorded_features(&cargo_args), None);
+
+    // Flags accept any order and duplicates; unknown flags and missing
+    // arguments refuse before cargo and stage nothing.
+    let swapped_runtime = directory
+        .path()
+        .join("guard-swapped/libreverie_liteinst.so");
+    let swapped = run_script(&swapped_runtime, &["--liteinst", "--allocator-fixture"]);
+    assert!(
+        swapped.status.success(),
+        "swapped flags failed:\n{}",
+        stderr(&swapped)
+    );
+    assert_eq!(
+        recorded_features(&cargo_args).as_deref(),
+        Some("liteinst,allocator-fixture")
+    );
+    let duplicate_runtime = directory
+        .path()
+        .join("guard-duplicate/libreverie_liteinst.so");
+    let duplicate = run_script(&duplicate_runtime, &["--liteinst", "--liteinst"]);
+    assert!(
+        duplicate.status.success(),
+        "duplicate flag failed:\n{}",
+        stderr(&duplicate)
+    );
+
+    let typo_runtime = directory.path().join("guard-typo/libreverie_liteinst.so");
+    let typo = run_script(&typo_runtime, &["--liteist"]);
+    // EXIT-CLASS: hermit (the staging script's usage refusal)
+    assert_eq!(typo.status.code(), Some(2), "{}", stderr(&typo));
+    assert!(!typo_runtime.exists());
+    assert!(!cargo_args.exists(), "unknown flag reached cargo");
+
+    let short = Command::new(repository.join("scripts/stage-liteinst-runtime.sh"))
+        .current_dir(repository)
+        .env("CARGO", &stand_in_cargo)
+        .arg("release")
+        .arg(directory.path().join("guard-short/libreverie_liteinst.so"))
+        .output()
+        .expect("failed to run stage-liteinst-runtime.sh with too few arguments");
+    // EXIT-CLASS: hermit (the staging script's usage refusal)
+    assert_eq!(short.status.code(), Some(2), "{}", stderr(&short));
 }
 
 /// The `hermit-dap` binary, when this build has one.

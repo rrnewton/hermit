@@ -61,7 +61,13 @@ use serde_json::json;
 const POINTER: &str = "target/ci/m1-allocator-fixtures.path";
 const STACK_POINTER: &str = "target/ci/m2-stack-fixtures.path";
 const COLD_POINTER: &str = "target/ci/cold-stack-fixtures.path";
-const FEATURES: [&str; 1] = ["allocator-fixture"];
+// Standalone preload leaf: FULL+FIXTURE. Copied from the first real
+// post-bump nested build at ef28dfb8; identical to the producer's
+// (true, true) row in liteinst-runtime-build/artifact.rs, because both
+// authenticate the same leaf through the same runtime-member forwards.
+const STANDALONE_FEATURES: [&str; 2] = ["allocator-fixture", "liteinst"];
+// Detcore leaf: its variant is not this fixture route's to choose.
+const DETCORE_FEATURES: [&str; 1] = ["allocator-fixture"];
 
 fn require(ok: bool, message: &str) -> Result<()> {
     if ok { Ok(()) } else { Err(message.to_owned()) }
@@ -312,20 +318,32 @@ fn build_leaf(
     ];
     if standalone {
         // Cargo can enable features only through a selected workspace member.
-        // This existing inert member forwards the diagnostic ABI to the real
-        // leaf; current-artifact selection below still requires only that leaf.
+        // This existing inert member forwards the diagnostic ABI and the
+        // patching-capable (FULL) configuration to the real leaf, so the
+        // standalone leaf staged as libreverie_liteinst.so is FULL+FIXTURE,
+        // never the trap-only leaf the same fixture selection would produce
+        // at ef28dfb8 without the liteinst forward; current-artifact
+        // selection below still requires only that leaf.
         build_arguments.extend([
             "-p".into(),
             "hermit-liteinst-runtime-artifact".into(),
             "--features".into(),
-            "allocator-fixture".into(),
+            "allocator-fixture,liteinst".into(),
         ]);
     } else {
         build_arguments.extend(["--features".into(), "allocator-fixture".into()]);
     }
     let output = run_cargo_build(&mut runner, name, &build_arguments, root)?;
     compiled_sources.verify_unchanged(&mut runner)?;
-    let features: Vec<String> = FEATURES.into_iter().map(str::to_owned).collect();
+    let selected_features: &[&str] = if standalone {
+        &STANDALONE_FEATURES
+    } else {
+        &DETCORE_FEATURES
+    };
+    let features: Vec<String> = selected_features
+        .iter()
+        .map(|feature| feature.to_string())
+        .collect();
     let cargo_artifact = m1_artifact::select_artifact(
         std::str::from_utf8(&output).map_err(|e| e.to_string())?,
         &package,

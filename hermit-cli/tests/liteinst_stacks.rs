@@ -258,7 +258,13 @@ fn qualify(
                 leaf.profile_name == profile_name && leaf.cargo_profile == expected_profile,
                 "leaf profile differs from required diagnostic producer",
             )?;
-            let features = vec!["allocator-fixture".into()];
+            let features: Vec<String> = if standalone {
+                // FULL+FIXTURE standalone leaf: the producer's standalone
+                // array, copied from the first real post-bump build.
+                vec!["allocator-fixture".into(), "liteinst".into()]
+            } else {
+                vec!["allocator-fixture".into()]
+            };
             let receipt = artifact::verify_runtime_receipt(
                 &leaf.receipt,
                 &leaf.runtime,
