@@ -26,5 +26,9 @@ pub static DET_INODE_OFFSET: DetInode = DetInode::mint(9000);
 
 pub const DEFAULT_HOSTNAME: &str = "hermetic-container.local";
 
+/// The domain name Hermit's container sets (`hermit run`'s UTS namespace)
+/// and `uname` reports without one: the last label of [`DEFAULT_HOSTNAME`].
+pub const DEFAULT_DOMAINNAME: &str = "local";
+
 /// A convention of how we set up our PID namespace leaves us with a starting pid of 3.
 pub const ROOT_DETPID: DetPid = DetPid::from_raw(3);

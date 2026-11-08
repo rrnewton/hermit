@@ -2180,6 +2180,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/procfs_sysctl_files.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/procfs_sysctl_files.c is owned by hermit-cli/tests/cli.rs: run_kvm_procfs_sysctl_files_answer_as_on_ptrace runs it under hermit run --strict on ptrace and on KVM at --proc=minimal and --proc=standard and requires KVM's output to equal ptrace's line for line: stat, lstat, read, fstat and access of /proc/sys files of the level table, with kernel/hostname and kernel/domainname holding uname's node and domain names on both backends; it stays a fixture because a generic manifest cannot compare one backend's run with another's."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/procfs_system_directories.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/procfs_system_directories.c is owned by hermit-cli/tests/cli.rs: run_kvm_procfs_system_directories_answer_as_on_ptrace runs it under hermit run --strict on ptrace and on KVM at --proc=minimal and --proc=standard and requires KVM's output to equal ptrace's line for line: stat, lstat, opendir, fstat and the listing of every system-wide /proc directory of the level table, the listing's inode agreement with stat, rewind, fstatfs, O_TMPFILE, access(W_OK) and statfs, and the same through a symbolic link to /proc/sys, by redundant spellings, with .., for names the level or the kernel lacks, and at PATH_MAX; it stays a fixture because a generic manifest cannot compare one backend's run with another's."

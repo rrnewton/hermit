@@ -233,6 +233,7 @@ static YIELD_LOOP_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DIRECTORY_SIZE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PROCFS_SYSTEM_DIRECTORY_LINKS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PROCFS_SYSTEM_DIRECTORIES_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static PROCFS_SYSCTL_FILES_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUSE_DIRECTORY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LAST_BAND_BACKGROUND_CALL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CHAOS_POLLER_BESIDE_SLEEPERS_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -64126,6 +64127,62 @@ fn run_kvm_procfs_bind_mounts_are_the_directory_they_show() {
             outputs.push(text);
         }
         assert_eq!(outputs[1], outputs[0], "{mode}: KVM against ptrace");
+    }
+}
+
+/// The `/proc/sys` files of the `--proc` level table answer on KVM as on
+/// ptrace, by tests/c/procfs_sysctl_files.c's stat, lstat, read, fstat and
+/// access of each, at both levels. `kernel/hostname` and
+/// `kernel/domainname` hold `uname`'s node and domain names on both
+/// backends, as on Linux, where all three read the caller's UTS namespace:
+/// Detcore renders the two from the names `uname` reports. At d2d71407 KVM
+/// refused both with EACCES.
+#[test]
+fn run_kvm_procfs_sysctl_files_answer_as_on_ptrace() {
+    if kvm_unavailable("run_kvm_procfs_sysctl_files_answer_as_on_ptrace") {
+        return;
+    }
+    let guest = futex_c_guest(&PROCFS_SYSCTL_FILES_GUEST, "procfs_sysctl_files")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let files = [
+        "/proc/sys/kernel/hostname",
+        "/proc/sys/kernel/domainname",
+        "/proc/sys/kernel/osrelease",
+        "/proc/sys/kernel/pid_max",
+    ];
+    let _guard = hermit_run_guard();
+    for level in ["--proc=minimal", "--proc=standard"] {
+        let mut outputs = Vec::new();
+        for backend in ["--backend=ptrace", "--backend=kvm"] {
+            let mut args = vec![
+                backend,
+                "run",
+                "--strict",
+                "--epoch=2026-01-01T00:00:00Z",
+                "--base-env=minimal",
+                level,
+                "--",
+                guest.as_str(),
+            ];
+            args.extend(files);
+            let output = hermit(&args);
+            let text = stdout(&output);
+            for file in &files[..2] {
+                assert!(
+                    text.contains(&format!("CHECK {file} is uname's 1\n")),
+                    "{level} {backend}: {file}:\n{text}"
+                );
+            }
+            assert!(
+                text.ends_with("RESULT failures=0\n"),
+                "{level} {backend}:\n{text}"
+            );
+            assert_success(&output, &args);
+            outputs.push(text);
+        }
+        assert_eq!(outputs[1], outputs[0], "{level}: KVM against ptrace");
     }
 }
 

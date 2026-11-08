@@ -9,7 +9,9 @@
 //! System-wide procfs files whose contents are fixed (owner decision, Oct
 //! 13; <https://github.com/rrnewton/hermit/issues/4266>): the files that
 //! describe the kernel and its limits, each one value from the
-//! [`MachineDescription`], and the kernel's tables (interrupts, memory zones,
+//! [`MachineDescription`], the UTS namespace's host and domain names, as
+//! `uname` reports them (`kernel/hostname`, `kernel/domainname`; Detcore
+//! refuses `sethostname` and `setdomainname`), and the kernel's tables (interrupts, memory zones,
 //! modules and others), rendered for the description's CPUs and memory with
 //! every counter zero. `/proc/diskstats` is not one yet: its disks must be
 //! those `/sys/block` lists, which still come from the host. Detcore renders them with no kernel open,
@@ -187,11 +189,21 @@ pub(crate) enum FixedProcfsFile {
     // Reported as the pinned capacity, it agrees with what
     // `F_SETPIPE_SZ` actually allows.
     PipeMaxSize,
+    /// `kernel/hostname`: the UTS namespace's host name, which `uname`
+    /// reports too ([`crate::consts::DEFAULT_HOSTNAME`], the name Hermit's
+    /// container sets and `uname` reports without one). Fixed for the run:
+    /// Detcore refuses `sethostname`. Last, as the next is, so that the
+    /// earlier variants keep their positions in the serialized form.
+    Hostname,
+    /// `kernel/domainname`: the UTS namespace's domain name, as `uname`
+    /// reports it ([`crate::consts::DEFAULT_DOMAINNAME`]). Fixed for the
+    /// run: Detcore refuses `setdomainname`.
+    Domainname,
 }
 
 impl FixedProcfsFile {
     /// Every fixed file.
-    pub(crate) const ALL: [Self; 36] = [
+    pub(crate) const ALL: [Self; 38] = [
         Self::Version,
         Self::Cmdline,
         Self::Osrelease,
@@ -228,6 +240,8 @@ impl FixedProcfsFile {
         Self::AioNr,
         Self::AioMaxNr,
         Self::PipeMaxSize,
+        Self::Hostname,
+        Self::Domainname,
     ];
 
     /// The file's path, NUL-terminated.
@@ -269,6 +283,8 @@ impl FixedProcfsFile {
             Self::AioNr => c"/proc/sys/fs/aio-nr",
             Self::AioMaxNr => c"/proc/sys/fs/aio-max-nr",
             Self::PipeMaxSize => c"/proc/sys/fs/pipe-max-size",
+            Self::Hostname => c"/proc/sys/kernel/hostname",
+            Self::Domainname => c"/proc/sys/kernel/domainname",
         }
     }
 
@@ -302,7 +318,9 @@ impl FixedProcfsFile {
             | Self::MmapMinAddr
             | Self::FileMax
             | Self::AioMaxNr
-            | Self::PipeMaxSize => 0o644,
+            | Self::PipeMaxSize
+            | Self::Hostname
+            | Self::Domainname => 0o644,
             _ => 0o444,
         }
     }
@@ -316,7 +334,12 @@ impl FixedProcfsFile {
         !self.is_seq_file()
             && !matches!(
                 self,
-                Self::Osrelease | Self::Ostype | Self::KernelVersion | Self::BootId
+                Self::Osrelease
+                    | Self::Ostype
+                    | Self::KernelVersion
+                    | Self::BootId
+                    | Self::Hostname
+                    | Self::Domainname
             )
     }
 
@@ -387,6 +410,8 @@ impl FixedProcfsFile {
             Self::AioNr => "0".to_owned(),
             Self::AioMaxNr => limits.aio_max_nr.to_string(),
             Self::PipeMaxSize => limits.pipe_max_size.to_string(),
+            Self::Hostname => crate::consts::DEFAULT_HOSTNAME.to_owned(),
+            Self::Domainname => crate::consts::DEFAULT_DOMAINNAME.to_owned(),
             _ => unreachable!("{self:?} is a table"),
         };
         format!("{text}\n").into_bytes()
@@ -614,6 +639,8 @@ mod tests {
             (OvercommitMemory, "0\n"),
             (MaxMapCount, "65530\n"),
             (MmapMinAddr, "65536\n"),
+            (Hostname, "hermetic-container.local\n"),
+            (Domainname, "local\n"),
             (Modules, ""),
             (Swaps, "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n"),
             (KeyUsers, "    0:     0 0/0 0/1000000 0/25000000\n"),
@@ -918,7 +945,7 @@ mod tests {
             );
         }
         assert_eq!(
-            FixedProcfsFile::from_path("/proc/sys/kernel/hostname"),
+            FixedProcfsFile::from_path("/proc/sys/net/core/somaxconn"),
             None
         );
         assert_eq!(FixedProcfsFile::from_path("/proc/self/cmdline"), None);

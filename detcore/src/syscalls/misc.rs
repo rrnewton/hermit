@@ -999,7 +999,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // FIXME: It should be possible to remove this once all tests
                 // are also using namespaces.
                 un.nodename = from_str(DEFAULT_HOSTNAME);
-                un.domainname = from_str(DEFAULT_HOSTNAME.split('.').next_back().unwrap_or(""));
+                un.domainname = from_str(crate::consts::DEFAULT_DOMAINNAME);
             }
 
             // The kernel procfs describes too (`procfs::fixed`).
@@ -1452,6 +1452,45 @@ impl<T: RecordOrReplay> Detcore<T> {
 
 #[cfg(test)]
 mod tests {
+    /// `uname`'s node and domain names are `/proc/sys/kernel/hostname` and
+    /// `/proc/sys/kernel/domainname`, as on Linux, where all three read the
+    /// caller's UTS namespace. Detcore renders the two files on every backend
+    /// (`procfs::FixedProcfsFile`) from the names `uname` reports where
+    /// Hermit sets no UTS namespace, and Hermit's container sets the same
+    /// names in the one it creates.
+    #[test]
+    fn uname_and_procfs_agree_on_the_host_and_domain_names() {
+        use reverie::syscalls::AddrMut;
+
+        use crate::procfs::FixedProcfsFile;
+        use crate::record_or_replay::NoopTool;
+        use crate::syscall_hot_path_tests::InjectGuest;
+        let tool = crate::syscall_hot_path_tests::detcore::<NoopTool>();
+        let mut guest = InjectGuest::<NoopTool>::new(Ok(0));
+        guest.config.has_uts_namespace = false;
+        // SAFETY: utsname is plain bytes, for which zero is valid.
+        let mut name: libc::utsname = unsafe { std::mem::zeroed() };
+        let buffer = AddrMut::from_raw(std::ptr::from_mut(&mut name) as usize);
+        let call = reverie::syscalls::Uname::new().with_buf(buffer);
+        futures::executor::block_on(tool.handle_uname(&mut guest, call)).unwrap();
+        let field = |bytes: &[libc::c_char]| {
+            let bytes: Vec<u8> = bytes
+                .iter()
+                .take_while(|byte| **byte != 0)
+                .map(|byte| *byte as u8)
+                .collect();
+            format!("{}\n", String::from_utf8(bytes).unwrap())
+        };
+        let machine = crate::machine::MachineDescription::of(&guest.config);
+        let procfs = |file: FixedProcfsFile| String::from_utf8(file.contents(&machine)).unwrap();
+        assert_eq!(field(&name.nodename), procfs(FixedProcfsFile::Hostname));
+        assert_eq!(field(&name.domainname), procfs(FixedProcfsFile::Domainname));
+        assert_eq!(
+            crate::consts::DEFAULT_HOSTNAME.rsplit('.').next(),
+            Some(crate::consts::DEFAULT_DOMAINNAME)
+        );
+    }
+
     /// PR_SET_NAME's name: the caller's string through its first NUL, at
     /// most 15 bytes, read exactly: a string that ends just before an
     /// unmapped page is read whole, and one whose bytes run into it is not.

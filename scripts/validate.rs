@@ -21717,9 +21717,10 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // and run_kvm_a_user_mount_over_proc_sys_keeps_its_links: 159.
         // And run_kvm_hermit_init_stat_and_comm_answer_as_on_ptrace: 160.
         // And run_kvm_procfs_system_directories_answer_as_on_ptrace: 161.
-        // And run_kvm_procfs_bind_mounts_are_the_directory_they_show: 162,
+        // And run_kvm_procfs_bind_mounts_are_the_directory_they_show: 162.
+        // And run_kvm_procfs_sysctl_files_answer_as_on_ptrace: 163,
         // matching the DAG pin in validation_dag_static.
-        ("privileged-only-test.cli_kvm", 162usize),
+        ("privileged-only-test.cli_kvm", 163usize),
     ] {
         let step = privileged
             .steps
