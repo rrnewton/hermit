@@ -81,10 +81,13 @@ liteinst_stage_name=$(basename -- "$liteinst_stable_input")
 # The canonical basename is the FULL patching-capable runtime's name. Refuse
 # to stage a trap-only build under it, before anything is built: shipping
 # TRAP as libreverie_liteinst.so is exactly the silent downgrade this guard
-# exists to make loud. Trap staging stays available under a distinct name.
+# exists to make loud. A distinct basename only gets a trap build past this
+# guard: at the pinned Reverie (ef28) the standalone qualifier then refuses
+# a plain TRAP build ("INSTALLATION_DEPTH TLS cell absent/ambiguous"), and
+# only TRAP+FIXTURE (--allocator-fixture) stages under a distinct name.
 if [[ $liteinst_stage_name == libreverie_liteinst.so ]] \
     && [[ " ${stage_features[*]} " != *" liteinst "* ]]; then
-    echo "refusing to stage a trap-only runtime as libreverie_liteinst.so; pass --liteinst or choose a distinct destination basename" >&2
+    echo "refusing to stage a trap-only runtime as libreverie_liteinst.so; pass --liteinst for this name (only TRAP+FIXTURE stages trap-only, under a distinct basename; a plain TRAP build is refused by the standalone qualifier at the pinned Reverie)" >&2
     exit 2
 fi
 
