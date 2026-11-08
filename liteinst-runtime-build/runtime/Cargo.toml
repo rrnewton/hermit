@@ -9,3 +9,4 @@ reverie-liteinst-preload = { version = "0.5.4", git = "https://github.com/rrnewt
 
 [features]
 allocator-fixture = ["reverie-liteinst-preload/allocator-fixture"]
+liteinst = ["reverie-liteinst-preload/liteinst"]

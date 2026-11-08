@@ -72,17 +72,62 @@ pub(crate) fn constructor_qualifier_source(
     Ok(source)
 }
 
+/// The `qualification.json` label for the requested producer variant. This
+/// records the request only; `liteinst_cdylib_from_cargo_messages` is what
+/// verifies the build actually produced that variant.
+pub(crate) fn site_patching_label(liteinst: bool) -> &'static str {
+    if liteinst { "liteinst" } else { "trap-only" }
+}
+
 pub(crate) fn liteinst_cdylib_from_cargo_messages(
     messages: &str,
     package_id: &str,
     manifest: &Path,
     allocator_fixture: bool,
+    liteinst: bool,
 ) -> Result<PathBuf, String> {
     let mut artifacts = Vec::new();
+    // (line, contains "liteinst", raw features) for every reverie-liteinst
+    // rlib compiler-artifact. The leaf has no feature-dependent code, so its
+    // own array cannot prove patching code was compiled in; this code-bearing
+    // crate's membership of "liteinst" is authenticated separately below.
+    let mut rlib_features: Vec<(usize, bool, Value)> = Vec::new();
     for (index, line) in messages.lines().filter(|line| !line.is_empty()).enumerate() {
         let message: Value = serde_json::from_str(line)
             .map_err(|error| format!("invalid Cargo JSON on line {}: {error}", index + 1))?;
         let target = &message["target"];
+        if message["reason"] == "compiler-artifact" && target["name"] == "reverie_liteinst" {
+            if target["kind"] != serde_json::json!(["rlib"])
+                || target["crate_types"] != serde_json::json!(["rlib"])
+            {
+                return Err(format!(
+                    "reverie-liteinst artifact on line {} has the wrong rlib target",
+                    index + 1
+                ));
+            }
+            let features = message["features"].as_array().ok_or_else(|| {
+                format!(
+                    "reverie-liteinst rlib artifact on line {} has unexpected features {}",
+                    index + 1,
+                    message["features"]
+                )
+            })?;
+            let mut has_liteinst = false;
+            for feature in features {
+                match feature.as_str() {
+                    Some("liteinst") => has_liteinst = true,
+                    Some(_) => {}
+                    None => {
+                        return Err(format!(
+                            "reverie-liteinst rlib artifact on line {} has unexpected features {}",
+                            index + 1,
+                            message["features"]
+                        ));
+                    }
+                }
+            }
+            rlib_features.push((index + 1, has_liteinst, message["features"].clone()));
+        }
         let is_preload = message["reason"] == "compiler-artifact"
             && target["name"] == "reverie_liteinst_preload";
         if !is_preload {
@@ -98,10 +143,19 @@ pub(crate) fn liteinst_cdylib_from_cargo_messages(
                 index + 1
             ));
         }
-        let expected_features = if allocator_fixture {
-            serde_json::json!(["allocator-fixture"])
-        } else {
-            serde_json::json!([])
+        // Exact leaf arrays copied from the first real post-bump producer
+        // builds at ef28dfb8 (nested Cargo JSON, release): TRAP [],
+        // TRAP+FIXTURE ["allocator-fixture"], FULL ["liteinst"],
+        // FULL+FIXTURE ["allocator-fixture", "liteinst"]. The matching
+        // reverie-liteinst rlib arrays were [], ["allocator-fixture"],
+        // ["liteinst"] and ["allocator-fixture", "liteinst"] respectively;
+        // the rlib invariant below is membership of "liteinst", not an exact
+        // rlib array, because the core legitimately accumulates other features.
+        let expected_features = match (liteinst, allocator_fixture) {
+            (false, false) => serde_json::json!([]),
+            (false, true) => serde_json::json!(["allocator-fixture"]),
+            (true, false) => serde_json::json!(["liteinst"]),
+            (true, true) => serde_json::json!(["allocator-fixture", "liteinst"]),
         };
         if message["features"] != expected_features {
             return Err(format!(
@@ -132,6 +186,16 @@ pub(crate) fn liteinst_cdylib_from_cargo_messages(
         return Err(format!(
             "expected exactly one LiteInst preload cdylib in current Cargo output, found {artifacts:?}"
         ));
+    }
+    if rlib_features.is_empty() {
+        return Err("no reverie-liteinst rlib in current Cargo output".into());
+    }
+    for (line, has_liteinst, features) in &rlib_features {
+        if *has_liteinst != liteinst {
+            return Err(format!(
+                "reverie-liteinst rlib artifact on line {line} has unexpected features {features}"
+            ));
+        }
     }
     Ok(artifacts.remove(0))
 }
@@ -267,8 +331,73 @@ mod tests {
         })
     }
 
+    fn features_for(allocator_fixture: bool, liteinst: bool) -> Value {
+        match (liteinst, allocator_fixture) {
+            (false, false) => serde_json::json!([]),
+            (false, true) => serde_json::json!(["allocator-fixture"]),
+            (true, false) => serde_json::json!(["liteinst"]),
+            (true, true) => serde_json::json!(["allocator-fixture", "liteinst"]),
+        }
+    }
+
+    fn rlib(features: Value) -> Value {
+        serde_json::json!({
+            "reason": "compiler-artifact",
+            "target": {"name":"reverie_liteinst", "kind":["rlib"], "crate_types":["rlib"]},
+            "features": features,
+            "filenames": ["/isolated/libreverie_liteinst.rlib"]
+        })
+    }
+
+    fn leaf_for(allocator_fixture: bool, liteinst: bool) -> Value {
+        let mut leaf = artifact();
+        leaf["features"] = features_for(allocator_fixture, liteinst);
+        leaf
+    }
+
+    fn variant_messages(allocator_fixture: bool, liteinst: bool) -> String {
+        format!(
+            "{}\n{}\n",
+            rlib(features_for(allocator_fixture, liteinst)),
+            leaf_for(allocator_fixture, liteinst)
+        )
+    }
+
+    fn select_variant(
+        messages: &str,
+        allocator_fixture: bool,
+        liteinst: bool,
+    ) -> Result<PathBuf, String> {
+        liteinst_cdylib_from_cargo_messages(
+            messages,
+            PACKAGE,
+            Path::new(MANIFEST),
+            allocator_fixture,
+            liteinst,
+        )
+    }
+
+    /// Select one leaf message paired with the rlib message a correct build
+    /// of the selected variant would emit, so leaf-check refusals below are
+    /// refused by the leaf check itself rather than the rlib check.
+    fn select_leaf(
+        leaf: &Value,
+        allocator_fixture: bool,
+        liteinst: bool,
+    ) -> Result<PathBuf, String> {
+        select_variant(
+            &format!(
+                "{}\n{}\n",
+                rlib(features_for(allocator_fixture, liteinst)),
+                leaf
+            ),
+            allocator_fixture,
+            liteinst,
+        )
+    }
+
     fn select(messages: &str) -> Result<PathBuf, String> {
-        liteinst_cdylib_from_cargo_messages(messages, PACKAGE, Path::new(MANIFEST), false)
+        select_variant(messages, false, false)
     }
 
     #[test]
@@ -276,7 +405,7 @@ mod tests {
         let messages = format!(
             "{}\n{}\n{}\n{}\n",
             serde_json::json!({"reason":"compiler-artifact","target":{"name":"unrelated","kind":["cdylib"]},"filenames":["/warm/libreverie_liteinst-stale.so"]}),
-            serde_json::json!({"reason":"compiler-artifact","target":{"name":"reverie_liteinst","kind":["rlib"]},"filenames":["/isolated/libreverie_liteinst.rlib"]}),
+            rlib(serde_json::json!([])),
             artifact(),
             serde_json::json!({"reason":"build-finished","success":true}),
         );
@@ -285,6 +414,18 @@ mod tests {
             select(&messages).unwrap(),
             PathBuf::from("/isolated/libreverie_liteinst_preload.so")
         );
+        for (allocator_fixture, liteinst) in [(true, false), (false, true), (true, true)] {
+            assert_eq!(
+                select_variant(
+                    &variant_messages(allocator_fixture, liteinst),
+                    allocator_fixture,
+                    liteinst
+                )
+                .unwrap(),
+                PathBuf::from("/isolated/libreverie_liteinst_preload.so"),
+                "variant allocator_fixture={allocator_fixture} liteinst={liteinst}"
+            );
+        }
     }
 
     #[test]
@@ -425,6 +566,9 @@ mod tests {
     fn refuses_duplicate_current_artifact_messages() {
         let message = artifact();
         assert!(select(&format!("{message}\n{message}\n")).is_err());
+        let full = leaf_for(false, true);
+        let full_messages = format!("{}\n{full}\n{full}\n", rlib(features_for(false, true)));
+        assert!(select_variant(&full_messages, false, true).is_err());
     }
 
     #[test]
@@ -446,15 +590,27 @@ mod tests {
             let mut message = artifact();
             message[field] = value;
             assert!(
-                select(&message.to_string()).is_err(),
+                select_leaf(&message, false, false).is_err(),
                 "accepted wrong {field}"
             );
+        }
+        // The trap selector also refuses every non-trap leaf array, including
+        // the direct-Reverie arrays that carry "default".
+        for features in [
+            serde_json::json!(["liteinst"]),
+            serde_json::json!(["allocator-fixture", "liteinst"]),
+            serde_json::json!(["default", "liteinst"]),
+            serde_json::json!(["allocator-fixture", "default", "liteinst"]),
+        ] {
+            let mut message = artifact();
+            message["features"] = features;
+            assert!(select_leaf(&message, false, false).is_err());
         }
         for field in ["kind", "crate_types"] {
             let mut message = artifact();
             message["target"][field] = serde_json::json!(["rlib", "cdylib"]);
             assert!(
-                select(&message.to_string()).is_err(),
+                select_leaf(&message, false, false).is_err(),
                 "accepted wrong {field}"
             );
         }
@@ -462,36 +618,42 @@ mod tests {
 
     #[test]
     fn refuses_missing_malformed_or_multiple_filenames() {
-        for value in [
-            Value::Null,
-            serde_json::json!([]),
-            serde_json::json!([42]),
-            serde_json::json!([
-                "/isolated/libreverie_liteinst_preload.so",
-                "/warm/libreverie_liteinst_preload.so"
-            ]),
-        ] {
-            let mut message = artifact();
-            message["filenames"] = value;
-            assert!(select(&message.to_string()).is_err());
+        for (allocator_fixture, liteinst) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            for value in [
+                Value::Null,
+                serde_json::json!([]),
+                serde_json::json!([42]),
+                serde_json::json!([
+                    "/isolated/libreverie_liteinst_preload.so",
+                    "/warm/libreverie_liteinst_preload.so"
+                ]),
+            ] {
+                let mut message = leaf_for(allocator_fixture, liteinst);
+                message["filenames"] = value;
+                assert!(select_leaf(&message, allocator_fixture, liteinst).is_err());
+            }
         }
     }
 
     #[test]
     fn selects_only_the_explicit_allocator_fixture_feature_mode() {
-        let select_fixture = |message: &str| {
-            liteinst_cdylib_from_cargo_messages(message, PACKAGE, Path::new(MANIFEST), true)
-        };
-        assert!(select_fixture(&artifact().to_string()).is_err());
+        let select_fixture = |leaf: &Value| select_leaf(leaf, true, false);
+        assert!(select_fixture(&artifact()).is_err());
         let mut message = artifact();
         message["features"] = serde_json::json!(["allocator-fixture"]);
-        assert!(select(&message.to_string()).is_err());
+        assert!(select_leaf(&message, false, false).is_err());
         assert_eq!(
-            select_fixture(&message.to_string()).unwrap(),
+            select_fixture(&message).unwrap(),
             PathBuf::from("/isolated/libreverie_liteinst_preload.so")
         );
-        assert!(select_fixture("").is_err());
-        assert!(select_fixture(&format!("{message}\n{message}\n")).is_err());
+        assert!(select_variant("", true, false).is_err());
+        let duplicate = format!(
+            "{}\n{message}\n{message}\n",
+            rlib(features_for(true, false))
+        );
+        assert!(select_variant(&duplicate, true, false).is_err());
         for features in [
             Value::Null,
             serde_json::json!([]),
@@ -501,7 +663,7 @@ mod tests {
         ] {
             let mut wrong = message.clone();
             wrong["features"] = features;
-            assert!(select_fixture(&wrong.to_string()).is_err());
+            assert!(select_fixture(&wrong).is_err());
         }
         for (field, value) in [
             ("package_id", serde_json::json!("wrong source")),
@@ -522,20 +684,134 @@ mod tests {
             ),
         ] {
             let mut wrong = message.clone();
-            wrong[field] = value;
+            wrong[field] = value.clone();
+            assert!(select_fixture(&wrong).is_err(), "accepted wrong {field}");
+            let mut wrong_full = leaf_for(true, true);
+            wrong_full[field] = value;
             assert!(
-                select_fixture(&wrong.to_string()).is_err(),
-                "accepted wrong {field}"
+                select_leaf(&wrong_full, true, true).is_err(),
+                "FULL+FIXTURE accepted wrong {field}"
             );
         }
         for field in ["kind", "crate_types"] {
             let mut wrong = message.clone();
             wrong["target"][field] = serde_json::json!(["rlib", "cdylib"]);
+            assert!(select_fixture(&wrong).is_err(), "accepted wrong {field}");
+            let mut wrong_full = leaf_for(true, true);
+            wrong_full["target"][field] = serde_json::json!(["rlib", "cdylib"]);
             assert!(
-                select_fixture(&wrong.to_string()).is_err(),
-                "accepted wrong {field}"
+                select_leaf(&wrong_full, true, true).is_err(),
+                "FULL+FIXTURE accepted wrong {field}"
             );
         }
+    }
+
+    #[test]
+    fn selects_only_the_exact_four_row_feature_matrix() {
+        let rows = [(false, false), (true, false), (false, true), (true, true)];
+        for &(selected_fixture, selected_liteinst) in &rows {
+            for &(leaf_fixture, leaf_liteinst) in &rows {
+                let leaf = leaf_for(leaf_fixture, leaf_liteinst);
+                let selected = select_leaf(&leaf, selected_fixture, selected_liteinst);
+                if (leaf_fixture, leaf_liteinst) == (selected_fixture, selected_liteinst) {
+                    assert_eq!(
+                        selected.unwrap(),
+                        PathBuf::from("/isolated/libreverie_liteinst_preload.so")
+                    );
+                } else {
+                    assert!(
+                        selected.is_err(),
+                        "selector fixture={selected_fixture} liteinst={selected_liteinst} \
+                         accepted leaf fixture={leaf_fixture} liteinst={leaf_liteinst}"
+                    );
+                }
+            }
+            // Every selector refuses malformed, unknown, superset and
+            // duplicate feature arrays.
+            let mut superset = features_for(selected_fixture, selected_liteinst);
+            superset
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!("other"));
+            let duplicate = if selected_liteinst {
+                serde_json::json!(["liteinst", "liteinst"])
+            } else if selected_fixture {
+                serde_json::json!(["allocator-fixture", "allocator-fixture"])
+            } else {
+                serde_json::json!(["other", "other"])
+            };
+            for features in [
+                Value::Null,
+                serde_json::json!(["other"]),
+                superset,
+                duplicate,
+            ] {
+                let mut wrong = leaf_for(selected_fixture, selected_liteinst);
+                wrong["features"] = features;
+                assert!(select_leaf(&wrong, selected_fixture, selected_liteinst).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn authenticates_reverie_liteinst_rlib_liteinst_membership() {
+        let select_with = |rlib_message: &Value,
+                           allocator_fixture: bool,
+                           liteinst: bool|
+         -> Result<PathBuf, String> {
+            select_variant(
+                &format!(
+                    "{rlib_message}\n{}\n",
+                    leaf_for(allocator_fixture, liteinst)
+                ),
+                allocator_fixture,
+                liteinst,
+            )
+        };
+        // FULL leaf with a trap rlib, and trap leaf with a FULL rlib, refuse.
+        assert!(select_with(&rlib(serde_json::json!([])), false, true).is_err());
+        assert!(select_with(&rlib(serde_json::json!(["liteinst"])), false, false).is_err());
+        assert!(select_with(&rlib(serde_json::json!(["allocator-fixture"])), true, true).is_err());
+        // No rlib line at all refuses under every selector.
+        for (allocator_fixture, liteinst) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let leaf_only = format!("{}\n", leaf_for(allocator_fixture, liteinst));
+            assert!(select_variant(&leaf_only, allocator_fixture, liteinst).is_err());
+        }
+        // Two rlib lines disagreeing on membership refuse under every selector.
+        for (allocator_fixture, liteinst) in [(false, false), (false, true)] {
+            let mixed = format!(
+                "{}\n{}\n{}\n",
+                rlib(serde_json::json!([])),
+                rlib(serde_json::json!(["liteinst"])),
+                leaf_for(allocator_fixture, liteinst)
+            );
+            assert!(select_variant(&mixed, allocator_fixture, liteinst).is_err());
+        }
+        // Malformed rlib features refuse.
+        assert!(select_with(&rlib(Value::Null), false, false).is_err());
+        assert!(select_with(&rlib(serde_json::json!([42])), false, false).is_err());
+        // Membership, not exact match: extra rlib features are accepted.
+        assert_eq!(
+            select_with(
+                &rlib(serde_json::json!(["coordinator-rpc", "liteinst"])),
+                false,
+                true
+            )
+            .unwrap(),
+            PathBuf::from("/isolated/libreverie_liteinst_preload.so")
+        );
+        assert_eq!(
+            select_with(&rlib(serde_json::json!(["coordinator-rpc"])), false, false).unwrap(),
+            PathBuf::from("/isolated/libreverie_liteinst_preload.so")
+        );
+    }
+
+    #[test]
+    fn site_patching_label_names_both_variants() {
+        assert_eq!(site_patching_label(true), "liteinst");
+        assert_eq!(site_patching_label(false), "trap-only");
     }
 }
 
