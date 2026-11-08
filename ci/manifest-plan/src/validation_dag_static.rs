@@ -1302,7 +1302,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // untrap_passthrough_syscalls_never_enters_the_legacy_form: 1968 + 2 = 1970, listed.
     // Inherited structural hint + five owned helper tests, not a fresh measured total.
     // Runtime completeness uses the listed identity census.
-    ("test.regular_crates", 1976),
+    // And manifest-plan's a_corpus_row_expands_expected_guest_exits_by_mode and
+    // a_replay_recipe_may_override_the_inherited_expected_exit_with_success
+    // (no-NUMA utility cells, https://github.com/rrnewton/hermit/pull/5287):
+    // 1976 + 2 = 1978 (manifest-plan lib listed 739 -> 741 executed against
+    // main 35ea84b0).
+    ("test.regular_crates", 1978),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -4016,7 +4021,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 1 (https://github.com/rrnewton/hermit/pull/5057) adds two
     // record/replay units: 229 + 2 = 231, measured by the 216dbc929a full
     // validate.
-    ("test.record_replay", 231),
+    // And record_replay_omits_numa_maps_from_task_directory_listings
+    // (https://github.com/rrnewton/hermit/pull/5287): 231 + 1 = 232.
+    ("test.record_replay", 232),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -5164,7 +5171,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (160 run_kvm_ plus the named setup test).
     // And run_kvm_procfs_bind_mounts_are_the_directory_they_show: 162 (161
     // run_kvm_ plus the named setup test).
-    ("privileged-test.cli_kvm", 162),
+    // And run_kvm_absent_cpu_node_backlinks_are_not_found
+    // (https://github.com/rrnewton/hermit/pull/5287): 162 + 1 = 163.
+    ("privileged-test.cli_kvm", 163),
     // The required tests of hermit-cli/tests/deadline_slice_cap.rs on KVM: the
     // suite's 42 tests less the rows of its known-gap ledger
     // (hermit-cli/tests/deadline_slice_cap.kvm-gaps.tsv), measured on Hermit
@@ -5580,7 +5589,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR #4764: the same two detcore-model untrap units: 1954 + 2 = 1956.
     // Inherited structural hint + five owned helper tests, not a fresh measured total.
     // Runtime completeness uses the listed identity census.
-    ("test.regular_crates_on_host", 1962),
+    // The same two manifest-plan expectation units as test.regular_crates,
+    // none hosted-excluded: 1962 + 2 = 1964.
+    ("test.regular_crates_on_host", 1964),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -6915,7 +6926,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR #4764: the same two detcore-model untrap units: 1954 + 2 = 1956.
     // Inherited structural hint + five owned helper tests, not a fresh measured total.
     // Runtime completeness uses the listed identity census.
-    ("test.regular_crates_on_host", 1962),
+    // The same two manifest-plan expectation units as test.regular_crates,
+    // none hosted-excluded: 1962 + 2 = 1964.
+    ("test.regular_crates_on_host", 1964),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
