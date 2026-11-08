@@ -1,0 +1,404 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `detcore/src/cpu_clock.rs`."><title>cpu_clock.rs - source</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="detcore" data-themes="" data-resource-suffix="" data-rustdoc-version="1.99.0-nightly (be8e82435 2026-07-11)" data-channel="nightly" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="../../static.files/src-script-813739b1.js"></script><script defer src="../../src-files.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc src"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="sidebar"><div class="src-sidebar-title"><h2>Files</h2></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1><div class="sub-heading">detcore/</div>cpu_clock.rs</h1><rustdoc-toolbar></rustdoc-toolbar></div><div class="example-wrap digits-3"><pre class="rust"><code><a href=#1 id=1 data-nosnippet>1</a><span class="comment">/*
+<a href=#2 id=2 data-nosnippet>2</a> * Copyright (c) Meta Platforms, Inc. and affiliates.
+<a href=#3 id=3 data-nosnippet>3</a> * All rights reserved.
+<a href=#4 id=4 data-nosnippet>4</a> *
+<a href=#5 id=5 data-nosnippet>5</a> * This source code is licensed under the BSD-style license found in the
+<a href=#6 id=6 data-nosnippet>6</a> * LICENSE file in the root directory of this source tree.
+<a href=#7 id=7 data-nosnippet>7</a> */
+<a href=#8 id=8 data-nosnippet>8</a>
+<a href=#9 id=9 data-nosnippet>9</a></span><span class="doccomment">//! Linux's CPU-time clocks, read from Detcore's logical CPU accounting.
+<a href=#10 id=10 data-nosnippet>10</a>//!
+<a href=#11 id=11 data-nosnippet>11</a>//! A CPU clock id is one of the two fixed ids, `CLOCK_PROCESS_CPUTIME_ID` (2)
+<a href=#12 id=12 data-nosnippet>12</a>//! and `CLOCK_THREAD_CPUTIME_ID` (3), or a negative id that encodes a task and
+<a href=#13 id=13 data-nosnippet>13</a>//! what to measure (include/linux/posix-timers_types.h:20-32 at v6.16):
+<a href=#14 id=14 data-nosnippet>14</a>//! `CPUCLOCK_PID(id) = ~(id &gt;&gt; 3)` names the task, bit 2
+<a href=#15 id=15 data-nosnippet>15</a>//! (`CPUCLOCK_PERTHREAD_MASK`) makes it a thread's clock rather than a
+<a href=#16 id=16 data-nosnippet>16</a>//! process's, and the low two bits (`CPUCLOCK_WHICH`) choose PROF (0), VIRT (1)
+<a href=#17 id=17 data-nosnippet>17</a>//! or SCHED (2). The low three bits 3 are a clock descriptor (`CLOCKFD`), not a
+<a href=#18 id=18 data-nosnippet>18</a>//! CPU clock. `pthread_getcpuclockid` and `clock_getcpuclockid` build these ids.
+<a href=#19 id=19 data-nosnippet>19</a>//!
+<a href=#20 id=20 data-nosnippet>20</a>//! Detcore models a thread's CPU time as the user and system time its own
+<a href=#21 id=21 data-nosnippet>21</a>//! logical clock has charged since the thread was created: retired branches
+<a href=#22 id=22 data-nosnippet>22</a>//! (and RDTSC/CPUID) as user time, intercepted syscalls at their modeled cost
+<a href=#23 id=23 data-nosnippet>23</a>//! as system time ([`DetTime::user_cpu_time`], [`DetTime::system_cpu_time`],
+<a href=#24 id=24 data-nosnippet>24</a>//! `ThreadState::thread_cpu_time`). That is the accounting `getrusage(2)` and
+<a href=#25 id=25 data-nosnippet>25</a>//! `times(2)` already report, so every CPU-time view of a task agrees.
+<a href=#26 id=26 data-nosnippet>26</a>//!
+<a href=#27 id=27 data-nosnippet>27</a>//! [`DetTime::user_cpu_time`]: crate::types::DetTime::user_cpu_time
+<a href=#28 id=28 data-nosnippet>28</a>//! [`DetTime::system_cpu_time`]: crate::types::DetTime::system_cpu_time
+<a href=#29 id=29 data-nosnippet>29</a>
+<a href=#30 id=30 data-nosnippet>30</a></span><span class="kw">use </span>reverie::Error;
+<a href=#31 id=31 data-nosnippet>31</a><span class="kw">use </span>reverie::Guest;
+<a href=#32 id=32 data-nosnippet>32</a><span class="kw">use </span>reverie::syscalls::Errno;
+<a href=#33 id=33 data-nosnippet>33</a><span class="kw">use </span>reverie::syscalls::Sysno;
+<a href=#34 id=34 data-nosnippet>34</a>
+<a href=#35 id=35 data-nosnippet>35</a><span class="kw">use </span><span class="kw">crate</span>::record_or_replay::RecordOrReplay;
+<a href=#36 id=36 data-nosnippet>36</a><span class="kw">use </span><span class="kw">crate</span>::scheduler::pid_namespaces::GuestPidAnswer;
+<a href=#37 id=37 data-nosnippet>37</a><span class="kw">use </span><span class="kw">crate</span>::tool_local::Detcore;
+<a href=#38 id=38 data-nosnippet>38</a><span class="kw">use </span><span class="kw">crate</span>::types::DetTid;
+<a href=#39 id=39 data-nosnippet>39</a><span class="kw">use </span><span class="kw">crate</span>::types::LogicalTime;
+<a href=#40 id=40 data-nosnippet>40</a>
+<a href=#41 id=41 data-nosnippet>41</a><span class="doccomment">/// What a CPU clock measures: `CPUCLOCK_WHICH` (`cpu_clock_sample`,
+<a href=#42 id=42 data-nosnippet>42</a>/// kernel/time/posix-cpu-timers.c:194-212 at v6.16).
+<a href=#43 id=43 data-nosnippet>43</a></span><span class="attr">#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+<a href=#44 id=44 data-nosnippet>44</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">enum </span>CpuClockKind {
+<a href=#45 id=45 data-nosnippet>45</a>    <span class="doccomment">/// `CPUCLOCK_PROF`: user plus system time.
+<a href=#46 id=46 data-nosnippet>46</a>    </span>Prof,
+<a href=#47 id=47 data-nosnippet>47</a>    <span class="doccomment">/// `CPUCLOCK_VIRT`: user time.
+<a href=#48 id=48 data-nosnippet>48</a>    </span>Virt,
+<a href=#49 id=49 data-nosnippet>49</a>    <span class="doccomment">/// `CPUCLOCK_SCHED`: the scheduler's runtime, which is what
+<a href=#50 id=50 data-nosnippet>50</a>    /// `CLOCK_THREAD_CPUTIME_ID` and `CLOCK_PROCESS_CPUTIME_ID` read. Linux
+<a href=#51 id=51 data-nosnippet>51</a>    /// scales `getrusage`'s and `times`'s user and system time so that they
+<a href=#52 id=52 data-nosnippet>52</a>    /// add up to it (`cputime_adjust`, kernel/sched/cputime.c:536-541), so in
+<a href=#53 id=53 data-nosnippet>53</a>    /// Detcore's model it is user plus system time too.
+<a href=#54 id=54 data-nosnippet>54</a>    </span>Sched,
+<a href=#55 id=55 data-nosnippet>55</a>}
+<a href=#56 id=56 data-nosnippet>56</a>
+<a href=#57 id=57 data-nosnippet>57</a><span class="kw">impl </span>CpuClockKind {
+<a href=#58 id=58 data-nosnippet>58</a>    <span class="doccomment">/// The clock's reading for a task that has used `user` and `system` time.
+<a href=#59 id=59 data-nosnippet>59</a>    </span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>sample(<span class="self">self</span>, user: LogicalTime, system: LogicalTime) -&gt; LogicalTime {
+<a href=#60 id=60 data-nosnippet>60</a>        <span class="kw">match </span><span class="self">self </span>{
+<a href=#61 id=61 data-nosnippet>61</a>            <span class="self">Self</span>::Virt =&gt; user,
+<a href=#62 id=62 data-nosnippet>62</a>            <span class="self">Self</span>::Prof | <span class="self">Self</span>::Sched =&gt; user + system,
+<a href=#63 id=63 data-nosnippet>63</a>        }
+<a href=#64 id=64 data-nosnippet>64</a>    }
+<a href=#65 id=65 data-nosnippet>65</a>}
+<a href=#66 id=66 data-nosnippet>66</a>
+<a href=#67 id=67 data-nosnippet>67</a><span class="doccomment">/// Whose CPU time a clock measures, by the pid its id carries. Pid 0 names
+<a href=#68 id=68 data-nosnippet>68</a>/// the caller: its own thread for a thread's clock, its own process for a
+<a href=#69 id=69 data-nosnippet>69</a>/// process's (`pid_for_clock`, kernel/time/posix-cpu-timers.c:66-71).
+<a href=#70 id=70 data-nosnippet>70</a></span><span class="attr">#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+<a href=#71 id=71 data-nosnippet>71</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">enum </span>CpuClockOwner {
+<a href=#72 id=72 data-nosnippet>72</a>    Thread(i32),
+<a href=#73 id=73 data-nosnippet>73</a>    Process(i32),
+<a href=#74 id=74 data-nosnippet>74</a>}
+<a href=#75 id=75 data-nosnippet>75</a>
+<a href=#76 id=76 data-nosnippet>76</a><span class="doccomment">/// A CPU clock id, decoded.
+<a href=#77 id=77 data-nosnippet>77</a></span><span class="attr">#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+<a href=#78 id=78 data-nosnippet>78</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">struct </span>CpuClock {
+<a href=#79 id=79 data-nosnippet>79</a>    <span class="kw">pub</span>(<span class="kw">crate</span>) owner: CpuClockOwner,
+<a href=#80 id=80 data-nosnippet>80</a>    <span class="kw">pub</span>(<span class="kw">crate</span>) kind: CpuClockKind,
+<a href=#81 id=81 data-nosnippet>81</a>}
+<a href=#82 id=82 data-nosnippet>82</a>
+<a href=#83 id=83 data-nosnippet>83</a><span class="doccomment">/// What a clock id is, as far as the id alone decides.
+<a href=#84 id=84 data-nosnippet>84</a></span><span class="attr">#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+<a href=#85 id=85 data-nosnippet>85</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">enum </span>ClockIdClass {
+<a href=#86 id=86 data-nosnippet>86</a>    <span class="doccomment">/// Not a CPU clock: a fixed clock other than 2 and 3, a clock descriptor,
+<a href=#87 id=87 data-nosnippet>87</a>    /// or an id that names no clock at all.
+<a href=#88 id=88 data-nosnippet>88</a>    </span>Other,
+<a href=#89 id=89 data-nosnippet>89</a>    <span class="doccomment">/// A CPU clock of a thread or a process.
+<a href=#90 id=90 data-nosnippet>90</a>    </span>Cpu(CpuClock),
+<a href=#91 id=91 data-nosnippet>91</a>    <span class="doccomment">/// A negative thread-clock id whose clock bits are `CPUCLOCK_MAX` (3):
+<a href=#92 id=92 data-nosnippet>92</a>    /// no CPU clock. `pid_for_clock` refuses it from the bits alone
+<a href=#93 id=93 data-nosnippet>93</a>    /// (kernel/time/posix-cpu-timers.c:63-64), so every call answers EINVAL.
+<a href=#94 id=94 data-nosnippet>94</a>    </span>NoCpuClock,
+<a href=#95 id=95 data-nosnippet>95</a>}
+<a href=#96 id=96 data-nosnippet>96</a>
+<a href=#97 id=97 data-nosnippet>97</a><span class="doccomment">/// Decode `clockid` (include/linux/posix-timers_types.h:20-32 at v6.16).
+<a href=#98 id=98 data-nosnippet>98</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>classify(clockid: i32) -&gt; ClockIdClass {
+<a href=#99 id=99 data-nosnippet>99</a>    <span class="kw">const </span>PERTHREAD: i32 = <span class="number">4</span>;
+<a href=#100 id=100 data-nosnippet>100</a>    <span class="kw">const </span>WHICH: i32 = <span class="number">3</span>;
+<a href=#101 id=101 data-nosnippet>101</a>    <span class="kw">let </span>clock = |owner| {
+<a href=#102 id=102 data-nosnippet>102</a>        ClockIdClass::Cpu(CpuClock {
+<a href=#103 id=103 data-nosnippet>103</a>            owner,
+<a href=#104 id=104 data-nosnippet>104</a>            kind: CpuClockKind::Sched,
+<a href=#105 id=105 data-nosnippet>105</a>        })
+<a href=#106 id=106 data-nosnippet>106</a>    };
+<a href=#107 id=107 data-nosnippet>107</a>    <span class="kw">match </span>clockid {
+<a href=#108 id=108 data-nosnippet>108</a>        libc::CLOCK_PROCESS_CPUTIME_ID =&gt; clock(CpuClockOwner::Process(<span class="number">0</span>)),
+<a href=#109 id=109 data-nosnippet>109</a>        libc::CLOCK_THREAD_CPUTIME_ID =&gt; clock(CpuClockOwner::Thread(<span class="number">0</span>)),
+<a href=#110 id=110 data-nosnippet>110</a>        id <span class="kw">if </span>id &gt;= <span class="number">0 </span>=&gt; ClockIdClass::Other,
+<a href=#111 id=111 data-nosnippet>111</a>        id =&gt; {
+<a href=#112 id=112 data-nosnippet>112</a>            <span class="kw">let </span>thread = id &amp; PERTHREAD != <span class="number">0</span>;
+<a href=#113 id=113 data-nosnippet>113</a>            <span class="kw">let </span>kind = <span class="kw">match </span>id &amp; WHICH {
+<a href=#114 id=114 data-nosnippet>114</a>                <span class="number">0 </span>=&gt; CpuClockKind::Prof,
+<a href=#115 id=115 data-nosnippet>115</a>                <span class="number">1 </span>=&gt; CpuClockKind::Virt,
+<a href=#116 id=116 data-nosnippet>116</a>                <span class="number">2 </span>=&gt; CpuClockKind::Sched,
+<a href=#117 id=117 data-nosnippet>117</a>                <span class="kw">_ if </span>thread =&gt; <span class="kw">return </span>ClockIdClass::NoCpuClock,
+<a href=#118 id=118 data-nosnippet>118</a>                <span class="kw">_ </span>=&gt; <span class="kw">return </span>ClockIdClass::Other,
+<a href=#119 id=119 data-nosnippet>119</a>            };
+<a href=#120 id=120 data-nosnippet>120</a>            <span class="kw">let </span>pid = !(id &gt;&gt; <span class="number">3</span>);
+<a href=#121 id=121 data-nosnippet>121</a>            <span class="kw">let </span>owner = <span class="kw">if </span>thread {
+<a href=#122 id=122 data-nosnippet>122</a>                CpuClockOwner::Thread(pid)
+<a href=#123 id=123 data-nosnippet>123</a>            } <span class="kw">else </span>{
+<a href=#124 id=124 data-nosnippet>124</a>                CpuClockOwner::Process(pid)
+<a href=#125 id=125 data-nosnippet>125</a>            };
+<a href=#126 id=126 data-nosnippet>126</a>            ClockIdClass::Cpu(CpuClock { owner, kind })
+<a href=#127 id=127 data-nosnippet>127</a>        }
+<a href=#128 id=128 data-nosnippet>128</a>    }
+<a href=#129 id=129 data-nosnippet>129</a>}
+<a href=#130 id=130 data-nosnippet>130</a>
+<a href=#131 id=131 data-nosnippet>131</a><span class="doccomment">/// The task a CPU clock names, found as Linux's `pid_for_clock` finds it.
+<a href=#132 id=132 data-nosnippet>132</a></span><span class="attr">#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+<a href=#133 id=133 data-nosnippet>133</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">enum </span>ClockTask {
+<a href=#134 id=134 data-nosnippet>134</a>    <span class="doccomment">/// The calling thread.
+<a href=#135 id=135 data-nosnippet>135</a>    </span>OwnThread,
+<a href=#136 id=136 data-nosnippet>136</a>    <span class="doccomment">/// Another live thread of the calling process.
+<a href=#137 id=137 data-nosnippet>137</a>    </span>Sibling(DetTid),
+<a href=#138 id=138 data-nosnippet>138</a>    <span class="doccomment">/// The calling process.
+<a href=#139 id=139 data-nosnippet>139</a>    </span>OwnProcess,
+<a href=#140 id=140 data-nosnippet>140</a>    <span class="doccomment">/// Another live process, whose CPU accounting Detcore keeps in that
+<a href=#141 id=141 data-nosnippet>141</a>    /// process's own threads, out of the caller's reach.
+<a href=#142 id=142 data-nosnippet>142</a>    </span>OtherProcess,
+<a href=#143 id=143 data-nosnippet>143</a>}
+<a href=#144 id=144 data-nosnippet>144</a>
+<a href=#145 id=145 data-nosnippet>145</a><span class="doccomment">/// Which call looks the clock's task up. Only `clock_gettime` also takes the
+<a href=#146 id=146 data-nosnippet>146</a>/// calling thread's own id as naming its process
+<a href=#147 id=147 data-nosnippet>147</a>/// (kernel/time/posix-cpu-timers.c:82-89); `clock_getres` and
+<a href=#148 id=148 data-nosnippet>148</a>/// `clock_nanosleep` require a process's id (`validate_clock_permissions`,
+<a href=#149 id=149 data-nosnippet>149</a>/// :97-106, and `posix_cpu_timer_create`, :386-397).
+<a href=#150 id=150 data-nosnippet>150</a></span><span class="attr">#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+<a href=#151 id=151 data-nosnippet>151</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">enum </span>ClockLookup {
+<a href=#152 id=152 data-nosnippet>152</a>    Read,
+<a href=#153 id=153 data-nosnippet>153</a>    Other,
+<a href=#154 id=154 data-nosnippet>154</a>}
+<a href=#155 id=155 data-nosnippet>155</a>
+<a href=#156 id=156 data-nosnippet>156</a><span class="kw">impl</span>&lt;T: RecordOrReplay&gt; Detcore&lt;T&gt; {
+<a href=#157 id=157 data-nosnippet>157</a>    <span class="doccomment">/// The task `owner` names for the calling thread (`pid_for_clock`,
+<a href=#158 id=158 data-nosnippet>158</a>    /// kernel/time/posix-cpu-timers.c:57-95 at v6.16): EINVAL for an id that
+<a href=#159 id=159 data-nosnippet>159</a>    /// names no live thread of the caller's process (a thread's clock) or no
+<a href=#160 id=160 data-nosnippet>160</a>    /// live process (a process's clock). Which process a task belongs to is
+<a href=#161 id=161 data-nosnippet>161</a>    /// the scheduler's thread tree, the answer a `SIGEV_THREAD_ID` timer's
+<a href=#162 id=162 data-nosnippet>162</a>    /// thread and a signal's target get.
+<a href=#163 id=163 data-nosnippet>163</a>    </span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">async fn </span>cpu_clock_task&lt;G: Guest&lt;<span class="self">Self</span>&gt;&gt;(
+<a href=#164 id=164 data-nosnippet>164</a>        <span class="kw-2">&amp;</span><span class="self">self</span>,
+<a href=#165 id=165 data-nosnippet>165</a>        guest: <span class="kw-2">&amp;mut </span>G,
+<a href=#166 id=166 data-nosnippet>166</a>        sysno: Sysno,
+<a href=#167 id=167 data-nosnippet>167</a>        owner: CpuClockOwner,
+<a href=#168 id=168 data-nosnippet>168</a>        lookup: ClockLookup,
+<a href=#169 id=169 data-nosnippet>169</a>    ) -&gt; <span class="prelude-ty">Result</span>&lt;ClockTask, Error&gt; {
+<a href=#170 id=170 data-nosnippet>170</a>        <span class="kw">let </span>(named, thread) = <span class="kw">match </span>owner {
+<a href=#171 id=171 data-nosnippet>171</a>            CpuClockOwner::Thread(pid) =&gt; (pid, <span class="bool-val">true</span>),
+<a href=#172 id=172 data-nosnippet>172</a>            CpuClockOwner::Process(pid) =&gt; (pid, <span class="bool-val">false</span>),
+<a href=#173 id=173 data-nosnippet>173</a>        };
+<a href=#174 id=174 data-nosnippet>174</a>        <span class="kw">if </span>named == <span class="number">0 </span>{
+<a href=#175 id=175 data-nosnippet>175</a>            <span class="kw">return </span><span class="prelude-val">Ok</span>(<span class="kw">if </span>thread {
+<a href=#176 id=176 data-nosnippet>176</a>                ClockTask::OwnThread
+<a href=#177 id=177 data-nosnippet>177</a>            } <span class="kw">else </span>{
+<a href=#178 id=178 data-nosnippet>178</a>                ClockTask::OwnProcess
+<a href=#179 id=179 data-nosnippet>179</a>            });
+<a href=#180 id=180 data-nosnippet>180</a>        }
+<a href=#181 id=181 data-nosnippet>181</a>        <span class="kw">let </span>named = <span class="self">self</span>.cpu_clock_pid_task(guest, sysno, named).<span class="kw">await</span><span class="question-mark">?</span>;
+<a href=#182 id=182 data-nosnippet>182</a>        <span class="kw">let </span>dettid = guest.thread_state().dettid;
+<a href=#183 id=183 data-nosnippet>183</a>        <span class="kw">let </span>detpid = guest.thread_state().detpid.expect(<span class="string">"detpid unset"</span>);
+<a href=#184 id=184 data-nosnippet>184</a>        <span class="kw">if </span>thread &amp;&amp; named == dettid {
+<a href=#185 id=185 data-nosnippet>185</a>            <span class="kw">return </span><span class="prelude-val">Ok</span>(ClockTask::OwnThread);
+<a href=#186 id=186 data-nosnippet>186</a>        }
+<a href=#187 id=187 data-nosnippet>187</a>        <span class="kw">if </span>!thread &amp;&amp; (named == detpid || (lookup == ClockLookup::Read &amp;&amp; named == dettid)) {
+<a href=#188 id=188 data-nosnippet>188</a>            <span class="kw">return </span><span class="prelude-val">Ok</span>(ClockTask::OwnProcess);
+<a href=#189 id=189 data-nosnippet>189</a>        }
+<a href=#190 id=190 data-nosnippet>190</a>        <span class="comment">// A thread's clock needs a thread of the caller's process
+<a href=#191 id=191 data-nosnippet>191</a>        // (`same_thread_group`, :77-80), and a process's clock a process's
+<a href=#192 id=192 data-nosnippet>192</a>        // id: a thread's id names its process for a signal, but not for a
+<a href=#193 id=193 data-nosnippet>193</a>        // clock (`pid_has_task(pid, PIDTYPE_TGID)`, :91-94).
+<a href=#194 id=194 data-nosnippet>194</a>        </span><span class="kw">match </span><span class="kw">crate</span>::tool_global::signal_target_process(guest, named).<span class="kw">await </span>{
+<a href=#195 id=195 data-nosnippet>195</a>            <span class="prelude-val">Some</span>(process) <span class="kw">if </span>thread &amp;&amp; process == detpid =&gt; <span class="prelude-val">Ok</span>(ClockTask::Sibling(named)),
+<a href=#196 id=196 data-nosnippet>196</a>            <span class="prelude-val">Some</span>(process) <span class="kw">if </span>!thread &amp;&amp; process == named =&gt; <span class="prelude-val">Ok</span>(ClockTask::OtherProcess),
+<a href=#197 id=197 data-nosnippet>197</a>            <span class="kw">_ </span>=&gt; <span class="prelude-val">Err</span>(Errno::EINVAL.into()),
+<a href=#198 id=198 data-nosnippet>198</a>        }
+<a href=#199 id=199 data-nosnippet>199</a>    }
+<a href=#200 id=200 data-nosnippet>200</a>
+<a href=#201 id=201 data-nosnippet>201</a>    <span class="doccomment">/// The task the positive `pid` of a CPU clock id names. At depth 0 the pid
+<a href=#202 id=202 data-nosnippet>202</a>    /// is the DetTid. In a nested PID namespace it is a pid of that namespace,
+<a href=#203 id=203 data-nosnippet>203</a>    /// translated through the scheduler's record (`scheduler::pid_namespaces`):
+<a href=#204 id=204 data-nosnippet>204</a>    /// a pid no task of the namespace has is EINVAL, as `pid_for_clock`'s
+<a href=#205 id=205 data-nosnippet>205</a>    /// `find_vpid` answers (:73-75); one the scheduler could not record is
+<a href=#206 id=206 data-nosnippet>206</a>    /// refused.
+<a href=#207 id=207 data-nosnippet>207</a>    </span><span class="kw">async fn </span>cpu_clock_pid_task&lt;G: Guest&lt;<span class="self">Self</span>&gt;&gt;(
+<a href=#208 id=208 data-nosnippet>208</a>        <span class="kw-2">&amp;</span><span class="self">self</span>,
+<a href=#209 id=209 data-nosnippet>209</a>        guest: <span class="kw-2">&amp;mut </span>G,
+<a href=#210 id=210 data-nosnippet>210</a>        sysno: Sysno,
+<a href=#211 id=211 data-nosnippet>211</a>        pid: i32,
+<a href=#212 id=212 data-nosnippet>212</a>    ) -&gt; <span class="prelude-ty">Result</span>&lt;DetTid, Error&gt; {
+<a href=#213 id=213 data-nosnippet>213</a>        <span class="kw">if </span>!guest.thread_state().nested_pid_namespace {
+<a href=#214 id=214 data-nosnippet>214</a>            <span class="kw">return </span><span class="prelude-val">Ok</span>(DetTid::from_raw(pid));
+<a href=#215 id=215 data-nosnippet>215</a>        }
+<a href=#216 id=216 data-nosnippet>216</a>        <span class="kw">match </span><span class="kw">crate</span>::tool_global::guest_pid(guest, pid).<span class="kw">await </span>{
+<a href=#217 id=217 data-nosnippet>217</a>            GuestPidAnswer::Task { task, .. } =&gt; <span class="prelude-val">Ok</span>(task),
+<a href=#218 id=218 data-nosnippet>218</a>            GuestPidAnswer::NoSuchPid =&gt; <span class="prelude-val">Err</span>(Errno::EINVAL.into()),
+<a href=#219 id=219 data-nosnippet>219</a>            GuestPidAnswer::Untranslatable(reason) =&gt; <span class="prelude-val">Err</span>(<span class="self">self
+<a href=#220 id=220 data-nosnippet>220</a>                </span>.refuse_cpu_clock(
+<a href=#221 id=221 data-nosnippet>221</a>                    guest,
+<a href=#222 id=222 data-nosnippet>222</a>                    sysno,
+<a href=#223 id=223 data-nosnippet>223</a>                    <span class="kw-2">&amp;</span><span class="macro">format!</span>(
+<a href=#224 id=224 data-nosnippet>224</a>                        <span class="string">"a CPU clock id naming pid {pid} in a nested PID namespace: {reason} (https://github.com/rrnewton/hermit/issues/4155)"
+<a href=#225 id=225 data-nosnippet>225</a>                    </span>),
+<a href=#226 id=226 data-nosnippet>226</a>                )
+<a href=#227 id=227 data-nosnippet>227</a>                .<span class="kw">await</span>),
+<a href=#228 id=228 data-nosnippet>228</a>        }
+<a href=#229 id=229 data-nosnippet>229</a>    }
+<a href=#230 id=230 data-nosnippet>230</a>
+<a href=#231 id=231 data-nosnippet>231</a>    <span class="doccomment">/// The current reading of `clock` for the calling thread, its task found
+<a href=#232 id=232 data-nosnippet>232</a>    /// as `clock_gettime` finds it (`posix_cpu_clock_get`,
+<a href=#233 id=233 data-nosnippet>233</a>    /// kernel/time/posix-cpu-timers.c:358-379 at v6.16).
+<a href=#234 id=234 data-nosnippet>234</a>    </span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">async fn </span>read_cpu_clock&lt;G: Guest&lt;<span class="self">Self</span>&gt;&gt;(
+<a href=#235 id=235 data-nosnippet>235</a>        <span class="kw-2">&amp;</span><span class="self">self</span>,
+<a href=#236 id=236 data-nosnippet>236</a>        guest: <span class="kw-2">&amp;mut </span>G,
+<a href=#237 id=237 data-nosnippet>237</a>        sysno: Sysno,
+<a href=#238 id=238 data-nosnippet>238</a>        clock: CpuClock,
+<a href=#239 id=239 data-nosnippet>239</a>    ) -&gt; <span class="prelude-ty">Result</span>&lt;LogicalTime, Error&gt; {
+<a href=#240 id=240 data-nosnippet>240</a>        <span class="kw">let </span>task = <span class="self">self
+<a href=#241 id=241 data-nosnippet>241</a>            </span>.cpu_clock_task(guest, sysno, clock.owner, ClockLookup::Read)
+<a href=#242 id=242 data-nosnippet>242</a>            .<span class="kw">await</span><span class="question-mark">?</span>;
+<a href=#243 id=243 data-nosnippet>243</a>        <span class="self">self</span>.cpu_clock_reading(guest, sysno, task, clock.kind).<span class="kw">await
+<a href=#244 id=244 data-nosnippet>244</a>    </span>}
+<a href=#245 id=245 data-nosnippet>245</a>
+<a href=#246 id=246 data-nosnippet>246</a>    <span class="doccomment">/// What a `kind` clock of `task` reads now: the calling thread's own CPU
+<a href=#247 id=247 data-nosnippet>247</a>    /// time or its process's, or a sibling thread's as of that thread's last
+<a href=#248 id=248 data-nosnippet>248</a>    /// accounting, which with threads sequentialized is where it last stopped
+<a href=#249 id=249 data-nosnippet>249</a>    /// running. A process's time includes its exited threads'
+<a href=#250 id=250 data-nosnippet>250</a>    /// (`thread_group_cputime`, kernel/sched/cputime.c:310-350). Another
+<a href=#251 id=251 data-nosnippet>251</a>    /// process's clock is refused by the unsupported-operation policy.
+<a href=#252 id=252 data-nosnippet>252</a>    </span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">async fn </span>cpu_clock_reading&lt;G: Guest&lt;<span class="self">Self</span>&gt;&gt;(
+<a href=#253 id=253 data-nosnippet>253</a>        <span class="kw-2">&amp;</span><span class="self">self</span>,
+<a href=#254 id=254 data-nosnippet>254</a>        guest: <span class="kw-2">&amp;mut </span>G,
+<a href=#255 id=255 data-nosnippet>255</a>        sysno: Sysno,
+<a href=#256 id=256 data-nosnippet>256</a>        task: ClockTask,
+<a href=#257 id=257 data-nosnippet>257</a>        kind: CpuClockKind,
+<a href=#258 id=258 data-nosnippet>258</a>    ) -&gt; <span class="prelude-ty">Result</span>&lt;LogicalTime, Error&gt; {
+<a href=#259 id=259 data-nosnippet>259</a>        <span class="kw">let </span>(user, system) = <span class="kw">match </span>task {
+<a href=#260 id=260 data-nosnippet>260</a>            ClockTask::OwnThread =&gt; guest.thread_state().thread_cpu_time(),
+<a href=#261 id=261 data-nosnippet>261</a>            ClockTask::Sibling(thread) =&gt; guest.thread_state().sibling_cpu_time(thread),
+<a href=#262 id=262 data-nosnippet>262</a>            ClockTask::OwnProcess =&gt; {
+<a href=#263 id=263 data-nosnippet>263</a>                <span class="kw">let </span>process = guest.thread_state_mut().process_cpu_time();
+<a href=#264 id=264 data-nosnippet>264</a>                (process.user, process.system)
+<a href=#265 id=265 data-nosnippet>265</a>            }
+<a href=#266 id=266 data-nosnippet>266</a>            ClockTask::OtherProcess =&gt; {
+<a href=#267 id=267 data-nosnippet>267</a>                <span class="kw">return </span><span class="prelude-val">Err</span>(<span class="self">self
+<a href=#268 id=268 data-nosnippet>268</a>                    </span>.refuse_cpu_clock(
+<a href=#269 id=269 data-nosnippet>269</a>                        guest,
+<a href=#270 id=270 data-nosnippet>270</a>                        sysno,
+<a href=#271 id=271 data-nosnippet>271</a>                        <span class="string">"reading another process's CPU clock: Detcore keeps a process's CPU accounting in that process's own threads"</span>,
+<a href=#272 id=272 data-nosnippet>272</a>                    )
+<a href=#273 id=273 data-nosnippet>273</a>                    .<span class="kw">await</span>);
+<a href=#274 id=274 data-nosnippet>274</a>            }
+<a href=#275 id=275 data-nosnippet>275</a>        };
+<a href=#276 id=276 data-nosnippet>276</a>        <span class="prelude-val">Ok</span>(kind.sample(user, system))
+<a href=#277 id=277 data-nosnippet>277</a>    }
+<a href=#278 id=278 data-nosnippet>278</a>
+<a href=#279 id=279 data-nosnippet>279</a>    <span class="doccomment">/// Refuse a CPU-clock operation Detcore cannot serve deterministically,
+<a href=#280 id=280 data-nosnippet>280</a>    /// by the unsupported-operation policy (`refuse_unserviceable_operation`):
+<a href=#281 id=281 data-nosnippet>281</a>    /// a fail-closed run ends naming `reason`; with
+<a href=#282 id=282 data-nosnippet>282</a>    /// `--allow-unsupported-syscalls` the guest gets ENOSYS.
+<a href=#283 id=283 data-nosnippet>283</a>    </span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">async fn </span>refuse_cpu_clock&lt;G: Guest&lt;<span class="self">Self</span>&gt;&gt;(
+<a href=#284 id=284 data-nosnippet>284</a>        <span class="kw-2">&amp;</span><span class="self">self</span>,
+<a href=#285 id=285 data-nosnippet>285</a>        guest: <span class="kw-2">&amp;mut </span>G,
+<a href=#286 id=286 data-nosnippet>286</a>        sysno: Sysno,
+<a href=#287 id=287 data-nosnippet>287</a>        reason: <span class="kw-2">&amp;</span>str,
+<a href=#288 id=288 data-nosnippet>288</a>    ) -&gt; Error {
+<a href=#289 id=289 data-nosnippet>289</a>        <span class="self">self</span>.refuse_unserviceable_operation_because(guest, sysno, Errno::ENOSYS, reason)
+<a href=#290 id=290 data-nosnippet>290</a>            .<span class="kw">await
+<a href=#291 id=291 data-nosnippet>291</a>            </span>.expect_err(<span class="string">"an unserviceable operation is never served"</span>)
+<a href=#292 id=292 data-nosnippet>292</a>    }
+<a href=#293 id=293 data-nosnippet>293</a>}
+<a href=#294 id=294 data-nosnippet>294</a>
+<a href=#295 id=295 data-nosnippet>295</a><span class="attr">#[cfg(test)]
+<a href=#296 id=296 data-nosnippet>296</a></span><span class="kw">mod </span>handler_tests;
+<a href=#297 id=297 data-nosnippet>297</a>
+<a href=#298 id=298 data-nosnippet>298</a><span class="attr">#[cfg(test)]
+<a href=#299 id=299 data-nosnippet>299</a></span><span class="kw">mod </span>tests {
+<a href=#300 id=300 data-nosnippet>300</a>    <span class="kw">use super</span>::<span class="kw-2">*</span>;
+<a href=#301 id=301 data-nosnippet>301</a>
+<a href=#302 id=302 data-nosnippet>302</a>    <span class="doccomment">/// `MAKE_PROCESS_CPUCLOCK(pid, clock)`, include/linux/posix-timers.h.
+<a href=#303 id=303 data-nosnippet>303</a>    </span><span class="kw">fn </span>process_clock(pid: i32, which: i32) -&gt; i32 {
+<a href=#304 id=304 data-nosnippet>304</a>        (!pid &lt;&lt; <span class="number">3</span>) | which
+<a href=#305 id=305 data-nosnippet>305</a>    }
+<a href=#306 id=306 data-nosnippet>306</a>
+<a href=#307 id=307 data-nosnippet>307</a>    <span class="doccomment">/// `MAKE_THREAD_CPUCLOCK(tid, clock)`.
+<a href=#308 id=308 data-nosnippet>308</a>    </span><span class="kw">fn </span>thread_clock(tid: i32, which: i32) -&gt; i32 {
+<a href=#309 id=309 data-nosnippet>309</a>        (!tid &lt;&lt; <span class="number">3</span>) | <span class="number">4 </span>| which
+<a href=#310 id=310 data-nosnippet>310</a>    }
+<a href=#311 id=311 data-nosnippet>311</a>
+<a href=#312 id=312 data-nosnippet>312</a>    <span class="kw">fn </span>cpu(owner: CpuClockOwner, kind: CpuClockKind) -&gt; ClockIdClass {
+<a href=#313 id=313 data-nosnippet>313</a>        ClockIdClass::Cpu(CpuClock { owner, kind })
+<a href=#314 id=314 data-nosnippet>314</a>    }
+<a href=#315 id=315 data-nosnippet>315</a>
+<a href=#316 id=316 data-nosnippet>316</a>    <span class="attr">#[test]
+<a href=#317 id=317 data-nosnippet>317</a>    </span><span class="kw">fn </span>fixed_cpu_clocks_name_the_caller() {
+<a href=#318 id=318 data-nosnippet>318</a>        <span class="macro">assert_eq!</span>(
+<a href=#319 id=319 data-nosnippet>319</a>            classify(libc::CLOCK_PROCESS_CPUTIME_ID),
+<a href=#320 id=320 data-nosnippet>320</a>            cpu(CpuClockOwner::Process(<span class="number">0</span>), CpuClockKind::Sched)
+<a href=#321 id=321 data-nosnippet>321</a>        );
+<a href=#322 id=322 data-nosnippet>322</a>        <span class="macro">assert_eq!</span>(
+<a href=#323 id=323 data-nosnippet>323</a>            classify(libc::CLOCK_THREAD_CPUTIME_ID),
+<a href=#324 id=324 data-nosnippet>324</a>            cpu(CpuClockOwner::Thread(<span class="number">0</span>), CpuClockKind::Sched)
+<a href=#325 id=325 data-nosnippet>325</a>        );
+<a href=#326 id=326 data-nosnippet>326</a>    }
+<a href=#327 id=327 data-nosnippet>327</a>
+<a href=#328 id=328 data-nosnippet>328</a>    <span class="attr">#[test]
+<a href=#329 id=329 data-nosnippet>329</a>    </span><span class="kw">fn </span>other_fixed_clocks_are_not_cpu_clocks() {
+<a href=#330 id=330 data-nosnippet>330</a>        <span class="kw">for </span>id <span class="kw">in </span>[
+<a href=#331 id=331 data-nosnippet>331</a>            libc::CLOCK_REALTIME,
+<a href=#332 id=332 data-nosnippet>332</a>            libc::CLOCK_MONOTONIC,
+<a href=#333 id=333 data-nosnippet>333</a>            libc::CLOCK_MONOTONIC_RAW,
+<a href=#334 id=334 data-nosnippet>334</a>            libc::CLOCK_REALTIME_COARSE,
+<a href=#335 id=335 data-nosnippet>335</a>            libc::CLOCK_MONOTONIC_COARSE,
+<a href=#336 id=336 data-nosnippet>336</a>            libc::CLOCK_BOOTTIME,
+<a href=#337 id=337 data-nosnippet>337</a>            libc::CLOCK_TAI,
+<a href=#338 id=338 data-nosnippet>338</a>            <span class="number">10</span>,
+<a href=#339 id=339 data-nosnippet>339</a>            <span class="number">12</span>,
+<a href=#340 id=340 data-nosnippet>340</a>            <span class="number">1000</span>,
+<a href=#341 id=341 data-nosnippet>341</a>        ] {
+<a href=#342 id=342 data-nosnippet>342</a>            <span class="macro">assert_eq!</span>(classify(id), ClockIdClass::Other, <span class="string">"{id}"</span>);
+<a href=#343 id=343 data-nosnippet>343</a>        }
+<a href=#344 id=344 data-nosnippet>344</a>    }
+<a href=#345 id=345 data-nosnippet>345</a>
+<a href=#346 id=346 data-nosnippet>346</a>    <span class="doccomment">/// The ids glibc's `pthread_getcpuclockid` and `clock_getcpuclockid`
+<a href=#347 id=347 data-nosnippet>347</a>    /// build, and the PROF and VIRT clocks a raw id can name.
+<a href=#348 id=348 data-nosnippet>348</a>    </span><span class="attr">#[test]
+<a href=#349 id=349 data-nosnippet>349</a>    </span><span class="kw">fn </span>encoded_ids_carry_their_task_and_clock() {
+<a href=#350 id=350 data-nosnippet>350</a>        <span class="kw">for </span>pid <span class="kw">in </span>[<span class="number">0</span>, <span class="number">1</span>, <span class="number">2</span>, <span class="number">77</span>, <span class="number">4_194_304</span>] {
+<a href=#351 id=351 data-nosnippet>351</a>            <span class="macro">assert_eq!</span>(
+<a href=#352 id=352 data-nosnippet>352</a>                classify(process_clock(pid, <span class="number">2</span>)),
+<a href=#353 id=353 data-nosnippet>353</a>                cpu(CpuClockOwner::Process(pid), CpuClockKind::Sched),
+<a href=#354 id=354 data-nosnippet>354</a>                <span class="string">"{pid}"
+<a href=#355 id=355 data-nosnippet>355</a>            </span>);
+<a href=#356 id=356 data-nosnippet>356</a>            <span class="macro">assert_eq!</span>(
+<a href=#357 id=357 data-nosnippet>357</a>                classify(thread_clock(pid, <span class="number">2</span>)),
+<a href=#358 id=358 data-nosnippet>358</a>                cpu(CpuClockOwner::Thread(pid), CpuClockKind::Sched),
+<a href=#359 id=359 data-nosnippet>359</a>                <span class="string">"{pid}"
+<a href=#360 id=360 data-nosnippet>360</a>            </span>);
+<a href=#361 id=361 data-nosnippet>361</a>            <span class="macro">assert_eq!</span>(
+<a href=#362 id=362 data-nosnippet>362</a>                classify(process_clock(pid, <span class="number">0</span>)),
+<a href=#363 id=363 data-nosnippet>363</a>                cpu(CpuClockOwner::Process(pid), CpuClockKind::Prof),
+<a href=#364 id=364 data-nosnippet>364</a>                <span class="string">"{pid}"
+<a href=#365 id=365 data-nosnippet>365</a>            </span>);
+<a href=#366 id=366 data-nosnippet>366</a>            <span class="macro">assert_eq!</span>(
+<a href=#367 id=367 data-nosnippet>367</a>                classify(thread_clock(pid, <span class="number">1</span>)),
+<a href=#368 id=368 data-nosnippet>368</a>                cpu(CpuClockOwner::Thread(pid), CpuClockKind::Virt),
+<a href=#369 id=369 data-nosnippet>369</a>                <span class="string">"{pid}"
+<a href=#370 id=370 data-nosnippet>370</a>            </span>);
+<a href=#371 id=371 data-nosnippet>371</a>        }
+<a href=#372 id=372 data-nosnippet>372</a>    }
+<a href=#373 id=373 data-nosnippet>373</a>
+<a href=#374 id=374 data-nosnippet>374</a>    <span class="doccomment">/// `FD_TO_CLOCKID(fd)` is `((~fd) &lt;&lt; 3) | CLOCKFD`: a clock descriptor,
+<a href=#375 id=375 data-nosnippet>375</a>    /// whose answer this module leaves alone; the same bits with the
+<a href=#376 id=376 data-nosnippet>376</a>    /// per-thread bit set name no clock.
+<a href=#377 id=377 data-nosnippet>377</a>    </span><span class="attr">#[test]
+<a href=#378 id=378 data-nosnippet>378</a>    </span><span class="kw">fn </span>clock_descriptors_and_clock_bits_three_are_not_cpu_clocks() {
+<a href=#379 id=379 data-nosnippet>379</a>        <span class="kw">for </span>fd <span class="kw">in </span>[<span class="number">0</span>, <span class="number">3</span>, <span class="number">1023</span>] {
+<a href=#380 id=380 data-nosnippet>380</a>            <span class="macro">assert_eq!</span>(classify(process_clock(fd, <span class="number">3</span>)), ClockIdClass::Other, <span class="string">"{fd}"</span>);
+<a href=#381 id=381 data-nosnippet>381</a>            <span class="macro">assert_eq!</span>(
+<a href=#382 id=382 data-nosnippet>382</a>                classify(thread_clock(fd, <span class="number">3</span>)),
+<a href=#383 id=383 data-nosnippet>383</a>                ClockIdClass::NoCpuClock,
+<a href=#384 id=384 data-nosnippet>384</a>                <span class="string">"{fd}"
+<a href=#385 id=385 data-nosnippet>385</a>            </span>);
+<a href=#386 id=386 data-nosnippet>386</a>        }
+<a href=#387 id=387 data-nosnippet>387</a>    }
+<a href=#388 id=388 data-nosnippet>388</a>
+<a href=#389 id=389 data-nosnippet>389</a>    <span class="attr">#[test]
+<a href=#390 id=390 data-nosnippet>390</a>    </span><span class="kw">fn </span>a_sample_reads_the_clocks_share_of_the_task_time() {
+<a href=#391 id=391 data-nosnippet>391</a>        <span class="kw">let </span>user = LogicalTime::from_nanos(<span class="number">7_000</span>);
+<a href=#392 id=392 data-nosnippet>392</a>        <span class="kw">let </span>system = LogicalTime::from_nanos(<span class="number">30_000</span>);
+<a href=#393 id=393 data-nosnippet>393</a>        <span class="macro">assert_eq!</span>(CpuClockKind::Virt.sample(user, system), user);
+<a href=#394 id=394 data-nosnippet>394</a>        <span class="macro">assert_eq!</span>(
+<a href=#395 id=395 data-nosnippet>395</a>            CpuClockKind::Prof.sample(user, system),
+<a href=#396 id=396 data-nosnippet>396</a>            LogicalTime::from_nanos(<span class="number">37_000</span>)
+<a href=#397 id=397 data-nosnippet>397</a>        );
+<a href=#398 id=398 data-nosnippet>398</a>        <span class="macro">assert_eq!</span>(
+<a href=#399 id=399 data-nosnippet>399</a>            CpuClockKind::Sched.sample(user, system),
+<a href=#400 id=400 data-nosnippet>400</a>            LogicalTime::from_nanos(<span class="number">37_000</span>)
+<a href=#401 id=401 data-nosnippet>401</a>        );
+<a href=#402 id=402 data-nosnippet>402</a>    }
+<a href=#403 id=403 data-nosnippet>403</a>}
+</code></pre></div></section></main></body></html>

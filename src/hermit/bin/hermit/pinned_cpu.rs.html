@@ -1,0 +1,1236 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `hermit-cli/src/bin/hermit/pinned_cpu.rs`."><title>pinned_cpu.rs - source</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../../../" data-static-root-path="../../../../static.files/" data-current-crate="hermit" data-themes="" data-resource-suffix="" data-rustdoc-version="1.99.0-nightly (be8e82435 2026-07-11)" data-channel="nightly" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../../../static.files/storage-41dd4d93.js"></script><script defer src="../../../../static.files/src-script-813739b1.js"></script><script defer src="../../../../src-files.js"></script><script defer src="../../../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../../../static.files/favicon-044be391.svg"></head><body class="rustdoc src"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="sidebar"><div class="src-sidebar-title"><h2>Files</h2></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1><div class="sub-heading">hermit/bin/hermit/</div>pinned_cpu.rs</h1><rustdoc-toolbar></rustdoc-toolbar></div><div class="example-wrap digits-4"><pre class="rust"><code><a href=#1 id=1 data-nosnippet>1</a><span class="comment">/*
+<a href=#2 id=2 data-nosnippet>2</a> * Copyright (c) Meta Platforms, Inc. and affiliates.
+<a href=#3 id=3 data-nosnippet>3</a> * All rights reserved.
+<a href=#4 id=4 data-nosnippet>4</a> *
+<a href=#5 id=5 data-nosnippet>5</a> * This source code is licensed under the BSD-style license found in the
+<a href=#6 id=6 data-nosnippet>6</a> * LICENSE file in the root directory of this source tree.
+<a href=#7 id=7 data-nosnippet>7</a> */
+<a href=#8 id=8 data-nosnippet>8</a>
+<a href=#9 id=9 data-nosnippet>9</a></span><span class="doccomment">//! The CPU a sequentialized run is pinned to.
+<a href=#10 id=10 data-nosnippet>10</a>//!
+<a href=#11 id=11 data-nosnippet>11</a>//! A run with a `max_timeslice` pins its tracer, its notifier threads and
+<a href=#12 id=12 data-nosnippet>12</a>//! every guest thread to one CPU for the whole run, because its retired-branch
+<a href=#13 id=13 data-nosnippet>13</a>//! counts must not see a migration (`RunOpts::pin_threads`). Every ptrace stop
+<a href=#14 id=14 data-nosnippet>14</a>//! then costs several wakeups on that one CPU: the guest stops, its notifier
+<a href=#15 id=15 data-nosnippet>15</a>//! thread wakes, the tracer wakes, and the tracer resumes the guest.
+<a href=#16 id=16 data-nosnippet>16</a>//!
+<a href=#17 id=17 data-nosnippet>17</a>//! So the CPU matters, and a CPU-bound task already on it is the worst case.
+<a href=#18 id=18 data-nosnippet>18</a>//! Linux shares a CPU between cgroups by weight, and it scales a cgroup's
+<a href=#19 id=19 data-nosnippet>19</a>//! weight on one CPU by about the share of the cgroup's load that is on that
+<a href=#20 id=20 data-nosnippet>20</a>//! CPU (`calc_group_shares`, kernel/sched/fair.c). A run inside a cgroup that
+<a href=#21 id=21 data-nosnippet>21</a>//! is busy on many other CPUs, as a test runner's is, therefore has almost no
+<a href=#22 id=22 data-nosnippet>22</a>//! weight on its own CPU. Beside a CPU-bound task from a cgroup whose load is
+<a href=#23 id=23 data-nosnippet>23</a>//! concentrated there, each of the run's wakeups waits for that task, and the
+<a href=#24 id=24 data-nosnippet>24</a>//! run does the same work hundreds of times slower
+<a href=#25 id=25 data-nosnippet>25</a>//! (&lt;https://github.com/rrnewton/hermit/issues/4824&gt;). Measured on a 316-CPU
+<a href=#26 id=26 data-nosnippet>26</a>//! host: one strict verify of an epoll guest took 1.5 s on an idle CPU and
+<a href=#27 id=27 data-nosnippet>27</a>//! 15.5 s on a CPU running a busy loop from another cgroup, while the run's
+<a href=#28 id=28 data-nosnippet>28</a>//! own cgroup kept 24 busy loops on other CPUs. Under a loaded test runner,
+<a href=#29 id=29 data-nosnippet>29</a>//! runs were 170 to 1,400 times slower and hit test deadlines.
+<a href=#30 id=30 data-nosnippet>30</a>//!
+<a href=#31 id=31 data-nosnippet>31</a>//! A uniformly random CPU lands on such a task as often as there are busy
+<a href=#32 id=32 data-nosnippet>32</a>//! CPUs. Instead, a run samples the allowed CPUs' busy time from `/proc/stat`
+<a href=#33 id=33 data-nosnippet>33</a>//! over [`SAMPLE_WINDOW`] and draws uniformly from the ones that were idle, or,
+<a href=#34 id=34 data-nosnippet>34</a>//! when none was, from the least busy.
+<a href=#35 id=35 data-nosnippet>35</a>//!
+<a href=#36 id=36 data-nosnippet>36</a>//! A sample alone cannot keep concurrent runs apart. Runs that sample at the
+<a href=#37 id=37 data-nosnippet>37</a>//! same moment draw from the same candidates: every idle CPU while there are
+<a href=#38 id=38 data-nosnippet>38</a>//! some (three runs among eight idle CPUs share one 34% of the time), but
+<a href=#39 id=39 data-nosnippet>39</a>//! often a single CPU when there are none, since at 10 ms ticks the least busy
+<a href=#40 id=40 data-nosnippet>40</a>//! fraction is rarely tied. And a run whose guest mostly waits leaves its CPU
+<a href=#41 id=41 data-nosnippet>41</a>//! looking idle to a later run's sample. Two runs on one CPU take turns at
+<a href=#42 id=42 data-nosnippet>42</a>//! every ptrace stop: two copies of a 40,000-syscall guest pinned to one core
+<a href=#43 id=43 data-nosnippet>43</a>//! took 260 s each, against 27 s on two cores. So a run also reserves its CPU
+<a href=#44 id=44 data-nosnippet>44</a>//! for its lifetime (`reserve`): an abstract Unix socket named after the CPU,
+<a href=#45 id=45 data-nosnippet>45</a>//! which the kernel lets one socket in a network namespace hold
+<a href=#46 id=46 data-nosnippet>46</a>//! (`unix_bind_abstract`, net/unix/af_unix.c) and releases when the last
+<a href=#47 id=47 data-nosnippet>47</a>//! descriptor for it closes: when Hermit and its container init, which holds
+<a href=#48 id=48 data-nosnippet>48</a>//! a copy and dies with Hermit, have exited, however they exit. A CPU another
+<a href=#49 id=49 data-nosnippet>49</a>//! run holds is passed over for the next draw from the same sample, and only
+<a href=#50 id=50 data-nosnippet>50</a>//! when every allowed CPU is held does a run share one: the CPU it drew
+<a href=#51 id=51 data-nosnippet>51</a>//! first. Sharing costs speed, never determinism. Runs in different network
+<a href=#52 id=52 data-nosnippet>52</a>//! namespaces do not see each other's reservations.
+<a href=#53 id=53 data-nosnippet>53</a>//!
+<a href=#54 id=54 data-nosnippet>54</a>//! A process holds one reservation at a time (`HELD`). Its later runs (the
+<a href=#55 id=55 data-nosnippet>55</a>//! second run of a `--verify` pair, `analyze` trials) sample again, count the
+<a href=#56 id=56 data-nosnippet>56</a>//! CPU the process holds as free rather than as another run's, and move the
+<a href=#57 id=57 data-nosnippet>57</a>//! reservation when they draw a different CPU.
+<a href=#58 id=58 data-nosnippet>58</a>//!
+<a href=#59 id=59 data-nosnippet>59</a>//! Among the candidates, a run passes over the CPUs a PMU is bound to while
+<a href=#60 id=60 data-nosnippet>60</a>//! any other candidate remains. Some PMUs open their events on a few CPUs,
+<a href=#61 id=61 data-nosnippet>61</a>//! named by `/sys/bus/event_source/devices/&lt;pmu&gt;/cpumask` (on AMD, `amd_l3`
+<a href=#62 id=62 data-nosnippet>62</a>//! on one CPU per L3 and `amd_df` and `amd_umc` on CPU 0), and ptrace stops
+<a href=#63 id=63 data-nosnippet>63</a>//! cost several times as much CPU there
+<a href=#64 id=64 data-nosnippet>64</a>//! (&lt;https://github.com/rrnewton/hermit/issues/3265&gt;: 7.6-7.9x for a
+<a href=#65 id=65 data-nosnippet>65</a>//! ptrace-stop-heavy cell; 2.5x for the epoll verify above on CPU 0). Because
+<a href=#66 id=66 data-nosnippet>66</a>//! validation and `bin/safehermit` keep runs off those CPUs, they are often
+<a href=#67 id=67 data-nosnippet>67</a>//! idle, and an idle draw would otherwise favour them. The set is derived as
+<a href=#68 id=68 data-nosnippet>68</a>//! the validation launcher derives the CPUs it excludes: the union of every
+<a href=#69 id=69 data-nosnippet>69</a>//! PMU `cpumask` that names at most a quarter of the online CPUs, since a
+<a href=#70 id=70 data-nosnippet>70</a>//! wider one belongs to a per-core PMU. Where the launcher would skip a PMU
+<a href=#71 id=71 data-nosnippet>71</a>//! entry or cpumask that is not what sysfs presents, this passes nothing over.
+<a href=#72 id=72 data-nosnippet>72</a>//!
+<a href=#73 id=73 data-nosnippet>73</a>//! Not handled: a CPU-bound task that reaches the CPU after the sample (load
+<a href=#74 id=74 data-nosnippet>74</a>//! balancing moves one there, or a job starts or pins itself there) still
+<a href=#75 id=75 data-nosnippet>75</a>//! slows the run for the rest of its life, and nothing reports it. Moving the
+<a href=#76 id=76 data-nosnippet>76</a>//! run then would migrate its guest threads, which is what pinning exists to
+<a href=#77 id=77 data-nosnippet>77</a>//! prevent. Nor can a sample tell a CPU-bound task from the run's own
+<a href=#78 id=78 data-nosnippet>78</a>//! launcher: with few allowed CPUs, the launcher can keep the only other CPU
+<a href=#79 id=79 data-nosnippet>79</a>//! busy for the whole window too, and the draw then takes either.
+<a href=#80 id=80 data-nosnippet>80</a>//!
+<a href=#81 id=81 data-nosnippet>81</a>//! The choice is host placement only, and it was already a random draw per
+<a href=#82 id=82 data-nosnippet>82</a>//! run. The guest sees its own virtual CPU through getcpu, sched_getaffinity,
+<a href=#83 id=83 data-nosnippet>83</a>//! `/proc/self/status` and RDTSCP's TSC_AUX. As before, only a guest that
+<a href=#84 id=84 data-nosnippet>84</a>//! executes RDPID although CPUID hides it, or that uses rseq under the
+<a href=#85 id=85 data-nosnippet>85</a>//! compatibility opt-out, can read the host CPU number.
+<a href=#86 id=86 data-nosnippet>86</a>
+<a href=#87 id=87 data-nosnippet>87</a></span><span class="kw">use </span>std::collections::BTreeMap;
+<a href=#88 id=88 data-nosnippet>88</a><span class="kw">use </span>std::collections::BTreeSet;
+<a href=#89 id=89 data-nosnippet>89</a><span class="kw">use </span>std::fmt;
+<a href=#90 id=90 data-nosnippet>90</a><span class="kw">use </span>std::fs;
+<a href=#91 id=91 data-nosnippet>91</a><span class="kw">use </span>std::io;
+<a href=#92 id=92 data-nosnippet>92</a><span class="kw">use </span>std::os::fd::AsRawFd;
+<a href=#93 id=93 data-nosnippet>93</a><span class="kw">use </span>std::os::fd::FromRawFd;
+<a href=#94 id=94 data-nosnippet>94</a><span class="kw">use </span>std::os::fd::OwnedFd;
+<a href=#95 id=95 data-nosnippet>95</a><span class="kw">use </span>std::path::Path;
+<a href=#96 id=96 data-nosnippet>96</a><span class="kw">use </span>std::sync::Mutex;
+<a href=#97 id=97 data-nosnippet>97</a><span class="kw">use </span>std::thread;
+<a href=#98 id=98 data-nosnippet>98</a><span class="kw">use </span>std::time::Duration;
+<a href=#99 id=99 data-nosnippet>99</a>
+<a href=#100 id=100 data-nosnippet>100</a><span class="doccomment">/// How long the allowed CPUs' busy time is sampled before a run takes one.
+<a href=#101 id=101 data-nosnippet>101</a>/// `/proc/stat` counts in 1/USER_HZ ticks, 10 ms on Linux, so this is about
+<a href=#102 id=102 data-nosnippet>102</a>/// five ticks per CPU. A CPU that was busy for 10 ms or more of the window
+<a href=#103 id=103 data-nosnippet>103</a>/// shows at least one busy tick, so a CPU-bound task is always seen; the
+<a href=#104 id=104 data-nosnippet>104</a>/// window is long enough that one which runs half of every 100 ms is too.
+<a href=#105 id=105 data-nosnippet>105</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">const </span>SAMPLE_WINDOW: Duration = Duration::from_millis(<span class="number">50</span>);
+<a href=#106 id=106 data-nosnippet>106</a>
+<a href=#107 id=107 data-nosnippet>107</a><span class="doccomment">/// A CPU is idle when at most this fraction of the sample was busy, expressed
+<a href=#108 id=108 data-nosnippet>108</a>/// as a denominator: one tick in five. Each read rounds to whole ticks, so an
+<a href=#109 id=109 data-nosnippet>109</a>/// idle CPU can show one busy tick, while a CPU-bound task shows four or five.
+<a href=#110 id=110 data-nosnippet>110</a></span><span class="kw">const </span>IDLE_DENOMINATOR: u64 = <span class="number">5</span>;
+<a href=#111 id=111 data-nosnippet>111</a>
+<a href=#112 id=112 data-nosnippet>112</a><span class="doccomment">/// The widest PMU `cpumask` that still counts as bound to a few CPUs, as a
+<a href=#113 id=113 data-nosnippet>113</a>/// share of the online CPUs: one quarter, the validation launcher's rule
+<a href=#114 id=114 data-nosnippet>114</a>/// (ci-hub/validate/cpu_placement.py in dev-hermit). A wider mask, such as
+<a href=#115 id=115 data-nosnippet>115</a>/// `power_core=0-157` on a 316-CPU host, belongs to a per-core PMU.
+<a href=#116 id=116 data-nosnippet>116</a></span><span class="kw">const </span>PMU_BOUND_SHARE_DENOMINATOR: usize = <span class="number">4</span>;
+<a href=#117 id=117 data-nosnippet>117</a>
+<a href=#118 id=118 data-nosnippet>118</a><span class="doccomment">/// The highest CPU number Linux allows (CONFIG_NR_CPUS is at most 8192). A
+<a href=#119 id=119 data-nosnippet>119</a>/// CPU list naming a higher one is malformed, and is refused before its range
+<a href=#120 id=120 data-nosnippet>120</a>/// is expanded.
+<a href=#121 id=121 data-nosnippet>121</a></span><span class="kw">const </span>MAX_CPU_NUMBER: usize = <span class="number">8191</span>;
+<a href=#122 id=122 data-nosnippet>122</a>
+<a href=#123 id=123 data-nosnippet>123</a><span class="doccomment">/// One CPU's cumulative time from `/proc/stat`, in USER_HZ ticks.
+<a href=#124 id=124 data-nosnippet>124</a></span><span class="attr">#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+<a href=#125 id=125 data-nosnippet>125</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">struct </span>CpuTime {
+<a href=#126 id=126 data-nosnippet>126</a>    <span class="doccomment">/// idle plus iowait.
+<a href=#127 id=127 data-nosnippet>127</a>    </span>idle: u64,
+<a href=#128 id=128 data-nosnippet>128</a>    <span class="doccomment">/// user, nice, system, idle, iowait, irq, softirq and steal. The guest
+<a href=#129 id=129 data-nosnippet>129</a>    /// columns are already counted in user and nice, so they are not added.
+<a href=#130 id=130 data-nosnippet>130</a>    </span>total: u64,
+<a href=#131 id=131 data-nosnippet>131</a>}
+<a href=#132 id=132 data-nosnippet>132</a>
+<a href=#133 id=133 data-nosnippet>133</a><span class="doccomment">/// Per-CPU times from one reading of `/proc/stat`.
+<a href=#134 id=134 data-nosnippet>134</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">type </span>Reading = BTreeMap&lt;usize, CpuTime&gt;;
+<a href=#135 id=135 data-nosnippet>135</a>
+<a href=#136 id=136 data-nosnippet>136</a><span class="doccomment">/// What a run's choice is made from.
+<a href=#137 id=137 data-nosnippet>137</a></span><span class="attr">#[derive(Clone, Debug)]
+<a href=#138 id=138 data-nosnippet>138</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">struct </span>Observation {
+<a href=#139 id=139 data-nosnippet>139</a>    <span class="doccomment">/// `/proc/stat` before [`SAMPLE_WINDOW`].
+<a href=#140 id=140 data-nosnippet>140</a>    </span><span class="kw">pub</span>(<span class="kw">crate</span>) before: Reading,
+<a href=#141 id=141 data-nosnippet>141</a>    <span class="doccomment">/// `/proc/stat` after it.
+<a href=#142 id=142 data-nosnippet>142</a>    </span><span class="kw">pub</span>(<span class="kw">crate</span>) after: Reading,
+<a href=#143 id=143 data-nosnippet>143</a>    <span class="doccomment">/// The CPUs a PMU is bound to (see the module documentation).
+<a href=#144 id=144 data-nosnippet>144</a>    </span><span class="kw">pub</span>(<span class="kw">crate</span>) pmu_bound: BTreeSet&lt;usize&gt;,
+<a href=#145 id=145 data-nosnippet>145</a>}
+<a href=#146 id=146 data-nosnippet>146</a>
+<a href=#147 id=147 data-nosnippet>147</a><span class="doccomment">/// How the CPUs a PMU is bound to figured in a draw.
+<a href=#148 id=148 data-nosnippet>148</a></span><span class="attr">#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+<a href=#149 id=149 data-nosnippet>149</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">enum </span>Pmu {
+<a href=#150 id=150 data-nosnippet>150</a>    <span class="doccomment">/// No candidate was PMU-bound.
+<a href=#151 id=151 data-nosnippet>151</a>    </span>NoneBound,
+<a href=#152 id=152 data-nosnippet>152</a>    <span class="doccomment">/// This many PMU-bound candidates were passed over for the others.
+<a href=#153 id=153 data-nosnippet>153</a>    </span>PassedOver(usize),
+<a href=#154 id=154 data-nosnippet>154</a>    <span class="doccomment">/// Every candidate was PMU-bound, so the run takes one of them.
+<a href=#155 id=155 data-nosnippet>155</a>    </span>AllBound,
+<a href=#156 id=156 data-nosnippet>156</a>}
+<a href=#157 id=157 data-nosnippet>157</a>
+<a href=#158 id=158 data-nosnippet>158</a><span class="doccomment">/// Why a run got the CPU it got, for the log line that names it.
+<a href=#159 id=159 data-nosnippet>159</a></span><span class="attr">#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+<a href=#160 id=160 data-nosnippet>160</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">enum </span>Basis {
+<a href=#161 id=161 data-nosnippet>161</a>    <span class="doccomment">/// The allowed set has one CPU.
+<a href=#162 id=162 data-nosnippet>162</a>    </span>OnlyAllowed,
+<a href=#163 id=163 data-nosnippet>163</a>    <span class="doccomment">/// Drawn from `candidates` of the `sampled` allowed CPUs, all idle across
+<a href=#164 id=164 data-nosnippet>164</a>    /// the sample.
+<a href=#165 id=165 data-nosnippet>165</a>    </span>Idle {
+<a href=#166 id=166 data-nosnippet>166</a>        candidates: usize,
+<a href=#167 id=167 data-nosnippet>167</a>        sampled: usize,
+<a href=#168 id=168 data-nosnippet>168</a>        pmu: Pmu,
+<a href=#169 id=169 data-nosnippet>169</a>    },
+<a href=#170 id=170 data-nosnippet>170</a>    <span class="doccomment">/// No sampled CPU was idle: drawn from the `candidates` least busy (ties
+<a href=#171 id=171 data-nosnippet>171</a>    /// all kept).
+<a href=#172 id=172 data-nosnippet>172</a>    </span>LeastBusy {
+<a href=#173 id=173 data-nosnippet>173</a>        candidates: usize,
+<a href=#174 id=174 data-nosnippet>174</a>        sampled: usize,
+<a href=#175 id=175 data-nosnippet>175</a>        pmu: Pmu,
+<a href=#176 id=176 data-nosnippet>176</a>    },
+<a href=#177 id=177 data-nosnippet>177</a>    <span class="doccomment">/// `/proc/stat` was unreadable or covered none of the allowed CPUs: drawn
+<a href=#178 id=178 data-nosnippet>178</a>    /// from every allowed CPU.
+<a href=#179 id=179 data-nosnippet>179</a>    </span>Unsampled,
+<a href=#180 id=180 data-nosnippet>180</a>}
+<a href=#181 id=181 data-nosnippet>181</a>
+<a href=#182 id=182 data-nosnippet>182</a><span class="kw">impl </span>fmt::Display <span class="kw">for </span>Pmu {
+<a href=#183 id=183 data-nosnippet>183</a>    <span class="kw">fn </span>fmt(<span class="kw-2">&amp;</span><span class="self">self</span>, f: <span class="kw-2">&amp;mut </span>fmt::Formatter&lt;<span class="lifetime">'_</span>&gt;) -&gt; fmt::Result {
+<a href=#184 id=184 data-nosnippet>184</a>        <span class="kw">match </span><span class="self">self </span>{
+<a href=#185 id=185 data-nosnippet>185</a>            Pmu::NoneBound =&gt; <span class="macro">write!</span>(f, <span class="string">"none PMU-bound"</span>),
+<a href=#186 id=186 data-nosnippet>186</a>            Pmu::PassedOver(count) =&gt; <span class="macro">write!</span>(f, <span class="string">"passing over {count} PMU-bound"</span>),
+<a href=#187 id=187 data-nosnippet>187</a>            Pmu::AllBound =&gt; <span class="macro">write!</span>(f, <span class="string">"all of them PMU-bound"</span>),
+<a href=#188 id=188 data-nosnippet>188</a>        }
+<a href=#189 id=189 data-nosnippet>189</a>    }
+<a href=#190 id=190 data-nosnippet>190</a>}
+<a href=#191 id=191 data-nosnippet>191</a>
+<a href=#192 id=192 data-nosnippet>192</a><span class="kw">impl </span>fmt::Display <span class="kw">for </span>Basis {
+<a href=#193 id=193 data-nosnippet>193</a>    <span class="kw">fn </span>fmt(<span class="kw-2">&amp;</span><span class="self">self</span>, f: <span class="kw-2">&amp;mut </span>fmt::Formatter&lt;<span class="lifetime">'_</span>&gt;) -&gt; fmt::Result {
+<a href=#194 id=194 data-nosnippet>194</a>        <span class="kw">let </span>window = SAMPLE_WINDOW.as_millis();
+<a href=#195 id=195 data-nosnippet>195</a>        <span class="kw">match </span><span class="self">self </span>{
+<a href=#196 id=196 data-nosnippet>196</a>            Basis::OnlyAllowed =&gt; <span class="macro">write!</span>(f, <span class="string">"the only allowed CPU"</span>),
+<a href=#197 id=197 data-nosnippet>197</a>            Basis::Idle {
+<a href=#198 id=198 data-nosnippet>198</a>                candidates,
+<a href=#199 id=199 data-nosnippet>199</a>                sampled,
+<a href=#200 id=200 data-nosnippet>200</a>                pmu,
+<a href=#201 id=201 data-nosnippet>201</a>            } =&gt; <span class="macro">write!</span>(
+<a href=#202 id=202 data-nosnippet>202</a>                f,
+<a href=#203 id=203 data-nosnippet>203</a>                <span class="string">"one of {candidates} of {sampled} allowed CPUs idle over {window} ms, {pmu}"
+<a href=#204 id=204 data-nosnippet>204</a>            </span>),
+<a href=#205 id=205 data-nosnippet>205</a>            Basis::LeastBusy {
+<a href=#206 id=206 data-nosnippet>206</a>                candidates,
+<a href=#207 id=207 data-nosnippet>207</a>                sampled,
+<a href=#208 id=208 data-nosnippet>208</a>                pmu,
+<a href=#209 id=209 data-nosnippet>209</a>            } =&gt; <span class="macro">write!</span>(
+<a href=#210 id=210 data-nosnippet>210</a>                f,
+<a href=#211 id=211 data-nosnippet>211</a>                <span class="string">"none of {sampled} allowed CPUs idle over {window} ms; one of the {candidates} \
+<a href=#212 id=212 data-nosnippet>212</a>                 least busy, {pmu}"
+<a href=#213 id=213 data-nosnippet>213</a>            </span>),
+<a href=#214 id=214 data-nosnippet>214</a>            Basis::Unsampled =&gt; {
+<a href=#215 id=215 data-nosnippet>215</a>                <span class="macro">write!</span>(f, <span class="string">"drawn from every allowed CPU; /proc/stat gave no sample"</span>)
+<a href=#216 id=216 data-nosnippet>216</a>            }
+<a href=#217 id=217 data-nosnippet>217</a>        }
+<a href=#218 id=218 data-nosnippet>218</a>    }
+<a href=#219 id=219 data-nosnippet>219</a>}
+<a href=#220 id=220 data-nosnippet>220</a>
+<a href=#221 id=221 data-nosnippet>221</a><span class="doccomment">/// Choose a CPU from `allowed`, the tracer's affinity mask, with the
+<a href=#222 id=222 data-nosnippet>222</a>/// observation made by `observe`, which tests replace, and say why. `None`
+<a href=#223 id=223 data-nosnippet>223</a>/// only when `allowed` is empty. Reserves nothing: runs choose through
+<a href=#224 id=224 data-nosnippet>224</a>/// [`choose_for_run`], which draws the same way.
+<a href=#225 id=225 data-nosnippet>225</a></span><span class="attr">#[cfg(test)]
+<a href=#226 id=226 data-nosnippet>226</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>choose_with(
+<a href=#227 id=227 data-nosnippet>227</a>    allowed: <span class="kw-2">&amp;</span>[usize],
+<a href=#228 id=228 data-nosnippet>228</a>    observe: <span class="kw">impl </span>FnOnce(<span class="kw-2">&amp;</span>[usize]) -&gt; <span class="prelude-ty">Option</span>&lt;Observation&gt;,
+<a href=#229 id=229 data-nosnippet>229</a>) -&gt; <span class="prelude-ty">Option</span>&lt;(usize, Basis)&gt; {
+<a href=#230 id=230 data-nosnippet>230</a>    <span class="kw">match </span>allowed {
+<a href=#231 id=231 data-nosnippet>231</a>        [] =&gt; <span class="prelude-val">None</span>,
+<a href=#232 id=232 data-nosnippet>232</a>        [only] =&gt; <span class="prelude-val">Some</span>((<span class="kw-2">*</span>only, Basis::OnlyAllowed)),
+<a href=#233 id=233 data-nosnippet>233</a>        <span class="kw">_ </span>=&gt; <span class="prelude-val">Some</span>(draw(allowed, observe(allowed).as_ref())),
+<a href=#234 id=234 data-nosnippet>234</a>    }
+<a href=#235 id=235 data-nosnippet>235</a>}
+<a href=#236 id=236 data-nosnippet>236</a>
+<a href=#237 id=237 data-nosnippet>237</a><span class="doccomment">/// One draw from `pool`, two or more CPUs: from its candidates under
+<a href=#238 id=238 data-nosnippet>238</a>/// `observation`, or from all of it without one.
+<a href=#239 id=239 data-nosnippet>239</a></span><span class="kw">fn </span>draw(pool: <span class="kw-2">&amp;</span>[usize], observation: <span class="prelude-ty">Option</span>&lt;<span class="kw-2">&amp;</span>Observation&gt;) -&gt; (usize, Basis) {
+<a href=#240 id=240 data-nosnippet>240</a>    <span class="kw">let </span>(candidates, basis) = observation
+<a href=#241 id=241 data-nosnippet>241</a>        .and_then(|observation| candidates(pool, observation))
+<a href=#242 id=242 data-nosnippet>242</a>        .unwrap_or_else(|| (pool.to_vec(), Basis::Unsampled));
+<a href=#243 id=243 data-nosnippet>243</a>    (candidates[rand::random_range(<span class="number">0</span>..candidates.len())], basis)
+<a href=#244 id=244 data-nosnippet>244</a>}
+<a href=#245 id=245 data-nosnippet>245</a>
+<a href=#246 id=246 data-nosnippet>246</a><span class="doccomment">/// The prefix of the abstract socket names that reserve a CPU
+<a href=#247 id=247 data-nosnippet>247</a>/// (`hermit-pinned-core:&lt;cpu&gt;`, [`reserve`]).
+<a href=#248 id=248 data-nosnippet>248</a></span><span class="kw">const </span>RESERVATION_PREFIX: <span class="kw-2">&amp;</span>str = <span class="string">"hermit-pinned-core"</span>;
+<a href=#249 id=249 data-nosnippet>249</a>
+<a href=#250 id=250 data-nosnippet>250</a><span class="doccomment">/// The lowest descriptor number a reservation is moved to, so that taking one
+<a href=#251 id=251 data-nosnippet>251</a>/// does not shift the numbers of the descriptors Hermit opens after it, some
+<a href=#252 id=252 data-nosnippet>252</a>/// of which reach the guest's setup.
+<a href=#253 id=253 data-nosnippet>253</a></span><span class="kw">const </span>RESERVATION_FD_FLOOR: libc::c_int = <span class="number">1000</span>;
+<a href=#254 id=254 data-nosnippet>254</a>
+<a href=#255 id=255 data-nosnippet>255</a><span class="doccomment">/// The reservation this process holds: its CPU and the descriptor that holds
+<a href=#256 id=256 data-nosnippet>256</a>/// its name. A later run of the same process (a `--verify` pair runs twice)
+<a href=#257 id=257 data-nosnippet>257</a>/// counts that CPU as free, and replacing the reservation closes the old
+<a href=#258 id=258 data-nosnippet>258</a>/// descriptor, so a process never holds a CPU it moved away from. Runs one
+<a href=#259 id=259 data-nosnippet>259</a>/// process makes at the same time (test threads, say) may draw its CPU too.
+<a href=#260 id=260 data-nosnippet>260</a></span><span class="kw">static </span>HELD: Mutex&lt;<span class="prelude-ty">Option</span>&lt;(usize, OwnedFd)&gt;&gt; = Mutex::new(<span class="prelude-val">None</span>);
+<a href=#261 id=261 data-nosnippet>261</a>
+<a href=#262 id=262 data-nosnippet>262</a><span class="doccomment">/// How a run holds its CPU against other Hermit runs.
+<a href=#263 id=263 data-nosnippet>263</a></span><span class="attr">#[derive(Clone, Debug, PartialEq, Eq)]
+<a href=#264 id=264 data-nosnippet>264</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">enum </span>Hold {
+<a href=#265 id=265 data-nosnippet>265</a>    <span class="doccomment">/// This process holds the CPU: no other Hermit run in this network
+<a href=#266 id=266 data-nosnippet>266</a>    /// namespace is pinned to it. `passed_over` CPUs other runs hold were
+<a href=#267 id=267 data-nosnippet>267</a>    /// passed over first.
+<a href=#268 id=268 data-nosnippet>268</a>    </span>Reserved { passed_over: usize },
+<a href=#269 id=269 data-nosnippet>269</a>    <span class="doccomment">/// This process already held the CPU, for an earlier run, and keeps it.
+<a href=#270 id=270 data-nosnippet>270</a>    </span>Kept,
+<a href=#271 id=271 data-nosnippet>271</a>    <span class="doccomment">/// Every allowed CPU is held by another Hermit run, so this run shares
+<a href=#272 id=272 data-nosnippet>272</a>    /// the CPU it drew first with one of them.
+<a href=#273 id=273 data-nosnippet>273</a>    </span>Shared,
+<a href=#274 id=274 data-nosnippet>274</a>    <span class="doccomment">/// A reservation could not be made (the error), so the CPU is used
+<a href=#275 id=275 data-nosnippet>275</a>    /// unreserved, and another run may share it.
+<a href=#276 id=276 data-nosnippet>276</a>    </span>Unreserved(String),
+<a href=#277 id=277 data-nosnippet>277</a>}
+<a href=#278 id=278 data-nosnippet>278</a>
+<a href=#279 id=279 data-nosnippet>279</a><span class="doccomment">/// The CPU a run is pinned to, why, and how it holds it.
+<a href=#280 id=280 data-nosnippet>280</a></span><span class="attr">#[derive(Clone, Debug, PartialEq, Eq)]
+<a href=#281 id=281 data-nosnippet>281</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">struct </span>Choice {
+<a href=#282 id=282 data-nosnippet>282</a>    <span class="kw">pub</span>(<span class="kw">crate</span>) cpu: usize,
+<a href=#283 id=283 data-nosnippet>283</a>    <span class="doccomment">/// How the CPU was drawn, over the allowed CPUs no other run was found to
+<a href=#284 id=284 data-nosnippet>284</a>    /// hold.
+<a href=#285 id=285 data-nosnippet>285</a>    </span><span class="kw">pub</span>(<span class="kw">crate</span>) basis: Basis,
+<a href=#286 id=286 data-nosnippet>286</a>    <span class="kw">pub</span>(<span class="kw">crate</span>) hold: Hold,
+<a href=#287 id=287 data-nosnippet>287</a>}
+<a href=#288 id=288 data-nosnippet>288</a>
+<a href=#289 id=289 data-nosnippet>289</a><span class="kw">impl </span>fmt::Display <span class="kw">for </span>Choice {
+<a href=#290 id=290 data-nosnippet>290</a>    <span class="kw">fn </span>fmt(<span class="kw-2">&amp;</span><span class="self">self</span>, f: <span class="kw-2">&amp;mut </span>fmt::Formatter&lt;<span class="lifetime">'_</span>&gt;) -&gt; fmt::Result {
+<a href=#291 id=291 data-nosnippet>291</a>        <span class="kw">if let </span>Hold::Reserved { passed_over } = <span class="self">self</span>.hold
+<a href=#292 id=292 data-nosnippet>292</a>            &amp;&amp; passed_over &gt; <span class="number">0
+<a href=#293 id=293 data-nosnippet>293</a>        </span>{
+<a href=#294 id=294 data-nosnippet>294</a>            <span class="macro">write!</span>(
+<a href=#295 id=295 data-nosnippet>295</a>                f,
+<a href=#296 id=296 data-nosnippet>296</a>                <span class="string">"among the allowed CPUs no other Hermit run holds ({passed_over} held): "
+<a href=#297 id=297 data-nosnippet>297</a>            </span>)<span class="question-mark">?</span>;
+<a href=#298 id=298 data-nosnippet>298</a>        }
+<a href=#299 id=299 data-nosnippet>299</a>        <span class="macro">write!</span>(f, <span class="string">"{}; "</span>, <span class="self">self</span>.basis)<span class="question-mark">?</span>;
+<a href=#300 id=300 data-nosnippet>300</a>        <span class="kw">match </span><span class="kw-2">&amp;</span><span class="self">self</span>.hold {
+<a href=#301 id=301 data-nosnippet>301</a>            Hold::Reserved { .. } =&gt; <span class="macro">write!</span>(f, <span class="string">"reserved"</span>),
+<a href=#302 id=302 data-nosnippet>302</a>            Hold::Kept =&gt; <span class="macro">write!</span>(f, <span class="string">"already reserved by this process"</span>),
+<a href=#303 id=303 data-nosnippet>303</a>            Hold::Shared =&gt; <span class="macro">write!</span>(
+<a href=#304 id=304 data-nosnippet>304</a>                f,
+<a href=#305 id=305 data-nosnippet>305</a>                <span class="string">"every allowed CPU is held by another Hermit run, so this run shares it and \
+<a href=#306 id=306 data-nosnippet>306</a>                 both run slower"
+<a href=#307 id=307 data-nosnippet>307</a>            </span>),
+<a href=#308 id=308 data-nosnippet>308</a>            Hold::Unreserved(error) =&gt; {
+<a href=#309 id=309 data-nosnippet>309</a>                <span class="macro">write!</span>(f, <span class="string">"unreserved, so another Hermit run may share it: {error}"</span>)
+<a href=#310 id=310 data-nosnippet>310</a>            }
+<a href=#311 id=311 data-nosnippet>311</a>        }
+<a href=#312 id=312 data-nosnippet>312</a>    }
+<a href=#313 id=313 data-nosnippet>313</a>}
+<a href=#314 id=314 data-nosnippet>314</a>
+<a href=#315 id=315 data-nosnippet>315</a><span class="doccomment">/// Choose and reserve the CPU this run is pinned to from `allowed`, the
+<a href=#316 id=316 data-nosnippet>316</a>/// tracer's affinity mask, over a fresh sample, counting the CPU this process
+<a href=#317 id=317 data-nosnippet>317</a>/// already holds as free. `None` only when `allowed` is empty.
+<a href=#318 id=318 data-nosnippet>318</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>choose_for_run(allowed: <span class="kw-2">&amp;</span>[usize]) -&gt; <span class="prelude-ty">Option</span>&lt;Choice&gt; {
+<a href=#319 id=319 data-nosnippet>319</a>    <span class="kw">let </span><span class="kw-2">mut </span>held = HELD.lock().unwrap_or_else(|poison| poison.into_inner());
+<a href=#320 id=320 data-nosnippet>320</a>    choose_for_run_with(allowed, observe, <span class="kw-2">&amp;mut </span>held, |cpu| {
+<a href=#321 id=321 data-nosnippet>321</a>        reserve(RESERVATION_PREFIX, cpu)
+<a href=#322 id=322 data-nosnippet>322</a>    })
+<a href=#323 id=323 data-nosnippet>323</a>}
+<a href=#324 id=324 data-nosnippet>324</a>
+<a href=#325 id=325 data-nosnippet>325</a><span class="doccomment">/// [`choose_for_run`] with the observation, the process's reservation and
+<a href=#326 id=326 data-nosnippet>326</a>/// the reservation call supplied, which tests replace. `reserve` answers the
+<a href=#327 id=327 data-nosnippet>327</a>/// descriptor that now holds a CPU, or `None` when another run holds it.
+<a href=#328 id=328 data-nosnippet>328</a>/// A run that reserves a different CPU replaces `held`, closing the old
+<a href=#329 id=329 data-nosnippet>329</a>/// descriptor; a run that shares or goes unreserved leaves `held` empty, since
+<a href=#330 id=330 data-nosnippet>330</a>/// the process no longer runs on the CPU it held.
+<a href=#331 id=331 data-nosnippet>331</a></span><span class="kw">fn </span>choose_for_run_with(
+<a href=#332 id=332 data-nosnippet>332</a>    allowed: <span class="kw-2">&amp;</span>[usize],
+<a href=#333 id=333 data-nosnippet>333</a>    observe: <span class="kw">impl </span>FnOnce(<span class="kw-2">&amp;</span>[usize]) -&gt; <span class="prelude-ty">Option</span>&lt;Observation&gt;,
+<a href=#334 id=334 data-nosnippet>334</a>    held: <span class="kw-2">&amp;mut </span><span class="prelude-ty">Option</span>&lt;(usize, OwnedFd)&gt;,
+<a href=#335 id=335 data-nosnippet>335</a>    <span class="kw-2">mut </span>reserve: <span class="kw">impl </span>FnMut(usize) -&gt; io::Result&lt;<span class="prelude-ty">Option</span>&lt;OwnedFd&gt;&gt;,
+<a href=#336 id=336 data-nosnippet>336</a>) -&gt; <span class="prelude-ty">Option</span>&lt;Choice&gt; {
+<a href=#337 id=337 data-nosnippet>337</a>    <span class="kw">let </span>own = held.as_ref().map(|(cpu, <span class="kw">_</span>)| <span class="kw-2">*</span>cpu);
+<a href=#338 id=338 data-nosnippet>338</a>    <span class="kw">let </span><span class="kw-2">mut </span>taken = <span class="prelude-val">None</span>;
+<a href=#339 id=339 data-nosnippet>339</a>    <span class="kw">let </span><span class="kw-2">mut </span>choice = choose_reserving(allowed, observe, |cpu| {
+<a href=#340 id=340 data-nosnippet>340</a>        <span class="kw">if </span><span class="prelude-val">Some</span>(cpu) == own {
+<a href=#341 id=341 data-nosnippet>341</a>            <span class="kw">return </span><span class="prelude-val">Ok</span>(<span class="bool-val">true</span>);
+<a href=#342 id=342 data-nosnippet>342</a>        }
+<a href=#343 id=343 data-nosnippet>343</a>        <span class="prelude-val">Ok</span>(reserve(cpu)<span class="question-mark">?</span>.map(|fd| taken = <span class="prelude-val">Some</span>((cpu, fd))).is_some())
+<a href=#344 id=344 data-nosnippet>344</a>    })<span class="question-mark">?</span>;
+<a href=#345 id=345 data-nosnippet>345</a>    <span class="kw">match </span>(<span class="kw-2">&amp;</span>choice.hold, taken) {
+<a href=#346 id=346 data-nosnippet>346</a>        (Hold::Reserved { .. }, <span class="prelude-val">Some</span>(new)) =&gt; <span class="kw-2">*</span>held = <span class="prelude-val">Some</span>(new),
+<a href=#347 id=347 data-nosnippet>347</a>        (Hold::Reserved { .. }, <span class="prelude-val">None</span>) =&gt; choice.hold = Hold::Kept,
+<a href=#348 id=348 data-nosnippet>348</a>        <span class="kw">_ </span>=&gt; <span class="kw-2">*</span>held = <span class="prelude-val">None</span>,
+<a href=#349 id=349 data-nosnippet>349</a>    }
+<a href=#350 id=350 data-nosnippet>350</a>    <span class="prelude-val">Some</span>(choice)
+<a href=#351 id=351 data-nosnippet>351</a>}
+<a href=#352 id=352 data-nosnippet>352</a>
+<a href=#353 id=353 data-nosnippet>353</a><span class="doccomment">/// [`choose_with`], passing over the CPUs other Hermit runs hold. `reserve`
+<a href=#354 id=354 data-nosnippet>354</a>/// takes a CPU for this run: `Ok(true)` when the run now holds it, `Ok(false)`
+<a href=#355 id=355 data-nosnippet>355</a>/// when another run does, and an error when reservations cannot be made at
+<a href=#356 id=356 data-nosnippet>356</a>/// all. Every draw uses the one observation: it is [`choose_with`]'s draw over
+<a href=#357 id=357 data-nosnippet>357</a>/// the allowed CPUs not yet found held, so a run passes a held idle CPU over
+<a href=#358 id=358 data-nosnippet>358</a>/// for another idle one, and then for the least busy free one. With every CPU
+<a href=#359 id=359 data-nosnippet>359</a>/// held, the run shares the CPU it drew first.
+<a href=#360 id=360 data-nosnippet>360</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>choose_reserving(
+<a href=#361 id=361 data-nosnippet>361</a>    allowed: <span class="kw-2">&amp;</span>[usize],
+<a href=#362 id=362 data-nosnippet>362</a>    observe: <span class="kw">impl </span>FnOnce(<span class="kw-2">&amp;</span>[usize]) -&gt; <span class="prelude-ty">Option</span>&lt;Observation&gt;,
+<a href=#363 id=363 data-nosnippet>363</a>    <span class="kw-2">mut </span>reserve: <span class="kw">impl </span>FnMut(usize) -&gt; io::Result&lt;bool&gt;,
+<a href=#364 id=364 data-nosnippet>364</a>) -&gt; <span class="prelude-ty">Option</span>&lt;Choice&gt; {
+<a href=#365 id=365 data-nosnippet>365</a>    <span class="kw">let </span>observation = <span class="kw">match </span>allowed {
+<a href=#366 id=366 data-nosnippet>366</a>        [] =&gt; <span class="kw">return </span><span class="prelude-val">None</span>,
+<a href=#367 id=367 data-nosnippet>367</a>        [<span class="kw">_</span>] =&gt; <span class="prelude-val">None</span>,
+<a href=#368 id=368 data-nosnippet>368</a>        <span class="kw">_ </span>=&gt; observe(allowed),
+<a href=#369 id=369 data-nosnippet>369</a>    };
+<a href=#370 id=370 data-nosnippet>370</a>    <span class="kw">let </span><span class="kw-2">mut </span>free = allowed.to_vec();
+<a href=#371 id=371 data-nosnippet>371</a>    <span class="kw">let </span><span class="kw-2">mut </span>first = <span class="prelude-val">None</span>;
+<a href=#372 id=372 data-nosnippet>372</a>    <span class="kw">loop </span>{
+<a href=#373 id=373 data-nosnippet>373</a>        <span class="kw">let </span>(cpu, basis) = <span class="kw">match </span>allowed {
+<a href=#374 id=374 data-nosnippet>374</a>            [only] =&gt; (<span class="kw-2">*</span>only, Basis::OnlyAllowed),
+<a href=#375 id=375 data-nosnippet>375</a>            <span class="kw">_ </span>=&gt; draw(<span class="kw-2">&amp;</span>free, observation.as_ref()),
+<a href=#376 id=376 data-nosnippet>376</a>        };
+<a href=#377 id=377 data-nosnippet>377</a>        <span class="kw">let </span>first = <span class="kw-2">*</span>first.get_or_insert((cpu, basis));
+<a href=#378 id=378 data-nosnippet>378</a>        <span class="kw">let </span>hold = <span class="kw">match </span>reserve(cpu) {
+<a href=#379 id=379 data-nosnippet>379</a>            <span class="prelude-val">Ok</span>(<span class="bool-val">true</span>) =&gt; Hold::Reserved {
+<a href=#380 id=380 data-nosnippet>380</a>                passed_over: allowed.len() - free.len(),
+<a href=#381 id=381 data-nosnippet>381</a>            },
+<a href=#382 id=382 data-nosnippet>382</a>            <span class="prelude-val">Ok</span>(<span class="bool-val">false</span>) =&gt; {
+<a href=#383 id=383 data-nosnippet>383</a>                free.retain(|other| <span class="kw-2">*</span>other != cpu);
+<a href=#384 id=384 data-nosnippet>384</a>                <span class="kw">if </span>!free.is_empty() {
+<a href=#385 id=385 data-nosnippet>385</a>                    <span class="kw">continue</span>;
+<a href=#386 id=386 data-nosnippet>386</a>                }
+<a href=#387 id=387 data-nosnippet>387</a>                <span class="kw">return </span><span class="prelude-val">Some</span>(Choice {
+<a href=#388 id=388 data-nosnippet>388</a>                    cpu: first.<span class="number">0</span>,
+<a href=#389 id=389 data-nosnippet>389</a>                    basis: first.<span class="number">1</span>,
+<a href=#390 id=390 data-nosnippet>390</a>                    hold: Hold::Shared,
+<a href=#391 id=391 data-nosnippet>391</a>                });
+<a href=#392 id=392 data-nosnippet>392</a>            }
+<a href=#393 id=393 data-nosnippet>393</a>            <span class="prelude-val">Err</span>(error) =&gt; Hold::Unreserved(error.to_string()),
+<a href=#394 id=394 data-nosnippet>394</a>        };
+<a href=#395 id=395 data-nosnippet>395</a>        <span class="kw">return </span><span class="prelude-val">Some</span>(Choice { cpu, basis, hold });
+<a href=#396 id=396 data-nosnippet>396</a>    }
+<a href=#397 id=397 data-nosnippet>397</a>}
+<a href=#398 id=398 data-nosnippet>398</a>
+<a href=#399 id=399 data-nosnippet>399</a><span class="doccomment">/// Hold `cpu` while the returned descriptor is open: an abstract Unix socket
+<a href=#400 id=400 data-nosnippet>400</a>/// named `&lt;prefix&gt;:&lt;cpu&gt;`, bound close-on-exec, which the kernel releases when
+<a href=#401 id=401 data-nosnippet>401</a>/// its last descriptor closes, at the latest when Hermit exits. Another run
+<a href=#402 id=402 data-nosnippet>402</a>/// that binds the same name gets `EADDRINUSE`, answered as `Ok(None)`. The
+<a href=#403 id=403 data-nosnippet>403</a>/// names belong to a network namespace: runs in different ones do not see
+<a href=#404 id=404 data-nosnippet>404</a>/// each other's CPUs.
+<a href=#405 id=405 data-nosnippet>405</a></span><span class="kw">fn </span>reserve(prefix: <span class="kw-2">&amp;</span>str, cpu: usize) -&gt; io::Result&lt;<span class="prelude-ty">Option</span>&lt;OwnedFd&gt;&gt; {
+<a href=#406 id=406 data-nosnippet>406</a>    <span class="kw">use </span>std::os::linux::net::SocketAddrExt;
+<a href=#407 id=407 data-nosnippet>407</a>    <span class="kw">let </span>name = <span class="macro">format!</span>(<span class="string">"{prefix}:{cpu}"</span>);
+<a href=#408 id=408 data-nosnippet>408</a>    <span class="kw">let </span>address = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())<span class="question-mark">?</span>;
+<a href=#409 id=409 data-nosnippet>409</a>    <span class="kw">let </span>socket = <span class="kw">match </span>std::os::unix::net::UnixDatagram::bind_addr(<span class="kw-2">&amp;</span>address) {
+<a href=#410 id=410 data-nosnippet>410</a>        <span class="prelude-val">Ok</span>(socket) =&gt; socket,
+<a href=#411 id=411 data-nosnippet>411</a>        <span class="prelude-val">Err</span>(error) <span class="kw">if </span>error.raw_os_error() == <span class="prelude-val">Some</span>(libc::EADDRINUSE) =&gt; <span class="kw">return </span><span class="prelude-val">Ok</span>(<span class="prelude-val">None</span>),
+<a href=#412 id=412 data-nosnippet>412</a>        <span class="prelude-val">Err</span>(error) =&gt; <span class="kw">return </span><span class="prelude-val">Err</span>(error),
+<a href=#413 id=413 data-nosnippet>413</a>    };
+<a href=#414 id=414 data-nosnippet>414</a>    <span class="comment">// Keep the reservation on a high descriptor and close the low one it was
+<a href=#415 id=415 data-nosnippet>415</a>    // bound on (`RESERVATION_FD_FLOOR`).
+<a href=#416 id=416 data-nosnippet>416</a>    // SAFETY: `socket` is an open descriptor this function owns.
+<a href=#417 id=417 data-nosnippet>417</a>    </span><span class="kw">let </span>moved = <span class="kw">unsafe </span>{
+<a href=#418 id=418 data-nosnippet>418</a>        libc::fcntl(
+<a href=#419 id=419 data-nosnippet>419</a>            socket.as_raw_fd(),
+<a href=#420 id=420 data-nosnippet>420</a>            libc::F_DUPFD_CLOEXEC,
+<a href=#421 id=421 data-nosnippet>421</a>            RESERVATION_FD_FLOOR,
+<a href=#422 id=422 data-nosnippet>422</a>        )
+<a href=#423 id=423 data-nosnippet>423</a>    };
+<a href=#424 id=424 data-nosnippet>424</a>    <span class="kw">if </span>moved &lt; <span class="number">0 </span>{
+<a href=#425 id=425 data-nosnippet>425</a>        <span class="kw">return </span><span class="prelude-val">Err</span>(io::Error::last_os_error());
+<a href=#426 id=426 data-nosnippet>426</a>    }
+<a href=#427 id=427 data-nosnippet>427</a>    <span class="comment">// SAFETY: `moved` is a new descriptor nothing else owns; `socket` closes
+<a href=#428 id=428 data-nosnippet>428</a>    // its own number when it drops.
+<a href=#429 id=429 data-nosnippet>429</a>    </span><span class="prelude-val">Ok</span>(<span class="prelude-val">Some</span>(<span class="kw">unsafe </span>{ OwnedFd::from_raw_fd(moved) }))
+<a href=#430 id=430 data-nosnippet>430</a>}
+<a href=#431 id=431 data-nosnippet>431</a>
+<a href=#432 id=432 data-nosnippet>432</a><span class="doccomment">/// Two readings of `/proc/stat`, [`SAMPLE_WINDOW`] apart, and the PMU-bound
+<a href=#433 id=433 data-nosnippet>433</a>/// CPUs.
+<a href=#434 id=434 data-nosnippet>434</a></span><span class="kw">fn </span>observe(allowed: <span class="kw-2">&amp;</span>[usize]) -&gt; <span class="prelude-ty">Option</span>&lt;Observation&gt; {
+<a href=#435 id=435 data-nosnippet>435</a>    <span class="kw">let </span>read = || {
+<a href=#436 id=436 data-nosnippet>436</a>        fs::read_to_string(<span class="string">"/proc/stat"</span>)
+<a href=#437 id=437 data-nosnippet>437</a>            .map_err(|error| <span class="macro">tracing::debug!</span>(<span class="string">"cannot sample CPU load from /proc/stat: {error}"</span>))
+<a href=#438 id=438 data-nosnippet>438</a>            .ok()
+<a href=#439 id=439 data-nosnippet>439</a>            .map(|text| parse_proc_stat(<span class="kw-2">&amp;</span>text, allowed))
+<a href=#440 id=440 data-nosnippet>440</a>    };
+<a href=#441 id=441 data-nosnippet>441</a>    <span class="kw">let </span>before = read()<span class="question-mark">?</span>;
+<a href=#442 id=442 data-nosnippet>442</a>    thread::sleep(SAMPLE_WINDOW);
+<a href=#443 id=443 data-nosnippet>443</a>    <span class="kw">let </span>after = read()<span class="question-mark">?</span>;
+<a href=#444 id=444 data-nosnippet>444</a>    <span class="prelude-val">Some</span>(Observation {
+<a href=#445 id=445 data-nosnippet>445</a>        before,
+<a href=#446 id=446 data-nosnippet>446</a>        after,
+<a href=#447 id=447 data-nosnippet>447</a>        pmu_bound: pmu_bound_cpus(Path::new(<span class="string">"/sys"</span>)),
+<a href=#448 id=448 data-nosnippet>448</a>    })
+<a href=#449 id=449 data-nosnippet>449</a>}
+<a href=#450 id=450 data-nosnippet>450</a>
+<a href=#451 id=451 data-nosnippet>451</a><span class="doccomment">/// The per-CPU lines of `/proc/stat` for the CPUs in `allowed`:
+<a href=#452 id=452 data-nosnippet>452</a>/// `cpuN user nice system idle iowait irq softirq steal guest guest_nice`,
+<a href=#453 id=453 data-nosnippet>453</a>/// where kernels before 2.6.11 stop earlier. The first line, `cpu`, sums
+<a href=#454 id=454 data-nosnippet>454</a>/// every CPU and has no number, so it is skipped.
+<a href=#455 id=455 data-nosnippet>455</a></span><span class="kw">fn </span>parse_proc_stat(text: <span class="kw-2">&amp;</span>str, allowed: <span class="kw-2">&amp;</span>[usize]) -&gt; Reading {
+<a href=#456 id=456 data-nosnippet>456</a>    <span class="kw">let </span><span class="kw-2">mut </span>times = BTreeMap::new();
+<a href=#457 id=457 data-nosnippet>457</a>    <span class="kw">for </span>line <span class="kw">in </span>text.lines() {
+<a href=#458 id=458 data-nosnippet>458</a>        <span class="kw">let </span><span class="prelude-val">Some</span>(rest) = line.strip_prefix(<span class="string">"cpu"</span>) <span class="kw">else </span>{
+<a href=#459 id=459 data-nosnippet>459</a>            <span class="kw">continue</span>;
+<a href=#460 id=460 data-nosnippet>460</a>        };
+<a href=#461 id=461 data-nosnippet>461</a>        <span class="kw">if </span>!rest.starts_with(|c: char| c.is_ascii_digit()) {
+<a href=#462 id=462 data-nosnippet>462</a>            <span class="kw">continue</span>;
+<a href=#463 id=463 data-nosnippet>463</a>        }
+<a href=#464 id=464 data-nosnippet>464</a>        <span class="kw">let </span><span class="kw-2">mut </span>fields = rest.split_ascii_whitespace();
+<a href=#465 id=465 data-nosnippet>465</a>        <span class="kw">let </span><span class="prelude-val">Some</span>(<span class="prelude-val">Ok</span>(cpu)) = fields.next().map(str::parse::&lt;usize&gt;) <span class="kw">else </span>{
+<a href=#466 id=466 data-nosnippet>466</a>            <span class="kw">continue</span>;
+<a href=#467 id=467 data-nosnippet>467</a>        };
+<a href=#468 id=468 data-nosnippet>468</a>        <span class="kw">if </span>!allowed.contains(<span class="kw-2">&amp;</span>cpu) {
+<a href=#469 id=469 data-nosnippet>469</a>            <span class="kw">continue</span>;
+<a href=#470 id=470 data-nosnippet>470</a>        }
+<a href=#471 id=471 data-nosnippet>471</a>        <span class="kw">let </span>ticks: Vec&lt;u64&gt; = fields
+<a href=#472 id=472 data-nosnippet>472</a>            .take(<span class="number">8</span>)
+<a href=#473 id=473 data-nosnippet>473</a>            .map_while(|field| field.parse().ok())
+<a href=#474 id=474 data-nosnippet>474</a>            .collect();
+<a href=#475 id=475 data-nosnippet>475</a>        <span class="comment">// user, nice, system and idle are the four columns every kernel has.
+<a href=#476 id=476 data-nosnippet>476</a>        </span><span class="kw">if </span>ticks.len() &lt; <span class="number">4 </span>{
+<a href=#477 id=477 data-nosnippet>477</a>            <span class="kw">continue</span>;
+<a href=#478 id=478 data-nosnippet>478</a>        }
+<a href=#479 id=479 data-nosnippet>479</a>        <span class="kw">let </span>iowait = ticks.get(<span class="number">4</span>).copied().unwrap_or(<span class="number">0</span>);
+<a href=#480 id=480 data-nosnippet>480</a>        times.insert(
+<a href=#481 id=481 data-nosnippet>481</a>            cpu,
+<a href=#482 id=482 data-nosnippet>482</a>            CpuTime {
+<a href=#483 id=483 data-nosnippet>483</a>                idle: ticks[<span class="number">3</span>] + iowait,
+<a href=#484 id=484 data-nosnippet>484</a>                total: ticks.iter().sum(),
+<a href=#485 id=485 data-nosnippet>485</a>            },
+<a href=#486 id=486 data-nosnippet>486</a>        );
+<a href=#487 id=487 data-nosnippet>487</a>    }
+<a href=#488 id=488 data-nosnippet>488</a>    times
+<a href=#489 id=489 data-nosnippet>489</a>}
+<a href=#490 id=490 data-nosnippet>490</a>
+<a href=#491 id=491 data-nosnippet>491</a><span class="doccomment">/// The CPUs a PMU is bound to, read under `sys` (normally `/sys`): the union
+<a href=#492 id=492 data-nosnippet>492</a>/// of every `bus/event_source/devices/&lt;pmu&gt;/cpumask` that names at most a
+<a href=#493 id=493 data-nosnippet>493</a>/// quarter of the online CPUs (`devices/system/cpu/online`). A PMU with no
+<a href=#494 id=494 data-nosnippet>494</a>/// cpumask names no CPUs. Anything else that is not what sysfs presents (an
+<a href=#495 id=495 data-nosnippet>495</a>/// unreadable directory, a PMU entry that does not resolve to a directory, a
+<a href=#496 id=496 data-nosnippet>496</a>/// cpumask that does not resolve to a regular file, a malformed list) makes
+<a href=#497 id=497 data-nosnippet>497</a>/// the result empty, so nothing is passed over: a partial set from a sysfs
+<a href=#498 id=498 data-nosnippet>498</a>/// that cannot be read is not trusted.
+<a href=#499 id=499 data-nosnippet>499</a></span><span class="kw">fn </span>pmu_bound_cpus(sys: <span class="kw-2">&amp;</span>Path) -&gt; BTreeSet&lt;usize&gt; {
+<a href=#500 id=500 data-nosnippet>500</a>    <span class="kw">let </span>read_list = |path: <span class="kw-2">&amp;</span>Path| {
+<a href=#501 id=501 data-nosnippet>501</a>        fs::read_to_string(path)
+<a href=#502 id=502 data-nosnippet>502</a>            .ok()
+<a href=#503 id=503 data-nosnippet>503</a>            .and_then(|text| parse_cpu_list(<span class="kw-2">&amp;</span>text))
+<a href=#504 id=504 data-nosnippet>504</a>    };
+<a href=#505 id=505 data-nosnippet>505</a>    <span class="kw">let </span><span class="prelude-val">Some</span>(online) = read_list(<span class="kw-2">&amp;</span>sys.join(<span class="string">"devices/system/cpu/online"</span>)) <span class="kw">else </span>{
+<a href=#506 id=506 data-nosnippet>506</a>        <span class="kw">return </span>BTreeSet::new();
+<a href=#507 id=507 data-nosnippet>507</a>    };
+<a href=#508 id=508 data-nosnippet>508</a>    <span class="kw">let </span><span class="prelude-val">Ok</span>(entries) = fs::read_dir(sys.join(<span class="string">"bus/event_source/devices"</span>)) <span class="kw">else </span>{
+<a href=#509 id=509 data-nosnippet>509</a>        <span class="kw">return </span>BTreeSet::new();
+<a href=#510 id=510 data-nosnippet>510</a>    };
+<a href=#511 id=511 data-nosnippet>511</a>    <span class="kw">let </span><span class="kw-2">mut </span>masks = Vec::new();
+<a href=#512 id=512 data-nosnippet>512</a>    <span class="kw">for </span>entry <span class="kw">in </span>entries {
+<a href=#513 id=513 data-nosnippet>513</a>        <span class="kw">let </span><span class="prelude-val">Ok</span>(entry) = entry <span class="kw">else </span>{
+<a href=#514 id=514 data-nosnippet>514</a>            <span class="kw">return </span>BTreeSet::new();
+<a href=#515 id=515 data-nosnippet>515</a>        };
+<a href=#516 id=516 data-nosnippet>516</a>        <span class="kw">if </span>!fs::metadata(entry.path()).is_ok_and(|metadata| metadata.is_dir()) {
+<a href=#517 id=517 data-nosnippet>517</a>            <span class="kw">return </span>BTreeSet::new();
+<a href=#518 id=518 data-nosnippet>518</a>        }
+<a href=#519 id=519 data-nosnippet>519</a>        <span class="comment">// Absent means no CPUs. Present, even as a symlink that resolves to
+<a href=#520 id=520 data-nosnippet>520</a>        // nothing, it must resolve to a regular file.
+<a href=#521 id=521 data-nosnippet>521</a>        </span><span class="kw">let </span>path = entry.path().join(<span class="string">"cpumask"</span>);
+<a href=#522 id=522 data-nosnippet>522</a>        <span class="kw">match </span>fs::symlink_metadata(<span class="kw-2">&amp;</span>path) {
+<a href=#523 id=523 data-nosnippet>523</a>            <span class="prelude-val">Ok</span>(<span class="kw">_</span>) =&gt; {}
+<a href=#524 id=524 data-nosnippet>524</a>            <span class="prelude-val">Err</span>(error) <span class="kw">if </span>error.kind() == std::io::ErrorKind::NotFound =&gt; <span class="kw">continue</span>,
+<a href=#525 id=525 data-nosnippet>525</a>            <span class="prelude-val">Err</span>(<span class="kw">_</span>) =&gt; <span class="kw">return </span>BTreeSet::new(),
+<a href=#526 id=526 data-nosnippet>526</a>        }
+<a href=#527 id=527 data-nosnippet>527</a>        <span class="kw">if </span>!fs::metadata(<span class="kw-2">&amp;</span>path).is_ok_and(|metadata| metadata.is_file()) {
+<a href=#528 id=528 data-nosnippet>528</a>            <span class="kw">return </span>BTreeSet::new();
+<a href=#529 id=529 data-nosnippet>529</a>        }
+<a href=#530 id=530 data-nosnippet>530</a>        <span class="kw">let </span><span class="prelude-val">Some</span>(mask) = read_list(<span class="kw-2">&amp;</span>path) <span class="kw">else </span>{
+<a href=#531 id=531 data-nosnippet>531</a>            <span class="kw">return </span>BTreeSet::new();
+<a href=#532 id=532 data-nosnippet>532</a>        };
+<a href=#533 id=533 data-nosnippet>533</a>        masks.push(mask);
+<a href=#534 id=534 data-nosnippet>534</a>    }
+<a href=#535 id=535 data-nosnippet>535</a>    bound_cpus(<span class="kw-2">&amp;</span>online, masks)
+<a href=#536 id=536 data-nosnippet>536</a>}
+<a href=#537 id=537 data-nosnippet>537</a>
+<a href=#538 id=538 data-nosnippet>538</a><span class="doccomment">/// The union of the `masks` that name at most a quarter of `online`, each
+<a href=#539 id=539 data-nosnippet>539</a>/// limited to `online`.
+<a href=#540 id=540 data-nosnippet>540</a></span><span class="kw">fn </span>bound_cpus(
+<a href=#541 id=541 data-nosnippet>541</a>    online: <span class="kw-2">&amp;</span>BTreeSet&lt;usize&gt;,
+<a href=#542 id=542 data-nosnippet>542</a>    masks: <span class="kw">impl </span>IntoIterator&lt;Item = BTreeSet&lt;usize&gt;&gt;,
+<a href=#543 id=543 data-nosnippet>543</a>) -&gt; BTreeSet&lt;usize&gt; {
+<a href=#544 id=544 data-nosnippet>544</a>    <span class="kw">let </span><span class="kw-2">mut </span>bound = BTreeSet::new();
+<a href=#545 id=545 data-nosnippet>545</a>    <span class="kw">for </span>mask <span class="kw">in </span>masks {
+<a href=#546 id=546 data-nosnippet>546</a>        <span class="kw">let </span>mask: BTreeSet&lt;usize&gt; = mask.intersection(online).copied().collect();
+<a href=#547 id=547 data-nosnippet>547</a>        <span class="kw">if </span>mask.len() * PMU_BOUND_SHARE_DENOMINATOR &lt;= online.len() {
+<a href=#548 id=548 data-nosnippet>548</a>            bound.extend(mask);
+<a href=#549 id=549 data-nosnippet>549</a>        }
+<a href=#550 id=550 data-nosnippet>550</a>    }
+<a href=#551 id=551 data-nosnippet>551</a>    bound
+<a href=#552 id=552 data-nosnippet>552</a>}
+<a href=#553 id=553 data-nosnippet>553</a>
+<a href=#554 id=554 data-nosnippet>554</a><span class="doccomment">/// Parse a kernel CPU list such as `0,16-19\n`. `None` if it is malformed or
+<a href=#555 id=555 data-nosnippet>555</a>/// names a CPU above [`MAX_CPU_NUMBER`].
+<a href=#556 id=556 data-nosnippet>556</a></span><span class="kw">fn </span>parse_cpu_list(text: <span class="kw-2">&amp;</span>str) -&gt; <span class="prelude-ty">Option</span>&lt;BTreeSet&lt;usize&gt;&gt; {
+<a href=#557 id=557 data-nosnippet>557</a>    <span class="kw">let </span>text = text.trim();
+<a href=#558 id=558 data-nosnippet>558</a>    <span class="kw">let </span><span class="kw-2">mut </span>cpus = BTreeSet::new();
+<a href=#559 id=559 data-nosnippet>559</a>    <span class="kw">if </span>text.is_empty() {
+<a href=#560 id=560 data-nosnippet>560</a>        <span class="kw">return </span><span class="prelude-val">Some</span>(cpus);
+<a href=#561 id=561 data-nosnippet>561</a>    }
+<a href=#562 id=562 data-nosnippet>562</a>    <span class="kw">for </span>part <span class="kw">in </span>text.split(<span class="string">','</span>) {
+<a href=#563 id=563 data-nosnippet>563</a>        <span class="kw">let </span>(low, high) = part.split_once(<span class="string">'-'</span>).unwrap_or((part, part));
+<a href=#564 id=564 data-nosnippet>564</a>        <span class="kw">let </span>number = |value: <span class="kw-2">&amp;</span>str| {
+<a href=#565 id=565 data-nosnippet>565</a>            (!value.is_empty() &amp;&amp; value.bytes().all(|byte| byte.is_ascii_digit()))
+<a href=#566 id=566 data-nosnippet>566</a>                .then(|| value.parse::&lt;usize&gt;().ok())
+<a href=#567 id=567 data-nosnippet>567</a>                .flatten()
+<a href=#568 id=568 data-nosnippet>568</a>        };
+<a href=#569 id=569 data-nosnippet>569</a>        <span class="kw">let </span>(low, high) = (number(low)<span class="question-mark">?</span>, number(high)<span class="question-mark">?</span>);
+<a href=#570 id=570 data-nosnippet>570</a>        <span class="kw">if </span>high &lt; low || high &gt; MAX_CPU_NUMBER {
+<a href=#571 id=571 data-nosnippet>571</a>            <span class="kw">return </span><span class="prelude-val">None</span>;
+<a href=#572 id=572 data-nosnippet>572</a>        }
+<a href=#573 id=573 data-nosnippet>573</a>        cpus.extend(low..=high);
+<a href=#574 id=574 data-nosnippet>574</a>    }
+<a href=#575 id=575 data-nosnippet>575</a>    <span class="prelude-val">Some</span>(cpus)
+<a href=#576 id=576 data-nosnippet>576</a>}
+<a href=#577 id=577 data-nosnippet>577</a>
+<a href=#578 id=578 data-nosnippet>578</a><span class="doccomment">/// The allowed CPUs to draw from: the idle ones, or the least busy when none
+<a href=#579 id=579 data-nosnippet>579</a>/// was idle, passing over PMU-bound CPUs while any other remains. `None` when
+<a href=#580 id=580 data-nosnippet>580</a>/// the readings cover none of `allowed`.
+<a href=#581 id=581 data-nosnippet>581</a></span><span class="kw">fn </span>candidates(allowed: <span class="kw-2">&amp;</span>[usize], observation: <span class="kw-2">&amp;</span>Observation) -&gt; <span class="prelude-ty">Option</span>&lt;(Vec&lt;usize&gt;, Basis)&gt; {
+<a href=#582 id=582 data-nosnippet>582</a>    <span class="comment">// (cpu, busy ticks, total ticks) over the sample.
+<a href=#583 id=583 data-nosnippet>583</a>    </span><span class="kw">let </span>busy: Vec&lt;(usize, u64, u64)&gt; = allowed
+<a href=#584 id=584 data-nosnippet>584</a>        .iter()
+<a href=#585 id=585 data-nosnippet>585</a>        .filter_map(|cpu| {
+<a href=#586 id=586 data-nosnippet>586</a>            <span class="kw">let </span>before = observation.before.get(cpu)<span class="question-mark">?</span>;
+<a href=#587 id=587 data-nosnippet>587</a>            <span class="kw">let </span>after = observation.after.get(cpu)<span class="question-mark">?</span>;
+<a href=#588 id=588 data-nosnippet>588</a>            <span class="kw">let </span>total = after.total.checked_sub(before.total)<span class="question-mark">?</span>;
+<a href=#589 id=589 data-nosnippet>589</a>            <span class="kw">let </span>idle = after.idle.checked_sub(before.idle)<span class="question-mark">?</span>;
+<a href=#590 id=590 data-nosnippet>590</a>            (total &gt; <span class="number">0</span>).then(|| (<span class="kw-2">*</span>cpu, total.saturating_sub(idle), total))
+<a href=#591 id=591 data-nosnippet>591</a>        })
+<a href=#592 id=592 data-nosnippet>592</a>        .collect();
+<a href=#593 id=593 data-nosnippet>593</a>    <span class="kw">if </span>busy.is_empty() {
+<a href=#594 id=594 data-nosnippet>594</a>        <span class="kw">return </span><span class="prelude-val">None</span>;
+<a href=#595 id=595 data-nosnippet>595</a>    }
+<a href=#596 id=596 data-nosnippet>596</a>    <span class="kw">let </span>sampled = busy.len();
+<a href=#597 id=597 data-nosnippet>597</a>    <span class="kw">let </span>idle: Vec&lt;usize&gt; = busy
+<a href=#598 id=598 data-nosnippet>598</a>        .iter()
+<a href=#599 id=599 data-nosnippet>599</a>        .filter(|(<span class="kw">_</span>, busy, total)| busy * IDLE_DENOMINATOR &lt;= <span class="kw-2">*</span>total)
+<a href=#600 id=600 data-nosnippet>600</a>        .map(|(cpu, ..)| <span class="kw-2">*</span>cpu)
+<a href=#601 id=601 data-nosnippet>601</a>        .collect();
+<a href=#602 id=602 data-nosnippet>602</a>    <span class="kw">let </span>(pool, found_idle) = <span class="kw">if </span>idle.is_empty() {
+<a href=#603 id=603 data-nosnippet>603</a>        <span class="comment">// The least busy fraction, every CPU at it kept; busy_a/total_a and
+<a href=#604 id=604 data-nosnippet>604</a>        // busy_b/total_b compare by cross-multiplying. Not widened by a tick:
+<a href=#605 id=605 data-nosnippet>605</a>        // with few allowed CPUs, the run's own launcher can make the only
+<a href=#606 id=606 data-nosnippet>606</a>        // other CPU look four ticks in five busy, and a widened set would then
+<a href=#607 id=607 data-nosnippet>607</a>        // admit a CPU a CPU-bound task held for the whole window.
+<a href=#608 id=608 data-nosnippet>608</a>        </span><span class="kw">let </span>(<span class="kw">_</span>, least_busy, least_total) =
+<a href=#609 id=609 data-nosnippet>609</a>            <span class="kw-2">*</span>busy
+<a href=#610 id=610 data-nosnippet>610</a>                .iter()
+<a href=#611 id=611 data-nosnippet>611</a>                .min_by(|(<span class="kw">_</span>, busy_a, total_a), (<span class="kw">_</span>, busy_b, total_b)| {
+<a href=#612 id=612 data-nosnippet>612</a>                    (busy_a * total_b).cmp(<span class="kw-2">&amp;</span>(busy_b * total_a))
+<a href=#613 id=613 data-nosnippet>613</a>                })<span class="question-mark">?</span>;
+<a href=#614 id=614 data-nosnippet>614</a>        <span class="kw">let </span>tied: Vec&lt;usize&gt; = busy
+<a href=#615 id=615 data-nosnippet>615</a>            .iter()
+<a href=#616 id=616 data-nosnippet>616</a>            .filter(|(<span class="kw">_</span>, busy, total)| busy * least_total == least_busy * total)
+<a href=#617 id=617 data-nosnippet>617</a>            .map(|(cpu, ..)| <span class="kw-2">*</span>cpu)
+<a href=#618 id=618 data-nosnippet>618</a>            .collect();
+<a href=#619 id=619 data-nosnippet>619</a>        (tied, <span class="bool-val">false</span>)
+<a href=#620 id=620 data-nosnippet>620</a>    } <span class="kw">else </span>{
+<a href=#621 id=621 data-nosnippet>621</a>        (idle, <span class="bool-val">true</span>)
+<a href=#622 id=622 data-nosnippet>622</a>    };
+<a href=#623 id=623 data-nosnippet>623</a>    <span class="kw">let </span>(unbound, bound): (Vec&lt;usize&gt;, Vec&lt;usize&gt;) = pool
+<a href=#624 id=624 data-nosnippet>624</a>        .into_iter()
+<a href=#625 id=625 data-nosnippet>625</a>        .partition(|cpu| !observation.pmu_bound.contains(cpu));
+<a href=#626 id=626 data-nosnippet>626</a>    <span class="kw">let </span>(candidates, pmu) = <span class="kw">match </span>(unbound.is_empty(), bound.len()) {
+<a href=#627 id=627 data-nosnippet>627</a>        (<span class="bool-val">false</span>, <span class="number">0</span>) =&gt; (unbound, Pmu::NoneBound),
+<a href=#628 id=628 data-nosnippet>628</a>        (<span class="bool-val">false</span>, passed_over) =&gt; (unbound, Pmu::PassedOver(passed_over)),
+<a href=#629 id=629 data-nosnippet>629</a>        (<span class="bool-val">true</span>, <span class="kw">_</span>) =&gt; (bound, Pmu::AllBound),
+<a href=#630 id=630 data-nosnippet>630</a>    };
+<a href=#631 id=631 data-nosnippet>631</a>    <span class="kw">let </span>basis = <span class="kw">if </span>found_idle {
+<a href=#632 id=632 data-nosnippet>632</a>        Basis::Idle {
+<a href=#633 id=633 data-nosnippet>633</a>            candidates: candidates.len(),
+<a href=#634 id=634 data-nosnippet>634</a>            sampled,
+<a href=#635 id=635 data-nosnippet>635</a>            pmu,
+<a href=#636 id=636 data-nosnippet>636</a>        }
+<a href=#637 id=637 data-nosnippet>637</a>    } <span class="kw">else </span>{
+<a href=#638 id=638 data-nosnippet>638</a>        Basis::LeastBusy {
+<a href=#639 id=639 data-nosnippet>639</a>            candidates: candidates.len(),
+<a href=#640 id=640 data-nosnippet>640</a>            sampled,
+<a href=#641 id=641 data-nosnippet>641</a>            pmu,
+<a href=#642 id=642 data-nosnippet>642</a>        }
+<a href=#643 id=643 data-nosnippet>643</a>    };
+<a href=#644 id=644 data-nosnippet>644</a>    <span class="prelude-val">Some</span>((candidates, basis))
+<a href=#645 id=645 data-nosnippet>645</a>}
+<a href=#646 id=646 data-nosnippet>646</a>
+<a href=#647 id=647 data-nosnippet>647</a><span class="attr">#[cfg(test)]
+<a href=#648 id=648 data-nosnippet>648</a></span><span class="kw">mod </span>tests {
+<a href=#649 id=649 data-nosnippet>649</a>    <span class="kw">use super</span>::<span class="kw-2">*</span>;
+<a href=#650 id=650 data-nosnippet>650</a>
+<a href=#651 id=651 data-nosnippet>651</a>    <span class="doccomment">/// A `/proc/stat` with the aggregate line, two full CPU lines, one short
+<a href=#652 id=652 data-nosnippet>652</a>    /// pre-2.6.11 line and the lines that follow the CPUs.
+<a href=#653 id=653 data-nosnippet>653</a>    </span><span class="kw">const </span>STAT: <span class="kw-2">&amp;</span>str = <span class="string">"cpu  100 0 50 1000 10 0 0 0 0 0\n\
+<a href=#654 id=654 data-nosnippet>654</a>                        cpu0 10 2 5 100 4 1 1 0 3 0\n\
+<a href=#655 id=655 data-nosnippet>655</a>                        cpu7 20 0 10 200 0 0 0 0 0 0\n\
+<a href=#656 id=656 data-nosnippet>656</a>                        cpu31 1 2 3 4\n\
+<a href=#657 id=657 data-nosnippet>657</a>                        intr 12345 0 0\n\
+<a href=#658 id=658 data-nosnippet>658</a>                        ctxt 99\n\
+<a href=#659 id=659 data-nosnippet>659</a>                        cpus_allowed 5\n"</span>;
+<a href=#660 id=660 data-nosnippet>660</a>
+<a href=#661 id=661 data-nosnippet>661</a>    <span class="kw">fn </span>times(entries: <span class="kw-2">&amp;</span>[(usize, u64, u64)]) -&gt; Reading {
+<a href=#662 id=662 data-nosnippet>662</a>        entries
+<a href=#663 id=663 data-nosnippet>663</a>            .iter()
+<a href=#664 id=664 data-nosnippet>664</a>            .map(|<span class="kw-2">&amp;</span>(cpu, idle, total)| (cpu, CpuTime { idle, total }))
+<a href=#665 id=665 data-nosnippet>665</a>            .collect()
+<a href=#666 id=666 data-nosnippet>666</a>    }
+<a href=#667 id=667 data-nosnippet>667</a>
+<a href=#668 id=668 data-nosnippet>668</a>    <span class="doccomment">/// Readings over five ticks: each entry is (cpu, busy ticks).
+<a href=#669 id=669 data-nosnippet>669</a>    </span><span class="kw">fn </span>busy(entries: <span class="kw-2">&amp;</span>[(usize, u64)], pmu_bound: <span class="kw-2">&amp;</span>[usize]) -&gt; Observation {
+<a href=#670 id=670 data-nosnippet>670</a>        Observation {
+<a href=#671 id=671 data-nosnippet>671</a>            before: times(
+<a href=#672 id=672 data-nosnippet>672</a>                <span class="kw-2">&amp;</span>entries
+<a href=#673 id=673 data-nosnippet>673</a>                    .iter()
+<a href=#674 id=674 data-nosnippet>674</a>                    .map(|<span class="kw-2">&amp;</span>(cpu, <span class="kw">_</span>)| (cpu, <span class="number">0</span>, <span class="number">0</span>))
+<a href=#675 id=675 data-nosnippet>675</a>                    .collect::&lt;Vec&lt;<span class="kw">_</span>&gt;&gt;(),
+<a href=#676 id=676 data-nosnippet>676</a>            ),
+<a href=#677 id=677 data-nosnippet>677</a>            after: times(
+<a href=#678 id=678 data-nosnippet>678</a>                <span class="kw-2">&amp;</span>entries
+<a href=#679 id=679 data-nosnippet>679</a>                    .iter()
+<a href=#680 id=680 data-nosnippet>680</a>                    .map(|<span class="kw-2">&amp;</span>(cpu, busy)| (cpu, <span class="number">5 </span>- busy, <span class="number">5</span>))
+<a href=#681 id=681 data-nosnippet>681</a>                    .collect::&lt;Vec&lt;<span class="kw">_</span>&gt;&gt;(),
+<a href=#682 id=682 data-nosnippet>682</a>            ),
+<a href=#683 id=683 data-nosnippet>683</a>            pmu_bound: pmu_bound.iter().copied().collect(),
+<a href=#684 id=684 data-nosnippet>684</a>        }
+<a href=#685 id=685 data-nosnippet>685</a>    }
+<a href=#686 id=686 data-nosnippet>686</a>
+<a href=#687 id=687 data-nosnippet>687</a>    <span class="kw">fn </span>set(cpus: <span class="kw-2">&amp;</span>[usize]) -&gt; BTreeSet&lt;usize&gt; {
+<a href=#688 id=688 data-nosnippet>688</a>        cpus.iter().copied().collect()
+<a href=#689 id=689 data-nosnippet>689</a>    }
+<a href=#690 id=690 data-nosnippet>690</a>
+<a href=#691 id=691 data-nosnippet>691</a>    <span class="attr">#[test]
+<a href=#692 id=692 data-nosnippet>692</a>    </span><span class="kw">fn </span>parsing_reads_each_numbered_cpu_and_skips_the_aggregate_and_other_lines() {
+<a href=#693 id=693 data-nosnippet>693</a>        <span class="kw">let </span>parsed = parse_proc_stat(STAT, <span class="kw-2">&amp;</span>[<span class="number">0</span>, <span class="number">7</span>, <span class="number">31</span>, <span class="number">99</span>]);
+<a href=#694 id=694 data-nosnippet>694</a>        <span class="comment">// cpu0: idle 100 + iowait 4; total user..steal = 10+2+5+100+4+1+1+0,
+<a href=#695 id=695 data-nosnippet>695</a>        // without the guest column, which user already counts.
+<a href=#696 id=696 data-nosnippet>696</a>        </span><span class="macro">assert_eq!</span>(
+<a href=#697 id=697 data-nosnippet>697</a>            parsed,
+<a href=#698 id=698 data-nosnippet>698</a>            times(<span class="kw-2">&amp;</span>[(<span class="number">0</span>, <span class="number">104</span>, <span class="number">123</span>), (<span class="number">7</span>, <span class="number">200</span>, <span class="number">230</span>), (<span class="number">31</span>, <span class="number">4</span>, <span class="number">10</span>)]),
+<a href=#699 id=699 data-nosnippet>699</a>            <span class="string">"the aggregate `cpu` line must not be read as a CPU numbered 100"
+<a href=#700 id=700 data-nosnippet>700</a>        </span>);
+<a href=#701 id=701 data-nosnippet>701</a>    }
+<a href=#702 id=702 data-nosnippet>702</a>
+<a href=#703 id=703 data-nosnippet>703</a>    <span class="attr">#[test]
+<a href=#704 id=704 data-nosnippet>704</a>    </span><span class="kw">fn </span>parsing_keeps_only_allowed_cpus() {
+<a href=#705 id=705 data-nosnippet>705</a>        <span class="macro">assert_eq!</span>(parse_proc_stat(STAT, <span class="kw-2">&amp;</span>[<span class="number">7</span>]), times(<span class="kw-2">&amp;</span>[(<span class="number">7</span>, <span class="number">200</span>, <span class="number">230</span>)]));
+<a href=#706 id=706 data-nosnippet>706</a>        <span class="macro">assert!</span>(parse_proc_stat(STAT, <span class="kw-2">&amp;</span>[]).is_empty());
+<a href=#707 id=707 data-nosnippet>707</a>    }
+<a href=#708 id=708 data-nosnippet>708</a>
+<a href=#709 id=709 data-nosnippet>709</a>    <span class="attr">#[test]
+<a href=#710 id=710 data-nosnippet>710</a>    </span><span class="kw">fn </span>a_cpu_running_a_cpu_bound_task_is_never_a_candidate_beside_idle_ones() {
+<a href=#711 id=711 data-nosnippet>711</a>        <span class="comment">// CPU 3 busy throughout, CPU 5 idle, CPU 9 one rounding tick busy,
+<a href=#712 id=712 data-nosnippet>712</a>        // which still counts as idle.
+<a href=#713 id=713 data-nosnippet>713</a>        </span><span class="macro">assert_eq!</span>(
+<a href=#714 id=714 data-nosnippet>714</a>            candidates(<span class="kw-2">&amp;</span>[<span class="number">3</span>, <span class="number">5</span>, <span class="number">9</span>], <span class="kw-2">&amp;</span>busy(<span class="kw-2">&amp;</span>[(<span class="number">3</span>, <span class="number">5</span>), (<span class="number">5</span>, <span class="number">0</span>), (<span class="number">9</span>, <span class="number">1</span>)], <span class="kw-2">&amp;</span>[])),
+<a href=#715 id=715 data-nosnippet>715</a>            <span class="prelude-val">Some</span>((
+<a href=#716 id=716 data-nosnippet>716</a>                <span class="macro">vec!</span>[<span class="number">5</span>, <span class="number">9</span>],
+<a href=#717 id=717 data-nosnippet>717</a>                Basis::Idle {
+<a href=#718 id=718 data-nosnippet>718</a>                    candidates: <span class="number">2</span>,
+<a href=#719 id=719 data-nosnippet>719</a>                    sampled: <span class="number">3</span>,
+<a href=#720 id=720 data-nosnippet>720</a>                    pmu: Pmu::NoneBound
+<a href=#721 id=721 data-nosnippet>721</a>                }
+<a href=#722 id=722 data-nosnippet>722</a>            ))
+<a href=#723 id=723 data-nosnippet>723</a>        );
+<a href=#724 id=724 data-nosnippet>724</a>    }
+<a href=#725 id=725 data-nosnippet>725</a>
+<a href=#726 id=726 data-nosnippet>726</a>    <span class="attr">#[test]
+<a href=#727 id=727 data-nosnippet>727</a>    </span><span class="kw">fn </span>with_no_idle_cpu_the_least_busy_fraction_wins_and_ties_are_all_kept() {
+<a href=#728 id=728 data-nosnippet>728</a>        <span class="comment">// CPU 1: 4 of 5 busy; CPU 2: 2 of 5; CPU 4: 2 of 5; CPU 6: 3 of 6,
+<a href=#729 id=729 data-nosnippet>729</a>        // one tick above the least busy fraction; CPU 8: 4 of 6.
+<a href=#730 id=730 data-nosnippet>730</a>        </span><span class="kw">let </span>before = times(<span class="kw-2">&amp;</span>[(<span class="number">1</span>, <span class="number">0</span>, <span class="number">0</span>), (<span class="number">2</span>, <span class="number">0</span>, <span class="number">0</span>), (<span class="number">4</span>, <span class="number">0</span>, <span class="number">0</span>), (<span class="number">6</span>, <span class="number">0</span>, <span class="number">0</span>), (<span class="number">8</span>, <span class="number">0</span>, <span class="number">0</span>)]);
+<a href=#731 id=731 data-nosnippet>731</a>        <span class="kw">let </span>after = times(<span class="kw-2">&amp;</span>[(<span class="number">1</span>, <span class="number">1</span>, <span class="number">5</span>), (<span class="number">2</span>, <span class="number">3</span>, <span class="number">5</span>), (<span class="number">4</span>, <span class="number">3</span>, <span class="number">5</span>), (<span class="number">6</span>, <span class="number">3</span>, <span class="number">6</span>), (<span class="number">8</span>, <span class="number">2</span>, <span class="number">6</span>)]);
+<a href=#732 id=732 data-nosnippet>732</a>        <span class="kw">let </span>observation = Observation {
+<a href=#733 id=733 data-nosnippet>733</a>            before,
+<a href=#734 id=734 data-nosnippet>734</a>            after,
+<a href=#735 id=735 data-nosnippet>735</a>            pmu_bound: BTreeSet::new(),
+<a href=#736 id=736 data-nosnippet>736</a>        };
+<a href=#737 id=737 data-nosnippet>737</a>        <span class="macro">assert_eq!</span>(
+<a href=#738 id=738 data-nosnippet>738</a>            candidates(<span class="kw-2">&amp;</span>[<span class="number">1</span>, <span class="number">2</span>, <span class="number">4</span>, <span class="number">6</span>, <span class="number">8</span>], <span class="kw-2">&amp;</span>observation),
+<a href=#739 id=739 data-nosnippet>739</a>            <span class="prelude-val">Some</span>((
+<a href=#740 id=740 data-nosnippet>740</a>                <span class="macro">vec!</span>[<span class="number">2</span>, <span class="number">4</span>],
+<a href=#741 id=741 data-nosnippet>741</a>                Basis::LeastBusy {
+<a href=#742 id=742 data-nosnippet>742</a>                    candidates: <span class="number">2</span>,
+<a href=#743 id=743 data-nosnippet>743</a>                    sampled: <span class="number">5</span>,
+<a href=#744 id=744 data-nosnippet>744</a>                    pmu: Pmu::NoneBound
+<a href=#745 id=745 data-nosnippet>745</a>                }
+<a href=#746 id=746 data-nosnippet>746</a>            ))
+<a href=#747 id=747 data-nosnippet>747</a>        );
+<a href=#748 id=748 data-nosnippet>748</a>    }
+<a href=#749 id=749 data-nosnippet>749</a>
+<a href=#750 id=750 data-nosnippet>750</a>    <span class="attr">#[test]
+<a href=#751 id=751 data-nosnippet>751</a>    </span><span class="kw">fn </span>a_cpu_busy_for_the_whole_window_loses_to_one_busy_for_most_of_it() {
+<a href=#752 id=752 data-nosnippet>752</a>        <span class="comment">// Measured with two allowed CPUs: a busy loop held CPU 28 for every
+<a href=#753 id=753 data-nosnippet>753</a>        // tick while the run's own launcher kept CPU 26 busy for four of five.
+<a href=#754 id=754 data-nosnippet>754</a>        // CPU 26 is the right choice; a set widened by a tick would admit 28.
+<a href=#755 id=755 data-nosnippet>755</a>        </span><span class="kw">let </span>observation = busy(<span class="kw-2">&amp;</span>[(<span class="number">26</span>, <span class="number">4</span>), (<span class="number">28</span>, <span class="number">5</span>)], <span class="kw-2">&amp;</span>[]);
+<a href=#756 id=756 data-nosnippet>756</a>        <span class="macro">assert_eq!</span>(
+<a href=#757 id=757 data-nosnippet>757</a>            candidates(<span class="kw-2">&amp;</span>[<span class="number">26</span>, <span class="number">28</span>], <span class="kw-2">&amp;</span>observation),
+<a href=#758 id=758 data-nosnippet>758</a>            <span class="prelude-val">Some</span>((
+<a href=#759 id=759 data-nosnippet>759</a>                <span class="macro">vec!</span>[<span class="number">26</span>],
+<a href=#760 id=760 data-nosnippet>760</a>                Basis::LeastBusy {
+<a href=#761 id=761 data-nosnippet>761</a>                    candidates: <span class="number">1</span>,
+<a href=#762 id=762 data-nosnippet>762</a>                    sampled: <span class="number">2</span>,
+<a href=#763 id=763 data-nosnippet>763</a>                    pmu: Pmu::NoneBound
+<a href=#764 id=764 data-nosnippet>764</a>                }
+<a href=#765 id=765 data-nosnippet>765</a>            ))
+<a href=#766 id=766 data-nosnippet>766</a>        );
+<a href=#767 id=767 data-nosnippet>767</a>    }
+<a href=#768 id=768 data-nosnippet>768</a>
+<a href=#769 id=769 data-nosnippet>769</a>    <span class="attr">#[test]
+<a href=#770 id=770 data-nosnippet>770</a>    </span><span class="kw">fn </span>idle_pmu_bound_cpus_are_passed_over_while_another_idle_cpu_remains() {
+<a href=#771 id=771 data-nosnippet>771</a>        <span class="comment">// CPUs 0 and 16 carry a bound PMU; 5 and 20 are idle too; 9 is busy.
+<a href=#772 id=772 data-nosnippet>772</a>        </span><span class="kw">let </span>observation = busy(<span class="kw-2">&amp;</span>[(<span class="number">0</span>, <span class="number">0</span>), (<span class="number">5</span>, <span class="number">0</span>), (<span class="number">9</span>, <span class="number">5</span>), (<span class="number">16</span>, <span class="number">1</span>), (<span class="number">20</span>, <span class="number">0</span>)], <span class="kw-2">&amp;</span>[<span class="number">0</span>, <span class="number">16</span>]);
+<a href=#773 id=773 data-nosnippet>773</a>        <span class="macro">assert_eq!</span>(
+<a href=#774 id=774 data-nosnippet>774</a>            candidates(<span class="kw-2">&amp;</span>[<span class="number">0</span>, <span class="number">5</span>, <span class="number">9</span>, <span class="number">16</span>, <span class="number">20</span>], <span class="kw-2">&amp;</span>observation),
+<a href=#775 id=775 data-nosnippet>775</a>            <span class="prelude-val">Some</span>((
+<a href=#776 id=776 data-nosnippet>776</a>                <span class="macro">vec!</span>[<span class="number">5</span>, <span class="number">20</span>],
+<a href=#777 id=777 data-nosnippet>777</a>                Basis::Idle {
+<a href=#778 id=778 data-nosnippet>778</a>                    candidates: <span class="number">2</span>,
+<a href=#779 id=779 data-nosnippet>779</a>                    sampled: <span class="number">5</span>,
+<a href=#780 id=780 data-nosnippet>780</a>                    pmu: Pmu::PassedOver(<span class="number">2</span>)
+<a href=#781 id=781 data-nosnippet>781</a>                }
+<a href=#782 id=782 data-nosnippet>782</a>            ))
+<a href=#783 id=783 data-nosnippet>783</a>        );
+<a href=#784 id=784 data-nosnippet>784</a>    }
+<a href=#785 id=785 data-nosnippet>785</a>
+<a href=#786 id=786 data-nosnippet>786</a>    <span class="attr">#[test]
+<a href=#787 id=787 data-nosnippet>787</a>    </span><span class="kw">fn </span>pmu_bound_cpus_are_drawn_when_no_other_candidate_remains() {
+<a href=#788 id=788 data-nosnippet>788</a>        <span class="comment">// Every idle CPU carries a bound PMU: they are still better than a
+<a href=#789 id=789 data-nosnippet>789</a>        // CPU-bound co-runner.
+<a href=#790 id=790 data-nosnippet>790</a>        </span><span class="kw">let </span>observation = busy(<span class="kw-2">&amp;</span>[(<span class="number">0</span>, <span class="number">0</span>), (<span class="number">5</span>, <span class="number">5</span>), (<span class="number">16</span>, <span class="number">0</span>)], <span class="kw-2">&amp;</span>[<span class="number">0</span>, <span class="number">16</span>]);
+<a href=#791 id=791 data-nosnippet>791</a>        <span class="macro">assert_eq!</span>(
+<a href=#792 id=792 data-nosnippet>792</a>            candidates(<span class="kw-2">&amp;</span>[<span class="number">0</span>, <span class="number">5</span>, <span class="number">16</span>], <span class="kw-2">&amp;</span>observation),
+<a href=#793 id=793 data-nosnippet>793</a>            <span class="prelude-val">Some</span>((
+<a href=#794 id=794 data-nosnippet>794</a>                <span class="macro">vec!</span>[<span class="number">0</span>, <span class="number">16</span>],
+<a href=#795 id=795 data-nosnippet>795</a>                Basis::Idle {
+<a href=#796 id=796 data-nosnippet>796</a>                    candidates: <span class="number">2</span>,
+<a href=#797 id=797 data-nosnippet>797</a>                    sampled: <span class="number">3</span>,
+<a href=#798 id=798 data-nosnippet>798</a>                    pmu: Pmu::AllBound
+<a href=#799 id=799 data-nosnippet>799</a>                }
+<a href=#800 id=800 data-nosnippet>800</a>            ))
+<a href=#801 id=801 data-nosnippet>801</a>        );
+<a href=#802 id=802 data-nosnippet>802</a>        <span class="comment">// With no idle CPU, the rule applies among the least busy.
+<a href=#803 id=803 data-nosnippet>803</a>        </span><span class="kw">let </span>observation = busy(<span class="kw-2">&amp;</span>[(<span class="number">0</span>, <span class="number">3</span>), (<span class="number">5</span>, <span class="number">3</span>), (<span class="number">16</span>, <span class="number">5</span>)], <span class="kw-2">&amp;</span>[<span class="number">0</span>]);
+<a href=#804 id=804 data-nosnippet>804</a>        <span class="macro">assert_eq!</span>(
+<a href=#805 id=805 data-nosnippet>805</a>            candidates(<span class="kw-2">&amp;</span>[<span class="number">0</span>, <span class="number">5</span>, <span class="number">16</span>], <span class="kw-2">&amp;</span>observation),
+<a href=#806 id=806 data-nosnippet>806</a>            <span class="prelude-val">Some</span>((
+<a href=#807 id=807 data-nosnippet>807</a>                <span class="macro">vec!</span>[<span class="number">5</span>],
+<a href=#808 id=808 data-nosnippet>808</a>                Basis::LeastBusy {
+<a href=#809 id=809 data-nosnippet>809</a>                    candidates: <span class="number">1</span>,
+<a href=#810 id=810 data-nosnippet>810</a>                    sampled: <span class="number">3</span>,
+<a href=#811 id=811 data-nosnippet>811</a>                    pmu: Pmu::PassedOver(<span class="number">1</span>)
+<a href=#812 id=812 data-nosnippet>812</a>                }
+<a href=#813 id=813 data-nosnippet>813</a>            ))
+<a href=#814 id=814 data-nosnippet>814</a>        );
+<a href=#815 id=815 data-nosnippet>815</a>    }
+<a href=#816 id=816 data-nosnippet>816</a>
+<a href=#817 id=817 data-nosnippet>817</a>    <span class="attr">#[test]
+<a href=#818 id=818 data-nosnippet>818</a>    </span><span class="kw">fn </span>cpus_the_readings_do_not_cover_are_left_out_and_no_coverage_gives_none() {
+<a href=#819 id=819 data-nosnippet>819</a>        <span class="kw">let </span>before = times(<span class="kw-2">&amp;</span>[(<span class="number">5</span>, <span class="number">0</span>, <span class="number">0</span>)]);
+<a href=#820 id=820 data-nosnippet>820</a>        <span class="kw">let </span>after = times(<span class="kw-2">&amp;</span>[(<span class="number">5</span>, <span class="number">5</span>, <span class="number">5</span>), (<span class="number">8</span>, <span class="number">5</span>, <span class="number">5</span>)]);
+<a href=#821 id=821 data-nosnippet>821</a>        <span class="kw">let </span>observation = Observation {
+<a href=#822 id=822 data-nosnippet>822</a>            before: before.clone(),
+<a href=#823 id=823 data-nosnippet>823</a>            after: after.clone(),
+<a href=#824 id=824 data-nosnippet>824</a>            pmu_bound: BTreeSet::new(),
+<a href=#825 id=825 data-nosnippet>825</a>        };
+<a href=#826 id=826 data-nosnippet>826</a>        <span class="comment">// CPU 8 has no first reading and CPU 11 no reading at all.
+<a href=#827 id=827 data-nosnippet>827</a>        </span><span class="macro">assert_eq!</span>(
+<a href=#828 id=828 data-nosnippet>828</a>            candidates(<span class="kw-2">&amp;</span>[<span class="number">5</span>, <span class="number">8</span>, <span class="number">11</span>], <span class="kw-2">&amp;</span>observation),
+<a href=#829 id=829 data-nosnippet>829</a>            <span class="prelude-val">Some</span>((
+<a href=#830 id=830 data-nosnippet>830</a>                <span class="macro">vec!</span>[<span class="number">5</span>],
+<a href=#831 id=831 data-nosnippet>831</a>                Basis::Idle {
+<a href=#832 id=832 data-nosnippet>832</a>                    candidates: <span class="number">1</span>,
+<a href=#833 id=833 data-nosnippet>833</a>                    sampled: <span class="number">1</span>,
+<a href=#834 id=834 data-nosnippet>834</a>                    pmu: Pmu::NoneBound
+<a href=#835 id=835 data-nosnippet>835</a>                }
+<a href=#836 id=836 data-nosnippet>836</a>            ))
+<a href=#837 id=837 data-nosnippet>837</a>        );
+<a href=#838 id=838 data-nosnippet>838</a>        <span class="macro">assert_eq!</span>(candidates(<span class="kw-2">&amp;</span>[<span class="number">8</span>, <span class="number">11</span>], <span class="kw-2">&amp;</span>observation), <span class="prelude-val">None</span>);
+<a href=#839 id=839 data-nosnippet>839</a>        <span class="comment">// A counter that went backwards, or did not move, is no reading.
+<a href=#840 id=840 data-nosnippet>840</a>        </span><span class="kw">let </span>backwards = Observation {
+<a href=#841 id=841 data-nosnippet>841</a>            before: after,
+<a href=#842 id=842 data-nosnippet>842</a>            after: before.clone(),
+<a href=#843 id=843 data-nosnippet>843</a>            pmu_bound: BTreeSet::new(),
+<a href=#844 id=844 data-nosnippet>844</a>        };
+<a href=#845 id=845 data-nosnippet>845</a>        <span class="macro">assert_eq!</span>(candidates(<span class="kw-2">&amp;</span>[<span class="number">5</span>], <span class="kw-2">&amp;</span>backwards), <span class="prelude-val">None</span>);
+<a href=#846 id=846 data-nosnippet>846</a>        <span class="kw">let </span>still = Observation {
+<a href=#847 id=847 data-nosnippet>847</a>            before: before.clone(),
+<a href=#848 id=848 data-nosnippet>848</a>            after: before,
+<a href=#849 id=849 data-nosnippet>849</a>            pmu_bound: BTreeSet::new(),
+<a href=#850 id=850 data-nosnippet>850</a>        };
+<a href=#851 id=851 data-nosnippet>851</a>        <span class="macro">assert_eq!</span>(candidates(<span class="kw-2">&amp;</span>[<span class="number">5</span>], <span class="kw-2">&amp;</span>still), <span class="prelude-val">None</span>);
+<a href=#852 id=852 data-nosnippet>852</a>    }
+<a href=#853 id=853 data-nosnippet>853</a>
+<a href=#854 id=854 data-nosnippet>854</a>    <span class="attr">#[test]
+<a href=#855 id=855 data-nosnippet>855</a>    </span><span class="kw">fn </span>cpu_lists_parse_as_the_kernel_prints_them_and_malformed_ones_are_refused() {
+<a href=#856 id=856 data-nosnippet>856</a>        <span class="macro">assert_eq!</span>(parse_cpu_list(<span class="string">"0\n"</span>), <span class="prelude-val">Some</span>(set(<span class="kw-2">&amp;</span>[<span class="number">0</span>])));
+<a href=#857 id=857 data-nosnippet>857</a>        <span class="macro">assert_eq!</span>(
+<a href=#858 id=858 data-nosnippet>858</a>            parse_cpu_list(<span class="string">"0,16-18,144"</span>),
+<a href=#859 id=859 data-nosnippet>859</a>            <span class="prelude-val">Some</span>(set(<span class="kw-2">&amp;</span>[<span class="number">0</span>, <span class="number">16</span>, <span class="number">17</span>, <span class="number">18</span>, <span class="number">144</span>]))
+<a href=#860 id=860 data-nosnippet>860</a>        );
+<a href=#861 id=861 data-nosnippet>861</a>        <span class="macro">assert_eq!</span>(parse_cpu_list(<span class="string">""</span>), <span class="prelude-val">Some</span>(set(<span class="kw-2">&amp;</span>[])));
+<a href=#862 id=862 data-nosnippet>862</a>        <span class="kw">for </span>malformed <span class="kw">in </span>[<span class="string">"0-"</span>, <span class="string">"-3"</span>, <span class="string">"3-1"</span>, <span class="string">"a"</span>, <span class="string">"1,,2"</span>, <span class="string">"0-8192"</span>, <span class="string">"1 2"</span>] {
+<a href=#863 id=863 data-nosnippet>863</a>            <span class="macro">assert_eq!</span>(parse_cpu_list(malformed), <span class="prelude-val">None</span>, <span class="string">"{malformed:?}"</span>);
+<a href=#864 id=864 data-nosnippet>864</a>        }
+<a href=#865 id=865 data-nosnippet>865</a>    }
+<a href=#866 id=866 data-nosnippet>866</a>
+<a href=#867 id=867 data-nosnippet>867</a>    <span class="attr">#[test]
+<a href=#868 id=868 data-nosnippet>868</a>    </span><span class="kw">fn </span>only_masks_of_at_most_a_quarter_of_the_online_cpus_are_bound() {
+<a href=#869 id=869 data-nosnippet>869</a>        <span class="kw">let </span>online: BTreeSet&lt;usize&gt; = (<span class="number">0</span>..<span class="number">316</span>).collect();
+<a href=#870 id=870 data-nosnippet>870</a>        <span class="comment">// This host's amd_l3, amd_df and power_core masks, and one naming an
+<a href=#871 id=871 data-nosnippet>871</a>        // offline CPU.
+<a href=#872 id=872 data-nosnippet>872</a>        </span><span class="kw">let </span>amd_l3: BTreeSet&lt;usize&gt; = (<span class="number">0</span>..<span class="number">160</span>).step_by(<span class="number">16</span>).collect();
+<a href=#873 id=873 data-nosnippet>873</a>        <span class="kw">let </span>masks = [amd_l3.clone(), set(<span class="kw-2">&amp;</span>[<span class="number">0</span>]), (<span class="number">0</span>..<span class="number">158</span>).collect(), set(<span class="kw-2">&amp;</span>[<span class="number">400</span>])];
+<a href=#874 id=874 data-nosnippet>874</a>        <span class="kw">let </span><span class="kw-2">mut </span>expected = amd_l3;
+<a href=#875 id=875 data-nosnippet>875</a>        expected.insert(<span class="number">0</span>);
+<a href=#876 id=876 data-nosnippet>876</a>        <span class="macro">assert_eq!</span>(bound_cpus(<span class="kw-2">&amp;</span>online, masks), expected);
+<a href=#877 id=877 data-nosnippet>877</a>        <span class="comment">// Exactly a quarter still counts as bound; one more CPU does not.
+<a href=#878 id=878 data-nosnippet>878</a>        </span><span class="kw">let </span>online: BTreeSet&lt;usize&gt; = (<span class="number">0</span>..<span class="number">8</span>).collect();
+<a href=#879 id=879 data-nosnippet>879</a>        <span class="macro">assert_eq!</span>(bound_cpus(<span class="kw-2">&amp;</span>online, [set(<span class="kw-2">&amp;</span>[<span class="number">0</span>, <span class="number">1</span>])]), set(<span class="kw-2">&amp;</span>[<span class="number">0</span>, <span class="number">1</span>]));
+<a href=#880 id=880 data-nosnippet>880</a>        <span class="macro">assert_eq!</span>(bound_cpus(<span class="kw-2">&amp;</span>online, [set(<span class="kw-2">&amp;</span>[<span class="number">0</span>, <span class="number">1</span>, <span class="number">2</span>])]), set(<span class="kw-2">&amp;</span>[]));
+<a href=#881 id=881 data-nosnippet>881</a>    }
+<a href=#882 id=882 data-nosnippet>882</a>
+<a href=#883 id=883 data-nosnippet>883</a>    <span class="doccomment">/// One PMU directory entry in a test sysfs.
+<a href=#884 id=884 data-nosnippet>884</a>    </span><span class="attr">#[derive(Clone, Copy)]
+<a href=#885 id=885 data-nosnippet>885</a>    </span><span class="kw">enum </span>Entry {
+<a href=#886 id=886 data-nosnippet>886</a>        <span class="doccomment">/// A directory with this cpumask.
+<a href=#887 id=887 data-nosnippet>887</a>        </span>Mask(<span class="kw-2">&amp;</span><span class="lifetime">'static </span>str),
+<a href=#888 id=888 data-nosnippet>888</a>        <span class="doccomment">/// A symlink to a directory with this cpumask, as sysfs presents one.
+<a href=#889 id=889 data-nosnippet>889</a>        </span>LinkedMask(<span class="kw-2">&amp;</span><span class="lifetime">'static </span>str),
+<a href=#890 id=890 data-nosnippet>890</a>        <span class="doccomment">/// A directory with no cpumask.
+<a href=#891 id=891 data-nosnippet>891</a>        </span>NoMask,
+<a href=#892 id=892 data-nosnippet>892</a>        <span class="doccomment">/// A directory whose cpumask is a directory.
+<a href=#893 id=893 data-nosnippet>893</a>        </span>MaskIsDir,
+<a href=#894 id=894 data-nosnippet>894</a>        <span class="doccomment">/// A directory whose cpumask is a symlink that resolves to nothing.
+<a href=#895 id=895 data-nosnippet>895</a>        </span>DanglingMask,
+<a href=#896 id=896 data-nosnippet>896</a>        <span class="doccomment">/// A symlink that resolves to nothing.
+<a href=#897 id=897 data-nosnippet>897</a>        </span>Dangling,
+<a href=#898 id=898 data-nosnippet>898</a>        <span class="doccomment">/// A plain file.
+<a href=#899 id=899 data-nosnippet>899</a>        </span>PlainFile,
+<a href=#900 id=900 data-nosnippet>900</a>    }
+<a href=#901 id=901 data-nosnippet>901</a>
+<a href=#902 id=902 data-nosnippet>902</a>    <span class="doccomment">/// A sysfs root with 16 online CPUs and these PMU entries.
+<a href=#903 id=903 data-nosnippet>903</a>    </span><span class="kw">fn </span>sysfs(entries: <span class="kw-2">&amp;</span>[(<span class="kw-2">&amp;</span>str, Entry)]) -&gt; tempfile::TempDir {
+<a href=#904 id=904 data-nosnippet>904</a>        <span class="kw">use </span>std::os::unix::fs::symlink;
+<a href=#905 id=905 data-nosnippet>905</a>        <span class="kw">let </span>root = tempfile::tempdir().expect(<span class="string">"temporary sysfs root"</span>);
+<a href=#906 id=906 data-nosnippet>906</a>        <span class="kw">let </span>cpu = root.path().join(<span class="string">"devices/system/cpu"</span>);
+<a href=#907 id=907 data-nosnippet>907</a>        <span class="kw">let </span>devices = root.path().join(<span class="string">"bus/event_source/devices"</span>);
+<a href=#908 id=908 data-nosnippet>908</a>        <span class="kw">let </span>targets = root.path().join(<span class="string">"devices/pmus"</span>);
+<a href=#909 id=909 data-nosnippet>909</a>        <span class="kw">for </span>directory <span class="kw">in </span>[<span class="kw-2">&amp;</span>cpu, <span class="kw-2">&amp;</span>devices, <span class="kw-2">&amp;</span>targets] {
+<a href=#910 id=910 data-nosnippet>910</a>            fs::create_dir_all(directory).expect(<span class="string">"sysfs directory"</span>);
+<a href=#911 id=911 data-nosnippet>911</a>        }
+<a href=#912 id=912 data-nosnippet>912</a>        fs::write(cpu.join(<span class="string">"online"</span>), <span class="string">"0-15\n"</span>).expect(<span class="string">"online file"</span>);
+<a href=#913 id=913 data-nosnippet>913</a>        <span class="kw">for </span>(name, entry) <span class="kw">in </span>entries {
+<a href=#914 id=914 data-nosnippet>914</a>            <span class="kw">let </span>path = devices.join(name);
+<a href=#915 id=915 data-nosnippet>915</a>            <span class="kw">let </span>gone = targets.join(<span class="string">"gone"</span>);
+<a href=#916 id=916 data-nosnippet>916</a>            <span class="kw">match </span>entry {
+<a href=#917 id=917 data-nosnippet>917</a>                Entry::Mask(mask) =&gt; {
+<a href=#918 id=918 data-nosnippet>918</a>                    fs::create_dir(<span class="kw-2">&amp;</span>path).expect(<span class="string">"PMU directory"</span>);
+<a href=#919 id=919 data-nosnippet>919</a>                    fs::write(path.join(<span class="string">"cpumask"</span>), mask).expect(<span class="string">"cpumask"</span>);
+<a href=#920 id=920 data-nosnippet>920</a>                }
+<a href=#921 id=921 data-nosnippet>921</a>                Entry::LinkedMask(mask) =&gt; {
+<a href=#922 id=922 data-nosnippet>922</a>                    <span class="kw">let </span>target = targets.join(name);
+<a href=#923 id=923 data-nosnippet>923</a>                    fs::create_dir(<span class="kw-2">&amp;</span>target).expect(<span class="string">"PMU directory"</span>);
+<a href=#924 id=924 data-nosnippet>924</a>                    fs::write(target.join(<span class="string">"cpumask"</span>), mask).expect(<span class="string">"cpumask"</span>);
+<a href=#925 id=925 data-nosnippet>925</a>                    symlink(<span class="kw-2">&amp;</span>target, <span class="kw-2">&amp;</span>path).expect(<span class="string">"PMU entry symlink"</span>);
+<a href=#926 id=926 data-nosnippet>926</a>                }
+<a href=#927 id=927 data-nosnippet>927</a>                Entry::NoMask =&gt; fs::create_dir(<span class="kw-2">&amp;</span>path).expect(<span class="string">"PMU directory"</span>),
+<a href=#928 id=928 data-nosnippet>928</a>                Entry::MaskIsDir =&gt; {
+<a href=#929 id=929 data-nosnippet>929</a>                    fs::create_dir(<span class="kw-2">&amp;</span>path).expect(<span class="string">"PMU directory"</span>);
+<a href=#930 id=930 data-nosnippet>930</a>                    fs::create_dir(path.join(<span class="string">"cpumask"</span>)).expect(<span class="string">"cpumask directory"</span>);
+<a href=#931 id=931 data-nosnippet>931</a>                }
+<a href=#932 id=932 data-nosnippet>932</a>                Entry::DanglingMask =&gt; {
+<a href=#933 id=933 data-nosnippet>933</a>                    fs::create_dir(<span class="kw-2">&amp;</span>path).expect(<span class="string">"PMU directory"</span>);
+<a href=#934 id=934 data-nosnippet>934</a>                    symlink(<span class="kw-2">&amp;</span>gone, path.join(<span class="string">"cpumask"</span>)).expect(<span class="string">"dangling cpumask"</span>);
+<a href=#935 id=935 data-nosnippet>935</a>                }
+<a href=#936 id=936 data-nosnippet>936</a>                Entry::Dangling =&gt; symlink(<span class="kw-2">&amp;</span>gone, <span class="kw-2">&amp;</span>path).expect(<span class="string">"dangling entry"</span>),
+<a href=#937 id=937 data-nosnippet>937</a>                Entry::PlainFile =&gt; fs::write(<span class="kw-2">&amp;</span>path, <span class="string">""</span>).expect(<span class="string">"plain file"</span>),
+<a href=#938 id=938 data-nosnippet>938</a>            }
+<a href=#939 id=939 data-nosnippet>939</a>        }
+<a href=#940 id=940 data-nosnippet>940</a>        root
+<a href=#941 id=941 data-nosnippet>941</a>    }
+<a href=#942 id=942 data-nosnippet>942</a>
+<a href=#943 id=943 data-nosnippet>943</a>    <span class="attr">#[test]
+<a href=#944 id=944 data-nosnippet>944</a>    </span><span class="kw">fn </span>an_unreadable_or_malformed_sysfs_passes_nothing_over() {
+<a href=#945 id=945 data-nosnippet>945</a>        <span class="kw">let </span>valid = [
+<a href=#946 id=946 data-nosnippet>946</a>            (<span class="string">"amd_l3"</span>, Entry::LinkedMask(<span class="string">"0,8\n"</span>)),
+<a href=#947 id=947 data-nosnippet>947</a>            (<span class="string">"amd_df"</span>, Entry::Mask(<span class="string">"0\n"</span>)),
+<a href=#948 id=948 data-nosnippet>948</a>            (<span class="string">"power_core"</span>, Entry::Mask(<span class="string">"0-7\n"</span>)),
+<a href=#949 id=949 data-nosnippet>949</a>            (<span class="string">"cpu"</span>, Entry::NoMask),
+<a href=#950 id=950 data-nosnippet>950</a>        ];
+<a href=#951 id=951 data-nosnippet>951</a>        <span class="kw">let </span>root = sysfs(<span class="kw-2">&amp;</span>valid);
+<a href=#952 id=952 data-nosnippet>952</a>        <span class="macro">assert_eq!</span>(
+<a href=#953 id=953 data-nosnippet>953</a>            pmu_bound_cpus(root.path()),
+<a href=#954 id=954 data-nosnippet>954</a>            set(<span class="kw-2">&amp;</span>[<span class="number">0</span>, <span class="number">8</span>]),
+<a href=#955 id=955 data-nosnippet>955</a>            <span class="string">"per-core power_core is skipped and cpu names no CPUs"
+<a href=#956 id=956 data-nosnippet>956</a>        </span>);
+<a href=#957 id=957 data-nosnippet>957</a>        <span class="kw">let </span>empty = tempfile::tempdir().expect(<span class="string">"temporary sysfs root"</span>);
+<a href=#958 id=958 data-nosnippet>958</a>        <span class="macro">assert!</span>(pmu_bound_cpus(empty.path()).is_empty(), <span class="string">"no online file"</span>);
+<a href=#959 id=959 data-nosnippet>959</a>        <span class="kw">for </span>(strange, what) <span class="kw">in </span>[
+<a href=#960 id=960 data-nosnippet>960</a>            (Entry::Mask(<span class="string">"zero\n"</span>), <span class="string">"a malformed cpumask"</span>),
+<a href=#961 id=961 data-nosnippet>961</a>            (Entry::MaskIsDir, <span class="string">"a cpumask that is not a regular file"</span>),
+<a href=#962 id=962 data-nosnippet>962</a>            (
+<a href=#963 id=963 data-nosnippet>963</a>                Entry::DanglingMask,
+<a href=#964 id=964 data-nosnippet>964</a>                <span class="string">"a cpumask symlink that resolves to nothing"</span>,
+<a href=#965 id=965 data-nosnippet>965</a>            ),
+<a href=#966 id=966 data-nosnippet>966</a>            (Entry::Dangling, <span class="string">"a PMU entry that resolves to nothing"</span>),
+<a href=#967 id=967 data-nosnippet>967</a>            (Entry::PlainFile, <span class="string">"a PMU entry that is not a directory"</span>),
+<a href=#968 id=968 data-nosnippet>968</a>        ] {
+<a href=#969 id=969 data-nosnippet>969</a>            <span class="kw">let </span><span class="kw-2">mut </span>entries = valid.to_vec();
+<a href=#970 id=970 data-nosnippet>970</a>            entries.push((<span class="string">"strange"</span>, strange));
+<a href=#971 id=971 data-nosnippet>971</a>            <span class="kw">let </span>root = sysfs(<span class="kw-2">&amp;</span>entries);
+<a href=#972 id=972 data-nosnippet>972</a>            <span class="macro">assert!</span>(
+<a href=#973 id=973 data-nosnippet>973</a>                pmu_bound_cpus(root.path()).is_empty(),
+<a href=#974 id=974 data-nosnippet>974</a>                <span class="string">"{what} must not leave a partial set"
+<a href=#975 id=975 data-nosnippet>975</a>            </span>);
+<a href=#976 id=976 data-nosnippet>976</a>        }
+<a href=#977 id=977 data-nosnippet>977</a>    }
+<a href=#978 id=978 data-nosnippet>978</a>
+<a href=#979 id=979 data-nosnippet>979</a>    <span class="attr">#[test]
+<a href=#980 id=980 data-nosnippet>980</a>    </span><span class="kw">fn </span>every_draw_over_a_sparse_mask_is_an_idle_member_of_it() {
+<a href=#981 id=981 data-nosnippet>981</a>        <span class="comment">// CPU 31 runs a CPU-bound task; 7 and 211 are idle.
+<a href=#982 id=982 data-nosnippet>982</a>        </span><span class="kw">let </span>observation = busy(<span class="kw-2">&amp;</span>[(<span class="number">7</span>, <span class="number">0</span>), (<span class="number">31</span>, <span class="number">5</span>), (<span class="number">211</span>, <span class="number">0</span>)], <span class="kw-2">&amp;</span>[]);
+<a href=#983 id=983 data-nosnippet>983</a>        <span class="kw">let </span><span class="kw-2">mut </span>drawn = BTreeMap::new();
+<a href=#984 id=984 data-nosnippet>984</a>        <span class="kw">for _ in </span><span class="number">0</span>..<span class="number">128 </span>{
+<a href=#985 id=985 data-nosnippet>985</a>            <span class="kw">let </span>(cpu, basis) =
+<a href=#986 id=986 data-nosnippet>986</a>                choose_with(<span class="kw-2">&amp;</span>[<span class="number">7</span>, <span class="number">31</span>, <span class="number">211</span>], |<span class="kw">_</span>| <span class="prelude-val">Some</span>(observation.clone())).expect(<span class="string">"non-empty mask"</span>);
+<a href=#987 id=987 data-nosnippet>987</a>            <span class="macro">assert_eq!</span>(
+<a href=#988 id=988 data-nosnippet>988</a>                basis,
+<a href=#989 id=989 data-nosnippet>989</a>                Basis::Idle {
+<a href=#990 id=990 data-nosnippet>990</a>                    candidates: <span class="number">2</span>,
+<a href=#991 id=991 data-nosnippet>991</a>                    sampled: <span class="number">3</span>,
+<a href=#992 id=992 data-nosnippet>992</a>                    pmu: Pmu::NoneBound
+<a href=#993 id=993 data-nosnippet>993</a>                }
+<a href=#994 id=994 data-nosnippet>994</a>            );
+<a href=#995 id=995 data-nosnippet>995</a>            <span class="kw-2">*</span>drawn.entry(cpu).or_insert(<span class="number">0</span>) += <span class="number">1</span>;
+<a href=#996 id=996 data-nosnippet>996</a>        }
+<a href=#997 id=997 data-nosnippet>997</a>        <span class="macro">assert!</span>(!drawn.contains_key(<span class="kw-2">&amp;</span><span class="number">31</span>), <span class="string">"drew the busy CPU: {drawn:?}"</span>);
+<a href=#998 id=998 data-nosnippet>998</a>        <span class="macro">assert_eq!</span>(
+<a href=#999 id=999 data-nosnippet>999</a>            drawn.keys().copied().collect::&lt;Vec&lt;<span class="kw">_</span>&gt;&gt;(),
+<a href=#1000 id=1000 data-nosnippet>1000</a>            [<span class="number">7</span>, <span class="number">211</span>],
+<a href=#1001 id=1001 data-nosnippet>1001</a>            <span class="string">"128 uniform draws from two idle CPUs reach both"
+<a href=#1002 id=1002 data-nosnippet>1002</a>        </span>);
+<a href=#1003 id=1003 data-nosnippet>1003</a>    }
+<a href=#1004 id=1004 data-nosnippet>1004</a>
+<a href=#1005 id=1005 data-nosnippet>1005</a>    <span class="attr">#[test]
+<a href=#1006 id=1006 data-nosnippet>1006</a>    </span><span class="kw">fn </span>without_a_reading_every_allowed_cpu_stays_a_candidate() {
+<a href=#1007 id=1007 data-nosnippet>1007</a>        <span class="kw">for _ in </span><span class="number">0</span>..<span class="number">128 </span>{
+<a href=#1008 id=1008 data-nosnippet>1008</a>            <span class="kw">let </span>(cpu, basis) = choose_with(<span class="kw-2">&amp;</span>[<span class="number">7</span>, <span class="number">31</span>, <span class="number">211</span>], |<span class="kw">_</span>| <span class="prelude-val">None</span>).expect(<span class="string">"non-empty mask"</span>);
+<a href=#1009 id=1009 data-nosnippet>1009</a>            <span class="macro">assert!</span>([<span class="number">7</span>, <span class="number">31</span>, <span class="number">211</span>].contains(<span class="kw-2">&amp;</span>cpu), <span class="string">"chose CPU {cpu}"</span>);
+<a href=#1010 id=1010 data-nosnippet>1010</a>            <span class="macro">assert_eq!</span>(basis, Basis::Unsampled);
+<a href=#1011 id=1011 data-nosnippet>1011</a>        }
+<a href=#1012 id=1012 data-nosnippet>1012</a>    }
+<a href=#1013 id=1013 data-nosnippet>1013</a>
+<a href=#1014 id=1014 data-nosnippet>1014</a>    <span class="attr">#[test]
+<a href=#1015 id=1015 data-nosnippet>1015</a>    </span><span class="kw">fn </span>choose_returns_a_member_of_the_allowed_set_or_none_when_it_is_empty() {
+<a href=#1016 id=1016 data-nosnippet>1016</a>        <span class="macro">assert_eq!</span>(choose_with(<span class="kw-2">&amp;</span>[], observe), <span class="prelude-val">None</span>);
+<a href=#1017 id=1017 data-nosnippet>1017</a>        <span class="macro">assert_eq!</span>(choose_with(<span class="kw-2">&amp;</span>[<span class="number">42</span>], observe), <span class="prelude-val">Some</span>((<span class="number">42</span>, Basis::OnlyAllowed)));
+<a href=#1018 id=1018 data-nosnippet>1018</a>        <span class="kw">let </span>allowed = cpu_ids_from_this_host();
+<a href=#1019 id=1019 data-nosnippet>1019</a>        <span class="kw">let </span>(cpu, basis) = choose_with(<span class="kw-2">&amp;</span>allowed, observe).expect(<span class="string">"this process has allowed CPUs"</span>);
+<a href=#1020 id=1020 data-nosnippet>1020</a>        <span class="macro">assert!</span>(
+<a href=#1021 id=1021 data-nosnippet>1021</a>            allowed.contains(<span class="kw-2">&amp;</span>cpu),
+<a href=#1022 id=1022 data-nosnippet>1022</a>            <span class="string">"chose CPU {cpu} from {allowed:?} ({basis})"
+<a href=#1023 id=1023 data-nosnippet>1023</a>        </span>);
+<a href=#1024 id=1024 data-nosnippet>1024</a>    }
+<a href=#1025 id=1025 data-nosnippet>1025</a>
+<a href=#1026 id=1026 data-nosnippet>1026</a>    <span class="doccomment">/// A reservation stub over `held`, the CPUs other runs hold.
+<a href=#1027 id=1027 data-nosnippet>1027</a>    </span><span class="kw">fn </span>held_by_others(held: <span class="kw-2">&amp;</span>[usize]) -&gt; <span class="kw">impl </span>FnMut(usize) -&gt; io::Result&lt;bool&gt; {
+<a href=#1028 id=1028 data-nosnippet>1028</a>        <span class="kw">let </span>held = set(held);
+<a href=#1029 id=1029 data-nosnippet>1029</a>        <span class="kw">move </span>|cpu| <span class="prelude-val">Ok</span>(!held.contains(<span class="kw-2">&amp;</span>cpu))
+<a href=#1030 id=1030 data-nosnippet>1030</a>    }
+<a href=#1031 id=1031 data-nosnippet>1031</a>
+<a href=#1032 id=1032 data-nosnippet>1032</a>    <span class="attr">#[test]
+<a href=#1033 id=1033 data-nosnippet>1033</a>    </span><span class="kw">fn </span>an_idle_cpu_another_run_holds_is_passed_over_for_another_idle_one() {
+<a href=#1034 id=1034 data-nosnippet>1034</a>        <span class="comment">// CPUs 1 and 2 idle, 3 busy throughout; another run holds CPU 1.
+<a href=#1035 id=1035 data-nosnippet>1035</a>        </span><span class="kw">for _ in </span><span class="number">0</span>..<span class="number">32 </span>{
+<a href=#1036 id=1036 data-nosnippet>1036</a>            <span class="kw">let </span>choice = choose_reserving(
+<a href=#1037 id=1037 data-nosnippet>1037</a>                <span class="kw-2">&amp;</span>[<span class="number">1</span>, <span class="number">2</span>, <span class="number">3</span>],
+<a href=#1038 id=1038 data-nosnippet>1038</a>                |<span class="kw">_</span>| <span class="prelude-val">Some</span>(busy(<span class="kw-2">&amp;</span>[(<span class="number">1</span>, <span class="number">0</span>), (<span class="number">2</span>, <span class="number">0</span>), (<span class="number">3</span>, <span class="number">5</span>)], <span class="kw-2">&amp;</span>[])),
+<a href=#1039 id=1039 data-nosnippet>1039</a>                held_by_others(<span class="kw-2">&amp;</span>[<span class="number">1</span>]),
+<a href=#1040 id=1040 data-nosnippet>1040</a>            )
+<a href=#1041 id=1041 data-nosnippet>1041</a>            .expect(<span class="string">"three CPUs"</span>);
+<a href=#1042 id=1042 data-nosnippet>1042</a>            <span class="macro">assert_eq!</span>(choice.cpu, <span class="number">2</span>, <span class="string">"{choice}"</span>);
+<a href=#1043 id=1043 data-nosnippet>1043</a>            <span class="macro">assert!</span>(
+<a href=#1044 id=1044 data-nosnippet>1044</a>                <span class="macro">matches!</span>(choice.hold, Hold::Reserved { passed_over } <span class="kw">if </span>passed_over &lt;= <span class="number">1</span>),
+<a href=#1045 id=1045 data-nosnippet>1045</a>                <span class="string">"{choice}"
+<a href=#1046 id=1046 data-nosnippet>1046</a>            </span>);
+<a href=#1047 id=1047 data-nosnippet>1047</a>        }
+<a href=#1048 id=1048 data-nosnippet>1048</a>    }
+<a href=#1049 id=1049 data-nosnippet>1049</a>
+<a href=#1050 id=1050 data-nosnippet>1050</a>    <span class="attr">#[test]
+<a href=#1051 id=1051 data-nosnippet>1051</a>    </span><span class="kw">fn </span>with_every_idle_cpu_held_the_least_busy_free_cpu_is_reserved() {
+<a href=#1052 id=1052 data-nosnippet>1052</a>        <span class="comment">// CPUs 1 and 2 idle but held; CPU 3 busy throughout; CPU 4 two ticks
+<a href=#1053 id=1053 data-nosnippet>1053</a>        // in five, so not idle but the least busy of the free ones.
+<a href=#1054 id=1054 data-nosnippet>1054</a>        </span><span class="kw">let </span>choice = choose_reserving(
+<a href=#1055 id=1055 data-nosnippet>1055</a>            <span class="kw-2">&amp;</span>[<span class="number">1</span>, <span class="number">2</span>, <span class="number">3</span>, <span class="number">4</span>],
+<a href=#1056 id=1056 data-nosnippet>1056</a>            |<span class="kw">_</span>| <span class="prelude-val">Some</span>(busy(<span class="kw-2">&amp;</span>[(<span class="number">1</span>, <span class="number">0</span>), (<span class="number">2</span>, <span class="number">0</span>), (<span class="number">3</span>, <span class="number">5</span>), (<span class="number">4</span>, <span class="number">2</span>)], <span class="kw-2">&amp;</span>[])),
+<a href=#1057 id=1057 data-nosnippet>1057</a>            held_by_others(<span class="kw-2">&amp;</span>[<span class="number">1</span>, <span class="number">2</span>]),
+<a href=#1058 id=1058 data-nosnippet>1058</a>        )
+<a href=#1059 id=1059 data-nosnippet>1059</a>        .expect(<span class="string">"four CPUs"</span>);
+<a href=#1060 id=1060 data-nosnippet>1060</a>        <span class="macro">assert_eq!</span>(
+<a href=#1061 id=1061 data-nosnippet>1061</a>            choice,
+<a href=#1062 id=1062 data-nosnippet>1062</a>            Choice {
+<a href=#1063 id=1063 data-nosnippet>1063</a>                cpu: <span class="number">4</span>,
+<a href=#1064 id=1064 data-nosnippet>1064</a>                basis: Basis::LeastBusy {
+<a href=#1065 id=1065 data-nosnippet>1065</a>                    candidates: <span class="number">1</span>,
+<a href=#1066 id=1066 data-nosnippet>1066</a>                    sampled: <span class="number">2</span>,
+<a href=#1067 id=1067 data-nosnippet>1067</a>                    pmu: Pmu::NoneBound
+<a href=#1068 id=1068 data-nosnippet>1068</a>                },
+<a href=#1069 id=1069 data-nosnippet>1069</a>                hold: Hold::Reserved { passed_over: <span class="number">2 </span>},
+<a href=#1070 id=1070 data-nosnippet>1070</a>            }
+<a href=#1071 id=1071 data-nosnippet>1071</a>        );
+<a href=#1072 id=1072 data-nosnippet>1072</a>    }
+<a href=#1073 id=1073 data-nosnippet>1073</a>
+<a href=#1074 id=1074 data-nosnippet>1074</a>    <span class="attr">#[test]
+<a href=#1075 id=1075 data-nosnippet>1075</a>    </span><span class="kw">fn </span>with_every_cpu_held_a_run_shares_the_cpu_it_drew_first() {
+<a href=#1076 id=1076 data-nosnippet>1076</a>        <span class="comment">// CPU 1 idle, CPU 2 busy: the first draw is CPU 1, and both are held.
+<a href=#1077 id=1077 data-nosnippet>1077</a>        </span><span class="kw">let </span>choice = choose_reserving(
+<a href=#1078 id=1078 data-nosnippet>1078</a>            <span class="kw-2">&amp;</span>[<span class="number">1</span>, <span class="number">2</span>],
+<a href=#1079 id=1079 data-nosnippet>1079</a>            |<span class="kw">_</span>| <span class="prelude-val">Some</span>(busy(<span class="kw-2">&amp;</span>[(<span class="number">1</span>, <span class="number">0</span>), (<span class="number">2</span>, <span class="number">5</span>)], <span class="kw-2">&amp;</span>[])),
+<a href=#1080 id=1080 data-nosnippet>1080</a>            held_by_others(<span class="kw-2">&amp;</span>[<span class="number">1</span>, <span class="number">2</span>]),
+<a href=#1081 id=1081 data-nosnippet>1081</a>        )
+<a href=#1082 id=1082 data-nosnippet>1082</a>        .expect(<span class="string">"two CPUs"</span>);
+<a href=#1083 id=1083 data-nosnippet>1083</a>        <span class="macro">assert_eq!</span>(
+<a href=#1084 id=1084 data-nosnippet>1084</a>            choice,
+<a href=#1085 id=1085 data-nosnippet>1085</a>            Choice {
+<a href=#1086 id=1086 data-nosnippet>1086</a>                cpu: <span class="number">1</span>,
+<a href=#1087 id=1087 data-nosnippet>1087</a>                basis: Basis::Idle {
+<a href=#1088 id=1088 data-nosnippet>1088</a>                    candidates: <span class="number">1</span>,
+<a href=#1089 id=1089 data-nosnippet>1089</a>                    sampled: <span class="number">2</span>,
+<a href=#1090 id=1090 data-nosnippet>1090</a>                    pmu: Pmu::NoneBound
+<a href=#1091 id=1091 data-nosnippet>1091</a>                },
+<a href=#1092 id=1092 data-nosnippet>1092</a>                hold: Hold::Shared,
+<a href=#1093 id=1093 data-nosnippet>1093</a>            }
+<a href=#1094 id=1094 data-nosnippet>1094</a>        );
+<a href=#1095 id=1095 data-nosnippet>1095</a>    }
+<a href=#1096 id=1096 data-nosnippet>1096</a>
+<a href=#1097 id=1097 data-nosnippet>1097</a>    <span class="attr">#[test]
+<a href=#1098 id=1098 data-nosnippet>1098</a>    </span><span class="kw">fn </span>where_reservations_cannot_be_made_the_drawn_cpu_is_used_unreserved() {
+<a href=#1099 id=1099 data-nosnippet>1099</a>        <span class="kw">let </span>choice = choose_reserving(
+<a href=#1100 id=1100 data-nosnippet>1100</a>            <span class="kw-2">&amp;</span>[<span class="number">1</span>, <span class="number">2</span>, <span class="number">3</span>],
+<a href=#1101 id=1101 data-nosnippet>1101</a>            |<span class="kw">_</span>| <span class="prelude-val">Some</span>(busy(<span class="kw-2">&amp;</span>[(<span class="number">1</span>, <span class="number">0</span>), (<span class="number">2</span>, <span class="number">5</span>), (<span class="number">3</span>, <span class="number">5</span>)], <span class="kw-2">&amp;</span>[])),
+<a href=#1102 id=1102 data-nosnippet>1102</a>            |<span class="kw">_</span>| <span class="prelude-val">Err</span>(io::Error::from_raw_os_error(libc::EPERM)),
+<a href=#1103 id=1103 data-nosnippet>1103</a>        )
+<a href=#1104 id=1104 data-nosnippet>1104</a>        .expect(<span class="string">"three CPUs"</span>);
+<a href=#1105 id=1105 data-nosnippet>1105</a>        <span class="macro">assert_eq!</span>(choice.cpu, <span class="number">1</span>, <span class="string">"{choice}"</span>);
+<a href=#1106 id=1106 data-nosnippet>1106</a>        <span class="macro">assert!</span>(<span class="macro">matches!</span>(choice.hold, Hold::Unreserved(<span class="kw">_</span>)), <span class="string">"{choice}"</span>);
+<a href=#1107 id=1107 data-nosnippet>1107</a>        <span class="macro">assert_eq!</span>(
+<a href=#1108 id=1108 data-nosnippet>1108</a>            choose_reserving(<span class="kw-2">&amp;</span>[], |<span class="kw">_</span>| <span class="prelude-val">None</span>, |<span class="kw">_</span>| <span class="prelude-val">Ok</span>(<span class="bool-val">true</span>)),
+<a href=#1109 id=1109 data-nosnippet>1109</a>            <span class="prelude-val">None</span>,
+<a href=#1110 id=1110 data-nosnippet>1110</a>            <span class="string">"an empty mask has no CPU to reserve"
+<a href=#1111 id=1111 data-nosnippet>1111</a>        </span>);
+<a href=#1112 id=1112 data-nosnippet>1112</a>    }
+<a href=#1113 id=1113 data-nosnippet>1113</a>
+<a href=#1114 id=1114 data-nosnippet>1114</a>    <span class="doccomment">/// A name prefix private to one test: its process ID alone could repeat
+<a href=#1115 id=1115 data-nosnippet>1115</a>    /// across PID namespaces that share a network namespace.
+<a href=#1116 id=1116 data-nosnippet>1116</a>    </span><span class="kw">fn </span>private_prefix() -&gt; String {
+<a href=#1117 id=1117 data-nosnippet>1117</a>        <span class="macro">format!</span>(
+<a href=#1118 id=1118 data-nosnippet>1118</a>            <span class="string">"hermit-pinned-core-test:{}:{:016x}"</span>,
+<a href=#1119 id=1119 data-nosnippet>1119</a>            std::process::id(),
+<a href=#1120 id=1120 data-nosnippet>1120</a>            rand::random::&lt;u64&gt;()
+<a href=#1121 id=1121 data-nosnippet>1121</a>        )
+<a href=#1122 id=1122 data-nosnippet>1122</a>    }
+<a href=#1123 id=1123 data-nosnippet>1123</a>
+<a href=#1124 id=1124 data-nosnippet>1124</a>    <span class="doccomment">/// Two runs reserving within a two-CPU set never share a CPU while each
+<a href=#1125 id=1125 data-nosnippet>1125</a>    /// holds its reservation: the second run's bind of the first one's name
+<a href=#1126 id=1126 data-nosnippet>1126</a>    /// fails, and it takes the other CPU. A third finds both held and shares.
+<a href=#1127 id=1127 data-nosnippet>1127</a>    </span><span class="attr">#[test]
+<a href=#1128 id=1128 data-nosnippet>1128</a>    </span><span class="kw">fn </span>runs_reserving_within_two_cpus_never_share_one() {
+<a href=#1129 id=1129 data-nosnippet>1129</a>        <span class="kw">let </span>prefix = private_prefix();
+<a href=#1130 id=1130 data-nosnippet>1130</a>        <span class="kw">let </span><span class="kw-2">mut </span>holders = Vec::new();
+<a href=#1131 id=1131 data-nosnippet>1131</a>        <span class="kw">let </span><span class="kw-2">mut </span>run = || {
+<a href=#1132 id=1132 data-nosnippet>1132</a>            choose_reserving(
+<a href=#1133 id=1133 data-nosnippet>1133</a>                <span class="kw-2">&amp;</span>[<span class="number">0</span>, <span class="number">1</span>],
+<a href=#1134 id=1134 data-nosnippet>1134</a>                |<span class="kw">_</span>| <span class="prelude-val">None</span>,
+<a href=#1135 id=1135 data-nosnippet>1135</a>                |cpu| <span class="prelude-val">Ok</span>(reserve(<span class="kw-2">&amp;</span>prefix, cpu)<span class="question-mark">?</span>.map(|fd| holders.push(fd)).is_some()),
+<a href=#1136 id=1136 data-nosnippet>1136</a>            )
+<a href=#1137 id=1137 data-nosnippet>1137</a>            .expect(<span class="string">"two CPUs"</span>)
+<a href=#1138 id=1138 data-nosnippet>1138</a>        };
+<a href=#1139 id=1139 data-nosnippet>1139</a>        <span class="kw">let </span>(first, second, third) = (run(), run(), run());
+<a href=#1140 id=1140 data-nosnippet>1140</a>        <span class="macro">assert!</span>(
+<a href=#1141 id=1141 data-nosnippet>1141</a>            <span class="macro">matches!</span>(first.hold, Hold::Reserved { .. }),
+<a href=#1142 id=1142 data-nosnippet>1142</a>            <span class="string">"first run: {first}"
+<a href=#1143 id=1143 data-nosnippet>1143</a>        </span>);
+<a href=#1144 id=1144 data-nosnippet>1144</a>        <span class="macro">assert!</span>(
+<a href=#1145 id=1145 data-nosnippet>1145</a>            <span class="macro">matches!</span>(second.hold, Hold::Reserved { .. }),
+<a href=#1146 id=1146 data-nosnippet>1146</a>            <span class="string">"second run: {second}"
+<a href=#1147 id=1147 data-nosnippet>1147</a>        </span>);
+<a href=#1148 id=1148 data-nosnippet>1148</a>        <span class="macro">assert_ne!</span>(first.cpu, second.cpu);
+<a href=#1149 id=1149 data-nosnippet>1149</a>        <span class="macro">assert_eq!</span>(third.hold, Hold::Shared, <span class="string">"third run: {third}"</span>);
+<a href=#1150 id=1150 data-nosnippet>1150</a>    }
+<a href=#1151 id=1151 data-nosnippet>1151</a>
+<a href=#1152 id=1152 data-nosnippet>1152</a>    <span class="attr">#[test]
+<a href=#1153 id=1153 data-nosnippet>1153</a>    </span><span class="kw">fn </span>a_reservation_sits_on_a_high_close_on_exec_descriptor_until_it_closes() {
+<a href=#1154 id=1154 data-nosnippet>1154</a>        <span class="kw">let </span>prefix = private_prefix();
+<a href=#1155 id=1155 data-nosnippet>1155</a>        <span class="kw">let </span>fd = reserve(<span class="kw-2">&amp;</span>prefix, <span class="number">5</span>)
+<a href=#1156 id=1156 data-nosnippet>1156</a>            .expect(<span class="string">"abstract sockets can be bound"</span>)
+<a href=#1157 id=1157 data-nosnippet>1157</a>            .expect(<span class="string">"the name is free"</span>);
+<a href=#1158 id=1158 data-nosnippet>1158</a>        <span class="macro">assert!</span>(fd.as_raw_fd() &gt;= RESERVATION_FD_FLOOR, <span class="string">"{fd:?}"</span>);
+<a href=#1159 id=1159 data-nosnippet>1159</a>        <span class="comment">// SAFETY: F_GETFD on a descriptor this test owns.
+<a href=#1160 id=1160 data-nosnippet>1160</a>        </span><span class="kw">let </span>flags = <span class="kw">unsafe </span>{ libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+<a href=#1161 id=1161 data-nosnippet>1161</a>        <span class="macro">assert_eq!</span>(
+<a href=#1162 id=1162 data-nosnippet>1162</a>            flags &amp; libc::FD_CLOEXEC,
+<a href=#1163 id=1163 data-nosnippet>1163</a>            libc::FD_CLOEXEC,
+<a href=#1164 id=1164 data-nosnippet>1164</a>            <span class="string">"flags {flags:#x}"
+<a href=#1165 id=1165 data-nosnippet>1165</a>        </span>);
+<a href=#1166 id=1166 data-nosnippet>1166</a>        <span class="macro">assert!</span>(
+<a href=#1167 id=1167 data-nosnippet>1167</a>            reserve(<span class="kw-2">&amp;</span>prefix, <span class="number">5</span>).expect(<span class="string">"bind"</span>).is_none(),
+<a href=#1168 id=1168 data-nosnippet>1168</a>            <span class="string">"a held name is refused"
+<a href=#1169 id=1169 data-nosnippet>1169</a>        </span>);
+<a href=#1170 id=1170 data-nosnippet>1170</a>        drop(fd);
+<a href=#1171 id=1171 data-nosnippet>1171</a>        <span class="macro">assert!</span>(
+<a href=#1172 id=1172 data-nosnippet>1172</a>            reserve(<span class="kw-2">&amp;</span>prefix, <span class="number">5</span>).expect(<span class="string">"bind"</span>).is_some(),
+<a href=#1173 id=1173 data-nosnippet>1173</a>            <span class="string">"closing the descriptor releases the name"
+<a href=#1174 id=1174 data-nosnippet>1174</a>        </span>);
+<a href=#1175 id=1175 data-nosnippet>1175</a>    }
+<a href=#1176 id=1176 data-nosnippet>1176</a>
+<a href=#1177 id=1177 data-nosnippet>1177</a>    <span class="attr">#[test]
+<a href=#1178 id=1178 data-nosnippet>1178</a>    </span><span class="kw">fn </span>a_later_run_of_the_process_keeps_the_cpu_it_holds() {
+<a href=#1179 id=1179 data-nosnippet>1179</a>        <span class="kw">let </span>prefix = private_prefix();
+<a href=#1180 id=1180 data-nosnippet>1180</a>        <span class="kw">let </span><span class="kw-2">mut </span>held = reserve(<span class="kw-2">&amp;</span>prefix, <span class="number">1</span>).expect(<span class="string">"bind"</span>).map(|fd| (<span class="number">1</span>, fd));
+<a href=#1181 id=1181 data-nosnippet>1181</a>        <span class="comment">// CPU 1 is idle and this process holds it; CPU 2 is busy.
+<a href=#1182 id=1182 data-nosnippet>1182</a>        </span><span class="kw">let </span>choice = choose_for_run_with(
+<a href=#1183 id=1183 data-nosnippet>1183</a>            <span class="kw-2">&amp;</span>[<span class="number">1</span>, <span class="number">2</span>],
+<a href=#1184 id=1184 data-nosnippet>1184</a>            |<span class="kw">_</span>| <span class="prelude-val">Some</span>(busy(<span class="kw-2">&amp;</span>[(<span class="number">1</span>, <span class="number">0</span>), (<span class="number">2</span>, <span class="number">5</span>)], <span class="kw-2">&amp;</span>[])),
+<a href=#1185 id=1185 data-nosnippet>1185</a>            <span class="kw-2">&amp;mut </span>held,
+<a href=#1186 id=1186 data-nosnippet>1186</a>            |cpu| reserve(<span class="kw-2">&amp;</span>prefix, cpu),
+<a href=#1187 id=1187 data-nosnippet>1187</a>        )
+<a href=#1188 id=1188 data-nosnippet>1188</a>        .expect(<span class="string">"two CPUs"</span>);
+<a href=#1189 id=1189 data-nosnippet>1189</a>        <span class="macro">assert_eq!</span>((choice.cpu, <span class="kw-2">&amp;</span>choice.hold), (<span class="number">1</span>, <span class="kw-2">&amp;</span>Hold::Kept), <span class="string">"{choice}"</span>);
+<a href=#1190 id=1190 data-nosnippet>1190</a>        <span class="macro">assert_eq!</span>(held.as_ref().map(|(cpu, <span class="kw">_</span>)| <span class="kw-2">*</span>cpu), <span class="prelude-val">Some</span>(<span class="number">1</span>));
+<a href=#1191 id=1191 data-nosnippet>1191</a>    }
+<a href=#1192 id=1192 data-nosnippet>1192</a>
+<a href=#1193 id=1193 data-nosnippet>1193</a>    <span class="attr">#[test]
+<a href=#1194 id=1194 data-nosnippet>1194</a>    </span><span class="kw">fn </span>a_run_that_moves_releases_the_cpu_the_process_held() {
+<a href=#1195 id=1195 data-nosnippet>1195</a>        <span class="kw">let </span>prefix = private_prefix();
+<a href=#1196 id=1196 data-nosnippet>1196</a>        <span class="kw">let </span><span class="kw-2">mut </span>held = reserve(<span class="kw-2">&amp;</span>prefix, <span class="number">1</span>).expect(<span class="string">"bind"</span>).map(|fd| (<span class="number">1</span>, fd));
+<a href=#1197 id=1197 data-nosnippet>1197</a>        <span class="comment">// The allowed set no longer has CPU 1: the run reserves CPU 2.
+<a href=#1198 id=1198 data-nosnippet>1198</a>        </span><span class="kw">let </span>choice = choose_for_run_with(
+<a href=#1199 id=1199 data-nosnippet>1199</a>            <span class="kw-2">&amp;</span>[<span class="number">2</span>, <span class="number">3</span>],
+<a href=#1200 id=1200 data-nosnippet>1200</a>            |<span class="kw">_</span>| <span class="prelude-val">Some</span>(busy(<span class="kw-2">&amp;</span>[(<span class="number">2</span>, <span class="number">0</span>), (<span class="number">3</span>, <span class="number">5</span>)], <span class="kw-2">&amp;</span>[])),
+<a href=#1201 id=1201 data-nosnippet>1201</a>            <span class="kw-2">&amp;mut </span>held,
+<a href=#1202 id=1202 data-nosnippet>1202</a>            |cpu| reserve(<span class="kw-2">&amp;</span>prefix, cpu),
+<a href=#1203 id=1203 data-nosnippet>1203</a>        )
+<a href=#1204 id=1204 data-nosnippet>1204</a>        .expect(<span class="string">"two CPUs"</span>);
+<a href=#1205 id=1205 data-nosnippet>1205</a>        <span class="macro">assert_eq!</span>(
+<a href=#1206 id=1206 data-nosnippet>1206</a>            (choice.cpu, <span class="kw-2">&amp;</span>choice.hold),
+<a href=#1207 id=1207 data-nosnippet>1207</a>            (<span class="number">2</span>, <span class="kw-2">&amp;</span>Hold::Reserved { passed_over: <span class="number">0 </span>})
+<a href=#1208 id=1208 data-nosnippet>1208</a>        );
+<a href=#1209 id=1209 data-nosnippet>1209</a>        <span class="macro">assert_eq!</span>(held.as_ref().map(|(cpu, <span class="kw">_</span>)| <span class="kw-2">*</span>cpu), <span class="prelude-val">Some</span>(<span class="number">2</span>));
+<a href=#1210 id=1210 data-nosnippet>1210</a>        <span class="macro">assert!</span>(
+<a href=#1211 id=1211 data-nosnippet>1211</a>            reserve(<span class="kw-2">&amp;</span>prefix, <span class="number">1</span>).expect(<span class="string">"bind"</span>).is_some(),
+<a href=#1212 id=1212 data-nosnippet>1212</a>            <span class="string">"the CPU the process moved away from is free again"
+<a href=#1213 id=1213 data-nosnippet>1213</a>        </span>);
+<a href=#1214 id=1214 data-nosnippet>1214</a>        <span class="comment">// Then a run restricted to CPU 4, which another run holds, shares it
+<a href=#1215 id=1215 data-nosnippet>1215</a>        // and leaves this process holding nothing.
+<a href=#1216 id=1216 data-nosnippet>1216</a>        </span><span class="kw">let </span>_other = reserve(<span class="kw-2">&amp;</span>prefix, <span class="number">4</span>).expect(<span class="string">"bind"</span>).expect(<span class="string">"free"</span>);
+<a href=#1217 id=1217 data-nosnippet>1217</a>        <span class="kw">let </span>choice = choose_for_run_with(<span class="kw-2">&amp;</span>[<span class="number">4</span>], |<span class="kw">_</span>| <span class="prelude-val">None</span>, <span class="kw-2">&amp;mut </span>held, |cpu| reserve(<span class="kw-2">&amp;</span>prefix, cpu))
+<a href=#1218 id=1218 data-nosnippet>1218</a>            .expect(<span class="string">"one CPU"</span>);
+<a href=#1219 id=1219 data-nosnippet>1219</a>        <span class="macro">assert_eq!</span>((choice.cpu, <span class="kw-2">&amp;</span>choice.hold), (<span class="number">4</span>, <span class="kw-2">&amp;</span>Hold::Shared));
+<a href=#1220 id=1220 data-nosnippet>1220</a>        <span class="macro">assert!</span>(held.is_none(), <span class="string">"a shared run holds no reservation"</span>);
+<a href=#1221 id=1221 data-nosnippet>1221</a>        <span class="macro">assert!</span>(
+<a href=#1222 id=1222 data-nosnippet>1222</a>            reserve(<span class="kw-2">&amp;</span>prefix, <span class="number">2</span>).expect(<span class="string">"bind"</span>).is_some(),
+<a href=#1223 id=1223 data-nosnippet>1223</a>            <span class="string">"and the CPU the process held before is free again"
+<a href=#1224 id=1224 data-nosnippet>1224</a>        </span>);
+<a href=#1225 id=1225 data-nosnippet>1225</a>    }
+<a href=#1226 id=1226 data-nosnippet>1226</a>
+<a href=#1227 id=1227 data-nosnippet>1227</a>    <span class="doccomment">/// The CPUs this test process may run on.
+<a href=#1228 id=1228 data-nosnippet>1228</a>    </span><span class="kw">fn </span>cpu_ids_from_this_host() -&gt; Vec&lt;usize&gt; {
+<a href=#1229 id=1229 data-nosnippet>1229</a>        <span class="kw">let </span>mask = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(<span class="number">0</span>))
+<a href=#1230 id=1230 data-nosnippet>1230</a>            .expect(<span class="string">"sched_getaffinity of this process"</span>);
+<a href=#1231 id=1231 data-nosnippet>1231</a>        (<span class="number">0</span>..nix::sched::CpuSet::count())
+<a href=#1232 id=1232 data-nosnippet>1232</a>            .filter(|cpu| mask.is_set(<span class="kw-2">*</span>cpu).unwrap_or(<span class="bool-val">false</span>))
+<a href=#1233 id=1233 data-nosnippet>1233</a>            .collect()
+<a href=#1234 id=1234 data-nosnippet>1234</a>    }
+<a href=#1235 id=1235 data-nosnippet>1235</a>}
+</code></pre></div></section></main></body></html>

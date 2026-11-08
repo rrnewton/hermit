@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["SchedTraceOpts"],"fn":["inspect_boundaries","legacy_schedule","per_thread_events","preempt_events","print_boundaries","record_tid"],"struct":["DiffOpts","InspectOpts","InterpolateOpts","PrintOpts"]};

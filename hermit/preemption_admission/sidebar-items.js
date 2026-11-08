@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["refuse_unqualified_annotated_launch","refuse_unqualified_annotated_replay","refuse_unqualified_annotated_replay_with_capabilities","refuse_unsupported_preemption","refuse_unsupported_preemption_with_capabilities"],"struct":["UnqualifiedAnnotatedReplay","UnsupportedPreemption"]};

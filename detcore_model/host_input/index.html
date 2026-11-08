@@ -1,0 +1,68 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="The host identity of a file a guest opened."><title>detcore_model::host_input - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="detcore_model" data-themes="" data-resource-suffix="" data-rustdoc-version="1.99.0-nightly (be8e82435 2026-07-11)" data-channel="nightly" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module host_input</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../detcore_model/index.html">detcore_<wbr>model</a><span class="version">0.5.4</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module host_<wbr>input</a></h2><h3><a href="#structs">Module Items</a></h3><ul class="block"><li><a href="#structs" title="Structs">Structs</a></li><li><a href="#constants" title="Constants">Constants</a></li><li><a href="#functions" title="Functions">Functions</a></li></ul></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="../index.html">In crate detcore_<wbr>model</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">detcore_model</a></div><h1>Module <span>host_<wbr>input</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/detcore_model/host_input.rs.html#9-374">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>The host identity of a file a guest opened.</p>
+<p>Hermit maps each host inode it sees to a deterministic one in the order it
+first sees them, so a host file that is REPLACED while a run is going (a
+package manager rewriting <code>/etc/ld.so.cache</code> between the opens of two
+guest processes, for example) gives that run one more inode than the other
+run, and every later inode number differs. <code>hermit run --verify</code> then
+reports a divergence that the guest did not cause. Each verification run
+therefore records one <a href="struct.HostInputRecord.html" title="struct detcore_model::host_input::HostInputRecord"><code>HostInputRecord</code></a> per host file the guest opens.
+Detcore reports each open to its global state
+(<a href="../config/struct.Config.html#structfield.record_host_inputs" title="field detcore_model::config::Config::record_host_inputs"><code>crate::config::Config::record_host_inputs</code></a>), which writes the run’s
+records to a side file (<a href="../config/struct.Config.html#structfield.host_input_log" title="field detcore_model::config::Config::host_input_log"><code>crate::config::Config::host_input_log</code></a>) when the
+run ends, never part of the compared log. On a divergence the two runs’
+records are compared to name such a change.</p>
+<p>A run that writes a record meant to be reproduced later (a
+<code>--record-preemptions-to</code> schedule, or a <code>--summary-json</code> summary) also
+keeps a <a href="struct.HostInputSet.html" title="struct detcore_model::host_input::HostInputSet"><code>HostInputSet</code></a>: each host file the guest opened, with the
+identity its first open found, and a digest of the set. A run that replays
+such a schedule compares the files it opens against the set and reports
+each one that changed (<a href="struct.HostInputChange.html" title="struct detcore_model::host_input::HostInputChange"><code>HostInputChange</code></a>): Hermit does not make a
+changing filesystem deterministic, so a replay that reads different host
+files can diverge, and it then says why.</p>
+</div></details><h2 id="structs" class="section-header">Structs<a href="#structs" class="anchor">§</a></h2><dl class="item-table"><dt><a class="struct" href="struct.HostFileIdentity.html" title="struct detcore_model::host_input::HostFileIdentity">Host<wbr>File<wbr>Identity</a></dt><dd>The host’s identity for a file at the moment it was opened or captured.</dd><dt><a class="struct" href="struct.HostInput.html" title="struct detcore_model::host_input::HostInput">Host<wbr>Input</a></dt><dd>One host file in a <a href="struct.HostInputSet.html" title="struct detcore_model::host_input::HostInputSet"><code>HostInputSet</code></a>: its path and the identity the run’s
+first open of that path found.</dd><dt><a class="struct" href="struct.HostInputChange.html" title="struct detcore_model::host_input::HostInputChange">Host<wbr>Input<wbr>Change</a></dt><dd>A host file that differs between a recorded run and the run that
+reproduces it (<a href="fn.host_input_changed.html" title="fn detcore_model::host_input::host_input_changed"><code>host_input_changed</code></a>): other bytes, or, where either run
+could not hash them, another identity (replaced, or modified in size or
+time). The reproduction may read other bytes than the recorded run did,
+and diverge where it does.</dd><dt><a class="struct" href="struct.HostInputLogEnd.html" title="struct detcore_model::host_input::HostInputLogEnd">Host<wbr>Input<wbr>LogEnd</a></dt><dd>The last line of a complete host-input log: how many records, of both
+kinds, precede it. A log without it, or with another count, is incomplete.</dd><dt><a class="struct" href="struct.HostInputRecord.html" title="struct detcore_model::host_input::HostInputRecord">Host<wbr>Input<wbr>Record</a></dt><dd>One host file a guest opened: the path it named, made absolute against its
+working directory or directory descriptor, the host identity of the file
+the open reached (or the captured origin of an authenticated launcher-owned
+snapshot), and the open itself, as the thread (<code>dtid</code>) and that
+thread’s syscall number (<code>syscall</code>, the <code>finish syscall #N</code> of the run’s
+log) that made it. A path that is not UTF-8 is recorded lossily.</dd><dt><a class="struct" href="struct.HostInputSet.html" title="struct detcore_model::host_input::HostInputSet">Host<wbr>Input<wbr>Set</a></dt><dd>The host files one run’s guest opened, for a later run that reproduces it
+to compare against: one <a href="struct.HostInput.html" title="struct detcore_model::host_input::HostInput"><code>HostInput</code></a> per path, sorted by path, and a
+digest of the set, so that two runs can be compared by one string. The
+digest is the SHA-256 (lowercase hex) of one line per file: its path and
+the SHA-256 of its bytes where they were hashed, otherwise its identity.
+So it agrees with <a href="fn.host_input_changed.html" title="fn detcore_model::host_input::host_input_changed"><code>host_input_changed</code></a>: two runs that read the same
+bytes at the same paths get the same digest whatever the files’ inodes
+and times. A path is left out when it is not absolute, names a kernel
+object (<a href="fn.is_kernel_object.html" title="fn detcore_model::host_input::is_kernel_object"><code>is_kernel_object</code></a>, also by the descriptor’s own path,
+<a href="struct.HostInputRecord.html#structfield.kernel_object" title="field detcore_model::host_input::HostInputRecord::kernel_object"><code>HostInputRecord::kernel_object</code></a>), or was rebound by the guest itself
+(<a href="fn.guest_rebound.html" title="fn detcore_model::host_input::guest_rebound"><code>guest_rebound</code></a>): those can change between runs without the host’s
+files changing.</dd><dt><a class="struct" href="struct.HostInputSnapshot.html" title="struct detcore_model::host_input::HostInputSnapshot">Host<wbr>Input<wbr>Snapshot</a></dt><dd>A private copy of a captured host input. The launcher supplies this only
+for a copy it owns: <code>physical</code> authenticates the object the guest opened,
+while <code>origin</code> names the object whose bytes were captured. Aliases of the
+copy have the same provenance; an unrelated object at its usual guest path
+does not. This is host-only state, never a guest or record-format payload.</dd><dt><a class="struct" href="struct.HostMutationRecord.html" title="struct detcore_model::host_input::HostMutationRecord">Host<wbr>Mutation<wbr>Record</a></dt><dd>A path the guest itself rebound in its file namespace during the run:
+renamed to or from, linked, unlinked, made as a symlink, node or directory,
+removed as a directory, or opened to create (see
+<a href="../config/struct.Config.html#structfield.record_host_inputs" title="field detcore_model::config::Config::record_host_inputs"><code>crate::config::Config::record_host_inputs</code></a>). Made absolute as an open’s
+path is. A host file whose path, or a directory above it, the guest
+rebound may have been replaced by the guest, so such a change is never
+named as a host input change.</dd></dl><h2 id="constants" class="section-header">Constants<a href="#constants" class="anchor">§</a></h2><dl class="item-table"><dt><a class="constant" href="constant.HOST_INPUT_CHANGED_SINCE_RECORDING_MARKER.html" title="constant detcore_model::host_input::HOST_INPUT_CHANGED_SINCE_RECORDING_MARKER">HOST_<wbr>INPUT_<wbr>CHANGED_<wbr>SINCE_<wbr>RECORDING_<wbr>MARKER</a></dt><dd>The marker that begins the stderr line a reproducing run prints for each
+<a href="struct.HostInputChange.html" title="struct detcore_model::host_input::HostInputChange"><code>HostInputChange</code></a>. A harness greps for it, as for
+<code>HERMIT_SKID_OVERSHOOT</code>; keep it stable.</dd><dt><a class="constant" href="constant.HOST_INPUT_CONTENT_LIMIT.html" title="constant detcore_model::host_input::HOST_INPUT_CONTENT_LIMIT">HOST_<wbr>INPUT_<wbr>CONTENT_<wbr>LIMIT</a></dt><dd>The largest file whose bytes Detcore hashes for a <a href="struct.HostInput.html" title="struct detcore_model::host_input::HostInput"><code>HostInput</code></a>: a larger
+one is compared by its identity alone, so that a guest that opens big data
+files does not pay to read them twice.</dd></dl><h2 id="functions" class="section-header">Functions<a href="#functions" class="anchor">§</a></h2><dl class="item-table"><dt><a class="fn" href="fn.guest_rebound.html" title="fn detcore_model::host_input::guest_rebound">guest_<wbr>rebound</a></dt><dd>Whether the guest may have rebound <code>path</code>, or a directory above it, in its
+file namespace: one of <code>mutated</code> (<a href="struct.HostMutationRecord.html" title="struct detcore_model::host_input::HostMutationRecord"><code>HostMutationRecord</code></a> paths) is <code>path</code>
+or an ancestor of it. Detcore reports <code>/</code>, the ancestor of every absolute
+path, for a change whose path it could not establish. A path that is not
+absolute cannot be matched against those changes at all, so it counts as
+rebound too.</dd><dt><a class="fn" href="fn.host_input_changed.html" title="fn detcore_model::host_input::host_input_changed">host_<wbr>input_<wbr>changed</a></dt><dd>Whether <code>now</code> shows a different file than <code>recorded</code>, for the same path:
+other bytes, where both runs hashed them, and otherwise another identity.
+A file rewritten with the same bytes (as a package manager’s <code>ldconfig</code>
+does) is therefore not a change where its content was hashed.</dd><dt><a class="fn" href="fn.is_kernel_object.html" title="fn detcore_model::host_input::is_kernel_object">is_<wbr>kernel_<wbr>object</a></dt><dd>Whether <code>path</code> names a kernel object under <code>/proc</code>, <code>/sys</code> or <code>/dev</code>
+rather than a host input file: its metadata is not file content, and
+Hermit virtualizes those trees separately.</dd></dl></section></div></main></body></html>

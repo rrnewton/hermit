@@ -1,0 +1,120 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `ci/manifest-plan/src/archived.rs`."><title>archived.rs - source</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="hermit_manifest_plan" data-themes="" data-resource-suffix="" data-rustdoc-version="1.99.0-nightly (be8e82435 2026-07-11)" data-channel="nightly" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="../../static.files/src-script-813739b1.js"></script><script defer src="../../src-files.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc src"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="sidebar"><div class="src-sidebar-title"><h2>Files</h2></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1><div class="sub-heading">hermit_manifest_plan/</div>archived.rs</h1><rustdoc-toolbar></rustdoc-toolbar></div><div class="example-wrap digits-3"><pre class="rust"><code><a href=#1 id=1 data-nosnippet>1</a><span class="doccomment">//! The archived execution paths: the backend and the preprocessing step the
+<a href=#2 id=2 data-nosnippet>2</a>//! owner stopped developing, whose tests left the per-commit validation for
+<a href=#3 id=3 data-nosnippet>3</a>//! the nightly pressure run.
+<a href=#4 id=4 data-nosnippet>4</a>//!
+<a href=#5 id=5 data-nosnippet>5</a>//! Owner direction, 2026-10-25: "mark our sabre and e9patch backends as
+<a href=#6 id=6 data-nosnippet>6</a>//! archived for now and move their tests to nightly only and not actively
+<a href=#7 id=7 data-nosnippet>7</a>//! develop them." Archived code still builds in every validation (the
+<a href=#8 id=8 data-nosnippet>8</a>//! third-party-backends workspace build, Clippy and the SaBRe smoke test
+<a href=#9 id=9 data-nosnippet>9</a>//! `test.sabre_examples`), so it cannot rot silently, but no feature work
+<a href=#10 id=10 data-nosnippet>10</a>//! lands on it.
+<a href=#11 id=11 data-nosnippet>11</a>//!
+<a href=#12 id=12 data-nosnippet>12</a>//! A manifest cell on an archived backend that would belong to the full run
+<a href=#13 id=13 data-nosnippet>13</a>//! type belongs to [`ARCHIVED_RUN_TYPE`] instead ([`crate::runner::cell_labels`]).
+<a href=#14 id=14 data-nosnippet>14</a>//! Full validation, its portable and hosted subsets, and the Buck route (whose
+<a href=#15 id=15 data-nosnippet>15</a>//! cells are `ci/expected-e2e-plan.json`'s) therefore do not select it, and the
+<a href=#16 id=16 data-nosnippet>16</a>//! scorecard reports it as not selected by full: a red cell, which the nightly
+<a href=#17 id=17 data-nosnippet>17</a>//! pressure sweep's red part runs three times a night, and a verify cell, which
+<a href=#18 id=18 data-nosnippet>18</a>//! its parity-all part measures beside ptrace. A cell that already names a
+<a href=#19 id=19 data-nosnippet>19</a>//! focused run type, such as `sabre-compat-only`, keeps it.
+<a href=#20 id=20 data-nosnippet>20</a>
+<a href=#21 id=21 data-nosnippet>21</a>/// What an archived entry is. Hermit AGENTS.md, "Backend Definition": only a
+<a href=#22 id=22 data-nosnippet>22</a>/// path that loads Detcore as a Reverie tool is a backend; e9patch rewrites a
+<a href=#23 id=23 data-nosnippet>23</a>/// binary that then runs on the ptrace backend.
+<a href=#24 id=24 data-nosnippet>24</a></span><span class="attr">#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+<a href=#25 id=25 data-nosnippet>25</a></span><span class="kw">pub enum </span>ArchivedKind {
+<a href=#26 id=26 data-nosnippet>26</a>    <span class="doccomment">/// A Reverie backend running `Detcore&lt;XxxGuest&gt;`, named by manifest cells.
+<a href=#27 id=27 data-nosnippet>27</a>    </span>Backend,
+<a href=#28 id=28 data-nosnippet>28</a>    <span class="doccomment">/// Preprocessing whose output runs on the ptrace backend. It has no
+<a href=#29 id=29 data-nosnippet>29</a>    /// manifest cells; its corpus is `ci/compat/corpus-e9patch.json`, run by
+<a href=#30 id=30 data-nosnippet>30</a>    /// `scripts/validate.rs --e9patch-compat-only`.
+<a href=#31 id=31 data-nosnippet>31</a>    </span>PreprocessingWithPtrace,
+<a href=#32 id=32 data-nosnippet>32</a>}
+<a href=#33 id=33 data-nosnippet>33</a>
+<a href=#34 id=34 data-nosnippet>34</a><span class="doccomment">/// One archived execution path.
+<a href=#35 id=35 data-nosnippet>35</a></span><span class="attr">#[derive(Clone, Copy, Debug)]
+<a href=#36 id=36 data-nosnippet>36</a></span><span class="kw">pub struct </span>Archived {
+<a href=#37 id=37 data-nosnippet>37</a>    <span class="doccomment">/// The `--backend` spelling.
+<a href=#38 id=38 data-nosnippet>38</a>    </span><span class="kw">pub </span>name: <span class="kw-2">&amp;</span><span class="lifetime">'static </span>str,
+<a href=#39 id=39 data-nosnippet>39</a>    <span class="kw">pub </span>kind: ArchivedKind,
+<a href=#40 id=40 data-nosnippet>40</a>    <span class="doccomment">/// The day of the owner's direction (US Eastern).
+<a href=#41 id=41 data-nosnippet>41</a>    </span><span class="kw">pub </span>since: <span class="kw-2">&amp;</span><span class="lifetime">'static </span>str,
+<a href=#42 id=42 data-nosnippet>42</a>    <span class="doccomment">/// Where its tests run now that per-commit validation runs only its smoke
+<a href=#43 id=43 data-nosnippet>43</a>    /// checks: "nightly only" when a scheduled run exercises them, "on demand
+<a href=#44 id=44 data-nosnippet>44</a>    /// only" when nothing scheduled does.
+<a href=#45 id=45 data-nosnippet>45</a>    </span><span class="kw">pub </span>schedule: <span class="kw-2">&amp;</span><span class="lifetime">'static </span>str,
+<a href=#46 id=46 data-nosnippet>46</a>    <span class="doccomment">/// What still runs per commit, and what runs only nightly.
+<a href=#47 id=47 data-nosnippet>47</a>    </span><span class="kw">pub </span>coverage: <span class="kw-2">&amp;</span><span class="lifetime">'static </span>str,
+<a href=#48 id=48 data-nosnippet>48</a>}
+<a href=#49 id=49 data-nosnippet>49</a>
+<a href=#50 id=50 data-nosnippet>50</a><span class="doccomment">/// Every archived execution path. Restoring one is removing its entry and
+<a href=#51 id=51 data-nosnippet>51</a>/// running `ci/sync-cell-config.sh`, which returns its cells to the full run
+<a href=#52 id=52 data-nosnippet>52</a>/// type and every derived file with them.
+<a href=#53 id=53 data-nosnippet>53</a></span><span class="kw">pub const </span>ARCHIVED: <span class="kw-2">&amp;</span>[Archived] = <span class="kw-2">&amp;</span>[
+<a href=#54 id=54 data-nosnippet>54</a>    Archived {
+<a href=#55 id=55 data-nosnippet>55</a>        name: <span class="string">"sabre"</span>,
+<a href=#56 id=56 data-nosnippet>56</a>        kind: ArchivedKind::Backend,
+<a href=#57 id=57 data-nosnippet>57</a>        since: <span class="string">"2026-10-25"</span>,
+<a href=#58 id=58 data-nosnippet>58</a>        schedule: <span class="string">"nightly only"</span>,
+<a href=#59 id=59 data-nosnippet>59</a>        coverage: <span class="string">"Per commit: the third-party-backends build and Clippy, and the \
+<a href=#60 id=60 data-nosnippet>60</a>                   test.sabre_examples smoke test (ptrace and SaBRe parity and a \
+<a href=#61 id=61 data-nosnippet>61</a>                   canonical --verify-strict run of one shell guest, and DETLOG \
+<a href=#62 id=62 data-nosnippet>62</a>                   agreement through post-exec). Nightly: every \
+<a href=#63 id=63 data-nosnippet>63</a>                   manifest cell, in the pressure sweep, and the SaBRe run type \
+<a href=#64 id=64 data-nosnippet>64</a>                   (scripts/validate.rs --sabre-compat-only: its compat cells and \
+<a href=#65 id=65 data-nosnippet>65</a>                   sabrecompat.sabre_examples, the other 34 tests of \
+<a href=#66 id=66 data-nosnippet>66</a>                   hermit-cli/tests/sabre_examples.rs), in the sweep's \
+<a href=#67 id=67 data-nosnippet>67</a>                   sabre-examples part."</span>,
+<a href=#68 id=68 data-nosnippet>68</a>    },
+<a href=#69 id=69 data-nosnippet>69</a>    Archived {
+<a href=#70 id=70 data-nosnippet>70</a>        name: <span class="string">"e9patch"</span>,
+<a href=#71 id=71 data-nosnippet>71</a>        kind: ArchivedKind::PreprocessingWithPtrace,
+<a href=#72 id=72 data-nosnippet>72</a>        since: <span class="string">"2026-10-25"</span>,
+<a href=#73 id=73 data-nosnippet>73</a>        schedule: <span class="string">"nightly only"</span>,
+<a href=#74 id=74 data-nosnippet>74</a>        coverage: <span class="string">"Per commit: the e9patch feature build, the e9patch corpus driver \
+<a href=#75 id=75 data-nosnippet>75</a>                   contract (check.e9patch_corpus) and the e9patch legs of the CLI \
+<a href=#76 id=76 data-nosnippet>76</a>                   tests. Nightly: the corpus itself (scripts/validate.rs \
+<a href=#77 id=77 data-nosnippet>77</a>                   --e9patch-compat-only, which builds e9patch and e9tool through \
+<a href=#78 id=78 data-nosnippet>78</a>                   hermit-install), in the sweep's e9patch-corpus part; it has no \
+<a href=#79 id=79 data-nosnippet>79</a>                   manifest cells."</span>,
+<a href=#80 id=80 data-nosnippet>80</a>    },
+<a href=#81 id=81 data-nosnippet>81</a>];
+<a href=#82 id=82 data-nosnippet>82</a>
+<a href=#83 id=83 data-nosnippet>83</a><span class="doccomment">/// The run type of an archived backend's cells that would otherwise be full's.
+<a href=#84 id=84 data-nosnippet>84</a>/// No validation profile selects it; the pressure test runs these cells under
+<a href=#85 id=85 data-nosnippet>85</a>/// it, as it runs every focused run type's.
+<a href=#86 id=86 data-nosnippet>86</a></span><span class="kw">pub const </span>ARCHIVED_RUN_TYPE: <span class="kw-2">&amp;</span>str = <span class="string">"archived-nightly"</span>;
+<a href=#87 id=87 data-nosnippet>87</a>
+<a href=#88 id=88 data-nosnippet>88</a><span class="doccomment">/// Whether manifest cells on `backend` are archived.
+<a href=#89 id=89 data-nosnippet>89</a></span><span class="kw">pub fn </span>is_archived_backend(backend: <span class="kw-2">&amp;</span>str) -&gt; bool {
+<a href=#90 id=90 data-nosnippet>90</a>    ARCHIVED
+<a href=#91 id=91 data-nosnippet>91</a>        .iter()
+<a href=#92 id=92 data-nosnippet>92</a>        .any(|entry| entry.kind == ArchivedKind::Backend &amp;&amp; entry.name == backend)
+<a href=#93 id=93 data-nosnippet>93</a>}
+<a href=#94 id=94 data-nosnippet>94</a>
+<a href=#95 id=95 data-nosnippet>95</a><span class="attr">#[cfg(test)]
+<a href=#96 id=96 data-nosnippet>96</a></span><span class="kw">mod </span>tests {
+<a href=#97 id=97 data-nosnippet>97</a>    <span class="kw">use super</span>::<span class="kw-2">*</span>;
+<a href=#98 id=98 data-nosnippet>98</a>
+<a href=#99 id=99 data-nosnippet>99</a>    <span class="attr">#[test]
+<a href=#100 id=100 data-nosnippet>100</a>    </span><span class="kw">fn </span>sabre_is_an_archived_backend_and_e9patch_is_archived_preprocessing() {
+<a href=#101 id=101 data-nosnippet>101</a>        <span class="macro">assert!</span>(is_archived_backend(<span class="string">"sabre"</span>));
+<a href=#102 id=102 data-nosnippet>102</a>        <span class="comment">// e9patch is not a backend, so no manifest cell is archived by its name.
+<a href=#103 id=103 data-nosnippet>103</a>        </span><span class="macro">assert!</span>(!is_archived_backend(<span class="string">"e9patch"</span>));
+<a href=#104 id=104 data-nosnippet>104</a>        <span class="macro">assert!</span>(
+<a href=#105 id=105 data-nosnippet>105</a>            ARCHIVED.iter().any(|entry| entry.name == <span class="string">"e9patch"
+<a href=#106 id=106 data-nosnippet>106</a>                </span>&amp;&amp; entry.kind == ArchivedKind::PreprocessingWithPtrace)
+<a href=#107 id=107 data-nosnippet>107</a>        );
+<a href=#108 id=108 data-nosnippet>108</a>        <span class="kw">for </span>backend <span class="kw">in </span>[
+<a href=#109 id=109 data-nosnippet>109</a>            <span class="string">"ptrace"</span>,
+<a href=#110 id=110 data-nosnippet>110</a>            <span class="string">"dbt"</span>,
+<a href=#111 id=111 data-nosnippet>111</a>            <span class="string">"kvm"</span>,
+<a href=#112 id=112 data-nosnippet>112</a>            <span class="string">"liteinst"</span>,
+<a href=#113 id=113 data-nosnippet>113</a>            <span class="string">"in-guest-trap"</span>,
+<a href=#114 id=114 data-nosnippet>114</a>            <span class="string">"native"</span>,
+<a href=#115 id=115 data-nosnippet>115</a>        ] {
+<a href=#116 id=116 data-nosnippet>116</a>            <span class="macro">assert!</span>(!is_archived_backend(backend), <span class="string">"{backend}"</span>);
+<a href=#117 id=117 data-nosnippet>117</a>        }
+<a href=#118 id=118 data-nosnippet>118</a>    }
+<a href=#119 id=119 data-nosnippet>119</a>}
+</code></pre></div></section></main></body></html>
