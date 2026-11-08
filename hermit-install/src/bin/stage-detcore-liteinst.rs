@@ -133,7 +133,6 @@ fn run() -> proof::Result<()> {
             "-p".into(),
             "detcore-liteinst".into(),
             "--lib".into(),
-            "--no-default-features".into(),
             "--profile".into(),
             "liteinst-runtime".into(),
             "--target-dir".into(),
