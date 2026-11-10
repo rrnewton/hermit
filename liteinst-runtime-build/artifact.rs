@@ -98,10 +98,13 @@ pub(crate) fn liteinst_cdylib_from_cargo_messages(
                 index + 1
             ));
         }
+        // Since reverie#1375 liteinst is the preload's own feature; this set is
+        // the pre-1375 FULL artifact; dh-md601 replaces it with selectable
+        // FULL/TRAP. Without `liteinst` the staged runtime is trap-only.
         let expected_features = if allocator_fixture {
-            serde_json::json!(["allocator-fixture"])
+            serde_json::json!(["allocator-fixture", "liteinst"])
         } else {
-            serde_json::json!([])
+            serde_json::json!(["liteinst"])
         };
         if message["features"] != expected_features {
             return Err(format!(
@@ -325,7 +328,7 @@ mod tests {
             "reason": "compiler-artifact", "package_id": PACKAGE,
             "manifest_path": MANIFEST,
             "target": {"name":"reverie_liteinst_preload", "kind":["cdylib"], "crate_types":["cdylib"]},
-            "features": [],
+            "features": ["liteinst"],
             "filenames": ["/isolated/libreverie_liteinst_preload.so"], "fresh":true
         })
     }
@@ -501,6 +504,13 @@ mod tests {
             ),
             ("manifest_path", serde_json::json!("/lookalike/Cargo.toml")),
             ("features", serde_json::json!(["allocator-fixture"])),
+            // A trap-only preload: built without site patching.
+            ("features", serde_json::json!([])),
+            ("features", serde_json::json!(["liteinst", "x"])),
+            (
+                "features",
+                serde_json::json!(["allocator-fixture", "liteinst"]),
+            ),
             (
                 "filenames",
                 serde_json::json!(["/warm/libreverie_liteinst.so"]),
@@ -547,7 +557,7 @@ mod tests {
         };
         assert!(select_fixture(&artifact().to_string()).is_err());
         let mut message = artifact();
-        message["features"] = serde_json::json!(["allocator-fixture"]);
+        message["features"] = serde_json::json!(["allocator-fixture", "liteinst"]);
         assert!(select(&message.to_string()).is_err());
         assert_eq!(
             select_fixture(&message.to_string()).unwrap(),
@@ -561,6 +571,10 @@ mod tests {
             serde_json::json!(["other"]),
             serde_json::json!(["allocator-fixture", "other"]),
             serde_json::json!(["allocator-fixture", "allocator-fixture"]),
+            // Trap-only fixture, the non-fixture set, and an extra feature.
+            serde_json::json!(["allocator-fixture"]),
+            serde_json::json!(["liteinst"]),
+            serde_json::json!(["allocator-fixture", "liteinst", "x"]),
         ] {
             let mut wrong = message.clone();
             wrong["features"] = features;

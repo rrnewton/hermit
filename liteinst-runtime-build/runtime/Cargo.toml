@@ -5,7 +5,8 @@ edition = "2024"
 publish = false
 
 [dependencies]
-reverie-liteinst-preload = { version = "0.5.5", git = "https://github.com/rrnewton/reverie.git", rev = "add6180bf2f0c4c7b12d093d7bf2cb843df82133", default-features = false }
+# explicit since reverie#1375; dh-md601 converts this to a forwarded feature
+reverie-liteinst-preload = { version = "0.5.5", git = "https://github.com/rrnewton/reverie.git", rev = "add6180bf2f0c4c7b12d093d7bf2cb843df82133", default-features = false, features = ["liteinst"] }
 
 [features]
 allocator-fixture = ["reverie-liteinst-preload/allocator-fixture"]
