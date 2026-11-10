@@ -8292,6 +8292,10 @@ fn scan_process_group(census: &mut SessionCensus, pgid: u32) -> Result<GroupScan
             members.push(pid);
         }
     }
+    // A test can hold the scan here, after its walk and before it publishes
+    // what it found, to show what else waits on a census meanwhile.
+    #[cfg(test)]
+    census_stall::hold(pgid);
     census.sessions.retain(|pid, _| seen.contains(pid));
     Ok(GroupScan {
         members,
@@ -8299,6 +8303,38 @@ fn scan_process_group(census: &mut SessionCensus, pgid: u32) -> Result<GroupScan
         #[cfg(test)]
         skipped,
     })
+}
+
+/// Holds a census for one process group at the end of its walk until the
+/// test that armed the gate releases it (dh-t0yzi1).
+#[cfg(test)]
+mod census_stall {
+    use std::sync::Mutex;
+    use std::sync::mpsc::Receiver;
+    use std::sync::mpsc::Sender;
+
+    pub(super) struct Gate {
+        pub(super) pgid: u32,
+        pub(super) entered: Sender<()>,
+        pub(super) release: Receiver<()>,
+    }
+
+    /// One gate per process group, so concurrent tests never share one.
+    pub(super) static GATES: Mutex<Vec<Gate>> = Mutex::new(Vec::new());
+
+    pub(super) fn hold(pgid: u32) {
+        let gate = {
+            let mut gates = GATES.lock().unwrap();
+            gates
+                .iter()
+                .position(|gate| gate.pgid == pgid)
+                .map(|index| gates.remove(index))
+        };
+        if let Some(gate) = gate {
+            let _ = gate.entered.send(());
+            let _ = gate.release.recv();
+        }
+    }
 }
 
 /// Records the session of the process group a child of this process created
@@ -11709,6 +11745,229 @@ mod tests {
         child.wait().unwrap();
         assert_eq!(first, vec![pgid]);
         assert_eq!(second, vec![pgid]);
+    }
+
+    /// How long a test waits for an event that, without the defect, follows
+    /// within a second. It turns a hang into a failure; it is not the
+    /// property under test, which is the order of two events.
+    const CENSUS_STALL_GUARD: Duration = Duration::from_secs(10);
+
+    /// A census for a process group of its own, held at the end of its walk
+    /// on a thread of its own until [`Self::release`] or drop. The group's
+    /// leader is killed on drop.
+    struct StalledCensus {
+        leader: std::process::Child,
+        release: Option<std::sync::mpsc::Sender<()>>,
+        census: Option<thread::JoinHandle<Result<Vec<u32>, String>>>,
+    }
+
+    impl StalledCensus {
+        fn start() -> Self {
+            use std::os::unix::process::CommandExt;
+            let leader = std::process::Command::new("sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            Self::start_for(leader)
+        }
+
+        fn start_for(leader: std::process::Child) -> Self {
+            let pgid = leader.id();
+            let (entered_tx, entered) = std::sync::mpsc::channel();
+            let (release, release_rx) = std::sync::mpsc::channel();
+            census_stall::GATES
+                .lock()
+                .unwrap()
+                .push(census_stall::Gate {
+                    pgid,
+                    entered: entered_tx,
+                    release: release_rx,
+                });
+            let census = thread::spawn(move || process_group_members(pgid));
+            let mut stalled = Self {
+                leader,
+                release: Some(release),
+                census: Some(census),
+            };
+            if entered.recv_timeout(CENSUS_STALL_GUARD).is_err() {
+                stalled.release();
+                panic!("the census for group {pgid} never reached its walk's end");
+            }
+            stalled
+        }
+
+        fn pgid(&self) -> u32 {
+            self.leader.id()
+        }
+
+        /// Lets the held census publish, and returns what it found.
+        fn release(&mut self) -> Option<Result<Vec<u32>, String>> {
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+            self.census.take().map(|census| census.join().unwrap())
+        }
+    }
+
+    impl Drop for StalledCensus {
+        fn drop(&mut self) {
+            self.release();
+            let _ = self.leader.kill();
+            let _ = self.leader.wait();
+        }
+    }
+
+    /// `work` running on a thread of its own.
+    struct Worker<T> {
+        result: std::sync::mpsc::Receiver<T>,
+        thread: thread::JoinHandle<()>,
+    }
+
+    impl<T: Send + 'static> Worker<T> {
+        fn start(work: impl FnOnce() -> T + Send + 'static) -> Self {
+            let (done, result) = std::sync::mpsc::channel();
+            let thread = thread::spawn(move || {
+                let _ = done.send(work());
+            });
+            Self { result, thread }
+        }
+
+        /// The result, if the work ends within [`CENSUS_STALL_GUARD`].
+        fn within_guard(&self) -> Option<T> {
+            self.result.recv_timeout(CENSUS_STALL_GUARD).ok()
+        }
+
+        /// Waits for the work to end however long it takes, so that a failing
+        /// test still lets its invocation be stopped and reaped rather than
+        /// leaving it running when the test process exits.
+        fn finish(self) -> T {
+            let result = self.result.recv().unwrap();
+            self.thread.join().unwrap();
+            result
+        }
+    }
+
+    /// A budgeted invocation starts, is measured and completes while another
+    /// thread's census is held at the end of its walk (dh-t0yzi1). With the
+    /// census lock held across the walk, the spawn's group record and every
+    /// CPU poll's membership census waited for that unrelated census: 0.5-2.7
+    /// s before the monitor started and 0.3-2.8 s per poll in loaded library
+    /// runs.
+    #[test]
+    fn a_budgeted_invocation_completes_while_another_census_is_held() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-census-held-quick-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut stalled = StalledCensus::start();
+        let work_root = root.clone();
+        let worker = Worker::start(move || {
+            bounded_process(
+                &work_root,
+                "quick",
+                "exit 0",
+                Duration::from_secs(60),
+                5_000_000,
+            )
+        });
+        let early = worker.within_guard();
+        let held = stalled.release();
+        let Some(output) = early else {
+            let late = worker.finish();
+            panic!(
+                "the invocation waited for an unrelated census to publish; after release it returned {:?}, {:?}, {} CPU-us",
+                late.status, late.timeout, late.cpu_usage_usec
+            );
+        };
+        assert!(output.status.success());
+        assert_eq!(output.timeout, None);
+        assert_eq!(held.unwrap().unwrap(), vec![stalled.pgid()]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A CPU burner is stopped by its CPU budget while another thread's
+    /// census is held at the end of its walk (dh-t0yzi1). With the census
+    /// lock held across the walk, the burner's CPU sample sat behind that
+    /// census, and the stop fired at 2.8-5.1 CPU-s against a 1 CPU-s budget in
+    /// loaded library runs, or the wall deadline fired first.
+    #[test]
+    fn a_cpu_burner_is_stopped_by_its_budget_while_another_census_is_held() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-census-held-burner-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut stalled = StalledCensus::start();
+        let work_root = root.clone();
+        let worker = Worker::start(move || {
+            bounded_process(
+                &work_root,
+                "burner",
+                "while :; do :; done",
+                Duration::from_secs(60),
+                1_000_000,
+            )
+        });
+        let early = worker.within_guard();
+        stalled.release();
+        let Some(output) = early else {
+            let late = worker.finish();
+            panic!(
+                "the burner's CPU budget waited for an unrelated census to publish; after release it returned {:?}, {:?}, {} CPU-us",
+                late.status, late.timeout, late.cpu_usage_usec
+            );
+        };
+        assert_eq!(output.timeout, Some(ProcessTimeout::Cpu));
+        assert!(output.cpu_usage_usec >= 1_000_000);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A membership request made after a census began is answered from the
+    /// process table as it stands after the request: a member that joined the
+    /// group after that census walked /proc is reported. Guards against
+    /// answering a request with an older scan's result.
+    #[test]
+    fn a_census_that_began_before_a_request_does_not_answer_it() {
+        use std::os::unix::process::CommandExt;
+        let leader = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut stalled = StalledCensus::start_for(leader);
+        let pgid = stalled.pgid();
+        let mut joined = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(pgid as i32)
+            .spawn()
+            .unwrap();
+        let (done, answer) = std::sync::mpsc::channel();
+        let request = thread::spawn(move || {
+            let _ = done.send(process_group_members(pgid));
+        });
+        let held = stalled.release();
+        let answer = answer.recv_timeout(CENSUS_STALL_GUARD);
+        request.join().unwrap();
+        let joined_pid = joined.id();
+        let _ = joined.kill();
+        let _ = joined.wait();
+        assert_eq!(
+            held.unwrap().unwrap(),
+            vec![pgid],
+            "the held census walked before the join"
+        );
+        let mut members = answer.expect("the request never got an answer").unwrap();
+        members.sort_unstable();
+        let mut expected = vec![pgid, joined_pid];
+        expected.sort_unstable();
+        assert_eq!(
+            members, expected,
+            "the request was answered with a census that began before it"
+        );
     }
 
     /// A census saved by one process and loaded by another finds the same
