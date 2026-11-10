@@ -8218,7 +8218,186 @@ fn process_cgroup(pid: u32) -> Result<Option<String>, String> {
 /// the walk, each scan waited for all the others, and in loaded library runs
 /// spawns waited 0.5-2.7 s and polls 0.3-2.8 s for censuses that each needed
 /// about 50 ms of CPU (dh-t0yzi1).
+///
+/// Requests share walks ([`WALKS`]). A request is answered by a walk that
+/// covers its group's session and began no earlier than one CPU poll interval
+/// ([`CELL_CPU_POLL_INTERVAL`]) before the request, so membership may be up to
+/// one poll interval stale. That adds no blind spot the CPU sampler does not
+/// already have: a process that lives less than one poll interval between two
+/// polls is invisible to it too. A request may wait for such a walk that is
+/// still running, but only until that walk's interval ends; then it starts its
+/// own, and requests that arrive meanwhile share that one. So at most about
+/// one walk starts per poll interval however many invocations poll, and a
+/// slow walk never holds a request up for longer than one interval. Unshared,
+/// every poll walked at once: in loaded library runs a walk took a median
+/// 374 ms of wall time for 54 ms of CPU, and the wall-bounded `dagrun::proccpu`
+/// scan in the same process ran out of time.
 fn process_group_members(pgid: u32) -> Result<Vec<u32>, String> {
+    let requested = Instant::now();
+    let session = request_session(pgid)?;
+    let mut board = WALKS.lock().map_err(walk_board_poisoned)?;
+    let id = loop {
+        let now = Instant::now();
+        board.forget_stale(now);
+        if let Some(groups) = board.answer(requested, session) {
+            return Ok(groups.get(&pgid).cloned().unwrap_or_default());
+        }
+        match board.wait_until(requested, session, now) {
+            Some(until) => {
+                board = WALK_FINISHED
+                    .wait_timeout(board, until - now)
+                    .map_err(walk_board_poisoned)?
+                    .0;
+            }
+            None => break board.start(now, session),
+        }
+    };
+    drop(board);
+    run_shared_walk(pgid, id)
+}
+
+/// Runs the walk registered on [`WALKS`] as `id` for a request for `pgid`,
+/// publishes it to the requests waiting for it, and answers the request.
+fn run_shared_walk(pgid: u32, id: u64) -> Result<Vec<u32>, String> {
+    #[cfg(test)]
+    WALK_STARTS.lock().unwrap().push(pgid);
+    let walked = walk_for(pgid);
+    let mut board = WALKS.lock().map_err(walk_board_poisoned)?;
+    board.finish(id, walked.as_ref().ok());
+    WALK_FINISHED.notify_all();
+    drop(board);
+    walked.map(|scan| scan.members)
+}
+
+fn walk_board_poisoned<T>(_: T) -> String {
+    "census walk board lock poisoned".to_string()
+}
+
+/// The session whose processes a census for `pgid` reads: the group leader's,
+/// or, once the leader is gone, the one recorded for the group while the
+/// kernel cannot have reused its number; `None` otherwise, and then a census
+/// reads every process.
+fn request_session(pgid: u32) -> Result<Option<u32>, String> {
+    if let StatRead::Bytes(stat) = read_process_stat(pgid)? {
+        if stat_process_group(&stat) == Some(pgid) {
+            return Ok(stat_session(&stat));
+        }
+    }
+    let mut census = SESSION_CENSUS
+        .get_or_init(session_census_from_env)
+        .lock()
+        .map_err(|_| "session census lock poisoned".to_string())?;
+    census.absorb_spawned_groups();
+    let (now, pid_max) = (PidAllocator::read(), read_pid_max());
+    Ok(census
+        .group_sessions
+        .get(&pgid)
+        .filter(|(_, since)| match (now, pid_max) {
+            (Some(now), Some(pid_max)) => !since.may_have_reused(now, pid_max, pgid),
+            _ => false,
+        })
+        .map(|(session, _)| *session))
+}
+
+/// One census walk that requests can share ([`process_group_members`]).
+struct SharedWalk {
+    id: u64,
+    started: Instant,
+    /// The session whose processes the walk reads; `None` reads every one.
+    session: Option<u32>,
+    /// Each process group the walk saw and its members, once it has finished.
+    groups: Option<std::sync::Arc<std::collections::HashMap<u32, Vec<u32>>>>,
+}
+
+/// The walks that may still answer a request: those running, and those that
+/// finished and began within the last poll interval.
+struct WalkBoard {
+    walks: Vec<SharedWalk>,
+    next: u64,
+}
+
+impl WalkBoard {
+    const fn new() -> Self {
+        Self {
+            walks: Vec::new(),
+            next: 0,
+        }
+    }
+
+    /// Whether `walk` may answer a request for a group of `session` made at
+    /// `requested`: it began no earlier than one poll interval before.
+    fn may_answer(walk: &SharedWalk, requested: Instant, session: Option<u32>) -> bool {
+        walk.started + CELL_CPU_POLL_INTERVAL >= requested
+            && (walk.session.is_none() || walk.session == session)
+    }
+
+    fn forget_stale(&mut self, now: Instant) {
+        self.walks
+            .retain(|walk| walk.groups.is_none() || walk.started + CELL_CPU_POLL_INTERVAL >= now);
+    }
+
+    fn answer(
+        &self,
+        requested: Instant,
+        session: Option<u32>,
+    ) -> Option<std::sync::Arc<std::collections::HashMap<u32, Vec<u32>>>> {
+        self.walks
+            .iter()
+            .filter(|walk| Self::may_answer(walk, requested, session))
+            .find_map(|walk| walk.groups.clone())
+    }
+
+    /// Until when a request may wait for a running walk that may answer it:
+    /// the end of that walk's poll interval, if it is still ahead.
+    fn wait_until(
+        &self,
+        requested: Instant,
+        session: Option<u32>,
+        now: Instant,
+    ) -> Option<Instant> {
+        self.walks
+            .iter()
+            .filter(|walk| walk.groups.is_none() && Self::may_answer(walk, requested, session))
+            .map(|walk| walk.started + CELL_CPU_POLL_INTERVAL)
+            .filter(|until| *until > now)
+            .max()
+    }
+
+    fn start(&mut self, now: Instant, session: Option<u32>) -> u64 {
+        let id = self.next;
+        self.next += 1;
+        self.walks.push(SharedWalk {
+            id,
+            started: now,
+            session,
+            groups: None,
+        });
+        id
+    }
+
+    /// Publishes a finished walk, or forgets one that failed: a failure is
+    /// returned to the request that walked, and others walk for themselves.
+    fn finish(&mut self, id: u64, scan: Option<&GroupScan>) {
+        match scan {
+            Some(scan) => {
+                if let Some(walk) = self.walks.iter_mut().find(|walk| walk.id == id) {
+                    walk.session = scan.session;
+                    walk.groups = Some(std::sync::Arc::new(scan.groups.clone()));
+                }
+            }
+            None => self.walks.retain(|walk| walk.id != id),
+        }
+    }
+}
+
+static WALKS: std::sync::Mutex<WalkBoard> = std::sync::Mutex::new(WalkBoard::new());
+static WALK_FINISHED: std::sync::Condvar = std::sync::Condvar::new();
+/// The group of each request that started a walk, for the tests.
+#[cfg(test)]
+static WALK_STARTS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// One walk of [`process_group_members`] for `pgid`.
+fn walk_for(pgid: u32) -> Result<GroupScan, String> {
     let shared = SESSION_CENSUS.get_or_init(session_census_from_env);
     let poisoned = |_| "session census lock poisoned".to_string();
     let mut working = {
@@ -8235,12 +8414,17 @@ fn process_group_members(pgid: u32) -> Result<Vec<u32>, String> {
         }
         census.saved = true;
     }
-    Ok(scan.members)
+    Ok(scan)
 }
 
 /// What one [`scan_process_group`] found and did.
 struct GroupScan {
     members: Vec<u32>,
+    /// Every process group among the PIDs it read, with its members, so that
+    /// one walk can answer a request for any group of [`Self::session`].
+    groups: std::collections::HashMap<u32, Vec<u32>>,
+    /// The session whose processes it read, or `None` when it read every one.
+    session: Option<u32>,
     /// How many PIDs' `stat` it read.
     read: usize,
     /// The PIDs it saw in /proc and did not read, because the census placed
@@ -8264,7 +8448,7 @@ fn scan_process_group(census: &mut SessionCensus, pgid: u32) -> Result<GroupScan
             .get(&pgid)
             .map(|(session, _)| *session),
     };
-    let mut members = Vec::new();
+    let mut groups = std::collections::HashMap::<u32, Vec<u32>>::new();
     let mut seen = std::collections::HashSet::new();
     let mut read = 0;
     #[cfg(test)]
@@ -8301,8 +8485,8 @@ fn scan_process_group(census: &mut SessionCensus, pgid: u32) -> Result<GroupScan
         if let Some(session) = session {
             census.sessions.insert(pid, session);
         }
-        if group == Some(pgid) {
-            members.push(pid);
+        if let Some(group) = group {
+            groups.entry(group).or_default().push(pid);
         }
     }
     // A test can hold the scan here, after its walk and before it publishes
@@ -8311,7 +8495,9 @@ fn scan_process_group(census: &mut SessionCensus, pgid: u32) -> Result<GroupScan
     census_stall::hold(pgid);
     census.sessions.retain(|pid, _| seen.contains(pid));
     Ok(GroupScan {
-        members,
+        members: groups.get(&pgid).cloned().unwrap_or_default(),
+        groups,
+        session: group_session,
         read,
         #[cfg(test)]
         skipped,
@@ -11845,7 +12031,13 @@ mod tests {
                     entered: entered_tx,
                     release: release_rx,
                 });
-            let census = thread::spawn(move || process_group_members(pgid));
+            // Always a walk of its own, which the gate can hold: a request
+            // may be answered by another walk instead (process_group_members).
+            let census = thread::spawn(move || {
+                let session = request_session(pgid)?;
+                let id = WALKS.lock().unwrap().start(Instant::now(), session);
+                run_shared_walk(pgid, id)
+            });
             let mut stalled = Self {
                 leader,
                 release: Some(release),
@@ -12021,47 +12213,120 @@ mod tests {
         );
     }
 
-    /// A membership request made after a census began is answered from the
-    /// process table as it stands after the request: a member that joined the
-    /// group after that census walked /proc is reported. Guards against
-    /// answering a request with an older scan's result.
+    /// A request is answered only by a walk that began no earlier than one CPU
+    /// poll interval ([`CELL_CPU_POLL_INTERVAL`]) before it. A walk that began
+    /// more than one interval earlier, finished or still running, does not
+    /// answer it: a member that joined the group before the request, and after
+    /// that walk read /proc, is reported. Each part waits one and a half
+    /// intervals after the join before it asks, so every walk that may answer
+    /// began after the join; load only lengthens that wait.
     #[test]
-    fn a_census_that_began_before_a_request_does_not_answer_it() {
+    fn a_walk_that_began_more_than_one_poll_interval_before_a_request_does_not_answer_it() {
         use std::os::unix::process::CommandExt;
-        let leader = std::process::Command::new("sleep")
+        let stale_by = CELL_CPU_POLL_INTERVAL * 3 / 2;
+        let sleeper = |group: u32| {
+            std::process::Command::new("sleep")
+                .arg("30")
+                .process_group(group as i32)
+                .spawn()
+                .unwrap()
+        };
+        let sorted = |mut pids: Vec<u32>| {
+            pids.sort_unstable();
+            pids
+        };
+
+        // A finished walk.
+        let mut leader = sleeper(0);
+        let pgid = leader.id();
+        assert_eq!(process_group_members(pgid).unwrap(), vec![pgid]);
+        let mut joined = sleeper(pgid);
+        thread::sleep(stale_by);
+        let answer = process_group_members(pgid);
+        let expected = sorted(vec![pgid, joined.id()]);
+        for child in [&mut joined, &mut leader] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert_eq!(
+            sorted(answer.unwrap()),
+            expected,
+            "a finished walk that began before the join answered the request"
+        );
+
+        // A walk still running: held at the end of its walk, before the join.
+        let mut stalled = StalledCensus::start_for(sleeper(0));
+        let pgid = stalled.pgid();
+        let mut joined = sleeper(pgid);
+        thread::sleep(stale_by);
+        let worker = Worker::start(move || process_group_members(pgid));
+        let early = worker.within_guard();
+        let held = stalled.release();
+        let expected = sorted(vec![pgid, joined.id()]);
+        let _ = joined.kill();
+        let _ = joined.wait();
+        let Some(answer) = early else {
+            let late = worker.finish();
+            panic!("the request waited for a walk that began before the join: {late:?}");
+        };
+        assert_eq!(
+            held.unwrap().unwrap(),
+            vec![pgid],
+            "the held walk read /proc before the join"
+        );
+        assert_eq!(
+            sorted(answer.unwrap()),
+            expected,
+            "a running walk that began before the join answered the request"
+        );
+    }
+
+    /// Requests made together share walks: however many arrive at once, the
+    /// walks they start number at most one per poll interval of the time they
+    /// took to be answered, plus one.
+    #[test]
+    fn simultaneous_membership_requests_share_one_walk_per_poll_interval() {
+        use std::os::unix::process::CommandExt;
+        const REQUESTS: usize = 32;
+        let mut leader = std::process::Command::new("sleep")
             .arg("30")
             .process_group(0)
             .spawn()
             .unwrap();
-        let mut stalled = StalledCensus::start_for(leader);
-        let pgid = stalled.pgid();
-        let mut joined = std::process::Command::new("sleep")
-            .arg("30")
-            .process_group(pgid as i32)
-            .spawn()
-            .unwrap();
-        let (done, answer) = std::sync::mpsc::channel();
-        let request = thread::spawn(move || {
-            let _ = done.send(process_group_members(pgid));
-        });
-        let held = stalled.release();
-        let answer = answer.recv_timeout(CENSUS_STALL_GUARD);
-        request.join().unwrap();
-        let joined_pid = joined.id();
-        let _ = joined.kill();
-        let _ = joined.wait();
-        assert_eq!(
-            held.unwrap().unwrap(),
-            vec![pgid],
-            "the held census walked before the join"
-        );
-        let mut members = answer.expect("the request never got an answer").unwrap();
-        members.sort_unstable();
-        let mut expected = vec![pgid, joined_pid];
-        expected.sort_unstable();
-        assert_eq!(
-            members, expected,
-            "the request was answered with a census that began before it"
+        let pgid = leader.id();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(REQUESTS));
+        let started = Instant::now();
+        let requests = (0..REQUESTS)
+            .map(|_| {
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    process_group_members(pgid)
+                })
+            })
+            .collect::<Vec<_>>();
+        let answers = requests
+            .into_iter()
+            .map(|request| request.join().unwrap())
+            .collect::<Vec<_>>();
+        let elapsed = started.elapsed();
+        let _ = leader.kill();
+        let _ = leader.wait();
+        for answer in answers {
+            assert_eq!(answer.unwrap(), vec![pgid]);
+        }
+        let walks = WALK_STARTS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|started_for| **started_for == pgid)
+            .count();
+        let intervals = elapsed
+            .as_nanos()
+            .div_ceil(CELL_CPU_POLL_INTERVAL.as_nanos()) as usize;
+        assert!(
+            walks <= 1 + intervals,
+            "{REQUESTS} simultaneous requests started {walks} walks in {elapsed:?}"
         );
     }
 
