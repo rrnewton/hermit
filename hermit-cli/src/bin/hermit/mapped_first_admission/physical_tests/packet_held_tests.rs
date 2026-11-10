@@ -257,6 +257,9 @@ async fn run(case: Case) -> io::Result<()> {
                         a.failed.load(std::sync::atomic::Ordering::Acquire),
                         "old A verify did not poison real A",
                     )?;
+                    // Poison is lease state, not storage: the sealed file the
+                    // poisoned lease retains still holds exactly A's packet.
+                    exact_storage(birth_a.leases().packet(), &sealed, &expected)?;
                 }
             }
             Case::WrongBirth => {

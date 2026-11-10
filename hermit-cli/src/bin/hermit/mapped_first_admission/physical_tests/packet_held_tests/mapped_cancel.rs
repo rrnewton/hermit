@@ -496,22 +496,22 @@ unsafe fn mapped_packet_control(
     primary
 }
 
-// Ordinary child module: no path includes or duplicate codec/owner.
-mod measured_v11;
-
+// The map-only controls run on the same package fixture as Initialize: the
+// producer's audit accepts only an image whose every syscall site is declared,
+// which the package's facts are and the historical V11 coordinates are not.
 #[test]
 fn mapped_packet_prepared_same_birth() -> io::Result<()> {
-    measured_v11::run(MappedCase::Positive)
+    with_package_fixture(MappedCase::Positive)
 }
 
 #[test]
 fn mapped_packet_prepared_other_birth_refuses() -> io::Result<()> {
-    measured_v11::run(MappedCase::OtherBirth)
+    with_package_fixture(MappedCase::OtherBirth)
 }
 
 #[test]
 fn mapped_packet_prepared_poison_refuses_old_lease() -> io::Result<()> {
-    measured_v11::run(MappedCase::Poison)
+    with_package_fixture(MappedCase::Poison)
 }
 
 #[cfg(test)]
@@ -701,12 +701,17 @@ mod retirement_unwind_tests {
 
 #[test]
 fn mapped_genuine_initializer_returns_before_guest() -> io::Result<()> {
+    with_package_fixture(MappedCase::Initialize)
+}
+
+/// Run `case` on the package fixture's audited image and coordinates.
+fn with_package_fixture(case: MappedCase) -> io::Result<()> {
     use crate::app::mapped_first_admission::runtime_binding::RetainedImage;
 
     // The maintained package gate supplies the actual paired resources for the
     // current host/runtime sources. Missing input is a failure, never a skip or
     // a fallback to the historical V11 initializer. Do not change global
-    // HERMIT_INSTALL_DIR: the other map/default controls keep their own inputs.
+    // HERMIT_INSTALL_DIR: the other controls keep their own inputs.
     let install = std::env::var_os("HERMIT_RETAINED_PACKAGE_TEST_INSTALL")
         .filter(|path| !path.is_empty())
         .ok_or_else(|| rpc("HERMIT_RETAINED_PACKAGE_TEST_INSTALL is required"))?;
@@ -721,9 +726,10 @@ fn mapped_genuine_initializer_returns_before_guest() -> io::Result<()> {
         // mapped_run. Stable CPUID/XState, signal/filter lineage, original
         // ptracer thread, real RPC and whole-subtree containment remain required.
         // The retained pair and coordinates are DATA, not execution authority
-        // or Ready. This control stops at initializer return and cancels before
-        // Guest; mapped_packet_control retains every lease until real cleanup.
-        unsafe { mapped_packet_control(MappedCase::Initialize, retained.audited(), initializer) }
+        // or Ready. Initialize stops at initializer return and the map-only
+        // cases after mapping; each cancels before Guest, and
+        // mapped_packet_control retains every lease until real cleanup.
+        unsafe { mapped_packet_control(case, retained.audited(), initializer) }
     }));
     // Close BOTH original OFDs after every Result and after confirmed-cleanup
     // panic. Neither a successful close nor a later error hides the real control.
