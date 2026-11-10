@@ -46,6 +46,13 @@
 //! cell serves both. An uninitialized submodule is a no-result (exit
 //! 75), never a pass.
 //!
+//! A reference counts by the name the shim resolves it to: the shim
+//! renames a few internal crate names (`sha2-010`) in the exact rewrite
+//! rules of `shim/build_defs/lib/oss.bzl`, which this check reads. Labels
+//! inside an `autocargo = {...}` argument are not references: that dict
+//! describes the Cargo manifest autocargo generates internally, the shim
+//! swallows it, and Buck never resolves the labels in it.
+//!
 //! Three referenced crates have no generated target and are named here
 //! instead of being silently skipped: `num_cpus`, `quickcheck_macros`
 //! and `test-case` are test-only dependencies outside what Reindeer
@@ -105,6 +112,8 @@ const KNOWN_MISSING: [&str; 3] = ["num_cpus", "quickcheck_macros", "test-case"];
 const DEAD_REFS: [&str; 3] = ["prost", "tonic", "tonic-prost"];
 const DEAD_REF_FILES: [&str; 1] = ["shim/shims.bzl"];
 const SHIMS: &str = "shim/shims.bzl";
+/// The shim's label rewrite rules, whose exact entries rename crates.
+const REWRITES: &str = "shim/build_defs/lib/oss.bzl";
 const ALIASES: &str = "shim/third-party/rust/shared-cell-aliases.txt";
 const GENERIC_ARRAY_FIXUPS: &str = "shim/third-party/rust/fixups/generic-array/fixups.toml";
 /// The cfg generic-array's build script emits on rustc >= 1.41.0.
@@ -217,16 +226,17 @@ fn run() -> Result<String, Outcome> {
     let mut files_scanned = 0usize;
     for file in tracked_build_files(&root)? {
         files_scanned += 1;
-        for name in extract_refs(&read(&root, &file)?) {
+        for name in extract_refs(&without_autocargo(&read(&root, &file)?)) {
             ref_files.entry(name).or_default().insert(file.clone());
         }
     }
     for file in reverie_build_files(&root)? {
         files_scanned += 1;
-        for name in extract_refs(&read(&root, &file)?) {
+        for name in extract_refs(&without_autocargo(&read(&root, &file)?)) {
             ref_files.entry(name).or_default().insert(file.clone());
         }
     }
+    let renames = shim_renames(&read(&root, REWRITES)?);
     let direct = direct_deps(&root)?;
     let known: BTreeSet<&str> = KNOWN_MISSING.into_iter().collect();
     let dead: BTreeSet<&str> = DEAD_REFS.into_iter().collect();
@@ -234,9 +244,11 @@ fn run() -> Result<String, Outcome> {
     let mut via_direct = 0usize;
     for (name, files) in &ref_files {
         let shown = files.iter().next().map(String::as_str).unwrap_or("?");
-        if shared_set.contains(name.as_str()) {
+        // The target the shim resolves the reference to.
+        let resolved = renames.get(name).unwrap_or(name);
+        if shared_set.contains(resolved.as_str()) {
             via_shared += 1;
-        } else if direct.contains(name) {
+        } else if direct.contains(resolved) {
             via_direct += 1;
         } else if known.contains(name.as_str()) {
             // Tolerated gap, named in the summary.
@@ -403,6 +415,64 @@ fn reverie_build_files(root: &Path) -> Result<Vec<String>, Outcome> {
 }
 
 /// Every `fbsource//third-party/rust:<name>` target named in `text`.
+/// `text` with the value of every `autocargo = {...}` argument removed.
+/// A dict that does not close is kept whole, so that what this cannot
+/// parse still counts.
+fn without_autocargo(text: &str) -> String {
+    const KEY: &str = "autocargo = {";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(KEY) {
+        let open = at + KEY.len() - 1;
+        let mut depth = 0i32;
+        let mut close = None;
+        for (offset, byte) in rest[open..].bytes().enumerate() {
+            match byte {
+                b'{' | b'[' | b'(' => depth += 1,
+                b'}' | b']' | b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + offset);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(close) = close else {
+            break;
+        };
+        out.push_str(&rest[..open]);
+        out.push_str("{}");
+        rest = &rest[close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The crate renames among the shim's exact rewrite rules: each
+/// `"third-party/rust:<from>": "third-party/rust:<to>",` line.
+fn shim_renames(text: &str) -> BTreeMap<String, String> {
+    const CRATE: &str = "\"third-party/rust:";
+    let mut renames = BTreeMap::new();
+    for line in text.lines() {
+        let Some(rest) = line.trim().strip_prefix(CRATE) else {
+            continue;
+        };
+        let Some((from, rest)) = rest.split_once("\": ") else {
+            continue;
+        };
+        let Some(rest) = rest.strip_prefix(CRATE) else {
+            continue;
+        };
+        let Some(to) = rest.strip_suffix("\",") else {
+            continue;
+        };
+        renames.insert(from.to_string(), to.to_string());
+    }
+    renames
+}
+
 fn extract_refs(text: &str) -> Vec<String> {
     let mut names = Vec::new();
     let mut rest = text;
@@ -622,6 +692,30 @@ mod tests {
             vec!["linux-raw-sys", "num_cpus", "serde_json"]
         );
         assert!(extract_refs("third-party/rust without the cell").is_empty());
+    }
+
+    #[test]
+    fn autocargo_labels_are_not_references() {
+        let text = "rust_library(\n    autocargo = {\"extra\": [(\"cc\", \
+                    \"fbsource//third-party/rust:cc\")], \"x\": {}},\n    \
+                    deps = [\"fbsource//third-party/rust:libc\"],\n)\n";
+        assert_eq!(extract_refs(&without_autocargo(text)), vec!["libc"]);
+        // A dict that does not close is kept, so its labels still count.
+        let open = "autocargo = {\"fbsource//third-party/rust:cc\",";
+        assert_eq!(extract_refs(&without_autocargo(open)), vec!["cc"]);
+        let plain = "deps = [\"fbsource//third-party/rust:libc\"]";
+        assert_eq!(without_autocargo(plain), plain);
+    }
+
+    #[test]
+    fn shim_renames_read_exact_crate_rules() {
+        let text = "    \"fbcode\": struct(\n        exact = {\n            \
+                    \"common/rust/shed/fbinit:fbinit\": \"third-party/rust:fbinit\",\n        \
+                    },\n    \"fbsource\": struct(\n        exact = {\n            \
+                    \"third-party/rust:sha2-010\": \"third-party/rust:sha2\",\n        },\n";
+        let renames = shim_renames(text);
+        assert_eq!(renames.len(), 1);
+        assert_eq!(renames.get("sha2-010").map(String::as_str), Some("sha2"));
     }
 
     #[test]

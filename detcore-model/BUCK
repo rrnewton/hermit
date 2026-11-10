@@ -5,35 +5,25 @@ oncall("hermit")
 
 rust_library(
     name = "detcore-model",
+    srcs = glob(["src/**/*"]),
     autocargo = {
-        "cargo_toml_dir": ".",
         "cargo_toml_config": {
-            "package": {
-                "version": "0.5.5",
-                "readme": "README.md",
-                "homepage": "https://hermetic-infra.org",
-                "documentation": "https://docs.rs/detcore-model",
-                "keywords": [
-                    "linux",
-                    "hermit",
-                    "determinism",
-                    "debugging"
-                ],
-                "categories": [
-                    "development-tools::debugging",
-                    "development-tools::testing"
-                ]
+            # Upstream's features, declared but empty so `cfg(feature = ...)`
+            # stays known to the fbsource Cargo check.
+            "features": {
+                "native-exec": [],
             },
         },
     },
-    srcs = glob(["src/**/*"]),
+    named_deps = {"reverie": "//hermetic_infra/reverie:reverie"},
+    # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
     test_deps = [
         "fbsource//third-party/rust:pretty_assertions",
     ],
     deps = [
         "fbsource//third-party/rust:anyhow",
         "fbsource//third-party/rust:bincode",
-        "fbsource//third-party/rust:serde_json",
         "fbsource//third-party/rust:bitvec",
         "fbsource//third-party/rust:bytesize",
         "fbsource//third-party/rust:chrono",
@@ -41,9 +31,9 @@ rust_library(
         "fbsource//third-party/rust:libc",
         "fbsource//third-party/rust:nix",
         "fbsource//third-party/rust:serde",
+        "fbsource//third-party/rust:serde_json",
         "fbsource//third-party/rust:shell-words",
         "fbsource//third-party/rust:tracing",
-        "//hermetic_infra/reverie:reverie",
         "//hermetic_infra/reverie:reverie-syscalls",
     ],
 )

@@ -1,6 +1,39 @@
-load("@fbcode_macros//build_defs:export_files.bzl", "export_file")
+# @lint-ignore-every AUTODEPS2
+# These repository maintenance scripts are not part of the fbsource Buck graph,
+# except the unchanged sources that fb-only/contract_checks builds and runs and
+# the validation-plan sources that the open-source ci/manifest-plan Buck
+# library maps.
+
+load("@fbcode_macros//build_defs:export_files.bzl", "buck_export_file", "export_file")
 
 oncall("hermit")
+
+# check.exit_status_class: the rust-script and the module it includes by #[path].
+[
+    buck_export_file(
+        name = src,
+        visibility = ["//hermetic_infra/hermit/fb-only/contract_checks:"],
+    )
+    for src in [
+        "check-exit-status-class.rs",
+        "lib/rust_script_prelude.rs",
+    ]
+]
+
+# check.backend_abstraction: the script and the source gate it executes.
+[
+    buck_export_file(
+        name = src,
+        visibility = [
+            "//hermetic_infra/hermit:",
+            "//hermetic_infra/hermit/fb-only/contract_checks:",
+        ],
+    )
+    for src in [
+        "check-detcore-backend-abstraction.sh",
+        "detcore-backend-source.rs",
+    ]
+]
 
 # Shared verbatim with ci/manifest-plan, which includes these files via
 # #[path] modules (ci/manifest-plan/src/lib.rs) exactly as

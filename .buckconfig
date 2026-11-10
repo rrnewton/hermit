@@ -54,3 +54,7 @@ file_watcher = notify
 # write made the daemon hold the second invocation until the first finished
 # ("Waiting on Synchronizing buck2 internal state").
 ignore = .git, target, ignored, shim/third-party/rust/vendor
+# The BUCK files are fbsource's, mirrored here, and fbsource lets a package
+# name sources inside a subpackage: the root BUCK exports files under ci/ and
+# scripts/, which are packages of their own in this tree.
+package_boundary_exceptions = .
