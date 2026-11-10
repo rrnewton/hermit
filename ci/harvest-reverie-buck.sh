@@ -75,8 +75,12 @@ for entry in "${TARGETS[@]}"; do
   BUCK_TARGETS+=("${entry%%|*}")
 done
 
+# Build against the pinned root's sysroot input so the binaries carry the
+# nix RUNPATH their Cargo twins carry and execute where prepare lists them
+# (inside the pinned root). A digest drift refuses in the staging script.
+bash shim/modes/stage-pinned-sysroot
 echo "harvest-reverie-buck: building ${#BUCK_TARGETS[@]} detcore targets with $BUCK2" >&2
-"$BUCK2" build --show-output "${BUCK_TARGETS[@]}" > "$BUILD_LOG" 2>&1 || {
+"$BUCK2" build -c hermit.rust_sysroot=pinned-rust-sysroot --show-output "${BUCK_TARGETS[@]}" > "$BUILD_LOG" 2>&1 || {
   tail -n 30 "$BUILD_LOG" >&2
   echo "harvest-reverie-buck: buck build failed (log retained at $BUILD_LOG)" >&2
   exit 2
@@ -182,4 +186,19 @@ printf '%s' "$ENTRIES" | while IFS='|' read -r _target name _src dest _placed _s
   esac
 done
 echo "harvest-reverie-buck: staged manifest and buck-harvest into $PINNED_VALIDATE" >&2
+
+# Acceptance: every harvested binary must resolve and list INSIDE the pinned
+# root, where prepare runs it. A host-linked binary (no nix RUNPATH) passes
+# every host check above and then fails prepare with exit 127, so prove the
+# in-root exec here, where the failure names this producer.
+mkdir -p ignored/hermetic/split/cargo
+for entry in "${TARGETS[@]}"; do
+  name=${entry##*|}
+  ./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split \
+    --src-rw --cargo-home ignored/hermetic/split/cargo -- \
+    bash -c "ldd /src/target/validate/buck-harvest/$name | grep -q 'not found' && exit 1; /src/target/validate/buck-harvest/$name --list >/dev/null" || {
+    echo "harvest-reverie-buck: $name does not resolve/execute inside the pinned root" >&2
+    exit 2
+  }
+done
 echo "harvest-reverie-buck: done" >&2

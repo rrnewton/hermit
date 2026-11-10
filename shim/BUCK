@@ -15,6 +15,7 @@ load("@prelude//toolchains:python.bzl", "system_python_bootstrap_toolchain", "sy
 load("@prelude//toolchains:remote_test_execution.bzl", "remote_test_execution_toolchain")
 load("@prelude//toolchains:rust.bzl", "system_rust_toolchain")
 load("//platforms:defs.bzl", "hermit_input_rust_toolchain", "remote_linking_cxx_toolchain")
+load("//:pinned_link_args.bzl", "PINNED_LINK_ARGS")
 
 oncall("open_source")
 
@@ -156,7 +157,12 @@ _RUST_RELEASE_FLAGS = select({
     hermit_input_rust_toolchain(
         name = "rust",
         default_edition = "2024",
-        rustc_flags = _RUST_RELEASE_FLAGS,
+        # Pinned-harvest mode only: link against the pinned image's nix
+        # libs with its interp + RUNPATH (like Cargo twins) so binaries
+        # execute inside the pinned root. The nix interp keeps the same
+        # flags runnable on the build host (its /nix/store holds the
+        # pinned closure), so build scripts stay consistent too.
+        rustc_flags = _RUST_RELEASE_FLAGS + (PINNED_LINK_ARGS if _RUST_SYSROOT == "pinned-rust-sysroot" else []),
         sysroot = ":rust-sysroot",
         visibility = ["PUBLIC"],
     )
