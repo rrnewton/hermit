@@ -444,7 +444,8 @@ fn follows_last_link(sysno: Sysno, operand: usize, values: &[usize; 6]) -> bool 
 /// The first object that `is_absent` finds absent on Linux's walk of
 /// `named`, an absolute path in the tool's view, as the entry `name` of the
 /// directory the walk has reached (`is_absent(directory, name)`), with the
-/// names the walk had still to look up after it. The walk looks up each
+/// names the walk had still to look up after it and the directories it
+/// looked a name up in on the way, in order, each once. The walk looks up each
 /// name in turn in the directory it has reached, follows the symbolic link
 /// that name is (the last name's only where `follow`), and takes a `..` in
 /// the directory it has reached, as `link_path_walk` does (fs/namei.c at
@@ -467,18 +468,26 @@ fn absent_on_walk(
     read_links: bool,
     own_entries: Option<&(PathBuf, PathBuf)>,
     is_absent: impl Fn(&Path, &[u8]) -> bool,
-) -> Option<(PathBuf, PathBuf)> {
+) -> Option<(PathBuf, PathBuf, Vec<PathBuf>)> {
     let mut pending = named.components().map(owned).collect::<VecDeque<_>>();
     let mut resolved = PathBuf::from("/");
+    let mut searched = Vec::<PathBuf>::new();
     let mut links = 0;
     while let Some(component) = pending.pop_front() {
+        if matches!(component, Owned::Parent | Owned::Name(_)) {
+            if read_links && !searchable(&resolved) {
+                return None;
+            }
+            if !searched.contains(&resolved) {
+                searched.push(resolved.clone());
+            }
+        }
         let name = match component {
             Owned::Root => {
                 resolved = PathBuf::from("/");
                 continue;
             }
             Owned::Current => continue,
-            _ if read_links && !searchable(&resolved) => return None,
             Owned::Parent => {
                 resolved.pop();
                 continue;
@@ -515,7 +524,7 @@ fn absent_on_walk(
                     Owned::Root | Owned::Current => {}
                 }
             }
-            return Some((next, rest));
+            return Some((next, rest, searched));
         }
         let last = pending.is_empty();
         if !read_links {
@@ -699,6 +708,10 @@ struct Decision {
     /// The path is a procfs name the table decides (not one it leaves to the
     /// kernel, such as a process's directory or an entry of `fd`).
     decided: bool,
+    /// The directories the guest's own lookup looks a name up in that the
+    /// substituted path does not go through, which the guest must be able
+    /// to search for the substitution to stand ([`Self::guest_may_search`]).
+    route: Vec<PathBuf>,
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
@@ -807,6 +820,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                     };
                     confined &= decision.decided;
                     if let Some(bytes) = decision.substituted {
+                        // Where the guest may not search its own way to the
+                        // object, its lookup fails there, and the kernel says
+                        // so.
+                        if !self.guest_may_search(guest, &decision.route).await {
+                            continue;
+                        }
                         replacements.push(Replacement {
                             argument: Some(path),
                             bytes,
@@ -824,7 +843,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let Ok(length_value) = usize::try_from(values[length] as u32 as i32) else {
                     return Ok(None);
                 };
-                let Some(bytes) = self.substituted_socket_address(
+                let Some((bytes, route)) = self.substituted_socket_address(
                     guest,
                     sysno,
                     values[address] as u64,
@@ -834,6 +853,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 ) else {
                     return Ok(None);
                 };
+                if !self.guest_may_search(guest, &route).await {
+                    return Ok(None);
+                }
                 if send {
                     match self.socket_is_datagram(guest, values[0] as RawFd).await {
                         Some(false) => return Ok(None),
@@ -860,7 +882,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
                 let name = u64::from_ne_bytes(header[..8].try_into().expect("8 bytes"));
                 let length = u32::from_ne_bytes(header[8..12].try_into().expect("4 bytes"));
-                let bytes = (name != 0)
+                let substituted = (name != 0)
                     .then(|| {
                         self.substituted_socket_address(
                             guest,
@@ -872,9 +894,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                         )
                     })
                     .flatten();
-                let Some(bytes) = bytes else {
+                let Some((bytes, route)) = substituted else {
                     return Ok(None);
                 };
+                if !self.guest_may_search(guest, &route).await {
+                    return Ok(None);
+                }
                 match self.socket_is_datagram(guest, values[0] as RawFd).await {
                     Some(false) => return Ok(None),
                     Some(true) => {}
@@ -1112,17 +1137,20 @@ impl<T: RecordOrReplay> Detcore<T> {
         // (`Detcore::absent_sysfs_object_on_walk`). The kernel is given the
         // object's own path, dashed, and the names the walk had still to look
         // up, so the call fails as one naming the object does.
+        let mut route = Vec::new();
         let substituted = substituted.or_else(|| {
             if !self.cfg.virtualize_metadata || root.is_some() || self.cfg.recordreplay_modes {
                 return None;
             }
-            let (absent, rest) =
+            let (absent, rest, searched) =
                 self.absent_sysfs_object_on_walk(guest, dirfd, spelling, follow)?;
+            route = searched;
             dashed_spelling(absent.parent()?, &absent, &absent.join(rest), bytes)
         });
         Decision {
             substituted,
             decided,
+            route,
         }
     }
 
@@ -1194,7 +1222,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// replay (whose replayed descriptor is not the socket); the caller
     /// refuses one whose substituted address does not fit. A bind makes its
     /// name, and a connect or a send looks it up, following a symbolic link
-    /// it names (`unix_find_bsd`, net/unix/af_unix.c).
+    /// it names (`unix_find_bsd`, net/unix/af_unix.c). Also the route the
+    /// guest must be able to search for it to stand (`Decision::route`).
     fn substituted_socket_address<G: Guest<Self>>(
         &self,
         guest: &G,
@@ -1203,7 +1232,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         length: usize,
         root: &Option<PathBuf>,
         numbers: Option<&BTreeMap<i32, Option<i32>>>,
-    ) -> Option<Vec<u8>> {
+    ) -> Option<(Vec<u8>, Vec<PathBuf>)> {
         let send = matches!(sysno, Sysno::sendto | Sysno::sendmsg);
         if length > std::mem::size_of::<libc::sockaddr_un>()
             || (send && self.cfg.recordreplay_modes)
@@ -1216,10 +1245,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             .read_exact(Addr::<u8>::from_raw(address as usize)?, &mut bytes)
             .ok()?;
         let path = PathBuf::from(OsStr::from_bytes(unix_address_path(&bytes)?));
-        let substituted = self
-            .decide(guest, None, &path, root, numbers, sysno != Sysno::bind)
-            .substituted?;
-        unix_address(&substituted)
+        let decision = self.decide(guest, None, &path, root, numbers, sysno != Sysno::bind);
+        Some((unix_address(&decision.substituted?)?, decision.route))
     }
 
     /// Issue `sysno` with `values`, each replacement's bytes on a transient
@@ -1680,6 +1707,100 @@ impl<T: RecordOrReplay> Detcore<T> {
         ))
     }
 
+    /// Whether the kernel checks the guest's lookups with the credentials it
+    /// checks the tool's with, so that what the tool may search the guest
+    /// may too ([`searchable`]): always where the tool runs on the guest's
+    /// own thread (DBT); where the guest's threads are other host tasks the
+    /// tool names in host procfs (ptrace), where the two threads' user and
+    /// group IDs, supplementary groups, effective capabilities, user
+    /// namespace and security label are the same, as when the guest has not
+    /// changed its own; never taken for granted where they are no host tasks
+    /// (KVM).
+    fn guest_has_tool_credentials<G: Guest<Self>>(&self, guest: &G) -> bool {
+        if self.cfg.backend.tool_shares_guest_descriptor_table {
+            return true;
+        }
+        let Some((_, thread)) = self.own_procfs_entries(guest) else {
+            return false;
+        };
+        let credentials = |task: &Path| {
+            let status = std::fs::read_to_string(task.join("status")).ok()?;
+            let ids = status
+                .lines()
+                .filter(|line| {
+                    ["Uid:", "Gid:", "Groups:", "CapEff:"]
+                        .iter()
+                        .any(|key| line.starts_with(key))
+                })
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            let namespace = std::fs::read_link(task.join("ns/user")).ok()?;
+            let label = std::fs::read(task.join("attr/current")).ok();
+            Some((ids, namespace, label))
+        };
+        match credentials(Path::new("/proc/thread-self")) {
+            Some(tool) => credentials(&thread) == Some(tool),
+            None => false,
+        }
+    }
+
+    /// Whether the guest may look a name up in each of `directories`: the
+    /// route its own lookup takes that the substituted path does not
+    /// (`Decision::route`), which the walk Detcore made for it searched with
+    /// the tool's credentials. Without asking where those are the guest's
+    /// ([`Self::guest_has_tool_credentials`]); otherwise by the kernel's own
+    /// check made in the guest's context (`faccessat2` with `X_OK` and
+    /// `AT_EACCESS`, on a transient page), so that the guest's credentials,
+    /// capabilities, ACLs and security label decide (`may_lookup`,
+    /// fs/namei.c:2600 at v7.1). Where it may not, its lookup fails there
+    /// with EACCES before it reaches the absent object, and the caller
+    /// leaves the call to the kernel. `true` where Detcore cannot ask (no
+    /// room for the question), so the object stays absent.
+    async fn guest_may_search<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        directories: &[PathBuf],
+    ) -> bool {
+        if directories.is_empty() || self.guest_has_tool_credentials(guest) {
+            return true;
+        }
+        let mut contents = Vec::new();
+        let mut offsets = Vec::with_capacity(directories.len());
+        for directory in directories {
+            offsets.push(contents.len());
+            contents.extend_from_slice(directory.as_os_str().as_bytes());
+            contents.push(0);
+        }
+        let Some(page) = map_transient(guest, contents.len()).await else {
+            return true;
+        };
+        let base = page.as_raw();
+        let mut may = true;
+        if guest.memory().write_exact(page, &contents).is_ok() {
+            for offset in offsets {
+                let checked = guest
+                    .inject_with_retry(Syscall::from_raw(
+                        Sysno::faccessat2,
+                        raw_args([
+                            libc::AT_FDCWD as usize,
+                            base + offset,
+                            libc::X_OK as usize,
+                            libc::AT_EACCESS as usize,
+                            0,
+                            0,
+                        ]),
+                    ))
+                    .await;
+                if checked.is_err() {
+                    may = false;
+                    break;
+                }
+            }
+        }
+        unmap_transient(guest, page, contents.len()).await;
+        may
+    }
+
     /// The first sysfs object the machine Detcore presents does not have
     /// that Linux's walk of `spelling`, relative to `dirfd`, reaches
     /// ([`absent_on_walk`]), following the symbolic link its last name names
@@ -1705,13 +1826,17 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// mount than the root's, it never reached sysfs, and nothing is walked;
     /// otherwise each name is looked at and each link read. A lookup that
     /// reaches no sysfs object costs one or two such opens.
+    ///
+    /// Also the directories the walk looked a name up in that the object's
+    /// own path, which the kernel is given, does not go through: the guest's
+    /// lookup must be able to search them too ([`Self::guest_may_search`]).
     fn absent_sysfs_object_on_walk<G: Guest<Self>>(
         &self,
         guest: &G,
         dirfd: i32,
         spelling: &Path,
         follow: bool,
-    ) -> Option<(PathBuf, PathBuf)> {
+    ) -> Option<(PathBuf, PathBuf, Vec<PathBuf>)> {
         let sysfs = rendered_procfs::sys_device()?;
         let named = self.named_in_tool_view(guest, dirfd, spelling)?;
         let follow = follow || follows_last_name(spelling);
@@ -1729,7 +1854,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         let cpus = self.cfg.virtual_cpu_count();
         let own_entries = self.own_procfs_entries(guest);
-        absent_on_walk(
+        let (absent, rest, searched) = absent_on_walk(
             &named,
             follow,
             read_links,
@@ -1739,7 +1864,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                     || crate::procfs::is_absent_device_attribute(directory, name))
                     && std::fs::metadata(directory).is_ok_and(|metadata| metadata.dev() == sysfs)
             },
-        )
+        )?;
+        let parent = absent.parent()?;
+        let route = searched
+            .into_iter()
+            .filter(|directory| !parent.starts_with(directory))
+            .collect();
+        Some((absent, rest, route))
     }
 
     /// The answer to the open `call` where the kernel opened `object`, a
@@ -2487,7 +2618,9 @@ mod tests {
             (directory == tree && name == b"node")
                 || (directory == cpu0 && name.starts_with(b"node"))
         };
-        let walk = |path: &Path, follow: bool| absent_on_walk(path, follow, true, None, absent);
+        let walk = |path: &Path, follow: bool| {
+            absent_on_walk(path, follow, true, None, absent).map(|(object, rest, _)| (object, rest))
+        };
         // By its own path, below it, and through a link to it.
         assert_eq!(
             walk(&tree.join("node"), true),
@@ -2523,6 +2656,19 @@ mod tests {
         assert_eq!(walk(&links.join("cpu/core_id/node0"), true), None);
         // A link loop ends the walk, as ELOOP ends Linux's.
         assert_eq!(walk(&links.join("loop/x"), true), None);
+        // The directories the walk looked a name up in, each once, in order:
+        // through the links, then below the tree.
+        let (_, _, searched) =
+            absent_on_walk(&links.join("again/node0"), true, true, None, absent).unwrap();
+        assert_eq!(searched.first(), Some(&PathBuf::from("/")));
+        assert_eq!(
+            searched[searched.len() - 3..],
+            [links.clone(), tree.clone(), cpu0.clone()]
+        );
+        let mut distinct = searched.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct.len(), searched.len());
         // A `..` below a file ends the walk too, as ENOTDIR ends Linux's,
         // before it reaches the absent directory.
         std::fs::write(links.join("file"), "").unwrap();
@@ -2554,7 +2700,8 @@ mod tests {
         std::os::unix::fs::symlink("/proc/self/node0", links.join("own")).unwrap();
         let own = (cpu0.clone(), tree.join("thread"));
         assert_eq!(
-            absent_on_walk(&links.join("own"), true, true, Some(&own), absent),
+            absent_on_walk(&links.join("own"), true, true, Some(&own), absent)
+                .map(|(object, rest, _)| (object, rest)),
             Some((cpu0.join("node0"), PathBuf::new()))
         );
         assert_eq!(walk(&links.join("own"), true), None);
@@ -2570,7 +2717,8 @@ mod tests {
         );
         // Without reading links, every name is taken as it is spelled.
         assert_eq!(
-            absent_on_walk(&tree.join("cpu0/../node/node0"), true, false, None, absent),
+            absent_on_walk(&tree.join("cpu0/../node/node0"), true, false, None, absent)
+                .map(|(object, rest, _)| (object, rest)),
             Some((tree.join("node"), PathBuf::from("node0")))
         );
         assert_eq!(
