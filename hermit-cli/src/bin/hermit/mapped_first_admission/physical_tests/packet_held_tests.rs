@@ -383,5 +383,6 @@ async fn genuine_packet_failed_repeat_with_real_b_invalidates_prior_a() {
     run(Case::RepeatedOtherAdmission).await.unwrap();
 }
 
-// Retained V11 bytes are mapped/cancelled only; no image instruction executes.
+// Retained test-package image: the map controls only map and cancel it, and
+// Initialize runs its initializer up to return, never the guest.
 mod mapped_cancel;
