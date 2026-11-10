@@ -14,12 +14,13 @@ use std::panic::resume_unwind;
 use std::sync::atomic::Ordering;
 
 use reverie_inguest::launcher::exec_stop::CleanupReceipt;
-use reverie_inguest::launcher::exec_stop::CopiedInputRequest;
 use reverie_inguest::launcher::exec_stop::ExecStop;
 use reverie_inguest::launcher::exec_stop::PreparedExec;
 use reverie_inguest::launcher::exec_stop::physical::BootstrapEntryCoordinates;
-use reverie_inguest::launcher::exec_stop::physical::Preparation;
-use reverie_inguest::launcher::exec_stop::register_words;
+use reverie_inguest::launcher::exec_stop::producer::Armed;
+use reverie_inguest::launcher::exec_stop::producer::ArmingFacts;
+use reverie_inguest::launcher::exec_stop::producer::AuditedRuntimeImage;
+use reverie_inguest::launcher::exec_stop::producer::BirthKind;
 use sha2::Digest;
 use sha2::Sha256;
 
@@ -45,12 +46,12 @@ fn same_error(error: io::Error, expected: &str) -> io::Result<()> {
 }
 fn launch_into<'fd>(
     root: &mut RetainedPhysical<'fd>,
-    a: &'fd PendingPacketLease,
-    b: &'fd PendingPacketLease,
+    a: &'fd MappedBirth<'_>,
+    b: &'fd MappedBirth<'_>,
     detlog: &'fd UnixStream,
-    runtime: &'fd File,
-    handoff: &'fd File,
+    own: &'fd MappedBirth<'_>,
 ) -> io::Result<()> {
+    let [_, runtime, handoff] = own.inherited();
     let request = PreparedExec::new(
         std::path::Path::new("/bin/true"),
         &["mapped-genuine-packet-cancel-only".into()],
@@ -59,11 +60,11 @@ fn launch_into<'fd>(
         // BOTH packet OFDs really cross BOTH births. No membership failure can
         // stand in for the intended negative watched-birth comparison.
         vec![
-            a.inherited_fd(),
-            b.inherited_fd(),
+            a.leases().packet(),
+            b.leases().packet(),
             detlog.as_fd(),
-            runtime.as_fd(),
-            handoff.as_fd(),
+            runtime,
+            handoff,
         ],
     )
     .map_err(rpc)?;
@@ -78,14 +79,11 @@ fn launch_into<'fd>(
 /// concurrent-RPC contract at its unsafe observer call; never Guest release.
 unsafe fn mapped_packet_control(
     case: MappedCase,
-    image_bytes: &[u8],
-    observed: &ObservedImage,
-    placement: &ProposedPlacement,
+    audited: &AuditedRuntimeImage,
     initializer: BootstrapEntryCoordinates,
 ) -> io::Result<()> {
     // All fallible pre-birth setup may use '?'. After birth every outcome reaches
     // same-owner cancellation before watch teardown or host assertion unwinds.
-    let (image, descriptor) = checked_image(image_bytes, observed).map_err(rpc)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -120,11 +118,10 @@ unsafe fn mapped_packet_control(
     let global = Arc::new(runtime.block_on(
         <detcore::GlobalState as GlobalTool>::init_global_state(&config),
     ));
-    let lease_a = PendingPacketLease::new()?;
-    let lease_b = PendingPacketLease::new()?;
-    let runtime_file = memfd_bytes(image_bytes, true)?;
-    let handoff_a = memfd_bytes(&[], false)?;
-    let handoff_b = memfd_bytes(&[], false)?;
+    let reserved_signals = reserved_signals(&config);
+    // Each birth's packet, runtime and handoff descriptors.
+    let birth_a = MappedBirth::new(audited, MEMFD_NAMES).map_err(rpc)?;
+    let birth_b = MappedBirth::new(audited, MEMFD_NAMES).map_err(rpc)?;
     let (sender_a, receiver_a) = if case == MappedCase::Initialize {
         let (sender, receiver) = crate::app::run::RunOpts::open_forwarded_detlog_channel()
             .map_err(rpc)?
@@ -159,23 +156,9 @@ unsafe fn mapped_packet_control(
     let mut b = RetainedPhysical::empty(CleanupReceipt::default());
     let mut panic_payload = None;
     let setup = catch_unwind(AssertUnwindSafe(|| -> io::Result<_> {
-        launch_into(
-            &mut a,
-            &lease_a,
-            &lease_b,
-            &sender_a,
-            &runtime_file,
-            &handoff_a,
-        )?;
+        launch_into(&mut a, &birth_a, &birth_b, &sender_a, &birth_a)?;
         if matches!(case, MappedCase::OtherBirth | MappedCase::Poison) {
-            launch_into(
-                &mut b,
-                &lease_a,
-                &lease_b,
-                &sender_b,
-                &runtime_file,
-                &handoff_b,
-            )?;
+            launch_into(&mut b, &birth_a, &birth_b, &sender_b, &birth_b)?;
         }
         let stop = a.initial()?;
         let captured = stop.capture_initial_inputs().map_err(rpc)?;
@@ -205,86 +188,57 @@ unsafe fn mapped_packet_control(
         } else {
             None
         };
-        let sealed_a = lease_a.fill(stop, &admission_a)?;
+        let sealed_a = birth_a
+            .fill_packet(stop, &*admission_a)
+            .map_err(producer_error)?;
         let sealed_b = match admission_b.as_ref() {
-            Some(admission) if case == MappedCase::OtherBirth => {
-                Some(lease_b.fill(b.initial()?, admission)?)
-            }
+            Some(admission) if case == MappedCase::OtherBirth => Some(
+                birth_b
+                    .fill_packet(b.initial()?, &**admission)
+                    .map_err(producer_error)?,
+            ),
             _ => None,
         };
-        exact_storage(&sealed_a, &admission_a.initial_packet()?)?;
-        sealed_a.verify(stop)?;
-        let control = placement.roles[4]
-            .start
-            .checked_add(PAGE)
-            .ok_or_else(|| rpc("control overflow"))?;
-        let relay = aligned(
-            control
-                .checked_add(descriptor[6])
-                .ok_or_else(|| rpc("relay overflow"))?,
-            descriptor[9],
-        )
-        .map_err(rpc)?;
-        let address = placement.roles[3]
-            .start
-            .checked_add(PAGE)
-            .ok_or_else(|| rpc("handoff address"))?;
-        let copied_address = address
-            .checked_add(2 * PAGE)
-            .ok_or_else(|| rpc("copied address"))?;
-        let copied_capacity = usize::try_from(
-            placement.roles[3]
-                .end
-                .checked_sub(PAGE)
-                .and_then(|end| end.checked_sub(copied_address))
-                .ok_or_else(|| rpc("copied capacity"))?,
-        )
-        .map_err(rpc)?;
+        exact_storage(
+            birth_a.leases().packet(),
+            &sealed_a,
+            &admission_a.initial_packet()?,
+        )?;
+        birth_a
+            .leases()
+            .verify_at(stop, &*admission_a)
+            .map_err(producer_error)?;
         let copied = stop
             .prepare_copied_inputs(
                 &captured,
-                &image,
-                &CopiedInputRequest {
-                    roles: placement.roles,
-                    free_band: placement.free_band,
-                    layout_address: observed.layout_address,
-                    copied_address,
-                    copied_capacity,
-                    control_address: control,
-                    relay_address: relay,
-                    filter_scratch: placement.filter_scratch,
-                },
+                &birth_a.validated_image().map_err(rpc)?,
+                &birth_a.copied_input_request().map_err(rpc)?,
             )
             .map_err(rpc)?;
         // SAFETY: actual unchanged stopped XState; runner's compatible CPU/XCR0
         // contract is explicit above. No host RDPKRU, guessed offset or zero.
         let pkru = unsafe { stop.entry().xstate().pkru() }.map_err(rpc)?;
-        let wire = PacketMappingWire::build(
-            &image,
-            WireInputs {
-                runtime: image_bytes,
-                observed,
-                roles: &placement.roles,
-                descriptor: &descriptor,
-                reference: observed.reference_address,
+        let Armed {
+            preparation,
+            entry: _,
+            claim: _,
+        } = birth_a
+            .arm(&ArmingFacts {
+                birth: BirthKind::Initial,
+                captured: &captured,
                 copied: &copied,
-                pkru,
-                free_band: placement.free_band,
-                packet: &sealed_a,
-            },
-            Context {
-                pid: stop.pid().as_raw() as u64,
-                regs: register_words(stop.entry().regs()),
                 mask: stop.entry().signal_mask(),
-                input_fd: sealed_a.fd().as_raw_fd() as u64,
-            },
-        )
-        .map_err(rpc)?;
-        handoff_a.write_all_at(&wire.bytes, 0)?;
-        handoff_a.set_len(wire.bytes.len() as u64)?;
-        handoff_a.sync_all()?;
-        seal_memfd(&handoff_a)?;
-        Ok((wire, sealed_a, sealed_b, admission_a, admission_b))
+                pkru,
+                reserved_signals,
+            })
+            .map_err(rpc)?;
+        Ok((
+            Some(preparation),
+            sealed_a,
+            sealed_b,
+            admission_a,
+            admission_b,
+        ))
     }));
     let mut primary = match setup {
         Ok(Ok(value)) => {
@@ -297,24 +251,23 @@ unsafe fn mapped_packet_control(
             Err(rpc("setup panicked; retained root cleanup follows"))
         }
     };
-    if let Some((wire, sealed_a, sealed_b, admission_a, admission_b)) = bundle.as_ref() {
-        let inputs = Preparation {
-            runtime_fd: runtime_file.as_fd(),
-            runtime_bytes: image_bytes,
-            layout_address: observed.layout_address,
-            handoff_fd: handoff_a.as_fd(),
-            handoff_bytes: &wire.bytes,
-            handoff_address: wire.address,
-            input_fd: lease_a.inherited_fd(),
-            free_band: placement.free_band,
-            filter_scratch: placement.filter_scratch,
-        };
+    if let Some((preparation, sealed_a, sealed_b, admission_a, admission_b)) = bundle.as_mut() {
         let observed = catch_unwind(AssertUnwindSafe(|| -> io::Result<()> {
+            let inputs = preparation
+                .take()
+                .ok_or_else(|| rpc("armed preparation already consumed"))?;
             // SAFETY: root retains exactly the outer leases named above; only
             // existing synchronous mapping syscall/INT3 at this step.
             unsafe { a.prepare(inputs) }?;
-            sealed_a.verify_prepared(a.mapped()?)?;
-            exact_storage(sealed_a, &admission_a.initial_packet()?)?;
+            birth_a
+                .leases()
+                .verify_at(a.mapped()?, &**admission_a)
+                .map_err(producer_error)?;
+            exact_storage(
+                birth_a.leases().packet(),
+                sealed_a,
+                &admission_a.initial_packet()?,
+            )?;
             need(
                 !admission_a.failed.load(Ordering::Acquire)
                     && !admission_a.initial_used.load(Ordering::Acquire),
@@ -354,14 +307,16 @@ unsafe fn mapped_packet_control(
                     })?;
                 }
                 MappedCase::OtherBirth => {
-                    let sealed_b = sealed_b
+                    sealed_b
                         .as_ref()
                         .ok_or_else(|| rpc("actual sealed B absent"))?;
                     let admission_b = admission_b
                         .as_ref()
                         .ok_or_else(|| rpc("actual admission B absent"))?;
-                    let error = sealed_b
-                        .verify_prepared(a.mapped()?)
+                    let error = birth_b
+                        .leases()
+                        .verify_at(a.mapped()?, &**admission_b)
+                        .map_err(producer_error)
                         .err()
                         .ok_or_else(|| rpc("other actual birth accepted after mapping"))?;
                     same_error(
@@ -373,7 +328,10 @@ unsafe fn mapped_packet_control(
                             && !admission_b.initial_used.load(Ordering::Acquire),
                         "wrong-birth admission not poisoned or nonce used",
                     )?;
-                    sealed_a.verify_prepared(a.mapped()?)?;
+                    birth_a
+                        .leases()
+                        .verify_at(a.mapped()?, &**admission_a)
+                        .map_err(producer_error)?;
                     need(
                         !admission_a.failed.load(Ordering::Acquire),
                         "wrong-birth B poisoned A",
@@ -383,8 +341,8 @@ unsafe fn mapped_packet_control(
                     let admission_b = admission_b
                         .as_ref()
                         .ok_or_else(|| rpc("actual admission B absent"))?;
-                    let error = match lease_a.fill(b.initial()?, admission_b) {
-                        Err(error) => error,
+                    let error = match birth_a.fill_packet(b.initial()?, &**admission_b) {
+                        Err(error) => producer_error(error),
                         Ok(_) => return Err(rpc("second fill accepted")),
                     };
                     same_error(error, "mapped packet lease fill was already attempted")?;
@@ -393,8 +351,10 @@ unsafe fn mapped_packet_control(
                             && !admission_a.failed.load(Ordering::Acquire),
                         "second-fill B did not poison exactly its actual admission",
                     )?;
-                    let error = sealed_a
-                        .verify_prepared(a.mapped()?)
+                    let error = birth_a
+                        .leases()
+                        .verify_at(a.mapped()?, &**admission_a)
+                        .map_err(producer_error)
                         .err()
                         .ok_or_else(|| rpc("old sealed A survived permanent poison"))?;
                     same_error(error, "mapped packet lease is permanently poisoned")?;
@@ -404,7 +364,7 @@ unsafe fn mapped_packet_control(
                     )?;
                     // Raw immutable bytes remain equal; storage equality cannot
                     // substitute for the permanently failed lease predicate.
-                    exact_storage(sealed_a, sealed_a.bytes())?;
+                    exact_storage(birth_a.leases().packet(), sealed_a, sealed_a)?;
                 }
             }
             Ok(())
@@ -511,7 +471,7 @@ unsafe fn mapped_packet_control(
     });
     drop(admissions); // Directory and GlobalState still live here.
     // Input digest closure is separate from packet/birth/cleanup observations.
-    if <[u8; 32]>::from(Sha256::digest(image_bytes)) != observed.image_sha256 {
+    if <[u8; 32]>::from(Sha256::digest(audited.bytes())) != audited.facts().image_sha256 {
         cleanup_errors.push("retained input image changed across control".to_owned());
     }
     if let Some(payload) = panic_payload {
@@ -752,7 +712,6 @@ fn mapped_genuine_initializer_returns_before_guest() -> io::Result<()> {
         .ok_or_else(|| rpc("HERMIT_RETAINED_PACKAGE_TEST_INSTALL is required"))?;
     let retained = RetainedImage::open_test_install(std::path::Path::new(&install))?;
     let outcome = catch_unwind(AssertUnwindSafe(|| -> io::Result<()> {
-        let placement = retained.placement()?;
         let initializer = BootstrapEntryCoordinates {
             entry: retained.entry(),
             terminal_int3: retained.terminal_int3(),
@@ -764,15 +723,7 @@ fn mapped_genuine_initializer_returns_before_guest() -> io::Result<()> {
         // The retained pair and coordinates are DATA, not execution authority
         // or Ready. This control stops at initializer return and cancels before
         // Guest; mapped_packet_control retains every lease until real cleanup.
-        unsafe {
-            mapped_packet_control(
-                MappedCase::Initialize,
-                retained.bytes(),
-                retained.observed(),
-                &placement,
-                initializer,
-            )
-        }
+        unsafe { mapped_packet_control(MappedCase::Initialize, retained.audited(), initializer) }
     }));
     // Close BOTH original OFDs after every Result and after confirmed-cleanup
     // panic. Neither a successful close nor a later error hides the real control.

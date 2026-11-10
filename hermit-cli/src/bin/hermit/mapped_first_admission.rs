@@ -514,9 +514,6 @@ mod tests {
 #[cfg(test)]
 mod physical_tests;
 
-// Requires the production exec-stop inherited-descriptor bridge and private runtime feature.
-mod packet_lease;
-
 mod mapped_run;
 mod runtime_binding;
 mod runtime_support;

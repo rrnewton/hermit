@@ -4,6 +4,7 @@ use std::fs::File;
 use std::io;
 use std::os::fd::AsFd;
 use std::os::fd::AsRawFd;
+use std::os::fd::BorrowedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixStream;
@@ -14,26 +15,17 @@ use std::time::Duration;
 
 use reverie_inguest::launcher::exec_stop::ChildOwner;
 use reverie_inguest::launcher::exec_stop::CleanupReceipt;
-use reverie_inguest::launcher::exec_stop::CopiedInitialData;
 use reverie_inguest::launcher::exec_stop::InitialExecStop;
 use reverie_inguest::launcher::exec_stop::LaunchFailure;
 use reverie_inguest::launcher::exec_stop::physical::CancelledPreparation;
 use reverie_inguest::launcher::exec_stop::physical::Preparation;
 use reverie_inguest::launcher::exec_stop::physical::PreparationFailure;
 use reverie_inguest::launcher::exec_stop::physical::PreparedMapping;
-use reverie_loader::artifact::RUNTIME_WINDOW;
-use reverie_loader::artifact::TOOL_REGION;
-use reverie_loader::handoff::Extent;
-use reverie_loader::handoff::{self};
-use reverie_loader::image::Image;
-use reverie_loader::image::Policy;
-use reverie_loader::image::ValidatedImage;
+use reverie_inguest::launcher::exec_stop::producer::EntryPoint;
+use reverie_inguest::launcher::exec_stop::producer::RuntimeImageFacts;
 use reverie_rpc_transport::RpcServer;
-use sha2::Digest;
-use sha2::Sha256;
 
 use super::MappedFirstAdmission;
-use super::packet_lease::SealedPacketLease;
 pub(crate) const WAIT: Duration = Duration::from_secs(10);
 pub(crate) fn need(condition: bool, message: &str) -> io::Result<()> {
     if condition {
@@ -49,7 +41,6 @@ pub(crate) fn rpc(error: impl std::fmt::Display) -> io::Error {
 /// always returned: an `io::Error` the producer passed through (the
 /// admission's watched-peer refusal, a descriptor call) comes back unchanged,
 /// and any other refusal is `InvalidData` with the producer's exact text.
-#[cfg(test)]
 pub(crate) fn producer_error(error: Box<dyn std::error::Error>) -> io::Error {
     match error.downcast::<io::Error>() {
         Ok(error) => *error,
@@ -59,7 +50,6 @@ pub(crate) fn producer_error(error: Box<dyn std::error::Error>) -> io::Error {
 /// The signals Detcore's subscriptions reserve: SIGSYS always, SIGSEGV when
 /// Detcore intercepts CPUID or RDTSC. The ToolInitialization observation and
 /// the producer's arming both use this one computation.
-#[cfg(test)]
 pub(crate) fn reserved_signals(config: &detcore::Config) -> u64 {
     // Token for token the expression init_trial.rs used inline.
     use reverie::Tool;
@@ -187,14 +177,9 @@ impl<'fd> RetainedPhysical<'fd> {
 // generic proof constructor or test suppression is added. The enclosing root
 // MUST retain this component and all its leases until actual confirmed cleanup.
 
-pub(crate) type NumericResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-pub(crate) const PAGE: u64 = 4096;
-pub(crate) fn require(ok: bool, why: &str) -> NumericResult<()> {
-    if ok { Ok(()) } else { Err(why.into()) }
-}
-
 /// Exact data coordinates supplied from independently retained output, then
-/// checked against the SAME full image bytes below. These are not source proof.
+/// audited against the SAME full image bytes by the producer
+/// (`AuditedRuntimeImage::new`). These are not source proof.
 pub(crate) struct ObservedImage {
     pub(crate) image_sha256: [u8; 32],
     pub(crate) layout_address: u64,
@@ -206,15 +191,11 @@ pub(crate) struct ObservedImage {
     pub(crate) sites: [[u64; 4]; 4],
     pub(crate) ordinary_post_ips: Vec<u64>,
 }
-#[cfg(test)]
 impl ObservedImage {
     /// The producer's facts for this image: these observations, one entry
     /// for the initial birth, no successor, and no data ranges (x86-64).
-    pub(crate) fn facts(
-        &self,
-        initial_entry: reverie_inguest::launcher::exec_stop::producer::EntryPoint,
-    ) -> reverie_inguest::launcher::exec_stop::producer::RuntimeImageFacts {
-        reverie_inguest::launcher::exec_stop::producer::RuntimeImageFacts {
+    pub(crate) fn facts(&self, initial_entry: EntryPoint) -> RuntimeImageFacts {
+        RuntimeImageFacts {
             image_sha256: self.image_sha256,
             layout_address: self.layout_address,
             reference_address: self.reference_address,
@@ -229,467 +210,6 @@ impl ObservedImage {
             data_ranges: Vec::new(),
         }
     }
-}
-pub(crate) struct ProposedPlacement {
-    pub(crate) roles: [Extent; 5],
-    pub(crate) free_band: Extent,
-    pub(crate) filter_scratch: u64,
-}
-pub(crate) struct PacketMappingWire {
-    pub(crate) bytes: Vec<u8>,
-    pub(crate) address: u64,
-}
-pub(crate) struct Context {
-    pub(crate) pid: u64,
-    pub(crate) regs: [u64; 27],
-    pub(crate) mask: u64,
-    pub(crate) input_fd: u64,
-}
-pub(crate) struct WireInputs<'a, 'packet> {
-    pub(crate) runtime: &'a [u8],
-    pub(crate) observed: &'a ObservedImage,
-    pub(crate) roles: &'a [Extent; 5],
-    pub(crate) descriptor: &'a [u64; 12],
-    pub(crate) reference: u64,
-    pub(crate) copied: &'a CopiedInitialData,
-    pub(crate) pkru: u32,
-    pub(crate) free_band: Extent,
-    pub(crate) packet: &'a SealedPacketLease<'packet>,
-}
-
-pub(crate) fn checked_image<'a>(
-    runtime: &'a [u8],
-    observed: &ObservedImage,
-) -> NumericResult<(ValidatedImage<'a>, [u64; 12])> {
-    require(
-        !runtime.is_empty() && runtime.len() <= 512 * 1024 * 1024,
-        "retained image size",
-    )?;
-    require(
-        <[u8; 32]>::from(Sha256::digest(runtime)) == observed.image_sha256,
-        "retained image SHA256",
-    )?;
-    let image = Image::parse(runtime)
-        .map_err(|e| format!("ELF: {e:?}"))?
-        .validate(&Policy {
-            window: RUNTIME_WINDOW,
-            allow_tls: true,
-        })
-        .map_err(|e| format!("ELF policy: {e:?}"))?;
-    image
-        .private_runtime_metadata()
-        .map_err(|e| format!("private metadata: {e:?}"))?;
-    let raw = exact_ro(&image, runtime, observed.layout_address, 96)?;
-    let mut descriptor = [0; 12];
-    for (out, row) in descriptor.iter_mut().zip(raw.as_chunks::<8>().0) {
-        *out = u64::from_le_bytes(*row);
-    }
-    require(
-        descriptor[..6]
-            == [
-                u64::from_le_bytes(*b"HLMLAY01"),
-                1,
-                96,
-                handoff::VERSION,
-                handoff::HEADER_BYTES as u64,
-                handoff::MAX_BYTES as u64,
-            ]
-            && descriptor[6] > 0
-            && descriptor[8] > 0
-            && descriptor[7].is_power_of_two()
-            && descriptor[9].is_power_of_two()
-            && descriptor[10] == RUNTIME_WINDOW.start + PAGE
-            && descriptor[11] == descriptor[10] + 0x7c,
-        "actual layout descriptor",
-    )?;
-    exact_ro(&image, runtime, observed.reference_address, PAGE as usize)?;
-    Ok((image, descriptor))
-}
-pub(crate) fn exact_ro(
-    image: &ValidatedImage<'_>,
-    _bytes: &[u8],
-    address: u64,
-    len: usize,
-) -> NumericResult<Vec<u8>> {
-    let end = address
-        .checked_add(u64::try_from(len)?)
-        .ok_or("RO span overflow")?;
-    for segment in image.segments() {
-        let initialized = image
-            .mapped_file_bytes(segment)
-            .map_err(|e| format!("RO load: {e:?}"))?;
-        let initialized_end = segment
-            .memory
-            .start
-            .checked_add(u64::try_from(initialized.len())?)
-            .ok_or("RO initialized end overflow")?;
-        if segment.permissions.read
-            && !segment.permissions.write
-            && !segment.permissions.execute
-            && segment.memory.start <= address
-            && end <= initialized_end
-        {
-            let at = usize::try_from(address - segment.memory.start)?;
-            return initialized
-                .get(at..at.checked_add(len).ok_or("RO offset overflow")?)
-                .map(<[u8]>::to_vec)
-                .ok_or_else(|| "RO initialized bytes".into());
-        }
-    }
-    Err("descriptor/reference must come from actual file-backed R-only segment".into())
-}
-
-pub(crate) fn exact_rx<'a>(
-    image: &ValidatedImage<'a>,
-    address: u64,
-    length: usize,
-) -> NumericResult<&'a [u8]> {
-    let end = address
-        .checked_add(length as u64)
-        .ok_or("RX span overflow")?;
-    for load in image.segments() {
-        let initialized = image
-            .mapped_file_bytes(load)
-            .map_err(|e| format!("RX load: {e:?}"))?;
-        if load.permissions.read
-            && load.permissions.execute
-            && !load.permissions.write
-            && load.memory.start <= address
-            && end
-                <= load
-                    .memory
-                    .start
-                    .checked_add(
-                        load.file
-                            .end
-                            .checked_sub(load.file.start)
-                            .ok_or("RX file size")?,
-                    )
-                    .ok_or("RX end overflow")?
-        {
-            let at = usize::try_from(address - load.memory.start)?;
-            return initialized
-                .get(at..at.checked_add(length).ok_or("RX offset overflow")?)
-                .ok_or_else(|| "RX file bounds".into());
-        }
-    }
-    Err("mapping-only observation outside initialized RX bytes".into())
-}
-pub(crate) fn aligned(value: u64, alignment: u64) -> NumericResult<u64> {
-    require(alignment.is_power_of_two(), "numeric alignment")?;
-    Ok(value
-        .checked_add(alignment - 1)
-        .ok_or("alignment overflow")?
-        & !(alignment - 1))
-}
-pub(crate) fn payload_words(
-    data: &CopiedInitialData,
-    address: u64,
-    count: u64,
-) -> NumericResult<Vec<u64>> {
-    let start = usize::try_from(address.checked_sub(data.address()).ok_or("copied offset")?)?;
-    let length = usize::try_from(count.checked_mul(8).ok_or("copied words overflow")?)?;
-    let end = start.checked_add(length).ok_or("copied end overflow")?;
-    Ok(data
-        .bytes()
-        .get(start..end)
-        .ok_or("copied words bounds")?
-        .as_chunks::<8>()
-        .0
-        .iter()
-        .map(|row| u64::from_le_bytes(*row))
-        .collect())
-}
-pub(crate) fn payload_bytes(
-    data: &CopiedInitialData,
-    address: u64,
-    length: u64,
-) -> NumericResult<&[u8]> {
-    let start = usize::try_from(address.checked_sub(data.address()).ok_or("copied offset")?)?;
-    let end = start
-        .checked_add(usize::try_from(length)?)
-        .ok_or("copied end overflow")?;
-    data.bytes()
-        .get(start..end)
-        .ok_or_else(|| "copied bytes bounds".into())
-}
-impl PacketMappingWire {
-    pub(crate) fn build(
-        image: &ValidatedImage<'_>,
-        inputs: WireInputs<'_, '_>,
-        context: Context,
-    ) -> NumericResult<Self> {
-        let WireInputs {
-            runtime,
-            observed,
-            roles,
-            descriptor,
-            reference,
-            copied: data,
-            pkru,
-            free_band,
-            packet,
-        } = inputs;
-        let address = roles[3].start.checked_add(PAGE).ok_or("handoff overflow")?;
-        let length = usize::try_from(
-            roles[3]
-                .end
-                .checked_sub(address)
-                .and_then(|end| end.checked_sub(PAGE))
-                .ok_or("handoff guards")?,
-        )?;
-        require(
-            length <= handoff::MAX_BYTES && length >= 3 * PAGE as usize,
-            "complete numeric fixture handoff needs header/table/payload space",
-        )?;
-        let mut bytes = vec![0; length];
-        let at = usize::try_from(
-            data.address()
-                .checked_sub(address)
-                .ok_or("payload offset")?,
-        )?;
-        let end = at
-            .checked_add(data.bytes().len())
-            .ok_or("payload overflow")?;
-        bytes
-            .get_mut(at..end)
-            .ok_or("payload bounds")?
-            .copy_from_slice(data.bytes());
-        let metadata = data.image_metadata();
-        let handler = observed.handler_address;
-        let handler_len = observed.handler_bytes;
-        require(
-            handler_len > 0 && handler_len <= 64 * 1024,
-            "handler observation bounds",
-        )?;
-        require(
-            <[u8; 32]>::from(Sha256::digest(exact_rx(image, handler, handler_len)?))
-                == observed.handler_sha256,
-            "actual handler bytes",
-        )?;
-        let dev_null = observed.dev_null_address;
-        require(
-            exact_ro(image, runtime, dev_null, 10)? == b"/dev/null\0",
-            "actual ELF dev-null literal",
-        )?;
-        let mut code = Vec::new();
-        for load in image.segments() {
-            if load.permissions.read && load.permissions.execute && !load.permissions.write {
-                let end = load
-                    .memory
-                    .start
-                    .checked_add(load.file.end - load.file.start)
-                    .ok_or("code end")?;
-                code.push(handoff::Code {
-                    start: load.memory.start,
-                    end,
-                });
-            }
-        }
-        let mut sites = Vec::new();
-        let mut seen = [false; 4];
-        for values in observed.sites {
-            let [ip, post, number, operation] = values;
-            let slot = match (operation, number) {
-                (1, 158) => 0,
-                (2, 218) => 1,
-                (3, 7) => 2,
-                (4, 2) => 3,
-                _ => return Err("measured operation/number".into()),
-            };
-            require(!seen[slot], "duplicate measured role")?;
-            seen[slot] = true;
-            require(
-                ip.checked_add(2) == Some(post) && exact_rx(image, ip, 2)? == [0x0f, 0x05],
-                "actual syscall/post instruction bytes",
-            )?;
-            sites.push(handoff::SiteRecord {
-                syscall_ip: ip,
-                return_ip: post,
-                number,
-                operation,
-            });
-        }
-        sites.sort_unstable_by_key(|site| site.return_ip);
-        let tool_init = &observed.ordinary_post_ips;
-        require(
-            !tool_init.is_empty() && tool_init.len() <= 4096,
-            "finite actual ToolInit sites",
-        )?;
-        require(
-            tool_init.windows(2).all(|pair| pair[0] < pair[1]),
-            "unique sorted ToolInit sites",
-        )?;
-        for &post in tool_init {
-            require(
-                exact_rx(image, post.checked_sub(2).ok_or("tool post")?, 2)? == [0x0f, 0x05],
-                "actual ordinary syscall bytes, not ToolInit authorization",
-            )?;
-        }
-        let maps = data.planned_maps();
-        let locations = data.locations();
-        let env = payload_words(data, locations.envp, locations.envp_words)?;
-        let aux = payload_words(data, locations.raw_aux, locations.raw_aux_words)?;
-        let name = payload_bytes(data, locations.program_name, locations.program_name_bytes)?;
-        let control = roles[4].start.checked_add(PAGE).ok_or("control overflow")?;
-        let relay = aligned(
-            control.checked_add(descriptor[6]).ok_or("relay overflow")?,
-            descriptor[9],
-        )?;
-        let tls = &metadata.tls;
-        let backing = data.tls_geometry().backing();
-        let mut header = handoff::Header {
-            prefix: [
-                handoff::MAGIC,
-                handoff::VERSION,
-                length as u64,
-                handoff::HEADER_BYTES as u64,
-                0,
-                0,
-                0,
-                0,
-            ],
-            binding: [[0; 4]; 5], // Explicit numeric fixture; no digest is an authority claim.
-            roles: *roles,
-            registers: context.regs,
-            scalars: [
-                context.pid,
-                control,
-                data.control_bytes(),
-                relay,
-                data.relay_bytes(),
-                context.input_fd,
-                u64::from(pkru),
-                context.mask,
-                data.tls_geometry().pthread().start as u64,
-                handler,
-                reference,
-                PAGE,
-                metadata.gnu_stack_bytes,
-                dev_null,
-                0,
-                0,
-            ],
-            tables: std::array::from_fn(|_| handoff::Table {
-                offset: 0,
-                count: 0,
-                stride: 0,
-            }),
-            tls: [
-                metadata.program_headers.start,
-                56,
-                u64::from(metadata.program_header_count),
-                tls.address,
-                tls.file_bytes,
-                tls.memory_bytes,
-                tls.alignment,
-                backing.start as u64,
-                backing.bytes as u64,
-                tls.load.memory.start,
-                tls.load.memory.end - tls.load.memory.start,
-                tls.load.file.end - tls.load.file.start,
-            ],
-        };
-        // Reserve complete metadata tables below the already placed copied payload.
-        let mut cursor = handoff::HEADER_BYTES as u64;
-        for (index, count, stride) in [
-            (0, maps.len(), 32),
-            (1, code.len(), 16),
-            (2, sites.len(), 32),
-            (3, packet.bytes().len(), 1),
-            (7, 10, 1),
-            (8, tool_init.len(), 8),
-        ] {
-            cursor = aligned(cursor, 8)?;
-            header.tables[index] = handoff::Table {
-                offset: cursor,
-                count: count as u64,
-                stride,
-            };
-            cursor = cursor
-                .checked_add((count as u64).checked_mul(stride).ok_or("table size")?)
-                .ok_or("table end")?;
-        }
-        require(cursor <= at as u64, "metadata would overlap copied payload")?;
-        for (index, location, count, stride) in [
-            (4, locations.envp, locations.envp_words, 8),
-            (5, locations.raw_aux, locations.raw_aux_words, 8),
-            (6, locations.program_name, locations.program_name_bytes, 1),
-        ] {
-            header.tables[index] = handoff::Table {
-                offset: location.checked_sub(address).ok_or("table offset")?,
-                count,
-                stride,
-            };
-        }
-        let tables = handoff::TableData {
-            maps,
-            code: &code,
-            sites: &sites,
-            packet: packet.bytes(),
-            env: &env,
-            aux: &aux,
-            program_name: name,
-            dev_null: b"/dev/null\0",
-            tool_init,
-        };
-        handoff::serialize(&header, &tables, address, &mut bytes)
-            .map_err(|e| format!("numeric fixture serialize: {e:?}"))?;
-        let expected = reverie_loader::mapped_inputs::ConsumerLayout {
-            free_band,
-            region: Extent {
-                start: TOOL_REGION.start,
-                end: TOOL_REGION.end,
-            },
-            control_bytes: descriptor[6],
-            relay_bytes: descriptor[8],
-            control_align: descriptor[7],
-            relay_align: descriptor[9],
-        };
-        // Run the unchanged complete production predicate before mapping.
-        // The readable-union correction is an explicit source prerequisite.
-        reverie_loader::mapped_inputs::ProductionMappedInputs::validate_at(
-            &bytes, address, expected,
-        )
-        .map_err(|e| format!("complete numeric baseline refused: {e:?}"))?;
-        let view = handoff::View::parse(&bytes, address)
-            .map_err(|e| format!("packet mapping parse: {e:?}"))?;
-        require(
-            view.table(3)
-                .map_err(|e| format!("packet table: {e:?}"))?
-                .bytes()
-                == packet.bytes(),
-            "serialized table3 lost genuine packet",
-        )?;
-        Ok(Self { bytes, address })
-    }
-}
-
-pub(crate) fn memfd_bytes(bytes: &[u8], seal: bool) -> io::Result<File> {
-    let file = File::from(
-        crate::app::verify_inputs::new_unsealed_memfd(c"mapped-packet-control").map_err(rpc)?,
-    );
-    file.write_all_at(bytes, 0)?;
-    file.set_len(bytes.len() as u64)?;
-    if seal {
-        seal_memfd(&file)?;
-    }
-    Ok(file)
-}
-pub(crate) fn seal_memfd(file: &File) -> io::Result<()> {
-    // SAFETY: this root owns the retained, already-filled memfd. No guest or
-    // concurrent writer runs. Positional writes never advanced its shared offset.
-    if unsafe {
-        libc::fcntl(
-            file.as_raw_fd(),
-            libc::F_ADD_SEALS,
-            libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL,
-        )
-    } < 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
 }
 // A caught payload may have a panicking destructor. Retain the first payload
 // (including an earlier setup/observation panic); never drop a secondary payload
@@ -961,14 +481,22 @@ fn retain_admission(
     Ok(owner)
 }
 
-pub(crate) fn exact_storage(sealed: &SealedPacketLease<'_>, expected: &[u8]) -> io::Result<()> {
+/// The packet storage check, over the packet descriptor `fd`, the bytes the
+/// fill `retained`, and the admission's `expected` packet. It neither poisons
+/// the lease nor fails the admission. `retained` and `expected` are separate
+/// operands: passing the fill's bytes as both would make the first check true.
+pub(crate) fn exact_storage(
+    fd: BorrowedFd<'_>,
+    retained: &[u8],
+    expected: &[u8],
+) -> io::Result<()> {
     need(
-        sealed.bytes() == expected,
+        retained == expected,
         "lease differs from actual initial_packet",
     )?;
     // Duplicate is a real shared-OFD alias for observation; positional IO leaves
     // its original shared offset unchanged. No path or replacement is used.
-    let file = File::from(sealed.fd().try_clone_to_owned()?);
+    let file = File::from(fd.try_clone_to_owned()?);
     need(
         file.metadata()?.len() == expected.len() as u64,
         "packet file length differs",

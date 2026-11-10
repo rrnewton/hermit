@@ -8,7 +8,6 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use detcore::detlog::NativePhysicalWatchIdentity;
-use reverie::Tool;
 use reverie_inguest::launcher::exec_stop::physical::BootstrapEntryCoordinates;
 use reverie_inguest::launcher::exec_stop::physical::ObservationDomain;
 use reverie_inguest::launcher::exec_stop::physical::PreparedMapping;
@@ -191,11 +190,7 @@ impl Trial {
             serving.owner.watched_process().watch_is_healthy(),
             "initial watch failed",
         )?;
-        let subscriptions = <detcore::Detcore as Tool>::subscriptions(config);
-        let mut reserved_signals = 1_u64 << (libc::SIGSYS - 1);
-        if subscriptions.has_cpuid() || subscriptions.has_rdtsc() {
-            reserved_signals |= 1_u64 << (libc::SIGSEGV - 1);
-        }
+        let reserved_signals = super::reserved_signals(config);
         let result = tokio::select! {
             // SAFETY: owner and all leases stay in the outer synchronous root.
             observed = unsafe { mapped.observe_until_terminal(
@@ -246,11 +241,7 @@ impl Trial {
             serving.owner.watched_process().watch_is_healthy(),
             "initial watch failed",
         )?;
-        let subscriptions = <detcore::Detcore as Tool>::subscriptions(config);
-        let mut reserved_signals = 1_u64 << (libc::SIGSYS - 1);
-        if subscriptions.has_cpuid() || subscriptions.has_rdtsc() {
-            reserved_signals |= 1_u64 << (libc::SIGSEGV - 1);
-        }
+        let reserved_signals = super::reserved_signals(config);
         let _result = tokio::select! {
             // SAFETY: owner and all leases stay in the outer synchronous root.
             observed = unsafe { mapped.observe_until_terminal(

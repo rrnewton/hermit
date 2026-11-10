@@ -13,8 +13,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 
-use reverie_loader::artifact::TOOL_REGION;
-use reverie_loader::handoff::Extent;
+use reverie_inguest::launcher::exec_stop::producer::AuditedRuntimeImage;
+use reverie_inguest::launcher::exec_stop::producer::EntryPoint;
 use serde::Deserialize;
 use sha2::Digest;
 use sha2::Sha256;
@@ -22,10 +22,6 @@ use sha2::Sha256;
 use super::super::verify_inputs::MappedPackageMeta;
 use super::super::verify_inputs::RetainedPackageFileMeta;
 use super::runtime_support::ObservedImage;
-use super::runtime_support::PAGE;
-use super::runtime_support::ProposedPlacement;
-use super::runtime_support::checked_image;
-use super::runtime_support::exact_rx;
 use super::runtime_support::rpc;
 
 const SCHEMA: &str = "hermit.private-static-runtime-data.v1";
@@ -247,7 +243,9 @@ impl RetainedFile {
 pub(crate) struct RetainedImage {
     image: RetainedFile,
     descriptor: RetainedFile,
-    observed: ObservedImage,
+    /// The one audited image of this package: the embedder asserts its facts
+    /// here, from the package it retains, and nowhere else.
+    audited: AuditedRuntimeImage,
     entry: u64,
     terminal_int3: u64,
     #[cfg(feature = "loader-rcb-observation")]
@@ -337,14 +335,27 @@ impl RetainedImage {
             sites: data.observed.sites,
             ordinary_post_ips: data.observed.ordinary_post_ips,
         };
-        // Preserve the existing loader and exact layout/reference predicates.
-        // Remaining handler/site/role checks still run unchanged in wire build.
-        let (validated, _) = checked_image(&image.bytes, &observed).map_err(rpc)?;
+        // The single audit of this package's image, against the facts this
+        // package declares (embedder-asserted; the package is the custody).
+        let audited = AuditedRuntimeImage::new(
+            image.bytes.clone(),
+            observed.facts(EntryPoint {
+                entry: data.entry,
+                terminal_trap: data.terminal_int3,
+            }),
+        )
+        .map_err(rpc)?;
+        let validated = audited.validated_image().map_err(rpc)?;
         if validated.entry() != data.entry
-            || exact_rx(&validated, data.terminal_int3, 1).map_err(rpc)? != [0xcc]
+            || audited
+                .exact_executable(data.terminal_int3, 1)
+                .map_err(rpc)?
+                != [0xcc]
             || data.fallback_entry >= data.completion_syscall
-            || exact_rx(&validated, data.fallback_entry, 1).is_err()
-            || exact_rx(&validated, data.completion_syscall, 4).map_err(rpc)?
+            || audited.exact_executable(data.fallback_entry, 1).is_err()
+            || audited
+                .exact_executable(data.completion_syscall, 4)
+                .map_err(rpc)?
                 != [0x0f, 0x05, 0x0f, 0x0b]
         {
             return Err(rpc(
@@ -356,7 +367,7 @@ impl RetainedImage {
         Ok(Self {
             image,
             descriptor,
-            observed,
+            audited,
             entry: data.entry,
             terminal_int3: data.terminal_int3,
             #[cfg(feature = "loader-rcb-observation")]
@@ -365,6 +376,7 @@ impl RetainedImage {
             completion_syscall: data.completion_syscall,
         })
     }
+    #[cfg(test)]
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.image.bytes
     }
@@ -372,8 +384,8 @@ impl RetainedImage {
     pub(crate) fn descriptor_bytes(&self) -> &[u8] {
         &self.descriptor.bytes
     }
-    pub(crate) fn observed(&self) -> &ObservedImage {
-        &self.observed
+    pub(crate) fn audited(&self) -> &AuditedRuntimeImage {
+        &self.audited
     }
     pub(crate) fn entry(&self) -> u64 {
         self.entry
@@ -392,9 +404,6 @@ impl RetainedImage {
     pub(crate) fn terminal_int3(&self) -> u64 {
         self.terminal_int3
     }
-    pub(crate) fn placement(&self) -> io::Result<ProposedPlacement> {
-        placement()
-    }
     pub(crate) fn verify(&self) -> io::Result<()> {
         // Both exact opened OFDs/byte snapshots survive the complete container
         // and cleanup lifetime. Do not reopen either path after namespace entry.
@@ -402,49 +411,6 @@ impl RetainedImage {
         self.image.verify()?;
         self.descriptor.verify()
     }
-}
-
-fn placement() -> io::Result<ProposedPlacement> {
-    // Existing shared free band DATA_FIRST=1MiB/PAGE, TOOL_BAND.0=65535.
-    // These are fallible proposed roles, not observed mappings or initialized
-    // arena ownership. Actual copied-input and complete shared validation, then
-    // the unchanged no-replace injector, check every role and planned map.
-    let first = TOOL_REGION
-        .start
-        .checked_add(1024 * 1024)
-        .ok_or_else(|| rpc("role start overflow"))?;
-    let last = TOOL_REGION
-        .start
-        .checked_add(65535 * PAGE)
-        .ok_or_else(|| rpc("free band overflow"))?;
-    let mut cursor = first;
-    let mut roles = [Extent { start: 0, end: 0 }; 5];
-    // Stack, TLS, bootstrap signal stack, handoff, scalar state; guards included.
-    for (role, pages) in roles.iter_mut().zip([256_u64, 64, 256, 256, 256]) {
-        let bytes = pages
-            .checked_mul(PAGE)
-            .ok_or_else(|| rpc("role bytes overflow"))?;
-        let end = cursor
-            .checked_add(bytes)
-            .ok_or_else(|| rpc("role end overflow"))?;
-        if end > last {
-            return Err(rpc("proposed roles exceed shared free band"));
-        }
-        *role = Extent { start: cursor, end };
-        cursor = end;
-    }
-    let filter_scratch = roles[4]
-        .start
-        .checked_add(8 * PAGE)
-        .ok_or_else(|| rpc("filter staging overflow"))?;
-    Ok(ProposedPlacement {
-        roles,
-        free_band: Extent {
-            start: first,
-            end: last,
-        },
-        filter_scratch,
-    })
 }
 
 #[cfg(test)]

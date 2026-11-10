@@ -5,7 +5,6 @@ use std::io;
 use std::os::fd::AsFd;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 
@@ -17,10 +16,12 @@ use reverie_inguest::launcher::exec_stop::ExecStop;
 use reverie_inguest::launcher::exec_stop::InitialExecStop;
 use reverie_inguest::launcher::exec_stop::LaunchFailure;
 use reverie_inguest::launcher::exec_stop::PreparedExec;
+use reverie_inguest::launcher::exec_stop::producer::MappedBirth;
+use reverie_inguest::launcher::exec_stop::producer::MappedBirthArming;
 use tokio::io::AsyncReadExt;
 
 use super::super::packet;
-use super::super::packet_lease::PendingPacketLease;
+use super::MEMFD_NAMES;
 use super::WAIT;
 use super::bounded;
 use super::need;
@@ -37,13 +38,13 @@ struct HeldExec<'fd> {
 }
 impl<'fd> HeldExec<'fd> {
     fn spawn(
-        lease: &'fd PendingPacketLease,
+        birth: &'fd MappedBirth<'_>,
         detlog: &'fd UnixStream,
         inherit_packet: bool,
     ) -> io::Result<Self> {
         let mut inherited = vec![detlog.as_fd()];
         if inherit_packet {
-            inherited.push(lease.inherited_fd());
+            inherited.push(birth.leases().packet());
         }
         let request = PreparedExec::new(
             std::path::Path::new("/bin/true"),
@@ -101,6 +102,7 @@ impl Drop for HeldExec<'_> {
 
 use super::super::runtime_support::admit;
 use super::super::runtime_support::exact_storage;
+use super::super::runtime_support::producer_error;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Case {
@@ -135,8 +137,10 @@ async fn run(case: Case) -> io::Result<()> {
         "real Config outside ordinary domain",
     )?;
     let global = Arc::new(<detcore::GlobalState as GlobalTool>::init_global_state(&config).await);
-    let lease_a = PendingPacketLease::new()?;
-    let lease_b = PendingPacketLease::new()?;
+    // The producer's births need an audited image; no image byte executes here.
+    let retained = super::fixture_package()?;
+    let birth_a = MappedBirth::new(retained.audited(), MEMFD_NAMES).map_err(rpc)?;
+    let birth_b = MappedBirth::new(retained.audited(), MEMFD_NAMES).map_err(rpc)?;
     let (sender_a, receiver_a) = UnixStream::pair()?;
     let (sender_b, receiver_b) = UnixStream::pair()?;
     receiver_a.set_nonblocking(true)?;
@@ -148,7 +152,7 @@ async fn run(case: Case) -> io::Result<()> {
     let mut admissions = Vec::new();
     let observed: io::Result<()> = async {
         held_a = Some(HeldExec::spawn(
-            &lease_a,
+            &birth_a,
             &sender_a,
             case != Case::OmittedPacket,
         )?);
@@ -168,7 +172,7 @@ async fn run(case: Case) -> io::Result<()> {
         .await?;
         let mut b = None;
         if matches!(case, Case::WrongBirth | Case::RepeatedOtherAdmission) {
-            held_b = Some(HeldExec::spawn(&lease_b, &sender_b, true)?);
+            held_b = Some(HeldExec::spawn(&birth_b, &sender_b, true)?);
             let stop_b = held_b
                 .as_ref()
                 .ok_or_else(|| rpc("held B absent"))?
@@ -191,14 +195,17 @@ async fn run(case: Case) -> io::Result<()> {
         match case {
             Case::Positive | Case::RepeatedOtherAdmission => {
                 let expected = a.initial_packet()?;
-                let sealed = lease_a.fill(stop_a, &a)?;
+                let sealed = birth_a.fill_packet(stop_a, &*a).map_err(producer_error)?;
                 need(
-                    sealed.fd().as_raw_fd() == lease_a.inherited_fd().as_raw_fd(),
+                    birth_a.leases().packet().as_raw_fd() == birth_a.inherited()[0].as_raw_fd(),
                     "packet lease replaced original descriptor",
                 )?;
-                exact_storage(&sealed, &expected)?;
-                sealed.verify(stop_a)?;
-                let packet = packet::decode(sealed.bytes()).map_err(rpc)?;
+                exact_storage(birth_a.leases().packet(), &sealed, &expected)?;
+                birth_a
+                    .leases()
+                    .verify_at(stop_a, &*a)
+                    .map_err(producer_error)?;
+                let packet = packet::decode(&sealed).map_err(rpc)?;
                 need(
                     packet.coordinator == socket("a").as_os_str().as_bytes(),
                     "actual packet lost bound listener",
@@ -221,7 +228,7 @@ async fn run(case: Case) -> io::Result<()> {
                 )?;
                 if case == Case::RepeatedOtherAdmission {
                     let b = b.as_ref().ok_or_else(|| rpc("real B admission absent"))?;
-                    let error = match lease_a.fill(stop_a, b) {
+                    let error = match birth_a.fill_packet(stop_a, &**b) {
                         Err(error) => error,
                         Ok(_) => return Err(rpc("second fill unexpectedly succeeded")),
                     };
@@ -237,8 +244,9 @@ async fn run(case: Case) -> io::Result<()> {
                         !a.failed.load(std::sync::atomic::Ordering::Acquire),
                         "repeat B error unexpectedly used A instead",
                     )?;
-                    let error = sealed
-                        .verify(stop_a)
+                    let error = birth_a
+                        .leases()
+                        .verify_at(stop_a, &*a)
                         .err()
                         .ok_or_else(|| rpc("old A lease survived failed B fill"))?;
                     need(
@@ -253,7 +261,7 @@ async fn run(case: Case) -> io::Result<()> {
             }
             Case::WrongBirth => {
                 let b = b.as_ref().ok_or_else(|| rpc("real B admission absent"))?;
-                let error = match lease_a.fill(stop_a, b) {
+                let error = match birth_a.fill_packet(stop_a, &**b) {
                     Err(error) => error,
                     Ok(_) => return Err(rpc("wrong actual birth accepted")),
                 };
@@ -267,7 +275,7 @@ async fn run(case: Case) -> io::Result<()> {
                 )?;
             }
             Case::OmittedPacket => {
-                let error = match lease_a.fill(stop_a, &a) {
+                let error = match birth_a.fill_packet(stop_a, &*a) {
                     Err(error) => error,
                     Ok(_) => return Err(rpc("omitted inherited descriptor accepted")),
                 };
@@ -374,6 +382,3 @@ async fn genuine_packet_failed_repeat_with_real_b_invalidates_prior_a() {
 
 // Retained V11 bytes are mapped/cancelled only; no image instruction executes.
 mod mapped_cancel;
-
-// Hermit's handoff producer against the Reverie producer (A(P) 2(f)).
-mod wire_differential;

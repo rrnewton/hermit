@@ -6,15 +6,13 @@ use std::os::unix::fs::FileExt;
 use std::os::unix::fs::MetadataExt;
 
 use reverie_inguest::launcher::exec_stop::physical::BootstrapEntryCoordinates;
-use reverie_loader::artifact::TOOL_REGION;
-use reverie_loader::handoff::Extent;
+use reverie_inguest::launcher::exec_stop::producer::AuditedRuntimeImage;
+use reverie_inguest::launcher::exec_stop::producer::EntryPoint;
 use sha2::Digest;
 use sha2::Sha256;
 
 use super::MappedCase;
 use super::ObservedImage;
-use super::PAGE;
-use super::ProposedPlacement;
 use super::mapped_packet_control;
 use super::rpc;
 
@@ -47,49 +45,6 @@ fn observed() -> ObservedImage {
         ],
         ordinary_post_ips: vec![0x6000e1002022],
     }
-}
-
-fn placement() -> io::Result<ProposedPlacement> {
-    // Existing shared free band DATA_FIRST=1MiB/PAGE, TOOL_BAND.0=65535.
-    // These are fallible proposed roles, not observed mappings or initialized
-    // arena ownership. Actual copied-input and complete shared validation, then
-    // the unchanged no-replace injector, check every role and planned map.
-    let first = TOOL_REGION
-        .start
-        .checked_add(1024 * 1024)
-        .ok_or_else(|| rpc("role start overflow"))?;
-    let last = TOOL_REGION
-        .start
-        .checked_add(65535 * PAGE)
-        .ok_or_else(|| rpc("free band overflow"))?;
-    let mut cursor = first;
-    let mut roles = [Extent { start: 0, end: 0 }; 5];
-    // Stack, TLS, bootstrap signal stack, handoff, scalar state; guards included.
-    for (role, pages) in roles.iter_mut().zip([256_u64, 64, 256, 256, 256]) {
-        let bytes = pages
-            .checked_mul(PAGE)
-            .ok_or_else(|| rpc("role bytes overflow"))?;
-        let end = cursor
-            .checked_add(bytes)
-            .ok_or_else(|| rpc("role end overflow"))?;
-        if end > last {
-            return Err(rpc("proposed roles exceed shared free band"));
-        }
-        *role = Extent { start: cursor, end };
-        cursor = end;
-    }
-    let filter_scratch = roles[4]
-        .start
-        .checked_add(8 * PAGE)
-        .ok_or_else(|| rpc("filter staging overflow"))?;
-    Ok(ProposedPlacement {
-        roles,
-        free_band: Extent {
-            start: first,
-            end: last,
-        },
-        filter_scratch,
-    })
 }
 
 fn file_state(file: &File) -> io::Result<[u64; 9]> {
@@ -129,11 +84,22 @@ pub(super) fn run(case: MappedCase) -> io::Result<()> {
     let file = File::open(path)?;
     let before = file_state(&file)?;
     let bytes = read_image(&file)?;
-    let proposed = placement()?;
     let mut coordinates = observed();
     if case == MappedCase::Initialize {
         coordinates.ordinary_post_ips = TOOL_INIT_RETURN_IPS.to_vec();
     }
+    let initializer = BootstrapEntryCoordinates {
+        entry: 0x6000e179aba0,
+        terminal_int3: 0x6000e16688d4,
+    };
+    let audited = AuditedRuntimeImage::new(
+        bytes.clone(),
+        coordinates.facts(EntryPoint {
+            entry: initializer.entry,
+            terminal_trap: initializer.terminal_int3,
+        }),
+    )
+    .map_err(rpc)?;
     // SAFETY: exclusively serial bounded fixture on the original ptracer OS
     // thread. Existing ExecStop creates/retains actual sole-leader births and
     // inherited FD leases. Initialize alone executes private Tool setup to its
@@ -144,16 +110,7 @@ pub(super) fn run(case: MappedCase) -> io::Result<()> {
     // Every FD/backing and genuine admission outlives actual retirement inside
     // that lexical root. A lost cleanup capability never returns here.
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        mapped_packet_control(
-            case,
-            &bytes,
-            &coordinates,
-            &proposed,
-            BootstrapEntryCoordinates {
-                entry: 0x6000e179aba0,
-                terminal_int3: 0x6000e16688d4,
-            },
-        )
+        mapped_packet_control(case, &audited, initializer)
     }));
     // A normal Result failure must close this same retained file as well. A
     // caught root panic reaches here only after its actual confirmed cleanup.

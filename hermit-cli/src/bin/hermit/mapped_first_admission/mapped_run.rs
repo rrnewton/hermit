@@ -5,7 +5,6 @@ use std::fs::File;
 use std::io;
 use std::os::fd::AsFd;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixStream;
 use std::panic::AssertUnwindSafe;
 use std::panic::catch_unwind;
@@ -18,12 +17,15 @@ use reverie::ExitStatus;
 use reverie::GlobalTool;
 use reverie::process::Command;
 use reverie_inguest::launcher::exec_stop::CleanupReceipt;
-use reverie_inguest::launcher::exec_stop::CopiedInputRequest;
 use reverie_inguest::launcher::exec_stop::ExecStop;
 use reverie_inguest::launcher::exec_stop::PreparedExec;
 use reverie_inguest::launcher::exec_stop::physical::BootstrapEntryCoordinates;
-use reverie_inguest::launcher::exec_stop::physical::Preparation;
-use reverie_inguest::launcher::exec_stop::register_words;
+use reverie_inguest::launcher::exec_stop::producer::Armed;
+use reverie_inguest::launcher::exec_stop::producer::ArmingFacts;
+use reverie_inguest::launcher::exec_stop::producer::BirthKind;
+use reverie_inguest::launcher::exec_stop::producer::MappedBirth;
+use reverie_inguest::launcher::exec_stop::producer::MappedBirthArming;
+use reverie_inguest::launcher::exec_stop::producer::MemfdNames;
 
 use super::packet;
 use super::runtime_binding::RetainedImage;
@@ -42,12 +44,10 @@ pub(crate) use stdio_capture::run_verification as capture_verification;
 
 /// The names Hermit's mapped memfds have always carried; a guest sees them in
 /// its `/proc/self/maps`.
-#[cfg(test)]
-pub(super) const MEMFD_NAMES: reverie_inguest::launcher::exec_stop::producer::MemfdNames =
-    reverie_inguest::launcher::exec_stop::producer::MemfdNames {
-        runtime: c"mapped-packet-control",
-        packet: c"hermit-mapped-initial",
-    };
+pub(super) const MEMFD_NAMES: MemfdNames = MemfdNames {
+    runtime: c"mapped-packet-control",
+    packet: c"hermit-mapped-initial",
+};
 
 struct RunOutput<'a> {
     records: detcore::detlog::ForwardedRecordSink,
@@ -201,10 +201,8 @@ unsafe fn run_inner_with_capture(
         packet::config_violation(&config).is_none(),
         "mapped Config outside existing ordinary domain",
     )?;
-    let observed = retained.observed();
-    let image_bytes = retained.bytes();
-    let (image, descriptor) = checked_image(image_bytes, observed).map_err(rpc)?;
-    let placement = retained.placement()?;
+    let audited = retained.audited();
+    let reserved_signals = reserved_signals(&config);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -239,9 +237,9 @@ unsafe fn run_inner_with_capture(
         std::process::id(),
         directory_fd.as_raw_fd()
     ));
-    let lease = super::packet_lease::PendingPacketLease::new()?;
-    let runtime_file = memfd_bytes(image_bytes, true)?;
-    let handoff_file = memfd_bytes(&[], false)?;
+    // The packet lease, the sealed runtime and the empty handoff, created in
+    // that order before any channel, as before.
+    let birth = MappedBirth::new(audited, MEMFD_NAMES).map_err(rpc)?;
     let channel = match forwarded {
         Some(plan) => Some(plan.open_mapped_in_container()?),
         None => crate::app::run::RunOpts::open_forwarded_detlog_channel()?,
@@ -273,17 +271,18 @@ unsafe fn run_inner_with_capture(
     let mut panic_payload = None;
     let setup = catch_unwind(AssertUnwindSafe(|| -> io::Result<_> {
         stdio_capture::check(capture_deadline)?;
+        let [packet_fd, runtime_fd, handoff_fd] = birth.inherited();
         let request = PreparedExec::new(
             &program,
             &arguments,
             &environment,
             cwd.as_deref(),
             vec![
-                lease.inherited_fd(),
+                packet_fd,
                 sender.as_fd(),
                 observer_sender.as_fd(),
-                runtime_file.as_fd(),
-                handoff_file.as_fd(),
+                runtime_fd,
+                handoff_fd,
             ],
         )
         .map_err(rpc)?
@@ -338,80 +337,36 @@ unsafe fn run_inner_with_capture(
                 .ok_or_else(|| rpc("observer receiver already consumed"))?,
             admission.observer_watch(),
         )?);
-        let sealed = lease.fill(stop, &admission)?;
-        exact_storage(&sealed, &admission.initial_packet()?)?;
-        sealed.verify(stop)?;
-        let control = placement.roles[4]
-            .start
-            .checked_add(PAGE)
-            .ok_or_else(|| rpc("control overflow"))?;
-        let relay = aligned(
-            control
-                .checked_add(descriptor[6])
-                .ok_or_else(|| rpc("relay overflow"))?,
-            descriptor[9],
-        )
-        .map_err(rpc)?;
-        let address = placement.roles[3]
-            .start
-            .checked_add(PAGE)
-            .ok_or_else(|| rpc("handoff address"))?;
-        let copied_address = address
-            .checked_add(2 * PAGE)
-            .ok_or_else(|| rpc("copied address"))?;
-        let copied_capacity = usize::try_from(
-            placement.roles[3]
-                .end
-                .checked_sub(PAGE)
-                .and_then(|end| end.checked_sub(copied_address))
-                .ok_or_else(|| rpc("copied capacity"))?,
-        )
-        .map_err(rpc)?;
+        let packet = birth
+            .fill_packet(stop, &*admission)
+            .map_err(producer_error)?;
         let copied = stop
             .prepare_copied_inputs(
                 &captured,
-                &image,
-                &CopiedInputRequest {
-                    roles: placement.roles,
-                    free_band: placement.free_band,
-                    layout_address: observed.layout_address,
-                    copied_address,
-                    copied_capacity,
-                    control_address: control,
-                    relay_address: relay,
-                    filter_scratch: placement.filter_scratch,
-                },
+                &birth.validated_image().map_err(rpc)?,
+                &birth.copied_input_request().map_err(rpc)?,
             )
             .map_err(rpc)?;
         // SAFETY: actual stopped ptrace XState on the same stable host domain.
         let pkru = unsafe { stop.entry().xstate().pkru() }.map_err(rpc)?;
-        let wire = PacketMappingWire::build(
-            &image,
-            WireInputs {
-                runtime: image_bytes,
-                observed,
-                roles: &placement.roles,
-                descriptor: &descriptor,
-                reference: observed.reference_address,
+        let armed = birth
+            .arm(&ArmingFacts {
+                birth: BirthKind::Initial,
+                captured: &captured,
                 copied: &copied,
-                pkru,
-                free_band: placement.free_band,
-                packet: &sealed,
-            },
-            Context {
-                pid: stop.pid().as_raw() as u64,
-                regs: register_words(stop.entry().regs()),
                 mask: stop.entry().signal_mask(),
-                input_fd: sealed.fd().as_raw_fd() as u64,
-            },
-        )
-        .map_err(rpc)?;
-        handoff_file.write_all_at(&wire.bytes, 0)?;
-        handoff_file.set_len(wire.bytes.len() as u64)?;
-        handoff_file.sync_all()?;
-        seal_memfd(&handoff_file)?;
+                pkru,
+                reserved_signals,
+            })
+            .map_err(rpc)?;
+        // Hermit never claims qualification (ruling B): the claim is dropped.
+        let Armed {
+            preparation,
+            entry: _,
+            claim: _,
+        } = armed;
         stdio_capture::check(capture_deadline)?;
-        Ok((wire, sealed, admission))
+        Ok((Some(preparation), packet, admission))
     }));
     let mut primary = match setup {
         Ok(Ok(value)) => {
@@ -424,28 +379,26 @@ unsafe fn run_inner_with_capture(
             Err(rpc("mapped setup panicked; retained cleanup follows"))
         }
     };
-    if let Some((wire, sealed, admission)) = bundle.as_ref() {
+    if let Some((preparation, packet, admission)) = bundle.as_mut() {
         let outcome = catch_unwind(AssertUnwindSafe(|| -> io::Result<ExitStatus> {
             stdio_capture::check(capture_deadline)?;
+            let preparation = preparation
+                .take()
+                .ok_or_else(|| rpc("armed preparation already consumed"))?;
             // SAFETY: same original held birth and complete retained leases.
-            unsafe {
-                physical.prepare(Preparation {
-                    runtime_fd: runtime_file.as_fd(),
-                    runtime_bytes: image_bytes,
-                    layout_address: observed.layout_address,
-                    handoff_fd: handoff_file.as_fd(),
-                    handoff_bytes: &wire.bytes,
-                    handoff_address: wire.address,
-                    input_fd: lease.inherited_fd(),
-                    free_band: placement.free_band,
-                    filter_scratch: placement.filter_scratch,
-                })
-            }?;
-            sealed.verify_prepared(physical.mapped()?)?;
+            unsafe { physical.prepare(preparation) }?;
+            birth
+                .leases()
+                .verify_at(physical.mapped()?, &**admission)
+                .map_err(producer_error)?;
             if let Some(pid) = observed_pid {
                 private_resource_diagnostic(pid, "mapped-before-init");
             }
-            exact_storage(sealed, &admission.initial_packet()?)?;
+            exact_storage(
+                birth.leases().packet(),
+                packet,
+                &admission.initial_packet()?,
+            )?;
             need(
                 !admission.failed.load(Ordering::Acquire)
                     && !admission.initial_used.load(Ordering::Acquire),
