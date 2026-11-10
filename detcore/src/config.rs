@@ -401,6 +401,9 @@ mod tests {
         // https://github.com/rrnewton/hermit/pull/5259; digest measured
         // at this head).
         (55, "91f04fcd0dfc89dd", "f013e36743d8d9e6"),
+        // Adds `DeliveryEntry` (the waiter's handler entry, same PR;
+        // digest measured at this head).
+        (56, "5f56003386aa361d", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
