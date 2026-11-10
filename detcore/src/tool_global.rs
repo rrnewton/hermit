@@ -8538,8 +8538,9 @@ pub enum SignalScope {
 /// writes and domain 4 covers (#4845, renumbered mechanically at each
 /// rebase). 55 adds the wait-mask lifetime requests (`BeginWaitMask`,
 /// `EndWaitMask`, `WithdrawWaitMask`, `PopDeliveryMask`) of
-/// https://github.com/rrnewton/hermit/pull/5259 and is current.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 55;
+/// https://github.com/rrnewton/hermit/pull/5259; 56 adds `DeliveryEntry`
+/// (the waiter's handler entry, same PR) and is current.
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 56;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
