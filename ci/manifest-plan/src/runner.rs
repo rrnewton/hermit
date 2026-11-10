@@ -8210,12 +8210,25 @@ fn process_cgroup(pid: u32) -> Result<Option<String>, String> {
 /// back after this process's first scan ([`SessionCensus::load`]), under the
 /// same reuse rule: an entry is kept only while the allocator cannot have
 /// handed its PID out again since the writer's scan began.
+///
+/// The walk runs on a copy of the census, without [`SESSION_CENSUS`] held,
+/// and what it learned is merged back afterwards ([`SessionCensus::merge`]).
+/// Every CPU poll of every budgeted invocation in this process runs a scan,
+/// and a test harness runs many invocations at once: with the lock held across
+/// the walk, each scan waited for all the others, and in loaded library runs
+/// spawns waited 0.5-2.7 s and polls 0.3-2.8 s for censuses that each needed
+/// about 50 ms of CPU (dh-t0yzi1).
 fn process_group_members(pgid: u32) -> Result<Vec<u32>, String> {
-    let mut census = SESSION_CENSUS
-        .get_or_init(session_census_from_env)
-        .lock()
-        .map_err(|_| "session census lock poisoned".to_string())?;
-    let scan = scan_process_group(&mut census, pgid)?;
+    let shared = SESSION_CENSUS.get_or_init(session_census_from_env);
+    let poisoned = |_| "session census lock poisoned".to_string();
+    let mut working = {
+        let mut census = shared.lock().map_err(poisoned)?;
+        census.absorb_spawned_groups();
+        census.clone()
+    };
+    let scan = scan_process_group(&mut working, pgid)?;
+    let mut census = shared.lock().map_err(poisoned)?;
+    census.merge(working);
     if !census.saved || scan.read >= SESSION_CENSUS_SAVE_READS {
         if let Some(path) = std::env::var_os(SESSION_CENSUS_ENV).filter(|v| !v.is_empty()) {
             census.save(Path::new(&path));
@@ -8343,12 +8356,22 @@ mod census_stall {
 /// created in this process's session, which the child inherited, and it never
 /// changes: a group's leader cannot call `setsid`, and a member that does
 /// leaves the group.
+///
+/// The record waits in [`SPAWNED_GROUPS`], whose lock is never held across a
+/// read of /proc, so a spawn never waits for a census; the next census takes
+/// it into [`SESSION_CENSUS`] before it begins
+/// ([`SessionCensus::absorb_spawned_groups`]).
 fn remember_spawned_group(pgid: u32) {
     let session = u32::try_from(unsafe { libc::getsid(0) }).ok();
-    if let Ok(mut census) = SESSION_CENSUS.get_or_init(session_census_from_env).lock() {
-        census.remember_group(pgid, session, PidAllocator::read());
+    if let Ok(mut spawned) = SPAWNED_GROUPS.lock() {
+        spawned.push((pgid, session, PidAllocator::read()));
     }
 }
+
+/// Groups [`remember_spawned_group`] recorded that no census has taken in yet:
+/// each group, its session, and where the allocator stood.
+static SPAWNED_GROUPS: std::sync::Mutex<Vec<(u32, Option<u32>, Option<PidAllocator>)>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// The session of each host PID an earlier [`process_group_members`] scan
 /// read, and the session of each process group it scanned for or this
@@ -8382,7 +8405,7 @@ fn census_scope() -> Option<String> {
     Some(format!("{} {}", boot.trim(), pidns.to_str()?))
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct SessionCensus {
     sessions: std::collections::HashMap<u32, u32>,
     /// Each group's session, with where the allocator stood when the group
@@ -8472,6 +8495,44 @@ impl SessionCensus {
             _ => self.group_sessions.clear(),
         }
         self.at = now;
+    }
+
+    /// Takes in the groups [`remember_spawned_group`] recorded since the last
+    /// census, as if each had been remembered here when it was recorded.
+    fn absorb_spawned_groups(&mut self) {
+        let spawned = match SPAWNED_GROUPS.lock() {
+            Ok(mut spawned) => std::mem::take(&mut *spawned),
+            Err(_) => return,
+        };
+        for (pgid, session, since) in spawned {
+            self.remember_group(pgid, session, since);
+        }
+    }
+
+    /// Merges back a copy that one scan walked with. The scan that began at the
+    /// later allocator position saw the later process table, so its PID
+    /// sessions replace these when it began no earlier than the last merged
+    /// scan, exactly as if the scans had run one after the other; an earlier
+    /// scan that finishes later loses only what it would have cached. A group
+    /// session is kept from whichever side knew it at the later position.
+    fn merge(&mut self, scanned: SessionCensus) {
+        let newer = match (self.at, scanned.at) {
+            (Some(ours), Some(theirs)) => theirs.forks >= ours.forks,
+            _ => true,
+        };
+        if newer {
+            self.sessions = scanned.sessions;
+            self.at = scanned.at;
+        }
+        for (pgid, (session, since)) in scanned.group_sessions {
+            let keep_ours = self
+                .group_sessions
+                .get(&pgid)
+                .is_some_and(|(_, ours)| ours.forks > since.forks);
+            if !keep_ours {
+                self.group_sessions.insert(pgid, (session, since));
+            }
+        }
     }
 
     /// Records that group `pgid` existed in `session` when the allocator
@@ -11924,6 +11985,40 @@ mod tests {
         assert_eq!(output.timeout, Some(ProcessTimeout::Cpu));
         assert!(output.cpu_usage_usec >= 1_000_000);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A census that walked /proc on its own copy leaves what it learned in
+    /// the shared census, so later scans can skip by session: the group
+    /// leader's session and the group's session are there once it returns.
+    #[test]
+    fn a_finished_census_leaves_what_it_learned_in_the_shared_census() {
+        use std::os::unix::process::CommandExt;
+        let mut leader = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = leader.id();
+        let members = process_group_members(pgid);
+        let (session, group_session) = {
+            let census = SESSION_CENSUS.get().unwrap().lock().unwrap();
+            (
+                census.sessions.get(&pgid).copied(),
+                census
+                    .group_sessions
+                    .get(&pgid)
+                    .map(|(session, _)| *session),
+            )
+        };
+        let _ = leader.kill();
+        let _ = leader.wait();
+        assert_eq!(members.unwrap(), vec![pgid]);
+        let ours = u32::try_from(unsafe { libc::getsid(0) }).ok();
+        assert_eq!(session, ours, "the leader's session was not merged back");
+        assert_eq!(
+            group_session, ours,
+            "the group's session was not merged back"
+        );
     }
 
     /// A membership request made after a census began is answered from the
