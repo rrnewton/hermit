@@ -26559,6 +26559,11 @@ enum TargetExpectation {
     Linux,
     /// A KNOWN DIVERGENCE: the line it records, until it closes.
     Diverges(KnownDivergence),
+    /// The backend refuses the run before any line: Detcore chooses Linux's
+    /// receiver, and ending that receiver's wait is a recorded unsupported
+    /// case (a masked `ppoll` that cannot keep a held signal). Judged by the
+    /// refusal itself, never by a substitute line.
+    Refuses,
 }
 
 use TargetExpectation::Diverges;
@@ -26835,7 +26840,7 @@ const PROCESS_SIGNAL_TARGET_CASES: [ProcessSignalTargetCase; 30] = [
     target_case(
         "chld-ppoll-pending-temp",
         "receiver=M interrupted=M\n",
-        PTRACE_POLLER_PASSED_OVER,
+        TargetExpectation::Refuses,
         Linux,
     ),
 ];
@@ -26915,6 +26920,9 @@ fn judge_process_signal_target(
     printed: &str,
 ) {
     match expectation {
+        TargetExpectation::Refuses => {
+            panic!("{mode}: refusals are judged by assert_ptrace_refuses, not a line")
+        }
         Linux => assert_eq!(printed, linux, "{mode}: {backend}"),
         Diverges(KnownDivergence { issue, line }) => {
             eprintln!(
@@ -26975,9 +26983,48 @@ fn a_kernel_sent_process_signal_reaches_the_thread_linux_chooses_natively_and_on
             "{}: natively",
             case.mode
         );
+        if matches!(case.ptrace, TargetExpectation::Refuses) {
+            assert_ptrace_refuses(case.mode);
+            continue;
+        }
         let ptrace = process_signal_target_at_l2(&[], case.mode);
         judge_process_signal_target("ptrace", case.mode, case.linux, case.ptrace, &ptrace);
     }
+}
+
+/// `mode` on ptrace refuses: Detcore chooses Linux's receiver (the creator
+/// in its masked `ppoll`), and ending that wait cannot keep the held
+/// private copy, a recorded unsupported case. The refusal, with no
+/// receiver line, is the outcome; a completed run — Linux's line or a
+/// sibling's — fails here, so a wrong receiver cannot hide behind it.
+fn assert_ptrace_refuses(mode: &str) {
+    let _guard = hermit_run_guard();
+    let guest = process_signal_target_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let output = hermit(&[
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--",
+        guest,
+        mode,
+    ]);
+    assert!(
+        !output.status.success(),
+        "{mode}: ptrace completed where it must refuse: {output:?}"
+    );
+    let stdout = stdout(&output);
+    assert!(
+        !stdout.contains("receiver="),
+        "{mode}: ptrace printed a receiver line where it must refuse: {stdout:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot keep a held signal"),
+        "{mode}: ptrace refused for an unrecorded reason: {stderr}"
+    );
 }
 
 /// <https://github.com/rrnewton/hermit/issues/4929> (the Claude review of
