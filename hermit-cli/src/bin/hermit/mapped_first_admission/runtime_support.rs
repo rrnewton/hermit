@@ -37,10 +37,11 @@ pub(crate) fn need(condition: bool, message: &str) -> io::Result<()> {
 pub(crate) fn rpc(error: impl std::fmt::Display) -> io::Error {
     io::Error::other(error.to_string())
 }
-/// A packet-lease refusal from the producer, as the error Hermit's lease
-/// always returned: an `io::Error` the producer passed through (the
-/// admission's watched-peer refusal, a descriptor call) comes back unchanged,
-/// and any other refusal is `InvalidData` with the producer's exact text.
+/// A packet-lease refusal from the producer: a text refusal is `InvalidData`
+/// with the producer's exact text, as Hermit's lease returned it. An
+/// `io::Error` the producer passes through (the admission's watched-peer
+/// refusal, a descriptor call, a `BirthStop` I/O failure) keeps its own kind,
+/// where Hermit's lease turned the last of these into `InvalidData`.
 pub(crate) fn producer_error(error: Box<dyn std::error::Error>) -> io::Error {
     match error.downcast::<io::Error>() {
         Ok(error) => *error,
