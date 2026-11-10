@@ -24,9 +24,9 @@ use std::process::Command;
 fn bootstrap_permits(value: Option<&str>) -> bool {
     match value {
         Some("1") => true,
-        Some(list) => list
-            .split(',')
-            .any(|name| name.trim() == "detcore_testutils"),
+        // rustc splits the crate list on commas and matches tokens
+        // exactly; a token with surrounding whitespace names nothing.
+        Some(list) => list.split(',').any(|name| name == "detcore_testutils"),
         None => false,
     }
 }
@@ -36,6 +36,11 @@ fn main() {
     println!("cargo:rerun-if-env-changed=RUSTC");
     println!("cargo:rerun-if-env-changed=RUSTC_BOOTSTRAP");
 
+    // An explicit -1 disables bootstrap even on a nightly compiler;
+    // it takes precedence over the channel fallback below.
+    if std::env::var("RUSTC_BOOTSTRAP").ok().as_deref() == Some("-1") {
+        return;
+    }
     if bootstrap_permits(std::env::var("RUSTC_BOOTSTRAP").ok().as_deref()) {
         println!("cargo:rustc-cfg=detcore_testutils_nightly");
         return;
