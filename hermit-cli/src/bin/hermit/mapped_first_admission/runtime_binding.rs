@@ -317,9 +317,9 @@ impl RetainedImage {
         data: PackageData,
     ) -> io::Result<Self> {
         let image_sha256 = digest(&data.image.sha256)?;
-        if image.state[2] != data.image.bytes
-            || <[u8; 32]>::from(Sha256::digest(&image.bytes)) != image_sha256
-        {
+        // The image is hashed once, by the audit below, against this same
+        // descriptor digest; a mismatch refuses there, before ELF validation.
+        if image.state[2] != data.image.bytes {
             return Err(rpc(
                 "exec-stop-package-invalid: actual image length/SHA256 differs",
             ));
@@ -693,7 +693,23 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("actual image length/SHA256 differs")
+                .contains("runtime image bytes differ from the facts' image_sha256")
+        );
+    }
+    #[test]
+    fn descriptor_length_differing_from_the_image_refuses_before_hashing() {
+        let directory = tempfile::tempdir().unwrap();
+        let image = directory.path().join("image");
+        let descriptor = directory.path().join("data");
+        std::fs::write(&image, [0; 4095]).unwrap();
+        std::fs::write(&descriptor, serde_json::to_vec(&data()).unwrap()).unwrap();
+        let error = RetainedImage::open_paths(&image, &descriptor)
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("exec-stop-package-invalid: actual image length/SHA256 differs")
         );
     }
 }
