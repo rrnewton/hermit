@@ -448,13 +448,14 @@ dependencies = [
 [[package]]
 name = "dagrun"
 version = "0.15.0"
-source = "git+https://github.com/rrnewton/agent-utils.git?rev=d2d102aa2e508d279b2a798b096dfb46d0f6977b#d2d102aa2e508d279b2a798b096dfb46d0f6977b"
+source = "git+https://github.com/rrnewton/agent-utils.git?rev=6bbb0121dc9afe111b67159a7b9844f24930813a#6bbb0121dc9afe111b67159a7b9844f24930813a"
 dependencies = [
  "libc",
  "serde",
  "serde_json",
  "serde_norway",
  "signal-hook",
+ "testrun-core",
 ]
 
 [[package]]
@@ -2368,6 +2369,16 @@ dependencies = [
  "quote",
  "syn 2.0.119",
  "test-case-core",
+]
+
+[[package]]
+name = "testrun-core"
+version = "0.1.0"
+source = "git+https://github.com/rrnewton/agent-utils.git?rev=6bbb0121dc9afe111b67159a7b9844f24930813a#6bbb0121dc9afe111b67159a7b9844f24930813a"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
