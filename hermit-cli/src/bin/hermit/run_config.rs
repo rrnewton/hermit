@@ -1586,6 +1586,13 @@ mod tests {
             "native-exec-shared-inputs",
             &["--verify-run=/tmp/vr", "--native-exec-shared-inputs=9"],
         ),
+        // Only builds that recognize native exec enrollment have this option;
+        // its declaration path is saved as given.
+        #[cfg(any(feature = "native-exec", feature = "native-exec-input-admission"))]
+        (
+            "native-exec-inputs",
+            &["--verify", "--native-exec-inputs=/tmp/native.yaml"],
+        ),
         ("summary", &["-u"]),
         ("summary-json", &["--summary-json=/tmp/s.json"]),
         (
