@@ -396,6 +396,11 @@ mod tests {
         // 54 at this rebase onto main's 53 (RecordExecStrings), skipping
         // reserved 33 to 39 and 42 to 44; digest measured at this head).
         (54, "4a8fdaad9b3c03b7", "f013e36743d8d9e6"),
+        // Adds `BeginWaitMask`, `EndWaitMask`, `WithdrawWaitMask` and
+        // `PopDeliveryMask` (the explicit wait-mask lifetime of
+        // https://github.com/rrnewton/hermit/pull/5259; digest measured
+        // at this head).
+        (55, "91f04fcd0dfc89dd", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
