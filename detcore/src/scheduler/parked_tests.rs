@@ -11438,14 +11438,15 @@ fn a_no_progress_probe_settles_at_step2_with_its_thread_requeued() {
     assert_eq!(grant_selected(&mut s), writer);
 }
 
-/// Review item 1 (7cdd90dc): the probe's precedence ends with its settle.
+/// Review item 1 (7cdd90dc): the probe's precedence does not outlive it.
 /// A placement that outlived the reservation kept the reader first at every
 /// other selection for the rest of the run. Precedence is now only the unrun
 /// probe's selection at step 3 (`reserved_probe_to_resume`), which registers
-/// no alarm taker; after the settle and the wake, selection is the run
-/// queue's own round robin.
+/// no alarm taker: it ends at the probe's grant, the settle then ends the
+/// reservation, and after the wake selection is the run queue's own round
+/// robin.
 #[test]
-fn the_reserved_probes_precedence_ends_with_its_settle() {
+fn the_reserved_probes_precedence_ends_at_its_grant() {
     let (mut s, reader, pid, queued) = reserved_reader_behind(&[300, 500]);
     assert_eq!(s.reserved_probe_to_resume(), Some((pid, reader)));
     assert!(
@@ -11461,7 +11462,7 @@ fn the_reserved_probes_precedence_ends_with_its_settle() {
     file_probe_successor(&mut s, reader, 2, false);
     s.step2_sigalrm_ledger();
     assert!(woken_by_sigalrm(&s, reader));
-    assert_eq!(s.reserved_probe_to_resume(), None, "precedence ended");
+    assert_eq!(s.sigalrm_reserved_poll_target(), None, "settled");
 
     let mut selections = Vec::new();
     for _ in 0..9 {
@@ -11516,7 +11517,8 @@ fn every_reservation_consumer_frees_the_single_flight() {
 fn a_backed_off_poller_reserved_for_its_probe_runs_before_a_writer() {
     // Attempt 1 backs off a band or two; attempt 20 reaches the last band,
     // whose restore keeps the entry counted as a poller until it runs
-    // (`deadline_restored`), which the reserved probe's placement allows.
+    // (`deadline_restored`), which the reserved probe's placed precedence
+    // allows.
     for attempt in [1, 20] {
         let mut s = liteinst_scheduler();
         let (reader, _, _) = add(&mut s, 100, 100);
@@ -11630,7 +11632,7 @@ fn a_reservation_needs_its_thread_queued_outside_a_selection() {
 /// is selected whether or not that priority is available: like a SIGCHLD
 /// taker it is exempt from the bound of
 /// https://github.com/rrnewton/hermit/issues/4929, one probe grant per due
-/// entry.
+/// entry under the delivery-at-completion contract.
 #[test]
 fn the_unrun_probe_resumes_ahead_of_everything_but_a_group_exit_decider() {
     for case in [
@@ -11900,4 +11902,45 @@ fn an_unrun_probe_out_of_the_run_queue_is_released_with_a_loss_at_step3() {
     assert_eq!(grant_selected(&mut s), third, "no precedence after release");
     assert_eq!(grant_selected(&mut s), other);
     assert_eq!(grant_selected(&mut s), reader);
+}
+
+/// Second reviewer of f013139f, point 3: the step-3 release ignores a probe
+/// that has run. Once granted, the target's stored request is no longer the
+/// unrun probe, whether its slot is still empty (`clear_nextturn`) or holds
+/// the filed successor, so a ran probe whose thread is out of the run queue
+/// keeps its reservation for classification and records no loss.
+#[test]
+fn the_step3_release_ignores_a_probe_that_has_run() {
+    for successor in ["empty-slot", "filed"] {
+        let (mut s, reader, pid, queued) = reserved_reader_behind(&[300]);
+        let other = queued[0];
+        assert_eq!(grant_selected(&mut s), reader, "{successor}");
+        match successor {
+            "empty-slot" => s.clear_nextturn(reader).unwrap(),
+            _ => file_probe_successor(&mut s, reader, 2, false),
+        }
+        assert!(s.run_queue.remove_tid(reader), "{successor}");
+
+        assert_eq!(grant_selected(&mut s), other, "{successor}");
+        assert!(sigalrm_reserved_for(&s, reader), "{successor}: kept");
+        assert!(!s.sigalrm_loss_recorded(pid), "{successor}: no loss");
+    }
+}
+
+/// Second reviewer of f013139f, point 3: the step-3 release runs after
+/// `hb_flush_wakes`, so a held reserved target whose gate opened since the
+/// last pass is readmitted first, counts as queued, and resumes by placed
+/// precedence with its reservation intact.
+#[test]
+fn a_held_probe_readmitted_in_the_same_pass_is_not_released() {
+    let (mut s, reader, pid, _) = reserved_reader_behind(&[300, 500]);
+    let mut hb = hb_hold_reader_spec();
+    hb.parked.insert(reader);
+    hb.wake_pending = true;
+    s.happens_before = Some(hb);
+    assert!(s.run_queue.remove_tid(reader));
+
+    assert_eq!(grant_selected(&mut s), reader, "readmitted, then first");
+    assert!(sigalrm_reserved_for(&s, reader), "not released");
+    assert!(!s.sigalrm_loss_recorded(pid));
 }
