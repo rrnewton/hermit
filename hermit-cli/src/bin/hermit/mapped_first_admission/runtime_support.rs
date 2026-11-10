@@ -45,6 +45,31 @@ pub(crate) fn need(condition: bool, message: &str) -> io::Result<()> {
 pub(crate) fn rpc(error: impl std::fmt::Display) -> io::Error {
     io::Error::other(error.to_string())
 }
+/// A packet-lease refusal from the producer, as the error Hermit's lease
+/// always returned: an `io::Error` the producer passed through (the
+/// admission's watched-peer refusal, a descriptor call) comes back unchanged,
+/// and any other refusal is `InvalidData` with the producer's exact text.
+#[cfg(test)]
+pub(crate) fn producer_error(error: Box<dyn std::error::Error>) -> io::Error {
+    match error.downcast::<io::Error>() {
+        Ok(error) => *error,
+        Err(error) => io::Error::new(io::ErrorKind::InvalidData, error.to_string()),
+    }
+}
+/// The signals Detcore's subscriptions reserve: SIGSYS always, SIGSEGV when
+/// Detcore intercepts CPUID or RDTSC. The ToolInitialization observation and
+/// the producer's arming both use this one computation.
+#[cfg(test)]
+pub(crate) fn reserved_signals(config: &detcore::Config) -> u64 {
+    // Token for token the expression init_trial.rs used inline.
+    use reverie::Tool;
+    let subscriptions = <detcore::Detcore as Tool>::subscriptions(config);
+    let mut reserved_signals = 1_u64 << (libc::SIGSYS - 1);
+    if subscriptions.has_cpuid() || subscriptions.has_rdtsc() {
+        reserved_signals |= 1_u64 << (libc::SIGSEGV - 1);
+    }
+    reserved_signals
+}
 pub(crate) async fn bounded<T>(
     future: impl std::future::Future<Output = io::Result<T>>,
 ) -> io::Result<T> {
@@ -180,6 +205,30 @@ pub(crate) struct ObservedImage {
     pub(crate) dev_null_address: u64,
     pub(crate) sites: [[u64; 4]; 4],
     pub(crate) ordinary_post_ips: Vec<u64>,
+}
+#[cfg(test)]
+impl ObservedImage {
+    /// The producer's facts for this image: these observations, one entry
+    /// for the initial birth, no successor, and no data ranges (x86-64).
+    pub(crate) fn facts(
+        &self,
+        initial_entry: reverie_inguest::launcher::exec_stop::producer::EntryPoint,
+    ) -> reverie_inguest::launcher::exec_stop::producer::RuntimeImageFacts {
+        reverie_inguest::launcher::exec_stop::producer::RuntimeImageFacts {
+            image_sha256: self.image_sha256,
+            layout_address: self.layout_address,
+            reference_address: self.reference_address,
+            sites: self.sites,
+            ordinary_post_ips: self.ordinary_post_ips.clone(),
+            handler_address: self.handler_address,
+            handler_bytes: self.handler_bytes as u64,
+            handler_sha256: self.handler_sha256,
+            dev_null_address: self.dev_null_address,
+            initial_entry: Some(initial_entry),
+            successor_entry: None,
+            data_ranges: Vec::new(),
+        }
+    }
 }
 pub(crate) struct ProposedPlacement {
     pub(crate) roles: [Extent; 5],
@@ -943,3 +992,90 @@ pub(crate) fn exact_storage(sealed: &SealedPacketLease<'_>, expected: &[u8]) -> 
 }
 
 pub(crate) mod init_trial;
+
+/// Pins `reserved_signals`' exact output. It runs at A(P)-1, where the function
+/// is a test-only copy of init_trial's inline computation, and at A(P)-2, where
+/// both init_trial call sites use it; equal output at both commits shows the
+/// refactor changes nothing.
+#[cfg(test)]
+mod reserved_signals_tests {
+    use super::reserved_signals;
+
+    const SIGSYS_BIT: u64 = 1 << 30;
+    const SIGSEGV_BIT: u64 = 1 << 10;
+
+    #[test]
+    fn reserved_signals_are_exact_for_every_config_init_trial_sees() {
+        assert_eq!(libc::SIGSYS, 31);
+        assert_eq!(libc::SIGSEGV, 11);
+        // mapped_run's and mapped_cancel's configs: the default subscription
+        // traps RDTSC, so SIGSEGV is reserved, with or without CPUID.
+        let ordinary = detcore::Config {
+            no_rcb_time: true,
+            max_timeslice: None,
+            target_timeslice: None,
+            sequentialize_threads: false,
+            in_guest_detlog_forward_policy: Some("INFO".to_owned()),
+            ..Default::default()
+        };
+        let cases = [
+            (
+                "default",
+                detcore::Config::default(),
+                SIGSYS_BIT | SIGSEGV_BIT,
+            ),
+            ("ordinary", ordinary.clone(), SIGSYS_BIT | SIGSEGV_BIT),
+            (
+                "virtualize_cpuid",
+                detcore::Config {
+                    virtualize_cpuid: true,
+                    ..ordinary.clone()
+                },
+                SIGSYS_BIT | SIGSEGV_BIT,
+            ),
+            (
+                "no virtualize_cpuid",
+                detcore::Config {
+                    virtualize_cpuid: false,
+                    ..ordinary.clone()
+                },
+                SIGSYS_BIT | SIGSEGV_BIT,
+            ),
+            // passthru_opt still traps RDTSC under virtual time, and CPUID
+            // when it is virtualized; with neither, SIGSYS alone is reserved.
+            (
+                "passthru_opt",
+                detcore::Config {
+                    passthru_opt: true,
+                    ..ordinary.clone()
+                },
+                SIGSYS_BIT | SIGSEGV_BIT,
+            ),
+            (
+                "passthru_opt, no virtual time, no virtualize_cpuid",
+                detcore::Config {
+                    passthru_opt: true,
+                    virtualize_time: false,
+                    virtualize_cpuid: false,
+                    ..ordinary.clone()
+                },
+                SIGSYS_BIT,
+            ),
+            (
+                "passthru_opt, no virtual time, virtualize_cpuid",
+                detcore::Config {
+                    passthru_opt: true,
+                    virtualize_time: false,
+                    virtualize_cpuid: true,
+                    ..ordinary
+                },
+                SIGSYS_BIT | SIGSEGV_BIT,
+            ),
+        ];
+        for (name, config, expected) in cases {
+            let actual = reserved_signals(&config);
+            eprintln!("reserved_signals[{name}] = {actual:#x}");
+            assert_eq!(actual, expected, "{name}");
+        }
+    }
+}

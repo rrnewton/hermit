@@ -374,3 +374,6 @@ async fn genuine_packet_failed_repeat_with_real_b_invalidates_prior_a() {
 
 // Retained V11 bytes are mapped/cancelled only; no image instruction executes.
 mod mapped_cancel;
+
+// Hermit's handoff producer against the Reverie producer (A(P) 2(f)).
+mod wire_differential;

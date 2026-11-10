@@ -32,7 +32,7 @@ crate-type = ["rlib"]
 # the first-party build and validation closure.
 [features]
 # Opt-in packaged first-image startup; unsupported routes remain refused.
-exec-stop-launcher = ["dep:reverie-inguest", "reverie-inguest/exec-stop", "reverie-inguest/loader-private-runtime", "dep:reverie-loader", "dep:sha2"]
+exec-stop-launcher = ["dep:reverie-inguest", "reverie-inguest/exec-stop", "reverie-inguest/loader-private-runtime", "reverie-inguest/exec-stop-producer", "dep:reverie-loader", "dep:sha2"]
 default = []
 # Retained-ptracer measurement build; ordinary mapped handover stays detached.
 loader-rcb-observation = ["exec-stop-launcher", "reverie-ptrace/rcb-observation"]

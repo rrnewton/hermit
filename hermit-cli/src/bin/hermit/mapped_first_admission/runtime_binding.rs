@@ -368,6 +368,10 @@ impl RetainedImage {
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.image.bytes
     }
+    #[cfg(test)]
+    pub(crate) fn descriptor_bytes(&self) -> &[u8] {
+        &self.descriptor.bytes
+    }
     pub(crate) fn observed(&self) -> &ObservedImage {
         &self.observed
     }

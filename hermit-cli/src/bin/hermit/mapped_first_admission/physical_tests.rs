@@ -50,6 +50,32 @@ async fn bounded<T>(future: impl std::future::Future<Output = io::Result<T>>) ->
     tokio::time::timeout(WAIT, future).await.map_err(rpc)?
 }
 
+use super::mapped_run::MEMFD_NAMES;
+const PACKAGE_FIXTURE: &str = "HERMIT_RETAINED_PACKAGE_TEST_INSTALL";
+
+/// The retained package the producer's births are made from, opened through
+/// the production parser. A missing fixture is a failure, never a skip. Both
+/// file digests are printed so a run names the exact package it used.
+fn fixture_package() -> io::Result<super::RetainedImage> {
+    let install = std::env::var_os(PACKAGE_FIXTURE)
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| rpc(format!("{PACKAGE_FIXTURE} is required")))?;
+    let retained = super::RetainedImage::open_test_install(std::path::Path::new(&install))?;
+    let hex = |bytes: &[u8]| -> String {
+        use sha2::Digest;
+        sha2::Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    };
+    eprintln!(
+        "package fixture: image sha256 {} descriptor sha256 {}",
+        hex(retained.bytes()),
+        hex(retained.descriptor_bytes())
+    );
+    Ok(retained)
+}
+
 /// A real process handle exists before any numeric id is read. Its control
 /// socket blocks it alive until instructed. Never accepts an arbitrary PID.
 struct HeldChild {

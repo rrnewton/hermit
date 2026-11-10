@@ -25,6 +25,7 @@ use detcore::detlog::NativePhysicalWatchIdentity;
 use detcore_model::liteinst_initial_image as packet;
 use hermit::in_guest_exits::InGuestExitAdmission;
 use hermit::in_guest_exits::NativeWatchedProcess;
+use reverie_inguest::launcher::exec_stop::producer::PacketAdmission;
 use reverie_rpc_transport::Admitted;
 use reverie_rpc_transport::ConnectionAdmission;
 use reverie_rpc_transport::RpcIssueMonitor;
@@ -294,6 +295,23 @@ impl MappedFirstAdmission {
     pub(super) fn fail(&self, error: &dyn std::fmt::Display) {
         self.failed.store(true, Ordering::Release);
         self.exits.fail_launch(error);
+    }
+}
+
+/// The producer's packet fill and re-verification ask this admission for its
+/// watched peer and its packet, and tell it when either fails.
+impl PacketAdmission for MappedFirstAdmission {
+    fn require_watched_peer(
+        &self,
+        birth: &OwnedFd,
+    ) -> reverie_inguest::launcher::exec_stop::Result<()> {
+        Ok(require_watched_peer(&self.watch, birth, &self.failed)?)
+    }
+    fn initial_packet(&self) -> reverie_inguest::launcher::exec_stop::Result<Vec<u8>> {
+        Ok(MappedFirstAdmission::initial_packet(self)?)
+    }
+    fn fail(&self, error: &dyn std::fmt::Display) {
+        MappedFirstAdmission::fail(self, error)
     }
 }
 

@@ -40,6 +40,15 @@ use stdio_capture::CaptureRequest;
 pub(crate) use stdio_capture::VerificationCapture;
 pub(crate) use stdio_capture::run_verification as capture_verification;
 
+/// The names Hermit's mapped memfds have always carried; a guest sees them in
+/// its `/proc/self/maps`.
+#[cfg(test)]
+pub(super) const MEMFD_NAMES: reverie_inguest::launcher::exec_stop::producer::MemfdNames =
+    reverie_inguest::launcher::exec_stop::producer::MemfdNames {
+        runtime: c"mapped-packet-control",
+        packet: c"hermit-mapped-initial",
+    };
+
 struct RunOutput<'a> {
     records: detcore::detlog::ForwardedRecordSink,
     observation: ObservationPolicy,
