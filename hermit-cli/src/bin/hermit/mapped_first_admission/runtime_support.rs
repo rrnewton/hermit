@@ -943,3 +943,5 @@ pub(crate) fn exact_storage(sealed: &SealedPacketLease<'_>, expected: &[u8]) -> 
 }
 
 pub(crate) mod init_trial;
+#[cfg(test)]
+mod retention_tests;
