@@ -11175,6 +11175,7 @@ fn a_kvm_child_exit_receiver_is_chosen_by_the_temporary_mask_its_call_installs()
 ///   pending work, M wants the child's SIGCHLD and is chosen;
 /// - own blocks SIGUSR2, the temporary mask admits it: the copy is pending
 ///   work, M is busy and the walk reaches the sibling.
+///
 /// The pending state is scripted through the real reader seam
 /// (`test_kernel_signal_states`), so the pending filter itself, with its
 /// exclusions, is the code under test.
