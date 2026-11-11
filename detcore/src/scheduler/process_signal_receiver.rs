@@ -251,10 +251,23 @@ impl Scheduler {
             return ProcessSignalReceiver::ExecInFlight;
         }
         let bit = kernel_signal_bit(signo);
+        // Where a process signal control is installed (KVM), each thread is
+        // read under the mask Linux's `blocked` holds for it now, a call's
+        // temporary mask included, and the thread's state was decided by the
+        // admission in this turn, before any effect
+        // (`guest_send_admission`), which this choice repeats.
+        let controlled = self.signal_control_installed();
         let threads: Vec<(DetTid, Wants)> = self
             .process_signal_targets(process)
             .into_iter()
-            .map(|thread| (thread, self.wants_signal(thread, sender, bit)))
+            .map(|thread| {
+                let wants = if controlled {
+                    self.controlled_wants(thread, sender, bit)
+                } else {
+                    self.wants_signal(thread, sender, bit)
+                };
+                (thread, wants)
+            })
             .collect();
         // A signal whose default action ends the process needs no choice at
         // all: whichever thread takes it, Linux ends the whole thread group
@@ -264,11 +277,15 @@ impl Scheduler {
         // code. So the two refusals below, which are about WHICH thread takes
         // the copy, do not apply to it; the kernel's own choice under ptrace
         // is as good as Linux's. The aborts and faults a guest raises in its
-        // own multi-threaded process take this path.
-        if threads
-            .first()
-            .and_then(|(thread, _)| self.stopped_thread_signal_state(*thread).ok())
-            .is_some_and(|state| state.default_action_ends_process(signo))
+        // own multi-threaded process take this path. Where the backend keeps
+        // its own queues the admission refused every such send but one an
+        // `rt_sigtimedwait` takes, which ends nothing, so the walk below
+        // chooses, as the admission's did.
+        if !controlled
+            && threads
+                .first()
+                .and_then(|(thread, _)| self.stopped_thread_signal_state(*thread).ok())
+                .is_some_and(|state| state.default_action_ends_process(signo))
         {
             // Every thread blocks it: Linux leaves it in the shared queue, and
             // no thread takes it until one unblocks it.
@@ -297,10 +314,13 @@ impl Scheduler {
             return ProcessSignalReceiver::Thread { thread, sole: true };
         }
         // The kernel wakes such a thread itself, at a host-timed moment, so
-        // which thread takes the copy is not the schedule's.
-        if let Some((thread, _)) = threads
-            .iter()
-            .find(|(thread, wants)| *wants != Wants::No && self.out_of_schedule(*thread))
+        // which thread takes the copy is not the schedule's. A backend that
+        // keeps its own queues wakes none; the admission refused a receiver
+        // in a host call.
+        if !controlled
+            && let Some((thread, _)) = threads
+                .iter()
+                .find(|(thread, wants)| *wants != Wants::No && self.out_of_schedule(*thread))
         {
             return ProcessSignalReceiver::OutOfSchedule(*thread);
         }
@@ -310,7 +330,13 @@ impl Scheduler {
         // `rt_sigtimedwait` set does. Each takes the copy at a moment host
         // timing sets, as it does for the scheduler's own sends
         // (`another_call_may_take_waiting_signal`), so no choice here holds.
-        if let Some(thread) = self.may_take_out_of_turn(process, bit) {
+        // Where the backend keeps its own queues the admission settled each
+        // of these before this choice (`guest_send_admission`): a probe and
+        // an `rt_sigtimedwait` run in the thread's own turn, and the walk
+        // above read their masks; a signalfd that may cover the signal
+        // refuses a caught copy, and any send while a thread that can read
+        // the signalfd is in a host call.
+        if !controlled && let Some(thread) = self.may_take_out_of_turn(process, bit) {
             return ProcessSignalReceiver::TakenOutOfTurn(thread);
         }
         // Linux does not queue a standard signal the shared queue already
@@ -701,7 +727,7 @@ impl Scheduler {
     /// Whether `thread`'s filed request is its own exit, which Linux runs to
     /// completion: `wants_signal` passes over an exiting thread (`PF_EXITING`,
     /// signal.c:951-952).
-    fn filed_exit_request(&self, thread: DetTid) -> bool {
+    pub(super) fn filed_exit_request(&self, thread: DetTid) -> bool {
         self.next_turns
             .get(&thread)
             .and_then(|turn| turn.req.try_read())
