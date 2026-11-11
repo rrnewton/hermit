@@ -68609,10 +68609,148 @@ fn a_signal_discarded_by_its_named_task_or_namespace_init_reaches_no_take() {
     ]);
 }
 
+/// The KVM twins of the three discarded-at-send tests above, each row under
+/// the same `--strict --verify --verify-strict`, now that Detcore admits the
+/// guest's sends to another process on KVM (stage X1 slice C of the KVM
+/// cross-process signal design, https://github.com/rrnewton/hermit/issues/4485).
+/// Twelve rows are not here, each with the same KVM answer before that
+/// change:
+/// - `kept-after-discard`: the futex wait ends ETIMEDOUT, and the handler
+///   runs after it, as KVM cannot end a futex wait for a signal (N8a);
+/// - `kept-timer-after-discard`: refused by name (`sigchld-decision-mismatch`),
+///   as the timer's expiry is a signal the scheduler sends, which KVM takes
+///   only as a published SIGCHLD;
+/// - `timer-unchanged`, `timer-rearm-near`: the wait ends EAGAIN, where Linux
+///   takes the expiry that came while SIGUSR1 was ignored once a handler is
+///   installed;
+/// - `init-dfl`, `init-caught`, `init-own`: KVM refuses the `CLONE_NEWPID`
+///   clone by name;
+/// - `fault-partial-16`, `fault-partial-64`: the faulting take writes none of
+///   the siginfo, where Linux writes the bytes before the fault;
+/// - `signalfd-inread`, `signalfd-eintr`, `signalfd-eintr-8k`: the worker's
+///   blocking signalfd read returns the SIGUSR1 main sent while it was
+///   ignored.
+#[test]
+fn run_kvm_a_signal_linux_discards_when_sent_ends_no_wait_and_reaches_no_take() {
+    if kvm_unavailable("run_kvm_a_signal_linux_discards_when_sent_ends_no_wait_and_reaches_no_take")
+    {
+        return;
+    }
+    // (mode, hermit line, native line where it differs)
+    assert_discard_at_send_rows_on(
+        Some("--backend=kvm"),
+        &[
+            ("futex-dfl", "futex -1 ETIMEDOUT, handled 0", None),
+            ("futex-dfl-yield", "futex -1 ETIMEDOUT, handled 0", None),
+            ("futex-ign", "futex -1 ETIMEDOUT, handled 0", None),
+            ("futex-ign-yield", "futex -1 ETIMEDOUT, handled 0", None),
+            ("sleep-dfl", "nanosleep 0 0, handled 0", None),
+            ("sleep-ign", "nanosleep 0 0, handled 0", None),
+            ("wait4-dfl", "wait4 child 0, status 7, handled 0", None),
+            ("blocked-keeps", "handled 1", None),
+            ("self-take", "sigtimedwait 10 0, handled 0", None),
+            (
+                "sigtimedwait-ign",
+                "sigtimedwait -1 EAGAIN, handled 0",
+                None,
+            ),
+            (
+                "sigtimedwait-ign-inwait",
+                "sigtimedwait -1 EAGAIN, handled 0",
+                None,
+            ),
+            ("signalfd-ign", "poll 0, read -1 EAGAIN, handled 0", None),
+            (
+                "sigpipe-take",
+                "first -1 EAGAIN, write -1 EPIPE, second 13 0",
+                None,
+            ),
+            (
+                "sigpipe-signalfd",
+                "first -1 EAGAIN, write -1 EPIPE, second 13 0",
+                None,
+            ),
+        ],
+    );
+}
+
+/// The KVM twin of
+/// `a_discarded_timer_expiry_or_take_fault_keeps_linuxs_wait_and_take_results`;
+/// `run_kvm_a_signal_linux_discards_when_sent_ends_no_wait_and_reaches_no_take`
+/// names the rows KVM does not yet answer as Linux does.
+#[test]
+fn run_kvm_a_discarded_timer_expiry_or_take_fault_keeps_linuxs_wait_and_take_results() {
+    if kvm_unavailable(
+        "run_kvm_a_discarded_timer_expiry_or_take_fault_keeps_linuxs_wait_and_take_results",
+    ) {
+        return;
+    }
+    // (mode, hermit line, native line where it differs)
+    assert_discard_at_send_rows_on(
+        Some("--backend=kvm"),
+        &[
+            ("timer-rearm-far", "sigtimedwait -1 EAGAIN", None),
+            ("timer-disarm", "sigtimedwait -1 EAGAIN", None),
+            ("timer-delete", "sigtimedwait -1 EAGAIN", None),
+            ("wait4-timer", "wait4 child 0, status 7, handled 0", None),
+            ("itimer-leader", "sigtimedwait 14 0", None),
+            ("xproc", "futex -1 ETIMEDOUT, handled 0", None),
+            ("fault-empty", "sigtimedwait -1 EAGAIN", None),
+            ("fault-discarded", "sigtimedwait -1 EAGAIN", None),
+            ("fault-kept", "sigtimedwait -1 EFAULT", None),
+            ("signalfd-two", "read 128 0", None),
+            ("signalfd-partial", "read 128 0", None),
+            (
+                "sigpipe-inwait",
+                "first -1 EAGAIN, write -1 EPIPE, second 13 0",
+                None,
+            ),
+            ("take-info", "sigtimedwait 10 0, info signal 10", None),
+        ],
+    );
+}
+
+/// The KVM twin of
+/// `a_signal_discarded_by_its_named_task_or_namespace_init_reaches_no_take`;
+/// `run_kvm_a_signal_linux_discards_when_sent_ends_no_wait_and_reaches_no_take`
+/// names the rows KVM does not yet answer as Linux does.
+#[test]
+fn run_kvm_a_signal_discarded_by_its_named_task_reaches_no_take() {
+    if kvm_unavailable("run_kvm_a_signal_discarded_by_its_named_task_reaches_no_take") {
+        return;
+    }
+    // (mode, hermit line, native line where it differs)
+    assert_discard_at_send_rows_on(
+        Some("--backend=kvm"),
+        &[
+            ("sole-nonleader", "sigtimedwait -1 EAGAIN", None),
+            ("exited-leader", "sigtimedwait 10 0", None),
+            ("tight-stack-null", "sigtimedwait 10, info signal -1", None),
+            ("tight-stack-info", "sigtimedwait 10, info signal 10", None),
+            (
+                "fault-partial-discarded",
+                "sigtimedwait -1 EAGAIN, changed 0",
+                None,
+            ),
+            (
+                "fault-partial-hole",
+                "sigtimedwait -1 EAGAIN, changed 0",
+                None,
+            ),
+        ],
+    );
+}
+
 /// Runs each row of the discarded-at-send tests: the guest's line under
 /// `--strict --verify --verify-strict` (ptrace, canonical bitwise parity), or
 /// under `--strict` alone for the `HOST_TIMED_REJOIN` rows.
 fn assert_discard_at_send_rows(rows: &[(&str, &str, Option<&str>)]) {
+    assert_discard_at_send_rows_on(None, rows);
+}
+
+/// `assert_discard_at_send_rows` on the backend `backend` selects (`None`:
+/// the default, ptrace).
+fn assert_discard_at_send_rows_on(backend: Option<&str>, rows: &[(&str, &str, Option<&str>)]) {
     let _guard = hermit_run_guard();
     let guest = guest_discard_at_send_guest().to_str().unwrap().to_owned();
     // KNOWN NONDETERMINISTIC, https://github.com/rrnewton/hermit/issues/4359:
@@ -68633,7 +68771,8 @@ fn assert_discard_at_send_rows(rows: &[(&str, &str, Option<&str>)]) {
     const HOST_TIMED_REJOIN: [&str; 3] = ["signalfd-inread", "signalfd-eintr", "signalfd-eintr-8k"];
     for &(mode, line, native) in rows {
         let verify = !HOST_TIMED_REJOIN.contains(&mode);
-        let mut args = vec!["run", "--strict"];
+        let mut args: Vec<&str> = backend.into_iter().collect();
+        args.extend(["run", "--strict"]);
         if verify {
             args.extend(["--verify", "--verify-strict"]);
         }
@@ -68644,7 +68783,8 @@ fn assert_discard_at_send_rows(rows: &[(&str, &str, Option<&str>)]) {
         assert_eq!(
             stdout(&output),
             format!("{mode}: {line}\n"),
-            "{mode} (native: {}): stderr:\n{log}",
+            "{mode} on {} (native: {}): stderr:\n{log}",
+            backend.unwrap_or("ptrace"),
             native.unwrap_or(line)
         );
         if !verify {
