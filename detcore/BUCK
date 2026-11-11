@@ -101,7 +101,10 @@ rust_library(
 # Utilities shared by integration tests.
 rust_library(
     name = "detcore-testutils",
-    srcs = ["tests/testutils/src/lib.rs"],
+    srcs = [
+        "tests/testutils/src/bootstrap.rs",
+        "tests/testutils/src/lib.rs",
+    ],
     autocargo = {
         "cargo_toml_config": {
             "features": {"nightly": []},

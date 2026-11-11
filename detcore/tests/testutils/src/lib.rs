@@ -13,6 +13,11 @@
 
 //! Testing utilities.
 
+// What build.rs decides `detcore_testutils_nightly` from; compiled here only
+// for its unit tests.
+#[cfg(test)]
+mod bootstrap;
+
 use std::ffi::OsStr;
 use std::io;
 use std::io::Write;
