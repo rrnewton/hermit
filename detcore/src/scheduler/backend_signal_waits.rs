@@ -40,6 +40,14 @@
 //! by then, the call declines again and the thread parks again, so a wake that
 //! finds nothing is never visible to the guest.
 //!
+//! A shared copy that a guest send chose one waiter for (its claim or taker
+//! mark, `guest_send_admission`) wakes that waiter alone, as Linux's
+//! `complete_signal` wakes only the thread it chooses (`signal_wake_up`,
+//! kernel/signal.c:963-1032 at v7.1.3): a sibling the same copy would end
+//! the wait of stays parked, with no turn, no `COMMIT` record and no charge
+//! of virtual time. A copy in a waiter's own queue, or one no send chose a
+//! thread for, wakes every waiter it ends, as before.
+//!
 //! It runs at one point: the end of the step-2 drain (`step2_drain_prefix`),
 //! after every barrier, which the controlled turn loop reaches only while no
 //! guest thread holds the turn and no exit fence, child-exit reservation,
@@ -232,6 +240,10 @@ impl Scheduler {
             .keys()
             .filter_map(|&tid| self.backend_suspend_mask(tid).map(|mask| (tid, mask)))
             .collect();
+        // Each waiter a signal ends the wait of: its thread, its temporary
+        // mask, the signals, and those of them only its process's shared
+        // queue holds.
+        let mut ending: Vec<(DetTid, u64, u64, u64)> = Vec::new();
         for (dettid, mask) in waiters {
             let Some(owner) = self.registered_process(dettid) else {
                 continue;
@@ -264,6 +276,54 @@ impl Scheduler {
             let signals =
                 Self::backend_suspend_signals(&state, mask, self.host_timed_signals(dettid));
             if signals == 0 {
+                continue;
+            }
+            ending.push((
+                dettid,
+                mask,
+                signals,
+                signals & state.shared_pending & !state.thread_pending,
+            ));
+        }
+        // The shared copies each of them was chosen to take, by a guest send
+        // to its process (`guest_send_claims`, `process_signal_takers`).
+        let chosen: Vec<u64> = ending
+            .iter()
+            .map(|&(dettid, _, signals, _)| {
+                let claimed = self
+                    .guest_send_claims
+                    .get(&dettid)
+                    .map_or(0, |claim| claim.shared);
+                let marked = self
+                    .process_signal_takers
+                    .get(&dettid)
+                    .copied()
+                    .unwrap_or(0);
+                signals & (claimed | marked)
+            })
+            .collect();
+        for (index, &(dettid, mask, signals, shared_only)) in ending.iter().enumerate() {
+            // Linux's `complete_signal` wakes the one thread it chooses for a
+            // process-directed signal (`signal_wake_up`). A waiter whose
+            // signals are all shared copies chosen for another waiter this
+            // drain wakes, and not for it, is left asleep: that waiter takes
+            // them. A copy in its own queue, or one chosen for no waiter here,
+            // still wakes it, and the next drain judges it again from the
+            // state, so a copy its chosen thread does not take reaches it then.
+            let for_another = ending
+                .iter()
+                .zip(&chosen)
+                .filter(|((other, _, _, _), _)| *other != dettid)
+                .fold(0, |bits, (_, chosen)| bits | chosen)
+                & shared_only
+                & !chosen[index];
+            if signals & !for_another == 0 {
+                tracing::info!(
+                    "[dtid {}] stays in its rt_sigsuspend: signals {:#x} it would end for are shared \
+                     copies chosen for another waiter this drain wakes.",
+                    dettid,
+                    signals
+                );
                 continue;
             }
             let signals: Vec<SigWrapper> = (1..=64)
