@@ -509,7 +509,11 @@ impl Scheduler {
     /// a sibling the same drain woke in the same wait, ahead of it in the run
     /// queue, took the copy Linux gives the chosen thread alone (the Codex
     /// review of https://github.com/rrnewton/hermit/pull/5415 at fcff78c8,
-    /// P1).
+    /// P1). Where that view cannot say (a thread readmitted from a call
+    /// outside the schedule whose mask its readmission could not record,
+    /// `BlockedPool::continuation_masks`), the mark stands: nothing shows the
+    /// thread blocks the signal, and the claims audit refuses an unknown
+    /// state by name.
     pub(super) fn first_process_signal_taker(&mut self) -> Option<DetTid> {
         let threads: Vec<DetTid> = self.process_signal_takers.keys().copied().collect();
         let controlled = self.signal_control_installed();
@@ -520,7 +524,15 @@ impl Scheduler {
             } else {
                 self.stopped_thread_mask(thread)
             };
-            let unblocked = mask.map_or(0, |mask| !mask);
+            // An unknown controlled mask (a readmission that could not
+            // record its call's mask) keeps the mark: it is no evidence the
+            // thread blocks the signal, and the claims audit refuses an
+            // unknown state by name (`Scheduler::audit_guest_send_claims`).
+            let unblocked = match mask {
+                Some(mask) => !mask,
+                None if controlled => !0,
+                None => 0,
+            };
             let standing = self
                 .process_signal_takers
                 .get(&thread)
