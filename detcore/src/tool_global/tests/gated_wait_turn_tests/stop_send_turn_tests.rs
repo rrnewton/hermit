@@ -574,3 +574,298 @@ async fn a_guest_sigtimedwait_is_polled_with_zero_timeouts_only() {
         );
     }
 }
+
+/// An in-guest thread on the default in-guest route (`route`) with the
+/// delivery gate `gate`.
+fn route_guest(route: bool, gate: bool) -> TurnGuest {
+    let mut guest = turn_guest(gate, Some(0));
+    guest.config.in_guest_refuses_stop_sends = route;
+    guest
+}
+
+/// The `StopSendRefusal` reasons `guest` filed, in order.
+fn stop_send_refusals(guest: &TurnGuest) -> Vec<String> {
+    guest
+        .rpcs()
+        .into_iter()
+        .filter_map(|rpc| match rpc {
+            GlobalRequest::StopSendRefusal(reason) => Some(reason),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The refusal holds where `Config::refuses_stop_sends` does: under the
+/// delivery gate, and on the default in-guest route with the gate off, which
+/// is how every shipped in-guest run is launched. With both off the send
+/// takes its ordinary path and nothing reaches the scheduler. Mutation: the
+/// gate-only condition restored (the route's case is admitted).
+#[tokio::test]
+async fn the_stop_send_refusal_holds_on_the_route_or_under_the_gate() {
+    let _seam = script_both(proc_state(0, 0, 0), Ok(proc_state(0, 0, 0)));
+    for (route, gate, refuse) in [
+        (false, true, true),
+        (true, false, true),
+        (false, false, false),
+    ] {
+        let mut guest = route_guest(route, gate);
+        let tool = tool(&guest);
+        let result = tool
+            .refuse_stop_signal_send(
+                &mut guest,
+                Sysno::kill,
+                libc::SIGSTOP,
+                ReservedSendTarget::Process(PEER.as_raw()),
+                ReservedSendSiginfo::None,
+            )
+            .await;
+        assert_eq!(
+            refused(&result),
+            refuse,
+            "route={route} gate={gate}: {result:?}"
+        );
+        if !refuse {
+            assert!(result.is_none(), "{result:?}");
+            assert!(guest.rpcs().is_empty(), "{:?}", guest.rpcs());
+        }
+    }
+}
+
+/// Each send handler files the `StopSendRefusal` in the sender's own turn,
+/// before anything reaches the kernel: the refused SIGSTOP injects nothing,
+/// and the refusal is the last RPC the call makes. The queued sends carry a
+/// valid siginfo, which reaches the refusal. Mutation: EPERM answered
+/// without filing the refusal.
+#[tokio::test]
+async fn each_send_handler_files_the_stop_send_refusal_before_the_kernel() {
+    let _seam = script_both(proc_state(0, 0, 0), Ok(proc_state(0, 0, 0)));
+    let peer = PEER.as_raw();
+    for handler in [
+        "kill",
+        "tkill",
+        "tgkill",
+        "rt_sigqueueinfo",
+        "rt_tgsigqueueinfo",
+    ] {
+        let mut guest = route_guest(true, false);
+        use_real_test_thread(&mut guest);
+        let tool = tool(&guest);
+        let info = AddrMut::from_raw(siginfo_page(
+            libc::SIGSTOP,
+            libc::SI_QUEUE,
+            0,
+            libc::PROT_READ,
+        ));
+        let result = match handler {
+            "kill" => {
+                tool.handle_kill(
+                    &mut guest,
+                    reverie::syscalls::Kill::new()
+                        .with_pid(peer)
+                        .with_sig(libc::SIGSTOP),
+                )
+                .await
+            }
+            "tkill" => {
+                tool.handle_tkill(
+                    &mut guest,
+                    reverie::syscalls::Tkill::new()
+                        .with_tid(peer)
+                        .with_sig(libc::SIGSTOP),
+                )
+                .await
+            }
+            "tgkill" => {
+                tool.handle_tgkill(
+                    &mut guest,
+                    reverie::syscalls::Tgkill::new()
+                        .with_tgid(peer)
+                        .with_tid(peer)
+                        .with_sig(libc::SIGSTOP),
+                )
+                .await
+            }
+            "rt_sigqueueinfo" => {
+                tool.handle_rt_sigqueueinfo(
+                    &mut guest,
+                    reverie::syscalls::RtSigqueueinfo::new()
+                        .with_tgid(peer)
+                        .with_sig(libc::SIGSTOP)
+                        .with_siginfo(info),
+                )
+                .await
+            }
+            _ => {
+                tool.handle_rt_tgsigqueueinfo(
+                    &mut guest,
+                    reverie::syscalls::RtTgsigqueueinfo::new()
+                        .with_tgid(peer)
+                        .with_tid(peer)
+                        .with_sig(libc::SIGSTOP)
+                        .with_siginfo(info),
+                )
+                .await
+            }
+        };
+        assert!(
+            matches!(result, Err(Error::Errno(Errno::EPERM))),
+            "{handler}: {result:?}"
+        );
+        assert!(guest.injected.is_empty(), "{handler}: {:?}", guest.injected);
+        let refusals = stop_send_refusals(&guest);
+        assert_eq!(refusals.len(), 1, "{handler}: {:?}", guest.rpcs());
+        assert!(
+            refusals[0].contains("HERMIT_STOP_SIGNAL_SEND_REFUSED"),
+            "{handler}: {refusals:?}"
+        );
+        assert!(
+            matches!(guest.rpcs().last(), Some(GlobalRequest::StopSendRefusal(_))),
+            "{handler}: {:?}",
+            guest.rpcs()
+        );
+    }
+}
+
+/// Where the coordinator answers the refusal (it does not own the guests'
+/// PID namespace), the sender gets EPERM and the WARN says so: the run goes
+/// on and ends with this refusal if it completes. The refusal it filed,
+/// which the owning coordinator prints when it ends the run, names the send
+/// and why, and does not claim an EPERM the sender never sees there.
+#[tokio::test]
+async fn a_sender_whose_refusal_is_answered_gets_eperm_and_the_warn() {
+    let _seam = script_both(proc_state(0, 0, 0), Ok(proc_state(0, 0, 0)));
+    let log = WarnLog::default();
+    let _subscriber = tracing::subscriber::set_default(log.clone());
+    let mut guest = route_guest(true, false);
+    use_real_test_thread(&mut guest);
+    let tool = tool(&guest);
+    let result = tool
+        .handle_kill(
+            &mut guest,
+            reverie::syscalls::Kill::new()
+                .with_pid(PEER.as_raw())
+                .with_sig(libc::SIGSTOP),
+        )
+        .await;
+    assert!(
+        matches!(result, Err(Error::Errno(Errno::EPERM))),
+        "{result:?}"
+    );
+    let warns = log.0.lock().unwrap().clone();
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(
+        warns[0].contains("received EPERM; the run continues"),
+        "{warns:?}"
+    );
+    let refusals = stop_send_refusals(&guest);
+    assert_eq!(refusals.len(), 1, "{:?}", guest.rpcs());
+    assert!(refusals[0].contains("signum=19 (SIGSTOP)"), "{refusals:?}");
+    assert!(!refusals[0].contains("received EPERM"), "{refusals:?}");
+}
+
+/// With threads unsequentialized, the target's action and mask could change
+/// before the kernel acts on the send, so SIGTSTP, SIGTTIN and SIGTTOU are
+/// refused without reading them (the `/proc` seam fails the test if it is
+/// consulted): an over-refusal, counted. Mutation: the dispositions read
+/// (the seam panics).
+#[tokio::test]
+async fn an_unsequentialized_stop_signal_send_is_refused_without_reading_the_target() {
+    let _seam = signal_state_read_seam::install(|pid, tid| {
+        panic!("an unsequentialized stop-signal send read /proc of {pid}/{tid}")
+    });
+    for signal in [libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU] {
+        let log = WarnLog::default();
+        let _subscriber = tracing::subscriber::set_default(log.clone());
+        let mut guest = route_guest(true, false);
+        guest.config.sequentialize_threads = false;
+        let tool = tool(&guest);
+        let result = tool
+            .refuse_stop_signal_send(
+                &mut guest,
+                Sysno::kill,
+                signal,
+                ReservedSendTarget::Process(PEER.as_raw()),
+                ReservedSendSiginfo::None,
+            )
+            .await;
+        assert!(refused(&result), "{signal}: {result:?}");
+        let warns = log.0.lock().unwrap().clone();
+        assert_eq!(warns.len(), 1, "{signal}: {warns:?}");
+        assert!(
+            warns[0].contains("threads are not sequentialized"),
+            "{signal}: {warns:?}"
+        );
+    }
+}
+
+/// Collects the INFO messages that name a stop-signal send decision.
+#[derive(Clone, Default)]
+struct DecisionLog(std::sync::Arc<Mutex<Vec<String>>>);
+
+impl tracing::Subscriber for DecisionLog {
+    fn register_callsite(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        Some(tracing::level_filters::LevelFilter::INFO)
+    }
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        *metadata.level() == tracing::Level::INFO
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut visitor = MessageVisitor(None);
+        event.record(&mut visitor);
+        if let Some(message) = visitor.0
+            && message.contains("stop-signal send of")
+        {
+            self.0.lock().unwrap().push(message);
+        }
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// The decision logs, at INFO, the target's `SigIgn`, `SigBlk` and `SigCgt`
+/// bits for the signal that it read in the sender's turn, admitted or
+/// refused, so a run shows the state the admission rule saw.
+#[tokio::test]
+async fn the_decision_logs_the_bits_it_read() {
+    let tstp = bit(libc::SIGTSTP);
+    for (state, wanted) in [
+        (
+            status(0, 0, tstp),
+            "SigIgn bit 1, SigBlk bit 0, SigCgt bit 0: admitted",
+        ),
+        (
+            status(tstp, 0, tstp),
+            "SigIgn bit 1, SigBlk bit 1, SigCgt bit 0: refused",
+        ),
+    ] {
+        let _seam = script_both(proc_state(0, 0, 0), Ok(state));
+        let log = DecisionLog::default();
+        let _subscriber = tracing::subscriber::set_default(log.clone());
+        let mut guest = route_guest(true, false);
+        let tool = tool(&guest);
+        let _ = tool
+            .refuse_stop_signal_send(
+                &mut guest,
+                Sysno::kill,
+                libc::SIGTSTP,
+                ReservedSendTarget::Process(PEER.as_raw()),
+                ReservedSendSiginfo::None,
+            )
+            .await;
+        let lines = log.0.lock().unwrap().clone();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains(wanted), "{lines:?}");
+        assert!(lines[0].contains("to thread 41"), "{lines:?}");
+    }
+}

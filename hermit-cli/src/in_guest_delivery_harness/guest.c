@@ -303,6 +303,39 @@ static int mode_stop_send(int sig) {
   return 0;
 }
 
+// Non-owner rows of a stop-signal send (https://github.com/rrnewton/hermit/issues/5430):
+// SIGSTOP to a child that waits on a pipe, with what kill returned written to
+// stop-send-result in the working directory. "checked" handles a refusal:
+// it kills and reaps the child and exits 0. "waits" ignores it and waits for
+// the child to stop, which a refused send never makes it do.
+static int mode_stop_send_non_owner(int checked) {
+  int go[2];
+  if (pipe(go)) return 3;
+  pid_t child = fork();
+  if (child == 0) {
+    char byte;
+    (void)!read(go[0], &byte, 1);
+    _exit(0);
+  }
+  int sent = kill(child, SIGSTOP);
+  int error = sent ? errno : 0;
+  FILE *result = fopen("stop-send-result", "w");
+  if (!result) return 4;
+  fprintf(result, "kill=%d errno=%d\n", sent, error);
+  fclose(result);
+  if (checked && sent != 0) {
+    kill(child, SIGKILL);
+    reap(child);
+    return 0;
+  }
+  int status = 0;
+  waitpid(child, &status, WUNTRACED);
+  kill(child, SIGCONT);
+  (void)!write(go[1], "g", 1);
+  reap(child);
+  return 0;
+}
+
 int main(int argc, char **argv) {
   setvbuf(stdout, NULL, _IONBF, 0);
   if (argc != 2) return 2;
@@ -315,5 +348,7 @@ int main(int argc, char **argv) {
   if (!strcmp(mode, "vfork-refusal")) return mode_vfork_refusal();
   if (!strcmp(mode, "stop-send-sigstop")) return mode_stop_send(SIGSTOP);
   if (!strcmp(mode, "stop-send-ignored-sigtstp")) return mode_stop_send(SIGTSTP);
+  if (!strcmp(mode, "stop-send-checked")) return mode_stop_send_non_owner(1);
+  if (!strcmp(mode, "stop-send-waits")) return mode_stop_send_non_owner(0);
   return 3;
 }

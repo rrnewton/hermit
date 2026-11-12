@@ -415,3 +415,275 @@ async fn a_filed_pidfd_self_refusal_is_recorded_as_its_type_and_as_a_policy_refu
     assert_eq!(state.take_pidfd_self_qualification_refusal(), Some(first));
     assert_eq!(state.take_pidfd_self_qualification_refusal(), None);
 }
+
+/// How a request filed with a coordinator that runs as PID 1 of a new PID
+/// namespace ended ([`in_namespace_init`]).
+struct InitOutcome {
+    /// The init's wait status.
+    status: i32,
+    /// Whether `receive_rpc` returned `PolicyRefusal` (`Some(true)`), another
+    /// reply (`Some(false)`), or never returned (`None`).
+    answered_policy_refusal: Option<bool>,
+    /// The processes of the namespace still alive after the init ended.
+    survivors: Vec<String>,
+}
+
+/// Runs `request` through the real `GlobalState::receive_rpc` in the init of
+/// a new user and PID namespace, as Hermit's container init runs the
+/// scheduler. The init forks a guest that waits for ever, initializes the
+/// global state from `config` itself, as PID 1, registers the refusing
+/// thread, and files the request. A coordinator that exits inside the call
+/// takes the guest with it (`zap_pid_ns_processes`); one that answers kills
+/// the guest and exits 0. Call it from a test that runs in a process of its
+/// own (`in_own_process`).
+fn in_namespace_init(config: Config, request: GlobalRequest) -> InitOutcome {
+    let mut report = [0; 2];
+    let mut threads = 0;
+    crate::util::find_in_directory(std::path::Path::new("/proc/self/task"), |_| {
+        threads += 1;
+        None::<()>
+    })
+    .unwrap();
+    assert!(threads <= 2, "{threads} threads at the first fork");
+    // SAFETY: plain descriptor and process calls. The forked init builds
+    // and uses the global state while the only other thread of this process,
+    // libtest's main thread, waits for this test, holding no lock it takes.
+    let launcher = unsafe {
+        assert_eq!(libc::pipe2(report.as_mut_ptr(), libc::O_CLOEXEC), 0);
+        fork_running(|| {
+            libc::close(report[0]);
+            if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWPID) != 0 {
+                return 90;
+            }
+            let init = fork_running(|| {
+                let guest = fork_running(|| {
+                    loop {
+                        libc::pause();
+                    }
+                });
+                assert_eq!(libc::getpid(), 1);
+                let state = GlobalState::initialize(&config, false);
+                let detpid = DetPid::from_raw(CHILD.as_raw());
+                state
+                    .sched
+                    .lock()
+                    .unwrap()
+                    .thread_tree
+                    .add_child(CHILD, CHILD, true);
+                install_test_registration(&state, CHILD, Ivar::new());
+                let mut call = std::pin::pin!(state.receive_rpc(
+                    Tid::from_raw(CHILD.as_raw()),
+                    (DetTime::new(&config), MmId::initial(detpid), request),
+                ));
+                let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+                let reply = loop {
+                    if let std::task::Poll::Ready((_, reply)) =
+                        std::future::Future::poll(call.as_mut(), &mut context)
+                    {
+                        break reply;
+                    }
+                };
+                let tag = if reply == GlobalResponse::PolicyRefusal(()) {
+                    b'P'
+                } else {
+                    b'O'
+                };
+                libc::write(report[1], [tag].as_ptr().cast(), 1);
+                libc::kill(guest, libc::SIGKILL);
+                libc::waitpid(guest, std::ptr::null_mut(), 0);
+                0
+            });
+            // The init's namespace, then how it ended.
+            let mut link = [0_u8; 64];
+            let mut namespace = [0_u8; 64];
+            let length = libc::readlink(
+                ns_pid_path(init, &mut link),
+                namespace.as_mut_ptr().cast(),
+                namespace.len(),
+            );
+            if length <= 0 {
+                return 91;
+            }
+            let mut status = 0;
+            libc::waitpid(init, &mut status, 0);
+            libc::write(report[1], b"\n".as_ptr().cast(), 1);
+            libc::write(report[1], namespace.as_ptr().cast(), length as usize);
+            libc::write(report[1], b"\n".as_ptr().cast(), 1);
+            libc::write(report[1], status.to_ne_bytes().as_ptr().cast(), 4);
+            0
+        })
+    };
+    // SAFETY: the parent's copy of the write end.
+    unsafe { libc::close(report[1]) };
+    let mut status = 0;
+    // SAFETY: waits for the launcher this test forked.
+    assert_eq!(unsafe { libc::waitpid(launcher, &mut status, 0) }, launcher);
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "the launcher failed: wait status {status:#x} (90: no user and PID namespace)"
+    );
+    let mut bytes = Vec::new();
+    // SAFETY: the read end of `report`, whose writers have exited.
+    unsafe {
+        let mut buffer = [0_u8; 128];
+        loop {
+            let n = libc::read(report[0], buffer.as_mut_ptr().cast(), buffer.len());
+            if n <= 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..n as usize]);
+        }
+        libc::close(report[0]);
+    }
+    // [tag] "\n" namespace "\n" status
+    let first = bytes.iter().position(|&b| b == b'\n').expect("report");
+    let answered_policy_refusal = match &bytes[..first] {
+        [] => None,
+        [tag] => Some(*tag == b'P'),
+        other => panic!("a malformed report: {other:?}"),
+    };
+    let rest = &bytes[first + 1..];
+    let second = rest.iter().position(|&b| b == b'\n').expect("namespace");
+    let namespace = std::ffi::OsStr::from_bytes(&rest[..second]).to_owned();
+    let status = i32::from_ne_bytes(rest[second + 1..second + 5].try_into().unwrap());
+    assert_ne!(
+        Some(namespace.clone()),
+        pid_namespace(std::process::id() as i32)
+    );
+    InitOutcome {
+        status,
+        answered_policy_refusal,
+        survivors: members(&namespace),
+    }
+}
+
+/// A gate-off configuration on the default in-guest route (`route`: whether
+/// Hermit's launch marked it, `Config::in_guest_refuses_stop_sends`).
+fn stop_send_config(route: bool) -> Config {
+    let mut config = Config {
+        sequentialize_threads: true,
+        max_timeslice: None,
+        in_guest_signal_delivery: false,
+        in_guest_refuses_stop_sends: route,
+        ..Config::default()
+    };
+    config.backend = reverie::BackendCapabilities::LITEINST_IN_GUEST;
+    config
+}
+
+fn stop_send_refusal() -> GlobalRequest {
+    GlobalRequest::StopSendRefusal(
+        "HERMIT_STOP_SIGNAL_SEND_REFUSED signum=19 (SIGSTOP) call=kill sender=7 target=8: \
+         filed by the stop-send test"
+            .to_owned(),
+    )
+}
+
+/// https://github.com/rrnewton/hermit/issues/5430: on the default in-guest
+/// route, with the delivery gate off, a coordinator that is PID 1 of the
+/// guests' namespace, and initialized its global state there, exits on a
+/// filed `StopSendRefusal` with `HERMIT_POLICY_REFUSAL_EXIT`, never answers
+/// it, and leaves no guest process alive. Mutation: the request routed
+/// through the generic gate-off arm (recorded and answered, no exit).
+#[test]
+fn an_owning_coordinator_ends_the_run_on_a_stop_send_refusal() {
+    if !in_own_process("an_owning_coordinator_ends_the_run_on_a_stop_send_refusal") {
+        return;
+    }
+    let outcome = in_namespace_init(stop_send_config(true), stop_send_refusal());
+    assert!(
+        libc::WIFEXITED(outcome.status)
+            && libc::WEXITSTATUS(outcome.status) == detcore_model::HERMIT_POLICY_REFUSAL_EXIT,
+        "the coordinator did not exit with the refusal status: wait status {:#x}, answered {:?}",
+        outcome.status,
+        outcome.answered_policy_refusal
+    );
+    assert_eq!(outcome.answered_policy_refusal, None);
+    assert_eq!(
+        outcome.survivors,
+        Vec::<String>::new(),
+        "a guest process outlived the refusal"
+    );
+}
+
+/// The run-wide exit belongs to the stop-send refusal alone: a coordinator
+/// that owns the guests' namespace (PID 1, route marked, gate off) still
+/// records and answers an ordinary `StoppingRefusal`, as IR-16 rules
+/// (https://github.com/rrnewton/hermit/issues/5430). Mutation: the generic
+/// arm given the ownership exit.
+#[test]
+fn an_owning_coordinator_answers_an_ordinary_stopping_refusal_without_the_exit() {
+    if !in_own_process(
+        "an_owning_coordinator_answers_an_ordinary_stopping_refusal_without_the_exit",
+    ) {
+        return;
+    }
+    let outcome = in_namespace_init(
+        stop_send_config(true),
+        GlobalRequest::StoppingRefusal(
+            "hermit refused to continue the run (stopping-refusal-test): an ordinary refusal"
+                .to_owned(),
+        ),
+    );
+    assert!(
+        libc::WIFEXITED(outcome.status) && libc::WEXITSTATUS(outcome.status) == 0,
+        "wait status {:#x}",
+        outcome.status
+    );
+    assert_eq!(outcome.answered_policy_refusal, Some(true));
+}
+
+/// A coordinator that is PID 1 but whose run Hermit did not mark as the
+/// default in-guest route (a ptrace launch, for one) does not own the
+/// guests for this refusal: a filed `StopSendRefusal` is recorded and
+/// answered, without the exit (https://github.com/rrnewton/hermit/issues/5430).
+/// Mutation: ownership taken from PID 1 alone.
+#[test]
+fn a_pid_1_coordinator_off_the_route_answers_a_stop_send_refusal_without_the_exit() {
+    if !in_own_process(
+        "a_pid_1_coordinator_off_the_route_answers_a_stop_send_refusal_without_the_exit",
+    ) {
+        return;
+    }
+    let outcome = in_namespace_init(stop_send_config(false), stop_send_refusal());
+    assert!(
+        libc::WIFEXITED(outcome.status) && libc::WEXITSTATUS(outcome.status) == 0,
+        "wait status {:#x}",
+        outcome.status
+    );
+    assert_eq!(outcome.answered_policy_refusal, Some(true));
+}
+
+/// A coordinator on the default in-guest route that is not PID 1 (here a
+/// test process; `hermit run --no-namespace` is another) does not own the
+/// guests: a filed `StopSendRefusal` is recorded as the run's policy refusal,
+/// which ends the run with `HERMIT_POLICY_REFUSAL_EXIT` once it completes,
+/// and answered, and the process goes on: this test returns
+/// (https://github.com/rrnewton/hermit/issues/5430). Mutation: the exit taken
+/// without ownership (this test process ends with the refusal status).
+#[tokio::test]
+async fn a_coordinator_that_is_not_pid_1_records_and_answers_a_stop_send_refusal() {
+    assert_ne!(std::process::id(), 1);
+    let config = stop_send_config(true);
+    let state = GlobalState::initialize(&config, false);
+    let detpid = DetPid::from_raw(CHILD.as_raw());
+    state
+        .sched
+        .lock()
+        .unwrap()
+        .thread_tree
+        .add_child(CHILD, CHILD, true);
+    install_test_registration(&state, CHILD, Ivar::new());
+    let request = stop_send_refusal();
+    let GlobalRequest::StopSendRefusal(reason) = request.clone() else {
+        unreachable!()
+    };
+    let (_, reply) = state
+        .receive_rpc(
+            Tid::from_raw(CHILD.as_raw()),
+            (DetTime::new(&config), MmId::initial(detpid), request),
+        )
+        .await;
+    assert_eq!(reply, GlobalResponse::PolicyRefusal(()));
+    assert_eq!(state.policy_refusal(), Some(reason));
+}

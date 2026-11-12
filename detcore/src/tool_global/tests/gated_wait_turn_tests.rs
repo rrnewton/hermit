@@ -418,6 +418,7 @@ impl GlobalRPC<GlobalState> for TurnGuest {
             }
             GlobalRequest::FutexAction(..) => GlobalResponse::FutexAction(None),
             GlobalRequest::StoppingRefusal(_) => GlobalResponse::PolicyRefusal(()),
+            GlobalRequest::StopSendRefusal(_) => GlobalResponse::PolicyRefusal(()),
             GlobalRequest::KernelRunTarget(target) => GlobalResponse::KernelRunTarget(
                 self.kernel_run
                     .filter(|_| self.kernel_run_for.is_none_or(|only| only == target)),
@@ -2762,11 +2763,24 @@ async fn under_the_gate_every_send_handler_refuses_a_sigstop() {
             "{handler}"
         );
         assert!(guest.injected.is_empty(), "{handler}: {:?}", guest.injected);
+        // Nothing reaches the scheduler but the target's resolution and, for
+        // a refused send, its `StopSendRefusal`
+        // (https://github.com/rrnewton/hermit/issues/5430).
         assert!(
+            guest.rpcs().iter().all(|rpc| matches!(
+                rpc,
+                GlobalRequest::ResolveKillTargets(_) | GlobalRequest::StopSendRefusal(_)
+            )),
+            "{handler}: {:?}",
+            guest.rpcs()
+        );
+        assert_eq!(
             guest
                 .rpcs()
                 .iter()
-                .all(|rpc| matches!(rpc, GlobalRequest::ResolveKillTargets(_))),
+                .filter(|rpc| matches!(rpc, GlobalRequest::StopSendRefusal(_)))
+                .count(),
+            usize::from(!queued),
             "{handler}: {:?}",
             guest.rpcs()
         );

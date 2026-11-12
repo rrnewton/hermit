@@ -418,3 +418,170 @@ fn forced_gate_a_sigtstp_the_runtime_mask_blocks_is_refused_by_name() {
         refused_stop_send("stop-send-ignored-sigtstp");
     }
 }
+
+const NON_OWNER_INIT_MARKER: &str = "HERMIT_TEST_STOP_SEND_NON_OWNER_INIT";
+const NON_OWNER_MARKER: &str = "HERMIT_TEST_STOP_SEND_NON_OWNER";
+const NON_OWNER_DIRECTORY: &str = "HERMIT_TEST_STOP_SEND_NON_OWNER_DIRECTORY";
+
+/// How a non-owner row's launching process ended ([`non_owner`]).
+#[derive(Debug, PartialEq, Eq)]
+enum NonOwnerEnd {
+    /// It returned, and its test passed.
+    Passed,
+    /// It returned, and its test failed.
+    Failed,
+    /// It was still running at the bound, and was killed.
+    Bound,
+}
+
+/// Runs the calling row's launch in a process that is not PID 1 of the PID
+/// namespace its guests live in, so that the coordinator does not own the
+/// guests (`scheduler_owns_guest_pid_namespace`), and returns true in that
+/// process, where the caller launches. This test binary is re-executed as PID
+/// 1 of new user and PID namespaces (`unshare`), which runs the row again
+/// as its own child and waits for it at most `bound`, killing it there; when
+/// PID 1 exits, the kernel kills every guest left in the namespace. The
+/// launch's working directory is a fresh directory shared with the parent,
+/// which gets it back with how the launching process ended. A host where the
+/// namespaces cannot be created fails the row: a skip is a failure.
+fn non_owner(name: &str, bound: std::time::Duration) -> Option<(NonOwnerEnd, tempfile::TempDir)> {
+    let test = format!("{}::{name}", module_path!().split_once("::").unwrap().1);
+    if std::env::var(NON_OWNER_MARKER).as_deref() == Ok(test.as_str()) {
+        // SAFETY: getpid has no preconditions.
+        assert_ne!(
+            unsafe { libc::getpid() },
+            1,
+            "{test}: the launcher is PID 1"
+        );
+        assert!(!super::FORCE_IN_GUEST_DELIVERY.load(std::sync::atomic::Ordering::Acquire));
+        std::env::set_current_dir(std::env::var(NON_OWNER_DIRECTORY).unwrap()).unwrap();
+        return None;
+    }
+    if std::env::var(NON_OWNER_INIT_MARKER).as_deref() == Ok(test.as_str()) {
+        // SAFETY: getpid has no preconditions.
+        assert_eq!(
+            unsafe { libc::getpid() },
+            1,
+            "{test}: the init is not PID 1"
+        );
+        let mut launcher = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test, "--nocapture", "--test-threads=1"])
+            .env_remove(NON_OWNER_INIT_MARKER)
+            .env(NON_OWNER_MARKER, &test)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + bound;
+        let end = loop {
+            if let Some(status) = launcher.try_wait().unwrap() {
+                break if status.success() { "passed" } else { "failed" };
+            }
+            if std::time::Instant::now() >= deadline {
+                launcher.kill().unwrap();
+                launcher.wait().unwrap();
+                break "bound";
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        println!("NON-OWNER-LAUNCHER {end}");
+        std::process::exit(0);
+    }
+    require_runtime();
+    let directory = tempfile::tempdir().unwrap();
+    let output = Command::new("unshare")
+        .args([
+            "--user",
+            "--map-root-user",
+            "--pid",
+            "--fork",
+            "--mount-proc",
+            "--kill-child",
+        ])
+        .arg(std::env::current_exe().unwrap())
+        .args(["--exact", &test, "--nocapture", "--test-threads=1"])
+        .env(NON_OWNER_INIT_MARKER, &test)
+        .env(NON_OWNER_DIRECTORY, directory.path())
+        .output()
+        .unwrap_or_else(|error| panic!("{test}: unshare could not run: {error}"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let end = if stdout.contains("NON-OWNER-LAUNCHER passed") {
+        NonOwnerEnd::Passed
+    } else if stdout.contains("NON-OWNER-LAUNCHER failed") {
+        NonOwnerEnd::Failed
+    } else if stdout.contains("NON-OWNER-LAUNCHER bound") {
+        NonOwnerEnd::Bound
+    } else {
+        panic!(
+            "{test}: the non-owner launcher did not report (a skip is a failure): {:?}\n\
+             --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+            output.status
+        );
+    };
+    println!("{test}: {end:?}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}");
+    Some((end, directory))
+}
+
+/// The in-guest launch of `mode` from a process that does not own the guests'
+/// PID namespace: the default route's configuration, through the real
+/// launcher and its aggregation of the run's policy refusal.
+fn launch_without_ownership(mode: &str) -> Result<super::Output, super::Error> {
+    let directory = std::env::current_dir().unwrap();
+    let guest = compile_guest(&directory);
+    let mut command = super::Command::new(&guest);
+    command.arg(mode).current_dir(&directory);
+    super::run_with_output_backend(command, config(), false, &None, Backend::InGuestTrap)
+}
+
+/// A non-owner row (design test 5, https://github.com/rrnewton/hermit/issues/5430):
+/// where the coordinator does not own the guests' PID namespace, a refused
+/// SIGSTOP is answered with EPERM, and a guest that handles it runs to its
+/// end; the run then ends with the policy refusal, which the launcher reads
+/// from the coordinator when the run completes (exit status 122 at the CLI).
+/// Mutation: the exit taken without ownership (the launching process ends
+/// with the refusal status before its test can pass).
+#[test]
+fn a_non_owned_stop_send_refusal_ends_a_completed_run_with_the_policy_refusal() {
+    let Some((end, directory)) = non_owner(
+        "a_non_owned_stop_send_refusal_ends_a_completed_run_with_the_policy_refusal",
+        std::time::Duration::from_secs(60),
+    ) else {
+        let error = launch_without_ownership("stop-send-checked")
+            .expect_err("the run must end with the policy refusal");
+        let text = format!("{error:?}");
+        assert_eq!(
+            super::SerializableError::from(error).kind(),
+            super::FailureKind::PolicyRefusal,
+            "{text}"
+        );
+        assert!(text.contains("HERMIT_STOP_SIGNAL_SEND_REFUSED"), "{text}");
+        return;
+    };
+    assert_eq!(end, NonOwnerEnd::Passed);
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("stop-send-result")).unwrap(),
+        "kill=-1 errno=1\n"
+    );
+}
+
+/// A non-owner row (design test 5, https://github.com/rrnewton/hermit/issues/5430):
+/// a guest that ignores the EPERM of a refused SIGSTOP and waits for the stop
+/// waits until an outer bound, and the run is not ended early with the
+/// policy refusal while it waits: the launching process is still running at
+/// the row's bound. A named limitation of a run whose coordinator does not
+/// own the guests. Mutation: the exit taken without ownership (the launching
+/// process ends before the bound).
+#[test]
+fn a_non_owned_stop_send_refusal_does_not_end_a_waiting_run_early() {
+    let Some((end, directory)) = non_owner(
+        "a_non_owned_stop_send_refusal_does_not_end_a_waiting_run_early",
+        std::time::Duration::from_secs(20),
+    ) else {
+        let result = launch_without_ownership("stop-send-waits");
+        panic!("the run ended before the bound: {result:?}");
+    };
+    assert_eq!(end, NonOwnerEnd::Bound);
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("stop-send-result")).unwrap(),
+        "kill=-1 errno=1\n"
+    );
+}

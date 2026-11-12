@@ -562,6 +562,15 @@ pub(crate) enum StopSendRefusal {
     /// The target's `/proc/<tid>/status` could not be read, so whether its
     /// action is `SIG_DFL` is unknown: refused, fail closed.
     StatusUnreadable,
+    /// Threads are not sequentialized, so the target's dispositions and mask
+    /// could change before the kernel acts on the send: SIGTSTP, SIGTTIN and
+    /// SIGTTOU are refused without reading them.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Unsequentialized,
+    /// A pidfd whose target Detcore cannot name (a received or inherited
+    /// one): refused, fail closed, for every stop signal.
+    #[cfg_attr(not(test), allow(dead_code))]
+    TargetUnknown,
 }
 
 /// The WARN for a send of a stop signal that Detcore refused with EPERM
@@ -587,6 +596,14 @@ pub(crate) fn stop_signal_send_refused_warning(
             "the target's /proc status could not be read, so whether its action for {name} is \
              SIG_DFL is unknown, and the send is refused, fail closed"
         ),
+        StopSendRefusal::Unsequentialized => format!(
+            "threads are not sequentialized, so the target's action and mask for {name} could \
+             change before the kernel acts on the send, and it is refused without reading them"
+        ),
+        StopSendRefusal::TargetUnknown => {
+            "the pidfd names a process Detcore cannot name, so the send is refused, fail closed"
+                .to_string()
+        }
     };
     format!(
         "HERMIT_STOP_SIGNAL_SEND_REFUSED signum={signum} ({name}) call={call} sender={sender} \
