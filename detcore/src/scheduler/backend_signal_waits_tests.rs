@@ -463,33 +463,95 @@ fn a_masked_poll_is_left_to_its_own_probes() {
 }
 
 /// Mutation "a claim rule": every waiter whose state shows a signal that ends
-/// its wait is woken, in DetTid order; a shared signal wakes each of them,
-/// and whichever runs the backend's call first takes it (the others park
-/// again in their own turns).
+/// its wait is woken, in DetTid order, where no guest send chose a thread for
+/// it; a shared signal no send chose a thread for wakes each of them, and
+/// whichever runs the backend's call first takes it (the others park again
+/// in their own turns).
+///
+/// Mutations "claims ignored", "marks ignored", "a private copy left
+/// asleep": a shared copy a guest send chose one of them for (its claim,
+/// `guest_send_claims`, or its taker mark, `process_signal_takers`) wakes
+/// that one alone, as Linux's `complete_signal` chooses one thread for a
+/// process-directed signal and `signal_wake_up` wakes only it
+/// (kernel/signal.c:963-997 at v7.1.3). A copy in a waiter's own queue still
+/// wakes it. This corrects the earlier pin, under which every waiter woke for
+/// every shared copy, to Linux's wake-one: the deterministic-scheduling
+/// review of https://github.com/rrnewton/hermit/pull/5415 at 5055d688,
+/// required change 1.
 #[test]
 fn every_waiter_a_shared_signal_ends_is_woken() {
     let usr1 = bit(libc::SIGUSR1);
-    let control = Arc::new(ScriptedControl::default());
-    let mut scheduler = kvm_scheduler(&control, true);
-    add_bound_thread(&mut scheduler, PROCESS, WAITER);
-    add_bound_thread(&mut scheduler, PROCESS, SIBLING);
-    for thread in [WAITER, SIBLING] {
-        control.script(thread, vec![Ok(state(0, usr1, usr1, 0, usr1))]);
-        file(
-            &mut scheduler,
-            thread,
-            suspend_request(thread, 0),
-            Place::Parked,
+    let usr2 = bit(libc::SIGUSR2);
+    let shared_usr1 = state(0, usr1, usr1, 0, usr1 | usr2);
+    for (name, waiter_sets, claim, mark, expected) in [
+        (
+            "no thread chosen",
+            shared_usr1,
+            None,
+            None,
+            [Some(vec![libc::SIGUSR1]), Some(vec![libc::SIGUSR1])],
+        ),
+        (
+            "claimed for the waiter",
+            shared_usr1,
+            Some(WAITER),
+            None,
+            [Some(vec![libc::SIGUSR1]), None],
+        ),
+        (
+            "marked for the sibling",
+            shared_usr1,
+            None,
+            Some(SIBLING),
+            [None, Some(vec![libc::SIGUSR1])],
+        ),
+        (
+            "claimed for the sibling, the waiter's own copy",
+            state(usr2, usr1, usr1 | usr2, 0, usr1 | usr2),
+            Some(SIBLING),
+            None,
+            [
+                Some(vec![libc::SIGUSR1, libc::SIGUSR2]),
+                Some(vec![libc::SIGUSR1]),
+            ],
+        ),
+    ] {
+        let control = Arc::new(ScriptedControl::default());
+        let mut scheduler = kvm_scheduler(&control, true);
+        add_bound_thread(&mut scheduler, PROCESS, WAITER);
+        add_bound_thread(&mut scheduler, PROCESS, SIBLING);
+        for (thread, sets) in [(WAITER, waiter_sets), (SIBLING, shared_usr1)] {
+            control.script(thread, vec![Ok(sets)]);
+            file(
+                &mut scheduler,
+                thread,
+                suspend_request(thread, 0),
+                Place::Parked,
+            );
+        }
+        if let Some(thread) = claim {
+            scheduler.guest_send_committed(
+                thread,
+                super::guest_send_admission::SendScope::Process,
+                libc::SIGUSR1,
+            );
+        }
+        if let Some(thread) = mark {
+            scheduler.process_signal_takers.insert(thread, usr1);
+        }
+        scheduler.wake_backend_signal_waits();
+        for (thread, expected) in [WAITER, SIBLING].into_iter().zip(expected) {
+            assert_eq!(woken(&scheduler, thread), expected, "{name}: {thread}");
+            if expected.is_none() {
+                assert!(still_waits(&scheduler, thread), "{name}: {thread}");
+            }
+        }
+        assert_eq!(
+            control.asked(),
+            vec![identity(PROCESS, WAITER), identity(PROCESS, SIBLING)],
+            "{name}"
         );
     }
-    scheduler.wake_backend_signal_waits();
-    for thread in [WAITER, SIBLING] {
-        assert_eq!(woken(&scheduler, thread), Some(vec![libc::SIGUSR1]));
-    }
-    assert_eq!(
-        control.asked(),
-        vec![identity(PROCESS, WAITER), identity(PROCESS, SIBLING)]
-    );
 }
 
 /// Mutations "the gate decides here" / "ptrace decides here": only a backend

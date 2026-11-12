@@ -821,3 +821,87 @@ fn the_admitted_polling_receiver_probes_before_its_sibling() {
         "the admitted receiver probes first and takes the shared copy"
     );
 }
+
+/// The deterministic-scheduling review of
+/// https://github.com/rrnewton/hermit/pull/5415 at 5055d688, required change
+/// 1: in the state of
+/// `the_admitted_suspend_waiter_takes_the_copy_not_its_woken_sibling`, Linux
+/// wakes only the leader (`complete_signal` chooses it and `signal_wake_up`
+/// wakes it alone, kernel/signal.c:963-997 at v7.1.3), so the sibling stays
+/// asleep in its `rt_sigsuspend`. Here too: after the drain the sibling
+/// still holds its park, with its own request, out of the run queue; and of
+/// the turns step 3 then offers, each granted as the turn loop grants one
+/// (a charge of virtual time, then the `COMMIT` record and the grant), only
+/// the leader's is one: one turn, one charge, and none of either for the
+/// sibling.
+#[test]
+fn the_unchosen_suspend_sibling_stays_asleep_and_has_no_turn() {
+    let usr1 = bit(libc::SIGUSR1);
+    let (mut s, control) = two_processes(state(0, 0, usr1, 0, usr1));
+    for tid in [LEADER, SIBLING] {
+        parked_in_suspend(&mut s, tid, !usr1);
+    }
+    assert_eq!(
+        kill(&s, libc::SIGUSR1),
+        catch(LEADER, CatchReach::BackendSuspend)
+    );
+    assert!(matches!(
+        s.process_signal_receiver(TARGET, LEADER, SENDER, libc::SIGUSR1),
+        ProcessSignalReceiver::Thread { thread, .. } if thread == LEADER
+    ));
+    s.process_signal_sent(SENDER, TARGET);
+    s.guest_send_committed(LEADER, SendScope::Process, libc::SIGUSR1);
+    sent_to_shared_queue(&mut s, &control, libc::SIGUSR1);
+
+    s.step2_drain_prefix_for_test();
+    assert_eq!(s.audit_guest_send_claims(), None);
+    // Every fact is gathered first and compared at once, so a failure shows
+    // the wake, the turns and the charge together.
+    let parked = |s: &Scheduler| {
+        s.backend_suspend_mask(SIBLING) == Some(!usr1)
+            && !s.run_queue.contains_tid(SIBLING)
+            && s.blocked.timed_waiters.thread_deadline(SIBLING).is_some()
+    };
+    let parked_after_drain = parked(&s);
+
+    let global = std::sync::Mutex::new(GlobalTime::new(&Config::default()));
+    let turn = s.turn;
+    let mut granted = Vec::new();
+    let mut charged_after_leader = None;
+    while let Some((tid, request, response)) = s.step3_peek() {
+        let request = request
+            .try_read()
+            .expect("a filed request")
+            .expect("a live thread");
+        s.bump_global_time(&global, &Ok(request.clone()));
+        assert!(s.step5_guest_unblock(tid, &request, &response).is_ok());
+        assert_eq!(s.run_queue.commit_tentative_pop_completed_turn(), tid);
+        granted.push(tid);
+        if tid == LEADER {
+            // The leader's call takes the copy and runs its handler.
+            let taken = state(0, 0, usr1, 0, usr1);
+            for tid in [LEADER, SIBLING] {
+                control.script(tid, vec![Ok(taken)]);
+                s.test_kernel_signal_states
+                    .insert(tid, KernelSignalState::from_backend_sets(&taken));
+            }
+            charged_after_leader = Some(s.committed_time);
+        }
+        if granted.len() > 2 {
+            break;
+        }
+    }
+    assert_eq!(
+        (
+            parked_after_drain,
+            granted,
+            s.turn - turn,
+            Some(s.committed_time) == charged_after_leader,
+            s.last_commit_at.contains_key(&SIBLING),
+            parked(&s),
+        ),
+        (true, vec![LEADER], 1, true, false, true),
+        "(sibling parked after the drain, turns granted, COMMIT records, no \
+         charge after the leader's turn, sibling committed, sibling parked at the end)"
+    );
+}
