@@ -368,3 +368,53 @@ fn forced_gate_a_send_to_a_vfork_parent_is_refused_by_name() {
         panic!("the run was not refused: {status:?}");
     }
 }
+
+/// Runs `mode`, a stop-signal send whose refusal ends this process, under the
+/// forced gate. The guest's stdout is this child's, so the parent sees how
+/// far the guest got.
+fn refused_stop_send(mode: &str) {
+    require_runtime();
+    let directory = tempfile::tempdir().unwrap();
+    let guest = compile_guest(directory.path());
+    let mut command = super::Command::new(&guest);
+    command.arg(mode);
+    let status = super::run_with_backend(command, config(), false, &None, Backend::InGuestTrap);
+    panic!("the run was not refused: {status:?}");
+}
+
+/// A refusal row (design test 2, https://github.com/rrnewton/hermit/issues/5430):
+/// under the gate a guest's SIGSTOP to its child ends the run in the named
+/// stopping refusal before the guest goes on. Before, the gated send was
+/// answered EPERM and the guest went on, and one that waited for the stop
+/// with `WUNTRACED` waited until an outer bound. Mutation: "EPERM without the
+/// stopping refusal" (the guest prints ROW-REACHED-AFTER-REFUSAL and exits 0).
+#[test]
+fn forced_gate_a_sigstop_to_a_child_is_refused_by_name() {
+    if isolated(
+        "forced_gate_a_sigstop_to_a_child_is_refused_by_name",
+        Expect::Refusal {
+            reason: "HERMIT_STOP_SIGNAL_SEND_REFUSED",
+        },
+    ) {
+        refused_stop_send("stop-send-sigstop");
+    }
+}
+
+/// A refusal row (https://github.com/rrnewton/hermit/issues/5430): under the
+/// gate the runtime's mask blocks SIGTSTP in a child that ignores it and does
+/// not block it itself, so Linux would queue the send rather than discard
+/// it, and the send is refused, ending the run: an over-refusal, counted,
+/// since the guest's own mask does not block it. Mutation: "the published
+/// guest mask read instead of the physical one" (the send is admitted and the
+/// guest prints ROW-REACHED-AFTER-REFUSAL).
+#[test]
+fn forced_gate_a_sigtstp_the_runtime_mask_blocks_is_refused_by_name() {
+    if isolated(
+        "forced_gate_a_sigtstp_the_runtime_mask_blocks_is_refused_by_name",
+        Expect::Refusal {
+            reason: "HERMIT_STOP_SIGNAL_SEND_REFUSED",
+        },
+    ) {
+        refused_stop_send("stop-send-ignored-sigtstp");
+    }
+}

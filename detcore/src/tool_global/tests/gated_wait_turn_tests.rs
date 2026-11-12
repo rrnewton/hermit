@@ -254,6 +254,10 @@ struct TurnGuest {
     /// The threads Detcore's model shows live, each its own process: what
     /// `GlobalRequest::ResolveKillTargets` answers.
     live: Vec<DetTid>,
+    /// Processes with more than one live thread, and those threads in the
+    /// order `GlobalRequest::ResolveKillTargets` answers them, in place of
+    /// `live`'s one.
+    threads_of: Vec<(DetTid, Vec<DetTid>)>,
     /// The host thread id `Guest::tid` reports instead of `THREAD`, for a
     /// path that reads the caller's own `/proc/<tid>` (`None`: `THREAD`); the
     /// thread's `dettid` is set to it too, as a guest thread's always is.
@@ -266,6 +270,9 @@ struct TurnGuest {
     /// The set of each injected `rt_sigtimedwait` (A5 step 3c.1d's removal of
     /// ignored signals, D37), in order.
     sigtimedwait_sets: Vec<u64>,
+    /// The timeout (seconds, nanoseconds) of each injected `rt_sigtimedwait`,
+    /// `None` for none, in order.
+    sigtimedwait_timeouts: Vec<Option<[i64; 2]>>,
     /// Set once a request is answered `Signaled` with SIGALRM, the wake a due
     /// entry substitutes: from then on the ledger answers `DueEntry` true
     /// too, as it does for the woken read's completion (dh-ru056 slice 2).
@@ -480,11 +487,21 @@ impl GlobalRPC<GlobalState> for TurnGuest {
             GlobalRequest::ResolveKillTargets(process) => {
                 let target = DetTid::from_raw(process.as_raw());
                 let live = self.live.contains(&target);
-                GlobalResponse::ResolveKillTargets(
-                    if live { vec![target] } else { Vec::new() },
-                    Some(false),
-                )
+                let threads = match self.threads_of.iter().find(|(leader, _)| *leader == target) {
+                    Some((_, threads)) => threads.clone(),
+                    None if live => vec![target],
+                    None => Vec::new(),
+                };
+                GlobalResponse::ResolveKillTargets(threads, Some(false))
             }
+            GlobalRequest::PosixTimerThread(process, named) => GlobalResponse::PosixTimerThread(
+                if named > 0 && DetPid::from_raw(named) == process {
+                    crate::types::PosixTimerThread::Thread(DetTid::from_raw(named))
+                } else {
+                    crate::types::PosixTimerThread::NotInGroup
+                },
+            ),
+            GlobalRequest::SetSigtimedwaitSet(_) => GlobalResponse::SetSigtimedwaitSet(()),
             GlobalRequest::PublishTemporaryMask(control) => {
                 GlobalResponse::PublishTemporaryMask(match control {
                     crate::scheduler::guest_mask_publication::TemporaryMaskControl::Publish {
@@ -636,6 +653,11 @@ impl Guest<Detcore> for TurnGuest {
                     .transpose()?
                     .unwrap_or(0);
                 self.sigtimedwait_sets.push(set);
+                let timeout = wait
+                    .timeout()
+                    .map(|timeout| LocalMemory::new().read_value::<_, [i64; 2]>(timeout.cast()))
+                    .transpose()?;
+                self.sigtimedwait_timeouts.push(timeout);
                 let requests = self.requests().len();
                 self.sigtimedwait_after_requests.push(requests);
                 let rpcs = self.rpcs.lock().unwrap().len();
@@ -857,11 +879,13 @@ fn turn_guest(gate: bool, own_mask: Option<u64>) -> TurnGuest {
         kernel_run_for: None,
         nested: Vec::new(),
         live: vec![THREAD, PEER],
+        threads_of: Vec::new(),
         host_tid: None,
         stack,
         tight_stack: false,
         memory_reads: Default::default(),
         sigtimedwait_sets: Vec::new(),
+        sigtimedwait_timeouts: Vec::new(),
         due_after_wake: std::sync::atomic::AtomicBool::new(false),
         take_entry: false,
         pipe_status_differs: false,
@@ -2500,11 +2524,12 @@ impl tracing::Subscriber for WarnLog {
 
 /// D48 with IR-4(b): under the gate a stop-signal send gets `EPERM` and the
 /// named WARN, by each target form and to the sender itself: SIGSTOP always;
-/// SIGTSTP, SIGTTIN and SIGTTOU while the target's action is `SIG_DFL` in its
-/// `/proc` status, read in the sender's turn, and when that status cannot be
-/// read (fail closed). Not refused: SIGTSTP the target ignores or catches,
-/// SIGCONT, a target with no live thread (its ordinary answer), and every
-/// send with the gate off.
+/// SIGTSTP, SIGTTIN and SIGTTOU unless Linux would discard the send when it
+/// is sent (the target's action is `SIG_IGN` and the signal is unblocked, in
+/// its `/proc` status, read in the sender's turn), and when that status cannot
+/// be read (fail closed). Not refused: SIGTSTP the target ignores without
+/// blocking it, SIGCONT, a target with no live thread (its ordinary answer),
+/// and every send with the gate off.
 #[tokio::test]
 async fn under_the_gate_a_stop_signal_send_is_refused_with_eperm_and_a_warn() {
     use crate::syscalls::ReservedSendSiginfo;
@@ -2546,16 +2571,31 @@ async fn under_the_gate_a_stop_signal_send_is_refused_with_eperm_and_a_warn() {
             Ok(proc_state(0, 0, 0)),
             true,
         ),
+        // `proc_state` blocks every signal, so Linux would queue these: a
+        // blocked signal is never ignored at generation (kernel/signal.c:103-122
+        // at v6.9), and a caught one is delivered. Refused
+        // (https://github.com/rrnewton/hermit/issues/5430; they were admitted
+        // before).
         (
-            "SIGTSTP SIG_IGN",
+            "SIGTSTP SIG_IGN, blocked",
             libc::SIGTSTP,
             Ok(proc_state(0, 0, tstp)),
-            false,
+            true,
         ),
         (
             "SIGTSTP caught",
             libc::SIGTSTP,
             Ok(proc_state(0, tstp, 0)),
+            true,
+        ),
+        // Unblocked and ignored: Linux discards it when it is sent.
+        (
+            "SIGTSTP SIG_IGN, unblocked",
+            libc::SIGTSTP,
+            Ok(KernelSignalState {
+                blocked: 0,
+                ..proc_state(0, 0, tstp)
+            }),
             false,
         ),
         (
@@ -3530,6 +3570,7 @@ async fn under_the_gate_a_refused_send_s_unreadable_siginfo_is_efault_only_where
     }
 }
 
+mod stop_send_turn_tests;
 mod temporary_mask_turn_tests;
 
 /// Runs `step` to its end, or to the guest's end: `Err` with the harness's

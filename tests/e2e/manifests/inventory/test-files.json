@@ -3361,6 +3361,12 @@
       "why": "tests/c/stdio_lseek_identity.c is owned by hermit-cli/tests/cli.rs and hermit-cli/tests/run_evidence.rs: The dedicated suites compile the guest and control inherited output descriptors to assert unseekable standard-stream identity and its recorded execution evidence."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/stop_send_refusal.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/stop_send_refusal.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test compiles this probe of stop-signal sends and armings, requires the default in-guest routes to refuse the ones they cannot hold with the policy-refusal status, the coordinator's named refusal and no guest left running, requires the admitted sends to print Linux's output, and runs the leader-mask and stop controls natively; it remains a guest fixture because a generic manifest cannot express a bounded refused run, a surviving-process check or a native-only control."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/symlink_ops.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
