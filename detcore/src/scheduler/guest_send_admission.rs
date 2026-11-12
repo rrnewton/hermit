@@ -98,19 +98,29 @@
 //! scheduler wakes for the copy and does not reserve the copy for it.
 //! Linux's `complete_signal` only chooses which thread to wake and wakes it
 //! (`signal_wake_up`, kernel/signal.c:963-1032 at v7.1.3); the copy stays in
-//! the process's shared queue, every thread that leaves it unblocked has it
-//! pending (`recalc_sigpending_tsk`, :159-166), and the first such thread to
-//! return to user mode dequeues it (`dequeue_signal` reads the thread's own
-//! queue and then `signal->shared_pending`, :618-640). So an ordinary
-//! boundary of another thread of the process that leaves the signal
-//! unblocked, which the scheduler authorizes without reading the claims
+//! the process's shared queue. Only the chosen thread is woken and flagged:
+//! `signal_wake_up_state` sets its `TIF_SIGPENDING` (:725), the per-task flag
+//! `signal_pending` reads (include/linux/sched/signal.h:382-396) and a return
+//! to user mode acts on (kernel/entry/common.c:63-64). An unchosen thread
+//! asleep in a call, a probe's sleep included, is not woken and does not
+//! take the copy. Another thread takes it only on a return to user mode with
+//! its own flag set, as after a change of its mask that leaves the signal
+//! unblocked (`__set_task_blocked` recalculates the flag, :3188-3197,
+//! through `recalc_sigpending_tsk`, :159-166); it then dequeues the copy
+//! (`dequeue_signal` reads the thread's own queue and then
+//! `signal->shared_pending`, :618-640). So an ordinary boundary of another
+//! thread of the process that leaves the signal unblocked, which the
+//! scheduler authorizes without reading the claims
 //! (`authorize_signal_boundary`), can take a copy claimed for a receiver
 //! that would take it at its next probe or once a gate releases it, if
 //! step 3 runs that thread first; the next audit finds the copy gone and
-//! drops the claim, and the run goes on, as on Linux. That boundary is in
-//! its own thread's serial grant, a point the schedule fixes. Only an
-//! observation, whose dequeue the observed thread's host thread makes, is
-//! refused (above).
+//! drops the claim, and the run goes on. Linux permits that outcome for a
+//! thread whose own flag is set, as above. For a running thread whose flag
+//! nothing has recalculated, Linux would leave the copy to the chosen
+//! thread; deciding that case is follow-up work (the contested-claim rule
+//! at ordinary boundaries). That boundary is in its own thread's serial
+//! grant, a point the schedule fixes. Only an observation, whose dequeue the
+//! observed thread's host thread makes, is refused (above).
 //!
 //! A probe stands for a sleeping call Linux will not interrupt, enforced by
 //! ORDER. Linux leaves a sibling asleep in `select` or `pselect6`: its

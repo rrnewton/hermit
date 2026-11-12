@@ -326,9 +326,11 @@ impl Scheduler {
             // for no thread of its process, still wakes it. The rule is
             // judged again from the state at every drain, so a copy its chosen
             // thread does not take (it blocks the signal, or exits) reaches
-            // this waiter once the claim and the mark are gone; until then the
-            // claims audit refuses that case by name
-            // (`Scheduler::audit_guest_send_claims`).
+            // this waiter once the claim and the mark are gone. Until then the
+            // claims audit refuses that case by name once it can read the
+            // chosen thread's state (`ClaimReason::Retarget`,
+            // `Scheduler::audit_guest_send_claims`); an unreadable claim it
+            // defers to its next pass.
             let for_another = self.shared_copies_chosen_for_another(owner, dettid)
                 & shared_only
                 & !self.shared_copies_chosen_for(dettid);

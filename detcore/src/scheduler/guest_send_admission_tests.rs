@@ -917,8 +917,9 @@ fn the_unchosen_suspend_sibling_stays_asleep_and_has_no_turn() {
 /// where the mask lets the signal in, dropped where it blocks it. Where the
 /// readmission could not record the mask (`None`: an `rt_sigsuspend` rejoin,
 /// a masked wait under record or replay), the mark stays: an unknown mask
-/// is no evidence the thread blocks the signal, and the claims audit, which
-/// refuses an unknown state by name, remains the backstop.
+/// is no evidence the thread blocks the signal. The claims audit does not
+/// refuse it but defers an unreadable claim to its next pass; admission is
+/// what refuses an unknown mask, at send time.
 #[test]
 fn a_readmitted_takers_mark_is_judged_under_its_continuation_mask() {
     let usr1 = bit(libc::SIGUSR1);

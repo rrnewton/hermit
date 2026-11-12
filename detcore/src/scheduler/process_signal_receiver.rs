@@ -525,8 +525,10 @@ impl Scheduler {
     /// P1). Where that view cannot say (a thread readmitted from a call
     /// outside the schedule whose mask its readmission could not record,
     /// `BlockedPool::continuation_masks`), the mark stands: nothing shows the
-    /// thread blocks the signal, and the claims audit refuses an unknown
-    /// state by name.
+    /// thread blocks the signal. The claims audit does not refuse such a
+    /// state: it defers an unreadable claim to its next pass
+    /// (`Scheduler::audit_guest_send_claims`). Admission is what refuses an
+    /// unknown mask, at send time (`SendRefusal::UnknownState`).
     pub(super) fn first_process_signal_taker(&mut self) -> Option<DetTid> {
         let threads: Vec<DetTid> = self.process_signal_takers.keys().copied().collect();
         let controlled = self.signal_control_installed();
@@ -539,8 +541,10 @@ impl Scheduler {
             };
             // An unknown controlled mask (a readmission that could not
             // record its call's mask) keeps the mark: it is no evidence the
-            // thread blocks the signal, and the claims audit refuses an
-            // unknown state by name (`Scheduler::audit_guest_send_claims`).
+            // thread blocks the signal. The claims audit defers an
+            // unreadable claim to its next pass
+            // (`Scheduler::audit_guest_send_claims`); only admission refuses
+            // an unknown mask, at send time.
             let unblocked = match mask {
                 Some(mask) => !mask,
                 None if controlled => !0,
