@@ -800,7 +800,9 @@ fn the_admitted_suspend_waiter_takes_the_copy_not_its_woken_sibling() {
 fn the_admitted_polling_receiver_probes_before_its_sibling() {
     let usr1 = bit(libc::SIGUSR1);
     let (mut s, control) = two_processes(state(0, 0, usr1, 0, usr1));
-    for tid in [LEADER, SIBLING] {
+    // The sibling is queued ahead of the leader, so queue order alone
+    // would probe it first.
+    for tid in [SIBLING, LEADER] {
         polling(&mut s, tid, "pselect6", Some(Errno::EINTR), Some(0));
     }
     assert_eq!(kill(&s, libc::SIGUSR1), catch(LEADER, CatchReach::Probe));
