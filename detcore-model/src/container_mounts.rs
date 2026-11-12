@@ -1322,7 +1322,7 @@ mod tests {
 20 1 259:4 / / rw,relatime shared:1 - btrfs /dev/root rw\n\
 21 20 0:58 / /home rw,relatime shared:218 - autofs /etc/auto.home rw,fd=12,pgrp=5026,timeout=600,indirect\n\
 22 20 0:31 / /proc/sys/fs/binfmt_misc rw,relatime shared:14 - autofs systemd-1 rw,fd=43,pgrp=1,direct\n\
-23 21 0:59 / /home/shared\\040dir rw,relatime shared:30 - autofs /etc/auto.shared rw,fd=7,pgrp=5026,indirect\n\
+23 21 0:59 / /srv/shared\\040dir rw,relatime shared:30 - autofs /etc/auto.shared rw,fd=7,pgrp=5026,indirect\n\
 24 20 0:58 / /home rw,relatime shared:219 - autofs /etc/auto.home rw,fd=13,pgrp=5026,indirect\n\
 25 20 0:24 / /dev/pts rw,relatime - devpts devpts rw\n",
         )
@@ -1332,7 +1332,7 @@ mod tests {
             autofs_mountpoints(&rows),
             Some(vec![
                 std::path::PathBuf::from("/home"),
-                std::path::PathBuf::from("/home/shared dir"),
+                std::path::PathBuf::from("/srv/shared dir"),
                 std::path::PathBuf::from("/proc/sys/fs/binfmt_misc"),
             ])
         );
