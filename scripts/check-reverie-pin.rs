@@ -2382,7 +2382,9 @@ fn check_buck_build_pin_binding(root: &Path, pin: &str) -> Result<i32, String> {
     }
 
     // Outside the block: the one load of the release values, and no other
-    // active mention of the pin's name, which could rebind it.
+    // active mention of either name it loads. Any other could rebind it, and
+    // Buck would then report the rebound value (a version that is not
+    // hermit-cli's, or a pin that is not the gitlink).
     let mut loads = Vec::new();
     let mut stray = Vec::new();
     for (index, line) in lines.iter().enumerate() {
@@ -2392,7 +2394,7 @@ fn check_buck_build_pin_binding(root: &Path, pin: &str) -> Result<i32, String> {
         let code = line.split('#').next().unwrap_or("").trim();
         if code == BUCK_RELEASE_VALUES_LOAD {
             loads.push(index + 1);
-        } else if code.contains(RELEASE_PIN_NAME) {
+        } else if code.contains(RELEASE_PIN_NAME) || code.contains(RELEASE_VERSION_NAME) {
             stray.push((index + 1, code));
         }
     }
@@ -2400,7 +2402,7 @@ fn check_buck_build_pin_binding(root: &Path, pin: &str) -> Result<i32, String> {
         loud_header("BUCK RELEASE VALUES LOAD MISSING OR AMBIGUOUS - BLOCKED");
         eprintln!("Canonical Reverie pin: {pin}");
         eprintln!(
-            "Expected exactly one active `{BUCK_RELEASE_VALUES_LOAD}` line in {BUCK_BUILD_PIN_SITE}, and no other active mention of {RELEASE_PIN_NAME} outside `{BUCK_BUILD_ENV_OPENER}`; found {} load line(s) and {} other mention(s).",
+            "Expected exactly one active `{BUCK_RELEASE_VALUES_LOAD}` line in {BUCK_BUILD_PIN_SITE}, and no other active mention of {RELEASE_PIN_NAME} or {RELEASE_VERSION_NAME} outside `{BUCK_BUILD_ENV_OPENER}`; found {} load line(s) and {} other mention(s).",
             loads.len(),
             stray.len()
         );
@@ -4853,6 +4855,16 @@ mod tests {
             check("check rebinding"),
             1,
             "a rebinding of the loaded name must not stand beside the load"
+        );
+
+        // The version is loaded beside the pin, and Buck reports a rebound
+        // value just the same.
+        fs::write(&buck, release_buck("HERMIT_VERSION = \"9.9.9\"\n"))
+            .expect("write a rebinding of the loaded version");
+        assert_eq!(
+            check("check version rebinding"),
+            1,
+            "a rebinding of the loaded version must not stand beside the load"
         );
 
         fs::write(
