@@ -905,3 +905,45 @@ fn the_unchosen_suspend_sibling_stays_asleep_and_has_no_turn() {
          charge after the leader's turn, sibling committed, sibling parked at the end)"
     );
 }
+
+/// The deterministic-scheduling review of
+/// https://github.com/rrnewton/hermit/pull/5415 at 5055d688, required change
+/// 2: a thread chosen for a shared copy whose call outside the schedule
+/// returned, readmitted with the temporary mask its readmission recorded
+/// (`BlockedPool::continuation_masks`), and queued to run. Its taker mark is
+/// judged under that mask, as the admission and the choice read it: kept
+/// where the mask lets the signal in, dropped where it blocks it. Where the
+/// readmission could not record the mask (`None`: an `rt_sigsuspend` rejoin,
+/// a masked wait under record or replay), the mark stays: an unknown mask
+/// is no evidence the thread blocks the signal, and the claims audit, which
+/// refuses an unknown state by name, remains the backstop.
+#[test]
+fn a_readmitted_takers_mark_is_judged_under_its_continuation_mask() {
+    let usr1 = bit(libc::SIGUSR1);
+    for (case, own, continuation, kept) in [
+        ("its temporary mask lets it in", usr1, Some(!usr1), true),
+        ("its temporary mask blocks it", 0, Some(usr1), false),
+        ("its temporary mask is unknown", usr1, None, true),
+    ] {
+        let (mut s, _control) = two_processes(state(0, usr1, own, 0, usr1));
+        let mut rejoin = Resources::new(LEADER);
+        rejoin.insert(
+            ResourceID::BlockedExternalContinue(crate::resources::ExternalOpId::new(LEADER, 1)),
+            Permission::RW,
+        );
+        s.next_turns.get_mut(&LEADER).unwrap().req = Ivar::full(Ok(rejoin));
+        s.blocked.continuation_masks.insert(LEADER, continuation);
+        s.runqueue_push_back(LEADER);
+        s.process_signal_takers.insert(LEADER, usr1);
+        assert_eq!(
+            s.first_process_signal_taker(),
+            kept.then_some(LEADER),
+            "{case}"
+        );
+        assert_eq!(
+            s.process_signal_takers.get(&LEADER).copied(),
+            kept.then_some(usr1),
+            "{case}"
+        );
+    }
+}
