@@ -546,10 +546,15 @@ impl Scheduler {
                 self.process_signal_takers.insert(thread, standing);
             }
         }
-        self.process_signal_takers
-            .keys()
-            .copied()
-            .find(|thread| self.run_queue.contains_non_polling_tid(*thread))
+        // With a control installed, a marked thread that polls a call whose
+        // probe takes the copy (`CatchReach::Probe`: `select`, `pselect6`, a
+        // masked `ppoll`, `rt_sigtimedwait`) is resumed first too: queue order
+        // alone let a sibling's probe, whose call Linux leaves asleep, take
+        // the copy first.
+        self.process_signal_takers.keys().copied().find(|thread| {
+            self.run_queue.contains_non_polling_tid(*thread)
+                || (controlled && self.run_queue.contains_tid(*thread))
+        })
     }
 
     /// A thread of `process` that can take a copy of the signal `bit` from
