@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["HERMIT_POLICY_REFUSAL_EXIT","HERMIT_SIGINT_DEATH_EXIT","SIGNAL_EXIT_BASE"],"fn":["signal_exit_status","signal_from_exit_status"],"mod":["backend_engagement","build_info","collections","config","fd","futex","happens_before","host_capability","pedigree","pid","procfs","schedule","summary","time"]};
