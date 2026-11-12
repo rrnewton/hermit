@@ -253,8 +253,8 @@ static void child_wait_for_go(void);
 
 static void *other_suspend_main(void *arg) {
   (void)arg;
-  char byte = 't';
-  if (write(thread_ready_pipe[1], &byte, 1) != 1) {
+  pid_t tid = gettid();
+  if (write(thread_ready_pipe[1], &tid, sizeof(tid)) != sizeof(tid)) {
     _exit(CHILD_SETUP_FAILED);
   }
   int result = sigsuspend(&suspend_admit);
@@ -398,12 +398,17 @@ static void child_main(const char *mode) {
     if (pthread_create(&other, NULL, other_suspend_main, NULL) != 0) {
       _exit(CHILD_SETUP_FAILED);
     }
-    char byte;
-    if (read(thread_ready_pipe[0], &byte, 1) != 1) {
+    /* Both thread ids follow the ready byte, for the parent's check that
+     * both threads are asleep in rt_sigsuspend. */
+    pid_t threads[2] = {gettid(), 0};
+    if (read(thread_ready_pipe[0], &threads[1], sizeof(threads[1])) != sizeof(threads[1])) {
       _exit(CHILD_SETUP_FAILED);
     }
     alarm(10);
     child_ready();
+    if (write(ready_pipe[1], threads, sizeof(threads)) != sizeof(threads)) {
+      _exit(CHILD_SETUP_FAILED);
+    }
     int result = sigsuspend(&suspend_admit);
     int error = errno;
     child_wait_for_go();
@@ -635,6 +640,48 @@ static void let_the_child_block(void) {
   nanosleep(&delay, NULL);
 }
 
+/* The system call /proc/CHILD/task/TID/syscall says the thread is blocked
+ * in: 1 when it is SYS_rt_sigsuspend, 0 when it is another or none, -1
+ * when the file cannot be read (Hermit's /proc has no such file). */
+static int blocked_in_rt_sigsuspend(pid_t child, pid_t tid) {
+  char path[64];
+  snprintf(path, sizeof(path), "/proc/%d/task/%d/syscall", (int)child, (int)tid);
+  FILE *file = fopen(path, "r");
+  if (file == NULL) {
+    return -1;
+  }
+  long number = -1;
+  int fields = fscanf(file, "%ld", &number);
+  fclose(file);
+  return fields == 1 && number == SYS_rt_sigsuspend;
+}
+
+/* The sigsuspend-two mode's wait: until both of the child's threads are
+ * asleep in rt_sigsuspend, polled for up to 10 seconds, so that a loaded
+ * host cannot send the signal while one of them is still on its way.
+ * Where /proc cannot say (under Hermit), the fixed delay above, which there
+ * is virtual time and lets both threads reach their calls first. */
+static void let_both_threads_block(pid_t child, const pid_t threads[2]) {
+  double deadline = monotonic() + 10;
+  for (;;) {
+    int first = blocked_in_rt_sigsuspend(child, threads[0]);
+    int other = blocked_in_rt_sigsuspend(child, threads[1]);
+    if (first < 0 || other < 0) {
+      let_the_child_block();
+      return;
+    }
+    if (first && other) {
+      return;
+    }
+    if (monotonic() > deadline) {
+      printf("parent: the child's threads were not both in rt_sigsuspend after 10 seconds\n");
+      return;
+    }
+    struct timespec poll_delay = {0, 1000 * 1000};
+    nanosleep(&poll_delay, NULL);
+  }
+}
+
 int main(int argc, char **argv) {
   if (argc < 2) {
     fprintf(stderr, "usage: %s MODE [HOW]\n", argv[0]);
@@ -703,7 +750,14 @@ int main(int argc, char **argv) {
     }
     send_signal(how, child, SIGCONT, pidfd);
   } else {
-    if (strcmp(mode, "runnable") != 0 && strcmp(mode, "newthread") != 0) {
+    if (strcmp(mode, "sigsuspend-two") == 0) {
+      pid_t threads[2];
+      if (read(ready_pipe[0], threads, sizeof(threads)) != sizeof(threads)) {
+        fprintf(stderr, "the child never sent its thread ids\n");
+        return 1;
+      }
+      let_both_threads_block(child, threads);
+    } else if (strcmp(mode, "runnable") != 0 && strcmp(mode, "newthread") != 0) {
       let_the_child_block();
     }
     send_signal(how, child, SIGUSR1, pidfd);
