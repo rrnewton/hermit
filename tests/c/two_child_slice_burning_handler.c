@@ -110,8 +110,13 @@ static void on_child(int signo, siginfo_t *info, void *context) {
   (void)context;
   int saved_errno = errno;
   /* Burn CPU in place, past at least one timeslice, before returning:
-   * no syscall, so only a slice boundary can observe this handler. */
-  for (volatile unsigned long i = 0; i < 600000000UL; ++i) {
+   * no syscall, so only a slice boundary can observe this handler. One
+   * inner conditional back-edge per iteration is about 20M retired
+   * branches per default timeslice, so 80M iterations cross about four
+   * slices - enough margin to prove the crossing without eating the
+   * test's whole CPU budget (600M crossed about thirty and timed the
+   * case out under the queue's 22 s budget). */
+  for (volatile unsigned long i = 0; i < 80000000UL; ++i) {
   }
   for (int i = 0; i < 2; ++i) {
     if (info->si_pid == children[i]) {
