@@ -25064,7 +25064,9 @@ const STRICT_VERIFY_ADMITTED_MODES: [&str; 5] =
 /// run's lines with no call refused by name. A case whose mode is in
 /// `STRICT_VERIFY_ADMITTED_MODES` runs on KVM once more under
 /// `--verify --verify-strict`, which must print the same lines, compare the
-/// two runs bitwise with no relaxation, and find them identical. The cases
+/// two runs bitwise with no relaxation, and find them identical, its
+/// `--verify-json` report saying bitwise parity over the same nonzero number
+/// of INFO records on each side. The cases
 /// are split across three tests so that each stays well inside nextest's
 /// 22-second CPU cap: each case costs about one CPU second for its two Hermit
 /// runs, and a verified case about one more for the two runs of `--verify`.
@@ -25114,12 +25116,17 @@ fn assert_admitted_sends_match_linux(test: &str, cases: &[(&str, &str)]) {
         if !kvm || !STRICT_VERIFY_ADMITTED_MODES.contains(&mode) {
             continue;
         }
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let report = directory.path().join("verify.json");
+        let report = report.to_str().expect("report path should be UTF-8");
         let args = [
             "--backend=kvm",
             "run",
             "--strict",
             "--verify",
             "--verify-strict",
+            "--verify-json",
+            report,
             "--base-env=minimal",
             "--",
             guest,
@@ -25147,6 +25154,9 @@ fn assert_admitted_sends_match_linux(test: &str, cases: &[(&str, &str)]) {
             log.contains(":: Success: deterministic. Determinism verified."),
             "--verify on kvm, {mode} {call}: verification failed:\n{log}"
         );
+        // A match of two empty logs is no parity
+        // (`empty_log_comparison_matches_but_is_never_parity`).
+        assert_bitwise_parity(report, &format!("--verify on kvm, {mode} {call}"));
     }
 }
 
