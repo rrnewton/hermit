@@ -14649,6 +14649,17 @@ impl RunOpts {
             && !self.det_opts.det_config.gdbserver
             && self.application_backend.is_none()
             && matches!(backend, Backend::Ptrace);
+        // Detcore's notice for a guest lookup that loops to ELOOP under an
+        // autofs mount the container made unbindable: same conditions as
+        // the abstract-bind notice (Detcore in Hermit's own process, where
+        // its stderr is Hermit's), on the default container path whose
+        // mounts the notice explains.
+        self.det_opts.det_config.notice_autofs_eloop = !self.no_namespace
+            && !self.namespace_only
+            && self.image.is_none()
+            && !self.det_opts.det_config.gdbserver
+            && self.application_backend.is_none()
+            && matches!(backend, Backend::Ptrace);
         if self.record_networking.is_some() {
             self.network = NetworkingMode::Host;
         }
@@ -16444,6 +16455,63 @@ impl RunOpts {
     /// `--no-namespace`. `work` receives the parent-held `guards`, the
     /// container's identity mounts, and any explicitly enrolled native run. An
     /// adapter that cannot consume a native run must refuse it.
+    /// Best-effort `O_PATH` holds that trigger, in this process's namespace
+    /// before the container clone copies it, the automounts the launch is
+    /// about to need: the guest's home, its working directory, and a
+    /// slash-containing program path. The cloned tree then contains those
+    /// mounts already made; holding the descriptors for the whole run
+    /// also keeps the host mounts busy, so the daemon cannot expire them
+    /// (and detach the guest's copies) mid-run. Keys beyond this set are
+    /// not pre-triggered: under the container's unbindable autofs mounts
+    /// their lookups reach the daemon, mount only host-side, and loop to
+    /// `ELOOP` in the guest (Detcore explains that once, see
+    /// `DetConfig::notice_autofs_eloop`). A hold that fails (a home that
+    /// does not exist, say) holds nothing and never fails the launch: the
+    /// guest observes the same absence natively.
+    fn pretrigger_autofs_holds(&self) -> Vec<std::os::fd::OwnedFd> {
+        let mut holds = Vec::new();
+        let mut hold = |path: &Path, directory: bool| {
+            if let Ok(fd) = hermit::hold_path(path, directory) {
+                holds.push(fd);
+            }
+        };
+        // Superset, not a mirror of the guest env resolution: the host's
+        // $HOME and every explicit --env HOME value (a bare --env HOME
+        // resolves to the host's, already first).
+        let mut homes: Vec<std::ffi::OsString> = Vec::new();
+        if let Some(home) = std::env::var_os("HOME") {
+            homes.push(home);
+        }
+        for (name, value) in &self.env {
+            if name == "HOME"
+                && let Some(value) = value
+            {
+                homes.push(value.into());
+            }
+        }
+        for home in &homes {
+            if !home.is_empty() {
+                hold(Path::new(home), true);
+            }
+        }
+        if let Some(workdir) = self.launch_workdir() {
+            hold(workdir, true);
+        }
+        let program = self
+            .prepared_program
+            .as_deref()
+            .unwrap_or_else(|| self.program_path());
+        if program.as_os_str().as_encoded_bytes().contains(&b'/') {
+            if let Some(parent) = program.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                hold(parent, true);
+            }
+            hold(program, false);
+        }
+        holds
+    }
+
     pub(super) fn launch_in_container<G, F, T>(
         &self,
         guards: G,
@@ -16465,6 +16533,16 @@ impl RunOpts {
             detcore::preemptions::validate_config_replay_inputs(&self.effective_det_config())?;
             <detcore::Detcore as reverie::Tool>::facility_admission(&self.det_opts.det_config)?;
         }
+        // Trigger the launch's automounts in this namespace before the
+        // clone copies it, and pin them for the whole run. Only the
+        // default container path needs this: --no-namespace looks up
+        // natively, --image's paths are rootfs-internal, and
+        // --namespace-only makes no private tree to strand a lookup in.
+        let _autofs_holds = if !self.no_namespace && !self.namespace_only && self.image.is_none() {
+            self.pretrigger_autofs_holds()
+        } else {
+            Vec::new()
+        };
         let gdbserver_port = self.bind_gdbserver_port()?;
         super::pinned_cpu::set_settings(self.pinned_cpu_settings());
         let (mut container, tmpfs, identity, resources) = if self.no_namespace {
@@ -20410,6 +20488,7 @@ pub(super) fn complete_container_config(
             config.mountinfo_mount_ids = view.order;
             config.mountinfo_mount_namespace = Some(view.namespace);
             config.container_mount_table = view.table;
+            config.autofs_roots = view.autofs_roots;
         }
         // No container (`--no-namespace`): the guest runs in this process's
         // own namespace, where Hermit installed no mount, so its table is
@@ -20428,6 +20507,9 @@ pub(super) fn complete_container_config(
             config.mountinfo_mount_ids = order;
             config.mountinfo_mount_namespace = Some(namespace);
             config.container_mount_table = Some(table);
+            // No autofs_roots: the guest runs in this process's own
+            // namespace, where autofs lookups are native and there is
+            // no unbindable-loop outcome to explain.
         }
     }
     Ok(config)
