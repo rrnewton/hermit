@@ -239,24 +239,46 @@ fn compile_c_guest(build_root: &Path, name: &str) -> PathBuf {
     guest
 }
 
-/// One of this host's autofs mountpoints, if it has any (from
-/// `/proc/self/mountinfo`, paths unescaped).
-fn host_autofs_root() -> Option<PathBuf> {
+/// A host autofs mountpoint whose lookups actually cross the kernel's
+/// automount gate. The first autofs row is typically systemd's direct
+/// `/proc/sys/fs/binfmt_misc` mount, inside a tree Hermit serves itself:
+/// a missing name there answers ENOENT without ever reaching autofs, so
+/// it proves nothing. Skip Hermit-served trees (`/proc`, `/sys`), prefer
+/// `/home`, and otherwise take the first remaining root whose *native*
+/// missing-name lookup answers ENOENT.
+fn host_autofs_root(missing_leaf: &str) -> Option<PathBuf> {
     let mountinfo = fs::read_to_string("/proc/self/mountinfo").ok()?;
+    let mut candidates: Vec<PathBuf> = Vec::new();
     for line in mountinfo.lines() {
-        let (left, right) = line.split_once(" - ")?;
+        let Some((left, right)) = line.split_once(" - ") else {
+            continue;
+        };
         if right.split_whitespace().next() != Some("autofs") {
             continue;
         }
-        let mountpoint = left.split_whitespace().nth(4)?;
+        let Some(mountpoint) = left.split_whitespace().nth(4) else {
+            continue;
+        };
         let unescaped = mountpoint
             .replace("\\040", " ")
             .replace("\\011", "\t")
             .replace("\\012", "\n")
             .replace("\\134", "\\");
-        return Some(PathBuf::from(unescaped));
+        let root = PathBuf::from(unescaped);
+        if root.starts_with("/proc") || root.starts_with("/sys") {
+            continue;
+        }
+        if !candidates.contains(&root) {
+            candidates.push(root);
+        }
     }
-    None
+    candidates.sort_by_key(|root| root.as_os_str() != "/home");
+    candidates.into_iter().find(|root| {
+        fs::metadata(root.join(missing_leaf))
+            .err()
+            .and_then(|err| err.raw_os_error())
+            == Some(libc::ENOENT)
+    })
 }
 
 /// A missing name directly under an autofs root answers ENOENT under
@@ -265,18 +287,20 @@ fn host_autofs_root() -> Option<PathBuf> {
 /// the lookup from Hermit's recursively private container with EPERM.
 #[test]
 fn autofs_missing_name_is_enoent_under_hermit() {
-    let Some(root) = host_autofs_root() else {
+    let leaf = format!("hermit-nonexistent-{}-7f3a", std::process::id());
+    let Some(root) = host_autofs_root(&leaf) else {
         record_test_skip(
             "autofs_missing_name_is_enoent_under_hermit",
-            "host has no autofs mount",
+            "host has no autofs mount outside /proc and /sys whose missing names answer ENOENT natively",
             "HERMIT_REQUIRE_AUTOFS",
         );
         return;
     };
+    println!("autofs oracle root: {}", root.display());
     let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("autofs-missing-{}", std::process::id()));
     let guest = compile_c_guest(&build_root, "autofs_probe");
-    let missing = root.join(format!("hermit-nonexistent-{}-7f3a", std::process::id()));
+    let missing = root.join(&leaf);
 
     let mut native = Command::new(&guest);
     native.arg("stat").arg(&missing);
@@ -297,8 +321,8 @@ fn autofs_missing_name_is_enoent_under_hermit() {
     let run = command_output(run, "hermit autofs missing-name stat");
     let stdout = String::from_utf8_lossy(&run.stdout);
     assert!(
-        stdout.contains("errno=2"),
-        "missing name under {} did not answer ENOENT under Hermit:\n{stdout}",
+        stdout.contains(&format!("stat {}: errno=2", missing.display())),
+        "missing name under chosen root {} did not answer ENOENT under Hermit:\n{stdout}",
         root.display()
     );
     assert!(
@@ -349,7 +373,7 @@ W="$1"; DAEMON="$2"; PROBE="$3"; HERMIT="$4"
 [ -n "${SUDO_GID:-}" ] || { echo "FIXTURE-FAIL: SUDO_GID unset"; exit 1; }
 as_invoker() { setpriv --reuid="$SUDO_UID" --regid="$SUDO_GID" --init-groups -- "$@"; }
 ROOT="$W/root"; mkdir -p "$ROOT"
-"$DAEMON" "$ROOT" "$W/ready" "$W/daemon.log" "ghostTrig,ghostTrigDir,ghostStat,ghostStatx" &
+"$DAEMON" "$ROOT" "$W/ready" "$W/daemon.log" "ghostTrig,ghostTrigDir,ghostStat,ghostStatx,ghostHome" &
 DPID=$!
 cleanup() { umount -R "$ROOT" >>"$W/cleanup.log" 2>&1 || umount -l "$ROOT" >>"$W/cleanup.log" 2>&1 || true; kill $DPID 2>/dev/null || true; wait $DPID 2>/dev/null || true; chown -R "$SUDO_UID:$SUDO_GID" "$W" >>"$W/cleanup.log" 2>&1 || echo "CHOWN-FAILED rc=$?" >>"$W/cleanup.log"; }
 trap cleanup EXIT
@@ -377,14 +401,29 @@ B=$(reqs); "$PROBE" statx "$ROOT/ghostStatx" | grep -q ": OK" || fail "statx gho
 OUT=$(as_invoker timeout --kill-after 5s 120s "$HERMIT" run --strict --base-env=minimal --epoch=2026-01-01T00:00:00Z -- "$PROBE" stat "$ROOT/missing1" 2>/dev/null) \
   || fail "hermit missing-name run failed: $OUT"
 echo "$OUT" | grep -q "errno=2" || fail "hermit missing name not ENOENT: $OUT"
-ERR=$(as_invoker timeout --kill-after 5s 120s "$HERMIT" run --strict --base-env=minimal --epoch=2026-01-01T00:00:00Z -- "$PROBE" stat "$ROOT/realHermit/marker" "$ROOT/realHermit/marker" 2>&1 >/dev/null) \
-  || true
+BOTH=$(as_invoker timeout --kill-after 5s 120s "$HERMIT" run --strict --base-env=minimal --epoch=2026-01-01T00:00:00Z -- "$PROBE" stat "$ROOT/realHermit/marker" "$ROOT/realHermit/marker" 2>"$W/eloop.err") \
+  || fail "hermit ELOOP-leg run failed: $BOTH"
+ERR=$(cat "$W/eloop.err")
+[ "$(echo "$BOTH" | grep -c "errno=40")" = 2 ] || fail "guest did not see ELOOP (errno=40) twice: $BOTH"
 echo "$ERR" | grep -q "hermit: NOTICE: the guest's lookup of \"$ROOT/realHermit/marker\" failed with ELOOP, likely" \
   || fail "ELOOP notice missing or unhedged: $ERR"
 [ "$(echo "$ERR" | grep -c 'hermit: NOTICE:')" = 1 ] || fail "notice printed more than once: $ERR"
+# Known divergence (design channel 4, pinned on purpose): the first run's
+# lookup made the daemon mount realHermit in the fixture namespace, so a
+# second run clones a tree already containing it and traverses it. The
+# surrendered ground is asserted exactly, so it cannot silently grow.
+OUT=$(as_invoker timeout --kill-after 5s 120s "$HERMIT" run --strict --base-env=minimal --epoch=2026-01-01T00:00:00Z -- "$PROBE" stat "$ROOT/realHermit/marker" 2>/dev/null) \
+  || fail "hermit leg-flip second run failed: $OUT"
+echo "$OUT" | grep -q ": OK" || fail "known-divergence leg-flip: second run did not traverse the host-mounted key: $OUT"
 OUT=$(as_invoker timeout --kill-after 5s 120s "$HERMIT" run --strict --base-env=minimal --epoch=2026-01-01T00:00:00Z --env "HOME=$ROOT/realHome" -- "$PROBE" stat "$ROOT/realHome/marker" 2>/dev/null) \
   || fail "hermit pretriggered-home run failed: $OUT"
 echo "$OUT" | grep -q ": OK" || fail "pre-triggered \$HOME key not mounted in guest: $OUT"
+# Browse-mode (ghost) $HOME: the daemon pre-created the key's dentry, so
+# only an O_PATH|O_DIRECTORY hold triggers it; a plain O_PATH hold would
+# leave the guest at the ELOOP leg above.
+OUT=$(as_invoker timeout --kill-after 5s 120s "$HERMIT" run --strict --base-env=minimal --epoch=2026-01-01T00:00:00Z --env "HOME=$ROOT/ghostHome" -- "$PROBE" stat "$ROOT/ghostHome/marker" 2>/dev/null) \
+  || fail "hermit ghost-home run failed: $OUT"
+echo "$OUT" | grep -q ": OK" || fail "pre-triggered ghost \$HOME key not mounted in guest: $OUT"
 echo "AUTOFS-FIXTURE-PASS"
 "#;
     let driver_path = build_root.join("driver.sh");
