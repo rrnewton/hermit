@@ -551,50 +551,53 @@ pub(crate) fn kernel_run_signal_refusal(
     )
 }
 
-/// Why a stop-signal send was refused (`stop_signal_send_refused_warning`).
+/// Why a stop-signal send was refused (`stop_signal_send_refusal`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StopSendRefusal {
     /// SIGSTOP, which always stops.
     Sigstop,
-    /// SIGTSTP, SIGTTIN or SIGTTOU while the target's action is `SIG_DFL`, as
-    /// its `/proc/<tid>/status` `SigIgn`/`SigCgt` say in the sender's turn.
+    /// SIGTSTP, SIGTTIN or SIGTTOU that Linux would not discard when it is
+    /// sent: the target's action is not `SIG_IGN`, or it blocks the signal,
+    /// as its `/proc/<tid>/status` says in the sender's turn. It would stop
+    /// the target now (its default action) or later (once unblocked).
     DefaultAction,
-    /// The target's `/proc/<tid>/status` could not be read, so whether its
-    /// action is `SIG_DFL` is unknown: refused, fail closed.
+    /// The target's `/proc/<tid>/status` could not be read, so whether Linux
+    /// would discard the send is unknown: refused, fail closed.
     StatusUnreadable,
     /// Threads are not sequentialized, so the target's dispositions and mask
     /// could change before the kernel acts on the send: SIGTSTP, SIGTTIN and
     /// SIGTTOU are refused without reading them.
-    #[cfg_attr(not(test), allow(dead_code))]
     Unsequentialized,
     /// A pidfd whose target Detcore cannot name (a received or inherited
     /// one): refused, fail closed, for every stop signal.
-    #[cfg_attr(not(test), allow(dead_code))]
     TargetUnknown,
 }
 
-/// The WARN for a send of a stop signal that Detcore refused with EPERM
-/// under the in-guest delivery gate (A5 design D48, IR-4): `call` is the
-/// system call, `sender` the calling thread, `target` the thread or process it
-/// named. A program that ignores the EPERM and then waits for the target with
-/// `waitpid(WUNTRACED)` waits until the run's wall timeout (IR-4(c)).
-pub(crate) fn stop_signal_send_refused_warning(
+/// The refusal of a stop-signal send that the in-guest backends cannot hold
+/// (A5 design D48, amended by <https://github.com/rrnewton/hermit/issues/5430>),
+/// filed as `GlobalRequest::StopSendRefusal`: `call` is the system call,
+/// `sender` the calling thread, `target` the thread or process it named
+/// (`None`: one Detcore cannot name). A coordinator that owns the guests'
+/// PID namespace prints it as it ends the run; elsewhere the sender's WARN
+/// (`stop_signal_send_refused_warning`) carries it.
+pub(crate) fn stop_signal_send_refusal(
     call: &str,
     signum: i32,
     sender: i32,
-    target: i32,
+    target: Option<i32>,
     why: StopSendRefusal,
 ) -> String {
     let name = signal_name(signum);
     let why = match why {
         StopSendRefusal::Sigstop => "SIGSTOP always stops its target".to_string(),
         StopSendRefusal::DefaultAction => format!(
-            "the target's action for {name} is SIG_DFL (its /proc status SigIgn and SigCgt, read in \
-             the sender's turn), which stops it"
+            "Linux would not discard {name} when it is sent: the target's action for it is not \
+             SIG_IGN, or the target blocks it (its /proc status SigIgn and SigBlk, read in the \
+             sender's turn), so it would stop the target now or once it is unblocked"
         ),
         StopSendRefusal::StatusUnreadable => format!(
-            "the target's /proc status could not be read, so whether its action for {name} is \
-             SIG_DFL is unknown, and the send is refused, fail closed"
+            "the target's /proc status could not be read, so whether Linux would discard {name} \
+             is unknown, and the send is refused, fail closed"
         ),
         StopSendRefusal::Unsequentialized => format!(
             "threads are not sequentialized, so the target's action and mask for {name} could \
@@ -605,11 +608,44 @@ pub(crate) fn stop_signal_send_refused_warning(
                 .to_string()
         }
     };
+    let target = target.map_or_else(|| "unknown".to_string(), |target| target.to_string());
     format!(
         "HERMIT_STOP_SIGNAL_SEND_REFUSED signum={signum} ({name}) call={call} sender={sender} \
-         target={target}: received EPERM and nothing was sent: {why}, and the in-guest backend \
-         cannot stop a guest process on the schedule. A named refusal, not Linux's behaviour \
-         (A5 design D48, https://github.com/rrnewton/hermit/issues/4485)."
+         target={target}: nothing was sent: {why}, and the in-guest backend cannot stop a guest \
+         process on the schedule. A named refusal, not Linux's behaviour \
+         (https://github.com/rrnewton/hermit/issues/5430)"
+    )
+}
+
+/// The WARN of a sender whose stop-send refusal the coordinator answered,
+/// because it does not own the guests' PID namespace: the sender received
+/// EPERM. A program that ignores it and then waits for the target with
+/// `waitpid(WUNTRACED)` waits until the run's outer bound.
+pub(crate) fn stop_signal_send_refused_warning(refusal: &str) -> String {
+    format!(
+        "{refusal}; received EPERM; the run continues and ends with this refusal if it completes"
+    )
+}
+
+/// The line the coordinator prints as it ends the run on the stop-send
+/// refusal `refusal`, where its exit ends every guest.
+pub(crate) fn stop_signal_send_refusal_ends_the_run(refusal: &str) -> String {
+    format!("{refusal}; the run stops here: the scheduler owns the guests' PID namespace")
+}
+
+/// The WARN for a POSIX timer whose notification is a stop signal, refused
+/// with EPERM when it is created where the in-guest backends cannot hold a
+/// stop (<https://github.com/rrnewton/hermit/issues/5430>): at its expiry
+/// Detcore's scheduler would send the signal itself, through no guest send
+/// handler. `caller` is the calling thread.
+pub(crate) fn stop_signal_arming_refused_warning(signum: i32, caller: i32) -> String {
+    let name = signal_name(signum);
+    format!(
+        "HERMIT_STOP_SIGNAL_ARMING_REFUSED signum={signum} ({name}) call=timer_create \
+         caller={caller}: received EPERM and no timer was created: at its expiry Detcore's \
+         scheduler would send {name} itself, and the in-guest backend cannot stop a guest \
+         process on the schedule. A named refusal, not Linux's behaviour \
+         (https://github.com/rrnewton/hermit/issues/5430)."
     )
 }
 

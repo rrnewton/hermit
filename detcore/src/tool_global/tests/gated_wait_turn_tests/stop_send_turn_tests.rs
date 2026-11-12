@@ -196,6 +196,21 @@ async fn a_process_directed_sigtstp_is_judged_by_the_leaders_status() {
     }
 }
 
+/// A `pidfd_send_signal` row: name, descriptor, signal, siginfo address,
+/// flags, and the errno expected before any refusal (`None`: refused).
+type PidfdRow = (&'static str, i32, i32, usize, u32, Option<Errno>);
+
+/// A `timer_create` row: name, gate, clock, sigevent, expected result, and
+/// the number of stop-arming WARNs expected.
+type TimerRow = (
+    &'static str,
+    bool,
+    i32,
+    Option<KernelSigevent>,
+    Result<i64, Errno>,
+    usize,
+);
+
 /// A pidfd descriptor at `fd` in `guest`'s table naming `target`, or naming
 /// nothing Detcore knows (a received or inherited pidfd).
 fn add_pidfd(guest: &mut TurnGuest, fd: i32, target: Option<DetPid>) {
@@ -272,7 +287,7 @@ async fn a_stop_signal_through_a_pidfd_detcore_cannot_name_is_refused() {
     let _seam = signal_state_read_seam::install(|pid, tid| {
         panic!("a /proc read of {pid}/{tid} for a target Detcore cannot name")
     });
-    let rows: Vec<(&str, i32, i32, usize, u32, Option<Errno>)> = vec![
+    let rows: Vec<PidfdRow> = vec![
         ("SIGSTOP, no siginfo", 9, libc::SIGSTOP, 0, 0, None),
         ("SIGTSTP, no siginfo", 9, libc::SIGTSTP, 0, 0, None),
         (
@@ -437,14 +452,7 @@ async fn a_stop_signal_timer_is_refused_when_it_is_created() {
     let own = THREAD.as_raw();
     let peer = PEER.as_raw();
     let monotonic = libc::CLOCK_MONOTONIC;
-    let rows: Vec<(
-        &str,
-        bool,
-        i32,
-        Option<KernelSigevent>,
-        Result<i64, Errno>,
-        usize,
-    )> = vec![
+    let rows: Vec<TimerRow> = vec![
         (
             "SIGEV_SIGNAL SIGTSTP",
             true,

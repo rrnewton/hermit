@@ -6495,6 +6495,95 @@ fn in_guest_a_sigtstp_is_admitted_only_where_linux_discards_it_when_sent() {
             run.stderr
         );
     }
+    assert_admitted_sigtstp_logs_its_precondition();
+}
+
+/// The admission's logged precondition (design test 3(a),
+/// https://github.com/rrnewton/hermit/issues/5430): when the sender's turn
+/// read the waiting child's status, its SigBlk bit for SIGTSTP was clear and
+/// its SigIgn bit set. The decision is a DETLOG record of the in-guest Tool,
+/// which the runtime forwards into the run's internal log (the Tool's INFO
+/// lines never reach stderr on the in-guest routes), so the mode runs under
+/// strict verification with its logs kept: the comparison of the two runs'
+/// logs establishes bitwise parity, so the second run's log, which Hermit
+/// deletes once it matched, carried the same records, and the kept first
+/// run's log has the exact line, once.
+fn assert_admitted_sigtstp_logs_its_precondition() {
+    use hermit::canonical_verdict::VerificationReport;
+
+    use super::kvm_cancellation::bounded_read;
+
+    let directory = process_build_root("stop-send-e3a-verify");
+    let logs = directory.join("logs");
+    fs::create_dir_all(&logs).expect("verify-log directory");
+    let report_path = directory.join("verify.json");
+    let report_arg = format!("--verify-json={}", report_path.display());
+    let logs_arg = logs.display().to_string();
+    let run = run_stop_send(
+        "e3a-verify",
+        "in-guest-trap",
+        &[
+            "--verify",
+            "--verify-strict",
+            &report_arg,
+            "--keep-logs",
+            "--verify-log-dir",
+            &logs_arg,
+        ],
+        "tstp-ign",
+    );
+    assert!(
+        run.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        run.status,
+        run.stdout,
+        run.stderr
+    );
+    let report =
+        VerificationReport::from_current_json_slice(&bounded_read(&report_path, 16 * 1024 * 1024))
+            .expect("complete current verification report");
+    report
+        .require_canonical_match()
+        .expect("nonempty canonical INFO comparison must match");
+    report
+        .require_exact_output_match()
+        .expect("exact status/stdout/stderr comparison must match");
+    let expected = "[detcore, dtid 3] stop-signal send of 20 by kill to thread 5: SigIgn bit 1, \
+                    SigBlk bit 0, SigCgt bit 0: admitted";
+    assert!(report.bitwise_parity, "{}", run.stderr);
+    assert!(
+        run.stderr
+            .contains("Deleted run 2's log: it matched run 1's, which is kept as the golden log"),
+        "{}",
+        run.stderr
+    );
+    let decision = |prefix: &str| {
+        let paths: Vec<PathBuf> = fs::read_dir(&logs)
+            .expect("read the retained verify logs")
+            .map(|entry| entry.expect("a retained log").path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(prefix))
+            })
+            .collect();
+        assert_eq!(paths.len(), 1, "{prefix}: {paths:?}");
+        let log = String::from_utf8_lossy(&bounded_read(&paths[0], 64 * 1024 * 1024)).into_owned();
+        let lines: Vec<String> = log
+            .lines()
+            .filter(|line| line.contains("stop-signal send of"))
+            .map(|line| {
+                let message = line.split_once("DETLOG ").map_or(line, |(_, rest)| rest);
+                message
+                    .rsplit_once(" DETLOG_RECORD=")
+                    .map_or(message, |(message, _)| message)
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(lines, [expected], "{prefix}");
+        lines
+    };
+    decision("run1_log_");
 }
 
 /// The native control of which task's mask decides a process-directed send
@@ -6588,4 +6677,46 @@ fn on_ptrace_a_blocked_ignored_sigtstp_is_admitted() {
     );
     assert_eq!(run.stdout, native, "ptrace versus native");
     assert!(!run.stderr.contains(STOP_SEND_REFUSED), "{}", run.stderr);
+}
+
+/// The refusal's line and the last scheduler turn before it, from a run's
+/// INFO log, without each line's wall-clock prefix.
+fn refusal_and_last_turn(stderr: &str) -> (String, String) {
+    let without_clock = |line: &str| {
+        line.split_once(' ')
+            .filter(|(clock, _)| clock.ends_with('Z'))
+            .map_or(line, |(_, rest)| rest)
+            .to_string()
+    };
+    let refusal = stderr
+        .lines()
+        .find(|line| line.contains(STOP_SEND_REFUSED) && line.contains("the run stops here"))
+        .map(without_clock)
+        .unwrap_or_default();
+    let last_turn = stderr
+        .lines()
+        .take_while(|line| !line.contains(STOP_SEND_REFUSED))
+        .filter(|line| line.contains("DETLOG"))
+        .last()
+        .map(without_clock)
+        .unwrap_or_default();
+    (refusal, last_turn)
+}
+
+/// Design test 7 (https://github.com/rrnewton/hermit/issues/5430): the
+/// stopping refusal of a SIGSTOP is repeatable. Two in-guest-trap runs of the
+/// same guest print the same refusal line, byte for byte, after the same last
+/// scheduler turn in their INFO logs (each line without its wall-clock
+/// prefix), which each run writes under the test's own directory.
+#[test]
+fn in_guest_a_refused_sigstop_ends_two_runs_at_the_same_turn() {
+    let _guard = hermit_run_guard();
+    let runs = ["e6-first", "e6-second"]
+        .map(|label| run_stop_send(label, "in-guest-trap", &[], "kill-stop"));
+    for run in &runs {
+        assert_stop_send_refused("repeat", run, "kill-stop");
+    }
+    let [first, second] = runs.map(|run| refusal_and_last_turn(&run.stderr));
+    assert!(!first.0.is_empty() && !first.1.is_empty(), "{first:?}");
+    assert_eq!(first, second);
 }

@@ -4270,6 +4270,7 @@ async fn dispatch_backend(
             config.in_guest_site_patching_off = in_guest_site_patching_off(backend);
             config.in_guest_refuses_host_timed_producers =
                 in_guest_refuses_host_timed_producers(backend);
+            config.in_guest_refuses_stop_sends = in_guest_refuses_stop_sends(backend);
             // Last, from the configuration every Tool image receives.
             config.in_guest_reserved_signals = in_guest_reserved_signals(&config, backend);
             // The delivery gate, from the final configuration and whether
@@ -4666,6 +4667,7 @@ async fn dispatch_output_backend(
             config.in_guest_site_patching_off = in_guest_site_patching_off(backend);
             config.in_guest_refuses_host_timed_producers =
                 in_guest_refuses_host_timed_producers(backend);
+            config.in_guest_refuses_stop_sends = in_guest_refuses_stop_sends(backend);
             // Last, from the configuration every Tool image receives.
             config.in_guest_reserved_signals = in_guest_reserved_signals(&config, backend);
             // The delivery gate, from the final configuration and whether
