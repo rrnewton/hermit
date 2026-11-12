@@ -3309,6 +3309,7 @@ const SUBMODULE_SERVICE_FIXTURE_SOURCES: &[&str] = &[
     "detcore/src/tool_global.rs",
     "docs/BUCK2_OSS.md",
     "hermit-cli/BUCK",
+    "shim/hermetic_infra/hermit/fb-only/release.bzl",
     "scripts/build-buck-release.rs",
     "scripts/validate.rs",
     "scripts/lib/validate_history.rs",
