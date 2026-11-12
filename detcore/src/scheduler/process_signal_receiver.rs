@@ -499,11 +499,28 @@ impl Scheduler {
     /// (`retarget_shared_pending`, signal.c:3090). Only a thread queued to run
     /// is chosen; one parked in a wait is woken by the ordinary path, and its
     /// mark stands until then.
+    ///
+    /// Where a process signal control is installed (KVM), the thread's mask
+    /// is read as the admission and the choice read it (`controlled_mask`):
+    /// a call's temporary mask included, and that of a backend-served
+    /// `rt_sigsuspend` the drain woke and that has not run since
+    /// (`backend_suspend_woken`). Read as its own mask, a waiter that blocks
+    /// the signal outside the call lost its mark once the drain woke it, and
+    /// a sibling the same drain woke in the same wait, ahead of it in the run
+    /// queue, took the copy Linux gives the chosen thread alone (the Codex
+    /// review of https://github.com/rrnewton/hermit/pull/5415 at fcff78c8,
+    /// P1).
     pub(super) fn first_process_signal_taker(&mut self) -> Option<DetTid> {
         let threads: Vec<DetTid> = self.process_signal_takers.keys().copied().collect();
+        let controlled = self.signal_control_installed();
         for thread in threads {
             let shared = self.read_shared_pending(thread).unwrap_or(0);
-            let unblocked = self.stopped_thread_mask(thread).map_or(0, |mask| !mask);
+            let mask = if controlled {
+                self.controlled_mask(thread)
+            } else {
+                self.stopped_thread_mask(thread)
+            };
+            let unblocked = mask.map_or(0, |mask| !mask);
             let standing = self
                 .process_signal_takers
                 .get(&thread)
