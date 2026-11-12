@@ -949,3 +949,97 @@ fn a_readmitted_takers_mark_is_judged_under_its_continuation_mask() {
         );
     }
 }
+
+/// A claim is a wake choice, not a reservation (module docs; the
+/// deterministic-scheduling review of
+/// https://github.com/rrnewton/hermit/pull/5415 at 5055d688, finding P2).
+/// The leader probes a masked `pselect6` that lets SIGUSR1 in while its own
+/// mask blocks it, and its runnable sibling blocks SIGUSR1 when `kill` is
+/// sent, so the leader is the only thread Linux can choose: it is claimed,
+/// with no taker mark (a sole receiver needs none). The sibling then
+/// unblocks SIGUSR1 itself, and step 3 runs it first by queue order. Its
+/// return to user mode dequeues the shared copy, as Linux's `dequeue_signal`
+/// lets any thread that leaves it unblocked do (kernel/signal.c:618-640 at
+/// v7.1.3). The next audit finds the copy gone, drops the claim, and does
+/// not end the run. (A sibling that leaves SIGUSR1 unblocked when it is
+/// sent gives the leader a taker mark, and step 3 then resumes the leader
+/// first: `the_admitted_polling_receiver_probes_before_its_sibling`.)
+#[test]
+fn a_sibling_boundary_that_takes_a_claimed_copy_first_drops_the_claim() {
+    let usr1 = bit(libc::SIGUSR1);
+    let (mut s, control) = two_processes(state(0, 0, usr1, 0, usr1));
+    runnable(&mut s, SIBLING);
+    polling(&mut s, LEADER, "pselect6", Some(Errno::EINTR), Some(0));
+    assert_eq!(kill(&s, libc::SIGUSR1), catch(LEADER, CatchReach::Probe));
+    assert!(matches!(
+        s.process_signal_receiver(TARGET, LEADER, SENDER, libc::SIGUSR1),
+        ProcessSignalReceiver::Thread { thread, .. } if thread == LEADER
+    ));
+    s.process_signal_sent(SENDER, TARGET);
+    s.guest_send_committed(LEADER, SendScope::Process, libc::SIGUSR1);
+    assert!(
+        s.process_signal_takers.is_empty(),
+        "a sole receiver has no mark"
+    );
+    // The copy is in the shared queue, and the sibling has since unblocked
+    // SIGUSR1 (its own `rt_sigprocmask`).
+    control.script(LEADER, vec![Ok(state(0, usr1, usr1, 0, usr1))]);
+    control.script(SIBLING, vec![Ok(state(0, usr1, 0, 0, usr1))]);
+    assert_eq!(s.audit_guest_send_claims(), None);
+
+    let (first, _, _) = s.step3_peek().expect("a thread is runnable");
+    s.run_queue.undo_tentative_pop();
+    assert_eq!(
+        first, SIBLING,
+        "the runnable sibling reaches its boundary first"
+    );
+    // Its return to user mode takes the shared copy.
+    control.script(LEADER, vec![Ok(state(0, 0, usr1, 0, usr1))]);
+    control.script(SIBLING, vec![Ok(state(0, 0, 0, 0, usr1))]);
+    assert_eq!(s.audit_guest_send_claims(), None, "no refusal ends the run");
+    assert!(s.guest_send_claims.is_empty());
+    assert_eq!(s.first_process_signal_taker(), None);
+}
+
+/// The receiver choice's re-check that the sender would take its own copy
+/// first (`ProcessSignalReceiver::SenderTakesIt`) reads the sender's mask
+/// in the controlled view, as the admission and the walk read every thread's
+/// (the deterministic-scheduling review of
+/// https://github.com/rrnewton/hermit/pull/5415 at 5055d688, finding P3).
+/// A sibling that blocks SIGUSR1 sends it to its process naming the
+/// runnable leader, which leaves it unblocked: the leader takes it, and the
+/// sender is not refused as taking it first.
+#[test]
+fn the_sender_check_of_the_choice_reads_the_controlled_mask() {
+    let usr1 = bit(libc::SIGUSR1);
+    let (mut s, control) = two_processes(catching());
+    control.script(SIBLING, vec![Ok(state(0, 0, usr1, 0, usr1))]);
+    runnable(&mut s, LEADER);
+    let choice = s.process_signal_receiver(TARGET, LEADER, SIBLING, libc::SIGUSR1);
+    assert!(
+        matches!(choice, ProcessSignalReceiver::Thread { thread, .. } if thread == LEADER),
+        "{choice:?}"
+    );
+}
+
+/// `Scheduler::own_process_signal_choice` reads only the stopped view
+/// because the sends it follows (`Detcore::own_process_signal`) happen only
+/// where the kernel's signal state is the guest's own, and no such backend
+/// installs a process signal control.
+#[test]
+fn own_process_sends_never_meet_a_control() {
+    use reverie::BackendCapabilities;
+    for (name, backend) in [
+        ("ptrace", BackendCapabilities::PTRACE),
+        ("e9patch", BackendCapabilities::E9PATCH),
+        ("kvm", BackendCapabilities::KVM),
+        ("sabre", BackendCapabilities::SABRE),
+        ("dbt", BackendCapabilities::DBT),
+        ("liteinst in-guest", BackendCapabilities::LITEINST_IN_GUEST),
+    ] {
+        assert!(
+            !(backend.kernel_signal_state_is_guests && backend.provides_process_signal_control),
+            "{name}"
+        );
+    }
+}
