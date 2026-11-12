@@ -391,12 +391,17 @@ impl Scheduler {
         // This refusal is decided before `curr_target` moves: Linux moves
         // the pointer only on a successful walk choice, and a refused send
         // chooses nothing.
+        // The sender's mask is read as the choice read every thread's: with
+        // a control installed, the controlled view (`controlled_mask`).
+        let sender_mask = if controlled {
+            self.controlled_mask(sender)
+        } else {
+            self.stopped_thread_mask(sender)
+        };
         if let ProcessSignalReceiver::Thread { thread, .. } = receiver
             && thread != sender
             && process == self.sigchld_process(sender)
-            && self
-                .stopped_thread_mask(sender)
-                .is_none_or(|mask| mask & bit == 0)
+            && sender_mask.is_none_or(|mask| mask & bit == 0)
         {
             return ProcessSignalReceiver::SenderTakesIt;
         }
@@ -447,6 +452,14 @@ impl Scheduler {
     /// As in `process_signal_receiver`, a standard signal the shared queue
     /// already holds (`legacy_queue`) and one Linux discards as it is sent
     /// (`prepare_signal`) reach no walk.
+    ///
+    /// It reads each thread under `wants_signal`'s stopped view alone:
+    /// `Detcore::own_process_signal` forwards such a send only where the
+    /// kernel's signal state is the guest's own
+    /// (`BackendCapabilities::kernel_signal_state_is_guests`), and no such
+    /// backend installs a process signal control
+    /// (`own_process_sends_never_meet_a_control` pins that), so the
+    /// controlled view never applies here.
     pub(crate) fn own_process_signal_choice(&mut self, sender: DetTid, named: DetTid, signo: i32) {
         self.pending_signal_curr_target = None;
         if !self.models_signal_targets {

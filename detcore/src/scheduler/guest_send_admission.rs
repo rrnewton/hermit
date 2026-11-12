@@ -93,6 +93,36 @@
 //! Which of the two claims Linux settles first is the design's opportunity
 //! rule (slice D2); until then such an observation is refused
 //! (`Scheduler::contested_guest_send_claim`).
+//!
+//! A claim is a wake choice, not a reservation: it names the thread the
+//! scheduler wakes for the copy and does not reserve the copy for it.
+//! Linux's `complete_signal` only chooses which thread to wake and wakes it
+//! (`signal_wake_up`, kernel/signal.c:963-1032 at v7.1.3); the copy stays in
+//! the process's shared queue, every thread that leaves it unblocked has it
+//! pending (`recalc_sigpending_tsk`, :159-166), and the first such thread to
+//! return to user mode dequeues it (`dequeue_signal` reads the thread's own
+//! queue and then `signal->shared_pending`, :618-640). So an ordinary
+//! boundary of another thread of the process that leaves the signal
+//! unblocked, which the scheduler authorizes without reading the claims
+//! (`authorize_signal_boundary`), can take a copy claimed for a receiver
+//! that would take it at its next probe or once a gate releases it, if
+//! step 3 runs that thread first; the next audit finds the copy gone and
+//! drops the claim, and the run goes on, as on Linux. That boundary is in
+//! its own thread's serial grant, a point the schedule fixes. Only an
+//! observation, whose dequeue the observed thread's host thread makes, is
+//! refused (above).
+//!
+//! A probe stands for a sleeping call Linux will not interrupt, enforced by
+//! ORDER. Linux leaves a sibling asleep in `select` or `pselect6`: its
+//! `do_select` ends the sleep only on its own `signal_pending`
+//! (fs/select.c:575, :603). Here the sibling's probe is a real call that
+//! takes any pending copy its mask lets in, so the chosen thread runs first
+//! instead (`Scheduler::first_process_signal_taker`, which on a controlled
+//! backend returns a polling taker too) and its call takes the copy before
+//! the sibling probes. Order is all that enforces it: a thread step 3 ranks
+//! above the process taker (a group-exit decider, a reserved SIGALRM probe,
+//! a SIGCHLD taker, a taker with a lower `DetTid`) still runs first and can
+//! take the copy, as a thread Linux woke for a reason of its own can.
 
 use std::fmt;
 
