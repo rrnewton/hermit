@@ -24973,31 +24973,128 @@ fn signals_to_targets_that_are_not_live_answer_as_on_linux() {
     }
 }
 
+/// The sends of tests/c/cross_process_signal_admission.c to a runnable
+/// child, by each of the seven sending calls, in three groups by kind of
+/// call (see `assert_admitted_sends_match_linux`). The calls that name a
+/// signal number only.
+const SENDS_BY_KILL_TGKILL_OR_TKILL: [(&str, &str); 3] = [
+    ("runnable", "kill"),
+    ("runnable", "tgkill"),
+    ("runnable", "tkill"),
+];
+
+/// The calls that also queue a `siginfo` (see `SENDS_BY_KILL_TGKILL_OR_TKILL`).
+const SENDS_BY_SIGQUEUE_OR_TGSIGQUEUE: [(&str, &str); 2] =
+    [("runnable", "sigqueue"), ("runnable", "tgsigqueue")];
+
+/// The calls through a pidfd (see `SENDS_BY_KILL_TGKILL_OR_TKILL`).
+const SENDS_BY_PIDFD: [(&str, &str); 2] = [("runnable", "pidfd"), ("runnable", "pidfd-thread")];
+
+/// The sends of tests/c/cross_process_signal_admission.c, by `kill` and by
+/// `tgkill`, to a child that ignores the signal or waits for it.
+const SENDS_KVM_ADMITS: [(&str, &str); 10] = [
+    ("ignored", "kill"),
+    ("ignored", "tgkill"),
+    ("select", "kill"),
+    ("select", "tgkill"),
+    ("pselect", "kill"),
+    ("pselect", "tgkill"),
+    ("sigsuspend", "kill"),
+    ("sigsuspend", "tgkill"),
+    ("sigtimedwait", "kill"),
+    ("sigtimedwait", "tgkill"),
+];
+
+/// The sends of tests/c/cross_process_signal_admission.c, by `kill` and by
+/// `tgkill`, across a wait, a new thread or an exec.
+const SENDS_ACROSS_A_WAIT_A_THREAD_OR_AN_EXEC: [(&str, &str); 8] = [
+    ("waitfatal", "kill"),
+    ("waitfatal", "tgkill"),
+    ("recv", "kill"),
+    ("recv", "tgkill"),
+    ("newthread", "kill"),
+    ("newthread", "tgkill"),
+    ("exec", "kill"),
+    ("exec", "tgkill"),
+];
+
 /// tests/c/cross_process_signal_admission.c: a caught SIGUSR1 from a parent
 /// to its runnable child reaches the child once, with the sender's tgid and
-/// the `si_code` of each of the seven sending calls. On ptrace the kernel
-/// delivers it. On KVM Detcore admits each send in the sender's turn, as stage
-/// X1 slice C of the KVM cross-process signal design has it
-/// (https://github.com/rrnewton/hermit/issues/4485), and orders its delivery,
-/// with no refusal. Both match the native run.
+/// the `si_code` of the sending call, here `kill`, `tgkill` and `tkill`
+/// (`SENDS_BY_KILL_TGKILL_OR_TKILL`). On ptrace the kernel delivers it,
+/// matching the native run. The KVM twin is
+/// `run_kvm_guest_signals_to_another_process_by_kill_tgkill_or_tkill_match_linux`.
 #[test]
-fn guest_signals_to_another_process_from_each_sending_call_match_linux() {
+fn guest_signals_to_another_process_by_kill_tgkill_or_tkill_match_linux() {
     assert_admitted_sends_match_linux(
-        "guest_signals_to_another_process_from_each_sending_call_match_linux",
-        &[
-            ("runnable", "kill"),
-            ("runnable", "tgkill"),
-            ("runnable", "tkill"),
-            ("runnable", "sigqueue"),
-            ("runnable", "tgsigqueue"),
-            ("runnable", "pidfd"),
-            ("runnable", "pidfd-thread"),
-        ],
+        "guest_signals_to_another_process_by_kill_tgkill_or_tkill_match_linux",
+        AdmittedOn::Ptrace,
+        &SENDS_BY_KILL_TGKILL_OR_TKILL,
+    );
+}
+
+/// `guest_signals_to_another_process_by_kill_tgkill_or_tkill_match_linux` on
+/// KVM, where Detcore admits each send in the sender's turn, as stage X1
+/// slice C of the KVM cross-process signal design has it
+/// (https://github.com/rrnewton/hermit/issues/4485), and orders its delivery,
+/// with no refusal, matching the native run, and each run verified bitwise.
+#[test]
+fn run_kvm_guest_signals_to_another_process_by_kill_tgkill_or_tkill_match_linux() {
+    assert_admitted_sends_match_linux(
+        "run_kvm_guest_signals_to_another_process_by_kill_tgkill_or_tkill_match_linux",
+        AdmittedOn::Kvm,
+        &SENDS_BY_KILL_TGKILL_OR_TKILL,
+    );
+}
+
+/// As `guest_signals_to_another_process_by_kill_tgkill_or_tkill_match_linux`,
+/// by `rt_sigqueueinfo` and `rt_tgsigqueueinfo` (`SENDS_BY_SIGQUEUE_OR_TGSIGQUEUE`).
+#[test]
+fn guest_signals_to_another_process_by_sigqueue_or_tgsigqueue_match_linux() {
+    assert_admitted_sends_match_linux(
+        "guest_signals_to_another_process_by_sigqueue_or_tgsigqueue_match_linux",
+        AdmittedOn::Ptrace,
+        &SENDS_BY_SIGQUEUE_OR_TGSIGQUEUE,
+    );
+}
+
+/// `guest_signals_to_another_process_by_sigqueue_or_tgsigqueue_match_linux`
+/// on KVM, as in
+/// `run_kvm_guest_signals_to_another_process_by_kill_tgkill_or_tkill_match_linux`.
+#[test]
+fn run_kvm_guest_signals_to_another_process_by_sigqueue_or_tgsigqueue_match_linux() {
+    assert_admitted_sends_match_linux(
+        "run_kvm_guest_signals_to_another_process_by_sigqueue_or_tgsigqueue_match_linux",
+        AdmittedOn::Kvm,
+        &SENDS_BY_SIGQUEUE_OR_TGSIGQUEUE,
+    );
+}
+
+/// As `guest_signals_to_another_process_by_kill_tgkill_or_tkill_match_linux`,
+/// by `pidfd_send_signal` to the process and to its thread (`SENDS_BY_PIDFD`).
+#[test]
+fn guest_signals_to_another_process_by_pidfd_match_linux() {
+    assert_admitted_sends_match_linux(
+        "guest_signals_to_another_process_by_pidfd_match_linux",
+        AdmittedOn::Ptrace,
+        &SENDS_BY_PIDFD,
+    );
+}
+
+/// `guest_signals_to_another_process_by_pidfd_match_linux` on KVM, as in
+/// `run_kvm_guest_signals_to_another_process_by_kill_tgkill_or_tkill_match_linux`.
+#[test]
+fn run_kvm_guest_signals_to_another_process_by_pidfd_match_linux() {
+    assert_admitted_sends_match_linux(
+        "run_kvm_guest_signals_to_another_process_by_pidfd_match_linux",
+        AdmittedOn::Kvm,
+        &SENDS_BY_PIDFD,
     );
 }
 
 /// tests/c/cross_process_signal_admission.c, by `kill` and by `tgkill`, as in
-/// `guest_signals_to_another_process_from_each_sending_call_match_linux`:
+/// `guest_signals_to_another_process_by_kill_tgkill_or_tkill_match_linux`
+/// (`SENDS_KVM_ADMITS`), on ptrace:
 /// - ignored, blocked and default-ignored copies, and SIGCONT, leave the
 ///   child's `pause()` running until its own alarm;
 /// - `select`, `pselect6` under a temporary mask that admits the signal,
@@ -25006,23 +25103,25 @@ fn guest_signals_to_another_process_from_each_sending_call_match_linux() {
 fn guest_signals_to_another_process_that_kvm_admits_match_linux() {
     assert_admitted_sends_match_linux(
         "guest_signals_to_another_process_that_kvm_admits_match_linux",
-        &[
-            ("ignored", "kill"),
-            ("ignored", "tgkill"),
-            ("select", "kill"),
-            ("select", "tgkill"),
-            ("pselect", "kill"),
-            ("pselect", "tgkill"),
-            ("sigsuspend", "kill"),
-            ("sigsuspend", "tgkill"),
-            ("sigtimedwait", "kill"),
-            ("sigtimedwait", "tgkill"),
-        ],
+        AdmittedOn::Ptrace,
+        &SENDS_KVM_ADMITS,
+    );
+}
+
+/// `guest_signals_to_another_process_that_kvm_admits_match_linux` on KVM,
+/// the `select`, `pselect6` and `sigtimedwait` rows also verified bitwise.
+#[test]
+fn run_kvm_guest_signals_to_another_process_that_kvm_admits_match_linux() {
+    assert_admitted_sends_match_linux(
+        "run_kvm_guest_signals_to_another_process_that_kvm_admits_match_linux",
+        AdmittedOn::Kvm,
+        &SENDS_KVM_ADMITS,
     );
 }
 
 /// tests/c/cross_process_signal_admission.c, by `kill` and by `tgkill`, as in
-/// `guest_signals_to_another_process_from_each_sending_call_match_linux`:
+/// `guest_signals_to_another_process_by_kill_tgkill_or_tkill_match_linux`
+/// (`SENDS_ACROSS_A_WAIT_A_THREAD_OR_AN_EXEC`), on ptrace:
 /// - a default-fatal SIGTERM the child blocks and waits for in
 ///   `sigtimedwait` is taken by the wait, and the child lives;
 /// - `recv` on a socket pair ends as on Linux;
@@ -25034,16 +25133,19 @@ fn guest_signals_to_another_process_that_kvm_admits_match_linux() {
 fn guest_signals_to_another_process_across_a_wait_a_thread_or_an_exec_match_linux() {
     assert_admitted_sends_match_linux(
         "guest_signals_to_another_process_across_a_wait_a_thread_or_an_exec_match_linux",
-        &[
-            ("waitfatal", "kill"),
-            ("waitfatal", "tgkill"),
-            ("recv", "kill"),
-            ("recv", "tgkill"),
-            ("newthread", "kill"),
-            ("newthread", "tgkill"),
-            ("exec", "kill"),
-            ("exec", "tgkill"),
-        ],
+        AdmittedOn::Ptrace,
+        &SENDS_ACROSS_A_WAIT_A_THREAD_OR_AN_EXEC,
+    );
+}
+
+/// `guest_signals_to_another_process_across_a_wait_a_thread_or_an_exec_match_linux`
+/// on KVM, the `waitfatal` rows also verified bitwise.
+#[test]
+fn run_kvm_guest_signals_to_another_process_across_a_wait_a_thread_or_an_exec_match_linux() {
+    assert_admitted_sends_match_linux(
+        "run_kvm_guest_signals_to_another_process_across_a_wait_a_thread_or_an_exec_match_linux",
+        AdmittedOn::Kvm,
+        &SENDS_ACROSS_A_WAIT_A_THREAD_OR_AN_EXEC,
     );
 }
 
@@ -25059,23 +25161,48 @@ fn guest_signals_to_another_process_across_a_wait_a_thread_or_an_exec_match_linu
 const STRICT_VERIFY_ADMITTED_MODES: [&str; 5] =
     ["runnable", "select", "pselect", "sigtimedwait", "waitfatal"];
 
+/// The backend an admitted-send test runs its cases on
+/// (`assert_admitted_sends_match_linux`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AdmittedOn {
+    /// ptrace, where the kernel performs the send: the portable lane.
+    Ptrace,
+    /// KVM, where Detcore admits the send, and its `--verify` leg: a
+    /// `run_kvm_` test, which the KVM lane requires and the portable lane
+    /// skips.
+    Kvm,
+}
+
 /// Runs each `(mode, call)` case of tests/c/cross_process_signal_admission.c
-/// natively, then on ptrace and on KVM, each of which must print the native
-/// run's lines with no call refused by name. A case whose mode is in
-/// `STRICT_VERIFY_ADMITTED_MODES` runs on KVM once more under
+/// natively, then on `on`'s backend, which must print the native run's lines
+/// with no call refused by name. On KVM, a case whose mode is in
+/// `STRICT_VERIFY_ADMITTED_MODES` runs once more under
 /// `--verify --verify-strict`, which must print the same lines, compare the
 /// two runs bitwise with no relaxation, and find them identical, its
 /// `--verify-json` report saying bitwise parity over the same nonzero number
-/// of INFO records on each side. The cases
-/// are split across three tests so that each stays well inside nextest's
-/// 22-second CPU cap: each case costs about one CPU second for its two Hermit
-/// runs, and a verified case about one more for the two runs of `--verify`.
-fn assert_admitted_sends_match_linux(test: &str, cases: &[(&str, &str)]) {
+/// of INFO records on each side.
+///
+/// The cases are split across tests so that each stays inside nextest's
+/// 22-second CPU cap. Measured in the validate Cargo profile, each test alone:
+/// a runnable case, whose receiver runs system calls until the signal lands,
+/// costs about 3.9 CPU seconds on ptrace (one Hermit run) and about 4.3 on
+/// KVM (one run and the two of `--verify`), so its seven sending calls are
+/// split by kind of call into groups of three, two and two. The other modes
+/// cost about 1.3 CPU seconds a case or less: the ten cases of
+/// `SENDS_KVM_ADMITS` took 1.2 CPU seconds on ptrace and 1.4 on KVM, and the
+/// eight of `SENDS_ACROSS_A_WAIT_A_THREAD_OR_AN_EXEC` 10.3 and 2.9.
+fn assert_admitted_sends_match_linux(test: &str, on: AdmittedOn, cases: &[(&str, &str)]) {
+    if on == AdmittedOn::Kvm && kvm_unavailable(test) {
+        return;
+    }
     let _guard = hermit_run_guard();
     let guest = cross_process_signal_admission_guest()
         .to_str()
         .expect("guest path should be UTF-8");
-    let kvm = !kvm_unavailable(test);
+    let backend = match on {
+        AdmittedOn::Ptrace => "--backend=ptrace",
+        AdmittedOn::Kvm => "--backend=kvm",
+    };
     for &(mode, call) in cases {
         let native = Command::new(guest)
             .args([mode, call])
@@ -25087,33 +25214,27 @@ fn assert_admitted_sends_match_linux(test: &str, cases: &[(&str, &str)]) {
             native.contains(&format!("{call} of ")) && !native.contains("child exited 4"),
             "the native run is the oracle, {mode} {call}:\n{native}"
         );
-        for backend in ["--backend=ptrace", "--backend=kvm"] {
-            if backend == "--backend=kvm" && !kvm {
-                continue;
-            }
-            let args = [
-                backend,
-                "run",
-                "--strict",
-                "--base-env=minimal",
-                "--",
-                guest,
-                mode,
-                call,
-            ];
-            let output = hermit(&args);
-            assert_success(&output, &args);
-            assert_eq!(stdout(&output), native, "{backend}, {mode} {call}");
-            let stderr = stderr(&output);
-            assert!(
-                !stderr
-                    .lines()
-                    .any(|line| line.contains(" refused: ")
-                        || line.contains(" refused by the backend")),
-                "{backend}, {mode} {call}: a call was refused by name\nstderr:\n{stderr}"
-            );
-        }
-        if !kvm || !STRICT_VERIFY_ADMITTED_MODES.contains(&mode) {
+        let args = [
+            backend,
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--",
+            guest,
+            mode,
+            call,
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), native, "{backend}, {mode} {call}");
+        let run_log = stderr(&output);
+        assert!(
+            !run_log
+                .lines()
+                .any(|line| line.contains(" refused: ") || line.contains(" refused by the backend")),
+            "{backend}, {mode} {call}: a call was refused by name\nstderr:\n{run_log}"
+        );
+        if on == AdmittedOn::Ptrace || !STRICT_VERIFY_ADMITTED_MODES.contains(&mode) {
             continue;
         }
         let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
