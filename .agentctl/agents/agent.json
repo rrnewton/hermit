@@ -1,0 +1,1 @@
+"agentctl registry layout 2: each agent lives in agents/<name>/ and its locks in locks/. This file is not an agent; it makes agentctl builds older than layout 2 refuse this registry instead of misreading it. Upgrade agentctl."

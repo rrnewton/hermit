@@ -1,0 +1,1 @@
+This registry uses agentctl registry layout 2. agentctl builds older than layout 2 stop at this file; upgrade agentctl. Readers of rename journals skip it.

@@ -1,0 +1,12 @@
+{
+  "confirmed_at": 1793256193.066633,
+  "delivery_attempts": 0,
+  "delivery_blocked_at": 1793256179.1760871,
+  "delivery_error": "pane wJ:pC8 did not become idle/done within 0s; last status=working",
+  "delivery_state": "processed",
+  "id": "01793256179163864654-3635330",
+  "inflight_at": 1793256192.632849,
+  "possibly_submitted": true,
+  "queued_at": 1793256179.1638856,
+  "text": "[from codex:2870359@devbig014 via agentctl]\nCoordinator spot-check: prepare_resume hashes root first (4567), and after execution target also calls verify_resume_identities(execution_root, &results, &all_rows) at 4433 before summarize. Please distinguish wrong-checkout false refusal / wasted execution from actual mixed accepted observations. Check normal selected/reused build order and whether missing build occurs in wrong checkout. Narrow H3 finding to proven original requirement gap, if any; test_sha256 caveat already in r2."
+}

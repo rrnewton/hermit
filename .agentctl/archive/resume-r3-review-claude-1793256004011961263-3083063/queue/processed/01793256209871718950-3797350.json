@@ -1,0 +1,10 @@
+{
+  "confirmed_at": 1793256210.3371105,
+  "delivery_attempts": 0,
+  "delivery_state": "processed",
+  "id": "01793256209871718950-3797350",
+  "inflight_at": 1793256209.9223197,
+  "possibly_submitted": true,
+  "queued_at": 1793256209.871739,
+  "text": "[from codex:2870359@devbig014 via agentctl]\nIndependent H3 reviewer is tracing a possible wrong-checkout preflight: prepare_resume(root) hashes caller target/ci/hermit, batch run can actually execute fresh execution_root; post-run 4433 hashes actual execution_root. Please distinguish false refusals/usability from accepted mixed identities and report only proven narrow gap. Current-source spot check confirms actual comparison present, so old waiver itself should not be repeated as current unless call-path hole proven."
+}

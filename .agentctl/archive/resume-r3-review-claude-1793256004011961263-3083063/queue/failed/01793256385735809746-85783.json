@@ -1,0 +1,12 @@
+{
+  "delivery_attempts": 1,
+  "delivery_error": "pane wJ:pC7 agent-prompt outcome is unknown; prompt may have been submitted: cannot verify peer pane wJ:pC8 after submission to wJ:pC7: pane read wJ:pC8: {\"error\":{\"code\":\"pane_not_found\",\"message\":\"pane wJ:pC8 not found\"},\"id\":\"cli:pane:read\"}; delivery attribution remains unproven",
+  "delivery_failed_at": 1793256456.0525324,
+  "delivery_state": "inflight",
+  "id": "01793256385735809746-85783",
+  "inflight_at": 1793256385.8082385,
+  "possibly_submitted": true,
+  "queued_at": 1793256385.7358322,
+  "text": "[from codex:2870359@devbig014 via agentctl]\nThanks; final report is visible. Please return any missing verification tail directly in terminal, no messaging discovery or writes. Coordinator verified H2 11799-11804 and M9 2314. For goalpost memory exemption at 9166/9175, do not call it justified solely because in-process write_plan checked; standalone resumes have no replacement full-graph validation, including zero-missing empty DAG case where completion map detection can succeed. Please confirm comparison with base and any invariant restored elsewhere. No additional broad review needed.",
+  "tui_delivery_attempts": 1
+}

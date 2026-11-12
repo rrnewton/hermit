@@ -1,0 +1,6 @@
+{
+  "artifact": "01793256385735809746-85783.json",
+  "error": "pane wJ:pC7 agent-prompt outcome is unknown; prompt may have been submitted: cannot verify peer pane wJ:pC8 after submission to wJ:pC7: pane read wJ:pC8: {\"error\":{\"code\":\"pane_not_found\",\"message\":\"pane wJ:pC8 not found\"},\"id\":\"cli:pane:read\"}; delivery attribution remains unproven",
+  "failed_at": 1793256456.0536666,
+  "outcome": "possibly_submitted"
+}
