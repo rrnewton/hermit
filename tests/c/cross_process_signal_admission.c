@@ -28,6 +28,11 @@
  *   pselect        The same in pselect6(2) under a temporary mask that admits
  *                  it, the child's own mask blocking it: EINTR.
  *   sigsuspend     The same in sigsuspend(2): EINTR, after the handler.
+ *   sigsuspend-two The same to a child with two threads, both in
+ *                  sigsuspend(2) under that temporary mask, sent to the
+ *                  process naming its first thread: Linux wakes that thread
+ *                  alone (complete_signal), which runs the handler, and the
+ *                  other thread is still in sigsuspend afterwards.
  *   sigtimedwait   SIGUSR1, blocked, to a child waiting for it in
  *                  sigtimedwait(2): the call returns it, no handler runs.
  *   poll           A caught SIGUSR1 to a child in poll(2) on an empty pipe:
@@ -227,6 +232,31 @@ static void *new_thread_main(void *arg) {
   return NULL;
 }
 
+/* The sigsuspend-two mode's other thread: it says it is about to wait, and
+ * waits in sigsuspend under the same temporary mask as the first thread. If
+ * it is the one that returns, it reports that and ends the child. */
+static int thread_ready_pipe[2];
+static sigset_t suspend_admit;
+static volatile sig_atomic_t other_returned = 0;
+
+static void child_wait_for_go(void);
+
+static void *other_suspend_main(void *arg) {
+  (void)arg;
+  char byte = 't';
+  if (write(thread_ready_pipe[1], &byte, 1) != 1) {
+    _exit(CHILD_SETUP_FAILED);
+  }
+  int result = sigsuspend(&suspend_admit);
+  int error = errno;
+  other_returned = 1;
+  child_wait_for_go();
+  report_call("sigsuspend in the other thread", result, error);
+  report_usr1();
+  printf("child: the handler ran in the %s thread\n", usr1_in_new_thread ? "other" : "first");
+  _exit(alarm_count ? CHILD_TIMED_OUT : 0);
+}
+
 /* Wait for the parent's go byte before reporting. */
 static void child_wait_for_go(void) {
   if (go_seen) {
@@ -325,6 +355,36 @@ static void child_main(const char *mode) {
     child_wait_for_go();
     report_call("sigsuspend", result, errno);
     report_usr1();
+    _exit(alarm_count ? CHILD_TIMED_OUT : 0);
+  }
+  if (strcmp(mode, "sigsuspend-two") == 0) {
+    install_usr1();
+    block(SIGUSR1);
+    sigprocmask(SIG_SETMASK, NULL, &suspend_admit);
+    sigdelset(&suspend_admit, SIGUSR1);
+    sigdelset(&suspend_admit, SIGALRM);
+    if (pipe(thread_ready_pipe) != 0) {
+      _exit(CHILD_SETUP_FAILED);
+    }
+    pthread_t other;
+    if (pthread_create(&other, NULL, other_suspend_main, NULL) != 0) {
+      _exit(CHILD_SETUP_FAILED);
+    }
+    char byte;
+    if (read(thread_ready_pipe[0], &byte, 1) != 1) {
+      _exit(CHILD_SETUP_FAILED);
+    }
+    alarm(10);
+    child_ready();
+    int result = sigsuspend(&suspend_admit);
+    int error = errno;
+    child_wait_for_go();
+    report_call("sigsuspend in the first thread", result, error);
+    report_usr1();
+    printf(
+        "child: the handler ran in the %s thread; the other thread %s\n",
+        usr1_in_new_thread ? "other" : "first",
+        other_returned ? "returned from sigsuspend" : "is still in sigsuspend");
     _exit(alarm_count ? CHILD_TIMED_OUT : 0);
   }
   if (strcmp(mode, "sigtimedwait") == 0) {

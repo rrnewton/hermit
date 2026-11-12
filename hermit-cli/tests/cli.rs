@@ -24991,8 +24991,9 @@ const SENDS_BY_SIGQUEUE_OR_TGSIGQUEUE: [(&str, &str); 2] =
 const SENDS_BY_PIDFD: [(&str, &str); 2] = [("runnable", "pidfd"), ("runnable", "pidfd-thread")];
 
 /// The sends of tests/c/cross_process_signal_admission.c, by `kill` and by
-/// `tgkill`, to a child that ignores the signal or waits for it.
-const SENDS_KVM_ADMITS: [(&str, &str); 10] = [
+/// `tgkill`, to a child that ignores the signal or waits for it, and by
+/// `kill` to a child whose two threads both wait in `sigsuspend`.
+const SENDS_KVM_ADMITS: [(&str, &str); 11] = [
     ("ignored", "kill"),
     ("ignored", "tgkill"),
     ("select", "kill"),
@@ -25003,6 +25004,7 @@ const SENDS_KVM_ADMITS: [(&str, &str); 10] = [
     ("sigsuspend", "tgkill"),
     ("sigtimedwait", "kill"),
     ("sigtimedwait", "tgkill"),
+    ("sigsuspend-two", "kill"),
 ];
 
 /// The sends of tests/c/cross_process_signal_admission.c, by `kill` and by
@@ -25098,7 +25100,9 @@ fn run_kvm_guest_signals_to_another_process_by_pidfd_match_linux() {
 /// - ignored, blocked and default-ignored copies, and SIGCONT, leave the
 ///   child's `pause()` running until its own alarm;
 /// - `select`, `pselect6` under a temporary mask that admits the signal,
-///   `sigsuspend` and `sigtimedwait` end as on Linux.
+///   `sigsuspend` and `sigtimedwait` end as on Linux;
+/// - with both of the child's threads in `sigsuspend` under such a mask,
+///   `kill` is refused by name (`PTRACE_REFUSED_ADMITTED_MODES`).
 #[test]
 fn guest_signals_to_another_process_that_kvm_admits_match_linux() {
     assert_admitted_sends_match_linux(
@@ -25109,7 +25113,15 @@ fn guest_signals_to_another_process_that_kvm_admits_match_linux() {
 }
 
 /// `guest_signals_to_another_process_that_kvm_admits_match_linux` on KVM,
-/// the `select`, `pselect6` and `sigtimedwait` rows also verified bitwise.
+/// the `select`, `pselect6`, `sigtimedwait` and two-thread `sigsuspend` rows
+/// also verified bitwise. With both of the child's threads in `sigsuspend`
+/// under a mask that admits the signal, `kill` wakes the first thread alone,
+/// which runs the handler, while the other is still in `sigsuspend`
+/// afterwards, as on Linux. The two-thread row shows by the guest's output
+/// which thread took the copy; that its sibling is not woken at all leaves
+/// no trace in the output, and two runs of one build compare equal either
+/// way, so it is shown by the scheduler's unit tests instead
+/// (`the_unchosen_suspend_sibling_stays_asleep_and_has_no_turn`).
 #[test]
 fn run_kvm_guest_signals_to_another_process_that_kvm_admits_match_linux() {
     assert_admitted_sends_match_linux(
@@ -25154,12 +25166,27 @@ fn run_kvm_guest_signals_to_another_process_across_a_wait_a_thread_or_an_exec_ma
 /// receiver, which takes its copy at a boundary of its own
 /// (`CatchReach::Boundary`), and the receivers whose next probe takes it
 /// (`CatchReach::Probe`: `select`, `pselect6`, `rt_sigtimedwait`, including
-/// the wait for a blocked default-fatal SIGTERM). Native equality alone does
+/// the wait for a blocked default-fatal SIGTERM), and the first of two
+/// threads in a backend-served `sigsuspend` (`CatchReach::BackendSuspend`),
+/// whose sibling must not take the copy. Native equality alone does
 /// not show that two runs commit the same schedule, so these rows need the
 /// bitwise comparison too (condition C1 of the deterministic-scheduling
 /// review of https://github.com/rrnewton/hermit/pull/5415).
-const STRICT_VERIFY_ADMITTED_MODES: [&str; 5] =
-    ["runnable", "select", "pselect", "sigtimedwait", "waitfatal"];
+const STRICT_VERIFY_ADMITTED_MODES: [&str; 6] = [
+    "runnable",
+    "select",
+    "pselect",
+    "sigtimedwait",
+    "waitfatal",
+    "sigsuspend-two",
+];
+
+/// The modes of `SENDS_KVM_ADMITS` that ptrace refuses by name. With both of
+/// the child's threads asleep in `rt_sigsuspend`, which ptrace leaves to the
+/// kernel, Detcore cannot choose the receiving thread as Linux's
+/// `complete_signal` does, since the kernel would wake one at a moment host
+/// timing sets (https://github.com/rrnewton/hermit/issues/4034).
+const PTRACE_REFUSED_ADMITTED_MODES: [&str; 1] = ["sigsuspend-two"];
 
 /// The backend an admitted-send test runs its cases on
 /// (`assert_admitted_sends_match_linux`).
@@ -25182,14 +25209,17 @@ enum AdmittedOn {
 /// `--verify-json` report saying bitwise parity over the same nonzero number
 /// of INFO records on each side.
 ///
+/// On ptrace, a mode in `PTRACE_REFUSED_ADMITTED_MODES` must instead be
+/// refused by name, with the policy status.
+///
 /// The cases are split across tests so that each stays inside nextest's
 /// 22-second CPU cap. Measured in the validate Cargo profile, each test alone:
 /// a runnable case, whose receiver runs system calls until the signal lands,
 /// costs about 3.9 CPU seconds on ptrace (one Hermit run) and about 4.3 on
 /// KVM (one run and the two of `--verify`), so its seven sending calls are
 /// split by kind of call into groups of three, two and two. The other modes
-/// cost about 1.3 CPU seconds a case or less: the ten cases of
-/// `SENDS_KVM_ADMITS` took 1.2 CPU seconds on ptrace and 1.4 on KVM, and the
+/// cost about 1.3 CPU seconds a case or less: the eleven cases of
+/// `SENDS_KVM_ADMITS` took 1.4 CPU seconds on ptrace and 1.5 on KVM, and the
 /// eight of `SENDS_ACROSS_A_WAIT_A_THREAD_OR_AN_EXEC` 10.3 and 2.9.
 fn assert_admitted_sends_match_linux(test: &str, on: AdmittedOn, cases: &[(&str, &str)]) {
     if on == AdmittedOn::Kvm && kvm_unavailable(test) {
@@ -25225,6 +25255,17 @@ fn assert_admitted_sends_match_linux(test: &str, on: AdmittedOn, cases: &[(&str,
             call,
         ];
         let output = hermit(&args);
+        if on == AdmittedOn::Ptrace && PTRACE_REFUSED_ADMITTED_MODES.contains(&mode) {
+            assert_hermit_refusal_contains(
+                &output,
+                Refusal::Policy,
+                &[
+                    "cannot choose the receiving thread",
+                    "https://github.com/rrnewton/hermit/issues/4034",
+                ],
+            );
+            continue;
+        }
         assert_success(&output, &args);
         assert_eq!(stdout(&output), native, "{backend}, {mode} {call}");
         let run_log = stderr(&output);
