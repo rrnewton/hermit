@@ -1,0 +1,54 @@
+[hermit2, musetrain, tbh-1005, devbig014, role=impl]
+
+**Plain Language Summary and Project Impact**
+
+This change makes the CPU profile Hermit presents to a guest (`--cpu-profile`, the x86-64 micro-architecture level behind CPUID, `/proc/cpuinfo`, `AT_HWCAP2` and the saved-config fingerprint) resolve itself when it is not named. The unset default is now `auto`: before launch, Hermit reads the ISA declarations (`GNU_PROPERTY_X86_ISA_1_NEEDED`) of the image the guest will exec first and of that image's program interpreter, and records the lowest profile that presents everything they declare (`x86-64-v2`, or `x86-64-v3` where a declaration needs it). An explicitly named profile is never overridden, and a guest image that declares more than its profile presents is refused by name before it runs. The resolved profile is saved with every saved run config, so replay, verification and manifest reruns use the recorded profile and never derive one again.
+
+Before this change, the default was always v2, so a v3-declaring guest under the default either ran with a CPU that hid what its loader checked for, or needed a human to know to pass `--cpu-profile x86-64-v3`; and a stale explicit choice had no launch-time check against what the first image actually declares. After it, the default follows the guest's own declarations, with the derivation named in the `--log=info` diagnostic and in every saved config.
+
+The re-review delta on `drain/4709` (revcodex CHANGES REQUESTED at `4409ffd2`) fixes the places where the first implementation read the wrong evidence that are closed at this head: Auto resolves through the record/run launch-view mapping for the direct cases, follows valid script interpreter chains the way the kernel does, never classifies the original program for a replay-only `--verify-replay-of` run, and refuses incomplete ISA scan evidence instead of selecting from a lower bound. One completed-launch-view half remains open under a recorded waiver (see **Known limitation** below). The KVM coverage claim is narrowed to what the backend does today.
+
+**Determinism**
+
+The selected profile is a function of bytes in the guest's own images: the `GNU_PROPERTY_X86_ISA_1_NEEDED` properties of the first executed image and its program interpreter, read at file offsets and through the mapped image the loader itself reads. It does not read host CPUID, wall time, or any host state to choose; the same guest images under the same options always derive the same profile. A declaration above every profile, unreadable evidence, a malformed property, a script chain past the bound, and (for the automatic consumer) a declaration beside scan evidence that could not be decided all refuse by name instead of guessing, so no run's CPU and fingerprint are ever built on sand. Where Detcore's per-exec check of each executed image and interpreter (`Detcore::isa_refusal`) runs, it remains what refuses a run whose actual objects need more; the launch-time derivation only chooses the profile. The limits of that statement are named in **Known limitation** below.
+
+**Linux Semantics**
+
+Two kernel rules are followed. First, what an image declares: Linux's ELF loader parses `PT_GNU_PROPERTY` notes and the x86 property handling derives the ISA level an image needs (`load_elf_binary` and `arch_parse_elf_property`, [fs/binfmt_elf.c](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/fs/binfmt_elf.c?h=v6.9) and [arch/x86/include/asm/elf.h](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/arch/x86/include/asm/elf.h?h=v6.9)); glibc's loader then checks that need against the CPU it sees, which under Hermit is the profile Detcore presents. This change reads the same properties the same way (the segment holding file offset 0 at the load bias, the note at its address there, a property's size as its unsigned 32-bit count) and refuses above the presented level, as the loader's check would end the run. Second, what a script execs: [`load_script` in fs/binfmt_script.c](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/fs/binfmt_script.c?h=v6.9) reads the first 256 bytes, ends the line at the first newline and the interpreter path at a space, tab or NUL, and the interpreter may itself be a script, bounded by the kernel's recursion handling. Auto follows that chain with the same boundaries and its own bound of four hops.
+
+**Validation**
+
+At `drain/4709` head `23ea511ef82248b88b15b5f7ea52ae5d61e3fa40` on hermit main `5c4cbb15fa23ff7b7e6aa6e3bab5463acc87d413` (targeted slices; the P3-only top commit changes two tests and no product code):
+
+- Sequential Detcore `exec_` slice: 187 passed; Detcore `exec_record`: 24 passed; detcore-model `cpu_profile`: 4 passed; hermit-run `--lib cpu_profile`: 21 passed.
+- CLI `auto` selection: 10 passed; `replay_only_ignores_an_unused_requested_cpu_profile`: 1 passed with the flag-v3 row now placing `--cpu-profile` before `--`.
+- `mapped_launch_path_preserves_an_exact_file_bind`: 1 passed comparing raw `OsStr`; with the mapper temporarily mutated back to `source.join(suffix)` it fails (`Some("/host/prog-source/") != Some("/host/prog-source")`).
+- hermit-manifest-plan `validation_dag::`: 42 passed; `generate-validation-dag -- --check` canonical/fresh; `cargo fmt --all -- --check` passes; workspace Clippy at the parent head and `hermit-run` Clippy at this head pass with `-D warnings`.
+
+No full validate is claimed for this head; the drain batch validate at the exact landed SHA is the landing evidence.
+
+**Known limitation (waived by coordinator, minibead dh-dw4dy)**
+
+Waiver: coordinator, 2026-11-05 3:19 AM ET. Follow-up: minibead dh-dw4dy ("4709 follow-up: CPU-profile Auto must resolve image and interpreters in the launch's mount/root/cwd view").
+
+Auto does not yet resolve the initial image and every script/ELF interpreter wholly inside the launch's completed mount/root/cwd view at every launch boundary. Measured witnesses, all false **named** refusals (exit 122) on the measured path, with explicit `x86-64-v2` running:
+
+- a symlink alias into a file-bind target;
+- a relative script interpreter (`#!./interp`) under `--workdir`;
+- an unmarked source bound over a v4-declaring host target at the public library admission boundary.
+
+This is fail-closed under the ptrace backend by Detcore's per-exec ISA check. It is **not** a universal cross-backend fail-closed guarantee. It is not guaranteed where:
+
+- `isa_refusal` is skipped for declared launchers / no CPUID interception (`detcore/src/syscalls/namespace.rs:1746-1748`);
+- public KVM ignores Command mounts/chroot (`hermit-cli/src/lib.rs:3131-3134`);
+- later KVM exec checking is disclosed absent (`detcore/src/syscalls/namespace.rs:1731-1738`).
+
+No silent under-selection witness has been established. The fix route in dh-dw4dy is Reverie Command mount/chroot accessors, a Hermit Reverie pin bump, completed-view resolution at every boundary, and the public file-bind regression.
+
+**Human Review Required**
+
+`post-facto-human-review` trigger 3 (new determinization strategy): an unnamed CPU profile is now derived from guest ISA declarations and recorded, changing what CPU and fingerprint every default run presents. Per that protocol, this change needs human review after the fact and the advertised dual adversarial review (Claude and Codex reviewers) bound to the exact head, with fixes landed fix-forward.
+
+Goalpost disclosure: the original stack's review-goalpost finding and its restoration (`goalpost-restoration.md` in the PR history) stand as recorded; this re-review delta does not move any goalpost — no assertion, tolerance, comparator, lane budget or test was weakened. The waived completed-launch-view half above is disclosed as a known limitation, not reclassified as fixed.
+
+**Test Plan** (queue fixes, head `16d901776f00cfddf2569988331f28c7c91efc60`): three full-profile reds on this stack's own defaults — direct Detcore test launches, adapter/record refusal ordering, standalone in-guest config round-trip — each reproduced red at the prior head and green at its fix; exact commands/counts in those commits' messages. Full-profile evidence: queue resubmission at this head.

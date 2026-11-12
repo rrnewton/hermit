@@ -1,0 +1,22 @@
+Running as unit: run-p319137-i3547863929.scope; invocation ID: 3026039e3bb742bf8bbfdcbe5b705a62
+
+running 1 test
+app::record_start::tests::mapped_launch_path_preserves_an_exact_file_bind --- FAILED
+
+failures:
+
+---- app::record_start::tests::mapped_launch_path_preserves_an_exact_file_bind stdout ----
+
+thread 'app::record_start::tests::mapped_launch_path_preserves_an_exact_file_bind' (367012) panicked at hermit-cli/src/bin/hermit/record_start.rs:2053:9:
+assertion `left == right` failed
+  left: Some("/host/prog-source/")
+ right: Some("/host/prog-source")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    app::record_start::tests::mapped_launch_path_preserves_an_exact_file_bind
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1309 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p hermit-run --lib`

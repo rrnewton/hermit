@@ -1,0 +1,111 @@
+    /// than when this run finds it finished.
+    ///
+    /// The recording ran `hermit run`'s policy in `step2c_process_io_blockers`
+    /// and logged each readmission it made. That policy readmits, while other
+    /// work is runnable, only a vfork-gated child, and otherwise every
+    /// finished call; with nothing queued, no timed waiter and a call still
+    /// out, it spins. So a logged readmission due while work is runnable is
+    /// that child's, and is applied here. Otherwise `step2c_replay_rejoin`
+    /// applies a readmission due now, or, with none due, goes on where the
+    /// recording went on and waits where it spun: there the recording
+    /// readmitted at this very point the first call to finish, so the replay
+    /// waits for the call its log names.
+    ///
+    /// A replay that has left its record without being refused yet could
+    /// stall where no logged readmission can become due before a readmission
+    /// happens, so in those states it leaves its record instead:
+    /// - where a backgrounded vfork-gated child holds the schedule and the
+    ///   record readmits nothing at this point, once the point has not moved
+    ///   for the valve;
+    /// - where only a readmission could move the point and a finished call
+    ///   is parked (`stuck` below), and where the record has no readmission
+    ///   left and a finished call is parked, after the valve.
+    fn step2c_run_replay_rejoin(
+        &mut self,
+        blockers: &[(DetTid, ExternalOpId, bool)],
+        ready: &[DetTid],
+        only_pollers: bool,
+        requeue_ready: impl Fn(&mut Self, &[DetTid]),
+    ) -> Result<(), SkipTurn> {
+        if !self.run_queue.is_empty() && !only_pollers {
+            if self.rejoin_due_now() {
+                return self.step2c_replay_rejoin(blockers, ready, requeue_ready, true);
+            }
+            // With the vfork gate on, step 3 commits nothing while the gated
+            // child is backgrounded, except a SIGCHLD taker's or a group-exit
+            // decider's turn, so this point moves only through those. A
+            // record whose next readmission is not due here waits for them,
+            // as its recording did, and is left once the point has not moved
+            // for the valve: nothing else could make it due.
+            if let Some(child) = self.vfork_gated_background_child() {
+                let point = (self.turn, self.empty_queue_wakes);
+                let since = match self.replay_gated_since {
+                    Some((at, since)) if at == point => since,
+                    _ => {
+                        let now = std::time::Instant::now();
+                        self.replay_gated_since = Some((point, now));
+                        now
+                    }
+                };
+                if since.elapsed() >= Self::REJOIN_STALL_VALVE {
+                    let reason = format!(
+                        "the backgrounded vfork child thread {} held the schedule at turn {} \
+                         after {} timer wakes for {} s, and the record readmits {}",
+                        child.as_raw(),
+                        self.turn,
+                        self.empty_queue_wakes,
+                        Self::REJOIN_STALL_VALVE.as_secs(),
+                        self.next_logged_readmission()
+                    );
+                    self.replay_gated_since = None;
+                    self.leave_replayed_record(reason);
+                    return Err(SkipTurn);
+                }
+            } else {
+                self.replay_gated_since = None;
+            }
+            return Ok(());
+        }
+        // A record with no readmission left readmits nothing more, so a
+        // finished call this policy would readmit stays parked while pollers
+        // spin on it. Its recording either ended with the call still out, and
+        // so does this run soon, or this replay has left its record: past the
+        // valve it goes on as a fresh run.
+        let exhausted = self
+            .rejoin_replay
+            .as_ref()
+            .is_some_and(|rejoins| rejoins.is_empty());
+        if exhausted && !ready.is_empty() {
+            let since = *self
+                .replay_exhausted_since
+                .get_or_insert_with(std::time::Instant::now);
+            if since.elapsed() >= Self::REJOIN_STALL_VALVE {
+                let reason = format!(
+                    "the record has no readmission left, and finished calls of threads {:?} \
+                     stayed parked {} s, up to turn {}",
+                    ready.iter().map(|dtid| dtid.as_raw()).collect::<Vec<_>>(),
+                    Self::REJOIN_STALL_VALVE.as_secs(),
+                    self.turn
+                );
+                self.replay_exhausted_since = None;
+                self.leave_replayed_record(reason);
+                return Err(SkipTurn);
+            }
+        } else {
+            self.replay_exhausted_since = None;
+        }
+        // Nothing can move this point but a readmission: no thread is queued,
+        // no deadline is reachable, and step2e has no parent to admit. If a
+        // call has finished here and the record readmits nothing here, the
+        // recording found nothing finished at this point, so either work
+        // reached it from the host first (a thread registering, say) or this
+        // replay has left its record. Going on would leave the call parked
+        // for good (step2d spins on an indefinite deadline) or end the run as
+        // a deadlock (a finished `rt_sigsuspend`), so wait for that work
+        // instead, up to the valve, after which the replay leaves its record.
+        let stuck = self.run_queue.is_empty()
+            && !self.next_deadline_is_reachable()
+            && self.blocked.sigchld_deferred.is_empty();
+        let moves_on = !(stuck && !ready.is_empty())
+            && (!self.run_queue.is_empty()
+                || !self.blocked.timed_waiters.is_empty()

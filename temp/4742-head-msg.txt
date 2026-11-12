@@ -1,0 +1,18 @@
+drain/4742: run all six ignored Binder CLI cases in the privileged node
+
+[hermit2, musedraina, tbh-1005, devbig014, role=impl]
+
+Plain Language Summary and Project Impact
+Per coordinator ruling (4761 and 4742 land together): privileged-test.binder_cli_cases now selects exactly six ignored identities - 4742's two, 4761's two renamed strict cases (the two that executed on main), and 4761's two new strict cases - count pin 2 -> 6, so no executed coverage is lost when the pair lands together. Node description, refusal text and docs/TESTING_ENVIRONMENTS.md rows updated to match; nextest listing with the node filter shows exactly the six names.
+
+Determinism
+Node selection/count only; the node still refuses loudly without Binderfs and no scheduled host runs it yet.
+
+Linux Semantics
+No behaviour change.
+
+Validation
+DAG regenerated --check canonical; manifest-plan lib 714 pass; nextest list with the node exact-name filter lists the six identities.
+
+Count-Pin-Decrease: test.cli 2 PR 4742's two executed binder CLI cases (a_descriptor_received_in_a_binder_transaction_is_usable, a_blocking_binder_read_does_not_hold_the_guests_turn) gated host-limited; both run in privileged-test.binder_cli_cases
+Count-Pin-Decrease: test.cli_on_host 2 PR 4742's two executed binder CLI cases (a_descriptor_received_in_a_binder_transaction_is_usable, a_blocking_binder_read_does_not_hold_the_guests_turn) gated host-limited; both run in privileged-test.binder_cli_cases

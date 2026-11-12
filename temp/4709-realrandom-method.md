@@ -1,0 +1,6 @@
+Method addendum for the real_random fix (determinism-regression-debugging): debug differentially.
+- Pin the pair first: good = main 0220dd857a, bad = 16d901776f. Run the IDENTICAL five-case repro (node privileged-test.pmu_ptrace_completion_cases selection) at both on this host. If the five also fail on main here, the local signal is host-environment, not code: say so, do not bisect locally, and work from source-level proof against the devbig030 logs.
+- If they pass on main and fail at head here, bisect within the 4709 stack (git bisect bad 16d90177, good = the stack's base on main) with the identical repro to ONE culprit commit. Then test any candidate fix at first-bad and at HEAD.
+- Capture good-vs-broken logs to files and find the FIRST divergence (log-diff / canonicalized diff); everything after it is downstream noise.
+- Classify the culprit in your report: step-backward (targeted fix/revert of the unintended change) vs wanted-change-exposing-latent-bug (fix forward, keep the change).
+- Never re-fake RDRAND/RDSEED visibility to satisfy a test: CPUID bits and masking must reflect what the backend actually intercepts/virtualizes (valid Linux semantics). If a test asserted the old wrong behavior, say so explicitly with proof instead of silently re-pinning.

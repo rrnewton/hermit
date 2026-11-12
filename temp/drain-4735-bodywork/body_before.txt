@@ -1,0 +1,390 @@
+[hermit2, vmakaev-metamate, claude-opus-5-5, devvm53386, role=impl]
+Owner: vmakaev-metamate (agentcloud, devvm53386) since 2026-10-26T09:51Z
+
+## Plain Language Summary and Project Impact
+
+On aarch64 a load/store-exclusive retry loop retires a variable number of branches for the same
+work. Any exception between the pair clears the local exclusive monitor, the store-exclusive
+fails, and the loop runs again: a timer tick, an IPI, a page fault, a PMU overflow, a ptrace stop.
+Hermit counts retired branches to place preemptions and to replay a schedule, so a program built
+with those loops cannot be replayed exactly on aarch64. The programs that matter here are the ones
+nobody can rebuild: a prebuilt sanitizer runtime, a system libc, a service shipped on a device.
+
+`hermit run --rewrite-exclusives` rewrites each canonical exclusive loop in the guest executable,
+and in any file named by `--rewrite-exclusives-also`, into a single FEAT_LSE atomic instruction,
+and bind-mounts the rewritten copy over the path the guest loads it from. Only code the file
+proves is rewritten: what its ARM mapping symbols mark `$x`. A stripped file, or a section that
+holds a mapping symbol other than `$x` and `$d`, is left unchanged and named
+(`no-mapping-symbols`, `unsupported-mapping-symbol`). `--rewrite-exclusives-stripped=heuristic`
+is an explicit opt-in that rewrites stripped files by a stripped-file heuristic whose residuals
+are documented, including that a mistaken classification can corrupt program data. `hermit
+rewrite-exclusives FILE...` reports the same analysis without running anything, so an image can be
+inspected before anyone runs it, and exits nonzero when a file still holds a loop it refused or a
+section it skipped.
+
+Before: a four-thread atomic-counter program built with exclusive loops diverged in all four
+`--strict --verify --verify-strict` runs, and a multi-process sanitizer test's recorded schedule
+could not be replayed at all. After: the same program reaches bitwise parity in all four, and the
+same test's schedule replays byte-identically in all four seeds, including reproducing the failure
+the recording caught.
+
+This is binary rewriting used as preprocessing for the ptrace backend, in the same sense as
+e9patch (`docs/E9PATCH_COMPATIBILITY.md`). It loads no Detcore tool through Reverie and is not a
+backend. It is refused on every other backend.
+
+## Mechanism
+
+Four idioms are recognised, each a contiguous window that ends in `CBNZ Rs, <loop top>`:
+
+| Idiom | Original | Replacement |
+|---|---|---|
+| Rmw | `LDxXR Rt; <alu> Rd,Rt,op; STxXR Rs,Rd; CBNZ Rs` | materialise the operand in Rs; `LD<op>`; the original ALU instruction; `MOV Ws,WZR` |
+| Swap | `LDxXR Rt; STxXR Rs,Rv; CBNZ Rs` | `SWP Rv,Rt,[Rn]`; `MOV Ws,WZR`; `NOP` |
+| CasCompare | `LDxXR Rt; CMP Rt,X; B.NE out; STxXR Rs,Rv; CBNZ Rs` | `MOV Rt,X`; `CAS Rt,Rv,[Rn]`; the original CMP; the original B.NE, re-encoded one slot later; `MOV Ws,WZR` |
+| CasZero | `LDxXR Rt; CBNZ Rt,out; STxXR Rs,Rv; CBNZ Rs` | `MOV Rt,ZR`; `CAS Rt,Rv,[Rn]`; the CBNZ re-encoded one slot later; `MOV Ws,WZR` |
+
+The replacement is the same length and in place, so every instruction keeps its address: every
+PC-relative branch, return address, unwind table entry, symbol and signal PC stays valid, and no
+trampoline or scratch page is needed.
+
+The scratch registers are the loop's own. A retry loop writes its status register unconditionally
+before anything can read it, and its load destination likewise, so neither holds a live value at
+the loop's entry; the replacement uses them to materialise its operand and restores on every exit
+path exactly the value the original left there. The status register may also BE the load
+destination, which is what LLVM emits for a compare-and-swap; the compare-and-swap replacements
+handle that case and the read-modify-write one refuses it, because an atomic with one register in
+both the operand and destination roles is CONSTRAINED UNPREDICTABLE.
+
+Anything that is not a fully decoded canonical loop is left exactly as it was and reported with
+its address and a reason: an exclusive pair instruction, no paired load, an instruction in the
+window outside the decoded subset, a non-canonical shape, a direct branch from elsewhere into the
+middle of the sequence, a register constraint the replacement needs, an operation with no
+single-instruction LSE form, or a moved branch that would no longer reach its target.
+
+Only sections marked `SHF_EXECINSTR` are scanned. An executable `PT_LOAD` segment also carries the
+ELF header, the dynamic symbol and relocation tables and read-only data, and those bytes decode as
+instructions as readily as code does: on one Android test binary a segment scan reported 69
+exclusive instructions where `.text` holds 6. A file with no section headers is left alone and
+said to be, and a section in a writable executable mapping is skipped rather than rewritten.
+
+Within those sections only code is rewritten, and by default only what ARM mapping symbols prove
+is code. The AArch64 ELF ABI has the assembler place a local, untyped mapping symbol at every
+switch between code (`$x`) and data (`$d`). The rewriter takes exactly the `$x` ranges, `$d` wins
+a tie, and a sequence that a literal load or `ADR` in the code reaches is refused. A section that
+no mapping symbol marks, as in every stripped file, is not read for code: each sequence in it is
+left alone as `no-mapping-symbols`. A section that holds a mapping symbol other than `$x` and `$d`
+(AArch32's `$a` or `$t`, or an unknown `$` name) is not proved by its marks, and under either
+policy each sequence in it is refused as `unsupported-mapping-symbol`, naming the symbol. Either
+way the run prints the file and lists it in its summary (`exclusive_rewrite_unmarked`), and
+`hermit rewrite-exclusives --list-refusals` lists each such loop by address.
+
+`--rewrite-exclusives-stripped=heuristic` (`--stripped=heuristic` on `hermit rewrite-exclusives`)
+is an explicit opt-in for files without mapping symbols. It takes for code what control reaches
+from the entries of the functions the unwind table describes, less what the code or the image
+addresses as data. Its residuals, each data that nothing in the image points at, taken for code,
+are these: data after a call to an imported function that never returns and whose name it does
+not know; what the code addresses after a write that loses an `ADRP`'s carried base; what an
+unresolved `ADRP`'s completion reaches past its page; the tail of a table that a false branch
+cuts; the bytes after a call to a function that returns through a changed `X30` or a syscall;
+and the bytes after a call through `BLR`, whose callee is unknown. A mistaken classification can
+corrupt program data. A run under the heuristic says so in its summary
+(`exclusive_rewrite_stripped_heuristic`) and in the preemption record it writes, and a replay or
+an analysis under the other setting is refused by the record's mark. Under the heuristic,
+`--verify-json` and `--verify-run`, the verification exports another tool reads without the
+command line, are refused.
+
+## Determinism
+
+The rewritten program cannot retry at the sites that were rewritten, because a single atomic
+instruction has no retry: an interrupted atomic is restarted by the kernel at its own instruction
+and performs one access. That is the whole mechanism; nothing about it depends on timing. The
+report says how many exclusive instructions remain, and a file whose report says zero cannot have
+an interrupt-dependent branch count from this cause at all.
+
+The rewrite itself is a pure function of the input bytes and the stripped-file policy: it reads
+only the file. Each cached copy is named by the rewriter's format, the policy, a digest of the
+rewritten bytes and the source's mode. So the two runs of one `--verify` pair, and a replay of a
+recording, map byte-identical images, and runs that would map different bytes (a default run and
+a heuristic run of one stripped file) never share a copy. A copy is never written in place: it is
+written to a private per-user directory under a temporary name and renamed into place, so a
+concurrent writer cannot be observed half-written, and a run that mounted a copy keeps it whatever
+another run writes later.
+
+Ordering is carried across pair to atomic, exactly:
+
+| load | store | atomic |
+|---|---|---|
+| LDAXR | STLXR | `AL` |
+| LDAXR | STXR | `A` |
+| LDXR | STLXR | `L` |
+| LDXR | STXR | plain |
+
+Only register-only instructions are allowed between the pair, so the acquire taken at the atomic
+rather than at the load, and the release taken at the atomic rather than at the store, order the
+same memory accesses in the same directions. One case is strictly stronger rather than equal: a
+`CASAL` whose comparison fails keeps its release semantics, where the original never executed its
+`STLXR` at all. More ordering cannot produce an execution the original could not have produced, so
+it cannot break a program; it can hide a weak-memory race from a native run, which is one reason
+this is opt-in. Under Detcore's sequentialized threads it is unobservable.
+
+## Linux Semantics
+
+No syscall result, errno, signal delivery, or `/proc` or `/sys` content is emulated differently
+by this change: it adds no syscall handling and touches no Detcore path. The guest keeps the
+same path for its executable, because the rewritten copy is bind-mounted over it, so argv,
+`/proc/self/exe` and the executable's path in `/proc/self/maps` are what they were, as for the
+e9patch preprocessor that uses the same overlay.
+
+What a guest CAN observe, and what this flag therefore promises:
+
+- It reads its own rewritten instructions. A program that checksums its text, or disassembles
+  it, sees the rewrite. The bind mount keeps the path, not the content.
+- The file behind that path is the cached copy, so its device, inode, size and timestamps are
+  the cache's, and the overlay appears in `/proc/self/mountinfo`.
+- A fault inside a rewritten sequence reports a PC one instruction later than the original's
+  would, with the materialising `MOV` already executed, because the atomic sits where the
+  load-exclusive did. A guest that handles SIGSEGV or SIGBUS and inspects the faulting PC or
+  the register state can tell.
+- With FEAT_LSE2, which Neoverse V2 has, a misaligned atomic within a 16-byte granule succeeds
+  where `LDAXR` would have raised an alignment fault, so a guest that relies on that SIGBUS
+  loses it.
+- A failed compare-and-swap still takes the write permission check that the never-executed
+  store-exclusive would not have taken, so a read-only mapping faults where the original
+  returned.
+
+None of these appears in the measured cases, and all of them are reasons the rewrite is opt-in
+rather than the default.
+
+The instruction semantics the rewrite relies on are architectural, not kernel behaviour: the
+exclusive monitor and its clearing on an exception, and the FEAT_LSE atomic instructions, are
+specified in the Arm Architecture Reference Manual for A-profile (DDI 0487, issue L.a), sections
+B2.9 "Synchronization and semaphores" (exclusive monitors, and the events that clear them),
+C3.2.6 "Load-Exclusive and Store-Exclusive", and C3.2.12 "Atomic instructions". That a compiler
+treats the two forms as the same source-level atomic is observable: the same source built
+`-march=armv8-a -mno-outline-atomics` and `-march=armv8.1-a` gives the exclusive loop and the
+single atomic this rewrite maps between.
+
+## Validation
+
+Host: an NVIDIA Grace (Neoverse V2) server, Linux 6.16, 64 KiB pages. Backend: ptrace. Log level:
+default. Relaxations: none, except where a line says otherwise.
+
+- `cargo test -p hermit-run --lib aarch64_lse`: 14 tests, 14 passed, 0 failed, on x86_64, plus
+  `cargo test -p hermit-run --bin hermit retained_in_reproducers`, 2 passed;
+  `cargo clippy -p hermit-run --lib --bins` and `cargo fmt` clean. The
+  module is pure and its tests are target-independent. Every expected encoding in the test table
+  is GNU as's own output for the sequence it claims, generated on the aarch64 host rather than
+  computed by hand: 14 rewrite cases (four orderings, byte and halfword sizes, both compilers'
+  CAS shapes, the LLVM shape whose status register is its load destination, an immediate the
+  instruction shifts left by 12, and a sub-word compare a zero extension admits), 6 refusals,
+  both zero-register forms, the negative case of each new family, a branch into the middle of a
+  sequence, and a loop found at an offset inside a larger region. The tests also assert that a
+  rewritten sequence contains no exclusive instruction, and the packed-relative-relocation
+  decoder has a case of its own over an address entry and a bitmap entry.
+- The `test.hermit_unit` node's pin moves 1102 -> 1117 and `ci/dag/validate.json` is
+  regenerated; `generate-validation-dag --check` reports it canonical and fresh. The number is
+  derived with that node's own selection: 1123 listed, five removed by its skip patterns and
+  one `#[ignore]` test listed but never executed, which is the old pin plus this change's
+  fifteen tests.
+- L2, exclusive-loop guest (four threads, atomic add and xor, built `-march=armv8-a
+  -mno-outline-atomics`): `hermit run --strict --chaos --preemption-timeout=20000 --seed=N
+  --epoch=2026-01-01T00:00:00Z --verify --verify-strict --verify-json=J`, seeds 1-4. Without the
+  flag: `bitwise_parity: false`, diverged 4/4. With it: `bitwise_parity: true`, verdict `matched`,
+  4/4, 889-909 compared INFO messages per run. Guest output identical either way.
+- Schedule replay, a multi-process sanitizer test (its prebuilt sanitizer runtime carries 461
+  exclusive loops): record with `--record-preemptions-to`, then replay with
+  `--replay-preemptions-from`, six seeds, chaos, non-strict. Without the flag: **0 of 6**
+  replayed. One panicked with `Cannot set RCB end of timeslice to 117460 ... current RCB count is
+  already 117646`, the retried branches themselves, and five with the virtual-time form of the
+  same overrun, since virtual time advances with retired branches. With the flag: **6 of 6**
+  replayed, byte-identical stdout and the recording's outcome, including the test failure the
+  recording caught. Measured honestly rather than claimed: in an earlier round one of those seeds
+  replayed with a virtual-time overrun WITH the flag on, and identically in the rounds either
+  side, so this removes the retried-branch cause of a replay divergence and does not claim to fix
+  schedule replay in general. This measurement ran on an integration tree, because two unrelated
+  fixes it needs on this host (a pipe-capacity pin for 64 KiB pages, and received-descriptor
+  aliasing) are not on main; the rewriter commits are identical in both trees.
+- Native differential semantics, no Hermit: 14 workloads covering every idiom and both compilers'
+  shapes, each rewritten and run against the original with the same inputs, 3 reps: identical
+  results in all 14, and `STREX_FAIL_SPEC` (PMU event 0x6E) reads 0 in the rewritten binaries
+  where the originals fail stores under the same load.
+- Coverage, by `hermit rewrite-exclusives`: the sanitizer test's LL/SC build 450 of 461 loops
+  rewritten (11 left alone: 7 non-canonical, 3 register constraints, 1 shifted subtraction); a
+  prebuilt compiler-rt sanitizer runtime 564 of 578; a device's `libc.so` 23 of 23 with nothing
+  left and its dynamic linker 33 of 41; a system glibc 2.34 19 of 19; two smaller test cases 4
+  of 4 each.
+- What the rewrite leaves behind, executed rather than counted: the rewritten sanitizer test
+  retires 30 store-exclusives per run against 1,831,781 before it, and the rewritten sanitizer
+  harness retires none at all against 250,485. A device's outline-atomics helpers, which are
+  where its libc keeps its exclusive loops, are behind a run-time FEAT_LSE check and never
+  execute their LL/SC tail on a core that has it.
+- The counter this rewrite makes unnecessary was measured on both targets, by a companion study
+  on the same branch's evidence: `BR_RETIRED` is an exact linear function of `STREX_FAIL_SPEC`
+  on a Neoverse V2 and on a Cortex-A78 (k = 1 for read-modify-write, swap, pair and spinlock
+  loops, k = 2 for every compare-and-swap form, residual 0 over 40 repetitions each), and on the
+  A78 the other two events this study used, `STREX_SPEC` and `INST_RETIRED`, are accepted by the
+  PMU and never scheduled. So a detector built on this must use `BR_RETIRED` and
+  `STREX_FAIL_SPEC` alone. No detector code is in this change.
+- Not claimed: no run of the full workspace test suite on aarch64, no L3 or L4, no measurement
+  under an emulated PMU, and no claim about any backend other than ptrace.
+
+## Human Review Required
+
+Trigger 3: a new determinization strategy. Hermit has not rewritten guest instructions to remove a
+source of nondeterminism before; e9patch preprocessing inserts trampolines for instrumentation,
+and this replaces one instruction sequence with an architecturally equivalent one so that the
+retired-branch count of a given piece of guest work becomes a property of the program alone. The
+specific judgements a human should weigh: that the four replacements restore every register and
+flag on every exit path, that the pair-to-atomic ordering map is exact (and that the one strictly
+stronger case, a failed `CASAL`, is acceptable), and that rewriting a prebuilt image by default is
+a decision to take separately from offering it behind a flag.
+
+
+## Head
+
+Head `311d35b3303e070f21092c80fd0049be2e241f57`, stacked directly on main `cd9e333e84291b1c2fd221d505a0821b007450f3`: #4726 ("Build Hermit on aarch64 Linux") landed in train 10 as `f0b0650d0`. Review all of this pull request's commits.
+
+
+## Revision 1
+
+Head `b1db8a02e87a0e7f920940452c7233a8eadc981b` (one commit on `e00e39403`). The relocation list in `elf.rs` was initialised with `Vec::new()` and then overwritten before any read, which `cargo clippy -p hermit-run --lib --bins -- -D warnings` rejects (`unused-assignments`). It is now declared without a value and filled once inside the block that owns the parsed ELF. No behaviour change: the 14 `aarch64_lse` unit tests and the 2 reproducer tests pass unchanged, and that clippy command is clean on x86_64 at this head (it failed at the previous head). An aarch64 `-D warnings` run of the whole workspace currently stops earlier, in `hermit-detcore`, on unused imports and variables under aarch64 `cfg` gates that predate this PR; none are in this PR's files.
+
+
+
+## Revision: analyze and bisect trials apply the rewrite
+
+Additional commit f2997181e0da95477bf9ffeddd15da9bc87d33ba (tree ab934616), on b1db8a02e. Owner of this commit: vmakaev-metamate (agentcloud, devvm53386); the rest of the pull request is unchanged.
+
+`hermit analyze` and `hermit bisect` accepted `--rewrite-exclusives` in their run arguments and printed it in every trial's reproducer, but no trial applied it. Trials start through `RunOpts::run`, and only `RunOpts::main` prepared the rewritten images. Each trial now prepares them before it starts (`RunOpts::prepare_trial_preprocessing`, called from the trial launch). The overlays are prepared once per process and reused, keyed by everything the preparation reads: program, `--rewrite-exclusives-also` files, backend, mounts and binds, working directory and `PATH`. That gives one rewrite and one report per analysis.
+
+This matters on aarch64. analyze's stack-trace replays stop at every timeslice end, and a single step clears the exclusive monitor, so an unrewritten `LDXR`/`STXR` loop livelocks under single-stepping and the replay desyncs. The Reverie-side fix, stepping over exclusive sequences as one unit, is filed separately; the rewrite is the workaround until then.
+
+Validation (ptrace backend, default log level, relaxations none):
+- Intel Xeon host: new CLI test `analyze_trials_prepare_the_exclusive_rewrite_their_reproducer_names` passes. `hermit run --rewrite-exclusives` refuses there (no FEAT_LSE), and the analysis's first trial must refuse the same way. At b1db8a02e the same analysis ran its trials unrewritten and failed elsewhere ("baseline run matched target criteria"). `cargo clippy -p hermit-run --bin hermit --tests -- -D warnings` is clean.
+- Grace (Neoverse V2), with this commit (exact tree) on an aarch64 integration build. Case: a FrameRetireHandler hang reproducer whose system ld.so and libc carry 4 and 19 exclusive loops, rewritten with `--rewrite-exclusives-also`. Run: `hermit analyze --prefix-search --run1-seed 1 --target-stderr FRH_HANG -- --strict --chaos --preemption-timeout=1000 --rewrite-exclusives --rewrite-exclusives-also=/lib/ld-linux-aarch64.so.1 --rewrite-exclusives-also=/lib64/libc.so.6 -- ./race_nofix`.
+  - Result: decision at #7712 in 197 s, 0 desync lines in any trial or stack-trace replay, and the rewrite report printed once.
+  - stack1 is thread 5 in `clock_gettime` from `main` race.cpp:26. stack2 is thread 3 in `nanosleep`/`usleep` from `main` race.cpp:27. `racing_accesses` is `timing` and names the two calls.
+  - Without this commit, the target run's checkpoints showed the unrewritten ld.so (the first `set_tid_address` at 14,249 retired branches instead of 14,247). Both stack-trace replays desynced (3,262 desync lines) and timed out, stack2 was missing and `racing_accesses` was unavailable.
+- hermit-cli's integration tests do not build on aarch64 at this base (`reverie-inguest` is x86-only), so the aarch64 evidence is the measurement above.
+
+
+
+## Revision (refuse under --no-namespace)
+
+Head `68e664d28f01e8596893e16e1b57e8e2c9f38955`, one additional commit on `f2997181e0da95477bf9ffeddd15da9bc87d33ba`: `--rewrite-exclusives` (and `--rewrite-exclusives-also`, which requires it) now conflicts with `--no-namespace` at argument parsing, because the rewrite installs its overlays as bind mounts and needs a mount namespace; before, the flag was accepted and silently did nothing there. `no_namespace_rejects_container_only_options` gains a `--rewrite-exclusives` case. Validation (Intel Xeon host): `cargo test -p hermit-run --test cli -- --exact no_namespace_rejects_container_only_options` passes; `cargo clippy -p hermit-run --bins --tests -- -D warnings` clean. Merge note: #4725 edits the same conflict list and test; whichever lands second keeps `rewrite_exclusives` in both.
+
+## Revision 2 (2026-10-27)
+
+rebased onto main `97611ab4d`, on #4726's new head `2df14cf01` (Reverie pin unchanged). One code conflict resolved by hand: main's `3ff972b9c` added a test-only module declaration to `hermit-cli/src/lib.rs` where this change adds `pub mod aarch64_lse`; both stay. Pins (main's value plus this change's tests, each matching `cargo nextest list`): `test.hermit_unit` 1117 → 1120, `test.hermit_unit_on_host` 1102 → 1120. `ci/sync-cell-config.sh --check`, fmt and `cargo clippy --workspace --all-targets -- -D warnings` are clean. Re-run at the new head (AMD host): `-p hermit-detcore --lib`: 2611 of 2611 passed; `-p hermit-run --lib` 15 named tests: 15 of 15 passed; `-p hermit-run --test cli` `analyze_trials_prepare_the_exclusive_rewrite_their_reproducer_names`: 1 of 1 passed; `-p hermit-run --bin hermit` (full suite): 509 of 509 passed. Commit messages no longer name internal hosts ("the bare-metal Intel test host", "the AMD EPYC KVM development host"); message-only, every commit keeps its tree. Adds a test-only commit with the `--save-config` round-trip samples for `--rewrite-exclusives` and `--rewrite-exclusives-also`; `every_option_has_a_round_trip_sample` failed without them. Adds a pins-only commit: `test.hermit_unit_on_host` now counts the same fifteen new unit tests as `test.hermit_unit` (1105 → 1120), as `cargo nextest list` does. Revision 1 was `68e664d28`.
+
+## Revision 3 (2026-10-27)
+
+rebased onto main `cbbe4c757`, on #4726's new head `7fbee6b61` (Reverie pin unchanged). Only the count pins and `ci/dag/validate.json` conflicted. Pins (main's value plus this change's tests, each matching `cargo nextest list`): `test.hermit_unit` and `_on_host` 1120 → 1121. `ci/sync-cell-config.sh --check`, fmt and `cargo clippy --workspace --all-targets -- -D warnings` are clean. Re-run at the new head (AMD host): `-p hermit-run --lib` 15 named tests: 15 of 15 passed; `-p hermit-run --test cli` `analyze_trials_prepare_the_exclusive_rewrite_their_reproducer_names`: 1 of 1 passed. Revision 2 was `098cd8caf`.
+
+**Revision note:** rebased onto main `5f53234fb` on #4726's new head (only the count pins and `ci/dag/validate.json` conflicted, re-derived), plus one pins-only commit: the CLI test that "Refuse --rewrite-exclusives under --no-namespace" added was never counted, so `test.cli` and `test.cli_on_host` now match `cargo nextest list` (621 and 540 at this change on `0948c8ebf`). Revision before this was `3185ca31c`.
+
+**Revision 4:** rebased onto main `6f6291158`, on #4726's new head `8578997da` (Reverie pin unchanged). Only the count pins and `ci/dag/validate.json` conflicted. Pins (main's value plus this change's tests, each matching `cargo nextest list`): `test.cli` 638 → 667, `test.cli_on_host` 557 → 586, `test.hermit_unit` 1175 → 1202, `test.hermit_unit_on_host` 1169 → 1196. Re-run at the new head (AMD host): `-p hermit-detcore --lib` `a_completed_syscall_shows_its_result_and_return_address`: 1 of 1 passed; `-p hermit-run --lib` 15 named tests: 15 of 15 passed; `-p hermit-run --test cli` `analyze_trials_prepare_the_exclusive_rewrite_their_reproducer_names`: 1 of 1 passed. The stack is corrected: this change now sits on #4726's current head; the copy of #4726's commit it carried (identical to it) is dropped, so only its own commits replay and the tree is unchanged. Revision 3 was `aaf328306`; `b6f881b5a`, this pass's first rebase, was pushed without a note.
+
+**Revision 5:** rebased onto main `16a66895f` (Reverie pin unchanged). Code conflicts resolved: #4726's commit landed in train 10 as `f0b0650d0`, so this change now sits directly on main; its own commits replay unchanged. Pins (main's value plus this change's tests, each matching `cargo nextest list`): `test.cli` 667 → 692, `test.cli_on_host` 586 → 611, `test.hermit_unit` 1202 → 1217, `test.hermit_unit_on_host` 1196 → 1211. Re-run at the new head (AMD host): `-p hermit-detcore --lib`: 2868 of 2868 passed; `-p hermit-run --lib` 15 named tests: 15 of 15 passed; `-p hermit-run --test cli` `analyze_trials_prepare_the_exclusive_rewrite_their_reproducer_names`: 1 of 1 passed. Revision 4 was `bf800064d`.
+
+**Revision 6:** rebased onto main `27c4c4017` (Reverie pin unchanged). Code conflicts resolved: 7464fc3fc run.rs no_namespace conflicts_with_all: took main's list from 2f7c569de (replay_schedule_from and replay_preemptions_from no longer conflict) and appended rewrite_exclusives. Pins (main's value plus this change's tests, each matching `cargo nextest list`): `test.cli` 692 → 741, `test.cli_on_host` 611 → 660, `test.hermit_unit` 1217 → 1303, `test.hermit_unit_on_host` 1211 → 1297. Re-run at the new head (AMD host): `-p hermit-detcore --lib`: 2999 of 2999 passed; `-p hermit-run --lib` 15 named tests: 15 of 15 passed; `-p hermit-run --test cli` `analyze_trials_prepare_the_exclusive_rewrite_their_reproducer_names`: 1 of 1 passed. Rustfmt flags only main 27c4c4017's own hunk, a doubled blank line in detcore-model/src/config.rs (from c13e497bd), which this change does not touch. Revision 5 was `42b9b7c33`.
+
+**Revision 7:** rebased onto main `badaea3ee` (Reverie pin unchanged). Code conflicts resolved: 7464fc3fc run.rs no_namespace conflicts_with_all: took main's list from 2f7c569de (replay_schedule_from and replay_preemptions_from no longer conflict) and appended rewrite_exclusives. Pins (main's value plus this change's tests, each matching `cargo nextest list`): `test.cli` 741 → 743, `test.cli_on_host` 660 → 662, `test.hermit_unit` 1303 → 1304, `test.hermit_unit_on_host` 1297 → 1298. `ci/sync-cell-config.sh --check`, fmt and `cargo clippy --workspace --all-targets -- -D warnings` are clean. Re-run at the new head (AMD host): `-p hermit-detcore --lib`: 3000 of 3000 passed; `-p hermit-run --lib` 15 named tests: 15 of 15 passed; `-p hermit-run --test cli` `analyze_trials_prepare_the_exclusive_rewrite_their_reproducer_names`: 1 of 1 passed. Revision 6 was `94ffe6cd8`.
+
+**Revision 8:** rebased onto main `e93a8ecac` (Reverie pin unchanged). Code conflicts resolved: 7464fc3fc run.rs no_namespace conflicts_with_all: took main's list from 2f7c569de (replay_schedule_from and replay_preemptions_from no longer conflict) and appended rewrite_exclusives. Pins: includes main bc60c6a37's three uncounted units from b4522ac13. Pins (main's value plus this change's tests, each matching `cargo nextest list`): `test.cli` 743 (unchanged), `test.cli_on_host` 662 (unchanged), `test.detcore_unit` and `_on_host` 3000 → 3003, `test.hermit_unit` 1304 (unchanged), `test.hermit_unit_on_host` 1298 (unchanged). `ci/sync-cell-config.sh --check`, fmt and `cargo clippy --workspace --all-targets -- -D warnings` are clean. Re-run at the new head (AMD host): `-p hermit-detcore --lib`: 3003 of 3003 passed; `-p hermit-run --lib` 15 named tests: 15 of 15 passed; `-p hermit-run --test cli` `analyze_trials_prepare_the_exclusive_rewrite_their_reproducer_names`: 1 of 1 passed. An added commit counts main's three uncounted detcore units (b4522ac13) in test.detcore_unit and its host twin: 3000 + 3 = 3003. Revision 7 was `eadf8065a`.
+
+**Revision 9:** rebased onto main `df10f4c29` (Reverie pin unchanged). Code conflicts resolved: 7464fc3fc run.rs no_namespace conflicts_with_all: took main's list from 2f7c569de (replay_schedule_from and replay_preemptions_from no longer conflict) and appended rewrite_exclusives. Pins (main's value plus this change's tests, each matching `cargo nextest list`): `test.cli` 743 (unchanged), `test.cli_on_host` 662 (unchanged), `test.hermit_unit` 1304 (unchanged), `test.hermit_unit_on_host` 1298 (unchanged). `ci/sync-cell-config.sh --check`, fmt and `cargo clippy --workspace --all-targets -- -D warnings` are clean. Re-run at the new head (AMD host): `-p hermit-detcore --lib`: 3017 of 3017 passed; `-p hermit-run --lib` 15 named tests: 15 of 15 passed; `-p hermit-run --test cli` `analyze_trials_prepare_the_exclusive_rewrite_their_reproducer_names`: 1 of 1 passed. Revision 8 was `55a0d3150`.
+
+**Revision 10:** rebased onto main `139772a17` (Reverie pin unchanged). Code conflicts resolved: 7464fc3fc run.rs no_namespace conflicts_with_all: took main's list from 2f7c569de (replay_schedule_from and replay_preemptions_from no longer conflict) and appended rewrite_exclusives. Pins (main's value plus this change's tests, each matching `cargo nextest list`): `test.cli` 743 → 745, `test.cli_on_host` 662 → 664, `test.hermit_unit` 1304 (unchanged), `test.hermit_unit_on_host` 1298 (unchanged). `ci/sync-cell-config.sh --check`, fmt and `cargo clippy --workspace --all-targets -- -D warnings` are clean. Re-run at the new head (AMD host): `-p hermit-detcore --lib`: 3034 of 3034 passed; `-p hermit-run --lib` 15 named tests: 15 of 15 passed; `-p hermit-run --test cli` `analyze_trials_prepare_the_exclusive_rewrite_their_reproducer_names`: 1 of 1 passed. Revision 9 was `2d8602379`.
+
+**Revision 11:** rebased onto main `4506fbb68` (Reverie pin unchanged). Code conflicts resolved: 7464fc3fc run.rs no_namespace conflicts_with_all: took main's list from 2f7c569de (replay_schedule_from and replay_preemptions_from no longer conflict) and appended rewrite_exclusives. Pins (main's value plus this change's tests, each matching `cargo nextest list`): `test.cli` 745 (unchanged), `test.cli_on_host` 664 (unchanged), `test.hermit_unit` 1304 (unchanged), `test.hermit_unit_on_host` 1298 (unchanged). `ci/sync-cell-config.sh --check`, fmt and `cargo clippy --workspace --all-targets -- -D warnings` are clean. Re-run at the new head (AMD host): `-p hermit-detcore --lib`: 3037 of 3037 passed; `-p hermit-run --lib` 15 named tests: 15 of 15 passed; `-p hermit-run --test cli` `analyze_trials_prepare_the_exclusive_rewrite_their_reproducer_names`: 1 of 1 passed; `-p hermit-run --lib`: 460 of 467 passed; the other 2 (`detcore_drives_kvm_guest_for_synthetic_syscall`, `kvm_runs_dynamic_echo_through_detcore`) stop at this VM's KVM guest clock, as on main; 5 fail the same way on main on this host (`real_random_copy_failure_retires_initialized_sibling_and_timer`, `real_random_copy_failure_with_trace_diagnostics`, `real_random_live_copy_preserves_sibling_and_timer_success`, `real_random_readv_import_failure_retires_initialized_sibling_and_timer`, `real_random_readv_live_import_preserves_sibling_and_timer_success`: host stack-size and VM-counter limits), so they give no result here; `-p detcore-model --lib`: 322 of 322 passed. The hermit_unit pin comment now gives the measured listing: `cargo nextest list -p hermit-run --features third-party-backends,kvm-native-test-support --lib --bins --run-ignored all` lists 1310, less 5 skipped and 1 ignored = 1304 (was a stale "lists 1200"; Codex nit). Revision 10 was `08d7a1ce9`.
+
+**Revision 12:** rebased onto main `286901287` (Reverie pin unchanged). Code conflicts resolved: d1e735bb1 pins: `test.cli_on_host` keeps main's retry-stack line and `test.regular_crates_on_host` from 5d111b3ec and adds this commit's refusal test as 665 (`test.cli` 746 likewise from main's 745). Pins (main's value plus this change's tests, each matching `cargo nextest list`): `test.cli` 745 → 746, `test.cli_on_host` 664 → 665, `test.hermit_unit` 1304 → 1305, `test.hermit_unit_on_host` 1298 → 1299. `ci/sync-cell-config.sh --check`, fmt and `cargo clippy --workspace --all-targets -- -D warnings` are clean. Re-run at the new head (AMD host): `-p hermit-detcore --lib`: 3242 of 3242 passed; `-p hermit-run --lib` 15 named tests: 15 of 15 passed; `-p hermit-run --test cli` `analyze_trials_prepare_the_exclusive_rewrite_their_reproducer_names`: 1 of 1 passed; `-p hermit-run --lib`: 468 of 480 passed; the other 12 fail the same way at main `286901287` on this host: `ptrace_completion::tests::real_random_copy_failure_retires_initialized_sibling_and_timer`, `ptrace_completion::tests::real_random_copy_failure_with_trace_diagnostics`, `ptrace_completion::tests::real_random_live_copy_preserves_sibling_and_timer_success`, `ptrace_completion::tests::real_random_readv_import_failure_retires_initialized_sibling_and_timer`, `ptrace_completion::tests::real_random_readv_live_import_preserves_sibling_and_timer_success` (host stack-size and VM-counter limits); `replay_departure_completion_tests::actual_cleanup_preserves_ordinary_statuses_and_owned_terminal_output`, `replay_departure_completion_tests::actual_departure_cleanup_survives_typed_context_tool_and_container_codec`, `replay_departure_completion_tests::genuine_summary_io_error_remains_primary_over_actual_departure`, `replay_departure_completion_tests::primary_backend_and_io_failures_keep_their_kind_with_actual_departure`, `replay_departure_completion_tests::rejected_publication_refuses_real_cleanup_without_fabricating_a_finding` (https://github.com/rrnewton/hermit/issues/4999, fixed on main by `b2db8b97d`); `tests::detcore_drives_kvm_guest_for_synthetic_syscall`, `tests::kvm_runs_dynamic_echo_through_detcore` (this VM's KVM guest clock); `-p detcore-model --lib`: 323 of 323 passed. The pins of `test.cli`, `test.cli_on_host`, `test.hermit_unit`, `test.hermit_unit_on_host` are main's value plus this change's tests; main `286901287` itself pins those cells below what they list (https://github.com/rrnewton/hermit/issues/4998), so their counts differ from the listing by main's own amount. Main has since moved to `91fa51176`; this head merges into it without a code conflict (pin files only, left to the lander). Revision 11 was `518f1c7b9`.
+
+**Revision 13:** rebased onto main `cd9e333e8` (Reverie pin unchanged). Code conflicts resolved: Moved onto main cd9e333e8 with this change's own lines unchanged; only the count pins conflicted, and they are main's values plus this change's tests (test.hermit_unit 1334, test.hermit_unit_on_host 1328, test.cli 764, test.cli_on_host 683); the test.hermit_unit comment's derivation now says the node's selection lists 1339 where it said 1310, moved by main's 29 recounted units, so 1339 less the 5 skipped still gives the pin 1334. Pins (main's value plus this change's tests, each matching `cargo nextest list`): `test.cli` 746 → 764, `test.cli_on_host` 665 → 683, `test.hermit_unit` 1305 → 1334, `test.hermit_unit_on_host` 1299 → 1328. `ci/sync-cell-config.sh --check`, fmt and `cargo clippy --workspace --all-targets -- -D warnings` are clean. Re-run at the new head (AMD host): `-p hermit-detcore --lib`: 3321 of 3321 passed; `-p hermit-run --lib` 15 named tests: 15 of 15 passed; `-p hermit-run --test cli` `analyze_trials_prepare_the_exclusive_rewrite_their_reproducer_names`: 1 of 1 passed; `-p hermit-run --lib`: 472 of 484 passed; the other 12 fail the same way at main `cd9e333e8` on this host: `preemption_admission::tests::an_annotated_priority_history_replays_only_with_precise_rcb_timers`, `preemption_admission::tests::explicit_active_maximum_is_refused_without_normalizing_the_request`, `preemption_admission::tests::explicit_timer_controls_still_refuse_after_disabling_the_maximum`, `tests::backend_capabilities_match_the_golden_table`, `tests::backend_timer_delivery_is_explicit` (stale capability expectations since main's Reverie `9443a6b28` pin, https://github.com/rrnewton/hermit/issues/5012); `ptrace_completion::tests::real_random_copy_failure_retires_initialized_sibling_and_timer`, `ptrace_completion::tests::real_random_copy_failure_with_trace_diagnostics`, `ptrace_completion::tests::real_random_live_copy_preserves_sibling_and_timer_success`, `ptrace_completion::tests::real_random_readv_import_failure_retires_initialized_sibling_and_timer`, `ptrace_completion::tests::real_random_readv_live_import_preserves_sibling_and_timer_success` (host stack-size and VM-counter limits); `tests::detcore_drives_kvm_guest_for_synthetic_syscall`, `tests::kvm_runs_dynamic_echo_through_detcore` (this VM's KVM guest clock); `-p detcore-model --lib`: 320 of 323 passed; the other 3 fail the same way at main `cd9e333e8` on this host: `config::tests::a_legacy_positional_array_reads_as_the_object_it_lists`, `config::tests::backend_config_json_preserves_every_backend_and_representable_bytes`, `config::tests::legacy_backend_json_round_trips_every_backend_capabilities_constant` (stale capability expectations since main's Reverie `9443a6b28` pin, https://github.com/rrnewton/hermit/issues/5012). The pins of `test.cli`, `test.cli_on_host`, `test.hermit_unit`, `test.hermit_unit_on_host` are main's value plus this change's tests; main `cd9e333e8` itself pins those cells below what they list (https://github.com/rrnewton/hermit/issues/4998), so their counts differ from the listing by main's own amount. Main has since moved to `5662f36a9`; this head merges into it without a code conflict (pin files only, left to the lander). Revision 12 was `d1e735bb1`. Carry-over: both reviewers approved this change at `d1e735bb1`; its own patch, apart from the count pins, is identical commit by commit, and its tests pass at this head.
+
+**Revision 14:** rebased onto main `d192e5d72` (Reverie pin unchanged). Code conflicts resolved: hermit-cli/src/bin/hermit/main.rs:81-82: main's `mod replay_refusal_note;` and this change's `mod rewrite_exclusives;` are both kept, in the file's alphabetical order. ci/manifest-plan/src/validation_dag_static.rs:1949: the `test.hermit_unit` derivation now gives the measured listing at this head (`cargo nextest list -p hermit-run --features third-party-backends,kvm-native-test-support --lib --bins` lists 1349, less the 5 skipped = 1344; the one ignored test is listed only with `--run-ignored all`, 1350) where it said 1339. Pins: `test.hermit_unit` 1344, `test.hermit_unit_on_host` 1338, `test.cli` 777, `test.cli_on_host` 696. Pins (main's value plus this change's tests, each matching `cargo nextest list`): `test.cli` 764 → 777, `test.cli_on_host` 683 → 696, `test.hermit_unit` 1334 → 1344, `test.hermit_unit_on_host` 1328 → 1338. `ci/sync-cell-config.sh --check`, fmt and `cargo clippy --workspace --all-targets -- -D warnings` are clean. Re-run at the new head (AMD host): `-p hermit-detcore --lib`: 3348 of 3348 passed; `-p hermit-run --lib` 15 named tests: 15 of 15 passed; `-p hermit-run --test cli` `analyze_trials_prepare_the_exclusive_rewrite_their_reproducer_names`: 1 of 1 passed; `-p hermit-run --lib`: 479 of 486 passed; the other 7 fail the same way at main `d192e5d72` on this host: `ptrace_completion::tests::real_random_copy_failure_retires_initialized_sibling_and_timer`, `ptrace_completion::tests::real_random_copy_failure_with_trace_diagnostics`, `ptrace_completion::tests::real_random_live_copy_preserves_sibling_and_timer_success`, `ptrace_completion::tests::real_random_readv_import_failure_retires_initialized_sibling_and_timer`, `ptrace_completion::tests::real_random_readv_live_import_preserves_sibling_and_timer_success` (host stack-size and VM-counter limits); `tests::detcore_drives_kvm_guest_for_synthetic_syscall`, `tests::kvm_runs_dynamic_echo_through_detcore` (this VM's KVM guest clock); `-p detcore-model --lib`: 323 of 323 passed. Main has since moved to `694f5df2f`; this head merges into it without a code conflict (count-pin files only, left to the lander). Revision 13 was `311d35b33`. Carry-over: both reviewers approved this change at `311d35b33`; its own patch, apart from the count pins, is identical commit by commit, and its tests pass at this head.
+
+**Revision 15:** the owner's decision on the stripped-file model (option 4). By default the rewriter now rewrites only what ARM mapping symbols prove is code. The stripped-file heuristic is kept behind a second, explicit opt-in that discloses its residuals. Head `bcb86b5490c2ad537d8b9fcf7741b27de1bb836f` on main `c1f3085da`. The base moved from `cb9694edf` through `e8e0f9a1c`, `ffe313b16` and `fbf9d5f0c`, and at each step only the count pins conflicted. The 30 earlier commits replay with their own lines unchanged, apart from pins and a per-commit `cargo fmt` of three early commits whose end tree is identical. Three new commits carry the change: `771a386f7` (the default and the opt-in), `c1dd4cdeb` (cache entries named by their bytes) and `bcb86b549` (a mapping symbol other than `$x` and `$d` leaves its section unproven); the last two answer the review of `771a386f7` by both seats.
+
+**Default (`--rewrite-exclusives`, `--rewrite-exclusives-stripped=refuse`).** The only code evidence it accepts is a mapping symbol: a local, untyped `$x` or `$d`, with data winning a tie (`d06c09715`). An executable section that no mapping symbol marks is not read for code at all, which covers every section of a stripped file. The planner still finds that section's sequences and counts its exclusive instructions, and each sequence is refused as the new `Refusal::NoMappingSymbols`, named `no-mapping-symbols`. So the file is left unchanged and named:
+- `hermit rewrite-exclusives --list-refusals` lists each loop by address with that reason.
+- The run's diagnostic line counts them, and a stderr line names the file and the opt-in.
+- The run summary lists the file under `exclusive_rewrite_unmarked`, in JSON and in the INFO view.
+- `hermit rewrite-exclusives` exits 1 for such a file, because the report is incomplete.
+
+A marked section is planned by the same code as before, so its output is unchanged.
+
+**Opt-in (`--rewrite-exclusives-stripped=heuristic`).** `hermit rewrite-exclusives` takes the same choice as `--stripped=heuristic`. The flag is named after its sibling `--rewrite-exclusives-also`, requires `--rewrite-exclusives`, appears in `--help` and the run-configuration samples, and is described in a new USER_GUIDE section, "Exclusive-Loop Rewrite (aarch64)". It runs `e6f7aa4ba`'s path unchanged. Its help, the module documentation and the guide all list the same residuals:
+- an imported function that never returns and whose name the reader does not know;
+- a lost carried `ADRP` base;
+- an unresolved `ADRP`'s reach past its page;
+- a false branch that cuts a table's tail;
+- a return through a changed `X30` or a syscall;
+- an unknown `BLR` callee;
+- and the plain statement that a mistaken classification can corrupt program data.
+
+**Visibility of the opt-in.**
+- **Run summary:** `Config::rewrite_exclusives_stripped_heuristic` is set by the CLI and has no legacy backend key. It becomes `RunSummary::exclusive_rewrite_stripped_heuristic` (JSON, plus an INFO line).
+- **Preemption record:** the scheduler stamps it as `rewrite_exclusives_stripped_heuristic`, written only when on.
+- **Replay:** a replay (`--replay-preemptions-from`, `--replay-schedule-from`) under the other setting is refused by the record's own mark, as a PolicyRefusal before launch.
+- **Analyze and bisect:** trials take the setting from their run arguments, every record analyze writes is stamped with it, recordings made under the other setting are refused before any trial, and the trial-preparation key includes the policy.
+- **Verification exports:** the heuristic refuses `--verify-json` and `--verify-run`. These are the two verification exports another tool reads without this command line: the typed report, and the saved run directory that `hermit log-diff --verify-json` compares. Neither would show the heuristic. The refusal sits in `main_with_backend`, before dispatch, and again in `prepare_exclusive_rewrite`, so analyze trials and library callers hit it too. Plain `--verify` stays allowed, because its verdict is printed beside the run's own summary, which states the heuristic.
+- **Offline route:** `hermit record start` takes no `--rewrite-exclusives`, and `record_start_takes_no_exclusive_rewrite` pins both flags as unknown arguments there. So no saved recording or verify-run directory can carry the heuristic for an offline consumer to read.
+
+**Coverage**, measured with `hermit rewrite-exclusives --output-dir` at `771a386f7`. Inputs are A64's twelve Grace files and K3's toolchain corpus. Counts are loops rewritten, with loops left as `no-mapping-symbols` in brackets.
+
+| file | mapping symbols | default | opt-in |
+| --- | --- | --- | --- |
+| libc.so.6 | yes | 19 | 19 |
+| ld-linux-aarch64.so.1 | yes | 4 | 4 |
+| libstdc++.so.6 (distro-stripped) | no | 0 (7) | 7 |
+| libgcc_s.so.1 (distro-stripped) | no | 0 (2) | 2 |
+| libcrypto.so.3 (distro-stripped) | no | 0 (9) | 9 |
+| libc-stripped.so.6 (`strip -o`) | no | 0 (19) | 19 |
+| ld-linux-stripped.so.1 (`strip -o`) | no | 0 (4) | 4 |
+| llsc-unstripped | yes | 6 (+1 not canonical) | 6 (+1) |
+| llsc-stripped | no | 0 (7) | 6 (+1) |
+| llsc-strong | yes | 7 | 7 |
+| llsc-strong-stripped | no | 0 (7) | 7 |
+| shp | yes | 2 | 2 |
+| **12 Grace files** | | **38 loops in 5 files** | **92 loops in 12 files** |
+| libLLVM.so | yes | 287 | 287 |
+| librustc_driver.so | yes | 290 | 290 |
+| libstd.so | yes | 15 | 15 |
+| libLLVM.so, stripped | no | 0 (288) | 284 |
+| librustc_driver.so, stripped | no | 0 (292) | 288 |
+| libstd.so, stripped | no | 0 (17) | 15 |
+
+How the outputs compare:
+- Under the opt-in, every output is byte-identical to `e6f7aa4ba`'s (all 18 files), and the twelve Grace outputs match A64's `EXPECTED.txt` sha256 recorded on the Arm host.
+- Under the default, a marked file's output is byte-identical to the opt-in's, and a stripped file's output is its input.
+
+No file in this corpus is only partly marked. Each unstripped toolchain library has one small executable section without a mapping symbol, and that section holds no exclusive instruction.
+
+**`REWRITE_FORMAT_VERSION` 4 → 5.** This one bump covers this change and #4879's planner change, both unlanded. #4879 carries no bump of its own.
+
+**Tests.** 18 new tests, each killed by a named mutant: 12 in `hermit-run`, 4 in `hermit-detcore`, 2 in `detcore-model`. The reply lists each test with its mutant.
+
+**Review of `771a386f7` (both seats), answered in two commits.**
+
+- **Cache aliasing (Claude and Codex, blocking).** The overlay's cache named a copy by format, source digest and file name only, so a default run and a heuristic run of one stripped file wrote different bytes under one name, and one run's check could be undone by the other's write before the bind mount. Fixed at `c1dd4cdeb`: `aarch64_lse::cached_rewrite` names each copy by the format, the policy, a digest of the rewritten bytes and the source's mode, so runs that would map different bytes never share a copy (two builds of the rewriter that share a format number included), and a copy is never written in place: a missing or wrong one is written under a temporary name and renamed over the name, so a run that mounted the file it replaces keeps it. A file the rewrite leaves unchanged is no longer copied into the cache. `hermit rewrite-exclusives` prints which policy decided the files without mapping symbols (Claude's non-blocking point). Test `each_policy_maps_only_its_own_rewrite_from_one_cache`: one shared cache directory, a default and a heuristic copy of one stripped source, in either order, each holding its own bytes, a held handle still reading its bytes after the other write, and a corrupt entry replaced by a new file while a handle on the old one reads the old bytes. Mutants: the policy and digest dropped from the name (0 passed, 1 failed); the entry written in place (0 passed, 1 failed). Limitation: the interleaving is forced at the file level (write, hold, rewrite) rather than through two live `hermit run` processes, which cannot run on this x86_64 host.
+- **Unsupported mapping symbols (Codex, blocking).** `mapping_kind` knew only `$x` and `$d`, so a `$a`, `$t`, `$q`, `$xyz` or `$dx` after a valid `$x` was ignored and the code range ran through it. Fixed at `bcb86b549`: any local, untyped `$` symbol other than `$x` and `$d` (each with or without AAELF64's `.suffix`) leaves its section unproven under either policy, every sequence in it refused as `unsupported-mapping-symbol` naming the symbol; the file is printed and listed in the summary with the files left for want of mapping symbols. Tests `an_unsupported_mapping_symbol_leaves_its_section_unproven` (`$a`, `$t`, `$q`, `$xyz`, `$dx` after a valid `$x`, under both policies; `$d` and `$x.f` controls) and `mapping_symbols_this_reader_does_not_know_are_collected` (including a global `$a`, an ordinary label). Mutant: `unsupported_in` ignored (0 passed, 1 failed). None of the 18 corpus files holds such a symbol: the coverage table is unchanged, re-measured at the head (heuristic outputs still equal `e6f7aa4ba`'s and A64's `EXPECTED.txt`; default outputs equal the heuristic's for marked files and the input for stripped ones).
+
+**Pins:**
+- `test.hermit_unit` 1283 and `_on_host` 1277: twelve new units (nine, then one, then two). The JSON copy had carried one fewer than the static table and now agrees with it.
+- `test.detcore_unit` and `_on_host` 3468 (four new units).
+- `test.regular_crates` 1952 and `_on_host` 1938 (two new units).
+- Each matches `cargo nextest list` under the node's own selection at this head. `test.cli` lists 772 against main's 795; that cell has no change here, and main's table no longer gates (`3c80b679f`).
+
+**RECORD_VERSION and GLOBAL_RPC_REVISION:** unchanged from main (`0x198`, 24).
+- The preemption record's new field is serde-default: absent means off, as in every record made before it, so the record format is not bumped. `#4795`'s `rewrite_exclusives_in_memory` follows the same pattern.
+- No RPC payload changes. The two Config fields have no legacy key, and `the_global_rpc_revision_matches_its_definitions` passes.
+
+Validation at `bcb86b549` (AMD x86_64 host, validate profile): `cargo nextest run -p hermit-detcore -p hermit-run -p detcore-model --lib --bins`: 5035 run, 5028 passed, 7 failed, the same seven baseline failures, none new; pins equal the listed counts (detcore 3468/3468, hermit 1283/1277, regular 1952/1938); at `771a386f7` it was 5032 run, 5025 passed, 7 failed, all seven in main's named baseline (five `ptrace_completion::tests::real_random_*`, two KVM; host-limited), none new; the 19 mutants each kill their test (0 passed). `-p hermit-manifest-plan`: 894 run, 6 failed, the same six `runner::tests::ptrace_given_{kvm,liteinst,sabre}_inputs_matches_its_own_*` that fail on main `c1f3085da` itself on this host. `cargo fmt --all -- --check`, `cargo clippy -p hermit-detcore -p hermit-run -p detcore-model --all-targets -- -D warnings`, `RUSTDOCFLAGS='-D warnings' cargo doc --no-deps` for the same crates, `scripts/check-doc-bare-urls.rs` and `ci/sync-cell-config.sh --check` are clean. Assurance: L0 on x86_64 for the host-independent tests; no guest ran here.
+
+**aarch64.** Validation on aarch64 (NVIDIA Grace, Neoverse V2, Linux 6.16, CentOS Stream 9; ptrace backend, default log level, no relaxations), all at bcb86b5490c2ad537d8b9fcf7741b27de1bb836f on main c1f3085da, built with the repository's nightly-2026-07-12 in the validate profile plus the same local compile-only patches as before for issue 4981 (Detcore and the recorder and replayer) and for Reverie's ungated `segv_repair` import, none of which touches this change's files. hermit-run's lib test target does not build on aarch64 at main, because its dev-dependency `reverie-inguest` has 244 x86_64-only errors, so the `aarch64_lse` modules were compiled unmodified into a harness crate with hermit-cli's dependencies: all 51 of their unit tests pass, including `each_policy_maps_only_its_own_rewrite_from_one_cache`, `an_unsupported_mapping_symbol_leaves_its_section_unproven` and `mapping_symbols_this_reader_does_not_know_are_collected`. On the twelve Grace files, `hermit rewrite-exclusives` rewrites 38 loops in 5 files by default and 92 loops in 12 files with `--stripped=heuristic`; every heuristic output has the expected sha256 (12 of 12), and under the default the 5 marked outputs have it while the 7 stripped outputs equal their inputs, each loop refused as `no-mapping-symbols` with exit 1 (the host's own libstdc++ and libc give the same 7 refusals and 19 rewrites). `hermit run --strict --verify --verify-strict --verify-json` on a C++ guest, with `--rewrite-exclusives-also` for libc and libstdc++, names libstdc++ (as the file its symlink resolves to) on stderr and in `exclusive_rewrite_unmarked` and matches with bitwise parity, 379 of 379 INFO messages; a strong-CAS LL/SC guest under the default matched in 20 of 20 runs (314 of 314 each). With `--rewrite-exclusives-stripped=heuristic`, both `--verify-json` and `--verify-run` are refused with exit 122 before the guest starts, and the stripped strong-CAS guest matched under `--verify --verify-strict` in 20 of 20 runs with `exclusive_rewrite_stripped_heuristic: true`; a preemption record made under the heuristic carries its mark, a replay without the heuristic is refused by name, and a replay with it runs. Four live runs per round sharing one fresh cache directory (default and heuristic, on a stripped guest and on the C++ guest) kept to their own copies in all 10 rounds: each cache entry is named by its policy and the digest of its contents, a file the default leaves unchanged gets no entry, the heuristic and C++ runs matched every time, and the default run of the stripped guest, whose loops stay LL/SC, diverged as expected. Executables built by gcc whose `.text` carries a local `$t`, `$a` or `$dx` after the assembler's `$x` keep both loops as `unsupported-mapping-symbol` under either policy, and `hermit run` names the file; with `$x.f`, or no extra symbol, both loops are rewritten.
+
+**Unpublished intermediate round (`e6f7aa4ba`), folded into this revision:** rebased onto main `cb9694edf` (Reverie pin unchanged); only the count pins conflicted, re-derived as main's value plus this change's tests, and the thirteen earlier commits replay with their own lines unchanged. Four new commits answer the review at `3ea4bee5d`, and one counts their tests. `646aa4ec1` rewrites only an executable section's code: what the file's mapping symbols mark `$x`, or, in a section without them (a stripped file), what control reaches from the entries of the functions the unwind table's FDEs describe; a sequence an `LDR` (literal) or `ADR` reaches is refused as `literal-inside-the-sequence` under any evidence, a file with neither mapping symbols nor an unwind table is left alone and reported, and `REWRITE_FORMAT_VERSION` becomes 3. That code-from-data reader (`aarch64_lse::mapping`) was first written for #4909, which sat on #4795; the review wants it in the rewriter, so it moves down here, #4795's move into Detcore carries it, and #4909 keeps only the store-exclusive census's use of it. `5e6449836` refuses `--rewrite-exclusives` for a guest run from an OCI image, in argument validation for `--image` and before the image store is opened for `hermit oci run`, on any host. `26595603c` keeps every refused loop in the report (`refused_sites`, renamed from `refused_examples`), so `--list-refusals` lists all of them; a run still logs the first sixteen and says how many more there are. `35f505261` keys prepared analyze and bisect trial overlays by every input the preparation reads, including `--tmp`, `--workdir`, `--image`, the guest environment and a digest of each resolved file. Pins: `test.hermit_unit` 1350 → 1372 and `test.hermit_unit_on_host` 1344 → 1366, each matching `cargo nextest list` under the node's own selection. RECORD_VERSION and GLOBAL_RPC_REVISION: unchanged from main (`0x198`, 21); this change adds no recorded field and no RPC payload, and the rewrite runs in the CLI before any Detcore RPC. `ae0e70e5a` closes the one shape the reachability walk left: where only the unwind table speaks for a section, a call is taken to return, so a table placed after a call that does not return is reached as code; whatever the code addresses as data (an `LDR` (literal), `ADR`, or `ADRP` with the `ADD` or unsigned-offset load or store that completes it) is now taken for data from that address to the next instruction a branch reaches, or the function's end, and no sequence over it is rewritten (`addressed-data-inside-the-sequence`). The module documentation now states the guarantee at each level of evidence instead of claiming bytes not known to be code are never taken for it, and names what is still taken for code wrongly: data after a non-returning call that no instruction of the file addresses. Sections with mapping symbols are untouched by this. Measured on three real aarch64 shared objects (the toolchain's `libstd`, `librustc_driver` and `libLLVM`, each also stripped of its symbol table so the unwind table is the only evidence): 1,179 rewritten loops before and 1,179 after, so a stripped library loses no coverage. `5dec660f5` counts its three tests (`test.hermit_unit` 1372 → 1375, `_on_host` 1366 → 1369). `149c55b43` answers the second review of the same head: the image refusal now also sits where every preparation converges (`prepare_exclusive_rewrite`), at the top of `RunOpts::main` before the dispatch that can serve a debug adapter, and at the top of `RunOpts::run`, the entry a library caller can use without validating; and the prepared-overlay key holds the cache directory (which follows `XDG_CACHE_HOME` and `HOME`) and each file's mode, with a cached copy replaced when its mode is not the source's, since the copy carries it. Its unit raises the pins to 1376 and 1370. Four more commits answer a second round of review on that head, from both seats and from the author of the code-from-data reader: `8fad4467a` ends an `ADRP` pairing where its register is written and takes the function an uncompleted pairing's page belongs to; `b686012ab` takes every completion of one `ADRP`, so a table addressed through its second use is data too, and filters the image's branches once rather than each round of the extents' fixed point (a quarter of a stripped 132 MB library's rewrite time); `d06c09715` takes only a local, untyped symbol for a mapping symbol, as the ABI defines them, so an ordinary global label named `$x` inside a `$d` table no longer starts a code range; `70b847ffb` counts the last two tests (pins 1380 and 1374). Three later commits close what reviewing that round found: `2f9e3a8cc` counts only a load as writing an `ADRP`'s register, so spilling the page (`STR X1, [SP]`) no longer ends the pairing, which was the fail-open direction; `e6f7aa4ba` takes a pointer the image stores into a function for data as well, so a table the code reaches only through a pointer it was handed is kept too (a dynamic relocation's address, a plain word of a loaded non-executable section in an `ET_EXEC` image, or a symbol naming data in an executable section), leaving only an address computed from an unrelated base, stated in the documentation. Measured on the three stripped shared objects, 15, 288 and 284 rewritten loops before and after, no coverage lost; two real stripped executables that reach a table only through a stored pointer, one `ET_EXEC` and one position-independent, are rewritten before and byte-identical after. A later commit, `e6f7aa4ba`, answers the rounds that followed by changing what a stripped file's code is taken to be rather than subtracting suspected data from it: a call falls through only where the callee can be shown to come back (a function whose body reaches a `RET`, or which tail-calls one that does, worked out over the unwind table's functions until the answer stops growing), and a function the image names as one that never returns -- `exit`, `abort`, `__stack_chk_fail`, `_Unwind_Resume`, a Rust panic entry point -- never does, whether called directly or through its procedure linkage table entry, matched to its `R_AARCH64_JUMP_SLOT` relocation. It also carries an `ADRP`'s base through an `ADD` into that register, and gives an unresolved `ADRP`'s whole page to the functions it overlaps instead of guessing one. Stripped coverage: libLLVM 284 to 261 loops, librustc_driver 288 to 252, libstd 15 to 15; unstripped files are unchanged. Reviewing that round found four holes in the proof and one way it was far too strict, all closed at `e6f7aa4ba`: the fixed point now knows which calls never return (a wrapper whose only call is `abort` was certified by a data word shaped like a `RET`); only `RET X30` proves a return, and an `SVC` proves nothing past it, so an exit helper is no longer certified by the dead `RET` after it; a procedure linkage table entry built for branch target identification is matched at its `BTI`, one instruction before its `ADRP`; an unresolved `ADRP` hands back the page it names rather than its own address, which is what took one Arm host's stripped libc from nineteen rewrites to none; a literal or `ADR` naming a function's entry is a pointer to the function, so a function whose address the program takes is rewritten again; and a completion followed by a write that does not carry the base leaves the page unresolved. `REWRITE_FORMAT_VERSION` becomes 4. Stripped coverage at that head: libLLVM 255 of the 284 the subtract model took, librustc_driver 288 of 288, libstd 15 of 15. `e6f7aa4ba` then takes back the one rule in that round that cost real rewrites: marking an `ADRP`'s whole page as data when a later write took its base away removed every rewrite in each function of that page, which measured as libLLVM 284 to 255 here and, on an Arm host, the dynamic loader 4 to none, libgcc_s 2 to none and two threaded guests 6 and 7 to none. The pairing ends at such a write, as before, and the module documentation now lists every limit together: data after an imported never-returning function this reader does not know, data an unresolved `ADRP` reaches beyond its page, the tail of a table a false branch could cut, what the code addresses through a register whose base was lost, a function returning through a changed link register or a syscall, and a call through a register. A syscall is terminal to the proof whatever its immediate, and `RETAA` and `RETAB` prove a return. Stripped coverage returns to the subtract model's: libLLVM 284, librustc_driver 288, libstd 15, and the Arm guests 6 and 7. Validation at `e6f7aa4ba` (AMD x86_64 host, validate profile): `-p detcore-model -p hermit-run --lib --bins`: 1520 run, 1513 passed, 7 failed, all seven in main's named baseline (five `ptrace_completion::tests::real_random_*` and two KVM, host-limited), none new; with the pin's features: 1377 run, the same seven plus six in-guest forced-gate rows that need a locally built liteinst runtime and two DBT rows that need the packaged DBT runtime, none touching this change; the review tests and their mutants are listed in the reply; `--test cli` `analyze_trials_prepare_the_exclusive_rewrite_their_reproducer_names` and `no_namespace_rejects_container_only_options`: 2 of 2 passed. fmt, `cargo clippy -p hermit-run --all-targets --features third-party-backends,kvm-native-test-support -- -D warnings`, `RUSTDOCFLAGS='-D warnings' cargo doc --no-deps -p hermit-run`, `scripts/check-doc-bare-urls.rs` and `ci/sync-cell-config.sh --check` are clean. A real aarch64 ELF built by clang and ld.lld from the review's literal-pool source (a branch over `c85ffc64 91000484 c805fc64 35ffffa5`, then an `LDR` of them), as an executable, a stripped executable and a shared object, is rewritten at `3ea4bee5d` (`c85ffc64` → `d2800025` and the three words after it, in all three) and left byte-for-byte unchanged here. **aarch64 host evidence.** An Arm host (Neoverse V2) ran this change's rewriter on real binaries; this x86_64 host cannot execute aarch64 at all. `hermit-run` does not build on aarch64 at main or here (https://github.com/rrnewton/hermit/issues/4981, 46 errors in Detcore), so the rewriter's modules were compiled unmodified into a harness crate: its unit tests ran 40 of 40. On a gcc-built LL/SC guest the file rewrite found 14 exclusive instructions, rewrote 6 and left 1 (a weak compare-exchange whose retry the compiler folded into the enclosing loop), with the same counts stripped and unstripped, and the rewritten guest ran correctly. System libraries rewrote 19 loops in libc, 4 in the dynamic loader, 7 in libstdc++, 2 in libgcc_s and 9 in libcrypto with no refusals, a rescan of each rewritten library found none left, and xz, zstd, sort, python3, sqlite3, openssl and a C++ guest gave byte-identical output against them. With a local compile patch for issue 4981 (and https://github.com/rrnewton/hermit/issues/1246 and https://github.com/rrnewton/hermit/issues/1248 for the Reverie side), which changes no pull request, the `hermit` binary builds there: `hermit rewrite-exclusives` reproduces the harness's counts and files byte for byte, and `hermit run --strict --verify --verify-strict` on a strong-CAS LL/SC guest diverged in all 20 runs without the rewrite and matched in all 20 with it (bitwise parity true, 314 of 314 INFO messages, and 329 to 341 under chaos seeds 1 to 3), which is L2 and, over those 20 repeats, L4 on that patched binary. The guest whose weak-CAS loop is left alone still matched 13 of 20, and the four new run.rs unit tests could not run there because the test target pulls in a Reverie crate that does not compile on aarch64. Memory mode belongs to the change stacked on this one. aarch64 execution is not possible on this x86_64 host; every test cited here is host-independent. Revision 14 was `3ea4bee5d`.
+
+Revision 14 was `3ea4bee5d`.

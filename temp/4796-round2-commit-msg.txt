@@ -1,0 +1,45 @@
+4796: keep the uncovered interval after a recovered re-arm, keep the hit budget per thread
+
+[hermit2, musetrain, tbh-1005, devbig014, role=impl]
+
+Plain Language Summary and Project Impact
+
+Round 2 of the blocked re-arm reporting fix. If the new image later
+unblocked SIGTRAP and armed again, the resumed observation overwrote
+the blocked status and the uncovered interval vanished from the trace
+and the warning. Separately, closing an interval had reset the
+thread's first-64/last-64 hit budget, so one thread could record 128
+hits per interval instead of 128 in total. The watch ledger now holds
+one hit budget and one bounded tail per thread for its whole life,
+and coverage intervals (armed/uncovered spans with their reasons)
+close at both edges of an uncovered span: at a failed re-arm and when
+observation resumes. Earlier genuine arms and hits are preserved.
+
+Determinism
+
+Reporting only. Interval closing and the budget are pure functions of
+the recorded watch-status and hit sequence per thread; summaries stay
+in thread and interval order. No schedule, signal mask, virtual time
+or guest-visible result changes, so the same recorded run writes the
+same summaries and warning on every replay.
+
+Linux Semantics
+
+No guest semantics change: exec still keeps the blocked signal mask
+and clears the debug registers, an unblock still lets the thread arm
+again, and stores made while uncovered still run unwatched. Only
+Hermit's coverage reporting and hit accounting change.
+
+Validation
+
+Red-first at b1bd9fb7: a_recovered_rearm_keeps_the_uncovered_interval
+saw an empty unarmed list, and the_watch_hit_budget_spans_coverage_
+intervals saw 256 recorded hits for one thread. At this head: those
+two units pass; detcore lib 3731/3731, detcore-model 347/347,
+hermit-run watch 26, run_config 24, races 51, access 5; CLI watch 2/2
+and access_trace 13/13 (new a_recovered_rearm_after_exec_keeps_the_
+uncovered_interval: blocked exec, store, unblock, store — three
+summaries, one hit, warning); validation_dag 42/42 with the DAG
+regenerated (detcore pins 3534, cli 802, cli_on_host 721); fmt and
+package Clippy clean. No RPC definition change (revision 45 digest
+unchanged).

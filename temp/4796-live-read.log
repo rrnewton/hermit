@@ -1,0 +1,5 @@
+[herdr-run] engine=rust (tracked Cargo launcher: rs/bin/herdr-run)
+[herdr-run] rust cache=verified source=7940999a905d binary=0eea71e2a969
+GH-PACED WARNING [hermit-bot3] read budget 250/hour per host reached (250 used in the last hour); sleeping 4 s (next slot 5:35 AM ET)
+accepts at most 1 arg(s), received 3
+herdr-run: retired idle tab wF:t2ED (pane wF:p2ED, agent musedrainb, last run 2026-11-05T10:28:53Z) idle past the 300s TTL

@@ -1,0 +1,32 @@
+=== systemd-run --user --scope -p MemoryHigh=40G -p MemoryMax=60G cargo test -q -p hermit-detcore --lib a_blocked_rearm_after_exec_is_reported_without_erasing_prior_hits -- --exact access_trace::tests::a_blocked_rearm_after_exec_is_reported_without_erasing_prior_hits
+Running as unit: run-p772152-i3560315963.scope; invocation ID: 283f231627ef452d8765001104677a77
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3728 filtered out; finished in 0.00s
+
+RC=0
+=== systemd-run --user --scope -p MemoryHigh=40G -p MemoryMax=60G cargo test -q -p hermit-run --test cli a_blocked_rearm_after_exec_reports_the_uncovered_interval -- --exact access_trace::a_blocked_rearm_after_exec_reports_the_uncovered_interval --test-threads=1
+Running as unit: run-p938401-i3560316374.scope; invocation ID: b67a7c144ed44a09b269797f7b285a69
+
+running 1 test
+/home/newton/work/dev-hermit/worktrees/slots/musetrain-20261101/temp/drain-4796/hermit-cli/tests/fixtures/access_trace_pipes.c:14: warning: "_GNU_SOURCE" redefined
+   14 | #define _GNU_SOURCE
+      | 
+<command-line>: note: this is the location of the previous definition
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 894 filtered out; finished in 0.73s
+
+RC=0
+=== systemd-run --user --scope -p MemoryHigh=40G -p MemoryMax=60G cargo test -q -p hermit-run --test cli a_watch_survives_exec_into_an_image_that_stores_first -- --exact access_trace::a_watch_survives_exec_into_an_image_that_stores_first --test-threads=1
+Running as unit: run-p1113398-i3560316724.scope; invocation ID: e3770777cc7048c3a96fff78fbee7e48
+
+running 1 test
+/home/newton/work/dev-hermit/worktrees/slots/musetrain-20261101/temp/drain-4796/hermit-cli/tests/fixtures/access_trace_pipes.c:14: warning: "_GNU_SOURCE" redefined
+   14 | #define _GNU_SOURCE
+      | 
+<command-line>: note: this is the location of the previous definition
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 894 filtered out; finished in 0.70s
+
+RC=0

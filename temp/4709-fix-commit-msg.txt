@@ -1,0 +1,49 @@
+4709: resolve the auto CPU profile for direct Detcore test launches
+
+[hermit2, musetrain, tbh-1005, devbig014, role=impl]
+
+Plain Language Summary and Project Impact
+
+The merge queue's privileged-cpuid.faulting node went red at
+23ea511e: rdrand_rdseed_is_masked panicked with "--cpu-profile auto
+reached Detcore unresolved". That test drives Detcore directly
+through detcore/tests/testutils, and every Config::default() now
+carries the clap default `auto`, which only a CLI launch view can
+classify from a first image. Test preparation now resolves an
+unresolved `auto` to x86-64-v2 — the profile `auto` itself selects
+for an unmarked image — at the one preparation seam every Detcore
+test launch funnels through, and the two direct callers that skipped
+preparation now use it. Detcore's own refusal of an unresolved
+`auto` is unchanged, so real launch paths keep their tripwire.
+
+Determinism
+
+Test-launch configuration only. The resolution is a constant named
+profile, not derived from host state, wall time or the host CPU; a
+guest image declaring a higher ISA level is still refused by name by
+Detcore's per-exec check, exactly as under an explicit v2 launch.
+No schedule, virtual-time or guest-visible product behaviour
+changes: production code gains only a `CpuProfile` re-export.
+
+Linux Semantics
+
+No Linux behaviour Hermit presents changes. This chooses which
+virtual CPU Detcore's own tests run under; the CPUID answers for the
+named v2 profile are the table Detcore already served.
+
+Test Plan:
+
+- Reproduced at 23ea511e: `cargo test -p hermit-detcore-tests
+  --test tests_misc -- rdrand_rdseed_is_masked --exact` FAILED
+  (isolated child exit 101, the queue's failure).
+- At this head: the same exact test passes 1/1; new testutils unit
+  prepare_resolves_an_unresolved_auto_cpu_profile passes (auto and
+  Config::default() resolve to v2; v2/v3/host-no-rdrand untouched);
+  detcore-testutils lib 11/11; tests_misc cpuinfo slice 2/2;
+  hermit-detcore lib 3732/3732 (includes the cpu_profile/cpuid
+  slices, 20/20 named); hermit-manifest-plan validation_dag:: 42/42
+  and generate-validation-dag --check canonical; cargo fmt --check
+  and Clippy (hermit-detcore, detcore-testutils,
+  hermit-detcore-tests, --all-targets -D warnings) clean.
+- Full-profile evidence is the merge queue's resubmission run at
+  this exact head.

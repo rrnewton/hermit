@@ -1,0 +1,266 @@
+=== systemd-run --user --scope -p MemoryHigh=40G -p MemoryMax=60G cargo test -q -p hermit-detcore --lib
+Running as unit: run-p1432554-i3561846078.scope; invocation ID: 51f783208d4e4d18b16f05afcae85f54
+
+running 3729 tests
+....................................................................................... 87/3729
+...................................................................................REFUSING to compare: the first log was truncated at the configured size bound (the log ends with the bounded writer's truncation marker, or with the stop line of hermit's --max-log-bytes cap). The discarded tail was never written, so no comparison of these files can establish that the runs agree past that point. Re-run with a larger HERMIT_LOG_MAX_BYTES (or 0 to disable that bound), or a larger --max-log-bytes. This is a NO-RESULT, not a difference and not a match.
+.... 174/3729
+................Logs contain 1 | 1 messages total
+Logs contain 0 | 0 messages total
+.Logs contain 0 | 0 detcore-specific messages
+Logs contain 0 | 0 INFO messages
+Logs contain 0 | 0 DETLOG & scheduler COMMIT messages
+Canonicalizing host addresses (ordinal by first appearance); comparing everything else exactly...
+  Comparing INFO messages...
+
+Done processing logs, but ZERO INFO messages were selected on either side: nothing was compared (no-result, not a match).
+..Logs contain 1 | 1 messages total
+Logs contain 1 | 1 detcore-specific messages
+Logs contain 1 | 1 INFO messages
+Logs contain 1 | 1 DETLOG & scheduler COMMIT messages
+Canonicalizing host addresses (ordinal by first appearance); comparing everything else exactly...
+  Comparing INFO messages...
+
+Done processing logs, no substantive differences found (1 | 1 INFO messages compared).
+Logs contain 0 | 0 scheduler empty-run-queue kick messages
+Logs contain 0 | 0 scheduler COMMIT records reading /proc/self/maps
+Logs contain 1 | 1 detcore-specific messages
+Logs contain 1 | 1 INFO messages
+Logs contain 1 | 1 DETLOG & scheduler COMMIT messages
+Canonicalizing host addresses (ordinal by first appearance); comparing everything else exactly...
+  Comparing INFO messages...
+
+(INFO) Mismatch at log messages 1 (run 1) and 1 (run 2): [1mDiff[0m [31m< left[0m. / [32mright >[0m :
+[31m<"INFO detcore: DETLOG payload=[0m[1;48;5;52;31mlef[0m[31mt"[0m
+[32m>"INFO detcore: DETLOG payload=[0m[1;48;5;22;32mrigh[0m[32mt"[0m
+(INFO) Original entries before normalization: [1mDiff[0m [31m< left[0m / [32mright >[0m :
+[31m<"INFO detcore: DETLOG payload=[0m[1;48;5;52;31mlef[0m[31mt"[0m
+[32m>"INFO detcore: DETLOG payload=[0m[1;48;5;22;32mrigh[0m[32mt"[0m
+Done processing logs, differences found.
+................................................................... 261/3729
+....................................................................................... 348/3729
+....................................................................................... 435/3729
+....................................................................................... 522/3729
+....................................................................................... 609/3729
+....................................................................................... 696/3729
+....................................................................................... 783/3729
+................................................................hermit: [detcore, dtid 4343] pidfd_send_signal through the self sentinel -10001 cannot be serviced: this backend's syscall executor declares that it does not perform pidfd_send_signal
+....................... 870/3729
+.....................................hermit: [detcore, dtid 4343] pidfd_send_signal through the self sentinel -10000 cannot be serviced: this backend's syscall executor declares that it does not perform pidfd_send_signal
+.................................................. 957/3729
+....................................................................................... 1044/3729
+....................................................................................... 1131/3729
+....................................................................................... 1218/3729
+....................................................................................... 1305/3729
+....................................................................................... 1392/3729
+....................................................................................... 1479/3729
+....................................................................................... 1566/3729
+....................................................................................... 1653/3729
+....................................................................................... 1740/3729
+....................................................................................... 1827/3729
+....................................................................................... 1914/3729
+....................................................................................... 2001/3729
+....................................................................................... 2088/3729
+....................................................................................... 2175/3729
+....................................................................................... 2262/3729
+hermit: hermit: [dtid 1] ioctl refused: a binder call on descriptor 99 waits for another process, so it would run off the guest's turn, which Hermit allows only while the caller is the run's one task, but the run has another task besides it (task 2 of process 1, which exited and is not reaped yet): Linux reads the call's argument when the call starts and installs each descriptor a read delivers in the caller's table before the call returns, so another task could change the call, use, close or replace those descriptors, or take the work it waits for, before Hermit accounts for them. --allow-unsupported-syscalls returns EOPNOTSUPP for it instead[dtid 1] ioctl refused: ioctl(BINDER_WRITE_READ) on descriptor 99 ran in the guest's turn and may have delivered descriptors Detcore cannot name (its read_consumed is not within its read_size), which Detcore does not record
+
+hermit: hermit: [dtid 1] ioctl refused: ioctl(BINDER_FREEZE) on descriptor 99 waits for its target's transactions to drain, so the freeze would take effect on the background path, at a moment this host chooses rather than one the schedule orders against the guest's other threads. Hermit cannot run it deterministically; --allow-unsupported-syscalls returns EOPNOTSUPP for it instead[dtid 1] ioctl refused: a binder call on descriptor 99 waits for another process, so it would run off the guest's turn, which Hermit allows only while the caller is the run's one task, but the run has another task besides it (task 3): Linux reads the call's argument when the call starts and installs each descriptor a read delivers in the caller's table before the call returns, so another task could change the call, use, close or replace those descriptors, or take the work it waits for, before Hermit accounts for them. --allow-unsupported-syscalls returns EOPNOTSUPP for it instead
+
+.............................hermit: [dtid 1] ioctl refused: ioctl(BINDER_WRITE_READ) on descriptor 99 both writes and waits to read, so its write half (the transactions, replies and commands it sends) would run on the background path, at a moment this host chooses rather than one the schedule orders against the guest's other threads. Hermit cannot run it deterministically; --allow-unsupported-syscalls returns EOPNOTSUPP for it instead
+.........hermit: [dtid 1] ioctl refused: ioctl(BINDER_WRITE_READ) on descriptor 99 both writes and waits to read, so its write half (the transactions, replies and commands it sends) would run on the background path, at a moment this host chooses rather than one the schedule orders against the guest's other threads. Hermit cannot run it deterministically; --allow-unsupported-syscalls returns EOPNOTSUPP for it instead
+hermit: [dtid 1] ioctl refused: a binder call on descriptor 99 waits for another process, so it would run off the guest's turn, which Hermit allows only while the caller is the run's one task, but the run has another task besides it (task 7): Linux reads the call's argument when the call starts and installs each descriptor a read delivers in the caller's table before the call returns, so another task could change the call, use, close or replace those descriptors, or take the work it waits for, before Hermit accounts for them. --allow-unsupported-syscalls returns EOPNOTSUPP for it instead
+hermit: [dtid 1] ioctl refused: a binder call on descriptor 99 waits for another process, so it would run off the guest's turn, which Hermit allows only while the caller is the run's one task, but the run has another task besides it (task 4): Linux reads the call's argument when the call starts and installs each descriptor a read delivers in the caller's table before the call returns, so another task could change the call, use, close or replace those descriptors, or take the work it waits for, before Hermit accounts for them. --allow-unsupported-syscalls returns EOPNOTSUPP for it instead
+hermit: [dtid 1] ioctl refused: ioctl(BINDER_WRITE_READ) on descriptor 99 failed with EFAULT, and its read half may have had effects: Linux does not undo the return commands it wrote, or the descriptors it installed, before a fault, and the call's binder_write_read does not say how much it wrote, so Detcore cannot record them. --allow-unsupported-syscalls lets the guest see the EFAULT
+hermit: [dtid 1] ioctl refused: a binder call on descriptor 99 waits for another process, so it would run off the guest's turn, which Hermit allows only while the caller is the run's one task, but the run has another task besides it (task 2 of process 1): Linux reads the call's argument when the call starts and installs each descriptor a read delivers in the caller's table before the call returns, so another task could change the call, use, close or replace those descriptors, or take the work it waits for, before Hermit accounts for them. --allow-unsupported-syscalls returns EOPNOTSUPP for it instead
+hermit: [dtid 1] ioctl refused: a binder call on descriptor 99 waits for another process, so it would run off the guest's turn, which Hermit allows only while the caller is the run's one task, but the run has another task besides it (task 2 of process 1): Linux reads the call's argument when the call starts and installs each descriptor a read delivers in the caller's table before the call returns, so another task could change the call, use, close or replace those descriptors, or take the work it waits for, before Hermit accounts for them. --allow-unsupported-syscalls returns EOPNOTSUPP for it instead
+hermit: [dtid 1] ioctl refused: a binder call on descriptor 99 waits for another process, so it would run off the guest's turn, which Hermit allows only while the caller is the run's one task, but the run has another task besides it (task 3): Linux reads the call's argument when the call starts and installs each descriptor a read delivers in the caller's table before the call returns, so another task could change the call, use, close or replace those descriptors, or take the work it waits for, before Hermit accounts for them. --allow-unsupported-syscalls returns EOPNOTSUPP for it instead
+.........hermit: .[dtid 1] ioctl refused: a binder call on descriptor 99 waits for another process, so it would run off the guest's turn, which Hermit allows only while the caller is the run's one task, but the run has another task besides it (task 3, which exited and is not reaped yet): Linux reads the call's argument when the call starts and installs each descriptor a read delivers in the caller's table before the call returns, so another task could change the call, use, close or replace those descriptors, or take the work it waits for, before Hermit accounts for them. --allow-unsupported-syscalls returns EOPNOTSUPP for it instead
+....................................... 2349/3729
+....hermit: [dtid 1] ioctl refused: ioctl(BINDER_WRITE_READ) on descriptor 99 ran off the guest's turn and may have delivered descriptors Detcore cannot name (its read_consumed is not within its read_size), which Detcore does not record
+.hermit: [dtid 1] ioctl refused: a binder call on descriptor 99 waits for another process, so it would run off the guest's turn, which Hermit allows only while the caller is the run's one task, but the run has another task besides it (which tasks are live is unknown (a backend reported a task it cloned natively without announcing the clone first)): Linux reads the call's argument when the call starts and installs each descriptor a read delivers in the caller's table before the call returns, so another task could change the call, use, close or replace those descriptors, or take the work it waits for, before Hermit accounts for them. --allow-unsupported-syscalls returns EOPNOTSUPP for it instead
+............................................hermit: HERMIT_BINDER_EXIT_REPORT_MISSING: a binder call on descriptor 99 waited 20 ms for the backend to report task 2's exit complete, so that the kernel's last writes for it are done before the call runs, and the report never came [dtid 1, ioctl refused]
+..................................hermit: [dtid 4242] pkey_alloc refused by the backend: this backend does not implement the call
+..unsupported: the poll wait cannot keep the held signal SIGCHLD: the pending SIGWINCH would stop the next injection and replace it (scope reduction of https://github.com/rrnewton/hermit/pull/3361; rerun with --allow-unsupported-syscalls to restart the call instead)
+.. 2436/3729
+...........hermit: [dtid 1] ioctl refused: a binder call on descriptor 99 waits for another process, so it would run off the guest's turn, which Hermit allows only while the caller is the run's one task, but the run has another task besides it (a task being created by task 1): Linux reads the call's argument when the call starts and installs each descriptor a read delivers in the caller's table before the call returns, so another task could change the call, use, close or replace those descriptors, or take the work it waits for, before Hermit accounts for them. --allow-unsupported-syscalls returns EOPNOTSUPP for it instead
+.................................................................hermit: [dtid 1] ioctl refused: a binder call on descriptor 99 waits for another process, so it would run off the guest's turn, which Hermit allows only while the caller is the run's one task, but the run has another task besides it (task 4 of process 1): Linux reads the call's argument when the call starts and installs each descriptor a read delivers in the caller's table before the call returns, so another task could change the call, use, close or replace those descriptors, or take the work it waits for, before Hermit accounts for them. --allow-unsupported-syscalls returns EOPNOTSUPP for it instead
+hermit: [dtid 1] ioctl refused: a binder call on descriptor 99 waits for another process, so it would run off the guest's turn, which Hermit allows only while the caller is the run's one task, but the run has another task besides it (a task being created by task 5): Linux reads the call's argument when the call starts and installs each descriptor a read delivers in the caller's table before the call returns, so another task could change the call, use, close or replace those descriptors, or take the work it waits for, before Hermit accounts for them. --allow-unsupported-syscalls returns EOPNOTSUPP for it instead
+...hermit: [dtid 4242] pkey_mprotect refused by the backend: this backend does not implement the call
+........ 2523/3729
+...........................................................................hermit: [dtid 4242] pkey_free refused by the backend: this backend does not implement the call
+............ 2610/3729
+...............hermit: [dtid 1] ioctl refused: a binder call on descriptor 99 waits for another process, so it would run off the guest's turn, which Hermit allows only while the caller is the run's one task, but a debugger the run serves (--gdbserver) can stop this task and write its memory while the call waits: Linux reads the call's argument when the call starts and installs each descriptor a read delivers in the caller's table before the call returns, so another task could change the call, use, close or replace those descriptors, or take the work it waits for, before Hermit accounts for them. --allow-unsupported-syscalls returns EOPNOTSUPP for it instead
+hermit: HERMIT_BINDER_EXIT_REPORT_MISSING: a binder call on descriptor 99 waited 20 ms for the backend to report task 2's exit complete, so that the kernel's last writes for it are done before the call runs, and the report never came [dtid 1, ioctl refused]
+.............hermit: .[dtid 1] ioctl refused: a binder call on descriptor 99 waits for another process, so it would run off the guest's turn, which Hermit allows only while the caller is the run's one task, but the run has another task besides it (which tasks are live is unknown (this thread's state was read back from its serialized form)): Linux reads the call's argument when the call starts and installs each descriptor a read delivers in the caller's table before the call returns, so another task could change the call, use, close or replace those descriptors, or take the work it waits for, before Hermit accounts for them. --allow-unsupported-syscalls returns EOPNOTSUPP for it instead
+.......................................................... 2697/3729
+..................................................hermit: [dtid 4242] userfaultfd refused by the backend: this backend does not implement the call
+..................................... 2784/3729
+....................................................................................... 2871/3729
+..................hermit: [dtid 23] clone refused by the backend: this backend cannot create a thread (flags CloneFlags(CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM), exit signal 0). No child was created.
+..................................................................... 2958/3729
+...............................................................................HERMIT_HOST_INPUT_CHANGED_SINCE_RECORDING host input /etc/ld.so.cache changed since the recording (dev:ino 0:33:9 size 36887 mtime 1700000000.000000005 then, dev:ino 0:33:11 size 36839 mtime 1700000000.000000005 now); the run may diverge where the guest reads it
+........ 3045/3729
+....................................................................................... 3132/3729
+................HERMIT_HOST_INPUT_CHANGED_SINCE_RECORDING host input /etc/ld.so.cache changed since the recording (dev:ino 0:50:3512209600 size 8 mtime 1793871743.155127576 then, dev:ino 0:50:3512209607 size 8 mtime 1793871743.155127576 now); the run may diverge where the guest reads it
+....................................................................... 3219/3729
+....................................................................................... 3306/3729
+....................................................................................... 3393/3729
+....................................................................................... 3480/3729
+.........................................................................HERMIT_HOST_INPUT_CHANGED_SINCE_RECORDING host input /tmp/.tmp01Y3S3/edited changed since the recording (dev:ino 0:50:3512209621 size 6 mtime 1793871743.156577441 then, dev:ino 0:50:3512209621 size 6 mtime 1793871743.187568438 now); the run may diverge where the guest reads it
+HERMIT_HOST_INPUT_CHANGED_SINCE_RECORDING host input /tmp/.tmp01Y3S3/replaced changed since the recording (dev:ino 0:50:3512209622 size 6 mtime 1793871743.156577441 then, dev:ino 0:50:3512210038 size 6 mtime 1793871743.188682557 now); the run may diverge where the guest reads it
+HERMIT_HOST_INPUT_CHANGED_SINCE_RECORDING host input /etc/ld.so.cache changed since the recording (dev:ino 0:50:3512210030 size 8 mtime 1793871743.187568438 then, dev:ino 0:50:3512210034 size 8 mtime 1793871743.187568438 now); the run may diverge where the guest reads it
+hermit: [dtid 17] link refused: link cannot be answered on this backend for /proc/21/cmdline/x, the call's second path: Linux walks the first path before it, and the backend's ENOENT does not say whether or how the first path failed (https://github.com/rrnewton/hermit/issues/4564)
+hermit: hermit: [dtid 17] openat refused: /proc/1/fdinfo/0, a descriptor's fdinfo of Hermit's own init, cannot be served: on this backend its descriptors are the supervisor's, which no guest process holds, and which of them exist changes with host timing (https://github.com/rrnewton/hermit/issues/4071)[dtid 17] openat refused: another guest process's /proc/21/cmdline cannot be served: on this backend /proc/<pid> names the host task with that number, if any, not the guest's process (https://github.com/rrnewton/hermit/issues/4564)
+
+.............. 3567/3729
+.........HERMIT_HOST_INPUT_CHANGED_SINCE_RECORDING host input /etc/ld.so.cache changed since the recording (dev:ino 0:50:3512210102 size 8 mtime 1793871743.195146413 then, dev:ino 0:50:3512210104 size 8 mtime 1793871743.195146413 now); the run may diverge where the guest reads it
+..........hermit: [dtid 17] link refused: link cannot be answered on this backend for /proc/21/cmdline/x, the call's second path: Linux walks the first path before it, and the backend's ENOENT does not say whether or how the first path failed (https://github.com/rrnewton/hermit/issues/4564)
+hermit: [dtid 17] openat refused: /proc/1/task/1/fdinfo/0, a descriptor's fdinfo of Hermit's own init, cannot be served: on this backend its descriptors are the supervisor's, which no guest process holds, and which of them exist changes with host timing (https://github.com/rrnewton/hermit/issues/4071)
+.hermit: [dtid 17] openat refused: another guest process's /proc/21/fd/1 cannot be served: on this backend /proc/<pid> names the host task with that number, if any, not the guest's process (https://github.com/rrnewton/hermit/issues/4564)
+...............HERMIT_HOST_INPUT_CHANGED_SINCE_RECORDING host input /etc/ld.so.cache changed since the recording (dev:ino 0:50:3512210122 size 8 mtime 1793871743.197568424 then, dev:ino 0:50:3512210123 size 8 mtime 1793871743.197568424 now); the run may diverge where the guest reads it
+.....hermit: .[dtid 17] openat refused: /proc/1/fdinfo/0/.., a descriptor's fdinfo of Hermit's own init, cannot be served: on this backend its descriptors are the supervisor's, which no guest process holds, and which of them exist changes with host timing (https://github.com/rrnewton/hermit/issues/4071)
+...............hermit: [dtid 17] utime refused: another guest process's /proc/21/cmdline cannot be served: on this backend /proc/<pid> names the host task with that number, if any, not the guest's process (https://github.com/rrnewton/hermit/issues/4564)
+...hermit: [dtid 17] openat refused: another guest process's /proc/21/fd/1/below cannot be served: on this backend /proc/<pid> names the host task with that number, if any, not the guest's process (https://github.com/rrnewton/hermit/issues/4564)
+..............hermit: [dtid 17] openat refused: /proc/1/fdinfo/0, a descriptor's fdinfo of Hermit's own init, cannot be served: on this backend its descriptors are the supervisor's, which no guest process holds, and which of them exist changes with host timing (https://github.com/rrnewton/hermit/issues/4071)
+.HERMIT_HOST_INPUT_CHANGED_SINCE_RECORDING host input /etc/ld.so.cache changed since the recording (dev:ino 0:50:3512210148 size 8 mtime 1793871743.212568404 then, dev:ino 0:50:3512210149 size 8 mtime 1793871743.212568404 now); the run may diverge where the guest reads it
+............. 3654/3729
+....hermit: [dtid 17] link refused: link cannot be answered on this backend for /proc/25/cmdline/x, the call's second path: Linux walks the first path before it, and the backend's ENOENT does not say whether or how the first path failed (https://github.com/rrnewton/hermit/issues/4564)
+..HERMIT_HOST_INPUT_CHANGED_SINCE_RECORDING host input /etc/ld.so.cache changed since the recording (dev:ino 0:50:3512210159 size 9 mtime 1793871743.216919140 then, dev:ino 0:50:3512210159 size 8 mtime 1793871743.216919140 now); the run may diverge where the guest reads it
+hermit: [dtid 17] openat refused: another guest process's /proc/21/fdinfo/1 cannot be served: on this backend /proc/<pid> names the host task with that number, if any, not the guest's process (https://github.com/rrnewton/hermit/issues/4564)
+.....hermit: [dtid 17] utimes refused: another guest process's /proc/21/cmdline cannot be served: on this backend /proc/<pid> names the host task with that number, if any, not the guest's process (https://github.com/rrnewton/hermit/issues/4564)
+hermit: hermit: [dtid 17] openat refused: another guest process's /proc/21/fd cannot be served: on this backend /proc/<pid> names the host task with that number, if any, not the guest's process (https://github.com/rrnewton/hermit/issues/4564)[dtid 17] link refused: link cannot be answered on this backend for /proc/25/cmdline/x, the call's second path: Linux walks the first path before it, and the backend's ENOENT does not say whether or how the first path failed (https://github.com/rrnewton/hermit/issues/4564)
+
+..hermit: [dtid 17] openat refused: another guest process's /proc/21/fdinfo/ cannot be served: on this backend /proc/<pid> names the host task with that number, if any, not the guest's process (https://github.com/rrnewton/hermit/issues/4564)
+..hermit: [dtid 17] openat refused: another guest process's /proc/21/task/23/cmdline cannot be served: on this backend /proc/<pid> names the host task with that number, if any, not the guest's process (https://github.com/rrnewton/hermit/issues/4564)
+..hermit: hermit: hermit: [dtid 17] openat refused: another guest process's /proc/23/cmdline cannot be served: on this backend /proc/<pid> names the host task with that number, if any, not the guest's process (https://github.com/rrnewton/hermit/issues/4564)[dtid 17] openat refused: another guest process's /proc/21/cmdline/ cannot be served: on this backend /proc/<pid> names the host task with that number, if any, not the guest's process (https://github.com/rrnewton/hermit/issues/4564)[dtid 17] utime refused: another guest process's /proc/21/cmdline cannot be served: on this backend /proc/<pid> names the host task with that number, if any, not the guest's process (https://github.com/rrnewton/hermit/issues/4564)
+
+
+.hermit: [dtid 17] mkdirat refused: another guest process's /proc/21/cmdline/ cannot be served: on this backend /proc/<pid> names the host task with that number, if any, not the guest's process (https://github.com/rrnewton/hermit/issues/4564)
+hermit: [dtid 17] openat refused: another guest process's /proc/21/cmdline cannot be served: on this backend /proc/<pid> names the host task with that number, if any, not the guest's process (https://github.com/rrnewton/hermit/issues/4564)
+hermit: [dtid 17] linkat refused: linkat cannot be answered on this backend for /proc/21/cmdline/x, the call's second path: Linux walks the first path before it, and the backend's ENOENT does not say whether or how the first path failed (https://github.com/rrnewton/hermit/issues/4564)
+hermit: hermit: [dtid 17] openat refused: another guest process's /proc/21/fdinfo/1/x cannot be served: on this backend /proc/<pid> names the host task with that number, if any, not the guest's process (https://github.com/rrnewton/hermit/issues/4564)[dtid 17] openat refused: another guest process's /proc/21/cmdline cannot be served: on this backend /proc/<pid> names the host task with that number, if any, not the guest's process (https://github.com/rrnewton/hermit/issues/4564)
+
+hermit: [dtid 17] linkat refused: linkat cannot be answered on this backend for /proc/21/cmdline/x, the call's second path: Linux walks the first path before it, and the backend's ENOENT does not say whether or how the first path failed (https://github.com/rrnewton/hermit/issues/4564)
+.....hermit: [dtid 17] openat refused: another guest process's /proc/21/fdinfo/1/ cannot be served: on this backend /proc/<pid> names the host task with that number, if any, not the guest's process (https://github.com/rrnewton/hermit/issues/4564)
+hermit: [dtid 17] utimes refused: another guest process's /proc/21/cmdline cannot be served: on this backend /proc/<pid> names the host task with that number, if any, not the guest's process (https://github.com/rrnewton/hermit/issues/4564)
+.hermit: [dtid 17] linkat refused: linkat cannot be answered on this backend for /proc/25/cmdline/x, the call's second path: Linux walks the first path before it, and the backend's ENOENT does not say whether or how the first path failed (https://github.com/rrnewton/hermit/issues/4564)
+..hermit: [dtid 17] linkat refused: linkat cannot be answered on this backend for /proc/25/cmdline/x, the call's second path: Linux walks the first path before it, and the backend's ENOENT does not say whether or how the first path failed (https://github.com/rrnewton/hermit/issues/4564)
+....hermit: [dtid 17] rename refused: rename cannot be answered on this backend for /proc/21/cmdline/x, the call's second path: Linux walks the first path before it, and the backend's ENOENT does not say whether or how the first path failed (https://github.com/rrnewton/hermit/issues/4564)
+.hermit: [dtid 17] rename refused: rename cannot be answered on this backend for /proc/21/cmdline/x, the call's second path: Linux walks the first path before it, and the backend's ENOENT does not say whether or how the first path failed (https://github.com/rrnewton/hermit/issues/4564)
+...hermit: [dtid 17] rename refused: rename cannot be answered on this backend for /proc/25/cmdline/x, the call's second path: Linux walks the first path before it, and the backend's ENOENT does not say whether or how the first path failed (https://github.com/rrnewton/hermit/issues/4564)
+hermit: [dtid 17] execveat refused: execveat of a descriptor open on another guest process's /proc/21/fd/1/ cannot be answered on this backend: the descriptor holds that link's target, which Detcore does not know (https://github.com/rrnewton/hermit/issues/4564)
+...hermit: [dtid 17] rename refused: rename cannot be answered on this backend for /proc/25/cmdline/x, the call's second path: Linux walks the first path before it, and the backend's ENOENT does not say whether or how the first path failed (https://github.com/rrnewton/hermit/issues/4564)
+...hermit: [dtid 17] renameat refused: renameat cannot be answered on this backend for /proc/21/cmdline/x, the call's second path: Linux walks the first path before it, and the backend's ENOENT does not say whether or how the first path failed (https://github.com/rrnewton/hermit/issues/4564)
+hermit: [dtid 17] renameat refused: renameat cannot be answered on this backend for /proc/21/cmdline/x, the call's second path: Linux walks the first path before it, and the backend's ENOENT does not say whether or how the first path failed (https://github.com/rrnewton/hermit/issues/4564)
+.hermit: [dtid 17] renameat refused: renameat cannot be answered on this backend for /proc/25/cmdline/x, the call's second path: Linux walks the first path before it, and the backend's ENOENT does not say whether or how the first path failed (https://github.com/rrnewton/hermit/issues/4564)
+..hermit: [dtid 17] renameat refused: renameat cannot be answered on this backend for /proc/25/cmdline/x, the call's second path: Linux walks the first path before it, and the backend's ENOENT does not say whether or how the first path failed (https://github.com/rrnewton/hermit/issues/4564)
+.hermit: [dtid 17] renameat2 refused: renameat2 cannot be answered on this backend for /proc/21/cmdline/x, the call's second path: Linux walks the first path before it, and the backend's ENOENT does not say whether or how the first path failed (https://github.com/rrnewton/hermit/issues/4564)
+hermit: [dtid 17] renameat2 refused: renameat2 cannot be answered on this backend for /proc/21/cmdline/x, the call's second path: Linux walks the first path before it, and the backend's ENOENT does not say whether or how the first path failed (https://github.com/rrnewton/hermit/issues/4564)
+.hermit: [dtid 17] renameat2 refused: renameat2 cannot be answered on this backend for /proc/25/cmdline/x, the call's second path: Linux walks the first path before it, and the backend's ENOENT does not say whether or how the first path failed (https://github.com/rrnewton/hermit/issues/4564)
+hermit: [dtid 17] renameat2 refused: renameat2 cannot be answered on this backend for /proc/25/cmdline/x, the call's second path: Linux walks the first path before it, and the backend's ENOENT does not say whether or how the first path failed (https://github.com/rrnewton/hermit/issues/4564)
+..............................
+test result: ok. 3729 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.20s
+
+RC=0
+=== systemd-run --user --scope -p MemoryHigh=40G -p MemoryMax=60G cargo test -q -p detcore-model
+Running as unit: run-p1477695-i3561216308.scope; invocation ID: e99f0c5936664cf49d30b436d4a7bfe8
+
+running 347 tests
+....................................................................................... 87/347
+....................................................................................... 174/347
+....................................................................................... 261/347
+......................................................................................
+test result: ok. 347 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.44s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+RC=0
+=== systemd-run --user --scope -p MemoryHigh=40G -p MemoryMax=60G cargo test -q -p hermit-run --lib --bins watch
+Running as unit: run-p1580531-i3561216678.scope; invocation ID: 012d0786a58242c181d4f118332f05f4
+
+running 26 tests
+:: hermit analyze stops if its own memory passes 17179869184.0 GiB (--max-memory)
+...............
+running 1 test
+test app::gdb_watch_helper::tests::exec_helper_entry ... 
+running 1 test
+test app::gdb_watch_helper::tests::exec_helper_entry ... ...........
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 1282 filtered out; finished in 0.21s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+RC=0
+=== systemd-run --user --scope -p MemoryHigh=40G -p MemoryMax=60G cargo test -q -p hermit-run --lib --bins access
+Running as unit: run-p1742654-i3561216945.scope; invocation ID: 09e9d39ccb464000a9ca979ebe2176e2
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 1303 filtered out; finished in 0.51s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+RC=0
+=== systemd-run --user --scope -p MemoryHigh=40G -p MemoryMax=60G cargo test -q -p hermit-run --test cli watch -- --test-threads=1
+Running as unit: run-p1745267-i3561216950.scope; invocation ID: e3a67dd6b0ad4fac8089dd2d15bbe4e4
+
+running 2 tests
+/home/newton/work/dev-hermit/worktrees/slots/musetrain-20261101/temp/drain-4796/hermit-cli/tests/fixtures/access_trace_pipes.c:14: warning: "_GNU_SOURCE" redefined
+   14 | #define _GNU_SOURCE
+      | 
+<command-line>: note: this is the location of the previous definition
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 893 filtered out; finished in 1.29s
+
+RC=0
+=== systemd-run --user --scope -p MemoryHigh=40G -p MemoryMax=60G cargo test -q -p hermit-run --test cli access_trace -- --test-threads=1
+Running as unit: run-p1748516-i3561216955.scope; invocation ID: 8aa7ca2845004fa1823d794d6526e0af
+
+running 12 tests
+/home/newton/work/dev-hermit/worktrees/slots/musetrain-20261101/temp/drain-4796/hermit-cli/tests/fixtures/access_trace_pipes.c:14: warning: "_GNU_SOURCE" redefined
+   14 | #define _GNU_SOURCE
+      | 
+<command-line>: note: this is the location of the previous definition
+............
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 883 filtered out; finished in 10.56s
+
+RC=0
+=== cargo test -q -p hermit-manifest-plan --lib validation_dag::
+
+running 42 tests
+..........................................
+test result: ok. 42 passed; 0 failed; 0 ignored; 0 measured; 673 filtered out; finished in 47.36s
+
+RC=0
+=== systemd-run --user --scope -p MemoryHigh=40G -p MemoryMax=60G cargo clippy -q -p detcore-model -p hermit-detcore -p hermit-run --all-targets -- -D warnings
+Running as unit: run-p2072826-i3561217637.scope; invocation ID: 9c1d4438b88a407ab6cfe85a2c79a4ce
+RC=0

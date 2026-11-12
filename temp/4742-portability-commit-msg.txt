@@ -1,0 +1,15 @@
+drain/4742: keep Binder node provenance portable
+
+[hermit2, musetrain, tbh-1005, devbig014, role=impl]
+
+Plain Language Summary and Project Impact
+The Binder CLI validation node can now pass the repository portability gate without losing the provenance of its first Binderfs execution. The generated DAG description no longer embeds a measurement-host name in a build/run file; the host is recorded in the designated measurement-host table instead. The stale pre-restack count wording is replaced with the durable population statement.
+
+Determinism
+Description, documentation, and generated DAG text only. The node's selection, command, labels, and count pin are unchanged.
+
+Linux Semantics
+No behaviour change.
+
+Validation
+scripts/check-portable-paths.sh passes; generate-validation-dag --check is canonical; hermit-manifest-plan validation_dag tests pass 42/42; cargo fmt --all -- --check passes.

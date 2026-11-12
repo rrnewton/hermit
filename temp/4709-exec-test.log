@@ -1,0 +1,11 @@
+Running as unit: run-p1241904-i3544059428.scope; invocation ID: f303ab22c7cd4867a8d2b1391161836d
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.16s
+     Running unittests src/lib.rs (target/debug/deps/detcore-26d83e239e423986)
+
+running 187 tests
+--cpu-profile auto refused: CPUID faulting is not active for this image, so the guest would see the host's CPUID; use a host and kernel with CPUID faulting
+error: test failed, to rerun pass `-p hermit-detcore --lib`
+
+Caused by:
+  process didn't exit successfully: `/home/newton/work/dev-hermit/worktrees/slots/musetrain-20261101/temp/drain-4709/target/debug/deps/detcore-26d83e239e423986 exec_` (exit status: 122)
+note: test exited abnormally; to see the full output pass --no-capture to the harness.

@@ -1,0 +1,3 @@
+[herdr-run] engine=rust (tracked Cargo launcher: rs/bin/herdr-run)
+[herdr-run] rust cache=verified source=7940999a905d binary=0eea71e2a969
+https://github.com/rrnewton/hermit/pull/4796
