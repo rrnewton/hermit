@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["FAIL_CLOSED_MANIFEST_BUCKETS","HOSTED_PORTABLE_EXCLUDED_BACKENDS","HOSTED_PORTABLE_LABEL","OUTPUT","PINNED_ROOT_COMMAND_GUARD"],"fn":["admitted_pin_command","canonical_text","expected_cells_from_json","generate","manifest_selector_flags","repo_root","require_fresh"]};
