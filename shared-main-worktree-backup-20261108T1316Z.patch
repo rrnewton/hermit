@@ -1,0 +1,165 @@
+diff --git a/ci-hub/health/tests/test_validate_checkout_cleanup.py b/ci-hub/health/tests/test_validate_checkout_cleanup.py
+index 4822c7f19ec9..684154d20c30 100644
+--- a/ci-hub/health/tests/test_validate_checkout_cleanup.py
++++ b/ci-hub/health/tests/test_validate_checkout_cleanup.py
+@@ -840,9 +840,82 @@ def test_malformed_retirement_result_is_could_not_determine(tmp_path: Path) -> N
+     assert "wrong outcome" in rendered["could_not_determine"][0]["reason"]
+ 
+ 
+-def test_retirement_rejects_unknown_top_level_field(tmp_path: Path) -> None:
++def test_retirement_accepts_unknown_additive_top_level_field(
++    tmp_path: Path,
++) -> None:
++    # agent-utils adds top-level JSON fields compatibly (e.g. a future
++    # additive field); the cleanup schema must ignore unknown extras and
++    # fail only on a missing or ill-typed required field.
++    provider = provider_report()
++    provider["future_additive_field"] = {"anything": [1, 2, 3]}
++
++    def run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
++        return subprocess.CompletedProcess(command, 0, json.dumps(provider), "")
++
++    code, rendered = cleanup.run_retirement_batch(tmp_path, run=run)
++
++    assert code == 0
++    assert rendered["state"] == "ok"
++
++
++def test_retirement_rejects_missing_required_field_by_name() -> None:
++    for field in (
++        "schema",
++        "limit",
++        "removed",
++        "retained",
++        "deferred",
++        "could_not_determine",
++        "recovery_required",
++    ):
++        provider = provider_report()
++        provider.pop(field)
++        with pytest.raises(ValueError, match=field):
++            cleanup.validate_retirement_result(provider)
++
++
++def test_retirement_accepts_skipped_foreign(tmp_path: Path) -> None:
++    # retire-pending emits a top-level skipped_foreign list (foreign-machine
++    # rows this host never writes to), usually empty.
++    foreign_row = {
++        "machine": "devbig999",
++        "slot": "foreign-slot",
++        "generation": 1,
++        "sha256": "b" * 64,
++        "outcome": "skipped-foreign",
++        "reason": "recorded by foreign machine 'devbig999'",
++    }
++    for skipped_foreign in ([], [foreign_row]):
++        provider = provider_report()
++        provider["skipped_foreign"] = skipped_foreign
++
++        def run(
++            command: list[str], **_kwargs: object
++        ) -> subprocess.CompletedProcess[str]:
++            return subprocess.CompletedProcess(command, 0, json.dumps(provider), "")
++
++        code, rendered = cleanup.run_retirement_batch(tmp_path, run=run)
++
++        assert code == 0
++        assert rendered["state"] == "ok"
++        assert rendered["skipped_foreign"] == skipped_foreign
++
++
++def test_retirement_rejects_changed_type_required_field(tmp_path: Path) -> None:
++    cases = [
++        ("schema", "1"),
++        ("limit", "8"),
++        ("removed", {}),
++        ("recovery_required", "false"),
++    ]
++    for field, bad_value in cases:
++        provider = provider_report()
++        provider[field] = bad_value
++        with pytest.raises(ValueError, match=f"'{field}'"):
++            cleanup.validate_retirement_result(provider)
++
+     provider = provider_report()
+-    provider["state"] = "ok"
++    provider["limit"] = "8"
+ 
+     def run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+         return subprocess.CompletedProcess(command, 0, json.dumps(provider), "")
+@@ -851,7 +924,7 @@ def test_retirement_rejects_unknown_top_level_field(tmp_path: Path) -> None:
+ 
+     assert code == cleanup.start_unit.EXIT_COULD_NOT_DETERMINE
+     assert rendered["state"] == "could-not-determine"
+-    assert "unknown=['state']" in rendered["could_not_determine"][0]["reason"]
++    assert "'limit'" in rendered["could_not_determine"][0]["reason"]
+ 
+ 
+ def test_retirement_rejects_recovery_marker_on_non_indeterminate_row(
+diff --git a/ci-hub/health/validate_checkout_cleanup.py b/ci-hub/health/validate_checkout_cleanup.py
+index cafb8d010580..6ec32d09b167 100644
+--- a/ci-hub/health/validate_checkout_cleanup.py
++++ b/ci-hub/health/validate_checkout_cleanup.py
+@@ -367,7 +367,7 @@ def retirement_failure(
+ def validate_retirement_result(value: object) -> dict[str, Any]:
+     if not isinstance(value, dict):
+         raise ValueError("retire-pending JSON root is not an object")
+-    expected_top_level_fields = {
++    required_top_level_fields = {
+         "schema",
+         "limit",
+         "removed",
+@@ -376,21 +376,28 @@ def validate_retirement_result(value: object) -> dict[str, Any]:
+         "could_not_determine",
+         "recovery_required",
+     }
+-    if set(value) != expected_top_level_fields:
+-        unknown = sorted(set(value) - expected_top_level_fields)
+-        missing = sorted(expected_top_level_fields - set(value))
++    # agent-utils adds top-level JSON fields compatibly (e.g. the
++    # ``skipped_foreign`` list retire-pending emits for foreign-machine
++    # rows): unknown additive fields are ignored, never a rejection.
++    # Validation fails only on a missing required field or a changed /
++    # ill-typed required field, each named in the error.
++    missing = sorted(required_top_level_fields - set(value))
++    if missing:
+         raise ValueError(
+-            "retire-pending JSON fields disagree with the documented schema: "
+-            f"unknown={unknown}, missing={missing}"
++            "retire-pending JSON missing required field(s): " + ", ".join(missing)
+         )
++    if "skipped_foreign" in value and not isinstance(value["skipped_foreign"], list):
++        raise ValueError("retire-pending JSON field 'skipped_foreign' is not a list")
+ 
+     if (
+         type(value.get("schema")) is not int
+         or value["schema"] != RETIREMENT_RESULT_SCHEMA
+     ):
+-        raise ValueError("retire-pending JSON has an unsupported schema")
++        raise ValueError("retire-pending JSON field 'schema' has an unsupported schema")
+     if type(value.get("limit")) is not int or value["limit"] != RETIREMENT_BATCH_LIMIT:
+-        raise ValueError("retire-pending JSON does not report the requested limit")
++        raise ValueError(
++            "retire-pending JSON field 'limit' does not report the requested limit"
++        )
+ 
+     categories = {
+         "removed": "removed",
+@@ -417,7 +424,7 @@ def validate_retirement_result(value: object) -> dict[str, Any]:
+     for field, expected_outcome in categories.items():
+         rows = value.get(field)
+         if not isinstance(rows, list):
+-            raise ValueError(f"retire-pending JSON field {field} is not a list")
++            raise ValueError(f"retire-pending JSON field '{field}' is not a list")
+         for index, row in enumerate(rows):
+             if not isinstance(row, dict):
+                 raise ValueError(
+@@ -488,7 +495,7 @@ def validate_retirement_result(value: object) -> dict[str, Any]:
+         )
+     recovery_required = value.get("recovery_required")
+     if type(recovery_required) is not bool:
+-        raise ValueError("retire-pending JSON recovery_required is not boolean")
++        raise ValueError("retire-pending JSON field 'recovery_required' is not boolean")
+     if recovery_required != bool(value["could_not_determine"]):
+         raise ValueError(
+             "retire-pending JSON recovery_required disagrees with its outcomes"

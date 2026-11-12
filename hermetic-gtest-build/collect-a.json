@@ -1,0 +1,79 @@
+{
+ "identities": {
+  "source_snapshot_identity": "src@48:6415744274",
+  "nix_store_identity": "nix-root/nix@48:6415748303",
+  "podman_store_identity": "gtest-repin-a/podman-data",
+  "run_id": "hermetic-gtest-repin-a.service",
+  "commit": "1c8aa13591b52ace5b0d65f3fb85a1de83de7dad"
+ },
+ "unit": {
+  "Result": "success",
+  "ExecMainStatus": "0",
+  "MemoryPeak": "8589938688",
+  "CPUUsageNSec": "1472214479000"
+ },
+ "output_physical": "/home/newton/temp/hermetic-gtest-build/gtest-repin-a/nix-root/nix/nix/store/r5jadk7g4jbwskbhc47gda7zq63qq1rn-hermit-hermetic-validate.tar.gz",
+ "archive_sha256": "df1f0dd4f9aa0c82fd6fedceac64d5607143add2f8d0d40a0163850b19289453",
+ "archive_size_bytes": 1716858397,
+ "output_logical": "/nix/store/r5jadk7g4jbwskbhc47gda7zq63qq1rn-hermit-hermetic-validate.tar.gz",
+ "output_nar_hash": "sha256-ysIA/N+h3OfXSbHYFSkrHeq5uLZMwr9DQZ7h6RArO5g=",
+ "output_nar_size_bytes": 1716858512,
+ "derivation_logical": "/nix/store/4kx0m189agsiv7kz4m8gwwiyn3mydzbh-hermit-hermetic-validate.tar.gz.drv",
+ "derivation_sha256": "7f593118905fc2ca6945130d4c12ba1ede80777eba88ae900339d740a14828a9",
+ "realized_candidates": {
+  "*-cargo-nextest-0.9.100": [
+   {
+    "name": "w23xp9yckwbvgx4m4p9993srys3am7cc-cargo-nextest-0.9.100",
+    "logical": "/nix/store/w23xp9yckwbvgx4m4p9993srys3am7cc-cargo-nextest-0.9.100",
+    "narHash": "sha256-GrXkdCFAiolD2Mo2fWuULE++66S9iKim4UW3kJawtJM=",
+    "narSize": 17308904
+   }
+  ],
+  "*-coreutils-9.11": [
+   {
+    "name": "97d5ygrvqj55f4nx1x34wfdcc7qn11c0-coreutils-9.11",
+    "logical": "/nix/store/97d5ygrvqj55f4nx1x34wfdcc7qn11c0-coreutils-9.11",
+    "narHash": "sha256-HwKkuagxA0OqOdRMd/hl0qqAEoPD06PpUTMCRTIYDzk=",
+    "narSize": 1806736
+   },
+   {
+    "name": "8lhm9rlwqq3p3rfn02m87bqhw2yrdm4i-coreutils-9.11",
+    "logical": "/nix/store/8lhm9rlwqq3p3rfn02m87bqhw2yrdm4i-coreutils-9.11",
+    "narHash": "sha256-mn40qYRmXDV0KBG+2j8dQaysvrMZI+GBHHTJYl4CzP0=",
+    "narSize": 1806984
+   }
+  ],
+  "*-rust-script-0.36.0": [
+   {
+    "name": "diyqi1pv2pdlgzwgah8xr2icif1zbqb5-rust-script-0.36.0",
+    "logical": "/nix/store/diyqi1pv2pdlgzwgah8xr2icif1zbqb5-rust-script-0.36.0",
+    "narHash": "sha256-1Lzh3iAZecWxQGIruzY4emvQ47yuKJGW2oQxOC2yQqQ=",
+    "narSize": 3387936
+   }
+  ]
+ },
+ "loaded": {
+  "loaded_id": "99b4079cf73ef0e4245994fb21272127bb37bc5e8b05af9922738b26cd5eacc6",
+  "loaded_digest": "sha256:4e1605ecbb13a6c5c6f45f4259f49e2c07efb21a7e6e7b7aabb5b97329232d6e"
+ },
+ "manifest_size_bytes": 598,
+ "manifest_compact_sha256": "sha256:4e1605ecbb13a6c5c6f45f4259f49e2c07efb21a7e6e7b7aabb5b97329232d6e",
+ "config_digest": "sha256:99b4079cf73ef0e4245994fb21272127bb37bc5e8b05af9922738b26cd5eacc6",
+ "config_size_bytes": 22069,
+ "layers": [
+  {
+   "member": "f106242342d9037290612bdcd422b10c009b2f67a12b299fcc84d79e9ce2705d/layer.tar",
+   "size": 5643857920,
+   "sha256": "sha256:f106242342d9037290612bdcd422b10c009b2f67a12b299fcc84d79e9ce2705d"
+  },
+  {
+   "member": "d3c87dd196d927e23ebcef73a30799f8efe3f895e320a09f13469efdaf17ae2d/layer.tar",
+   "size": 144363520,
+   "sha256": "sha256:d3c87dd196d927e23ebcef73a30799f8efe3f895e320a09f13469efdaf17ae2d"
+  }
+ ],
+ "diff_ids": [
+  "sha256:f106242342d9037290612bdcd422b10c009b2f67a12b299fcc84d79e9ce2705d",
+  "sha256:d3c87dd196d927e23ebcef73a30799f8efe3f895e320a09f13469efdaf17ae2d"
+ ]
+}

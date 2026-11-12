@@ -1,0 +1,14 @@
+source_snapshot_identity=src@48:6417250157
+nix_store_identity=nix-root/nix@48:6417254190
+podman_store_identity=gtest-repin-b/podman-data
+run_id=hermetic-gtest-repin-b.service
+commit=1c8aa13591b52ace5b0d65f3fb85a1de83de7dad
+Running as unit: hermetic-gtest-repin-b.service; invocation ID: a5d8b52f44c0468397fd94b42ac89f10
+unit started: hermetic-gtest-repin-b
+Result=success
+ExecMainStatus=0
+MemoryPeak=8589934592
+CPUUsageNSec=1129900556000
+
+Result=success
+ExecMainStatus=0

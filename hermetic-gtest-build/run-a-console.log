@@ -1,0 +1,16 @@
+source_snapshot_identity=src@48:6415744274
+nix_store_identity=nix-root/nix@48:6415748303
+podman_store_identity=gtest-repin-a/podman-data
+run_id=hermetic-gtest-repin-a.service
+commit=1c8aa13591b52ace5b0d65f3fb85a1de83de7dad
+Running as unit: hermetic-gtest-repin-a.service; invocation ID: 54643e864e294c2689602ed896190cb6
+unit started: hermetic-gtest-repin-a
+Result=success
+ExecMainStatus=0
+MemoryPeak=8589938688
+CPUUsageNSec=1472214479000
+
+Result=success
+ExecMainStatus=0
+output=/home/newton/temp/hermetic-gtest-build/gtest-repin-a/nix-root/nix/store/r5jadk7g4jbwskbhc47gda7zq63qq1rn-hermit-hermetic-validate.tar.gz
+sha256sum: /home/newton/temp/hermetic-gtest-build/gtest-repin-a/nix-root/nix/store/r5jadk7g4jbwskbhc47gda7zq63qq1rn-hermit-hermetic-validate.tar.gz: No such file or directory
