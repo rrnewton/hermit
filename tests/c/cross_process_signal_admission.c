@@ -37,10 +37,15 @@
  *                  (syscall(SYS_select), no descriptors, no timeout; libc's
  *                  select() issues pselect6 instead): EINTR.
  *   select-raw-two The same to a child whose first thread is in that raw
- *                  select and whose other thread runs system calls with
- *                  SIGUSR1 unblocked: Linux wakes the first thread alone
- *                  (complete_signal), which runs the handler, and the other
- *                  thread keeps running and sees that it ran.
+ *                  select and whose other thread spins in user code, with
+ *                  no system call, and SIGUSR1 unblocked: runnable, so the
+ *                  first thread is not the only receiver Linux could pick.
+ *                  Linux wakes the first thread alone (complete_signal),
+ *                  which runs the handler, and the other thread keeps
+ *                  running and sees that it ran. ptrace's wrong-thread
+ *                  delivery (https://github.com/rrnewton/hermit/issues/5455)
+ *                  needs a sibling that makes system calls, and these rows
+ *                  do not cover it.
  *   select-raw-timed, select-raw-two-timed
  *                  The same two with a 5-second timeout instead of none.
  *   sigtimedwait   SIGUSR1, blocked, to a child waiting for it in
