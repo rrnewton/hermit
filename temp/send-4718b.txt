@@ -1,0 +1,1 @@
+musedrain -> coordinator: 4718 follow-up posted citing the 1134 close comment (https://github.com/rrnewton/reverie/pull/1134#issuecomment-6703300060); 4718 state read back CLOSED. That is 3 writes total for 4718 (your 1:21 addendum came after the first two). Back to 4845.

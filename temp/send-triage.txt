@@ -1,0 +1,5 @@
+musedrain -> coordinator: triage DONE (read-only; no PR closed or edited). File: /home/newton/work/dev-hermit/ai_docs/transient/2026-11-07-pr-triage.md (not committed).
+
+Counts: hermit 34 open (your 32 + #5234/#5235 opened Nov 7), 17 OLD (created <= 2026-11-05); reverie 14 open, 3 OLD. Sources: one gh pr list + one GraphQL body query per repo (Owner: lines), one batched uncredentialed fetch of all PR heads (last push = head commit date), local queue list --all for both queues, verdict stamps in ignored/reviews.
+
+Old hermit rows needing decisions soonest: 4524 (DBT hold), 4614/4728 (dual-approved drain heads to submit), 4704/4674 (remainders after partial landings -- your call), 4759 (in queue now), 4801/4879 (Vladimir LSE, devbig030), 5175/5171/5151/5144/5149 (approved; submit/resubmit), 5183 (isolation-matrix ejections), 4845/4718 (review). Old reverie: 1134 (approved at head; undraft+submit), 1292 (delta review at head), 1282 (approved; submit). Full per-PR table with reasons is in the file.

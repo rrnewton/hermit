@@ -1,0 +1,22 @@
+diff --git a/hermit-cli/tests/cli.rs b/hermit-cli/tests/cli.rs
+index 0530cda8aa3..fd99a80c25c 100644
+--- a/hermit-cli/tests/cli.rs
++++ b/hermit-cli/tests/cli.rs
+@@ -27918,7 +27918,7 @@ fn branch_free_race_lost(seed: u64, extra: &[&str]) -> u64 {
+         "--max-timeslice=200000",
+     ];
+     args.extend(extra);
+-    args.extend(["--", guest, "100000"]);
++    args.extend(["--", guest, "25000"]);
+     let output = hermit(&args);
+     assert_success(&output, &args);
+     parse_branch_free_race(&stdout(&output))
+@@ -28032,7 +28032,7 @@ fn a_chaos_instruction_offset_run_verifies_and_replays_at_its_offsets() {
+         &replay_arg,
+         "--",
+         guest,
+-        "100000",
++        "25000",
+     ];
+     let replay = hermit(&args);
+     assert_success(&replay, &args);

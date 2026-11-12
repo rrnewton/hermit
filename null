@@ -1,0 +1,188 @@
+export default async function workflow(host) {
+  const evidenceSchema = {
+    type: "object",
+    required: ["complete", "evidence", "unresolved"],
+    properties: {
+      complete: { type: "boolean" },
+      evidence: { type: "array", items: { type: "string" } },
+      unresolved: { type: "array", items: { type: "string" } }
+    }
+  };
+
+  const synthesisNotes = [];
+  const notesFor = (result, scope) => {
+    const values = [];
+    if (typeof result?.notes === "string" && result.notes.trim()) values.push({ source: scope, ref: result.ref ?? null, value: result.notes });
+    return values;
+  };
+
+  function readCompletedResult(result, scope) {
+    if (!result?.ref || typeof host.readResult !== "function") return null;
+    try {
+      const parts = [];
+      let offset = 0;
+      for (let guard = 0; guard < 100; guard++) {
+        const part = host.readResult(result.ref, offset, 4096);
+        if (part?.text) parts.push(part.text);
+        offset = part?.nextOffset ?? offset;
+        if (part?.done) break;
+      }
+      if (!parts.length) return null;
+      return JSON.parse(parts.join(""));
+    } catch (error) {
+      synthesisNotes.push(scope + ": completed-result read failed for " + result.ref + ": " + (error?.code || error?.message || String(error)));
+      return null;
+    }
+  }
+
+  function dataFrom(result, scope) {
+    if (!result || result.error_kind) return null;
+    if (result.data && typeof result.data === "object") return result.data;
+    const parsed = readCompletedResult(result, scope);
+    if (!parsed || typeof parsed !== "object") return null;
+    if (parsed.data && typeof parsed.data === "object") return parsed.data;
+    if (typeof parsed.complete === "boolean" || Array.isArray(parsed.evidence) || Array.isArray(parsed.unresolved)) return parsed;
+    return null;
+  }
+
+  function compact(result, scope, fallbackGap) {
+    const failed = result === null || !!result?.error_kind;
+    const data = failed ? null : dataFrom(result, scope);
+    const evidence = Array.isArray(data?.evidence) ? data.evidence.filter(Boolean) : [];
+    const declared = Array.isArray(data?.unresolved) ? data.unresolved.filter(Boolean) : [];
+    const complete = data?.complete === true && evidence.length > 0 && declared.length === 0;
+    const parsedNotes = [];
+    if (typeof data?.notes === "string" && data.notes.trim()) parsedNotes.push({ source: scope, ref: result?.ref ?? null, value: data.notes });
+    return {
+      scope,
+      ref: result?.ref ?? null,
+      complete,
+      evidence,
+      notes: [...notesFor(result, scope), ...parsedNotes],
+      unresolved: complete ? [] : (declared.length ? declared : [fallbackGap || (scope + ": missing complete inspected evidence")]),
+      error_kind: result?.error_kind ?? null,
+      spilled: result?.data_spilled_for_size === true,
+      text: !data && typeof result?.text === "string" ? result.text : null
+    };
+  }
+
+  const common = [
+    "READ-ONLY: do not edit, push, close, reopen, submit, validate, label, comment, rebase, or send messages.",
+    "Open and inspect the relevant bodies before citing them; filenames/search hits alone are not evidence.",
+    "Hermit slot: /home/newton/work/dev-hermit/worktrees/slots/musedrain-20261101.",
+    "Dev-hermit records: /home/newton/work/dev-hermit/temp and /home/newton/work/dev-hermit/ignored.",
+    "Verify current refs with at most one batched uncredentialed command for your assigned refs: git -c credential.helper= ls-remote https://github.com/rrnewton/hermit <refspecs>. No gh loops and no credentialed public fetches.",
+    "Return at most 12 compact evidence strings. Prefix each with BLOCKING, READY, WAITING-REVIEW, WAITING-SEQUENCE, WAITING-EXTERNAL, CLOSE-LATER, STALE-CLAIM, or INFO. Include exact SHAs, paths/symbols, review/test names, and observed state.",
+    "complete=true only if every assigned claim was inspected. Name every missing body, reviewer decision, queue outcome, or external condition in unresolved."
+  ].join("\n");
+
+  const tasks = [
+    {
+      label: "queue-substrate",
+      input: common + "\n\nASSIGNMENT: Determine whether the merge queue is actually able to advance work now and what blocks it. Inspect /home/newton/work/dev-hermit/ci-hub/merge-queue/hermit.config.json, the state under /home/newton/merge-queue-shadow/musedrain-round2/state, recent run/report artifacts if present, the queue binary help/list/status surface, and relevant tops of temp/musedrain-status.md plus lane statuses. Cover PRs 4627, 4742, 4759, 4769, 4750, 4743, 4722, 5120, and ejected 5139. Distinguish live validation/landing from pending-intake, writer-lock recording, duplicate 4722 intake records, failed/held dependencies, and any full-validate requirement. Identify the single first unblocker and whether new submissions would merely accumulate."
+    },
+    {
+      label: "submitted-exact-heads",
+      input: common + "\n\nASSIGNMENT: Audit exact-head readiness for submitted/coordinator-approved work: 4769, 4750 at a6fdaaf9bb5ce6559ff3af4ac9407e7fb4e18578, 4743 at b13cd555fa8242082693e5d010eef7d41312580a, 4722 at 51212a1c64, and 5120 approved-vs-queued-head mismatch. Open the actual verdict files under ignored/reviews for these PRs, relevant lane status tops, and inspect git ancestry/diff/file and RPC/RECORD surfaces at the exact heads. Verify approvals bind the exact current heads, targeted test evidence is real, owners are recorded, and whether queue full validation is the only remaining gate. Surface RPC ordering collisions and stale approvals."
+    },
+    {
+      label: "pr-4741-review",
+      input: common + "\n\nASSIGNMENT: Audit PR 4741 at bbc0ed909dad7d49f245d6c8abe5e5398f90f0eb as the first analyze gate. Open temp/musedraind-status.md's 22:34 handback, current review directory entries for 4741, and the relevant main-vs-head bodies in hermit-cli/src/bin/hermit/analyze/phases.rs plus access-trace/test owners reached by this stack. Verify the traced_prefix_stack/prefix_stack_trial union, both spliced tests, zero-loss claims, no RPC/RECORD change, targeted-test sufficiency, and trigger/review class. State exact questions musereviewb and revopus1 must answer and whether any blocker exists before their verdicts."
+    },
+    {
+      label: "analyze-nesting",
+      input: common + "\n\nASSIGNMENT: Independently audit the corrected analyze sequence 4741 -> 4752 -> 4746. Baselines: 4741 bbc0ed909dad, 4752 e905dec15d67, 4746 3ca3fc4e04b3, main at current remote. Open musedraina's 22:53/10:53 audit entry, musedrainf's formal 4746 handback in its status/message record, git logs/subjects/patch-ids/diffs, and representative bodies in analyze/races.rs, verdict.rs, budget.rs, checkpoint.rs, phases.rs, and rundata.rs. Verify or falsify: 4752 commits #1-21 are 4741-carried, #22-33 are the only verdict layer to review after 4741, #34-38 are adaptations, and 4746 then shrinks to 13 own commits. Identify exact rebase/test/review work at each step and any claim that would cause duplicate review or lost behavior."
+    },
+    {
+      label: "pr-4791-and-4845",
+      input: common + "\n\nASSIGNMENT: Audit PR 4791 at 48f75ab40414984ceb2b384ddce05b800bdcd42a and paired PR 4845. Open ignored/reviews/drain-4791-musereviewb-r3.md in full, musedrainc's 4791 handback/status top, and inspect the candidate code/test bodies for resolved_parent_is_area and property_snapshot host-absence paths using git show at the exact head. Determine the smallest durable regression test and fix surface, adjacent fail-open cases, whether any part is already fixed, RPC 41 provisional sequencing, archive pointer status, and dual-review readiness. For 4845, inspect musedrainb's audit and verify live residual, file/RPC dependency on 4769, and exact work that can or cannot start before 4769 lands. Do not implement the fix."
+    },
+    {
+      label: "closures-and-residuals",
+      input: common + "\n\nASSIGNMENT: Adversarially audit closure/residual dispositions: closed 4714, 4847, 4878, 5086, 4938, 4934, 4729, 5084, plus 4593 ready-to-close-after-5120. Inspect the relevant lane status evidence and current git ancestry/cherry/content facts in the slot. For each, say whether the closure is fully supported, residual remains, or evidence is insufficient. Do not rely only on patch-id. For 4593, verify the stated zero uncovered semantic residual against queued 5120 at cf61c0a05f and list exact re-verification required after landing. Also flag any other already-landed work mislabeled open/stale in ready-queue if directly proven by inspected ancestry."
+    },
+    {
+      label: "coordination-capacity",
+      input: common + "\n\nASSIGNMENT: Audit coordination and capacity, not code correctness. Open temp/musedrain-status.md's newest entries, all musedraina-f status tops, allocation-1325.md, ownership-sweep.md, coalesce-inventory-2035.md, and ready-queue.md. Use bounded read-only local observations for disk and queue/monitor state only if directly available. Identify each lane's current owner/task, duplicated work, idle-but-blocked lanes, stale status claims, reviewer bottlenecks, coordinator-only decisions, GitHub/credential constraints, disk/CARGO_TARGET_DIR constraints, and the next useful assignment for every free lane. Explicitly name work that should stop or stay held to prevent duplicate review/submissions."
+    }
+  ];
+
+  phase("Evidence sweep");
+  const reports = await host.parallel(tasks.map((task) => ({
+    input: task.input,
+    schema: evidenceSchema,
+    label: task.label,
+    phase: "Evidence sweep"
+  })));
+  const compactReports = reports.map((result, index) => compact(result, tasks[index].label));
+  const reportRefs = compactReports.map((report) => report.ref).filter(Boolean);
+
+  phase("Adversarial check");
+  const critic = await host.agent({
+    input: common + "\n\nASSIGNMENT: Adversarially falsify the emerging launch plan. Prior child results to inspect: " + reportRefs.join("\n") + "\nCompact evidence: " + JSON.stringify(compactReports) + "\nIndependently inspect the highest-risk primary bodies behind any READY claim, the actual queue state, 4741 review readiness, analyze nesting, 4791 P2, exact-head approvals, and closure evidence. Try to prove that at least one supposedly ready item is not launchable, one blocker is fictitious/stale, one sequence risks duplicate review or RPC/DAG collision, or one lane assignment duplicates live work. Return only inspected counterevidence or confirmations; unavailable checks belong in unresolved, not as approvals.",
+    schema: evidenceSchema,
+    label: "adversarial-critic",
+    phase: "Adversarial check"
+  });
+  const compactCritic = compact(critic, "adversarial-critic", "adversarial-critic: no usable verdict");
+
+  const allBeforeFollowup = [...compactReports, compactCritic];
+  const openGaps = allBeforeFollowup.flatMap((report) => report.unresolved);
+  const actionableGap = openGaps.find((gap) => !/await|pending|external|reviewer verdict|queue landing|coordinator|lands first|not yet landed/i.test(gap));
+
+  let followupReport = null;
+  if (actionableGap) {
+    phase("Gap follow-up");
+    const followup = await host.agent({
+      input: common + "\n\nASSIGNMENT: Resolve this one concrete evidence gap exactly once by inspecting the primary local bodies/refs. Do not broaden into a new sweep. Gap: " + actionableGap + "\nPrior result refs: " + [...reportRefs, compactCritic.ref].filter(Boolean).join("\n") + "\nIf the gap cannot be resolved from local evidence, return it unchanged in unresolved.",
+      schema: evidenceSchema,
+      label: "single-gap-followup",
+      phase: "Gap follow-up"
+    });
+    followupReport = compact(followup, "single-gap-followup", actionableGap);
+  }
+
+  const allReports = followupReport ? [...allBeforeFollowup, followupReport] : allBeforeFollowup;
+  const allRefs = allReports.map((report) => report.ref).filter(Boolean);
+  const evidence = allReports.flatMap((report) => report.evidence.map((value) => ({ source: report.scope, ref: report.ref, value })));
+  const notes = allReports.flatMap((report) => report.notes);
+  const unresolved = [...new Set(allReports.flatMap((report) => report.unresolved))];
+
+  phase("Launch synthesis");
+  const synthesis = await host.agent({
+    input: common + "\n\nASSIGNMENT: Synthesize a launch plan only from inspected evidence. Prior result refs: " + allRefs.join("\n") + "\nCompact evidence: " + JSON.stringify({ evidence, unresolved, notes }) + "\nOrder the evidence strings as: (1) TOP GATE(S) that must clear first; (2) FIRST executable wave with exact PRs, owners, review/test/submission steps; (3) later sequence and dependencies; (4) deferred or close-later actions; (5) blocked-external items with the named unblocker; (6) stop conditions and observations after each wave. Distinguish actions musedrain/coordinator must take from lane/reviewer/queue work. Do not invent approvals, queue outcomes, or RPC allocations. If evidence is incomplete, complete=false and name every gap.",
+    schema: evidenceSchema,
+    label: "launch-synthesis",
+    phase: "Launch synthesis"
+  });
+  const compactSynthesis = compact(synthesis, "launch-synthesis", "launch-synthesis: no usable synthesis");
+  const finalReports = [...allReports, compactSynthesis];
+  const finalEvidence = finalReports.flatMap((report) => report.evidence.map((value) => ({ source: report.scope, ref: report.ref, value })));
+  const finalNotes = [...notes, ...synthesisNotes, ...compactSynthesis.notes];
+  const finalUnresolved = [...new Set([...unresolved, ...compactSynthesis.unresolved])];
+
+  const report = {
+    status: finalUnresolved.length ? "partial" : "complete",
+    scope: host.args?.scope ?? null,
+    launch_plan: compactSynthesis.evidence,
+    unresolved: finalUnresolved,
+    evidence: finalEvidence,
+    reports: finalReports.map((entry) => ({
+      scope: entry.scope,
+      ref: entry.ref,
+      complete: entry.complete,
+      evidence: entry.evidence,
+      unresolved: entry.unresolved,
+      notes: entry.notes,
+      error_kind: entry.error_kind,
+      spilled: entry.spilled,
+      text: entry.text
+    })),
+    notes: finalNotes,
+    omitted_scope: [
+      "Read-only review: no new tests, validates, submissions, closures, rebases, or lane assignments were executed by the workflow.",
+      "Only the assigned PRs and queue/lane records were swept; the full historical PR population was not re-inventoried in this run."
+    ]
+  };
+  return { ...report, summary: JSON.stringify(report) };
+}

@@ -1,0 +1,270 @@
+{
+  "sched_turns": 5,
+  "schedevent_replayed": 0,
+  "schedevent_recorded": 220,
+  "schedevent_desynced": 0,
+  "desync_descrip": null,
+  "reprio_descrip": "Record of 0 preemption and reprioritization events:\n  (Writing to file \"/home/newton/work/dev-hermit/worktrees/slots/musedrain-20261101/temp/analyze-cli-check/hermit_analyzemv9Njv/run1_target.preempts_with_times\")\n",
+  "threads_descrip": "[3]",
+  "num_processes": 1,
+  "num_threads": 1,
+  "syscalls": 33,
+  "virttime_elapsed": 3816505,
+  "virttime_final": 1767225600003816505,
+  "realtime_elapsed": {
+    "secs": 0,
+    "nanos": 111240365
+  },
+  "timeslice_stats": {
+    "count": 1,
+    "sum_ns": 1316505,
+    "min_ns": 1316505,
+    "max_ns": 1316505
+  },
+  "per_thread_timeslice": [
+    [
+      3,
+      {
+        "count": 1,
+        "sum_ns": 1316505,
+        "min_ns": 1316505,
+        "max_ns": 1316505
+      }
+    ]
+  ],
+  "preemption": {
+    "max_timeslice_ns": 200000000,
+    "timer_enabled": true,
+    "stopless_slice_ends": 0
+  },
+  "dispatch_stats": {
+    "schema_version": 1,
+    "backend": "ptrace",
+    "counters": {
+      "signal_traps": 0,
+      "patched_direct_calls": 0,
+      "ptrace_seccomp_stops": 33,
+      "ptrace_sigtrap_stops": 0,
+      "sigill_marker_hits": 0,
+      "ptrace_syscall_entry_stops": null,
+      "ptrace_syscall_exit_stops": null,
+      "refusals": 0
+    },
+    "sites": {
+      "candidates": 0,
+      "patched": 0,
+      "fell_back": 0
+    },
+    "per_process": [
+      {
+        "process": 0,
+        "counters": {
+          "signal_traps": null,
+          "patched_direct_calls": null,
+          "ptrace_seccomp_stops": 33,
+          "ptrace_sigtrap_stops": null,
+          "sigill_marker_hits": null,
+          "ptrace_syscall_entry_stops": null,
+          "ptrace_syscall_exit_stops": null,
+          "refusals": null
+        }
+      }
+    ]
+  },
+  "syscall_histogram": {
+    "architecture": "x86_64",
+    "observation_scope": {
+      "kind": "complete"
+    },
+    "syscalls": [
+      {
+        "nr": 0,
+        "name": "read",
+        "calls": 1,
+        "detcore": 0,
+        "backend": 1,
+        "refused": 0
+      },
+      {
+        "nr": 3,
+        "name": "close",
+        "calls": 2,
+        "detcore": 0,
+        "backend": 2,
+        "refused": 0
+      },
+      {
+        "nr": 5,
+        "name": "fstat",
+        "calls": 2,
+        "detcore": 0,
+        "backend": 2,
+        "refused": 0
+      },
+      {
+        "nr": 9,
+        "name": "mmap",
+        "calls": 8,
+        "detcore": 0,
+        "backend": 8,
+        "refused": 0
+      },
+      {
+        "nr": 10,
+        "name": "mprotect",
+        "calls": 3,
+        "detcore": 0,
+        "backend": 3,
+        "refused": 0
+      },
+      {
+        "nr": 11,
+        "name": "munmap",
+        "calls": 1,
+        "detcore": 0,
+        "backend": 1,
+        "refused": 0
+      },
+      {
+        "nr": 12,
+        "name": "brk",
+        "calls": 1,
+        "detcore": 0,
+        "backend": 1,
+        "refused": 0
+      },
+      {
+        "nr": 17,
+        "name": "pread64",
+        "calls": 4,
+        "detcore": 0,
+        "backend": 4,
+        "refused": 0
+      },
+      {
+        "nr": 21,
+        "name": "access",
+        "calls": 1,
+        "detcore": 0,
+        "backend": 1,
+        "refused": 0
+      },
+      {
+        "nr": 59,
+        "name": "execve",
+        "calls": 1,
+        "detcore": 0,
+        "backend": 0,
+        "refused": 0
+      },
+      {
+        "nr": 158,
+        "name": "arch_prctl",
+        "calls": 2,
+        "detcore": 1,
+        "backend": 1,
+        "refused": 0
+      },
+      {
+        "nr": 218,
+        "name": "set_tid_address",
+        "calls": 1,
+        "detcore": 0,
+        "backend": 1,
+        "refused": 0
+      },
+      {
+        "nr": 231,
+        "name": "exit_group",
+        "calls": 1,
+        "detcore": 0,
+        "backend": 0,
+        "refused": 0
+      },
+      {
+        "nr": 257,
+        "name": "openat",
+        "calls": 2,
+        "detcore": 0,
+        "backend": 2,
+        "refused": 0
+      },
+      {
+        "nr": 273,
+        "name": "set_robust_list",
+        "calls": 1,
+        "detcore": 0,
+        "backend": 1,
+        "refused": 0
+      },
+      {
+        "nr": 302,
+        "name": "prlimit64",
+        "calls": 1,
+        "detcore": 1,
+        "backend": 0,
+        "refused": 0
+      },
+      {
+        "nr": 334,
+        "name": "rseq",
+        "calls": 1,
+        "detcore": 0,
+        "backend": 0,
+        "refused": 1
+      }
+    ]
+  },
+  "host_inputs": {
+    "digest": "c9ffd1ef786ce11b898ab9b54db63fa2a0808948093dc06b85cd394080815ba2",
+    "files": [
+      {
+        "path": "/etc/ld.so.cache",
+        "dev": 33,
+        "ino": 142838323,
+        "size": 29499,
+        "mtime_sec": 1794121350,
+        "mtime_nsec": 826135599,
+        "snapshot_content": null,
+        "content": "e84f89705a0c808ca0c840a74c521ee96a2ddd86936465b256b794ea9bc6b4ad"
+      },
+      {
+        "path": "/lib64/libc.so.6",
+        "dev": 33,
+        "ino": 136903435,
+        "size": 2553784,
+        "mtime_sec": 1792148307,
+        "mtime_nsec": 0,
+        "snapshot_content": null,
+        "content": "3df5ce6ed1e733afb5bac2e22a434a9381a2ae880898f839725165776d86c7b3"
+      },
+      {
+        "path": "/usr/bin/true",
+        "dev": 33,
+        "ino": 101031,
+        "size": 27936,
+        "mtime_sec": 1781095363,
+        "mtime_nsec": 0,
+        "snapshot_content": null,
+        "content": "b9b6ec37ac996b4152caca5a87e5ae23abb649bbc82dc6e1ca1d423d7bf4c171"
+      },
+      {
+        "path": "/usr/lib64/ld-linux-x86-64.so.2",
+        "dev": 33,
+        "ino": 136903431,
+        "size": 939952,
+        "mtime_sec": 1792148307,
+        "mtime_nsec": 0,
+        "snapshot_content": null,
+        "content": "861e6e23bb12212683d535c00e0fd752cac36b760fb4bc0770049281f08f6d84"
+      }
+    ],
+    "stdio": {
+      "stdin": "char_device",
+      "stdout": "pipe",
+      "stderr": "pipe"
+    }
+  },
+  "skid_overshoots": 0,
+  "skid_overshoot_reports": 0
+}

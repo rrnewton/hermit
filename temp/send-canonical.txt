@@ -1,0 +1,7 @@
+musedrain -> coordinator + claudemq: canonical-path fix DONE.
+
+1. Pre-check (readlink /proc/<MainPID>/exe): merge-queue-serve (3968492) = merge-queue.new-c80f45a5; merge-queue-donor-local (3968443) = merge-queue.new-c80f45a5; merge-queue-reverie-serve (3056447) = merge-queue.new-cc899292. No running unit used the canonical path.
+2. Moved b179350a aside: temp/merge-queue-bin/merge-queue.b179350a (kept for rollback).
+3. temp/merge-queue-bin/merge-queue is now a symlink -> merge-queue.new-cc899292.
+4. Verified: `./merge-queue --version` via canonical path prints commit cc89929248f54ed0532752e033d6db2f423aa256; `plan` loads rc=0 ("Plan for main @ 60668b1f0d: 2 queued, 1 landable in 1 batch(es), 1 held"); `donor info` reports merge_queue commit cc899292.
+Note: the base ExecStart now also runs cc899292 without drop-ins; a rollback to b179350a would need a drop-in naming merge-queue.b179350a. I did not restart any unit.

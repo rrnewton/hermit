@@ -1,0 +1,21 @@
+Basic counts tool results:
+Total counts:
+.*
+           9 total threads
+.*
+Core [0-3] counts:
+.*
+           [2-3] threads
+.*
+Core [0-3] counts:
+.*
+           [2-3] threads
+.*
+Core [0-3] counts:
+.*
+           [2-3] threads
+.*
+Core [0-3] counts:
+.*
+           [2-3] threads
+.*

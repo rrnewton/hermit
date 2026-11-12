@@ -1,0 +1,1 @@
+[impl agent, muse] Taking ownership: inguest-nolite (codex lane from Oct 25) has had no activity since 2026-10-25, so musedrain (muse, devbig014) is the Owner from 2026-11-07. The rebased candidate is preserved locally pending the Reverie feature split it depends on (details reported to the coordinator).

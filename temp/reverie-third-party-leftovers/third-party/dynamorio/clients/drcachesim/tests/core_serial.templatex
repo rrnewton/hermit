@@ -1,0 +1,104 @@
+Schedule stats tool results:
+Total counts:
+           4 cores
+           9 threads: W0.T872.*
+      650576 instructions
+          21 total context switches
+   0.0322791 CSPKI \(context switches per 1000 instructions\)
+       30980 instructions per context switch
+          21 voluntary context switches
+           0 direct context switches
+           0 context switch sequence injections
+           0 system call sequence injections
+      100.00% voluntary switches
+        0.00% direct switches
+           8 switches input-to-input
+          20 switches input-to-idle
+          20 switches idle-to-input
+           0 switches nop-ed
+           0 quantum_preempts
+           0 migrations
+           0 work steals
+           0 rebalances
+           0 output limits hit
+         480 system calls
+         183 maybe-blocking system calls
+           0 direct switch requests
+           0 observed migrations
+           0 waits
+   *[0-9]* idles
+   *[0-9\.]*% cpu busy by record count
+    [0-9 ]* cpu microseconds
+    [0-9 ]* wait microseconds
+    [0-9 ]* idle microseconds
+    [0-9 ]* idle microseconds at last instr
+    [0-9\. ]*% cpu busy by time
+    [0-9\. ]*% cpu busy by time, ignoring idle past last instr
+  Instructions per context switch histogram:
+           0..   50000    15
+       50000..  100000     6
+  Thread W0.T.* instructions per context switch histogram:
+.*
+  Cores per thread:
+           1..       2     9
+  Latencies for syscalls that incurred a switch:
+.*
+  Latencies for syscalls that did not incur a switch:
+.*
+Core #0 counts:
+.*
+Core #1 counts:
+.*
+Core #2 counts:
+.*
+Core #3 counts:
+.*
+Core #0 schedule: [A-I_]*
+Core #1 schedule: [A-I_]*
+Core #2 schedule: [A-I_]*
+Core #3 schedule: [A-I_]*
+Core #0 switch-outs:
+    0 W0.T[0-9]* @.*
+Core #1 switch-outs:
+    0 W0.T[0-9]* @.*
+Core #2 switch-outs:
+    0 W0.T[0-9]* @.*
+Core #3 switch-outs:
+    0 W0.T[0-9]* @.*
+.*
+
+===========================================================================
+Basic counts tool results:
+Total counts:
+      650576 total \(fetched\) instructions
+        6360 total unique \(fetched\) instructions
+         126 total non-fetched instructions
+           0 total prefetches
+      172208 total data loads
+      100150 total data stores
+           0 total icache flushes
+           0 total dcache flushes
+           9 total threads
+        3314 total timestamp \+ cpuid markers
+   *[0-9]* total idle markers
+           0 total wait markers
+         530 total kernel transfer markers
+          49 total function id markers
+           0 total function return address markers
+         144 total function argument markers
+          25 total function return value markers
+           0 total physical address \+ virtual address marker pairs
+           0 total physical address unavailable markers
+         480 total system call number markers
+         183 total blocking system call markers
+           0 total skipped memref markers
+         316 total other markers
+       21842 total encodings
+Core [0-9] counts:
+.*
+Core [0-9] counts:
+.*
+Core [0-9] counts:
+.*
+Core [0-9] counts:
+.*

@@ -1,0 +1,1 @@
+musedrain: verified live. New-binary `status` shows daemon started 2026-11-06T14:12:52Z (pid 3968492), `merge-queue here: c80f45a5a170b883f3f3bf4780c8ce4e49b61763`, donor status shows local donor claiming (last claim 16s ago). The sync line shows only the hourly API budget (retry ~3 min) -- not an anomaly. Watching for the devbig030 donor switch and any post-swap anomalies.

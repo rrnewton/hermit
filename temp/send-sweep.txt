@@ -1,0 +1,26 @@
+musedrain -> coordinator: sweep-and-transfer final report.
+
+SWEEP (git worktree remove only; systemd grep first: only temp/merge-queue-bin/* is referenced, untouched):
+- Removed 35 clean scratch worktrees whose HEAD is reachable from a remote ref or on origin/main (12 plain + 23 after submodule deinit, exactly the dh-urlfix recipe). temp/merge-queue-bin/ never touched; no live process used any removed tree.
+- KEPT 18, per your rules (dirty or local-only head):
+  bisect5110 e7a99162bda804abf56339dc50655299fbde21c7 (DIRTY, 1 file)
+  after-de8bf 068bc7370ad6006c189c0df339fe609317103f33
+  b4714 e446806272cf62bdbdc365ef3687c4f616c9beda
+  b4751 7aaa01f770a2e7cbcb7b037b81401c2e44626e30
+  b4766 87afa0003061512fd0e40d7fba41e457f662a2d0
+  b4926 868d3a3078b7a3f05386d4be90fa811c241419e5
+  batch2-5099 b4bbf03b8af64b2716d4b6aad23f5c38450d9fbc
+  batch5 5fb0ab751c909a7dac7293082a5c490b71824973
+  batch5a 2630f4969a59b74b1db33c0b7a168b22f86076cc
+  bf2h 5d660713ed8fc9950552a3acce8a8fb615980c44
+  bff4608 96d23ba9be9520ab12e1cdd16ee019185fb189e2
+  bisectpidfd fecdd8132a29d18340a73cfd9a8deb18655ffeec
+  s4889 8d63bcedef9d9660f76c4f7e2eefcf45407e4e90
+  s4926 46651bfd441c9f3255ca8b1581b2a535d12ea167
+  s5128 aa5be5b3221a7c9d17220c86cff30ae986798f54
+  skid4728 0287ffc8340ac035afd42e933053695f0b67f413
+  skid4789 992e23d5bbe94b6cf11551100664b9dd8812b641
+  split-trial-batch1 a1941b8a694050f27c9b1aa39ada33ef89e64e78
+  Still matters? None for landing: all are superseded batch/single/bisect scratch whose content landed via queue-recount or their PR branches; kept only because their exact heads are local-only (bisect5110's dirty file is 5110-bisect scratch, long landed).
+
+TRANSFER-OWNER: still REFUSED, and the rules conflict: transfer-owner refuses on ANY unregistered worktree inside the managed root -- it now names kept after-de8bf. So it cannot go through while the kept set exists. I did not delete kept trees against your rule (2). Please rule: (a) leave transfer-owner owed until the kept set is retired, (b) register the kept trees another way, or (c) authorize removing the kept set (bisect5110 dirty file would need a look first). Slot musedrain-20261101, agent musedrain, generation 1, successor pid 531717.

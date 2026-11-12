@@ -1,0 +1,259 @@
+/* **********************************************************
+ * Copyright (c) 2015-2025 Google, Inc.  All rights reserved.
+ * **********************************************************/
+
+/*
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * * Redistributions of source code must retain the above copyright notice,
+ *   this list of conditions and the following disclaimer.
+ *
+ * * Redistributions in binary form must reproduce the above copyright notice,
+ *   this list of conditions and the following disclaimer in the documentation
+ *   and/or other materials provided with the distribution.
+ *
+ * * Neither the name of Google, Inc. nor the names of its contributors may be
+ *   used to endorse or promote products derived from this software without
+ *   specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL VMWARE, INC. OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH
+ * DAMAGE.
+ */
+
+/* reader: virtual base class for an iterator that provides a single memory
+ * stream for use by a cache simulator.
+ */
+
+#ifndef _READER_H_
+#define _READER_H_
+
+#include <assert.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include <iterator>
+#include <queue>
+#include <unordered_map>
+#include <unordered_set>
+
+// For exporting we avoid "../common" and rely on -I.
+#include "memref.h"
+#include "memtrace_stream.h"
+#include "reader_base.h"
+#include "trace_entry.h"
+#include "utils.h"
+
+namespace dynamorio {
+namespace drmemtrace {
+
+/**
+ * Iterator over #dynamorio::drmemtrace::memref_t trace entries. This class converts a
+ * trace (offline or online) into a stream of #dynamorio::drmemtrace::memref_t entries. It
+ * also provides more information about the trace using the
+ * #dynamorio::drmemtrace::memtrace_stream_t API.
+ */
+class reader_t : public reader_base_t {
+public:
+    // Ensure derived classes operate as a proper C++ iterator in all circumstances.
+    using iterator_category = std::input_iterator_tag;
+    using difference_type = std::ptrdiff_t;
+    using value_type = memref_t;
+    using pointer = value_type *;
+    using reference = value_type &;
+
+    reader_t()
+        : reader_base_t()
+    {
+        cur_ref_ = {};
+    }
+    reader_t(bool online, int verbosity, const char *prefix)
+        : reader_base_t(online, verbosity, prefix)
+    {
+        cur_ref_ = {};
+    }
+    virtual ~reader_t()
+    {
+    }
+
+    virtual const memref_t &
+    operator*();
+
+    virtual reader_t &
+    operator++();
+
+    // Skips records until "count" instruction records have been passed.  If any
+    // timestamp (plus cpuid) is skipped, the most recent skipped timestamp will be
+    // duplicated prior to the target instruction.  Top-level headers will still be
+    // observed.  This generally should call pre_skip_instructions() to observe the
+    // headers, perform any fast skipping, and then should call
+    // skip_instructions_with_timestamp() to properly duplicate the prior timestamp.
+    // Skipping 0 instructions is supported and will skip ahead to right before the
+    // next instruction.
+    virtual reader_t &
+    skip_instructions(uint64_t instruction_count);
+
+    // Supplied for subclasses that may fail in their constructors.
+    virtual bool
+    operator!()
+    {
+        return false;
+    }
+
+    // We do not support the post-increment operator for two reasons:
+    // 1) It prevents pure virtual functions here, as it cannot
+    //    return an abstract type;
+    // 2) It is difficult to implement for file_reader_t as streams do not
+    //    have a copy constructor.
+
+    uint64_t
+    get_record_ordinal() const override
+    {
+        return cur_ref_count_;
+    }
+    uint64_t
+    get_instruction_ordinal() const override
+    {
+        return cur_instr_count_;
+    }
+    uint64_t
+    get_last_timestamp() const override
+    {
+        return last_timestamp_;
+    }
+    uint64_t
+    get_first_timestamp() const override
+    {
+        return first_timestamp_;
+    }
+    uint64_t
+    get_version() const override
+    {
+        return version_;
+    }
+    uint64_t
+    get_filetype() const override
+    {
+        return filetype_;
+    }
+    uint64_t
+    get_cache_line_size() const override
+    {
+        return cache_line_size_;
+    }
+    uint64_t
+    get_chunk_instr_count() const override
+    {
+        return chunk_instr_count_;
+    }
+    uint64_t
+    get_page_size() const override
+    {
+        return page_size_;
+    }
+    bool
+    is_record_kernel() const override
+    {
+        return kernel_tracker_.in_kernel_trace();
+    }
+    bool
+    is_record_synthetic() const override
+    {
+        if (cur_ref_.marker.type == TRACE_TYPE_MARKER &&
+            (cur_ref_.marker.marker_type == TRACE_MARKER_TYPE_CORE_WAIT ||
+             cur_ref_.marker.marker_type == TRACE_MARKER_TYPE_CORE_IDLE)) {
+            // These are synthetic records not part of the input and not
+            // counting toward ordinals.
+            return true;
+        }
+        return suppress_ref_count_ >= 0;
+    }
+
+protected:
+    // This updates internal state for the just-read input_entry_.
+    // Returns whether a new memref record is now available.
+    virtual bool
+    process_input_entry();
+
+    // Meant to be called from skip_instructions();
+    // Looks for headers prior to a skip in case it is from the start of the trace.
+    // Returns whether the skip can continue (it might fail if at eof).
+    virtual bool
+    pre_skip_instructions();
+
+    // Meant to be called from skip_instructions();
+    // Performs a simple walk until it sees the instruction whose ordinal is
+    // "stop_instruction_count" along with all of its associated records such as
+    // memrefs.  If any timestamp (plus cpuid) is skipped, the most recent skipped
+    // timestamp will be duplicated prior to the target instruction.
+    virtual reader_t &
+    skip_instructions_with_timestamp(uint64_t stop_instruction_count);
+
+    uint64_t cur_ref_count_ = 0;
+    int64_t suppress_ref_count_ = -1;
+    uint64_t cur_instr_count_ = 0;
+    std::unordered_set<memref_tid_t> skip_chunk_header_;
+    uint64_t last_timestamp_ = 0;
+    uint64_t first_timestamp_ = 0;
+    trace_entry_t *input_entry_ = nullptr;
+    uint64_t last_cpuid_ = 0;
+    // Remember top-level headers for the memtrace_stream_t interface.
+    uint64_t version_ = 0;
+    uint64_t filetype_ = 0;
+    uint64_t cache_line_size_ = 0;
+    uint64_t chunk_instr_count_ = 0;
+    uint64_t page_size_ = 0;
+
+    struct encoding_info_t {
+        // We use a char type to save space, as this can eat up memory when we have a
+        // copy in each of thousands of input traces for large multi-threaded
+        // applications. This struct is 16 bytes, vs 24 bytes if we use size_t. We
+        // don't actually need a size field at all as we could rely on the instr
+        // fetch record size, but removing one byte doesn't change the struct size.
+        unsigned char size = 0;
+        // We could try to shrink further by having a union of the 1st 8 bytes of the
+        // encoding with a pointer to heap-allocated storage for >8-byte encodings: but
+        // we would then actually need a size field (or some field indicating which
+        // union field to use) so we can clean up the heap-allocated memory (and a pool
+        // for cleaning all at the end is not enough as we need to replace/update
+        // individual encodings): and that keeps encoding_info_t at 16 bytes with
+        // standard alignment, unless we want to pack it down to 9 which probably won't
+        // save memory if the container heap-allocates into a 16-byte heap bucket
+        // anyway; and we don't want the complexity of a custom allocator.
+        unsigned char bits[MAX_ENCODING_LENGTH];
+    };
+
+    std::unordered_map<addr_t, encoding_info_t> encodings_;
+    // Whether this reader's input stream interleaves software threads and thus
+    // some thread-based checks may not apply.
+    bool core_sharded_ = false;
+    bool found_filetype_ = false;
+
+private:
+    memref_t cur_ref_;
+    memref_tid_t cur_tid_ = 0;
+    memref_pid_t cur_pid_ = 0;
+    addr_t cur_pc_ = 0;
+    addr_t next_pc_;
+    addr_t prev_instr_addr_ = 0;
+    int bundle_idx_ = 0;
+    std::unordered_map<memref_tid_t, memref_pid_t> tid2pid_;
+    bool expect_no_encodings_ = true;
+    encoding_info_t last_encoding_;
+    addr_t last_branch_target_ = 0;
+    kernel_tracker_t kernel_tracker_;
+};
+
+} // namespace drmemtrace
+} // namespace dynamorio
+
+#endif /* _READER_H_ */

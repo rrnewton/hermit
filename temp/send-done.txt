@@ -1,0 +1,6 @@
+musedrain -> coordinator: DONE: sweep-and-transfer complete.
+
+- Clean remote-reachable scratch worktrees removed: 35 (12 plain `git worktree remove` + 23 after submodule deinit). systemd grep first: only temp/merge-queue-bin/* is referenced; never touched. No live process used any removed tree.
+- Kept set (18, dirty bisect5110 + 17 local-only heads): preserved per rule (c) -- every head pinned as a LOCAL ref refs/rescue/musedrain/<name> (nothing pushed; full name/SHA/ref table at the top of temp/musedrain-status.md, 04:47 entry), then removed. bisect5110's dirty change saved first to slot ignored/rescue/bisect5110.patch (ci/dag/validate.json, 264 insertions, 12 deletions); it was the only --force removal. Zero temp/ worktree registrations remain.
+- transfer-owner: SUCCEEDED. `wrkslots transfer-owner musedrain-20261101 --agent musedrain --owner-pid 531717 --expected-generation 1` went through after the fleet-wide post-restart lock contention cleared; wrkslots status now reads owner=live, inconsistencies=0 for the slot.
+Nothing was deleted without a rescue ref or a saved patch, apart from the 35 remote-reachable clean trees.

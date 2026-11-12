@@ -1,0 +1,70 @@
+[hermit2, inguest-nolite, gpt-6.1-sol, host withheld, role=impl]
+
+Owner: musedrain (muse, devbig014) since 2026-11-07T06:01Z
+
+## Plain Language Summary and Project Impact
+
+Default-on LiteInst; `--backend=in-guest-trap` without LiteInst2. Defaults off: `native-exec`, `exec-stop-launcher` and `mm-cancellation-test-support` imply only the trap base. FullTool/preload/RPC/loader remain. CLI/Tool refuse absent LiteInst (ON CLI/OFF runtime, unset selector); explicit values same. Trap disables patching; mode/statistics checked.
+
+Signed H `b797378dc40edc549eecae256087d8c4ac0fa536`, base `f8120b588d66ba9260d36946eff13d86aa36b52e`, pins RV `09dc3a7d0da265e7144d749ef0107ac5d3b4cf71`: https://github.com/rrnewton/reverie/pull/1125. H:107 exact pin substitutions/21 files+gitlink; other bytes/modes/defaults same; machine/body-SHA amend. RV:2 catalog literals/5795B ON raw-mseal manifest,53/53 match/predicates/tests same; machine amend/same2e39 tree. Catalog/pin approval2e39/c44 only.
+
+450 default-ON kept/OFF additive;14 files retain direct Trap oracles;removed comparisons never sole oracles. Buck: existing ON/new OFF labels; crate split deferred. Private-static factories build Detcore archive trap-only (`--no-default-features`), also with outer LiteInst.
+
+## Boundaries
+
+Sole intended ON fix: signed RV bottom `94b9a2b0d928287c8f2d069b2f8fc0093042af81`, parent `b2f157820cf4f8be82f5d5b6f379d956176fdb0d`. Plain FullTool owner guard precedes unknown-raw classification: protected mseal EPERM matches Strace/Compat/nested FullTool; outside-owner ENOSYS.
+
+Own ON direct-C:C/ASM identical; guest identity in RV PR, real installer/RPC.840aebec fixture-only control:Cargo101/C Complete1/-38,-38; fixed94b:Cargo0/C Complete0/-1,-38(protected,outside). Each1 test/0 ignored/measured; command35.924/36.602s,C55/58ms/not whole-leg. VMA/permissions/lease/sentinel/identity complete; exactly2 lease reuses; route/site/hook checks; only baseline owner errno fails. NONQUALIFIED/M1=false/no qualified RuntimeReceipt; qualified FAILED_SETUP/C NOTRUN; pair-only approval/no ELF/matrix credit.
+
+OFF legacy Strace/Compat: typed preactivation refusal; standalone positives ON-only. 06079 QS/WS: 127/exact diagnostics replace 139, not parity. Adapter: `dh-fkupu`; Buck native/loader: `release-05`.
+
+Historical LocalKey TLS arm, finite: only 0x98/0xd8/full177B allocation/nine roles/exact38B getters; only RIP operands masked. Separate strict current direct-TLS arms: Detcore 0xe8/alloc241/getter22; Standalone 0xd8/alloc186/no installation getter. Feature-independent;added Tool moved ON fixture to 0xd8. Typed Rust-v0/exact provider layout/maintained producer/source-matched whole-ELF/M1/ambiguity negatives required. OFF M2 synthetic Builtin fixture: **not shipped-constructor coverage/product parity**; disabled-stack mismatch open `dh-k3w5h`.
+
+RV0e2bf15a ON `--all-features`:3 Cargo101/0P/1F failures, third inherited-filter status before stdout; IDs/base receipt in RV PR. Refusal-oracle fixes retain lean ON positive/refusal/pristine checks; Native-role assertions stronger/other-number completion reordered: ON bodies not all byte-identical. Selector/publication order matches base. Gates reject empty output/Cargo/grep failure/missing grep;6 shell-stub passes/no build/runtime credit.
+
+## Determinism
+
+Scheduling/clocks same; Trap/coordinator/RPC/state oracles and uniform owner policy kept.
+
+## Linux Semantics
+
+[SECCOMP_RET_TRAP/SIGSYS](https://github.com/torvalds/linux/blob/v6.12/include/uapi/linux/seccomp.h) same; Reverie owner EPERM/outside-owner raw 462 ENOSYS; no native Linux mseal/syscall parity.
+
+## Validation
+
+Actual-4 **H29 FAILED**:27P/1 ABI F/1 isolation unrun(450 planned/0 credited),815.518176s; Nextest6981P/252 filtered. Ten kept schema2/inotify publications895811B; Case/CPU/607 joins match; raw libtest absent. ABI60s/terminal65.904s, CPU-timeout/aborted=false;307B log: Podman10s image-probe timeout then `--pull=never`; inner ABI progress/cause/base-red unknown. Separate607 **PASS**:303 Trap+304 LiteInst/filter0/7 commands0/22.909693/24.171992s; within-cell RR is not cross-backend parity. Scope/14 births closed;lease0/46.386529s. Clocks/caps same; local diagnostic/no global exclusivity/canonical receipt. Retention-helper10MiB pre-copy FAIL/wrong annotation kept;46 metadata corrected/no build/inventory/test rerun.
+
+Actual-3 RV2e39/Hc44 only:H29 FAILED27P/1 ABI F/1 isolation dependency skip/808.000s; Nextest6981/6981P,ABI65.824s>60s. Separate607 PASS303+304/filter0/7 commands0/22.653/24.071s.14 births closed/lease released; IDs/CPU/presentation kept,raw libtest/schema2 case rows unretained/unreconstructed. No transfer.
+
+12986/12988 REFUSED/not pushed;12990 listed/incomplete. Pushes verified; whole-feature review pending; narrow audits not approval.
+
+Setup cache/catalog/schema FAIL retained in paired RV PR; no credit.
+
+Offline pin/checker/locked metadata passed. Unstaged-gitlink/checker/enumeration FAIL kept. Commit-only hook exception/strict gates; push hooks/config same; optional network advisory NOTRUN.
+
+H `d09ce8fc6512`; 06079 message-only/same tree:
+
+- Normal7:60 controls/fmt/workspace all-target Clippy pass; setup FAIL.
+- OFF6 FAILED538.019s:2134 ran/2130P/4 required V11F; Nextest1676P/4F,manifest303P(HOST62),isolation150P,mixed refusal1P,scratch-race pass;133 excluded(8 ignored+125 filtered); raw isolation mismatches disclosed.
+- ON29 FAILED26P/2F/1 dependency skip; ABI65.690s>60s,CLI615/616 typed attempts/missing ID unknown; official6365 excludes CLI.
+- Separate607 pass303+304.06079 ON450 IDs/ledger diagnostic pass;raw647 mismatches/45650 missing observations;node83.737s/HOST138.786s/operator565.135/600s. Earlier450 prep late/unexecuted; no current-head/ON29 credit.
+
+RV dc7f689c ON FAILED (RV PR counts): selector expected 101/diagnostic vs 127/empty streams; later assertions unreached/oracle same.
+
+## Limits
+
+Four required OFF V11 FAIL: exact 31,315,160-byte ELF missing, SHA256 `24ca0e02e844e121298cfb0b3319034edbc54a03907bdc9b65be5cb876e36eea`; no substitute/filter/waiver. OFF wall475.304s at d09; added full/portable cost unknown. B3 sharing/narrowing or approved periodic owner/cadence/failure policy open.
+
+Preexisting ON brk: fallback refused EOPNOTSUPP/cached `__curbrk=-95`; neither caused nor fixed; reproduced pre-feature 1b894c0c (unqualified diagnostic)/840aebec; run 1359 excludes test: https://github.com/rrnewton/reverie/issues/1112 (`dh-9jtuf`).
+
+Monitoring after loader/libc/program constructors; `--max-timeslice=disabled` required; verify/timeout/skid-margin/gdbserver refused. No static/set-user-ID/non-x86-64/DT_PREINIT_ARRAY/nonregular programs; fork supported/vfork copies/no threads/exec; image/NAR/GNU provenance separate.
+
+## Producer
+
+ELF qualification SATISFIED at current heads:kept ON; fresh host OFF `--without-liteinst`0/131.834s(total157.937s). ON features `allocator-fixture,liteinst`, OFF `allocator-fixture`; both `fresh:false`. Source/ELF/receipt joined; `declared_content`,tests0/fullM1=false. Host GNU; no pinned-image/runtime/parity credit.
+
+Mseal SATISFIED:coord3 accepted20:29Z fixed5076/control e76fd3fe. B1 attempts1–5 FAILED_PRETEST;4:root1/304.575637s,builds0,`KeyError('binary')`,test NOTRUN,cleans0×2/caches absent/ON-test ELFs unretained.5:ordinary OFF built0/root1/193.929870s,3 live children,old cleanup NOTDONE,411 files/172473510B kept. New continuation:1P/filter0,root0/176.695508s,scope closed,cleans0×2/caches absent;B1 only/independent audit pending. Current OFF2134 NOTRUN; H soft green/paired landing OPEN.
+
+## Human Review Required
+
+Trigger 2: backend/interception/OFF install/patch/refusal; no lane HumanReviewRequired label. Scoped approvals; coordinator review pending. Full validation after landing.

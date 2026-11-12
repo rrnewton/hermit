@@ -1,0 +1,11 @@
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.99s
+     Running tests/cli.rs (/home/newton/work/dev-hermit/worktrees/slots/musedrain-20261101/temp/cargo-target-base/debug/deps/cli-2cfa7657e036ddf9)
+
+running 1 test
+test a_chaos_instruction_offset_run_verifies_and_replays_at_its_offsets ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1054 filtered out; finished in 33.66s
+

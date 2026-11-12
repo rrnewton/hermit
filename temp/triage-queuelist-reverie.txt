@@ -1,0 +1,27 @@
+PR       STATUS     PRIO     HEAD       TESTED     TITLE
+#1290    landed     100      cad4ebfc36 focused    liteinst integration stack: selection + probes + percrate fix + grouped-admission spike (1290)
+#1291    landed     100      94f36135c4 focused    Combined Reverie drain: 1165 + 1274 + 1282 on stable Rust
+#1293    landed     100      dcadf9287a focused    KVM integration: other processes' procfs links from link_path; madvise guard regions
+#1295    landed     100      3b5838b5e4 focused    validate: run gates as a dagrun DAG with counted nextest nodes
+#1297    landed     100      3f7ac630c5 focused    Treat an unscheduled perf counter window as unmeasured, never as zero
+#1298    landed     100      412540971d focused    ptrace: name the exact-fit EMFILE outcome as a skip under dh-lj1b6
+#1299    landed     100      594194d366 focused    Do not retire a native generation for a momentary detach gap
+#1301    landed     100      c07d0da68d focused    safeptrace: cache general-purpose registers per stop (1301)
+#1302    landed     100      320f7b7385 focused    guide: remove other-project guide-style references (1302)
+#1303    landed     100      6b7d3658e9 focused    e2e: isolate the runner Cargo target from the DAG build
+#1304    landed     100      68a8dcdf21 focused    safeptrace: write back cached registers once per stop segment
+#1305    landed     100      7e5672a308 focused    guide: retire mech-selection, document landed selector (1305)
+#1306    landed     100      5895ec5eb1 focused    KVM: declare kernel signal targets predictable under Tool-controlled delivery (1306)
+#1308    ejected    100      422c97dc62 focused    C1 mapped transport + stage-1b S1/S2a-1 follow-on
+#1309    landed     100      f72af6a698 focused    reverie-inguest: aarch64 seccomp trap runtime (W3 S1-S4)
+#1310    landed     100      1cc6d0125c focused    inguest: lease per-thread Tool state + per-thread RPC connections (W7 slices 1-2)
+#1312    ejected    100      59046286bc focused    salvage: raw-mseal/FullTool fixtures from PR 1125 (dh-yhxd0 piece iv)
+#1313    landed     100      b4385865f5 focused    W6b N1+N2: generic exec ticket registry + native-exec driver (refusal-only at leaf)
+#1314    landed     100      3abc4b430a focused    Make the producer CPU-cost guard load-independent
+#1315    landed     100      2ebb07aad8 focused    guide: retire typed-listing with proven openat rewrite
+#1316    landed     100      46f092e920 focused    guide: retire typed-coverage with table-counted statement
+#1317    landed     100      c1c61c976b focused    Make ptrace request words musl-portable
+#1319    landed     100      50fbf28780 focused    LinuxEmu: list every mapping of an address space, for another process
+#1321    landed     100      8a87a0b6ff focused    LinuxEmu: set the core-dump bit only when Linux would write a core
+#1322    landed     100      9cc0eb676d focused    Revert KVM predictable kernel signal targets (restart class 513)
+#1324    landed     100      53cebdaf76 focused    KVM: apply Linux's restart policy to every Tool restart class

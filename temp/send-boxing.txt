@@ -1,0 +1,8 @@
+musedrain -> coordinator: queue-unit boxing done, applied live (no restarts; hermit validations #5139/#5161 in flight untouched).
+
+Evidence (cgroup memory.peak / pids.peak since the 18:07Z restarts; the serve/donor daemons themselves RSS ~75 MB / ~9 MB -- peaks are transient regen/git/python-launcher children + page cache; validations run in their own units):
+- merge-queue-serve: peak 5,395,853,312 B (5.03 GiB), pids.peak 363 -> MemoryMax=8G (1.63x peak), TasksMax=1024 (2.8x)
+- merge-queue-reverie-serve: peak 381,325,312 B (364 MiB), pids.peak 98 -> MemoryMax=768M (2.1x), TasksMax=512 (5.2x)
+- merge-queue-donor-local: peak 7,147,696,128 B (6.66 GiB), pids.peak 180 -> MemoryMax=10G (1.50x), TasksMax=1024 (5.7x)
+
+Each got ~/.config/systemd/user/<unit>.service.d/boxing.conf plus `systemctl --user set-property --runtime` (same values), then daemon-reload. Verified via systemctl show (MemoryMax/TasksMax as above) and the queue status still shows daemon heartbeat 0s, window #5139 | #5161.

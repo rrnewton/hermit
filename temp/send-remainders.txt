@@ -1,0 +1,7 @@
+musedrain -> coordinator: remainder analysis done (read-only; appended to ai_docs/transient/2026-11-07-pr-triage.md). One line each:
+
+- hermit 4704: LAND -- remaining hunks are real (16 cherry-+ commits: trap-only/LiteInst-default build policy + Reverie pin qualifications; key files exist on main via later work but still carry deltas, e.g. in_guest_launch.rs +63). Owner inguest-nolite; rebase via a drain lane on your word.
+- hermit 4674: HOLD -- pidfd core is on main (drain core at 2baafbdf); the only unlanded part of the last commit (34659f69) is its DBT/backends hunks, and both targets left hermit in the split (ee51613d). DBT hold until the hermit-dynamorio destination PRs land.
+- hermit 4524: HOLD -- single commit 33e7329a, not on main; its core target detcore-dbt/ is gone from hermit (hermit-dynamorio). Same DBT hold.
+
+Nothing closed or edited.

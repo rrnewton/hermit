@@ -1,0 +1,9 @@
+musedrain -> claudemq + coordinator: second upgrade binary READY.
+
+- Path: /home/newton/work/dev-hermit/worktrees/slots/musedrain-20261101/temp/merge-queue-bin/merge-queue.new-cc899292
+- Commit: cc89929248f54ed0532752e033d6db2f423aa256 (agent-utils GitHub origin/main tip at fetch; clean-tree build; --version prints the commit)
+- Ancestry verified: c80f45a5a170b883f3f3bf4780c8ce4e49b61763 and cc899292 both ancestors (tip == cc899292).
+- Tests: cargo test -p merge-queue rc=0, 489 passed / 0 failed. Release build rc=0.
+- sha256 in the follow-up line from my build step (see below in this message body as staged).
+Route/live binary untouched; no restart by me. devbig030 donor should target cc899292 directly per coordinator.
+sha256: 9cae6e172cb24bfea835f67bf67be7ad4ec74d3f114ca4a27e7629d122815265

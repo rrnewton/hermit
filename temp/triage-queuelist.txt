@@ -1,0 +1,118 @@
+PR       STATUS     PRIO     HEAD       TESTED     TITLE
+#4521    withdrawn  100      24aec2b976 -          
+#4539    withdrawn  100      e5fb4ecc90 -          Document Hermit container requirements and tested commands
+#4614    withdrawn  100      f49493c1bb -          Make a schedule replay with --chaos follow its recording
+#4627    landed     100      309af8fa03 -          
+#4640    landed     100      bac189e055 -          
+#4674    withdrawn  100      375765bac5 -          
+#4677    withdrawn  100      b27adde4bc -          Identify staged compression fixtures by content
+#4706    landed     100      f827a7014f -          
+#4709    landed     100      c4adf5a36d focused    cpu-profile auto (4709)
+#4722    landed     100      e9f7807d72 focused    finalize-before-write refusal + lone slice-end replay fix (4722)
+#4735    landed     100      8aa74d9435 focused    Replay provenance + aarch64 LSE ADRP+LDR reader fix (4735)
+#4741    landed     100      383243733d focused    analyze budget/resume F1: fd-reuse race test, rpc excluded from PMU node (4741)
+#4742    landed     100      f296c11423 -          
+#4743    landed     100      b13cd555fa -          analyze: trial-log and PMU integrations (4743)
+#4746    landed     100      a1fa519da2 focused    analyze: stop at a budget with a partial report, and resume (4746)
+#4748    withdrawn  52       69c5611d0f -          
+#4750    landed     100      81ebb1df3d focused    stdio-kind host input recording (4750)
+#4752    landed     100      58d6aaf13b focused    analyze verdict exits (4752)
+#4759    queued     100      0537ca95df focused    Stamp uncapped slices from completed-slice evidence (4759)
+#4761    landed     100      71b7f40b78 -          
+#4764    landed     100      bd4f9d2fdc focused    Add --untrap-passthrough-syscalls, an opt-in that leaves seven pass-through syscalls untrapped
+#4769    landed     100      c016a4a2fd focused    
+#4772    landed     100      886a44e702 -          
+#4774    withdrawn  50       06a7fa5db5 -          
+#4791    landed     100      b0046750d6 focused    Detcore files: single ParentArea::Outside producer (4791)
+#4796    landed     100      a05c5a122f focused    Detcore watch flag (4796)
+#4802    withdrawn  100      9478b9ba9b -          Let a thread switched away from at a replayed prehook carry out its call first
+#4803    withdrawn  100      7f45e0c81c -          
+#4877    withdrawn  51       3d070e5308 -          
+#4885    landed     100      0986618f40 -          
+#4886    withdrawn  100      cb6f440fc8 -          Fix-forward for #4622: a split timer stop keeps its RIP on its second half
+#4889    withdrawn  100      78b61e69a2 -          
+#4907    landed     100      038a0f28a7 focused    strex coverage overlay (4907)
+#4920    landed     100      c407030e6f -          
+#4933    withdrawn  100      345ae0cf2f -          Test the MSG_ERRQUEUE decision through Detcore's descriptor model
+#4935    withdrawn  55       001dbb1ede -          
+#5084    withdrawn  40       ab806a6e11 -          
+#5085    withdrawn  41       4b5a22f38e -          
+#5086    withdrawn  42       b50deeaa92 -          
+#5093    landed     100      2b96578cf2 -          
+#5099    withdrawn  30       44ec239aa4 -          
+#5100    withdrawn  100      487b068076 -          
+#5120    landed     100      16b46dbda7 focused    shared-memory replay fix (5120)
+#5138    landed     100!     23c301aa96 -          
+#5139    landed     100      426a6071d2 focused    KVM: serve another guest process's /proc/<pid> directories, stat and comm from Detcore
+#5140    ejected    100!     d92f739ffd -          
+#5144    withdrawn  100      d0de77d282 -          
+#5145    landed     100!     8ff8f6e587 -          
+#5146    landed     100!     6d23856588 focused    0.5.5 MUST ports (cpuid masking restored)
+#5147    landed     100      4e14bbf948 -          analyze: validate coverage guard (4976)
+#5148    landed     100      9c377519aa focused    Add the shared super/pressure tier marker (5148)
+#5149    withdrawn  100      6445dc265c -          
+#5150    landed     100!     4e6685b4f3 -          
+#5152    landed     100      11b3400b96 -          
+#5153    landed     100      9a1c453d62 -          Super tier: full plus super union selection
+#5156    landed     100      f13e10e87e -          super re-tier pressure labels (5156)
+#5157    landed     100      0c9fa2214a -          timerfd comment: virtual time remaining
+#5158    landed     100      c341e04afa -          manifest-plan: DAG extension registry (5158)
+#5159    withdrawn  100      0f19e65ee3 focused    validate: fail-fast by default (5159)
+#5160    landed     100      23a816e10d focused    buck cells fail-fast exemption docs (5160)
+#5161    landed     100      29ade7ce40 focused    rr Batch 0: pressure bucket spike (rr/simple verify+replay)
+#5162    landed     100      2074450aae focused    e2e harness fail-fast (5162)
+#5163    landed     100      5dfe2c6c83 focused    super affected-node selection (5163)
+#5164    landed     100      50efb31a4a focused    dagrun priorities (5164)
+#5165    landed     100      b74c831e64 -          
+#5166    landed     100      388cea07c8 focused    
+#5167    landed     100      c794f2be03 -          
+#5168    landed     100!     211259b77b focused    Pin agent-utils 96d05180 for wrkslots fixes (5168)
+#5169    landed     100!     8c455d4e54 focused    Size the quick/super rust-script producer CPU cap from a cold build (5169)
+#5170    landed     100      94327f5ebe focused    reverie pin to ac71ee9c: THP file-mapping alignment (5170)
+#5171    ejected    100      61d2b5a702 focused    rr batch 1: 31 pressure rows (5171)
+#5173    landed     100      279d4d50d0 focused    Hermetic scorecard fixture: no agent-utils clone (5173)
+#5175    queued     100      414dbe51d1 focused    Let KVM's rt_sigsuspend and masked ppoll wait for a signal as Linux does (SIGSHARE S2b)
+#5176    landed     100      93d7684f3e focused    Buck e2e: cpuid_on_re routing plumbing, default off (5176)
+#5178    landed     100!     c64d41614c focused    Pin agent-utils 5f92b018 (#885 create-journal fix) (5178)
+#5180    landed     100      c12d0d4562 focused    descriptor_links native oracle: spread ELOOP retries (5180)
+#5182    landed     100!     f246147df3 focused    xstate probe: share the first prober's verdict instead of an unbounded lock wait (5182)
+#5183    ejected    100      06cfe05004 focused    Flip 14 sweep-clean cells to required (2026-11-05 sweep)
+#5185    landed     100      802b912f28 focused    signal_at_snapshot: publish QMP socket after listen; bounded connect retry (5185)
+#5186    landed     100      59859114f3 focused    image archive OCI support (5186)
+#5187    landed     100      c1e145b23d -          
+#5188    landed     100      2ee3dc2c7e focused    robust_futex exec-two-waiters: synchronize waiters, bounded native-oracle retry (5188)
+#5189    landed     100!     619cb1d01d focused    nextest: retry validate profiles twice and record the attempts as flaky
+#5190    landed     100!     8720d90718 complete   flock filter: descendant-row triples + settled double read
+#5192    landed     100      fe3441e440 focused    KVM madvise guard-region cells and a load-proof post_crash (5192)
+#5193    landed     100!     c11b950d34 complete   Pin reverie to 1ed8f151 (exact branch counter, reverie 1284)
+#5194    landed     100      3edf693771 focused    Vendor gVisor syscall tests with Buck build and manifest bucket
+#5195    landed     100      550aec5176 focused    validate DAG: manifest guest cap 12 -> 20
+#5197    landed     100      397b77fa9c focused    BUCK: fix stale OSS build files for fbsource import (5197)
+#5198    landed     100      2c35ca77f1 -          validate: warm the series checker during the DAG
+#5199    landed     100      be927c9a84 focused    Split compat java and javac rows into compile and run cells (5199)
+#5200    landed     100      cf17b33563 focused    user-bus-could-not-run: systemd user-bus refusal at scope launch is could-not-run (5200)
+#5201    landed     100      e279769880 focused    super test-body footprints (5201)
+#5202    landed     100      d742b9de8f focused    agent-utils pin: 5f92b018 -> cf760db4 (dagrun artifact-ready + selection closure) (5202)
+#5203    withdrawn  100!     6b38117f97 focused    Merge facebookexperimental/hermit main into rrnewton (ancestry, rebased)
+#5204    landed     100      65aa99cac8 focused    Resolve a pending flock open against its recorded base directory
+#5205    landed     100      ac77635a03 focused    Name the replay materialization gate that refuses a recorded open (5205)
+#5206    landed     100      98e160898f focused    Gate detcore-testutils output capture behind a nightly feature
+#5207    landed     100      7c25150729 focused    Bump Reverie pin to 94f36135c492
+#5208    landed     100      3c3b87de75 focused    validate DAG: publish the E2E artifact on the hermit-bin signal
+#5209    landed     100      9c1d6dbbc6 focused    Teach the selective bracket about extension-registry buckets (5209)
+#5210    landed     100      2cb1979f3a focused    Bump Reverie pin to 42cf7223ebaf
+#5211    landed     100      4c5d5c4d3d focused    pressure-test: pass each cell execution owner so sabre/dbt survey cells run (5211)
+#5216    landed     100      2e8a421d8b focused    test-harness: write verdict cells under fail-fast, report undispatched cells as cancelled
+#5217    landed     100      e658046971 focused    Repair the drifted Buck graph and gate it against drifting again
+#5218    landed     100      b3896b3c30 focused    Bump agent-utils pin cf760db4 -> f6b3ec4a for wrkslots census fix
+#5219    landed     100      de72089a10 focused    Carry the aarch64 UDF and SVE entry-guard fixes onto main
+#5220    landed     100      0b77a5a1f2 focused    Bump agent-utils pin f6b3ec4a -> 8dca3d85 for wrkslots generic recover
+#5222    landed     100      43bfa67ba9 focused    Carry the aarch64 not-written reason and the --verify retry wording onto main
+#5223    queued     100!     bbd4d3bd1b focused    source-identity-diagnostics: name the changed source root; refuse run summaries in non-disposable work trees
+#5224    landed     100!     9b60c4eabc focused    buck-e2e: stop the daemon before keeping records on a signal (dh-6aaks)
+#5225    queued     100!     077b0bf3cb focused    nextest-counted: name tests still in flight when a run is cut (dh-for17)
+#5226    queued     100      6dd24f5958 focused    validate test: fail-fast cancels a running sibling (dh-nmfzx)
+#5227    landed     100      0b8c68d374 focused    Bump agent-utils pin 8dca3d85 -> 78056f94
+#5229    queued     100      f3f94bf02a focused    manifest-plan tests: make the four CPU-budget tests load-independent (dh-ravrz)
+#5230    queued     100      b2ca8b1b9d focused    Carry the aarch64 census change that counts only proved code as verified
+#5231    queued     100!     2324cb3642 focused    isolation: name the changed input and classify instability as infra (dh-j8eb7)

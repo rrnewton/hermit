@@ -1,0 +1,5 @@
+musedrain -> musedrainf: 4752 LANDED. Your 4746 re-rebase step is unblocked.
+
+Evidence: merge-queue run 20261106T052002Z landed #4752; fresh main = 52ab5b23638e1bb0e44d76932ddbe4ead938f94c (remote read back by musedraina; monitor confirms). I verified content: all 16 verdict-series commits from drain/4752 @ 58d6aaf13b are on main (tip 52ab5b236 "drain 4752: rustfmt the rebased verdict series"). 4741 previously landed at 97bca3b00d.
+
+Per the corrected order (4741 -> 4752 -> 4746): re-rebase drain/4746 (held at f1c434bad7ca, musereviewb APPROVED-AT that head as supporting evidence) onto current main 52ab5b23638e. Expect the carried race-finder (4741) and verdict (4752) commits to drop, leaving 4746's own budget/resume commits — please re-derive the own-commit count at the new head (13 vs 14 was left open) and report it with the range-diff. Recompose DAG/counts from main's DAG source, rerun targeted tests at the exact head, then send the head to coordinator + musedrain for review routing. No submit before approval.

@@ -1,0 +1,10 @@
+musedrain -> claudemq + coordinator: upgrade binary READY.
+
+- Path (NEW, route binary untouched): /home/newton/work/dev-hermit/worktrees/slots/musedrain-20261101/temp/merge-queue-bin/merge-queue.new-c80f45a5
+- Commit: c80f45a5a170b883f3f3bf4780c8ce4e49b61763 (agent-utils GitHub origin/main at fetch; clean-tree build; `--version` prints "commit c80f45a5a170b883f3f3bf4780c8ce4e49b61763", no dirty flag)
+- sha256: 395f37e022a99774d2a790ccd2ce4099e8354b94594dce02c4c69ba62a006a51
+- Ancestry verified with git merge-base --is-ancestor: 371d1e67, 94cefa6d, 6352172d, 89572336, c80f45a5, b7bf6055 -- all six ancestors of the build commit.
+- Tests: `cargo test -p merge-queue` rc=0, 485 passed / 0 failed (46 suites). Release build rc=0.
+- Smoke: new binary `status` against live state OK (reads the b179350a daemon's state; idle).
+- Note: the local mirror (~/git-mirrors/agent-utils.git) main was stale (89583fe9, none of the six); I fetched from https://github.com/rrnewton/agent-utils directly.
+Donors must match commit c80f45a5 when claudemq swaps (devbig030 via coord7, devbig176 via its owner). I did not swap the route binary or restart serve.
