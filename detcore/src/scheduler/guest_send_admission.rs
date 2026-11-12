@@ -214,7 +214,7 @@ pub enum SendRefusal {
     /// The receiver waits in a raw `select`, which has no signal mask the
     /// backend's probe can check, so no probe of it takes the copy: refused
     /// until its probes are lowered to `pselect6`
-    /// (https://github.com/rrnewton/hermit/issues/5452).
+    /// (<https://github.com/rrnewton/hermit/issues/5452>).
     RawSelect(DetTid),
     /// The receiver is a vfork parent waiting for its child, which no slice
     /// of stage X1 admits as a receiver.
