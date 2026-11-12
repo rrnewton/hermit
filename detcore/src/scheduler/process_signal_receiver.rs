@@ -564,8 +564,9 @@ impl Scheduler {
             }
         }
         // With a control installed, a marked thread that polls a call whose
-        // probe takes the copy (`CatchReach::Probe`: `select`, `pselect6`, a
-        // masked `ppoll`, `rt_sigtimedwait`) is resumed first too: queue order
+        // probe takes the copy (`CatchReach::Probe`: `pselect6`, a masked
+        // `ppoll`, `rt_sigtimedwait`; never a raw `select`, which admission
+        // refuses, `SendRefusal::RawSelect`) is resumed first too: queue order
         // alone let a sibling's probe, whose call Linux leaves asleep, take
         // the copy first.
         self.process_signal_takers.keys().copied().find(|thread| {

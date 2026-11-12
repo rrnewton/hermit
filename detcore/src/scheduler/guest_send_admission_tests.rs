@@ -296,9 +296,9 @@ fn each_receiver_state_is_admitted_or_refused_by_name() {
             catch(LEADER, CatchReach::Boundary),
         ),
         (
-            "probing select",
+            "raw select, which no probe ends",
             |s| polling(s, LEADER, "select", Some(Errno::EINTR), None),
-            catch(LEADER, CatchReach::Probe),
+            refused(SendRefusal::RawSelect(LEADER)),
         ),
         (
             "probing masked ppoll",

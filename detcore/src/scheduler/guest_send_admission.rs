@@ -53,10 +53,11 @@
 //! 4. Whether the receiver's state lets it take the copy without a later
 //!    slice (`CatchReach`): at a boundary of its own (runnable, a posted
 //!    continuation, a delivery permit's holder, or held at a happens-before
-//!    gate), at its next probe (`select`, `pselect6`, a masked `ppoll`,
+//!    gate), at its next probe (`pselect6`, a masked `ppoll`,
 //!    `rt_sigtimedwait`), through the drain (an internal IO poll with the
 //!    restart marker, a backend-served `rt_sigsuspend`). Every other state
-//!    is refused by name (`SendRefusal`).
+//!    is refused by name (`SendRefusal`), a raw `select` included
+//!    (`SendRefusal::RawSelect`).
 //!
 //! A signalfd reads its reader's own queue and its process's shared one. A
 //! read of a blocking signalfd runs outside the schedule, as a host call, and
@@ -173,7 +174,7 @@ pub enum CatchReach {
     Boundary,
     /// Held at a happens-before gate: at its boundary once it is released.
     Gate,
-    /// Probing in `select`, `pselect6`, a masked `ppoll` or
+    /// Probing in `pselect6`, a masked `ppoll` or
     /// `rt_sigtimedwait`: its next probe takes the copy.
     Probe,
     /// Parked in an internal IO poll with the restart marker: the drain
@@ -210,6 +211,11 @@ pub enum SendRefusal {
     /// The receiver polls in a call whose probe never takes a pending signal
     /// (`poll`, `epoll_wait`, an unmasked `ppoll`): slice D.
     Poll(DetTid),
+    /// The receiver waits in a raw `select`, which has no signal mask the
+    /// backend's probe can check, so no probe of it takes the copy: refused
+    /// until its probes are lowered to `pselect6`
+    /// (https://github.com/rrnewton/hermit/issues/5452).
+    RawSelect(DetTid),
     /// The receiver is a vfork parent waiting for its child, which no slice
     /// of stage X1 admits as a receiver.
     VforkParent(DetTid),
@@ -271,6 +277,12 @@ impl fmt::Display for SendRefusal {
                 "thread {thread}, which takes it, polls in a call whose probe never takes a \
                  pending signal (poll, epoll_wait, an unmasked ppoll), which KVM does not yet \
                  end for a signal another process sends (stage X1 slice D)"
+            ),
+            SendRefusal::RawSelect(thread) => write!(
+                f,
+                "thread {thread}, which takes it, waits in select, and select has no signal \
+                 mask the backend can check; use pselect6 \
+                 (https://github.com/rrnewton/hermit/issues/5452)"
             ),
             SendRefusal::VforkParent(thread) => write!(
                 f,
@@ -703,12 +715,17 @@ impl Scheduler {
         if !lone_poll {
             return Ok(CatchReach::Boundary);
         }
+        // A raw `select` has no mask of its own, and the backend's probe of
+        // it never takes a pending signal: no probe ends its wait.
+        if request.fyi.as_str() == "select" {
+            return Err(SendRefusal::RawSelect(thread));
+        }
         // Each probe of these calls applies the call's mask and takes a
         // pending signal it lets in (a `ppoll` only under a mask of its own:
         // `Detcore::backend_masked_ppoll_wait`).
         let probes = request.fyi.as_str() == "rt_sigtimedwait"
             || (request.signal_interrupt_errno() == Some(Errno::EINTR.into_raw())
-                && (matches!(request.fyi.as_str(), "select" | "pselect6")
+                && (request.fyi.as_str() == "pselect6"
                     || (request.fyi.as_str() == "ppoll" && request.blocked_signal_mask.is_some())));
         if probes {
             return Ok(CatchReach::Probe);
