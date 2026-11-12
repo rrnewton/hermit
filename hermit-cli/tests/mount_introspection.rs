@@ -351,7 +351,8 @@ as_invoker() { setpriv --reuid="$SUDO_UID" --regid="$SUDO_GID" --init-groups -- 
 ROOT="$W/root"; mkdir -p "$ROOT"
 "$DAEMON" "$ROOT" "$W/ready" "$W/daemon.log" "ghostTrig,ghostTrigDir,ghostStat,ghostStatx" &
 DPID=$!
-trap 'kill $DPID 2>/dev/null || true; chown -R "$SUDO_UID:$SUDO_GID" "$W" 2>/dev/null || true' EXIT
+cleanup() { umount -R "$ROOT" >>"$W/cleanup.log" 2>&1 || umount -l "$ROOT" >>"$W/cleanup.log" 2>&1 || true; kill $DPID 2>/dev/null || true; wait $DPID 2>/dev/null || true; chown -R "$SUDO_UID:$SUDO_GID" "$W" >>"$W/cleanup.log" 2>&1 || echo "CHOWN-FAILED rc=$?" >>"$W/cleanup.log"; }
+trap cleanup EXIT
 chmod 0755 "$W" "$ROOT"
 for i in $(seq 1 100); do [ -f "$W/ready" ] && break; sleep 0.1; done
 [ -f "$W/ready" ] || { echo "daemon never became ready"; cat "$W/daemon.log"; exit 1; }
@@ -403,4 +404,23 @@ echo "AUTOFS-FIXTURE-PASS"
         "privileged autofs fixture failed\nstatus: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
         output.status
     );
+    // The driver's EXIT trap chowns its work tree back to the invoker;
+    // root-owned leftovers in CARGO_TARGET_TMPDIR are a failure, not a
+    // cleanup chore (they survive unprivileged cache reclamation).
+    fn assert_invoker_owned(path: &Path, euid: u32) {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = fs::metadata(path).expect("fixture leftover metadata");
+        assert_eq!(
+            meta.uid(),
+            euid,
+            "root-owned fixture leftover: {}",
+            path.display()
+        );
+        if meta.is_dir() {
+            for entry in fs::read_dir(path).expect("fixture leftover dir") {
+                assert_invoker_owned(&entry.expect("fixture leftover entry").path(), euid);
+            }
+        }
+    }
+    assert_invoker_owned(&work, unsafe { libc::geteuid() });
 }
