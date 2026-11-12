@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["CPU_WRAPPER_ENV","GUESTS_ENV","REQUIRED_ENV","SELECTION_ENV"],"fn":["assert_profile","budget_context","build_cpu_wrapper","config_selections","cpu_wrapper","executable","prepare","profile_selections","run","selection_key","split_arguments"],"mod":["record_workloads"],"struct":["Arguments","PreparationError"]};
