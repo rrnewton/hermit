@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["BACKEND_PARITY_REPORT_SCHEMA"],"enum":["BackendParityVerdict"],"struct":["BackendParityOperand","BackendParityReport"]};
