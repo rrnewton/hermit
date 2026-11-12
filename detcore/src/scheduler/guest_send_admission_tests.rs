@@ -713,3 +713,111 @@ fn the_controlled_receiver_choice_reads_temporary_masks() {
         ProcessSignalReceiver::Thread { thread, .. } if thread == LEADER
     ));
 }
+
+/// `tid` is parked in a backend-served `rt_sigsuspend` whose temporary mask
+/// is `mask`, as the S2b wait files it.
+fn parked_in_suspend(s: &mut Scheduler, tid: DetTid, mask: u64) {
+    let mut r = Resources::new(tid);
+    r.insert(
+        ResourceID::SleepUntil(LogicalTime::INDEFINITE),
+        Permission::W,
+    );
+    r.fyi(crate::resources::RT_SIGSUSPEND_FYI);
+    r.blocked_signal_mask = Some(mask);
+    s.next_turns[&tid].req.put(Ok(r));
+    s.blocked.timed_waiters.insert(LogicalTime::INDEFINITE, tid);
+}
+
+/// The forwarded process-directed send left one copy of `signal` in the
+/// target's shared queue; both threads still block it outside their calls.
+fn sent_to_shared_queue(s: &mut Scheduler, control: &ScriptedControl, signal: i32) {
+    let usr = bit(signal);
+    let sent = state(0, usr, usr, 0, usr);
+    for tid in [LEADER, SIBLING] {
+        control.script(tid, vec![Ok(sent)]);
+        s.test_kernel_signal_states
+            .insert(tid, KernelSignalState::from_backend_sets(&sent));
+    }
+}
+
+/// The Codex review of https://github.com/rrnewton/hermit/pull/5415 at
+/// fcff78c8, P1, past the admission: the leader and its sibling both catch
+/// SIGUSR1 and block it outside the call, and both wait in a backend-served
+/// `rt_sigsuspend` whose temporary mask lets it in. `kill(leader, SIGUSR1)`
+/// from another process: Linux's `complete_signal` chooses the named leader,
+/// whose `blocked` is the suspend's mask (kernel/signal.c:4835-4846 and
+/// 963-997 at v7.1.3), and `signal_wake_up` wakes it alone, so the leader
+/// takes the copy and runs its handler, and the sibling sleeps on. The
+/// admission chose the leader; the drain that follows the send, the wake,
+/// and the choice of who runs first must keep it, so the leader's call runs
+/// before the sibling's and takes the copy, and the claim settles once it is
+/// taken.
+#[test]
+fn the_admitted_suspend_waiter_takes_the_copy_not_its_woken_sibling() {
+    let usr1 = bit(libc::SIGUSR1);
+    let (mut s, control) = two_processes(state(0, 0, usr1, 0, usr1));
+    for tid in [LEADER, SIBLING] {
+        parked_in_suspend(&mut s, tid, !usr1);
+    }
+    assert_eq!(
+        kill(&s, libc::SIGUSR1),
+        catch(LEADER, CatchReach::BackendSuspend)
+    );
+    assert!(matches!(
+        s.process_signal_receiver(TARGET, LEADER, SENDER, libc::SIGUSR1),
+        ProcessSignalReceiver::Thread { thread, .. } if thread == LEADER
+    ));
+    s.process_signal_sent(SENDER, TARGET);
+    s.guest_send_committed(LEADER, SendScope::Process, libc::SIGUSR1);
+    sent_to_shared_queue(&mut s, &control, libc::SIGUSR1);
+
+    s.step2_drain_prefix_for_test();
+    assert_eq!(s.audit_guest_send_claims(), None);
+    let (first, _, _) = s.step3_peek().expect("a woken waiter is runnable");
+    s.run_queue.undo_tentative_pop();
+    assert_eq!(
+        first, LEADER,
+        "the admitted receiver's call runs first and takes the shared copy"
+    );
+
+    // The leader's call takes the copy and runs its handler.
+    let response = s.next_turns[&LEADER].resp.clone();
+    assert!(s.unblock_guest(LEADER, &response).is_ok());
+    let taken = state(0, 0, usr1, 0, usr1);
+    for tid in [LEADER, SIBLING] {
+        control.script(tid, vec![Ok(taken)]);
+        s.test_kernel_signal_states
+            .insert(tid, KernelSignalState::from_backend_sets(&taken));
+    }
+    assert_eq!(s.audit_guest_send_claims(), None);
+    assert!(s.guest_send_claims.is_empty());
+    assert_eq!(s.first_process_signal_taker(), None);
+}
+
+/// The same choice where both threads probe a masked `pselect6` from the
+/// run queue: the admitted leader's probe runs first and takes the copy.
+#[test]
+fn the_admitted_polling_receiver_probes_before_its_sibling() {
+    let usr1 = bit(libc::SIGUSR1);
+    let (mut s, control) = two_processes(state(0, 0, usr1, 0, usr1));
+    for tid in [LEADER, SIBLING] {
+        polling(&mut s, tid, "pselect6", Some(Errno::EINTR), Some(0));
+    }
+    assert_eq!(kill(&s, libc::SIGUSR1), catch(LEADER, CatchReach::Probe));
+    assert!(matches!(
+        s.process_signal_receiver(TARGET, LEADER, SENDER, libc::SIGUSR1),
+        ProcessSignalReceiver::Thread { thread, .. } if thread == LEADER
+    ));
+    s.process_signal_sent(SENDER, TARGET);
+    s.guest_send_committed(LEADER, SendScope::Process, libc::SIGUSR1);
+    sent_to_shared_queue(&mut s, &control, libc::SIGUSR1);
+
+    s.step2_drain_prefix_for_test();
+    assert_eq!(s.audit_guest_send_claims(), None);
+    let (first, _, _) = s.step3_peek().expect("a poller is runnable");
+    s.run_queue.undo_tentative_pop();
+    assert_eq!(
+        first, LEADER,
+        "the admitted receiver probes first and takes the shared copy"
+    );
+}
