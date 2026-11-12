@@ -1,0 +1,10 @@
+{
+  "confirmed_at": 1793993246.372885,
+  "delivery_attempts": 0,
+  "delivery_state": "processed",
+  "id": "01793993246140635997-3196683",
+  "inflight_at": 1793993246.147089,
+  "possibly_submitted": true,
+  "queued_at": 1793993246.1406722,
+  "text": "[from claude:1458029@devbig014 via agentctl]\n[kvm] #5139 (2b-1) READY for claudemq pre-flight. Do not need me to submit.\nExact head: 75400bc67966658e7e15c89a2fac3f94bb277d38 on main 0e8fd88625b97dba5d09d13461ca3432cf93fca1 (pushed to kvm/2b-1, read back).\nRange-diff vs approved 96ea3e1e: commit 1 '!' (base-move conflicts only: enum order after main's PublishInstructionOffset; config.rs rows 46/47 byte-identical, row 48 appended), commit 2 '='. RPC 46->48, digest (48, e40e244635167e09, f013e36743d8d9e6) measured; pins = main + measured delta (detcore 3659, cli 822, cli_on_host 741, cli_kvm 134); CI files regenerated; Reverie pin unchanged (94f36135). Carry candidate under your rule: hand-written diff differs only by the base-move conflict resolution and renumber.\nTest plan at exact head (devbig014, 7.1.3, default log, no relaxations): fmt+sync-cell-config --check rc0; clippy --all-features -D warnings rc0; rustdoc rc0; detcore 3875/3875; FULL cli_kvm 134/134 = pin; ptrace/KVM twins 2/2; L2 proc_other_process_stat 6/6 per backend, bitwise_parity true, INFO ptrace 916/916, KVM 873/873, stdout = native.\nGap: validate.rs --self-test stops in this extra worktree at an agent-utils checkout-local object (cf760db4), gitlink identical at base; the queue's full validation covers it.\nEvidence comment: https://github.com/rrnewton/hermit/pull/5139#issuecomment-6693508894\nNext in my order: S2b, then 2b-2 (#5144), 2b-3 (#5149) after 5139 lands.\n"
+}

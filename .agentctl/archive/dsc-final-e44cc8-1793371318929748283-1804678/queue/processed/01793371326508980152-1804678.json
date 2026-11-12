@@ -1,0 +1,12 @@
+{
+  "confirmed_at": 1793371339.119888,
+  "delivery_attempts": 0,
+  "delivery_blocked_at": 1793371326.618696,
+  "delivery_error": "pane wJ:pD5 did not become idle/done within 0s; last status=unknown",
+  "delivery_state": "processed",
+  "id": "01793371326508980152-1804678",
+  "inflight_at": 1793371338.7523348,
+  "possibly_submitted": true,
+  "queued_at": 1793371326.5090058,
+  "text": "READ-ONLY REVIEW WORKER. Repository and exact checkout: /home/newton/work/dev-hermit/worktrees/slots/kvm-20261012; branch coord/kvm-20261012; target commit e44cc8a0c6a5fa3754ec3b72c4a426f5041d0f00; comparison base c343f454. Do not write product files, change git state, run builds, publish, or change any external application. This is a read-only review in the existing checkout: do not provision or change slots or branches. Coordinator delegated nontrivial evidence inspection. Read applicable rules. Read the DSC-KVM-ready-to-land heading at the top of /home/newton/work/dev-hermit/temp/kvm-status.md and /home/newton/work/dev-hermit/ai_docs/2026-10-30-kvm-known-gap-ledger-contract.md. Inspect only privileged-test.deadline_slice_cap_kvm and its 20-row hermit-cli/tests/deadline_slice_cap.kvm-gaps.tsv ledger. Answer: (1) Does a same-name replacement of a required test BODY with a trivial passing body evade source-versus-nextest-list comparison or any other check? Distinguish membership verification from semantic coverage, and assess whether owning the diff through review suffices under this contract. (2) Is the complete c343f454..e44cc8a0 diff only RUST_BACKTRACE=0 plus comments, and what behavior does the environment change affect? (3) Can any gap row count as a pass in scorecard, known-gaps.json, or qualifier? Explicitly audit goalpost moving against base: changed tests, assertions, thresholds, allowlists, skips, labels, classifications, gates; state original requirement met versus weakened. Be narrow, use source/file line citations, provide concise synthesized evidence and approve/changes requested. No raw tool dumps. You are a read-only evidence worker, not a coordinator; inspect directly and do not delegate. If messaging other agents is needed use agentctl send, never raw pane typing. Stop when complete and give a DONE: verdict with precise evidence; do not edit or persist a report."
+}
