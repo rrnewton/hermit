@@ -7201,7 +7201,7 @@ mod tests {
             ImageContainerOpts {
                 bind_kvm: false,
                 workdir_binds: &[],
-                        mounts: &[],
+                mounts: &[],
             },
         )
         .expect("construct image container with generated tmp");
@@ -7217,7 +7217,7 @@ mod tests {
             ImageContainerOpts {
                 bind_kvm: false,
                 workdir_binds: &[],
-                        mounts: &[],
+                mounts: &[],
             },
         )
         .expect("construct image container with user tmp");

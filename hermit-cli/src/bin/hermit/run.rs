@@ -5277,7 +5277,10 @@ fn an_image_mount_is_refused_by_shape() {
         ("type=tmpfs,target=rel/path", "must be an absolute path"),
         ("type=tmpfs,target=/a/../b", "must be an absolute path"),
         ("target=/data", "bind mount with no source"),
-        ("type=tmpfs,target=/.hermit-oci-x/sub", "Hermit's own image files"),
+        (
+            "type=tmpfs,target=/.hermit-oci-x/sub",
+            "Hermit's own image files",
+        ),
     ] {
         let refused = validate_image_mounts(&mounts(spec), &[])
             .unwrap_err()
@@ -5285,9 +5288,8 @@ fn an_image_mount_is_refused_by_shape() {
         assert!(refused.contains(named), "{spec}: {refused}");
     }
     // The same shape rules cover --bind, the other spelling of a bind.
-    let binds = |spec: &str| {
-        run_opts_for(&["hermit", "run", &format!("--bind={spec}"), "/bin/true"]).bind
-    };
+    let binds =
+        |spec: &str| run_opts_for(&["hermit", "run", &format!("--bind={spec}"), "/bin/true"]).bind;
     assert!(validate_image_mounts(&[], &binds("/srv:/data")).is_ok());
     for (spec, named) in [
         ("/srv:/", "--bind target / with --image would replace"),
@@ -5310,21 +5312,48 @@ fn an_image_mount_is_refused_by_shape() {
 fn an_image_mount_target_is_prepared_inside_the_rootfs() {
     let rootfs = tempfile::tempdir().expect("rootfs tempdir");
     let base = rootfs.path();
-    let created = prepare_image_mount_target(base, Path::new("data/sub"), true, Path::new("/data/sub"), "--mount", "the image rootfs")
-        .expect("a missing directory target is created");
+    let created = prepare_image_mount_target(
+        base,
+        Path::new("data/sub"),
+        true,
+        Path::new("/data/sub"),
+        "--mount",
+        "the image rootfs",
+    )
+    .expect("a missing directory target is created");
     assert!(created.is_dir());
-    let file = prepare_image_mount_target(base, Path::new("etc/marker"), false, Path::new("/etc/marker"), "--mount", "the image rootfs")
-        .expect("a missing file target is created");
+    let file = prepare_image_mount_target(
+        base,
+        Path::new("etc/marker"),
+        false,
+        Path::new("/etc/marker"),
+        "--mount",
+        "the image rootfs",
+    )
+    .expect("a missing file target is created");
     assert!(file.is_file());
-    let wrong = prepare_image_mount_target(base, Path::new("etc/marker"), true, Path::new("/etc/marker"), "--mount", "the image rootfs")
-        .unwrap_err()
-        .to_string();
+    let wrong = prepare_image_mount_target(
+        base,
+        Path::new("etc/marker"),
+        true,
+        Path::new("/etc/marker"),
+        "--mount",
+        "the image rootfs",
+    )
+    .unwrap_err()
+    .to_string();
     assert!(wrong.contains("exists in the image as a file"), "{wrong}");
     std::os::unix::fs::symlink("/etc", base.join("link")).expect("symlink in rootfs");
-    let escaped =
-        prepare_image_mount_target(base, Path::new("link/x"), true, Path::new("/link/x"), "--bind", "the image rootfs")
-            .unwrap_err()
-            .to_string();
+    let escaped = prepare_image_mount_target(
+        base,
+        Path::new("link/x"),
+        true,
+        Path::new("/link/x"),
+        "--bind",
+        "the image rootfs",
+    )
+    .unwrap_err()
+    .to_string();
     assert!(escaped.contains("passes through the symlink"), "{escaped}");
     assert!(escaped.contains("--bind target"), "{escaped}");
 }
@@ -5393,7 +5422,10 @@ fn a_bind_below_dev_mqueue_is_decided_with_the_mounts() {
     let refused = refuse_below_private_mqueue(&uncovered.mount, &uncovered.bind, dev_mqueue)
         .unwrap_err()
         .to_string();
-    assert!(refused.contains("cannot mount at /dev/mqueue/x"), "{refused}");
+    assert!(
+        refused.contains("cannot mount at /dev/mqueue/x"),
+        "{refused}"
+    );
 }
 
 /// A general `--bind` suppresses Hermit's private `/dev/shm` and
@@ -5440,7 +5472,10 @@ fn a_general_bind_suppresses_the_private_dev_shm_and_mqueue() {
             .trim_start_matches("target=");
         if cover_target == "/dev/shm" {
             assert_eq!(
-                targets.iter().filter(|t| *t == Path::new("/dev/shm")).count(),
+                targets
+                    .iter()
+                    .filter(|t| *t == Path::new("/dev/shm"))
+                    .count(),
                 1,
                 "{cover}: only the caller's bind mounts /dev/shm: {targets:?}"
             );
@@ -18800,8 +18835,7 @@ impl RunOpts {
         mounts.extend(into_dev_shm);
         mounts.extend(private_tmp);
         mounts.extend(
-            private_mqueue(self.user_mount_targets().into_iter())?
-                .map(PlannedMount::hermit),
+            private_mqueue(self.user_mount_targets().into_iter())?.map(PlannedMount::hermit),
         );
 
         Ok(PreparedMounts {
@@ -18926,9 +18960,9 @@ impl RunOpts {
                 if !under_earlier {
                     let want_dir = match image_mount_kind(mount)? {
                         ImageMountKind::Tmpfs => true,
-                        ImageMountKind::Bind => mount
-                            .get_source()
-                            .is_some_and(|source| source.is_dir()),
+                        ImageMountKind::Bind => {
+                            mount.get_source().is_some_and(|source| source.is_dir())
+                        }
                     };
                     if let Ok(under_tmp) = target.strip_prefix(TMP_DIR) {
                         prepare_image_mount_target(
@@ -18979,9 +19013,7 @@ impl RunOpts {
                     ImageMountKind::Bind => {
                         identity_sources.add_user_bind(mount.get_target(), None)
                     }
-                    ImageMountKind::Tmpfs => {
-                        identity_sources.add_user_tmpfs(mount.get_target())
-                    }
+                    ImageMountKind::Tmpfs => identity_sources.add_user_tmpfs(mount.get_target()),
                 }
             }
             self.network
