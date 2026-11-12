@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["GLOBAL_MAX_OFFSET","GLOBAL_SLAB_TOP"],"enum":["SkipError"],"static":["GLOBAL"],"struct":["Global","OvercommitBumpAlloc"]};
