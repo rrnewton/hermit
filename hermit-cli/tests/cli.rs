@@ -24991,9 +24991,10 @@ const SENDS_BY_SIGQUEUE_OR_TGSIGQUEUE: [(&str, &str); 2] =
 const SENDS_BY_PIDFD: [(&str, &str); 2] = [("runnable", "pidfd"), ("runnable", "pidfd-thread")];
 
 /// The sends of tests/c/cross_process_signal_admission.c, by `kill` and by
-/// `tgkill`, to a child that ignores the signal or waits for it, and by
-/// `kill` to a child whose two threads both wait in `sigsuspend`.
-const SENDS_KVM_ADMITS: [(&str, &str); 11] = [
+/// `tgkill`, to a child that ignores the signal or waits for it, by `kill`
+/// to a child whose two threads both wait in `sigsuspend`, and by `kill` to
+/// a child alone in the raw `select` system call.
+const SENDS_KVM_ADMITS: [(&str, &str); 12] = [
     ("ignored", "kill"),
     ("ignored", "tgkill"),
     ("select", "kill"),
@@ -25005,6 +25006,7 @@ const SENDS_KVM_ADMITS: [(&str, &str); 11] = [
     ("sigtimedwait", "kill"),
     ("sigtimedwait", "tgkill"),
     ("sigsuspend-two", "kill"),
+    ("select-raw", "kill"),
 ];
 
 /// The sends of tests/c/cross_process_signal_admission.c, by `kill` and by
@@ -25102,7 +25104,9 @@ fn run_kvm_guest_signals_to_another_process_by_pidfd_match_linux() {
 /// - `select`, `pselect6` under a temporary mask that admits the signal,
 ///   `sigsuspend` and `sigtimedwait` end as on Linux;
 /// - with both of the child's threads in `sigsuspend` under such a mask,
-///   `kill` is refused by name (`PTRACE_REFUSED_ADMITTED_MODES`).
+///   `kill` is refused by name (`PTRACE_REFUSED_ADMITTED_MODES`);
+/// - the raw `select` system call ends with EINTR and the handler, as on
+///   Linux (KVM refuses it by name: `KVM_REFUSED_ADMITTED_MODES`).
 #[test]
 fn guest_signals_to_another_process_that_kvm_admits_match_linux() {
     assert_admitted_sends_match_linux(
@@ -25188,6 +25192,12 @@ const STRICT_VERIFY_ADMITTED_MODES: [&str; 6] = [
 /// timing sets (https://github.com/rrnewton/hermit/issues/4034).
 const PTRACE_REFUSED_ADMITTED_MODES: [&str; 1] = ["sigsuspend-two"];
 
+/// The modes of `SENDS_KVM_ADMITS` that KVM refuses by name, as
+/// `run_kvm_guest_signals_kvm_cannot_yet_deliver_are_named_refusals` checks
+/// with its other cases (`RAW_SELECT_MODES`): a receiver in the raw `select`
+/// system call, which ptrace runs as on Linux.
+const KVM_REFUSED_ADMITTED_MODES: [&str; 1] = ["select-raw"];
+
 /// The backend an admitted-send test runs its cases on
 /// (`assert_admitted_sends_match_linux`).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -25210,7 +25220,8 @@ enum AdmittedOn {
 /// of INFO records on each side.
 ///
 /// On ptrace, a mode in `PTRACE_REFUSED_ADMITTED_MODES` must instead be
-/// refused by name, with the policy status.
+/// refused by name, with the policy status; on KVM, a mode in
+/// `KVM_REFUSED_ADMITTED_MODES` is left to the refusal test that names it.
 ///
 /// The cases are split across tests so that each stays inside nextest's
 /// 22-second CPU cap. Measured in the validate Cargo profile, each test alone:
@@ -25234,6 +25245,9 @@ fn assert_admitted_sends_match_linux(test: &str, on: AdmittedOn, cases: &[(&str,
         AdmittedOn::Kvm => "--backend=kvm",
     };
     for &(mode, call) in cases {
+        if on == AdmittedOn::Kvm && KVM_REFUSED_ADMITTED_MODES.contains(&mode) {
+            continue;
+        }
         let native = Command::new(guest)
             .args([mode, call])
             .output()
@@ -25322,6 +25336,18 @@ fn assert_admitted_sends_match_linux(test: &str, on: AdmittedOn, cases: &[(&str,
     }
 }
 
+/// The modes of tests/c/cross_process_signal_admission.c whose receiver
+/// waits in the raw `select` system call: alone or beside a runnable
+/// sibling that leaves the signal unblocked, with no timeout or with one.
+/// The timed ones come first, so a run that returns late fails before one
+/// that would hang.
+const RAW_SELECT_MODES: [&str; 4] = [
+    "select-raw-timed",
+    "select-raw-two-timed",
+    "select-raw",
+    "select-raw-two",
+];
+
 /// tests/c/cross_process_signal_admission.c on KVM: the sends to another
 /// process that stage X1 slice C refuses by name, before any effect
 /// (https://github.com/rrnewton/hermit/issues/4485): a caught signal to a
@@ -25332,6 +25358,13 @@ fn assert_admitted_sends_match_linux(test: &str, on: AdmittedOn, cases: &[(&str,
 /// the refusal, and the sender prints nothing after its call. With
 /// `--allow-unsupported-syscalls` the call returns ENOSYS and the child sees
 /// nothing: it reports as if no signal had been sent.
+///
+/// A receiver in the raw `select` system call (`RAW_SELECT_MODES`) is refused
+/// the same way: raw `select` has no signal mask the backend can check, and
+/// its probes never took the copy, so such a send hung the run with no
+/// timeout or ended the call with 0 at its timeout instead of EINTR. Only
+/// the fail-closed run is checked there: allowed, a wait with no timeout
+/// that no probe ends has no transcript to compare.
 #[test]
 fn run_kvm_guest_signals_kvm_cannot_yet_deliver_are_named_refusals() {
     if kvm_unavailable("run_kvm_guest_signals_kvm_cannot_yet_deliver_are_named_refusals") {
@@ -25389,7 +25422,7 @@ fn run_kvm_guest_signals_kvm_cannot_yet_deliver_are_named_refusals() {
              child exited 0\n",
         ),
     ];
-    for (mode, reason, allowed) in cases {
+    let assert_refused = |mode: &str, reason: &str| {
         let args = [
             "--backend=kvm",
             "run",
@@ -25417,7 +25450,15 @@ fn run_kvm_guest_signals_kvm_cannot_yet_deliver_are_named_refusals() {
             !out.contains("kill of "),
             "{mode}: the sender went on past the refused call\nstdout:\n{out}"
         );
-
+    };
+    for mode in RAW_SELECT_MODES {
+        assert_refused(
+            mode,
+            "waits in select, and select has no signal mask the backend can check; use pselect6",
+        );
+    }
+    for (mode, reason, allowed) in cases {
+        assert_refused(mode, reason);
         let args = [
             "--backend=kvm",
             "run",

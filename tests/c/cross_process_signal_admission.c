@@ -33,6 +33,16 @@
  *                  process naming its first thread: Linux wakes that thread
  *                  alone (complete_signal), which runs the handler, and the
  *                  other thread is still in sigsuspend afterwards.
+ *   select-raw     A caught SIGUSR1 to a child in the raw select system call
+ *                  (syscall(SYS_select), no descriptors, no timeout; libc's
+ *                  select() issues pselect6 instead): EINTR.
+ *   select-raw-two The same to a child whose first thread is in that raw
+ *                  select and whose other thread runs system calls with
+ *                  SIGUSR1 unblocked: Linux wakes the first thread alone
+ *                  (complete_signal), which runs the handler, and the other
+ *                  thread keeps running and sees that it ran.
+ *   select-raw-timed, select-raw-two-timed
+ *                  The same two with a 5-second timeout instead of none.
  *   sigtimedwait   SIGUSR1, blocked, to a child waiting for it in
  *                  sigtimedwait(2): the call returns it, no handler runs.
  *   poll           A caught SIGUSR1 to a child in poll(2) on an empty pipe:
@@ -257,6 +267,24 @@ static void *other_suspend_main(void *arg) {
   _exit(alarm_count ? CHILD_TIMED_OUT : 0);
 }
 
+/* The select-raw-two modes' other thread: it says it runs, then runs user
+ * code with SIGUSR1 unblocked until it sees that the handler ran. It makes
+ * no system call in the loop, which under Hermit would each take a turn
+ * while the parent waits for the first thread to block. */
+static volatile sig_atomic_t other_saw_handler = 0;
+
+static void *other_runnable_main(void *arg) {
+  (void)arg;
+  char byte = 't';
+  if (write(thread_ready_pipe[1], &byte, 1) != 1) {
+    _exit(CHILD_SETUP_FAILED);
+  }
+  while (usr1_count == 0 && alarm_count == 0) {
+  }
+  other_saw_handler = usr1_count > 0;
+  return NULL;
+}
+
 /* Wait for the parent's go byte before reporting. */
 static void child_wait_for_go(void) {
   if (go_seen) {
@@ -385,6 +413,50 @@ static void child_main(const char *mode) {
         "child: the handler ran in the %s thread; the other thread %s\n",
         usr1_in_new_thread ? "other" : "first",
         other_returned ? "returned from sigsuspend" : "is still in sigsuspend");
+    _exit(alarm_count ? CHILD_TIMED_OUT : 0);
+  }
+  if (strcmp(mode, "select-raw") == 0 || strcmp(mode, "select-raw-timed") == 0) {
+    install_usr1();
+    alarm(10);
+    child_ready();
+    struct timeval timeout = {5, 0};
+    long result = syscall(
+        SYS_select, 0, NULL, NULL, NULL, strcmp(mode, "select-raw") == 0 ? NULL : &timeout);
+    int error = errno;
+    child_wait_for_go();
+    report_call("select", result, error);
+    report_usr1();
+    _exit(alarm_count ? CHILD_TIMED_OUT : 0);
+  }
+  if (strcmp(mode, "select-raw-two") == 0 || strcmp(mode, "select-raw-two-timed") == 0) {
+    install_usr1();
+    if (pipe(thread_ready_pipe) != 0) {
+      _exit(CHILD_SETUP_FAILED);
+    }
+    pthread_t other;
+    if (pthread_create(&other, NULL, other_runnable_main, NULL) != 0) {
+      _exit(CHILD_SETUP_FAILED);
+    }
+    char byte;
+    if (read(thread_ready_pipe[0], &byte, 1) != 1) {
+      _exit(CHILD_SETUP_FAILED);
+    }
+    alarm(10);
+    child_ready();
+    struct timeval timeout = {5, 0};
+    long result = syscall(
+        SYS_select, 0, NULL, NULL, NULL, strcmp(mode, "select-raw-two") == 0 ? NULL : &timeout);
+    int error = errno;
+    if (pthread_join(other, NULL) != 0) {
+      _exit(CHILD_SETUP_FAILED);
+    }
+    child_wait_for_go();
+    report_call("select in the first thread", result, error);
+    report_usr1();
+    printf(
+        "child: the handler ran in the %s thread; the other thread %s\n",
+        usr1_in_new_thread ? "other" : "first",
+        other_saw_handler ? "ran and saw it" : "never saw it");
     _exit(alarm_count ? CHILD_TIMED_OUT : 0);
   }
   if (strcmp(mode, "sigtimedwait") == 0) {
