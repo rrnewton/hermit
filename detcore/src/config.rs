@@ -418,6 +418,10 @@ mod tests {
         // its rebase onto main's 55, and 57 at its rebase onto main's 56
         // (https://github.com/rrnewton/hermit/pull/5259). Digest measured at this head.
         (57, "42fff6542bd35935", "f8b1309588141fd0"),
+        // Appends `GlobalRequest::StopSendRefusal`
+        // (https://github.com/rrnewton/hermit/issues/5430). Digest measured
+        // at this head.
+        (58, "1a68dfb27faf4e6a", "f8b1309588141fd0"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that

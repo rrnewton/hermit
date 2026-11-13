@@ -1379,6 +1379,17 @@ pub const fn in_guest_refuses_host_timed_producers(backend: Backend) -> bool {
     backend.is_in_guest_liteinst()
 }
 
+/// Whether Detcore refuses the stop-signal sends and armings the in-guest
+/// backends cannot hold in a run of `backend`
+/// (`detcore::Config::in_guest_refuses_stop_sends`,
+/// https://github.com/rrnewton/hermit/issues/5430): on Hermit's default
+/// in-guest route, for both in-guest backends, and never on another backend.
+/// The in-guest loader route never calls this, so the setting stays off there
+/// (https://github.com/rrnewton/hermit/issues/5433).
+pub const fn in_guest_refuses_stop_sends(backend: Backend) -> bool {
+    backend.is_in_guest_liteinst()
+}
+
 /// Whether this process, which runs the scheduler of the in-guest run it
 /// launches, owns the guests' PID namespace (A5 step 3c.1, D51 and D52): it
 /// is PID 1 of its PID namespace, and every guest it launches descends from
@@ -3712,6 +3723,10 @@ pub fn prepare_backend_config_with_capabilities(
     // So is the refusal of host-timed signal producers
     // (`in_guest_refuses_host_timed_producers`, A5 step 3c slice 0b).
     config.in_guest_refuses_host_timed_producers = false;
+    // So is the refusal of the stop-signal sends the in-guest backends cannot
+    // hold (`in_guest_refuses_stop_sends`,
+    // https://github.com/rrnewton/hermit/issues/5430).
+    config.in_guest_refuses_stop_sends = false;
     // And the in-guest delivery gate, which only the default route's launch
     // sets, from the final configuration and the process's PID-namespace
     // ownership (`in_guest_signal_delivery_gate`, A5 step 3c.1, D35 and D52).
@@ -4257,6 +4272,7 @@ async fn dispatch_backend(
             config.in_guest_site_patching_off = in_guest_site_patching_off(backend);
             config.in_guest_refuses_host_timed_producers =
                 in_guest_refuses_host_timed_producers(backend);
+            config.in_guest_refuses_stop_sends = in_guest_refuses_stop_sends(backend);
             // Last, from the configuration every Tool image receives.
             config.in_guest_reserved_signals = in_guest_reserved_signals(&config, backend);
             // The delivery gate, from the final configuration and whether
@@ -4653,6 +4669,7 @@ async fn dispatch_output_backend(
             config.in_guest_site_patching_off = in_guest_site_patching_off(backend);
             config.in_guest_refuses_host_timed_producers =
                 in_guest_refuses_host_timed_producers(backend);
+            config.in_guest_refuses_stop_sends = in_guest_refuses_stop_sends(backend);
             // Last, from the configuration every Tool image receives.
             config.in_guest_reserved_signals = in_guest_reserved_signals(&config, backend);
             // The delivery gate, from the final configuration and whether
@@ -6976,6 +6993,33 @@ mod tests {
             .expect("the loader route admits this configuration");
         assert!(!loader.in_guest_refuses_host_timed_producers);
         assert!(loader.in_guest_site_patching_off);
+    }
+
+    /// A configuration that already asks for the stop-send refusal (a public,
+    /// serialized field) never keeps it through Hermit's preparation: every
+    /// backend's preparation and the loader route's turn it off. Only the
+    /// default in-guest route turns it on afterwards, from the backend alone:
+    /// both in-guest backends and no other
+    /// (https://github.com/rrnewton/hermit/issues/5430).
+    #[test]
+    fn a_poisoned_stop_send_refusal_never_survives_preparation() {
+        let poisoned = DetConfig {
+            in_guest_refuses_stop_sends: true,
+            ..DetConfig::default()
+        };
+        for backend in Backend::ALL {
+            let prepared = prepare_backend_config(poisoned.clone(), backend);
+            assert!(!prepared.in_guest_refuses_stop_sends, "{backend:?}");
+            assert!(!prepared.refuses_stop_sends(), "{backend:?}");
+            assert_eq!(
+                in_guest_refuses_stop_sends(backend),
+                matches!(backend, Backend::Liteinst | Backend::InGuestTrap),
+                "{backend:?}"
+            );
+        }
+        let loader = prepare_in_guest_loader_route_config(poisoned)
+            .expect("the loader route admits this configuration");
+        assert!(!loader.in_guest_refuses_stop_sends);
     }
 
     /// A configuration that every condition of the in-guest delivery gate

@@ -1949,6 +1949,28 @@ pub struct Config {
     #[clap(skip)]
     pub in_guest_signal_delivery: bool,
 
+    /// Whether Detcore refuses the stop-signal sends and armings the in-guest
+    /// backends cannot hold (<https://github.com/rrnewton/hermit/issues/5430>):
+    /// a send of SIGSTOP, or of SIGTSTP, SIGTTIN or SIGTTOU that Linux would
+    /// not discard when it is sent, would stop a guest's host task, and the
+    /// scheduler would then wait for a thread that never asks for its next
+    /// turn. Where this or [`Config::in_guest_signal_delivery`] is set
+    /// ([`Config::refuses_stop_sends`]), such a send ends the run by name
+    /// where the scheduler owns the guests' PID namespace, and gets `EPERM`
+    /// elsewhere, and a POSIX timer whose notification is a stop signal is
+    /// refused with `EPERM` when it is created.
+    ///
+    /// The host sets it, not a flag, when it prepares an in-guest run on the
+    /// default route. Preparing any run clears it first, so a caller's
+    /// configuration cannot carry it in; every other backend and the in-guest
+    /// loader route leave it false. Every Tool image receives it in the
+    /// configuration handshake, which guest code cannot change. False, the
+    /// default, changes nothing. Like `in_guest_signal_delivery`, it has no
+    /// legacy key.
+    #[serde(default)]
+    #[clap(skip)]
+    pub in_guest_refuses_stop_sends: bool,
+
     /// Whether `--replay-preemptions-from` names a record that carries
     /// callback checkpoints, so priority-history replay ends each annotated
     /// row at its recorded callback endpoint instead of at the first stop that
@@ -2060,6 +2082,15 @@ impl Config {
     /// historical one.
     pub fn virtual_cpu_count(&self) -> u32 {
         self.virtual_cpus.map_or(1, NonZeroU32::get)
+    }
+
+    /// Whether Detcore refuses the stop-signal sends and armings the in-guest
+    /// backends cannot hold (<https://github.com/rrnewton/hermit/issues/5430>):
+    /// on the default in-guest route
+    /// ([`Config::in_guest_refuses_stop_sends`]), and under the in-guest
+    /// delivery gate ([`Config::in_guest_signal_delivery`]).
+    pub fn refuses_stop_sends(&self) -> bool {
+        self.in_guest_refuses_stop_sends || self.in_guest_signal_delivery
     }
 
     /// Whether the scheduler models which thread the kernel gives a signal,
@@ -4277,7 +4308,8 @@ mod legacy_backend_json {
     /// in-guest runs), so it is never written and reads as empty.
     /// `in_guest_refuses_host_timed_producers` is false for DBT (it is set
     /// only for in-guest runs), so it is never written and reads as false.
-    /// So is `in_guest_signal_delivery`, for the same reason.
+    /// So is `in_guest_signal_delivery`, for the same reason, and so is
+    /// `in_guest_refuses_stop_sends`.
     /// `launch_image` came after the legacy form froze: it is never written
     /// and reads as unset. DBT's runtime takes it from the coordinator's
     /// configuration instead, which declares DynamoRIO's library as the
@@ -4375,7 +4407,7 @@ mod legacy_backend_json {
     /// states its provenance, so it is never written and reads as false.
     /// `untrap_passthrough_syscalls` came after it too. `hermit run` refuses it
     /// on every backend but ptrace, so it is never written and reads as false.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 62] = [
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 63] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -4410,6 +4442,7 @@ mod legacy_backend_json {
         "signal_at",
         "post_crash_timeslice",
         "in_guest_signal_delivery",
+        "in_guest_refuses_stop_sends",
         "annotated_priority_replay",
         "virtual_cpus",
         "notice_host_network_abstract_binds",
@@ -4575,6 +4608,7 @@ mod legacy_backend_json {
                     | "in_guest_site_patching_off"
                     | "in_guest_refuses_host_timed_producers"
                     | "in_guest_signal_delivery"
+                    | "in_guest_refuses_stop_sends"
                     | "annotated_priority_replay"
                     | "target_timeslice_syscalls_only"
                     | "futex_wake_yields"
@@ -4952,6 +4986,7 @@ mod legacy_backend_json {
                 | "signal_at"
                 | "post_crash_timeslice"
                 | "in_guest_signal_delivery"
+                | "in_guest_refuses_stop_sends"
                 | "annotated_priority_replay"
                 | "virtual_cpus"
                 | "notice_host_network_abstract_binds"
@@ -6031,6 +6066,7 @@ mod tests {
                 | "signal_at"
                 | "post_crash_timeslice"
                 | "in_guest_signal_delivery"
+                | "in_guest_refuses_stop_sends"
                 | "annotated_priority_replay"
                 | "virtual_cpus"
                 | "notice_host_network_abstract_binds"
@@ -6088,7 +6124,7 @@ mod tests {
         // `mountinfo_mount_namespace`, `directory_placeholder`,
         // `container_procfs`, `signal_delivery_check_fatal`,
         // `work_span_report`, `signal_at`, `in_guest_signal_delivery`,
-        // `annotated_priority_replay`, `virtual_cpus`, `replay_edited_preemptions`,
+        // `in_guest_refuses_stop_sends`, `annotated_priority_replay`, `virtual_cpus`, `replay_edited_preemptions`,
         // `notice_host_network_abstract_binds`, `eager_lone_preemptions`,
         // `chaos_timeslice_range`, `chaos_timeslice_draw`, `chaos_timeslice`,
         // `guest_ids`, `virtual_timeout`, `detlog_anon`,
@@ -6101,10 +6137,11 @@ mod tests {
         // `chaos_instruction_offset`, `rewrite_exclusives_overlay_requested`,
         // `rewrite_exclusives_unmarked`, `untrap_passthrough_syscalls`
         // and `strict_schedule_boundaries` none: fourteen more keys and
-        // sixty-one fewer (lenient_replay joined them in dh-mvz7y,
-        // chaos_timed_wait_spread later), so forty-seven keys fewer than fields.
+        // sixty-two fewer (lenient_replay, chaos_timed_wait_spread and
+        // in_guest_refuses_stop_sends joined them in that order), so
+        // forty-eight keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 47);
+        assert_eq!(fields.len(), keys.len() + 48);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -7959,6 +7996,77 @@ mod tests {
             .expect("the field is serialized");
         let decoded: Config = serde_json::from_value(encoded).unwrap();
         assert!(!decoded.in_guest_signal_delivery);
+    }
+
+    /// `in_guest_refuses_stop_sends` is false for DBT, so the legacy form
+    /// never carries it, and it reads back as false from both the object and
+    /// the array form.
+    #[test]
+    fn in_guest_refuses_stop_sends_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            in_guest_refuses_stop_sends: true,
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(!json.contains("in_guest_refuses_stop_sends"), "{json}");
+        assert!(
+            !from_legacy_backend_json(&json)
+                .unwrap()
+                .in_guest_refuses_stop_sends
+        );
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert!(
+            !from_legacy_backend_json(&array)
+                .unwrap()
+                .in_guest_refuses_stop_sends
+        );
+    }
+
+    /// The stop-send route reaches every Tool image through Reverie's bincode
+    /// handshake unchanged, on or off, and a JSON configuration without the
+    /// key reads as off (its serde default). `refuses_stop_sends` is the
+    /// route or the delivery gate.
+    #[test]
+    fn in_guest_refuses_stop_sends_round_trips_and_defaults_to_off() {
+        for on in [false, true] {
+            let config = Config {
+                in_guest_refuses_stop_sends: on,
+                ..Config::default()
+            };
+            let wire = bincode::serde::encode_to_vec(&config, bincode::config::legacy()).unwrap();
+            let (decoded, read): (Config, usize) =
+                bincode::serde::decode_from_slice(&wire, bincode::config::legacy()).unwrap();
+            assert_eq!(read, wire.len());
+            assert_eq!(decoded.in_guest_refuses_stop_sends, on);
+            let json: Config =
+                serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+            assert_eq!(json.in_guest_refuses_stop_sends, on);
+        }
+        let mut encoded = serde_json::to_value(Config::default()).unwrap();
+        encoded
+            .as_object_mut()
+            .unwrap()
+            .remove("in_guest_refuses_stop_sends")
+            .expect("the field is serialized");
+        let decoded: Config = serde_json::from_value(encoded).unwrap();
+        assert!(!decoded.in_guest_refuses_stop_sends);
+        for (route, gate) in [(false, false), (true, false), (false, true), (true, true)] {
+            let config = Config {
+                in_guest_refuses_stop_sends: route,
+                in_guest_signal_delivery: gate,
+                ..Config::default()
+            };
+            assert_eq!(config.refuses_stop_sends(), route || gate, "{route} {gate}");
+        }
     }
 
     /// `annotated_priority_replay` never enters the legacy form, and reads

@@ -1257,6 +1257,18 @@ pub struct GlobalState {
     // refused (`GlobalRequest::PolicyRefusal`); the first report is kept.
     policy_refusal: Mutex<Option<String>>,
 
+    // Whether this coordinator owns the guests' PID namespace on the default
+    // in-guest route, so that its exit ends every guest
+    // (`GlobalRequest::StopSendRefusal`,
+    // https://github.com/rrnewton/hermit/issues/5430): the route bit
+    // `Config::in_guest_refuses_stop_sends`, which only Hermit's default
+    // in-guest launch sets, and this process being PID 1 of its namespace,
+    // read from the process when the global state is initialized, never
+    // taken from a caller. When a namespace's init exits the kernel kills
+    // every task in it (`zap_pid_ns_processes`, kernel/pid_namespace.c:170-222
+    // at v6.9).
+    owns_guest_pid_namespace: bool,
+
     // The first self-sentinel `pidfd_send_signal` a Tool image refused as
     // unqualified (`GlobalRequest::PidfdSelfQualificationRefusal`).
     pidfd_self_qualification_refusal: Mutex<Option<crate::PidfdSelfQualificationRefusal>>,
@@ -2044,6 +2056,9 @@ impl GlobalState {
             host_diskstats: std::sync::OnceLock::new(),
             procfs_sequences: Mutex::new(BTreeMap::new()),
             policy_refusal: Mutex::new(None),
+            // SAFETY: getpid has no preconditions.
+            owns_guest_pid_namespace: cfg.in_guest_refuses_stop_sends
+                && unsafe { libc::getpid() } == 1,
             pidfd_self_qualification_refusal: Mutex::new(None),
             host_inputs: Mutex::new(Vec::new()),
             host_mutations: Mutex::new(BTreeSet::new()),
@@ -4437,6 +4452,7 @@ impl GlobalState {
                     | GlobalRequest::PolicyRefusal(_)
                     | GlobalRequest::PidfdSelfQualificationRefusal(_)
                     | GlobalRequest::StoppingRefusal(_)
+                    | GlobalRequest::StopSendRefusal(_)
             );
 
         let (exec_reconnect, is_exec_caller_after_local_mm_swap) = {
@@ -4831,6 +4847,34 @@ impl GlobalState {
                 }
                 warn!(
                     "[detcore] a stopping refusal was filed without the in-guest delivery gate; recorded as a policy refusal, without the run-wide exit: {}",
+                    reason
+                );
+                self.policy_refusal.lock().unwrap().get_or_insert(reason);
+                R::PolicyRefusal(())
+            }
+            // A stop-signal send the in-guest backends cannot hold
+            // (https://github.com/rrnewton/hermit/issues/5430), filed in the
+            // sender's own turn. The run-wide exit is taken where it ends
+            // every guest: under the in-guest delivery gate, whose conditions
+            // include that ownership (D51, D52), and where this coordinator
+            // owns the guests' PID namespace on the default in-guest route
+            // (`owns_guest_pid_namespace`). It is this refusal's alone: every
+            // other `StoppingRefusal` producer keeps IR-16's gate-off answer.
+            // Elsewhere the reason is recorded as the run's policy refusal and
+            // answered, as a gate-off `StoppingRefusal` is, through the
+            // bookkeeping after this `match`.
+            GlobalRequest::StopSendRefusal(reason) => {
+                if self.cfg.in_guest_signal_delivery || self.owns_guest_pid_namespace {
+                    crate::scheduler::exit_on_scheduler_refusal(
+                        &crate::refused_signal_controls::stop_signal_send_refusal_ends_the_run(
+                            &reason,
+                        ),
+                    )
+                }
+                warn!(
+                    "[detcore] a stop-signal send was refused where the coordinator does not own \
+                     the guests' PID namespace; recorded as a policy refusal, without the run-wide \
+                     exit: {}",
                     reason
                 );
                 self.policy_refusal.lock().unwrap().get_or_insert(reason);
@@ -8599,8 +8643,9 @@ pub enum SignalScope {
 /// the append rule above does not cover them (finding 1 of rev5338-cx's
 /// review of 29b3e6a8, finding 2 of coord7's; 56 on its first rebase, 57 at
 /// its rebase onto main's 56, where https://github.com/rrnewton/hermit/pull/5259
-/// had taken 56); it is current.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 57;
+/// had taken 56). 58 appends `StopSendRefusal`
+/// (https://github.com/rrnewton/hermit/issues/5430); it is current.
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 58;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
@@ -9354,7 +9399,8 @@ pub enum GlobalRequest {
     /// reason while only the refusing Tool image exits, no guest process runs
     /// on after it, and it is never answered. Filed only under
     /// `Config::in_guest_signal_delivery`, whose gate requires that
-    /// ownership. Appended last.
+    /// ownership; a refused stop-signal send has its own request,
+    /// `StopSendRefusal`. Appended last.
     StoppingRefusal(String),
     /// The process a `/proc/<pid>/cmdline` names (a thread's number names its
     /// process), and its argument and environment areas
@@ -9639,6 +9685,16 @@ pub enum GlobalRequest {
     /// environment strings (`ProcessAuxvTable::current_exec_strings`).
     /// Appended last.
     ProcessExecStrings(DetPid),
+    /// A stop-signal send the in-guest backends cannot hold was refused, for
+    /// this reason, the whole `HERMIT_STOP_SIGNAL_SEND_REFUSED` line
+    /// (https://github.com/rrnewton/hermit/issues/5430). Under the in-guest
+    /// delivery gate, or where the coordinator owns the guests' PID namespace
+    /// on the default in-guest route, the coordinator ends the whole run on
+    /// it (`scheduler::exit_on_scheduler_refusal`) and never answers it;
+    /// elsewhere it records it as the run's policy refusal, which ends the
+    /// run with `HERMIT_POLICY_REFUSAL_EXIT` once it completes, and answers
+    /// `PolicyRefusal`. Appended last.
+    StopSendRefusal(String),
 }
 
 /// What a guest thread publishes of its CPU accounting with a request
@@ -10709,6 +10765,27 @@ where
             GlobalResponse::PolicyRefusal(()) | GlobalResponse::ThreadExited
         ),
         "unexpected response to StoppingRefusal: {response:?}"
+    );
+}
+
+/// File the refusal `reason` of a stop-signal send
+/// (`GlobalRequest::StopSendRefusal`,
+/// https://github.com/rrnewton/hermit/issues/5430). A coordinator that owns
+/// the guests' PID namespace exits on it, taking every guest with it, and
+/// this never returns; otherwise it records the refusal and answers, and this
+/// returns.
+pub(crate) async fn stop_send_refusal<G, T>(guest: &mut G, reason: String)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let (_, response) = send_and_update_time(guest, GlobalRequest::StopSendRefusal(reason)).await;
+    assert!(
+        matches!(
+            response,
+            GlobalResponse::PolicyRefusal(()) | GlobalResponse::ThreadExited
+        ),
+        "unexpected response to StopSendRefusal: {response:?}"
     );
 }
 

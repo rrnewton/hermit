@@ -1760,6 +1760,7 @@ mod tests {
             .det_config
             .in_guest_refuses_host_timed_producers = true;
         options.det_opts.det_config.in_guest_signal_delivery = true;
+        options.det_opts.det_config.in_guest_refuses_stop_sends = true;
         options.det_opts.det_config.guest_may_inherit_a_terminal = true;
         let builtin = options.mounts_directory_placeholder();
         assert_eq!(
@@ -1784,6 +1785,7 @@ mod tests {
             assert_eq!(physical.config.in_guest_reserved_signals, 0);
             assert!(!physical.config.in_guest_refuses_host_timed_producers);
             assert!(!physical.config.in_guest_signal_delivery);
+            assert!(!physical.config.in_guest_refuses_stop_sends);
             let expected = hermit::prepare_backend_config_with_capabilities(
                 options.effective_det_config(),
                 capabilities,
@@ -1819,6 +1821,7 @@ mod tests {
                     .in_guest_refuses_host_timed_producers
             );
             assert!(options.det_opts.det_config.in_guest_signal_delivery);
+            assert!(options.det_opts.det_config.in_guest_refuses_stop_sends);
         }
         let physical = PreparedPhysical::new(&options, reverie::BackendCapabilities::DBT);
         assert_eq!(physical.config.backend, reverie::BackendCapabilities::DBT);

@@ -6293,3 +6293,430 @@ fn sigalrm_first_pending_metadata_matches_native_linux() {
         "first-copy metadata modes failed: {failures:?}"
     );
 }
+
+static STOP_SEND_GUEST: OnceLock<PathBuf> = OnceLock::new();
+
+/// The line the coordinator prints with a stop-signal send it refuses on the
+/// owned in-guest route, which ends the run
+/// (https://github.com/rrnewton/hermit/issues/5430).
+const STOP_SEND_REFUSED: &str = "HERMIT_STOP_SIGNAL_SEND_REFUSED";
+
+/// Runs `mode` of `tests/c/stop_send_refusal.c` natively, from this test
+/// process: the guest's children then live in process groups whose parent
+/// shares their session, so a default SIGTSTP stops them.
+fn native_stop_send(mode: &str) -> String {
+    let guest = c_guest(&STOP_SEND_GUEST, "stop_send_refusal");
+    let output = Command::new(guest)
+        .arg(mode)
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run the stop-send guest natively");
+    assert!(output.status.success(), "native {mode}: {output:?}");
+    String::from_utf8(output.stdout).expect("UTF-8 native output")
+}
+
+/// One bounded `hermit run` of a stop-send guest mode, with its retained
+/// evidence.
+struct StopSendRun {
+    status: std::process::ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
+/// Runs `mode` of the stop-send guest under `backend` with `extra` options,
+/// strict, at the canonical epoch, with no maximum timeslice and INFO logs,
+/// and stdin `/dev/null` (so no terminal can stop a guest), within a 60-second
+/// wall bound: a run still going then is killed with its whole process group
+/// and the test fails there. `label` names the evidence directory.
+fn run_stop_send(label: &str, backend: &str, extra: &[&str], mode: &str) -> StopSendRun {
+    use super::kvm_cancellation::bounded_command_with_timeout;
+    use super::kvm_cancellation::bounded_read;
+
+    let guest = c_guest(&STOP_SEND_GUEST, "stop_send_refusal");
+    let directory = process_build_root(&format!("stop-send-{label}"));
+    let mut command = Command::new(hermit_binary());
+    command.args(["--log=info", "--backend", backend, "run"]);
+    super::hermit_test::pin_canonical_epoch(&mut command);
+    command
+        .args([
+            "--max-timeslice=disabled",
+            "--strict",
+            "--base-env=minimal",
+            "--mount=type=tmpfs,target=/test",
+            "--workdir=/test",
+        ])
+        .args(extra)
+        .env_remove("RUST_LOG")
+        .env_remove("HERMIT_LOG")
+        .env_remove("HERMIT_LOG_FILE")
+        .arg("--")
+        .arg(guest)
+        .arg(mode);
+    let status = bounded_command_with_timeout(&mut command, &directory, Duration::from_secs(60));
+    let stdout = bounded_read(&directory.join("stdout"), 1024 * 1024);
+    let stderr = bounded_read(&directory.join("stderr"), 16 * 1024 * 1024);
+    StopSendRun {
+        status,
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+    }
+}
+
+/// The processes still running `mode` of the stop-send guest, by their
+/// command lines (readable for every process, unlike `/proc/<pid>/exe`).
+fn stop_send_guests_alive(mode: &str) -> Vec<String> {
+    let guest = c_guest(&STOP_SEND_GUEST, "stop_send_refusal");
+    let mut wanted = guest.as_os_str().as_encoded_bytes().to_vec();
+    wanted.push(0);
+    wanted.extend_from_slice(mode.as_bytes());
+    wanted.push(0);
+    let mut alive = Vec::new();
+    for entry in fs::read_dir("/proc").expect("read /proc").flatten() {
+        let name = entry.file_name();
+        if !name.as_encoded_bytes().iter().all(u8::is_ascii_digit) {
+            continue;
+        }
+        if fs::read(entry.path().join("cmdline")).is_ok_and(|cmdline| cmdline == wanted) {
+            alive.push(name.to_string_lossy().into_owned());
+        }
+    }
+    alive
+}
+
+/// Requires the stopping refusal of a stop-signal send on the owned in-guest
+/// route: the policy-refusal status and class line, the coordinator's
+/// refusal line saying the run stops here, nothing the guest writes after its
+/// send, and no guest process left once Hermit returned.
+fn assert_stop_send_refused(context: &str, run: &StopSendRun, mode: &str) {
+    let details = format!(
+        "{context}: status={:?}\nstdout={}\nstderr={}",
+        run.status, run.stdout, run.stderr
+    );
+    assert_eq!(
+        run.status.code(),
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        "{details}"
+    );
+    assert!(
+        run.stderr
+            .contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+        "{details}"
+    );
+    assert!(
+        run.stderr
+            .lines()
+            .any(|line| line.contains(STOP_SEND_REFUSED) && line.contains("the run stops here")),
+        "{details}"
+    );
+    assert!(!run.stdout.contains("after-kill"), "{details}");
+    assert_eq!(
+        stop_send_guests_alive(mode),
+        Vec::<String>::new(),
+        "{details}"
+    );
+}
+
+/// Design test 1 (https://github.com/rrnewton/hermit/issues/5430): a guest
+/// that sends its child SIGSTOP on the default in-guest route is refused, and
+/// the run ends at once, by name, where it used to hang until an outer bound:
+/// the child would stop on the host, and the scheduler would wait for a
+/// thread that never asks for its next turn. The scheduler runs as the init
+/// of the run's PID namespace, so its exit takes every guest with it; the
+/// refusal line says so ("the run stops here"). Refused, not Linux's
+/// behaviour: a program that needs the stop cannot run. Arms: in-guest-trap,
+/// and liteinst with its site patching off and with its shipped patching on.
+/// Mutations: the refusal condition left to the delivery gate (every arm hits
+/// the bound); EPERM answered without ending the run (`after-kill` printed);
+/// the route not marked on the liteinst arm (its arms hit the bound).
+#[test]
+fn in_guest_a_sigstop_to_a_child_is_refused_and_ends_the_run() {
+    let _guard = hermit_run_guard();
+    for (label, backend, extra, selected) in [
+        ("trap", "in-guest-trap", &[][..], IN_GUEST_TRAP_SELECTED),
+        (
+            "liteinst-patching-off",
+            "liteinst",
+            &["--env=REVERIE_LITEINST_SITE_PATCHING=0"][..],
+            IN_GUEST_SELECTED,
+        ),
+        ("liteinst", "liteinst", &[][..], IN_GUEST_SELECTED),
+    ] {
+        let run = run_stop_send(&format!("e1-{label}"), backend, extra, "kill-stop");
+        assert!(
+            run.stderr.lines().any(|line| line == selected),
+            "{label}: {}",
+            run.stderr
+        );
+        assert_stop_send_refused(label, &run, "kill-stop");
+    }
+}
+
+/// Design test 3 (https://github.com/rrnewton/hermit/issues/5430) on
+/// in-guest-trap: SIGTSTP to a child in a process group of its own, whose
+/// parent shares its session, so that a default SIGTSTP is not discarded as
+/// sent to an orphaned group. Admitted only where Linux discards the send
+/// when it is sent (the child ignores SIGTSTP and does not block it), and
+/// SIGCONT: those runs print what Linux prints. Refused, ending the run: a
+/// child that ignores SIGTSTP but blocks it (Linux queues it, and the child
+/// stops once it restores SIG_DFL and unblocks it), and a child whose action
+/// is SIG_DFL. The native runs of the refused modes show they stop on Linux,
+/// so the refusals are not vacuous. Mutation: the blocked-bit check dropped
+/// (the blocked mode is admitted, and the run hits the bound).
+#[test]
+fn in_guest_a_sigtstp_is_admitted_only_where_linux_discards_it_when_sent() {
+    let _guard = hermit_run_guard();
+    for mode in ["tstp-ign-blocked-then-default", "tstp-dfl"] {
+        let native = native_stop_send(mode);
+        assert!(
+            native.lines().any(|line| line == "first stopped=20"),
+            "native {mode}: {native}"
+        );
+        let run = run_stop_send(&format!("e3-{mode}"), "in-guest-trap", &[], mode);
+        assert_stop_send_refused(mode, &run, mode);
+    }
+    for mode in ["tstp-ign", "cont"] {
+        let native = native_stop_send(mode);
+        assert!(
+            native.lines().any(|line| line == "first exited=0"),
+            "native {mode}: {native}"
+        );
+        let run = run_stop_send(&format!("e3-{mode}"), "in-guest-trap", &[], mode);
+        assert!(
+            run.status.success(),
+            "{mode}: status={:?}\nstdout={}\nstderr={}",
+            run.status,
+            run.stdout,
+            run.stderr
+        );
+        assert_eq!(run.stdout, native, "{mode}: in-guest-trap versus native");
+        assert!(
+            !run.stderr.contains(STOP_SEND_REFUSED),
+            "{mode}: {}",
+            run.stderr
+        );
+    }
+    assert_admitted_sigtstp_logs_its_precondition();
+}
+
+/// The admission's logged precondition (design test 3(a),
+/// https://github.com/rrnewton/hermit/issues/5430): when the sender's turn
+/// read the waiting child's status, its SigBlk bit for SIGTSTP was clear and
+/// its SigIgn bit set. The decision is a DETLOG record of the in-guest Tool,
+/// which the runtime forwards into the run's internal log (the Tool's INFO
+/// lines never reach stderr on the in-guest routes), so the mode runs under
+/// strict verification with its logs kept: the comparison of the two runs'
+/// logs establishes bitwise parity, so the second run's log, which Hermit
+/// deletes once it matched, carried the same records, and the kept first
+/// run's log has the exact line, once.
+fn assert_admitted_sigtstp_logs_its_precondition() {
+    use hermit::canonical_verdict::VerificationReport;
+
+    use super::kvm_cancellation::bounded_read;
+
+    let directory = process_build_root("stop-send-e3a-verify");
+    let logs = directory.join("logs");
+    fs::create_dir_all(&logs).expect("verify-log directory");
+    let report_path = directory.join("verify.json");
+    let report_arg = format!("--verify-json={}", report_path.display());
+    let logs_arg = logs.display().to_string();
+    let run = run_stop_send(
+        "e3a-verify",
+        "in-guest-trap",
+        &[
+            "--verify",
+            "--verify-strict",
+            &report_arg,
+            "--keep-logs",
+            "--verify-log-dir",
+            &logs_arg,
+        ],
+        "tstp-ign",
+    );
+    assert!(
+        run.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        run.status,
+        run.stdout,
+        run.stderr
+    );
+    let report =
+        VerificationReport::from_current_json_slice(&bounded_read(&report_path, 16 * 1024 * 1024))
+            .expect("complete current verification report");
+    report
+        .require_canonical_match()
+        .expect("nonempty canonical INFO comparison must match");
+    report
+        .require_exact_output_match()
+        .expect("exact status/stdout/stderr comparison must match");
+    let expected = "[detcore, dtid 3] stop-signal send of 20 by kill to thread 5: SigIgn bit 1, \
+                    SigBlk bit 0, SigCgt bit 0: admitted";
+    assert!(report.bitwise_parity, "{}", run.stderr);
+    assert!(
+        run.stderr
+            .contains("Deleted run 2's log: it matched run 1's, which is kept as the golden log"),
+        "{}",
+        run.stderr
+    );
+    let decision = |prefix: &str| {
+        let paths: Vec<PathBuf> = fs::read_dir(&logs)
+            .expect("read the retained verify logs")
+            .map(|entry| entry.expect("a retained log").path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(prefix))
+            })
+            .collect();
+        assert_eq!(paths.len(), 1, "{prefix}: {paths:?}");
+        let log = String::from_utf8_lossy(&bounded_read(&paths[0], 64 * 1024 * 1024)).into_owned();
+        let lines: Vec<String> = log
+            .lines()
+            .filter(|line| line.contains("stop-signal send of"))
+            .map(|line| {
+                let message = line.split_once("DETLOG ").map_or(line, |(_, rest)| rest);
+                message
+                    .rsplit_once(" DETLOG_RECORD=")
+                    .map_or(message, |(message, _)| message)
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(lines, [expected], "{prefix}");
+        lines
+    };
+    decision("run1_log_");
+}
+
+/// The native control of which task's mask decides a process-directed send
+/// (design test 3(d), https://github.com/rrnewton/hermit/issues/5430): a child
+/// process ignores SIGTSTP and its second thread blocks it. With the leader
+/// unblocked, `kill(child, SIGTSTP)` is discarded when sent, and nothing
+/// stops once the process restores SIG_DFL and the thread unblocks it; with
+/// the leader blocked too, the signal was queued, and the process stops. So
+/// the leader's mask, which Detcore reads for such a send, is the one Linux
+/// checks (kernel/signal.c:967 and :103-122 at v6.9). Native only: the
+/// in-guest routes refuse a second thread.
+#[test]
+fn natively_the_leaders_mask_decides_whether_a_process_directed_sigtstp_is_discarded() {
+    let unblocked = native_stop_send("leader-unblocked");
+    assert!(
+        unblocked.lines().any(|line| line == "first exited=0"),
+        "{unblocked}"
+    );
+    let blocked = native_stop_send("leader-blocked");
+    assert!(
+        blocked.lines().any(|line| line == "first stopped=20"),
+        "{blocked}"
+    );
+}
+
+/// Design test 6 (https://github.com/rrnewton/hermit/issues/5430): a POSIX
+/// timer whose notification is a stop signal is refused when it is created on
+/// the default in-guest route, with EPERM and the named WARN, because
+/// Detcore's own send at its expiry would stop a guest the in-guest backend
+/// cannot hold; the guest sees the errno and goes on. On ptrace the same
+/// timers are created, as before. Mutation: the stop-signal timer check
+/// removed (the in-guest timers are created).
+#[test]
+fn in_guest_a_stop_signal_timer_is_refused_when_it_is_created() {
+    let _guard = hermit_run_guard();
+    let run = run_stop_send("e5-trap", "in-guest-trap", &[], "timers");
+    let details = format!(
+        "status={:?}\nstdout={}\nstderr={}",
+        run.status, run.stdout, run.stderr
+    );
+    assert!(run.status.success(), "{details}");
+    assert_eq!(
+        run.stdout, "timer-signal-tstp=-1 errno=1\ntimer-thread-id-stop=-1 errno=1\n",
+        "{details}"
+    );
+    assert_eq!(
+        run.stderr
+            .matches("HERMIT_STOP_SIGNAL_ARMING_REFUSED")
+            .count(),
+        2,
+        "{details}"
+    );
+    let ptrace = run_stop_send("e5-ptrace", "ptrace", &[], "timers");
+    assert!(
+        ptrace.status.success(),
+        "ptrace: status={:?}\nstderr={}",
+        ptrace.status,
+        ptrace.stderr
+    );
+    assert_eq!(
+        ptrace.stdout,
+        native_stop_send("timers"),
+        "ptrace versus native"
+    );
+    assert!(
+        !ptrace.stderr.contains("HERMIT_STOP_SIGNAL_ARMING_REFUSED"),
+        "{}",
+        ptrace.stderr
+    );
+}
+
+/// The stop-send refusal belongs to the default in-guest route only
+/// (https://github.com/rrnewton/hermit/issues/5430): on ptrace, whose
+/// scheduler is also the init of the run's PID namespace, a SIGTSTP queued
+/// for a child that ignores and blocks it, and then unblocked while still
+/// ignored, is admitted, and the run prints what Linux prints. Mutations: the
+/// route marked on a ptrace configuration, or ownership taken from PID 1
+/// alone, would refuse the send and end the run.
+#[test]
+fn on_ptrace_a_blocked_ignored_sigtstp_is_admitted() {
+    let _guard = hermit_run_guard();
+    let mode = "tstp-ign-blocked-then-unblock";
+    let native = native_stop_send(mode);
+    let run = run_stop_send("e7-ptrace", "ptrace", &[], mode);
+    assert!(
+        run.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        run.status,
+        run.stdout,
+        run.stderr
+    );
+    assert_eq!(run.stdout, native, "ptrace versus native");
+    assert!(!run.stderr.contains(STOP_SEND_REFUSED), "{}", run.stderr);
+}
+
+/// The refusal's line and the last scheduler turn before it, from a run's
+/// INFO log, without each line's wall-clock prefix.
+fn refusal_and_last_turn(stderr: &str) -> (String, String) {
+    let without_clock = |line: &str| {
+        line.split_once(' ')
+            .filter(|(clock, _)| clock.ends_with('Z'))
+            .map_or(line, |(_, rest)| rest)
+            .to_string()
+    };
+    let refusal = stderr
+        .lines()
+        .find(|line| line.contains(STOP_SEND_REFUSED) && line.contains("the run stops here"))
+        .map(without_clock)
+        .unwrap_or_default();
+    let last_turn = stderr
+        .lines()
+        .take_while(|line| !line.contains(STOP_SEND_REFUSED))
+        .filter(|line| line.contains("DETLOG"))
+        .last()
+        .map(without_clock)
+        .unwrap_or_default();
+    (refusal, last_turn)
+}
+
+/// Design test 7 (https://github.com/rrnewton/hermit/issues/5430): the
+/// stopping refusal of a SIGSTOP is repeatable. Two in-guest-trap runs of the
+/// same guest print the same refusal line, byte for byte, after the same last
+/// scheduler turn in their INFO logs (each line without its wall-clock
+/// prefix), which each run writes under the test's own directory.
+#[test]
+fn in_guest_a_refused_sigstop_ends_two_runs_at_the_same_turn() {
+    let _guard = hermit_run_guard();
+    let runs = ["e6-first", "e6-second"]
+        .map(|label| run_stop_send(label, "in-guest-trap", &[], "kill-stop"));
+    for run in &runs {
+        assert_stop_send_refused("repeat", run, "kill-stop");
+    }
+    let [first, second] = runs.map(|run| refusal_and_last_turn(&run.stderr));
+    assert!(!first.0.is_empty() && !first.1.is_empty(), "{first:?}");
+    assert_eq!(first, second);
+}

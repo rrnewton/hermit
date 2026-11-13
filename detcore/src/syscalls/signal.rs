@@ -4282,28 +4282,46 @@ impl<T: RecordOrReplay> Detcore<T> {
         Some(Err(Errno::EPERM.into()))
     }
 
-    /// A5 step 3c.1c, design D48 with IR-4(b): under the in-guest delivery
-    /// gate, refuse with EPERM and a WARN a send of a stop signal to any
-    /// in-guest process, the caller's own included: SIGSTOP always, and
-    /// SIGTSTP, SIGTTIN or SIGTTOU while the target's action is `SIG_DFL`. The
-    /// in-guest backend cannot stop a guest process on the schedule, and a
-    /// stopped one would hold the run (16.1, D48(a)). SIGCONT is admitted: no
-    /// guest process is stopped, so it acts as a default-ignored signal (D48(i)).
+    /// Refuse a send of a stop signal that the in-guest backends cannot hold
+    /// (A5 design D48, amended by
+    /// <https://github.com/rrnewton/hermit/issues/5430>), to any in-guest
+    /// process, the caller's own included, wherever
+    /// [`Config::refuses_stop_sends`](crate::config::Config::refuses_stop_sends)
+    /// holds: on the default in-guest route, and under the in-guest delivery
+    /// gate. Such a send would stop a guest's host task, and the scheduler
+    /// would then wait for a thread that never asks for its next turn.
     ///
-    /// "The target's action is `SIG_DFL`" is read from the named live
-    /// thread's `/proc/<tid>/status` (`SigIgn` and `SigCgt`), in the sender's
-    /// turn: under premise P the target is inside its runtime then, and on the
-    /// in-guest backends a guest thread id names its host task
-    /// (`procfs_inode::guest_tids_name_host_tasks`). A status that cannot be
-    /// read refuses the send, fail closed. A target with no live thread in
-    /// Detcore's model keeps the ordinary path (a zombie takes the signal, 0;
-    /// a reaped or unknown id is ESRCH), as do a thread outside the group a
-    /// `tgkill` names, a non-positive id, and group sends, which their handlers
-    /// refuse first (F15). With the gate off, or another signal, `None`.
+    /// SIGSTOP is always refused. SIGTSTP, SIGTTIN and SIGTTOU are admitted
+    /// only where Linux would discard the send when it is sent:
+    /// `prepare_signal` returns `!sig_ignored(p, ..)` for the task `p` the
+    /// send names (kernel/signal.c:967 at v6.9), and `sig_ignored` never
+    /// ignores a blocked signal (:103-122). So the action must be `SIG_IGN`
+    /// and the signal unblocked, in the `SigIgn` and `SigBlk` of that task's
+    /// `/proc/<tid>/status`, read in the sender's turn: for a process-directed
+    /// send the thread whose id is the pid, for a thread-directed one the
+    /// named thread. The decision and the bits it read are logged at INFO.
+    /// Detcore never leaves an in-guest thread sleeping in a host
+    /// `rt_sigtimedwait` with a nonzero timeout (its injections carry a zero
+    /// one), so `SigBlk` is the whole blocked set Linux checks. A status that
+    /// cannot be read refuses, fail closed. With threads unsequentialized the
+    /// target's state could change before the kernel acts, so these three are
+    /// refused without reading it. A pidfd whose target Detcore cannot name is
+    /// refused for every stop signal, fail closed.
+    ///
+    /// A target with no live thread in Detcore's model keeps the ordinary path
+    /// (a zombie takes the signal, 0; a reaped or unknown id is ESRCH), as do
+    /// a thread outside the group a `tgkill` names, a non-positive id, and
+    /// group sends, which their handlers refuse first (F15). Elsewhere, or
+    /// for another signal, `None`. SIGCONT is admitted.
     ///
     /// Only a valid send reaches the refusal: one the kernel would fail
     /// before sending anything (its `siginfo`, a forged `si_code`;
-    /// `refused_send_kernel_errno`) gets that errno, without the WARN.
+    /// `refused_send_kernel_errno`) gets that errno. A refused send files
+    /// `GlobalRequest::StopSendRefusal` in the sender's own turn, before
+    /// anything reaches the kernel. A coordinator that owns the guests' PID
+    /// namespace ends the run on it, and this never returns; otherwise the
+    /// sender gets EPERM and a WARN, and the run ends with the refusal if it
+    /// completes.
     pub(crate) async fn refuse_stop_signal_send<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -4313,7 +4331,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         siginfo: ReservedSendSiginfo,
     ) -> Option<Result<i64, Error>> {
         use crate::refused_signal_controls::StopSendRefusal;
-        if !guest.config().in_guest_signal_delivery
+        if !guest.config().refuses_stop_sends()
             || !matches!(
                 signal,
                 libc::SIGSTOP | libc::SIGTSTP | libc::SIGTTIN | libc::SIGTTOU
@@ -4321,44 +4339,99 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return None;
         }
+        // `None` from `reserved_send_task`, a nested caller's id Detcore
+        // cannot name, is unreachable in-guest (no nested PID namespace is
+        // admitted there); it is refused as an unknown target all the same.
         let (query, thread) = match target {
             ReservedSendTarget::Process(pid) => {
                 if pid <= 0 {
                     return None;
                 }
-                (self.reserved_send_task(guest, pid).await?, None)
+                match self.reserved_send_task(guest, pid).await {
+                    Some(task) => (task, None),
+                    None => {
+                        return self
+                            .refuse_stop_send_to_an_unknown_target(guest, sysno, signal, siginfo)
+                            .await;
+                    }
+                }
             }
             ReservedSendTarget::Thread { tgid, tid } => {
                 if tid <= 0 || tgid.is_some_and(|tgid| tgid <= 0) {
                     return None;
                 }
-                let thread = self.reserved_send_task(guest, tid).await?;
+                let Some(thread) = self.reserved_send_task(guest, tid).await else {
+                    return self
+                        .refuse_stop_send_to_an_unknown_target(guest, sysno, signal, siginfo)
+                        .await;
+                };
                 let group = match tgid {
-                    Some(tgid) => Some(self.reserved_send_task(guest, tgid).await?),
+                    Some(tgid) => match self.reserved_send_task(guest, tgid).await {
+                        Some(group) => Some(group),
+                        None => {
+                            return self
+                                .refuse_stop_send_to_an_unknown_target(
+                                    guest, sysno, signal, siginfo,
+                                )
+                                .await;
+                        }
+                    },
                     None => None,
                 };
                 (group.unwrap_or(thread), Some(thread))
             }
-            ReservedSendTarget::Pidfd { named, thread } => {
-                let named = named?;
-                (named, thread.then_some(named))
-            }
+            ReservedSendTarget::Pidfd { named, thread } => match named {
+                Some(named) => (named, thread.then_some(named)),
+                None => {
+                    return self
+                        .refuse_stop_send_to_an_unknown_target(guest, sysno, signal, siginfo)
+                        .await;
+                }
+            },
         };
         let (targets, _) = resolve_kill_targets_and_exit(guest, query).await;
+        // The task Linux checks: the named thread, or for a process-directed
+        // send the thread whose id is the pid, which need not be the first
+        // live thread.
         let receiver = match thread {
             Some(thread) if targets.contains(&thread) => thread,
             Some(_) => return None,
-            None => *targets.first()?,
+            None if targets.is_empty() => return None,
+            None => query,
         };
+        let sender = guest.thread_state().dettid;
         let why = if signal == libc::SIGSTOP {
             StopSendRefusal::Sigstop
+        } else if !guest.config().sequentialize_threads {
+            StopSendRefusal::Unsequentialized
         } else {
             let task = reverie::Pid::from_raw(receiver.as_raw());
             match crate::syscalls::read_guest_task_signal_state(guest, task, task) {
-                Ok(state) if (state.ignored | state.caught) & kernel_sigset_bit(signal) != 0 => {
-                    return None;
+                Ok(state) => {
+                    let bit = kernel_sigset_bit(signal);
+                    let discarded = state.ignored & bit != 0
+                        && state.blocked & bit == 0
+                        && state.caught & bit == 0;
+                    // A DETLOG line, which the in-guest runtime forwards: the
+                    // target's state in the sender's turn, deterministic
+                    // under sequentialization.
+                    crate::detlog!(
+                        "[detcore, dtid {}] stop-signal send of {} by {} to thread {}: SigIgn bit \
+                         {}, SigBlk bit {}, SigCgt bit {}: {}",
+                        sender,
+                        signal,
+                        sysno.name(),
+                        receiver,
+                        u8::from(state.ignored & bit != 0),
+                        u8::from(state.blocked & bit != 0),
+                        u8::from(state.caught & bit != 0),
+                        if discarded { "admitted" } else { "refused" },
+                    );
+                    if discarded {
+                        return None;
+                    }
+                    StopSendRefusal::DefaultAction
                 }
-                Ok(_) => StopSendRefusal::DefaultAction,
                 Err(_) => StopSendRefusal::StatusUnreadable,
             }
         };
@@ -4371,17 +4444,52 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return Some(Err(errno.into()));
         }
+        let reason = crate::refused_signal_controls::stop_signal_send_refusal(
+            sysno.name(),
+            signal,
+            sender.as_raw(),
+            Some(receiver.as_raw()),
+            why,
+        );
+        Some(Err(Self::file_stop_send_refusal(guest, reason).await))
+    }
+
+    /// [`Self::refuse_stop_signal_send`] for a target Detcore cannot name (a
+    /// pidfd it did not open, or a nested caller's id), refused, fail closed,
+    /// for every stop signal, after the kernel's answer to the copy of the
+    /// `siginfo`. Its `si_code` check, which needs the target, is not judged:
+    /// the send takes its refusal.
+    async fn refuse_stop_send_to_an_unknown_target<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: Sysno,
+        signal: i32,
+        siginfo: ReservedSendSiginfo,
+    ) -> Option<Result<i64, Error>> {
+        if let RefusedSendSiginfo::Errno(errno) = refused_send_siginfo(guest, signal, siginfo) {
+            return Some(Err(errno.into()));
+        }
+        let reason = crate::refused_signal_controls::stop_signal_send_refusal(
+            sysno.name(),
+            signal,
+            guest.thread_state().dettid.as_raw(),
+            None,
+            crate::refused_signal_controls::StopSendRefusal::TargetUnknown,
+        );
+        Some(Err(Self::file_stop_send_refusal(guest, reason).await))
+    }
+
+    /// File the stop-send refusal `reason` in the sender's own turn
+    /// (`GlobalRequest::StopSendRefusal`). A coordinator that owns the guests'
+    /// PID namespace ends the run on it, and this never returns; one that
+    /// answers leaves the sender EPERM, with the WARN.
+    async fn file_stop_send_refusal<G: Guest<Self>>(guest: &mut G, reason: String) -> Error {
+        crate::tool_global::stop_send_refusal(guest, reason.clone()).await;
         tracing::warn!(
             "{}",
-            crate::refused_signal_controls::stop_signal_send_refused_warning(
-                sysno.name(),
-                signal,
-                guest.thread_state().dettid.as_raw(),
-                receiver.as_raw(),
-                why,
-            )
+            crate::refused_signal_controls::stop_signal_send_refused_warning(&reason)
         );
-        Some(Err(Errno::EPERM.into()))
+        Errno::EPERM.into()
     }
 
     /// A5 step 3c.1c: Linux's answer, before anything is sent, for a send to

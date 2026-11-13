@@ -113,6 +113,17 @@ fn timer_create_clock_refusal(clockid: ClockId) -> Option<Errno> {
     }
 }
 
+/// Whether a POSIX timer notifying with `signo` is refused when it is
+/// created: a stop signal, where the in-guest backends cannot hold a stop
+/// (`Config::refuses_stop_sends`, https://github.com/rrnewton/hermit/issues/5430).
+fn refuses_stop_signal_timer(config: &crate::config::Config, signo: i32) -> bool {
+    config.refuses_stop_sends()
+        && matches!(
+            signo,
+            libc::SIGSTOP | libc::SIGTSTP | libc::SIGTTIN | libc::SIGTTOU
+        )
+}
+
 fn time_from_resources(rsrcs: &Resources) -> Option<LogicalTime> {
     if rsrcs.resources.len() > 1 {
         panic!(
@@ -1265,12 +1276,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                     event.sigev_value.sival_ptr as usize as u64,
                 )
             };
-            // A reserved in-guest signal: Linux answers for the clock right
-            // after copying the sigevent, before it looks at the notification
+            // A reserved in-guest signal, or a stop signal where the in-guest
+            // backends cannot hold a stop, as a notification that delivers
+            // one: Linux answers for the clock right after copying the
+            // sigevent, before it looks at the notification
             // (`do_timer_create`), so an unsupported clock is that answer even
             // when the notification is invalid too
-            // (`timer_create_clock_refusal`).
-            if guest.config().reserves_in_guest_signal(signo.into())
+            // (`timer_create_clock_refusal`), and comes before either refusal.
+            if (guest.config().reserves_in_guest_signal(signo.into())
+                || (notify != libc::SIGEV_NONE && refuses_stop_signal_timer(guest.config(), signo)))
                 && let Some(errno) = timer_create_clock_refusal(clockid)
             {
                 return Err(errno.into());
@@ -1334,6 +1348,24 @@ impl<T: RecordOrReplay> Detcore<T> {
                 crate::refused_signal_controls::ReservedArming::TimerCreate,
                 signo.into(),
             )?;
+        }
+        // A stop signal as the timer's notification signal, where the in-guest
+        // backends cannot hold a stop (https://github.com/rrnewton/hermit/issues/5430):
+        // at its expiry the scheduler would send it itself, through no guest
+        // send handler, and stop a guest the backend cannot hold. Refused with
+        // EPERM and a WARN when the timer is created, after Linux's answers
+        // above; `SIGEV_NONE`, which notifies nothing, has no signal here.
+        if let Some(signo) = signo
+            && refuses_stop_signal_timer(guest.config(), signo)
+        {
+            tracing::warn!(
+                "{}",
+                crate::refused_signal_controls::stop_signal_arming_refused_warning(
+                    signo,
+                    guest.thread_state().dettid.as_raw(),
+                )
+            );
+            return Err(Errno::EPERM.into());
         }
         // `None` for a real-time signal (32 to 64): see `handle_timer_settime`.
         let signal = signo.and_then(|signo| Signal::try_from(signo).ok());

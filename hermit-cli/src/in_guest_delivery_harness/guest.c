@@ -274,6 +274,68 @@ static int mode_vfork_refusal(void) {
   return 0;
 }
 
+// Refusal rows of a stop-signal send (https://github.com/rrnewton/hermit/issues/5430):
+// SIGSTOP to a child, or SIGTSTP to a child in a group of its own that
+// ignores it without blocking it, which the runtime mask blocks physically
+// under the gate. A run that goes on past the send prints the line that must
+// not be reached, releases the child, and reaps it.
+static int mode_stop_send(int sig) {
+  printf("ROW-STARTED\n");
+  fflush(stdout);
+  int ready[2], go[2];
+  if (pipe(ready) || pipe(go)) return 3;
+  pid_t child = fork();
+  if (child == 0) {
+    setpgid(0, 0);
+    if (sig == SIGTSTP) signal(SIGTSTP, SIG_IGN);
+    (void)!write(ready[1], "x", 1);
+    char byte;
+    (void)!read(go[0], &byte, 1);
+    _exit(0);
+  }
+  setpgid(child, child);
+  char byte;
+  (void)!read(ready[0], &byte, 1);
+  int sent = kill(child, sig);
+  printf("ROW-REACHED-AFTER-REFUSAL kill=%d errno=%d\n", sent, sent ? errno : 0);
+  (void)!write(go[1], "g", 1);
+  reap(child);
+  return 0;
+}
+
+// Non-owner rows of a stop-signal send (https://github.com/rrnewton/hermit/issues/5430):
+// SIGSTOP to a child that waits on a pipe, with what kill returned written to
+// stop-send-result in the working directory. "checked" handles a refusal:
+// it kills and reaps the child and exits 0. "waits" ignores it and waits for
+// the child to stop, which a refused send never makes it do.
+static int mode_stop_send_non_owner(int checked) {
+  int go[2];
+  if (pipe(go)) return 3;
+  pid_t child = fork();
+  if (child == 0) {
+    char byte;
+    (void)!read(go[0], &byte, 1);
+    _exit(0);
+  }
+  int sent = kill(child, SIGSTOP);
+  int error = sent ? errno : 0;
+  FILE *result = fopen("stop-send-result", "w");
+  if (!result) return 4;
+  fprintf(result, "kill=%d errno=%d\n", sent, error);
+  fclose(result);
+  if (checked && sent != 0) {
+    kill(child, SIGKILL);
+    reap(child);
+    return 0;
+  }
+  int status = 0;
+  waitpid(child, &status, WUNTRACED);
+  kill(child, SIGCONT);
+  (void)!write(go[1], "g", 1);
+  reap(child);
+  return 0;
+}
+
 int main(int argc, char **argv) {
   setvbuf(stdout, NULL, _IONBF, 0);
   if (argc != 2) return 2;
@@ -284,5 +346,9 @@ int main(int argc, char **argv) {
   if (!strcmp(mode, "sigtimedwait")) return mode_sigtimedwait();
   if (!strcmp(mode, "maskcalls")) return mode_maskcalls();
   if (!strcmp(mode, "vfork-refusal")) return mode_vfork_refusal();
+  if (!strcmp(mode, "stop-send-sigstop")) return mode_stop_send(SIGSTOP);
+  if (!strcmp(mode, "stop-send-ignored-sigtstp")) return mode_stop_send(SIGTSTP);
+  if (!strcmp(mode, "stop-send-checked")) return mode_stop_send_non_owner(1);
+  if (!strcmp(mode, "stop-send-waits")) return mode_stop_send_non_owner(0);
   return 3;
 }
