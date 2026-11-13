@@ -15463,6 +15463,7 @@ impl RunOpts {
         // their existence against the materialized rootfs when the
         // container is built, not against the host here.
         if self.image.is_none() {
+            refuse_below_private_mqueue(&self.mount, &self.bind, Path::is_dir)?;
             validate_mount_targets(&self.mount, Path::exists)?;
         }
         // `--bind` targets are guest paths on the same footing as
@@ -15472,9 +15473,6 @@ impl RunOpts {
         // rootfs, and refuses what it cannot).
         for bind in &self.bind {
             refuse_bind_target_with_option(bind_paths(bind).1)?;
-        }
-        if self.image.is_none() {
-            refuse_below_private_mqueue(&self.mount, &self.bind, Path::is_dir)?;
         }
         if self.image.is_none() {
             validate_bind_targets(
