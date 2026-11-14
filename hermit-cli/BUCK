@@ -6,6 +6,7 @@
 
 # DELETED WITHOUT NOTICE - DO NOT DEPEND ON IT.
 load("@fbcode//hermetic_infra/hermit/fb-only/gated_tests:defs.bzl", "gated_test", "hermit_host_test", "run_gated_only")
+load("@fbcode//hermetic_infra/hermit/fb-only:release.bzl", "HERMIT_REVERIE_PIN", "HERMIT_VERSION")
 load("@fbcode//hermetic_infra/hermit/hermit-cli:integration_tests.bzl", "hermit_integration_tests")
 load("@fbcode_macros//build_defs:clippy_configuration.bzl", "clippy_configuration")
 load("@fbcode_macros//build_defs:export_files.bzl", "buck_export_file")
@@ -78,15 +79,17 @@ LIBHERMIT_TEST_DEPS = [
 ]
 
 LIBHERMIT_ENV = {
-    # src/bin/hermit/version.rs reports it in `hermit --version`. Keep in sync
-    # with the version in Cargo.toml.
-    "CARGO_PKG_VERSION": "0.5.7",
+    # src/bin/hermit/version.rs reports it in `hermit --version`. Both trees
+    # share this file, and each keeps its release values in its own
+    # fb-only/release.bzl (on GitHub, the shim stand-in at the same label), so
+    # no release or Reverie pin bump edits this file.
+    "CARGO_PKG_VERSION": HERMIT_VERSION,
     # The open-source Buck build's version string names these (an fbcode
     # build reports BuildInfo instead); a regular build embeds no date or
     # revision.
     "HERMIT_BUILD_DATE": "unknown",
     "HERMIT_BUILD_GIT_SHA": "unknown",
-    "HERMIT_REVERIE_PIN": "10c4c1b7266819bb55c00d18603f62ff82c9acb0",
+    "HERMIT_REVERIE_PIN": HERMIT_REVERIE_PIN,
 }
 
 # The unit tests' run-time environment.
