@@ -282,11 +282,12 @@ def rust_binary(
     default_strip_mode = None,
     test_deps = None,
     test_env = None,
+    test_labels = None,
     test_srcs = None,
     visibility = ["PUBLIC"],
     **kwargs,
 ):
-    _unused = (unittests, allocator, default_strip_mode, autocargo, test_deps, test_env, test_srcs)  # @unused
+    _unused = (unittests, allocator, default_strip_mode, autocargo, test_deps, test_env, test_labels, test_srcs)  # @unused
     deps = _fix_deps(deps or [])
 
     # @lint-ignore BUCKLINT: avoid "Direct usage of native rules is not allowed."

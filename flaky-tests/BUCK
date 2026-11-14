@@ -51,6 +51,10 @@ rust_binary(
 buck_sh_test(
     name = "run_hello_race",
     args = [],
+    # A deliberately racy fixture ("Antagonistic schedule reached, failing")
+    # for exercising Hermit's flakiness tooling, not a test that should pass
+    # natively; keep it out of CI.
+    labels = [tpx_labels.local_only],
     # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
     target_compatible_with = ["ovr_config//cpu:x86_64"],
     test = ":hello_race",
@@ -63,6 +67,9 @@ rust_binary(
     crate_root = "hello_race.rs",
     # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
     target_compatible_with = ["ovr_config//cpu:x86_64"],
+    # The implicit hello_race-unittest runs the same race and exits 1 on the
+    # antagonistic schedule; keep it out of CI like run_hello_race.
+    test_labels = [tpx_labels.local_only],
 )
 
 rust_binary(
@@ -72,6 +79,9 @@ rust_binary(
     crate_root = "hello_race_mini.rs",
     # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
     target_compatible_with = ["ovr_config//cpu:x86_64"],
+    # The implicit hello_race_mini-unittest runs the same two-thread race and
+    # exits 1 on the antagonistic schedule; keep it out of CI.
+    test_labels = [tpx_labels.local_only],
 )
 
 buck_sh_test(
@@ -89,6 +99,10 @@ buck_sh_test(
 buck_sh_test(
     name = "run_flaky_nanosleep-threads-simple",
     args = [],
+    # A deliberately racy fixture: the child thread may null the pointer the
+    # main thread then writes through, which crashes on that schedule; keep it
+    # out of CI.
+    labels = [tpx_labels.local_only],
     # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
     target_compatible_with = ["ovr_config//cpu:x86_64"],
     test = "//hermetic_infra/hermit/tests:nanosleep-threads-simple",

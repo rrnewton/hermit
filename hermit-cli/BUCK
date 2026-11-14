@@ -4,9 +4,9 @@
 
 # WILL BE DELETED. UNLESS THERE IS AN ONCALL ADDED THIS FILE WILL BE
 
+load("@fbcode//hermetic_infra/hermit/fb-only:release.bzl", "HERMIT_REVERIE_PIN", "HERMIT_VERSION")
 # DELETED WITHOUT NOTICE - DO NOT DEPEND ON IT.
 load("@fbcode//hermetic_infra/hermit/fb-only/gated_tests:defs.bzl", "gated_test", "hermit_host_test", "run_gated_only")
-load("@fbcode//hermetic_infra/hermit/fb-only:release.bzl", "HERMIT_REVERIE_PIN", "HERMIT_VERSION")
 load("@fbcode//hermetic_infra/hermit/hermit-cli:integration_tests.bzl", "hermit_integration_tests")
 load("@fbcode_macros//build_defs:clippy_configuration.bzl", "clippy_configuration")
 load("@fbcode_macros//build_defs:export_files.bzl", "buck_export_file")
