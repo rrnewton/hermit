@@ -867,6 +867,18 @@ pub struct Config {
     #[clap(skip)]
     pub strict_binder: bool,
 
+    /// `--strict`'s unknown-syscall policy: a guest syscall whose number the
+    /// pinned syscall table cannot name ends the run as a policy refusal
+    /// (`HERMIT_POLICY_REFUSAL_EXIT`) instead of receiving the deterministic
+    /// `ENOSYS` every other run gives it. `hermit run --strict` sets it;
+    /// nothing else does.
+    ///
+    /// The host sets it. It has no legacy key: [`to_legacy_backend_json`]
+    /// leaves it out and [`from_legacy_backend_json`] reads it back as false.
+    #[serde(default)]
+    #[clap(skip)]
+    pub strict_unknown_syscalls: bool,
+
     /// Schedule threads chaotically.
     ///
     /// The behavior of this flag is subject to change. Current behavior is to randomize thread
@@ -4301,6 +4313,8 @@ mod legacy_backend_json {
     /// it is never written and reads as false.
     /// `strict_binder` is the host's `--strict` policy for binder, which the
     /// frozen form predates: never written, read as false.
+    /// `strict_unknown_syscalls` is the same for unknown syscall numbers:
+    /// never written, read as false.
     /// `work_span_report` came after it as well: the report is written by the
     /// scheduler, not the in-guest runtime, so it is never written and reads
     /// as unset.
@@ -4375,7 +4389,7 @@ mod legacy_backend_json {
     /// states its provenance, so it is never written and reads as false.
     /// `untrap_passthrough_syscalls` came after it too. `hermit run` refuses it
     /// on every backend but ptrace, so it is never written and reads as false.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 62] = [
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 63] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -4406,6 +4420,7 @@ mod legacy_backend_json {
         "container_procfs",
         "signal_delivery_check_fatal",
         "strict_binder",
+        "strict_unknown_syscalls",
         "work_span_report",
         "signal_at",
         "post_crash_timeslice",
@@ -4588,6 +4603,7 @@ mod legacy_backend_json {
                     | "eager_lone_preemptions"
                     | "replay_continue_fairly"
                     | "strict_binder"
+                    | "strict_unknown_syscalls"
                     | "rewrite_exclusives_in_memory"
                     | "rewrite_exclusives_overlay_requested"
                     | "count_store_exclusives"
@@ -4948,6 +4964,7 @@ mod legacy_backend_json {
                 | "container_procfs"
                 | "signal_delivery_check_fatal"
                 | "strict_binder"
+                | "strict_unknown_syscalls"
                 | "work_span_report"
                 | "signal_at"
                 | "post_crash_timeslice"
@@ -6027,6 +6044,7 @@ mod tests {
                 | "container_procfs"
                 | "signal_delivery_check_fatal"
                 | "strict_binder"
+                | "strict_unknown_syscalls"
                 | "work_span_report"
                 | "signal_at"
                 | "post_crash_timeslice"
@@ -6101,10 +6119,11 @@ mod tests {
         // `chaos_instruction_offset`, `rewrite_exclusives_overlay_requested`,
         // `rewrite_exclusives_unmarked`, `untrap_passthrough_syscalls`
         // and `strict_schedule_boundaries` none: fourteen more keys and
-        // sixty-one fewer (lenient_replay joined them in dh-mvz7y,
-        // chaos_timed_wait_spread later), so forty-seven keys fewer than fields.
+        // sixty-two fewer (lenient_replay joined them in dh-mvz7y,
+        // chaos_timed_wait_spread and strict_unknown_syscalls later), so
+        // forty-eight keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 47);
+        assert_eq!(fields.len(), keys.len() + 48);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
