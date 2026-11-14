@@ -520,6 +520,49 @@ impl Image {
     }
 }
 
+/// The library's mirror of [`Image`] (`hermit::RecordedImageIdentity`),
+/// which a recording's metadata stores: the library cannot name this
+/// binary's type, so the two convert here, field for field.
+impl From<Image> for hermit::RecordedImageIdentity {
+    fn from(image: Image) -> Self {
+        Self {
+            source: match image.source {
+                ImageSource::PodmanStore => hermit::RecordedImageSource::PodmanStore,
+                ImageSource::OciDir => hermit::RecordedImageSource::OciDir,
+                ImageSource::DockerArchive => hermit::RecordedImageSource::DockerArchive,
+            },
+            reference: image.reference,
+            identity: image.identity,
+            manifest_digest: image.manifest_digest,
+            image_id: image.image_id,
+        }
+    }
+}
+
+/// The recorded identity back as an [`Image`], validated as a manifest
+/// would validate it: metadata.json is caller-editable, so a value
+/// that no materialization could have resolved refuses here instead
+/// of reaching the identity comparison as a plausible mismatch.
+impl TryFrom<hermit::RecordedImageIdentity> for Image {
+    type Error = Error;
+
+    fn try_from(recorded: hermit::RecordedImageIdentity) -> Result<Self, Error> {
+        let image = Self {
+            source: match recorded.source {
+                hermit::RecordedImageSource::PodmanStore => ImageSource::PodmanStore,
+                hermit::RecordedImageSource::OciDir => ImageSource::OciDir,
+                hermit::RecordedImageSource::DockerArchive => ImageSource::DockerArchive,
+            },
+            reference: recorded.reference,
+            identity: recorded.identity,
+            manifest_digest: recorded.manifest_digest,
+            image_id: recorded.image_id,
+        };
+        image.validate()?;
+        Ok(image)
+    }
+}
+
 /// One manifest document.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1269,6 +1312,55 @@ mod tests {
 }"#;
         assert_eq!(text, expected);
         assert_eq!(parse(&text).unwrap(), manifest);
+    }
+
+    /// The recording metadata's mirror of [`Image`] converts both
+    /// ways without loss — through JSON as metadata.json stores it —
+    /// for every source, and a hand-edited identity no materialization
+    /// could have resolved refuses on the way back.
+    #[test]
+    fn an_image_identity_round_trips_through_its_recorded_mirror() {
+        let digest = "a".repeat(64);
+        for image in [
+            Image {
+                source: ImageSource::PodmanStore,
+                reference: Some("docker.io/library/debian:trixie-slim".to_owned()),
+                identity: digest.clone(),
+                manifest_digest: Some(format!("sha256:{}", "b".repeat(64))),
+                image_id: Some(digest.clone()),
+            },
+            Image {
+                source: ImageSource::OciDir,
+                reference: None,
+                identity: digest.clone(),
+                manifest_digest: Some(format!("sha256:{digest}")),
+                image_id: None,
+            },
+            Image {
+                source: ImageSource::DockerArchive,
+                reference: None,
+                identity: digest.clone(),
+                manifest_digest: None,
+                image_id: Some(digest.clone()),
+            },
+        ] {
+            let recorded: hermit::RecordedImageIdentity = image.clone().into();
+            let json = serde_json::to_string(&recorded).unwrap();
+            let reloaded: hermit::RecordedImageIdentity = serde_json::from_str(&json).unwrap();
+            assert_eq!(reloaded, recorded);
+            let back = Image::try_from(reloaded).unwrap();
+            assert_eq!(back, image);
+            assert!(back.same_content_identity(&image));
+        }
+
+        let edited = hermit::RecordedImageIdentity {
+            source: hermit::RecordedImageSource::OciDir,
+            reference: None,
+            identity: "not-a-digest".to_owned(),
+            manifest_digest: None,
+            image_id: None,
+        };
+        assert!(Image::try_from(edited).is_err());
     }
 
     #[test]

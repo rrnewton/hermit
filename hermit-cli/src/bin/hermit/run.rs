@@ -280,12 +280,12 @@ fn validate_bind_targets(
 /// an OCI rootfs. Reverie's `Mount` does not give its filesystem type
 /// back, so this reads `type=` from the spec `MountArg` retains.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ImageMountKind {
+pub(super) enum ImageMountKind {
     Bind,
     Tmpfs,
 }
 
-fn image_mount_kind(mount: &MountArg) -> Result<ImageMountKind, Error> {
+pub(super) fn image_mount_kind(mount: &MountArg) -> Result<ImageMountKind, Error> {
     let fstype = mount
         .spec
         .split(',')
@@ -311,7 +311,7 @@ fn image_mount_kind(mount: &MountArg) -> Result<ImageMountKind, Error> {
 /// deterministic rendering, not the caller's. `spelling` is the flag
 /// that named the target (`--mount` or `--bind`); both spellings of a
 /// bind get exactly these rules.
-fn validate_image_target(target: &Path, spelling: &str) -> Result<(), Error> {
+pub(super) fn validate_image_target(target: &Path, spelling: &str) -> Result<(), Error> {
     anyhow::ensure!(
         target.is_absolute()
             && target
@@ -351,7 +351,7 @@ fn validate_image_target(target: &Path, spelling: &str) -> Result<(), Error> {
 /// Refuse the `--mount`s and `--bind`s that cannot be installed inside
 /// an OCI rootfs: an unsupported mount type, a bind mount with no
 /// source, and every target [`validate_image_target`] refuses.
-fn validate_image_mounts(mounts: &[MountArg], binds: &[Bind]) -> Result<(), Error> {
+pub(super) fn validate_image_mounts(mounts: &[MountArg], binds: &[Bind]) -> Result<(), Error> {
     for mount in mounts {
         if image_mount_kind(mount)? == ImageMountKind::Bind {
             anyhow::ensure!(
@@ -385,7 +385,7 @@ fn validate_image_mounts(mounts: &[MountArg], binds: &[Bind]) -> Result<(), Erro
 /// and that mount could swap in a symlink. In that window the guest
 /// is not running and the image is already materialized; the residual
 /// is accepted and stated here rather than implied away.
-fn prepare_image_mount_target(
+pub(super) fn prepare_image_mount_target(
     base: &Path,
     rel: &Path,
     want_dir: bool,
@@ -11565,7 +11565,7 @@ fn normalize_guest_path(path: &Path) -> Result<PathBuf, Error> {
 ///
 /// Search `path_env` (colon-separated guest dirs) for `name` inside `rootfs`,
 /// returning the guest-absolute path of the first existing entry.
-fn search_image_path(rootfs: &Path, name: &Path, path_env: &str) -> Option<PathBuf> {
+pub(super) fn search_image_path(rootfs: &Path, name: &Path, path_env: &str) -> Option<PathBuf> {
     for dir in path_env.split(':').filter(|d| !d.is_empty()) {
         let guest = Path::new(dir).join(name);
         if crate::app::image::resolve_in_rootfs(rootfs, &guest).exists() {
@@ -11575,7 +11575,10 @@ fn search_image_path(rootfs: &Path, name: &Path, path_env: &str) -> Option<PathB
     None
 }
 
-fn resolve_image_guest_program(requested: &Path, guest_cwd: &Path) -> Result<PathBuf, Error> {
+pub(super) fn resolve_image_guest_program(
+    requested: &Path,
+    guest_cwd: &Path,
+) -> Result<PathBuf, Error> {
     if requested.is_absolute() {
         Ok(requested.to_path_buf())
     } else if requested.to_string_lossy().contains('/') {

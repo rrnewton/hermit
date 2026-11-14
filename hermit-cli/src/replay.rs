@@ -38,6 +38,7 @@ use crate::event_stream::EventReader;
 use crate::event_stream::EventStreamId;
 use crate::metadata::Metadata;
 use crate::metadata::RECORD_VERSION;
+use crate::metadata::RecordedImage;
 use crate::metadata::record_or_replay_config;
 type Tracer = reverie_ptrace::Tracer<detcore::GlobalState>;
 
@@ -55,14 +56,67 @@ pub struct Replay {
     _materialization_scope: hermit_replay::ReplayMaterializationScope,
 }
 
+/// Refuse a replay whose container was not built from the rootfs its
+/// recording ran in. `given` is the image identity the caller built
+/// this replay's container from (`None` for a host-root container).
+/// An image recording replays inside the same image content or not
+/// at all: falling back to the host root would run the recorded
+/// executable against the host's loader and libraries.
+fn refuse_mismatched_image(
+    dir: &Path,
+    recorded: Option<&RecordedImage>,
+    given: Option<&RecordedImage>,
+) -> Result<(), Error> {
+    match (recorded, given) {
+        (None, None) => Ok(()),
+        (Some(recorded), Some(given))
+            if recorded.identity.same_content_identity(&given.identity) =>
+        {
+            Ok(())
+        }
+        (Some(recorded), None) => Err(anyhow::anyhow!(
+            "recording {} ran inside image {} (identity {}), but this replay runs on the \
+             host root; replay it with `hermit replay`, which re-enters the recorded \
+             image, or build the replay container from that image and pass its recorded \
+             identity to the replay call",
+            dir.display(),
+            recorded.reference,
+            recorded.identity.identity,
+        )),
+        (Some(recorded), Some(given)) => Err(anyhow::anyhow!(
+            "recording {} ran inside image {} (identity {}), but this replay's container \
+             was built from image {} (identity {}); rebuild the replay container from \
+             the recorded image so the guest runs against the rootfs it was recorded in",
+            dir.display(),
+            recorded.reference,
+            recorded.identity.identity,
+            given.reference,
+            given.identity.identity,
+        )),
+        (None, Some(given)) => Err(anyhow::anyhow!(
+            "recording {} ran on the host root, but this replay's container was built \
+             from image {} (identity {}); replay it in a host-root container instead",
+            dir.display(),
+            given.reference,
+            given.identity.identity,
+        )),
+    }
+}
+
 impl Replay {
     /// Spawns a new replay using the provided base directory where the replay
     /// data is stored.
+    ///
+    /// `image` is the recorded image this replay's container was built
+    /// from, or `None` for a host-root container: an image recording
+    /// refuses a caller that passes no identity, or a different one,
+    /// before the guest starts ([`refuse_mismatched_image`]).
     pub async fn spawn(
         dir: &Path,
         capture_output: bool,
         gdbserver: Option<u16>,
         mounts: &[Mount],
+        image: Option<&RecordedImage>,
     ) -> Result<Self, Error> {
         let metadata = Metadata::load(dir)?;
         crate::cpu_profile_admission::check_record_or_replay(metadata.cpu_profile)?;
@@ -81,6 +135,7 @@ impl Replay {
                 recording_version, replayer_version
             )));
         }
+        refuse_mismatched_image(dir, metadata.image.as_ref(), image)?;
 
         let mut command = metadata.command();
 
@@ -631,13 +686,14 @@ mod tests {
             "domainname": null,
             "envs": {},
             "version": 0x122,
+            "image": null,
         });
         fs::write(
             dir.path().join(crate::consts::METADATA_NAME),
             metadata.to_string(),
         )
         .unwrap();
-        let error = match Replay::spawn(dir.path(), false, None, &[]).await {
+        let error = match Replay::spawn(dir.path(), false, None, &[], None).await {
             Ok(_) => panic!("replay accepted a 0x122 recording"),
             Err(error) => error.to_string(),
         };
@@ -663,13 +719,14 @@ mod tests {
             "domainname": null,
             "envs": {},
             "version": 0x196,
+            "image": null,
         });
         fs::write(
             dir.path().join(crate::consts::METADATA_NAME),
             metadata.to_string(),
         )
         .unwrap();
-        let error = match Replay::spawn(dir.path(), false, None, &[]).await {
+        let error = match Replay::spawn(dir.path(), false, None, &[], None).await {
             Ok(_) => panic!("replay accepted the pre-pairing 0x196 recording"),
             Err(error) => error,
         };
@@ -716,6 +773,7 @@ mod tests {
                 "domainname": null,
                 "envs": {},
                 "version": serde_json::to_value(RECORD_VERSION).unwrap(),
+                "image": null,
             });
             if let Some(identity) = identity {
                 metadata["rcb_identity"] = identity;
@@ -725,7 +783,7 @@ mod tests {
                 metadata.to_string(),
             )
             .unwrap();
-            let error = match Replay::spawn(dir.path(), false, None, &[]).await {
+            let error = match Replay::spawn(dir.path(), false, None, &[], None).await {
                 Ok(_) => panic!("replay accepted a recording without this run's RCB identity"),
                 Err(error) => error,
             };
@@ -753,6 +811,7 @@ mod tests {
             "domainname": null,
             "envs": {},
             "version": serde_json::to_value(RECORD_VERSION).unwrap(),
+            "image": null,
             "replay_refused": "a SIGKILL victim had a background operation outstanding",
         });
         fs::write(
@@ -760,12 +819,157 @@ mod tests {
             metadata.to_string(),
         )
         .unwrap();
-        let error = match Replay::spawn(dir.path(), false, None, &[]).await {
+        let error = match Replay::spawn(dir.path(), false, None, &[], None).await {
             Ok(_) => panic!("replay accepted a recording that refuses replay"),
             Err(error) => error.to_string(),
         };
         assert!(
             error.contains("cannot be replayed faithfully: a SIGKILL victim had a background operation outstanding"),
+            "unexpected refusal: {error}"
+        );
+    }
+
+    fn recorded_image(digest: &str) -> RecordedImage {
+        RecordedImage {
+            reference: "oci-dir:/srv/rootfs".to_owned(),
+            identity: crate::metadata::RecordedImageIdentity {
+                source: crate::metadata::RecordedImageSource::OciDir,
+                reference: None,
+                identity: digest.to_owned(),
+                manifest_digest: Some(format!("sha256:{digest}")),
+                image_id: None,
+            },
+        }
+    }
+
+    fn write_recording(dir: &Path, version: u32, image: Option<&RecordedImage>) {
+        let metadata = serde_json::json!({
+            "exe": "/bin/true",
+            "program": "true",
+            "arg0": "true",
+            "args": [],
+            "current_dir": "/",
+            "hostname": null,
+            "domainname": null,
+            "envs": {},
+            "version": version,
+            "image": image,
+        });
+        fs::write(dir.join(crate::consts::METADATA_NAME), metadata.to_string()).unwrap();
+    }
+
+    /// An image recording refuses a library replay that passes no
+    /// identity, and one that passes a different content identity,
+    /// before the guest starts; the matching identity passes this
+    /// guard (and reaches the next admission check). A host-root
+    /// recording likewise refuses a container built from an image.
+    #[tokio::test]
+    async fn replay_refuses_a_container_from_another_rootfs() {
+        let version = serde_json::to_value(RECORD_VERSION)
+            .unwrap()
+            .as_u64()
+            .unwrap() as u32;
+        let recorded = recorded_image(&"a".repeat(64));
+        let other = recorded_image(&"b".repeat(64));
+
+        for (given, expect) in [
+            (None, "but this replay runs on the host root"),
+            (Some(&other), "was built from image oci-dir:/srv/rootfs"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            write_recording(dir.path(), version, Some(&recorded));
+            let error = match Replay::spawn(dir.path(), false, None, &[], given).await {
+                Ok(_) => panic!("replay accepted a mismatched container"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains(expect), "unexpected refusal: {error}");
+            assert!(
+                error.contains("oci-dir:/srv/rootfs"),
+                "the refusal must name the image: {error}"
+            );
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        write_recording(dir.path(), version, Some(&recorded));
+        let error = match Replay::spawn(dir.path(), false, None, &[], Some(&recorded)).await {
+            Ok(_) => panic!("replay ran without a recorded event stream"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            error.contains("states no RCB coordinate identity"),
+            "the matching identity must pass the image guard: {error}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        write_recording(dir.path(), version, None);
+        let error = match Replay::spawn(dir.path(), false, None, &[], Some(&recorded)).await {
+            Ok(_) => panic!("replay accepted an image container for a host recording"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("ran on the host root, but this replay's container was built"),
+            "unexpected refusal: {error}"
+        );
+    }
+
+    /// Deleting the `image` field from a current recording's
+    /// metadata must not silently downgrade it to a host-root
+    /// replay: serde reads the missing `Option` as `None`, so load
+    /// refuses a current-version file that states no field. An
+    /// older recording, which never wrote one, still loads and is
+    /// refused by the version gate below instead.
+    #[tokio::test]
+    async fn replay_refuses_a_recording_whose_image_field_was_deleted() {
+        let version = serde_json::to_value(RECORD_VERSION)
+            .unwrap()
+            .as_u64()
+            .unwrap() as u32;
+        let dir = tempfile::tempdir().unwrap();
+        let metadata = serde_json::json!({
+            "exe": "/bin/true",
+            "program": "true",
+            "arg0": "true",
+            "args": [],
+            "current_dir": "/",
+            "hostname": null,
+            "domainname": null,
+            "envs": {},
+            "version": version,
+        });
+        fs::write(
+            dir.path().join(crate::consts::METADATA_NAME),
+            metadata.to_string(),
+        )
+        .unwrap();
+        let error = match Replay::spawn(dir.path(), false, None, &[], None).await {
+            Ok(_) => panic!("replay accepted a recording with its image field deleted"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            error.contains("states no \"image\" field"),
+            "unexpected refusal: {error}"
+        );
+    }
+
+    /// The previous-version case of the 0x1a2 bump: an image recording
+    /// read by this replayer at an older epoch is refused by version,
+    /// with the version refusal's wording, not replayed on the host
+    /// root. (The symmetric direction — this recording read by a
+    /// pre-0x1a2 binary — is the same equality gate in that binary.)
+    #[tokio::test]
+    async fn replay_refuses_an_image_recording_from_the_previous_version() {
+        let dir = tempfile::tempdir().unwrap();
+        write_recording(dir.path(), 0x1a0, Some(&recorded_image(&"a".repeat(64))));
+        let error = match Replay::spawn(dir.path(), false, None, &[], None).await {
+            Ok(_) => panic!("replay accepted a 0x1a0 image recording"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains(
+                "Version mismatch, recording version RecordVersion(416), replayer version \
+                 RecordVersion(418); record it again with this build, or replay it with \
+                 the build that made it"
+            ),
             "unexpected refusal: {error}"
         );
     }

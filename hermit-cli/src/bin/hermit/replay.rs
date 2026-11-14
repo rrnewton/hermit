@@ -21,6 +21,8 @@ use hermit::Shebang;
 use reverie::process::ExitStatus;
 
 use super::container::deterministic_container;
+use super::container::record_image_container;
+use super::container::reenter_record_image;
 use super::gdb_client::CLIENT_EXITED_BEFORE_CONNECTING;
 use super::gdb_client::GdbClientWatch;
 use super::global_opts::GlobalOpts;
@@ -149,6 +151,25 @@ impl ReplayOpts {
         hermit::cpu_profile_admission::check_record_or_replay(metadata.cpu_profile).map_err(
             |refusal| Error::new(super::container::PolicyRefusal).context(refusal.to_string()),
         )?;
+        // An image recording replays inside its recorded rootfs or
+        // not at all: re-materialize it by its content identity now,
+        // before the DAP adapter replaces this process, the gdb
+        // port, the gdb client, or any container, so a recording
+        // this host cannot re-enter refuses by name with nothing
+        // started on every replay surface. There is no fallback to
+        // the host root. (The DAP adapter's inner replay re-enters
+        // the same rootfs through the shared builder when it runs.)
+        let image_rootfs = match &metadata.image {
+            Some(recorded) => Some(reenter_record_image(recorded).map_err(|error| {
+                Error::msg(format!(
+                    "recording {id} ran inside image {} (identity {}); replay cannot \
+                     re-enter it: {error:#}; make that image content available at \
+                     the recorded reference and replay again",
+                    recorded.reference, recorded.identity.identity,
+                ))
+            })?),
+            None => None,
+        };
         if let Some(address) = &self.dap_listen {
             return Err(self.exec_dap_adapter(&hermit, id, address));
         }
@@ -173,6 +194,12 @@ impl ReplayOpts {
             })?;
         }
         let network = replay_network(metadata.local_networking);
+        // Hermit's own paths the replay inside the image container
+        // must keep reaching at the same path.
+        let mut host_binds = vec![hermit.data_dir().join(id.to_string())];
+        if let Some(log_file) = &global.log_file {
+            host_binds.push(log_file.clone());
+        }
         // Bound here, in the host's network namespace, before the container
         // exists, so the gdb client reaches it whatever network the replay
         // has (`hermit::gdbserver`).
@@ -202,23 +229,25 @@ impl ReplayOpts {
             );
         }
         if self.autopilot || self.serve_only {
-            let (mut container, identity) = deterministic_container()?;
+            let (mut container, identity, staging) =
+                recording_container(image_rootfs.as_deref(), &host_binds)?;
             network.configure(&mut container, false);
             let options = self.clone();
             let global = global.clone();
+            let image = metadata.image.clone();
             let resources = format!("replay {} and identity mounts", hermit.data_dir().display());
             super::owned_container::run(
                 &mut container,
-                (identity, hermit, gdbserver_port),
+                (identity, hermit, gdbserver_port, staging),
                 resources,
                 true,
                 "with_container",
                 None,
-                move |(_, hermit, gdbserver_port)| {
+                move |(_, hermit, gdbserver_port, _staging)| {
                     if let Some(port) = gdbserver_port.take() {
                         port.serve_next_gdbserver();
                     }
-                    options.container_main(&global, options.autopilot, hermit, id)
+                    options.container_main(&global, options.autopilot, hermit, id, image.as_ref())
                 },
             )
             .map(|(value, _guards)| value)
@@ -256,9 +285,17 @@ impl ReplayOpts {
             // Recorded rather than quietly deleted, because the claim is in a
             // landed commit message where it cannot be edited.
             let gdb_watch = GdbClientWatch::spawn(gdb_command, port)?;
-            let (mut container, identity) = deterministic_container()?;
+            let (mut container, identity, staging) =
+                recording_container(image_rootfs.as_deref(), &host_binds)?;
             network.configure(&mut container, false);
-            let guards = Rc::new(RefCell::new((identity, hermit, gdb_watch, gdbserver_port)));
+            let image = metadata.image.clone();
+            let guards = Rc::new(RefCell::new((
+                identity,
+                hermit,
+                gdb_watch,
+                gdbserver_port,
+                staging,
+            )));
             let resources = format!(
                 "replay {}, identity mounts and GDB watcher",
                 guards.borrow().1.data_dir().display()
@@ -276,7 +313,13 @@ impl ReplayOpts {
                     if let Some(port) = guards.borrow_mut().3.take() {
                         port.serve_next_gdbserver();
                     }
-                    options.container_main(&global, options.autopilot, &guards.borrow().1, id)
+                    options.container_main(
+                        &global,
+                        options.autopilot,
+                        &guards.borrow().1,
+                        id,
+                        image.as_ref(),
+                    )
                 },
             );
             // On unresolved cleanup the factory retains the SAME guard scope.
@@ -418,6 +461,7 @@ impl ReplayOpts {
         autopilot: bool,
         hermit: &HermitData,
         id: Id,
+        image: Option<&hermit::RecordedImage>,
     ) -> Result<ExitStatus, Error> {
         let _guard = global.init_tracing();
 
@@ -425,9 +469,40 @@ impl ReplayOpts {
         // which returns `hermit::SchedulerEndedRun`: the deadlock under
         // Hermit's model the recording ended on.
         if autopilot {
-            hermit.replay(id)
+            hermit.replay_with_image(id, image)
         } else {
-            hermit.replay_with_gdbserver(id, self.gdbserver_port)
+            hermit.replay_with_gdbserver_and_image(id, self.gdbserver_port, image)
+        }
+    }
+}
+
+/// The container a replay runs in: the shared record image
+/// container over the recording's re-entered rootfs, or today's
+/// host-root deterministic container for a recording that ran on
+/// the host root. The staging guard (image case) backs the guest's
+/// private `/tmp` and is held beside the identity guard.
+/// `host_binds` are Hermit's own paths bound at the same path (the
+/// recording directory, any log file), as in
+/// `record_image_container`.
+fn recording_container(
+    image_rootfs: Option<&Path>,
+    host_binds: &[PathBuf],
+) -> Result<
+    (
+        reverie::process::Container,
+        super::container::IdentityGuard,
+        Option<tempfile::TempDir>,
+    ),
+    Error,
+> {
+    match image_rootfs {
+        Some(rootfs) => {
+            let (container, identity, staging) = record_image_container(rootfs, &[], host_binds)?;
+            Ok((container, identity, Some(staging)))
+        }
+        None => {
+            let (container, identity) = deterministic_container()?;
+            Ok((container, identity, None))
         }
     }
 }

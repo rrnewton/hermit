@@ -1017,7 +1017,22 @@ impl RecordVersion {
 // took such a signal, would replay with different output. It is refused
 // here.
 // https://github.com/rrnewton/hermit/pull/5259
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x1a0);
+// 0x1a0 -> 0x1a2 (0x1a1 is reserved for
+// https://github.com/rrnewton/hermit/issues/5478, whose accepted-range
+// `compatible_with` this change does not adopt; whichever of the two
+// lands second takes the other's scheme at its own number. This number
+// is reserved in dev-hermit
+// ai_docs/reports/hermit-record-version-reservations.md):
+// `hermit record start --image` binds a recording to the OCI rootfs it
+// ran in: metadata.json now carries the image reference and its
+// resolved content identity (`Metadata::image`), and replay re-enters
+// that rootfs or refuses by name before the guest starts. `Metadata`
+// does not refuse unknown fields, so without this bump a replayer that
+// predates the field would parse an image recording, ignore the field,
+// and replay it on the host root with the host's loader and libraries.
+// With the bump it refuses by version instead. Every new recording
+// carries the field (`null` without `--image`), so all of them move.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x1a2);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -1042,7 +1057,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x1a0);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x1a0;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x1a2;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1076,9 +1091,75 @@ impl RecordedSchedule {
     }
 }
 
+/// Where a recording's image came from. Mirrors the CLI's
+/// `manifest::ImageSource` (`hermit-cli/src/bin/hermit/manifest.rs`)
+/// variant for variant, with the same serde spelling: the library
+/// cannot name the binary's type, so the binary converts between the
+/// two (see the `From`/`TryFrom` impls beside `manifest::Image`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RecordedImageSource {
+    /// A reference resolved against the local podman store.
+    PodmanStore,
+    /// A local OCI layout directory (`oci-dir:`).
+    OciDir,
+    /// A local Docker archive tarball (`docker-archive:`).
+    DockerArchive,
+}
+
+/// The resolved content identity of a recording's `--image`, mirroring
+/// the CLI's `manifest::Image` field for field. `identity` is the
+/// canonical content identity for the source: a podman image ID, an
+/// OCI manifest digest without the algorithm prefix, or a
+/// docker-archive config digest without the algorithm prefix.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordedImageIdentity {
+    /// Where the image came from.
+    pub source: RecordedImageSource,
+    /// The store reference as supplied. Omitted (`None`) for local
+    /// sources, whose reference is the host path in
+    /// [`RecordedImage::reference`].
+    pub reference: Option<String>,
+    /// Canonical content identity for the source (see above).
+    pub identity: String,
+    /// OCI manifest digest (`sha256:...`) when the source records one.
+    pub manifest_digest: Option<String>,
+    /// Canonical image/config ID (64 hex digits) when the source has one.
+    pub image_id: Option<String>,
+}
+
+impl RecordedImageIdentity {
+    /// Whether two records name the same image content, as
+    /// `manifest::Image::same_content_identity` defines it: the
+    /// supplied reference is intentionally not compared, because the
+    /// same content can be reached through a tag, an ID, or a
+    /// digest-pinned reference.
+    pub fn same_content_identity(&self, other: &Self) -> bool {
+        self.source == other.source
+            && self.identity == other.identity
+            && self.manifest_digest == other.manifest_digest
+            && self.image_id == other.image_id
+    }
+}
+
+/// The image a recording ran inside (`hermit record start --image`):
+/// the reference a replay re-materializes, and the content identity
+/// that materialization must resolve to. A replay re-enters this
+/// rootfs or refuses by name before the guest starts; it never falls
+/// back to the host root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordedImage {
+    /// The `--image` value as recorded, with a local path made
+    /// absolute: a relative path would resolve against a later
+    /// replay's working directory instead of the recording's.
+    pub reference: String,
+    /// The content identity the recording's materialization resolved.
+    pub identity: RecordedImageIdentity,
+}
+
 /// Choices `hermit record start` makes that the recording stores in its
 /// `metadata.json` and that its replays honor.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct RecordOptions {
     /// Run the guest with an isolated loopback interface instead of the host
     /// network (`record start --network local`).
@@ -1089,6 +1170,11 @@ pub struct RecordOptions {
     pub cpu_profile: detcore_model::cpu_profile::CpuProfile,
     /// How the guest's threads are scheduled.
     pub schedule: RecordedSchedule,
+    /// The image the guest runs inside (`record start --image`), already
+    /// materialized and resolved by the caller, which owns the
+    /// container: the recorder only binds it into the metadata so
+    /// every replay re-enters the same rootfs.
+    pub image: Option<RecordedImage>,
 }
 
 /// Metadata associated with the recording. This is serialized as a JSON file.
@@ -1190,6 +1276,13 @@ pub struct Metadata {
     /// Absent means the default scheduler.
     #[serde(default)]
     pub schedule: RecordedSchedule,
+    /// The image the recording ran inside (`record start --image`), or
+    /// `None` for a host-root recording. Written by every recorder at
+    /// this version (see the 0x1a2 bump above): a replay of an image
+    /// recording re-enters this rootfs by its content identity or
+    /// refuses by name before the guest starts, and never falls back
+    /// to the host root.
+    pub image: Option<RecordedImage>,
 }
 
 impl Metadata {
@@ -1255,18 +1348,46 @@ impl Metadata {
             cpu_table_digest: None,
             cpu_profile_residual: None,
             schedule: RecordedSchedule::Default,
+            // Stamped by the recorder from the caller's resolved
+            // `--image` before the metadata is written.
+            image: None,
         })
     }
 
     /// Reads the metadata of the recording stored in `dir`.
     pub fn load(dir: &Path) -> Result<Self, Error> {
         let metadata_path = dir.join(METADATA_NAME);
-        // Buffered: serde_json reads an unbuffered file one byte per read(2).
-        serde_json::from_reader(std::io::BufReader::new(
-            fs::File::open(&metadata_path)
-                .with_context(|| format!("Failed to open {:?}", metadata_path))?,
-        ))
-        .with_context(|| format!("Failed to parse {:?}", metadata_path))
+        let bytes = fs::read(&metadata_path)
+            .with_context(|| format!("Failed to open {:?}", metadata_path))?;
+        let metadata: Self = serde_json::from_slice(&bytes)
+            .with_context(|| format!("Failed to parse {:?}", metadata_path))?;
+        // Serde reads a missing `Option` field as `None`, so absence
+        // of `image` must be told apart from a stated `null` here.
+        // (An edit to an explicit `null` stays indistinguishable
+        // from a genuine host-root recording: metadata.json is
+        // unauthenticated, and this check catches deletion, the
+        // edit a reader could otherwise make by accident.)
+        // every recorder at 0x1a2 or later writes the field, and a
+        // recording at such a version without it was edited — reading
+        // it as a host-root recording would silently replay an image
+        // recording against the host's loader and libraries. Older
+        // recordings state no field and load, so the version gate
+        // refuses them with its own wording.
+        if metadata.version >= RecordVersion(0x1a2) {
+            let raw: serde_json::Value = serde_json::from_slice(&bytes)
+                .with_context(|| format!("Failed to parse {:?}", metadata_path))?;
+            if raw.get("image").is_none() {
+                return Err(Error::msg(format!(
+                    "{:?} states no \"image\" field, which every recording at its \
+                     version ({:?}) writes (null for a host-root recording); the \
+                     file was edited, and treating it as a host-root recording \
+                     could replay an image recording on the host root. Restore \
+                     the field from the recording as made, or record again.",
+                    metadata_path, metadata.version
+                )));
+            }
+        }
+        Ok(metadata)
     }
 
     /// Constructs a command from the metadata.
@@ -2266,6 +2387,18 @@ mod tests {
         assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
     }
 
+    /// A replayer older than 0x1a2 predates `Metadata::image`: it would
+    /// parse an image recording, ignore the field, and replay it on the
+    /// host root. The gate must refuse the previous epochs instead
+    /// (0x1a1 is issue 5478's; this build does not speak it either).
+    #[test]
+    fn record_version_rejects_streams_from_before_recorded_images() {
+        assert_eq!(RECORD_VERSION, RecordVersion(0x1a2));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x1a1)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x1a0)));
+        assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
+    }
+
     /// A recording older than 0x149 was made when /proc/cpuinfo showed the
     /// host's CPU while CPUID showed the virtual one
     /// (https://github.com/rrnewton/hermit/issues/4161).
@@ -2667,7 +2800,7 @@ mod tests {
     fn record_version_rejects_streams_from_before_the_corrected_rcb_event() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x19a)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x186)));
-        assert!(RECORD_VERSION.compatible_with(&RecordVersion(0x1a0)));
+        assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
     }
 
     #[test]
@@ -2691,6 +2824,7 @@ mod tests {
             "domainname": null,
             "envs": {},
             "version": RECORD_VERSION,
+            "image": null,
         }))
         .unwrap();
         assert_eq!(metadata.local_networking, None);
@@ -2720,5 +2854,55 @@ mod tests {
         let loaded: Metadata =
             serde_json::from_str(&serde_json::to_string(&metadata).unwrap()).unwrap();
         assert_eq!(loaded.schedule, RecordedSchedule::Chaos { seed: 7 });
+    }
+
+    /// The recorded image binds a replay to its rootfs by content
+    /// identity: it round-trips through metadata JSON, and content
+    /// comparison ignores the supplied reference while seeing every
+    /// identity field.
+    #[test]
+    fn a_recorded_image_round_trips_through_metadata_json() {
+        let digest = "a".repeat(64);
+        let image = RecordedImage {
+            reference: "oci-dir:/srv/rootfs".to_owned(),
+            identity: RecordedImageIdentity {
+                source: RecordedImageSource::OciDir,
+                reference: None,
+                identity: digest.clone(),
+                manifest_digest: Some(format!("sha256:{digest}")),
+                image_id: None,
+            },
+        };
+        let mut metadata = Metadata::new(&Command::new("/bin/true")).unwrap();
+        metadata.image = Some(image.clone());
+        let loaded: Metadata =
+            serde_json::from_str(&serde_json::to_string(&metadata).unwrap()).unwrap();
+        assert_eq!(loaded.image, Some(image));
+
+        let other_reference = RecordedImageIdentity {
+            reference: Some("docker.io/library/busybox:latest".to_owned()),
+            ..metadata.image.as_ref().unwrap().identity.clone()
+        };
+        assert!(
+            metadata
+                .image
+                .as_ref()
+                .unwrap()
+                .identity
+                .same_content_identity(&other_reference)
+        );
+        let other_content = RecordedImageIdentity {
+            identity: "b".repeat(64),
+            manifest_digest: Some(format!("sha256:{}", "b".repeat(64))),
+            ..metadata.image.as_ref().unwrap().identity.clone()
+        };
+        assert!(
+            !metadata
+                .image
+                .as_ref()
+                .unwrap()
+                .identity
+                .same_content_identity(&other_content)
+        );
     }
 }

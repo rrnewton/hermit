@@ -584,6 +584,9 @@ use goblin::elf::section_header;
 pub use id::Id;
 use metadata::Metadata;
 pub use metadata::RecordOptions;
+pub use metadata::RecordedImage;
+pub use metadata::RecordedImageIdentity;
+pub use metadata::RecordedImageSource;
 pub use metadata::RecordedSchedule;
 pub use ptrace_completion::HermitCleanupStage;
 pub use ptrace_completion::HermitCleanupUnconfirmed;
@@ -4978,6 +4981,20 @@ impl HermitData {
         replay_from(&data)
     }
 
+    /// Replays the given recording ID inside the container the caller
+    /// built from `image` (see [`replay_from_with_image`]).
+    ///
+    /// The ptrace session runs on a tracer thread, so the calling thread needs no
+    /// particular stack; see [`run`].
+    pub fn replay_with_image(
+        &self,
+        id: Id,
+        image: Option<&RecordedImage>,
+    ) -> Result<ExitStatus, Error> {
+        let data = self.data_dir.join(id.to_string());
+        replay_from_with_image(&data, image)
+    }
+
     /// Replays the given recording ID with a gdbserver available to attach to.
     ///
     /// The ptrace session runs on a tracer thread, so the calling thread needs no
@@ -4985,6 +5002,22 @@ impl HermitData {
     pub fn replay_with_gdbserver(&self, id: Id, port: u16) -> Result<ExitStatus, Error> {
         let data = self.data_dir.join(id.to_string());
         replay_with_gdbserver(&data, port)
+    }
+
+    /// Replays the given recording ID with a gdbserver available to
+    /// attach to, inside the container the caller built from `image`
+    /// (see [`replay_from_with_image`]).
+    ///
+    /// The ptrace session runs on a tracer thread, so the calling thread needs no
+    /// particular stack; see [`run`].
+    pub fn replay_with_gdbserver_and_image(
+        &self,
+        id: Id,
+        port: u16,
+        image: Option<&RecordedImage>,
+    ) -> Result<ExitStatus, Error> {
+        let data = self.data_dir.join(id.to_string());
+        replay_with_gdbserver_and_image(&data, port, image)
     }
 
     /// Returns an iterator over the recordings.
@@ -5555,8 +5588,31 @@ async fn record_with_output_async(
 ///
 /// The ptrace session runs on a tracer thread, so the calling thread needs no
 /// particular stack; see [`run`].
+/// The image the recording in `dir` ran inside, if it recorded one:
+/// what a caller building that recording's replay container
+/// re-enters, and then states back to the replay call.
+pub fn recording_image(dir: &Path) -> Result<Option<RecordedImage>, Error> {
+    Ok(Metadata::load(dir)?.image)
+}
+
 pub fn replay_from(dir: &Path) -> Result<ExitStatus, Error> {
-    replay_plain(dir, None, &[])
+    replay_plain(dir, None, &[], None)
+}
+
+/// Replays inside the container the caller built from `image`, the
+/// recording's recorded image identity. The caller owns the
+/// container; this only states which rootfs it was built from, so an
+/// image recording refuses a replay on any other root before the
+/// guest starts. `None` states a host-root container, as
+/// [`replay_from`] does.
+///
+/// The ptrace session runs on a tracer thread, so the calling thread needs no
+/// particular stack; see [`run`].
+pub fn replay_from_with_image(
+    dir: &Path,
+    image: Option<&RecordedImage>,
+) -> Result<ExitStatus, Error> {
+    replay_plain(dir, None, &[], image)
 }
 
 /// Replays with a gdb server.
@@ -5564,7 +5620,20 @@ pub fn replay_from(dir: &Path) -> Result<ExitStatus, Error> {
 /// The ptrace session runs on a tracer thread, so the calling thread needs no
 /// particular stack; see [`run`].
 pub fn replay_with_gdbserver(dir: &Path, port: u16) -> Result<ExitStatus, Error> {
-    replay_plain(dir, Some(port), &[])
+    replay_plain(dir, Some(port), &[], None)
+}
+
+/// Replays with a gdb server inside the container the caller built
+/// from `image` (see [`replay_from_with_image`]).
+///
+/// The ptrace session runs on a tracer thread, so the calling thread needs no
+/// particular stack; see [`run`].
+pub fn replay_with_gdbserver_and_image(
+    dir: &Path,
+    port: u16,
+    image: Option<&RecordedImage>,
+) -> Result<ExitStatus, Error> {
+    replay_plain(dir, Some(port), &[], image)
 }
 
 /// Replays with a gdb server and mounts inside the replay chroot.
@@ -5576,16 +5645,37 @@ pub fn replay_with_gdbserver_and_mounts(
     port: u16,
     mounts: &[Mount],
 ) -> Result<ExitStatus, Error> {
-    replay_plain(dir, Some(port), mounts)
+    replay_plain(dir, Some(port), mounts, None)
 }
 
-fn replay_plain(dir: &Path, port: Option<u16>, mounts: &[Mount]) -> Result<ExitStatus, Error> {
+/// Replays with a gdb server and mounts inside the replay chroot,
+/// inside the container the caller built from `image` (see
+/// [`replay_from_with_image`]).
+///
+/// The ptrace session runs on a tracer thread, so the calling thread needs no
+/// particular stack; see [`run`].
+pub fn replay_with_gdbserver_and_mounts_and_image(
+    dir: &Path,
+    port: u16,
+    mounts: &[Mount],
+    image: Option<&RecordedImage>,
+) -> Result<ExitStatus, Error> {
+    replay_plain(dir, Some(port), mounts, image)
+}
+
+fn replay_plain(
+    dir: &Path,
+    port: Option<u16>,
+    mounts: &[Mount],
+    image: Option<&RecordedImage>,
+) -> Result<ExitStatus, Error> {
     let dir = dir.to_owned();
     let mounts = mounts.to_vec();
+    let image = image.cloned();
     ptrace_completion::run_on_tracer_thread(None, move |control| async move {
         let report = SkidOvershootReport::begin(true);
         let result = async {
-            Replay::spawn(&dir, false, port, &mounts)
+            Replay::spawn(&dir, false, port, &mounts, image.as_ref())
                 .await?
                 .wait(control)
                 .await
@@ -5608,12 +5698,27 @@ pub fn replay_with_output(dir: &Path) -> Result<Output, Error> {
 /// The ptrace session runs on a tracer thread, so the calling thread needs no
 /// particular stack; see [`run`].
 pub fn replay_with_output_and_mounts(dir: &Path, mounts: &[Mount]) -> Result<Output, Error> {
+    replay_with_output_and_mounts_and_image(dir, mounts, None)
+}
+
+/// Replays with captured output and mounts inside the replay chroot,
+/// inside the container the caller built from `image` (see
+/// [`replay_from_with_image`]).
+///
+/// The ptrace session runs on a tracer thread, so the calling thread needs no
+/// particular stack; see [`run`].
+pub fn replay_with_output_and_mounts_and_image(
+    dir: &Path,
+    mounts: &[Mount],
+    image: Option<&RecordedImage>,
+) -> Result<Output, Error> {
     let dir = dir.to_owned();
     let mounts = mounts.to_vec();
+    let image = image.cloned();
     ptrace_completion::run_on_tracer_thread(None, move |control| async move {
         let report = SkidOvershootReport::begin(true);
         let result = async {
-            Replay::spawn(&dir, true, None, &mounts)
+            Replay::spawn(&dir, true, None, &mounts, image.as_ref())
                 .await?
                 .wait_with_output(control)
                 .await

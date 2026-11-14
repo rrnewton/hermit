@@ -4621,6 +4621,260 @@ pub(super) fn deterministic_container() -> Result<(Container, IdentityGuard), Er
     Ok((container, identity_guard))
 }
 
+/// A `record start --image` rootfs, materialized once: the identity
+/// the recording binds, and the materialized tree both the recording
+/// and its immediate `--verify` replay run in.
+#[derive(Clone, Debug)]
+pub(super) struct RecordImageRootfs {
+    /// What the recording's metadata stores for its replays.
+    pub recorded: hermit::RecordedImage,
+    /// The materialized rootfs `recorded` was resolved from.
+    pub rootfs: PathBuf,
+}
+
+/// The `--image` value a recording stores: a local path made absolute,
+/// so it names the same input from a later replay's working
+/// directory. Store references are recorded as given; a bare-relative
+/// local spelling is left for materialization to refuse by name.
+fn absolutized_image_reference(image_ref: &str) -> Result<String, Error> {
+    use crate::app::image_source::ImageSourceRef;
+    match crate::app::image_source::parse_image_source(image_ref) {
+        ImageSourceRef::Local { kind, path } => Ok(format!(
+            "{}:{}",
+            kind.prefix(),
+            std::path::absolute(&path)
+                .with_context(|| {
+                    format!("cannot make --image path {} absolute", path.display())
+                })?
+                .display()
+        )),
+        ImageSourceRef::StoreReference | ImageSourceRef::BareRelative { .. } => {
+            Ok(image_ref.to_owned())
+        }
+    }
+}
+
+/// The identity a recording binds from a materialization of
+/// `reference`. A materialization that resolved no identity (the
+/// legacy store-cache fallback) refuses by name: without one the
+/// recording has no content for a replay to re-enter.
+fn require_recorded_identity(
+    reference: &str,
+    identity: Option<crate::app::manifest::Image>,
+) -> Result<crate::app::manifest::Image, Error> {
+    identity.ok_or_else(|| {
+        Error::msg(format!(
+            "record start --image={reference} materialized without a resolved content \
+             identity, so the recording cannot bind the rootfs it ran in; use a \
+             digest-pinned store reference or a local oci-dir:/docker-archive: image"
+        ))
+    })
+}
+
+/// Materialize `image_ref` for a recording and resolve the identity
+/// the recording binds ([`require_recorded_identity`]).
+pub(super) fn resolve_record_image(image_ref: &str) -> Result<RecordImageRootfs, Error> {
+    let reference = absolutized_image_reference(image_ref)?;
+    let materialized = crate::app::image::materialize_rootfs(&reference)?;
+    let identity = require_recorded_identity(&reference, materialized.identity)?;
+    Ok(RecordImageRootfs {
+        recorded: hermit::RecordedImage {
+            reference,
+            identity: identity.into(),
+        },
+        rootfs: materialized.path,
+    })
+}
+
+/// Re-materialize the rootfs a recording ran in, choosing it by its
+/// recorded content identity, never by its path alone. Every failure
+/// — the reference gone or unreadable, not an image, absent from the
+/// store, or resolving to different content — is the caller's refusal
+/// to name with the recording; no path here falls back to the host
+/// root.
+pub(super) fn reenter_record_image(recorded: &hermit::RecordedImage) -> Result<PathBuf, Error> {
+    let expected =
+        crate::app::manifest::Image::try_from(recorded.identity.clone()).map_err(|error| {
+            Error::msg(format!(
+                "the recording's image identity is not one a materialization could \
+                 have resolved: {error}"
+            ))
+        })?;
+    let materialized = crate::app::image::materialize_rootfs(&recorded.reference)?;
+    crate::app::image::ensure_materialized_identity_matches(
+        &recorded.reference,
+        Some(&expected),
+        materialized.identity.as_ref(),
+    )?;
+    Ok(materialized.path)
+}
+
+/// The container a recording (or its replay) runs in inside `rootfs`:
+/// [`image_container`] with the private `/tmp` staging and `--mount`
+/// retargeting `hermit run --image` does. The recording and both of
+/// its replays — `record start --verify`'s and `hermit replay`'s —
+/// build through here, so each enters the same rootfs the same way.
+/// The returned staging directory backs the guest's private `/tmp`
+/// and must be held until after `Container::run` returns, beside the
+/// [`IdentityGuard`].
+///
+/// `host_binds` are Hermit's own host paths the code inside the
+/// container must keep reaching at the same absolute path — the
+/// recording directory the recorder writes and the replayer reads,
+/// and any log file tracing opens inside. Each is bound at its own
+/// path, preparing the target in the rootfs (or, under `/tmp`, in
+/// the staging bound there) as `run --image` prepares a `--bind`
+/// target. The guest can see these files, as it can on the host
+/// root today, where the recording directory is ordinary host
+/// filesystem; their mount rows record like a caller's binds, so
+/// the replay, which builds the same binds and renders the recorded
+/// mount table, shows the guest the same bytes.
+pub(super) fn record_image_container(
+    rootfs: &Path,
+    mounts: &[crate::app::run::MountArg],
+    host_binds: &[PathBuf],
+) -> Result<(Container, IdentityGuard, tempfile::TempDir), Error> {
+    let staging = tempfile::tempdir().context("cannot create the guest's private /tmp")?;
+    // Hermit's paths, plus every bind mount's source at its own
+    // path: a replay inside this container re-binds each source
+    // into its own chroot (`prepare_replay_mounts` stats and mounts
+    // it controller-side), so the source must name the same file
+    // inside the container as outside. Sources bind read-only:
+    // the controller only reads them, and the guest reaches the
+    // source's files read-write only through its own mount when
+    // that mount allows it — a writable self-bind would hand the
+    // guest a second, writable path around a readonly `--mount`.
+    let mut workdir_binds: Vec<(PathBuf, PathBuf, bool)> = host_binds
+        .iter()
+        .map(|path| (path.clone(), path.clone(), false))
+        .collect();
+    for mount in mounts {
+        if crate::app::run::image_mount_kind(mount)? == crate::app::run::ImageMountKind::Bind
+            && let Some(source) = mount.get_source()
+            && !workdir_binds.iter().any(|(bound, _, _)| bound == source)
+        {
+            workdir_binds.push((source.to_path_buf(), source.to_path_buf(), true));
+        }
+    }
+    for (source, target, _) in &workdir_binds {
+        // The image container installs its own /proc and /dev after
+        // these binds, so a Hermit path under either would be bound
+        // and then shadowed — unreachable inside, failing obscurely
+        // instead of by name here.
+        for managed in ["/proc", "/dev"] {
+            anyhow::ensure!(
+                !target.starts_with(managed),
+                "host bind target {} is inside {managed}, which the image container \
+                 provides itself; put the recording directory and any log file \
+                 outside {managed} (for example under /tmp or a data directory)",
+                target.display()
+            );
+        }
+        let rel = target.strip_prefix("/").unwrap_or(target);
+        let want_dir = source.is_dir();
+        if let Ok(under_tmp) = target.strip_prefix("/tmp") {
+            crate::app::run::prepare_image_mount_target(
+                staging.path(),
+                under_tmp,
+                want_dir,
+                target,
+                "host bind",
+                "the guest's private /tmp",
+            )?;
+        } else {
+            crate::app::run::prepare_image_mount_target(
+                rootfs,
+                rel,
+                want_dir,
+                target,
+                "host bind",
+                "the image rootfs",
+            )?;
+        }
+    }
+    // The caller's mounts, retargeted into the rootfs, as in
+    // `RunOpts::container`: a target under /tmp is prepared in the
+    // private /tmp staging (bound at the rootfs's /tmp before these
+    // mounts); one under an earlier mount is left to container setup.
+    let mut image_mounts: Vec<Mount> = Vec::with_capacity(mounts.len());
+    for (index, mount) in mounts.iter().enumerate() {
+        let target = mount.get_target().to_path_buf();
+        let rel = target.strip_prefix("/").unwrap_or(&target).to_path_buf();
+        let under_earlier = mounts[..index]
+            .iter()
+            .any(|earlier| target.starts_with(earlier.get_target()))
+            || workdir_binds
+                .iter()
+                .any(|(_, bind_target, _)| target.starts_with(bind_target));
+        if !under_earlier {
+            let want_dir = match crate::app::run::image_mount_kind(mount)? {
+                crate::app::run::ImageMountKind::Tmpfs => true,
+                crate::app::run::ImageMountKind::Bind => {
+                    mount.get_source().is_some_and(|source| source.is_dir())
+                }
+            };
+            if let Ok(under_tmp) = target.strip_prefix("/tmp") {
+                crate::app::run::prepare_image_mount_target(
+                    staging.path(),
+                    under_tmp,
+                    want_dir,
+                    &target,
+                    "--mount",
+                    "the guest's private /tmp",
+                )?;
+            } else {
+                crate::app::run::prepare_image_mount_target(
+                    rootfs,
+                    &rel,
+                    want_dir,
+                    &target,
+                    "--mount",
+                    "the image rootfs",
+                )?;
+            }
+        }
+        image_mounts.push((**mount).clone().target(rootfs.join(&rel)));
+    }
+    let placeholder = detcore::needs_directory_placeholder(&hermit::backend_capabilities(
+        hermit::Backend::Ptrace,
+    ));
+    let (mut container, mut identity_sources) = image_container(
+        rootfs,
+        staging.path(),
+        true,
+        None,
+        true,
+        placeholder,
+        ImageContainerOpts {
+            bind_kvm: false,
+            workdir_binds: &workdir_binds,
+            mounts: &image_mounts,
+        },
+    )?;
+    // The container init's working directory inside the image: the
+    // code inside reads its current directory (a recording's
+    // metadata captures it), and the host working directory names
+    // nothing in the rootfs. The guest's own working directory
+    // (`--workdir`, else this) is set on its command.
+    container.current_dir("/");
+    // Deterministic mountinfo roots for the caller's mounts and
+    // Hermit's binds, as in `hermit run --image`.
+    for (_, target, _) in &workdir_binds {
+        identity_sources.add_user_bind(target, None);
+    }
+    for mount in mounts {
+        match crate::app::run::image_mount_kind(mount)? {
+            crate::app::run::ImageMountKind::Bind => {
+                identity_sources.add_user_bind(mount.get_target(), None)
+            }
+            crate::app::run::ImageMountKind::Tmpfs => {
+                identity_sources.add_user_tmpfs(mount.get_target())
+            }
+        }
+    }
+    Ok((container, identity_sources, staging))
+}
+
 /// Tie the container's init process to the lifetime of the `hermit` process
 /// that created it.
 ///
@@ -7218,6 +7472,54 @@ mod tests {
         assert_eq!(
             provenance.deterministic_mountpoint_prefix.as_deref(),
             Some(b"/tmp".as_slice())
+        );
+    }
+
+    /// A recording stores its `--image` with a local path made
+    /// absolute; store references (and the refused bare-relative
+    /// spelling) are recorded as given.
+    #[test]
+    fn a_recorded_image_reference_makes_a_local_path_absolute() {
+        let absolute = absolutized_image_reference("oci-dir:/srv/rootfs").unwrap();
+        assert_eq!(absolute, "oci-dir:/srv/rootfs");
+        let relative = absolutized_image_reference("oci-dir:./rootfs").unwrap();
+        assert!(
+            relative.starts_with("oci-dir:/") && relative.ends_with("/rootfs"),
+            "{relative}"
+        );
+        assert_eq!(
+            absolutized_image_reference("docker.io/library/busybox@sha256:abc").unwrap(),
+            "docker.io/library/busybox@sha256:abc"
+        );
+        assert_eq!(
+            absolutized_image_reference("oci-dir:my-image").unwrap(),
+            "oci-dir:my-image"
+        );
+    }
+
+    /// A materialization that resolved no identity cannot bind a
+    /// recording: refused by name, with the working spellings.
+    #[test]
+    fn a_recording_requires_a_resolved_image_identity() {
+        let error = require_recorded_identity("docker.io/library/busybox:latest", None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("materialized without a resolved content identity"),
+            "{error}"
+        );
+        assert!(error.contains("oci-dir:"), "{error}");
+        let digest = "a".repeat(64);
+        let image = crate::app::manifest::Image {
+            source: crate::app::manifest::ImageSource::OciDir,
+            reference: None,
+            identity: digest.clone(),
+            manifest_digest: Some(format!("sha256:{digest}")),
+            image_id: None,
+        };
+        assert_eq!(
+            require_recorded_identity("oci-dir:/srv/rootfs", Some(image.clone())).unwrap(),
+            image
         );
     }
 

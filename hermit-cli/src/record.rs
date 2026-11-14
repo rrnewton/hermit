@@ -50,14 +50,22 @@ impl Record {
         mountinfo_mount_ids: Option<Vec<u64>>,
         options: Option<RecordOptions>,
     ) -> Result<Self, Error> {
-        let cpu_profile = options.unwrap_or_default().cpu_profile;
+        // Bound once: the choices name what the recording stores, and a
+        // library caller that chose nothing stores the defaults.
+        let chosen = options.is_some();
+        let options = options.unwrap_or_default();
+        let cpu_profile = options.cpu_profile;
         crate::cpu_profile_admission::check_record_or_replay(cpu_profile)?;
         let mut metadata = Metadata::new(&command)?;
-        metadata.local_networking = options.map(|options| options.local_networking);
+        metadata.local_networking = chosen.then_some(options.local_networking);
         // A recording always names its level, so its replay does not depend
         // on the replaying Hermit's default.
-        metadata.proc_level = Some(options.unwrap_or_default().proc_level);
-        metadata.schedule = options.unwrap_or_default().schedule;
+        metadata.proc_level = Some(options.proc_level);
+        metadata.schedule = options.schedule;
+        // The image this recording runs inside, resolved by the caller
+        // that built the container: bound here so every replay
+        // re-enters the same rootfs by its content identity.
+        metadata.image = options.image;
         // Under x86-64-v3 the host must qualify, and the recording binds the
         // host facts the guest's answers come from
         // (https://github.com/rrnewton/hermit/issues/4243).

@@ -244,6 +244,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "random_uuid_determinism",
             "--test",
+            "record_image",
+            "--test",
             "redis_strict",
             "--test",
             "relaxed_flag_matrix",

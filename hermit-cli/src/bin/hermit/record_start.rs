@@ -41,18 +41,23 @@ use reverie::process::MountFlags;
 
 use super::container::IdentityGuard;
 use super::container::PlannedMount;
+use super::container::RecordImageRootfs;
 use super::container::container_proc_mount;
 use super::container::identity_hardening_mounts;
 use super::container::is_below_dev_shm;
 use super::container::namespace_container;
 use super::container::private_dev_shm;
 use super::container::private_mqueue;
+use super::container::record_image_container;
+use super::container::reenter_record_image;
 use super::container::refuse_bind_from_host_dev_shm;
+use super::container::resolve_record_image;
 use super::gdb_client::CLIENT_EXITED_BEFORE_CONNECTING;
 use super::gdb_client::GdbClientWatch;
 use super::global_opts::GlobalOpts;
 use super::record_envelope::RecordEnvelope;
 use super::run::BaseEnv;
+use super::run::MountArg;
 use super::run::NetworkingMode;
 use super::run::apply_base_environment;
 use super::run::parse_assignment;
@@ -248,7 +253,36 @@ pub struct StartOpts {
 
     /// Mount a file, directory, or fresh filesystem for recording and an immediate verify replay.
     #[clap(long)]
-    mount: Vec<Mount>,
+    mount: Vec<MountArg>,
+
+    /// Record the guest against the root filesystem of an OCI image
+    /// instead of the host filesystem, as `hermit run --image` does
+    /// (a podman-store reference, `oci-dir:/path`, or
+    /// `docker-archive:/file.tar`; see `hermit run --help`). The
+    /// recording stores the image reference and the content identity
+    /// its materialization resolved to, and every replay — an
+    /// immediate `--verify` replay and a later `hermit replay` —
+    /// re-enters that rootfs by its identity or refuses by name
+    /// before the guest starts; no replay falls back to the host
+    /// root. Unlike `hermit run --image`, an explicit PROGRAM is
+    /// always required and the image's Entrypoint/Cmd, Env and
+    /// WorkingDir are NOT applied: `--workdir`, `-e` and
+    /// `--base-env` govern, and the recorded environment is what a
+    /// replay runs with. Hermit's recording directory and any log
+    /// file are bound into the image at their host paths, as they
+    /// are visible on the host root without `--image`, so a
+    /// recording's guest-visible mount table names those host
+    /// paths. Runs only on the ptrace backend, without
+    /// binary-rewriting preprocessing.
+    #[clap(long, value_name = "OCI-REFERENCE")]
+    image: Option<String>,
+
+    /// The `--image` rootfs once materialized and resolved
+    /// (`resolve_record_image`): the recording and its immediate
+    /// replays run in this one tree, and its identity is what the
+    /// recording stores.
+    #[clap(skip)]
+    resolved_image: Option<RecordImageRootfs>,
 
     /// Select guest networking, with the same contract as `hermit run --network`. `local`
     /// (the default) gives the recording and its verify replay an isolated loopback
@@ -504,7 +538,93 @@ impl StartOpts {
             } else {
                 hermit::RecordedSchedule::Default
             },
+            image: self.recorded_image(),
         }
+    }
+
+    /// This invocation's mounts as the library's replay calls take
+    /// them (the spec each was parsed from stays behind).
+    fn replay_mounts(&self) -> Vec<Mount> {
+        self.mount.iter().map(|mount| (**mount).clone()).collect()
+    }
+
+    /// The image identity this invocation's containers are built
+    /// from, which its replays state back to the library.
+    fn recorded_image(&self) -> Option<hermit::RecordedImage> {
+        self.resolved_image
+            .as_ref()
+            .map(|image| image.recorded.clone())
+    }
+
+    /// `--image` on a backend or preprocessing path `record` cannot
+    /// run inside a rootfs: refused by name before the guest starts,
+    /// as `hermit run --image` refuses its unqualified backends. The
+    /// record runtime is ptrace; e9patch's rewritten-program overlay
+    /// is resolved and bound at host paths and has not been qualified
+    /// inside an OCI rootfs.
+    fn refuse_image_backend(
+        &self,
+        global: &GlobalOpts,
+        preparation: RecordPreparation<'_>,
+    ) -> Result<(), Error> {
+        if self.image.is_none() {
+            return Ok(());
+        }
+        if preparation.prepare.is_some() {
+            anyhow::bail!(
+                "record --image does not support {} preprocessing: its \
+                 rewritten-program overlay has not been qualified inside an OCI \
+                 rootfs; record on the ptrace backend without preprocessing \
+                 (drop --image, or drop the preprocessing backend selection)",
+                preparation.backend_name
+            );
+        }
+        if let Some(backend) = global.backend
+            && backend != Backend::Ptrace
+        {
+            anyhow::bail!(
+                "record --image runs only on the ptrace backend; --backend={} was selected",
+                backend.as_str()
+            );
+        }
+        Ok(())
+    }
+
+    /// The host path of this invocation's program inside `rootfs`, for
+    /// `--cpu-profile auto` classification: the file the guest will
+    /// exec, resolved as `hermit run --image` resolves it (an
+    /// absolute path as-is, a `/`-carrying relative path against
+    /// `--workdir`, a bare name searched on the guest's PATH inside
+    /// the image), then mapped into the materialized tree. Mounts
+    /// are not consulted, as run's auto resolution does not consult
+    /// them under `--image`.
+    fn image_guest_program(&self, rootfs: &Path) -> Result<PathBuf, Error> {
+        let program = self.program();
+        let guest = if program.is_absolute() || program.to_string_lossy().contains('/') {
+            let cwd = self
+                .workdir
+                .as_deref()
+                .map_or_else(|| PathBuf::from("/"), PathBuf::from);
+            super::run::resolve_image_guest_program(program, &cwd)?
+        } else {
+            let path_env = self
+                .guest_command()?
+                .get_captured_envs()
+                .into_iter()
+                .find(|(name, _)| name.to_string_lossy() == "PATH")
+                .map(|(_, value)| value.to_string_lossy().into_owned())
+                .unwrap_or_else(|| {
+                    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned()
+                });
+            super::run::search_image_path(rootfs, program, &path_env).ok_or_else(|| {
+                Error::msg(format!(
+                    "Could not resolve program {program:?} in PATH inside the image; \
+                     give its path inside the image (for example /usr/bin/{})",
+                    program.display()
+                ))
+            })?
+        };
+        Ok(crate::app::image::resolve_in_rootfs(rootfs, &guest))
     }
 
     /// The network the recording (and an immediate replay of it) runs in.
@@ -515,27 +635,46 @@ impl StartOpts {
     /// The recording's container, with `backend_mounts` (e9patch's overlay
     /// of the rewritten program) installed as a backend's own before the
     /// private `/dev/shm`, so that their sources are still the host's.
+    /// Under `--image` the container is the shared record image
+    /// container over the resolved rootfs instead, and the third
+    /// return is its private `/tmp` staging, held beside the guard.
     fn configured_container(
         &self,
         network: NetworkingMode,
         backend_mounts: Vec<Mount>,
-    ) -> Result<(Container, IdentityGuard), Error> {
+        host_binds: &[PathBuf],
+    ) -> Result<(Container, IdentityGuard, Option<tempfile::TempDir>), Error> {
         // This subcommand's own flags under the default policy, never a policy
         // another subcommand of this process set.
         super::pinned_cpu::set_settings(
             self.pinned_cpu_placement
                 .settings(super::pinned_cpu::PinnedCpuPolicy::Share, None),
         );
+        if let Some(image) = &self.resolved_image {
+            // Refused at admission (`refuse_image_backend`); a backend
+            // mount here would bind a host-resolved overlay over a
+            // path inside the rootfs.
+            anyhow::ensure!(
+                backend_mounts.is_empty(),
+                "record --image does not support preprocessing: its \
+                 rewritten-program overlay has not been qualified inside an OCI \
+                 rootfs; record on the ptrace backend without preprocessing"
+            );
+            let (mut container, identity_guard, staging) =
+                record_image_container(&image.rootfs, &self.mount, host_binds)?;
+            network.configure(&mut container, false);
+            return Ok((container, identity_guard, Some(staging)));
+        }
         let mut container = namespace_container(true, None)?;
         network.configure(&mut container, false);
         let (mut identity_mounts, mut identity_guard) = identity_hardening_mounts(None)?;
-        let dev_shm = private_dev_shm(self.mount.iter().map(Mount::get_target));
+        let mounts: Vec<Mount> = self.mount.iter().map(|mount| (**mount).clone()).collect();
+        let dev_shm = private_dev_shm(mounts.iter().map(Mount::get_target));
         // The caller's mounts below `/dev/shm`, which go into the private one.
-        let (into_dev_shm, user_mounts): (Vec<_>, Vec<_>) = self
-            .mount
+        let (into_dev_shm, user_mounts): (Vec<_>, Vec<_>) = mounts
             .iter()
             .partition(|mount| dev_shm.is_some() && is_below_dev_shm(mount.get_target()));
-        for mount in &self.mount {
+        for mount in &mounts {
             let user_target = mount.get_target();
             if into_dev_shm.contains(&mount) {
                 refuse_bind_from_host_dev_shm(mount)?;
@@ -561,20 +700,21 @@ impl StartOpts {
                 .map(|mount| PlannedMount::hermit(mount.clone().touch_target())),
         );
         plan.extend(
-            private_mqueue(self.mount.iter().map(Mount::get_target))?.map(PlannedMount::hermit),
+            private_mqueue(mounts.iter().map(Mount::get_target))?.map(PlannedMount::hermit),
         );
         identity_guard.set_plan(&mut container, plan)?;
         if let Some(workdir) = &self.workdir {
             container.current_dir(workdir);
         }
-        Ok((container, identity_guard))
+        Ok((container, identity_guard, None))
     }
 
     fn recording_container(
         &self,
         global: &GlobalOpts,
         preparation: RecordPreparation<'_>,
-    ) -> Result<(Container, IdentityGuard), Error> {
+        host_binds: &[PathBuf],
+    ) -> Result<(Container, IdentityGuard, Option<tempfile::TempDir>), Error> {
         // The rewritten program over its original path: backend-owned
         // mounts, which the guest's mount table leaves out.
         let overlay = self
@@ -588,7 +728,20 @@ impl StartOpts {
                 ]
             })
             .unwrap_or_default();
-        self.configured_container(self.network(), overlay)
+        self.configured_container(self.network(), overlay, host_binds)
+    }
+
+    /// Hermit's own host paths an `--image` container binds at the
+    /// same path (`record_image_container`): this run's log file,
+    /// which tracing opens inside the container, beside the
+    /// caller's recording directories.
+    fn image_host_binds(&self, global: &GlobalOpts, extra: &[PathBuf]) -> Vec<PathBuf> {
+        let mut binds = Vec::new();
+        if let Some(log_file) = &global.log_file {
+            binds.push(log_file.clone());
+        }
+        binds.extend(extra.iter().cloned());
+        binds
     }
 
     /// The `--verify-json` path this invocation will publish a verdict to, if
@@ -673,6 +826,19 @@ impl StartOpts {
         // original here would refuse a replay that would have run, so
         // Auto is resolved only for a run that records.
         let replay_only = self.verify_replay_of.is_some();
+        // `--image` materializes once, before anything reads the
+        // program: classification and the recording both work against
+        // this one rootfs, and its resolved identity is what the
+        // recording stores. A replay-only run resolves its image from
+        // the recording instead (`replay_from`).
+        if self.image.is_some() && self.resolved_image.is_none() && !replay_only {
+            self.refuse_image_backend(global, preparation)?;
+            super::run::validate_image_mounts(&self.mount, &[])?;
+            let resolved = resolve_record_image(self.image.as_deref().unwrap())?;
+            let mut with_image = self.clone();
+            with_image.resolved_image = Some(resolved);
+            return with_image.main_with_preparation(global, preparation);
+        }
         // `--cpu-profile auto` records the named profile it resolves to
         // (`hermit::cpu_profile_admission::resolve_auto`), so replay uses
         // that profile and never derives it again. The program and every
@@ -680,19 +846,35 @@ impl StartOpts {
         // path under a `--mount` target is read at its source, as the
         // guest sees it, never at the host file the target shadows.
         if self.cpu_profile == detcore_model::cpu_profile::CpuProfile::Auto && !replay_only {
-            let found = self.guest_command()?.find_program().with_context(|| {
-                format!("Could not resolve program {:?} in PATH", self.program())
-            })?;
             let refuse = |why: String| {
                 Error::new(crate::app::container::PolicyRefusal)
                     .context(format!("--cpu-profile auto refused: {why}"))
             };
-            let program = self
-                .mapped_launch_path(&found)
-                .ok_or_else(|| refuse(format!("{} is hidden by a mount", found.display())))?;
+            // Under `--image` the program auto classifies is the
+            // image's, read in the materialized rootfs; on the host
+            // root it is read in this launch's completed view.
+            let (program, image_rootfs) = match &self.resolved_image {
+                Some(image) => (
+                    self.image_guest_program(&image.rootfs)
+                        .map_err(|error| refuse(format!("{error}")))?,
+                    Some(image.rootfs.clone()),
+                ),
+                None => {
+                    let found = self.guest_command()?.find_program().with_context(|| {
+                        format!("Could not resolve program {:?} in PATH", self.program())
+                    })?;
+                    let program = self.mapped_launch_path(&found).ok_or_else(|| {
+                        refuse(format!("{} is hidden by a mount", found.display()))
+                    })?;
+                    (program, None)
+                }
+            };
             let (profile, why) =
                 match hermit::cpu_profile_admission::resolve_auto(&program, |guest| {
-                    self.mapped_launch_path(guest)
+                    match &image_rootfs {
+                        Some(rootfs) => Some(crate::app::image::resolve_in_rootfs(rootfs, guest)),
+                        None => self.mapped_launch_path(guest),
+                    }
                 }) {
                     Ok(resolved) => resolved,
                     Err(why) => {
@@ -764,8 +946,20 @@ impl StartOpts {
             let hermit = HermitData::from(self.data_dir.as_ref());
             let record_timeout = self.record_timeout();
             let record_options = self.record_options();
-
-            let (mut container, identity_guard) = self.recording_container(global, preparation)?;
+            // Under `--image` the data directory is bound into the
+            // rootfs at its own path, so it must exist as a directory
+            // when the container is built.
+            if self.resolved_image.is_some() {
+                fs::create_dir_all(hermit.data_dir()).with_context(|| {
+                    format!(
+                        "Failed to create recording directory: {}",
+                        hermit.data_dir().display()
+                    )
+                })?;
+            }
+            let host_binds = self.image_host_binds(global, &[hermit.data_dir().to_path_buf()]);
+            let (mut container, identity_guard, staging) =
+                self.recording_container(global, preparation, &host_binds)?;
 
             // Parent-owned for BOTH deadline and unbounded spellings. No
             // metadata/last-id commit occurs before real successful completion.
@@ -773,44 +967,45 @@ impl StartOpts {
             let resources = format!("recording {} and identity mounts", data.path().display());
             let options = self.clone();
             let global = global.clone();
-            let ((exit_status, outcome), (data, _identity)) = super::owned_container::run(
-                &mut container,
-                (data, identity_guard),
-                resources,
-                true,
-                if record_timeout.is_some() {
-                    "record.main.deadline"
-                } else {
-                    "record.main"
-                },
-                None,
-                move |(data, identity)| {
-                    let _guard = global.init_tracing();
-                    if let Some(resolution) = &options.auto_resolution {
-                        tracing::debug!("{resolution}");
-                    }
-                    identity.record_plan()?;
-                    let command = options.guest_command()?;
-                    let mountinfo = identity.mount_provenance()?;
-                    // A deadlocked guest's recording is finished and kept.
-                    hermit::SchedulerEndedRun::status_of(match record_timeout {
-                        Some(timeout) => with_recording_deadline(timeout, || {
-                            hermit::record_to_with_mountinfo(
+            let ((exit_status, outcome), (data, _identity, _staging)) =
+                super::owned_container::run(
+                    &mut container,
+                    (data, identity_guard, staging),
+                    resources,
+                    true,
+                    if record_timeout.is_some() {
+                        "record.main.deadline"
+                    } else {
+                        "record.main"
+                    },
+                    None,
+                    move |(data, identity, _staging)| {
+                        let _guard = global.init_tracing();
+                        if let Some(resolution) = &options.auto_resolution {
+                            tracing::debug!("{resolution}");
+                        }
+                        identity.record_plan()?;
+                        let command = options.guest_command()?;
+                        let mountinfo = identity.mount_provenance()?;
+                        // A deadlocked guest's recording is finished and kept.
+                        hermit::SchedulerEndedRun::status_of(match record_timeout {
+                            Some(timeout) => with_recording_deadline(timeout, || {
+                                hermit::record_to_with_mountinfo(
+                                    command,
+                                    data.path(),
+                                    mountinfo,
+                                    record_options.clone(),
+                                )
+                            }),
+                            None => hermit::record_to_with_mountinfo(
                                 command,
                                 data.path(),
                                 mountinfo,
-                                record_options,
-                            )
-                        }),
-                        None => hermit::record_to_with_mountinfo(
-                            command,
-                            data.path(),
-                            mountinfo,
-                            record_options,
-                        ),
-                    })
-                },
-            )?;
+                                record_options.clone(),
+                            ),
+                        })
+                    },
+                )?;
             // A deadlocked guest's recording is kept like any other: its
             // replay deadlocks at the same point. Its status is
             // `HERMIT_GUEST_DEADLOCK_EXIT`, reported below as the outcome.
@@ -901,12 +1096,14 @@ impl StartOpts {
             setup_double_run(global, "record", "replay", strictness)
                 .context("Failed to create verification log files")?;
 
-        let (mut recording_container, record_identity_guard) =
-            self.recording_container(global, preparation)?;
+        // Created before the containers: under `--image` it is bound
+        // into the rootfs at its own path for both halves.
+        let temp_data_dir = tempfile::tempdir()?;
+        let record_binds = self.image_host_binds(&global1, &[temp_data_dir.path().to_path_buf()]);
+        let (mut recording_container, record_identity_guard, record_staging) =
+            self.recording_container(global, preparation, &record_binds)?;
 
         eprintln!(":: {}", "Recording...".yellow().bold());
-
-        let temp_data_dir = tempfile::tempdir()?;
         let resources = format!(
             "verification recording {}, identity mounts and both logs",
             temp_data_dir.path().display()
@@ -915,15 +1112,21 @@ impl StartOpts {
         let record_options = self.record_options();
         let options = self.clone();
         let record_global = global1.clone();
-        let (recording, (temp_data_dir, _record_identity, log1, log2)) =
+        let (recording, (temp_data_dir, _record_identity, log1, log2, _record_staging)) =
             super::owned_container::run(
                 &mut recording_container,
-                (temp_data_dir, record_identity_guard, log1, log2),
+                (
+                    temp_data_dir,
+                    record_identity_guard,
+                    log1,
+                    log2,
+                    record_staging,
+                ),
                 resources.clone(),
                 true,
                 "record_verify.record",
                 None,
-                move |(data, identity, _, _)| {
+                move |(data, identity, _, _, _)| {
                     let _guard = record_global.init_tracing();
                     identity.record_plan()?;
                     let command = options.guest_command()?;
@@ -934,39 +1137,45 @@ impl StartOpts {
                                 command,
                                 data.path(),
                                 mountinfo,
-                                record_options,
+                                record_options.clone(),
                             )
                         }),
                         None => hermit::record_with_output_with_mountinfo(
                             command,
                             data.path(),
                             mountinfo,
-                            record_options,
+                            record_options.clone(),
                         ),
                     })
                 },
             )?;
         let (recording, recording_outcome) = recording;
         eprintln!(":: {}", "Replaying...".yellow().bold());
-        let (mut replay_container, replay_identity) =
-            self.configured_container(self.network(), Vec::new())?;
-        let mounts = self.mount.clone();
+        let replay_binds = self.image_host_binds(&global2, &[temp_data_dir.path().to_path_buf()]);
+        let (mut replay_container, replay_identity, replay_staging) =
+            self.configured_container(self.network(), Vec::new(), &replay_binds)?;
+        let mounts = self.replay_mounts();
+        let replay_image = self.recorded_image();
         let replay_global = global2.clone();
-        let (replay, (_data, _identity, log1, log2)) = super::owned_container::run(
-            &mut replay_container,
-            (temp_data_dir, replay_identity, log1, log2),
-            resources,
-            true,
-            "record_verify.replay",
-            None,
-            move |(data, _, _, _)| {
-                let _guard = replay_global.init_tracing();
-                hermit::SchedulerEndedRun::output_of(hermit::replay_with_output_and_mounts(
-                    data.path(),
-                    &mounts,
-                ))
-            },
-        )?;
+        let (replay, (_data, _identity, log1, log2, _replay_staging)) =
+            super::owned_container::run(
+                &mut replay_container,
+                (temp_data_dir, replay_identity, log1, log2, replay_staging),
+                resources,
+                true,
+                "record_verify.replay",
+                None,
+                move |(data, _, _, _, _)| {
+                    let _guard = replay_global.init_tracing();
+                    hermit::SchedulerEndedRun::output_of(
+                        hermit::replay_with_output_and_mounts_and_image(
+                            data.path(),
+                            &mounts,
+                            replay_image.as_ref(),
+                        ),
+                    )
+                },
+            )?;
         let (replay, replay_outcome) = replay;
 
         let status = conclude_record_replay(
@@ -1087,7 +1296,9 @@ impl StartOpts {
         preparation: RecordPreparation<'_>,
     ) -> Result<(reverie::process::Output, Option<detcore::TerminalOutcome>), Error> {
         fs::create_dir(data).with_context(|| format!("creating {}", data.display()))?;
-        let (mut container, identity_guard) = self.recording_container(global, preparation)?;
+        let host_binds = self.image_host_binds(global, &[data.to_path_buf()]);
+        let (mut container, identity_guard, staging) =
+            self.recording_container(global, preparation, &host_binds)?;
         eprintln!(":: {}", "Recording...".yellow().bold());
         let record_timeout = self.record_timeout();
         let record_options = self.record_options();
@@ -1098,14 +1309,14 @@ impl StartOpts {
             "verification recording {} and identity mounts",
             data.display()
         );
-        let (recording, _identity) = super::owned_container::run(
+        let (recording, (_identity, _staging)) = super::owned_container::run(
             &mut container,
-            identity_guard,
+            (identity_guard, staging),
             resources,
             true,
             "record_verify_run.record",
             None,
-            move |identity| {
+            move |(identity, _staging)| {
                 let _guard = record_global.init_tracing();
                 identity.record_plan()?;
                 let command = options.guest_command()?;
@@ -1116,14 +1327,14 @@ impl StartOpts {
                             command,
                             &data,
                             mountinfo,
-                            record_options,
+                            record_options.clone(),
                         )
                     }),
                     None => hermit::record_with_output_with_mountinfo(
                         command,
                         &data,
                         mountinfo,
-                        record_options,
+                        record_options.clone(),
                     ),
                 })
             },
@@ -1139,23 +1350,86 @@ impl StartOpts {
         global: &GlobalOpts,
     ) -> Result<(reverie::process::Output, Option<detcore::TerminalOutcome>), Error> {
         eprintln!(":: {}", "Replaying...".yellow().bold());
-        let (mut container, identity) = self.configured_container(self.network(), Vec::new())?;
-        let mounts = self.mount.clone();
+        // The recording names its image; this invocation's `--image`,
+        // given so both halves take the same options, must resolve to
+        // the same content. The container is built from the
+        // recording's image either way.
+        let recorded = hermit::recording_image(data)
+            .with_context(|| format!("Failed to read the recording in {}", data.display()))?;
+        if let Some(image) = &self.image {
+            // Identity resolution only (no materialization): a
+            // materialize failure must not mask the mismatch this
+            // check exists to name.
+            let given: hermit::RecordedImageIdentity =
+                crate::app::image::resolved_image_identity(image)?.into();
+            match &recorded {
+                Some(recorded) if recorded.identity.same_content_identity(&given) => {}
+                Some(recorded) => anyhow::bail!(
+                    "recording {} ran inside image {} (identity {}), but --image={} \
+                     resolved to identity {}; give the replay half the same --image \
+                     as the recording half, or drop --image and let the recording's \
+                     image govern",
+                    data.display(),
+                    recorded.reference,
+                    recorded.identity.identity,
+                    image,
+                    given.identity,
+                ),
+                None => anyhow::bail!(
+                    "recording {} ran on the host root, but --image={} was given; \
+                     drop --image for the replay half",
+                    data.display(),
+                    image,
+                ),
+            }
+        }
+        let (mut container, identity, staging) = match &recorded {
+            Some(recorded) => {
+                let rootfs = reenter_record_image(recorded).map_err(|error| {
+                    Error::msg(format!(
+                        "recording {} ran inside image {} (identity {}); replay \
+                         cannot re-enter it: {error:#}; make that image content \
+                         available at the recorded reference and replay again",
+                        data.display(),
+                        recorded.reference,
+                        recorded.identity.identity,
+                    ))
+                })?;
+                super::run::validate_image_mounts(&self.mount, &[])?;
+                // Before the container reads them, as in
+                // `configured_container`.
+                super::pinned_cpu::set_settings(
+                    self.pinned_cpu_placement
+                        .settings(super::pinned_cpu::PinnedCpuPolicy::Share, None),
+                );
+                let host_binds = self.image_host_binds(global, &[data.to_path_buf()]);
+                let (mut container, identity, staging) =
+                    record_image_container(&rootfs, &self.mount, &host_binds)?;
+                self.network().configure(&mut container, false);
+                (container, identity, Some(staging))
+            }
+            None => self.configured_container(self.network(), Vec::new(), &[])?,
+        };
+        let mounts = self.replay_mounts();
         let replay_global = global.clone();
         let data = data.to_owned();
         let resources = format!("verification replay {} and identity mounts", data.display());
-        let (replay, _identity) = super::owned_container::run(
+        let (replay, (_identity, _staging)) = super::owned_container::run(
             &mut container,
-            identity,
+            (identity, staging),
             resources,
             true,
             "record_verify_run.replay",
             None,
             move |_| {
                 let _guard = replay_global.init_tracing();
-                hermit::SchedulerEndedRun::output_of(hermit::replay_with_output_and_mounts(
-                    &data, &mounts,
-                ))
+                hermit::SchedulerEndedRun::output_of(
+                    hermit::replay_with_output_and_mounts_and_image(
+                        &data,
+                        &mounts,
+                        recorded.as_ref(),
+                    ),
+                )
             },
         )?;
         Ok(replay)
@@ -1167,11 +1441,14 @@ impl StartOpts {
         global: &GlobalOpts,
         preparation: RecordPreparation<'_>,
     ) -> Result<ExitStatus, Error> {
-        let (mut container, identity_guard) = self.recording_container(global, preparation)?;
+        // Created before the containers: under `--image` it is bound
+        // into the rootfs at its own path for both halves.
+        let temp_data_dir = tempfile::tempdir()?;
+        let host_binds = self.image_host_binds(global, &[temp_data_dir.path().to_path_buf()]);
+        let (mut container, identity_guard, staging) =
+            self.recording_container(global, preparation, &host_binds)?;
 
         eprintln!(":: {}", "Recording...".yellow().bold());
-
-        let temp_data_dir = tempfile::tempdir()?;
         let record_timeout = self.record_timeout();
         let record_options = self.record_options();
         let options = self.clone();
@@ -1180,14 +1457,14 @@ impl StartOpts {
             "debug recording {}, identity mounts and GDB watcher",
             temp_data_dir.path().display()
         );
-        let (_, (temp_data_dir, _identity)) = super::owned_container::run(
+        let (_, (temp_data_dir, _identity, _staging)) = super::owned_container::run(
             &mut container,
-            (temp_data_dir, identity_guard),
+            (temp_data_dir, identity_guard, staging),
             resources.clone(),
             true,
             "record_verify_debug.record",
             None,
-            move |(data, identity)| {
+            move |(data, identity, _staging)| {
                 let _guard = record_global.init_tracing();
                 identity.record_plan()?;
                 let command = options.guest_command()?;
@@ -1198,14 +1475,14 @@ impl StartOpts {
                             command,
                             data.path(),
                             mountinfo,
-                            record_options,
+                            record_options.clone(),
                         )
                     }),
                     None => hermit::record_to_with_mountinfo(
                         command,
                         data.path(),
                         mountinfo,
-                        record_options,
+                        record_options.clone(),
                     ),
                 })
                 .map(|(status, _)| status)
@@ -1258,15 +1535,18 @@ impl StartOpts {
         // on that container result, unreachable in exactly the case that needed
         // it. The watch owns the reap and releases the accept.
         let gdb_watch = GdbClientWatch::spawn(gdb_command, gdbserver_port)?;
-        let (mut container, identity) = self.configured_container(self.network(), Vec::new())?;
+        let (mut container, identity, staging) =
+            self.configured_container(self.network(), Vec::new(), &host_binds)?;
         let guards = Rc::new(RefCell::new((
             temp_data_dir,
             identity,
             gdb_watch,
             Some(bound_port),
+            staging,
         )));
         let replay_global = global.clone();
-        let mounts = self.mount.clone();
+        let mounts = self.replay_mounts();
+        let replay_image = self.recorded_image();
         let result = super::owned_container::run(
             &mut container,
             Rc::clone(&guards),
@@ -1279,10 +1559,11 @@ impl StartOpts {
                 if let Some(port) = guards.borrow_mut().3.take() {
                     port.serve_next_gdbserver();
                 }
-                hermit::replay_with_gdbserver_and_mounts(
+                hermit::replay_with_gdbserver_and_mounts_and_image(
                     guards.borrow().0.path(),
                     gdbserver_port,
                     &mounts,
+                    replay_image.as_ref(),
                 )
             },
         );
@@ -1341,6 +1622,12 @@ fn write_full_record_manifest(
             host_drawn: Default::default(),
         },
     );
+    // The rootfs binding metadata.json carries, stated in the
+    // manifest too so manifest consumers can see it without opening
+    // the metadata.
+    if let Some(image) = &metadata.image {
+        document = document.with_image(manifest::Image::try_from(image.identity.clone())?);
+    }
     document.exit = Some(manifest::Exit::from_status(exit_status));
     document.artifacts = Some(manifest::Artifacts {
         network_trace: None,
@@ -1537,6 +1824,8 @@ mod tests {
             env,
             base_env: BaseEnv::Host,
             mount: Vec::new(),
+            image: None,
+            resolved_image: None,
             network: None,
             pinned_cpu_placement: Default::default(),
             proc: Default::default(),
@@ -1667,6 +1956,123 @@ mod tests {
             "cpu-profile=x86-64-v2"
         );
         assert_eq!(parse(Some("x86-64-v4"), &[]), "refused: InvalidValue");
+    }
+
+    /// `record start --image` parses as `run --image` does, and its
+    /// backend refusals name the flag: only ptrace, no preprocessing.
+    #[test]
+    fn record_image_refuses_other_backends_and_preprocessing_by_name() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[clap(flatten)]
+            start: StartOpts,
+        }
+        let parsed = <Cli as clap::Parser>::try_parse_from([
+            "start",
+            "--image=oci-dir:/srv/rootfs",
+            "/bin/true",
+        ])
+        .unwrap()
+        .start;
+        assert_eq!(parsed.image.as_deref(), Some("oci-dir:/srv/rootfs"));
+
+        let mut options = start_options(Vec::new());
+        options.image = Some("oci-dir:/srv/rootfs".to_owned());
+        let no_prepare = RecordPreparation {
+            backend_name: "ptrace",
+            prepare: None,
+        };
+        let ptrace = <GlobalOpts as clap::Parser>::parse_from(["hermit"]);
+        assert!(options.refuse_image_backend(&ptrace, no_prepare).is_ok());
+
+        let kvm = <GlobalOpts as clap::Parser>::parse_from(["hermit", "--backend=kvm"]);
+        let error = options
+            .refuse_image_backend(&kvm, no_prepare)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "record --image runs only on the ptrace backend; --backend=kvm was selected"
+        );
+
+        let prepare = |_target: &Path| Ok(None);
+        let e9patch = RecordPreparation {
+            backend_name: "e9patch",
+            prepare: Some(&prepare),
+        };
+        let error = options
+            .refuse_image_backend(&ptrace, e9patch)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("record --image does not support e9patch preprocessing"),
+            "{error}"
+        );
+
+        // Without `--image` this check is not the one that refuses
+        // other backends.
+        options.image = None;
+        assert!(options.refuse_image_backend(&kvm, no_prepare).is_ok());
+    }
+
+    /// A mount type `run --image` does not install in a rootfs
+    /// refuses `record --image` by name too, before the image is
+    /// even materialized.
+    #[test]
+    fn record_image_refuses_unsupported_mount_types_by_name() {
+        let mut options = start_options(Vec::new());
+        options.image = Some("oci-dir:/srv/rootfs".to_owned());
+        options.mount = ["type=sysfs,target=/sys"]
+            .iter()
+            .map(|spec| spec.parse().unwrap())
+            .collect();
+        let global = <GlobalOpts as clap::Parser>::parse_from(["hermit"]);
+        let error = options.main(&global).unwrap_err().to_string();
+        assert!(
+            error.contains("--mount type=sysfs is not supported with --image"),
+            "{error}"
+        );
+    }
+
+    /// The program `--cpu-profile auto` classifies under `--image` is
+    /// the image's: absolute, working-directory-relative, and
+    /// PATH-searched spellings all read inside the rootfs, and a name
+    /// the image does not have refuses by name.
+    #[test]
+    fn record_image_program_resolves_inside_the_rootfs() {
+        let rootfs = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(rootfs.path().join("usr/bin")).unwrap();
+        std::fs::write(rootfs.path().join("usr/bin/guest"), b"elf").unwrap();
+        std::fs::create_dir_all(rootfs.path().join("work")).unwrap();
+        std::fs::write(rootfs.path().join("work/guest"), b"elf").unwrap();
+
+        let mut options = start_options(Vec::new());
+        options.program = Some(PathBuf::from("/usr/bin/guest"));
+        assert_eq!(
+            options.image_guest_program(rootfs.path()).unwrap(),
+            rootfs.path().join("usr/bin/guest")
+        );
+
+        options.program = Some(PathBuf::from("guest"));
+        options.env = vec![("PATH".to_owned(), Some("/usr/bin".to_owned()))];
+        assert_eq!(
+            options.image_guest_program(rootfs.path()).unwrap(),
+            rootfs.path().join("usr/bin/guest")
+        );
+
+        options.program = Some(PathBuf::from("./guest"));
+        options.workdir = Some("/work".to_owned());
+        assert_eq!(
+            options.image_guest_program(rootfs.path()).unwrap(),
+            rootfs.path().join("work/guest")
+        );
+
+        options.program = Some(PathBuf::from("missing"));
+        let error = options
+            .image_guest_program(rootfs.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("in PATH inside the image"), "{error}");
     }
 
     /// Without `--strict`, a recording on a counter that fails Reverie's
@@ -2044,6 +2450,8 @@ mod tests {
             env: Vec::new(),
             base_env: BaseEnv::Host,
             mount: Vec::new(),
+            image: None,
+            resolved_image: None,
             network: None,
             pinned_cpu_placement: Default::default(),
             proc: Default::default(),
@@ -2091,11 +2499,14 @@ mod tests {
     #[test]
     fn mapped_launch_path_preserves_an_exact_file_bind() {
         let mut options = start_options(Vec::new());
-        options.mount = vec![
-            Mount::bind("/host/prog-source", "/guest/prog"),
-            Mount::bind("/host/libdir", "/guest/lib"),
-            Mount::new("/guest/hidden"),
-        ];
+        options.mount = [
+            "type=bind,source=/host/prog-source,target=/guest/prog",
+            "type=bind,source=/host/libdir,target=/guest/lib",
+            "type=bind,target=/guest/hidden",
+        ]
+        .iter()
+        .map(|spec| spec.parse().unwrap())
+        .collect();
         // Raw OsStr: PathBuf equality treats a trailing slash (the old
         // exact-bind bug, SOURCE/) as the same path as SOURCE.
         assert_eq!(
