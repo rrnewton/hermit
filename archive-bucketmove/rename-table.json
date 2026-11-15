@@ -1,0 +1,21 @@
+{
+ "portable/bin-c/bin-c/preempt-spin-flag/chaos/dbt": "portable/c-programs/c-programs/preempt-spin-flag/chaos/dbt",
+ "portable/bin-c/bin-c/preempt-spin-flag/chaos/in-guest-trap": "portable/c-programs/c-programs/preempt-spin-flag/chaos/in-guest-trap",
+ "portable/bin-c/bin-c/preempt-spin-flag/chaos/kvm": "portable/c-programs/c-programs/preempt-spin-flag/chaos/kvm",
+ "portable/bin-c/bin-c/preempt-spin-flag/chaos/liteinst": "portable/c-programs/c-programs/preempt-spin-flag/chaos/liteinst",
+ "portable/bin-c/bin-c/preempt-spin-flag/chaos/ptrace": "portable/c-programs/c-programs/preempt-spin-flag/chaos/ptrace",
+ "portable/bin-c/bin-c/preempt-spin-flag/chaos/sabre": "portable/c-programs/c-programs/preempt-spin-flag/chaos/sabre",
+ "portable/bin-c/bin-c/preempt-spin-flag/naked/native": "portable/c-programs/c-programs/preempt-spin-flag/naked/native",
+ "portable/bin-c/bin-c/preempt-spin-flag/replay/dbt": "portable/c-programs/c-programs/preempt-spin-flag/replay/dbt",
+ "portable/bin-c/bin-c/preempt-spin-flag/replay/in-guest-trap": "portable/c-programs/c-programs/preempt-spin-flag/replay/in-guest-trap",
+ "portable/bin-c/bin-c/preempt-spin-flag/replay/kvm": "portable/c-programs/c-programs/preempt-spin-flag/replay/kvm",
+ "portable/bin-c/bin-c/preempt-spin-flag/replay/liteinst": "portable/c-programs/c-programs/preempt-spin-flag/replay/liteinst",
+ "portable/bin-c/bin-c/preempt-spin-flag/replay/ptrace": "portable/c-programs/c-programs/preempt-spin-flag/replay/ptrace",
+ "portable/bin-c/bin-c/preempt-spin-flag/replay/sabre": "portable/c-programs/c-programs/preempt-spin-flag/replay/sabre",
+ "portable/bin-c/bin-c/preempt-spin-flag/verify/dbt": "portable/c-programs/c-programs/preempt-spin-flag/verify/dbt",
+ "portable/bin-c/bin-c/preempt-spin-flag/verify/in-guest-trap": "portable/c-programs/c-programs/preempt-spin-flag/verify/in-guest-trap",
+ "portable/bin-c/bin-c/preempt-spin-flag/verify/kvm": "portable/c-programs/c-programs/preempt-spin-flag/verify/kvm",
+ "portable/bin-c/bin-c/preempt-spin-flag/verify/liteinst": "portable/c-programs/c-programs/preempt-spin-flag/verify/liteinst",
+ "portable/bin-c/bin-c/preempt-spin-flag/verify/ptrace": "portable/c-programs/c-programs/preempt-spin-flag/verify/ptrace",
+ "portable/bin-c/bin-c/preempt-spin-flag/verify/sabre": "portable/c-programs/c-programs/preempt-spin-flag/verify/sabre"
+}
