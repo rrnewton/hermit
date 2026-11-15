@@ -371,6 +371,22 @@ buck_genrule(
     target_compatible_with = ["ovr_config//cpu:x86_64"],
 )
 
+# hermit with the LiteInst in-guest runtimes staged as an installation
+# (hermit-resources: the executable's directory holds rsrcs/). The staged
+# .so files carry Cargo's installed names, with the preload's revision
+# record beside its library, as the Cargo installer stages them.
+buck_genrule(
+    name = "hermit-liteinst-install",
+    out = "install",
+    cmd = "mkdir -p $OUT/rsrcs" +
+        " && cp $(location :hermit) $OUT/hermit" +
+        " && cp $(location //hermetic_infra/hermit:detcore-liteinst[cdylib]) $OUT/rsrcs/libdetcore_liteinst.so" +
+        " && cp $(location //hermetic_infra/reverie:reverie-liteinst-preload[cdylib]) $OUT/rsrcs/libreverie_liteinst.so" +
+        " && cp $(location //hermetic_infra/hermit:reverie-liteinst-revision) $OUT/rsrcs/libreverie_liteinst.so.revision",
+    # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
+)
+
 # Cargo's src/bin/verification-report.rs; integration tests run it.
 rust_binary(
     name = "verification-report",

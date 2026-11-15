@@ -1,8 +1,9 @@
 load("@fbcode//hermetic_infra/hermit/fb-only/contract_checks:backend_abstraction.bzl", "MEMBER_MANIFESTS")
+load("@fbcode//hermetic_infra/hermit/fb-only:release.bzl", "HERMIT_REVERIE_PIN")
 load("@fbcode//hermetic_infra/hermit/hermit-cli:integration_tests_data.bzl", "EXTERNAL_SRCS")
 load("@fbcode//hermetic_infra/hermit_import:excluded_paths.bzl", "excluded_paths_test")
 load("@fbcode_macros//build_defs:export_files.bzl", "buck_export_file", "export_file")
-load("@fbcode_macros//build_defs:native_rules.bzl", "buck_filegroup")
+load("@fbcode_macros//build_defs:native_rules.bzl", "buck_filegroup", "buck_genrule")
 load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
 
 oncall("hermit")
@@ -70,6 +71,59 @@ rust_library(
         "//hermetic_infra/reverie:reverie-liteinst",
         "//hermetic_infra/reverie:reverie-rpc-transport",
     ],
+)
+
+# Request :detcore-liteinst[cdylib] explicitly. The default is a check
+# output; [shared]/[dylib] is not this runtime's C ABI artifact.
+rust_library(
+    name = "detcore-liteinst",
+    srcs = glob(["detcore-liteinst/src/**/*.rs"]) + ["detcore-liteinst/build.rs"],
+    # Its Cargo manifest is the open-source one (detcore-liteinst/Cargo.toml);
+    # fbsource builds this runtime with Buck only.
+    autocargo = {"ignore_rule": True},
+    crate = "detcore_liteinst",
+    crate_root = "detcore-liteinst/src/lib.rs",
+    doctests = False,
+    env = {"NIX_DONT_SET_RPATH_x86_64_unknown_linux_gnu": "1"},
+    features = [],
+    linker_flags = ["-Wl,-u,_Unwind_RaiseException"],
+    # glibc_compat.rs lives in the //common package, so it cannot be a srcs
+    # path here. Map it to the same virtual path the #[path] module in
+    # detcore-liteinst/src/lib.rs resolves (../../common/inguest/...), so both
+    # builders compile identical sources.
+    mapped_srcs = {
+        "//hermetic_infra/hermit/common:glibc_compat.rs": "common/inguest/glibc_compat.rs",
+    },
+    preferred_linkage = "any",
+    # This runtime supports GNU Linux x86-64 only. Keep the Cargo build.rs
+    # static unwinder / no build-root RUNPATH policy in the native output.
+    rustc_flags = ["-lstatic:-bundle=gcc_eh"],
+    target_compatible_with = [
+        "ovr_config//cpu:x86_64",
+        "ovr_config//os:linux",
+    ],
+    unittests = False,
+    deps = [
+        "fbsource//third-party/rust:libc",
+        "//hermetic_infra/hermit/detcore:detcore",
+        "//hermetic_infra/reverie:reverie",
+        # The reverie-inguest feature variant that reverie-liteinst links, so
+        # the runtime and reverie-liteinst share one reverie_inguest crate.
+        "//hermetic_infra/reverie:reverie-inguest-liteinst",  # @manual name:reverie_inguest
+        "//hermetic_infra/reverie:reverie-liteinst-sitepatch",  # @manual name:reverie_liteinst
+        "//hermetic_infra/reverie:reverie-rpc-transport",
+    ],
+)
+
+# The LiteInst preload's installed revision record: the Reverie pin this
+# tree builds. hermit-cli stages it beside libreverie_liteinst.so; it is
+# generated here because hermit-cli/BUCK may bind the pin only into its
+# build environment (scripts/check-reverie-pin.rs).
+buck_genrule(
+    name = "reverie-liteinst-revision",
+    out = "libreverie_liteinst.so.revision",
+    cmd = "echo " + HERMIT_REVERIE_PIN + " > $OUT",
+    visibility = ["//hermetic_infra/hermit/hermit-cli:"],
 )
 
 # Export the maintained header, never a second generated/copy-owned header.

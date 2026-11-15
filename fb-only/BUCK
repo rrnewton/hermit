@@ -9,6 +9,8 @@ fbpkg.builder(
     path_actions = {
         "hermit": "//hermetic_infra/hermit/hermit-cli:hermit",
         "install.toml": "install.toml",
+        "rsrcs/libdetcore_liteinst.so": "//hermetic_infra/hermit:detcore-liteinst[cdylib]",
+        "rsrcs/libreverie_liteinst.so": "//hermetic_infra/reverie:reverie-liteinst-preload[cdylib]",
     },
     # hermit is x86-64 only (detcore virtualizes the x86 cpuid instruction).
     target_compatible_with = ["ovr_config//cpu:x86_64"],

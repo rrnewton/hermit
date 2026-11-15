@@ -119,6 +119,21 @@ buck_genrule(
     cmd = "mkdir -p $OUT",
 )
 
+# hermit/install/ for LiteInst cells: the rsrcs/ of hermit-cli's staged
+# installation (the LiteInst runtimes and the preload revision). Nothing
+# selects it yet: the bundle's install input comes from
+# fb-only/e2e_cells.bzl's e2e_bundle_inputs() — fbsource keeps :empty-install
+# while its kept cells stay on ptrace/kvm, and the open-source stand-in keeps
+# ./stage's staged-install. Point e2e_bundle_inputs() at :liteinst-install
+# when LiteInst cells are kept.
+buck_genrule(
+    name = "liteinst-install",
+    out = "install",
+    cmd = "mkdir -p $OUT/rsrcs && cp -rL $(location //hermetic_infra/hermit/hermit-cli:hermit-liteinst-install)/rsrcs/. $OUT/rsrcs/",
+    # :hermit-liteinst-install is x86-64 only.
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
+)
+
 # hermit/hermit: Hermit built optimized whatever mode the cells are built in.
 # The manifests' CPU budgets are calibrated on upstream's optimized release
 # build; a dev-mode (unoptimized) Hermit spent about 4x the CPU and exceeded
