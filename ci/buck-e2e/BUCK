@@ -120,7 +120,9 @@ buck_genrule(
 )
 
 # hermit/install/ for LiteInst cells: the rsrcs/ of hermit-cli's staged
-# installation (the LiteInst runtimes and the preload revision). Nothing
+# installation layout (the LiteInst runtimes, the Detcore receipt and the
+# preload revision; unqualified until the finalizer genrule passes -- see
+# hermit-cli's :hermit-liteinst-install). Nothing
 # selects it yet: the bundle's install input comes from
 # fb-only/e2e_cells.bzl's e2e_bundle_inputs() — fbsource keeps :empty-install
 # while its kept cells stay on ptrace/kvm, and the open-source stand-in keeps

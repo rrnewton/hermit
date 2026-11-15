@@ -4,6 +4,7 @@ load("@fbcode//hermetic_infra/hermit/hermit-cli:integration_tests_data.bzl", "EX
 load("@fbcode//hermetic_infra/hermit_import:excluded_paths.bzl", "excluded_paths_test")
 load("@fbcode_macros//build_defs:export_files.bzl", "buck_export_file", "export_file")
 load("@fbcode_macros//build_defs:native_rules.bzl", "buck_filegroup", "buck_genrule")
+load("@fbsource//tools/build_defs:rust_binary.bzl", "rust_binary")
 load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
 
 oncall("hermit")
@@ -73,6 +74,13 @@ rust_library(
     ],
 )
 
+# Landing order: the LiteInst targets in this package and in hermit-cli
+# depend on Reverie's reverie-liteinst-sitepatch / reverie-liteinst-preload
+# targets (D1a). In fbsource they are direct fbcode deps; on the GitHub
+# side they require D1a landed in Reverie plus the export pin flow that
+# advances this tree's Reverie pin. Do not read their presence here as that
+# flow having run.
+#
 # Request :detcore-liteinst[cdylib] explicitly. The default is a check
 # output; [shared]/[dylib] is not this runtime's C ABI artifact.
 rust_library(
@@ -111,8 +119,75 @@ rust_library(
         # the runtime and reverie-liteinst share one reverie_inguest crate.
         "//hermetic_infra/reverie:reverie-inguest-liteinst",  # @manual name:reverie_inguest
         "//hermetic_infra/reverie:reverie-liteinst-sitepatch",  # @manual name:reverie_liteinst
-        "//hermetic_infra/reverie:reverie-rpc-transport",
+        # No reverie-rpc-transport here: in Cargo it is optional, selected
+        # only by the exec-private-init feature, and this target builds the
+        # ordinary runtime with features = [].
     ],
+)
+
+# The Cargo finalizer that qualifies the ordinary Detcore preload and
+# writes its hermit-packaged-detcore/v1 receipt, as a Buck binary so the
+# staging genrule below can run the same logic over the Buck-built
+# runtime. hermit-install has no BUCK package of its own; like
+# :detcore-liteinst, this target lives in the root package under the
+# autocargo ignore_rule pattern (its Cargo manifest stays the
+# open-source one). The binary derives the Hermit root from
+# CARGO_MANIFEST_DIR exactly as under Cargo and resolves its source
+# authority from that tree's manifests -- authority the fbsource import
+# does not carry (the import drops every Cargo.toml), so there it
+# refuses by name until such an authority exists in its environment.
+rust_binary(
+    name = "stage-detcore-liteinst",
+    srcs = ["hermit-install/src/bin/stage-detcore-liteinst.rs"],
+    autocargo = {"ignore_rule": True},
+    crate_root = "hermit-install/src/bin/stage-detcore-liteinst.rs",
+    # The binary include!s the pin reader by its repository-relative path
+    # (../../../hermit-cli/reverie_pin.rs) -- map it to that same virtual
+    # path, as :detcore-liteinst maps glibc_compat.rs.
+    mapped_srcs = {
+        "//hermetic_infra/hermit/hermit-cli:reverie_pin.rs": "hermit-cli/reverie_pin.rs",
+    },
+    # It qualifies the x86-64 runtime; x86-64 only.
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
+    deps = [
+        "fbsource//third-party/rust:reverie-liteinst-artifact",
+        "fbsource//third-party/rust:serde_json",
+        "fbsource//third-party/rust:toml",
+    ],
+)
+
+# The Buck staging of the Detcore runtime is an UNQUALIFIED layout: this
+# genrule runs the unchanged Cargo finalizer (with --prebuilt) over
+# :detcore-liteinst[cdylib], and the finalizer stages those bytes and
+# writes the receipt only if they are byte-identical to the qualified
+# fixed liteinst-runtime build. Buck-profile bytes are not, so this
+# target refuses by name ("prebuilt runtime differs from the qualified
+# fixed liteinst-runtime build") until the Buck recipe produces the
+# qualified bytes. No receipt is fabricated and core verification
+# (ci/verify-packaged-detcore.py, scripts/build-buck-release.rs) is
+# unchanged: without this genrule's output an installation is missing
+# rsrcs/libdetcore_liteinst.package.json and is refused there.
+buck_genrule(
+    name = "detcore-liteinst-staged",
+    out = "detcore-liteinst-staged",
+    cmd = "mkdir -p $OUT/rsrcs $OUT/target/install_pkg/rsrcs" +
+        " && $(exe :stage-detcore-liteinst) --source-copy $OUT/target --prebuilt $(location :detcore-liteinst[cdylib])" +
+        " && cp $OUT/target/install_pkg/rsrcs/libdetcore_liteinst.so $OUT/rsrcs/libdetcore_liteinst.so" +
+        " && cp $OUT/target/install_pkg/rsrcs/libdetcore_liteinst.package.json $OUT/rsrcs/libdetcore_liteinst.package.json" +
+        " && rm -rf $OUT/target",
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
+    visibility = ["//hermetic_infra/hermit/hermit-cli:"],
+)
+
+# The receipt alone, for consumers that stage files one by one (the
+# fbpkg's path_actions). It extracts :detcore-liteinst-staged's receipt,
+# so it carries that genrule's by-name refusal of unqualified bytes.
+buck_genrule(
+    name = "detcore-liteinst-receipt",
+    out = "libdetcore_liteinst.package.json",
+    cmd = "cp $(location :detcore-liteinst-staged)/rsrcs/libdetcore_liteinst.package.json $OUT",
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
+    visibility = ["//hermetic_infra/hermit/fb-only:"],
 )
 
 # The LiteInst preload's installed revision record: the Reverie pin this
@@ -123,7 +198,10 @@ buck_genrule(
     name = "reverie-liteinst-revision",
     out = "libreverie_liteinst.so.revision",
     cmd = "echo " + HERMIT_REVERIE_PIN + " > $OUT",
-    visibility = ["//hermetic_infra/hermit/hermit-cli:"],
+    visibility = [
+        "//hermetic_infra/hermit/fb-only:",
+        "//hermetic_infra/hermit/hermit-cli:",
+    ],
 )
 
 # Export the maintained header, never a second generated/copy-owned header.

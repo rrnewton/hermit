@@ -372,15 +372,24 @@ buck_genrule(
 )
 
 # hermit with the LiteInst in-guest runtimes staged as an installation
-# (hermit-resources: the executable's directory holds rsrcs/). The staged
-# .so files carry Cargo's installed names, with the preload's revision
-# record beside its library, as the Cargo installer stages them.
+# layout (hermit-resources: the executable's directory holds rsrcs/).
+# This is an UNQUALIFIED layout, not a complete installation: the Detcore
+# runtime and its receipt come from the root package's
+# :detcore-liteinst-staged, which runs the unchanged Cargo finalizer over
+# the Buck-built .so and refuses by name until those bytes are the
+# qualified fixed-profile ones. Until it passes, no
+# rsrcs/libdetcore_liteinst.package.json exists here and core
+# verification refuses the layout; no receipt is fabricated to fill the
+# gap. Landing order: the preload target below requires Reverie D1a
+# (reverie-liteinst-preload) -- a direct fbcode dep in fbsource, and on
+# the GitHub side D1a landed plus the export pin flow.
 buck_genrule(
     name = "hermit-liteinst-install",
     out = "install",
     cmd = "mkdir -p $OUT/rsrcs" +
         " && cp $(location :hermit) $OUT/hermit" +
-        " && cp $(location //hermetic_infra/hermit:detcore-liteinst[cdylib]) $OUT/rsrcs/libdetcore_liteinst.so" +
+        " && cp $(location //hermetic_infra/hermit:detcore-liteinst-staged)/rsrcs/libdetcore_liteinst.so $OUT/rsrcs/libdetcore_liteinst.so" +
+        " && cp $(location //hermetic_infra/hermit:detcore-liteinst-staged)/rsrcs/libdetcore_liteinst.package.json $OUT/rsrcs/libdetcore_liteinst.package.json" +
         " && cp $(location //hermetic_infra/reverie:reverie-liteinst-preload[cdylib]) $OUT/rsrcs/libreverie_liteinst.so" +
         " && cp $(location //hermetic_infra/hermit:reverie-liteinst-revision) $OUT/rsrcs/libreverie_liteinst.so.revision",
     # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
@@ -420,6 +429,13 @@ hermit_integration_tests()
 buck_export_file(
     name = "tests/common/liteinst_in_guest_programs.rs",
     visibility = ["//hermetic_infra/hermit/fb-only/contract_checks:"],
+)
+
+# The root package's :stage-detcore-liteinst include!s this pin reader by
+# its repository-relative path and maps it from this export.
+buck_export_file(
+    name = "reverie_pin.rs",
+    visibility = ["//hermetic_infra/hermit:"],
 )
 
 # Inputs of fb-only/integration_tests/generate.py, checked for drift by its test,
