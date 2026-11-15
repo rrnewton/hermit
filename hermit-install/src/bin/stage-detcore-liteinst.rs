@@ -6,6 +6,17 @@
 //! run and the prebuilt bytes prove identical to the qualified artifact.
 //! Any other bytes are refused: this receipt attests the fixed
 //! `liteinst-runtime` build, and no second provenance can be recorded in it.
+//!
+//! `--buck` is PLUMBING ONLY (D1c-3, unqualified): it parses the explicit
+//! genrule-supplied Buck inputs and carries the `builder=buck2` receipt arm
+//! that `ci/verify-packaged-detcore.py` already pins, but it cannot qualify
+//! anything yet. The compiled `reverie-liteinst-artifact` dependency is the
+//! Hermit-pinned git revision, which has no Buck declared-content authority
+//! (`resolve_buck` / `with_buck_build`); until a Reverie pin bump carries
+//! that authority, `--buck` validates its arguments and then refuses by
+//! name before touching the target directory. Qualifying actual Buck bytes
+//! additionally waits on the D1c-2/D1c-6 machine-code recipes, which need a
+//! real fbsource-built ELF. No Buck receipt has ever been emitted.
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -32,38 +43,333 @@ fn close<T>(result: proof::Result<T>, closing: proof::Result<()>) -> proof::Resu
     }
 }
 
-/// The arguments after the program name: the source authority, the target
-/// directory, and optionally a prebuilt runtime to stage in place of the
-/// Cargo output (admitted only if its bytes are the qualified ones).
-fn parse_args(args: &[String]) -> proof::Result<(String, String, Option<PathBuf>)> {
+/// One finalizer invocation: either a Cargo mode (`--git` / `--source-copy`,
+/// optionally staging byte-identical `--prebuilt` output) or the `--buck`
+/// mode that qualifies a supplied Buck `.so` directly. The modes never mix:
+/// the byte-identity gate belongs to `--prebuilt` Cargo mode only, and Buck
+/// mode never runs a Cargo build.
+#[derive(Debug, PartialEq)]
+enum Mode {
+    Cargo {
+        authority: String,
+        target: String,
+        prebuilt: Option<PathBuf>,
+    },
+    Buck(Box<BuckArgs>),
+}
+
+/// Explicit Buck-mode inputs, all supplied by the declaring genrule. Buck
+/// mode derives nothing from `CARGO_MANIFEST_DIR` or any `Cargo.toml`: the
+/// roots, pins, profile, target literals and declared source file lists are
+/// arguments, so the fbsource import (which drops every manifest) can spell
+/// them all.
+#[derive(Debug, PartialEq)]
+struct BuckArgs {
+    target: PathBuf,
+    artifact: PathBuf,
+    workspace_root: PathBuf,
+    reverie_root: PathBuf,
+    reverie_pin: String,
+    imported_sha: String,
+    profile_bzl: PathBuf,
+    buck_target: String,
+    buck_platform: String,
+    buck_constraints: Vec<String>,
+    workspace_files: Vec<String>,
+    reverie_files: Vec<String>,
+}
+
+/// Buck literals pinned with exact equality by the verifier's Buck arm in
+/// `ci/verify-packaged-detcore.py`. The finalizer refuses any other spelling
+/// rather than emitting a receipt its own reader would reject.
+const BUCK_TARGET: &str = "//hermetic_infra/hermit:detcore-liteinst[cdylib]";
+const BUCK_PLATFORM: &str = "ovr_config//platform/linux:x86_64-fbcode";
+const BUCK_CONSTRAINTS: [&str; 2] = ["ovr_config//cpu:x86_64", "ovr_config//os:linux"];
+/// The reviewed Buck `liteinst-runtime` flag set: release opt 3 with debug
+/// assertions and overflow checks on, and no `-Clto` at all (matching the
+/// Cargo profile's `lto = false`, which also passes no flag).
+const BUCK_RUSTC_FLAGS: [&str; 8] = [
+    "-Copt-level=3",
+    "-Cdebuginfo=0",
+    "-Cdebug-assertions=yes",
+    "-Coverflow-checks=yes",
+    "-Ccodegen-units=16",
+    "-Cembed-bitcode=no",
+    "-Cpanic=unwind",
+    "-Cstrip=none",
+];
+/// The one refusal `--buck` can honestly make at the current Reverie pin.
+const BUCK_UNAVAILABLE: &str = "Buck authority unavailable at pinned Reverie: \
+    reverie-liteinst-artifact is compiled from the Hermit-pinned git revision, \
+    which carries no resolve_buck/BuckCompiledSourceExpectation/with_buck_build; \
+    --buck qualification requires a Reverie pin bump to a revision carrying the \
+    Buck declared-content authority, plus the D1c-2/D1c-6 recipes for real Buck \
+    bytes. PLUMBING ONLY: no artifact was qualified and nothing was staged";
+
+/// The arguments after the program name: the mode, the target directory, and
+/// the mode's own inputs.
+fn parse_args(args: &[String]) -> proof::Result<Mode> {
     let mut args = args.iter();
     let authority = args
         .next()
-        .ok_or("expected --git or --source-copy")?
+        .ok_or("expected --git, --source-copy or --buck")?
         .clone();
-    require(
-        matches!(authority.as_str(), "--git" | "--source-copy"),
-        "expected --git or --source-copy",
-    )?;
     let target = args
         .next()
         .ok_or("expected existing target directory")?
         .clone();
-    let prebuilt = match args.next().map(String::as_str) {
-        None => None,
-        Some("--prebuilt") => Some(PathBuf::from(
+    match authority.as_str() {
+        "--git" | "--source-copy" => {
+            let prebuilt = match args.next().map(String::as_str) {
+                None => None,
+                Some("--prebuilt") => Some(PathBuf::from(
+                    args.next()
+                        .ok_or("expected prebuilt runtime path after --prebuilt")?,
+                )),
+                Some(_) => return Err("unexpected finalizer arguments".into()),
+            };
+            require(args.next().is_none(), "unexpected finalizer arguments")?;
+            Ok(Mode::Cargo {
+                authority,
+                target,
+                prebuilt,
+            })
+        }
+        "--buck" => parse_buck_args(PathBuf::from(target), &mut args),
+        _ => Err("expected --git, --source-copy or --buck".into()),
+    }
+}
+
+fn parse_buck_args(
+    target: PathBuf,
+    args: &mut std::slice::Iter<'_, String>,
+) -> proof::Result<Mode> {
+    let mut artifact = None;
+    let mut workspace_root = None;
+    let mut reverie_root = None;
+    let mut reverie_pin = None;
+    let mut imported_sha = None;
+    let mut profile_bzl = None;
+    let mut buck_target = None;
+    let mut buck_platform = None;
+    let mut buck_constraints = Vec::new();
+    let mut workspace_files = Vec::new();
+    let mut reverie_files = Vec::new();
+    // Every singleton may be spelled once; the three list flags repeat.
+    fn set_once(slot: &mut Option<String>, value: String) -> proof::Result<()> {
+        require(slot.is_none(), "duplicate --buck argument")?;
+        *slot = Some(value);
+        Ok(())
+    }
+    while let Some(flag) = args.next() {
+        let mut value = || {
             args.next()
-                .ok_or("expected prebuilt runtime path after --prebuilt")?,
-        )),
-        Some(_) => return Err("unexpected finalizer arguments".into()),
-    };
-    require(args.next().is_none(), "unexpected finalizer arguments")?;
-    Ok((authority, target, prebuilt))
+                .cloned()
+                .ok_or_else(|| format!("expected value after {flag}"))
+        };
+        match flag.as_str() {
+            "--artifact" => set_once(&mut artifact, value()?)?,
+            "--workspace-root" => set_once(&mut workspace_root, value()?)?,
+            "--reverie-root" => set_once(&mut reverie_root, value()?)?,
+            "--reverie-pin" => set_once(&mut reverie_pin, value()?)?,
+            "--imported-sha" => set_once(&mut imported_sha, value()?)?,
+            "--profile-bzl" => set_once(&mut profile_bzl, value()?)?,
+            "--buck-target" => set_once(&mut buck_target, value()?)?,
+            "--buck-platform" => set_once(&mut buck_platform, value()?)?,
+            "--buck-constraint" => buck_constraints.push(value()?),
+            "--workspace-file" => workspace_files.push(value()?),
+            "--reverie-file" => reverie_files.push(value()?),
+            _ => return Err("unexpected --buck argument".into()),
+        }
+    }
+    let required =
+        |slot: Option<String>, flag: &str| slot.ok_or_else(|| format!("--buck requires {flag}"));
+    Ok(Mode::Buck(Box::new(BuckArgs {
+        target,
+        artifact: PathBuf::from(required(artifact, "--artifact")?),
+        workspace_root: PathBuf::from(required(workspace_root, "--workspace-root")?),
+        reverie_root: PathBuf::from(required(reverie_root, "--reverie-root")?),
+        reverie_pin: required(reverie_pin, "--reverie-pin")?,
+        imported_sha: required(imported_sha, "--imported-sha")?,
+        profile_bzl: PathBuf::from(required(profile_bzl, "--profile-bzl")?),
+        buck_target: required(buck_target, "--buck-target")?,
+        buck_platform: required(buck_platform, "--buck-platform")?,
+        buck_constraints,
+        workspace_files,
+        reverie_files,
+    })))
+}
+
+fn is_full_sha(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Argument checks that need no source authority and no filesystem: the pins
+/// are full lowercase-hex SHAs, the Buck literals are exactly the verifier's,
+/// the profile input names the reviewed `.bzl`, and the declared file lists
+/// are nonempty logical relative paths naming at least the leaf and the
+/// qualifier sources the closed factory will hash.
+fn validate_buck_args(args: &BuckArgs) -> proof::Result<()> {
+    require(
+        is_full_sha(&args.reverie_pin),
+        "--buck requires a full 40-hex --reverie-pin",
+    )?;
+    require(
+        is_full_sha(&args.imported_sha),
+        "--buck requires a full 40-hex --imported-sha",
+    )?;
+    require(
+        args.buck_target == BUCK_TARGET,
+        "--buck-target is not the pinned Buck runtime target",
+    )?;
+    require(
+        args.buck_platform == BUCK_PLATFORM,
+        "--buck-platform is not the pinned Buck runtime platform",
+    )?;
+    require(
+        args.buck_constraints == BUCK_CONSTRAINTS,
+        "--buck-constraint values are not the pinned runtime constraints",
+    )?;
+    require(
+        args.profile_bzl
+            .file_name()
+            .is_some_and(|name| name == "liteinst-runtime-profile.bzl"),
+        "--profile-bzl is not the liteinst-runtime profile .bzl",
+    )?;
+    for files in [&args.workspace_files, &args.reverie_files] {
+        require(!files.is_empty(), "--buck requires declared source files")?;
+        for file in files {
+            let path = Path::new(file);
+            require(
+                !file.is_empty()
+                    && !path.is_absolute()
+                    && path
+                        .components()
+                        .all(|component| matches!(component, std::path::Component::Normal(_))),
+                "--buck declared files must be logical relative paths",
+            )?;
+        }
+    }
+    require(
+        args.workspace_files
+            .iter()
+            .any(|file| file == "detcore-liteinst/src/lib.rs"),
+        "--buck workspace files must declare the detcore-liteinst leaf source",
+    )?;
+    require(
+        args.reverie_files
+            .iter()
+            .any(|file| file == "reverie-liteinst-artifact/src/lib.rs"),
+        "--buck reverie files must declare the qualifier source",
+    )?;
+    Ok(())
+}
+
+fn buck_argv() -> Vec<String> {
+    vec![
+        "build".into(),
+        BUCK_TARGET.into(),
+        "--target-platforms".into(),
+        BUCK_PLATFORM.into(),
+    ]
+}
+
+fn buck_profile_objects() -> serde_json::Value {
+    json!({"liteinst-runtime": {"rustc_flags": BUCK_RUSTC_FLAGS}})
+}
+
+/// The `buck_artifact` mirror of the Cargo receipt's artifact record: the
+/// ordinary (empty) feature mode, the exact compiler profile the Buck flag
+/// set produces, the synthesized leaf package, and the Buck output path the
+/// qualification proof must name. There is no `fresh`: Buck has no such
+/// notion to report honestly.
+#[allow(dead_code)] // Wired by run_buck at the Reverie pin bump; unit-tested now.
+fn buck_artifact(package: serde_json::Value, reported_path: &Path) -> serde_json::Value {
+    json!({
+        "features": [],
+        "profile": {"opt_level": "3", "debuginfo": 0, "debug_assertions": true,
+                    "overflow_checks": true, "test": false},
+        "package": package,
+        "reported_path": reported_path.to_string_lossy(),
+    })
+}
+
+/// The `builder=buck2` receipt body, before publication adds `installed`,
+/// `source_close_completed` and the executed `commands` (the qualifier's
+/// readelf/objdump runs). It carries no `cargo_*` key and synthesizes no
+/// Cargo value; `profile_inputs` is the profile `.bzl` identity, which is
+/// also the Buck compiled-sources manifest slot, and `rustc_version` is the
+/// ELF `.comment` identity read at qualification time.
+#[allow(dead_code)] // Wired by run_buck at the Reverie pin bump; unit-tested now.
+fn buck_receipt(
+    args: &BuckArgs,
+    profile_inputs: serde_json::Value,
+    artifact: serde_json::Value,
+    qualifier_source: serde_json::Value,
+    compiled_sources: serde_json::Value,
+    qualification: serde_json::Value,
+    rustc_version: &str,
+) -> serde_json::Value {
+    json!({
+        "schema": "hermit-packaged-detcore/v1",
+        "builder": "buck2",
+        "reverie_pin": args.reverie_pin,
+        "profile_name": "liteinst-runtime",
+        "profile_inputs": profile_inputs,
+        "profile_objects": buck_profile_objects(),
+        "buck_target": BUCK_TARGET,
+        "buck_platform": BUCK_PLATFORM,
+        "buck_constraints": BUCK_CONSTRAINTS,
+        "buck_argv": buck_argv(),
+        "buck_artifact": artifact,
+        "rustc_version": rustc_version,
+        "qualifier_source": qualifier_source,
+        "compiled_qualifier_sha256": proof::qualifier_source_sha256(),
+        "compiled_sources": compiled_sources,
+        "qualification": qualification,
+    })
+}
+
+/// Buck mode: qualify the supplied Buck `.so` directly against Buck-declared
+/// sources — no Cargo build and no byte-identity gate. The qualification
+/// sequence, once the pinned Reverie carries the Buck authority, is:
+/// `VerifiedCompiledSources::resolve_buck` over the declared roots/files,
+/// `with_buck_build(artifact)` for the `BuildWitness::Buck` witness,
+/// `qualify_detcore_constructor_with_sources` on the supplied artifact, then
+/// stage + publish [`buck_receipt`] exactly as the Cargo arm publishes its
+/// receipt. At the current pin none of those entry points exist in the
+/// compiled dependency, so this validates every input it honestly can and
+/// then refuses by name, before any staged file is touched.
+fn run_buck(args: &BuckArgs) -> proof::Result<()> {
+    validate_buck_args(args)?;
+    for path in [&args.target, &args.workspace_root, &args.reverie_root] {
+        require(
+            fs::canonicalize(path).map_err(|e| e.to_string())?.is_dir(),
+            "Buck input is not a directory",
+        )?;
+    }
+    for path in [&args.artifact, &args.profile_bzl] {
+        require(
+            path.is_file() && !path.is_symlink(),
+            "Buck input must be a regular non-symlink file",
+        )?;
+    }
+    Err(BUCK_UNAVAILABLE.into())
 }
 
 fn run() -> proof::Result<()> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    let (authority, target, prebuilt) = parse_args(&argv)?;
+    let (authority, target, prebuilt) = match parse_args(&argv)? {
+        Mode::Cargo {
+            authority,
+            target,
+            prebuilt,
+        } => (authority, target, prebuilt),
+        Mode::Buck(args) => return run_buck(&args),
+    };
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .ok_or("Hermit root missing")?;
@@ -325,7 +631,11 @@ mod tests {
     fn arguments_accept_an_optional_prebuilt_runtime() {
         assert_eq!(
             parse_args(&argv(&["--git", "target"])).unwrap(),
-            ("--git".to_string(), "target".to_string(), None)
+            Mode::Cargo {
+                authority: "--git".to_string(),
+                target: "target".to_string(),
+                prebuilt: None,
+            }
         );
         assert_eq!(
             parse_args(&argv(&[
@@ -335,20 +645,24 @@ mod tests {
                 "buck-out/lib.so"
             ]))
             .unwrap(),
-            (
-                "--source-copy".to_string(),
-                "target".to_string(),
-                Some(PathBuf::from("buck-out/lib.so"))
-            )
+            Mode::Cargo {
+                authority: "--source-copy".to_string(),
+                target: "target".to_string(),
+                prebuilt: Some(PathBuf::from("buck-out/lib.so")),
+            }
         );
     }
 
     #[test]
     fn arguments_refuse_every_other_shape() {
         for (args, message) in [
-            (vec![], "expected --git or --source-copy"),
-            (vec!["--prebuilt", "x"], "expected --git or --source-copy"),
+            (vec![], "expected --git, --source-copy or --buck"),
+            (
+                vec!["--prebuilt", "x"],
+                "expected --git, --source-copy or --buck",
+            ),
             (vec!["--git"], "expected existing target directory"),
+            (vec!["--buck"], "expected existing target directory"),
             (
                 vec!["--git", "target", "extra"],
                 "unexpected finalizer arguments",
@@ -361,10 +675,280 @@ mod tests {
                 vec!["--git", "target", "--prebuilt", "x", "extra"],
                 "unexpected finalizer arguments",
             ),
+            // The modes never mix: no --prebuilt byte-identity gate in Buck
+            // mode, and no Buck flags in Cargo mode.
+            (
+                vec!["--buck", "target", "--prebuilt", "x"],
+                "unexpected --buck argument",
+            ),
+            (
+                vec!["--git", "target", "--artifact", "x"],
+                "unexpected finalizer arguments",
+            ),
         ] {
             let error = parse_args(&argv(&args)).unwrap_err().to_string();
             assert!(error.contains(message), "{args:?}: {error}");
         }
+    }
+
+    fn buck_argv_fixture() -> Vec<&'static str> {
+        vec![
+            "--buck",
+            "target",
+            "--artifact",
+            "buck-out/libdetcore_liteinst.so",
+            "--workspace-root",
+            "hermit",
+            "--reverie-root",
+            "reverie",
+            "--reverie-pin",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--imported-sha",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "--profile-bzl",
+            "fb-only/liteinst-runtime-profile.bzl",
+            "--buck-target",
+            BUCK_TARGET,
+            "--buck-platform",
+            BUCK_PLATFORM,
+            "--buck-constraint",
+            BUCK_CONSTRAINTS[0],
+            "--buck-constraint",
+            BUCK_CONSTRAINTS[1],
+            "--workspace-file",
+            "detcore-liteinst/src/lib.rs",
+            "--workspace-file",
+            "detcore-liteinst/build.rs",
+            "--reverie-file",
+            "reverie-liteinst-artifact/src/lib.rs",
+        ]
+    }
+
+    fn buck_args_fixture() -> BuckArgs {
+        let Mode::Buck(args) = parse_args(&argv(&buck_argv_fixture())).unwrap() else {
+            panic!("fixture must parse as Buck mode");
+        };
+        *args
+    }
+
+    #[test]
+    fn buck_arguments_are_all_explicit() {
+        let args = buck_args_fixture();
+        assert_eq!(args.target, PathBuf::from("target"));
+        assert_eq!(
+            args.artifact,
+            PathBuf::from("buck-out/libdetcore_liteinst.so")
+        );
+        assert_eq!(args.workspace_root, PathBuf::from("hermit"));
+        assert_eq!(args.reverie_root, PathBuf::from("reverie"));
+        assert_eq!(args.reverie_pin, "a".repeat(40));
+        assert_eq!(args.imported_sha, "b".repeat(40));
+        assert_eq!(args.buck_constraints, BUCK_CONSTRAINTS);
+        validate_buck_args(&args).unwrap();
+    }
+
+    #[test]
+    fn buck_arguments_refuse_incomplete_and_misspelled_shapes() {
+        let full = buck_argv_fixture();
+        for (args, message) in [
+            (vec!["--buck", "target"], "--buck requires --artifact"),
+            (
+                vec!["--buck", "target", "--artifact"],
+                "expected value after --artifact",
+            ),
+            (
+                vec!["--buck", "target", "--unknown", "x"],
+                "unexpected --buck argument",
+            ),
+        ] {
+            let error = parse_args(&argv(&args)).unwrap_err().to_string();
+            assert!(error.contains(message), "{args:?}: {error}");
+        }
+        // Dropping either half of a singleton pair, or repeating it, refuses.
+        for cut in [2, 4, 10, 14] {
+            let mut truncated = full.clone();
+            truncated.drain(cut..cut + 2);
+            assert!(parse_args(&argv(&truncated)).is_err(), "cut {cut}");
+        }
+        let mut duplicated = full.clone();
+        duplicated.extend(["--artifact", "other.so"]);
+        let error = parse_args(&argv(&duplicated)).unwrap_err().to_string();
+        assert!(error.contains("duplicate --buck argument"), "{error}");
+    }
+
+    #[test]
+    fn buck_validation_refuses_unpinned_provenance() {
+        let mut args = buck_args_fixture();
+        args.reverie_pin = "abc".into();
+        assert!(
+            validate_buck_args(&args)
+                .unwrap_err()
+                .contains("full 40-hex --reverie-pin")
+        );
+        let mut args = buck_args_fixture();
+        args.imported_sha = "B".repeat(40);
+        assert!(
+            validate_buck_args(&args)
+                .unwrap_err()
+                .contains("full 40-hex --imported-sha")
+        );
+        let mut args = buck_args_fixture();
+        args.buck_target = "//hermetic_infra/hermit:detcore-liteinst".into();
+        assert!(
+            validate_buck_args(&args)
+                .unwrap_err()
+                .contains("pinned Buck runtime target")
+        );
+        let mut args = buck_args_fixture();
+        args.buck_platform = "ovr_config//platform/linux:aarch64-fbcode".into();
+        assert!(
+            validate_buck_args(&args)
+                .unwrap_err()
+                .contains("pinned Buck runtime platform")
+        );
+        let mut args = buck_args_fixture();
+        args.buck_constraints.reverse();
+        assert!(
+            validate_buck_args(&args)
+                .unwrap_err()
+                .contains("pinned runtime constraints")
+        );
+        let mut args = buck_args_fixture();
+        args.profile_bzl = PathBuf::from("fb-only/other.bzl");
+        assert!(
+            validate_buck_args(&args)
+                .unwrap_err()
+                .contains("liteinst-runtime profile .bzl")
+        );
+        let mut args = buck_args_fixture();
+        args.workspace_files = vec!["/absolute/lib.rs".into()];
+        assert!(
+            validate_buck_args(&args)
+                .unwrap_err()
+                .contains("logical relative paths")
+        );
+        let mut args = buck_args_fixture();
+        args.workspace_files = vec!["detcore-liteinst/build.rs".into()];
+        assert!(
+            validate_buck_args(&args)
+                .unwrap_err()
+                .contains("leaf source")
+        );
+        let mut args = buck_args_fixture();
+        args.reverie_files = vec!["reverie-liteinst/src/patch_alloc.rs".into()];
+        assert!(
+            validate_buck_args(&args)
+                .unwrap_err()
+                .contains("qualifier source")
+        );
+        let mut args = buck_args_fixture();
+        args.reverie_files.clear();
+        assert!(
+            validate_buck_args(&args)
+                .unwrap_err()
+                .contains("declared source files")
+        );
+    }
+
+    #[test]
+    fn buck_mode_refuses_by_name_at_the_pinned_reverie() {
+        // Valid arguments whose paths do not exist stop at path checks; the
+        // authority refusal itself is exercised end to end by the dress
+        // rehearsal against real roots. Here the named refusal text is the
+        // contract: it must keep identifying the missing authority.
+        assert!(BUCK_UNAVAILABLE.starts_with("Buck authority unavailable at pinned Reverie"));
+        assert!(BUCK_UNAVAILABLE.contains("resolve_buck"));
+        assert!(BUCK_UNAVAILABLE.contains("PLUMBING ONLY"));
+        let error = run_buck(&buck_args_fixture()).unwrap_err();
+        assert!(!error.is_empty());
+    }
+
+    /// The receipt body must match the verifier's Buck arm exactly: same
+    /// schema, `builder=buck2`, the flag-dict profile, the Buck literals and
+    /// argv, the artifact mirror, and no `cargo_*` key anywhere.
+    #[test]
+    fn buck_receipt_matches_the_verifier_buck_arm() {
+        let args = buck_args_fixture();
+        let package = json!({"name": "detcore-liteinst", "target": "detcore_liteinst",
+            "source": null, "kind": ["cdylib"], "crate_types": ["cdylib"]});
+        let profile_inputs = json!({"path": "/fixture/fb-only/liteinst-runtime-profile.bzl", "sha256": "1".repeat(64)});
+        let record = buck_receipt(
+            &args,
+            profile_inputs.clone(),
+            buck_artifact(
+                package.clone(),
+                Path::new("/fixture/buck-out/libdetcore_liteinst.so"),
+            ),
+            json!({"path": "/fixture/reverie/reverie-liteinst-artifact/src/lib.rs",
+                   "sha256": proof::qualifier_source_sha256()}),
+            json!({"image_kind": "Detcore", "reverie_pin": args.reverie_pin,
+                   "manifest": profile_inputs, "leaf": package,
+                   "reverie_root": "/fixture/reverie"}),
+            json!({"artifact": {"path": "/fixture/buck-out/libdetcore_liteinst.so"}}),
+            "rustc fixture",
+        );
+        let object = record.as_object().unwrap();
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "buck_argv",
+                "buck_artifact",
+                "buck_constraints",
+                "buck_platform",
+                "buck_target",
+                "builder",
+                "compiled_qualifier_sha256",
+                "compiled_sources",
+                "profile_inputs",
+                "profile_name",
+                "profile_objects",
+                "qualification",
+                "qualifier_source",
+                "reverie_pin",
+                "rustc_version",
+                "schema",
+            ]
+        );
+        assert!(keys.iter().all(|key| !key.starts_with("cargo_")));
+        assert_eq!(record["schema"], "hermit-packaged-detcore/v1");
+        assert_eq!(record["builder"], "buck2");
+        assert_eq!(record["profile_name"], "liteinst-runtime");
+        assert_eq!(
+            record["profile_objects"],
+            json!({"liteinst-runtime": {"rustc_flags": [
+                "-Copt-level=3", "-Cdebuginfo=0", "-Cdebug-assertions=yes",
+                "-Coverflow-checks=yes", "-Ccodegen-units=16",
+                "-Cembed-bitcode=no", "-Cpanic=unwind", "-Cstrip=none"]}})
+        );
+        assert_eq!(
+            record["buck_argv"],
+            json!(["build", BUCK_TARGET, "--target-platforms", BUCK_PLATFORM])
+        );
+        assert_eq!(record["buck_target"], BUCK_TARGET);
+        assert_eq!(record["buck_platform"], BUCK_PLATFORM);
+        assert_eq!(record["buck_constraints"], json!(BUCK_CONSTRAINTS));
+        assert_eq!(record["buck_artifact"]["features"], json!([]));
+        assert_eq!(
+            record["buck_artifact"]["profile"],
+            json!({"opt_level": "3", "debuginfo": 0, "debug_assertions": true,
+                   "overflow_checks": true, "test": false})
+        );
+        assert_eq!(
+            record["buck_artifact"]["reported_path"],
+            "/fixture/buck-out/libdetcore_liteinst.so"
+        );
+        // The verifier joins profile_inputs to the compiled-sources manifest
+        // slot; in the Buck arm both are the profile .bzl identity.
+        assert_eq!(
+            record["profile_inputs"],
+            record["compiled_sources"]["manifest"]
+        );
+        assert_eq!(
+            record["compiled_qualifier_sha256"],
+            proof::qualifier_source_sha256()
+        );
     }
 
     #[test]
