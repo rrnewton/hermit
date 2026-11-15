@@ -251,10 +251,8 @@ fn profile_dir_of(out_dir: &Path) -> PathBuf {
 
 include!("../hermit-cli/reverie_pin.rs");
 
-/// The Reverie revision this tree pins, read from the canonical manifest.
+/// The Reverie revision this tree pins: the `reverie` submodule gitlink
+/// (manifest read remains as the pre-migration fallback).
 fn reverie_pin(repository: &Path) -> String {
-    let Ok(text) = fs::read_to_string(repository.join("detcore/Cargo.toml")) else {
-        return "unknown".into();
-    };
-    parse_reverie_pin(&text).unwrap_or_else(|| "unknown".into())
+    reverie_pin_at(repository).unwrap_or_else(|| "unknown".into())
 }

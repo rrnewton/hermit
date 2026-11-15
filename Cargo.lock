@@ -892,6 +892,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "hermit-abi"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e17592d60ebacc7d5e169f4663c5f84f9161cc90328abcfe8456f41e4dfcb284"
+
+[[package]]
 name = "hermit-cdylib"
 version = "0.5.7"
 dependencies = [
@@ -1209,6 +1215,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "io-uring"
+version = "0.7.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "878c26bc5e45fe089ce2ca25689260c152a87ce1d7de2ca86101efeea6973932"
+dependencies = [
+ "bitflags 2.13.1",
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1466,6 +1483,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "num_cpus"
+version = "1.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91df4bbde75afed763b708b7eee1e8e7651e02d97f6d5dd763e89367e957b23b"
+dependencies = [
+ "hermit-abi",
+ "libc",
+]
+
+[[package]]
 name = "num_threads"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1645,6 +1672,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "quickcheck_macros"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9a28b8493dd664c8b171dd944da82d933f7d456b829bfb236738e1fe06c5ba4"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1763,7 +1801,6 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "reverie-core"
 version = "0.5.7"
-source = "git+https://github.com/facebookexperimental/reverie.git?rev=61a342fe45f9d989939e8ee22959484319f47222#61a342fe45f9d989939e8ee22959484319f47222"
 dependencies = [
  "addr2line",
  "anyhow",
@@ -1783,20 +1820,23 @@ dependencies = [
  "reverie-process",
  "reverie-syscalls",
  "serde",
+ "serde_json",
  "syscalls",
  "thiserror",
  "tracing",
+ "tracing-subscriber",
  "typed-arena",
 ]
 
 [[package]]
 name = "reverie-inguest"
 version = "0.5.7"
-source = "git+https://github.com/facebookexperimental/reverie.git?rev=61a342fe45f9d989939e8ee22959484319f47222#61a342fe45f9d989939e8ee22959484319f47222"
 dependencies = [
  "bincode",
+ "iced-x86",
  "libc",
  "nix 0.30.1",
+ "object 0.40.0",
  "reverie-core",
  "reverie-loader",
  "reverie-memory",
@@ -1804,21 +1844,23 @@ dependencies = [
  "reverie-syscalls",
  "safeptrace",
  "serde",
+ "serde_json",
  "sha2",
  "syscalls",
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
 name = "reverie-kvm"
 version = "0.5.7"
-source = "git+https://github.com/facebookexperimental/reverie.git?rev=61a342fe45f9d989939e8ee22959484319f47222#61a342fe45f9d989939e8ee22959484319f47222"
 dependencies = [
  "futures 0.3.33",
  "goblin",
  "iced-x86",
+ "io-uring",
  "kvm-bindings",
  "kvm-ioctls",
  "libc",
@@ -1826,13 +1868,15 @@ dependencies = [
  "reverie-core",
  "reverie-kvm-core",
  "reverie-linuxemu",
+ "reverie-ptrace",
+ "serde",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
 name = "reverie-kvm-core"
 version = "0.5.7"
-source = "git+https://github.com/facebookexperimental/reverie.git?rev=61a342fe45f9d989939e8ee22959484319f47222#61a342fe45f9d989939e8ee22959484319f47222"
 dependencies = [
  "futures 0.3.33",
  "goblin",
@@ -1846,7 +1890,6 @@ dependencies = [
 [[package]]
 name = "reverie-linuxemu"
 version = "0.5.7"
-source = "git+https://github.com/facebookexperimental/reverie.git?rev=61a342fe45f9d989939e8ee22959484319f47222#61a342fe45f9d989939e8ee22959484319f47222"
 dependencies = [
  "cc",
  "futures 0.3.33",
@@ -1863,9 +1906,9 @@ dependencies = [
 [[package]]
 name = "reverie-liteinst"
 version = "0.5.7"
-source = "git+https://github.com/facebookexperimental/reverie.git?rev=61a342fe45f9d989939e8ee22959484319f47222#61a342fe45f9d989939e8ee22959484319f47222"
 dependencies = [
  "bincode",
+ "goblin",
  "iced-x86",
  "libc",
  "liteinst",
@@ -1874,16 +1917,19 @@ dependencies = [
  "reverie-core",
  "reverie-inguest",
  "reverie-rpc-transport",
+ "safeptrace",
  "serde",
+ "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
 name = "reverie-liteinst-artifact"
 version = "0.5.7"
-source = "git+https://github.com/facebookexperimental/reverie.git?rev=61a342fe45f9d989939e8ee22959484319f47222#61a342fe45f9d989939e8ee22959484319f47222"
 dependencies = [
  "goblin",
  "libc",
@@ -1895,20 +1941,18 @@ dependencies = [
 [[package]]
 name = "reverie-loader"
 version = "0.5.7"
-source = "git+https://github.com/facebookexperimental/reverie.git?rev=61a342fe45f9d989939e8ee22959484319f47222#61a342fe45f9d989939e8ee22959484319f47222"
 
 [[package]]
 name = "reverie-memory"
 version = "0.5.7"
-source = "git+https://github.com/facebookexperimental/reverie.git?rev=61a342fe45f9d989939e8ee22959484319f47222#61a342fe45f9d989939e8ee22959484319f47222"
 dependencies = [
+ "libc",
  "syscalls",
 ]
 
 [[package]]
 name = "reverie-process"
 version = "0.5.7"
-source = "git+https://github.com/facebookexperimental/reverie.git?rev=61a342fe45f9d989939e8ee22959484319f47222#61a342fe45f9d989939e8ee22959484319f47222"
 dependencies = [
  "bincode",
  "bitflags 2.13.1",
@@ -1916,8 +1960,11 @@ dependencies = [
  "futures 0.3.33",
  "libc",
  "nix 0.30.1",
+ "num_cpus",
+ "raw-cpuid",
  "serde",
  "syscalls",
+ "tempfile",
  "thiserror",
  "tokio",
 ]
@@ -1925,16 +1972,15 @@ dependencies = [
 [[package]]
 name = "reverie-procfs"
 version = "0.5.7"
-source = "git+https://github.com/facebookexperimental/reverie.git?rev=61a342fe45f9d989939e8ee22959484319f47222#61a342fe45f9d989939e8ee22959484319f47222"
 dependencies = [
  "libc",
  "serde",
+ "syn 2.0.119",
 ]
 
 [[package]]
 name = "reverie-ptrace"
 version = "0.5.7"
-source = "git+https://github.com/facebookexperimental/reverie.git?rev=61a342fe45f9d989939e8ee22959484319f47222#61a342fe45f9d989939e8ee22959484319f47222"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1955,6 +2001,7 @@ dependencies = [
  "reverie-core",
  "safeptrace",
  "serde",
+ "test-case",
  "thiserror",
  "tokio",
  "tokio-stream",
@@ -1966,7 +2013,6 @@ dependencies = [
 [[package]]
 name = "reverie-rpc-transport"
 version = "0.5.7"
-source = "git+https://github.com/facebookexperimental/reverie.git?rev=61a342fe45f9d989939e8ee22959484319f47222#61a342fe45f9d989939e8ee22959484319f47222"
 dependencies = [
  "async-trait",
  "bincode",
@@ -1981,7 +2027,6 @@ dependencies = [
 [[package]]
 name = "reverie-syscalls"
 version = "0.5.7"
-source = "git+https://github.com/facebookexperimental/reverie.git?rev=61a342fe45f9d989939e8ee22959484319f47222#61a342fe45f9d989939e8ee22959484319f47222"
 dependencies = [
  "bitflags 2.13.1",
  "derive_more",
@@ -2046,17 +2091,19 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "safeptrace"
 version = "0.5.7"
-source = "git+https://github.com/facebookexperimental/reverie.git?rev=61a342fe45f9d989939e8ee22959484319f47222#61a342fe45f9d989939e8ee22959484319f47222"
 dependencies = [
  "bitflags 2.13.1",
  "futures 0.3.33",
  "libc",
  "nix 0.30.1",
  "parking_lot",
+ "quickcheck",
+ "quickcheck_macros",
  "reverie-memory",
  "reverie-process",
  "syscalls",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

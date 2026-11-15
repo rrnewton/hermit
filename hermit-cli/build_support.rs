@@ -193,10 +193,12 @@ pub fn registry_build(identity: Option<&str>) -> Result<bool, String> {
     }
 }
 
-/// The Reverie revision this tree pins, read from the canonical manifest.
+/// The Reverie revision this tree pins: the `reverie` submodule gitlink.
 ///
-/// `detcore/Cargo.toml` is the source of truth the pin checker uses; every other
-/// site restates it. Returns `unknown` rather than failing the build, because a
+/// Manifests name no revision since the path-dependency migration; the
+/// gitlink is the source of truth the pin checker uses (a manifest read
+/// remains as the pre-migration fallback in `reverie_pin_at`). Returns
+/// `unknown` rather than failing the build, because a
 /// missing pin must not stop a developer compiling -- the loader treats
 /// `unknown` as "cannot verify" and says so instead of asserting a match.
 ///
@@ -218,10 +220,7 @@ pub fn reverie_pin_in(crate_dir: &Path) -> String {
     let Some(root) = crate_dir.parent() else {
         return "unknown".into();
     };
-    let Ok(text) = std::fs::read_to_string(root.join("detcore/Cargo.toml")) else {
-        return "unknown".into();
-    };
-    parse_reverie_pin(&text).unwrap_or_else(|| "unknown".into())
+    reverie_pin_at(root).unwrap_or_else(|| "unknown".into())
 }
 
 /// Build actual native artifacts through the existing isolated build-only root.

@@ -55,6 +55,32 @@ resolver = "2"
 license = "BSD-3-Clause"
 repository = "https://github.com/facebookexperimental/hermit"
 
+# Reverie is depended on by path into the `reverie` submodule, so the
+# submodule gitlink is the only commit hash a Reverie advance changes
+# (Reverie pin-flow design, Finding 3). Every entry keeps `version =`
+# beside `path =` so `cargo publish` drops the path and uses the
+# registry version, at the matching Hermit/Reverie release version.
+# Members inherit with `workspace = true` and add only their own
+# features/optional. `default-features = false` lives here for the four
+# crates every member already took that way, because Cargo refuses a
+# member-level default-features override on an inherited dependency.
+# In fbsource the same paths
+# resolve through the `hermit/reverie` symlink fb-only/ci.sh
+# materializes to the sibling in-tree Reverie.
+[workspace.dependencies]
+reverie-core = { path = "reverie/reverie", version = "0.5.7" }
+reverie-inguest = { path = "reverie/reverie-inguest", version = "0.5.7", default-features = false }
+reverie-kvm = { path = "reverie/reverie-kvm", version = "0.5.7" }
+reverie-liteinst = { path = "reverie/reverie-liteinst", version = "0.5.7", default-features = false }
+reverie-liteinst-artifact = { path = "reverie/reverie-liteinst-artifact", version = "0.5.7", default-features = false }
+reverie-liteinst-preload = { path = "reverie/reverie-liteinst-preload", version = "0.5.7", default-features = false }
+reverie-loader = { path = "reverie/reverie-loader", version = "0.5.7" }
+reverie-procfs = { path = "reverie/reverie-procfs", version = "0.5.7" }
+reverie-ptrace = { path = "reverie/reverie-ptrace", version = "0.5.7" }
+reverie-rpc-transport = { path = "reverie/reverie-rpc-transport", version = "0.5.7" }
+reverie-syscalls = { path = "reverie/reverie-syscalls", version = "0.5.7" }
+safeptrace = { path = "reverie/safeptrace", version = "0.5.7" }
+
 # SHA-256 is the io-buffer hash, and an unoptimised build of it is the single
 # dominant cost of `--detlog-io-buffers`. Measured on a 64 MiB buffer: 1.590s
 # unoptimised versus 0.046s optimised -- 25.4 s/GB versus 0.7 s/GB, a 34.6x

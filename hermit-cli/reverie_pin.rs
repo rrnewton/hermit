@@ -34,6 +34,65 @@
 // a revision that was never the pin sends the reader somewhere that does not
 // exist.
 
+/// The Reverie revision recorded by the `reverie` submodule gitlink of the
+/// checkout rooted at `root`, or `None` when it cannot be read.
+///
+/// Since the path-dependency migration the gitlink is the ONE pin: manifests
+/// name no revision, so this is the primary reader and
+/// [`parse_reverie_pin`] below remains only for pre-migration trees (and its
+/// tests). The recorded value is the index entry when an advance is staged,
+/// else HEAD's tree entry — the same pair `scripts/check-reverie-pin.rs`
+/// reads. `None` (no git, no submodule entry, a registry/tarball build)
+/// degrades exactly as an unparseable manifest did: callers render
+/// `"unknown"` and the guard skips.
+fn reverie_gitlink_pin(root: &std::path::Path) -> Option<String> {
+    fn git(root: &std::path::Path, args: &[&str]) -> Option<String> {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+    fn full_sha(value: &str) -> Option<String> {
+        (value.len() == 40 && value.chars().all(|c| c.is_ascii_hexdigit()))
+            .then(|| value.to_owned())
+    }
+    // Index entry: `160000 <sha> <stage>\treverie`.
+    if let Some(text) = git(root, &["ls-files", "--stage", "--", "reverie"]) {
+        for line in text.lines() {
+            let mut fields = line.split_whitespace();
+            if fields.next() == Some("160000") {
+                if let Some(sha) = fields.next().and_then(full_sha) {
+                    return Some(sha);
+                }
+            }
+        }
+    }
+    // HEAD tree entry: `160000 commit <sha>\treverie`.
+    let text = git(root, &["ls-tree", "HEAD", "--", "reverie"])?;
+    let mut fields = text.split_whitespace();
+    if fields.next() != Some("160000") || fields.next() != Some("commit") {
+        return None;
+    }
+    fields.next().and_then(full_sha)
+}
+
+/// The Reverie pin of the checkout rooted at `root`: the submodule gitlink,
+/// falling back to the canonical manifest's uniform revision on
+/// pre-migration trees. `None` renders as `"unknown"` at callers.
+fn reverie_pin_at(root: &std::path::Path) -> Option<String> {
+    if let Some(pin) = reverie_gitlink_pin(root) {
+        return Some(pin);
+    }
+    let text = std::fs::read_to_string(root.join("detcore/Cargo.toml")).ok()?;
+    parse_reverie_pin(&text)
+}
+
 /// Extract the single Reverie revision a manifest pins, or `None` if the
 /// manifest names zero revisions, more than one distinct revision, or names
 /// Reverie on a line whose revision cannot be parsed.
