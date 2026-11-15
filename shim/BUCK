@@ -56,6 +56,24 @@ HERMIT_RELEASE_RUSTC_FLAGS = [
     "-Cstrip=none",
 ]
 
+# Cargo's liteinst-runtime profile (the root Cargo.toml) for the Detcore
+# runtime's closure: the release flags above with debug assertions and
+# overflow checks on, in the reviewed order of
+# fb-only/liteinst-runtime-profile.bzl (its open-source stand-in is
+# hermetic_infra/hermit/fb-only/liteinst-runtime-profile.bzl in this cell),
+# which stage-detcore-liteinst and ci/verify-packaged-detcore.py pin exactly.
+# As there, lto = false passes no -Clto flag, so none appears here.
+HERMIT_LITEINST_RUNTIME_RUSTC_FLAGS = [
+    "-Copt-level=3",
+    "-Cdebuginfo=0",
+    "-Cdebug-assertions=yes",
+    "-Coverflow-checks=yes",
+    "-Ccodegen-units=16",
+    "-Cembed-bitcode=no",
+    "-Cpanic=unwind",
+    "-Cstrip=none",
+]
+
 constraint_setting(
     name = "hermit_rust_profile",
     visibility = ["PUBLIC"],
@@ -75,6 +93,24 @@ config_setting(
 platform(
     name = "hermit_rust_release_platform",
     constraint_values = [":hermit_rust_release"],
+    deps = ["prelude//platforms:default"],
+    visibility = ["PUBLIC"],
+)
+
+constraint_value(
+    name = "hermit_liteinst_runtime",
+    constraint_setting = ":hermit_rust_profile",
+    visibility = ["PUBLIC"],
+)
+
+config_setting(
+    name = "hermit_liteinst_runtime_enabled",
+    constraint_values = [":hermit_liteinst_runtime"],
+)
+
+platform(
+    name = "hermit_liteinst_runtime_platform",
+    constraint_values = [":hermit_liteinst_runtime"],
     deps = ["prelude//platforms:default"],
     visibility = ["PUBLIC"],
 )
@@ -150,7 +186,8 @@ system_python_bootstrap_toolchain(
     visibility = ["PUBLIC"],
 )
 
-_RUST_RELEASE_FLAGS = select({
+_RUST_PROFILE_FLAGS = select({
+    ":hermit_liteinst_runtime_enabled": HERMIT_LITEINST_RUNTIME_RUSTC_FLAGS,
     ":hermit_rust_release_enabled": HERMIT_RELEASE_RUSTC_FLAGS,
     "DEFAULT": [],
 })
@@ -173,7 +210,7 @@ _RUST_RELEASE_FLAGS = select({
         # execute inside the pinned root. The nix interp keeps the same
         # flags runnable on the build host (its /nix/store holds the
         # pinned closure), so build scripts stay consistent too.
-        rustc_flags = _RUST_RELEASE_FLAGS + (PINNED_LINK_ARGS if _RUST_SYSROOT == "pinned-rust-sysroot" else []),
+        rustc_flags = _RUST_PROFILE_FLAGS + (PINNED_LINK_ARGS if _RUST_SYSROOT == "pinned-rust-sysroot" else []),
         sysroot = ":rust-sysroot",
         visibility = ["PUBLIC"],
     )
@@ -184,7 +221,7 @@ _RUST_RELEASE_FLAGS = select({
     system_rust_toolchain(
         name = "rust",
         default_edition = "2024",
-        rustc_flags = _RUST_RELEASE_FLAGS,
+        rustc_flags = _RUST_PROFILE_FLAGS,
         visibility = ["PUBLIC"],
     )
     for _ in ([] if _RUST_SYSROOT else [None])

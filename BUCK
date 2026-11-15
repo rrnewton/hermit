@@ -1,4 +1,5 @@
 load("@fbcode//hermetic_infra/hermit/fb-only/contract_checks:backend_abstraction.bzl", "MEMBER_MANIFESTS")
+load("@fbcode//hermetic_infra/hermit/fb-only:liteinst-runtime-profile.bzl", "detcore_liteinst_runtime_alias")
 load("@fbcode//hermetic_infra/hermit/fb-only:release.bzl", "HERMIT_REVERIE_PIN")
 load("@fbcode//hermetic_infra/hermit/hermit-cli:integration_tests_data.bzl", "EXTERNAL_SRCS")
 load("@fbcode//hermetic_infra/hermit_import:excluded_paths.bzl", "excluded_paths_test")
@@ -125,6 +126,19 @@ rust_library(
     ],
 )
 
+# :detcore-liteinst under the liteinst-runtime profile (fb-only/
+# liteinst-runtime-profile.bzl), for the staging genrule below. Request
+# :detcore-liteinst-liteinst-runtime[cdylib] explicitly, as with
+# :detcore-liteinst. The open-source build pins the shim liteinst-runtime
+# platform, which applies the profile's exact flags to the whole closure;
+# fbcode pins its x86_64 Linux platform plus opt, whose flag propagation
+# over the closure is unproven until a real fbsource-built ELF is checked
+# (see the profile file). No default target references this alias.
+detcore_liteinst_runtime_alias(
+    name = "detcore-liteinst-liteinst-runtime",
+    actual = ":detcore-liteinst",
+)
+
 # The Cargo finalizer that qualifies the ordinary Detcore preload and
 # writes its hermit-packaged-detcore/v1 receipt, as a Buck binary so the
 # staging genrule below can run the same logic over the Buck-built
@@ -157,21 +171,22 @@ rust_binary(
 )
 
 # The Buck staging of the Detcore runtime is an UNQUALIFIED layout: this
-# genrule runs the unchanged Cargo finalizer (with --prebuilt) over
-# :detcore-liteinst[cdylib], and the finalizer stages those bytes and
-# writes the receipt only if they are byte-identical to the qualified
-# fixed liteinst-runtime build. Buck-profile bytes are not, so this
-# target refuses by name ("prebuilt runtime differs from the qualified
-# fixed liteinst-runtime build") until the Buck recipe produces the
-# qualified bytes. No receipt is fabricated and core verification
-# (ci/verify-packaged-detcore.py, scripts/build-buck-release.rs) is
-# unchanged: without this genrule's output an installation is missing
-# rsrcs/libdetcore_liteinst.package.json and is refused there.
+# genrule runs the unchanged Cargo finalizer (with --prebuilt) over the
+# liteinst-runtime-configured :detcore-liteinst-liteinst-runtime[cdylib],
+# and the finalizer stages those bytes and writes the receipt only if
+# they are byte-identical to the qualified fixed liteinst-runtime build.
+# Buck-profile bytes are not, so this target refuses by name ("prebuilt
+# runtime differs from the qualified fixed liteinst-runtime build") until
+# the Buck recipe produces the qualified bytes. No receipt is fabricated
+# and core verification (ci/verify-packaged-detcore.py,
+# scripts/build-buck-release.rs) is unchanged: without this genrule's
+# output an installation is missing rsrcs/libdetcore_liteinst.package.json
+# and is refused there.
 buck_genrule(
     name = "detcore-liteinst-staged",
     out = "detcore-liteinst-staged",
     cmd = "mkdir -p $OUT/rsrcs $OUT/target/install_pkg/rsrcs" +
-        " && $(exe :stage-detcore-liteinst) --source-copy $OUT/target --prebuilt $(location :detcore-liteinst[cdylib])" +
+        " && $(exe :stage-detcore-liteinst) --source-copy $OUT/target --prebuilt $(location :detcore-liteinst-liteinst-runtime[cdylib])" +
         " && cp $OUT/target/install_pkg/rsrcs/libdetcore_liteinst.so $OUT/rsrcs/libdetcore_liteinst.so" +
         " && cp $OUT/target/install_pkg/rsrcs/libdetcore_liteinst.package.json $OUT/rsrcs/libdetcore_liteinst.package.json" +
         " && rm -rf $OUT/target",
@@ -186,6 +201,17 @@ buck_genrule(
     name = "detcore-liteinst-receipt",
     out = "libdetcore_liteinst.package.json",
     cmd = "cp $(location :detcore-liteinst-staged)/rsrcs/libdetcore_liteinst.package.json $OUT",
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
+    visibility = ["//hermetic_infra/hermit/fb-only:"],
+)
+
+# The staged .so alone, likewise for the fbpkg's path_actions, so the
+# package's runtime and receipt are the same staged pair instead of a
+# staged receipt beside the raw :detcore-liteinst[cdylib] bytes.
+buck_genrule(
+    name = "detcore-liteinst-staged-so",
+    out = "libdetcore_liteinst.so",
+    cmd = "cp $(location :detcore-liteinst-staged)/rsrcs/libdetcore_liteinst.so $OUT",
     target_compatible_with = ["ovr_config//cpu:x86_64"],
     visibility = ["//hermetic_infra/hermit/fb-only:"],
 )

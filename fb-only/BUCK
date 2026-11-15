@@ -4,11 +4,12 @@ load("@fbcode_macros//build_defs:export_files.bzl", "buck_export_file")
 oncall("hermit")
 
 # The LiteInst receipt and preload revision ride along so the package is
-# checkable by ci/verify-packaged-detcore.py --core. The receipt target
-# refuses by name until the Buck-built runtime is the qualified
-# fixed-profile bytes (see the root BUCK's :detcore-liteinst-staged), so
-# this package does not build as a seemingly complete installation in
-# the meantime.
+# checkable by ci/verify-packaged-detcore.py --core. The runtime and its
+# receipt are both the staged pair (the root BUCK's
+# :detcore-liteinst-staged), not a staged receipt beside the raw cdylib
+# bytes. The staged targets refuse by name until the Buck-built runtime
+# is the qualified fixed-profile bytes, so this package does not build as
+# a seemingly complete installation in the meantime.
 fbpkg.builder(
     name = "hermetic_infra.hermit_cli",
     architectures = ["x86_64"],
@@ -16,7 +17,7 @@ fbpkg.builder(
         "hermit": "//hermetic_infra/hermit/hermit-cli:hermit",
         "install.toml": "install.toml",
         "rsrcs/libdetcore_liteinst.package.json": "//hermetic_infra/hermit:detcore-liteinst-receipt",
-        "rsrcs/libdetcore_liteinst.so": "//hermetic_infra/hermit:detcore-liteinst[cdylib]",
+        "rsrcs/libdetcore_liteinst.so": "//hermetic_infra/hermit:detcore-liteinst-staged-so",
         "rsrcs/libreverie_liteinst.so": "//hermetic_infra/reverie:reverie-liteinst-preload[cdylib]",
         "rsrcs/libreverie_liteinst.so.revision": "//hermetic_infra/hermit:reverie-liteinst-revision",
     },
