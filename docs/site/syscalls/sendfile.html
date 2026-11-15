@@ -1,0 +1,105 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sendfile | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>sendfile</code> (40)</h1>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; linux determinism: conditional &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+sendfile&amp;body=Discussion+for+the+%60sendfile%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsendfile.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60sendfile%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p>Copies up to <code>count</code> bytes from <code>in_fd</code> to <code>out_fd</code> inside the kernel, with no user-space buffer. Hermit mediates copies between regular files and memfds: it orders the write to the destination file through the scheduler and records the result. It returns <code>ENOSYS</code> for socket, pipe and procfs endpoints, where Linux would succeed.</p>
+<h2>Linux semantics</h2>
+<p><code>sendfile(out_fd, in_fd, offset, count)</code> reads from <code>in_fd</code> and writes to <code>out_fd</code>, and returns the number of bytes copied. <code>in_fd</code> must support mmap-like reads, so it cannot be a socket. Since Linux 2.6.33 <code>out_fd</code> can be any file, not only a socket. Since Linux 5.12, when <code>out_fd</code> is a pipe, the call is carried out as a splice and <code>in_fd</code> may be any file that supports splice reads. A host probe on 2026-07-24 copied 8 bytes from <code>/etc/hostname</code> to a temporary file and got 8 (see Additional information).</p>
+<p>The copy is not atomic with respect to the destination's readers. A copy to a socket or pipe can block or be partial, like <code>write(2)</code>. The number of bytes moved per call is capped at <code>MAX_RW_COUNT</code> (0x7ffff000).</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>offset == NULL</code>: read from <code>in_fd</code>'s file offset and advance it by the bytes copied.</li>
+<li>F2: <code>offset != NULL</code>: read from <code>*offset</code>, store the updated position in <code>*offset</code>, and leave <code>in_fd</code>'s file offset unchanged. <code>ESPIPE</code> if <code>in_fd</code> is not seekable.</li>
+<li>F3: <code>count</code>: at most <code>MAX_RW_COUNT</code> bytes per call. A short count at end of file, 0 at end of file, and 0 for <code>count == 0</code>.</li>
+<li>F4: <code>in_fd</code> type: must be a regular file (or another file with mmap-like reads); a socket or pipe input gives <code>EINVAL</code>, except for the Linux 5.12 splice path when <code>out_fd</code> is a pipe.</li>
+<li>F5: <code>out_fd</code> is a regular file or memfd.</li>
+<li>F6: <code>out_fd</code> is a socket, the classic use: the copy can block on a full send buffer and can be partial.</li>
+<li>F7: <code>out_fd</code> is a pipe, including stdout when it is a pipe: the copy can block on a full pipe and can be partial.</li>
+<li>F8: <code>out_fd</code> opened with <code>O_APPEND</code> gives <code>EINVAL</code>.</li>
+<li>F9: <code>out_fd</code> with <code>O_NONBLOCK</code> gives <code>EAGAIN</code> when the copy would block.</li>
+<li>F10: errors: <code>EBADF</code> (an fd not open, <code>in_fd</code> not readable or <code>out_fd</code> not writable), <code>EFAULT</code> (bad <code>offset</code> pointer), <code>EINVAL</code> (descriptor locked or unusable, negative offset), <code>EOVERFLOW</code> (<code>count</code> too large for the offset), <code>EIO</code>, <code>ENOMEM</code>.</li>
+<li>F11: a signal while the copy is blocked gives <code>EINTR</code> if nothing was copied, and a short count otherwise.</li>
+<li>F12: <code>in_fd</code> on procfs or sysfs: the kernel copies live kernel-generated content.</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: conditional</code>. A copy between regular files, or memfds, is deterministic for fixed file contents and offsets: the count and the bytes written depend only on file state (F1-F5, F8, F10). It stops being deterministic when:</p>
+<ul>
+<li>the destination is a socket or pipe (F6, F7, F9, F11), because how many bytes fit before the call blocks or returns short depends on how fast the reader drains the other end;</li>
+<li>the source is a procfs or sysfs file (F12), because its contents are live kernel state;</li>
+<li>another process writes the same destination file at the same time, because the order of the two writes is decided by the host scheduler.</li>
+</ul>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>Socket and pipe destinations: partial counts, <code>EAGAIN</code> and <code>EINTR</code> depend on reader timing.</li>
+<li>Live procfs and sysfs content in the source.</li>
+<li>Concurrent writers to the destination file.</li>
+<li>The offset update must stay ordered with other reads, writes and seeks on the same open file description, or a replay sees different positions.</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>model</code>. Detcore decides which endpoint types the call may touch and orders every allowed copy with the other file operations. The dispatch arm at <code>detcore/src/lib.rs:2374</code> calls <code>handle_sendfile</code> at <code>detcore/src/syscalls/files.rs:2155</code>:</p>
+<ul>
+<li>It looks up both descriptors' types, and the destination's resource and inode, in Detcore's fd table.</li>
+<li>A procfs source returns <code>ENOSYS</code> (<code>detcore/src/syscalls/files.rs:2183</code>). The comment at <code>detcore/src/syscalls/files.rs:2173</code> explains why: a procfs descriptor is classified as a regular file, so without this check the kernel would copy live bytes that the mediated <code>read</code> path sanitizes (F12).</li>
+<li>Any source or destination that is not a regular file or memfd returns <code>ENOSYS</code> (<code>detcore/src/syscalls/files.rs:2187</code>). This covers socket and pipe destinations (F6, F7) and non-regular sources (F4).</li>
+<li>For an allowed copy it requests write permission on the destination's file contents, with a determinized inode, and waits for it (<code>detcore/src/syscalls/files.rs:2210</code>). It then runs the call through <code>record_or_replay</code> (<code>detcore/src/syscalls/files.rs:2214</code>), so the count and both offset updates are recorded and replayed in order (F1, F2, F3, F5).</li>
+<li>With <code>virtualize_metadata</code>, a copy of more than zero bytes updates the destination's virtual timestamps (<code>detcore/src/syscalls/files.rs:2219</code>).</li>
+<li>Kernel errors for the allowed types (F8, F10) come back unchanged from the kernel.</li>
+</ul>
+<p>Why <code>model</code> and not the alternatives:</p>
+<ul>
+<li><code>passthrough</code> would let a copy to a socket or pipe block inside the kernel, where the deterministic scheduler cannot see it, and would let a procfs source leak live kernel state.</li>
+<li><code>refuse</code> for every case would break the common regular-file copy that the current code already handles deterministically.</li>
+<li><code>emulate</code> with <code>read</code> and <code>write</code> inside Detcore is a possible way to support socket and pipe destinations later, but it is a design for the gap below, not a different policy.</li>
+</ul>
+<p>What remains before the code fully realizes <code>model</code>:</p>
+<ul>
+<li><strong>F6, F7, F9, F11:</strong> socket and pipe destinations return <code>ENOSYS</code>. The doc comment at <code>detcore/src/syscalls/files.rs:2143</code> says this makes libc or the application fall back to <code>read</code> and <code>write</code>. Python's <code>socket.sendfile</code> and some servers do fall back. glibc's <code>sendfile(3)</code> is, as far as I know, a plain syscall wrapper with no fallback, so the claim in the <code>TODO-HUMAN-REVIEW(PR-973)</code> comment (https://github.com/rrnewton/hermit/issues/973, an issue despite the PR- prefix) that &quot;glibc's sendfile does exactly this&quot; looks wrong. A program that calls <code>sendfile</code> to a socket without its own fallback (for example a static file server) fails under Hermit where it works natively. See Open questions.</li>
+<li><strong>F4:</strong> a pipe or socket source returns <code>ENOSYS</code>, while Linux returns <code>EINVAL</code> (or, since 5.12 with a pipe destination, succeeds).</li>
+<li><strong>F12:</strong> a procfs source returns <code>ENOSYS</code>; Linux succeeds. Refusing is the deterministic choice until the copy can go through the procfs snapshot.</li>
+<li><code>ENOSYS</code> is also the errno for a type Hermit simply does not support, so a caller cannot tell &quot;this kernel lacks sendfile&quot; from &quot;Hermit refused this endpoint&quot;.</li>
+</ul>
+<p><code>linux_determinism</code> stays <code>conditional</code>, as explained above.</p>
+<p>Target (owner decision 14): a socket or pipe destination (F6, F7) takes the same nonblocking probe plus scheduler wait that <code>write</code> uses through <code>execute_nonblockable_fd_syscall</code> (<code>detcore/src/syscalls/helpers.rs:202</code>), with <code>SO_SNDTIMEO</code> measured on virtual time for a socket (decision 13). In run mode those descriptors are already physically nonblocking (see the <code>socket</code> body), so the probe is the plain kernel call, and an <code>EAGAIN</code> on a guest-blocking destination is the point to wait and retry; a guest <code>O_NONBLOCK</code> destination returns <code>EAGAIN</code> (F9). Until that is built, the refusal stays: the guest sees <code>ENOSYS</code> (<code>detcore/src/syscalls/files.rs:2190</code>). Programs with their own fallback recover: Python's <code>socket.sendfile</code> falls back to <code>send</code> when <code>os.sendfile</code> fails before sending anything. A program that calls <code>sendfile</code> with no fallback still fails under Hermit.</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F3, F5): copy between two regular files with a NULL offset under <code>hermit run --verify</code> on ptrace. Check that the source offset advances, that a request past end of file returns a short count and then 0, and that <code>count == 0</code> returns 0. Existing candidate: <code>tests/c/sendfile_copy.c</code> (cell <code>c-programs/sendfile-copy</code>, <code>tests/e2e/manifests/c-programs.yaml:14731</code>, verify ci on ptrace). It covers the NULL-offset advance; it does not test <code>count == 0</code>.</li>
+<li>T2 (covers F2, F5): copy with an explicit offset. <code>*offset</code> must be updated and the source's own file offset must not move. Existing candidates: <code>tests/c/sendfile_copy.c</code>; <code>tests/c/syscall_quick_wins.c:74</code> (cell <code>c-programs/syscall-quick-wins</code>, <code>tests/e2e/manifests/c-programs.yaml:9345</code>, verify ci on ptrace; raw <code>syscall(SYS_sendfile, ...)</code> with an offset that becomes 1); <code>tests/c/record_replay_file_state_regular_sink.c:56</code> (cell <code>c-programs/record-replay-file-state-regular-sink</code>, <code>tests/e2e/manifests/c-programs.yaml:7038</code>, verify ci on ptrace).</li>
+<li>T3 (covers F6, F9): copy a file to a connected AF_UNIX socket and to a loopback TCP socket, blocking and with <code>O_NONBLOCK</code> on a full send buffer. Linux copies the bytes, or returns <code>EAGAIN</code> when nonblocking; at this SHA Hermit returns <code>ENOSYS</code>. The test records that gap until the open question is settled.</li>
+<li>T4 (covers F7): copy a file to a pipe and to stdout when stdout is a pipe. Linux succeeds; Hermit returns <code>ENOSYS</code> at this SHA. Related: <code>tests/c/record_replay_file_state.c:117</code> copies to <code>STDOUT_FILENO</code>; its cell <code>c-programs/record-replay-file-state</code> (<code>tests/e2e/manifests/c-programs.yaml:6977</code>) has verify ci on ptrace set to false.</li>
+<li>T5 (covers F4, F8, F10): a raw <code>syscall(SYS_sendfile, ...)</code> error matrix, compared with native results: a pipe or socket <code>in_fd</code> (<code>EINVAL</code> natively), an <code>O_APPEND</code> <code>out_fd</code> (<code>EINVAL</code>), a closed fd and a read-only <code>out_fd</code> (<code>EBADF</code>), an unmapped <code>offset</code> (<code>EFAULT</code>), a negative <code>*offset</code> (<code>EINVAL</code>), a non-NULL offset on a non-seekable input (<code>ESPIPE</code>), and a <code>count</code> larger than <code>MAX_RW_COUNT</code> (clamped).</li>
+<li>T6 (covers F11): send a signal to a thread blocked in a copy to a pipe whose reader is stalled. Expect <code>EINTR</code> when nothing was copied and a short count otherwise. Depends on F7 being supported; until then, assert that a regular-file copy never returns <code>EINTR</code>.</li>
+<li>T7 (covers F12): a copy from <code>/proc/self/stat</code> returns <code>ENOSYS</code>, and the destination stays empty. Existing candidate: <code>check_sendfile_refused</code> at <code>tests/c/procfs_positioned_probe.c:90</code> (cell <code>c-programs/procfs-positioned-probe</code>, <code>tests/e2e/manifests/c-programs.yaml:6208</code>, verify ci on ptrace).</li>
+<li>T8 (covers F1, F2, F5): record and replay a guest that copies regular files with both offset modes. Replay must return the same counts and leave the same offsets.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/437: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch typed.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; model (regular/memfd copies mediated and recorded); linux_determinism stays conditional; socket, pipe and procfs endpoints return ENOSYS where Linux succeeds; left todo with an open question on socket/pipe destinations and the glibc fallback claim.</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): decision 14 applied (Target paragraph: socket and pipe destinations use the nonblocking probe plus scheduler wait, SO_SNDTIMEO on virtual time; ENOSYS stays until then); no new F/T ids; removed the open question on supporting socket and pipe destinations</li>
+<li>2026-10-05 · hermit f4055eb9cae4 · syscall-tracking-2 · covered: T2 covered by tests/c/sendfile_copy.c (C08 review of the 2026-10-04 coverage proposals; guest source read at this SHA, not run by this agent)</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+sendfile&amp;amp;body=Discussion+for+the+%60sendfile%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsendfile.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60sendfile%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `sendfile`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: sendfile&quot; (https://github.com/rrnewton/hermit/issues/437), legacy variant A1. Its comment history stays on that issue. The fallback-block statement in the evidence below was true when it was written; at f4055eb9 the call is dispatched to <code>handle_sendfile</code>.</p>
+<p>A stale comment in <code>tests/c/short_io_split_identity.c:46</code> points at <code>files.rs:840-844</code> for the socket <code>ENOSYS</code> path; at this SHA the check is at <code>detcore/src/syscalls/files.rs:2187</code>.</p>
+<h3>2026-07-24 host strace evidence</h3>
+<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) with <code>strace -f -e trace=sendfile</code> on a direct <code>syscall()</code> harness (invoked with non-destructive query/no-op/failing arguments) and, where applicable, on common programs. Hermit currently routes <code>sendfile</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code>.</p>
+<p>Observed strace line:</p>
+<pre><code>sendfile(4, 3, NULL, 8)         = 8
+</code></pre>
+<hr>
+<p>*Autonomous syscall-classification sweep (ranks 151-250 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
+<h3>Open questions</h3>
+<ul>
+<li>The claim in the comments at <code>detcore/src/syscalls/files.rs:2143</code> and <code>detcore/src/syscalls/files.rs:2173</code> that libc falls back to <code>read</code> and <code>write</code> on <code>ENOSYS</code> should be checked against glibc's source. If it is wrong, the comments should be corrected when the code is next touched.</li>
+</ul>
+</body></html>

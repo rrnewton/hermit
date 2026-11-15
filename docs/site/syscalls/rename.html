@@ -1,0 +1,107 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rename | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>rename</code> (82)</h1>
+<p>Strategy: <strong>passthrough</strong> &middot; dispatch: <code>passthrough</code> &middot; linux determinism: deterministic &middot; target policy: passthrough &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+rename&amp;body=Discussion+for+the+%60rename%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Frename.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60rename%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>rename(oldpath, newpath)</code> moves a directory entry to a new name within one mount, atomically replacing an existing <code>newpath</code> when the types allow it. Hermit forwards it to the host kernel unchanged. It relies on the guest's container filesystem being private and stable, and Detcore keeps no directory state of its own.</p>
+<h2>Linux semantics</h2>
+<p>The kernel resolves the parents of both paths, following symlinks in every earlier component but never in the last component of either path. Both paths resolve relative to the caller's working directory. Both must be on the same mount. The kernel locks both parents and checks the types of the two objects, then performs the move as one step: no other process can see a state where <code>newpath</code> is missing, or where both names are gone. It returns 0 or a negative errno and writes nothing to guest memory. Side effects show up only through other calls: both parents' mtime and ctime change; on most filesystems the moved inode's ctime changes; a moved directory's <code>..</code> is repointed; and a replaced inode loses one link. Errors are checked in path-walk order, so the errno is a function of the two paths, the filesystem state, the credentials and the mounts.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>newpath</code> does not exist: the entry is moved and <code>oldpath</code> disappears</li>
+<li>F2: <code>newpath</code> exists and both are non-directories: <code>newpath</code> is atomically replaced. The replaced inode loses a link and is freed only when no links and no open descriptors remain. A non-directory <code>oldpath</code> onto an existing directory <code>newpath</code>: <code>EISDIR</code>.</li>
+<li>F3: <code>oldpath</code> is a directory: <code>newpath</code> must be absent or an empty directory, which is replaced. A non-empty directory <code>newpath</code>: <code>ENOTEMPTY</code> (POSIX also allows <code>EEXIST</code>; Linux returns <code>ENOTEMPTY</code>). An existing non-directory <code>newpath</code>: <code>ENOTDIR</code>.</li>
+<li>F4: <code>oldpath</code> and <code>newpath</code> are hard links to the same inode: the call does nothing and returns 0, and both names remain</li>
+<li>F5: a symlink in the last component of either path is not followed: renaming a symlink moves the link itself, and a symlink at <code>newpath</code> is replaced rather than its target</li>
+<li>F6: <code>newpath</code> is inside the directory <code>oldpath</code> (a directory moved into its own subtree): <code>EINVAL</code>. A last component of <code>.</code> or <code>..</code> in either path: <code>EBUSY</code>. Either path is a mount point, or the root: <code>EBUSY</code>.</li>
+<li>F7: <code>oldpath</code> and <code>newpath</code> are on different mounts, including two bind mounts of one filesystem: <code>EXDEV</code></li>
+<li>F8: trailing slashes are accepted only when <code>oldpath</code> is a directory. A trailing slash on either path when <code>oldpath</code> is not a directory: <code>ENOTDIR</code>.</li>
+<li>F9: <code>oldpath</code> is missing, either path is empty, or <code>newpath</code>'s parent is missing: <code>ENOENT</code>. An intermediate component is not a directory: <code>ENOTDIR</code>.</li>
+<li>F10: write permission is denied on either parent, search permission on a path component, or write permission on a directory being moved to a new parent (to update its <code>..</code>): <code>EACCES</code>. A parent is sticky and the caller owns neither the parent nor the entry being removed or replaced: <code>EPERM</code>. F13 holds immutable and append-only entries.</li>
+<li>F11: a component is longer than <code>NAME_MAX</code>, or a path is longer than <code>PATH_MAX</code>: <code>ENAMETOOLONG</code>. Too many symlinks in a prefix: <code>ELOOP</code>. Either path points outside the address space: <code>EFAULT</code>.</li>
+<li>F12: <code>EROFS</code>: either parent is on a read-only mount. F14 and F15 hold the other host-dependent failures.</li>
+<li>F13: the entry being moved, removed or replaced, or a parent, carries the immutable or append-only attribute, which only the host can set: <code>EPERM</code>.</li>
+<li>F14: host-transient failures: <code>ENOSPC</code> (the target directory needs a new block and the host filesystem is full), <code>EDQUOT</code> (a host quota is exceeded) and <code>EIO</code> (failing storage).</li>
+<li>F15: <code>EMLINK</code>: moving a directory into a parent whose link count is at the host filesystem's limit.</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p>The result is a function of the filesystem state along both paths, the caller's credentials, and the mount layout. Nothing in the call depends on timing. The kernel makes the move atomic with respect to other threads and processes, and Hermit runs threads one at a time anyway, so two guest threads racing on the same names get a fixed order. The call repeats exactly when the guest-visible filesystem starts in the same state and nothing outside the container changes it.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>Changes to the filesystem made outside the container. Hermit does not try to make a changing host filesystem deterministic.</li>
+<li>Host resources and configuration behind F12, F13, F14 and F15: read-only remounts, inode attributes, free space, quota, filesystem link limits.</li>
+<li>Values the call changes but does not return: the parents' and the moved inode's timestamps. They become visible only through <code>stat</code> and similar calls, and are handled there.</li>
+</ul>
+<h3>Cross-host variation</h3>
+<ul>
+<li>Host mount layout visible in the guest: which paths are mount points (<code>EBUSY</code>, F6) and which pairs of paths lie on different mounts (<code>EXDEV</code>, F7).</li>
+<li>Filesystem type behind the guest's paths: its directory link limit decides where <code>EMLINK</code> starts (F15).</li>
+<li>Inode attributes set on the host: immutable or append-only entries give <code>EPERM</code> (F13).</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>passthrough</code>. The code already does this at hermit f4055eb9cae4:</p>
+<ul>
+<li><code>rename</code> is classified <code>PassThrough</code> at <code>detcore/src/syscall_classification.rs:762</code>, inside the pass-through block that starts at <code>detcore/src/syscall_classification.rs:690</code>. The comment at <code>detcore/src/syscall_classification.rs:756</code> and <code>:757</code> gives the condition: &quot;These synchronous extent and pathname operations are repeatable for guest-owned files in a fixed namespace with adequate space and no external mutation&quot;. <code>renameat</code> sits beside it at <code>detcore/src/syscall_classification.rs:764</code>, and <code>renameat2</code> is in the pass-through group at <code>detcore/src/syscall_classification.rs:732</code>.</li>
+<li>The generic arm <code>SyscallClassification::PassThrough =&gt; self.passthrough(guest, call).await</code> at <code>detcore/src/lib.rs:2843</code> forwards it. <code>passthrough</code> at <code>detcore/src/lib.rs:367</code> only calls <code>record_or_replay_preserving_tool_errors</code> (<code>detcore/src/tool_local.rs:349</code>). The injecting <code>NoopTool</code> passes the call through unchanged (<code>detcore/src/record_or_replay.rs:47</code>).</li>
+<li>The unit test <code>representative_policies_stay_in_their_reviewed_sections</code> (<code>detcore/src/syscall_classification.rs:1899</code>) lists <code>Sysno::rename</code> at <code>detcore/src/syscall_classification.rs:2062</code> and asserts it is <code>PassThrough</code> at <code>detcore/src/syscall_classification.rs:2094</code>.</li>
+</ul>
+<p>Why passthrough, not <code>model</code> or <code>emulate</code>:</p>
+<ul>
+<li>Hermit has no virtual filesystem. The directory tree in the guest's container mount namespace is the state, and only the kernel can apply F1 to F12 the same way the guest's other path syscalls see them.</li>
+<li>Every input that decides the result is either container state Hermit already holds fixed (the private <code>/tmp</code>, the launch filesystem image, fixed virtual-root credentials, serialized threads) or a host resource that no emulation could make up without lying about the filesystem.</li>
+<li>The return value carries no host-specific data: 0 or an errno that follows from the inputs.</li>
+</ul>
+<p>Record and replay. Code facts show <code>subscribed_record_replay: false</code>, so under <code>--passthru-opt</code> Detcore does not see <code>rename</code>. <code>hermit record</code> has its own subscriptions, in a recorder module that the comment at <code>detcore/src/lib.rs:1078</code> names; that module is not in the exported tree, so this body does not describe how record captures <code>rename</code>. The integration test <code>record_path_queries_and_legacy_mutations</code> (<code>hermit-cli/tests/record_replay.rs:2171</code>) requires the raw <code>SYS_rename</code> calls at <code>tests/c/record_replay_path_queries.c:238</code> (success) and <code>:246</code> (<code>ENOENT</code>) to replay from the recording.</p>
+<p>Existing run-mode evidence, all on ptrace:</p>
+<ul>
+<li>The cargo integration test <code>deterministic_file_io_syscalls_verify</code> (<code>hermit-cli/tests/syscall_file_io.rs:51</code>) runs <code>tests/c/syscall_file_io.c</code> with <code>--backend=ptrace run --strict</code> and then <code>--verify</code>. That guest issues raw <code>syscall(SYS_rename, original, renamed)</code> at <code>tests/c/syscall_file_io.c:154</code> and checks with <code>require_absent</code> that the source is gone (<code>tests/c/syscall_file_io.c:155</code>). The test asserts that the trace shows <code>inbound syscall: rename(</code> (<code>hermit-cli/tests/syscall_file_io.rs:91</code> to <code>:95</code>). This covers only F1, with absolute paths.</li>
+<li><code>tests/c/rename_ops.c:69</code> (move to an absent name), <code>:76</code> (replace an existing file) and <code>:103</code> (missing source, <code>ENOENT</code>) call glibc <code>rename()</code>, which issues <code>SYS_rename</code> on this host's glibc 2.34 (host strace under Additional information). Cell <code>c-programs/rename-ops</code> at <code>tests/e2e/manifests/c-programs.yaml:13408</code> runs it in verify mode with <code>ci: true</code> and ptrace enabled.</li>
+</ul>
+<p>No coverage token is recorded yet: these tests cover F1, part of F2 and part of F9, and the remaining behaviours have no test.</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F2): under <code>hermit run --verify</code> on ptrace, <code>chdir</code> into a fresh directory and call raw <code>syscall(SYS_rename, ...)</code> with relative paths. Move a file to an absent name. Replace an existing file while a descriptor holds the replaced file open: reading that descriptor must still return the old bytes, and its <code>fstat</code> must report <code>st_nlink</code> 0. Assert <code>EISDIR</code> for a file onto an existing directory. Existing partial coverage: <code>hermit-cli/tests/syscall_file_io.rs:51</code> (raw <code>SYS_rename</code> at <code>tests/c/syscall_file_io.c:154</code>, absent destination) and <code>tests/c/rename_ops.c:69</code> and <code>:76</code> (glibc; cell <code>c-programs/rename-ops</code>).</li>
+<li>T2 (covers F3): move a directory to an absent name and onto an empty directory (replaced). Assert <code>ENOTEMPTY</code> onto a non-empty directory and <code>ENOTDIR</code> onto a regular file.</li>
+<li>T3 (covers F4, F5): rename one hard link onto the other: assert 0, both names present, and <code>st_nlink</code> 2. Rename a symlink and a dangling symlink and check with <code>lstat</code> that the link moved. Rename a file onto a symlink and check that the symlink was replaced and its target is untouched.</li>
+<li>T4 (covers F6, F7): assert <code>EINVAL</code> for <code>rename(&quot;d&quot;, &quot;d/sub/x&quot;)</code>, and <code>EBUSY</code> for <code>rename(&quot;.&quot;, &quot;x&quot;)</code> and for <code>rename(&quot;x&quot;, &quot;..&quot;)</code>. Assert <code>EBUSY</code> when either path is a guest-visible mount point. Assert <code>EXDEV</code> between two distinct guest-visible mounts. Record the chosen paths in the test.</li>
+<li>T5 (covers F8, F9): assert that <code>rename(&quot;dir/&quot;, &quot;dir2/&quot;)</code> succeeds and that a trailing slash on a regular file gives <code>ENOTDIR</code>. Assert <code>ENOENT</code> for a missing source, for <code>&quot;&quot;</code>, and for a missing parent of <code>newpath</code>, and <code>ENOTDIR</code> when a regular file is used as an intermediate component. Existing partial coverage: <code>tests/c/rename_ops.c:103</code> (glibc, missing source) and the record-mode <code>tests/c/record_replay_path_queries.c:246</code>.</li>
+<li>T6 (covers F10): assert <code>EACCES</code> for a move out of a directory the guest cannot write. Under ptrace the guest is root in a user namespace, so use a directory owned by an unmapped host uid. Assert <code>EPERM</code> for removing another owner's entry from a sticky directory, using an entry and directory owned by unmapped uids.</li>
+<li>T7 (covers F11): assert <code>ENAMETOOLONG</code> for a 256-byte component and for a path over 4096 bytes in each argument, <code>ELOOP</code> for a symlink loop in a prefix, and <code>EFAULT</code> for <code>oldpath = (char *)1</code> and for <code>newpath = (char *)1</code>.</li>
+<li>T8 (covers F12): assert <code>EROFS</code> under a read-only mount the guest can see. <code>ENOSPC</code>, <code>EDQUOT</code>, <code>EIO</code>, <code>EMLINK</code> and immutable-entry <code>EPERM</code> are F13 to F15, recorded by U1 and U2.</li>
+<li>U1 (covers F14; host-transient): <code>ENOSPC</code>, <code>EDQUOT</code> and <code>EIO</code> depend on the host filesystem's free space, quotas and storage health, shared with other processes. The plain passthrough (<code>detcore/src/lib.rs:2843</code>) hands them to the guest today. F14 counts toward done only once Hermit hides these errors or reports them as an infrastructure error.</li>
+<li>U2 (covers F13, F15; host-config): the immutable and append-only attributes need <code>CAP_LINUX_IMMUTABLE</code> in the host's initial user namespace, which the guest lacks, and the directory link limit belongs to the host filesystem, so CI cannot produce these errors from inside the container. Hermit forwards the kernel's answer unchanged (<code>detcore/src/syscall_classification.rs:762</code>, <code>detcore/src/lib.rs:2843</code>).</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/400: linux_determinism deterministic (from <strong>Classification:</strong>); target_policy from legacy PASS-THRU; code at this SHA: passthrough, dispatch passthrough.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: kept deterministic/passthrough (the code forwards at detcore/src/lib.rs:2843, and Hermit owns no directory state); listed 12 flag behaviours and 8 tests; existing ptrace evidence (hermit-cli/tests/syscall_file_io.rs, c-programs/rename-ops) covers only F1 and parts of F2 and F9, so no coverage token is recorded and tracking_status stays todo</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d12 (owner decisions 1 and 2): cross_host_variant true (host mount layout for EBUSY and EXDEV, filesystem link limit, host inode attributes); F10 narrowed, new F13 immutable or append-only EPERM; F12 narrowed to EROFS, new F14 ENOSPC/EDQUOT/EIO (host-transient U1) and F15 EMLINK; F13 and F15 host-config (U2); the open question on unreachable host errors is resolved by decision 1</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+rename&amp;amp;body=Discussion+for+the+%60rename%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Frename.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60rename%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `rename`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: rename&quot; (https://github.com/rrnewton/hermit/issues/400), legacy variant A1.</p>
+<p>Legacy text replaced in this pass: Summary &quot;Renames/moves a file within a filesystem.&quot;; Linux semantics &quot;Atomic replace within a filesystem. Verified: renaming a /tmp file returned 0.&quot;; Determinism analysis &quot;Deterministic given fixed FS state; an FS mutation passed through (hermit does not determinize a changing filesystem).&quot; with the source &quot;None from the syscall; only external concurrent FS mutation.&quot; Every claim is kept in the sections above.</p>
+<h3>Open questions</h3>
+<ul>
+<li>Timestamps that <code>rename</code> changes are outside this issue. They belong to the stat family tracking.</li>
+</ul>
+<h3>2026-10-03 host strace evidence</h3>
+<p>On this host (glibc 2.34, x86_64), a scratch probe calling glibc <code>rename()</code> under <code>strace -f</code> showed the raw syscall, so the glibc-based tests above do exercise <code>SYS_rename</code>:</p>
+<pre><code>rename(&quot;a&quot;, &quot;b&quot;)                        = 0
+</code></pre>
+<h3>2026-07-24 host strace evidence</h3>
+<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) with <code>strace -f -e trace=rename</code> on a direct <code>syscall()</code> harness (invoked with non-destructive query/no-op/failing arguments) and, where applicable, on common programs. Hermit currently routes <code>rename</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code>.</p>
+<p>Observed strace line:</p>
+<pre><code>rename(&quot;/tmp/sysclass45/sl&quot;, &quot;/tmp/sysclass45/slr&quot;) = 0
+</code></pre>
+<hr>
+<p>*Autonomous syscall-classification sweep (ranks 151-250 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
+</body></html>

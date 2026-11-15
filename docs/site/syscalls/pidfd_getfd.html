@@ -1,0 +1,83 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pidfd_getfd | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>pidfd_getfd</code> (438)</h1>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>sysno-guard</code> &middot; linux determinism: conditional &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+pidfd_getfd&amp;body=Discussion+for+the+%60pidfd_getfd%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fpidfd_getfd.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60pidfd_getfd%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>pidfd_getfd(pidfd, targetfd, flags)</code> duplicates descriptor <code>targetfd</code> of the process named by <code>pidfd</code> into the caller. Hermit models the self-targeted case: when the pidfd names the calling thread-group leader, Detcore installs the result as a real alias of the source open file. Every other target returns <code>EOPNOTSUPP</code>, and so does every call when threads are not sequentialized.</p>
+<h2>Linux semantics</h2>
+<p>Added in Linux 5.6. The kernel checks <code>flags</code> first (any nonzero value is <code>EINVAL</code>), resolves the pidfd, checks that the caller may <code>ptrace</code>-attach to the target (<code>PTRACE_MODE_ATTACH_REALCREDS</code>), and then installs a new descriptor in the caller that refers to the same open file description as the target's <code>targetfd</code>: the two share the file offset, status flags and <code>flock</code> locks. The new descriptor is the lowest free number and always has <code>FD_CLOEXEC</code> set.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>flags == 0</code>, live target, open <code>targetfd</code>: returns the lowest free descriptor in the caller, with <code>FD_CLOEXEC</code>, aliasing the target's open file description.</li>
+<li>F2: <code>flags != 0</code>: returns <code>EINVAL</code>, ahead of every descriptor or permission check.</li>
+<li>F3: <code>targetfd</code> not open in the target: returns <code>EBADF</code>.</li>
+<li>F4: <code>pidfd</code> is not a pidfd, or is not open: returns <code>EBADF</code>.</li>
+<li>F5: Target errors: an exited target returns <code>ESRCH</code>; a target the caller may not ptrace-attach to returns <code>EPERM</code>.</li>
+<li>F6: Target identity: the target may be the caller itself, another process, or another thread group member with a different descriptor table.</li>
+<li>F7: Caller's table full (<code>RLIMIT_NOFILE</code> reached): returns <code>EMFILE</code>.</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: conditional</code>. The result depends on two descriptor tables, the caller's and the target's, and on the target being alive.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>The returned number is the lowest free descriptor in the caller's table, which depends on what the caller and threads that share its table have opened.</li>
+<li>For another process, which file <code>targetfd</code> names at the moment of the call, or whether it is open at all, depends on how far the target has run.</li>
+<li><code>ESRCH</code> versus success depends on whether the target has exited, which is a race.</li>
+</ul>
+<p>The call repeats when both tables are fixed and the target's progress relative to the caller is fixed by a deterministic scheduler; the self-targeted case needs only the caller's own table.</p>
+<h2>Hermit design</h2>
+<p>Target policy: <code>model</code>. Detcore owns the descriptor table, so the duplicate must be installed in its model as an alias of the source open file; it does that for the self-targeted case and refuses the rest.</p>
+<p>What the code does at hermit f4055eb9cae4:</p>
+<ul>
+<li>Dispatch: a Sysno-guarded arm passes <code>pidfd</code>, <code>targetfd</code> and <code>flags</code> to <code>handle_pidfd_getfd</code> (<code>detcore/src/lib.rs:2068-2082</code>); the call stays subscribed under the pass-through optimization (<code>detcore/src/lib.rs:1189-1192</code>).</li>
+<li>F2: nonzero <code>flags</code> takes the raw <code>record_or_replay</code> path &quot;to preserve the kernel's exact <code>EINVAL</code>&quot;; an unexpected success is closed and reported as a Tool error (<code>detcore/src/syscalls/files.rs:4411-4413</code>, <code>detcore/src/syscalls/files.rs:4432-4443</code>).</li>
+<li>Without <code>sequentialize_threads</code>, the call is refused with <code>EOPNOTSUPP</code> before reaching the kernel (<code>detcore/src/syscalls/files.rs:4445-4449</code>).</li>
+<li>Source capture: Detcore reads the caller's TGID and TID (<code>detcore/src/syscalls/files.rs:4451-4452</code>) and validates both descriptors under one table lock (<code>detcore/src/tool_local.rs:2640-2669</code>): a descriptor not modeled as <code>FdType::Pidfd</code> returns <code>EBADF</code> (<code>detcore/src/tool_local.rs:2659-2661</code>), and a target that is not the calling task returns <code>EOPNOTSUPP</code> (<code>detcore/src/tool_local.rs:2662-2664</code>). The doc comment explains why: &quot;<code>CLONE_THREAD</code> does not imply <code>CLONE_FILES</code>&quot;, so only <code>target == getpid() == gettid()</code> proves <code>targetfd</code> is in the caller's table (<code>detcore/src/syscalls/files.rs:4415-4423</code>).</li>
+<li>Success: the kernel call goes through <code>record_or_replay</code>; on failure the capture is abandoned (<code>detcore/src/syscalls/files.rs:4459-4467</code>); on success the result is installed as an alias with <code>O_CLOEXEC</code> (<code>detcore/src/syscalls/files.rs:4468-4473</code>). If the source table changed in between, the new descriptor is closed and the call returns <code>EOPNOTSUPP</code> (<code>detcore/src/syscalls/files.rs:4475-4494</code>).</li>
+</ul>
+<p>Why model: the legacy recommendation was NEEDS-HANDLER, and the handler exists. The self-targeted alias is fully modeled, including its effect on Detcore's <code>flock</code> state. A cross-process target would need a channel to keep another task's cached descriptor state current, which Detcore does not have, so it fails closed.</p>
+<p>Known gaps:</p>
+<ul>
+<li>F5 and the cross-process half of F6 return <code>EOPNOTSUPP</code> under Hermit, where Linux returns a descriptor, <code>ESRCH</code> or <code>EPERM</code>.</li>
+<li>The relaxed (<code>--no-sequentialize-threads</code>) refusal also returns <code>EOPNOTSUPP</code> for arguments Linux would reject with <code>EBADF</code>, by design (<code>hermit-cli/tests/flock_exclusion.rs:534-552</code>).</li>
+<li><code>tests/c/flock_exclusion.c</code> has no e2e manifest cell; it runs only through the cargo tests below.</li>
+</ul>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F2, F3, F6): Self dup of a locked descriptor shares <code>flock</code> state with its source; <code>targetfd = -1</code> returns <code>EBADF</code>; four nonzero-flags combinations return <code>EINVAL</code>; a foreign child's descriptor returns <code>EOPNOTSUPP</code>. Existing candidate: the <code>#[test]</code> <code>pidfd_getfd_alias_mutation_invalidates_source_flock_authority</code> in <code>hermit-cli/tests/flock_exclusion.rs</code> (lines 529-532, ptrace, scenario markers at lines 502-514), driving <code>tests/c/flock_exclusion.c</code> (self dup at line 656, <code>EBADF</code> at line 708, flags cases at lines 729-763, foreign refusal at lines 854-859). It runs with <code>--allow-unsupported-syscalls</code> (line 494).</li>
+<li>T2 (covers F1, F2): Record and replay a successful self dup that shares a file offset with its source, plus nonzero-flags failures. Existing candidate: the <code>#[test]</code> <code>replay_reissues_pidfd_getfd_success_and_failure</code> in <code>hermit-cli/tests/flock_exclusion.rs</code> (line 849), scenario <code>pidfd-getfd-record</code>.</li>
+<li>T3 (covers F4): With <code>flags == 0</code>, a regular-file descriptor, a closed descriptor and <code>-1</code> as <code>pidfd</code> each return <code>EBADF</code> under <code>--strict --verify</code>, and the caller's table is unchanged.</li>
+<li>T4 (covers F5, F6): A non-leader thread calls with a pidfd for its own process and gets <code>EOPNOTSUPP</code>; a pidfd for a reaped child returns <code>EOPNOTSUPP</code> under Hermit (Linux: <code>ESRCH</code>); both repeat under <code>--verify</code>.</li>
+<li>T5 (covers F7): Lower <code>RLIMIT_NOFILE</code>, fill the table, and a self <code>pidfd_getfd</code> returns <code>EMFILE</code>; the source descriptor and its lock remain usable afterwards.</li>
+<li>T6 (covers none): With <code>--no-sequentialize-threads</code>, <code>pidfd_getfd(-1, -1, 0)</code> returns <code>EOPNOTSUPP</code> without reaching the kernel. Existing candidate: the <code>#[test]</code> <code>pidfd_getfd_relaxed_mode_refuses_before_kernel_injection</code> in <code>hermit-cli/tests/flock_exclusion.rs</code> (lines 534-552).</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-09-28 · hermit 81ca8822f78c · hermit2 · closed under the legacy rule (an explicit <code>classify_syscall</code> arm), not the v1 done rule; closing comment https://github.com/rrnewton/hermit/issues/318#issuecomment-5872901827</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/318: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch sysno-guard.</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · reopen: under the owner rule of 2026-10-02, closed means every flag and option is covered by a named test and the implementation works; pidfd_getfd records no test coverage, so tracking_status is todo and https://github.com/rrnewton/hermit/issues/318 reopens.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; model (self-targeted alias installed in Detcore's table; nonzero flags forwarded for kernel EINVAL; foreign targets and unsequentialized runs refused with EOPNOTSUPP); linux_determinism stays conditional; 7 flag behaviours and 6 tests listed; T1, T2 and T6 have ptrace cargo-test candidates but F4, F5 and F7 are uncovered, so tracking_status stays todo</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+pidfd_getfd&amp;amp;body=Discussion+for+the+%60pidfd_getfd%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fpidfd_getfd.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60pidfd_getfd%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `pidfd_getfd`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: pidfd_getfd&quot; (https://github.com/rrnewton/hermit/issues/318), legacy variant A1.</p>
+<p>The legacy Determinism analysis said the returned descriptor and the pidfd identity &quot;require virtualization&quot;. At f4055eb9cae4 the descriptor number comes from the kernel through record/replay, and the pidfd's target is recorded at <code>pidfd_open</code> time; Detcore does not renumber either.</p>
+<p>Comment history: 1 comment(s) on https://github.com/rrnewton/hermit/issues/318.</p>
+<h3>2026-07-24 host strace evidence</h3>
+<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) by tracing a direct <code>syscall()</code> harness and common programs with <code>strace -f -e trace=pidfd_getfd</code>, and by confirming hermit currently routes <code>pidfd_getfd</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code> (the harness ran end-to-end under <code>hermit run</code>, exit 0, so passthrough does not crash).</p>
+<p>Observed strace line:</p>
+<pre><code>pidfd_getfd(3, 0, 0)            = 4
+</code></pre>
+<hr>
+<p>*Autonomous syscall-classification sweep, batch 3 (ranks 101-150 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
+<h3>Legacy closure</h3>
+<p>Closed 2026-09-28 by the 2026-09-28 sweep, which closed issues whose syscall had an explicit <code>classify_syscall</code> arm. Closing comment: https://github.com/rrnewton/hermit/issues/318#issuecomment-5872901827</p>
+</body></html>

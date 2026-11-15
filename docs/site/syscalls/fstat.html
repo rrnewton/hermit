@@ -1,0 +1,89 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fstat | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>fstat</code> (5)</h1>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; linux determinism: conditional &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+fstat&amp;body=Discussion+for+the+%60fstat%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ffstat.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60fstat%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>fstat(fd, statbuf)</code> fills a <code>struct stat</code> for the file an open descriptor refers to. Detcore handles it in <code>handle_stat_family</code> (<code>detcore/src/syscalls/files.rs:3031</code>): when <code>virtualize_metadata</code> is on (the <code>hermit run</code> default), the kernel runs the call and Detcore then rewrites the identity and time fields with deterministic values. In record/replay, which turns <code>virtualize_metadata</code> off, the result buffer is recorded and replayed.</p>
+<p>Manual reference: Linux man-pages stat(2).</p>
+<h2>Linux semantics</h2>
+<p><code>fstat</code> cannot block and has no side effects. It copies the inode's attributes into the caller's buffer. Several fields are host state that the guest never chose:</p>
+<ul>
+<li><code>st_ino</code> and <code>st_dev</code> name the inode and the filesystem. Pipes, sockets, anonymous inodes, procfs, sysfs and tmpfs get numbers from host-wide allocators, so they change between runs.</li>
+<li><code>st_atime</code>, <code>st_mtime</code>, <code>st_ctime</code> (and the birth time, which <code>fstat</code> does not report) come from the real clock when the file was touched.</li>
+<li><code>st_size</code>, <code>st_blocks</code>, <code>st_blksize</code>, <code>st_nlink</code>, <code>st_uid</code>, <code>st_gid</code>, <code>st_mode</code> and <code>st_rdev</code> describe the file as the host filesystem and the user namespace present it. For files the guest created on the same filesystem they follow from the guest's own actions; for host files they are whatever the host holds.</li>
+</ul>
+<p>Errors: <code>EBADF</code> for a descriptor that is not open, and <code>EFAULT</code> when <code>statbuf</code> is not writable. An <code>O_PATH</code> descriptor is accepted. <code>EOVERFLOW</code> exists only for 32-bit callers and cannot occur on x86_64.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: regular file or directory descriptor: returns the inode's attributes, including size, link count and the three timestamps</li>
+<li>F2: pipe, FIFO or socket descriptor: <code>S_IFIFO</code> or <code>S_IFSOCK</code> in <code>st_mode</code>, with <code>st_ino</code> and <code>st_dev</code> from the kernel's pseudo-filesystems (pipefs, sockfs)</li>
+<li>F3: inherited standard streams (fd 0, 1, 2 as the container provides them): attributes of whatever the outer runner connected, such as a tty, a pipe or a log file</li>
+<li>F4: <code>O_PATH</code> descriptor: accepted, and returns the attributes of the referenced inode</li>
+<li>F5: procfs, sysfs and device-node descriptors: host-assigned <code>st_dev</code>, <code>st_ino</code> and, for devices, <code>st_rdev</code></li>
+<li>F6: descriptor not open: <code>EBADF</code></li>
+<li>F7: <code>statbuf</code> NULL or not writable: <code>EFAULT</code></li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: conditional</code>. Given the same file in the same state, <code>fstat</code> returns the same bytes, except for the fields the host assigns: inode and device numbers from global allocators and timestamps from the real clock. Those differ between two runs of the same program. The call repeats only when every inode it is asked about is stable on the host and was not touched by the clock between runs, which is rarely true for pipes, sockets, procfs, tmpfs or any file the guest writes.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li><code>st_ino</code> and <code>st_dev</code> from host-wide allocators (pipefs, sockfs, anonymous inodes, procfs, tmpfs). The <code>TODO-HUMAN-REVIEW(PR-1056)</code> comment at <code>detcore/src/syscalls/files.rs:3008</code> records that the raw <code>st_dev</code> of procfs, sysfs and tmpfs drifted between the two runs of <code>--verify</code>.</li>
+<li><code>st_atime</code>, <code>st_mtime</code> and <code>st_ctime</code> from the real clock</li>
+<li>Host filesystem layout: <code>st_blocks</code> and <code>st_blksize</code> depend on the filesystem; <code>st_size</code>, <code>st_nlink</code>, <code>st_uid</code> and <code>st_gid</code> of host files depend on the host</li>
+<li>What the outer runner connected to fd 0, 1 and 2</li>
+</ul>
+<h3>Cross-host variation</h3>
+<ul>
+<li>Filesystem type and block size behind the file: <code>st_blksize</code> and <code>st_blocks</code>, and a directory's <code>st_size</code> and <code>st_nlink</code>, are the host filesystem's values, which Detcore passes through (<code>detcore/src/stat.rs:46</code>); btrfs, ext4 and tmpfs report different values for the same guest-created file or directory (F1).</li>
+<li>Host uid that launches Hermit: the user namespace maps that one uid to the guest's root, so the <code>st_uid</code> and <code>st_gid</code> of host files the guest can see (passed through raw) differ between hosts (F1, F5).</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>model</code>. The kernel remains the source of the stat record and of every error, and Detcore replaces the host-assigned identity and time fields with values from its own model. At hermit f4055eb9cae4:</p>
+<ul>
+<li>The dispatch arm is <code>detcore/src/lib.rs:2412</code>, which calls <code>handle_stat_family</code> (<code>detcore/src/syscalls/files.rs:3031</code>), shared with <code>stat</code>, <code>lstat</code> and <code>newfstatat</code>.</li>
+<li>With <code>virtualize_metadata</code>, the call is injected first (<code>detcore/src/syscalls/files.rs:3041</code>), so <code>EBADF</code> and <code>EFAULT</code> (F6, F7) come from the kernel unchanged. The NB comment there gives the reason: reproducing every kernel corner case in the tracer is impractical.</li>
+<li><code>determinize_stat</code> (<code>detcore/src/syscalls/files.rs:2981</code>) then rewrites the buffer:</li>
+<li><code>st_ino</code> becomes a deterministic inode from <code>determinize_inode</code> (<code>detcore/src/tool_global.rs:3682</code>), which hands out run-local numbers in first-seen order.</li>
+<li><code>st_dev</code> becomes a deterministic device from <code>determinize_device</code> (<code>detcore/src/syscalls/files.rs:3013</code>, <code>detcore/src/tool_global.rs:3697</code>).</li>
+<li><code>st_atime</code> and <code>st_ctime</code> (and the birth time used by <code>statx</code>) become the configured epoch; <code>st_mtime</code> becomes Detcore's logical mtime for that inode. The logical mtime starts at the epoch when the inode is first seen (<code>detcore/src/tool_global.rs:2522</code>) and is advanced when the guest writes through a tracked descriptor (<code>touch_file</code> in <code>handle_write</code>, <code>detcore/src/syscalls/files.rs:2255</code>).</li>
+<li>For <code>fstat</code> only, descriptors still bound to the container's standard streams get fixed inodes 1000, 1001 and 1002 (<code>deterministic_stdio_inode_for_resource</code>, <code>detcore/src/syscalls.rs:48</code>; unit test <code>stdio_inode_namespace_is_fixed</code> at <code>detcore/src/syscalls.rs:65</code>). A file the guest installs on fd 1 with <code>dup2</code> loses that override and gets an ordinary pooled inode (F3).</li>
+<li>Without <code>virtualize_metadata</code> (record/replay sets it to <code>false</code> at <code>hermit-cli/src/metadata.rs:406</code>; <code>--strace-only</code> clears it at <code>hermit-cli/src/bin/hermit/run.rs:3757</code>), the call goes through <code>record_or_replay</code>. The recorder routes <code>Fstat</code> to its own stat handler (<code>hermit-cli/src/recorder.rs:546</code>) and the replayer substitutes the recorded buffer (<code>hermit-cli/src/replayer.rs:449</code>).</li>
+</ul>
+<p>Why <code>model</code> and not the alternatives: <code>passthrough</code> would leak host inode numbers, device numbers and real timestamps into every <code>--verify</code> comparison. <code>emulate</code> would have to reproduce kernel error precedence and every file type, which the NB comment explicitly rejects. <code>refuse</code> would break almost every program.</p>
+<p>What the model does not cover yet:</p>
+<ul>
+<li><code>st_size</code>, <code>st_blocks</code>, <code>st_blksize</code>, <code>st_nlink</code>, <code>st_uid</code>, <code>st_gid</code>, <code>st_mode</code> and <code>st_rdev</code> pass through raw (<code>DetStat</code> in <code>detcore/src/stat.rs:46</code> carries them unchanged). For files the guest created they are a function of the guest's own writes on a given filesystem; for host files, procfs files and devices they are host state. <code>st_blocks</code> in particular depends on the filesystem's allocation policy.</li>
+<li>The detcore stat tests in <code>detcore/tests/stats/mod.rs</code>, including <code>fstat_with_nullptr_errno_sanity</code> (<code>detcore/tests/stats/mod.rs:177</code>) and <code>stat_fstat_is_consistent</code> (<code>detcore/tests/stats/mod.rs:224</code>), are not a cargo test target: <code>detcore/Cargo.toml</code> declares only <code>tests_misc</code>, <code>tests_parallelism</code> and <code>tests_time</code>, and the BUCK target <code>tests_stats</code> is commented out (&quot;too brittle&quot;, <code>detcore/BUCK:145</code>). They do not run.</li>
+</ul>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F2, F5): with raw <code>syscall(SYS_fstat, ...)</code>, fstat a regular file the guest creates, a directory, a pipe, a socketpair end and a <code>/proc</code> file, and print <code>st_ino</code>, <code>st_dev</code>, the three timestamps, <code>st_nlink</code> and <code>st_blocks</code>. Under <code>hermit run --verify</code> on ptrace every printed value must match between runs, and a write followed by a second fstat must show <code>st_mtime</code> advancing. Existing candidate: <code>tests/c/stat_metadata_identity.c</code> (cell <code>c-programs/stat-metadata-identity</code>, <code>tests/e2e/manifests/c-programs.yaml:16625</code>, verify ci on ptrace). It calls the glibc <code>fstat</code> wrapper (<code>tests/c/stat_metadata_identity.c:103</code>, <code>tests/c/stat_metadata_identity.c:195</code>), which modern glibc may implement with <code>newfstatat</code>, so it may not reach <code>SYS_fstat</code> at all.</li>
+<li>T2 (covers F3): fstat fd 0, 1 and 2 as inherited, then after <code>dup2</code> of a regular file onto fd 1, and check that the inherited streams report inodes 1000, 1001 and 1002 while the replaced slot reports an ordinary inode. Existing candidate: <code>tests/c/fixtures/stdio_inode_identity.c</code>, which uses raw <code>syscall(SYS_fstat, ...)</code> (<code>tests/c/fixtures/stdio_inode_identity.c:91</code>) and is run by <code>run_kvm_preserves_closed_standard_input</code> (<code>hermit-cli/tests/cli.rs:4254</code>) for both <code>ptrace</code> and <code>kvm</code>.</li>
+<li>T3 (covers F4): open a file with <code>O_PATH</code>, fstat it, and check that the result succeeds and matches a path <code>stat</code> of the same file in <code>st_ino</code>, <code>st_dev</code> and <code>st_mtime</code>.</li>
+<li>T4 (covers F6, F7): raw <code>SYS_fstat</code> on a closed descriptor gives <code>EBADF</code>; on a valid descriptor with a NULL buffer gives <code>EFAULT</code>. Existing logic in <code>fstat_with_nullptr_errno_sanity</code> (<code>detcore/tests/stats/mod.rs:177</code>) is not wired as a test target, so a live test is still needed.</li>
+<li>T5 (covers F1): record and replay a guest that fstats a regular file and prints the fields; replay must print the recorded values even after the file is deleted between record and replay.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · created for v1: no tracking issue existed for this pinned Sysno; code at this SHA: determinized, dispatch typed.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy model (the kernel produces the stat record and every error; Detcore rewrites st_ino, st_dev and the timestamps, with fixed inodes for inherited stdio); linux_determinism stays conditional; 7 flag behaviours and 5 tests listed; open questions on raw st_blocks/st_nlink/st_uid and the unbuilt detcore/tests/stats; no coverage token, so tracking_status stays todo</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d12 (owner decisions 1 and 2): cross_host_variant true (filesystem type and block size, launching host uid); no U items; resolved the open question on virtualizing st_blocks, st_blksize, st_nlink, st_uid and st_gid</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+fstat&amp;amp;body=Discussion+for+the+%60fstat%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ffstat.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60fstat%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `fstat`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Created by the syscall-tracking v1 migration on 2026-10-03. No tracking issue existed for <code>fstat</code>: the 2026-07-24 classification campaign filed issues only for syscalls in the old temporary pass-through block, and Detcore already handled this one.</p>
+<h3>Open questions</h3>
+<ul>
+<li><code>detcore/tests/stats/mod.rs</code> is not built by cargo, and its BUCK target is commented out as too brittle (<code>detcore/BUCK:145</code>). Should it be revived as a test target or deleted? Until then <code>fstat_with_nullptr_errno_sanity</code> and <code>stat_fstat_is_consistent</code> give no coverage.</li>
+<li><code>detcore/tests/lit/fstat/main.rs:13</code> carries a FIXME saying <code>hermit run --strict --verify</code> fails because of an <code>st_mtime</code> nondeterminism bug. Whether that is still true at this SHA has not been measured.</li>
+<li>The glibc <code>fstat</code> wrapper may be implemented with <code>newfstatat</code>, so a test that wants to exercise <code>SYS_fstat</code> should call it with raw <code>syscall(SYS_fstat, ...)</code>, as <code>tests/c/fixtures/stdio_inode_identity.c:91</code> does.</li>
+</ul>
+</body></html>

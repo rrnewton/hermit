@@ -1,0 +1,181 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>recvmsg | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>recvmsg</code> (47)</h1>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; linux determinism: conditional &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+recvmsg&amp;body=Discussion+for+the+%60recvmsg%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Frecvmsg.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60recvmsg%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>recvmsg</code> receives one message into a scatter list of buffers, together with the sender's address, ancillary data and result flags. Hermit models it:</p>
+<ul>
+<li>Detcore owns the blocking, through physically nonblocking sockets and scheduler-ordered retries;</li>
+<li>it replaces host timestamps in <code>SCM_TIMESTAMP*</code> messages with logical time;</li>
+<li>it records a logical receive time for <code>SIOCGSTAMP</code>;</li>
+<li>it canonicalizes host socket identities in netlink dumps.</li>
+</ul>
+<p>The per-call flags and other ancillary messages go to the kernel uninspected.</p>
+<h2>Linux semantics</h2>
+<p><code>recvmsg(sockfd, msg, flags)</code> reads a <code>struct msghdr</code> and fills:</p>
+<ul>
+<li>the buffers named by <code>msg_iov</code>;</li>
+<li>the source address in <code>msg_name</code>, updating <code>msg_namelen</code>;</li>
+<li>ancillary messages in <code>msg_control</code>, updating <code>msg_controllen</code>;</li>
+<li>result flags in <code>msg_flags</code>.</li>
+</ul>
+<p>It returns the number of data bytes received. Datagram, stream, blocking and EOF behaviour follow <code>recvfrom</code>. Ancillary data is produced by kernel state, and some of it is host-specific:</p>
+<ul>
+<li>descriptors passed with <code>SCM_RIGHTS</code> become new descriptors in the receiver;</li>
+<li><code>SCM_CREDENTIALS</code> carries the sender's pid, uid and gid;</li>
+<li><code>SCM_TIMESTAMP*</code> carries the host arrival time.</li>
+</ul>
+<p>The kernel allows the control buffer to overlap the <code>msghdr</code> itself.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>msg_name</code>/<code>msg_namelen</code>: the source address, truncated to <code>msg_namelen</code>, with the real length written back. A null <code>msg_name</code> is allowed.</li>
+<li>F2: <code>msg_iov</code>/<code>msg_iovlen</code>: scatter into several buffers. More than <code>IOV_MAX</code> entries gives <code>EMSGSIZE</code>.</li>
+<li>F3: <code>msg_control</code>/<code>msg_controllen</code>: the ancillary buffer. It may be null or zero-length. The length written back covers only what fit.</li>
+<li>F4: <code>msg_flags</code> output:</li>
+<li><code>MSG_TRUNC</code>, when the datagram was longer than the buffers;</li>
+<li><code>MSG_CTRUNC</code>, when the control buffer was too small;</li>
+<li><code>MSG_EOR</code>, <code>MSG_OOB</code> and <code>MSG_ERRQUEUE</code>.</li>
+<li>F5: <code>SCM_RIGHTS</code> reception: descriptors are installed at the lowest free numbers. <code>MSG_CMSG_CLOEXEC</code> sets close-on-exec on them. Descriptors that do not fit are closed, and <code>MSG_CTRUNC</code> is set.</li>
+<li>F6: <code>SCM_CREDENTIALS</code>, with <code>SO_PASSCRED</code> set: the sender's pid, uid and gid.</li>
+<li>F7: <code>SCM_TIMESTAMP</code>, <code>SCM_TIMESTAMPNS</code> and <code>SCM_TIMESTAMPING</code>, in both the old and the new (time64) layouts, enabled by <code>SO_TIMESTAMP*</code>: host arrival times.</li>
+<li>F8: Protocol ancillary data:</li>
+<li><code>IP_PKTINFO</code>, <code>IP_TTL</code>, <code>IP_TOS</code> and <code>IPV6_PKTINFO</code>;</li>
+<li><code>UDP_GRO</code> and <code>SO_RXQ_OVFL</code>;</li>
+<li><code>SO_INCOMING_CPU</code>-related state.</li>
+<li>F9: <code>MSG_ERRQUEUE</code>: extended errors (<code>sock_extended_err</code>), zerocopy completions and transmit timestamps from the error queue.</li>
+<li>F10: <code>MSG_DONTWAIT</code>: nonblocking for this call only.</li>
+<li>F11: <code>MSG_PEEK</code>: returns data without consuming it.</li>
+<li>F12: <code>MSG_WAITALL</code>: on stream sockets, waits for the full length.</li>
+<li>F13: <code>MSG_TRUNC</code> as an input flag: returns the real datagram length.</li>
+<li>F14: <code>MSG_OOB</code>: reads urgent data.</li>
+<li>F15: Return 0: an orderly stream shutdown or a zero-length datagram.</li>
+<li>F16: Blocking versus nonblocking descriptor.</li>
+<li>F17: <code>SO_RCVTIMEO</code>: a blocking receive gives up with <code>EAGAIN</code> after the timeout.</li>
+<li>F18: Signal interruption: <code>EINTR</code>, or a restart under <code>SA_RESTART</code>.</li>
+<li>F19: Errors:</li>
+<li><code>EBADF</code> and <code>ENOTSOCK</code>;</li>
+<li><code>EFAULT</code>, for a null or bad <code>msg</code>, bad iovecs, or a bad control buffer;</li>
+<li><code>ENOTCONN</code>, <code>ECONNREFUSED</code>, <code>ECONNRESET</code>, <code>EINVAL</code> and <code>EMSGSIZE</code>.</li>
+<li>F20: A control buffer that overlaps the <code>msghdr</code> itself.</li>
+<li>F21: Netlink dumps. <code>NETLINK_SOCK_DIAG</code> and <code>NETLINK_ROUTE</code> replies in <code>msg_iov</code> carry host socket inode numbers and live interface counters.</li>
+<li>F22: Receive timestamp side state, readable through <code>SIOCGSTAMP</code>/<code>SIOCGSTAMPNS</code>.</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p>Which data arrives, and when, depends on the peer and the schedule. On top of the data, <code>recvmsg</code> returns ancillary values that differ between hosts and between runs even under one fixed schedule:</p>
+<ul>
+<li>host arrival timestamps (F7);</li>
+<li>descriptor numbers, which depend on the receiver's table (F5);</li>
+<li>credentials (F6);</li>
+<li>host socket identities in netlink dumps (F21).</li>
+</ul>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>Peer progress, which decides counts, short reads, <code>MSG_TRUNC</code> and blocking (F4, F12, F15, F16).</li>
+<li>External peers, ICMP errors (F9, F19), and kernel-chosen source ports (F1).</li>
+<li>Host clocks: <code>SCM_TIMESTAMP*</code> (F7), <code>SIOCGSTAMP</code> (F22), and real-time receive timeouts (F17).</li>
+<li>Host identities: socket inodes and interface counters (F21), and credential ids (F6).</li>
+<li>The arrival time of signals (F18).</li>
+</ul>
+<p><code>linux_determinism: conditional</code>.</p>
+<h2>Hermit design</h2>
+<p><code>target_policy: model</code>. Dispatch: <code>Syscall::Recvmsg(s) =&gt; self.handle_recvmsg(guest, s)</code> at detcore/src/lib.rs:2708. <code>handle_recvmsg</code> is at detcore/src/syscalls/io.rs:1465-1518 and handles the cases in this order: 1. A netlink diagnostics or route socket goes to <code>handle_sock_diag_recvmsg</code> (io.rs:1478-1480, 1673-1695). That function snapshots the iovec list before the receive and sanitizes the reply in place (io.rs:1569-1632). The same predicate covers <code>recvfrom</code>, <code>read</code>, <code>readv</code> and <code>recvmmsg</code> (io.rs:1529-1535). 2. Without <code>virtualize_time</code>, the call is a plain <code>execute_nonblockable_fd_syscall</code> (io.rs:1482-1484). 3. With a null <code>msg</code>, a null control pointer or a zero control length, it goes to <code>handle_socket_receive</code>, which records the logical receive time (io.rs:1486-1499, 1785-1800). 4. Otherwise:</p>
+<ul>
+<li>It snapshots the <code>msghdr</code> before the receive, because the control buffer may overlap the header (io.rs:1491-1494).</li>
+<li>It clamps the control length to <code>MAX_CONTROL_BYTES</code> (64 KiB, io.rs:221, 1500), and checks the control buffer is readable before a datagram is consumed (io.rs:1503-1505).</li>
+<li>After the receive it records the logical time (io.rs:1507-1508) and rereads the control buffer.</li>
+<li>If the buffer holds any <code>SCM_TIMESTAMP*</code> message (io.rs:215-220, 272), it rewrites those timestamps to logical time (io.rs:1511-1516, 330).</li>
+</ul>
+<p>The receive time stored on the open file description is what <code>SIOCGSTAMP</code> returns (detcore/src/syscalls/socket_timestamp_ioctl.rs:73-102). <code>Recvmsg</code> counts <code>EAGAIN</code>/<code>EWOULDBLOCK</code> as &quot;would have blocked&quot; (helpers.rs:1304-1315).</p>
+<p><code>SCM_RIGHTS</code> descriptors are installed by the kernel; Detcore registers them only when it first sees them. With <code>discover_live_file_metadata</code> set, <code>with_detfd</code> discovers an unknown descriptor from the live process (detcore/src/tool_local.rs:2559-2568). The type comes from <code>fstat</code> and the flags from <code>F_GETFL</code>, and the descriptor's <code>flock</code> state is marked unknown (tool_local.rs:696-733). Without discovery, the lookup fails and the next nonblockable call on that descriptor takes the blocking path (helpers.rs:212-226).</p>
+<p>Shared send/receive path at hermit f4055eb9 (run mode with <code>sequentialize_threads</code>, the default for <code>hermit run</code>):</p>
+<ul>
+<li>Socket creation makes every guest socket physically nonblocking while the guest-visible flags stay as requested. <code>socket</code> adds <code>SOCK_NONBLOCK</code> and records the guest's own <code>SOCK_NONBLOCK | SOCK_CLOEXEC</code> bits (detcore/src/syscalls/files.rs:3772-3787, gated by <code>use_nonblocking_sockets</code> at detcore-model/src/config.rs:872-874). <code>socketpair</code> does the same (files.rs:3827-3828), and so does <code>accept4</code> for the connection it returns (files.rs:4531-4536).</li>
+<li><code>execute_nonblockable_fd_syscall</code> (detcore/src/syscalls/helpers.rs:202) reads the descriptor's logical and physical nonblocking bits and picks a strategy (helpers.rs:745-778):</li>
+<li>logically blocking on a physically nonblocking socket gives <code>NonblockizeRetry</code>;</li>
+<li>logically nonblocking gives <code>PassThru</code>, a single kernel call (helpers.rs:268-275);</li>
+<li>both blocking gives <code>Blocking</code>.</li>
+<li><code>NonblockizeRetry</code> requests the scheduler resource <code>InternalIOPolling</code> and calls <code>retry_nonblocking_syscall</code> (helpers.rs:254-267). The helper re-issues the call at scheduler-chosen points while the result is <code>EAGAIN</code> or <code>EWOULDBLOCK</code> (helpers.rs:1501-1530). Any other result is returned to the guest (helpers.rs:1531-1534). A signal that arrives while the call waits returns <code>ERESTARTSYS</code> (helpers.rs:1476-1484, default at helpers.rs:953-954). The kernel still moves the bytes; Detcore decides when a blocked call is retried, so a blocking wait becomes a deterministic scheduling point.</li>
+<li>If Detcore cannot classify the descriptor, the call runs through the blocking path so the kernel's errno precedence is kept (helpers.rs:212-226).</li>
+<li>In record/replay mode, sockets from <code>socket</code> stay physically blocking (files.rs:3758-3769), while <code>socketpair</code> endpoints are still made physically nonblocking (the condition at files.rs:3827 does not check for record/replay). Sockets are never treated as container-internal, because Hermit cannot yet tell a socket between two guests from one to a host peer (helpers.rs:782-797). The call therefore goes through <code>record_or_replay_blocking</code> with the <code>BlockingExternalIO</code> resource (helpers.rs:241-250, 111-120). <code>tests/rust/shutdown.rs:26-31</code> skips record mode because socketpair guests currently hang there.</li>
+<li>No <code>MSG_*</code> flag passed by the guest is inspected anywhere in <code>detcore/src</code>; <code>MSG_TRUNC</code> appears only in comments. <code>setsockopt</code> is forwarded unchanged (files.rs:3868-3875), so <code>SO_RCVTIMEO</code> and <code>SO_SNDTIMEO</code> are never modelled.</li>
+</ul>
+<p>Why <code>model</code>. Detcore owns the parts of <code>recvmsg</code> that differ between runs: when a blocked receive resumes, the time values written to the guest, and host socket identities. The kernel keeps the data and the descriptor transfer. <code>passthrough</code> would leak host timestamps and inodes, and would let a blocking receive stall the scheduler.</p>
+<p>Existing ptrace coverage at f4055eb9. All of these cells have <code>verify</code> <code>ci: true</code> on ptrace unless noted.</p>
+<ul>
+<li><code>c-programs/socket-timestamp-timeval</code> (tests/e2e/manifests/c-programs.yaml:9022): UDP loopback with <code>SO_TIMESTAMP</code>; <code>recvmsg</code> and an <code>SCM_TIMESTAMP</code> check (tests/c/socket_timestamp_timeval.c:48-57).</li>
+<li><code>c-programs/recvmsg-scm-rights-mmap</code> (c-programs.yaml:7225): receiving <code>SCM_RIGHTS</code> (tests/c/recvmsg_scm_rights_mmap.c:69). Its replay cell is not in CI. <code>record_sqlite_memory_query</code> (hermit-cli/tests/record_replay.rs:1874-1885) documents the record/replay event misalignment that <code>recvmsg</code> with <code>SCM_RIGHTS</code> used to cause.</li>
+<li><code>c-programs/socket-timestamp-edge-cases</code> (c-programs.yaml:8901): a truncated control buffer (tests/c/socket_timestamp_edge_cases.c:66-68) and an aliased control buffer (:110-112). This cell has <code>verify</code> ptrace CI disabled: the recorded reason is a crash-error, &quot;verify exited with status 125 before producing a terminal comparison&quot; (c-programs.yaml:8919-8930).</li>
+</ul>
+<p>What remains: hypotheses from reading the code, not yet measured.</p>
+<ul>
+<li>H1 (F10). <code>MSG_DONTWAIT</code> on a logically blocking socket is retried rather than returned as <code>EAGAIN</code>.</li>
+<li>H2 (F12). <code>MSG_WAITALL</code> can return short on the physically nonblocking socket.</li>
+<li>H3 (F17). <code>SO_RCVTIMEO</code> never fires in run mode.</li>
+<li>H4 (F3, F7). Timestamp messages that lie past the 64 KiB clamp keep host time.</li>
+<li>H5 (F6). <code>SCM_CREDENTIALS</code> values are not virtualized by Detcore.</li>
+<li>H6 (F9). Timestamps delivered through <code>MSG_ERRQUEUE</code> go through the same rewrite only if they use the <code>SCM_TIMESTAMP*</code> types listed at io.rs:215-220.</li>
+<li>The open crash-error on the edge-cases cell needs a diagnosis before F20 can be counted as covered.</li>
+</ul>
+<p>Target (owner decision 14, with decision 13 for the timeout and the timestamps): a guest-blocking <code>recvmsg</code> waits in Detcore's scheduler, never in the kernel, through a nonblocking probe plus a scheduler wait. Run mode already does this through <code>NonblockizeRetry</code> (<code>detcore/src/syscalls/helpers.rs:254</code>, retry loop <code>retry_nonblocking_syscall</code> at <code>detcore/src/syscalls/helpers.rs:1414</code>). Missing: the cases that still block in the kernel while holding the turn, through <code>record_or_replay_blocking</code> (<code>detcore/src/syscalls/helpers.rs:225</code> and <code>detcore/src/syscalls/helpers.rs:250</code>): no scheduler, record and replay, and a descriptor Detcore cannot classify; per-call flags, where <code>MSG_DONTWAIT</code> returns the kernel's <code>EAGAIN</code> at once (F10, H1) and <code>MSG_WAITALL</code> keeps waiting for the full length (F12, H2); and a deadline, where <code>SO_RCVTIMEO</code> ends the wait with <code>EAGAIN</code> or the bytes already received once that much virtual time has passed (F16, F17, H3). <code>retry_nonblocking_syscall_with_timeout</code> (<code>detcore/src/syscalls/helpers.rs:1432</code>) already takes a logical deadline for poll, epoll, futex and signal waits, but nothing in <code>detcore/src</code> reads <code>SO_RCVTIMEO</code> or <code>SO_SNDTIMEO</code> today (see the <code>setsockopt</code> body). Under decision 13 every <code>SCM_TIMESTAMP*</code> value the guest receives is virtual time, including messages past the <code>MAX_CONTROL_BYTES</code> clamp (<code>detcore/src/syscalls/io.rs:221</code>; H4) and timestamps from the error queue (F9, H6). <code>recvmsg</code> stays <code>model</code>, not <code>refuse</code>, because nearly every networked program receives on sockets.</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F2, F3, F4, F13): on UDP and <code>AF_UNIX</code> datagram pairs:</li>
+<li><code>msg_name</code> full-size, truncated and null;</li>
+<li>a three-buffer scatter;</li>
+<li>a datagram longer than the buffers, setting <code>MSG_TRUNC</code> in <code>msg_flags</code>, and with <code>MSG_TRUNC</code> as an input flag returning the full length;</li>
+<li>a control buffer too small for <code>SCM_RIGHTS</code>, setting <code>MSG_CTRUNC</code>.</li>
+</ul>
+<p>Run under <code>--verify</code>.</p>
+<ul>
+<li>T2 (covers F5): receive 1 and 3 descriptors with <code>SCM_RIGHTS</code>. The descriptor numbers must match across runs, and <code>MSG_CMSG_CLOEXEC</code> must set <code>FD_CLOEXEC</code>. Then use a received socket for a blocking <code>read</code>, with and without metadata discovery. Extends <code>tests/c/recvmsg_scm_rights_mmap.c</code>.</li>
+<li>T3 (covers F6, F8): with <code>SO_PASSCRED</code> set, the received <code>SCM_CREDENTIALS</code> pid and uid must match the guest's <code>getpid</code>/<code>getuid</code> and be identical across runs (H5). Also <code>IP_PKTINFO</code> and <code>IP_TTL</code> on UDP loopback.</li>
+<li>T4 (covers F7, F20, F22): timestamp ancillary data and aliasing:</li>
+<li><code>SCM_TIMESTAMP</code>, <code>SCM_TIMESTAMPNS</code> and <code>SCM_TIMESTAMPING</code>, old and new layouts, must equal logical time and match <code>SIOCGSTAMP</code>;</li>
+<li>a control buffer larger than 64 KiB, with a timestamp near its end (H4);</li>
+<li>an overlapping control buffer.</li>
+</ul>
+<p>Requires the crash-error on <code>c-programs/socket-timestamp-edge-cases</code> to be diagnosed.</p>
+<ul>
+<li>T5 (covers F9, F19): <code>MSG_ERRQUEUE</code> after a UDP send to a closed loopback port, reading <code>sock_extended_err</code> (H6). Also:</li>
+<li><code>EFAULT</code> for a null <code>msg</code> and for a bad <code>msg_control</code>;</li>
+<li><code>EBADF</code> and <code>ENOTSOCK</code>;</li>
+<li><code>ENOTCONN</code> on an unconnected stream;</li>
+<li>more than <code>IOV_MAX</code> entries, expecting <code>EMSGSIZE</code>.</li>
+<li>T6 (covers F10, F16): on a logically blocking socketpair with nothing queued, <code>MSG_DONTWAIT</code> must return <code>EAGAIN</code> (H1). The same call on a <code>SOCK_NONBLOCK</code> pair returns <code>EAGAIN</code>.</li>
+<li>T7 (covers F11, F12, F14, F15): receive flags and EOF on stream and datagram pairs:</li>
+<li><code>MSG_PEEK</code> then a consuming receive return the same bytes;</li>
+<li><code>MSG_WAITALL</code> across two delayed 4-byte sends must return 8 (H2);</li>
+<li><code>MSG_OOB</code> on TCP;</li>
+<li>EOF after the peer calls <code>shutdown(SHUT_WR)</code>, and a zero-length datagram.</li>
+<li>T8 (covers F17, F18): with <code>SO_RCVTIMEO</code> set and no data, <code>recvmsg</code> returns <code>EAGAIN</code> in logical time (H3). A signal during a blocked <code>recvmsg</code> gives <code>EINTR</code>, or a restart under <code>SA_RESTART</code>.</li>
+<li>T9 (covers F21): <code>recvmsg</code> on a <code>NETLINK_SOCK_DIAG</code> dump and on an <code>RTM_GETLINK</code> dump, with the reply scattered over two iovecs. Inode numbers and counters must match across runs.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · created for v1: no tracking issue existed for this pinned Sysno; code at this SHA: determinized, dispatch typed.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; model (handle_recvmsg: nonblockable retry, SCM_TIMESTAMP* rewritten to logical time within a 64 KiB control clamp, netlink dumps sanitized). linux_determinism stays conditional. 22 flags and 9 tests. The MSG_DONTWAIT, MSG_WAITALL, SO_RCVTIMEO, clamp, SCM_CREDENTIALS and MSG_ERRQUEUE hypotheses are under Open questions, as is the socket-timestamp-edge-cases crash-error. Stays todo; no coverage recorded.</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): decisions 13 and 14 applied (Target paragraph: blocking receives wait under the scheduler in every mode, honour MSG_DONTWAIT and MSG_WAITALL, end at a virtual-time SO_RCVTIMEO deadline, and every received timestamp is virtual time); no new F/T ids; no open questions removed (H1-H6 and the crash diagnosis are measurements)</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+recvmsg&amp;amp;body=Discussion+for+the+%60recvmsg%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Frecvmsg.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60recvmsg%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `recvmsg`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Created by the syscall-tracking v1 migration on 2026-10-03. No tracking issue existed for <code>recvmsg</code>: the 2026-07-24 classification campaign filed issues only for syscalls in the old temporary pass-through block, and Detcore already handled this one.</p>
+<h3>Open questions</h3>
+<p>These questions need a measurement, not an owner decision, and none of them changes the <code>target_policy</code> choice. Each is a hypothesis under Hermit design and names the test that answers it.</p>
+<ul>
+<li>H1: on a logically blocking socket, does <code>MSG_DONTWAIT</code> wait instead of returning <code>EAGAIN</code>? (T6)</li>
+<li>H2: does <code>MSG_WAITALL</code> return short? (T7)</li>
+<li>H3: does <code>SO_RCVTIMEO</code> never fire in run mode? (T8)</li>
+<li>H4: do timestamp messages past the 64 KiB control clamp keep host time? (T4)</li>
+<li>H5: do the received <code>SCM_CREDENTIALS</code> values match the guest's virtual ids? (T3)</li>
+<li>H6: are transmit timestamps from <code>MSG_ERRQUEUE</code> rewritten? (T5)</li>
+<li>What causes the crash-error (&quot;verify exited with status 125&quot;) recorded for <code>c-programs/socket-timestamp-edge-cases</code> (tests/e2e/manifests/c-programs.yaml:8929-8930)? (T4)</li>
+</ul>
+</body></html>

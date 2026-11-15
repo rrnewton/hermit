@@ -1,0 +1,80 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>request_key | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>request_key</code> (249)</h1>
+<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_kernel_keyring_syscall</code> &middot; linux determinism: nondeterministic &middot; target policy: refuse &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+request_key&amp;body=Discussion+for+the+%60request_key%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Frequest_key.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60request_key%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>request_key(type, description, callout_info, dest_keyring)</code> searches the caller's keyrings for a key and returns its serial number. If no key is found and <code>callout_info</code> is given, the kernel runs the user-space <code>/sbin/request-key</code> helper to construct one. Under the default fail-closed policy Hermit returns <code>ENOSYS</code> without consulting the host, as if the kernel had been built without <code>CONFIG_KEYS</code> (<code>detcore/src/lib.rs:2125</code>). Only the explicit <code>--allow-unsupported-syscalls</code> opt-out forwards the call.</p>
+<p>Manual reference: Linux man-pages request_key(2), keyrings(7), request-key(8).</p>
+<h2>Linux semantics</h2>
+<p>The kernel searches the thread, process and session keyrings in that order. Through the session keyring, or the user-session keyring when there is none, it also reaches the user's keyrings. It returns the first matching key the caller may search. The call needs <code>CONFIG_KEYS</code>; without it the syscall gives <code>ENOSYS</code>.</p>
+<p>If nothing matches and <code>callout_info</code> is not <code>NULL</code>, the kernel creates an uninstantiated key, starts <code>/sbin/request-key</code> through the usermode helper, and waits. The helper, configured by the host's <code>/etc/request-key.conf</code> and <code>/etc/request-key.d/</code>, instantiates, negates or rejects the key with <code>keyctl</code>. The caller sleeps until it does, and a signal can interrupt the wait.</p>
+<p>A found or constructed key is linked into the destination keyring when one is given. A key's serial number was chosen at random when it was created (<code>key_alloc_serial</code>, <code>security/keys/key.c</code>).</p>
+<p>Verified on the host (strace under Additional information): a lookup of a nonexistent <code>user</code> key with no callout fails with <code>ENOKEY</code>.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>type</code> and <code>description</code>: a type the kernel does not provide gives <code>ENOKEY</code>. A type name beginning with <code>.</code> gives <code>EPERM</code>. Oversized or unreadable strings give <code>EINVAL</code> or <code>EFAULT</code>.</li>
+<li>F2: search-only lookup (<code>callout_info == NULL</code>): search the thread, process and session keyrings and the user keyrings reached through them, and return the first match. With no match the call gives <code>ENOKEY</code>.</li>
+<li>F3: lookup with upcall (<code>callout_info</code> not <code>NULL</code>): if no key matches, construct one through <code>/sbin/request-key</code> and wait for it. The outcome depends on the host's request-key configuration and helper programs.</li>
+<li>F4: <code>dest_keyring == 0</code>: link the result into the default request-key keyring, chosen by <code>KEYCTL_SET_REQKEY_KEYRING</code> and falling back through the thread, process and session keyrings.</li>
+<li>F5: <code>dest_keyring</code> as a special <code>KEY_SPEC_*</code> ID or a serial: link the result into that keyring, which needs write permission, or <code>EACCES</code>.</li>
+<li>F6: a key found negative, rejected, revoked or expired: <code>ENOKEY</code>, <code>EKEYREJECTED</code>, <code>EKEYREVOKED</code> or <code>EKEYEXPIRED</code>, which a later call repeats only until the negative key times out.</li>
+<li>F7: a signal interrupts the wait for construction: <code>EINTR</code>.</li>
+<li>F8: quota exhausted while constructing a key: <code>EDQUOT</code>.</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: nondeterministic</code> (was <code>conditional</code> in the rendered body). A successful call returns the serial of a key that the host or a request-key helper created, and every key serial is random. Which key is found, if any, depends on the host's session and user keyrings, which the guest inherits from the process that started Hermit. With an upcall (F3) the result also depends on host configuration files, helper programs and scheduling. The lookup that cannot match, such as the host probe's <code>ENOKEY</code> for a nonexistent <code>user</code> key with no callout, repeats only while no process on the host creates such a key.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>Random key serial numbers</li>
+<li>Host session, user and persistent keyring contents, which differ across machines and login sessions</li>
+<li><code>/sbin/request-key</code> upcalls: host configuration, helper programs and their timing</li>
+<li>Signal timing during the construction wait (F7)</li>
+<li>Negative-key timeouts, key expiry and concurrent mutation by processes outside the container</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target (owner decision 9, 6): <code>refuse</code> with a fixed <code>ENOSYS</code>, the answer of a kernel built without <code>CONFIG_KEYS</code>, returned before any argument is examined, so a valid call and a garbage-argument call get the same <code>ENOSYS</code>, and no request-key upcall ever starts. No unprivileged success case needs preserving: a kernel without <code>CONFIG_KEYS</code> refuses every caller, so decision 6's exceptions do not apply. Owner decision 9 makes this the long-term target; Detcore will not model a guest-private keyring. The supportable fallback is a program that treats <code>ENOSYS</code> as a keyring-less kernel and keeps its secrets elsewhere; the in-tree workload that needs a working keyring, rr's <code>keyctl</code> compatibility test (comment at <code>detcore/src/lib.rs:2121</code>), runs only under the <code>--allow-unsupported-syscalls</code> opt-out. Today's code realizes the target under the default fail-closed policy (<code>detcore/src/lib.rs:2125-2126</code>). The opt-out forwards the call to the host (<code>detcore/src/lib.rs:2129</code>); that is a reduced-fidelity mode the user asks for explicitly, not the target, so no code change is needed.</p>
+<ul>
+<li><code>request_key</code> is classified Determinized (<code>detcore/src/syscall_classification.rs:476</code>) and belongs to the kernel-keyring family predicate <code>is_kernel_keyring_syscall</code> (<code>detcore/src/syscall_classification.rs:1243</code>). The predicate's doc comment (<code>detcore/src/syscall_classification.rs:1238</code>) names <code>request_key</code> user-space upcalls as part of the shared host-kernel state the family exposes, and says a fixed <code>ENOSYS</code> keeps the guest from triggering host keyrings.</li>
+<li>The dispatch arm (<code>detcore/src/lib.rs:2125</code>) returns <code>Err(Errno::ENOSYS)</code> when <code>panic_on_unsupported_syscalls</code> is set (<code>detcore/src/lib.rs:2126</code>), without reading any argument, so F1-F8 all give <code>ENOSYS</code> and no upcall ever starts. The run is not stopped.</li>
+<li>The flag's documentation (<code>detcore-model/src/config.rs:447</code>) says ordinary <code>hermit run</code> enables this policy and that compatibility requires <code>--allow-unsupported-syscalls</code>. Under that opt-out the call is forwarded to the host (<code>detcore/src/lib.rs:2129</code>). A forwarded call with <code>callout_info</code> can then start a host helper process outside the container and outside Detcore's scheduler, which the default policy rules out.</li>
+<li>The family is in <code>is_strict_only_deterministic_refusal_syscall</code> (<code>detcore/src/syscall_classification.rs:1311</code>), which backends that bypass Detcore's dispatcher consult to enforce the same refusal, and the performance opt-in subscription still subscribes it (<code>detcore/src/lib.rs:1256</code>).</li>
+</ul>
+<p>Why <code>refuse</code> and not the alternatives:</p>
+<ul>
+<li><code>passthrough</code> returns host keys and random serials, and an upcall runs a host program that the guest triggered.</li>
+<li><code>model</code> would need a guest-private keyring store and a deterministic replacement for the request-key helper. Detcore has neither. The legacy NEEDS-INVESTIGATION recommendation predates the refusal (https://github.com/rrnewton/hermit/pull/848 per the code tags).</li>
+<li><code>ENOSYS</code> is what a kernel without <code>CONFIG_KEYS</code> returns, so callers such as keyutils, NFS id mapping and Kerberos keyring caches already have a fallback for it.</li>
+</ul>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F2, F3, F4, F5, F6, F7, F8): under default-policy <code>hermit run --verify</code> on ptrace, issue raw <code>syscall(SYS_request_key, ...)</code> with a nonexistent <code>user</code> key and no callout, the same key with a non-<code>NULL</code> <code>callout_info</code>, a <code>.</code>-prefixed type, a bad <code>description</code> pointer, <code>dest_keyring</code> 0, each special ID and a bogus serial. Every call must return -1 with <code>ENOSYS</code>, and both runs must match. Existing partial candidate: <code>tests/c/request_key_enosys.c</code> (one argument set: a missing <code>user</code> key, no callout, <code>KEY_SPEC_PROCESS_KEYRING</code>), run by the e2e cell <code>c-programs/request-key-enosys</code> (<code>tests/e2e/manifests/c-programs.yaml:7482</code>, verify ci on ptrace) and by <code>kernel_keyring_is_deterministically_unavailable</code> at <code>hermit-cli/tests/kernel_keyring.rs:34</code>.</li>
+<li>T2 (covers F3): no upcall escapes. On a host with <code>/sbin/request-key</code> installed, run a guest that calls <code>request_key</code> with a <code>callout_info</code> under the default policy, and check that no <code>request-key</code> helper process starts and the host keyrings and <code>/proc/key-users</code> for the uid are unchanged.</li>
+<li>T3 (covers F2, F6): compatibility opt-out. Run a <code>request_key</code> guest that looks up a nonexistent <code>user</code> key natively and under <code>hermit run --allow-unsupported-syscalls</code> on ptrace, and compare the errno. <code>kernel_keyring_passes_through_with_compatibility_opt_out</code> at <code>hermit-cli/tests/kernel_keyring.rs:108</code> is the pattern for <code>keyctl</code>; no <code>request_key</code> variant exists yet.</li>
+<li>T4 (covers F2): record and replay a guest that calls <code>request_key</code> under the default policy. Both the recording and the replay must return <code>ENOSYS</code>.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/403: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy NEEDS-INVESTIGATION; code at this SHA: determinized, dispatch pred:is_kernel_keyring_syscall, refused only when fail-closed.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; refuse (default policy returns a fixed ENOSYS, the CONFIG_KEYS-absent boundary, at detcore/src/lib.rs:2125, so no host keyring lookup or request-key upcall happens; host passthrough only under --allow-unsupported-syscalls); linux_determinism conditional -&gt; nondeterministic (a success returns a random serial from host keyrings); 8 flag behaviours and 4 tests listed; no coverage token yet because no test has been run against this list, so tracking_status stays todo</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): decisions 9 and 6 applied (fixed ENOSYS, as without CONFIG_KEYS, before any argument check, realized under the default policy at detcore/src/lib.rs:2125-2126; the opt-out passthrough at detcore/src/lib.rs:2129 stays a user-chosen reduced-fidelity mode); target_policy stays refuse; no new F/T ids; removed the open question on refuse versus a guest-private keyring model</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+request_key&amp;amp;body=Discussion+for+the+%60request_key%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Frequest_key.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60request_key%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `request_key`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: request_key&quot; (https://github.com/rrnewton/hermit/issues/403), legacy variant A1.</p>
+<h3>2026-07-24 host strace evidence</h3>
+<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) with <code>strace -f -e trace=request_key</code> on a direct <code>syscall()</code> harness (invoked with non-destructive query/no-op/failing arguments) and, where applicable, on common programs. Hermit currently routes <code>request_key</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code>.</p>
+<p>Observed strace line:</p>
+<pre><code>request_key(&quot;user&quot;, &quot;nonexistent-desc&quot;, NULL, 0) = -1 ENOKEY (Required key not available)
+</code></pre>
+<hr>
+<p>*Autonomous syscall-classification sweep (ranks 151-250 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
+<p>The &quot;UNCLASSIFIED temporary-passthrough&quot; sentence above describes the code on 2026-07-24. At hermit f4055eb9cae4 <code>request_key</code> is classified Determinized and refused with <code>ENOSYS</code> under the default policy, as described under Hermit design.</p>
+</body></html>

@@ -1,0 +1,90 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>name_to_handle_at | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>name_to_handle_at</code> (303)</h1>
+<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>typed</code> &middot; linux determinism: nondeterministic &middot; target policy: refuse &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+name_to_handle_at&amp;body=Discussion+for+the+%60name_to_handle_at%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fname_to_handle_at.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60name_to_handle_at%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p>Returns an opaque, persistent file handle (plus a mount id) for a path, for later use with <code>open_by_handle_at</code>. Hermit refuses every call with <code>EOPNOTSUPP</code> without reading the arguments or writing any output, because the handle bytes and the mount id are host filesystem identities that Detcore does not virtualize.</p>
+<h2>Linux semantics</h2>
+<p><code>name_to_handle_at(dirfd, pathname, handle, mount_id, flags)</code> resolves <code>pathname</code> relative to <code>dirfd</code> and fills <code>struct file_handle { handle_bytes; handle_type; f_handle[] }</code> with filesystem-defined bytes (commonly inode number plus generation) and <code>*mount_id</code> with the mount's id. The caller sets <code>handle_bytes</code> to the space it provided; the kernel writes back the size it needs. No privilege is needed to obtain a handle; using it with <code>open_by_handle_at</code> needs <code>CAP_DAC_READ_SEARCH</code>.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: path resolution: <code>pathname</code> absolute, relative to <code>AT_FDCWD</code>, or relative to a directory <code>dirfd</code>. A missing path gives <code>ENOENT</code>; a bad <code>dirfd</code> gives <code>EBADF</code>; a non-directory <code>dirfd</code> with a relative path gives <code>ENOTDIR</code>.</li>
+<li>F2: <code>AT_EMPTY_PATH</code>: with an empty <code>pathname</code>, the handle describes <code>dirfd</code> itself (which may be an <code>O_PATH</code> descriptor).</li>
+<li>F3: <code>AT_SYMLINK_FOLLOW</code>: follow a trailing symlink. Without it the handle describes the symlink.</li>
+<li>F4: <code>AT_HANDLE_FID</code> (Linux 6.5): request a handle usable only for identification (for example by fanotify), which filesystems without full export support can also produce.</li>
+<li>F5: <code>AT_HANDLE_MNT_ID_UNIQUE</code> (Linux 6.12): <code>*mount_id</code> receives the 64-bit unique mount id instead of the reusable 32-bit one.</li>
+<li>F6: <code>AT_HANDLE_CONNECTABLE</code> (Linux 6.13): request a handle that can be reconnected to a path when opened.</li>
+<li>F7: undefined <code>flags</code> bits, or an invalid combination: <code>EINVAL</code>.</li>
+<li>F8: <code>handle_bytes</code> too small: <code>EOVERFLOW</code>, with the needed size written back to <code>handle_bytes</code>. Probing with <code>handle_bytes = 0</code> is the documented way to learn the size.</li>
+<li>F9: <code>handle_bytes</code> above <code>MAX_HANDLE_SZ</code> (128): <code>EINVAL</code>.</li>
+<li>F10: a filesystem without export support (for example some FUSE or pseudo filesystems): <code>EOPNOTSUPP</code>.</li>
+<li>F11: bad <code>pathname</code>, <code>handle</code> or <code>mount_id</code> pointers: <code>EFAULT</code>.</li>
+<li>F12: success outputs: <code>handle_type</code>, the <code>f_handle</code> bytes, the updated <code>handle_bytes</code>, and <code>*mount_id</code>.</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p>A successful call writes host filesystem identities into guest memory. The handle bytes encode the inode number and, on many filesystems, a generation number chosen when the inode was created (randomized on ext4, for example); a file created during the run gets a new inode and generation each time. The mount id depends on the order in which the host's mount table was built. So two runs, or two hosts, return different bytes for the same path: <code>nondeterministic</code>. Only the error paths (F1, F7, F8 size probing, F9, F11) repeat.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li><code>f_handle</code> bytes: host inode and generation numbers (F12).</li>
+<li><code>*mount_id</code>: host mount-table position, or the unique mount id under F5.</li>
+<li><code>handle_type</code> and the needed size: depend on the host filesystem type behind the path.</li>
+<li>F10: whether <code>EOPNOTSUPP</code> is returned depends on the host filesystem.</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>refuse</code>. Code at hermit f4055eb9cae4:</p>
+<ul>
+<li>Dispatch (<code>detcore/src/lib.rs:2595</code>): <code>Syscall::NameToHandleAt(_) =&gt; Err(Error::Errno(Errno::EOPNOTSUPP))</code>, with the comment <code>TODO-HUMAN-REVIEW(PR-899)</code> &quot;Host object handles and mount IDs are outside Detcore's filesystem identity model&quot; (<code>detcore/src/lib.rs:2593</code>-<code>2594</code>).</li>
+<li>Classification: listed as Determinized (<code>detcore/src/syscall_classification.rs:516</code>-<code>518</code>), checked by the unit test <code>filesystem_handle_export_is_determinized</code> (<code>detcore/src/syscall_classification.rs:2430</code>), and named in <code>is_deterministically_refused_syscall</code> (<code>detcore/src/syscall_classification.rs:1344</code>), which <code>detcore/src/lib.rs:226</code> exposes so backends that run guest syscalls outside the Detcore dispatcher return the same fixed refusal.</li>
+<li>The refusal is unconditional. Detcore reads no argument and writes no output, so every call, whatever its path, flags, buffer size or pointers, returns <code>EOPNOTSUPP</code>. <code>EOPNOTSUPP</code> is an answer Linux gives itself for a filesystem without export support (F10), so a program that handles that case (for example by falling back to path-based access) keeps working.</li>
+</ul>
+<p>Differences from Linux that remain:</p>
+<ul>
+<li>Every error path that Linux reports with another errno is replaced by <code>EOPNOTSUPP</code>: a missing path (F1, <code>ENOENT</code>), a bad <code>dirfd</code> (F1, <code>EBADF</code>), undefined flags (F7, <code>EINVAL</code>), a too-small buffer (F8, <code>EOVERFLOW</code> plus the size write-back), an oversized buffer (F9, <code>EINVAL</code>), and bad pointers (F11, <code>EFAULT</code>).</li>
+<li>F4: <code>AT_HANDLE_FID</code> is refused too, although Linux supports it on more filesystems than full export. Programs that use fanotify with file ids lose that path.</li>
+<li>The size probe (F8) does not report a size, so a program that probes before allocating sees <code>EOPNOTSUPP</code> on the probe.</li>
+</ul>
+<p>Why <code>refuse</code> and not the alternatives: <code>passthrough</code> leaks host inode, generation and mount numbers, which is the reason this issue was filed; <code>model</code> or <code>emulate</code> would need Detcore to issue stable virtual handles and translate them back in <code>open_by_handle_at</code>, which the comment at <code>detcore/src/lib.rs:2593</code> places outside the filesystem identity model; <code>open_by_handle_at</code> is refused as well, so a modeled handle would have no consumer.</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F10, F12): absolute paths <code>/</code>, <code>/tmp</code> and <code>/etc/hosts</code>, and the relative path <code>.</code>, all return <code>EOPNOTSUPP</code> under <code>hermit run --verify</code> on ptrace, and the handle's sentinel <code>handle_type</code> and <code>*mount_id</code> are left unchanged. Existing candidates: <code>tests/c/name_to_handle_at_eopnotsupp.c</code> (raw syscall on <code>/</code>, cell <code>c-programs/name-to-handle-at-eopnotsupp</code>, <code>tests/e2e/manifests/c-programs.yaml:3902</code>), <code>tests/c/name_to_handle_directory_eopnotsupp.c</code> (<code>/tmp</code>, <code>tests/e2e/manifests/c-programs.yaml:3960</code>), <code>tests/c/name_to_handle_regular_eopnotsupp.c</code> (<code>/etc/hosts</code>, <code>tests/e2e/manifests/c-programs.yaml:4076</code>) and <code>tests/c/name_to_handle.c</code> (<code>/</code> and <code>.</code>, with the sentinel check at <code>tests/c/name_to_handle.c:63</code>, cell <code>c-programs/name-to-handle-refusal</code>, <code>tests/e2e/manifests/c-programs.yaml:12775</code>). Each cell has verify <code>ci: true</code>. None checks <code>*mount_id</code>.</li>
+<li>T2 (covers F2): an <code>O_PATH</code> descriptor with an empty path and <code>AT_EMPTY_PATH</code> returns <code>EOPNOTSUPP</code>. Existing candidate: <code>tests/c/name_to_handle_empty_path_eopnotsupp.c</code> (cell at <code>tests/e2e/manifests/c-programs.yaml:4018</code>, verify <code>ci: true</code>).</li>
+<li>T3 (covers F3, F4, F5, F6, F7): each of <code>AT_SYMLINK_FOLLOW</code> (on a symlink), <code>AT_HANDLE_FID</code>, <code>AT_HANDLE_MNT_ID_UNIQUE</code>, <code>AT_HANDLE_CONNECTABLE</code> and an undefined flag bit returns <code>EOPNOTSUPP</code> under Hermit. Record the Linux results next to them.</li>
+<li>T4 (covers F8, F9): <code>handle_bytes = 0</code> and <code>handle_bytes = 129</code> both return <code>EOPNOTSUPP</code>, and <code>handle_bytes</code> is not rewritten.</li>
+<li>T5 (covers F1, F11): a missing path, a bad <code>dirfd</code>, and NULL <code>pathname</code>, <code>handle</code> and <code>mount_id</code> pointers all return <code>EOPNOTSUPP</code> under Hermit. This pins the documented divergence so a future change to it is deliberate.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-09-28 · hermit 81ca8822f78c · hermit2 · closed under the legacy rule (an explicit <code>classify_syscall</code> arm), not the v1 done rule; closing comment https://github.com/rrnewton/hermit/issues/311#issuecomment-5872885759</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/311: linux_determinism nondeterministic (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch typed, refused.</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · reopen: under the owner rule of 2026-10-02, closed means every flag and option is covered by a named test and the implementation works; name_to_handle_at records no test coverage, so tracking_status is todo and https://github.com/rrnewton/hermit/issues/311 reopens.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; refuse (lib.rs:2595 returns EOPNOTSUPP for every call without reading arguments or writing output; listed in is_deterministically_refused_syscall); linux_determinism stays nondeterministic; 12 flag behaviours and 5 tests listed; five refusal cells exist (verify ci true) but cover only plain paths and AT_EMPTY_PATH; no coverage token yet, so tracking_status stays todo</li>
+<li>2026-10-05 · hermit f4055eb9cae4 · syscall-tracking-2 · covered: T2 covered by tests/c/name_to_handle_empty_path_eopnotsupp.c (C08 review of the 2026-10-04 coverage proposals; guest source read at this SHA, not run by this agent)</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+name_to_handle_at&amp;amp;body=Discussion+for+the+%60name_to_handle_at%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fname_to_handle_at.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60name_to_handle_at%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `name_to_handle_at`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: name_to_handle_at&quot; (https://github.com/rrnewton/hermit/issues/311), legacy variant A1.</p>
+<p>Comment history: 1 comment(s) on https://github.com/rrnewton/hermit/issues/311.</p>
+<p>The companion call <code>open_by_handle_at</code> has its own body; it is also refused.</p>
+<h3>Open questions</h3>
+<ul>
+<li>Should the refusal keep Linux's error precedence for arguments it can check without the host (<code>EINVAL</code> for undefined flags or <code>handle_bytes &gt; 128</code>, <code>EFAULT</code> for bad pointers), and return <code>EOPNOTSUPP</code> only where Linux would otherwise succeed? Today every call gets <code>EOPNOTSUPP</code> (<code>detcore/src/lib.rs:2595</code>).</li>
+</ul>
+<h3>2026-07-24 host strace evidence</h3>
+<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) by tracing a direct <code>syscall()</code> harness and common programs with <code>strace -f -e trace=name_to_handle_at</code>, and by confirming hermit currently routes <code>name_to_handle_at</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code> (the harness ran end-to-end under <code>hermit run</code>, exit 0, so passthrough does not crash).</p>
+<p>Observed strace line:</p>
+<pre><code>name_to_handle_at(AT_FDCWD, &quot;/etc/hostname&quot;, {handle_bytes=128 =&gt; 20, handle_type=77, f_handle=&quot;\x99\x25\x03\x00\x00\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x0d\x00\x00\x00&quot;}, [5201], 0) = 0
+</code></pre>
+<p>That routing claim is history: at hermit f4055eb9cae4 the call is refused with <code>EOPNOTSUPP</code> (<code>detcore/src/lib.rs:2595</code>).</p>
+<hr>
+<p>*Autonomous syscall-classification sweep, batch 3 (ranks 101-150 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
+<h3>Legacy closure</h3>
+<p>Closed 2026-09-28 by the 2026-09-28 sweep, which closed issues whose syscall had an explicit <code>classify_syscall</code> arm. Closing comment: https://github.com/rrnewton/hermit/issues/311#issuecomment-5872885759</p>
+</body></html>

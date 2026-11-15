@@ -1,0 +1,87 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mount_setattr | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>mount_setattr</code> (442)</h1>
+<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_mount_ns_admin_refused_syscall</code> &middot; linux determinism: conditional &middot; target policy: refuse &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+mount_setattr&amp;body=Discussion+for+the+%60mount_setattr%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fmount_setattr.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60mount_setattr%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>mount_setattr(dfd, path, flags, attr, size)</code> changes the properties of an existing mount, or with <code>AT_RECURSIVE</code> of a whole mount subtree: mount attributes such as read-only, the propagation type, and idmapping (Linux 5.12). Hermit refuses every call with a fixed <code>EPERM</code> and never forwards it to the host (<code>detcore/src/lib.rs:2215-2219</code>).</p>
+<h2>Linux semantics</h2>
+<p>The kernel resolves <code>path</code> relative to <code>dfd</code> and applies the changes described by <code>struct mount_attr</code> (<code>attr_set</code>, <code>attr_clr</code>, <code>propagation</code>, <code>userns_fd</code>), whose size the caller passes in <code>size</code>. With <code>AT_RECURSIVE</code> the change applies to every mount in the subtree, and either all of them change or none does.</p>
+<p>Argument shape is checked before privilege:</p>
+<p>1. Flag bits other than <code>AT_EMPTY_PATH</code>, <code>AT_RECURSIVE</code>, <code>AT_SYMLINK_NOFOLLOW</code> and <code>AT_NO_AUTOMOUNT</code> give <code>EINVAL</code>. 2. A <code>size</code> larger than a page gives <code>E2BIG</code>; a <code>size</code> smaller than <code>MOUNT_ATTR_SIZE_VER0</code> (32) gives <code>EINVAL</code>. The host strace under Additional information, <code>mount_setattr(-1, &quot;&quot;, 0, NULL, 0) = -1 EINVAL</code>, shows the size check running before any privilege check.</p>
+<p>Changing a mount needs <code>CAP_SYS_ADMIN</code> over its mount namespace, otherwise <code>EPERM</code>. Bytes of a larger structure beyond the fields the kernel knows must be zero (<code>E2BIG</code>). An <code>attr</code> with nothing to set, clear or propagate is a no-op that returns 0. Unknown attribute bits, or a <code>propagation</code> value other than 0 or one of <code>MS_SHARED</code>, <code>MS_SLAVE</code>, <code>MS_PRIVATE</code> and <code>MS_UNBINDABLE</code>, give <code>EINVAL</code>. Idmapping has further conditions on <code>userns_fd</code> and on the mount and filesystem.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>AT_RECURSIVE</code>: apply the change to the whole mount subtree, atomically.</li>
+<li>F2: <code>AT_EMPTY_PATH</code>: an empty <code>path</code> refers to <code>dfd</code> itself.</li>
+<li>F3: <code>AT_SYMLINK_NOFOLLOW</code>: do not follow a trailing symlink in <code>path</code>.</li>
+<li>F4: <code>AT_NO_AUTOMOUNT</code>: do not trigger an automount on the final component.</li>
+<li>F5: <code>attr_set</code>/<code>attr_clr</code> with <code>MOUNT_ATTR_RDONLY</code>, <code>MOUNT_ATTR_NOSUID</code>, <code>MOUNT_ATTR_NODEV</code>, <code>MOUNT_ATTR_NOEXEC</code>, <code>MOUNT_ATTR_NODIRATIME</code> or <code>MOUNT_ATTR_NOSYMFOLLOW</code>: set or clear that attribute.</li>
+<li>F6: atime mode: with <code>MOUNT_ATTR__ATIME</code> in <code>attr_clr</code>, set <code>MOUNT_ATTR_RELATIME</code>, <code>MOUNT_ATTR_NOATIME</code> or <code>MOUNT_ATTR_STRICTATIME</code> in <code>attr_set</code>.</li>
+<li>F7: <code>MOUNT_ATTR_IDMAP</code> with <code>userns_fd</code>: idmap the mount through the user namespace that <code>userns_fd</code> refers to.</li>
+<li>F8: <code>propagation</code>: <code>MS_SHARED</code>, <code>MS_SLAVE</code>, <code>MS_PRIVATE</code> or <code>MS_UNBINDABLE</code> changes the propagation type; 0 leaves it unchanged.</li>
+<li>F9: <code>size</code> and structure version: below 32 is <code>EINVAL</code>, above a page is <code>E2BIG</code>, non-zero bytes beyond the known fields are <code>E2BIG</code>; an all-zero <code>attr</code> is a no-op that returns 0.</li>
+<li>F10: other errors: undefined flag or attribute bits, or an invalid <code>propagation</code> value, are <code>EINVAL</code>; missing <code>CAP_SYS_ADMIN</code> is <code>EPERM</code>.</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: conditional</code>, kept from the legacy classification. Malformed arguments fail deterministically (<code>EINVAL</code>, <code>E2BIG</code>), and an unprivileged caller with well-formed arguments fails with <code>EPERM</code>. With privilege, the result depends on the host mount namespace and changes mount state that other processes see, and propagation changes affect peer mounts.</p>
+<p>Under Hermit the call returns <code>EPERM</code> without consulting the host, so it is deterministic by construction.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>Requires <code>CAP_SYS_ADMIN</code>; the effect depends on the host mount namespace. Verified on 2026-07-24: a bad-argument call fails with <code>EINVAL</code> deterministically.</li>
+<li>Propagation changes, which affect peer mounts in other namespaces</li>
+<li>Automount triggers on the final component, unless <code>AT_NO_AUTOMOUNT</code></li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>refuse</code> (from <code>investigate</code>). What the code does at hermit f4055eb9cae4:</p>
+<ul>
+<li><code>mount_setattr</code> is a member of <code>is_mount_ns_admin_refused_syscall</code> (<code>detcore/src/syscall_classification.rs:939</code>, member at line 944) and is classified Determinized (<code>detcore/src/syscall_classification.rs:357</code>).</li>
+<li>The dispatch arm at <code>detcore/src/lib.rs:2215-2219</code> matches that predicate before the typed match and returns <code>Err(Error::Errno(Errno::EPERM))</code> for every argument combination. Its comment (<code>detcore/src/lib.rs:2203-2214</code>) says the call is never forwarded to the host.</li>
+<li>The predicate is part of <code>is_deterministically_refused_syscall</code> (<code>detcore/src/syscall_classification.rs:1324</code>). The arm has no <code>panic_on_unsupported_syscalls</code> branch, so the refusal is the same whether or not Hermit fails closed.</li>
+<li>The unit test <code>mount_ns_admin_syscalls_are_determinized_and_consistent</code> (<code>detcore/src/syscall_classification.rs:2666</code>, member at line 2673) checks only the classification and the predicate membership; it does not run a guest.</li>
+</ul>
+<p>Why <code>refuse</code>: the predicate's doc comment (<code>detcore/src/syscall_classification.rs:926-938</code>) says a deterministic container pins the guest's mount hierarchy for the whole run. A forwarded <code>mount_setattr</code> could make paths Detcore tracks read-only or non-executable mid-run, and a propagation change could affect mounts outside the guest. Modelling it would need a virtual mount table that Detcore does not have.</p>
+<p>Where Hermit differs from Linux:</p>
+<ul>
+<li>F9, F10: natively a malformed call fails with <code>EINVAL</code> or <code>E2BIG</code> before any privilege check; Hermit returns <code>EPERM</code>. The host-strace case (size 0) gives <code>EINVAL</code> natively and <code>EPERM</code> under Hermit.</li>
+<li>F1 to F8: under the ptrace backend the guest runs as uid 0 inside a user namespace (<code>detcore/src/syscalls/misc.rs:672</code>). If that namespace owns the guest's mount namespace, the kernel would grant changes to mounts it owns, so <code>EPERM</code> is a policy refusal there rather than the kernel's answer.</li>
+</ul>
+<p>Target (owner decision 6): keep the fixed <code>EPERM</code>, returned before any argument is read, which is what the code does today (<code>detcore/src/lib.rs:2215-2219</code>). Linux's order, in <code>SYSCALL_DEFINE5(mount_setattr)</code> in <code>fs/namespace.c</code>, checks the flag bits and then <code>size</code> before privilege (F9, F10); Hermit deliberately does not reproduce it, because the call is refused, not emulated. A guest that uses it (a container runtime making a mount read-only or idmapped) gets the permission error an unprivileged Linux caller gets for well-formed arguments.</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F2, F3, F4, F5, F6, F8): under <code>hermit run --verify</code> on ptrace, call raw <code>syscall(SYS_mount_setattr, ...)</code> on <code>/</code> with a 32-byte <code>struct mount_attr</code> that sets each attribute, each atime mode and each propagation type, with and without <code>AT_RECURSIVE</code>, and on an open directory descriptor with <code>&quot;&quot;</code> and <code>AT_EMPTY_PATH</code>, plus <code>AT_SYMLINK_NOFOLLOW</code> and <code>AT_NO_AUTOMOUNT</code> on a symlink. Each call returns -1 with <code>EPERM</code>, <code>/proc/self/mountinfo</code> read before and after is byte-identical, and both runs agree.</li>
+<li>T2 (covers F7): <code>MOUNT_ATTR_IDMAP</code> with <code>userns_fd</code> from <code>open(&quot;/proc/self/ns/user&quot;)</code> returns <code>EPERM</code>, and mountinfo is unchanged.</li>
+<li>T3 (covers F9, F10): the host-strace case <code>mount_setattr(-1, &quot;&quot;, 0, NULL, 0)</code>, <code>size</code> 4097, a 40-byte structure with a non-zero tail, an all-zero <code>attr</code>, an undefined flag bit and an undefined attribute bit all return <code>EPERM</code> under Hermit, where a privileged Linux caller gets <code>EINVAL</code>, <code>E2BIG</code>, <code>E2BIG</code>, 0, <code>EINVAL</code> and <code>EINVAL</code>; the size and flag-bit cases fail the same way for an unprivileged caller, because they are checked before privilege. The test pins the fixed errno of owner decision 6.</li>
+<li>T4 (covers none): record a guest that calls <code>mount_setattr</code> and replay it; replay returns the same <code>EPERM</code> and the guest's output matches.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-09-28 · hermit 81ca8822f78c · hermit2 · closed under the legacy rule (an explicit <code>classify_syscall</code> arm), not the v1 done rule; closing comment https://github.com/rrnewton/hermit/issues/295#issuecomment-5872850636</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/295: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy NEEDS-INVESTIGATION; code at this SHA: determinized, dispatch pred:is_mount_ns_admin_refused_syscall, refused.</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · reopen: under the owner rule of 2026-10-02, closed means every flag and option is covered by a named test and the implementation works; mount_setattr records no test coverage, so tracking_status is todo and https://github.com/rrnewton/hermit/issues/295 reopens.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; refuse (Detcore returns a fixed EPERM for every argument combination at detcore/src/lib.rs:2215-2219 and never forwards the call); linux_determinism stays conditional; 10 flag behaviours and 4 tests listed; no runtime test names mount_setattr, so tracking_status stays todo and ptrace_verification untested; open question on native argument errnos</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): decision 6 applied (fixed EPERM before any argument check stays the target; Linux order in SYSCALL_DEFINE5(mount_setattr) deliberately not reproduced); target_policy stays refuse; T3 now pins the decision-6 errno; no new F/T ids; open question on native argument errnos removed</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+mount_setattr&amp;amp;body=Discussion+for+the+%60mount_setattr%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fmount_setattr.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60mount_setattr%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `mount_setattr`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: mount_setattr&quot; (https://github.com/rrnewton/hermit/issues/295), legacy variant A1.</p>
+<h3>Note on the strace evidence below</h3>
+<p>The strace text below was written on 2026-07-24, when <code>mount_setattr</code> was forwarded to the kernel. At hermit f4055eb9cae4 Hermit no longer forwards it; it returns <code>EPERM</code> (<code>detcore/src/lib.rs:2215-2219</code>), so the same call under Hermit gives <code>EPERM</code>, not <code>EINVAL</code>.</p>
+<p>Comment history: 1 comment(s) on https://github.com/rrnewton/hermit/issues/295.</p>
+<h3>2026-07-24 host strace evidence</h3>
+<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) by tracing a direct <code>syscall()</code> harness and common programs with <code>strace -f -e trace=mount_setattr</code>, and by confirming hermit currently routes <code>mount_setattr</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code> (the harness ran end-to-end under <code>hermit run</code>, exit 0, so passthrough does not crash).</p>
+<p>Observed strace line:</p>
+<pre><code>mount_setattr(-1, &quot;&quot;, 0, NULL, 0) = -1 EINVAL (Invalid argument)
+</code></pre>
+<hr>
+<p>*Autonomous syscall-classification sweep, batch 3 (ranks 101-150 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
+<h3>Legacy closure</h3>
+<p>Closed 2026-09-28 by the 2026-09-28 sweep, which closed issues whose syscall had an explicit <code>classify_syscall</code> arm. Closing comment: https://github.com/rrnewton/hermit/issues/295#issuecomment-5872850636</p>
+</body></html>

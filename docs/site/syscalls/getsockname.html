@@ -1,0 +1,72 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>getsockname | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>getsockname</code> (51)</h1>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; linux determinism: conditional &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+getsockname&amp;body=Discussion+for+the+%60getsockname%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fgetsockname.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60getsockname%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>getsockname(2)</code> returns the local address a socket is bound to. Detcore forwards it to the kernel. The result is deterministic when Detcore chose the address in <code>bind(2)</code>: AF_UNIX autobind names, netlink port IDs, and ports requested as 0. Ports the kernel autobinds during <code>connect</code>, <code>listen</code> or <code>sendto</code> are still host-chosen.</p>
+<h2>Linux semantics</h2>
+<p><code>getsockname(fd, addr, addrlen)</code> asks the protocol for the socket's local address and copies it to <code>addr</code>. <code>*addrlen</code> is the buffer size on entry and the address's full size on return. If the buffer is too small, the address is truncated and the returned <code>*addrlen</code> is larger than the buffer. The call does not change socket state.</p>
+<p>What comes back depends on how the socket got its address: an explicit <code>bind</code>, a <code>bind</code> that left the choice to the kernel, an implicit autobind during <code>connect</code>, <code>listen</code> or an unbound datagram send, or no address at all.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>*addrlen</code> in/out: the input is the buffer size; the output is the real address length. A short buffer truncates the copy, and the returned length exceeds the buffer.</li>
+<li>F2: bound AF_INET/AF_INET6 socket: the bound address and port, including a port the kernel picked for a port-0 <code>bind</code>.</li>
+<li>F3: unbound AF_INET/AF_INET6 socket: the wildcard address with port 0.</li>
+<li>F4: AF_INET/AF_INET6 socket autobound by <code>connect</code>, <code>listen</code> or an unbound UDP <code>sendto</code>: the kernel's ephemeral port and the source address it routed from.</li>
+<li>F5: AF_UNIX: a pathname, an abstract name, an autobind name (a NUL byte and five hex digits; length <code>offsetof(sun_path) + 6</code>), or an unnamed socket (from <code>socketpair</code> or never bound) with length <code>sizeof(sa_family_t)</code>.</li>
+<li>F6: AF_NETLINK: <code>nl_pid</code> (the explicit or autobound port ID) and <code>nl_groups</code>.</li>
+<li>F7: errors: <code>EBADF</code> for a closed fd, <code>ENOTSOCK</code> for a non-socket fd, <code>EFAULT</code> for an unreadable <code>addrlen</code> or unwritable <code>addr</code>, <code>EINVAL</code> for a negative <code>*addrlen</code>.</li>
+<li>F8: other families (AF_PACKET, AF_VSOCK, ...): family-specific addresses, returned by the kernel.</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: conditional</code>, kept. The call only reports state, so it repeats whenever the address it reports was chosen deterministically. Explicit addresses repeat. Kernel-chosen ports, autobind names and netlink port IDs are randomized by Linux, and an address from the host network differs across hosts.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>Kernel-chosen ephemeral ports (F2 with port 0 on Linux, F4), AF_UNIX autobind names and netlink port IDs (F5, F6)</li>
+<li>Interface addresses of the host network namespace, only with <code>--network=host</code></li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>model</code>. The kernel reports the address, and Detcore makes the address deterministic when it is assigned. <code>getsockname</code> itself needs no rewriting once every assignment goes through Detcore.</p>
+<p>What the code does now:</p>
+<ul>
+<li>The typed dispatch arm at <code>detcore/src/lib.rs:2562</code> calls <code>handle_getsockname</code> (<code>detcore/src/syscalls/files.rs:3890</code>), which forwards the call through <code>record_or_replay</code> (<code>detcore/src/syscalls/files.rs:3895</code>). Both carry an autonomous-bot &quot;needs human review&quot; tag.</li>
+<li><code>handle_bind</code> (<code>detcore/src/syscalls/files.rs:4014</code>) assigns the addresses F2, F5 and F6 report: ports for port-0 binds, <code>\0%05x</code> AF_UNIX autobind names, and netlink IDs <code>0x4000_0000 | port</code>. See the <code>bind</code> body.</li>
+<li>By default the guest has a private network namespace with only loopback (<code>hermit-cli/src/bin/hermit/global_opts.rs:53</code>), so the local IP addresses repeat.</li>
+<li>Record mode captures the output buffer: the recorder sends <code>Getsockname</code> to <code>handle_sockopt_family</code> (<code>hermit-cli/src/recorder.rs:631</code>), and the replayer returns the recorded bytes (<code>hermit-cli/src/replayer.rs:538</code>).</li>
+</ul>
+<p>Why <code>model</code>: code facts rule out <code>passthrough</code> for a determinized syscall. <code>emulate</code> would duplicate the kernel's address table. <code>refuse</code> would break servers that bind port 0 and print their port.</p>
+<p>Gap between the code and <code>model</code>:</p>
+<ul>
+<li><strong>Implicit autobind ports (F4).</strong> Only <code>handle_bind</code> asks the global port allocator (<code>GlobalRequest::RequestPort</code> at <code>detcore/src/syscalls/files.rs:4043</code>, <code>:4072</code>, <code>:4119</code> and <code>:4158</code>, all inside <code>handle_bind</code>). <code>connect</code> (<code>detcore/src/syscalls/io.rs:1336</code>) and <code>listen</code> (<code>detcore/src/syscalls/files.rs:3879</code>) forward unbound sockets to the kernel, which picks a random port. <code>getsockname</code> then reports that port, and so does the peer's <code>getpeername</code>. Fixing it belongs in those calls, not here.</li>
+</ul>
+<p>Target (owner decision 12): every local port the kernel would choose for an unbound AF_INET or AF_INET6 socket comes from Detcore's global port allocator, the one an explicit <code>bind</code> to port 0 already uses. <code>handle_bind</code> requests the port with <code>GlobalRequest::RequestPort</code> (<code>detcore/src/syscalls/files.rs:4119</code> for AF_INET, <code>detcore/src/syscalls/files.rs:4158</code> for AF_INET6); the global tool serves the request at <code>detcore/src/tool_global.rs:1731</code> from the range in the host's <code>ip_local_port_range</code> (<code>detcore/src/tool_global.rs:2783</code>); and <code>release_port_for_open_file</code> (<code>detcore/src/syscalls/files.rs:952</code>) frees the port when the socket's last descriptor closes. An implicit bind, meaning <code>connect</code>, <code>listen</code>, <code>sendto</code>, <code>sendmsg</code> or <code>sendmmsg</code> on an unbound socket, must take its port the same way and bind the socket to it before the call reaches the kernel, so that <code>getsockname</code>, the peer's <code>getpeername</code> and the peer's <code>accept</code> report the same port in every run. <code>getsockname</code> itself needs no change: once the implicit binds take allocator ports, the port it reports for F4 is the allocator's. Today <code>connect</code> (<code>detcore/src/syscalls/io.rs:1336</code>), <code>listen</code> (<code>detcore/src/syscalls/files.rs:3879</code>) and an unbound <code>sendto</code> (<code>handle_sendrecv</code>, <code>detcore/src/syscalls/io.rs:1409</code>) forward the socket to the kernel, which picks a random port.</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F2): bind AF_INET and AF_INET6 loopback sockets to port 0 and print the port <code>getsockname</code> reports. It must be identical across <code>--verify</code> runs on ptrace. Existing candidates: <code>tests/c/socket_epoll_ordering.c</code> (prints the port; cell at <code>tests/e2e/manifests/c-programs.yaml:13718</code>), <code>tests/c/record_replay_setsockopt.c</code> (getsockname at line 49; cell at <code>tests/e2e/manifests/c-programs.yaml:7167</code>), and <code>tests/c/tcp_info_accept6.c</code> for AF_INET6 (cell at <code>tests/e2e/manifests/c-programs.yaml:9855</code>), all verify ci on ptrace.</li>
+<li>T2 (covers F5): AF_UNIX abstract, autobind and unnamed sockets, plus a pathname bind (new). Existing candidates: <code>tests/c/bind_getsockname.c</code> (abstract name echo; cell at <code>tests/e2e/manifests/c-programs.yaml:14534</code>), <code>tests/c/unix_autobind_common.h</code> (autobind shape check at lines 40-57; cells <code>unix-autobind-stream</code>/<code>-dgram</code>/<code>-seqpacket</code> at <code>tests/e2e/manifests/c-programs.yaml:10541</code>, <code>:10425</code>, <code>:10483</code>), and <code>tests/c/sockname_unnamed.c</code> (family-only length at line 46; cell at <code>tests/e2e/manifests/c-programs.yaml:14472</code>).</li>
+<li>T3 (covers F6): netlink <code>nl_pid</code> after a <code>nl_pid == 0</code> bind. Existing candidates: <code>tests/c/netlink_autobind_common.h</code> through cells <code>netlink-autobind-route</code>/<code>-generic</code>/<code>-usersock</code> (<code>tests/e2e/manifests/c-programs.yaml:4417</code>, <code>:4355</code>, <code>:4479</code>).</li>
+<li>T4 (covers F1): pass a 4-byte buffer for an AF_INET6 socket. The returned length must be 28, and bytes past the fourth must be untouched.</li>
+<li>T5 (covers F3, F4): an unbound TCP socket reports <code>0.0.0.0:0</code>. After <code>connect</code> to a loopback listener without <code>bind</code>, the local port must be identical across <code>--verify</code> runs. This is expected to fail until implicit autobind goes through the allocator.</li>
+<li>T6 (covers F7): <code>EBADF</code> for fd -1, <code>ENOTSOCK</code> for a pipe, <code>EFAULT</code> for a bad <code>addrlen</code>, <code>EINVAL</code> for <code>*addrlen == -1</code>. Existing partial coverage: <code>EBADF</code> in <code>tests/c/sockname_unnamed.c:59</code>.</li>
+<li>T7 (covers F2, F8): record and replay a program that prints its port-0 bind port, and check that the replayed output matches. Separately, check that an AF_PACKET or AF_VSOCK address passes through where the host allows it.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant B of https://github.com/rrnewton/hermit/issues/608: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch typed.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; model (Detcore assigns the addresses at bind; the recorder captures the output buffer); linux_determinism conditional kept; F1-F8 inventoried, T1-T7 proposed; gap: ports autobound by connect/listen/sendto are kernel-chosen.</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): decision 12 applied (Target paragraph: implicit binds take allocator ports, so the F4 port getsockname reports repeats with no change here); no new F/T ids; removed the open question (allocator in the callers versus rewriting the reported port) and the empty heading</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+getsockname&amp;amp;body=Discussion+for+the+%60getsockname%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fgetsockname.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60getsockname%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `getsockname`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: getsockname&quot; (https://github.com/rrnewton/hermit/issues/608), legacy variant B.</p>
+<h3>Legacy tracking note (2026-07-24)</h3>
+<p>Filed by the complete syscall-classification audit. The implementation classifies <code>PASS-THRU</code> entries under fixed-container/stable-state assumptions and routes all other entries through the explicit unsupported policy until a deterministic handler is implemented.</p>
+</body></html>

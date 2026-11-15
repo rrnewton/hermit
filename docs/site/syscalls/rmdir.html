@@ -1,0 +1,99 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rmdir | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>rmdir</code> (84)</h1>
+<p>Strategy: <strong>passthrough</strong> &middot; dispatch: <code>passthrough</code> &middot; linux determinism: deterministic &middot; target policy: passthrough &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+rmdir&amp;body=Discussion+for+the+%60rmdir%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Frmdir.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60rmdir%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>rmdir(pathname)</code> removes an empty directory. Hermit forwards it to the host kernel unchanged. It relies on the guest's container filesystem being private and stable, and Detcore keeps no directory state of its own.</p>
+<h2>Linux semantics</h2>
+<p>The kernel looks up the parent of the last path component, following symlinks in every earlier component. The last component must name a directory and is never followed if it is a symlink. The directory must contain no entries besides <code>.</code> and <code>..</code>. On success the entry disappears from its parent, the parent's mtime and ctime change, and on most filesystems the parent's link count drops by one. The call returns 0 or a negative errno and writes nothing to guest memory. A process whose working directory, or an open descriptor, still refers to the removed directory keeps that reference, but the directory can no longer gain entries. Errors are checked in path-walk order, so the errno is a function of the path, the filesystem state, the credentials and the mounts.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: an empty directory is removed. If it is a process's working directory or is held open, those references stay valid, but creating an entry inside it then fails with <code>ENOENT</code>.</li>
+<li>F2: the directory contains entries other than <code>.</code> and <code>..</code>: <code>ENOTEMPTY</code> (POSIX also allows <code>EEXIST</code>; Linux returns <code>ENOTEMPTY</code>)</li>
+<li>F3: the last component is not a directory, including a symlink to a directory, which is not followed: <code>ENOTDIR</code></li>
+<li>F4: a last component of <code>.</code>: <code>EINVAL</code>. A last component of <code>..</code>: <code>ENOTEMPTY</code>. The process's root directory (for example <code>/</code>): <code>EBUSY</code>.</li>
+<li>F5: the directory is a mount point: <code>EBUSY</code></li>
+<li>F6: trailing slashes are accepted: <code>rmdir(&quot;d/&quot;)</code> removes <code>d</code></li>
+<li>F7: the directory is missing, an intermediate component is missing, or <code>pathname</code> is empty: <code>ENOENT</code>. An intermediate component is not a directory: <code>ENOTDIR</code>.</li>
+<li>F8: write or search permission is denied on the parent, or search permission on a path component: <code>EACCES</code>. The parent is sticky and the caller owns neither the parent nor the directory: <code>EPERM</code>. F12 holds immutable and append-only directories.</li>
+<li>F9: a component is longer than <code>NAME_MAX</code>, or the path is longer than <code>PATH_MAX</code>: <code>ENAMETOOLONG</code>. Too many symlinks in the prefix: <code>ELOOP</code>. <code>pathname</code> points outside the address space: <code>EFAULT</code>.</li>
+<li>F10: <code>EROFS</code>: the parent is on a read-only mount. F13 holds <code>EIO</code>.</li>
+<li>F11: a relative <code>pathname</code> resolves against the calling process's working directory, inside its root and mount namespace</li>
+<li>F12: the directory or its parent carries the immutable or append-only attribute, which only the host can set: <code>EPERM</code>.</li>
+<li>F13: <code>EIO</code> from failing host storage.</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p>The result is a function of the filesystem state along the path, the caller's credentials, and the mount layout. Nothing in the call depends on timing. Under Hermit, threads run one at a time, so a guest thread that creates an entry while another removes the directory gets a fixed order. The call repeats exactly when the guest-visible filesystem starts in the same state and nothing outside the container changes it.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>Changes to the filesystem made outside the container. Hermit does not try to make a changing host filesystem deterministic.</li>
+<li>Host configuration behind F10, F12 and F13: read-only remounts, inode attributes and device errors.</li>
+<li>Values the call changes but does not return: the parent's timestamps and link count. They become visible only through <code>stat</code> and similar calls, and are handled there.</li>
+</ul>
+<h3>Cross-host variation</h3>
+<ul>
+<li>Host mount layout visible in the guest: which directories are mount points and give <code>EBUSY</code> (F5).</li>
+<li>Inode attributes set on the host: immutable or append-only directories give <code>EPERM</code> (F12).</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>passthrough</code>. The code already does this at hermit f4055eb9cae4:</p>
+<ul>
+<li><code>rmdir</code> is classified <code>PassThrough</code> at <code>detcore/src/syscall_classification.rs:733</code>, inside the pass-through block that starts at <code>detcore/src/syscall_classification.rs:690</code>. The comment at <code>detcore/src/syscall_classification.rs:725</code> and <code>:726</code> gives the condition: these calls &quot;repeat given stable guest-visible filesystem state with no external mutation&quot;.</li>
+<li>The generic arm <code>SyscallClassification::PassThrough =&gt; self.passthrough(guest, call).await</code> at <code>detcore/src/lib.rs:2843</code> forwards it. <code>passthrough</code> at <code>detcore/src/lib.rs:367</code> only calls <code>record_or_replay_preserving_tool_errors</code> (<code>detcore/src/tool_local.rs:349</code>). The injecting <code>NoopTool</code> passes the call through unchanged (<code>detcore/src/record_or_replay.rs:47</code>).</li>
+<li>The unit test <code>representative_policies_stay_in_their_reviewed_sections</code> (<code>detcore/src/syscall_classification.rs:1899</code>) lists <code>Sysno::rmdir</code> at <code>detcore/src/syscall_classification.rs:2083</code> and asserts it is <code>PassThrough</code> at <code>detcore/src/syscall_classification.rs:2094</code>.</li>
+</ul>
+<p>Why passthrough, not <code>model</code> or <code>emulate</code>:</p>
+<ul>
+<li>Hermit has no virtual filesystem. The directory tree in the guest's container mount namespace is the state, and only the kernel can apply F1 to F11 the same way the guest's other path syscalls see them.</li>
+<li>Every input that decides the result is either container state Hermit already holds fixed (the private <code>/tmp</code>, the launch filesystem image, fixed virtual-root credentials, serialized threads) or a host condition that no emulation could make up without lying about the filesystem.</li>
+<li>The return value carries no host-specific data: 0 or an errno that follows from the inputs. Detcore keeps no virtual working directory, so removing the current directory (F1) needs no bookkeeping: <code>fchdir</code> and <code>getcwd</code> are passed through too.</li>
+</ul>
+<p>Record and replay. Code facts show <code>subscribed_record_replay: false</code>, so under <code>--passthru-opt</code> Detcore does not see <code>rmdir</code>. <code>hermit record</code> has its own subscriptions, in a recorder module that the comment at <code>detcore/src/lib.rs:1078</code> names; that module is not in the exported tree, so this body does not describe how record captures <code>rmdir</code>. The integration test <code>record_path_queries_and_legacy_mutations</code> (<code>hermit-cli/tests/record_replay.rs:2171</code>) requires the raw <code>SYS_rmdir</code> calls at <code>tests/c/record_replay_path_queries.c:245</code> and <code>:261</code> to replay. The test <code>record_refuses_a_removed_working_directory</code> (<code>hermit-cli/tests/record_replay.rs:2200</code>) runs the same guest with <code>--removed-cwd</code>, which removes its own working directory with raw <code>SYS_rmdir</code> at <code>tests/c/record_replay_path_queries.c:111</code> and then calls <code>fchdir</code> on it; recording must refuse that <code>fchdir</code>, not the <code>rmdir</code>.</p>
+<p>Existing run-mode evidence, all on ptrace and through glibc <code>rmdir()</code>, which issues <code>SYS_rmdir</code> on this host's glibc 2.34 (host strace under Additional information):</p>
+<ul>
+<li><code>tests/c/mkdir_rmdir.c:84</code> (<code>ENOTEMPTY</code>), <code>:90</code> (child removed) and <code>:92</code> (now-empty parent removed). Cell <code>c-programs/mkdir-rmdir</code> at <code>tests/e2e/manifests/c-programs.yaml:12575</code>.</li>
+<li><code>tests/c/errno_path_identity.c:93</code> (<code>rmdir</code> of a missing path). Cell <code>system-utils/errno-path-identity</code> at <code>tests/e2e/manifests/system-utils.yaml:1777</code>. It prints the errno and fails only on an unexpected success, so it checks that runs agree, not that the errno is <code>ENOENT</code>.</li>
+</ul>
+<p>No coverage token is recorded yet: these tests cover F1 and F2 with absolute paths and part of F7, and the remaining behaviours have no test.</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F11): under <code>hermit run --verify</code> on ptrace, <code>chdir</code> into a fresh directory and call raw <code>syscall(SYS_rmdir, ...)</code> with relative paths. Remove an empty directory and assert that <code>stat</code> then gives <code>ENOENT</code>. Remove the current working directory after opening it with <code>O_DIRECTORY</code>: assert that <code>rmdir</code> returns 0, that <code>fchdir</code> on the descriptor still succeeds, and that <code>mkdir(&quot;x&quot;)</code> inside it gives <code>ENOENT</code>. Existing partial coverage: <code>tests/c/mkdir_rmdir.c:90</code> and <code>:92</code> (glibc, absolute paths; cell <code>c-programs/mkdir-rmdir</code>).</li>
+<li>T2 (covers F2, F3): assert <code>ENOTEMPTY</code> for a directory holding a file, and for one holding only an empty subdirectory. Assert <code>ENOTDIR</code> for a regular file and for a symlink to a directory, and check with <code>lstat</code> that the symlink and its target both survive. Existing partial coverage: <code>tests/c/mkdir_rmdir.c:84</code> (glibc, <code>ENOTEMPTY</code>).</li>
+<li>T3 (covers F4, F5): assert <code>EINVAL</code> for <code>rmdir(&quot;d/.&quot;)</code>, <code>ENOTEMPTY</code> for <code>rmdir(&quot;d/..&quot;)</code> where the parent is not empty, and <code>EBUSY</code> for <code>rmdir(&quot;/&quot;)</code>. Assert <code>EBUSY</code> for an empty directory that is a guest-visible mount point. Record the chosen path in the test.</li>
+<li>T4 (covers F6, F7): assert that <code>rmdir(&quot;d/&quot;)</code> removes <code>d</code>. Assert <code>ENOENT</code> for a missing directory, for a missing parent and for <code>&quot;&quot;</code>, and <code>ENOTDIR</code> when a regular file is used as an intermediate component. Existing partial coverage: <code>tests/c/errno_path_identity.c:93</code> (glibc, missing path; agreement only).</li>
+<li>T5 (covers F8): assert <code>EACCES</code> for removing a child of a directory the guest cannot write. Under ptrace the guest is root in a user namespace, so use a directory owned by an unmapped host uid. Assert <code>EPERM</code> for removing another owner's empty directory from a sticky directory, using a directory and parent owned by unmapped uids.</li>
+<li>T6 (covers F9): assert <code>ENAMETOOLONG</code> for a 256-byte component and for a path over 4096 bytes, <code>ELOOP</code> for a symlink loop in the prefix, and <code>EFAULT</code> for <code>pathname = (char *)1</code>.</li>
+<li>T7 (covers F10): assert <code>EROFS</code> for removing an empty directory under a read-only mount the guest can see. <code>EIO</code> and immutable-directory <code>EPERM</code> are F13 and F12, recorded by U1 and U2.</li>
+<li>U1 (covers F13; host-transient): <code>EIO</code> depends on the health of host storage shared with other processes. The plain passthrough (<code>detcore/src/lib.rs:2843</code>) hands it to the guest today. F13 counts toward done only once Hermit hides it or reports it as an infrastructure error.</li>
+<li>U2 (covers F12; host-config): the immutable and append-only attributes need <code>CAP_LINUX_IMMUTABLE</code> in the host's initial user namespace, which the guest lacks, so CI cannot produce this error from inside the container. Hermit forwards the kernel's answer unchanged (<code>detcore/src/syscall_classification.rs:733</code>, <code>detcore/src/lib.rs:2843</code>).</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/405: linux_determinism deterministic (from <strong>Classification:</strong>); target_policy from legacy PASS-THRU; code at this SHA: passthrough, dispatch passthrough.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: kept deterministic/passthrough (the code forwards at detcore/src/lib.rs:2843, and Hermit owns no directory state); listed 11 flag behaviours and 7 tests; existing ptrace evidence (c-programs/mkdir-rmdir, system-utils/errno-path-identity) uses glibc rmdir with absolute paths and covers only F1, F2 and part of F7, so no coverage token is recorded and tracking_status stays todo</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d12 (owner decisions 1 and 2): cross_host_variant true (host mount layout for EBUSY, host inode attributes); F8 narrowed, new F12 immutable or append-only EPERM (host-config U2); F10 narrowed to EROFS, new F13 EIO (host-transient U1); the open question on the unreachable EIO is resolved by decision 1</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+rmdir&amp;amp;body=Discussion+for+the+%60rmdir%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Frmdir.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60rmdir%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `rmdir`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: rmdir&quot; (https://github.com/rrnewton/hermit/issues/405), legacy variant A1.</p>
+<p>Legacy text replaced in this pass: Summary &quot;Removes an empty directory.&quot;; Linux semantics &quot;Fails ENOTEMPTY if non-empty. Verified: removing an empty /tmp directory returned 0.&quot;; Determinism analysis &quot;Deterministic given fixed FS state; an FS mutation passed through.&quot; with the source &quot;None from the syscall; only external concurrent FS mutation.&quot; Every claim is kept in the sections above.</p>
+<h3>2026-10-03 host strace evidence</h3>
+<p>On this host (glibc 2.34, x86_64), a scratch probe calling glibc <code>rmdir()</code> under <code>strace -f</code> showed the raw syscall, so the glibc-based tests above do exercise <code>SYS_rmdir</code>:</p>
+<pre><code>rmdir(&quot;dd&quot;)                             = 0
+</code></pre>
+<h3>2026-07-24 host strace evidence</h3>
+<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) with <code>strace -f -e trace=rmdir</code> on a direct <code>syscall()</code> harness (invoked with non-destructive query/no-op/failing arguments) and, where applicable, on common programs. Hermit currently routes <code>rmdir</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code>.</p>
+<p>Observed strace line:</p>
+<pre><code>rmdir(&quot;/tmp/sysclass45/rd&quot;)     = 0
+</code></pre>
+<hr>
+<p>*Autonomous syscall-classification sweep (ranks 151-250 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
+</body></html>

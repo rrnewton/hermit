@@ -1,0 +1,118 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>getxattr | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>getxattr</code> (191)</h1>
+<p>Strategy: <strong>passthrough</strong> &middot; dispatch: <code>passthrough</code> &middot; linux determinism: conditional &middot; target policy: passthrough &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+getxattr&amp;body=Discussion+for+the+%60getxattr%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fgetxattr.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60getxattr%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>getxattr(path, name, value, size)</code> reads the value of one extended attribute of the object named by <code>path</code>, following symlinks, or reports its size when <code>size</code> is 0. Hermit forwards it to the host kernel unchanged: the attribute store is the container filesystem, which Hermit treats as fixed input, and every xattr writer is passed through too.</p>
+<h2>Linux semantics</h2>
+<p>The kernel copies <code>name</code>, resolves <code>path</code> (following a symlink in the last component, unlike <code>lgetxattr</code>), checks permission for the name's namespace, and asks the filesystem or security module for the value. The result is the value's length, with the bytes copied into <code>value</code>, or an errno. Some namespaces are synthesized rather than stored: <code>security.*</code> values may come from the LSM (for example <code>security.selinux</code> on an SELinux host), and <code>system.posix_acl_*</code> values are encoded from the inode's ACL. The call has no side effect: on the host probe the inode's ctime did not change. Namespace support depends on the filesystem type and mount options.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>size = 0</code>: returns the current value's length and writes nothing (<code>value</code> may be NULL). This is the size probe programs use before allocating.</li>
+<li>F2: <code>size</code> at least the value's length: copies the value and returns its length. A <code>size</code> above 65536 (<code>XATTR_SIZE_MAX</code>) is clamped, so a 1 MiB buffer works (host probe).</li>
+<li>F3: <code>0 &lt; size &lt;</code> value length: <code>ERANGE</code></li>
+<li>F4: an attribute with an empty value: returns 0</li>
+<li>F5: the attribute is absent: <code>ENODATA</code>. Also <code>ENODATA</code> for a <code>user.*</code> name on an inode that is neither a regular file nor a directory, and for <code>trusted.*</code> without <code>CAP_SYS_ADMIN</code> in the initial user namespace (host probe, unprivileged).</li>
+<li>F6: namespace from the name prefix: <code>user.</code> (stored), <code>trusted.</code> (stored, privileged), <code>security.</code> (LSM label or stored value, for example <code>security.capability</code> on a binary), <code>system.posix_acl_access</code>/<code>system.posix_acl_default</code> (the ACL in binary form, <code>ENODATA</code> if the inode has none). No recognised prefix or an unknown <code>system.</code> name: <code>EOPNOTSUPP</code>. Missing filesystem support is F12.</li>
+<li>F7: <code>name</code> empty or longer than 255 bytes: <code>ERANGE</code>; a bare prefix such as <code>user.</code>: <code>EINVAL</code> (host probe)</li>
+<li>F8: path resolution follows symlinks in every component: a dangling symlink or missing path gives <code>ENOENT</code>; <code>ENOTDIR</code>; <code>ENAMETOOLONG</code>; <code>ELOOP</code>; no search permission on a prefix <code>EACCES</code></li>
+<li>F9: permission on the inode: reading a <code>user.*</code> attribute needs read access, so a mode-000 file gives <code>EACCES</code> even to its owner (host probe)</li>
+<li>F10: <code>path</code>, <code>name</code>, or <code>value</code> with a nonzero <code>size</code> points outside the address space: <code>EFAULT</code> (a NULL <code>value</code> with <code>size = 64</code> gave <code>EFAULT</code> in the host probe)</li>
+<li>F11: no side effects: no mutation of the value, the inode or its ctime (host probe), and no inotify event</li>
+<li>F12: host-config failure: a filesystem without xattr support for the namespace, or without ACL support for <code>system.posix_acl_*</code>: <code>EOPNOTSUPP</code>.</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p>getxattr returns filesystem metadata bytes and errors from the host object and namespace. Within one Hermit run on one host, the result is a function of the filesystem state, the path, the name, the credentials and the filesystem's xattr support. Threads run one at a time under Hermit, so a size probe (F1) followed by a read (F2) sees no guest writer in between, and a guest thread racing <code>rename</code>, <code>unlink</code> or <code>setxattr</code> against the read gets a fixed order. The call is <code>conditional</code>: values, support, permissions and security labels can differ across hosts and filesystems, and host processes can change them between runs.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>Attributes that come with the filesystem image rather than from the guest: LSM labels such as <code>security.selinux</code> (present only on hosts with that LSM), <code>security.capability</code> on binaries, ACLs, and attributes left by earlier runs in a non-scratch directory.</li>
+<li>Filesystem type and mount options, which decide namespace and ACL support (F6).</li>
+<li>Credentials, including the privilege of the guest's root inside Hermit's user namespace (F5, F9).</li>
+<li>External changes to the path or the attribute by host processes.</li>
+</ul>
+<h3>Cross-host variation</h3>
+<ul>
+<li>Host security module: labels such as <code>security.selinux</code> exist only on hosts running that LSM, and their values come from its policy (F5, F6).</li>
+<li>Filesystem type, kernel version and mount options behind the guest's paths: whether the filesystem supports the attribute's namespace and ACLs decides <code>EOPNOTSUPP</code> (F12); for example tmpfs gained <code>user.*</code> support only in Linux 6.6.</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>passthrough</code>, changed from the rendered <code>investigate</code>. The code already does this at hermit f4055eb9cae4. <code>getxattr</code> is classified <code>PassThrough</code> at <code>detcore/src/syscall_classification.rs:739</code>, under the comment at <code>detcore/src/syscall_classification.rs:737</code> (&quot;getxattr/lgetxattr/removexattr/setxattr are deterministic for stable objects and do not introduce asynchronous state or new kernel objects&quot;), in the block that opens at <code>detcore/src/syscall_classification.rs:690</code> and ends at <code>detcore/src/syscall_classification.rs:804</code>. The census lists it in <code>PASSTHROUGH_SYSCALLS</code> at <code>detcore/src/syscall_classification.rs:1711</code>, and <code>representative_policies_stay_in_their_reviewed_sections</code> (<code>detcore/src/syscall_classification.rs:1899</code>) lists it at <code>detcore/src/syscall_classification.rs:2066</code> and asserts <code>PassThrough</code> at <code>detcore/src/syscall_classification.rs:2094</code>. The generic arm at <code>detcore/src/lib.rs:2843</code> sends it to <code>Detcore::passthrough</code> (<code>detcore/src/lib.rs:367</code>), which forwards it unchanged.</p>
+<p>The 2026-08-07 strategy draft (kept under Additional information) proposed serving xattrs from a deterministic metadata store keyed by object identity, or snapshotting host values and validating them on replay. This body does not adopt it, for three reasons:</p>
+<ul>
+<li>Every xattr writer (<code>setxattr</code>, <code>lsetxattr</code>, <code>fsetxattr</code>, <code>removexattr</code> and its variants, between <code>detcore/src/syscall_classification.rs:739</code> and <code>detcore/src/syscall_classification.rs:793</code>) is passed through, and so are <code>chmod</code>-family calls that change what <code>system.posix_acl_access</code> reports. A store for reads alone would stop reading back what the guest wrote. A model would have to cover all twelve xattr syscalls, which is a filesystem model Hermit does not have.</li>
+<li>Within a run on one host, nothing in the result varies from run to run. The attributes that differ between hosts (LSM labels, ACLs, capabilities on binaries) are part of the filesystem image, the same input class as file contents, which Hermit also passes through.</li>
+<li>The legacy draft's own acceptance text (&quot;Move this row out of PASSTHROUGH only when implementation and tests bind the result to deterministic state&quot;) treats modelling as future new syscall support, not as current policy.</li>
+</ul>
+<p>Run mode subscribes every syscall (<code>Subscription::all_syscalls()</code> at <code>detcore/src/lib.rs:1094</code>). Code facts show <code>subscribed_record_replay: false</code>: under <code>--passthru-opt</code>, which the comment at <code>detcore/src/lib.rs:3140</code> says <code>hermit record</code> and <code>hermit replay</code> turn on, <code>getxattr</code> never reaches Detcore and is not recorded. A replay reads the replay host's attributes, so record/replay fidelity for this call depends on the replay filesystem matching the recording one. The legacy draft's &quot;snapshot and validate on replay&quot; idea addresses exactly that gap; it is listed as an open question below rather than adopted.</p>
+<p>Existing evidence: <code>tests/c/syscall_file_metadata.c:171</code> calls glibc <code>getxattr(path, &quot;user.hermit&quot;, buf, 32)</code> after a <code>setxattr</code>. When the <code>setxattr</code> succeeded, it requires the exact 9-byte value (<code>tests/c/syscall_file_metadata.c:172</code>, checked at <code>tests/c/syscall_file_metadata.c:57</code>); otherwise it accepts <code>EACCES</code>, <code>ENODATA</code>, <code>ENOTSUP</code>, <code>EOPNOTSUPP</code> or <code>EPERM</code> (<code>tests/c/syscall_file_metadata.c:37</code>). It runs on ptrace under <code>run --strict --verify</code> in <code>hermit-cli/tests/syscall_file_metadata.rs:51</code>, whose trace assertion list (<code>hermit-cli/tests/syscall_file_metadata.rs:91</code>) does not name <code>getxattr</code>, and in the cell <code>c-programs/syscall-file-metadata</code> (<code>tests/e2e/manifests/c-programs.yaml:9275</code>). verification on the default backend stays untested: no test names <code>SYS_getxattr</code> and the success path is optional.</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F2, F3, F4): after <code>setxattr(path, &quot;user.k&quot;, &quot;vv&quot;, 2, 0)</code> and an empty <code>user.e</code>, call raw <code>syscall(SYS_getxattr, ...)</code> with <code>size = 0</code> and a NULL buffer (expect 2), <code>size = 2</code> (expect 2 and the bytes <code>vv</code>), <code>size = 1</code> (expect <code>ERANGE</code>), <code>size = 1 MiB</code> (expect 2), and read <code>user.e</code> (expect 0). Existing partial coverage of the exact-buffer case through glibc: <code>tests/c/syscall_file_metadata.c:171</code>, which is skipped when <code>setxattr</code> failed.</li>
+<li>T2 (covers F5): assert <code>ENODATA</code> for a missing <code>user.*</code> name on a regular file and on a directory, for <code>user.k</code> read through <code>getxattr</code> on a FIFO, and record what the ptrace guest's root gets for <code>trusted.k</code>.</li>
+<li>T3 (covers F6): assert <code>EOPNOTSUPP</code> for <code>noprefix</code> and <code>system.bogus</code> and for a file under <code>/proc</code>; assert <code>ENODATA</code> for <code>system.posix_acl_access</code> on a file without an ACL. On a fixture filesystem with ACL support, set an ACL and assert the exact bytes returned.</li>
+<li>T4 (covers F7, F10): assert <code>ERANGE</code> for an empty and a 256-byte name, <code>EINVAL</code> for <code>user.</code>, and <code>EFAULT</code> for <code>path</code>, <code>name</code>, or <code>value</code> set to <code>(void *)1</code> with <code>size = 64</code>.</li>
+<li>T5 (covers F8): through a symlink to a file with <code>user.k</code> set, assert the target's value is returned; assert <code>ENOENT</code> for a dangling symlink and a missing path, plus <code>ENOTDIR</code>, <code>ELOOP</code> and <code>ENAMETOOLONG</code>.</li>
+<li>T6 (covers F9): assert <code>EACCES</code> for <code>user.k</code> on a mode-000 file owned by the guest.</li>
+<li>T7 (covers F11): assert that <code>st_ctime</code> and the value are unchanged after a <code>getxattr</code>, and that an inotify watch sees no event.</li>
+<li>T8 (covers F1, F2, F8): one guest thread alternates <code>setxattr</code> values of different lengths and <code>rename</code>s the file while another does a size probe followed by a read. Under <code>hermit run --verify</code> on ptrace the sequence of results (<code>ERANGE</code>, <code>ENOENT</code> or value) must match across runs.</li>
+<li>T9 (covers none): run T1 under <code>hermit record</code> and <code>hermit replay</code> on ptrace and assert the replayed output matches the recording, so the record/replay gap above has a test once it is decided.</li>
+<li>U1 (covers F12; host-config): which namespaces and ACLs the host filesystem supports is host configuration that CI cannot choose, so CI cannot produce this <code>EOPNOTSUPP</code> on every host. Hermit forwards the kernel's answer unchanged (<code>detcore/src/syscall_classification.rs:739</code>, <code>detcore/src/lib.rs:2843</code>).</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-08-07 · hermit 303113c10522 · orc-coord-014 · filed (legacy variant C): The pinned x86-64 Sysno denominator is 373/373 classified: 289 DETERMINIZED, 83 PASSTHROUGH, and 1 UNSUPPORTED. The release tracking denominator is the 84/373 non-determinized rows. getxattr is PASSTHROUGH. It reaches the host through the blanket pass-through dispatcher; it must not be counted as determinized coverage.</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant C of https://github.com/rrnewton/hermit/issues/1950: linux_determinism not stated in the legacy body; target_policy from no legacy recommended action; code at this SHA: passthrough, dispatch passthrough.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: linux_determinism conditional (confirmed); target_policy investigate -&gt; passthrough (forwarded at detcore/src/lib.rs:2843 and every xattr writer is passed through, so a read-only store would break read-after-write; the 2026-08-07 model draft is kept as history); listed 11 flag behaviours and 9 tests; record/replay fidelity left as an open question; ptrace_verification stays untested; tracking_status stays todo</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d12 (owner decisions 1 and 2): cross_host_variant true (host LSM labels, filesystem namespace and ACL support); split filesystem-support EOPNOTSUPP out of F6 into new F12 with U1 host-config; resolved the open question on hiding host LSM labels</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+getxattr&amp;amp;body=Discussion+for+the+%60getxattr%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fgetxattr.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60getxattr%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `getxattr`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-08-07 as &quot;Syscall classification: getxattr&quot; (https://github.com/rrnewton/hermit/issues/1950), legacy variant C. Comment history stays on that issue.</p>
+<p>Original filing tag: <code>[orc-coord-014] [coordinator, gpt-5.6-sol] [orc-coord-014]</code>.</p>
+<h3>Open questions</h3>
+<ul>
+<li>Record/replay: <code>getxattr</code> is not in the <code>--passthru-opt</code> subscription, so <code>hermit replay</code> reads the replay host's attributes instead of the recorded ones. Should record/replay capture xattr reads (the 2026-08-07 &quot;snapshot and validate&quot; idea), or is a matching replay filesystem part of the replay contract, as it is for file contents? Owner decision; it does not change the run-mode policy.</li>
+</ul>
+<h3>2026-10-03 host probe (syscall-tracking-p3)</h3>
+<p>Raw <code>syscall(191, ...)</code> through Python <code>ctypes</code> on this host (Linux 7.1.3, unprivileged uid, btrfs, no SELinux). Not run under Hermit. <code>user.k</code> held the 2-byte value <code>vv</code>; <code>user.e</code> held an empty value.</p>
+<pre><code>getxattr user.k probe size 0                -&gt; 2
+getxattr user.k exact 2                     -&gt; 2 (value b'vv')
+getxattr user.k short 1                     -&gt; -1 ERANGE
+getxattr user.k big 64                      -&gt; 2
+getxattr user.k size 1 MiB                  -&gt; 2
+getxattr user.e empty value                 -&gt; 0
+getxattr missing attr                       -&gt; -1 ENODATA
+getxattr on directory, missing attr         -&gt; -1 ENODATA
+getxattr missing path                       -&gt; -1 ENOENT
+getxattr ENOTDIR                            -&gt; -1 ENOTDIR
+getxattr no prefix                          -&gt; -1 ENOTSUP
+getxattr name empty                         -&gt; -1 ERANGE
+getxattr name 256                           -&gt; -1 ERANGE
+getxattr 'user.'                            -&gt; -1 EINVAL
+getxattr bad buf ptr                        -&gt; -1 EFAULT
+getxattr NULL value, size 64                -&gt; -1 EFAULT
+getxattr via symlink (follows)              -&gt; 1
+getxattr dangling symlink                   -&gt; -1 ENOENT
+getxattr security.selinux                   -&gt; -1 ENODATA
+getxattr system.posix_acl_access (no ACL)   -&gt; -1 ENODATA
+getxattr trusted.k (unprivileged)           -&gt; -1 ENODATA
+getxattr mode 000 user.k (owner)            -&gt; -1 EACCES
+getxattr: ctime changed                     -&gt; False
+</code></pre>
+<h3>Legacy strategy draft (2026-08-07)</h3>
+<p>Hermit design draft: &quot;Serve xattrs from deterministic filesystem metadata keyed by resolved object identity, with a defined namespace policy. If host xattrs are imported, snapshot values and provenance and validate the same object during replay.&quot; Not adopted; see Hermit design.</p>
+<p>Legacy required tests, folded into T1-T9 above: user attributes, missing attributes, missing paths, denied namespaces, empty values and buffer-size probing (T1-T6); exact, short and large buffers and invalid pointers (T1, T4); racing rename/unlink and xattr mutation under scheduler control (T8); strict repeats and record/replay (T8, T9). The legacy &quot;across filesystems and supporting backends&quot; comparison is dropped: tracking is ptrace only (owner Q3), and filesystem differences are recorded per test fixture instead.</p>
+<p>Legacy acceptance text: &quot;Move this row out of PASSTHROUGH only when implementation and tests bind the result to deterministic state. A future implementation is new syscall support and must follow the repository's human-review audit-tag policy.&quot;</p>
+<h3>Legacy state and denominator (2026-08-07)</h3>
+<p>Source authority: rrnewton/hermit main at 303113c10522360de9051e21ed2d777c3436e17b.</p>
+<p>The pinned x86-64 Sysno denominator is 373/373 classified: 289 DETERMINIZED, 83 PASSTHROUGH, and 1 UNSUPPORTED. The release tracking denominator is the 84/373 non-determinized rows.</p>
+<p>getxattr is PASSTHROUGH. It reaches the host through the blanket pass-through dispatcher; it must not be counted as determinized coverage.</p>
+</body></html>

@@ -1,0 +1,84 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>readahead | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>readahead</code> (187)</h1>
+<p>Strategy: <strong>passthrough</strong> &middot; dispatch: <code>passthrough</code> &middot; linux determinism: deterministic &middot; target policy: passthrough &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+readahead&amp;body=Discussion+for+the+%60readahead%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Freadahead.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60readahead%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>readahead(fd, offset, count)</code> asks the kernel to start reading the pages of a file range into the page cache, so that later reads hit memory. It copies no data to the caller and returns only 0 or an errno. Hermit forwards it to the host kernel unchanged; the only state it changes, page-cache residency, belongs to the host.</p>
+<h2>Linux semantics</h2>
+<p>The kernel resolves <code>fd</code>, requires it to be open for reading, and requires a file whose data lives in the page cache (a regular file or a block device). It then issues <code>POSIX_FADV_WILLNEED</code>-style readahead for the range and returns 0. The return value does not say how many pages were read, whether any I/O was needed, or whether the range lies past end of file. How much is actually read is capped by the device's maximum readahead size, and the call may block while it submits the reads. The file offset, the file data and the inode metadata do not change. A failure to read pages is not reported to the caller.</p>
+<p>Errno results observed on the host (Linux 7.1, btrfs, raw <code>syscall(187, ...)</code> probe; see Additional information): <code>EBADF</code> for a closed fd, an <code>O_WRONLY</code> fd and an <code>O_PATH</code> fd; <code>EINVAL</code> for a negative offset, for <code>count = (size_t)-1</code>, and for a pipe, a socket, a directory and <code>/dev/null</code>; 0 for a regular file at offset 0, for <code>count = 0</code>, for an offset past end of file, and for <code>/proc/self/status</code> (a procfs regular file).</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>fd</code> is a regular file (or block device) open for reading: readahead of <code>[offset, offset + count)</code> is scheduled and the call returns 0</li>
+<li>F2: <code>count = 0</code>, or a range that starts past end of file: the call still returns 0. The amount read is a host decision and is not reported.</li>
+<li>F3: a negative <code>offset</code>, or a <code>count</code> so large that <code>offset + count</code> overflows <code>loff_t</code> (for example <code>(size_t)-1</code>): <code>EINVAL</code></li>
+<li>F4: <code>fd</code> is not an open descriptor, or is not open for reading (<code>O_WRONLY</code>, <code>O_PATH</code>): <code>EBADF</code></li>
+<li>F5: <code>fd</code> refers to a file without page-cache backing for readahead (pipe, socket, directory, character device such as <code>/dev/null</code>): <code>EINVAL</code></li>
+<li>F6: side effects: none on the file offset, the file data or the inode metadata. The only effect is page-cache residency, which a guest can observe only indirectly (through <code>mincore(2)</code> on a file mapping, <code>preadv2(..., RWF_NOWAIT)</code> succeeding instead of returning <code>EAGAIN</code>, or timing).</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p>The return value is a function of the descriptor's file type and open mode and of the two integer arguments. It does not depend on what is already cached, on the file's size, or on timing. Under Hermit the descriptor table is the guest's own and threads run one at a time, so the call repeats whenever the guest reaches it with the same descriptor and arguments.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>None in the result.</li>
+<li>The side effect (F6) changes host page-cache state, which other processes on the host also change. That state is visible only through other syscalls (<code>mincore</code>, <code>preadv2</code> with <code>RWF_NOWAIT</code>) and through timing. Making those observations deterministic is the job of the tracking issues for those syscalls, not of this one; passing <code>readahead</code> through neither adds nor removes that exposure.</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>passthrough</code>. The code already does this at hermit f4055eb9cae4. <code>readahead</code> is classified <code>PassThrough</code> at <code>detcore/src/syscall_classification.rs:797</code>, inside the block that opens at <code>detcore/src/syscall_classification.rs:690</code> and ends with <code>=&gt; SyscallClassification::PassThrough</code> at <code>detcore/src/syscall_classification.rs:804</code>. The group comment at <code>detcore/src/syscall_classification.rs:767</code> states the assumption: &quot;Stable guest-owned metadata and synchronous writeback operations are repeatable in Hermit's fixed mount namespace and filesystem image.&quot; The census test lists it in <code>PASSTHROUGH_SYSCALLS</code> at <code>detcore/src/syscall_classification.rs:1735</code>, and <code>representative_policies_stay_in_their_reviewed_sections</code> (<code>detcore/src/syscall_classification.rs:1899</code>) asserts the classification at <code>detcore/src/syscall_classification.rs:2094</code>. The generic arm at <code>detcore/src/lib.rs:2843</code> sends it to <code>Detcore::passthrough</code> (<code>detcore/src/lib.rs:367</code>), which forwards the call through <code>record_or_replay_preserving_tool_errors</code> without changing it.</p>
+<p>Why passthrough:</p>
+<ul>
+<li>The result carries no host-dependent value (see Determinism analysis), so there is nothing to model.</li>
+<li>Emulating it as a no-op returning 0 would be wrong for F3 to F5 unless Hermit reimplemented the kernel's file-type and open-mode checks. Forwarding gets them right for free.</li>
+<li>Dropping the hint would change no guest-visible value but would cost real I/O performance for programs (databases, loaders) that rely on it.</li>
+</ul>
+<p>Run mode subscribes every syscall (<code>Subscription::all_syscalls()</code> at <code>detcore/src/lib.rs:1094</code>), so <code>readahead</code> does reach Detcore and is logged. Code facts show <code>subscribed_record_replay: false</code>: under <code>--passthru-opt</code>, which the comment at <code>detcore/src/lib.rs:3140</code> says <code>hermit record</code> and <code>hermit replay</code> turn on, the call never reaches Detcore and runs directly against the kernel. That is harmless here because the result needs no recording.</p>
+<p>Existing evidence: <code>tests/c/syscall_file_metadata.c:218</code> calls <code>syscall(SYS_readahead, fd, 0, 4096)</code> on a regular file and requires 0. The cargo test <code>hermit-cli/tests/syscall_file_metadata.rs:51</code> runs it on <code>--backend=ptrace</code> under <code>run --strict --panic-on-unsupported-syscalls</code>, asserts that the trace contains <code>inbound syscall: readahead(</code> (<code>hermit-cli/tests/syscall_file_metadata.rs:97</code>), and then requires <code>Determinism verified</code> from <code>run --strict --verify</code> (<code>hermit-cli/tests/syscall_file_metadata.rs:127</code>). The same program is the e2e cell <code>c-programs/syscall-file-metadata</code> (<code>tests/e2e/manifests/c-programs.yaml:9275</code>, verify mode with <code>ptrace: true</code> at <code>tests/e2e/manifests/c-programs.yaml:9294</code>). This covers F1 only, so verification is <code>partial</code>, not <code>verified</code>. This agent read the tests and did not run them.</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F2): on a regular file opened <code>O_RDONLY</code>, call raw <code>syscall(SYS_readahead, ...)</code> with <code>(0, 4096)</code>, <code>(0, 0)</code> and an offset past end of file. Assert 0 each time. Existing coverage of the <code>(0, 4096)</code> case: <code>tests/c/syscall_file_metadata.c:218</code>, run on ptrace by <code>hermit-cli/tests/syscall_file_metadata.rs</code> and by the cell <code>c-programs/syscall-file-metadata</code>.</li>
+<li>T2 (covers F3): assert <code>EINVAL</code> for <code>offset = -1</code> and for <code>count = (size_t)-1</code>.</li>
+<li>T3 (covers F4): assert <code>EBADF</code> for a closed descriptor, an <code>O_WRONLY</code> descriptor and an <code>O_PATH</code> descriptor.</li>
+<li>T4 (covers F5): assert <code>EINVAL</code> for the read end of a pipe, an <code>AF_UNIX</code> socket, a directory opened <code>O_RDONLY|O_DIRECTORY</code>, and <code>/dev/null</code>.</li>
+<li>T5 (covers F6): around a successful <code>readahead</code>, assert that <code>lseek(fd, 0, SEEK_CUR)</code>, the file's bytes and its <code>st_size</code> are unchanged. Run the program under <code>hermit run --verify</code> on ptrace so that both runs must agree.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/393: linux_determinism deterministic (from <strong>Classification:</strong>); target_policy from legacy PASS-THRU; code at this SHA: passthrough, dispatch passthrough.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: kept deterministic/passthrough (forwarded at detcore/src/lib.rs:2843; the result carries no host value); listed 6 flag behaviours and 5 tests; ptrace_verification untested -&gt; partial because hermit-cli/tests/syscall_file_metadata.rs runs SYS_readahead (F1 only) on ptrace under --strict --verify; no coverage token recorded, tracking_status stays todo</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+readahead&amp;amp;body=Discussion+for+the+%60readahead%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Freadahead.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60readahead%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `readahead`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: readahead&quot; (https://github.com/rrnewton/hermit/issues/393), legacy variant A1.</p>
+<h3>2026-10-03 host probe (syscall-tracking-p3)</h3>
+<p>Raw <code>syscall(187, ...)</code> through Python <code>ctypes</code> on this host (Linux 7.1.3, btrfs scratch directory, unprivileged uid). Not run under Hermit.</p>
+<pre><code>readahead reg 0 4096           -&gt; 0
+readahead reg count 0          -&gt; 0
+readahead reg off past EOF     -&gt; 0
+readahead reg off -1           -&gt; -1 EINVAL
+readahead reg count huge       -&gt; -1 EINVAL
+readahead O_WRONLY             -&gt; -1 EBADF
+readahead bad fd               -&gt; -1 EBADF
+readahead O_PATH               -&gt; -1 EBADF
+readahead pipe                 -&gt; -1 EINVAL
+readahead directory            -&gt; -1 EINVAL
+readahead socket               -&gt; -1 EINVAL
+readahead /dev/null            -&gt; -1 EINVAL
+readahead /proc/self/status    -&gt; 0
+</code></pre>
+<h3>2026-07-24 host strace evidence</h3>
+<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) with <code>strace -f -e trace=readahead</code> on a direct <code>syscall()</code> harness (invoked with non-destructive query/no-op/failing arguments) and, where applicable, on common programs. Hermit currently routes <code>readahead</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code>.</p>
+<p>Observed strace line:</p>
+<pre><code>readahead(3, 0, 4096)           = 0
+</code></pre>
+<hr>
+<p>*Autonomous syscall-classification sweep (ranks 151-250 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
+<p>Legacy body claims superseded here: the 2026-07-24 Summary said only &quot;Initiates non-blocking readahead&quot;; the call can block while submitting reads, so this body says it &quot;may block&quot;. The legacy Linux semantics line (&quot;Verified: returns 0 on a regular file&quot;) is kept as F1.</p>
+</body></html>

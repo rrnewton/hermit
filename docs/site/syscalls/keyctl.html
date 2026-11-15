@@ -1,0 +1,107 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>keyctl | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>keyctl</code> (250)</h1>
+<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_kernel_keyring_syscall</code> &middot; linux determinism: nondeterministic &middot; target policy: refuse &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+keyctl&amp;body=Discussion+for+the+%60keyctl%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fkeyctl.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60keyctl%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>keyctl(operation, arg2, arg3, arg4, arg5)</code> is the multiplexed control interface of the kernel key-management facility: it reads, links, updates, revokes and searches keys and keyrings, manages session keyrings and request-key authority, and runs public-key and Diffie-Hellman operations. Under the default fail-closed policy Hermit returns <code>ENOSYS</code> for every operation without consulting the host, as if the kernel had been built without <code>CONFIG_KEYS</code> (<code>detcore/src/lib.rs:2125</code>). Only the explicit <code>--allow-unsupported-syscalls</code> opt-out forwards the call, which keeps rr's <code>keyctl</code> compatibility test working.</p>
+<p>Manual reference: Linux man-pages keyctl(2), keyrings(7).</p>
+<h2>Linux semantics</h2>
+<p>Keys and keyrings are kernel objects identified by serial numbers, which the kernel chooses at random when it creates a key (<code>key_alloc_serial</code>, <code>security/keys/key.c</code>). Special negative IDs (<code>KEY_SPEC_*</code>, <code>include/uapi/linux/keyctl.h</code>) name the calling thread's, process's and session's keyrings and the per-user keyrings. The session keyring is inherited across <code>fork</code> and <code>execve</code>, so a guest started from a login shell shares the host session's keyring.</p>
+<p>Every operation checks a 32-bit permission mask with possessor, user, group and other fields, plus LSM policy. Objects are charged to per-user quotas (<code>/proc/sys/kernel/keys/</code>, visible in <code>/proc/key-users</code>). Key expiry uses wall-clock seconds, and revoked, invalidated and expired keys are removed by an asynchronous garbage collector.</p>
+<p>The operation codes are defined in <code>include/uapi/linux/keyctl.h</code>. An unknown code gives <code>EOPNOTSUPP</code>.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>KEYCTL_GET_KEYRING_ID</code> (0): map a special ID to the keyring's serial. A nonzero <code>arg3</code> creates the keyring if it does not exist yet. Returns a serial.</li>
+<li>F2: <code>KEYCTL_JOIN_SESSION_KEYRING</code> (1): with a <code>NULL</code> name, start a new anonymous session keyring; with a name, join the named keyring or create it. Returns the serial.</li>
+<li>F3: <code>KEYCTL_UPDATE</code> (2): replace a key's payload, if its type supports update.</li>
+<li>F4: <code>KEYCTL_REVOKE</code> (3): revoke a key; later accesses give <code>EKEYREVOKED</code>.</li>
+<li>F5: <code>KEYCTL_CHOWN</code> (4): change a key's uid and gid; -1 leaves a field unchanged. Changing the uid needs <code>CAP_SYS_ADMIN</code>.</li>
+<li>F6: <code>KEYCTL_SETPERM</code> (5): set the key's permission mask.</li>
+<li>F7: <code>KEYCTL_DESCRIBE</code> (6): write <code>type;uid;gid;perm;description</code> into a buffer and return the size needed.</li>
+<li>F8: <code>KEYCTL_CLEAR</code> (7): unlink every key from a keyring.</li>
+<li>F9: <code>KEYCTL_LINK</code> (8): link a key into a keyring, displacing a key of the same type and description.</li>
+<li>F10: <code>KEYCTL_UNLINK</code> (9): remove a key from a keyring.</li>
+<li>F11: <code>KEYCTL_SEARCH</code> (10): search a keyring tree for a key by type and description, optionally linking the result into a destination keyring. Returns the serial.</li>
+<li>F12: <code>KEYCTL_READ</code> (11): read a key's payload, or a keyring's list of member serials in link order, and return the size needed.</li>
+<li>F13: <code>KEYCTL_INSTANTIATE</code> (12): instantiate a key under construction; only a request-key handler that holds the authority may do this.</li>
+<li>F14: <code>KEYCTL_NEGATE</code> (13): negatively instantiate a key under construction for a timeout.</li>
+<li>F15: <code>KEYCTL_SET_REQKEY_KEYRING</code> (14): set the default request-key destination (<code>KEY_REQKEY_DEFL_*</code>) and return the old one.</li>
+<li>F16: <code>KEYCTL_SET_TIMEOUT</code> (15): set a key's expiry, in wall-clock seconds from now; 0 clears it.</li>
+<li>F17: <code>KEYCTL_ASSUME_AUTHORITY</code> (16): assume, or with 0 drop, the authority to instantiate a key under construction.</li>
+<li>F18: <code>KEYCTL_GET_SECURITY</code> (17): read the key's LSM security label.</li>
+<li>F19: <code>KEYCTL_SESSION_TO_PARENT</code> (18): replace the parent process's session keyring with the caller's, at the parent's next return to user space.</li>
+<li>F20: <code>KEYCTL_REJECT</code> (19): negatively instantiate a key under construction with a chosen error and timeout.</li>
+<li>F21: <code>KEYCTL_INSTANTIATE_IOV</code> (20): like F13 with the payload in an iovec array.</li>
+<li>F22: <code>KEYCTL_INVALIDATE</code> (21): mark a key invalid; the garbage collector removes it later.</li>
+<li>F23: <code>KEYCTL_GET_PERSISTENT</code> (22): get, creating if needed, a user's persistent keyring and link it into a keyring. It expires after a host-configured idle time.</li>
+<li>F24: <code>KEYCTL_DH_COMPUTE</code> (23): compute a Diffie-Hellman shared secret from keys holding the prime, base and private value, optionally through a KDF (<code>struct keyctl_kdf_params</code>).</li>
+<li>F25: <code>KEYCTL_PKEY_QUERY</code> (24): report an asymmetric key's supported operations and sizes (<code>struct keyctl_pkey_query</code>).</li>
+<li>F26: <code>KEYCTL_PKEY_ENCRYPT</code> (25): encrypt with an asymmetric key. Padding schemes with random padding, such as PKCS#1 v1.5, give a different ciphertext on every call.</li>
+<li>F27: <code>KEYCTL_PKEY_DECRYPT</code> (26): decrypt with an asymmetric key.</li>
+<li>F28: <code>KEYCTL_PKEY_SIGN</code> (27): sign with an asymmetric key.</li>
+<li>F29: <code>KEYCTL_PKEY_VERIFY</code> (28): verify a signature with an asymmetric key.</li>
+<li>F30: <code>KEYCTL_RESTRICT_KEYRING</code> (29): restrict which keys may be linked into a keyring.</li>
+<li>F31: <code>KEYCTL_MOVE</code> (30): move a key from one keyring to another; <code>KEYCTL_MOVE_EXCL</code> fails instead of displacing a matching key in the target.</li>
+<li>F32: <code>KEYCTL_CAPABILITIES</code> (31): copy the keyring subsystem's capability bits (<code>KEYCTL_CAPS0_*</code>, <code>KEYCTL_CAPS1_*</code>) into a buffer; the bits depend on the host kernel's configuration.</li>
+<li>F33: <code>KEYCTL_WATCH_KEY</code> (32): attach a key or keyring to a watch-queue pipe, so changes produce notifications.</li>
+<li>F34: an unknown operation code: <code>EOPNOTSUPP</code>.</li>
+<li>F35: common errors across operations: <code>ENOKEY</code>, <code>EKEYREVOKED</code>, <code>EKEYEXPIRED</code>, <code>EACCES</code>, <code>EDQUOT</code>, <code>EFAULT</code>, <code>EINVAL</code> and <code>ENOTDIR</code> for a key that should be a keyring.</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: nondeterministic</code>, kept from the legacy classification. Every operation that returns or reports a serial (F1, F2, F11, F12) exposes random numbers, and most operations act on host keyrings that the guest inherits from the process that started Hermit. Some outputs are random by design (F26) or depend on wall-clock time (F16, F23) and on the host kernel's configuration (F32). A failing call on an object that cannot exist, such as an unknown operation code, repeats, but the main uses of the call do not.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>Random key serial numbers</li>
+<li>Host session, user and persistent keyring contents, inherited by the guest</li>
+<li>Wall-clock key expiry and asynchronous garbage collection</li>
+<li>Randomized public-key padding (F26)</li>
+<li>Host kernel configuration, LSM labels and quotas</li>
+<li>Concurrent mutation by processes outside the container, and changes made to the parent process's session (F19)</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target (owner decision 9, 6): <code>refuse</code> with a fixed <code>ENOSYS</code>, the answer of a kernel built without <code>CONFIG_KEYS</code>, returned before any argument is examined, so a valid call and a garbage-argument call get the same <code>ENOSYS</code>, for every operation code including an unknown one. No unprivileged success case needs preserving: a kernel without <code>CONFIG_KEYS</code> refuses every caller, so decision 6's exceptions do not apply. Owner decision 9 makes this the long-term target; Detcore will not model a guest-private keyring. The supportable fallback is a program that treats <code>ENOSYS</code> as a keyring-less kernel and keeps its secrets elsewhere; the in-tree workload that needs a working keyring, rr's <code>keyctl</code> compatibility test (comment at <code>detcore/src/lib.rs:2121</code>), runs only under the <code>--allow-unsupported-syscalls</code> opt-out. Today's code realizes the target under the default fail-closed policy (<code>detcore/src/lib.rs:2125-2126</code>). The opt-out forwards the call to the host (<code>detcore/src/lib.rs:2129</code>); that is a reduced-fidelity mode the user asks for explicitly, not the target, so no code change is needed.</p>
+<ul>
+<li><code>keyctl</code> is classified Determinized (<code>detcore/src/syscall_classification.rs:478</code>) and belongs to the kernel-keyring family predicate <code>is_kernel_keyring_syscall</code> (<code>detcore/src/syscall_classification.rs:1243</code>). The predicate's doc comment (<code>detcore/src/syscall_classification.rs:1238</code>) says keyring serials, quotas, permissions and contents are shared host-kernel state, and that a fixed <code>ENOSYS</code> lets feature probes take their fallback and keeps the guest from reading or mutating host keyrings.</li>
+<li>The dispatch arm (<code>detcore/src/lib.rs:2125</code>) returns <code>Err(Errno::ENOSYS)</code> when <code>panic_on_unsupported_syscalls</code> is set (<code>detcore/src/lib.rs:2126</code>), without reading the operation code. All of F1-F35 give <code>ENOSYS</code>, including the unknown-operation case F34, where Linux would give <code>EOPNOTSUPP</code>. That matches a kernel without <code>CONFIG_KEYS</code>. The run is not stopped.</li>
+<li>The flag's documentation (<code>detcore-model/src/config.rs:447</code>) says ordinary <code>hermit run</code> enables this policy and that compatibility requires <code>--allow-unsupported-syscalls</code>. Under that opt-out the call is forwarded to the host (<code>detcore/src/lib.rs:2129</code>). The arm's comment (<code>detcore/src/lib.rs:2121</code>) says this keeps the guest on a real working keyring for the rr <code>keyctl</code> compatibility test. <code>kernel_keyring_passes_through_with_compatibility_opt_out</code> (<code>hermit-cli/tests/kernel_keyring.rs:108</code>) checks that the opt-out reproduces the native ENOSYS-or-not verdict.</li>
+<li>The family is in <code>is_strict_only_deterministic_refusal_syscall</code> (<code>detcore/src/syscall_classification.rs:1311</code>), which backends that bypass Detcore's dispatcher consult to enforce the same refusal, and the performance opt-in subscription still subscribes it (<code>detcore/src/lib.rs:1256</code>).</li>
+</ul>
+<p>Why <code>refuse</code> and not the alternatives:</p>
+<ul>
+<li><code>passthrough</code> exposes random serials and host keyring contents, lets the guest change the host's session keyring and its parent's (F2, F19), and gives randomized and time-dependent results (F16, F26).</li>
+<li><code>model</code> or <code>emulate</code> would need a guest-private key store covering 33 operations, deterministic serials, permission and quota checks, request-key authority, and the crypto operations. Detcore has none of that. The legacy NEEDS-HANDLER recommendation predates the refusal (https://github.com/rrnewton/hermit/pull/848 per the code tags).</li>
+<li>Without <code>CONFIG_KEYS</code> a real kernel returns <code>ENOSYS</code>, so keyutils and its callers already handle it.</li>
+</ul>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F35): under default-policy <code>hermit run --verify</code> on ptrace, <code>keyctl(KEYCTL_GET_KEYRING_ID, KEY_SPEC_SESSION_KEYRING, 0)</code> returns -1 with <code>ENOSYS</code>, and both runs match. Existing candidate: <code>tests/c/keyctl_enosys.c</code>, run by the e2e cell <code>c-programs/keyctl-enosys</code> (<code>tests/e2e/manifests/c-programs.yaml:2867</code>, verify ci on ptrace) and by <code>kernel_keyring_is_deterministically_unavailable</code> at <code>hermit-cli/tests/kernel_keyring.rs:34</code> with <code>--backend=ptrace run --strict --verify --panic-on-unsupported-syscalls</code>.</li>
+<li>T2 (covers F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15, F16, F17, F18, F19, F20, F21, F22, F23, F24, F25, F26, F27, F28, F29, F30, F31, F32, F33, F34, F35): under the same default policy, issue every operation code 0 through 32 and an unknown code (for example 1000) with inert arguments: special IDs, a bogus serial, <code>NULL</code> buffers. Every call must return -1 with <code>ENOSYS</code>, and both runs must match.</li>
+<li>T3 (covers F2, F9, F19, F23): host isolation. Read the host's <code>keyctl show @s</code> and the <code>/proc/key-users</code> line for the test's uid before and after a guest that tries <code>KEYCTL_JOIN_SESSION_KEYRING</code>, <code>KEYCTL_LINK</code>, <code>KEYCTL_SESSION_TO_PARENT</code> and <code>KEYCTL_GET_PERSISTENT</code> under the default policy. Nothing on the host may change, including the session keyring of the shell that started Hermit.</li>
+<li>T4 (covers F1): compatibility opt-out. The guest's ENOSYS-or-not verdict for <code>KEYCTL_GET_KEYRING_ID</code> is the same natively and under <code>hermit run --allow-unsupported-syscalls</code> on ptrace. Existing candidate: <code>kernel_keyring_passes_through_with_compatibility_opt_out</code> at <code>hermit-cli/tests/kernel_keyring.rs:108</code>, with guest <code>tests/c/keyctl_passthrough.c</code>. The same guest also runs in the e2e cell <code>c-programs/keyctl-passthrough</code> (<code>tests/e2e/manifests/c-programs.yaml:2931</code>, verify ci on ptrace), which checks only that two runs print the same line.</li>
+<li>T5 (covers F1, F12): record and replay a guest that calls <code>keyctl</code> under the default policy. Both the recording and the replay must return <code>ENOSYS</code>.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant B of https://github.com/rrnewton/hermit/issues/624: linux_determinism nondeterministic (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch pred:is_kernel_keyring_syscall, refused only when fail-closed.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; refuse (default policy returns a fixed ENOSYS for every operation, the CONFIG_KEYS-absent boundary, at detcore/src/lib.rs:2125; host passthrough only under --allow-unsupported-syscalls for the rr keyctl compatibility test); linux_determinism stays nondeterministic; 35 flag behaviours (33 operation codes, unknown code, common errors) and 5 tests listed; no coverage token yet because no test has been run against this list, so tracking_status stays todo</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): decisions 9 and 6 applied (fixed ENOSYS, as without CONFIG_KEYS, before any argument check, realized under the default policy at detcore/src/lib.rs:2125-2126; the opt-out passthrough at detcore/src/lib.rs:2129 stays a user-chosen reduced-fidelity mode); target_policy stays refuse; no new F/T ids; removed the open question on refuse versus a guest-private keyring model</li>
+<li>2026-10-05 · hermit f4055eb9cae4 · syscall-tracking-2 · covered: T1 covered by tests/c/keyctl_enosys.c (C08 review of the 2026-10-04 coverage proposals; guest source read at this SHA, not run by this agent)</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+keyctl&amp;amp;body=Discussion+for+the+%60keyctl%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fkeyctl.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60keyctl%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `keyctl`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: keyctl&quot; (https://github.com/rrnewton/hermit/issues/624), legacy variant B.</p>
+<h3>Related tests</h3>
+<ul>
+<li><code>hermit-cli/tests/key_users_determinism.rs</code> names <code>SYS_keyctl</code> (<code>hermit-cli/tests/key_users_determinism.rs:80</code>, <code>KEYCTL_UPDATE</code>, and <code>hermit-cli/tests/key_users_determinism.rs:119</code>, <code>KEYCTL_UNLINK</code>), but those calls run natively in the test process, not in a guest. They churn a host key's payload so that <code>/proc/key-users</code> changes while <code>cat</code>, <code>awk</code> and <code>sed</code> read it under strict verification. The test covers <code>/proc/key-users</code> virtualization, not this syscall under Hermit.</li>
+</ul>
+<h3>Legacy tracking note (2026-07-24)</h3>
+<p>Filed by the complete syscall-classification audit. The implementation classifies <code>PASS-THRU</code> entries under fixed-container/stable-state assumptions and routes all other entries through the explicit unsupported policy until a deterministic handler is implemented.</p>
+</body></html>

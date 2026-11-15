@@ -1,0 +1,76 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sched_get_priority_max | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>sched_get_priority_max</code> (146)</h1>
+<p>Strategy: <strong>passthrough</strong> &middot; dispatch: <code>passthrough</code> &middot; linux determinism: deterministic &middot; target policy: passthrough &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+sched_get_priority_max&amp;body=Discussion+for+the+%60sched_get_priority_max%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsched_get_priority_max.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60sched_get_priority_max%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>sched_get_priority_max(policy)</code> returns the maximum static priority that <code>sched_setscheduler</code> and <code>sched_setparam</code> accept for a scheduling policy: 99 for <code>SCHED_FIFO</code> and <code>SCHED_RR</code>, 0 for the other policies, <code>EINVAL</code> for an unknown policy. Detcore passes it to the kernel unchanged (<code>detcore/src/lib.rs:2843</code>).</p>
+<h2>Linux semantics</h2>
+<p>The kernel answers from a fixed switch on <code>policy</code>. It reads no task, no memory and no host state. The only thing that varies is which policy numbers the running kernel knows: <code>SCHED_EXT</code> (7) is known from Linux 6.12 (from upstream history, not probed on an older kernel here).</p>
+<p>Host results measured for this issue on Linux 7.1.3: policies 0, 3, 5, 6 and 7 return 0; policies 1 and 2 return 99; -1, 4, 8, <code>0x40000000</code> and <code>0x40000001</code> return <code>EINVAL</code>.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>SCHED_OTHER</code> (0), <code>SCHED_BATCH</code> (3) and <code>SCHED_IDLE</code> (5): return 0</li>
+<li>F2: <code>SCHED_FIFO</code> (1) and <code>SCHED_RR</code> (2): return 99</li>
+<li>F3: <code>SCHED_DEADLINE</code> (6): returns 0; deadline tasks carry no static priority</li>
+<li>F4: <code>SCHED_EXT</code> (7): returns 0 on a kernel that knows the policy (6.12 and later)</li>
+<li>F5: any other value, including the reserved 4 (<code>SCHED_ISO</code>), negative values and values above 7: <code>EINVAL</code></li>
+<li>F6: a valid policy with <code>SCHED_RESET_ON_FORK</code> (<code>0x40000000</code>) OR'd in: <code>EINVAL</code>; only <code>sched_setscheduler</code> accepts that bit</li>
+<li>F7: <code>SCHED_EXT</code> (7) on a kernel older than 6.12, which does not know the policy: <code>EINVAL</code></li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: deterministic</code>. The result is a constant for each policy on a given kernel, and the call has no side effect. It changes only if the kernel version changes between runs, and then only for <code>SCHED_EXT</code> (F4, F7).</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>None at run time. The host kernel version decides between F4 and F7.</li>
+</ul>
+<h3>Cross-host variation</h3>
+<ul>
+<li>Host kernel version: whether policy 7 (<code>SCHED_EXT</code>) returns 0 (F4) or <code>EINVAL</code> (F7); kernels before 6.12 do not know the policy, and Hermit forwards the kernel's answer unchanged.</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>passthrough</code>. This matches the code at hermit f4055eb9cae4.</p>
+<ul>
+<li><code>classify_syscall</code> returns <code>PassThrough</code> for <code>sched_get_priority_max</code> in the &quot;ISSUE-REVIEWED PASS-THROUGH SYSCALLS&quot; block (<code>detcore/src/syscall_classification.rs:824</code>). The block's comment at <code>detcore/src/syscall_classification.rs:808</code> says these remain conditional on Hermit's fixed-container assumptions, and <code>detcore/src/syscall_classification.rs:811</code> still carries <code>TODO-HUMAN-REVIEW(PR-643)</code>. The unit test <code>representative_policies_stay_in_their_reviewed_sections</code> pins it (<code>detcore/src/syscall_classification.rs:2113</code>).</li>
+<li>Dispatch is the generic arm at <code>detcore/src/lib.rs:2843</code>, which calls <code>passthrough</code> (<code>detcore/src/lib.rs:367</code>). Under record and replay, <code>passthru_opt</code> (<code>detcore/src/lib.rs:3140</code>) leaves it unsubscribed (<code>detcore/src/lib.rs:1084</code>).</li>
+</ul>
+<p>Passing through is enough because the answer is a kernel constant. The kernel's answers also agree with Detcore's own scheduling model on a current kernel:</p>
+<ul>
+<li>Detcore's <code>sched_setattr</code> validation uses <code>MAX_RT_PRIO = 100</code> with real-time priorities 1 to 99 (<code>detcore/src/syscalls/threads.rs:202</code>, enforced at <code>detcore/src/syscalls/threads.rs:373</code>).</li>
+<li>Detcore reports every thread as <code>SCHED_OTHER</code> (<code>detcore/src/lib.rs:2655</code>) and accepts <code>sched_setscheduler</code> without applying it (<code>detcore/src/lib.rs:2652</code>); the &quot;Batch 3&quot; unit-test loop pins those as determinized (<code>detcore/src/syscall_classification.rs:2121</code>).</li>
+</ul>
+<h3>Gaps and open points</h3>
+<ul>
+<li><code>SCHED_EXT</code> (F4): Detcore's <code>is_valid_sched_policy</code> accepts policy 7 on every host (<code>detcore/src/syscalls/threads.rs:235</code>); its doc comment (<code>detcore/src/syscalls/threads.rs:230</code>) says the kernel accepts it only with <code>CONFIG_SCHED_CLASS_EXT</code>. On a host kernel older than 6.12, <code>sched_get_priority_max(7)</code> would return <code>EINVAL</code> (F7) while Detcore's <code>sched_setattr</code> validation accepts the same policy. Owner decision 2 (2026-10-04) keeps the pass-through rather than a fixed table, and the difference is recorded under Cross-host variation.</li>
+</ul>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F2, F3): raw <code>syscall(SYS_sched_get_priority_max, p)</code> for p in 0, 1, 2, 3, 5 and 6 under <code>hermit run --verify</code> on ptrace; print each result and require the values above.</li>
+<li>T2 (covers F4): <code>sched_get_priority_max(7)</code> returns 0 on the CI host and the result is identical across runs; the harness records the host kernel release (<code>uname -r</code> outside Hermit, since the guest's <code>uname</code> reports <code>5.2.0</code>, <code>detcore/src/syscalls/misc.rs:541</code>) next to the result, so a host change is visible.</li>
+<li>T3 (covers F5, F6): -1, 4, 8, <code>INT_MAX</code>, <code>SCHED_FIFO | SCHED_RESET_ON_FORK</code> and <code>SCHED_OTHER | SCHED_RESET_ON_FORK</code> all return <code>EINVAL</code>.</li>
+<li>U1 (covers F7; host-config): the CI host runs a kernel that knows <code>SCHED_EXT</code>, so CI cannot produce the <code>EINVAL</code> that kernels before 6.12 return for policy 7. Hermit forwards the kernel's answer unchanged (<code>detcore/src/syscall_classification.rs:824</code>, <code>detcore/src/lib.rs:2843</code>).</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/411: linux_determinism deterministic (from <strong>Classification:</strong>); target_policy from legacy PASS-THRU; code at this SHA: passthrough, dispatch passthrough.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: linux_determinism deterministic and target_policy passthrough kept (a kernel constant per policy, agreeing with Detcore's MAX_RT_PRIO at threads.rs:202); 6 flag behaviours and 3 tests; open question for the owner whether to answer from a fixed table so SCHED_EXT matches is_valid_sched_policy on pre-6.12 hosts, tracking_status todo</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d12 (owner decisions 1 and 2): cross_host_variant true (host kernel version: SCHED_EXT known from 6.12); F4 narrowed to kernels that know SCHED_EXT and new F7 for the pre-6.12 EINVAL, covered by host-config U1; the open question on a fixed table versus pass-through is resolved by decision 2 (keep the pass-through, record the cross-host difference)</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+sched_get_priority_max&amp;amp;body=Discussion+for+the+%60sched_get_priority_max%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsched_get_priority_max.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60sched_get_priority_max%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `sched_get_priority_max`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: sched_get_priority_max&quot; (https://github.com/rrnewton/hermit/issues/411), legacy variant A1.</p>
+<h3>2026-07-24 host strace evidence</h3>
+<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) with <code>strace -f -e trace=sched_get_priority_max</code> on a direct <code>syscall()</code> harness (invoked with non-destructive query/no-op/failing arguments) and, where applicable, on common programs. Hermit currently routes <code>sched_get_priority_max</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code>.</p>
+<p>Observed strace line:</p>
+<pre><code>sched_get_priority_max(SCHED_OTHER) = 0
+</code></pre>
+<hr>
+<p>*Autonomous syscall-classification sweep (ranks 151-250 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
+</body></html>

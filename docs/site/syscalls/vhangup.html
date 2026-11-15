@@ -1,0 +1,75 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vhangup | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>vhangup</code> (153)</h1>
+<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_privileged_admin_refused_syscall</code> &middot; linux determinism: conditional &middot; target policy: refuse &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+vhangup&amp;body=Discussion+for+the+%60vhangup%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fvhangup.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60vhangup%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>vhangup()</code> simulates a hangup on the caller's controlling terminal, so that other processes lose access to it. Hermit refuses it: Detcore returns a fixed <code>EPERM</code> without forwarding the call (<code>detcore/src/lib.rs:2164</code>), which is the errno any process without <code>CAP_SYS_TTY_CONFIG</code> in the initial user namespace receives.</p>
+<p>Manual reference: <a href="https://man7.org/linux/man-pages/man2/vhangup.2.html">vhangup(2)</a>.</p>
+<h2>Linux semantics</h2>
+<p><code>vhangup</code> takes no arguments. It is used by getty and login programs before they hand a terminal to a new session.</p>
+<ul>
+<li>The kernel checks <code>CAP_SYS_TTY_CONFIG</code> with <code>capable()</code>, that is, in the initial user namespace. A process that is root only inside a user namespace still gets <code>EPERM</code>.</li>
+<li>With the capability, the kernel hangs up the caller's controlling terminal: open descriptors on it stop working (reads see end of file, writes fail), and the terminal's session is signalled (<code>SIGHUP</code>, <code>SIGCONT</code>). The call returns 0, also when the caller has no controlling terminal.</li>
+<li>Without the capability it returns <code>EPERM</code> and changes nothing. The legacy host probes (Linux 6.17, the measurement host) and a 2026-10-03 probe on Linux 7.1.3 (unprivileged, no effective capabilities) all returned <code>EPERM</code>.</li>
+</ul>
+<h3>Flags and options</h3>
+<p>_None: the syscall takes no flags or options._</p>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: conditional</code>. For a caller without <code>CAP_SYS_TTY_CONFIG</code> the result is a fixed <code>EPERM</code> with no side effect. For a privileged caller the effect depends on which processes, inside or outside the guest, hold the terminal open, on which session owns it, and on when the resulting signals are delivered, so the observable outcome depends on host terminal state and host scheduling.</p>
+<p>The legacy twin https://github.com/rrnewton/hermit/issues/531 classified it as nondeterministic; this body keeps <code>conditional</code> from https://github.com/rrnewton/hermit/issues/510, because the nondeterminism exists only on the privileged path, which a Hermit guest never reaches.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>Whether the caller holds <code>CAP_SYS_TTY_CONFIG</code> in the initial user namespace</li>
+<li>Controlling-terminal ownership, the session and process groups attached to it, and descriptors held by processes outside the guest</li>
+<li>Signal delivery timing for the <code>SIGHUP</code>/<code>SIGCONT</code> the hangup sends</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>refuse</code>. At hermit f4055eb9cae4 the dispatch arm at <code>detcore/src/lib.rs:2164-2168</code> returns <code>Err(Error::Errno(Errno::EPERM))</code> for every syscall in <code>is_privileged_admin_refused_syscall</code> (<code>detcore/src/syscall_classification.rs:902</code>), which lists <code>vhangup</code> among 16 privileged administration calls. The arm runs before the typed match and before any <code>record_or_replay</code> call: it does not read guest memory and never forwards the call, so record, replay and both <code>--verify</code> runs compute the same <code>EPERM</code>. The refusal applies in every mode, not only when Hermit fails closed. The rationale comments are at <code>detcore/src/lib.rs:2154-2163</code> and <code>detcore/src/syscall_classification.rs:889-901</code>, tagged <code>TODO-HUMAN-REVIEW(#722)</code> (https://github.com/rrnewton/hermit/issues/722).</p>
+<p>Why <code>refuse</code>:</p>
+<ul>
+<li>The guest's controlling terminal can be the user's real terminal. A forwarded, privileged <code>vhangup</code> would hang up a terminal shared with processes outside the guest, a host side effect Detcore cannot model or replay.</li>
+<li>Because the kernel checks the capability in the initial user namespace, an unprivileged Linux process gets exactly this <code>EPERM</code>, also when it is root inside a user namespace. The refusal is therefore what Linux returns for the identity Hermit presents (virtual uid 0, <code>detcore/src/syscall_classification.rs:657-668</code>), not a Hermit-specific errno.</li>
+<li><code>emulate</code> (pretending the hangup happened) would need a model of terminal sessions that Detcore does not have, and would report success for an operation the guest's credentials could not perform.</li>
+</ul>
+<p>The code already realizes the policy. The unit test <code>privileged_admin_syscalls_are_determinized_and_consistent</code> (<code>detcore/src/syscall_classification.rs:2535</code>) checks only that <code>vhangup</code> is classified Determinized and is in the refusal set; it does not execute the syscall, and as a unit test it cannot serve as a coverage path.</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers none): under <code>hermit run --verify</code> on ptrace, a guest calls <code>syscall(SYS_vhangup)</code>, asserts -1 with <code>errno == EPERM</code>, and then writes a marker to stdout to show its descriptors still work. Both runs must print identical output. An unprivileged native run also returns <code>EPERM</code>, so this test alone cannot tell the refusal from forwarding; it pins the guest-visible result.</li>
+<li>T2 (covers none): record and then replay the same guest on ptrace; replay must reproduce the <code>EPERM</code> and the marker output.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/510: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy NEEDS-INVESTIGATION; code at this SHA: determinized, dispatch pred:is_privileged_admin_refused_syscall, refused.</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · duplicate https://github.com/rrnewton/hermit/issues/531 is retired into this issue; its text waits under Additional information for a section-by-section merge.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; refuse (Detcore returns a fixed EPERM at detcore/src/lib.rs:2164-2168 and never forwards; capable() in the initial user namespace makes EPERM the native unprivileged result too); linux_determinism stays conditional; merged duplicate https://github.com/rrnewton/hermit/issues/531; no flags, 2 tests listed; no coverage token, so tracking_status stays todo</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+vhangup&amp;amp;body=Discussion+for+the+%60vhangup%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fvhangup.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60vhangup%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `vhangup`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: vhangup&quot; (https://github.com/rrnewton/hermit/issues/510), legacy variant A1.</p>
+<h3>2026-07-24 host strace evidence</h3>
+<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) with <code>strace -f -e trace=vhangup</code> on a direct <code>syscall()</code> harness (invoked with non-destructive query/no-op/failing arguments) and, where applicable, on common programs. Hermit currently routes <code>vhangup</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code>.</p>
+<p>Observed strace line:</p>
+<pre><code>vhangup()                       = -1 EPERM (Operation not permitted)
+</code></pre>
+<hr>
+<p>*Autonomous syscall-classification sweep (ranks 151-250 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
+<h3>Merged duplicate https://github.com/rrnewton/hermit/issues/531</h3>
+<p>Filed 2026-07-24 as &quot;Syscall classification: vhangup&quot; (legacy variant A1); its comment history (0 comments) stays on that issue. Merged 2026-10-03 by syscall-tracking-p3:</p>
+<ul>
+<li>Its classification NONDETERMINISTIC lost to CONDITIONAL from https://github.com/rrnewton/hermit/issues/510, for the reason under Determinism analysis.</li>
+<li>Its recommended action NEEDS-HANDLER, and NEEDS-INVESTIGATION from https://github.com/rrnewton/hermit/issues/510, are both superseded by the refusal arm Detcore already has.</li>
+<li>Its host evidence matches the evidence above: on <code>the measurement host</code> (Linux 6.17, x86_64, glibc), traced with <code>strace -qq -f -e trace=vhangup</code>, at <code>detcore/src/syscall_classification.rs</code> revision <code>dd60278f</code> (then in the legacy pass-through block):</li>
+</ul>
+<pre><code>vhangup()                       = -1 EPERM (Operation not permitted)
+</code></pre>
+<h3>2026-10-03 host probe (syscall-tracking-p3)</h3>
+<p>Linux 7.1.3, uid 212630 with an empty effective capability set, raw <code>syscall(153)</code> through Python ctypes: <code>vhangup() = -1 EPERM</code>.</p>
+</body></html>

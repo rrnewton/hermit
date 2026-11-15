@@ -1,0 +1,90 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fanotify_init | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>fanotify_init</code> (300)</h1>
+<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_mount_ns_admin_refused_syscall</code> &middot; linux determinism: nondeterministic &middot; target policy: refuse &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+fanotify_init&amp;body=Discussion+for+the+%60fanotify_init%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ffanotify_init.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60fanotify_init%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>fanotify_init(flags, event_f_flags)</code> creates a fanotify notification group and returns a file descriptor from which filesystem events (and, for permission classes, access decisions) are read. Hermit refuses every call with a fixed <code>EPERM</code> and never forwards it to the host (<code>detcore/src/lib.rs:2215-2219</code> at hermit f4055eb9cae4), so a guest never obtains a fanotify descriptor and <code>fanotify_mark</code> has nothing to act on.</p>
+<p>Manual reference: <a href="https://man7.org/linux/man-pages/man2/fanotify_init.2.html">fanotify_init(2)</a>.</p>
+<h2>Linux semantics</h2>
+<p>The kernel (<code>fs/notify/fanotify/fanotify_user.c</code>) first checks privilege. <code>CAP_SYS_ADMIN</code> is checked with <code>capable()</code>, that is, in the initial user namespace. Without it (since Linux 5.13) only a limited group is allowed: notification class only, events reported with file handles (one of the <code>FAN_REPORT_*FID</code> modes), no unlimited queue or marks and no <code>FAN_REPORT_TID</code>; anything else gives <code>EPERM</code>. The host probe under Additional information, with every bit set, stops here with <code>EPERM</code>. A process that is root only inside a user namespace, as Hermit's ptrace guest is (<code>detcore/src/syscalls/misc.rs:672</code>), counts as unprivileged.</p>
+<p>Then the flags are validated (<code>EINVAL</code> for unknown bits, an invalid class, or inconsistent reporting flags), a group is allocated with its event queue and limits, and an anonymous-inode descriptor is installed in the lowest free slot. The group sees nothing until <code>fanotify_mark</code> adds marks; events then arrive asynchronously from any process touching the marked objects.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: notification class: <code>FAN_CLASS_NOTIF</code> (0), <code>FAN_CLASS_CONTENT</code> or <code>FAN_CLASS_PRE_CONTENT</code> (the two permission classes need <code>CAP_SYS_ADMIN</code>); the value <code>0xc</code> is not a class and gives <code>EINVAL</code> (with privilege) or <code>EPERM</code> (without).</li>
+<li>F2: descriptor flags <code>FAN_CLOEXEC</code> and <code>FAN_NONBLOCK</code> on the group descriptor.</li>
+<li>F3: <code>FAN_UNLIMITED_QUEUE</code> and <code>FAN_UNLIMITED_MARKS</code>: lift the default queue (16384 events) and mark limits; need <code>CAP_SYS_ADMIN</code>.</li>
+<li>F4: <code>FAN_ENABLE_AUDIT</code>: let permission responses write audit records; needs <code>CAP_AUDIT_WRITE</code>.</li>
+<li>F5: file-handle reporting: <code>FAN_REPORT_FID</code>, <code>FAN_REPORT_DIR_FID</code>, <code>FAN_REPORT_NAME</code>, <code>FAN_REPORT_TARGET_FID</code> (with their consistency rules, <code>EINVAL</code> otherwise), and on recent kernels <code>FAN_REPORT_FD_ERROR</code> and <code>FAN_REPORT_MNT</code>. A file-handle mode is required for an unprivileged group.</li>
+<li>F6: process reporting: <code>FAN_REPORT_TID</code> (thread ID instead of process ID; needs <code>CAP_SYS_ADMIN</code>) and <code>FAN_REPORT_PIDFD</code> (a pidfd for the event's process; not combinable with <code>FAN_REPORT_TID</code>).</li>
+<li>F7: <code>event_f_flags</code>: open flags for the descriptors that events carry in non-file-handle groups (<code>O_RDONLY</code>, <code>O_WRONLY</code>, <code>O_RDWR</code>, <code>O_LARGEFILE</code>, <code>O_CLOEXEC</code>, <code>O_APPEND</code>, <code>O_DSYNC</code>, <code>O_NOATIME</code>, <code>O_NONBLOCK</code>, <code>O_SYNC</code>); other bits give <code>EINVAL</code>.</li>
+<li>F8: privilege: <code>CAP_SYS_ADMIN</code> in the initial user namespace for everything; without it, only <code>FAN_CLASS_NOTIF</code> with a file-handle mode and no F3 or <code>FAN_REPORT_TID</code> bits, otherwise <code>EPERM</code> (the host probe).</li>
+<li>F9: other errors: <code>EMFILE</code> at the per-user group limit (<code>fs.fanotify.max_user_groups</code>) or the descriptor limit, <code>ENOMEM</code>, <code>ENOSYS</code> without <code>CONFIG_FANOTIFY</code>.</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: nondeterministic</code>, kept from the legacy classification. The call itself repeats for fixed inputs and privilege, but its purpose is to subscribe to an asynchronous stream of host filesystem activity. Once marks exist, which events arrive, in what order, how many are merged or dropped on overflow, and which process IDs, descriptors and file handles they carry depend on every process on the host touching the marked objects. Whether the call succeeds depends on host privilege, kernel configuration and the per-user group limit.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>Descriptor allocation and per-user group bookkeeping (<code>fs.fanotify.max_user_groups</code>)</li>
+<li>The host filesystem event stream: timing, ordering, merging and overflow of events from all processes</li>
+<li>Host-dependent event contents: process IDs, file handles (which embed host inode numbers and filesystem IDs), and event descriptors</li>
+<li>Privilege, kernel version (which reporting flags exist) and kernel configuration</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>refuse</code>. At hermit f4055eb9cae4 the code already realizes it:</p>
+<ul>
+<li><code>classify_syscall</code> marks <code>fanotify_init</code> Determinized in the mount and namespace administration group (<code>detcore/src/syscall_classification.rs:339-369</code>, reviewed under the code tag <code>TODO-HUMAN-REVIEW(#724)</code>, https://github.com/rrnewton/hermit/issues/724). The comment there names &quot;configure global filesystem-event notification&quot; among the operations a deterministic container pins.</li>
+<li><code>is_mount_ns_admin_refused_syscall</code> (<code>detcore/src/syscall_classification.rs:939</code>) includes it, and <code>handle_syscall_event</code> returns <code>Err(Errno::EPERM)</code> before the typed match (<code>detcore/src/lib.rs:2215-2219</code>). The arm reads neither argument and is not gated by <code>--strict</code>.</li>
+<li>The predicate is part of <code>is_deterministically_refused_syscall</code> (<code>detcore/src/syscall_classification.rs:1324</code>), so <code>code_facts.refused</code> is true.</li>
+<li>The only test is the unit test <code>mount_ns_admin_syscalls_are_determinized_and_consistent</code> (<code>detcore/src/syscall_classification.rs:2666</code>), which checks classification and membership and runs no guest.</li>
+</ul>
+<p>Why <code>refuse</code>:</p>
+<ul>
+<li>Events are produced asynchronously by the host kernel and carry host identities (process IDs, inode-based file handles). Detcore would have to generate the event stream itself from the guest's own file operations, in a deterministic order, to <code>model</code> it; nothing at this SHA does.</li>
+<li><code>EPERM</code> is what Linux returns to the guest for the privileged modes, since <code>CAP_SYS_ADMIN</code> is checked in the initial user namespace.</li>
+<li>Refusing <code>fanotify_init</code> makes <code>fanotify_mark</code> unreachable with a real descriptor, which keeps the pair consistent.</li>
+</ul>
+<p>Known differences from Linux:</p>
+<ul>
+<li>On Linux 5.13 and later an unprivileged process, including the Hermit guest, can create a <code>FAN_CLASS_NOTIF</code> group with <code>FAN_REPORT_FID</code> and watch inodes it can read. Under Hermit that fails with <code>EPERM</code>. Programs that fall back to inotify when fanotify is unavailable keep working; Detcore has its own inotify handlers (<code>detcore/src/lib.rs:2581-2587</code>).</li>
+<li>Hermit returns <code>EPERM</code> for invalid flags where a privileged Linux caller would get <code>EINVAL</code>.</li>
+</ul>
+<p>Target (owner decisions 6 and 9): keep the fixed <code>EPERM</code> for every request, which is what the code does today (<code>detcore/src/lib.rs:2215-2219</code>). The unprivileged subset is not modelled: decision 9 models a refused family only where a named workload breaks under refusal, and no workload in the tree is known to need fanotify. The refusal matches a configuration Linux itself presents: before Linux 5.13 every unprivileged <code>fanotify_init</code> returns <code>EPERM</code>, so a program that supports those kernels already meets that error, and file watchers fall back to inotify, which Detcore handles (<code>detcore/src/lib.rs:2581-2587</code>).</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F2, F5, F6, F7): under <code>hermit run --verify</code> on ptrace, a guest calls <code>syscall(SYS_fanotify_init, ...)</code> with the unprivileged subset <code>FAN_CLASS_NOTIF|FAN_REPORT_FID|FAN_CLOEXEC|FAN_NONBLOCK</code> and <code>O_RDONLY</code>, with <code>FAN_REPORT_DFID_NAME|FAN_REPORT_PIDFD</code>, and with <code>FAN_CLASS_CONTENT</code> and <code>O_RDWR|O_LARGEFILE</code>. Each must return -1 with <code>EPERM</code>, and the next <code>open</code> must get the same descriptor number it would have got without the calls.</li>
+<li>T2 (covers F3, F4, F8, F9): the same guest tries <code>FAN_UNLIMITED_QUEUE|FAN_UNLIMITED_MARKS</code>, <code>FAN_ENABLE_AUDIT</code>, <code>FAN_REPORT_TID</code>, and the host probe's all-bits value. Each returns the fixed <code>EPERM</code> of owner decision 6 (the host probe also gave <code>EPERM</code>), and both <code>--verify</code> runs agree.</li>
+<li>T3 (covers F1, F5): <code>hermit record</code> then <code>hermit replay</code> a guest that tries <code>fanotify_init</code>, falls back to <code>inotify_init1</code> on failure, and prints which path it took; the recording and replay must both report the fallback.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-09-28 · hermit 81ca8822f78c · hermit2 · closed under the legacy rule (an explicit <code>classify_syscall</code> arm), not the v1 done rule; closing comment https://github.com/rrnewton/hermit/issues/348#issuecomment-5872969203</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A2 of https://github.com/rrnewton/hermit/issues/348: linux_determinism nondeterministic (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch pred:is_mount_ns_admin_refused_syscall, refused.</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · reopen: under the owner rule of 2026-10-02, closed means every flag and option is covered by a named test and the implementation works; fanotify_init records no test coverage, so tracking_status is todo and https://github.com/rrnewton/hermit/issues/348 reopens.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; refuse (Detcore returns a fixed EPERM at detcore/src/lib.rs:2215 for every fanotify_init request, never forwarded, so the guest never holds a fanotify descriptor); linux_determinism stays nondeterministic; 9 flag behaviours and 3 tests listed; no coverage token because no test runs a guest that calls fanotify_init, so tracking_status stays todo; open question on modelling the unprivileged subset under Additional information</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): decisions 6 and 9 applied (fixed EPERM stays the target; the unprivileged subset is not modelled because no named workload needs it, and EPERM is what Linux before 5.13 gives every unprivileged caller); target_policy stays refuse; T2 now asserts the decision-6 errno; no new F/T ids; open question on modelling the unprivileged subset removed</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+fanotify_init&amp;amp;body=Discussion+for+the+%60fanotify_init%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ffanotify_init.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60fanotify_init%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `fanotify_init`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: fanotify_init&quot; (https://github.com/rrnewton/hermit/issues/348), legacy variant A2.</p>
+<p>Comment history: 1 comment(s) on https://github.com/rrnewton/hermit/issues/348.</p>
+<p>The legacy body ranked it 69th in the batch-2 classification sequence, after excluding the 50 workload-observed batch-1 syscalls.</p>
+<h3>2026-07-24 host strace evidence</h3>
+<p>Test host: Linux 6.17.13 x86_64; strace 6.12.</p>
+<p>Ran a syscall-specific safe raw probe with deliberately inert/invalid arguments so privileged or mutating operations could not change host state:</p>
+<pre><code>strace -f -qq -e trace=fanotify_init -s 160 python3 -c 'import ctypes; c=ctypes.CDLL(None,use_errno=True); c.syscall(300, *([ctypes.c_long(-1)]*6))'
+</code></pre>
+<p>Actual strace output:</p>
+<pre><code>fanotify_init(0xc /* FAN_CLASS_??? */|FAN_CLOEXEC|FAN_NONBLOCK|FAN_UNLIMITED_QUEUE|FAN_UNLIMITED_MARKS|FAN_ENABLE_AUDIT|FAN_REPORT_PIDFD|FAN_REPORT_TID|FAN_REPORT_FID|FAN_REPORT_DIR_FID|FAN_REPORT_NAME|FAN_REPORT_TARGET_FID|0xffffe000, O_ACCMODE|O_CREAT|O_EXCL|O_NOCTTY|O_TRUNC|O_APPEND|O_NONBLOCK|O_SYNC|O_DIRECT|O_LARGEFILE|O_NOFOLLOW|O_NOATIME|O_CLOEXEC|O_PATH|O_TMPFILE|FASYNC|0xff80003c) = -1 EPERM (Operation not permitted)
+</code></pre>
+<p>The trace confirms the host kernel path and observed errno/result for this ABI. The determinism recommendation also accounts for documented success-path state dependencies; an invalid-argument result alone is not treated as proof of determinism.</p>
+<h3>Legacy closure</h3>
+<p>Closed 2026-09-28 by the 2026-09-28 sweep, which closed issues whose syscall had an explicit <code>classify_syscall</code> arm. Closing comment: https://github.com/rrnewton/hermit/issues/348#issuecomment-5872969203</p>
+</body></html>

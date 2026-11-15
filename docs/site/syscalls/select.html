@@ -1,0 +1,109 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>select | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>select</code> (23)</h1>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; linux determinism: nondeterministic &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+select&amp;body=Discussion+for+the+%60select%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fselect.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60select%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>select(nfds, readfds, writefds, exceptfds, timeout)</code> waits until a descriptor in one of three bitmaps is ready, or until a <code>timeval</code> timeout expires. It rewrites the bitmaps and the remaining time in place. Detcore models it like <code>pselect6</code>. Under sequentialized threads it polls with zero-timeout probes on the deterministic schedule and measures the timeout in virtual time. Record/replay captures the result, the sets and the remaining time (<code>detcore/src/syscalls/io.rs:729-924</code> at hermit f4055eb9cae4). One divergence is known: Hermit rejects a <code>tv_usec</code> of one million or more, which Linux accepts.</p>
+<h2>Linux semantics</h2>
+<p><code>select</code> checks descriptors <code>0..nfds-1</code> in the read, write and exception sets.</p>
+<ul>
+<li><strong>Return value:</strong> the total number of ready bits, with each set rewritten to show only the ready descriptors. 0 means the timeout expired, and on error the sets are unspecified.</li>
+<li><strong>Timeout:</strong> a <code>NULL</code> timeout waits forever, and a zero timeout polls once. Linux writes the time not slept back into <code>*timeout</code>, also on <code>EINTR</code>; a fault during that writeback does not change the result.</li>
+<li><strong>nfds:</strong> a negative <code>nfds</code> gives <code>EINVAL</code>. An <code>nfds</code> beyond the process's fd table is clamped to the table size.</li>
+<li><strong>Errors:</strong></li>
+<li>a closed descriptor in any set gives <code>EBADF</code>;</li>
+<li>an unreadable set gives <code>EFAULT</code>, and so does an unwritable set when the results are copied back; sets copied before the faulting one have already been written;</li>
+<li>a negative <code>tv_sec</code> or <code>tv_usec</code> gives <code>EINVAL</code>;</li>
+<li>a signal gives <code>EINTR</code>, since <code>select</code> is not restarted after a handler runs.</li>
+<li><strong>Large `tv_usec`:</strong> Linux normalizes a <code>tv_usec</code> of one million or more into seconds rather than rejecting it. Measured on this host (Linux 7.1.3) by <code>a scratch directory</code>:</li>
+<li><code>{0, 1500000}</code> waited 1.501 s and returned 0;</li>
+<li><code>{0, -1}</code>, <code>{1, -1000000}</code> and <code>{-1, 0}</code> each gave <code>EINVAL</code>.</li>
+<li><strong>glibc:</strong> on x86-64, glibc's <code>select()</code> wrapper issues <code>pselect6</code> (<code>tests/c/record_replay_select.c:22</code>, <code>tests/rust/select.rs:16-18</code>), so this syscall is reached mainly by raw <code>syscall(SYS_select, ...)</code> callers and by other runtimes.</li>
+</ul>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: read set: descriptors with data, EOF or a pending connection are reported readable.</li>
+<li>F2: write set: descriptors with buffer space are reported writable.</li>
+<li>F3: exception set: descriptors with exceptional conditions (for example TCP urgent data) are reported.</li>
+<li>F4: return value and in-place rewrite: the count of ready bits, with each set reduced to its ready descriptors.</li>
+<li>F5: a negative <code>nfds</code> gives <code>EINVAL</code>.</li>
+<li>F6: an <code>nfds</code> larger than the fd table is clamped (for example <code>FD_SETSIZE</code> with few open fds).</li>
+<li>F7: a <code>NULL</code> timeout waits until a descriptor is ready or a signal arrives.</li>
+<li>F8: a zero timeout polls once and returns at once.</li>
+<li>F9: a positive timeout waits up to that long, returns 0 on expiry, and writes the time not slept back into <code>*timeout</code>.</li>
+<li>F10: a <code>tv_usec</code> of one million or more is accepted and normalized by Linux; Hermit returns <code>EINVAL</code> (divergence).</li>
+<li>F11: a negative <code>tv_sec</code> or <code>tv_usec</code> gives <code>EINVAL</code>.</li>
+<li>F12: a closed descriptor in any set gives <code>EBADF</code>.</li>
+<li>F13: <code>EFAULT</code> for an unreadable set or timeout, and partial copy-out when a later output set is unwritable; a fault while writing the remaining time is ignored.</li>
+<li>F14: a signal while waiting gives <code>EINTR</code>, with the remaining time written back.</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p>Readiness depends on when other threads, processes or external peers act on the descriptors (F1, F2, F3), so the result count and the sets vary between runs (F4). A positive timeout races readiness against the host clock, and the remaining time written back comes from the host clock (F9). Whether a signal interrupts the wait depends on delivery timing (F14). A <code>NULL</code> timeout blocks for a host-decided time (F7). Only argument validation (F5, F10, F11, F12, F13) and a zero-timeout poll of already-settled descriptors repeat on their own. Hence <code>nondeterministic</code>.</p>
+<h2>Hermit design</h2>
+<p>The policy is <code>model</code>, as implemented at hermit f4055eb9cae4:</p>
+<ul>
+<li><strong>Dispatch:</strong> <code>Syscall::Select</code> goes to <code>handle_select</code> (<code>detcore/src/lib.rs:2615</code>, with <code>TODO-HUMAN-REVIEW(#800)</code> at <code>detcore/src/lib.rs:2614</code>).</li>
+<li><strong>Record/replay modes:</strong> the call goes to <code>record_or_replay_select_family</code> (<code>detcore/src/syscalls/io.rs:742-752</code>). A zero timeout takes an ordinary scheduler turn and is recorded. Any other call runs as a recorded blocking external operation. The recorder captures the result, the sets and the remaining time, so replay never asks the live kernel about descriptors it did not recreate (<code>detcore/src/syscalls/io.rs:434-451</code>). The ready-pipe regression for this is https://github.com/rrnewton/hermit/issues/3569, cited in <code>tests/c/record_replay_select.c:11</code>.</li>
+<li><strong>Not sequentialized:</strong> a raw inject (<code>detcore/src/syscalls/io.rs:753-755</code>).</li>
+<li><strong>Sequentialized run mode:</strong></li>
+<li>a negative <code>nfds</code> is injected so the kernel returns <code>EINVAL</code> (<code>detcore/src/syscalls/io.rs:757-759</code>) (F5);</li>
+<li>the timeval is read, and a fault gives <code>EFAULT</code> (<code>detcore/src/syscalls/io.rs:761-767</code>) (F13);</li>
+<li>a zero timeout is injected directly (<code>detcore/src/syscalls/io.rs:768-771</code>) (F8);</li>
+<li>an <code>nfds</code> above 64 (<code>PSELECT6_INTERNAL_MAX_NFDS</code>, <code>detcore/src/syscalls/io.rs:96</code>) leaves the sets to the kernel through <code>record_or_replay_blocking</code> (<code>detcore/src/syscalls/io.rs:775-779</code>), so readiness timing for those calls is host-decided (F6);</li>
+<li>otherwise the timeout is converted (<code>detcore/src/syscalls/io.rs:781</code>, <code>select_timeout_duration</code> at <code>detcore/src/syscalls/io.rs:198-206</code>) (F10, F11), and the call goes to <code>handle_internal_select</code> (<code>detcore/src/syscalls/io.rs:785-889</code>).</li>
+<li><strong>`handle_internal_select`:</strong></li>
+<li>sets the deadline to virtual time plus the timeout (<code>detcore/src/syscalls/io.rs:792-795</code>);</li>
+<li>copies the guest sets and probes with scratch sets and a scratch zero timeout on the guest stack (<code>detcore/src/syscalls/io.rs:796-831</code>);</li>
+<li>loops on an InternalIOPolling resource whose signal interruption yields <code>EINTR</code> (<code>detcore/src/syscalls/io.rs:833-848</code>) (F14);</li>
+<li>returns any nonzero or error probe result after copying the sets back (<code>detcore/src/syscalls/io.rs:860-870</code>) (F1-F4, F12);</li>
+<li>returns 0 when the virtual deadline passes (<code>detcore/src/syscalls/io.rs:873-881</code>) (F9).</li>
+</ul>
+<p><code>write_select_remaining</code> derives the remaining time from virtual time and ignores writeback faults, as Linux does (<code>detcore/src/syscalls/io.rs:903-924</code>) (F9, F13). A <code>NULL</code> timeout never reaches a deadline and retries until a descriptor is ready or a signal arrives (F7).</p>
+<p>Why not <code>passthrough</code>: readiness and timeout are the nondeterminism, and both are already virtualized. Why not <code>emulate</code>: readiness of real kernel objects must be probed.</p>
+<p>Target (owner decisions 6, 13, 14): the timeout check follows the kernel's order and arithmetic. <code>kern_select</code> copies the timeval (<code>EFAULT</code>), then calls <code>poll_select_set_timeout</code> with <code>tv_sec + tv_usec / 1000000</code> seconds and <code>(tv_usec % 1000000) * 1000</code> nanoseconds, which gives <code>EINVAL</code> only when the result is not a valid timespec (a negative second or nanosecond field); <code>core_sys_select</code> then checks <code>nfds &lt; 0</code> (<code>EINVAL</code>), clamps <code>nfds</code> to the table's <code>max_fds</code> and copies the sets (<code>EFAULT</code>), and <code>do_select</code> reports <code>EBADF</code>. So <code>select_timeout_duration</code> (<code>detcore/src/syscalls/io.rs:198-206</code>) must normalize a <code>tv_usec</code> of one million or more instead of returning <code>EINVAL</code> (F10, T6). The wait stays a non-blocking probe plus a scheduler wait against a virtual deadline, as <code>handle_internal_select</code> already does (<code>detcore/src/syscalls/io.rs:792-795</code>); the <code>nfds &gt; 64</code> path (<code>detcore/src/syscalls/io.rs:775-779</code>) must become the same, with the bitmap read clamped as in pselect6, instead of <code>record_or_replay_blocking</code>.</p>
+<p><strong>Divergences and gaps that keep this `todo`:</strong></p>
+<p>1. <code>select_timeout_duration</code> returns <code>EINVAL</code> for a <code>tv_usec</code> of one million or more, citing &quot;Linux rejects select timeouts whose microsecond field is out of range&quot; (<code>detcore/src/syscalls/io.rs:201-204</code>). The host probe above contradicts that comment (F10). 2. The run-mode probe result is returned raw (<code>detcore/src/syscalls/io.rs:860</code>), while <code>pselect6</code> maps an injected <code>ERESTARTSYS</code> to <code>EINTR</code> (<code>detcore/src/syscalls/io.rs:111-119</code>). Whether a zero-timeout <code>select</code> probe can leak a restart code is unverified. 3. In run mode, a zero-timeout <code>select</code> takes no scheduler turn (<code>detcore/src/syscalls/io.rs:768-771</code>), whereas zero-timeout <code>poll</code> yields one so that a polling thread cannot monopolize the guest between preemptions (<code>detcore/src/syscalls/io.rs:408-417</code>).</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F4, F6, F8, F9): raw <code>SYS_select</code> on a ready pipe with a 5 s timeout, with a zero timeout, with <code>nfds == FD_SETSIZE</code>, and on an empty pipe with 10 ms. Replay must reproduce the result, the sets and the remaining time. Existing candidate: <code>record_raw_select_ready_pipe</code> in <code>hermit-cli/tests/record_replay.rs:2253</code> (guest <code>tests/c/record_replay_select.c</code>, mode <code>raw</code>).</li>
+<li>T2 (covers F13): raw select whose write set is on a read-only page writes the read set, then gives <code>EFAULT</code>, in record and replay. Existing candidate: <code>record_select_partial_fd_set_copyout</code> in <code>hermit-cli/tests/record_replay.rs:2268</code>.</li>
+<li>T3 (covers F5): raw select with a negative <code>nfds</code> gives <code>EINVAL</code> in record and replay. Existing candidate: <code>record_select_negative_nfds_preserves_einval</code> in <code>hermit-cli/tests/record_replay.rs:2273</code>.</li>
+<li>T4 (covers F7): a second thread blocks in raw select with a <code>NULL</code> timeout on an empty pipe that the main thread then fills, and replay does not wait on the live pipe. Existing candidate: <code>record_select_null_timeout_woken_by_thread</code> in <code>hermit-cli/tests/record_replay.rs:2283</code>.</li>
+<li>T5 (covers F1, F9): the ready path and the 10 ms timeout path of raw select under <code>hermit run --verify</code> on ptrace (run mode, <code>handle_internal_select</code>). Existing guest: <code>tests/rust/select.rs</code> (cargo target <code>rustbin_select</code>, used in record/replay by <code>record_rs_select</code> at <code>hermit-cli/tests/record_replay.rs:2334</code>). It has no e2e manifest cell at f4055eb9cae4, so run-mode coverage needs one.</li>
+<li>T6 (covers F10, F11): a timeout of <code>{0, 1500000}</code> must wait 1.5 virtual seconds and return 0, as Linux does. <code>{0, -1}</code> and <code>{-1, 0}</code> must give <code>EINVAL</code>. This fails today on the first case.</li>
+<li>T7 (covers F2, F3, F12): a write set on a pipe with free space reports writable; an exception set on a loopback TCP socket after <code>send(..., MSG_OOB)</code> reports the exception, and on a pipe reports nothing; a closed fd in the read set gives <code>EBADF</code>, identically across runs.</li>
+<li>T8 (covers F14): a timer signal with a handler interrupts a raw select that has a 10 s timeout. Expect <code>EINTR</code>, and a remaining time derived from virtual time that is identical across runs under <code>--verify</code>.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/424: linux_determinism nondeterministic (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch typed.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · facts-bot · code_facts changed: tests_naming 1 -&gt; 2.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; model (virtual-time zero-timeout probe loop, recorded sets and remaining time in record/replay); linux_determinism stays nondeterministic; 14 flags, T1-T8 proposed; open questions: tv_usec &gt;= 1e6 is EINVAL under Hermit but normalized by Linux, raw probe result vs pselect6 ERESTARTSYS mapping, no scheduler turn on zero timeout; tracking_status stays todo.</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): applied decision 6 (normalize tv_usec &gt;= 1000000 as kern_select does, kernel check order stated) and decisions 13 and 14 (nfds &gt; 64 becomes probe plus virtual-time wait); target_policy unchanged; no new F/T ids; removed the tv_usec normalization question.</li>
+<li>2026-10-05 · hermit f4055eb9cae4 · syscall-tracking-2 · covered: T1 covered by hermit-cli/tests/record_replay.rs, T2 covered by hermit-cli/tests/record_replay.rs, T3 covered by hermit-cli/tests/record_replay.rs, T4 covered by hermit-cli/tests/record_replay.rs (C08 review of the 2026-10-04 coverage proposals; guest source read at this SHA, not run by this agent)</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+select&amp;amp;body=Discussion+for+the+%60select%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fselect.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60select%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `select`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: select&quot; (https://github.com/rrnewton/hermit/issues/424), legacy variant A1.</p>
+<p>The 2026-07-24 evidence below describes how the call was routed at that time. At hermit f4055eb9cae4, <code>select</code> has its own typed handler (see Hermit design), and the &quot;temporary-passthrough&quot; wording no longer applies.</p>
+<h3>Open questions</h3>
+<ul>
+<li>Should the run-mode probe at <code>detcore/src/syscalls/io.rs:860</code> map <code>ERESTARTSYS</code> to <code>EINTR</code> as <code>pselect6_probe_result</code> does (<code>detcore/src/syscalls/io.rs:111-119</code>)?</li>
+<li>Should a zero-timeout <code>select</code> in sequentialized run mode take a scheduler turn as zero-timeout <code>poll</code> does (<code>detcore/src/syscalls/io.rs:408-417</code> versus <code>detcore/src/syscalls/io.rs:768-771</code>)?</li>
+</ul>
+<h3>2026-07-24 host strace evidence</h3>
+<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) with <code>strace -f -e trace=select</code> on a direct <code>syscall()</code> harness (invoked with non-destructive query/no-op/failing arguments) and, where applicable, on common programs. Hermit currently routes <code>select</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code>.</p>
+<p>Observed strace line:</p>
+<pre><code>select(0, NULL, NULL, NULL, {tv_sec=0, tv_usec=0}) = 0 (Timeout)
+</code></pre>
+<hr>
+<p>*Autonomous syscall-classification sweep (ranks 151-250 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
+</body></html>

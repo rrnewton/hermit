@@ -1,0 +1,121 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>preadv | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>preadv</code> (295)</h1>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; linux determinism: conditional &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+preadv&amp;body=Discussion+for+the+%60preadv%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fpreadv.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60preadv%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>preadv(fd, iov, iovcnt, pos_l, pos_h)</code> reads into several buffers from an explicit file offset, without using or moving the file offset. Detcore has a typed handler (<code>detcore/src/syscalls/files.rs:2645</code>) that:</p>
+<ul>
+<li>rejects negative offsets the way Linux does</li>
+<li>serves <code>/proc/self/timerslack_ns</code> from virtual state</li>
+<li>serves random devices from Hermit's canonical stream</li>
+<li>refuses other virtualized procfs files with <code>ENOSYS</code></li>
+<li>sends everything else to the kernel under a read lock on the file's resource</li>
+</ul>
+<h2>Linux semantics</h2>
+<p><code>do_preadv</code> checks the arguments in this order:</p>
+<p>1. A negative offset gives <code>EINVAL</code>, before the descriptor is looked up. 2. The descriptor is looked up. A missing descriptor or an <code>O_PATH</code> one gives <code>EBADF</code>. 3. A file without positional-read support gives <code>ESPIPE</code>. That covers pipes, FIFOs, sockets, and anything opened through <code>nonseekable_open</code>. 4. <code>vfs_readv</code> then checks that the file was opened for reading (<code>EBADF</code> if not) and imports the iovec array.</p>
+<p>The read fills the buffers in order and returns the number of bytes copied. That number is short at end of file and can be short after a fault part-way through. The file offset is never read or written. On x86_64 the whole 64-bit offset is <code>pos_l</code>, and <code>pos_h</code> is ignored. The 2026-07-24 host strace under Additional information shows a 16-byte read of <code>/etc/hostname</code> at offset 0.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: explicit offset: reads start at <code>offset</code> and fill each buffer before the next. The file offset is neither used nor changed, so a <code>dup</code> copy sharing the open file description sees no movement.</li>
+<li>F2: offset encoding on x86_64: the 64-bit offset is <code>pos_l</code>, and <code>pos_h</code> is ignored</li>
+<li>F3: negative offset: <code>EINVAL</code>. This is checked before the descriptor lookup, so <code>preadv(-1, ..., -2)</code> gives <code>EINVAL</code>, not <code>EBADF</code>.</li>
+<li>F4: descriptor not open, or opened with <code>O_PATH</code>: <code>EBADF</code></li>
+<li>F5: descriptor not opened for reading (<code>O_WRONLY</code>): <code>EBADF</code>. This is checked before the iovec array, so even <code>iovcnt == 0</code> gives <code>EBADF</code>.</li>
+<li>F6: the iovec array:</li>
+<li><code>iovcnt</code> is truncated to 32 bits, so <code>1UL &lt;&lt; 32</code> acts as 0 and <code>(1UL &lt;&lt; 32) | 1</code> as 1.</li>
+<li><code>iovcnt == 0</code> returns 0 and reads nothing.</li>
+<li><code>iovcnt</code> above <code>IOV_MAX</code> (1024) gives <code>EINVAL</code>.</li>
+<li>An unreadable array or first buffer gives <code>EFAULT</code>.</li>
+<li>A fault in a later buffer, after some bytes were copied, returns the short count.</li>
+<li>F7: descriptor that does not support positional reads (pipe, FIFO, socket, terminal): <code>ESPIPE</code></li>
+<li>F8: end of file and short reads: a read that crosses end of file returns only the bytes before it, and a read at or past end of file returns 0. On FUSE and network filesystems, and after a signal, a regular-file read can also return a short count or <code>EINTR</code>.</li>
+<li>F9: offset overflow: a non-empty request with <code>offset + length</code> past <code>INT64_MAX</code> gives <code>EINVAL</code>. An empty request at <code>INT64_MAX</code> returns 0.</li>
+<li>F10: random devices (<code>/dev/urandom</code>, <code>/dev/random</code>): the offset is ignored, and each call returns fresh random bytes</li>
+<li>F11: procfs and sysfs pseudo-files: the kernel generates the contents from its own state when the read happens, and then serves the bytes at the given offset</li>
+<li>F12: <code>/proc/&lt;pid&gt;/task/&lt;tid&gt;/timerslack_ns</code> and <code>/proc/self/timerslack_ns</code>: a positional read of the decimal timer-slack text</li>
+<li>F13: a directory descriptor: <code>EISDIR</code></li>
+<li>F14: <code>O_DIRECT</code> descriptors: the filesystem requires an aligned buffer, length and offset, and gives <code>EINVAL</code> otherwise</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: conditional</code>. For a regular file, the bytes returned depend only on the file's contents and the offset, so the call repeats when nothing outside the guest changes the file. It does not repeat for pseudo-files that report kernel state, for random devices, or where a filesystem returns short counts that depend on timing. Pipes and sockets are not a source here: they give <code>ESPIPE</code> (F7), so the earlier wording that said reads from pipes and sockets were nondeterministic did not apply to this call.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>Processes outside the guest writing the file</li>
+<li>Pseudo-files whose contents are host kernel state, such as most of procfs and sysfs (F11)</li>
+<li>Random devices (F10)</li>
+<li>Short counts and <code>EINTR</code> on FUSE and network filesystems (F8)</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>model</code>. The kernel serves regular files. Detcore serves the files whose contents it virtualizes, and it serializes access to the file resource. What the handler at f4055eb9cae4 does, in order:</p>
+<ul>
+<li>It decodes the offset with <code>vectored_offset</code>, which on 64-bit uses <code>pos_l</code> alone (<code>detcore/src/syscalls/files.rs:137</code>), as F2 requires. It returns <code>EINVAL</code> for a negative offset before any descriptor lookup (<code>detcore/src/syscalls/files.rs:2651</code>), as F3 requires.</li>
+<li>A descriptor bound to timer slack is served by <code>readv_timer_slack</code> at the explicit offset (<code>detcore/src/syscalls/files.rs:2656</code>), after an access check (<code>require_timer_slack_access</code>) for F12.</li>
+<li>A descriptor with a procfs position, meaning a procfs file Detcore virtualizes, gives <code>ENOSYS</code> (<code>detcore/src/syscalls/files.rs:2664</code>). Linux would return the bytes (F11). See the open question below.</li>
+<li>If the descriptor names a resource, the handler takes a read permit on it (<code>detcore/src/syscalls/files.rs:2675</code>). That orders the read against writers that take the write permit, such as <code>pwritev</code>.</li>
+<li>An <code>FdType::Rng</code> descriptor is served by <code>read_random_vectors</code> at the explicit offset (<code>detcore/src/syscalls/files.rs:2680</code>). The handler's doc comment says &quot;RNG reads use the canonical stream at the explicit offset without advancing its shared cursor&quot; (<code>detcore/src/syscalls/files.rs:2635</code>). That replaces the host randomness of F10 with a repeatable stream. Linux ignores the offset, so this is a deliberate difference.</li>
+<li>Everything else goes to the kernel through <code>record_or_replay_preserving_tool_errors</code> (<code>detcore/src/syscalls/files.rs:2693</code>). That gives Linux's own F1, F4 to F9, F13 and F14, and the bytes are recorded in record mode.</li>
+</ul>
+<p>The handler and its sibling <code>pwritev</code> were added by https://github.com/rrnewton/hermit/pull/794, and the code tag <code>TODO-HUMAN-REVIEW(#794)</code> at <code>detcore/src/syscalls/files.rs:2632</code> refers to it.</p>
+<p>Why <code>model</code> and not the alternatives: plain <code>passthrough</code> would leak host randomness through <code>/dev/urandom</code>, and the timer-slack value and procfs snapshots through the kernel's real files. <code>emulate</code> for regular files would duplicate the page cache for no determinism gain. <code>refuse</code> would break databases and loaders that read with <code>preadv</code>.</p>
+<p>What remains before the code fully realizes <code>model</code>:</p>
+<ul>
+<li><strong>Virtualized procfs files.</strong> <code>preadv</code> gives <code>ENOSYS</code> where <code>pread64</code> serves the same file from its snapshot. <code>pread64</code> initializes the snapshot and serves bytes at the offset (<code>detcore/src/syscalls/files.rs:1899</code> and <code>detcore/src/syscalls/files.rs:1910</code>). <code>readv</code> refuses the same way (<code>detcore/src/syscalls/files.rs:2578</code>). <code>tests/c/proc_locks.c:160</code> asserts the <code>ENOSYS</code>, so the current behaviour is pinned by a test, but it differs from Linux.</li>
+<li><strong>Short reads.</strong> <code>pread64</code> retries short reads on regular files when <code>deterministic_io</code> is set (<code>detcore/src/syscalls/files.rs:1936</code>; option documented at <code>detcore-model/src/config.rs:440</code>). <code>preadv</code> has no such retry, so on filesystems that return short counts (F8) its result can vary even with that option on.</li>
+</ul>
+<p><code>linux_determinism</code> stays <code>conditional</code>. Hermit removes the random-device source and the virtual-file sources it handles. Host writers to shared files remain.</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F2): <code>preadv</code> into two buffers at an explicit offset returns the expected bytes and leaves <code>lseek(fd, 0, SEEK_CUR)</code> unchanged. A raw <code>syscall(SYS_preadv, ...)</code> with garbage in <code>pos_h</code> reads the same bytes. Existing partial coverage: <code>tests/c/vectored_file_io.c:96</code> (cell <code>c-programs/vectored-file-io</code>, <code>tests/e2e/manifests/c-programs.yaml:15323</code>, verify ci), which reads 10 bytes into two buffers at offset 0 but does not check the offset afterwards. Also <code>positioned_result</code> in <code>tests/c/random_readv_stream.c:446</code>, which passes non-zero <code>pos_h</code> padding, but only on a random device.</li>
+<li>T2 (covers F3, F4, F5): on a regular file, check:</li>
+<li><code>preadv(-1, iov, 1, -2)</code> gives <code>EINVAL</code></li>
+<li><code>preadv(-1, iov, 1, 0)</code> gives <code>EBADF</code></li>
+<li><code>O_WRONLY</code> and <code>O_PATH</code> descriptors give <code>EBADF</code>, also with <code>iovcnt == 0</code> Existing coverage on a random device: <code>positioned_errors</code> in <code>tests/c/random_readv_stream.c:504</code> (cell <code>c-programs/random-readv-stream</code>, <code>tests/e2e/manifests/c-programs.yaml:4</code>, verify and replay ci on ptrace). Hermit serves that device itself, so a regular-file variant is needed to check the kernel path.</li>
+<li>T3 (covers F6): on a regular file, check:</li>
+<li><code>iovcnt</code> 0, <code>1UL &lt;&lt; 32</code> and <code>(1UL &lt;&lt; 32) | 1</code> return 0, 0 and 1 byte</li>
+<li>1025 and <code>~0UL</code> give <code>EINVAL</code></li>
+<li>an invalid array gives <code>EFAULT</code></li>
+<li>a valid first buffer followed by an invalid second one returns the first buffer's length The random-device cases exist in <code>tests/c/random_readv_stream.c:525</code>.</li>
+<li>T4 (covers F7): <code>preadv</code> on a pipe, a FIFO, an <code>AF_UNIX</code> socketpair and a pseudo-terminal gives <code>ESPIPE</code>.</li>
+<li>T5 (covers F8, F9): on a 10-byte file, a 16-byte read at offset 6 returns 4, and a read at offset 10 or 4096 returns 0. A 1-byte read at <code>INT64_MAX</code> gives <code>EINVAL</code>, and an empty request at <code>INT64_MAX</code> returns 0. The <code>INT64_MAX</code> cases exist for the random device in <code>tests/c/random_readv_stream.c:530</code>.</li>
+<li>T6 (covers F10): positioned reads of <code>/dev/urandom</code> follow Hermit's canonical stream at offsets 5, 65536, <code>0x100000005</code> and <code>INT64_MAX - 1</code>, and do not move the shared cursor seen through a <code>dup</code> copy. Existing candidate: <code>positioned_stream</code> in <code>tests/c/random_readv_stream.c:469</code>, same cell as T2.</li>
+<li>T7 (covers F11): <code>preadv</code> on a procfs file Detcore virtualizes. Today Hermit returns <code>ENOSYS</code> where Linux returns the file's bytes. Existing candidate pinning the current Hermit result: <code>tests/c/proc_locks.c:160</code> (cell <code>c-programs/proc-locks</code>, <code>tests/e2e/manifests/c-programs.yaml:5943</code>, verify ci). If the owner decides <code>preadv</code> should serve the snapshot, this assertion changes with the code.</li>
+<li>T8 (covers F12): <code>preadv</code> of <code>/proc/self/timerslack_ns</code> at offset 1 returns the tail of the virtual value, and offset -1 gives <code>EINVAL</code>. Existing candidate: <code>timer_slack_procfs_vector_io_matches_linux</code> at <code>detcore/tests/misc/mod.rs:434</code> (the <code>preadv</code> checks are at lines 588 and 613).</li>
+<li>T9 (covers F13, F14): <code>preadv</code> on a directory descriptor gives <code>EISDIR</code>. On a filesystem that supports <code>O_DIRECT</code>, an unaligned buffer gives <code>EINVAL</code>. Record the filesystem in the test output, because this is filesystem-dependent.</li>
+<li>T10 (covers F1, F8): record a guest that reads a regular file with <code>preadv</code>, then change the file and replay. Replay must return the recorded bytes and counts.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-09-28 · hermit 81ca8822f78c · hermit2 · closed under the legacy rule (an explicit <code>classify_syscall</code> arm), not the v1 done rule; closing comment https://github.com/rrnewton/hermit/issues/327#issuecomment-5872923807</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/327: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch typed.</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · reopen: under the owner rule of 2026-10-02, closed means every flag and option is covered by a named test and the implementation works; preadv records no test coverage, so tracking_status is todo and https://github.com/rrnewton/hermit/issues/327 reopens.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; model (kernel serves regular files under a resource read permit; Detcore serves timerslack_ns and the canonical RNG stream at the explicit offset); linux_determinism stays conditional; 14 flag behaviours and 10 tests listed; open question: preadv returns ENOSYS on virtualized procfs files where pread64 serves the snapshot; no coverage token, so tracking_status stays todo</li>
+<li>2026-10-05 · hermit f4055eb9cae4 · syscall-tracking-2 · covered: T6 covered by tests/c/random_readv_stream.c (C08 review of the 2026-10-04 coverage proposals; guest source read at this SHA, not run by this agent)</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+preadv&amp;amp;body=Discussion+for+the+%60preadv%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fpreadv.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60preadv%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `preadv`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: preadv&quot; (https://github.com/rrnewton/hermit/issues/327), legacy variant A1.</p>
+<p>Comment history: 1 comment(s) on https://github.com/rrnewton/hermit/issues/327.</p>
+<h3>Open questions</h3>
+<ul>
+<li>Should <code>preadv</code> (and <code>readv</code>) on a procfs file Detcore virtualizes serve the snapshot as <code>pread64</code> does, instead of returning <code>ENOSYS</code> (<code>detcore/src/syscalls/files.rs:2664</code>, <code>detcore/src/syscalls/files.rs:2578</code>)? Linux returns the bytes. <code>tests/c/proc_locks.c:160</code> currently asserts <code>ENOSYS</code>, so changing it is an owner decision, not a bug fix.</li>
+<li>Should <code>preadv</code> honour <code>deterministic_io</code> short-read retries as <code>pread64</code> does (<code>detcore/src/syscalls/files.rs:1936</code>)?</li>
+</ul>
+<h3>2026-07-24 host strace evidence</h3>
+<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) by tracing a direct <code>syscall()</code> harness and common programs with <code>strace -f -e trace=preadv</code>, and by confirming hermit currently routes <code>preadv</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code> (the harness ran end-to-end under <code>hermit run</code>, exit 0, so passthrough does not crash).</p>
+<p>Observed strace line:</p>
+<pre><code>preadv(5, [{iov_base=&quot;measurement-host&quot;, iov_len=16}], 1, 0) = 16
+</code></pre>
+<hr>
+<p>*Autonomous syscall-classification sweep, batch 3 (ranks 101-150 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
+<h3>Legacy closure</h3>
+<p>Closed 2026-09-28 by the 2026-09-28 sweep, which closed issues whose syscall had an explicit <code>classify_syscall</code> arm. Closing comment: https://github.com/rrnewton/hermit/issues/327#issuecomment-5872923807</p>
+</body></html>

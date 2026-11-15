@@ -1,0 +1,75 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lstat | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>lstat</code> (6)</h1>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; linux determinism: conditional &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+lstat&amp;body=Discussion+for+the+%60lstat%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Flstat.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60lstat%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>lstat(path, statbuf)</code> is <code>stat</code> without following a symbolic link in the last path component: for a symlink it describes the link itself. Detcore handles it in <code>handle_stat_family</code> (<code>detcore/src/syscalls/files.rs:3031</code>), the same handler as <code>stat</code>, <code>fstat</code> and <code>newfstatat</code>: with <code>virtualize_metadata</code> on (the <code>hermit run</code> default) the kernel runs the call and Detcore rewrites the identity and time fields; in record/replay the result is recorded and replayed.</p>
+<p>Manual reference: Linux man-pages stat(2).</p>
+<h2>Linux semantics</h2>
+<p><code>lstat</code> resolves <code>path</code> relative to the current directory (or from <code>/</code> when absolute), following every symlink except the final component. It cannot block on its own, although resolution through a slow or FUSE filesystem can stall. It has no side effects.</p>
+<p>For a symlink, <code>st_mode</code> is <code>S_IFLNK</code> and <code>st_size</code> is the length of the link target. For anything else the result is the same as <code>stat</code>. As with <code>fstat</code>, <code>st_ino</code>, <code>st_dev</code> and the timestamps are host-assigned, and <code>st_size</code>, <code>st_blocks</code>, <code>st_blksize</code>, <code>st_nlink</code>, <code>st_uid</code>, <code>st_gid</code>, <code>st_mode</code> and <code>st_rdev</code> reflect the host filesystem.</p>
+<p>Errors come from path resolution: <code>ENOENT</code>, <code>ENOTDIR</code>, <code>ELOOP</code> (too many links in the intermediate components), <code>ENAMETOOLONG</code>, <code>EACCES</code> (search permission denied on a directory), and <code>EFAULT</code> for an unreadable <code>path</code> or an unwritable <code>statbuf</code>. <code>EOVERFLOW</code> exists only for 32-bit callers.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: final component is a symbolic link: the link is described (<code>S_IFLNK</code>, <code>st_size</code> = target length) and not followed, including dangling links and <code>/proc</code> magic links such as <code>/proc/self/exe</code></li>
+<li>F2: final component is not a symlink: same result as <code>stat</code>, including symlinks in intermediate components, which are followed</li>
+<li>F3: relative path: resolved against the calling thread's current directory</li>
+<li>F4: path resolution errors: <code>ENOENT</code>, <code>ENOTDIR</code>, <code>ELOOP</code>, <code>ENAMETOOLONG</code>, <code>EACCES</code></li>
+<li>F5: <code>path</code> or <code>statbuf</code> not accessible: <code>EFAULT</code></li>
+<li>F6: procfs, sysfs and device paths: host-assigned <code>st_dev</code>, <code>st_ino</code> and, for devices, <code>st_rdev</code></li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: conditional</code>. For the same path in the same filesystem state, <code>lstat</code> returns the same bytes except for the host-assigned fields: inode and device numbers from global allocators and timestamps from the real clock. Those differ between runs, so the call repeats only for paths whose inodes are stable on the host and whose timestamps are not observed. Whether a path exists at all, and what it points to, is filesystem state outside the program.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li><code>st_ino</code> and <code>st_dev</code> from host-wide allocators, notably for procfs, sysfs and tmpfs (the <code>TODO-HUMAN-REVIEW(PR-1056)</code> comment at <code>detcore/src/syscalls/files.rs:3008</code> records <code>st_dev</code> drift between the two runs of <code>--verify</code>)</li>
+<li><code>st_atime</code>, <code>st_mtime</code> and <code>st_ctime</code> from the real clock</li>
+<li>Host filesystem content and layout: which paths exist, symlink targets, <code>st_blocks</code>, <code>st_nlink</code>, <code>st_uid</code>, <code>st_gid</code></li>
+<li>Other processes that create, rename or delete the path concurrently</li>
+</ul>
+<h3>Cross-host variation</h3>
+<ul>
+<li>Filesystem type and block size behind the file: <code>st_blksize</code> and <code>st_blocks</code>, and a directory's <code>st_size</code> and <code>st_nlink</code>, are the host filesystem's values, which Detcore passes through (<code>detcore/src/stat.rs:46</code>); btrfs, ext4 and tmpfs report different values for the same guest-created file or directory (F2).</li>
+<li>Host uid that launches Hermit: the user namespace maps that one uid to the guest's root, so the <code>st_uid</code> and <code>st_gid</code> of host files the guest can see (passed through raw) differ between hosts (F1, F2, F6).</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>model</code>, the same as <code>stat</code> and <code>fstat</code>. The kernel resolves the path, follows or does not follow the link, and produces every error; Detcore replaces the host-assigned identity and time fields. At hermit f4055eb9cae4:</p>
+<ul>
+<li>The dispatch arm is <code>detcore/src/lib.rs:2411</code>, which calls <code>handle_stat_family</code> (<code>detcore/src/syscalls/files.rs:3031</code>).</li>
+<li>With <code>virtualize_metadata</code>, the call is injected first (<code>detcore/src/syscalls/files.rs:3041</code>), so every resolution error (F4, F5) and the symlink rule (F1) are the kernel's own. The NB comment there explains that resolving paths in the tracer can hang on some FUSE filesystems.</li>
+<li><code>determinize_stat</code> (<code>detcore/src/syscalls/files.rs:2981</code>) then sets <code>st_ino</code> from <code>determinize_inode</code> (<code>detcore/src/tool_global.rs:3682</code>), <code>st_dev</code> from <code>determinize_device</code> (<code>detcore/src/syscalls/files.rs:3013</code>), <code>st_atime</code> and <code>st_ctime</code> to the configured epoch, and <code>st_mtime</code> to Detcore's logical mtime, which starts at the epoch when the inode is first seen (<code>detcore/src/tool_global.rs:2522</code>). A symlink's own inode is determinized like any other.</li>
+<li>The <code>fstat</code>-only standard-stream inode override (<code>detcore/src/syscalls/files.rs:3043</code>) does not apply to <code>lstat</code>.</li>
+<li>Without <code>virtualize_metadata</code> (record/replay sets it to <code>false</code> at <code>hermit-cli/src/metadata.rs:406</code>), the call goes through <code>record_or_replay</code>. The recorder routes <code>Lstat</code> to its stat handler (<code>hermit-cli/src/recorder.rs:547</code>) and the replayer substitutes the recorded buffer (<code>hermit-cli/src/replayer.rs:450</code>), so replay does not need the path to exist.</li>
+</ul>
+<p>Why <code>model</code>: <code>passthrough</code> leaks host inode and device numbers and real timestamps; <code>emulate</code> would mean re-implementing path resolution in the tracer, which the NB comment rejects; <code>refuse</code> would break <code>ls -l</code>, <code>find</code>, <code>tar</code> and most build tools.</p>
+<p>What the model does not cover yet: <code>st_size</code>, <code>st_blocks</code>, <code>st_blksize</code>, <code>st_nlink</code>, <code>st_uid</code>, <code>st_gid</code>, <code>st_mode</code> and <code>st_rdev</code> pass through raw (<code>DetStat</code>, <code>detcore/src/stat.rs:46</code>). No test at this SHA names <code>SYS_lstat</code>. The detcore test <code>stat_lstat_symlink</code> (<code>detcore/tests/stats/mod.rs:205</code>), which checks that <code>lstat</code> of <code>/proc/self/exe</code> reports <code>S_IFLNK</code>, is in a file that is not a cargo test target (see Additional information).</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F2, F6): with raw <code>syscall(SYS_lstat, ...)</code>, lstat a regular file, a directory, a symlink to that file, a dangling symlink, <code>/proc/self/exe</code> and a path that reaches the file through an intermediate symlink. Check <code>S_IFLNK</code> and <code>st_size</code> for the links, <code>stat</code>-equivalent results for the rest, and that <code>st_ino</code>, <code>st_dev</code> and the timestamps match between the two runs of <code>hermit run --verify</code> on ptrace. Existing partial candidate: <code>tests/c/stat_metadata_identity.c</code> (cell <code>c-programs/stat-metadata-identity</code>, <code>tests/e2e/manifests/c-programs.yaml:16625</code>, verify ci on ptrace) calls the glibc <code>lstat</code> wrapper at <code>tests/c/stat_metadata_identity.c:165</code>. Modern glibc implements that wrapper with <code>newfstatat(AT_FDCWD, path, buf, AT_SYMLINK_NOFOLLOW)</code>, so the fixture may never issue <code>SYS_lstat</code>.</li>
+<li>T2 (covers F3): <code>chdir</code> into a directory the guest created and lstat a relative path; then <code>fchdir</code> elsewhere and check the same relative name now gives <code>ENOENT</code>.</li>
+<li>T3 (covers F4, F5): raw <code>SYS_lstat</code> on a missing path (<code>ENOENT</code>), a path through a regular file (<code>ENOTDIR</code>), a symlink loop in an intermediate component (<code>ELOOP</code>), a 4096-byte component (<code>ENAMETOOLONG</code>), a NULL <code>path</code> and a NULL <code>statbuf</code> (<code>EFAULT</code>).</li>
+<li>T4 (covers F1): record a guest that lstats a symlink it then deletes, and replay it; the replayed output must show the recorded <code>S_IFLNK</code> result.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · created for v1: no tracking issue existed for this pinned Sysno; code at this SHA: determinized, dispatch typed.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy model (same handler as stat/fstat: the kernel resolves the path and keeps the symlink rule, Detcore rewrites st_ino, st_dev and the timestamps); linux_determinism stays conditional; 6 flag behaviours and 4 tests listed; open questions: no test issues SYS_lstat and raw st_blocks/st_nlink/st_uid; tracking_status stays todo</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d12 (owner decisions 1 and 2): cross_host_variant true (filesystem type and block size, launching host uid); no U items; resolved the open question on virtualizing st_blocks, st_blksize, st_nlink, st_uid and st_gid</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+lstat&amp;amp;body=Discussion+for+the+%60lstat%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Flstat.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60lstat%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `lstat`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Created by the syscall-tracking v1 migration on 2026-10-03. No tracking issue existed for <code>lstat</code>: the 2026-07-24 classification campaign filed issues only for syscalls in the old temporary pass-through block, and Detcore already handled this one.</p>
+<h3>Open questions</h3>
+<ul>
+<li>No test at this SHA names <code>SYS_lstat</code>, and the glibc <code>lstat</code> wrapper is usually implemented with <code>newfstatat</code>, so the dispatch arm at <code>detcore/src/lib.rs:2411</code> may have no live coverage at all. T1 and T3 must use raw <code>syscall(SYS_lstat, ...)</code>.</li>
+<li><code>stat_lstat_symlink</code> (<code>detcore/tests/stats/mod.rs:205</code>) is in a file that cargo does not build and whose BUCK target is commented out (<code>detcore/BUCK:145</code>). Revive or delete?</li>
+</ul>
+</body></html>

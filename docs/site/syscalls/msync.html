@@ -1,0 +1,80 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>msync | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>msync</code> (26)</h1>
+<p>Strategy: <strong>passthrough</strong> &middot; dispatch: <code>passthrough</code> &middot; linux determinism: deterministic &middot; target policy: passthrough &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+msync&amp;body=Discussion+for+the+%60msync%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fmsync.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60msync%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>msync(addr, length, flags)</code> flushes changes made through a shared file mapping back to the file, or schedules that flush. Hermit forwards it to the host kernel unchanged; its result depends only on the guest's own mappings and flags, and the physical flush is outside guest-visible state.</p>
+<h2>Linux semantics</h2>
+<p>The kernel checks the flags and the alignment of <code>addr</code>, rounds <code>length</code> up to a page multiple, and walks the VMAs in the range. For <code>MS_SYNC</code> it writes back the dirty pages of each shared file-backed VMA and waits for completion, returning any writeback error recorded on the file. <code>MS_ASYNC</code> has been a no-op since Linux 2.6.19, because dirty pages are already tracked and written back by the kernel. <code>MS_INVALIDATE</code> asks that other mappings of the file see the new contents; on Linux the page cache is already coherent, so its only observable effect is the locked-page check. Private and anonymous mappings have nothing to write back. In every case the data the guest reads through <code>read</code>, <code>pread</code> or another mapping of the same file is the same before and after the call, because they share the page cache.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>MS_SYNC</code>: write back the dirty pages of shared file mappings in the range and wait; afterwards the file contents, as seen through <code>pread</code>, match the mapping</li>
+<li>F2: <code>MS_ASYNC</code>: accepted and returns 0 without starting I/O (a no-op since 2.6.19)</li>
+<li>F3: <code>MS_INVALIDATE</code>: accepted; on a range containing <code>mlock</code>ed pages it gives <code>EBUSY</code></li>
+<li>F4: <code>MS_SYNC</code> and <code>MS_ASYNC</code> together, or any unknown bit in <code>flags</code>: <code>EINVAL</code></li>
+<li>F5: <code>addr</code> not page aligned: <code>EINVAL</code></li>
+<li>F6: part of the range is not mapped: <code>ENOMEM</code> (the mapped parts are still flushed for <code>MS_SYNC</code>)</li>
+<li>F7: <code>length</code> is rounded up to a page multiple; <code>length == 0</code> succeeds</li>
+<li>F8: private (<code>MAP_PRIVATE</code>) and anonymous mappings, including <code>MAP_SHARED|MAP_ANONYMOUS</code>: succeed without I/O</li>
+<li>F9: a writeback error recorded on the backing file (for example <code>EIO</code> from a failing device, or <code>ENOSPC</code> on a filesystem that allocates at writeback) is reported by <code>MS_SYNC</code>; running out of space when a page is first dirtied raises <code>SIGBUS</code> at the store instead, not an <code>msync</code> error</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p>The return value is a function of the flags, the alignment, the guest's mapping layout and, for F9, the health of the backing filesystem. The guest-visible file contents do not depend on the call at all, since the page cache is shared, so the only output is the return value. Physical flush timing affects nothing the guest can observe. On a given layout the result repeats exactly, which is why <code>linux_determinism</code> stays deterministic; F9 is a host failure, like <code>ENOSPC</code> on any write, rather than a source of run-to-run variation on a healthy host.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>Host filesystem failures behind F9.</li>
+<li>Changes to the backing file made outside the container.</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>passthrough</code>. The code already does this. <code>msync</code> is classified <code>PassThrough</code> at <code>detcore/src/syscall_classification.rs:795</code>, in the pass-through block that starts at <code>detcore/src/syscall_classification.rs:690</code>, under the comment at <code>detcore/src/syscall_classification.rs:767</code>: &quot;Stable guest-owned metadata and synchronous writeback operations are repeatable in Hermit's fixed mount namespace and filesystem image.&quot; The test <code>representative_policies_stay_in_their_reviewed_sections</code> (<code>detcore/src/syscall_classification.rs:1899</code>) pins it as PassThrough at <code>detcore/src/syscall_classification.rs:2079</code>, and it is in the census at <code>detcore/src/syscall_classification.rs:1728</code>. The blanket arm <code>SyscallClassification::PassThrough =&gt; self.passthrough(guest, call).await</code> at <code>detcore/src/lib.rs:2843</code> forwards it. It has no entry in the virtual cost table, so it takes the default at <code>detcore/src/syscall_time.rs:156</code>.</p>
+<p>Why passthrough, not <code>model</code> or <code>emulate</code>:</p>
+<ul>
+<li>The state it acts on, the page cache and the shared mapping, belongs to the kernel. On ptrace the guest's mappings are real mappings, so only the kernel can write them back.</li>
+<li>Its result reads only guest-owned state, and the physical flush is outside guest logical time, so there is nothing to virtualize.</li>
+</ul>
+<p>The ptrace cell <code>c-programs/msync-writeback</code> (<code>tests/e2e/manifests/c-programs.yaml:14596</code>) is the main evidence: it runs under <code>--verify</code> in CI on ptrace and liteinst with <code>bitwise_parity: true</code>. Its manifest disables KVM with the note that KVM's in-memory mapping model &quot;does not flush MAP_SHARED writes to the backing file&quot;; that is a KVM backend gap, outside this ptrace-scoped tracking issue.</p>
+<p>Code facts show <code>subscribed_record_replay: false</code>: <code>msync</code> is not in the <code>--passthru-opt</code> list near <code>detcore/src/lib.rs:1214</code>. <code>hermit record</code> uses its own subscriptions, which the comment at <code>detcore/src/lib.rs:1078</code> places outside the exported tree; the cell above has replay disabled (&quot;never been run for this guest&quot;).</p>
+<p>The open gap is test evidence for the remaining flags. <code>tests_naming</code> is 0: no test calls <code>SYS_msync</code> directly.</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F5): under <code>hermit run --verify</code> on ptrace, write two patterns through a <code>MAP_SHARED</code> file mapping, call raw <code>syscall(SYS_msync, ..., MS_SYNC)</code> after each, and assert <code>pread</code> returns the pattern; assert <code>EINVAL</code> for an unaligned <code>addr</code>. Existing partial coverage via glibc <code>msync()</code>: <code>tests/c/msync_writeback.c:57</code>, <code>tests/c/msync_writeback.c:65</code> and <code>tests/c/msync_writeback.c:73</code> do exactly this (cell <code>c-programs/msync-writeback</code>, <code>tests/e2e/manifests/c-programs.yaml:14596</code>, ptrace verify in CI); the test only needs to issue the raw syscall to count as direct coverage.</li>
+<li>T2 (covers F2, F3, F4): assert <code>MS_ASYNC</code> and <code>MS_INVALIDATE</code> return 0 on a shared file mapping, <code>MS_SYNC|MS_ASYNC</code> and <code>flags = 0x100</code> give <code>EINVAL</code>, and <code>MS_INVALIDATE</code> on a range that has been <code>mlock</code>ed gives <code>EBUSY</code>.</li>
+<li>T3 (covers F6, F7): map three pages, unmap the middle one, and assert <code>MS_SYNC</code> over all three gives <code>ENOMEM</code>; assert <code>length == 0</code> and a <code>length</code> of one byte both succeed.</li>
+<li>T4 (covers F8): assert <code>MS_SYNC</code> succeeds on a <code>MAP_PRIVATE</code> file mapping (and the file is unchanged by writes through it), on a private anonymous mapping and on a <code>MAP_SHARED|MAP_ANONYMOUS</code> mapping. Existing partial coverage via glibc <code>msync()</code>: <code>tests/c/mmap_stress_determinism.c:95</code> (<code>MS_SYNC</code> on a shared anonymous mapping; cell <code>c-programs/mmap-stress-determinism</code>, <code>tests/e2e/manifests/c-programs.yaml:3834</code>, ptrace verify in CI).</li>
+<li>T5 (covers none): map a file on a device that fails writes (a <code>dm-error</code> or <code>dm-flakey</code> target, for example), dirty a page, and assert <code>MS_SYNC</code> reports <code>EIO</code>. Such a device is set up on the host, outside the container, so this test does not cover F9; U1 records F9.</li>
+<li>U1 (covers F9; host-transient): writeback errors (<code>EIO</code> from failing storage, <code>ENOSPC</code> on a filesystem that allocates at writeback) depend on host storage health and free space shared with other processes. The plain passthrough (<code>detcore/src/lib.rs:2843</code>) hands them to the guest today. F9 counts toward done only once Hermit hides these errors or reports them as an infrastructure error.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-09-28 · hermit 81ca8822f78c · hermit2 · closed under the legacy rule (an explicit <code>classify_syscall</code> arm), not the v1 done rule; closing comment https://github.com/rrnewton/hermit/issues/308#issuecomment-5872879564</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/308: linux_determinism deterministic (from <strong>Classification:</strong>); target_policy from legacy PASS-THRU; code at this SHA: passthrough, dispatch passthrough.</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · reopen: under the owner rule of 2026-10-02, closed means every flag and option is covered by a named test and the implementation works; msync records no test coverage, so tracking_status is todo and https://github.com/rrnewton/hermit/issues/308 reopens.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: kept deterministic/passthrough (classified PassThrough at detcore/src/syscall_classification.rs:795, forwarded at detcore/src/lib.rs:2843; the write-back state is the kernel's); listed 9 flag behaviours and 5 tests; c-programs/msync-writeback covers F1 and F5 through glibc, but no coverage token is recorded because no test calls SYS_msync directly, so tracking_status stays todo</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d12 (owner decisions 1 and 2): cross_host_variant stays false; F9 writeback errors recorded as host-transient (U1); T5 no longer claims F9; the open question on the unreachable writeback error is resolved by decision 1</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+msync&amp;amp;body=Discussion+for+the+%60msync%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fmsync.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60msync%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `msync`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: msync&quot; (https://github.com/rrnewton/hermit/issues/308), legacy variant A1.</p>
+<p>Comment history: 1 comment(s) on https://github.com/rrnewton/hermit/issues/308.</p>
+<h3>Open questions</h3>
+<ul>
+<li>Whether the existing glibc-based cell <code>c-programs/msync-writeback</code> may count as coverage for F1 and F5 (glibc's <code>msync()</code> issues <code>SYS_msync</code> directly), or a raw-syscall test is required as for the other bodies.</li>
+</ul>
+<h3>2026-07-24 host strace evidence</h3>
+<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) by tracing a direct <code>syscall()</code> harness and common programs with <code>strace -f -e trace=msync</code>, and by confirming hermit currently routes <code>msync</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code> (the harness ran end-to-end under <code>hermit run</code>, exit 0, so passthrough does not crash).</p>
+<p>Observed strace line:</p>
+<pre><code>msync(0x406000, 4096, MS_ASYNC) = 0
+</code></pre>
+<hr>
+<p>*Autonomous syscall-classification sweep, batch 3 (ranks 101-150 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
+<h3>Legacy closure</h3>
+<p>Closed 2026-09-28 by the 2026-09-28 sweep, which closed issues whose syscall had an explicit <code>classify_syscall</code> arm. Closing comment: https://github.com/rrnewton/hermit/issues/308#issuecomment-5872879564</p>
+</body></html>

@@ -1,0 +1,74 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>listmount | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>listmount</code> (458)</h1>
+<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_mount_introspection_enosys_syscall</code> &middot; linux determinism: nondeterministic &middot; target policy: refuse &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+listmount&amp;body=Discussion+for+the+%60listmount%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Flistmount.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60listmount%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>listmount(req, mnt_ids, nr_mnt_ids, flags)</code> (Linux 6.8 and later) writes the 64-bit unique ids of the mounts under a given mount into a caller array, a page at a time. Hermit refuses it: Detcore answers every call with <code>ENOSYS</code> before looking at the arguments and never calls the kernel (<code>detcore/src/lib.rs:2110-2114</code> at hermit f4055eb9cae4), which is what a pre-6.8 kernel returns and sends callers to <code>/proc/self/mountinfo</code>, a file Hermit sanitizes.</p>
+<p>Manual reference: Linux man-pages listmount(2).</p>
+<h2>Linux semantics</h2>
+<p><code>listmount</code> and its companion <code>statmount</code> replace parsing <code>/proc/self/mountinfo</code>: <code>listmount</code> enumerates mount ids, and <code>statmount</code> describes each one. The caller passes a <code>struct mnt_id_req</code> (<code>size</code>, <code>spare</code>, <code>mnt_id</code>, <code>param</code>, <code>mnt_ns_id</code>); for <code>listmount</code>, <code>mnt_id</code> is the mount whose descendants are listed and <code>param</code> is the last id returned by the previous call, for paging. The return value is the number of ids written; a full array means the caller should call again with <code>param</code> set to the last id. The call is read-only.</p>
+<p>Constants below are from <code>/usr/include/linux/mount.h</code> (kernel-headers 6.17.4 on this host): <code>struct mnt_id_req</code> at line 198, the request sizes at lines 207-208, <code>LSMT_ROOT</code> at line 232 and <code>LISTMOUNT_REVERSE</code> at line 233.</p>
+<p>The ids are the 64-bit unique mount ids (also reported by <code>statx</code> with <code>STATX_MNT_ID_UNIQUE</code>), not the reusable ids printed in <code>mountinfo</code>. Listing mounts in another namespace, or below a mount the caller cannot reach from its root, needs privilege over that namespace.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>req-&gt;size</code> is <code>MNT_ID_REQ_SIZE_VER0</code> (24) or <code>MNT_ID_REQ_SIZE_VER1</code> (32, which adds <code>mnt_ns_id</code>); any other size, or a nonzero reserved <code>spare</code>, gives <code>EINVAL</code>.</li>
+<li>F2: <code>req-&gt;mnt_id</code> names the mount whose descendants are listed by its unique id, or is <code>LSMT_ROOT</code> (<code>0xffffffffffffffff</code>) for the namespace's root mount; an id that names no mount in the target namespace gives <code>ENOENT</code>.</li>
+<li>F3: <code>req-&gt;param</code> is 0 for the first page, or the last id of the previous page to continue after it.</li>
+<li>F4: <code>req-&gt;mnt_ns_id</code> (VER1 only) selects another mount namespace by its id; 0 means the caller's namespace. Listing another namespace, or below a mount outside the caller's root, without privilege over it gives <code>EPERM</code>.</li>
+<li>F5: <code>nr_mnt_ids</code> caps how many ids are written to <code>mnt_ids</code>; the return value is the count actually written.</li>
+<li>F6: <code>flags</code> <code>LISTMOUNT_REVERSE</code> (0x1): list later (larger-id) mounts first.</li>
+<li>F7: any other <code>flags</code> bit: <code>EINVAL</code>.</li>
+<li>F8: <code>req</code> or <code>mnt_ids</code> not accessible: <code>EFAULT</code>.</li>
+<li>F9: kernel older than 6.8: <code>ENOSYS</code>, the same errno Hermit returns for every call.</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: nondeterministic</code> (changed from conditional). The output is nothing but unique mount ids, and those come from a kernel-wide counter that only grows. Any mount created at the start of a run, by a container setup or by the guest, gets a different id in every run, even on one host, and so does any namespace id passed in F4. Which mounts appear, and how many pages they need (F3, F5), depend on the host's mount table and on concurrent mounts and unmounts. Only error results (F1, F7, F8) repeat; the success path does not for any argument.</p>
+<p>The migrated body said conditional, from the legacy classification. It is changed to nondeterministic for the reason above, and to match <code>statmount</code>, whose ids come from the same counter.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>Unique mount ids and mount-namespace ids, allocated from kernel-wide increasing counters</li>
+<li>Mount-namespace contents and concurrent mounts or unmounts, which change the listed set and the paging</li>
+<li>Capability checks against the caller's namespace (F4) and kernel version (F9)</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>refuse</code>. The code at hermit f4055eb9cae4 already realizes it:</p>
+<ul>
+<li><code>classify_syscall</code> lists <code>listmount</code> among the Determinized syscalls (<code>detcore/src/syscall_classification.rs:381</code>), and <code>is_mount_introspection_enosys_syscall</code> includes it (<code>detcore/src/syscall_classification.rs:1190-1200</code>). The doc comment (<code>detcore/src/syscall_classification.rs:1182-1189</code>) says <code>listmount</code> reads mount ids and topology, which are not part of a deterministic guest's modeled state.</li>
+<li>In <code>handle_syscall_event</code> (<code>detcore/src/lib.rs:1892</code>), the dispatch match (<code>detcore/src/lib.rs:2028</code>) returns <code>Err(Errno::ENOSYS)</code> for this predicate (<code>detcore/src/lib.rs:2110-2114</code>). It does not read <code>req</code> and does not inject the syscall, so <code>mnt_ids</code> is never written and the answer is the same for F1-F9.</li>
+<li>The arm does not consult <code>panic_on_unsupported_syscalls</code> (contrast the <code>rseq</code> arm at <code>detcore/src/lib.rs:2031-2037</code>), so the answer is <code>ENOSYS</code> with and without fail-closed mode, matching <code>refused_only_when_fail_closed: false</code>.</li>
+<li>The predicate is in the deterministic refusal set (<code>detcore/src/syscall_classification.rs:1331</code>); the unit test <code>mount_introspection_syscalls_are_determinized_and_consistent</code> (<code>detcore/src/syscall_classification.rs:2377</code>) pins the classification and the membership.</li>
+</ul>
+<p>Why <code>refuse</code>:</p>
+<ul>
+<li><code>ENOSYS</code> is what every kernel before 6.8 returns (F9), so callers that prefer <code>listmount</code> must already fall back to <code>/proc/self/mountinfo</code>. Hermit sanitizes that file: reads of <code>/proc/&lt;pid&gt;/mountinfo</code> are recognized (<code>detcore/src/procfs.rs:684</code>) and rewritten by <code>sanitize_mountinfo</code> (<code>detcore/src/procfs.rs:3429</code>), with device numbers taken from the same run-global pool as <code>stat</code>/<code>statx</code> (<code>detcore/src/procfs.rs:491-498</code>).</li>
+<li><code>passthrough</code> would return the ever-increasing host ids directly.</li>
+<li><code>model</code> would need virtual unique ids that stay consistent with <code>statmount</code>, with <code>statx</code>'s <code>STATX_MNT_ID_UNIQUE</code> and with the <code>mountinfo</code> sanitizer. <code>listmount</code> alone is useless without <code>statmount</code>, which is also refused, so modelling one without the other gains nothing.</li>
+</ul>
+<p>The legacy recommendation was NEEDS-HANDLER. The old Summary text, which described replacing a temporary catch-all policy, is superseded: the refusal is explicit at this SHA.</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F2, F3, F4, F5): a VER1 request for mount id 1 with <code>param</code> 0, <code>mnt_ns_id</code> 0, a 64-entry array and <code>flags</code> 0 returns <code>ENOSYS</code> under <code>hermit run --verify</code> on ptrace, in both default and fail-closed (<code>--panic-on-unsupported-syscalls</code>) runs. Existing candidates: <code>tests/c/listmount_enosys.c</code> through cell <code>c-programs/listmount-enosys</code> (<code>tests/e2e/manifests/c-programs.yaml:2989</code>, verify <code>ci: ptrace: true</code>), and <code>mount_introspection_syscalls_fall_back_deterministically</code> at <code>hermit-cli/tests/mount_introspection.rs:30</code>, which runs that guest with <code>--backend=ptrace</code>, <code>--strict</code>, <code>--verify</code> and <code>--panic-on-unsupported-syscalls</code>.</li>
+<li>T2 (covers F2, F6, F7): <code>LSMT_ROOT</code> with <code>flags</code> 0, with <code>LISTMOUNT_REVERSE</code>, and with an undefined flag bit, on an array pre-filled with a sentinel. Every call must return <code>ENOSYS</code> and the sentinel must be unchanged.</li>
+<li>T3 (covers F1, F4, F8, F9): a 16-byte request, a made-up <code>mnt_ns_id</code>, and NULL <code>req</code>/<code>mnt_ids</code> each return <code>ENOSYS</code> rather than <code>EINVAL</code>, <code>EPERM</code>/<code>ENOENT</code> or <code>EFAULT</code>.</li>
+<li>T4 (covers F2, F3): a guest that tries <code>listmount</code> first and falls back to parsing <code>/proc/self/mountinfo</code> on <code>ENOSYS</code> prints the same mount list in both <code>--verify</code> runs.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant B of https://github.com/rrnewton/hermit/issues/632: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch pred:is_mount_introspection_enosys_syscall, refused.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; refuse (Detcore returns ENOSYS for every call without touching the kernel, detcore/src/lib.rs:2110-2114, as a pre-6.8 kernel does; callers fall back to /proc/self/mountinfo, which detcore/src/procfs.rs:3429 sanitizes); linux_determinism conditional -&gt; nondeterministic (unique mount ids come from a kernel-wide increasing counter, so they differ every run); 9 flag behaviours and 4 tests listed; existing ptrace candidates for T1 named but no run result seen and one request shape exercised, so tracking_status stays todo and ptrace_verification untested</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+listmount&amp;amp;body=Discussion+for+the+%60listmount%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Flistmount.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60listmount%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `listmount`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: listmount&quot; (https://github.com/rrnewton/hermit/issues/632), legacy variant B.</p>
+<h3>Legacy tracking note (2026-07-24)</h3>
+<p>Filed by the complete syscall-classification audit. The implementation classifies <code>PASS-THRU</code> entries under fixed-container/stable-state assumptions and routes all other entries through the explicit unsupported policy until a deterministic handler is implemented.</p>
+<p>The legacy Determinism analysis said <code>listmount</code> &quot;enumerates host mount-namespace state and mount identifiers that require virtualization&quot;. That claim is kept in the analysis above; the conclusion drawn from it changed from &quot;virtualize&quot; to &quot;refuse&quot;, for the reasons under Hermit design.</p>
+</body></html>

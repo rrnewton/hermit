@@ -1,0 +1,86 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sched_getparam | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>sched_getparam</code> (143)</h1>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; linux determinism: conditional &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+sched_getparam&amp;body=Discussion+for+the+%60sched_getparam%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsched_getparam.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60sched_getparam%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>sched_getparam(pid, param)</code> reads a thread's static scheduling priority into a <code>struct sched_param</code>. Detcore answers from its fixed virtual scheduling state without asking the host: <code>handle_sched_getparam</code> writes priority 0 and returns 0 (<code>detcore/src/syscalls/threads.rs:2183</code>). That is an <code>emulate</code> policy. This body keeps it and proposes adding the argument checks Linux makes, which the handler skips today.</p>
+<p>Manual reference: <a href="https://man7.org/linux/man-pages/man2/sched_setparam.2.html">sched_getparam(2)</a> (shared page with <code>sched_setparam</code>).</p>
+<h2>Linux semantics</h2>
+<p>The kernel handles the call in this order:</p>
+<p>1. A NULL <code>param</code> or a negative <code>pid</code> is <code>EINVAL</code>. 2. The target is looked up. <code>pid == 0</code> is the calling thread, and any other value can be any live thread ID, not only a thread-group leader. No match is <code>ESRCH</code>. 3. A Linux security module may refuse with <code>EPERM</code>. Without one, any caller may read any thread's priority. 4. The priority is <code>rt_priority</code> for a thread running <code>SCHED_FIFO</code> or <code>SCHED_RR</code>, from 1 to 99, and 0 for every other policy. 5. The result is copied out. An unwritable <code>param</code> is <code>EFAULT</code>, found only after the lookup, so a missing target with a bad pointer is <code>ESRCH</code>.</p>
+<p>The 2026-07-24 host trace under Additional information shows the common case: <code>sched_getparam(0, [0]) = 0</code>.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>pid == 0</code>: the calling thread</li>
+<li>F2: <code>pid &gt; 0</code>: any live thread ID, including a thread that is not a thread-group leader</li>
+<li>F3: <code>pid &lt; 0</code> or a NULL <code>param</code>: <code>EINVAL</code></li>
+<li>F4: no task has ID <code>pid</code>: <code>ESRCH</code></li>
+<li>F5: the target runs <code>SCHED_FIFO</code> or <code>SCHED_RR</code>: its real-time priority, 1 to 99</li>
+<li>F6: the target runs any other policy: 0</li>
+<li>F7: <code>param</code> is unwritable: <code>EFAULT</code>, after the target lookup</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: conditional</code>, kept from the legacy classification. The answer is the target's current priority, which is fixed unless something outside the program changes it:</p>
+<ul>
+<li>the policy and priority the program inherited from its launcher (a launcher such as <code>chrt -f 10</code> makes the answer 10; F5);</li>
+<li>other processes changing the thread's priority, for example a host <code>chrt -p</code>;</li>
+<li>whether a thread with ID <code>pid</code> exists (F4).</li>
+</ul>
+<p>For a program started normally and not changed from outside, every thread reports 0, so the call is deterministic in practice. The conditions above are what make it <code>conditional</code> and not <code>deterministic</code>.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>Scheduling policy and priority inherited from the launcher</li>
+<li>Changes made by processes outside the program</li>
+<li>Whether the target thread exists</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>model</code> (owner decision 7, 2026-10-04). The p3 plan in the next paragraphs was <code>emulate</code> against a fixed policy; the Target paragraph at the end of this section replaces it. Today Detcore presents one scheduling policy, <code>SCHED_OTHER</code>, for every thread (<code>VIRTUAL_CURRENT_POLICY</code>, <code>detcore/src/syscalls/threads.rs:112</code>), and <code>sched_setparam</code>, <code>sched_setscheduler</code> and <code>sched_setattr</code> never change it. So the priority is always 0, and <code>sched_getparam</code> should report it after Linux's argument checks:</p>
+<ul>
+<li><code>EINVAL</code> for a negative <code>pid</code> or NULL <code>param</code> (F3), as <code>handle_sched_setattr</code> does for the same clause (<code>detcore/src/syscalls/threads.rs:2327</code>).</li>
+<li><code>ESRCH</code> when <code>pid</code> is not a live guest thread, answered from Detcore's task table with <code>thread_is_live</code> (<code>detcore/src/syscalls/threads.rs:2423</code>), which accepts any live thread and not only leaders (F2, F4).</li>
+<li>Write <code>sched_priority = 0</code> and return 0 (F1, F6).</li>
+<li><code>EFAULT</code> when the write fails (F7).</li>
+<li>F5 cannot occur, because no guest thread is ever real-time under Detcore, whatever the launcher's policy was.</li>
+</ul>
+<p>The code at hermit f4055eb9cae4 realizes the value but not the checks. The typed arm (<code>detcore/src/lib.rs:2656</code>) calls <code>handle_sched_getparam</code>, which writes <code>sched_param { sched_priority: 0 }</code> only if <code>param</code> is not NULL (<code>detcore/src/syscalls/threads.rs:2188</code> to <code>detcore/src/syscalls/threads.rs:2190</code>) and returns 0. It never looks at <code>pid</code>. So:</p>
+<ul>
+<li>F1, F2 and F6 match Linux for a normally started program.</li>
+<li>F3 differs: a NULL <code>param</code> returns 0 without writing, and a negative <code>pid</code> writes 0 and returns 0. Linux gives <code>EINVAL</code> for both.</li>
+<li>F4 differs: a PID with no guest thread returns 0 instead of <code>ESRCH</code>.</li>
+<li>F7: a failed write propagates whatever error the memory layer reports. <code>handle_sched_setattr</code> notes that the backend reports a failed read as <code>EIO</code> and maps it to <code>EFAULT</code> (<code>detcore/src/syscalls/threads.rs:2336</code>). Whether a failed write is also <code>EIO</code> was not checked; if it is, <code>sched_getparam</code> returns an errno Linux never gives here.</li>
+</ul>
+<p>Why the p3 plan chose <code>emulate</code>: it treated the guest-visible state as a constant, the same constant <code>sched_getscheduler</code> (<code>detcore/src/lib.rs:2655</code>) and <code>sched_getattr</code> (<code>detcore/src/syscalls/threads.rs:2218</code>) report, so there is nothing to model. <code>passthrough</code> would report the launcher's real priority and break <code>--verify</code> across launchers. Adding the checks needs no new state.</p>
+<p>Target (owner decision 7, with decision 6): <code>sched_getparam</code> reports <code>rt_priority</code> from the target thread's virtual scheduling record, the per-thread record that <code>sched_setscheduler</code>, <code>sched_setparam</code> and <code>sched_setattr</code> write (kept in Detcore's thread state next to <code>timer_slack_ns</code>, <code>detcore/src/tool_local.rs:1795</code>, and copied at clone as at <code>detcore/src/lib.rs:1555</code>). The record starts as <code>SCHED_OTHER</code> priority 0, whatever the launcher's real policy, so T3 still holds; after a guest thread records <code>SCHED_FIFO</code> or <code>SCHED_RR</code>, its priority is reported (F5). A fork child inherits the parent's record, except that <code>SCHED_RESET_ON_FORK</code> resets a real-time policy to <code>SCHED_OTHER</code> priority 0 (kernel <code>sched_fork()</code>). The checks follow the kernel's order (sched_getparam(2); kernel <code>sys_sched_getparam()</code>): <code>EINVAL</code> for a negative <code>pid</code> or NULL <code>param</code> (F3), <code>ESRCH</code> from <code>thread_is_live</code> (<code>detcore/src/syscalls/threads.rs:2423</code>) (F2, F4), then the copy-out, whose failure is <code>EFAULT</code> (F7). Today the handler writes 0 without reading <code>pid</code> (<code>detcore/src/syscalls/threads.rs:2188</code> to <code>detcore/src/syscalls/threads.rs:2190</code>).</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F2, F6): under <code>hermit run --verify</code> on ptrace, <code>sched_getparam</code> with <code>pid = 0</code>, with a forked child's PID and with a second thread's TID each returns 0 and writes priority 0. Existing coverage: none on ptrace. The compat corpus row <code>chrt</code> (<code>tests/e2e/manifests/compat.yaml:185</code>) runs <code>chrt -p $$</code> on ptrace, but <code>handle_sched_getattr</code>'s doc says it is what makes <code>chrt</code> work (<code>detcore/src/syscalls/threads.rs:2220</code>), so that row probably reaches <code>sched_getattr</code> and not <code>sched_getparam</code>; this was not traced.</li>
+<li>T2 (covers F3, F4): <code>pid = -1</code> gives <code>EINVAL</code>, a NULL <code>param</code> gives <code>EINVAL</code>, and a PID with no guest thread gives <code>ESRCH</code>. Today Hermit returns 0 for all three.</li>
+<li>T3 (covers F5): launch Hermit under host <code>chrt -f 10</code>; the guest still reads priority 0 and <code>sched_getscheduler</code> still reports <code>SCHED_OTHER</code>, so the launcher's real-time policy does not reach the guest.</li>
+<li>T4 (covers F7): <code>param</code> pointing at an unmapped page gives <code>EFAULT</code>, and <code>param</code> pointing at an unmapped page with a PID that does not exist gives <code>ESRCH</code>, showing the lookup comes first.</li>
+<li>T5 (covers F2, F5): thread A calls <code>sched_setscheduler(0, SCHED_FIFO, {10})</code>; thread B's <code>sched_getparam(A's TID)</code> reports 10, and its own <code>sched_getparam(0)</code> reports 0. A child forked by A reports 10; a child forked after <code>sched_setscheduler(0, SCHED_FIFO | SCHED_RESET_ON_FORK, {10})</code> reports 0. Output is identical across both runs of <code>hermit run --verify</code> on ptrace. Today Hermit reports 0 in every case.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/414: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch typed.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: linux_determinism stays conditional; target_policy investigate -&gt; emulate (constant SCHED_OTHER priority 0, which the handler already writes); the handler skips Linux's EINVAL and ESRCH checks and its EFAULT errno is unverified, so it does not yet fully realize the policy; 7 flag behaviours and 4 tests</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): decisions 7 and 6 applied (report rt_priority from the per-thread scheduling record, inherited at fork with SCHED_RESET_ON_FORK; Linux checks in kernel order); target_policy emulate -&gt; model; new T5; no open questions</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+sched_getparam&amp;amp;body=Discussion+for+the+%60sched_getparam%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsched_getparam.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60sched_getparam%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `sched_getparam`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: sched_getparam&quot; (https://github.com/rrnewton/hermit/issues/414), legacy variant A1. The handler carries <code>TODO-HUMAN-REVIEW(#720)</code> (<code>detcore/src/syscalls/threads.rs:2182</code>), from https://github.com/rrnewton/hermit/pull/720, which determinized the NUMA and CPU-scheduling calls.</p>
+<h3>2026-07-24 host strace evidence</h3>
+<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) with <code>strace -f -e trace=sched_getparam</code> on a direct <code>syscall()</code> harness (invoked with non-destructive query/no-op/failing arguments) and, where applicable, on common programs. Hermit then routed <code>sched_getparam</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code>. (That was the state on 2026-07-24; at f4055eb9cae4 the call is Determinized and handled as described above.)</p>
+<p>Observed strace line:</p>
+<pre><code>sched_getparam(0, [0])          = 0
+</code></pre>
+<hr>
+<p>*Autonomous syscall-classification sweep (ranks 151-250 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
+</body></html>

@@ -1,0 +1,68 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lsm_list_modules | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>lsm_list_modules</code> (461)</h1>
+<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_host_kernel_probe_syscall</code> &middot; linux determinism: conditional &middot; target policy: refuse &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+lsm_list_modules&amp;body=Discussion+for+the+%60lsm_list_modules%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Flsm_list_modules.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60lsm_list_modules%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>lsm_list_modules(ids, size, flags)</code> (Linux 6.8 and later) writes the IDs of the Linux Security Modules active on the running kernel, in their stacking order. Hermit refuses it with a fixed <code>ENOSYS</code> before anything reaches the host (<code>detcore/src/lib.rs:2329</code>), the answer a kernel without the LSM syscalls gives, consistent with its <code>ENOSYS</code> refusal of the sibling calls <code>lsm_get_self_attr</code> and <code>lsm_set_self_attr</code>.</p>
+<p>Manual reference: Linux man-pages lsm_list_modules(2).</p>
+<h2>Linux semantics</h2>
+<p><code>ids</code> points to an array of <code>u64</code>, and <code>size</code> points to a <code>u32</code> that holds the array's size in bytes on entry. The kernel rejects a non-zero <code>flags</code> with <code>EINVAL</code>, reads <code>*size</code>, and always writes back the size it needs (the number of active LSMs times 8). If the caller's buffer is too small it returns <code>E2BIG</code>; otherwise it writes one <code>LSM_ID_*</code> value per active module (<code>LSM_ID_CAPABILITY</code> 100, <code>LSM_ID_SELINUX</code> 101, <code>LSM_ID_SMACK</code> 102, <code>LSM_ID_TOMOYO</code> 103, <code>LSM_ID_APPARMOR</code> 104, <code>LSM_ID_YAMA</code> 105, <code>LSM_ID_LOADPIN</code> 106, <code>LSM_ID_SAFESETID</code> 107, <code>LSM_ID_LOCKDOWN</code> 108, <code>LSM_ID_BPF</code> 109, <code>LSM_ID_LANDLOCK</code> 110, <code>LSM_ID_IMA</code> 111, <code>LSM_ID_EVM</code> 112, <code>LSM_ID_IPE</code> 113, from <code>&lt;linux/lsm.h&gt;</code>) and returns the count. A bad <code>size</code> or <code>ids</code> pointer gives <code>EFAULT</code>.</p>
+<p>The list is fixed at boot: it depends on which LSMs the kernel was built with and on the <code>lsm=</code> boot parameter, and does not change while the system runs. The call needs no privilege and has no side effects. <code>capability</code> is always active, so on a kernel that has the call the list is never empty and a zero-sized query always gets <code>E2BIG</code>.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>flags</code> must be 0; any other value is <code>EINVAL</code>, checked before <code>size</code> is read.</li>
+<li>F2: size query: <code>*size</code> smaller than the needed size (for example 0 with <code>ids = NULL</code>) gives <code>E2BIG</code>, with the needed size written to <code>*size</code>.</li>
+<li>F3: full query: <code>*size</code> at least the needed size: the IDs are written to <code>ids</code> in stacking order, <code>*size</code> is set to the bytes used, and the return value is the number of modules.</li>
+<li>F4: bad pointers: an unreadable or unwritable <code>size</code>, or an unwritable <code>ids</code> when the buffer is large enough, gives <code>EFAULT</code>.</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: conditional</code>, changed from the legacy <code>nondeterministic</code>. The result is a pure function of the running kernel's build configuration and boot command line: two calls on the same booted host always return the same IDs in the same order, and nothing a process does changes them. It differs between hosts, kernel builds and boots with a different <code>lsm=</code>, and the call does not exist before Linux 6.8. That is host-configuration dependence, which this tracking set records as <code>conditional</code> (as for other calls that repeat given fixed host state), not run-to-run variation on one host.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>Host kernel version: before 6.8 the call returns <code>ENOSYS</code>.</li>
+<li>Host kernel configuration (<code>CONFIG_SECURITY_*</code>, <code>CONFIG_LSM</code>) and the <code>lsm=</code> boot parameter decide the set and the order (F2, F3).</li>
+<li>Distribution choices: an AppArmor host and an SELinux host return different lists.</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>refuse</code>. The code already does this at hermit f4055eb9cae4:</p>
+<ul>
+<li><code>lsm_list_modules</code> is classified <code>Determinized</code> (<code>detcore/src/syscall_classification.rs:556</code>); the comment at <code>detcore/src/syscall_classification.rs:544</code> gives the reason: it exposes the host's active security stack.</li>
+<li><code>is_host_kernel_probe_syscall</code> (<code>detcore/src/syscall_classification.rs:1277</code>) matches it, and the dispatch arm at <code>detcore/src/lib.rs:2329</code> returns <code>Err(Error::Errno(Errno::ENOSYS))</code>. Nothing is forwarded, neither <code>size</code> nor <code>ids</code> is read or written, and the answer does not depend on <code>--strict</code> or <code>--panic-on-unsupported-syscalls</code>.</li>
+<li>The predicate is part of <code>is_deterministically_refused_syscall</code> (<code>detcore/src/syscall_classification.rs:1334</code>), hence <code>refused: true</code>.</li>
+<li><code>lsm_list_modules</code> is the last row of the pinned syscall table, which <code>Sysno::iter()</code> skips. The Detcore unit test <code>passthru_opt_covers_the_final_row_of_the_pinned_table</code> (<code>detcore/src/lib.rs:3105</code>) records that it once ran natively under <code>--passthru-opt</code>, the default for <code>hermit record</code> and <code>hermit replay</code>, and now requires Detcore to subscribe it so the refusal applies there too.</li>
+</ul>
+<p>Under Hermit every row of F1 to F4 gives <code>-1</code>/<code>ENOSYS</code>, and <code>*size</code> keeps the caller's value.</p>
+<p>Why <code>refuse</code> and not the alternatives:</p>
+<ul>
+<li><code>passthrough</code> would make the guest see the host's security stack, which differs between the hosts Hermit runs on.</li>
+<li><code>emulate</code> with a fixed list (for example only <code>LSM_ID_CAPABILITY</code>) would be deterministic. It would, however, describe a kernel that has the LSM syscalls, while Hermit refuses the two calls added with it in Linux 6.8, <code>lsm_get_self_attr</code> and <code>lsm_set_self_attr</code>, with <code>ENOSYS</code> (<code>detcore/src/syscall_classification.rs:1207</code>, dispatched at <code>detcore/src/lib.rs:2150</code>). Presenting all three as absent is the consistent &quot;pre-6.8 kernel&quot; answer.</li>
+<li><code>model</code> has nothing to model: the call has no guest-controlled state.</li>
+</ul>
+<p>What remains is test evidence. The only test calls the size query with <code>ids = NULL</code> and <code>*size = 0</code> (<code>tests/c/lsm_list_modules_enosys.c:26</code>). Non-zero <code>flags</code>, a full-size buffer and bad pointers are not exercised.</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F2): <code>lsm_list_modules(NULL, &amp;size, 0)</code> with <code>size = 0</code> returns <code>-1</code>/<code>ENOSYS</code>, not <code>E2BIG</code>, and leaves <code>size</code> at 0, under <code>hermit run --strict --verify</code> on ptrace. Existing candidates: <code>tests/c/lsm_list_modules_enosys.c</code> in cell <code>c-programs/lsm-list-modules-enosys</code> (<code>tests/e2e/manifests/c-programs.yaml:3186</code>, verify ci on ptrace at <code>tests/e2e/manifests/c-programs.yaml:3205</code>), and <code>host_kernel_probes_fall_back_deterministically</code> (<code>hermit-cli/tests/host_kernel_probes.rs:30</code>), which compiles that guest and runs it with <code>--backend=ptrace</code> (<code>hermit-cli/tests/host_kernel_probes.rs:62</code>). The existing guest does not check that <code>size</code> is unchanged.</li>
+<li>T2 (covers F1, F3): with a 64-entry sentinel-filled <code>ids</code> buffer and <code>size = 512</code>, both <code>flags = 0</code> and <code>flags = 1</code> return <code>ENOSYS</code>; <code>ids</code> stays sentinel-filled and <code>size</code> stays 512.</li>
+<li>T3 (covers F4): a NULL <code>size</code> pointer, and an <code>ids</code> pointer to an unmapped page with a large <code>size</code>, return <code>ENOSYS</code>, never <code>EFAULT</code>.</li>
+<li>T4 (covers F2, F3): record and replay a guest that calls <code>lsm_list_modules</code> and branches on the result; replay reproduces <code>ENOSYS</code> without a host call. The existing cell has replay disabled (<code>tests/e2e/manifests/c-programs.yaml:3226</code>).</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant B of https://github.com/rrnewton/hermit/issues/639: linux_determinism nondeterministic (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch pred:is_host_kernel_probe_syscall, refused.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; refuse (detcore/src/lib.rs:2329 returns a fixed ENOSYS, matching the ENOSYS refusal of lsm_get_self_attr/lsm_set_self_attr); linux_determinism nondeterministic -&gt; conditional (the list is fixed per booted kernel and varies only with host build and boot configuration); 4 flag behaviours and 4 tests listed; no coverage token recorded, so tracking_status stays todo and ptrace_verification untested</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+lsm_list_modules&amp;amp;body=Discussion+for+the+%60lsm_list_modules%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Flsm_list_modules.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60lsm_list_modules%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `lsm_list_modules`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: lsm_list_modules&quot; (https://github.com/rrnewton/hermit/issues/639), legacy variant B.</p>
+<p>The dispatch arm and the predicate carry <code>TODO-HUMAN-REVIEW(PR-847)</code> tags (<code>detcore/src/lib.rs:2326</code>, <code>detcore/src/syscall_classification.rs:1271</code>); the human review they ask for has not been recorded in the code.</p>
+<h3>Legacy tracking note (2026-07-24)</h3>
+<p>Filed by the complete syscall-classification audit. The implementation classifies <code>PASS-THRU</code> entries under fixed-container/stable-state assumptions and routes all other entries through the explicit unsupported policy until a deterministic handler is implemented.</p>
+</body></html>

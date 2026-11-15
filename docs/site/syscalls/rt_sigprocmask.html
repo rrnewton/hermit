@@ -1,0 +1,85 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rt_sigprocmask | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>rt_sigprocmask</code> (14)</h1>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; linux determinism: conditional &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+rt_sigprocmask&amp;body=Discussion+for+the+%60rt_sigprocmask%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Frt_sigprocmask.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60rt_sigprocmask%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>rt_sigprocmask</code> reads and changes the calling thread's set of blocked signals. The kernel keeps the mask, and Hermit forwards every call to it after the kernel's own size and pointer checks, except that it removes <code>SIGSTKFLT</code> from any set the guest asks to block, because Hermit uses that signal as its preemption timer.</p>
+<h2>Linux semantics</h2>
+<p><code>rt_sigprocmask(how, set, oldset, sigsetsize)</code> is the raw form behind <code>sigprocmask(2)</code> and <code>pthread_sigmask(3)</code>. On x86_64 the mask is one 64-bit word, so <code>sigsetsize</code> must be 8. The call returns 0 or <code>-1</code> with <code>errno</code>.</p>
+<ul>
+<li>The mask belongs to one thread. A new thread or a <code>fork</code> child starts with its creator's mask, and <code>execve</code> keeps it, so a program's starting mask depends on the process that launched it.</li>
+<li>A blocked signal stays pending instead of being delivered. A standard signal raised several times while blocked is pending once; realtime signals queue.</li>
+<li>When the call unblocks a pending signal, the kernel delivers it on the way back to user space, so the handler runs before <code>rt_sigprocmask</code> appears to return.</li>
+<li>The kernel copies <code>set</code> in, applies it, and only then writes the old mask to <code>oldset</code>. An <code>EFAULT</code> on <code>oldset</code> therefore comes after the mask has already changed.</li>
+</ul>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>SIG_BLOCK</code> adds the signals in <code>set</code> to the mask.</li>
+<li>F2: <code>SIG_UNBLOCK</code> removes the signals in <code>set</code> from the mask.</li>
+<li>F3: <code>SIG_SETMASK</code> replaces the mask with <code>set</code>.</li>
+<li>F4: <code>set</code> NULL leaves the mask unchanged and ignores <code>how</code>, so the call is a pure query when <code>oldset</code> is given.</li>
+<li>F5: an unknown <code>how</code> with a non-NULL <code>set</code> gives <code>EINVAL</code> and leaves the mask unchanged; the kernel copies <code>set</code> first, so an inaccessible <code>set</code> gives <code>EFAULT</code> instead.</li>
+<li>F6: <code>oldset</code>, when not NULL, receives the mask as it was before the call.</li>
+<li>F7: <code>SIGKILL</code> and <code>SIGSTOP</code> cannot be blocked; they are dropped from <code>set</code> without an error.</li>
+<li>F8: <code>sigsetsize</code> other than 8 gives <code>EINVAL</code> before either pointer is read.</li>
+<li>F9: an inaccessible <code>set</code> gives <code>EFAULT</code> with the mask unchanged; an inaccessible <code>oldset</code> gives <code>EFAULT</code> after the mask has changed.</li>
+<li>F10: the mask is per thread, inherited by new threads and <code>fork</code> children, and kept across <code>execve</code>.</li>
+<li>F11: unblocking a pending signal delivers it before the call returns; a standard signal raised several times while blocked is delivered once.</li>
+<li>F12: glibc's wrappers silently drop signals 32 and 33, which glibc keeps for itself; the raw call blocks them like any other signal.</li>
+<li>F13: on Linux, signal 16 (<code>SIGSTKFLT</code>) is an ordinary signal: it can be blocked, and <code>oldset</code> and later queries report it as blocked.</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism</code> is <code>conditional</code>. The mask changes only through the thread's own calls, signal handler entry and return, and the calls that take a temporary mask (<code>rt_sigsuspend</code>, <code>ppoll</code>, <code>pselect6</code>, <code>epoll_pwait</code>). Given the same starting mask, every value the call returns is a function of the thread's earlier calls. The sources that break this:</p>
+<ul>
+<li>Inherited mask. <code>execve</code> keeps the mask, so a query returns whatever the launching shell, service manager or CI runner left blocked.</li>
+<li>Pending signals at unblock time. Whether a handler runs inside a <code>SIG_UNBLOCK</code> or <code>SIG_SETMASK</code> call (F11) depends on which signals are pending, which depends on when other threads, processes and timers sent them.</li>
+<li>Threads in one process each have their own mask, so which thread receives a process-directed signal depends on the masks at the moment of delivery and on scheduling.</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>model</code>. The kernel keeps the masks, and Detcore does not shadow them. Detcore keeps the kernel's argument checks while it keeps its own preemption signal deliverable. <code>handle_rt_sigprocmask</code> at <code>detcore/src/syscalls/signal.rs:499</code> (tagged <code>TODO-HUMAN-REVIEW(#1046)</code> at <code>detcore/src/syscalls/signal.rs:497</code>):</p>
+<ul>
+<li>Checks <code>sigsetsize</code> first (<code>detcore/src/syscalls/signal.rs:505</code>), so <code>EINVAL</code> comes before any <code>EFAULT</code> (F8).</li>
+<li>Forwards <code>SIG_UNBLOCK</code> and any unknown <code>how</code> unchanged (<code>detcore/src/syscalls/signal.rs:507-508</code>). Neither can block <code>SIGSTKFLT</code>, and the kernel's own <code>EINVAL</code> covers F5.</li>
+<li>For <code>SIG_BLOCK</code> and <code>SIG_SETMASK</code> with a <code>set</code>, reads the set through <code>read_kernel_sigset</code> (<code>detcore/src/syscalls/signal.rs:140</code>). That helper first injects the same <code>set</code> with <code>how = -1</code>, which the kernel copies and then rejects with <code>EINVAL</code>, so an <code>EFAULT</code> comes from the kernel's own copy and not from a ptrace read that can see a protected page (F9). Detcore then clears the <code>SIGSTKFLT</code> bit (<code>without_perf_event_signal</code>, <code>detcore/src/syscalls/signal.rs:126</code>), pushes the result on the guest stack, and injects the modified call with the guest's own <code>oldset</code> (<code>detcore/src/syscalls/signal.rs:509-521</code>). The kernel still writes <code>oldset</code>, so F6 and the <code>oldset</code> half of F9 are the kernel's behaviour.</li>
+<li>With a NULL <code>set</code>, forwards the query unchanged (<code>detcore/src/syscalls/signal.rs:523</code>).</li>
+<li>Uses <code>inject_with_retry</code> on every path, so a preemption by the tracer is retried instead of surfacing as <code>ERESTARTSYS</code> (<code>detcore/src/syscalls/signal.rs:519-520</code>).</li>
+<li>Does not go through <code>record_or_replay</code>: signals are not recorded (<code>detcore/src/syscalls/signal.rs:528-529</code>), and in record and replay the masks are rebuilt by re-executing the guest's own calls.</li>
+<li>When a signal arrives during a blocking syscall that Detcore emulates, reads the guest's mask from the kernel (<code>block_signals_for_disposition</code>, <code>detcore/src/syscalls/threads.rs:640</code>, called at <code>detcore/src/syscalls/threads.rs:1681-1682</code>) and skips signals the guest has blocked (<code>detcore/src/syscalls/threads.rs:590</code>), then restores the mask (<code>restore_signals_after_disposition</code>, <code>detcore/src/syscalls/threads.rs:666</code>).</li>
+<li>Charges <code>FAST_NS</code> of logical time (<code>detcore/src/syscall_time.rs:43-45</code>).</li>
+</ul>
+<p>The scheduler orders the threads of the guest, which makes the second and third sources in the analysis repeatable for signals that Hermit itself generates. The inherited mask stays an outside input.</p>
+<p>Why <code>model</code>: the kernel must hold the mask, because it delivers the signals, so <code>emulate</code> is not possible. <code>passthrough</code> would let a guest block <code>SIGSTKFLT</code> and stop preemption. <code>refuse</code> would break every program that uses threads or signal handlers.</p>
+<p>Where Hermit differs from Linux today (F13): a guest can never block <code>SIGSTKFLT</code>, and <code>oldset</code> and queries never show it blocked. The lit test <code>detcore/tests/lit/rt_sigprocmask/hermit-run.lit</code> pins &quot;SIGSTKFLT is not masked&quot; under Hermit for a full set with <code>SIG_BLOCK</code> and with <code>SIG_SETMASK</code>, where the native run says &quot;masked&quot;. The unit test <code>reserved_signal_is_removed_from_the_kernel_sized_mask_only</code> at <code>detcore/src/syscalls/signal.rs:861</code> checks the bit clearing.</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F2, F3, F4, F6): <code>SIG_SETMASK</code> to block <code>SIGUSR1</code> and <code>SIGUSR2</code>, a NULL-<code>set</code> query, <code>SIG_UNBLOCK</code> of <code>SIGUSR1</code>, <code>SIG_BLOCK</code> of <code>SIGUSR1</code>, then clear the mask, checking <code>oldset</code> and the query after each step. Existing candidate: <code>tests/c/sigprocmask_state.c</code> (cell <code>c-programs/sigprocmask-state</code>, <code>tests/e2e/manifests/c-programs.yaml:18101</code>, verify ci on ptrace).</li>
+<li>T2 (covers F5, F4): a raw call with <code>how = 3</code> and a valid <code>set</code> returns <code>EINVAL</code> and the mask is unchanged; with <code>how = 3</code> and a NULL <code>set</code> it returns 0; with <code>how = 3</code> and an inaccessible <code>set</code> it returns <code>EFAULT</code>.</li>
+<li>T3 (covers F7): <code>SIG_SETMASK</code> with a full set, then a query: <code>SIGKILL</code> and <code>SIGSTOP</code> are not in it, and <code>kill(getpid(), SIGKILL)</code> from a child still ends the process.</li>
+<li>T4 (covers F8, F9): raw calls check <code>EINVAL</code> for <code>sigsetsize</code> 9 with an inaccessible <code>set</code>, <code>EFAULT</code> for <code>set</code> on a <code>PROT_NONE</code> page, a valid <code>set</code> ending exactly at a page boundary, and <code>EFAULT</code> for an inaccessible <code>oldset</code> with a check that the mask did change. Existing candidate: <code>tests/c/signal_delivery_sequence.c</code> (cell <code>c-programs/signal-delivery-sequence</code>, <code>tests/e2e/manifests/c-programs.yaml:17172</code>, verify ci on ptrace): size-before-pointer at line 254, inaccessible <code>set</code> at line 315, page-boundary <code>set</code> at lines 382-390. It does not test an inaccessible <code>oldset</code>.</li>
+<li>T5 (covers F10): a blocked signal stays blocked in a new thread, in a <code>fork</code> child and after <code>execve</code>; four threads changing their own masks concurrently do not see each other's changes. Existing candidates: <code>signal_masks_survive_fork_and_clone</code> at <code>hermit-cli/tests/signal_determinism.rs:384</code> and <code>pending_signal_and_mask_survive_exec</code> at <code>hermit-cli/tests/signal_determinism.rs:408</code> (they choose their backend with <code>format!(&quot;--backend={backend}&quot;)</code> at <code>hermit-cli/tests/signal_determinism.rs:191</code>, so they cannot be coverage tokens); <code>tests/c/sigmask_preemption.c</code> (cell <code>c-programs/sigmask-preemption</code>, <code>tests/e2e/manifests/c-programs.yaml:8070</code>, verify ci on ptrace), which runs <code>pthread_sigmask</code> <code>SIG_BLOCK</code>/<code>SIG_SETMASK</code> in a loop on several threads.</li>
+<li>T6 (covers F11, F1, F3): block <code>SIGUSR1</code>, raise it five times, check that it is pending once, restore the mask with <code>SIG_SETMASK</code>, and check that the handler ran exactly once before the call returned. Existing candidate: <code>main</code> in <code>tests/c/signal_delivery_sequence.c:425</code>.</li>
+<li>T7 (covers F12): block signals 32 and 33 with a raw call and read them back as blocked; do the same through <code>sigprocmask(3)</code> and check that glibc dropped them.</li>
+<li>T8 (covers F13): block <code>SIGSTKFLT</code> alone and in a full set, then query. Record what Hermit reports: by the code and the lit test, <code>SIGSTKFLT</code> is never shown as blocked, where Linux shows it. This documents the divergence; whether it should change is the open question below. Existing candidate: <code>detcore/tests/lit/rt_sigprocmask/main.c</code> with <code>detcore/tests/lit/rt_sigprocmask/hermit-run.lit</code>, which runs with <code>--no-sequentialize-threads --no-deterministic-io</code> rather than under <code>--verify</code>.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · created for v1: no tracking issue existed for this pinned Sysno; code at this SHA: determinized, dispatch typed.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy model (the kernel keeps the per-thread mask; Detcore keeps the kernel's size and pointer checks and strips SIGSTKFLT from SIG_BLOCK and SIG_SETMASK sets); linux_determinism stays conditional (inherited mask, pending signals at unblock time); 13 flag behaviours and 8 tests listed; open question for the owner on the SIGSTKFLT divergence, so tracking_status stays todo</li>
+<li>2026-10-05 · hermit f4055eb9cae4 · syscall-tracking-2 · covered: T6 covered by tests/c/signal_delivery_sequence.c (C08 review of the 2026-10-04 coverage proposals; guest source read at this SHA, not run by this agent)</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+rt_sigprocmask&amp;amp;body=Discussion+for+the+%60rt_sigprocmask%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Frt_sigprocmask.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60rt_sigprocmask%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `rt_sigprocmask`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Created by the syscall-tracking v1 migration on 2026-10-03. No tracking issue existed for <code>rt_sigprocmask</code>: the 2026-07-24 classification campaign filed issues only for syscalls in the old temporary pass-through block, and Detcore already handled this one.</p>
+<h3>Open questions</h3>
+<ul>
+<li>Should a guest be able to see <code>SIGSTKFLT</code> as blocked? Today Hermit silently drops it from every set the guest blocks (F13), because Reverie uses it as the preemption timer. A guest that blocks all signals and then checks its mask sees a difference from Linux; <code>detcore/tests/lit/rt_sigprocmask/hermit-run.lit</code> pins it. This is the same contract question as for <code>rt_sigaction</code> (the comment at <code>detcore/src/syscalls/signal.rs:79-85</code> calls it &quot;genuinely open&quot;); one possible answer is a virtual bit that <code>oldset</code> reports while the kernel mask leaves the signal deliverable. The owner decides.</li>
+</ul>
+</body></html>

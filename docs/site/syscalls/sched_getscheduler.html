@@ -1,0 +1,74 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sched_getscheduler | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>sched_getscheduler</code> (145)</h1>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; linux determinism: conditional &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+sched_getscheduler&amp;body=Discussion+for+the+%60sched_getscheduler%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsched_getscheduler.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60sched_getscheduler%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p>Returns the Linux scheduling policy of a thread. Hermit returns SCHED_OTHER (0) for every call without contacting the kernel. The target keeps that fixed answer and adds Linux's pid validation.</p>
+<h2>Linux semantics</h2>
+<p><code>sched_getscheduler(pid)</code> in Linux 6.9 (kernel/sched/core.c):</p>
+<ul>
+<li><code>pid &lt; 0</code> gives EINVAL.</li>
+<li><code>pid</code> 0 means the calling thread. Otherwise the kernel looks up any live task with that thread id, and an unknown id gives ESRCH.</li>
+<li>On success it returns the policy number: SCHED_OTHER 0, FIFO 1, RR 2, BATCH 3, IDLE 5, DEADLINE 6, or EXT 7 on kernels with sched_ext. If the thread has the reset-on-fork flag set, the result has SCHED_RESET_ON_FORK (0x40000000) ORed in.</li>
+<li>It writes no memory.</li>
+</ul>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>pid</code> selection. 0 is the calling thread; a positive value names any live thread, including a non-leader thread; a negative value gives EINVAL; an id that names no live task gives ESRCH.</li>
+<li>F2: the returned value. It is the thread's policy number, ORed with SCHED_RESET_ON_FORK (0x40000000) when that flag is set. A thread inherits both from its parent at fork, and both survive execve.</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p>On Linux the answer is the thread's real policy. That value is inherited, so it is whatever the launcher had, unless the guest changed it. Hermit launched under <code>chrt -b</code>, under a systemd unit with CPUSchedulingPolicy, or by a parent with reset-on-fork set, would show that host setting to the guest. ESRCH depends on whether the host's task table holds the id. Within one launch environment, a query of the calling thread repeats. linux_determinism stays conditional.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>Inherited host scheduling policy and the reset-on-fork flag (F2).</li>
+<li>The host task table, for ESRCH (F1).</li>
+</ul>
+<h2>Hermit design</h2>
+<p><strong>What the code does today (hermit f4055eb9cae4).</strong></p>
+<ul>
+<li>detcore/src/lib.rs:2654-2655 is commented &quot;Report the fixed default policy SCHED_OTHER (0)&quot; and returns <code>Ok(0)</code> for every call.</li>
+<li>The surrounding block comment (detcore/src/lib.rs:2638-2644) and the determinism argument at detcore/src/syscall_classification.rs:318-325 explain why: Detcore replaces the Linux scheduler, so the Linux policy cannot affect guest-visible computation. A fixed answer removes the inherited host value. The call is listed as determinized at detcore/src/syscall_classification.rs:336.</li>
+<li>The answer agrees with the other policy getters. <code>sched_getattr</code> writes SCHED_OTHER (detcore/src/syscalls/threads.rs:2242), the value named <code>VIRTUAL_CURRENT_POLICY</code> at detcore/src/syscalls/threads.rs:107-112. <code>sched_getparam</code> writes priority 0 (detcore/src/syscalls/threads.rs:2176-2193).</li>
+</ul>
+<p><strong>Gap.</strong> The arm ignores <code>pid</code>. <code>pid = -1</code> returns 0 where Linux gives EINVAL, and a thread id that names no task returns 0 where Linux gives ESRCH.</p>
+<p><strong>p3 plan: emulate</strong> (the Target paragraph at the end of this section replaces it under owner decision 7). Keep the fixed SCHED_OTHER answer, and add Linux's checks in kernel order:</p>
+<p>1. <code>pid &lt; 0</code> gives EINVAL. 2. A nonzero <code>pid</code> that names no live Detcore thread gives ESRCH. Use the scheduler's own task table, as <code>handle_sched_setattr</code> does at detcore/src/syscalls/threads.rs:2423 with <code>thread_is_live</code>, not the host's.</p>
+<p>Why the p3 plan ruled out the alternatives:</p>
+<ul>
+<li><strong>Not passthrough.</strong> Passing the call to the kernel would show the guest the inherited host policy.</li>
+<li><strong>Not refuse.</strong> <code>chrt -p</code> (the <code>chrt</code> row at tests/e2e/manifests/compat.yaml:185) and runtimes that inspect their own policy need an answer.</li>
+<li><strong>Not model.</strong> Modelling would mean reporting what the guest set through <code>sched_setscheduler</code> or <code>sched_setattr</code>, including SCHED_RESET_ON_FORK. That depends on the open question recorded in the sched_setscheduler body. Today detcore/tests/misc/mod.rs:313-315 pins the fixed answer: SCHED_OTHER even after a successful SCHED_FIFO request.</li>
+</ul>
+<p>Target (owner decision 7, with decision 6): return the policy in the target thread's virtual scheduling record, ORed with SCHED_RESET_ON_FORK when the record's flag is set (F2). The record is the per-thread state that <code>sched_setscheduler</code> and <code>sched_setattr</code> write, kept in Detcore's thread state next to <code>timer_slack_ns</code> (<code>detcore/src/tool_local.rs:1795</code>). It starts as SCHED_OTHER without the flag, whatever the launcher's real policy, so T2's launcher check still holds. A fork or clone child copies the record (as at <code>detcore/src/lib.rs:1555</code>), except that a set reset-on-fork flag gives the child SCHED_OTHER with the flag clear (kernel <code>sched_fork()</code>); <code>execve</code> keeps it. The checks follow the kernel's order (sched_getscheduler(2); kernel <code>sys_sched_getscheduler()</code>): <code>pid &lt; 0</code> gives EINVAL, then a <code>pid</code> with no live guest thread gives ESRCH from <code>thread_is_live</code> (<code>detcore/src/syscalls/threads.rs:2423</code>) (F1). The assertion at detcore/tests/misc/mod.rs:315 changes to expect SCHED_FIFO. Today the arm returns 0 for every call (<code>detcore/src/lib.rs:2655</code>).</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1): under <code>hermit run --verify</code> on ptrace: <code>sched_getscheduler(-1)</code> gives EINVAL; a thread id that never existed gives ESRCH; <code>sched_getscheduler(gettid())</code> of a live non-leader thread and <code>sched_getscheduler(0)</code> both return 0.</li>
+<li>T2 (covers F2): launch the guest from a parent whose real policy is SCHED_BATCH, set with <code>chrt -b 0</code>, which needs no privilege. The guest must still see 0 from <code>sched_getscheduler(0)</code>, so the host policy does not leak. The <code>sched_getscheduler(0) == SCHED_OTHER</code> assertion in detcore/tests/misc/mod.rs:315 (<code>timer_slack_prctl_and_procfs_share_virtual_state</code>) pins the p3 fixed answer after a SCHED_FIFO request; under the target it expects SCHED_FIFO instead (T3).</li>
+<li>T3 (covers F1, F2): read-back under <code>hermit run --verify</code> on ptrace. After <code>sched_setscheduler(0, SCHED_FIFO, {1})</code>, <code>sched_getscheduler(0)</code> returns SCHED_FIFO, and a sibling thread's <code>sched_getscheduler(&lt;that TID&gt;)</code> returns the same while its own <code>sched_getscheduler(0)</code> returns SCHED_OTHER. After <code>sched_setscheduler(0, SCHED_OTHER | SCHED_RESET_ON_FORK, &amp;zero)</code> the answer is 0x40000000. A child forked from a SCHED_FIFO parent reports SCHED_FIFO before and after <code>execve</code>; a child forked from a <code>SCHED_FIFO | SCHED_RESET_ON_FORK</code> parent reports SCHED_OTHER. Today Hermit returns 0 in every case.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/415: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch typed.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; emulate (fixed SCHED_OTHER per lib.rs:2655, plus pid EINVAL/ESRCH validation that is missing today); linux_determinism conditional kept; 2 flag behaviours and 2 tests; left todo pending the owner question on a modelled read-back policy.</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): decisions 7 and 6 applied (report the per-thread virtual policy with SCHED_RESET_ON_FORK, fork inheritance per sched_fork; pid EINVAL then ESRCH); target_policy emulate -&gt; model; new T3; T2's stays-0 clause replaced by T3; removed the open question on modelling the read-back</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+sched_getscheduler&amp;amp;body=Discussion+for+the+%60sched_getscheduler%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsched_getscheduler.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60sched_getscheduler%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `sched_getscheduler`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: sched_getscheduler&quot; (https://github.com/rrnewton/hermit/issues/415), legacy variant A1.</p>
+<h3>2026-07-24 host strace evidence</h3>
+<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) with <code>strace -f -e trace=sched_getscheduler</code> on a direct <code>syscall()</code> harness, invoked with arguments that query, do nothing, or fail, and on common programs where applicable. At that time the call had not yet been classified. At hermit f4055eb9cae4 it is determinized (detcore/src/syscall_classification.rs:336).</p>
+<p>Observed strace line:</p>
+<pre><code>sched_getscheduler(0)           = 0 (SCHED_OTHER)
+</code></pre>
+<hr>
+<p>*Autonomous syscall-classification sweep of the calls that were then awaiting classification in <code>syscall_classification.rs</code>. Host testing + analysis only; no code change proposed here.*</p>
+</body></html>

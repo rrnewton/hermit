@@ -1,0 +1,112 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mlock | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>mlock</code> (149)</h1>
+<p>Strategy: <strong>passthrough</strong> &middot; dispatch: <code>sysno-guard</code> &middot; linux determinism: conditional &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+mlock&amp;body=Discussion+for+the+%60mlock%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fmlock.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60mlock%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>mlock(addr, len)</code> locks the pages covering <code>[addr, addr + len)</code> into RAM: the kernel faults them in now and keeps them resident until they are unlocked or unmapped. Detcore passes the call to the kernel unchanged (<code>detcore/src/lib.rs:2843</code>). Its result therefore depends on the host's real <code>RLIMIT_MEMLOCK</code>, while Detcore tells the guest that limit is unlimited.</p>
+<h2>Linux semantics</h2>
+<p>Order of checks, from the probes below and upstream <code>do_mlock</code>:</p>
+<ul>
+<li>Without <code>CAP_IPC_LOCK</code> and with a soft <code>RLIMIT_MEMLOCK</code> of 0, every call returns <code>EPERM</code>, even with <code>len == 0</code>.</li>
+<li><code>addr</code> is rounded down and <code>addr + len</code> rounded up to page boundaries. <code>len == 0</code> then returns 0.</li>
+<li>Without <code>CAP_IPC_LOCK</code> (checked in the initial user namespace, so container root does not have it), the pages already locked plus the new range must fit the soft <code>RLIMIT_MEMLOCK</code>, or the call returns <code>ENOMEM</code>. Pages that are already locked are not counted twice.</li>
+<li>Each mapping in the range is marked locked, in address order. A hole stops the walk with <code>ENOMEM</code>, and the pages before the hole stay locked.</li>
+<li>The pages are then faulted in, which breaks copy-on-write for private writable mappings. A fault failure is reported as <code>ENOMEM</code> (for example a <code>PROT_NONE</code> mapping, which stays marked locked) or as <code>EAGAIN</code> when the kernel cannot get the memory.</li>
+</ul>
+<p>Locks do not nest: one <code>munlock</code> undoes any number of <code>mlock</code> calls on a page. They are not inherited by <code>fork</code>, and <code>execve</code> and <code>munmap</code> remove them. The locked total shows in <code>/proc/self/status</code> (<code>VmLck</code>) and per mapping in <code>/proc/self/smaps</code> (<code>Locked</code>, and <code>lo</code> in <code>VmFlags</code>).</p>
+<p>Host results measured for this issue on Linux 7.1.3 as an unprivileged user with a soft limit of 1059890176 bytes: <code>len == 0</code> returns 0; a 1-byte lock at <code>addr + 100</code> locks 4 kB; a length that wraps returns <code>ENOMEM</code>; a range with a hole returns <code>ENOMEM</code> with the first page left locked (<code>VmLck</code> 4 kB); an unmapped range returns <code>ENOMEM</code>; a <code>PROT_NONE</code> page returns <code>ENOMEM</code> and still raises <code>VmLck</code> from 0 to 4 kB; 64 MiB succeeds; locking a page twice and unlocking once leaves <code>VmLck</code> 0. With the soft limit at 2 pages, 2 pages succeed and 4 more return <code>ENOMEM</code>; with the limit at 0 every call returns <code>EPERM</code>.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>len == 0</code>: returns 0 and locks nothing (but see F4 for a zero limit)</li>
+<li>F2: page rounding: the locked range runs from <code>addr</code> rounded down to <code>addr + len</code> rounded up</li>
+<li>F3: a fully mapped, accessible range: every page is faulted in and locked; copy-on-write is broken for private writable mappings; <code>VmLck</code>, smaps <code>Locked</code> and the <code>lo</code> flag change; returns 0</li>
+<li>F4: the soft <code>RLIMIT_MEMLOCK</code> in force, without <code>CAP_IPC_LOCK</code> in the initial user namespace: <code>ENOMEM</code> when the new total would exceed the soft limit (already-locked pages count once); <code>EPERM</code> for every call when the soft limit is 0. Under owner decision 5 the limit in force is the one <code>getrlimit</code> and <code>prlimit64</code> report to the guest, so these errors come exactly at the reported limit</li>
+<li>F5: <code>addr + len</code> wraps: <code>ENOMEM</code> when the limit check fails first, <code>EINVAL</code> when there is no effective limit, so the errno depends on the limit</li>
+<li>F6: an unmapped range or a range with a hole: <code>ENOMEM</code>; pages before the hole remain locked</li>
+<li>F7: a <code>PROT_NONE</code> mapping: <code>ENOMEM</code>, but the mapping stays marked locked</li>
+<li>F8: the kernel cannot fault the pages in (memory or memory-cgroup pressure): <code>EAGAIN</code></li>
+<li>F9: lifetime: locks do not nest, are not inherited by <code>fork</code>, and are removed by <code>munmap</code> and <code>execve</code>; a range locked on fault by <code>mlock2(MLOCK_ONFAULT)</code> becomes fully locked</li>
+<li>F10: mappings the kernel will not lock (<code>VM_IO</code>/<code>VM_PFNMAP</code> device mappings, hugetlb, DAX, <code>memfd_secret</code> memory): skipped without an error and not counted (from upstream source, not probed here)</li>
+<li>F11: host-enforced limit below the reported one: infrastructure error (owner decision 5 interim). When the host's real <code>RLIMIT_MEMLOCK</code> is below the one the guest was told, the <code>ENOMEM</code> (or <code>EPERM</code> at a host limit of 0) it causes is reported as <code>HERMIT_HOST_NONDETERMINISM cause=host-rlimit syscall=mlock errno=&lt;ENOMEM|EPERM&gt;</code>, not handed to the guest</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: conditional</code>. For a fixed memory map the outcome follows from the guest's own mappings (F1 to F3, F6, F7, F9, F10). Three inputs come from outside the process:</p>
+<ul>
+<li>the soft <code>RLIMIT_MEMLOCK</code> inherited from the launching shell, which differs between hosts (F4, F5);</li>
+<li><code>CAP_IPC_LOCK</code> in the initial user namespace (F4, F5);</li>
+<li>host memory and memory-cgroup pressure (F8).</li>
+</ul>
+<p>So the same program can lock 16 MiB on one host and get <code>ENOMEM</code> on another, and a call near the limit can change result when pressure changes. Locking does not change what a program computes.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>The host's real <code>RLIMIT_MEMLOCK</code> and <code>CAP_IPC_LOCK</code> (F4, F5, F11).</li>
+<li>Host memory and memory-cgroup pressure (F8).</li>
+</ul>
+<h3>Cross-host variation</h3>
+<ul>
+<li>Host soft <code>RLIMIT_MEMLOCK</code> inherited at launch: how much the guest can lock before <code>ENOMEM</code>, <code>EPERM</code> for every call when it is 0, and whether a wrapping length gives <code>ENOMEM</code> or <code>EINVAL</code> (F4, F5, F11). The guest is told the limit is unlimited.</li>
+<li><code>CAP_IPC_LOCK</code> of the user running Hermit, in the initial user namespace: with it, the limit does not apply (F4, F5).</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>model</code> (the code at hermit f4055eb9cae4 passes it through).</p>
+<p>What the code does today:</p>
+<ul>
+<li><code>classify_syscall</code> returns <code>PassThrough</code> for <code>mlock</code> in the &quot;ISSUE-REVIEWED PASS-THROUGH SYSCALLS&quot; block (<code>detcore/src/syscall_classification.rs:816</code>). The block's comment at <code>detcore/src/syscall_classification.rs:808</code> says these remain conditional on Hermit's fixed-container and stable-state assumptions, and <code>detcore/src/syscall_classification.rs:811</code> carries <code>TODO-HUMAN-REVIEW(PR-643)</code>. The unit test <code>representative_policies_stay_in_their_reviewed_sections</code> pins it (<code>detcore/src/syscall_classification.rs:2105</code>).</li>
+<li>Dispatch is the generic arm at <code>detcore/src/lib.rs:2843</code>, which calls <code>passthrough</code> (<code>detcore/src/lib.rs:367</code>). Under record and replay, <code>passthru_opt</code> (<code>detcore/src/lib.rs:3140</code>) leaves it unsubscribed (<code>detcore/src/lib.rs:1084</code>), so replay runs it live on the replay host.</li>
+</ul>
+<p>Why passthrough is not enough:</p>
+<ul>
+<li><strong>The guest is told the limit is unlimited.</strong> Detcore's per-process <code>ResourceLimits</code> default every limit to <code>RLIM64_INFINITY</code> except <code>RLIMIT_STACK</code> and <code>RLIMIT_NOFILE</code> (<code>detcore/src/tool_local.rs:279</code>), so <code>getrlimit</code> and <code>prlimit64</code> report an unlimited <code>RLIMIT_MEMLOCK</code> (<code>detcore/src/syscalls/sysinfo.rs:163</code>, <code>detcore/src/syscalls/sysinfo.rs:222</code>). The guest cannot change it: any real change to a limit other than <code>STACK</code>, <code>NOFILE</code> and <code>CORE</code> returns <code>EPERM</code> (<code>detcore/src/syscalls/sysinfo.rs:147</code>). The doc comment at <code>detcore/src/syscalls/sysinfo.rs:212</code> says these limits are not enforced on the host.</li>
+<li><strong>The host still enforces its own limit.</strong> A guest that believes it has no limit gets <code>ENOMEM</code> or <code>EPERM</code> from the host's real limit (F4, F5), and the threshold differs between hosts. A run and its replay on different hosts can disagree.</li>
+<li><strong>What Detcore already hides.</strong> <code>VmLck</code> in <code>/proc/self/status</code> is reported as 0 (<code>detcore/src/procfs.rs:1372</code>, rewritten at <code>detcore/src/procfs.rs:1437</code>). smaps <code>Locked</code> is kept from the host (<code>detcore/src/procfs.rs:3033</code>). <code>mincore</code> reports every page resident whatever is locked (<code>handle_mincore</code>, <code>detcore/src/syscalls/memory.rs:203</code>).</li>
+</ul>
+<p>Target (owner decision 5, 2026-10-04: limits become real and deterministic): the <code>RLIMIT_MEMLOCK</code> the guest reads is the limit in force, so F4 and F5 happen exactly at the reported limit and nowhere else. Hermit gets there in one of two ways, chosen per resource: Detcore enforces the reported limit itself, checking the range against the guest's mappings so F2, F6 and F7 keep Linux's errors and counting locked pages against the reported soft limit; or Hermit configures the guest's host <code>RLIMIT_MEMLOCK</code> to the reported value at launch and on each accepted <code>setrlimit</code>/<code>prlimit64</code>, and the kernel's own check then matches what the guest was told. Either way <code>EAGAIN</code> from host pressure (F8) is not handed to the guest.</p>
+<p>Target, narrowed by the decision-5 refinement (owner, 2026-10-04: &quot;I'm also fine with this resource limit proposal&quot;; standing least-common-denominator policy): <code>mlock</code> is unsupported and returns <code>EPERM</code> for every call. That is what Linux returns when the soft <code>RLIMIT_MEMLOCK</code> is 0 and <code>CAP_IPC_LOCK</code> is absent in the initial user namespace: <code>do_mlock</code> calls <code>can_do_mlock</code> (<code>mm/mlock.c</code>) before it rounds the range or walks the mappings, so a hole, a <code>PROT_NONE</code> page and <code>len == 0</code> all get <code>EPERM</code> too (F4). The reported <code>RLIMIT_MEMLOCK</code> is 0, soft and hard, so the answer matches what the guest reads, and a raise is <code>EPERM</code>, so the guest can never make a lock legal. Detcore answers without calling the host, so nothing is locked physically: smaps <code>Locked</code> stays 0 and <code>lo</code> never appears, as on Linux after a refused call. Host pressure (F8) and the host's own limit (F11) can no longer reach the guest. Most programs that lock memory treat <code>EPERM</code> as the ordinary unprivileged case (gpg, for example, warns about insecure memory and continues); a program that requires the lock fails as it would for an unprivileged user. This settles the mechanism question and replaces the two routes above for <code>mlock</code>.</p>
+<p>Interim, until <code>RLIMIT_MEMLOCK</code> reaches the target (F11): a failure caused by a host limit that the reported limit would not predict is a determinism failure, not a guest failure, and is reported as <code>HERMIT_HOST_NONDETERMINISM cause=host-rlimit syscall=mlock errno=&lt;NAME&gt;</code> through the infrastructure-error convention. Today it reaches the guest unchanged through the plain passthrough (<code>detcore/src/syscall_classification.rs:816</code>, <code>detcore/src/lib.rs:2843</code>); that is the gap. A host-limit <code>ENOMEM</code> cannot be told apart from a hole <code>ENOMEM</code> after the fact, so detecting it needs Detcore's own range check before the call, or the configure route, where a host hard limit below the reported value is found once at launch.</p>
+<h3>Gaps and open points</h3>
+<ul>
+<li>No test at this SHA calls <code>mlock</code> under Hermit.</li>
+<li>Other calls lock memory or charge <code>RLIMIT_MEMLOCK</code> too: <code>mmap</code> with <code>MAP_LOCKED</code> (Linux returns <code>EPERM</code> when <code>can_do_mlock</code> fails), <code>shmctl(SHM_LOCK)</code>, <code>perf_event_open</code> buffers and <code>io_uring</code> buffer registration. With the reported limit at 0, each must answer as Linux does at a limit of 0, or the host's real limit shows through. Their own bodies own that; this body only records the dependency.</li>
+</ul>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F2, F3): under <code>hermit run --verify</code> on ptrace, <code>mlock(addr, 0)</code>, <code>mlock(addr + 100, 1)</code> and a 64 MiB lock of a private writable mapping all return <code>EPERM</code>; smaps shows <code>Locked: 0 kB</code> and no <code>lo</code> flag for the mapping, the same in both runs. Fails at this SHA, where the passthrough returns 0 on a host with a nonzero limit.</li>
+<li>T2 (covers F4, F5): raw <code>getrlimit</code> and <code>prlimit64</code> report <code>RLIMIT_MEMLOCK</code> as 0 soft and hard; <code>setrlimit</code> raising either limit returns <code>EPERM</code>; <code>mlock(addr, 0)</code> and <code>mlock</code> with a wrapping length both return <code>EPERM</code>, because the permission check comes first. Fails at this SHA, which reports the limit as unlimited (<code>detcore/src/tool_local.rs:279</code>).</li>
+<li>T3 (covers F6, F7): a range with a hole, a fully unmapped range and a <code>PROT_NONE</code> page all return <code>EPERM</code>, not <code>ENOMEM</code>, and smaps afterwards shows no locked page in any of them.</li>
+<li>T4 (covers F8): under a memory cgroup too small for the request, the call still returns <code>EPERM</code>: the result does not depend on host pressure. This needs a cgroup the CI host can create.</li>
+<li>T5 (covers F9): <code>mlock</code> on a page twice returns <code>EPERM</code> both times and <code>munlock</code> returns 0; <code>mlock2(MLOCK_ONFAULT)</code> on the range returns <code>EPERM</code>; a forked child and an <code>execve</code>d image show no lock in smaps.</li>
+<li>T6 (covers F10): <code>mlock</code> over a <code>memfd_secret</code> or hugetlb mapping returns <code>EPERM</code>, and smaps shows no <code>lo</code> flag on it.</li>
+<li>T7 (covers F11): launch Hermit with <code>prlimit --memlock=0:0</code> and again with <code>--memlock=8192:8192</code> on the launcher. In both, the guest's 64 KiB <code>mlock</code> returns <code>EPERM</code>, no <code>cause=host-rlimit</code> report appears, and the guest output equals that of a launch under the host's default limit. Today the guest gets the host's answer, which differs between the three launches.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-09-28 · hermit 81ca8822f78c · hermit2 · closed under the legacy rule (an explicit <code>classify_syscall</code> arm), not the v1 done rule; closing comment https://github.com/rrnewton/hermit/issues/290#issuecomment-5872839500</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/290: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy PASS-THRU; code at this SHA: passthrough, dispatch passthrough.</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · reopen: under the owner rule of 2026-10-02, closed means every flag and option is covered by a named test and the implementation works; mlock records no test coverage, so tracking_status is todo and https://github.com/rrnewton/hermit/issues/290 reopens.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: linux_determinism conditional kept (host RLIMIT_MEMLOCK, CAP_IPC_LOCK and memory pressure decide ENOMEM/EPERM/EAGAIN); target_policy passthrough -&gt; model (Detcore reports RLIMIT_MEMLOCK unlimited at tool_local.rs:279 while the host enforces its real limit); 10 flag behaviours and 6 tests; whether the model still locks physically is an open question for the owner, tracking_status todo</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d12 (owner decisions 1 and 2): cross_host_variant true (host RLIMIT_MEMLOCK, CAP_IPC_LOCK in the initial user namespace); host-transient U1 for the F8 EAGAIN under memory pressure; no open question resolved</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d5 (owner decision 5): target described (reported RLIMIT_MEMLOCK is the limit in force, enforced by Detcore or configured on the host; interim host-rlimit infrastructure error, passed through today at syscall_classification.rs:816 and lib.rs:2843); target_policy stays model; F4 narrowed to the limit in force; T2 rewritten as a guest-lowered at-limit test; new F11, T7; mechanism question narrowed (option c ruled out); added the unconfirmed standing-policy proposal as an open question</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d5r (owner approved the decision-5 refinement): target narrowed (mlock unsupported: EPERM for every call, as can_do_mlock gives at RLIMIT_MEMLOCK 0; reported limit 0 soft and hard; no host call, so no physical lock); target_policy stays model; T1-T7 now assert EPERM, with T7 showing the answer is the same under any host limit; removed host-transient U1 (T4 covers F8); removed open questions 1 (mechanism, now settled) and 2 (the proposal, now approved); new gap on other RLIMIT_MEMLOCK users (mmap MAP_LOCKED, shmctl SHM_LOCK, perf, io_uring)</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+mlock&amp;amp;body=Discussion+for+the+%60mlock%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fmlock.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60mlock%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `mlock`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: mlock&quot; (https://github.com/rrnewton/hermit/issues/290), legacy variant A1.</p>
+<p>Comment history: 1 comment(s) on https://github.com/rrnewton/hermit/issues/290.</p>
+<h3>2026-07-24 host strace evidence</h3>
+<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) by tracing a direct <code>syscall()</code> harness and common programs with <code>strace -f -e trace=mlock</code>, and by confirming hermit currently routes <code>mlock</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code> (the harness ran end-to-end under <code>hermit run</code>, exit 0, so passthrough does not crash).</p>
+<p>Observed strace line:</p>
+<pre><code>mlock(0x406000, 4096)           = 0
+</code></pre>
+<hr>
+<p>*Autonomous syscall-classification sweep, batch 3 (ranks 101-150 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
+<h3>Legacy closure</h3>
+<p>Closed 2026-09-28 by the 2026-09-28 sweep, which closed issues whose syscall had an explicit <code>classify_syscall</code> arm. Closing comment: https://github.com/rrnewton/hermit/issues/290#issuecomment-5872839500</p>
+</body></html>

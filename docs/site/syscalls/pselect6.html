@@ -1,0 +1,112 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pselect6 | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>pselect6</code> (270)</h1>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; linux determinism: nondeterministic &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+pselect6&amp;body=Discussion+for+the+%60pselect6%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fpselect6.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60pselect6%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>pselect6(nfds, readfds, writefds, exceptfds, timeout, sigmask_arg)</code> waits until a descriptor in one of three bitmaps is ready, the timeout expires, or a signal arrives. While it waits, it can swap in a temporary signal mask atomically. Detcore models the wait (<code>detcore/src/syscalls/io.rs:456</code>). Under sequentialized <code>hermit run</code>, it replaces the kernel's sleep with zero-timeout probes against a deadline in virtual time, and each probe carries the snapshotted temporary mask. Record/replay records the call's outputs.</p>
+<p>Manual reference: Linux man-pages select(2) (section &quot;pselect6&quot;), signal(7).</p>
+<h2>Linux semantics</h2>
+<p><code>pselect6</code> is the kernel entry point behind glibc's <code>pselect()</code>. The header of <code>tests/c/record_replay_select.c</code> says x86-64 glibc also issues <code>select()</code> as <code>pselect6</code>. The kernel call differs from the glibc wrapper in two ways:</p>
+<ul>
+<li>the sixth argument is a pointer to a two-word wrapper <code>{ const sigset_t *ss; size_t ss_len; }</code>, not a <code>sigset_t *</code></li>
+<li>the timeout is in-out: the kernel writes the time it did not sleep back into <code>*timeout</code>. glibc passes a private copy, so callers of the wrapper never see this.</li>
+</ul>
+<p>The kernel checks arguments in this order:</p>
+<p>1. copy the sigmask wrapper (<code>EFAULT</code>) 2. copy the timeout (<code>EFAULT</code>) 3. validate the timeout (<code>EINVAL</code>) 4. install the inner mask (<code>EINVAL</code> for a bad size, <code>EFAULT</code> for an unreadable mask) 5. check <code>nfds</code> and copy the descriptor sets</p>
+<p>On return, it writes the three sets back so they hold only the ready descriptors, writes back the remaining time, and restores the original signal mask. If the remaining-time copy faults, the result is kept. <code>nfds</code> is clamped to the size of the process's descriptor table. That table starts at one machine word (64 descriptors) and grows as descriptors are opened.</p>
+<p>Readiness is decided by whatever else touches the descriptors: other threads, other processes, the network, terminals. A signal handler that runs during the wait ends it with <code>EINTR</code>. Per signal(7), <code>pselect</code> is never restarted after a handler, even with <code>SA_RESTART</code>.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>nfds</code>: one more than the highest descriptor to test. Negative gives <code>EINVAL</code>. A value larger than the descriptor table is clamped to the table size; it is not an error.</li>
+<li>F2: <code>readfds</code>, <code>writefds</code>, <code>exceptfds</code>: in-out bitmaps, any of which may be NULL. On return each holds only the ready descriptors, and the call returns the total count of set bits (0 on timeout). A set bit naming a descriptor that is not open gives <code>EBADF</code>.</li>
+<li>F3: NULL <code>timeout</code>: wait without a time limit.</li>
+<li>F4: zero <code>timeout</code> (<code>{0, 0}</code>): test readiness once and return immediately. A zero timeout is not written back.</li>
+<li>F5: finite <code>timeout</code>: wait up to that long. The raw syscall writes the unslept remainder back to <code>*timeout</code>, also after <code>EINTR</code> and after an <code>EFAULT</code> on the sets. A fault during that copy-out is ignored and the result kept.</li>
+<li>F6: malformed <code>timeout</code> (negative <code>tv_sec</code>, or <code>tv_nsec</code> outside <code>[0, 1e9)</code>) gives <code>EINVAL</code>. An unreadable <code>timeout</code> gives <code>EFAULT</code>.</li>
+<li>F7: sigmask wrapper NULL, or wrapper with a NULL inner pointer: the signal mask is not changed.</li>
+<li>F8: sigmask wrapper with a non-NULL inner pointer: <code>ss_len</code> must be 8 (<code>EINVAL</code> otherwise). The mask replaces the thread's mask atomically for the duration of the wait and is restored on return. An unreadable wrapper or inner mask gives <code>EFAULT</code>.</li>
+<li>F9: argument validation order, as listed above: wrapper <code>EFAULT</code>, then timeout <code>EFAULT</code>, then timeout <code>EINVAL</code>, then mask size <code>EINVAL</code> and mask <code>EFAULT</code>, then <code>nfds</code> and the sets.</li>
+<li>F10: unreadable or unwritable descriptor sets give <code>EFAULT</code>, and the remaining time is still written back.</li>
+<li>F11: a signal handler runs during the wait: <code>EINTR</code>, never restarted even with <code>SA_RESTART</code>. If no handler runs (for example a stop and continue), the kernel restarts the call transparently.</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: nondeterministic</code>, kept from the legacy classification. When a descriptor becomes ready, whether the timeout fires first, and how much time is written back all depend on host scheduling and on a real clock. Whether a signal lands inside the wait depends on signal arrival time. The call repeats only for a zero timeout against descriptors whose state is already settled, for example <code>nfds = 0</code> or a pipe that is already readable.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>Readiness timing of the descriptors, set by peer threads, processes and outside I/O</li>
+<li>Timeout expiry against the real clock, and the remaining time written back</li>
+<li>Signal arrival relative to the wait, which decides between <code>EINTR</code> and a normal return</li>
+<li>The temporary mask, which decides which of those signals can interrupt the wait</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>model</code>. Detcore keeps the kernel as the judge of readiness and of argument errors, and replaces the sleep with a wait it schedules itself in virtual time. <code>handle_pselect6</code> (<code>detcore/src/syscalls/io.rs:456</code>) chooses among four paths:</p>
+<ul>
+<li><strong>Record/replay</strong> (<code>detcore/src/syscalls/io.rs:461-471</code>). The call goes through <code>record_or_replay_select_family</code> (<code>detcore/src/syscalls/io.rs:439-451</code>). A zero timeout takes a scheduler turn and is recorded. Any other timeout runs as <code>record_or_replay_blocking</code>, which deschedules the thread as blocking external I/O. The recorder captures the sets and the remaining time, so replay does not ask the live kernel.</li>
+<li><strong>Unsequentialized run</strong> (<code>detcore/src/syscalls/io.rs:472-474</code>): injected unchanged.</li>
+<li><strong>Sequentialized run, kernel-owned cases.</strong></li>
+<li>A negative <code>nfds</code> is injected so the kernel returns <code>EINVAL</code> (<code>detcore/src/syscalls/io.rs:476-478</code>).</li>
+<li>A zero timeout is injected as is (<code>detcore/src/syscalls/io.rs:526-528</code>).</li>
+<li><code>nfds</code> above 64 goes to <code>record_or_replay_blocking</code> (<code>detcore/src/syscalls/io.rs:534-538</code>), because the kernel's clamp to the table size cannot be reproduced from userspace.</li>
+<li><strong>Sequentialized run, modelled wait</strong> (<code>handle_internal_pselect6</code>, <code>detcore/src/syscalls/io.rs:572-691</code>):</li>
+<li>Before reading the wrapper, Detcore injects a validation probe: <code>nfds = 0</code> with the deliberately malformed timeout <code>{0, 1e9}</code> (<code>detcore/src/syscalls/io.rs:480-517</code>). This makes the kernel check the wrapper first, so F9 is kept, and the only accepted answer is <code>EINVAL</code>.</li>
+<li>The timeout is read and validated (<code>ppoll_timeout_duration</code>, <code>detcore/src/syscalls/io.rs:189-196</code>).</li>
+<li>A non-NULL inner mask must have size 8 (<code>detcore/src/syscalls/io.rs:549-553</code>). The mask is read and snapshotted, with Hermit's perf-event signal bit cleared by <code>sanitize_ppoll_signal_mask</code> (<code>detcore/src/syscalls/io.rs:386-389</code>). The wrapper is then dropped from the call, so later changes the guest makes to it cannot alter a retry (<code>detcore/src/syscalls/io.rs:564-566</code>).</li>
+<li>The deadline is virtual time plus the timeout (<code>detcore/src/syscalls/io.rs:580-583</code>).</li>
+<li>Each iteration takes an <code>InternalIOPolling</code> turn, restores the scratch copies of the original sets, re-zeroes the scratch timeout, and injects a probe that carries the snapshotted mask in a scratch wrapper (<code>detcore/src/syscalls/io.rs:613-662</code>). A pending signal that the mask unblocks therefore ends the probe with <code>EINTR</code> at a point the scheduler chose, not at host arrival time.</li>
+<li>A scheduler resume with <code>Signaled</code> returns <code>EINTR</code> (<code>detcore/src/syscalls/io.rs:643-650</code>). A non-zero probe result copies the sets back (<code>detcore/src/syscalls/io.rs:662-672</code>). Passing the deadline returns 0 with the sets copied (<code>detcore/src/syscalls/io.rs:674-683</code>).</li>
+<li>Every exit writes back <code>deadline - now</code> in virtual time and ignores a copy-out fault, as Linux does (<code>write_pselect6_remaining</code>, <code>detcore/src/syscalls/io.rs:705-727</code>).</li>
+</ul>
+<p>Why <code>model</code> and not the alternatives:</p>
+<ul>
+<li><code>passthrough</code> would leave a sequentialized thread asleep in the kernel holding the only guest turn. The comment at <code>detcore/src/syscalls/io.rs:540-548</code> records the earlier masked path, which ran as blocking external I/O and diverged the execution log of <code>make -jN</code>.</li>
+<li><code>emulate</code> cannot answer readiness without the kernel.</li>
+<li><code>refuse</code> would break glibc <code>select()</code> and <code>pselect()</code>, which almost every event loop uses.</li>
+</ul>
+<p>Target (owner decisions 13, 14): every sequentialized wait is a non-blocking probe plus a scheduler wait against a virtual-time deadline. The modelled path already does this (deadline from <code>thread_observe_time</code> at <code>detcore/src/syscalls/io.rs:580-583</code>, probes at <code>detcore/src/syscalls/io.rs:613-662</code>), and its per-probe mask is the shared answer for the masked family: ppoll's <code>ENOSYS</code> (<code>detcore/src/syscalls/io.rs:1039-1048</code>) is an interim refusal and epoll_pwait's masked kernel wait (<code>detcore/src/syscalls/io.rs:1217-1221</code>) is a decision-14 gap, both to be replaced by the same form. The remaining sequentialized gap is <code>nfds &gt; 64</code> (<code>detcore/src/syscalls/io.rs:534-538</code>): it must also become probe plus wait, with the bitmap read no longer than the kernel's copy (clamped to the descriptor table's <code>max_fds</code>, per the comment at <code>detcore/src/syscalls/io.rs:530-533</code>). It stays <code>model</code>, not <code>refuse</code>: glibc <code>select()</code> with <code>FD_SETSIZE</code> reaches it.</p>
+<p>What remains before the code fully realizes <code>model</code>:</p>
+<ul>
+<li><strong>`nfds &gt; 64` in sequentialized run.</strong> That case uses <code>record_or_replay_blocking</code> (<code>detcore/src/syscalls/io.rs:534-538</code>), whose doc comment (<code>detcore/src/syscalls/helpers.rs:108-110</code>) says it is valid only in record/replay or in unsequentialized run. The thread rejoins the schedule when the host kernel returns, so the completion point is host-decided. Callers that pass <code>FD_SETSIZE</code> (1024) take this path. That this diverges is a hypothesis from the code, not a measurement; T7 tests it.</li>
+<li><strong>Record mode with a non-zero timeout</strong> runs as blocking external I/O (<code>detcore/src/syscalls/io.rs:449</code>). The recording is faithful, but the point at which the thread rejoins during recording comes from the host.</li>
+<li>The validation probe returns <code>EIO</code> if a backend ever accepts the malformed timeout (<code>detcore/src/syscalls/io.rs:511</code>). Linux never does this, so it is only a backend guard.</li>
+</ul>
+<p><code>linux_determinism</code> stays <code>nondeterministic</code>. Hermit removes the timing sources for waits it models; it does not change what Linux does.</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F2, F4, F5): under <code>hermit run --strict --verify</code> on ptrace, check readiness and copy-out: a readable pipe with a 1 s timeout and a mask returns 1 with only that bit set; a drained pipe with a zero timeout returns 0; a 20 ms timeout returns 0; a raw call with <code>nfds = 0</code> writes back a remaining time of 0. Existing candidate: <code>tests/c/pselect6_simulation.c</code> <code>run_default_workload</code> (<code>tests/c/pselect6_simulation.c:189</code>), cell <code>c-programs/pselect6-simulation</code> (<code>tests/e2e/manifests/c-programs.yaml:6333</code>, verify ci and replay ci on ptrace). Also <code>pselect6_preserves_kernel_abi_and_unblocks_scheduler</code> at <code>hermit-cli/tests/pselect6_simulation.rs:30</code>, which checks the trace for the <code>Retry #1 ... pselect6(</code> probe line and then runs <code>--verify</code>.</li>
+<li>T2 (covers F3): a NULL-timeout wait on an empty pipe is woken by a second thread, without deadlocking the sequentialized scheduler. Existing candidates: the infinite wait in <code>tests/c/pselect6_simulation.c:389</code>, and <code>record_select_null_timeout_woken_by_thread</code> at <code>hermit-cli/tests/record_replay.rs:2283</code>.</li>
+<li>T3 (covers F1, F6, F10): a negative <code>nfds</code> gives <code>EINVAL</code>; <code>tv_nsec = 1e9</code> gives <code>EINVAL</code>; an unreadable timeout gives <code>EFAULT</code>; an unreadable set gives <code>EFAULT</code> with the remaining time still written back. Existing candidates: <code>tests/c/pselect6_simulation.c:235</code>, <code>:243</code>, <code>:253</code> and <code>:281</code>; <code>record_select_negative_nfds_preserves_einval</code> at <code>hermit-cli/tests/record_replay.rs:2273</code>.</li>
+<li>T4 (covers F7, F8, F9): the wrapper and mask rules. A NULL inner pointer leaves the mask alone. <code>ss_len = 4</code> gives <code>EINVAL</code>. An unreadable inner mask gives <code>EFAULT</code>. The validation order of F9 holds, including a wrapper split across a page edge. Existing candidates: <code>run_argument_validation_order</code> (<code>tests/c/pselect6_simulation.c:134</code>), <code>run_wrapper_boundary</code> (<code>tests/c/pselect6_simulation.c:67</code>), and the inaccessible-mask <code>EFAULT</code> in <code>tests/c/signal_delivery_sequence.c:333-348</code>. None of these asserts <code>EINVAL</code> for a wrong <code>ss_len</code> on its own.</li>
+<li>T5 (covers F8, F11): a signal whose handler is installed, blocked in the normal mask and unblocked by the temporary mask, sent from another thread during a 1 s wait, gives <code>EINTR</code> with a remaining time below 1 s. Run under <code>--verify</code>, so the point where the signal lands is identical across runs. Existing candidate: the interrupted wait at <code>tests/c/pselect6_simulation.c:347</code>.</li>
+<li>T6 (covers F2): <code>EBADF</code> for a set bit naming a closed descriptor, in both the modelled path and the zero-timeout path. No existing test asserts this.</li>
+<li>T7 (covers F1, F2): sequentialized <code>hermit run --verify</code> of a guest that calls <code>pselect6</code> with <code>nfds = FD_SETSIZE</code> and a wait that a peer thread ends, repeated in a loop. Record whether the run is deterministic. Record mode already covers this shape (<code>record_glibc_select_ready_pipe</code>, <code>hermit-cli/tests/record_replay.rs:2258</code>, whose guest runs an <code>FD_SETSIZE</code> call), but sequentialized run does not.</li>
+<li>T8 (covers F2, F5, F8): record and replay of ready, zero-timeout, <code>FD_SETSIZE</code> and timed-out shapes, with and without a real mask. Replay must reproduce the result, the sets and the remaining time. Existing candidates: <code>record_glibc_select_ready_pipe</code> (<code>hermit-cli/tests/record_replay.rs:2258</code>) and <code>record_pselect_with_signal_mask_ready_pipe</code> (<code>hermit-cli/tests/record_replay.rs:2263</code>), both driving <code>tests/c/record_replay_select.c</code>.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/384: linux_determinism nondeterministic (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch typed.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · facts-bot · code_facts changed: tests_naming 2 -&gt; 3.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; model (Detcore replaces the kernel sleep with zero-timeout probes that carry the snapshotted mask, against a virtual-time deadline; record/replay records the outputs); linux_determinism stays nondeterministic; 11 flag behaviours and 8 tests listed; open question about the nfds &gt; 64 path under sequentialized run; no coverage token yet, so tracking_status stays todo</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): applied decisions 13 and 14 (nfds &gt; 64 becomes probe plus scheduler wait; the per-probe mask is the shared form for ppoll and epoll_pwait); target_policy unchanged; no new F/T ids; removed both open questions and the heading.</li>
+<li>2026-10-05 · hermit f4055eb9cae4 · syscall-tracking-2 · covered: T1 covered by tests/c/pselect6_simulation.c, T2 covered by tests/c/pselect6_simulation.c, T8 covered by hermit-cli/tests/record_replay.rs (C08 review of the 2026-10-04 coverage proposals; guest source read at this SHA, not run by this agent)</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+pselect6&amp;amp;body=Discussion+for+the+%60pselect6%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fpselect6.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60pselect6%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `pselect6`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: pselect6&quot; (https://github.com/rrnewton/hermit/issues/384), legacy variant A1.</p>
+<p>The handler carries the review tag <code>TODO-HUMAN-REVIEW(#686)</code> (<code>detcore/src/syscalls/io.rs:455</code>, <code>detcore/src/lib.rs:2611</code>). It names https://github.com/rrnewton/hermit/pull/686, &quot;Determinize pselect6 and expand strict archive coverage&quot;.</p>
+<h3>2026-07-24 host strace evidence</h3>
+<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) with <code>strace -f -e trace=pselect6</code> on a direct <code>syscall()</code> harness (invoked with non-destructive query/no-op/failing arguments) and, where applicable, on common programs. Hermit currently routes <code>pselect6</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code>.</p>
+<p>Observed strace line:</p>
+<pre><code>pselect6(0, NULL, NULL, NULL, {tv_sec=0, tv_nsec=0}, NULL) = 0 (Timeout)
+</code></pre>
+<hr>
+<p>*Autonomous syscall-classification sweep (ranks 151-250 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
+<p>The paragraph above is historical (2026-07-24). At hermit f4055eb9cae4, <code>pselect6</code> has the typed handler described under Hermit design.</p>
+</body></html>

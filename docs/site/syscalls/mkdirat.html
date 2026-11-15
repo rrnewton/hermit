@@ -1,0 +1,102 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mkdirat | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>mkdirat</code> (258)</h1>
+<p>Strategy: <strong>passthrough</strong> &middot; dispatch: <code>passthrough</code> &middot; linux determinism: deterministic &middot; target policy: passthrough &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+mkdirat&amp;body=Discussion+for+the+%60mkdirat%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fmkdirat.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60mkdirat%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>mkdirat(dirfd, pathname, mode)</code> creates a directory at <code>pathname</code>, resolved against the directory open as <code>dirfd</code>, or against the working directory when <code>dirfd</code> is <code>AT_FDCWD</code>. Hermit forwards it to the host kernel unchanged. It relies on the guest's container filesystem being private and stable, and Detcore keeps no directory state of its own.</p>
+<h2>Linux semantics</h2>
+<p><code>mkdirat</code> is the directory-descriptor form of <code>mkdir</code>; <code>mkdir(path, mode)</code> is <code>mkdirat(AT_FDCWD, path, mode)</code> inside the kernel. The kernel looks up the parent of the last path component, starting from <code>dirfd</code> for a relative path and ignoring <code>dirfd</code> for an absolute one, and following symlinks in every earlier component. The last component must not exist, and a symlink there is never followed, so a dangling symlink also gives <code>EEXIST</code>. On success the kernel allocates an inode, sets its timestamps to the current time, and updates the parent's mtime, ctime and, on most filesystems, link count. The call returns 0 or a negative errno and never reports the new inode number or timestamps; a guest sees those only through the stat family. Errors are checked in path-walk order, so the errno is a function of <code>dirfd</code>, the path, the filesystem state, the credentials and the mount flags. The call takes no flags argument; unlike several other <code>*at</code> calls it has no <code>AT_EMPTY_PATH</code>.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: permission bits: the new directory gets <code>mode &amp; 0777 &amp; ~umask</code></li>
+<li>F2: special bits in <code>mode</code>: <code>S_ISVTX</code> (sticky) is kept, subject to the umask. <code>S_ISUID</code>, <code>S_ISGID</code> and file-type bits are ignored.</li>
+<li>F3: the parent has a default POSIX ACL: the umask is not applied and the new directory inherits the default ACL. The kernel combines <code>mode</code> with the ACL instead.</li>
+<li>F4: ownership: the owner is the caller's filesystem uid. The group is the caller's filesystem gid, unless the parent is setgid (or the filesystem is mounted <code>grpid</code>). In that case the new directory takes the parent's group and also gets <code>S_ISGID</code>.</li>
+<li>F5: <code>pathname</code> already exists as any type, including a symlink, dangling or not: <code>EEXIST</code></li>
+<li>F6: an intermediate component is missing, or <code>pathname</code> is empty: <code>ENOENT</code>. An intermediate component is not a directory: <code>ENOTDIR</code>.</li>
+<li>F7: trailing slashes are accepted: <code>mkdirat(dfd, &quot;d/&quot;, ...)</code> creates <code>d</code></li>
+<li>F8: search or write permission is denied on the path: <code>EACCES</code></li>
+<li>F9: a component is longer than <code>NAME_MAX</code>, or the path is longer than <code>PATH_MAX</code>: <code>ENAMETOOLONG</code>. Too many symlinks in the prefix: <code>ELOOP</code>.</li>
+<li>F10: <code>pathname</code> points outside the address space: <code>EFAULT</code></li>
+<li>F11: <code>pathname</code> lies under a read-only mount the guest can see: <code>EROFS</code></li>
+<li>F12: <code>dirfd == AT_FDCWD</code>: a relative <code>pathname</code> resolves against the calling process's working directory, inside its root and mount namespace</li>
+<li>F13: <code>dirfd</code> is an open directory, including an <code>O_PATH</code> one: a relative <code>pathname</code> resolves against it. Host check: an <code>O_PATH</code> directory descriptor worked.</li>
+<li>F14: <code>dirfd</code> is open but not a directory, with a relative <code>pathname</code>: <code>ENOTDIR</code>. <code>dirfd</code> is not open: <code>EBADF</code>.</li>
+<li>F15: an absolute <code>pathname</code> ignores <code>dirfd</code> entirely, even when it is not open. Host check: descriptor 9999 with an absolute path created the directory.</li>
+<li>F16: host-config failure: the host filesystem holding the parent does not support creating directories: <code>EPERM</code></li>
+<li>F17: host-config failure: <code>EMLINK</code> when the parent's link count is at the limit of the host filesystem (the limit depends on the filesystem: ext4 without the <code>dir_nlink</code> feature stops at 65000 subdirectories, while ext4 with it and tmpfs do not stop)</li>
+<li>F18: host-transient failures: <code>ENOSPC</code> (no space or no inodes) and <code>EDQUOT</code> (quota)</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p>The result is a function of the directory <code>dirfd</code> names, the filesystem state along the path, the umask, the caller's credentials and the mount flags. Nothing in the call depends on timing or on another thread. Under Hermit, threads run one at a time, so two guest threads racing on the same path get a fixed order. The descriptor number in <code>dirfd</code> is the guest's own, issued by an earlier <code>open</code>, so it repeats whenever the guest's descriptor history does. The call repeats exactly when the guest-visible filesystem starts in the same state and nothing outside the container changes it.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>Changes to the filesystem made outside the container. Hermit does not try to make a changing host filesystem deterministic.</li>
+<li>Host configuration behind F16 and F17: filesystem support and link limits. Host resources behind F18: free space, inode count and quota.</li>
+<li>Values the call creates but does not return: the inode number and timestamps. They become visible only through <code>stat</code>, <code>getdents</code> and similar calls, and are handled there.</li>
+</ul>
+<h3>Cross-host variation</h3>
+<ul>
+<li>Filesystem type and features under the guest's files: whether directory creation is supported (F16) and the parent's link-count limit that gives <code>EMLINK</code> (F17).</li>
+<li>Host mount options: on a filesystem mounted <code>grpid</code>, a new directory takes the parent's group even when the parent is not setgid (F4).</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>passthrough</code>. The code already does this. <code>mkdirat</code> is classified <code>PassThrough</code> at <code>detcore/src/syscall_classification.rs:731</code>, in the pass-through block that starts at <code>detcore/src/syscall_classification.rs:690</code>. The comment at <code>detcore/src/syscall_classification.rs:725</code> gives the condition: these calls &quot;repeat given stable guest-visible filesystem state with no external mutation&quot;. The generic arm <code>SyscallClassification::PassThrough =&gt; self.passthrough(guest, call).await</code> at <code>detcore/src/lib.rs:2843</code> forwards it.</p>
+<p>Why passthrough, not <code>model</code> or <code>emulate</code>:</p>
+<ul>
+<li>Hermit has no virtual filesystem. The directory tree in the guest's container mount namespace is the state, and only the kernel can apply F1 to F15 the same way the guest's other path syscalls see them.</li>
+<li>Every input that decides the result is container state Hermit already holds fixed, or another syscall's concern: <code>umask</code> is passed through at <code>detcore/src/syscall_classification.rs:724</code>, and <code>dirfd</code> comes from the guest's own earlier <code>open</code>.</li>
+<li>Its sibling <code>mkdir</code> (<code>detcore/src/syscall_classification.rs:730</code>) is passed through on the same grounds; the two must not diverge, because <code>mkdir</code> is <code>mkdirat(AT_FDCWD, ...)</code> in the kernel.</li>
+</ul>
+<p>Code facts show <code>subscribed_record_replay: false</code>: Detcore's <code>--passthru-opt</code> subscription leaves <code>mkdirat</code> out, so in that mode the call never reaches Detcore. <code>hermit record</code> has its own subscriptions, which the comment at <code>detcore/src/lib.rs:1078</code> places in a recorder module that is not in the exported tree. The integration test <code>record_mkdir_eexist_materialization_semantics</code> (<code>hermit-cli/tests/record_replay.rs:1479</code>) shows record/replay has <code>mkdirat</code>-specific replay behaviour: its doc comment at <code>hermit-cli/tests/record_replay.rs:1474</code> covers &quot;mkdirat's absolute-path rule that ignores an unusable dirfd&quot;. It drives <code>tests/c/record_replay_mkdir_eexist.c</code>, whose <code>mkdirat</code> calls are at line 31.</p>
+<p>The open gap is test evidence, not code. <code>tests_naming</code> is 0: no test names <code>SYS_mkdirat</code>. The existing run-mode coverage is one glibc <code>mkdirat()</code> call at <code>tests/c/mkdir_rmdir.c:77</code>, which creates a child relative to a directory descriptor (cell <code>c-programs/mkdir-rmdir</code>, <code>tests/e2e/manifests/c-programs.yaml:12575</code>, verify mode with ptrace in CI).</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F2, F12, F13): under <code>hermit run --verify</code> on ptrace, call raw <code>syscall(SYS_mkdirat, ...)</code> with <code>AT_FDCWD</code> after a <code>chdir</code>, with an <code>O_RDONLY|O_DIRECTORY</code> descriptor, and with an <code>O_PATH</code> descriptor. Use modes <code>0777</code>, <code>0755|S_ISVTX</code> and <code>0777|S_ISUID|S_ISGID</code> under umask <code>022</code> and <code>077</code>, and assert the exact <code>st_mode</code> from <code>fstatat</code>. Existing partial coverage via glibc <code>mkdirat()</code>: <code>tests/c/mkdir_rmdir.c:77</code> (relative to an <code>O_RDONLY|O_DIRECTORY</code> parent).</li>
+<li>T2 (covers F3): set a default ACL on the parent through <code>setxattr(&quot;system.posix_acl_default&quot;)</code> and create a child relative to the parent's descriptor under umask <code>077</code>. Assert that the child's mode and access ACL follow the default ACL. If the fixture filesystem lacks ACL support, the test fails rather than skips.</li>
+<li>T3 (covers F4): make the parent setgid and <code>chown</code> it to a second mapped group. Assert that the child's <code>st_gid</code> is the parent's group and that <code>S_ISGID</code> is set; assert that a child of a non-setgid parent takes the caller's gid.</li>
+<li>T4 (covers F5): assert <code>EEXIST</code> for an existing directory, a regular file, a symlink to an existing file, and a dangling symlink. Existing record/replay coverage: <code>tests/c/record_replay_mkdir_eexist.c:90</code> and <code>:91</code>, driven by <code>hermit-cli/tests/record_replay.rs:1479</code>.</li>
+<li>T5 (covers F6, F7): assert <code>ENOENT</code> for a missing parent and for <code>&quot;&quot;</code>, <code>ENOTDIR</code> when a regular file is an intermediate component, and that <code>&quot;newdir/&quot;</code> creates <code>newdir</code>.</li>
+<li>T6 (covers F8): assert <code>EACCES</code> when creating under a directory the guest cannot write. The filesystem-support <code>EPERM</code> is F16, recorded as U1; this test does not cover it.</li>
+<li>T7 (covers F9, F10): assert <code>ENAMETOOLONG</code> for a 256-byte component and a path over 4096 bytes, <code>ELOOP</code> for a symlink loop in the prefix, and <code>EFAULT</code> for <code>pathname = (char *)1</code>.</li>
+<li>T8 (covers F11): assert <code>EROFS</code> under a read-only mount the guest can see. <code>EMLINK</code> (F17) is recorded as U1, and <code>ENOSPC</code> and <code>EDQUOT</code> (F18) as U2; an <code>ENOSPC</code> from a small test-owned tmpfs would not cover F18, which is about host storage.</li>
+<li>T9 (covers F14, F15): assert <code>ENOTDIR</code> for a relative path with a regular-file descriptor and <code>EBADF</code> with a closed descriptor number. Then pass the closed descriptor number with an absolute path and assert that the directory is created.</li>
+<li>U1 (covers F16, F17; host-config): directory support and the link-count limit belong to the host filesystem under the guest's files, which the test does not choose. Hermit forwards the kernel's answer unchanged (<code>detcore/src/syscall_classification.rs:731</code>, <code>detcore/src/lib.rs:2843</code>).</li>
+<li>U2 (covers F18; host-transient): <code>ENOSPC</code> and <code>EDQUOT</code> come from host storage shared with other processes. The plain passthrough (<code>detcore/src/lib.rs:2843</code>) hands them to the guest today. F18 counts toward done only once Hermit hides these errors or reports them as infrastructure errors.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-09-28 · hermit 81ca8822f78c · hermit2 · closed under the legacy rule (an explicit <code>classify_syscall</code> arm), not the v1 done rule; closing comment https://github.com/rrnewton/hermit/issues/287#issuecomment-5872833051</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/287: linux_determinism deterministic (from <strong>Classification:</strong>); target_policy from legacy PASS-THRU; code at this SHA: passthrough, dispatch passthrough.</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · reopen: under the owner rule of 2026-10-02, closed means every flag and option is covered by a named test and the implementation works; mkdirat records no test coverage, so tracking_status is todo and https://github.com/rrnewton/hermit/issues/287 reopens.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: kept deterministic/passthrough (forwarded at detcore/src/lib.rs:2843, same grounds as mkdir); listed 15 flag behaviours (mkdir's 12 plus 3 dirfd cases) and 9 tests; no coverage token, because the only run-mode caller (tests/c/mkdir_rmdir.c:77) uses glibc mkdirat() for one case, so tracking_status stays todo</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d12 (owner decisions 1 and 2): cross_host_variant true (filesystem type and features, grpid mount option); filesystem-support EPERM split from F8 as new F16; F11 narrowed to EROFS with EMLINK split out as new F17 (host-config U1, with F16) and ENOSPC and EDQUOT as new F18 (host-transient U2); T6 and T8 narrowed; the open question on unreachable host errors is resolved by decision 1</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+mkdirat&amp;amp;body=Discussion+for+the+%60mkdirat%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fmkdirat.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60mkdirat%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `mkdirat`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: mkdirat&quot; (https://github.com/rrnewton/hermit/issues/287), legacy variant A1.</p>
+<p>Comment history: 1 comment(s) on https://github.com/rrnewton/hermit/issues/287.</p>
+<h3>Open questions</h3>
+<ul>
+<li>New inode numbers and timestamps are outside this issue. They belong to the stat family and getdents tracking.</li>
+</ul>
+<h3>2026-10-03 host errno probe</h3>
+<p>Run by syscall-tracking-p3 on the measurement host (Linux 7.1.3, btrfs, unprivileged uid, Python <code>os.mkdir(..., dir_fd=...)</code>): <code>&quot;m1/&quot;</code> created <code>m1</code>; <code>&quot;&quot;</code> gave <code>ENOENT</code>; a regular-file descriptor gave <code>ENOTDIR</code>; descriptor 9999 gave <code>EBADF</code>; an <code>O_PATH</code> directory descriptor succeeded; descriptor 9999 with an absolute path succeeded; raw <code>syscall(258, AT_FDCWD, (char *)1, 0777)</code> gave <code>EFAULT</code>. The same host showed glibc and Python <code>mkdir()</code> issuing <code>SYS_mkdir</code>, not <code>SYS_mkdirat</code>, and <code>os.mkdir(name, dir_fd=fd)</code> issuing <code>mkdirat(3, &quot;d3&quot;, 0777)</code>. This was the host, not Hermit.</p>
+<h3>2026-07-24 host strace evidence</h3>
+<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) by tracing a direct <code>syscall()</code> harness and common programs with <code>strace -f -e trace=mkdirat</code>, and by confirming hermit currently routes <code>mkdirat</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code> (the harness ran end-to-end under <code>hermit run</code>, exit 0, so passthrough does not crash).</p>
+<p>Observed strace line:</p>
+<pre><code>mkdirat(AT_FDCWD, &quot;/tmp/sysclass/hd2&quot;, 0755) = 0
+</code></pre>
+<hr>
+<p>*Autonomous syscall-classification sweep, batch 3 (ranks 101-150 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
+<h3>Legacy closure</h3>
+<p>Closed 2026-09-28 by the 2026-09-28 sweep, which closed issues whose syscall had an explicit <code>classify_syscall</code> arm. Closing comment: https://github.com/rrnewton/hermit/issues/287#issuecomment-5872833051</p>
+</body></html>

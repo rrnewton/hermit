@@ -1,0 +1,82 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mq_notify | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>mq_notify</code> (244)</h1>
+<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_unsupported_async_ipc_syscall</code> &middot; linux determinism: nondeterministic &middot; target policy: refuse &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+mq_notify&amp;body=Discussion+for+the+%60mq_notify%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fmq_notify.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60mq_notify%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>mq_notify(mqdes, sevp)</code> registers the calling process for a one-shot notification when a message arrives on an empty POSIX message queue, or removes that registration. Detcore refuses it with a fixed <code>ENOSYS</code> before the kernel sees it (<code>detcore/src/lib.rs:2237-2241</code>), as it refuses the whole <code>mq_*</code> family; that is what a kernel built without <code>CONFIG_POSIX_MQUEUE</code> returns.</p>
+<h2>Linux semantics</h2>
+<p>At most one process can be registered on a queue at a time. The notification fires when a message arrives on a queue that was empty and no thread is waiting in <code>mq_receive</code>/<code>mq_timedreceive</code>; a waiting receiver takes the message instead and the registration stays. Firing removes the registration, so the process must call <code>mq_notify</code> again to be told about the next message. The notification is delivered asynchronously, at a moment chosen by the sender's progress, not by the registered process.</p>
+<p>glibc implements <code>SIGEV_THREAD</code> in user space: it passes the kernel a netlink socket and a cookie, and a helper thread in the process starts the user's function when the kernel writes to that socket.</p>
+<p>No strace line was captured for this call (see Additional information).</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>sigev_notify == SIGEV_SIGNAL</code>: send <code>sigev_signo</code> to the registered process, with <code>si_code == SI_MESGQ</code>, the sender's PID and UID, and <code>sigev_value</code>. An invalid signal number gives <code>EINVAL</code>.</li>
+<li>F2: <code>sigev_notify == SIGEV_THREAD</code> at the syscall level: <code>sigev_signo</code> names a netlink socket descriptor and <code>sigev_value.sival_ptr</code> points to a cookie the kernel writes to that socket when the notification fires. A closed descriptor gives <code>EBADF</code> and a descriptor that is not a socket gives <code>ENOTSOCK</code>.</li>
+<li>F3: <code>sigev_notify == SIGEV_NONE</code>: register without any notification; the registration still blocks other processes and is removed when a message arrives.</li>
+<li>F4: <code>sevp == NULL</code>: remove the caller's registration. If the caller is not the registered process, the call still returns 0 and changes nothing.</li>
+<li>F5: another process is already registered: <code>EBUSY</code>.</li>
+<li>F6: one-shot firing: only on an empty-to-non-empty transition with no waiting receiver; firing removes the registration.</li>
+<li>F7: errors: <code>EBADF</code> if <code>mqdes</code> is not a message-queue descriptor; <code>EINVAL</code> for an unknown <code>sigev_notify</code>; <code>EFAULT</code> for a bad <code>sevp</code> pointer; <code>ENOMEM</code>.</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: nondeterministic</code>, kept from the legacy classification. The notification arrives when another process sends to the empty queue, so the moment it is delivered, relative to what the registered process is doing, depends on host scheduling. Whether a given message produces a notification also depends on whether a receiver happened to be waiting at that instant. For <code>SIGEV_SIGNAL</code> the signal interrupts the process at an arbitrary point. For <code>SIGEV_THREAD</code> a new thread is started at an arbitrary point. Registration can fail with <code>EBUSY</code> because a process outside the guest registered first.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>Asynchronous delivery timing, driven by other processes' sends</li>
+<li>Whether a receiver is waiting when a message arrives, which decides whether the notification fires</li>
+<li>Competition for the single registration slot with processes outside the guest</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target (owner decision 9, 6): <code>refuse</code> with a fixed <code>ENOSYS</code>, the answer of a kernel built without <code>CONFIG_POSIX_MQUEUE</code>, returned before any argument is examined, so a well-formed call and a garbage-argument call get the same <code>ENOSYS</code>. No unprivileged success case needs preserving, so decision 6's exceptions do not apply. A program that needs a message queue has to fall back to another IPC channel, such as a pipe, a Unix-domain socket or a mutex-guarded queue in shared memory; this body names no specific program that does so. Today's code already realizes the target (<code>detcore/src/lib.rs:2237-2241</code>), so no code change is needed:</p>
+<ul>
+<li><code>classify_syscall</code> lists <code>mq_notify</code> (<code>detcore/src/syscall_classification.rs:413</code>) in the arm that returns <code>SyscallClassification::Determinized</code> (<code>detcore/src/syscall_classification.rs:688</code>).</li>
+<li><code>is_unsupported_async_ipc_syscall</code> includes it (<code>detcore/src/syscall_classification.rs:1064</code>), with the rest of the <code>mq_*</code> family (<code>detcore/src/syscall_classification.rs:1060-1065</code>).</li>
+<li>In <code>handle_syscall_event</code>, the match on the classification (<code>detcore/src/lib.rs:2028</code>) reaches the arm at <code>detcore/src/lib.rs:2237-2241</code>, which returns <code>Err(Error::Errno(Errno::ENOSYS))</code> without injecting the syscall. The host kernel never runs it, so no registration exists and no asynchronous signal or netlink message can reach the guest from a queue. The arm does not consult <code>panic_on_unsupported_syscalls</code>, so the result is the same with or without fail-closed mode.</li>
+<li><code>is_deterministically_refused_syscall</code> includes the predicate (<code>detcore/src/syscall_classification.rs:1325</code>).</li>
+</ul>
+<p>Why <code>refuse</code> and not the alternatives:</p>
+<ul>
+<li><code>mq_open</code> is refused (<code>detcore/src/syscall_classification.rs:1060</code>), so no guest can obtain a message-queue descriptor through Hermit, and a notification could never fire for a guest-owned queue.</li>
+<li><code>passthrough</code> would let the host kernel deliver signals or netlink messages at times Detcore does not choose, which defeats deterministic signal delivery. The predicate's doc comment (<code>detcore/src/syscall_classification.rs:1034-1047</code>) calls the legacy pass-through nondeterministic and a container-isolation hole.</li>
+<li><code>model</code> would need a Detcore-owned queue model first, plus delivery of the notification at a deterministic point in the schedule. It only makes sense as part of modelling all six <code>mq_*</code> calls. The legacy NEEDS-HANDLER recommendation predates this family-wide refusal.</li>
+<li><code>ENOSYS</code> matches a real kernel without <code>CONFIG_POSIX_MQUEUE</code>.</li>
+</ul>
+<p>Guest-visible difference from Linux: F1-F7 all return <code>ENOSYS</code>, including the argument errors, because the refusal precedes every check. This is the intended refusal.</p>
+<p>Existing test evidence at f4055eb9cae4: the unit test <code>representative_policies_stay_in_their_reviewed_sections</code> (<code>detcore/src/syscall_classification.rs:1899</code>) asserts, in its loop at <code>detcore/src/syscall_classification.rs:2143</code>, that <code>mq_notify</code> classifies as Determinized and is in the predicate. It does not run a guest and does not check the errno. No e2e program or integration test calls <code>mq_notify</code>.</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F2, F3, F4, F5, F6, F7): under <code>hermit run --verify</code> on ptrace, call raw <code>syscall(SYS_mq_notify, ...)</code> on an invalid descriptor (-1) and on an ordinary pipe descriptor, with <code>SIGEV_SIGNAL</code> (a valid and an invalid signal), <code>SIGEV_THREAD</code> with a non-socket descriptor, <code>SIGEV_NONE</code>, an unknown <code>sigev_notify</code>, a NULL <code>sevp</code> and a bad <code>sevp</code> pointer. Each call must return -1 with <code>errno == ENOSYS</code>, and the output must be identical across both runs.</li>
+<li>T2 (covers F1, F6): after a refused <code>SIGEV_SIGNAL</code> registration with a handler installed, the guest must receive no signal during the rest of the run; the handler's counter stays 0.</li>
+<li>T3 (covers none): record and replay a guest that calls <code>mq_notify</code>; replay must produce the same <code>ENOSYS</code>.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-09-28 · hermit 81ca8822f78c · hermit2 · closed under the legacy rule (an explicit <code>classify_syscall</code> arm), not the v1 done rule; closing comment https://github.com/rrnewton/hermit/issues/299#issuecomment-5872859856</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/299: linux_determinism nondeterministic (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch pred:is_unsupported_async_ipc_syscall, refused.</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · reopen: under the owner rule of 2026-10-02, closed means every flag and option is covered by a named test and the implementation works; mq_notify records no test coverage, so tracking_status is todo and https://github.com/rrnewton/hermit/issues/299 reopens.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy refuse (Detcore returns a fixed ENOSYS for every mq_* call at detcore/src/lib.rs:2237-2241, the result of a kernel without CONFIG_POSIX_MQUEUE; no registration exists, so no asynchronous signal or thread can be triggered from a queue); linux_determinism stays nondeterministic; 7 flag behaviours and 3 tests listed; no guest-level test calls mq_notify yet, so tracking_status stays todo</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): decisions 9 and 6 applied (fixed ENOSYS, as without CONFIG_POSIX_MQUEUE, before any argument check, already realized at detcore/src/lib.rs:2237-2241); target_policy stays refuse; no new F/T ids; no questions removed</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+mq_notify&amp;amp;body=Discussion+for+the+%60mq_notify%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fmq_notify.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60mq_notify%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `mq_notify`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: mq_notify&quot; (https://github.com/rrnewton/hermit/issues/299), legacy variant A1.</p>
+<p>Comment history: 1 comment(s) on https://github.com/rrnewton/hermit/issues/299.</p>
+<p>The 2026-07-24 evidence below says Hermit routed <code>mq_notify</code> through a temporary pass-through block. That was true then; at f4055eb9cae4 the call is refused with <code>ENOSYS</code> (see Hermit design).</p>
+<h3>2026-07-24 host strace evidence</h3>
+<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) by tracing a direct <code>syscall()</code> harness and common programs with <code>strace -f -e trace=mq_notify</code>, and by confirming hermit currently routes <code>mq_notify</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code> (the harness ran end-to-end under <code>hermit run</code>, exit 0, so passthrough does not crash).</p>
+<p>Observed strace line:</p>
+<pre><code>(not triggered by tested programs; classification from man page + kernel behavior)
+</code></pre>
+<hr>
+<p>*Autonomous syscall-classification sweep, batch 3 (ranks 101-150 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
+<h3>Legacy closure</h3>
+<p>Closed 2026-09-28 by the 2026-09-28 sweep, which closed issues whose syscall had an explicit <code>classify_syscall</code> arm. Closing comment: https://github.com/rrnewton/hermit/issues/299#issuecomment-5872859856</p>
+</body></html>

@@ -1,0 +1,88 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fgetxattr | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>fgetxattr</code> (193)</h1>
+<p>Strategy: <strong>passthrough</strong> &middot; dispatch: <code>passthrough</code> &middot; linux determinism: deterministic &middot; target policy: passthrough &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+fgetxattr&amp;body=Discussion+for+the+%60fgetxattr%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ffgetxattr.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60fgetxattr%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>fgetxattr(fd, name, value, size)</code> reads the value of one extended attribute of the file open on <code>fd</code>. Hermit forwards it to the host kernel unchanged. The value comes from the guest's container filesystem, and Detcore keeps no extended-attribute state of its own.</p>
+<h2>Linux semantics</h2>
+<p>The kernel resolves <code>fd</code> to its open file, copies <code>name</code> from guest memory and passes the request to the filesystem's handler for the name's namespace prefix. The access mode of <code>fd</code> does not matter: a read-only descriptor can read attributes, because the permission check is made against the inode. The handler, or the security module for <code>security.*</code> names, produces the value bytes. The kernel copies at most <code>size</code> bytes to <code>value</code> and returns the value length. The call changes nothing in the file. Values are opaque bytes, except where the kernel builds them: POSIX ACLs and file capabilities are converted into the caller's user namespace on the way out.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>user.*</code> names: the caller needs read permission on the inode. On an inode that is neither a regular file nor a directory (a FIFO or device opened by <code>fd</code>), <code>user.*</code> reads give <code>ENODATA</code>.</li>
+<li>F2: <code>trusted.*</code> names are visible only with <code>CAP_SYS_ADMIN</code> in the initial user namespace. Without it the kernel answers <code>ENODATA</code>, as if the attribute did not exist. Hermit's guest root inside a user namespace is in this case.</li>
+<li>F3: <code>security.*</code> names: a security module may supply the value (for example <code>security.selinux</code>), and <code>security.capability</code> is converted between file-capability formats according to the caller's user namespace.</li>
+<li>F4: <code>system.posix_acl_access</code> and <code>system.posix_acl_default</code>: the value is built from the inode's ACL, with uids and gids mapped into the caller's user namespace. <code>ENODATA</code> when the inode has no such ACL. Missing ACL support is F12.</li>
+<li>F5: a name with no known namespace prefix: <code>EOPNOTSUPP</code></li>
+<li>F6: <code>size == 0</code>: the call returns the current value length and does not write <code>value</code></li>
+<li>F7: <code>size</code> smaller than the value: <code>ERANGE</code>. A <code>size</code> above <code>XATTR_SIZE_MAX</code> (65536) is clamped to it.</li>
+<li>F8: an empty name, or a name longer than <code>XATTR_NAME_MAX</code> (255 bytes): <code>ERANGE</code></li>
+<li>F9: the attribute does not exist: <code>ENODATA</code>. Missing filesystem support is F12.</li>
+<li>F10: <code>fd</code> is not open, or was opened with <code>O_PATH</code>: <code>EBADF</code> (host probe, kernel 7.1.3, under Additional information)</li>
+<li>F11: <code>name</code> or <code>value</code> points outside the address space: <code>EFAULT</code></li>
+<li>F12: host-config failure: a filesystem without extended-attribute support, or without ACL support for <code>system.posix_acl_*</code>: <code>EOPNOTSUPP</code>.</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p>The result is a function of the attribute's stored bytes, the caller's credentials and user namespace, the filesystem type and the host's security-module policy. Nothing in the call depends on timing. Under Hermit, threads run one at a time, so a guest thread that sets the attribute while another reads it is ordered the same way in every run. The call repeats exactly when the guest-visible file starts with the same attributes and nothing outside the container changes them.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>Changes to extended attributes made outside the container. Hermit does not try to make a changing host filesystem deterministic.</li>
+<li>Host configuration behind F2 to F4 and F9: the active security module and its policy, ACL and xattr support on the backing filesystem, and the user-namespace mapping. These are fixed for one host but differ between hosts, so a recording replayed on another host can see different values or errors.</li>
+</ul>
+<h3>Cross-host variation</h3>
+<ul>
+<li>Host security module: labels such as <code>security.selinux</code> exist only on hosts running that LSM, and their values come from its policy (F3).</li>
+<li>Filesystem type, kernel version and mount options behind the guest's paths: whether the filesystem supports the attribute's namespace and ACLs decides <code>EOPNOTSUPP</code> (F12); for example tmpfs gained <code>user.*</code> support only in Linux 6.6.</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>passthrough</code>. The code already does this. <code>fgetxattr</code> is classified <code>PassThrough</code> at <code>detcore/src/syscall_classification.rs:777</code>, inside the pass-through block that starts at <code>detcore/src/syscall_classification.rs:690</code>. The block comment at <code>detcore/src/syscall_classification.rs:767</code> gives the condition: &quot;Stable guest-owned metadata ... are repeatable in Hermit's fixed mount namespace and filesystem image&quot;, and the line at <code>detcore/src/syscall_classification.rs:769</code> leaves that boundary open for human review. The generic arm at <code>detcore/src/lib.rs:2843</code> forwards the call through <code>passthrough</code> at <code>detcore/src/lib.rs:367</code>, which calls <code>record_or_replay_preserving_tool_errors</code> and nothing else. The census unit test <code>representative_policies_stay_in_their_reviewed_sections</code> (<code>detcore/src/syscall_classification.rs:1899</code>) pins the classification at <code>detcore/src/syscall_classification.rs:2054</code>; it checks the table, not the behaviour.</p>
+<p>Why passthrough, not <code>model</code> or <code>emulate</code>:</p>
+<ul>
+<li>Hermit has no virtual filesystem. The attribute bytes live in the container's filesystem, and only the kernel applies F1 to F4 the same way the guest's <code>setxattr</code>, <code>listxattr</code> and <code>stat</code> calls see them.</li>
+<li>The value is not timing-dependent. Its inputs are filesystem state and host configuration, which Hermit treats as fixed in run mode.</li>
+<li>The only kernel-generated content (F3 and F4) is converted against the guest's own user namespace, which Hermit holds fixed for the run.</li>
+</ul>
+<p><code>detcore/src/syscalls/helpers.rs:857</code> maps <code>Syscall::Fgetxattr</code> to its fd in <code>get_fd</code>, so code that needs a syscall's descriptor can find it; the call still takes the pass-through arm. Code facts show <code>subscribed_record_replay: false</code>, so in <code>--passthru-opt</code> mode the call never reaches Detcore. <code>hermit record</code> has its own subscriptions, which the comment at <code>detcore/src/lib.rs:1078</code> places in a recorder module that is not in the exported tree, so this body does not describe how record captures the returned value.</p>
+<p>The open gap is test evidence, not code. <code>tests_naming</code> is 0: no test names <code>SYS_fgetxattr</code>. The one test that runs the call does not check any F item strictly (see Recommended tests).</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F6, F7, F9): under <code>hermit run --verify</code> on ptrace, call raw <code>syscall(SYS_fgetxattr, ...)</code> on a regular file in the guest's <code>/tmp</code> after setting <code>user.a</code> to a 10-byte value. Assert the length from <code>size == 0</code>, <code>ERANGE</code> for <code>size = 4</code>, the exact bytes for a large buffer, and <code>ENODATA</code> for a missing name. Repeat on a read-only descriptor and on a FIFO's descriptor (expect <code>ENODATA</code> for <code>user.*</code>). The test must fail, not skip, if the backing filesystem rejects <code>user.*</code> attributes. Existing partial coverage: <code>tests/c/syscall_file_metadata.c:185</code> calls the glibc wrapper, run by <code>hermit-cli/tests/syscall_file_metadata.rs:51</code> (whose trace check names <code>fgetxattr</code> at <code>hermit-cli/tests/syscall_file_metadata.rs:94</code>) and by manifest cell <code>c-programs/syscall-file-metadata</code> (<code>tests/e2e/manifests/c-programs.yaml:9275</code>). It accepts <code>EACCES</code>, <code>ENODATA</code>, <code>ENOTSUP</code>, <code>EOPNOTSUPP</code> and <code>EPERM</code> as success (<code>tests/c/syscall_file_metadata.c:37</code>), and compares the value only if <code>fsetxattr</code> succeeded (<code>tests/c/syscall_file_metadata.c:183</code>), so it passes even when every call fails.</li>
+<li>T2 (covers F2, F3): read <code>trusted.x</code> (expect <code>ENODATA</code>), then write a version-2 <code>security.capability</code> value with <code>fsetxattr</code> and read it back. Assert that the returned capability value is in the format for the guest's user namespace, and that the result matches between the two <code>--verify</code> runs.</li>
+<li>T3 (covers F4): set an access ACL through <code>fsetxattr(&quot;system.posix_acl_access&quot;)</code> and read it back. Assert the exact bytes and the ids inside them. Assert <code>ENODATA</code> for <code>system.posix_acl_default</code> on a regular file.</li>
+<li>T4 (covers F5, F8): assert <code>EOPNOTSUPP</code> for <code>bogus.a</code>, and <code>ERANGE</code> for <code>&quot;&quot;</code> and for a 256-byte name.</li>
+<li>T5 (covers F10, F11): assert <code>EBADF</code> for a closed descriptor and for an <code>O_PATH</code> descriptor, and <code>EFAULT</code> for <code>name = (char *)1</code> and for <code>value = (char *)1</code> with a non-zero <code>size</code>.</li>
+<li>U1 (covers F12; host-config): which namespaces and ACLs the host filesystem supports is host configuration that CI cannot choose, so CI cannot produce this <code>EOPNOTSUPP</code> on every host. Hermit forwards the kernel's answer unchanged (<code>detcore/src/syscall_classification.rs:777</code>, <code>detcore/src/lib.rs:2843</code>).</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-09-28 · hermit 81ca8822f78c · hermit2 · closed under the legacy rule (an explicit <code>classify_syscall</code> arm), not the v1 done rule; closing comment https://github.com/rrnewton/hermit/issues/354#issuecomment-5872984561</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A2 of https://github.com/rrnewton/hermit/issues/354: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy PASS-THRU; code at this SHA: passthrough, dispatch passthrough.</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · reopen: under the owner rule of 2026-10-02, closed means every flag and option is covered by a named test and the implementation works; fgetxattr records no test coverage, so tracking_status is todo and https://github.com/rrnewton/hermit/issues/354 reopens.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: linux_determinism conditional -&gt; deterministic (the value is a function of stored attributes, credentials and host policy, with no timing input; same footing as removexattr); kept passthrough (forwarded at detcore/src/lib.rs:2843, classified at detcore/src/syscall_classification.rs:777); 11 flag items, 5 tests; no coverage token because the only test tolerates every expected errno, so tracking_status stays todo</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d12 (owner decisions 1 and 2): cross_host_variant true (host LSM labels, filesystem xattr and ACL support); split filesystem-support EOPNOTSUPP out of F4 and F9 into new F12 with U1 host-config; no open questions section</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+fgetxattr&amp;amp;body=Discussion+for+the+%60fgetxattr%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ffgetxattr.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60fgetxattr%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `fgetxattr`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: fgetxattr&quot; (https://github.com/rrnewton/hermit/issues/354), legacy variant A2.</p>
+<p>Comment history: 1 comment(s) on https://github.com/rrnewton/hermit/issues/354.</p>
+<h3>2026-07-24 host strace evidence</h3>
+<p>Test host: Linux 6.17.13 x86_64; strace 6.12.</p>
+<p>Ran a syscall-specific safe raw probe with deliberately inert/invalid arguments so privileged or mutating operations could not change host state:</p>
+<pre><code>strace -f -qq -e trace=fgetxattr -s 160 python3 -c 'import ctypes; c=ctypes.CDLL(None,use_errno=True); c.syscall(193, *([ctypes.c_long(-1)]*6))'
+</code></pre>
+<p>Actual strace output:</p>
+<pre><code>fgetxattr(-1, 0xffffffffffffffff, 0xffffffffffffffff, 18446744073709551615) = -1 EFAULT (Bad address)
+</code></pre>
+<p>The trace confirms the host kernel path and observed errno/result for this ABI. The determinism recommendation also accounts for documented success-path state dependencies; an invalid-argument result alone is not treated as proof of determinism.</p>
+<h3>Legacy closure</h3>
+<p>Closed 2026-09-28 by the 2026-09-28 sweep, which closed issues whose syscall had an explicit <code>classify_syscall</code> arm. Closing comment: https://github.com/rrnewton/hermit/issues/354#issuecomment-5872984561</p>
+<h3>2026-10-03 host probe (syscall-tracking-p3)</h3>
+<p>Raw <code>syscall(193, ...)</code> through Python <code>ctypes</code> on the measurement host (kernel 7.1.3, btrfs, not under Hermit), against a file holding <code>user.b = &quot;v&quot;</code> and <code>user.big = &quot;0123456789&quot;</code>: <code>size == 0</code> returned 1 for <code>user.b</code>; <code>size = 4</code> for <code>user.big</code> gave <code>ERANGE</code>; a missing name gave <code>ENODATA</code>; an <code>O_PATH</code> descriptor gave <code>EBADF</code>. On the same host, <code>removexattr</code> with <code>bogus.a</code> gave <code>ENOTSUP</code> and with an empty or 305-byte name gave <code>ERANGE</code>, The name check is shared by all the xattr calls, so <code>fgetxattr</code> is expected to answer F5 and F8 the same way; that part is an inference, not probed directly.</p>
+</body></html>

@@ -1,0 +1,92 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>settimeofday | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>settimeofday</code> (164)</h1>
+<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_mount_ns_admin_refused_syscall</code> &middot; linux determinism: nondeterministic &middot; target policy: refuse &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+settimeofday&amp;body=Discussion+for+the+%60settimeofday%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsettimeofday.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60settimeofday%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>settimeofday(tv, tz)</code> sets the system wall clock (<code>CLOCK_REALTIME</code>) and, optionally, the kernel's legacy timezone. It is obsoleted by <code>clock_settime</code>. Hermit refuses every call with a fixed <code>EPERM</code> and never forwards it to the host (<code>detcore/src/lib.rs:2215-2219</code> at hermit f4055eb9cae4), the same answer it gives for <code>clock_settime</code> (<code>detcore/src/lib.rs:2477</code>).</p>
+<p>Manual reference: <a href="https://man7.org/linux/man-pages/man2/settimeofday.2.html">settimeofday(2)</a>.</p>
+<h2>Linux semantics</h2>
+<p>The kernel checks the arguments in a fixed order (<code>kernel/time/time.c</code>):</p>
+<p>1. <code>tv</code>, if non-NULL, is copied in (<code>EFAULT</code> on a bad pointer) and its microseconds are range-checked (<code>EINVAL</code>). 2. <code>tz</code>, if non-NULL, is copied in (<code>EFAULT</code>). 3. The seconds value must be in the settable range (<code>EINVAL</code>). 4. The LSM hook <code>security_settime64</code> runs. The capability module requires <code>CAP_SYS_TIME</code> in the initial user namespace, so it fails with <code>EPERM</code> for any process inside a user namespace, and for an unprivileged host process, even when both pointers are NULL. 5. <code>tz</code> is range-checked (<code>tz_minuteswest</code> within ±15 hours, else <code>EINVAL</code>) and stored in the global <code>sys_tz</code>. The first timezone-only call after boot also warps the clock once (<code>timekeeping_warp_clock</code>), for hardware clocks kept in local time. 6. If <code>tv</code> is non-NULL, the wall clock steps to the new value for every process on the host.</p>
+<p>Time namespaces do not virtualize <code>CLOCK_REALTIME</code>, so a time namespace offers no private wall clock to set.</p>
+<p>The two host probes under Additional information both stop before the capability check: an out-of-range <code>tv_usec</code> gave <code>EINVAL</code>, and a bad <code>tv</code> pointer gave <code>EFAULT</code>. Neither changed the clock.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>tv</code> non-NULL and valid: step <code>CLOCK_REALTIME</code> for the whole host. Needs <code>CAP_SYS_TIME</code> in the initial user namespace; otherwise <code>EPERM</code>.</li>
+<li>F2: <code>tz</code> non-NULL: set the kernel timezone <code>sys_tz</code> (<code>tz_minuteswest</code> must be within ±900 minutes, else <code>EINVAL</code>; <code>tz_dsttime</code> is stored but unused). The first timezone-only call after boot warps the clock once. Same capability requirement as F1.</li>
+<li>F3: <code>tv</code> and <code>tz</code> both NULL: changes nothing; returns 0 with <code>CAP_SYS_TIME</code>, <code>EPERM</code> without it.</li>
+<li>F4: invalid <code>tv</code>: <code>tv_usec</code> outside 0..999999, or <code>tv_sec</code> outside the settable range, gives <code>EINVAL</code> before the capability check.</li>
+<li>F5: bad <code>tv</code> or <code>tz</code> pointer: <code>EFAULT</code> before the capability check.</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: nondeterministic</code>, kept from the legacy classification. A successful call changes host-global state: every later wall-clock read by every process on the host, and every file timestamp written afterwards, depends on it, and the host's own time daemons may be adjusting the same clock concurrently. Whether it succeeds depends on the caller's capabilities and LSM policy. The failure paths (F4, F5, and F1-F3 without <code>CAP_SYS_TIME</code>) depend only on the arguments and the caller's privilege, so they repeat; the success path never does with respect to the rest of the host.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>Capabilities, LSM policy and user-namespace placement decide between success and <code>EPERM</code>.</li>
+<li>A successful set is global: it moves the clock seen by processes outside the guest and races with NTP or <code>chrony</code> adjustments.</li>
+<li>Hermit's guest sees a virtual wall clock (<code>gettimeofday</code> is handled by Detcore when time is virtualized, <code>detcore/src/lib.rs:2447</code>), so forwarding a set would either fail or change a clock the guest no longer reads.</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>refuse</code>. At hermit f4055eb9cae4 the code already realizes it:</p>
+<ul>
+<li><code>classify_syscall</code> marks <code>settimeofday</code> Determinized in the mount and namespace administration group (<code>detcore/src/syscall_classification.rs:339-369</code>, reviewed under the code tag <code>TODO-HUMAN-REVIEW(#724)</code>, https://github.com/rrnewton/hermit/issues/724).</li>
+<li><code>is_mount_ns_admin_refused_syscall</code> (<code>detcore/src/syscall_classification.rs:939</code>) includes it, and <code>handle_syscall_event</code> returns <code>Err(Errno::EPERM)</code> for every member before the typed match (<code>detcore/src/lib.rs:2215-2219</code>). The arm is unconditional: it does not depend on <code>--strict</code>/<code>panic_on_unsupported_syscalls</code> or on whether time is virtualized.</li>
+<li>The same predicate feeds <code>is_deterministically_refused_syscall</code> (<code>detcore/src/syscall_classification.rs:1324</code>), so <code>code_facts.refused</code> is true.</li>
+<li>The only test is the unit test <code>mount_ns_admin_syscalls_are_determinized_and_consistent</code> (<code>detcore/src/syscall_classification.rs:2666</code>). It checks the classification and the predicate's membership; it runs no guest.</li>
+</ul>
+<p>Why <code>refuse</code>:</p>
+<ul>
+<li><code>EPERM</code> is what Linux itself returns to the Hermit guest for valid arguments. The ptrace guest runs inside a user namespace (<code>detcore/src/syscalls/misc.rs:672</code>), and <code>CAP_SYS_TIME</code> is checked against the initial user namespace, so a forwarded call could never succeed there.</li>
+<li>It is consistent with the rest of the clock-setting family: <code>clock_settime</code> returns a fixed <code>EPERM</code> (<code>detcore/src/lib.rs:2477</code>), and <code>adjtimex</code>/<code>clock_adjtime</code> refuse their mutation modes (<code>detcore/src/syscall_classification.rs:613-615</code>).</li>
+<li><code>model</code> (moving the guest's virtual wall clock by the requested offset) was the other candidate the legacy NEEDS-HANDLER action named. It would let a guest that runs as virtual root set its own clock deterministically, but no workload in the tree needs it, and it would make <code>settimeofday</code> succeed where <code>clock_settime</code> refuses. Choosing it should be done for the whole family at once.</li>
+<li><code>passthrough</code>, the legacy behaviour, could only fail or, if Hermit ever held <code>CAP_SYS_TIME</code>, change the host clock.</li>
+</ul>
+<p>Known difference from Linux: Hermit returns <code>EPERM</code> before looking at the arguments, so F4 and F5 give <code>EPERM</code> under Hermit where Linux gives <code>EINVAL</code> or <code>EFAULT</code>. The result is still deterministic.</p>
+<p>Target (owner decision 6): keep the fixed <code>EPERM</code>, returned before either pointer is read, which is what the code does today (<code>detcore/src/lib.rs:2215-2219</code>). Linux's order is the one listed under Linux semantics (<code>SYSCALL_DEFINE2(settimeofday)</code> and <code>do_sys_settimeofday64</code> in <code>kernel/time/time.c</code>: copy and range checks, then <code>security_settime64</code>); Hermit deliberately does not reproduce the <code>EINVAL</code> and <code>EFAULT</code> that come before the capability check. For valid arguments the fixed <code>EPERM</code> is exactly what Linux gives a process in a user namespace, so <code>date -s</code> and NTP clients behave as they do in an unprivileged container. Setting a private virtual wall clock (<code>model</code>) stays out of scope: owner decision 9 models a refused family only where a named workload breaks, and none is known here; owner decision 13 moves clock and timer reads to virtual time and does not add a settable clock.</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F2, F3): under <code>hermit run --verify</code> on ptrace, call <code>syscall(SYS_settimeofday, ...)</code> with (valid <code>tv</code>, NULL), (NULL, valid <code>tz</code>), (valid <code>tv</code>, valid <code>tz</code>) and (NULL, NULL). Each must return -1 with <code>errno == EPERM</code>. A <code>clock_gettime(CLOCK_REALTIME)</code> and a <code>gettimeofday</code> taken before and after must show the virtual clock continuing, with no jump to the requested time.</li>
+<li>T2 (covers F4, F5): call it with <code>tv_usec = 1000000</code>, <code>tz_minuteswest = 10000</code>, and <code>tv = (void *)-1</code>. Each returns the fixed <code>EPERM</code> of owner decision 6 (Linux gives <code>EINVAL</code>, <code>EINVAL</code> and <code>EFAULT</code>, the second only to a caller holding <code>CAP_SYS_TIME</code>), and both <code>--verify</code> runs agree.</li>
+<li>T3 (covers F1): <code>hermit record</code> then <code>hermit replay</code> a guest that calls <code>settimeofday</code> and prints the return value and <code>errno</code>. Replay must print the same <code>EPERM</code> result.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/460: linux_determinism nondeterministic (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch pred:is_mount_ns_admin_refused_syscall, refused.</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · duplicate https://github.com/rrnewton/hermit/issues/467 is retired into this issue; its text waits under Additional information for a section-by-section merge.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; refuse (Detcore returns a fixed EPERM at detcore/src/lib.rs:2215 without forwarding, matching clock_settime at detcore/src/lib.rs:2477); linux_determinism stays nondeterministic; duplicate https://github.com/rrnewton/hermit/issues/467 merged; 5 flag behaviours and 3 tests listed; no coverage token because no test runs a guest that calls settimeofday, so tracking_status stays todo; open question on errno order under Additional information</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): decision 6 applied (fixed EPERM before reading tv/tz stays the target; Linux order in kernel/time/time.c deliberately not reproduced); decision 9 with 13: no settable virtual wall clock; target_policy stays refuse; T2 now asserts the decision-6 errno; no new F/T ids; both open questions removed</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+settimeofday&amp;amp;body=Discussion+for+the+%60settimeofday%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsettimeofday.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60settimeofday%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `settimeofday`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: settimeofday&quot; (https://github.com/rrnewton/hermit/issues/460), legacy variant A1. Its comment history stays on that issue.</p>
+<p>Merged duplicate: https://github.com/rrnewton/hermit/issues/467, filed 2026-07-24 as &quot;Syscall classification: settimeofday&quot; (legacy variant A1), retired into this issue. Its comment history (0 comments at migration) stays on that issue.</p>
+<h3>Merge notes</h3>
+<ul>
+<li>Both issues classified the call NONDETERMINISTIC and recommended NEEDS-HANDLER; the merged body keeps <code>nondeterministic</code> and resolves NEEDS-HANDLER as <code>refuse</code>.</li>
+<li>The duplicate's facts kept here: it is obsoleted by <code>clock_settime</code>; it requires <code>CAP_SYS_TIME</code>; it must be neutralized so it cannot affect Hermit's virtual time; a bad pointer fails with <code>EFAULT</code> (now F5).</li>
+<li>Both issues said Hermit routed <code>settimeofday</code> through the UNCLASSIFIED temporary pass-through block of <code>detcore/src/syscall_classification.rs</code> (at <code>dd60278f</code>). That was true when filed and is superseded: at f4055eb9cae4 the call is Determinized and refused (Hermit design). The code at the cited SHA wins.</li>
+<li>No other contradiction: the two strace probes test different argument errors (F4 and F5).</li>
+</ul>
+<h3>2026-07-24 host strace evidence (https://github.com/rrnewton/hermit/issues/460)</h3>
+<p>Evidence was gathered on <code>the measurement host</code> (Linux 6.17, x86_64, glibc) with a direct <code>syscall()</code> harness. The probe used safe self-targeting, no-op, temporary-file, or deliberately invalid arguments and was traced with <code>strace -qq -f -e trace=settimeofday</code>. The harness exited 0, and <code>detcore/src/syscall_classification.rs</code> at <code>dd60278f</code> places <code>settimeofday</code> in the UNCLASSIFIED temporary-passthrough block.</p>
+<p>Observed strace line:</p>
+<pre><code>settimeofday({tv_sec=0, tv_usec=1000000}, NULL) = -1 EINVAL (Invalid argument)
+</code></pre>
+<hr>
+<p>*Autonomous syscall-classification sweep, batch 5 (ranks 201-250 of the unique <code>syscall_classification.rs</code> UNCLASSIFIED list). Manual research plus host strace evidence; no code change proposed here.*</p>
+<h3>2026-07-24 host strace evidence (duplicate https://github.com/rrnewton/hermit/issues/467)</h3>
+<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) with <code>strace -f -e trace=settimeofday</code> on a direct <code>syscall()</code> harness (invoked with non-destructive query/no-op/failing arguments) and, where applicable, on common programs. Hermit then routed <code>settimeofday</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code>.</p>
+<p>Observed strace line:</p>
+<pre><code>settimeofday(0xffffffffffffffff, NULL) = -1 EFAULT (Bad address)
+</code></pre>
+<hr>
+<p>*Autonomous syscall-classification sweep (ranks 151-250 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
+</body></html>

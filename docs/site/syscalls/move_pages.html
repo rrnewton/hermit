@@ -1,0 +1,104 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>move_pages | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>move_pages</code> (279)</h1>
+<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_memory_policy_syscall</code> &middot; linux determinism: nondeterministic &middot; target policy: refuse &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+move_pages&amp;body=Discussion+for+the+%60move_pages%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fmove_pages.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60move_pages%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>move_pages</code> moves individual pages of a process to specified NUMA nodes, and/or queries the node each page currently resides on. Hermit presents a kernel built without NUMA, so Detcore refuses every <code>move_pages</code> with the fixed <code>ENOSYS</code> that kernel's stub returns, before it looks at any argument.</p>
+<p>Manual reference: Linux man-pages move_pages(2), numa(7).</p>
+<h2>Linux semantics</h2>
+<p><code>move_pages(pid, count, pages, nodes, status, flags)</code> operates on <code>count</code> page addresses in the memory of process <code>pid</code>.</p>
+<ul>
+<li><strong>Query mode</strong> (<code>nodes == NULL</code>): the kernel writes the current node of each page into <code>status[i]</code>. A page that is not present gets <code>-ENOENT</code>, and an address with no mapping gets <code>-EFAULT</code>.</li>
+<li><strong>Move mode</strong> (<code>nodes != NULL</code>): the kernel tries to migrate page <code>i</code> to <code>nodes[i]</code> and writes the resulting node, or a negative errno, into <code>status[i]</code>.</li>
+</ul>
+<p>The return value is 0 on full success, a positive count of pages that could not be moved for non-fatal reasons, or -1 with <code>errno</code> for a call-level error. status[] array is filled with node numbers or negative errnos. Verified query mode returns 0 with node ids on this host.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>pid</code>: 0 means the calling process. Another pid needs <code>PTRACE_MODE_READ_REALCREDS</code> access to that process (<code>EPERM</code> otherwise), and a pid that does not exist gives <code>ESRCH</code>.</li>
+<li>F2: query mode (<code>nodes == NULL</code>): <code>status[i]</code> receives the node holding page <code>i</code>, <code>-ENOENT</code> for a page that is not present (never touched, or a shared zero page), or <code>-EFAULT</code> for an unmapped address.</li>
+<li>F3: move mode (<code>nodes != NULL</code>): each page is migrated to <code>nodes[i]</code>. The per-page result in <code>status[i]</code> is the new node or a negative errno (<code>-EACCES</code> for a page mapped by several processes without <code>MPOL_MF_MOVE_ALL</code>, <code>-EBUSY</code>, <code>-EFAULT</code>, <code>-ENOENT</code>, <code>-ENOMEM</code>, <code>-EIO</code>, <code>-EINVAL</code>). A target node that is not online gives <code>ENODEV</code> for the call. A node the task's cpuset does not allow gives <code>EACCES</code>.</li>
+<li>F4: <code>MPOL_MF_MOVE</code> (the only bit for an ordinary process): move only pages mapped by this process alone.</li>
+<li>F5: <code>MPOL_MF_MOVE_ALL</code>: also move shared pages. It needs <code>CAP_SYS_NICE</code> (<code>EPERM</code> otherwise). Any flag bit other than these two gives <code>EINVAL</code>.</li>
+<li>F6: array arguments: an unreadable <code>pages</code> or <code>nodes</code> array, or an unwritable <code>status</code> array, gives <code>EFAULT</code>. <code>count = 0</code> returns 0 without touching the arrays.</li>
+<li>F7: on a kernel built without <code>CONFIG_NUMA</code> the syscall returns <code>ENOSYS</code>.</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p>In query mode it returns the NUMA node id of each page, which reflects host placement/topology and varies across hosts and runs. It does not affect computed results.</p>
+<p>Move mode outcomes also depend on host state: which nodes are online, cpuset membership, whether a page is busy or shared at that instant, and memory pressure on the target node. In both modes, whether a page is present (<code>-ENOENT</code>) depends on reclaim and swap.</p>
+<h3>Nondeterminism sources</h3>
+<p>Returned per-page node ids reflect host NUMA state (nondeterministic). No effect on results.</p>
+<ul>
+<li>Page presence (<code>-ENOENT</code> versus a node id) depends on whether the page was touched and whether the host reclaimed or swapped it.</li>
+<li>Move-mode per-page errnos (<code>-EBUSY</code>, <code>-ENOMEM</code>) depend on host contention and free memory.</li>
+<li>The set of online nodes and the cpuset depend on the host.</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Current behaviour (hermit 239ca43d3092): target policy <code>refuse</code>. Hermit now presents a kernel built without NUMA instead of a single virtual NUMA node. The six memory-policy syscalls are gated by one predicate, <code>is_memory_policy_syscall</code> (<code>detcore/src/syscall_classification.rs:1311</code>), refused at one dispatch gate by syscall number before the typed match (<code>detcore/src/lib.rs:7525</code>), and included in the deterministic-refusal aggregate, so each returns <code>ENOSYS</code> before any argument is examined — Linux compiles <code>mm/mempolicy.o</code> only under <code>CONFIG_NUMA</code>, and its <code>cond_syscall</code> entry points are the same stubs. The single-virtual-node model analysed below is superseded: it fabricated node answers a real no-NUMA kernel never gives, and it made <code>/proc</code> NUMA views host-shaped work to maintain.</p>
+<p>Target policy: <code>emulate</code>. The guest sees one virtual NUMA node, and <code>get_mempolicy</code> reports the default single-node policy (<code>detcore/src/syscalls/misc.rs:719-738</code>). <code>move_pages</code> should answer from that model and never reach the kernel, because a real migration would let host NUMA state into the guest and gains nothing on one virtual node.</p>
+<p>The dispatch arm is <code>detcore/src/lib.rs:2651</code>, inside the NUMA batch block (<code>detcore/src/lib.rs:2638-2650</code>, tag <code>TODO-HUMAN-REVIEW(#720)</code>, which refers to https://github.com/rrnewton/hermit/pull/720). <code>handle_move_pages</code> (<code>detcore/src/syscalls/misc.rs:740-759</code>) ignores <code>pid</code>, <code>pages</code>, <code>nodes</code> and <code>flags</code>. If <code>status</code> is non-NULL it writes <code>count</code> zeros there, then it returns 0. The answer is a constant, so it is identical across <code>--verify</code> runs and record/replay.</p>
+<p>Why <code>emulate</code> and not the alternatives:</p>
+<ul>
+<li><code>passthrough</code> or <code>model</code> would report host node ids and host page presence.</li>
+<li><code>refuse</code> would break NUMA-aware allocators and runtimes that query placement.</li>
+<li>On one node a constant answer is a faithful model of an idle migration.</li>
+</ul>
+<p>What remains before the code fully realizes <code>emulate</code> (gaps measured by reading the handler; none is exercised by a test):</p>
+<ul>
+<li>F1: no pid check. A nonexistent pid returns 0 where Linux gives <code>ESRCH</code>.</li>
+<li>F3: a target node other than 0 is accepted and reported as node 0, where Linux gives <code>ENODEV</code> for a node that does not exist.</li>
+<li>F5: no flag validation. Unknown bits succeed, where Linux gives <code>EINVAL</code>. <code>MPOL_MF_MOVE_ALL</code> also succeeds, which is the right answer: the guest holds full capabilities at launch, including <code>CAP_SYS_NICE</code> (owner decision 4).</li>
+<li>F6: <code>pages</code> and <code>nodes</code> are never read, so an unreadable array does not give <code>EFAULT</code>. A NULL <code>status</code> with <code>count &gt; 0</code> returns 0, where Linux faults.</li>
+<li>F2: pages that are not present, and addresses with no mapping, are reported as node 0 rather than <code>-ENOENT</code> or <code>-EFAULT</code>. The first is deliberate (see Open questions). The second is not.</li>
+<li>Hypothesis: <code>vec![0i32; count]</code> (<code>detcore/src/syscalls/misc.rs:754-756</code>) allocates <code>4 * count</code> bytes in the tracer for any guest-supplied <code>count</code>. A huge <code>count</code> with a non-NULL <code>status</code> could make the tracer abort on allocation failure instead of returning an error. Not measured.</li>
+</ul>
+<p>Target (owner decision 6, with decision 4): the policy stays <code>emulate</code>; on one node every page already sits on node 0, so there is nothing to read back beyond that. Decision 6 owes Linux's checks in the kernel's order (move_pages(2); kernel <code>kernel_move_pages()</code> in <code>mm/migrate.c</code>): (1) a <code>flags</code> bit other than <code>MPOL_MF_MOVE</code> and <code>MPOL_MF_MOVE_ALL</code> gives <code>EINVAL</code> (F5); (2) <code>MPOL_MF_MOVE_ALL</code> is accepted, because the guest holds <code>CAP_SYS_NICE</code> (owner decision 4) and the privilege rule at <code>detcore/src/syscalls/threads.rs:2292</code> never reproduces that <code>EPERM</code> (F5); (3) the target, as <code>find_mm_struct()</code> resolves it: <code>pid</code> 0 is the caller, any other pid is looked up with <code>thread_is_live</code> (<code>detcore/src/tool_global.rs:4032</code>), no match gives <code>ESRCH</code>, and the ptrace-access <code>EPERM</code> is never owed under full capabilities (F1); (4) in move mode, <code>do_pages_move()</code> reads <code>pages[i]</code> and <code>nodes[i]</code> in turn (<code>EFAULT</code> if unreadable), and a node other than 0 ends the call with <code>ENODEV</code>, the virtual machine having no other node (F3, F6); each page then gets status 0, or <code>-EFAULT</code> for an address with no mapping, written as it goes (<code>EFAULT</code> for the call if <code>status</code> is unwritable) (F3, F4, F6); (5) in query mode, <code>do_pages_stat()</code> reads <code>pages</code> and writes <code>status</code> in chunks of 16 (<code>DO_PAGES_STAT_CHUNK_NR</code>), so an unreadable <code>pages</code> or unwritable <code>status</code> gives <code>EFAULT</code>, and each address gets node 0, or <code>-EFAULT</code> with no mapping (F2, F6); <code>count = 0</code> returns 0 before either array is touched. Working in fixed chunks also removes the guest-sized <code>vec![0i32; count]</code> allocation in the tracer (<code>detcore/src/syscalls/misc.rs:754</code>). Pages that are present and pages that are not both report node 0 until the open question below is answered. Detecting an address with no mapping needs the guest's mapping list, the same need as <code>mbind</code>'s hole check. Today the handler ignores every argument but <code>status</code> (<code>detcore/src/syscalls/misc.rs:746</code>).</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F2, F6): a raw <code>SYS_move_pages</code> query with <code>pid = 0</code> on two pages, one touched and one not present, asserts status 0 for both over four iterations under <code>--verify</code>. Existing candidate: <code>tests/c/numa_node_identity.c:44</code> (query helper) and its loop at <code>tests/c/numa_node_identity.c:126-130</code>. The cell is <code>c-programs/numa-node-identity</code> (<code>tests/e2e/manifests/c-programs.yaml:12704</code>), verify ci on ptrace, kvm and liteinst, with dbt disabled. Extend it with <code>count = 0</code> returning 0.</li>
+<li>T2 (covers F1): <code>pid = getpid()</code> succeeds like <code>pid = 0</code>. A pid that does not exist gives <code>ESRCH</code>. No existing test.</li>
+<li>T3 (covers F3, F4): move mode with <code>nodes = {0, 0}</code> and <code>MPOL_MF_MOVE</code> returns 0 with status 0. <code>nodes = {1}</code> gives <code>ENODEV</code> on the single virtual node. No existing test.</li>
+<li>T4 (covers F5): <code>MPOL_MF_MOVE_ALL</code> returns 0 with status 0, because the guest holds <code>CAP_SYS_NICE</code> (owner decision 4). An unknown flag bit gives <code>EINVAL</code>. No existing test.</li>
+<li>T5 (covers F6): an unreadable <code>pages</code>, an unreadable <code>nodes</code> in move mode, and an unwritable <code>status</code> each give <code>EFAULT</code>. An unmapped page address in an otherwise valid array is reported per page. No existing test.</li>
+<li>T6 (covers F2, F3): record and replay of a query and a move call reproduce the return value and <code>status[]</code>. No existing test.</li>
+<li>T7 (covers F7): no Hermit test is possible on a NUMA-enabled host kernel. Record that the emulated answer never returns <code>ENOSYS</code>, which matches a kernel built with <code>CONFIG_NUMA</code>. Document-only.</li>
+<li>T8 (covers F1, F3, F5, F6): check order. Flag bit <code>0x100</code> with a nonexistent pid gives <code>EINVAL</code> (flags first); <code>MPOL_MF_MOVE_ALL</code> with a nonexistent pid gives <code>ESRCH</code>; a nonexistent pid with an unreadable <code>pages</code> array gives <code>ESRCH</code> (target before the arrays); in move mode, <code>nodes = {1}</code> with an unwritable <code>status</code> gives <code>ENODEV</code> (the node is checked before that page's status is written); a <code>count</code> of <code>1 &lt;&lt; 30</code> with an unmapped <code>pages</code> array gives <code>EFAULT</code> and the tracer stays up.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-09-28 · hermit 81ca8822f78c · hermit2 · closed under the legacy rule (an explicit <code>classify_syscall</code> arm), not the v1 done rule; closing comment https://github.com/rrnewton/hermit/issues/297#issuecomment-5872855312</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/297: linux_determinism nondeterministic (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch typed.</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · reopen: under the owner rule of 2026-10-02, closed means every flag and option is covered by a named test and the implementation works; move_pages records no test coverage, so tracking_status is todo and https://github.com/rrnewton/hermit/issues/297 reopens.</li>
+</ul>
+<ul>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; emulate (single virtual NUMA node; handler writes node 0 into every status slot and returns 0 without entering the kernel); linux_determinism stays nondeterministic; 7 flag behaviours and 7 tests listed; argument-validation gaps recorded; open question for the owner on reporting -ENOENT for pages that are not present; no coverage token, so tracking_status stays todo</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): decisions 6 and 4 applied (Linux checks in kernel order: flags, target against Detcore's thread table, then the arrays page by page; ENODEV for a node other than 0; -EFAULT status for an unmapped address; fixed-size chunks instead of a guest-sized tracer allocation; MPOL_MF_MOVE_ALL accepted under full launch capabilities); target_policy stays emulate; new T8; T4 now expects 0 for MPOL_MF_MOVE_ALL; the -ENOENT open question is kept, since no decision answers it</li>
+<li>2026-10-05 · hermit f4055eb9cae4 · syscall-tracking-2 · covered: T1 covered by tests/c/numa_node_identity.c (C08 review of the 2026-10-04 coverage proposals; guest source read at this SHA, not run by this agent)</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · reclassified: deterministic refusal added (Hermit presents a kernel built without NUMA; all six memory-policy syscalls return ENOSYS); Summary and Hermit design updated, target_policy -&gt; refuse.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+move_pages&amp;amp;body=Discussion+for+the+%60move_pages%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fmove_pages.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60move_pages%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `move_pages`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: move_pages&quot; (https://github.com/rrnewton/hermit/issues/297), legacy variant A1.</p>
+<p>Comment history: 1 comment(s) on https://github.com/rrnewton/hermit/issues/297.</p>
+<h3>2026-07-24 host strace evidence</h3>
+<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) by tracing a direct <code>syscall()</code> harness and common programs with <code>strace -f -e trace=move_pages</code>, and by confirming hermit currently routes <code>move_pages</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code> (the harness ran end-to-end under <code>hermit run</code>, exit 0, so passthrough does not crash).</p>
+<p>Observed strace line:</p>
+<pre><code>move_pages(0, 1, [0x406000], NULL, [0], 0) = 0
+</code></pre>
+<hr>
+<p>*Autonomous syscall-classification sweep, batch 3 (ranks 101-150 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
+<h3>Legacy closure</h3>
+<p>Closed 2026-09-28 by the 2026-09-28 sweep, which closed issues whose syscall had an explicit <code>classify_syscall</code> arm. Closing comment: https://github.com/rrnewton/hermit/issues/297#issuecomment-5872855312</p>
+<p>The &quot;UNCLASSIFIED temporary-passthrough block&quot; described in the 2026-07-24 evidence above is historical. At f4055eb9cae4 <code>move_pages</code> is dispatched to <code>handle_move_pages</code> (<code>detcore/src/lib.rs:2651</code>).</p>
+<h3>Open questions</h3>
+<ul>
+<li>Should a page that is not present be reported as <code>-ENOENT</code>, as Linux does, rather than node 0? <code>tests/c/numa_node_identity.c:14-28</code> pins node 0 deliberately, because presence depends on host reclaim and swap. Reporting <code>-ENOENT</code> faithfully would need Detcore to track which guest pages were touched, and even then a swapped-out page reads as present on Linux. This is a fidelity-versus-simplicity policy decision for the owner.</li>
+</ul>
+</body></html>

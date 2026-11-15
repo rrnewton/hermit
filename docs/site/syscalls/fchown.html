@@ -1,0 +1,103 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fchown | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>fchown</code> (93)</h1>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>pred:is_ownership_change_noop_syscall</code> &middot; linux determinism: conditional &middot; target policy: emulate &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+fchown&amp;body=Discussion+for+the+%60fchown%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ffchown.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60fchown%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>fchown(fd, owner, group)</code> changes the owner and group of the file an open descriptor refers to. Detcore does not forward it: it emulates the call as the success a real root process gets, checks the descriptor with <code>fcntl(fd, F_GETFL)</code> (refusing an <code>O_PATH</code> descriptor with <code>EBADF</code>), and has the kernel apply the other effects of a successful chown by reissuing <code>fchown(fd, -1, -1)</code> (<code>detcore/src/syscalls/files.rs:3353</code>). The requested owner and group are never applied.</p>
+<p>Manual reference: Linux man-pages chown(2).</p>
+<h2>Linux semantics</h2>
+<p>The kernel looks up <code>fd</code> with <code>fdget</code>, which does not accept an <code>O_PATH</code> descriptor, takes write access to the mount (<code>mnt_want_write_file</code>), and then runs the same <code>chown_common</code>/<code>notify_change</code> path as <code>chown</code>, through idmapping and LSM hooks. The descriptor's access mode does not matter: a read-only descriptor can be used.</p>
+<p>Permission: changing the owner needs <code>CAP_CHOWN</code> in the inode's user namespace; the owner may change the group only to a group it belongs to. An id unmapped in the caller's user namespace gives <code>EINVAL</code>. The errno and the success therefore depend on credentials and namespace mapping.</p>
+<p>A successful call on a non-directory clears <code>S_ISUID</code>, clears <code>S_ISGID</code> only if the file is group-executable, and drops file capabilities; directories keep set-ID bits; ctime is always updated, even when both ids are <code>-1</code>.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: an id argument of <code>-1</code> leaves that id unchanged; with both <code>-1</code> no id changes, but F4 still applies.</li>
+<li>F2: an explicit owner and/or group (0, the caller's own id, or a foreign id): changes ownership. Linux returns <code>EPERM</code> without the needed privilege, and <code>EINVAL</code> for an id unmapped in the caller's user namespace.</li>
+<li>F3: descriptor validity: <code>EBADF</code> if <code>fd</code> is not open or is an <code>O_PATH</code> descriptor; a descriptor opened read-only or write-only is accepted.</li>
+<li>F4: side effects of success: a non-directory loses <code>S_ISUID</code>, loses <code>S_ISGID</code> only if <code>S_IXGRP</code> is set, and loses file capabilities; directories keep set-ID bits; ctime is updated even if nothing else changes.</li>
+<li>F5: write-side error: <code>EROFS</code> on a read-only mount in the guest's mount namespace.</li>
+<li>F6: host-config write-side errors: <code>EPERM</code> on an inode the host marked immutable or append-only (setting either flag needs <code>CAP_LINUX_IMMUTABLE</code> in the initial user namespace, which the guest lacks), and denials by the host's LSM policy.</li>
+<li>F7: host-transient write-side error: <code>EIO</code> from failing host storage.</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: conditional</code>, kept from the legacy classification. For a fixed descriptor, fixed ids, fixed credentials and ID mappings, and metadata nothing outside the guest changes, the result, the errno and the metadata transition repeat. They change with the caller's identity (F2), the namespace configuration, and outside changes to the file. The ctime written by F4 is the host clock; Hermit's metadata virtualization keeps a later <code>stat</code> stable.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>User-namespace ID mappings</li>
+<li>External metadata mutation</li>
+<li>Capability and LSM policy</li>
+<li>Host clock value written to ctime (F4)</li>
+</ul>
+<h3>Cross-host variation</h3>
+<ul>
+<li>Inode flags on host files the guest sees: an immutable or append-only flag set on the host gives <code>EPERM</code> (F6) where the reissued <code>fchown(fd, -1, -1)</code> changes the mode, on that host and not on another.</li>
+<li>Host LSM policy: a denial (F6) depends on which LSM the host runs and its rules.</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>emulate</code>, changed from the legacy <code>passthrough</code>. Code at hermit f4055eb9cae4:</p>
+<ul>
+<li><code>detcore/src/syscall_classification.rs:686</code> puts <code>fchown</code> in the Determinized set (comment with <code>TODO-HUMAN-REVIEW(#1851)</code> at <code>detcore/src/syscall_classification.rs:676</code>). The arm at <code>detcore/src/lib.rs:2303-2307</code> sends it to <code>handle_ownership_change_noop</code> (<code>detcore/src/syscalls/files.rs:3353</code>).</li>
+<li>Identity half, emulated. The requested ids are never applied; the handler returns 0 after validation (<code>detcore/src/syscalls/files.rs:3474</code>), so F2's host-identity <code>EPERM</code>/<code>EINVAL</code> cannot reach the guest. This matches the virtual-root identity used for <code>getuid</code> and for the credential-setting no-ops (<code>detcore/src/lib.rs:2272-2276</code>).</li>
+<li>Argument half. <code>fcntl(fd, F_GETFL)</code> goes through <code>record_or_replay</code> (<code>detcore/src/syscalls/files.rs:3387-3393</code>): a closed descriptor gives the kernel's <code>EBADF</code>, and a descriptor whose flags include <code>O_PATH</code> gets <code>EBADF</code> from Detcore (<code>detcore/src/syscalls/files.rs:3394-3395</code>), because <code>fstat</code> would accept it where <code>fchown</code> does not (F3).</li>
+<li>Consequence half, delegated. The handler reissues <code>fchown(fd, -1, -1)</code> (<code>detcore/src/syscalls/files.rs:3443-3445</code>, <code>detcore/src/syscalls/files.rs:3473</code>), so F1 and F4 come from the kernel and an errno from that call propagates.</li>
+<li>Replay does not need the file to exist, because every call goes through <code>record_or_replay</code> (<code>detcore/src/syscalls/files.rs:3320</code>).</li>
+</ul>
+<p>Why <code>emulate</code>: <code>passthrough</code> returns the host identity's answer, <code>EPERM</code> with no user namespace and <code>EINVAL</code> for an unmapped id under the default one-uid map (<code>detcore/src/syscall_classification.rs:1001-1008</code>), while the guest believes it is root. <code>model</code> would need per-file ownership tracking, which Detcore does not have (<code>detcore/src/syscall_classification.rs:1016-1024</code>). <code>refuse</code> would break programs that chown files they create.</p>
+<p>Known differences from Linux:</p>
+<ul>
+<li>The ownership change is not observable through a later <code>fstat</code> (<code>detcore/src/syscalls/files.rs:3323-3328</code>).</li>
+<li>The doc comment at <code>detcore/src/syscalls/files.rs:3330-3333</code> says a read-only mount target passes where Linux returns <code>EROFS</code>. By my reading of Linux <code>fs/open.c</code>, <code>ksys_fchown</code> calls <code>mnt_want_write_file</code> before <code>chown_common</code>, so the <code>(-1, -1)</code> reissue should now return <code>EROFS</code> and propagate. Hypothesis from the kernel source; T3 settles it.</li>
+<li>On a file the guest does not own, the reissue can return <code>EPERM</code> (<code>detcore/src/syscalls/files.rs:3339-3347</code>), which is what pass-through returned.</li>
+<li>Hypothesis, not measured: an immutable or append-only file without set-ID bits may accept the <code>(-1, -1)</code> reissue, so Hermit would return 0 where Linux refuses a real ownership change with <code>EPERM</code>.</li>
+</ul>
+<p>Target (owner decision 6): because <code>fchown</code> is emulated, it owes Linux's checks in kernel order on the half it emulates, and the immutable and append-only case is one of them. In <code>fs/open.c</code>, <code>ksys_fchown()</code> takes the descriptor with <code>fdget()</code> (<code>EBADF</code>), <code>vfs_fchown()</code> calls <code>mnt_want_write_file()</code> (<code>EROFS</code>), and <code>chown_common()</code> sets <code>ATTR_UID</code>/<code>ATTR_GID</code> for each id that is not -1 before <code>notify_change()</code>; there <code>may_setattr()</code> (<code>fs/attr.c</code>) returns <code>EPERM</code> for <code>ATTR_UID</code>/<code>ATTR_GID</code> on an inode that <code>IS_IMMUTABLE</code> or <code>IS_APPEND</code>. So when either id is not -1 and the inode carries one of those flags, Hermit returns <code>EPERM</code>, after the descriptor checks (<code>detcore/src/syscalls/files.rs:3387-3395</code>) and the write-access check, instead of 0. With both ids -1, the reissued <code>fchown(fd, -1, -1)</code> (<code>detcore/src/syscalls/files.rs:3473</code>) already gives Linux's answer. Today the handler applies no such check, so the case returns 0 when the reissue succeeds; the change is a read of the inode flags (for example <code>FS_IOC_GETFLAGS</code> on the descriptor, with a filesystem that does not support it treated as having neither flag) before the reissue. Only the host can set those flags, so F6 stays a <code>host-config</code> item (U1), and the flag read is the place where Hermit takes that host state. Whether the requested ids should be applied at all stays with the owner (https://github.com/rrnewton/hermit/pull/1851); this target does not change the identity half.</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F2, F4): under <code>hermit run</code> on ptrace, in both namespace configurations, <code>fchown</code> an open descriptor of a 06755 file to a foreign uid and to -1:-1. Both return 0, <code>fstat</code> shows the owner unchanged, the mode becomes 0755 and ctime moves (metadata virtualization off). Repeat on a directory descriptor, whose set-ID bits must survive. Existing partial coverage: <code>chown_family_keeps_virtual_root_identity_and_real_errors</code> at <code>hermit-cli/tests/chown_virtual_root_identity.rs:185</code> and <code>chown_family_keeps_virtual_root_identity_without_a_user_namespace</code> at <code>hermit-cli/tests/chown_virtual_root_identity.rs:197</code>; the guest calls <code>fchown(fd, FOREIGN_UID, FOREIGN_GID)</code> at <code>tests/c/chown_virtual_root_identity.c:148</code>. Its mode and ctime read-back comes after several family calls, so it does not show that <code>fchown</code> alone cleared the bits, and it never calls <code>fchown</code> with -1:-1.</li>
+<li>T2 (covers F3): <code>EBADF</code> for fd -1, for an unopened fd, and for an <code>O_PATH</code> descriptor; success on a descriptor opened <code>O_RDONLY</code>. Existing partial coverage: <code>tests/c/chown_virtual_root_identity.c:170</code>, <code>tests/c/chown_virtual_root_identity.c:172</code> and <code>tests/c/chown_virtual_root_identity.c:181</code> (no read-only descriptor case).</li>
+<li>T3 (covers F5): <code>fchown</code> a read-only descriptor of a file on a read-only bind mount and record Hermit's errno next to the native <code>EROFS</code>, which confirms or refutes the reissue hypothesis.</li>
+<li>T4 (covers F2): under <code>hermit run --strict --verify</code> on ptrace, <code>fchown(fd, getuid(), getgid())</code> returns 0 in both runs. Existing candidates: cell <code>c-programs/syscall-file-metadata</code> (<code>tests/e2e/manifests/c-programs.yaml:9275</code>, verify ci on ptrace) and <code>deterministic_file_metadata_syscalls_verify</code> at <code>hermit-cli/tests/syscall_file_metadata.rs:51</code>; the guest call is at <code>tests/c/syscall_file_metadata.c:148</code>.</li>
+<li>T5 (covers F1, F2, F3): record and replay a guest that calls <code>fchown</code> with -1:-1, with a foreign uid and on a closed descriptor; replay returns the recorded results. No existing test.</li>
+<li>U1 (covers F6; host-config): only the host can mark an inode immutable or append-only or install an LSM policy, so CI cannot produce these errors on demand. Hermit hands the kernel's errno from the reissued <code>fchown(fd, -1, -1)</code> to the guest unchanged (<code>detcore/src/syscalls/files.rs:3473</code>).</li>
+<li>U2 (covers F7; host-transient): <code>EIO</code> comes from failing host storage shared with other processes. The reissued <code>fchown(fd, -1, -1)</code> (<code>detcore/src/syscalls/files.rs:3473</code>) hands it to the guest today. F7 counts toward done only once Hermit hides this error or reports it as an infrastructure error.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-09-28 · hermit 81ca8822f78c · hermit2 · closed under the legacy rule (an explicit <code>classify_syscall</code> arm), not the v1 done rule; closing comment https://github.com/rrnewton/hermit/issues/352#issuecomment-5872979699</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A2 of https://github.com/rrnewton/hermit/issues/352: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy PASS-THRU, which disagrees with the code; code at this SHA: determinized, dispatch pred:is_ownership_change_noop_syscall.</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · reopen: under the owner rule of 2026-10-02, closed means every flag and option is covered by a named test and the implementation works; fchown records no test coverage, so tracking_status is todo and https://github.com/rrnewton/hermit/issues/352 reopens.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy passthrough -&gt; emulate (Detcore emulates the identity half as a virtual-root success, validates the descriptor with F_GETFL and refuses O_PATH with EBADF, and delegates set-ID clearing and ctime to an fchown(fd, -1, -1) reissue; see detcore/src/syscalls/files.rs:3353); linux_determinism stays conditional; 5 flag behaviours and 5 tests listed; no coverage token because no test has been run against this list, so tracking_status stays todo; two kernel-reading hypotheses (EROFS now surfaces, immutable files) are left as open questions for T3</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d12 (owner decisions 1 and 2): cross_host_variant true (inode flags on host files, host LSM policy); F5 narrowed to EROFS, with immutable and LSM EPERM split out as new F6 (host-config U1) and EIO as new F7 (host-transient U2); no open question is resolved by decisions 1 or 2 (the EROFS and immutable questions are about Hermit's emulated result, not reachability)</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): decision 6 applied to the emulated half: target is EPERM for an explicit id on an immutable or append-only inode, in Linux's order (fdget EBADF, mnt_want_write_file EROFS, then may_setattr EPERM); today the (-1, -1) reissue at detcore/src/syscalls/files.rs:3473 can succeed there, so Hermit returns 0; target_policy stays emulate; immutable/append-only open question removed; the EROFS measurement and https://github.com/rrnewton/hermit/pull/1851 questions kept</li>
+<li>2026-10-05 · hermit f4055eb9cae4 · syscall-tracking-2 · covered: T4 covered by tests/c/syscall_file_metadata.c (C08 review of the 2026-10-04 coverage proposals; guest source read at this SHA, not run by this agent)</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+fchown&amp;amp;body=Discussion+for+the+%60fchown%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ffchown.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60fchown%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `fchown`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: fchown&quot; (https://github.com/rrnewton/hermit/issues/352), legacy variant A2. It was ranked 73 in the batch-2 classification order, which excluded the 50 syscalls seen in batch-1 workloads.</p>
+<p>Comment history: 1 comment(s) on https://github.com/rrnewton/hermit/issues/352.</p>
+<p>The determinization was implemented by https://github.com/rrnewton/hermit/pull/1851. The membership unit test <code>ownership_change_family_is_determinized_not_passthrough</code> (<code>detcore/src/syscall_classification.rs:2785</code>) pins only set membership.</p>
+<h3>Open questions</h3>
+<ul>
+<li>Is the <code>EROFS</code> residual in the doc comment at <code>detcore/src/syscalls/files.rs:3330-3333</code> stale now that the reissue goes through <code>mnt_want_write_file</code>? T3 measures it.</li>
+<li>The design carries <code>TODO-HUMAN-REVIEW(#1851)</code> (<code>detcore/src/syscall_classification.rs:676</code>), so the owner has not yet signed off on emulating the identity half.</li>
+</ul>
+<h3>2026-07-24 host strace evidence</h3>
+<p>Test host: Linux 6.17.13 x86_64; strace 6.12.</p>
+<p>Ran a syscall-specific safe raw probe with deliberately inert/invalid arguments so privileged or mutating operations could not change host state:</p>
+<pre><code>strace -f -qq -e trace=fchown -s 160 python3 -c 'import ctypes; c=ctypes.CDLL(None,use_errno=True); c.syscall(93, *([ctypes.c_long(-1)]*6))'
+</code></pre>
+<p>Actual strace output:</p>
+<pre><code>fchown(-1, -1, -1)              = -1 EBADF (Bad file descriptor)
+</code></pre>
+<p>The trace confirms the host kernel path and observed errno/result for this ABI. The determinism recommendation also accounts for documented success-path state dependencies; an invalid-argument result alone is not treated as proof of determinism.</p>
+<h3>Legacy closure</h3>
+<p>Closed 2026-09-28 by the 2026-09-28 sweep, which closed issues whose syscall had an explicit <code>classify_syscall</code> arm. Closing comment: https://github.com/rrnewton/hermit/issues/352#issuecomment-5872979699</p>
+</body></html>

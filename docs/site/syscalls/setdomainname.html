@@ -1,0 +1,79 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>setdomainname | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>setdomainname</code> (171)</h1>
+<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_privileged_admin_refused_syscall</code> &middot; linux determinism: conditional &middot; target policy: emulate &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+setdomainname&amp;body=Discussion+for+the+%60setdomainname%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsetdomainname.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60setdomainname%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>setdomainname(name, len)</code> sets the NIS (YP) domain name of the caller's UTS namespace, which <code>uname</code> reports as <code>domainname</code>. Hermit refuses it today: Detcore returns a fixed <code>EPERM</code> without forwarding the call or reading <code>name</code> (<code>detcore/src/lib.rs:2164</code>), so the guest's domain name stays fixed for the whole run. The target (owner decision 11) is to emulate it, as for <code>sethostname</code>: a per-run domain name that <code>uname</code> then reports, with <code>EINVAL</code> for an over-long name.</p>
+<p>Manual reference: <a href="https://man7.org/linux/man-pages/man2/sethostname.2.html">setdomainname(2)</a>.</p>
+<h2>Linux semantics</h2>
+<ul>
+<li>The kernel checks <code>CAP_SYS_ADMIN</code> in the user namespace that owns the caller's UTS namespace before it checks <code>len</code>. A 2026-10-03 probe on Linux 7.1.3, unprivileged, returned <code>EPERM</code> for <code>len = -1</code>. The legacy probes on Linux 6.17 returned <code>EPERM</code> for <code>setdomainname(&quot;&quot;, 0)</code>.</li>
+<li>With the capability, <code>len</code> must be between 0 and 64 (<code>__NEW_UTS_LEN</code>). The kernel copies <code>len</code> bytes, zero-fills the rest of the 65-byte field, and the new name is visible at once to every process sharing the UTS namespace, through <code>uname</code>, <code>getdomainname</code> and <code>/proc/sys/kernel/domainname</code>.</li>
+<li>Root in a user namespace that owns a fresh UTS namespace passes the check; root in a user namespace whose UTS namespace belongs to another user namespace does not.</li>
+</ul>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>0 &lt;= len &lt;= 64</code>, privileged caller: the UTS domain name becomes the first <code>len</code> bytes of <code>name</code>; <code>len = 0</code> sets an empty name.</li>
+<li>F2: <code>len &lt; 0</code> or <code>len &gt; 64</code>, privileged caller: <code>EINVAL</code>.</li>
+<li>F3: <code>name</code> is not readable, privileged caller: <code>EFAULT</code>.</li>
+<li>F4: no <code>CAP_SYS_ADMIN</code> over the UTS namespace: <code>EPERM</code>, before <code>len</code> and <code>name</code> are checked.</li>
+<li>F5: the change is visible to every process sharing the UTS namespace, and later <code>uname</code> calls report it in <code>domainname</code>.</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: conditional</code>. The requested bytes come from the guest, so a successful call in a UTS namespace only the guest uses is a deterministic state change. The result becomes host-dependent when the UTS namespace is shared with processes outside the guest, and when success depends on the capabilities the host grants in the governing user namespace. Unprivileged, the result is always <code>EPERM</code>.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>Whether the UTS namespace is shared with processes outside the guest, and the domain name they set</li>
+<li><code>CAP_SYS_ADMIN</code> in the user namespace that owns the UTS namespace</li>
+<li>The domain name in effect before the call, which later <code>uname</code> output reflects</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>emulate</code> (owner decision 11, 2026-10-04); the code realizes <code>refuse</code> today. At hermit f4055eb9cae4 the dispatch arm at <code>detcore/src/lib.rs:2164-2168</code> returns <code>Err(Error::Errno(Errno::EPERM))</code> for every syscall in <code>is_privileged_admin_refused_syscall</code> (<code>detcore/src/syscall_classification.rs:902</code>), which lists <code>setdomainname</code> among 16 privileged administration calls. The arm runs before the typed match and before any <code>record_or_replay</code> call: it reads neither argument, never forwards the call, and record, replay and both <code>--verify</code> runs compute the same <code>EPERM</code>. The refusal applies in every mode, not only when Hermit fails closed. The rationale comments are at <code>detcore/src/lib.rs:2154-2163</code> and <code>detcore/src/syscall_classification.rs:889-901</code>, tagged <code>TODO-HUMAN-REVIEW(#722)</code> (https://github.com/rrnewton/hermit/issues/722).</p>
+<p>How the domain name reaches the guest: <code>handle_uname</code> (<code>detcore/src/syscalls/misc.rs:523</code>) forwards <code>uname</code> through <code>record_or_replay</code> and, when the run has no UTS namespace (<code>has_uts_namespace</code>, <code>detcore-model/src/config.rs:482-485</code>), overwrites <code>domainname</code> with the last dot-separated label of <code>hermetic-container.local</code> (<code>DEFAULT_HOSTNAME</code>, <code>detcore/src/consts.rs:27</code>), that is <code>local</code> (<code>detcore/src/syscalls/misc.rs:539</code>). With a UTS namespace the kernel's value is reported. The refusal keeps either value fixed for the whole run.</p>
+<p>Why today's refusal is not the target: the ptrace backend runs the guest inside a <code>CLONE_NEWUSER</code> namespace that maps its uid to 0 (comment at <code>detcore/src/syscall_classification.rs:660-663</code>), and <code>capget</code> passes through (<code>detcore/src/syscall_classification.rs:714-717</code>). A uid 0 process in its own UTS namespace may set its domain name on Linux, so the fixed <code>EPERM</code> is a compatibility difference, even though it is deterministic.</p>
+<p>Target (owner decision 11): Detcore keeps one domain name for the run, shared by every guest process as a UTS namespace is (F5), beside the host name of <code>sethostname</code>. It starts as the <code>domainname</code> <code>uname</code> reports today. <code>setdomainname</code> replaces it and returns 0, and <code>handle_uname</code> writes the stored name into <code>domainname</code> in every mode, not only when <code>has_uts_namespace</code> is false (today's override at <code>detcore/src/syscalls/misc.rs:539</code>). The handler runs the kernel's checks in the order of <code>SYSCALL_DEFINE2(setdomainname)</code> in <code>kernel/sys.c</code>: the capability check (F4), then <code>len</code> outside 0..64 gives <code>EINVAL</code> (F2), then <code>name</code> is copied (<code>EFAULT</code>, F3; <code>len = 0</code> copies nothing, so a NULL <code>name</code> with <code>len = 0</code> succeeds). The stored field is the <code>len</code> bytes copied verbatim and zero-filled to 65 bytes. The guest holds <code>CAP_SYS_ADMIN</code> in its own user namespace, so F4 arises only once the decision-4 credential record lets a guest drop that capability. Not covered by decision 11: <code>/proc/sys/kernel/domainname</code> still reads the kernel's value. The container setup that decides whether the run's UTS namespace is owned by the guest's user namespace is in <code>hermit-cli/src</code>, which is not in the export at this SHA.</p>
+<p>The unit test <code>privileged_admin_syscalls_are_determinized_and_consistent</code> (<code>detcore/src/syscall_classification.rs:2535</code>) checks only that <code>setdomainname</code> is classified Determinized and is in the refusal set; it does not execute the syscall, and as a unit test it cannot serve as a coverage path.</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F5): under <code>hermit run --verify</code> on ptrace, a guest forks a child that waits on a pipe, calls <code>uname</code>, then <code>setdomainname(&quot;hermit.test&quot;, 11)</code>, asserts 0, then calls <code>uname</code> again in itself, in the waiting child and in a child forked afterwards, and asserts all three report <code>domainname</code> <code>hermit.test</code> and an unchanged <code>nodename</code>; then <code>setdomainname(&quot;&quot;, 0)</code> returns 0 and <code>uname</code> reports an empty <code>domainname</code>. Both runs must print the same output.</li>
+<li>T2 (covers F2, F3): <code>setdomainname</code> with <code>len = -1</code> and <code>len = 65</code> returns <code>EINVAL</code>, a NULL <code>name</code> with <code>len = 5</code> returns <code>EFAULT</code>, a NULL <code>name</code> with <code>len = 0</code> returns 0, and <code>len = 64</code> with a valid 64-byte buffer returns 0 with <code>uname</code> reporting all 64 bytes. After each failing call <code>uname</code> still reports the previous domain name.</li>
+<li>T3 (covers F4): after the guest drops <code>CAP_SYS_ADMIN</code> from its effective set through <code>capset</code> (the decision-4 capability record), <code>setdomainname</code> with <code>len = -1</code> returns <code>EPERM</code>, not <code>EINVAL</code>, and <code>uname</code> is unchanged.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/423: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch pred:is_privileged_admin_refused_syscall, refused.</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · duplicate https://github.com/rrnewton/hermit/issues/441 is retired into this issue; its text waits under Additional information for a section-by-section merge.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; refuse (fixed EPERM at detcore/src/lib.rs:2164-2168, never forwarded; uname domainname stays fixed for the run); linux_determinism stays conditional; merged duplicate https://github.com/rrnewton/hermit/issues/441; 5 flag behaviours and 2 tests listed; open question for the owner (shared with sethostname): emulate inside a guest-owned UTS namespace instead of refusing; tracking_status stays todo</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): decision 11 applied (per-run domain name reported by uname, kernel check order EPERM then EINVAL then EFAULT); target_policy refuse-&gt;emulate; T1 and T2 rewritten for the target; new T3 (F4); open question on emulating inside a guest-owned UTS namespace removed</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+setdomainname&amp;amp;body=Discussion+for+the+%60setdomainname%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsetdomainname.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60setdomainname%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `setdomainname`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: setdomainname&quot; (https://github.com/rrnewton/hermit/issues/423), legacy variant A1.</p>
+<h3>2026-07-24 host strace evidence</h3>
+<p>Evidence was gathered on <code>the measurement host</code> (Linux 6.17, x86_64, glibc) with a direct <code>syscall()</code> harness. The probe used safe self-targeting, no-op, temporary-file, or deliberately invalid arguments and was traced with <code>strace -qq -f -e trace=setdomainname</code>. The harness exited 0, and <code>detcore/src/syscall_classification.rs</code> at <code>dd60278f</code> places <code>setdomainname</code> in the UNCLASSIFIED temporary-passthrough block.</p>
+<p>Observed strace line:</p>
+<pre><code>setdomainname(&quot;&quot;, 0)            = -1 EPERM (Operation not permitted)
+</code></pre>
+<hr>
+<p>*Autonomous syscall-classification sweep, batch 5 (ranks 201-250 of the unique <code>syscall_classification.rs</code> UNCLASSIFIED list). Manual research plus host strace evidence; no code change proposed here.*</p>
+<h3>Merged duplicate https://github.com/rrnewton/hermit/issues/441</h3>
+<p>Filed 2026-07-24 as &quot;Syscall classification: setdomainname&quot; (legacy variant A1); its comment history (0 comments) stays on that issue. Merged 2026-10-03 by syscall-tracking-p3:</p>
+<ul>
+<li>Both issues classified the call CONDITIONAL; that is kept.</li>
+<li>Its recommended action NEEDS-INVESTIGATION, and NEEDS-HANDLER from https://github.com/rrnewton/hermit/issues/423, are both superseded by the refusal arm Detcore already has; the investigation it asked for is the open question below.</li>
+<li>Its view that the domain name &quot;should be virtualized like hostname&quot; is kept as the constraint on any <code>emulate</code> design; Hermit virtualizes it today only for runs without a UTS namespace (<code>detcore/src/syscalls/misc.rs:535-540</code>).</li>
+<li>Its host evidence, on Linux 6.17 x86_64 with glibc, traced with <code>strace -f -e trace=setdomainname</code>, matches the evidence above:</li>
+</ul>
+<pre><code>setdomainname(&quot;&quot;, 0)            = -1 EPERM (Operation not permitted)
+</code></pre>
+<h3>2026-10-03 host probe (syscall-tracking-p3)</h3>
+<p>Linux 7.1.3, uid 212630 with an empty effective capability set, raw <code>syscall(171, NULL, -1)</code> through Python ctypes: <code>EPERM</code>, showing the capability check precedes the length check.</p>
+</body></html>

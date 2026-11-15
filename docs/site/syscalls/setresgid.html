@@ -1,0 +1,138 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>setresgid | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>setresgid</code> (119)</h1>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>pred:is_credential_identity_noop_syscall</code> &middot; linux determinism: conditional &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+setresgid&amp;body=Discussion+for+the+%60setresgid%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsetresgid.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60setresgid%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>setresgid(rgid, egid, sgid)</code> sets the calling thread's real, effective and saved group IDs; <code>-1</code> leaves any of them unchanged. Hermit never forwards the call. Today it returns 0 for every argument and changes nothing, so the guest always presents as the fixed virtual root (<code>getresgid</code> reports 0, 0, 0). The target (owner decision 4) is a per-process credential record in Detcore that <code>setresgid</code> updates under Linux's permission rules and <code>getresgid</code> reads back, without kernel enforcement. See <a href="https://man7.org/linux/man-pages/man2/setresgid.2.html">setresgid(2)</a>.</p>
+<h2>Linux semantics</h2>
+<p>The kernel (<code>__sys_setresgid</code>) maps each argument that is not <code>-1</code> into the caller's user namespace (<code>EINVAL</code> if one has no mapping), then checks privilege:</p>
+<ul>
+<li>With <code>CAP_SETGID</code> in that namespace, any mapped values are accepted.</li>
+<li>Without it, each argument that is not <code>-1</code> must equal one of the current real, effective or saved gids; otherwise the call fails with <code>EPERM</code>.</li>
+</ul>
+<p>The filesystem gid always follows the new effective gid. The new credentials are installed with <code>commit_creds</code>, which resets the dumpable flag and clears the parent-death signal when the effective or filesystem gid changes. Group changes do not touch capabilities or the supplementary group list.</p>
+<p>The syscall acts on the calling thread only; glibc's <code>setresgid()</code> wrapper repeats it on every thread through an internal signal. The call returns 0 or a negative errno and reports no other value.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>-1</code> in any argument leaves that ID unchanged; <code>setresgid(-1, -1, -1)</code> succeeds and changes nothing (verified on the host on 2026-07-24)</li>
+<li>F2: caller has <code>CAP_SETGID</code> in its user namespace: any mapped values are set</li>
+<li>F3: caller lacks <code>CAP_SETGID</code>: each argument that is not <code>-1</code> must equal the current real, effective or saved gid, otherwise <code>EPERM</code></li>
+<li>F4: an argument other than <code>-1</code> with no mapping in the caller's user namespace: <code>EINVAL</code></li>
+<li>F5: the filesystem gid becomes the new effective gid</li>
+<li>F6: identity call, <code>setresgid(r, e, s)</code> with the current values: succeeds and changes nothing (verified on the host on 2026-07-24)</li>
+<li>F7: side effects: when the effective or filesystem gid changes, the dumpable flag is reset to the <code>fs.suid_dumpable</code> sysctl and the parent-death signal is cleared; capabilities and supplementary groups are unchanged</li>
+<li>F8: thread scope: the raw syscall changes only the calling thread; glibc's <code>setresgid()</code> applies it to every thread through its internal set-id signal</li>
+<li>F9: observers: after a change, <code>getgid</code>/<code>getegid</code>/<code>getresgid</code> and the <code>Gid:</code> line of <code>/proc/self/status</code> report the new IDs; new files take the new filesystem gid as their group (unless the parent directory is set-group-ID); group permission checks use the new IDs</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: conditional</code>. The result depends only on the caller's current gids and capabilities, the user-namespace mapping and the three arguments. Nothing in the call races and nothing outside the calling process affects it. It repeats when every run starts with the same identity and mapping.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>The real, effective and saved gids and the capabilities the guest is started with, inherited from whoever launched Hermit; the 2026-07-24 host probe ran with gid 100.</li>
+<li>The user-namespace mapping, which decides F4.</li>
+<li><code>CAP_SETGID</code>, which decides between F2 and F3, and through F7 and F9 which later operations succeed.</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>model</code> (owner decision 4, 2026-10-04): <code>setresgid</code> updates the per-process credential record described under &quot;Target: the credential record&quot; below. The code at hermit f4055eb9cae4 has no such record. Today <code>setresgid</code> is an argument-blind no-op:</p>
+<ul>
+<li><code>setresgid</code> is classified <code>Determinized</code> at <code>detcore/src/syscall_classification.rs:650</code>. The batch-38 rationale for the whole credential-setting family is at <code>detcore/src/syscall_classification.rs:636</code> (tagged <code>TODO-HUMAN-REVIEW(#787)</code> at line 630).</li>
+<li>The dispatcher answers it before the typed match, in the arm at <code>detcore/src/lib.rs:2272</code>-<code>2276</code>: <code>SyscallClassification::Determinized if is_credential_identity_noop_syscall(call.number()) =&gt; { Ok(0) }</code>. The arm reads no argument and never reaches the host; its comment is at <code>detcore/src/lib.rs:2262</code>.</li>
+<li>The predicate is defined at <code>detcore/src/syscall_classification.rs:974</code>, with <code>setresgid</code> at <code>detcore/src/syscall_classification.rs:980</code>.</li>
+<li>The matching getter <code>getresgid</code> writes 0 to every result pointer (<code>detcore/src/syscalls/misc.rs:702</code>-<code>717</code>), and <code>getgid</code>/<code>getegid</code> return 0 (<code>detcore/src/lib.rs:2760</code>-<code>2763</code>). So the guest always presents as root, whatever it set.</li>
+<li>The unit test <code>batch38_openat2_and_credential_syscalls_are_determinized</code> (<code>detcore/src/syscall_classification.rs:2265</code>, membership loop at lines 2276-2297) pins the classification and the predicate membership. It cannot see what the arm returns; the chown family's test file records the same limitation (<code>hermit-cli/tests/chown_virtual_root_identity.rs:14</code>-<code>17</code>). No test names <code>setresgid</code> at this SHA.</li>
+</ul>
+<h3>Reconciling the two legacy filings</h3>
+<ul>
+<li>https://github.com/rrnewton/hermit/issues/453 said <strong>PASS-THRU</strong>: the call &quot;can be forwarded under Hermit's fixed container-identity assumptions&quot;.</li>
+<li>Its duplicate https://github.com/rrnewton/hermit/issues/458 said <strong>NEEDS-HANDLER</strong>: &quot;Same as setregid with three IDs; privilege-gated; identity virtualized by hermit.&quot;</li>
+</ul>
+<p><strong>https://github.com/rrnewton/hermit/issues/458 won.</strong> The handler exists (above), and <code>getresgid</code>, which reports exactly the three IDs this call sets, is emulated rather than forwarded. Forwarding <code>setresgid</code> next to it would split the guest's view from the kernel's.</p>
+<p>Both filings agreed on <code>conditional</code> and that saved ids, capabilities, the namespace mapping and the initial group identity decide the outcome; that is kept.</p>
+<h3>Target: the credential record (owner decision 4)</h3>
+<p>The owner accepted this target on 2026-10-04. Every credential body (the set*id family, <code>setgroups</code>, <code>capset</code>, the get*id family, <code>getgroups</code>, <code>capget</code>) describes it the same way:</p>
+<ul>
+<li><strong>Record.</strong> Detcore keeps, per guest process, the real, effective, saved and filesystem uid and gid, the supplementary group list and the capability sets.</li>
+<li><strong>Calls.</strong> The set*id calls, <code>setgroups</code> and <code>capset</code> update the record. The get*id calls, <code>getgroups</code> and <code>capget</code> report it.</li>
+<li><strong>Starting state.</strong> Every id is 0, as <code>getuid</code> reports today, and the group list is empty. The capability sets start as the guest holds them at launch in the ptrace container, as uid 0 in a fresh user namespace: permitted and effective full, inheritable empty.</li>
+<li><strong>Inheritance.</strong> fork and clone copy the record; execve keeps it.</li>
+<li><strong>Permission rules.</strong> Each setter applies Linux's own rules against the record, never against host state, so the checks are deterministic. With the matching capability (<code>CAP_SETUID</code>, <code>CAP_SETGID</code>) in the record's effective set, a caller may set any valid id; without it, only the ids Linux allows an unprivileged caller. Linux's capability fixups for uid and filesystem-uid changes apply to the record. So once the guest has dropped to uid 1000 with no <code>CAP_SETUID</code> left, <code>setuid(0)</code> returns <code>EPERM</code>, which is what OpenSSH's <code>permanently_set_uid</code> checks.</li>
+<li><strong>Valid ids.</strong> Every id except <code>(uid_t)-1</code> and <code>(gid_t)-1</code> is valid in the record, as in the initial user namespace. Where <code>-1</code> does not mean &quot;unchanged&quot;, Linux rejects it: <code>EINVAL</code>, or for <code>setfsuid</code>/<code>setfsgid</code> no change.</li>
+<li><strong>No enforcement.</strong> The kernel goes on checking the real credentials: the guest stays root in the container's user namespace. After <code>setuid(1000)</code> the guest can still open root-only files, and new files keep the kernel's owner and group. That is the accepted cost.</li>
+<li><strong>Not covered.</strong> The <code>Uid:</code>, <code>Gid:</code>, <code>Groups:</code> and <code>Cap*:</code> lines of <code>/proc/&lt;pid&gt;/status</code> still show the kernel's credentials and disagree with the record; that stays open for <code>/proc</code> virtualization. Effects outside the record (the dumpable flag, the parent-death signal, <code>RLIMIT_NPROC</code> accounting) do not follow a change.</li>
+<li><strong>Thread scope.</strong> Linux credentials are per thread in the kernel, and glibc's set*id and <code>setgroups</code> wrappers broadcast a change to every thread through an internal signal. The record is per process (owner-approved), so a raw syscall on one thread of a multithreaded guest changes the credentials every thread reads back. That is a documented difference. <code>setfsuid</code>, <code>setfsgid</code> and <code>capset</code> have no glibc broadcast, so for them the glibc call differs from Linux too.</li>
+</ul>
+<p><strong>What `setresgid` must do against the record.</strong></p>
+<ul>
+<li><code>-1</code> leaves that id unchanged (F1, F6).</li>
+<li>With <code>CAP_SETGID</code> in the record's effective set, set any valid values (F2).</li>
+<li>Without <code>CAP_SETGID</code>, each argument that is not <code>-1</code> must equal the record's current real, effective or saved gid; otherwise return <code>EPERM</code> and leave the record unchanged (F3).</li>
+<li>Set the filesystem gid to the new effective gid (F5). Capabilities and the group list do not change (F7).</li>
+<li>Afterwards <code>getresgid</code>, <code>getgid</code> and <code>getegid</code> read the record back (F9).</li>
+</ul>
+<h3>Differences from Linux</h3>
+<p>Under the target (documented differences, owner decision 4):</p>
+<ul>
+<li><strong>No enforcement (F9).</strong> After <code>setresgid(1000, 1000, 1000)</code> the kernel still uses the guest's real group: new files get the kernel's group, group permission checks follow the kernel's credentials, and the <code>Gid:</code> line of <code>/proc/self/status</code> disagrees with <code>getresgid</code>.</li>
+<li><strong>No `EINVAL` (F4).</strong> Every id other than <code>-1</code> is valid in the record, and <code>-1</code> means &quot;unchanged&quot; here, so <code>EINVAL</code> cannot arise. The no-op today behaves the same way.</li>
+<li><strong>No dumpable or parent-death effects (F7).</strong> The kernel's credentials do not change.</li>
+<li><strong>Per-process scope (F8).</strong> A raw <code>SYS_setresgid</code> on one thread changes what every thread reads back. On Linux only the calling thread changes, and only glibc's wrapper reaches the others.</li>
+</ul>
+<p>Today, until the record lands (the no-op at <code>detcore/src/lib.rs:2272</code>):</p>
+<ul>
+<li><strong>F1 and F6 match Linux.</strong> <code>-1</code> arguments and identity calls succeed and change nothing, which is exactly what the no-op does.</li>
+<li><strong>The change is invisible (F2, F5, F9).</strong> After <code>setresgid(1000, 1000, 1000)</code>, <code>getresgid</code> still reports 0, 0, 0 (<code>detcore/src/syscalls/misc.rs:707</code>-<code>715</code>).</li>
+<li><strong>F3 cannot arise.</strong> The guest never stops being the virtual root.</li>
+</ul>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F6): under <code>hermit run --strict --verify</code> on ptrace, raw <code>syscall(SYS_setresgid, -1, -1, -1)</code> and <code>setresgid</code> with the values <code>getresgid</code> just reported both return 0, and <code>getresgid</code> reports the same values before and after.</li>
+<li>T2 (covers F2, F5, F9): <code>syscall(SYS_setresgid, 1000, 2000, 3000)</code> returns 0; then <code>getresgid</code> reports 1000, 2000, 3000 and <code>setfsgid(-1)</code> returns 2000. The <code>Gid:</code> line of <code>/proc/self/status</code> and the group of a newly created file are recorded and listed as documented differences. Today <code>getresgid</code> reports 0, 0, 0.</li>
+<li>T3 (covers F3, F4): continuing from T2, <code>setuid(1000)</code> drops every capability from the record. Then <code>setresgid(3000, 1000, 2000)</code> returns 0 and <code>getresgid</code> reports 3000, 1000, 2000; <code>setresgid(0, 0, 0)</code> and <code>setresgid(4000, -1, -1)</code> return <code>EPERM</code> and leave the record unchanged. The test states that <code>EINVAL</code> (F4) cannot arise because every id other than <code>-1</code> is valid in the record. Today every call returns 0.</li>
+<li>T4 (covers F7): set <code>prctl(PR_SET_PDEATHSIG, SIGUSR1)</code>, call <code>setresgid(1000, 1000, 1000)</code>, then read <code>PR_GET_PDEATHSIG</code>, <code>PR_GET_DUMPABLE</code> and <code>capget</code>. All stay unchanged (the first two are a documented difference; capabilities are unchanged on Linux too), and results are identical across runs.</li>
+<li>T5 (covers F8): in a process with two threads, raw <code>SYS_setresgid(1000, 1000, 1000)</code> from one thread; then <code>getresgid</code> reports 1000, 1000, 1000 in both threads (the per-process record; on Linux the other thread keeps 0, a documented difference). Repeat in a fresh process with glibc <code>setresgid()</code>. Also assert that the set-id signal broadcast does not change the run's schedule between runs.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/453: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy PASS-THRU, which disagrees with the code; code at this SHA: determinized, dispatch pred:is_credential_identity_noop_syscall.</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · duplicate https://github.com/rrnewton/hermit/issues/458 is retired into this issue; its text waits under Additional information for a section-by-section merge.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: merged https://github.com/rrnewton/hermit/issues/458 into this issue; target_policy passthrough -&gt; emulate (NEEDS-HANDLER from 458 wins over PASS-THRU from 453: the arm at detcore/src/lib.rs:2272 answers setresgid as a no-op returning 0 and getresgid is emulated to 0,0,0); linux_determinism stays conditional; 9 flag behaviours, 5 tests; the invisible change listed as a difference from Linux</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d34 (owner decisions 3 and 4): target_policy emulate -&gt; model (per-process credential record, Linux permission rules, no enforcement); Hermit design target, Differences from Linux and T1-T5 rewritten to assert read-back (T2: setresgid(1000,2000,3000) reads back 1000,2000,3000; T3: EPERM once CAP_SETGID is gone); no new F/T ids; removed the open question on modelling credentials; no reduced-fidelity line, the result does not depend on the mode</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+setresgid&amp;amp;body=Discussion+for+the+%60setresgid%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsetresgid.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60setresgid%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `setresgid`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: setresgid&quot; (https://github.com/rrnewton/hermit/issues/453), legacy variant A1. The duplicate https://github.com/rrnewton/hermit/issues/458 was filed the same day with the same title, also legacy variant A1, and was merged into this body section by section on 2026-10-03.</p>
+<p>Comment histories:</p>
+<ul>
+<li>https://github.com/rrnewton/hermit/issues/453: the comment history stays on that issue.</li>
+<li>https://github.com/rrnewton/hermit/issues/458: 0 comments.</li>
+</ul>
+<h3>Where the merged text went</h3>
+<ul>
+<li>Summaries: 453 &quot;Sets the real, effective, and saved group IDs of the calling process&quot; and 458 &quot;Sets the real, effective, and saved group IDs of the process&quot; agree; both are replaced by the Summary.</li>
+<li>Linux notes: from 453, &quot;The syscall updates any subset whose argument is not -1. The no-op probe supplied the current IDs and succeeded&quot; is now F1 and F6. From 458, &quot;-1 leaves a value unchanged. Verified: setresgid(-1,-1,-1) returned 0&quot; is now F1 and T1.</li>
+<li>Determinism: from 453, &quot;deterministic for fixed initial credentials and capabilities&quot; and &quot;Saved IDs, capabilities, user namespace mappings, and initial group identity affect success and later permission checks&quot;; from 458, &quot;Success depends on host privileges; credential identity should be virtualized&quot;. All kept under Determinism analysis.</li>
+<li>Recommended action: 453 PASS-THRU, 458 NEEDS-HANDLER, reconciled under Hermit design.</li>
+</ul>
+<h3>2026-07-24 host strace evidence (https://github.com/rrnewton/hermit/issues/453)</h3>
+<p>Evidence was gathered on <code>the measurement host</code> (Linux 6.17, x86_64, glibc) with a direct <code>syscall()</code> harness. The probe used safe self-targeting, no-op, temporary-file, or deliberately invalid arguments and was traced with <code>strace -qq -f -e trace=setresgid</code>. The harness exited 0, and <code>detcore/src/syscall_classification.rs</code> at <code>dd60278f</code> places <code>setresgid</code> in the UNCLASSIFIED temporary-passthrough block.</p>
+<p>Observed strace line:</p>
+<pre><code>setresgid(100, 100, 100)        = 0
+</code></pre>
+<hr>
+<p>*Autonomous syscall-classification sweep, batch 5 (ranks 201-250 of the unique <code>syscall_classification.rs</code> UNCLASSIFIED list). Manual research plus host strace evidence; no code change proposed here.*</p>
+<h3>2026-07-24 host strace evidence (https://github.com/rrnewton/hermit/issues/458)</h3>
+<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) with <code>strace -f -e trace=setresgid</code> on a direct <code>syscall()</code> harness (invoked with non-destructive query/no-op/failing arguments) and, where applicable, on common programs. Hermit currently routes <code>setresgid</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code>.</p>
+<p>Observed strace line:</p>
+<pre><code>setresgid(-1, -1, -1)           = 0
+</code></pre>
+<hr>
+<p>*Autonomous syscall-classification sweep (ranks 151-250 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
+</body></html>

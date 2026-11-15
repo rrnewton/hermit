@@ -1,0 +1,77 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>utimes | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>utimes</code> (235)</h1>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; linux determinism: conditional &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+utimes&amp;body=Discussion+for+the+%60utimes%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Futimes.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60utimes%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>utimes(filename, times)</code> sets a file's access and modification times from two <code>struct timeval</code>s, or to the current time when <code>times</code> is NULL. Detcore handles it (<code>detcore/src/syscalls/files.rs:3703</code>): it replaces the &quot;current time&quot; with Detcore's virtual time, converts explicit timevals to timespecs, and forwards the call to the kernel as <code>utimensat(AT_FDCWD, filename, times, 0)</code>, which goes through record/replay.</p>
+<p>Manual reference: Linux man-pages utimes(2) and utime(2).</p>
+<h2>Linux semantics</h2>
+<p>The kernel resolves <code>filename</code> relative to the working directory and follows symlinks. With an explicit <code>times</code>, it sets atime to <code>times[0]</code> and mtime to <code>times[1]</code>, converting microseconds to nanoseconds. With <code>times == NULL</code>, it sets both to the current host time. In both cases ctime becomes the current host time. The filesystem truncates every timestamp to its own granularity.</p>
+<p>Permission rules differ by form. NULL is an <code>ATTR_TOUCH</code> request: the caller must own the file, have write permission on it, or hold <code>CAP_FOWNER</code>. Explicit times are an <code>ATTR_TIMES_SET</code> request: only the owner or a <code>CAP_FOWNER</code> holder may set them, and write permission is not enough.</p>
+<p>The kernel only reads the <code>times</code> buffer. It never writes it.</p>
+<p>Modern glibc's <code>utimes()</code> wrapper does not issue <code>SYS_utimes</code> at all: on this host (glibc 2.34), a host strace of <code>utimes(path, NULL)</code> showed <code>utimensat(AT_FDCWD, path, NULL, 0)</code>. <code>SYS_utimes</code> is reached by raw <code>syscall()</code> callers, static or older C libraries, and runtimes that issue syscalls directly.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>times == NULL</code>: set atime and mtime to the current time. Allowed for the owner, a caller with write permission, or a <code>CAP_FOWNER</code> holder; otherwise <code>EACCES</code>.</li>
+<li>F2: explicit <code>times</code>: set atime to <code>times[0]</code> and mtime to <code>times[1]</code>, with <code>tv_usec</code> scaled to nanoseconds. Allowed only for the owner or a <code>CAP_FOWNER</code> holder; otherwise <code>EPERM</code>.</li>
+<li>F3: <code>tv_usec</code> outside <code>[0, 999999]</code> in either element: <code>EINVAL</code>, and no timestamp changes.</li>
+<li>F4: ctime side effect: every successful call sets ctime to the current time, whichever form was used.</li>
+<li>F5: path resolution: symlinks are followed; <code>ENOENT</code>, <code>ENOTDIR</code>, <code>EACCES</code> on a search component, <code>ELOOP</code>, <code>ENAMETOOLONG</code>.</li>
+<li>F6: bad pointers: an unreadable <code>filename</code> or <code>times</code> gives <code>EFAULT</code>.</li>
+<li>F7: file flags and mounts: explicit times on an append-only or immutable file give <code>EPERM</code>; NULL is allowed on an append-only file but refused on an immutable one; any change on a read-only mount gives <code>EROFS</code>.</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: conditional</code>. With explicit times (F2), the result is a function of the arguments and the file's state: owner, mode, flags, mount. With NULL (F1), the stored atime and mtime come from the host clock, so two runs write different timestamps. The ctime side effect (F4) reads the host clock in both forms. The call repeats when the caller passes explicit times and the guest sees the same filesystem state.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>The host clock, read for the NULL form (F1) and for ctime in every form (F4)</li>
+<li>File ownership, mode, attributes and mount flags, which decide <code>EACCES</code>, <code>EPERM</code> and <code>EROFS</code></li>
+<li>Filesystem timestamp granularity, which truncates the stored values</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>model</code>. The kernel holds the file's timestamps, and Detcore owns the one nondeterministic input it can supply, the current time. The handler at <code>detcore/src/syscalls/files.rs:3703</code> does this:</p>
+<ul>
+<li>For NULL (F1), it reads Detcore's virtual clock with <code>thread_observe_time</code> (<code>detcore/src/syscalls/files.rs:3712</code>; the function at <code>detcore/src/tool_global.rs:3791</code> returns the global time lower bound), writes <code>[now, now]</code> as two timespecs into a reserved guest stack slot, and passes that slot on.</li>
+<li>For explicit times (F2, F3), it reads the two timevals and writes them back over the guest's own buffer as two timespecs (<code>detcore/src/syscalls/files.rs:3719</code> to <code>:3730</code>), using reverie's <code>From&lt;libc::timeval&gt; for Timespec</code> conversion, which multiplies <code>tv_usec</code> by 1000.</li>
+<li>It then builds <code>utimensat(AT_FDCWD, filename, tp, 0)</code> (<code>detcore/src/syscalls/files.rs:3733</code>) and sends it through <code>handle_utimensat</code>, which is only <code>record_or_replay</code> (<code>detcore/src/syscalls/files.rs:3747</code>). The kernel therefore does path resolution, permission checks, <code>EINVAL</code> for an out-of-range <code>tv_nsec</code>, and the write; replay returns the recorded result.</li>
+<li>Classification: <code>utimes</code> is in the Determinized list (<code>detcore/src/syscall_classification.rs:219</code>); dispatch is at <code>detcore/src/lib.rs:2540</code>.</li>
+</ul>
+<p>Why <code>model</code> and not the alternatives: <code>passthrough</code> would let the NULL form stamp host time into files the guest later reads back with <code>stat</code>; <code>emulate</code> would mean Detcore keeping its own timestamp table instead of the filesystem; <code>refuse</code> would break <code>touch</code>-style callers.</p>
+<p>What remains before the code fully realizes <code>model</code>. These are readings of the code, not measurements:</p>
+<ul>
+<li><strong>NULL becomes explicit times, which changes the permission rule.</strong> The kernel sees <code>utimensat</code> with a non-NULL <code>times</code>, so it applies the <code>ATTR_TIMES_SET</code> rule of F2 instead of the <code>ATTR_TOUCH</code> rule of F1. A caller with write permission that does not own the file, which Linux allows, would get <code>EPERM</code>. NULL on an append-only file would also give <code>EPERM</code> instead of success (F7). A fix has to keep the touch permission rule while still storing virtual time; how to do that is an open question below.</li>
+<li><strong>The guest's `times` buffer is overwritten.</strong> Linux never writes it. Detcore rewrites it in place as timespecs, before the kernel has validated anything, so even a call that later fails with <code>EINVAL</code> leaves the guest's array changed. The code's own safety comment (<code>detcore/src/syscalls/files.rs:3724</code>) notes that a read-only buffer, such as a <code>static const struct timeval[2]</code>, may make the write fail, which would give <code>EFAULT</code> where Linux succeeds.</li>
+<li><strong>No range check before the multiply.</strong> Reverie's conversion (<code>reverie-syscalls/src/args/time.rs:66</code> at the reverie pin <code>d766df20b780</code>) computes <code>1000 * tv_usec</code> with no check. Ordinary out-of-range values still reach the kernel as out-of-range nanoseconds and give <code>EINVAL</code>, as F3 requires. A huge <code>tv_usec</code> overflows the multiply: a debug build panics, and a release build wraps, which can land on a valid nanosecond value and turn Linux's <code>EINVAL</code> into success. The wrapped value is always a multiple of 8, so it can never equal <code>UTIME_NOW</code> or <code>UTIME_OMIT</code>.</li>
+<li><strong>ctime still comes from the host clock</strong> (F4). The kernel stamps it during <code>utimensat</code>. Whether a later <code>stat</code> hides that value depends on the stat handlers, not on this one.</li>
+</ul>
+<p><code>linux_determinism</code> stays <code>conditional</code>: Hermit removes the clock dependence of F1, and the filesystem-state dependence remains as on Linux.</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F2, F4): with a raw <code>syscall(SYS_utimes, ...)</code>, run the NULL form and then an explicit form on a file the guest owns, and <code>stat</code> after each. Under <code>hermit run --verify</code> on ptrace, both runs must print identical atime and mtime; the explicit form must store exactly the given seconds and microseconds. Existing candidate: <code>detcore/tests/lit/utimes/main.rs</code>, which calls <code>libc::utimes</code> with NULL (line 33) and with explicit times (line 62). It runs only through LLVM lit under Buck (<code>detcore/tests/lit/README.md:28</code>), not on ptrace in CI, and because glibc 2.34's <code>utimes()</code> issues <code>utimensat</code>, it probably never reaches <code>SYS_utimes</code>. A raw-syscall C fixture with an e2e cell is needed.</li>
+<li>T2 (covers F3): <code>tv_usec</code> of <code>-1</code> and <code>1000000</code> in each element must give <code>EINVAL</code> and leave the timestamps unchanged. Also call it with <code>tv_usec = 1L &lt;&lt; 62</code> and record whether Hermit returns <code>EINVAL</code> like Linux or panics or succeeds.</li>
+<li>T3 (covers F2, F6): pass <code>times</code> pointing at a <code>static const struct timeval[2]</code> in read-only memory. Linux succeeds and the array is unchanged. Record Hermit's result and whether the array's bytes changed. Also check <code>EFAULT</code> for an unmapped <code>filename</code> and an unmapped <code>times</code>.</li>
+<li>T4 (covers F1, F2, F7): as a non-owner with write permission, the NULL form must succeed and the explicit form must give <code>EPERM</code>. Under Hermit, the code suggests the NULL form also gives <code>EPERM</code>; if so, file it as a defect against the NULL-to-explicit conversion. Where the test can set <code>chattr +a</code>, NULL must succeed on an append-only file and explicit times must give <code>EPERM</code>.</li>
+<li>T5 (covers F5): <code>ENOENT</code> for a missing path, <code>ENOTDIR</code> for a file used as a directory component, and symlink following: the target's times change, not the link's.</li>
+<li>T6 (covers F1, F2): record a guest that runs both forms and <code>stat</code>s the file, then replay it; replay must reproduce the stat output.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · created for v1: no tracking issue existed for this pinned Sysno; code at this SHA: determinized, dispatch typed.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; model (NULL times become Detcore virtual time; the call is forwarded as utimensat through record_or_replay); linux_determinism stays conditional; 7 flag behaviours and 6 tests listed; gaps found in the code: NULL is sent as explicit times (stricter permission rule), the guest's timeval buffer is overwritten in place, and tv_usec is not range-checked before the multiply; no coverage token because no test has been run against this list, so tracking_status stays todo; one open question recorded</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+utimes&amp;amp;body=Discussion+for+the+%60utimes%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Futimes.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60utimes%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `utimes`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Created by the syscall-tracking v1 migration on 2026-10-03. No tracking issue existed for <code>utimes</code>: the 2026-07-24 classification campaign filed issues only for syscalls in the old temporary pass-through block, and Detcore already handled this one.</p>
+<h3>Open questions</h3>
+<ul>
+<li>Should the NULL form keep Linux's touch permission rule (F1)? The current conversion to explicit times makes it stricter. Fixing it needs a design choice in <code>handle_utimes</code>; this body only records the gap.</li>
+</ul>
+</body></html>

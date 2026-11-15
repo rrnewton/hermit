@@ -1,0 +1,116 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>getsockopt | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>getsockopt</code> (55)</h1>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; linux determinism: conditional &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+getsockopt&amp;body=Discussion+for+the+%60getsockopt%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fgetsockopt.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60getsockopt%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p>Reads an option value from a socket. Most values are configuration the guest set itself or fixed facts about the socket, but some are host identities, counters or timings: socket cookies, the CPU that last handled a packet, TCP statistics, peer credentials. Detcore rewrites four of these and lets the kernel answer the rest.</p>
+<p>Manual reference: <a href="https://man7.org/linux/man-pages/man2/getsockopt.2.html">getsockopt(2)</a>.</p>
+<h2>Linux semantics</h2>
+<p><code>getsockopt(fd, level, optname, optval, optlen)</code> asks the handler for <code>level</code> to copy the option's value into <code>optval</code>. <code>*optlen</code> is a value-result argument: on entry it is the size of the buffer, and on success the kernel stores the number of bytes it wrote. Most <code>int</code> options accept a shorter buffer and are truncated. Some options require an exact or minimum length and give <code>EINVAL</code> otherwise. On error the kernel writes neither <code>optval</code> nor <code>optlen</code>.</p>
+<p>Values come from three places:</p>
+<ul>
+<li>configuration set earlier with <code>setsockopt</code>, sometimes changed on the way in (<code>SO_RCVBUF</code> is stored doubled)</li>
+<li>fixed facts about the socket, such as its type and domain</li>
+<li>live kernel state: pending errors, peer credentials, cookies from a host-global counter, the CPU that last handled a packet, and protocol statistics such as <code>TCP_INFO</code></li>
+</ul>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>optlen</code> handling: a value-result length; a short buffer truncates an <code>int</code> option; a NULL <code>optval</code> with <code>*optlen</code> 0 succeeds and stores 0.</li>
+<li>F2: fixed facts about the socket: <code>SO_TYPE</code>, <code>SO_DOMAIN</code>, <code>SO_PROTOCOL</code>, <code>SO_ACCEPTCONN</code>.</li>
+<li>F3: reading back configuration the guest set: boolean and integer <code>SOL_SOCKET</code> options (<code>SO_REUSEADDR</code>, <code>SO_KEEPALIVE</code>, <code>SO_BROADCAST</code>, <code>SO_PRIORITY</code>, <code>SO_RCVLOWAT</code>, <code>SO_PEEK_OFF</code>), <code>SO_LINGER</code>, and <code>SO_RCVTIMEO</code>/<code>SO_SNDTIMEO</code>.</li>
+<li>F4: <code>SO_RCVBUF</code> / <code>SO_SNDBUF</code>: the stored size, which is twice the requested value, clamped by host sysctls. Without a <code>setsockopt</code>, the default comes from host sysctls, and TCP autotuning can change it while the connection runs.</li>
+<li>F5: <code>SO_ERROR</code>: returns and clears the pending socket error, for example the result of a nonblocking <code>connect</code>. Whether an error is pending depends on when the call runs.</li>
+<li>F6: peer credentials: <code>SO_PEERCRED</code> (pid, uid and gid of the peer when it connected), <code>SO_PEERGROUPS</code>, <code>SO_PEERSEC</code>, <code>SO_PEERPIDFD</code>.</li>
+<li>F7: <code>SO_COOKIE</code>: a 64-bit cookie identifying the socket, taken from a host-global kernel counter. The buffer must hold 8 bytes, otherwise <code>EINVAL</code>.</li>
+<li>F8: <code>SO_NETNS_COOKIE</code>: a 64-bit cookie identifying the socket's network namespace, also from a host-global counter.</li>
+<li>F9: <code>SO_INCOMING_CPU</code>: the CPU that last processed a packet for the socket, or -1 if none has arrived.</li>
+<li>F10: <code>SO_MEMINFO</code>: the socket's memory counters (receive and send allocations, backlog, drops).</li>
+<li>F11: <code>SO_BINDTODEVICE</code> / <code>SO_BINDTOIFINDEX</code>: the bound interface's name or index.</li>
+<li>F12: <code>TCP_INFO</code>: a <code>struct tcp_info</code> with the connection state, negotiated options and window scales, and also RTT estimates, timers and packet and byte counters.</li>
+<li>F13: other <code>IPPROTO_TCP</code> values: <code>TCP_CONGESTION</code> (the algorithm name, a host default), <code>TCP_MAXSEG</code> (depends on the route MTU), <code>TCP_CC_INFO</code> (congestion-control counters), and read-back of <code>TCP_NODELAY</code>, <code>TCP_CORK</code> and the keepalive timers.</li>
+<li>F14: <code>IPPROTO_IP</code> / <code>IPPROTO_IPV6</code> values: <code>IP_TOS</code>, <code>IP_TTL</code> (default from a sysctl), <code>IP_MTU</code> (route state), <code>IPV6_V6ONLY</code> (default from <code>net.ipv6.bindv6only</code>), <code>SO_ORIGINAL_DST</code>.</li>
+<li>F15: other levels: <code>SOL_NETLINK</code> (<code>NETLINK_LIST_MEMBERSHIPS</code>), <code>SOL_PACKET</code> (<code>PACKET_STATISTICS</code>, whose counters are cleared when read), <code>SOL_UDP</code>.</li>
+<li>F16: errors: <code>EBADF</code>, <code>ENOTSOCK</code>, <code>EFAULT</code>, <code>EINVAL</code> (a length the option does not accept), <code>ENOPROTOOPT</code> (unknown level or option).</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: conditional</code>, kept from the legacy classification. F1, F2 and F3 return the same value on every run once the guest's own <code>setsockopt</code> calls are the same. The other options can differ between runs or between hosts:</p>
+<ul>
+<li>host-global counters: F7, F8</li>
+<li>which CPU ran the network stack: F9</li>
+<li>timing and peer activity: F5, F10, F12, F13, F15</li>
+<li>host sysctls, routes and modules: F4, F13, F14</li>
+<li>process identities: F6</li>
+</ul>
+<p>The call repeats when every peer is in one deterministic schedule in a private network namespace, and the options read are configuration, fixed facts, or values Detcore rewrites.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>Host-global cookie counters (F7, F8)</li>
+<li>Which CPU processed a packet (F9)</li>
+<li>TCP timers, RTT estimates and packet counters (F12, F13)</li>
+<li>Memory accounting and drop counters (F10, F15)</li>
+<li>Host sysctls and routes: default buffer sizes, TTL, MTU, <code>bindv6only</code>, the default congestion algorithm (F4, F13, F14)</li>
+<li>When asynchronous errors arrive (F5)</li>
+<li>Peer process ids (F6)</li>
+</ul>
+<h3>Cross-host variation</h3>
+<ul>
+<li>Host socket-buffer sysctls (<code>net.core.rmem_default</code>, <code>net.core.wmem_default</code>, <code>net.core.rmem_max</code>, <code>net.core.wmem_max</code>): these are global, not per network namespace, so they set the default <code>SO_RCVBUF</code>/<code>SO_SNDBUF</code> of UNIX and UDP sockets and the clamp on requested sizes inside the guest's private namespace too (F4). Detcore returns the kernel's value unchanged.</li>
+<li>Host default TCP congestion algorithm (<code>net.ipv4.tcp_congestion_control</code>) and the congestion modules loaded: a new network namespace starts with the host's default, so <code>TCP_CONGESTION</code> reads it (F13).</li>
+<li>Host LSM: whether <code>SO_PEERSEC</code> returns a security label or <code>ENOPROTOOPT</code>, and which label (F6).</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>model</code>. The kernel answers, and Detcore rewrites the values that would leak host identity or timing. It does this for four options today.</p>
+<p>What the code does at f4055eb9:</p>
+<ul>
+<li>The arm at <code>detcore/src/lib.rs:2568</code> calls <code>handle_getsockopt</code> (<code>detcore/src/syscalls/files.rs:3914</code>). The doc comment at <code>detcore/src/syscalls/files.rs:3911</code> promises run determinism only for isolated guest networking, which is the default <code>--network=local</code>: the guest gets its own network namespace with only loopback (<code>hermit-cli/src/bin/hermit/global_opts.rs:53</code>).</li>
+<li>The kernel call goes through <code>record_or_replay</code> (<code>detcore/src/syscalls/files.rs:3951</code>; helper at <code>detcore/src/tool_local.rs:382</code>). Run mode executes it unchanged, record mode saves the result and the bytes written, and replay returns them.</li>
+<li><strong>F7 `SO_COOKIE`</strong> (<code>detcore/src/syscalls/files.rs:3936</code> and <code>detcore/src/syscalls/files.rs:3988</code>): before the call, Detcore reads <code>*optlen</code> and the open file's identity. Afterwards it writes <code>deterministic_socket_cookie()</code> (<code>detcore-model/src/fd.rs:164</code>): the creating thread's id in the high 32 bits and a per-creator socket sequence number in the low 32. Unit tests: <code>deterministic_socket_cookies_track_open_file_identity</code> at <code>detcore-model/src/fd.rs:175</code> and <code>regular_file_opens_do_not_shift_socket_cookie_identity</code> at <code>detcore/src/tool_local.rs:3195</code>.</li>
+<li><strong>F8 `SO_NETNS_COOKIE`</strong> (<code>detcore/src/syscalls/files.rs:3919</code> and <code>detcore/src/syscalls/files.rs:3979</code>): for a tracked socket, Detcore writes the constant <code>DETERMINISTIC_NETNS_COOKIE</code> = 1 (<code>detcore/src/syscalls/files.rs:389</code>), because the guest has exactly one network namespace.</li>
+<li><strong>F9 `SO_INCOMING_CPU`</strong> (<code>detcore/src/syscalls/files.rs:3953</code>): after a successful call, the value is replaced with 0, since Hermit presents one virtual CPU.</li>
+<li><strong>F12 `TCP_INFO`</strong> (<code>detcore/src/syscalls/files.rs:3967</code>): after a successful call, <code>canonicalize_tcp_info</code> (<code>detcore/src/syscalls/files.rs:380</code>) keeps bytes 0, 1, 5 and 6 (<code>tcpi_state</code>, <code>tcpi_ca_state</code>, <code>tcpi_options</code> and the window-scale byte) and zeroes every timing, rate, packet and byte counter.</li>
+<li>Every other option is returned as the kernel produced it.</li>
+</ul>
+<p>Why <code>model</code>: the kernel already keeps every option's value, and the call is safe to run as is. Only the leaking values need rewriting. <code>emulate</code> would duplicate the socket layer. <code>refuse</code> would break common calls such as <code>SO_ERROR</code> after a nonblocking <code>connect</code>, and <code>SO_TYPE</code>.</p>
+<p>What remains before the code fully realizes <code>model</code>. These are hypotheses read from the code, not measurements:</p>
+<ul>
+<li><strong>Cookie writes are not gated on success.</strong> The F7 and F8 rewrites run whether or not the kernel call succeeded; only F9 and F12 check <code>result == 0</code>. Linux writes nothing on error, but Detcore still writes cookie bytes into <code>optval</code> when, for example, <code>SO_COOKIE</code> is given a 4-byte buffer (<code>EINVAL</code>) or used on a tracked fd that is not a socket (<code>ENOTSOCK</code>). The return value stays correct; only the buffer differs. T5 checks this.</li>
+<li><strong>Untracked descriptors.</strong> <code>SO_COOKIE</code> calls <code>with_detfd</code> before the kernel call (<code>detcore/src/syscalls/files.rs:3945</code>), so a descriptor Detcore does not track gets Detcore's error, not the kernel's.</li>
+<li><strong>F9 on an idle socket.</strong> Linux returns -1 when no packet has arrived; Detcore replaces it with 0.</li>
+<li><strong>F4 sizes.</strong> The value read back depends on host sysctls and on TCP autotuning. <code>tests/c/socket_options.c:12</code> leaves <code>SO_SNDBUF</code> out for this reason.</li>
+<li><strong>F5 timing.</strong> Whether <code>SO_ERROR</code> is already set depends on when the kernel finished the connect. With every peer in the guest and connects retried under the scheduler, this should repeat, but it is not tested.</li>
+<li><strong>F6 identities.</strong> <code>SO_PEERCRED</code> returns kernel pids. The guest runs in its own PID namespace (<code>default_container</code>, <code>hermit-cli/src/bin/hermit/container.rs:442</code>), so the pids repeat when processes are created in the same order. uid and gid are those of the mapped root user.</li>
+<li><strong>F10, F13, F14, F15 counters and host defaults</strong> pass through unchanged: <code>SO_MEMINFO</code>, <code>TCP_CC_INFO</code>, <code>TCP_MAXSEG</code>, <code>IP_MTU</code>, <code>PACKET_STATISTICS</code>, and the default congestion algorithm. They need the same treatment as <code>TCP_INFO</code>, or a measurement showing they repeat in a loopback-only namespace.</li>
+</ul>
+<p><code>linux_determinism</code> stays <code>conditional</code>. Detcore removes the cookie, CPU and TCP statistics sources. Host sysctl defaults and the counters listed above remain.</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F2): read <code>SO_TYPE</code>, <code>SO_DOMAIN</code>, <code>SO_PROTOCOL</code> and <code>SO_ACCEPTCONN</code> with full and short buffers, and with a NULL <code>optval</code> and <code>*optlen</code> 0, under <code>hermit run --verify</code> on ptrace. Existing candidates: <code>tests/c/getsockopt_null.c:21</code> (cell <code>c-programs/getsockopt-null</code>, program at <code>tests/e2e/manifests/c-programs.yaml:2057</code>, verify ci on ptrace; recorded by <code>record_c_getsockopt_null</code> at <code>hermit-cli/tests/record_replay.rs:2315</code>) and <code>tests/c/socketpair_flags.c:51</code> (program at <code>tests/e2e/manifests/c-programs.yaml:15519</code>).</li>
+<li>T2 (covers F3, F4): set and read back the F3 options, then read <code>SO_RCVBUF</code>/<code>SO_SNDBUF</code> with and without a prior <code>setsockopt</code>. The values must match across runs under <code>--verify</code>; record whether the defaults differ between hosts. Existing candidate: <code>tests/c/socket_options.c</code> (program at <code>tests/e2e/manifests/c-programs.yaml:14358</code>, verify ci on ptrace), which reads back <code>SO_REUSEADDR</code>, <code>SO_KEEPALIVE</code> and <code>SO_BROADCAST</code>.</li>
+<li>T3 (covers F5, F6): a nonblocking loopback <code>connect</code> to a port with no listener and to a listening port, then <code>SO_ERROR</code>. On a UNIX socketpair, read <code>SO_PEERCRED</code> and <code>SO_PEERPIDFD</code> from a forked child. Values must match across runs under <code>--verify</code>.</li>
+<li>T4 (covers F7, F8): <code>SO_COOKIE</code> is non-zero, different for different sockets and the same across <code>dup</code>; <code>SO_NETNS_COOKIE</code> is the same for every socket. Both must match across runs. Existing candidates: <code>tests/c/socket_cookie_common.h</code>, used by <code>tests/c/socket_cookie_unix.c</code>, <code>tests/c/socket_cookie_tcp.c</code> and <code>tests/c/socket_cookie_udp.c</code> (programs at <code>tests/e2e/manifests/c-programs.yaml:8788</code>, <code>:8672</code> and <code>:8730</code>, verify ci on ptrace), and <code>tests/c/netns_cookie_tcp4.c</code>, <code>tests/c/netns_cookie_tcp6.c</code> and <code>tests/c/netns_cookie_udp4.c</code> (programs at <code>tests/e2e/manifests/c-programs.yaml:4551</code>, <code>:4609</code> and <code>:4667</code>).</li>
+<li>T5 (covers F7, F8, F16): fill <code>optval</code> with a known pattern and call <code>SO_COOKIE</code> with a 4-byte buffer, and on a regular file. Linux returns <code>EINVAL</code> and <code>ENOTSOCK</code> and leaves the buffer alone. Record whether Detcore writes cookie bytes, as the code suggests. Also check <code>EBADF</code>, <code>EFAULT</code> and <code>ENOPROTOOPT</code>.</li>
+<li>T6 (covers F9): <code>SO_INCOMING_CPU</code> after loopback traffic must be 0. On a socket with no traffic, record the Hermit value against the Linux -1. Existing candidates: <code>tests/c/so_incoming_cpu_tcp4.c</code>, <code>tests/c/so_incoming_cpu_tcp6.c</code> and <code>tests/c/so_incoming_cpu_udp4.c</code> (programs at <code>tests/e2e/manifests/c-programs.yaml:8492</code>, <code>:8556</code> and <code>:8614</code>, verify ci on ptrace).</li>
+<li>T7 (covers F12, F13): after a loopback TCP transfer, <code>TCP_INFO</code> must match across runs, with state and options kept and counters zero. Read <code>TCP_CONGESTION</code>, <code>TCP_MAXSEG</code> and <code>TCP_CC_INFO</code> and check whether they repeat. Existing candidates: <code>tests/c/tcp_info_accept4.c</code>, <code>tests/c/tcp_info_accept6.c</code> and <code>tests/c/tcp_info_client4.c</code> (programs at <code>tests/e2e/manifests/c-programs.yaml:9807</code>, <code>:9865</code> and <code>:9923</code>, verify ci on ptrace).</li>
+<li>T8 (covers F10, F11, F14, F15): read <code>SO_MEMINFO</code> after a transfer, <code>SO_BINDTODEVICE</code> after binding to &quot;lo&quot;, <code>IP_TTL</code>, <code>IP_MTU</code> and <code>IPV6_V6ONLY</code> defaults, <code>NETLINK_LIST_MEMBERSHIPS</code>, and <code>PACKET_STATISTICS</code> where permitted. Record which values differ between two <code>--verify</code> runs.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant B of https://github.com/rrnewton/hermit/issues/609: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch typed.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy model (kernel answers via record_or_replay; Detcore rewrites SO_COOKIE, SO_NETNS_COOKIE, SO_INCOMING_CPU, TCP_INFO in detcore/src/syscalls/files.rs:3914); linux_determinism conditional kept; 16 flags, 8 tests; gaps: cookie writes not gated on success (hypothesis, T5), SO_MEMINFO/TCP_CC_INFO/IP_MTU pass through; no coverage recorded, so todo.</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d12 (owner decisions 1 and 2): cross_host_variant true (global net.core socket-buffer sysctls, the host default TCP congestion algorithm inherited by the guest's network namespace, host LSM for SO_PEERSEC); no U items; no open questions</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+getsockopt&amp;amp;body=Discussion+for+the+%60getsockopt%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fgetsockopt.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60getsockopt%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `getsockopt`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: getsockopt&quot; (https://github.com/rrnewton/hermit/issues/609), legacy variant B.</p>
+<p>Comment history: 1 comment(s) on https://github.com/rrnewton/hermit/issues/609.</p>
+<h3>Legacy tracking note (2026-07-24)</h3>
+<p>Filed by the complete syscall-classification audit. At that time the implementation classified <code>PASS-THRU</code> entries under fixed-container and stable-state assumptions, and sent every other entry to the explicit unsupported policy until a deterministic handler existed. At f4055eb9 <code>getsockopt</code> has that handler (<code>detcore/src/syscalls/files.rs:3914</code>).</p>
+</body></html>

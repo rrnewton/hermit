@@ -1,0 +1,64 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>epoll_create1 | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>epoll_create1</code> (291)</h1>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; linux determinism: deterministic &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+epoll_create1&amp;body=Discussion+for+the+%60epoll_create1%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fepoll_create1.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60epoll_create1%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>epoll_create1(flags)</code> creates an epoll instance and returns a descriptor for it. The instance holds an interest list and a ready list. Detcore handles the call at <code>detcore/src/syscalls/io.rs:1143</code>. It makes an empty scheduler request, lets the kernel create the instance through <code>record_or_replay</code>, and registers the descriptor in its mirror. That registration is what lets <code>dup</code>, <code>F_DUPFD_CLOEXEC</code> and <code>F_SETFD</code> on an epoll descriptor work.</p>
+<p>Manual reference: Linux man-pages epoll_create(2).</p>
+<h2>Linux semantics</h2>
+<p>The call returns the lowest free descriptor. The only valid flag is <code>EPOLL_CLOEXEC</code>, which has the same value as <code>O_CLOEXEC</code>; any other bit gives <code>EINVAL</code>.</p>
+<p>The interest list belongs to the open file description. Copies made by <code>dup</code> or <code>fork</code>, or sent through <code>SCM_RIGHTS</code>, share it. The instance is freed when its last descriptor is closed.</p>
+<p>Creating an instance has no effect beyond the descriptor table and memory accounting. Readiness and event order come from the later <code>epoll_ctl</code> and <code>epoll_wait</code> calls.</p>
+<p>The older <code>epoll_create(size)</code> (nr 213) requires <code>size &gt; 0</code>, otherwise it fails with <code>EINVAL</code>. Apart from that check it ignores <code>size</code>, and it creates the instance as <code>epoll_create1(0)</code> does.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>flags = 0</code>: a new instance on a descriptor that is not close-on-exec</li>
+<li>F2: <code>EPOLL_CLOEXEC</code>: the new descriptor is close-on-exec</li>
+<li>F3: any other bit in <code>flags</code>: <code>EINVAL</code></li>
+<li>F4: resource errors: <code>EMFILE</code> (per-process limit), <code>ENFILE</code> (system-wide limit), <code>ENOMEM</code></li>
+<li>F5: <code>epoll_create(size)</code> (nr 213): <code>EINVAL</code> if <code>size &lt;= 0</code>; otherwise <code>size</code> is ignored and the call acts like <code>epoll_create1(0)</code></li>
+<li>F6: description sharing: descriptors made by <code>dup</code>, <code>F_DUPFD</code>, <code>F_DUPFD_CLOEXEC</code> or <code>fork</code> refer to the same instance and its interest list</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: deterministic</code>. The descriptor number and its close-on-exec state depend only on <code>flags</code> and on the calling process's descriptor table, which Hermit serializes. The resource errors in F4 depend on host limits, as they do for every call that creates a descriptor. Readiness order, which is the real source of nondeterminism in epoll, belongs to <code>epoll_wait</code> and is tracked there.</p>
+<h2>Hermit design</h2>
+<p>Target policy: <code>model</code>. The kernel holds the epoll instance, and Detcore mirrors the descriptor.</p>
+<ul>
+<li>The handler first makes an empty <code>resource_request</code> (<code>detcore/src/syscalls/io.rs:1149</code>), which gives the scheduler a switch point, then sends the call to the kernel through <code>record_or_replay</code> (<code>detcore/src/syscalls/io.rs:1150</code>). The kernel therefore decides F3 and F4.</li>
+<li>The descriptor is registered as <code>FdType::Epoll</code>, and the guest's <code>flags</code> are passed straight through as <code>O_CLOEXEC</code> (<code>detcore/src/syscalls/io.rs:1161</code> to <code>detcore/src/syscalls/io.rs:1165</code>; the bit equivalence is noted at <code>detcore/src/syscalls/io.rs:1159</code>) (F1, F2). <code>DetFd::new</code> keeps the bit as the close-on-exec flag (<code>detcore/src/fd.rs:204</code>).</li>
+<li>The comment at <code>detcore/src/syscalls/io.rs:1151</code> records why the registration exists. Without it, <code>dup</code> and <code>fcntl</code> on the descriptor returned <code>EBADF</code>, which broke rustup's proxies, because their tokio runtime duplicates its epoll descriptor at startup (F6).</li>
+<li><code>epoll_create</code> is routed to the same handler through <code>EpollCreate1::from</code> (<code>detcore/src/lib.rs:2618</code> to <code>detcore/src/lib.rs:2621</code>) (F5).</li>
+</ul>
+<p>Detcore neither refuses nor emulates anything here, and <code>passthrough</code> would bring back the <code>EBADF</code> failure above. So <code>model</code> is what the code already does.</p>
+<p>Open items:</p>
+<ul>
+<li><strong>`epoll_create(0)` and `epoll_create(-1)`.</strong> The conversion in the reverie checkout of this parent repository (<code>impl From&lt;EpollCreate&gt; for EpollCreate1</code> in <code>reverie-syscalls/src/syscalls.rs</code>, not pinned to this hermit SHA) overwrites the first argument with flags 0, and its own comment says this &quot;could have changed behavior when calling <code>epoll_create(-1)</code>&quot;. By that reading, Hermit gives a working descriptor where Linux returns <code>EINVAL</code>. This is not measured; T3 checks it. If confirmed, it belongs to <code>epoll_create</code>'s tracking body, which this body does not cover.</li>
+<li><strong>Record and replay.</strong> The Recorder's subscription list (<code>hermit-cli/src/recorder.rs:384</code> to <code>hermit-cli/src/recorder.rs:474</code>) contains <code>epoll_wait</code> but not <code>epoll_create1</code>, so creation runs live again on replay. Creation is deterministic, so this is expected to be harmless. The parent-repository report <code>ai_docs/hermit-record-mode-current-state-20260915.md</code> (measured at an earlier hermit SHA, not re-run here) lists an <code>epoll_pipe</code> program using <code>epoll_create1</code> as passing record and replay.</li>
+</ul>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F2, F6): create instances with <code>flags = 0</code> and with <code>EPOLL_CLOEXEC</code>. Check <code>F_GETFD</code>; that <code>F_GETFL</code>, <code>F_SETFD</code>, <code>dup</code>, <code>F_DUPFD</code> and <code>F_DUPFD_CLOEXEC</code> on the descriptor succeed; and that a <code>dup</code> copy sees an <code>epoll_ctl</code> registration made through the original. Existing candidate: <code>epoll_fd_supports_descriptor_table_ops</code> (<code>hermit-cli/tests/epoll_determinism.rs:416</code>). It runs <code>tests/c/epoll_determinism.c</code> with the <code>dupfd</code> scenario (<code>tests/c/epoll_determinism.c:427</code>) through <code>hermit run</code>, with no <code>--backend</code> argument (<code>hermit-cli/tests/epoll_determinism.rs:88</code>). The scenario creates the instance with <code>EPOLL_CLOEXEC</code> (<code>tests/c/epoll_determinism.c:39</code>), does not try <code>flags = 0</code>, and does not check that a registration is shared. Also: <code>mixed_epoll_sources_are_deterministic</code> (<code>detcore/tests/misc/notification_fds.rs:322</code>, cargo test target <code>tests_misc</code>), which creates its instance with <code>EPOLL_CLOEXEC</code> (<code>detcore/tests/misc/notification_fds.rs:257</code>), and the cell <code>c-programs/epoll-readiness</code> (<code>tests/e2e/manifests/c-programs.yaml:11508</code>, verify ci on ptrace).</li>
+<li>T2 (covers F3, F4): <code>epoll_create1(1)</code> returns <code>EINVAL</code>. With <code>RLIMIT_NOFILE</code> lowered to the number of open descriptors, the call returns <code>EMFILE</code> and opens nothing.</li>
+<li>T3 (covers F5): raw <code>syscall(SYS_epoll_create, 1)</code> succeeds, and <code>syscall(SYS_epoll_create, 0)</code> and <code>syscall(SYS_epoll_create, -1)</code> return <code>EINVAL</code>, under <code>hermit run --verify</code> on ptrace and natively.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · created for v1: no tracking issue existed for this pinned Sysno; code at this SHA: determinized, dispatch typed.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy model (kernel instance; Detcore registers the descriptor so dup and fcntl work); linux_determinism deterministic; 6 flag behaviours and 3 tests listed; no coverage token, tracking_status stays todo</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+epoll_create1&amp;amp;body=Discussion+for+the+%60epoll_create1%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fepoll_create1.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60epoll_create1%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `epoll_create1`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Created by the syscall-tracking v1 migration on 2026-10-03. No tracking issue existed for <code>epoll_create1</code>: the 2026-07-24 classification campaign filed issues only for syscalls in the old temporary pass-through block, and Detcore already handled this one.</p>
+<h3>Open questions</h3>
+<ul>
+<li>None for <code>epoll_create1</code>. The <code>epoll_create(size &lt;= 0)</code> behaviour (T3) belongs to <code>epoll_create</code>'s tracking body; it is noted here because the two calls share one handler.</li>
+</ul>
+</body></html>

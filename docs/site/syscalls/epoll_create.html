@@ -1,0 +1,86 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>epoll_create | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>epoll_create</code> (213)</h1>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; linux determinism: conditional &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+epoll_create&amp;body=Discussion+for+the+%60epoll_create%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fepoll_create.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60epoll_create%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>epoll_create(size)</code> creates a new epoll instance and returns a file descriptor for it. This is the older form of <code>epoll_create1</code>. Detcore converts the call to <code>epoll_create1(0)</code> and runs it through the shared <code>handle_epoll_create1</code> handler (<code>detcore/src/lib.rs:2618</code>-<code>2621</code> at hermit f4055eb9cae4). That handler lets the kernel create the instance and records the new descriptor in Detcore's fd table. One known gap: the conversion drops <code>size</code>, so <code>epoll_create(0)</code> and <code>epoll_create(-1)</code> succeed under Hermit, where Linux returns <code>EINVAL</code>.</p>
+<h2>Linux semantics</h2>
+<p><code>size</code> was once a hint for how many descriptors the instance would watch. Since Linux 2.6.8 the kernel ignores the value, but it must still be greater than zero for backward compatibility. Otherwise the call fails with <code>EINVAL</code>.</p>
+<p>On success the call returns the lowest free descriptor number in the calling process. The descriptor does not have close-on-exec set; only <code>epoll_create1(EPOLL_CLOEXEC)</code> sets it. Other errors:</p>
+<ul>
+<li><code>EMFILE</code>: the process has reached <code>RLIMIT_NOFILE</code>.</li>
+<li><code>ENFILE</code>: the system-wide limit on open files has been reached.</li>
+<li><code>ENOMEM</code>: the kernel could not allocate the instance.</li>
+</ul>
+<p>The instance lives until every descriptor that refers to it is closed. <code>fork</code> and <code>dup</code> share it, and so does <code>execve</code>, because close-on-exec is not set.</p>
+<p>Host probe on the agent host (Linux 7.1.3, python ctypes, 2026-10-03), recorded by this body's author: <code>epoll_create(0)</code> and <code>epoll_create(-1)</code> gave <code>EINVAL</code>, and <code>epoll_create(1)</code> returned fd 3.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>size</code> greater than zero: the value is ignored, a new epoll instance is created, and a descriptor without close-on-exec is returned (the same as <code>epoll_create1(0)</code>)</li>
+<li>F2: <code>size</code> zero or negative: <code>EINVAL</code>, and no descriptor is created</li>
+<li>F3: descriptor allocation: the lowest free descriptor number is used, and <code>EMFILE</code> is returned at <code>RLIMIT_NOFILE</code></li>
+<li>F4: host resource failure: <code>ENFILE</code> at the system-wide file limit, <code>ENOMEM</code> when allocation fails</li>
+<li>F5: lifetime: without close-on-exec, the descriptor is shared across <code>fork</code> and <code>dup</code> and survives <code>execve</code></li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: conditional</code>. When it succeeds, the result is a function of the process's own state: whether <code>size</code> is valid (F1, F2), and the lowest free descriptor number (F3). A program that opens and closes descriptors in the same order gets the same number each time.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li><code>RLIMIT_NOFILE</code> is inherited from whatever launched the process, so the point at which <code>EMFILE</code> appears depends on the launcher (F3).</li>
+<li><code>ENFILE</code> and <code>ENOMEM</code> depend on host-wide state outside the process (F4).</li>
+<li>Descriptors the process inherits at startup change which number is lowest and free. Hermit's launcher decides this, not the guest.</li>
+</ul>
+<p>The epoll instance itself holds no host-dependent data when it is created. What it later reports through <code>epoll_wait</code> belongs to <code>epoll_ctl</code> and <code>epoll_wait</code>, not to this call.</p>
+<h3>Cross-host variation</h3>
+<ul>
+<li>Host <code>RLIMIT_NOFILE</code> inherited by Hermit's guest: the kernel enforces that limit, not the virtual 1048576 that Detcore reports (<code>detcore/src/tool_local.rs:289</code>), so the descriptor count at which F3's <code>EMFILE</code> appears differs between hosts.</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>model</code>. The kernel creates the real instance, and Detcore keeps its own record of the descriptor so that later fd operations work.</p>
+<p>What happens today:</p>
+<ul>
+<li>The typed arm converts <code>EpollCreate</code> to <code>EpollCreate1</code> (<code>detcore/src/lib.rs:2618</code>-<code>2621</code>). In the pinned Reverie (<code>reverie-syscalls/src/syscalls.rs:3107</code>-<code>3116</code>, Reverie d766df20b780), <code>impl From&lt;EpollCreate&gt; for EpollCreate1</code> sets the flags argument to 0 and drops <code>size</code>. Its doc comment admits that a negative <code>size</code> changes behaviour after the conversion.</li>
+<li><code>handle_epoll_create1</code> (<code>detcore/src/syscalls/io.rs:1143</code>) makes an empty resource request to the scheduler (<code>detcore/src/syscalls/io.rs:1149</code>).</li>
+<li>It then hands the call to the record/replay layer (<code>detcore/src/syscalls/io.rs:1150</code>; <code>record_or_replay</code> at <code>detcore/src/tool_local.rs:382</code>), which runs the syscall on the host. The kernel picks the descriptor number from the guest process's own descriptor table (F3).</li>
+<li>It registers the descriptor in Detcore's fd table as <code>FdType::Epoll</code>, with close-on-exec taken from the flags (<code>detcore/src/syscalls/io.rs:1161</code>-<code>1166</code>). The flags are 0 after the conversion, so the descriptor is recorded without close-on-exec, as F1 and F5 require. The comment above this call explains that <code>dup</code> and <code>fcntl</code> on the epoll descriptor fail with <code>EBADF</code> without the registration.</li>
+<li>The syscall is subscribed (<code>detcore/src/lib.rs:1205</code>) and is in the <code>Determinized</code> list (<code>detcore/src/syscall_classification.rs:72</code>).</li>
+</ul>
+<p>Gap against Linux:</p>
+<ul>
+<li><strong>F2 is not modeled.</strong> Because <code>size</code> is dropped before the kernel sees it, <code>epoll_create(0)</code> and <code>epoll_create(-1)</code> create an instance and return a descriptor under Hermit. Linux returns <code>EINVAL</code>. The answer is the same on every run, but it is the wrong answer. Fix: in the <code>EpollCreate</code> arm, return <code>EINVAL</code> when <code>size &lt;= 0</code>, before the conversion. This needs a hermit issue; this agent had no GitHub access and could not file one.</li>
+</ul>
+<p>F4 is passed through from the host. An <code>ENFILE</code> or <code>ENOMEM</code> is a host failure that Hermit cannot make deterministic, the same as for any other descriptor-creating call.</p>
+<p><code>model</code> fits better than the alternatives:</p>
+<ul>
+<li><code>passthrough</code> would leave the descriptor out of Detcore's fd table and break later fd operations.</li>
+<li><code>emulate</code> cannot work, because later epoll calls need a real kernel instance.</li>
+<li><code>refuse</code> would break programs that still use the old entry point, including older libevent and libuv builds.</li>
+</ul>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F5): <code>epoll_create(1)</code> and <code>epoll_create(1024)</code> each return a descriptor. <code>fcntl(F_GETFD)</code> shows close-on-exec clear, <code>dup</code> of the descriptor succeeds, and an <code>epoll_ctl</code> add of a pipe followed by <code>epoll_wait</code> reports the pipe once it is written. A child created with <code>fork</code> and <code>execve</code> still sees the descriptor open. All of this runs under <code>hermit run --verify</code> on ptrace.</li>
+<li>T2 (covers F2): <code>epoll_create(0)</code> and <code>epoll_create(-1)</code> must return -1 with <code>errno</code> <code>EINVAL</code> and leave the descriptor table unchanged. This fails at f4055eb9cae4, where both calls succeed. Add it together with the fix above.</li>
+<li>T3 (covers F3): close descriptors 3-5, then call <code>epoll_create(1)</code> three times. The calls must return 3, 4 and 5 in that order. Then lower <code>RLIMIT_NOFILE</code> to the current descriptor count and check that the next call returns <code>EMFILE</code>. Under <code>--verify</code>, the numbers must be identical across runs.</li>
+<li>T4 (covers none): <code>ENFILE</code> and <code>ENOMEM</code> cannot be triggered reliably without host-wide side effects. With a fault-injection hook in the test harness, assert that a failed kernel call registers no descriptor. It no longer claims F4, which U1 records as a host-transient error.</li>
+<li>U1 (covers F4; host-transient): <code>ENFILE</code> and <code>ENOMEM</code> depend on host-wide state shared with other processes. The host call at <code>detcore/src/syscalls/io.rs:1150</code> returns the error to the guest unchanged today. F4 counts toward done only once Hermit hides these errors or reports them as an infrastructure error.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · created for v1: no tracking issue existed for this pinned Sysno; code at this SHA: determinized, dispatch typed.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy model (converted to epoll_create1(0), kernel creates the instance, descriptor registered as FdType::Epoll; lib.rs:2618, io.rs:1143); linux_determinism stays conditional (RLIMIT_NOFILE, ENFILE/ENOMEM, inherited descriptors); 5 flags and 4 tests listed; tracking_status stays todo: no test names this syscall, and F2 is a defect (size &lt;= 0 succeeds instead of EINVAL) that needs a hermit issue</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d12 (owner decisions 1 and 2): cross_host_variant true (the kernel enforces the host RLIMIT_NOFILE, not the virtual one, so the EMFILE point of F3 differs between hosts); F4 ENFILE/ENOMEM recorded as host-transient U1 and T4 no longer claims F4; no open questions</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+epoll_create&amp;amp;body=Discussion+for+the+%60epoll_create%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fepoll_create.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60epoll_create%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `epoll_create`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Created by the syscall-tracking v1 migration on 2026-10-03. No tracking issue existed for <code>epoll_create</code>: the 2026-07-24 classification campaign filed issues only for syscalls in the old temporary pass-through block, and Detcore already handled this one.</p>
+<p>The Reverie typed struct is <code>EpollCreate { size: i32 }</code> (<code>reverie-syscalls/src/syscalls.rs:2190</code> at Reverie d766df20b780). Its doc comment says <code>size</code> &quot;must be greater than 0&quot;, which the conversion at lines 3107-3116 does not enforce.</p>
+<p>No test at f4055eb9cae4 names <code>epoll_create</code>; <code>code_facts.tests_naming</code> is 0. <code>tests/c/epoll_determinism.c</code> creates its epoll instance with <code>epoll_create1(EPOLL_CLOEXEC)</code> (<code>tests/c/epoll_determinism.c:39</code>).</p>
+</body></html>

@@ -1,0 +1,67 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>getpmsg | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>getpmsg</code> (181)</h1>
+<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_unimplemented_enosys_syscall</code> &middot; linux determinism: deterministic &middot; target policy: refuse &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+getpmsg&amp;body=Discussion+for+the+%60getpmsg%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fgetpmsg.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60getpmsg%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>getpmsg(fd, ctlptr, dataptr, bandp, flagsp)</code> is the reserved entry for receiving a System V STREAMS message. Mainline Linux never implemented STREAMS and returns <code>ENOSYS</code>. Detcore returns that same fixed <code>ENOSYS</code> itself and never forwards the call (<code>detcore/src/lib.rs:2090-2094</code>).</p>
+<p>Manual reference: Linux man-pages getpmsg(2) (an alias page of unimplemented(2)).</p>
+<h2>Linux semantics</h2>
+<p>The number is reserved so that out-of-tree STREAMS implementations could use it. In STREAMS, <code>getpmsg</code> reads a control part into <code>ctlptr</code> and a data part into <code>dataptr</code> from a stream, with <code>*flagsp</code> selecting <code>MSG_HIPRI</code>, <code>MSG_BAND</code> (with <code>*bandp</code>) or <code>MSG_ANY</code>. Mainline Linux maps number 181 to <code>sys_ni_syscall</code> (<code>__SYSCALL(181, sys_ni_syscall)</code> in the generated <code>syscalls_64.h</code> of both kernel trees under <code>/usr/src/kernels</code> on the evidence host), which returns <code>-ENOSYS</code> without looking at <code>fd</code> or any pointer.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>*flagsp</code> set to <code>MSG_HIPRI</code>, <code>MSG_BAND</code> (with <code>*bandp</code>) or <code>MSG_ANY</code>: <code>ENOSYS</code>; <code>*flagsp</code>, <code>*bandp</code> and both <code>strbuf</code> buffers are left unchanged.</li>
+<li>F2: <code>fd</code> is a valid readable descriptor with data queued, such as a pipe: <code>ENOSYS</code>, and the queued data is not consumed.</li>
+<li>F3: <code>fd</code> is closed or invalid, or a pointer argument is <code>NULL</code> or unmapped: <code>ENOSYS</code>, not <code>EBADF</code> or <code>EFAULT</code>.</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: deterministic</code>. Linux does not implement STREAMS <code>getpmsg</code> on x86_64; the call returns <code>ENOSYS</code> without consulting any argument or state.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>None; the current ABI is an unconditional refusal.</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>refuse</code>. The rendered body carried <code>passthrough</code> from the legacy PASS-THRU recommendation, which predates the code. At hermit f4055eb9cae4 Detcore never forwards <code>getpmsg</code> to the host:</p>
+<ul>
+<li><code>getpmsg</code> is listed in the Determinized arm of <code>classify_syscall</code> (<code>detcore/src/syscall_classification.rs:275-287</code>; the arm ends <code>=&gt; SyscallClassification::Determinized</code> at <code>detcore/src/syscall_classification.rs:688</code>) and in the predicate <code>is_unimplemented_enosys_syscall</code> (<code>detcore/src/syscall_classification.rs:856</code>).</li>
+<li>The dispatch arm at <code>detcore/src/lib.rs:2090-2094</code> returns <code>Err(Error::Errno(Errno::ENOSYS))</code> for every call. It reads no argument and consults no configuration, so the answer is the same with or without <code>panic_on_unsupported_syscalls</code> and under the fail-closed policy.</li>
+<li>The predicate is part of the refusal boundary <code>is_deterministically_refused_syscall</code> (<code>detcore/src/syscall_classification.rs:1319-1321</code>), which is why <code>code_facts.refused</code> is <code>true</code>.</li>
+<li>The unit test <code>unimplemented_enosys_syscalls_are_determinized_and_consistent</code> (<code>detcore/src/syscall_classification.rs:2209</code>) pins the classification and the exact predicate set. It does not start Hermit, so it is not ptrace coverage.</li>
+</ul>
+<p>Why <code>refuse</code> and not the alternatives:</p>
+<ul>
+<li>A fixed <code>ENOSYS</code> is exactly what every supported x86_64 kernel returns for this number, so a guest sees no difference from native execution. The doc comment at <code>detcore/src/syscall_classification.rs:851-855</code> states the same intent: deterministic by construction, without depending on the host kernel being modern.</li>
+<li><code>passthrough</code> contradicts the code and would bring back a host-kernel dependence: a host kernel patched with an out-of-tree STREAMS implementation would read from real streams and make the result depend on the host.</li>
+<li><code>model</code> or <code>emulate</code> would mean reimplementing an interface that current Linux does not provide, which no program running on a modern kernel can rely on.</li>
+</ul>
+<p>The code already realizes <code>refuse</code>. What is missing is a test that starts Hermit on ptrace and calls <code>getpmsg</code> (none names it at this SHA). The classification, predicate and dispatch arm all still carry <code>TODO-HUMAN-REVIEW(#715)</code> (<code>detcore/src/syscall_classification.rs:271</code>, <code>detcore/src/syscall_classification.rs:850</code>, <code>detcore/src/lib.rs:2084</code>; https://github.com/rrnewton/hermit/issues/715). That review concerns the arm as written and does not argue for a different policy.</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F2, F3): under <code>hermit run --verify</code> on ptrace, write a few bytes into a pipe, then call <code>syscall(SYS_getpmsg, ...)</code> on the read end with sentinel-filled <code>strbuf</code> structures and each of the three flag values, then on fd -1 and with <code>(void *)1</code> pointers. Every call must return <code>-1</code> with <code>errno == ENOSYS</code>, the sentinels must be unchanged, and a following <code>read()</code> must still return the bytes written. Shape: a C program <code>tests/c/getpmsg_enosys.c</code> modelled on <code>tests/c/futex_wake_enosys.c</code>, which calls a raw <code>syscall()</code> and fails unless it gets <code>-1</code>/<code>ENOSYS</code>, with a cell modelled on <code>c-programs/futex-wake-enosys</code> (<code>tests/e2e/manifests/c-programs.yaml:1660</code>, <code>verify</code> with <code>ci: ptrace: true</code>). Neither the program nor the cell exists for <code>getpmsg</code> at this SHA.</li>
+<li>T2 (covers none): record and replay a guest that calls <code>getpmsg</code> once; both the recording and the replay must see <code>-1/ENOSYS</code>, and the replay must not diverge.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A2 of https://github.com/rrnewton/hermit/issues/375: linux_determinism deterministic (from <strong>Classification:</strong>); target_policy from legacy PASS-THRU, which disagrees with the code; code at this SHA: determinized, dispatch pred:is_unimplemented_enosys_syscall, refused.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy passthrough -&gt; refuse (Detcore returns a fixed ENOSYS at detcore/src/lib.rs:2090-2094, the value current x86_64 kernels return); linux_determinism stays deterministic; 3 flag behaviours, 2 tests; no ptrace test calls getpmsg, so tracking_status stays todo</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+getpmsg&amp;amp;body=Discussion+for+the+%60getpmsg%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fgetpmsg.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60getpmsg%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `getpmsg`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: getpmsg&quot; (https://github.com/rrnewton/hermit/issues/375), legacy variant A2. It was ranked 96 in the batch-2 classification order, which excluded the 50 syscalls seen in batch-1 workloads.</p>
+<h3>2026-07-24 host strace evidence</h3>
+<p>Test host: Linux 6.17.13 x86_64; strace 6.12.</p>
+<p>Ran a syscall-specific safe raw probe with deliberately inert/invalid arguments so privileged or mutating operations could not change host state:</p>
+<pre><code>strace -f -qq -e trace=getpmsg -s 160 python3 -c 'import ctypes; c=ctypes.CDLL(None,use_errno=True); c.syscall(181, *([ctypes.c_long(-1)]*6))'
+</code></pre>
+<p>Actual strace output:</p>
+<pre><code>getpmsg(0xffffffffffffffff, 0xffffffffffffffff, 0xffffffffffffffff, 0xffffffffffffffff, 0xffffffffffffffff) = -1 ENOSYS (Function not implemented)
+</code></pre>
+<p>The trace confirms the host kernel path and observed errno/result for this ABI. The determinism recommendation also accounts for documented success-path state dependencies; an invalid-argument result alone is not treated as proof of determinism.</p>
+</body></html>

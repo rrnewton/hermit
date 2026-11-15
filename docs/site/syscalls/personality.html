@@ -1,0 +1,96 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>personality | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>personality</code> (135)</h1>
+<p>Strategy: <strong>passthrough</strong> &middot; dispatch: <code>passthrough</code> &middot; linux determinism: conditional &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+personality&amp;body=Discussion+for+the+%60personality%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fpersonality.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60personality%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>personality(persona)</code> reads or replaces the calling thread's persona: an execution domain in the low byte plus flag bits that change how later <code>execve</code>, <code>mmap</code>, <code>uname</code> and <code>select</code> behave. Detcore passes it to the kernel unchanged (<code>detcore/src/lib.rs:2843</code>). The persona Hermit starts the guest with is not the host default: the ptrace tracer sets <code>PER_LINUX | ADDR_NO_RANDOMIZE</code> before the first exec, and that flag is what keeps the guest's address layout fixed. A guest can clear it, and nothing in Hermit puts it back.</p>
+<h2>Linux semantics</h2>
+<p>The persona is a 32-bit value stored per task. The argument is truncated to 32 bits. <code>0xffffffff</code> only reads it; any other value replaces the whole persona and the call returns the previous one. On x86_64 the kernel does not validate the value: any bits are stored and read back, and the call does not fail in practice. The persona is copied to children by <code>fork</code> and <code>clone</code> and survives <code>execve</code>, except that an exec that gains privilege (setuid, setgid or file capabilities) clears <code>ADDR_NO_RANDOMIZE</code>, <code>ADDR_COMPAT_LAYOUT</code>, <code>READ_IMPLIES_EXEC</code> and <code>MMAP_PAGE_ZERO</code>. Under <code>PR_SET_NO_NEW_PRIVS</code> an exec never gains privilege, so those flags are not cleared.</p>
+<p>Most flags take effect only at the next <code>execve</code>. At exec the kernel randomizes the stack, <code>mmap</code> base, vDSO and heap start unless <code>ADDR_NO_RANDOMIZE</code> is set or <code>kernel.randomize_va_space</code> is 0.</p>
+<p>Host results measured for this issue on Linux 7.1.3: the query returns <code>0x0</code> for a normal shell child; <code>0x1ffffffff</code> acts as a query; setting <code>0x123456</code> returns the old value and a later query returns <code>0x123456</code>.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>persona == 0xffffffff</code>: query only; returns the current persona and changes nothing</li>
+<li>F2: the argument is truncated to 32 bits, so a 64-bit value whose low 32 bits are <code>0xffffffff</code> (for example <code>0x1ffffffff</code>) is also a query</li>
+<li>F3: any other value replaces the whole persona and returns the previous one; there is no validation, unknown bits are stored and read back, and the call does not fail</li>
+<li>F4: execution domain (<code>persona &amp; PER_MASK</code>): <code>PER_LINUX</code> (0) is the default; <code>PER_LINUX32</code> makes <code>uname</code> report <code>i686</code> in <code>machine</code>; other domain numbers are stored but change nothing else on x86_64</li>
+<li>F5: <code>ADDR_NO_RANDOMIZE</code>: the next <code>execve</code> lays out stack, <code>mmap</code> base, vDSO and heap without randomization; clearing it makes the next <code>execve</code> randomize them when <code>kernel.randomize_va_space</code> is nonzero</li>
+<li>F6: <code>ADDR_COMPAT_LAYOUT</code>: the next <code>execve</code> uses the legacy bottom-up <code>mmap</code> layout</li>
+<li>F7: <code>READ_IMPLIES_EXEC</code>: <code>PROT_READ</code> mappings also get <code>PROT_EXEC</code>; on x86_64 <code>execve</code> sets or clears it from the new program's <code>PT_GNU_STACK</code></li>
+<li>F8: <code>MMAP_PAGE_ZERO</code>: the next <code>execve</code> maps page 0 read-only</li>
+<li>F9: <code>UNAME26</code>: <code>uname</code> reports a <code>2.6.x</code> release string instead of the real one</li>
+<li>F10: <code>STICKY_TIMEOUTS</code>: <code>select</code> and <code>pselect6</code> do not write the remaining time back to the timeout argument</li>
+<li>F11: <code>ADDR_LIMIT_32BIT</code>, <code>ADDR_LIMIT_3GB</code>, <code>SHORT_INODE</code>, <code>WHOLE_SECONDS</code>, <code>FDPIC_FUNCPTRS</code>: stored, inherited and read back; this issue found no other effect on 64-bit x86_64 processes</li>
+<li>F12: inheritance: copied by <code>fork</code> and <code>clone</code>, kept by <code>execve</code>; a privilege-gaining exec clears the four flags named above, which <code>PR_SET_NO_NEW_PRIVS</code> prevents</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: conditional</code>. The call itself is a function of its argument and of the persona the task inherited, so it repeats when the starting persona is fixed. Natively the starting persona comes from the parent (a launch under <code>setarch -R</code> starts with <code>ADDR_NO_RANDOMIZE</code>). The larger effect is F5: the persona decides whether every later <code>execve</code> gets a random address layout. A program that clears <code>ADDR_NO_RANDOMIZE</code> and then execs gets a different stack, <code>mmap</code> base, vDSO and heap address on every run.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>The persona inherited from the launching process (F1, F3).</li>
+<li>ASLR at the next <code>execve</code> when <code>ADDR_NO_RANDOMIZE</code> is clear and <code>kernel.randomize_va_space</code> is nonzero (F5).</li>
+<li><code>kernel.randomize_va_space</code>, a host setting (F5).</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>model</code> (the code at hermit f4055eb9cae4 passes it through).</p>
+<p>What the code does today:</p>
+<ul>
+<li><code>classify_syscall</code> returns <code>PassThrough</code> for <code>personality</code> in the &quot;ISSUE-REVIEWED PASS-THROUGH SYSCALLS&quot; block (<code>detcore/src/syscall_classification.rs:820</code>). The comment at <code>detcore/src/syscall_classification.rs:808</code> says these remain conditional on Hermit's fixed-container assumptions, and <code>detcore/src/syscall_classification.rs:811</code> still carries <code>TODO-HUMAN-REVIEW(PR-643)</code>. The unit test <code>representative_policies_stay_in_their_reviewed_sections</code> pins the classification (<code>detcore/src/syscall_classification.rs:2109</code>).</li>
+<li>Dispatch is the generic arm at <code>detcore/src/lib.rs:2843</code>, which calls <code>passthrough</code> (<code>detcore/src/lib.rs:367</code>). Under record and replay, <code>passthru_opt</code> (<code>detcore/src/lib.rs:3140</code>) leaves it unsubscribed (<code>detcore/src/lib.rs:1084</code>).</li>
+<li>The starting persona comes from Reverie, not Detcore. In Reverie at the rev pinned by <code>Cargo.lock:1377</code> (d766df20b780), <code>init_tracee</code> in <code>reverie-ptrace/src/tracer.rs</code> sets <code>PR_SET_NO_NEW_PRIVS</code> (line 3971) and then calls <code>personality(PER_LINUX | ADDR_NO_RANDOMIZE)</code> (line 3976). It runs once, before the guest's first exec, and replaces the whole persona. No Rust file in the export names <code>personality</code> or <code>ADDR_NO_RANDOMIZE</code> except the classification table and <code>hermit-cli/tests/rr_suite.rs</code>.</li>
+<li>So a guest query returns <code>0x40000</code> under Hermit where a normal native launch returns <code>0x0</code>. That value is fixed, and <code>tests/c/personality_domain.c:12</code> already relies on it (&quot;Hermit already enables ADDR_NO_RANDOMIZE&quot;).</li>
+</ul>
+<p>Why <code>model</code> and not <code>passthrough</code>:</p>
+<ul>
+<li><strong>ASLR escape (F5).</strong> A guest that calls <code>personality(PER_LINUX)</code> and then <code>execve</code> gives the new program a randomized layout, because nothing re-applies <code>ADDR_NO_RANDOMIZE</code>. Every address that program prints or hashes then differs between runs. This follows from the code above; it was not run under Hermit for this issue.</li>
+<li><strong>`UNAME26` is lost (F9).</strong> <code>handle_uname</code> sets <code>release</code> to <code>&quot;5.2.0&quot;</code> unconditionally (<code>detcore/src/syscalls/misc.rs:541</code>), so the flag that asks for a <code>2.6.x</code> string has no effect under Hermit. This is deterministic but differs from Linux. <code>machine</code> is not rewritten, so <code>PER_LINUX32</code> (F4) still works.</li>
+<li>A model fixes both: Detcore keeps a virtual persona per task (inherited at <code>clone</code>, kept at <code>execve</code>), returns it for F1 to F3, always keeps <code>ADDR_NO_RANDOMIZE</code> set in the real persona, and lets <code>handle_uname</code> read the virtual <code>UNAME26</code> bit.</li>
+</ul>
+<h3>Gaps and open points</h3>
+<ul>
+<li><code>STICKY_TIMEOUTS</code> (F10): the <code>select</code> and <code>pselect6</code> arms (<code>detcore/src/lib.rs:2615</code>, <code>detcore/src/lib.rs:2612</code>) go to Detcore handlers, and no Rust file in the export names the flag. Whether those handlers write the remaining time back, and so ignore the flag, was not checked.</li>
+<li><code>rr_personality</code> (<code>hermit-cli/tests/rr_suite.rs:376</code>) is marked <code>#[ignore]</code> by its <code>rr_test!</code> macro (<code>hermit-cli/tests/rr_suite.rs:230</code>), so it is not coverage.</li>
+<li>The mechanism and the starting value the guest should see are owner questions; see Open questions under Additional information.</li>
+</ul>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F2, F3): query with <code>0xffffffff</code> and with <code>0x1ffffffff</code>; set <code>0x123456</code>, check that the set returns the old persona and the query returns <code>0x123456</code>; restore. Identical across runs under <code>hermit run --verify</code> on ptrace. Existing candidate: <code>tests/c/personality_domain.c</code> (cell <code>c-programs/personality-domain</code>, <code>tests/e2e/manifests/c-programs.yaml:11063</code>, verify ci on ptrace) does the query and a start, target, start round trip with <code>UNAME26</code>, through glibc <code>personality</code>, and prints the starting persona.</li>
+<li>T2 (covers F4, F9): with <code>PER_LINUX32</code>, <code>uname</code> reports <code>machine == &quot;i686&quot;</code>; with <code>UNAME26</code>, <code>uname</code> reports a <code>2.6.x</code> release as Linux does. The second check fails at this SHA because of <code>detcore/src/syscalls/misc.rs:541</code>.</li>
+<li>T3 (covers F5, F12): parent clears <code>ADDR_NO_RANDOMIZE</code>, forks, and the child execs a helper that prints its persona, the address of a stack variable, of a fresh anonymous <code>mmap</code>, of <code>sbrk(0)</code> and of the vDSO. Under <code>--verify</code> both runs must print the same addresses. Today this is expected to fail.</li>
+<li>T4 (covers F6, F8): set <code>ADDR_COMPAT_LAYOUT</code>, then <code>MMAP_PAGE_ZERO</code>, exec a helper that reports its first anonymous <code>mmap</code> address and whether <code>/proc/self/maps</code> has a mapping at address 0. Identical across runs and matching Linux.</li>
+<li>T5 (covers F7): set <code>READ_IMPLIES_EXEC</code>, <code>mmap</code> a <code>PROT_READ</code> page and check <code>/proc/self/maps</code> shows it executable; exec a program with a non-executable stack and check the flag is cleared.</li>
+<li>T6 (covers F10): with <code>STICKY_TIMEOUTS</code>, <code>select</code> with no descriptors and a 10 ms timeout leaves the <code>timeval</code> unchanged; without it the <code>timeval</code> is written back. Results match Linux and repeat.</li>
+<li>T7 (covers F11): set each of <code>ADDR_LIMIT_32BIT</code>, <code>ADDR_LIMIT_3GB</code>, <code>SHORT_INODE</code>, <code>WHOLE_SECONDS</code> and <code>FDPIC_FUNCPTRS</code>, read it back, fork and exec, and read it back again.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-09-28 · hermit 81ca8822f78c · hermit2 · closed under the legacy rule (an explicit <code>classify_syscall</code> arm), not the v1 done rule; closing comment https://github.com/rrnewton/hermit/issues/317#issuecomment-5872899491</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/317: linux_determinism deterministic (from <strong>Classification:</strong>); target_policy from legacy PASS-THRU; code at this SHA: passthrough, dispatch passthrough.</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · reopen: under the owner rule of 2026-10-02, closed means every flag and option is covered by a named test and the implementation works; personality records no test coverage, so tracking_status is todo and https://github.com/rrnewton/hermit/issues/317 reopens.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: linux_determinism deterministic -&gt; conditional (clearing ADDR_NO_RANDOMIZE makes the next execve's layout random); target_policy passthrough -&gt; model (Reverie sets PER_LINUX|ADDR_NO_RANDOMIZE once before the first exec and nothing re-applies it; UNAME26 is lost to handle_uname's fixed release); 12 flag behaviours and 7 tests; mechanism and starting persona are open questions for the owner, tracking_status todo</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+personality&amp;amp;body=Discussion+for+the+%60personality%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fpersonality.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60personality%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `personality`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: personality&quot; (https://github.com/rrnewton/hermit/issues/317), legacy variant A1.</p>
+<p>Comment history: 1 comment(s) on https://github.com/rrnewton/hermit/issues/317.</p>
+<h3>2026-07-24 host strace evidence</h3>
+<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) by tracing a direct <code>syscall()</code> harness and common programs with <code>strace -f -e trace=personality</code>, and by confirming hermit currently routes <code>personality</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code> (the harness ran end-to-end under <code>hermit run</code>, exit 0, so passthrough does not crash).</p>
+<p>Observed strace line:</p>
+<pre><code>personality(0xffffffff)         = 0 (PER_LINUX)
+</code></pre>
+<hr>
+<p>*Autonomous syscall-classification sweep, batch 3 (ranks 101-150 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
+<h3>Legacy closure</h3>
+<p>Closed 2026-09-28 by the 2026-09-28 sweep, which closed issues whose syscall had an explicit <code>classify_syscall</code> arm. Closing comment: https://github.com/rrnewton/hermit/issues/317#issuecomment-5872899491</p>
+<h3>Open questions</h3>
+<p>For the owner (asked 2026-10-03 by syscall-tracking-p3; tracking_status stays todo until answered):</p>
+<p>1. Mechanism. Should Detcore (a) keep a virtual persona per task and always OR <code>ADDR_NO_RANDOMIZE</code> into the real one, (b) keep passing the call through but re-apply <code>ADDR_NO_RANDOMIZE</code> by injection before forwarding each <code>execve</code>, or (c) refuse a persona that clears <code>ADDR_NO_RANDOMIZE</code>? Only (a) also lets <code>uname</code> honour <code>UNAME26</code>. 2. Starting value. Should a guest's first query return <code>0x40000</code> (today's value, which Reverie sets and <code>tests/c/personality_domain.c</code> prints) or <code>0x0</code> (what a normal native launch returns)?</p>
+</body></html>

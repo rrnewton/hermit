@@ -1,0 +1,143 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>setfsuid | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>setfsuid</code> (122)</h1>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>pred:is_credential_identity_noop_syscall</code> &middot; linux determinism: conditional &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+setfsuid&amp;body=Discussion+for+the+%60setfsuid%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsetfsuid.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60setfsuid%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>setfsuid(fsuid)</code> sets the calling thread's filesystem user ID, which the kernel uses instead of the effective uid for filesystem permission checks and new-file ownership. It always returns the previous filesystem uid and never reports an error. Hermit never forwards the call. Today it returns 0 for every argument and changes nothing. 0 is the previous filesystem uid of the fixed virtual root, so <code>setfsuid(-1)</code> no longer leaks the host uid. The target (owner decision 4) is a per-process credential record in Detcore whose filesystem uid <code>setfsuid</code> updates under Linux's permission rules and returns, without kernel enforcement. See <a href="https://man7.org/linux/man-pages/man2/setfsuid.2.html">setfsuid(2)</a>.</p>
+<h2>Linux semantics</h2>
+<p>The kernel (<code>__sys_setfsuid</code>) first records the current filesystem uid, as seen from the caller's user namespace, as the return value. Then:</p>
+<ul>
+<li>If the argument has no mapping in the caller's namespace (<code>-1</code> never has one), nothing changes.</li>
+<li>Otherwise the change is allowed if the caller has <code>CAP_SETUID</code> in that namespace, or if the value equals the current real, effective, saved or filesystem uid. If the change is not allowed, nothing changes.</li>
+<li>In every case the call returns the previous filesystem uid. The caller cannot tell from the return value whether the change happened; the idiom is to call <code>setfsuid(-1)</code> afterwards, which changes nothing and returns the current value.</li>
+</ul>
+<p>A filesystem uid change is installed with <code>commit_creds</code>, which resets the dumpable flag and clears the parent-death signal. The capability fixup for filesystem-uid changes moves the filesystem-related capabilities (<code>CAP_CHOWN</code>, <code>CAP_DAC_OVERRIDE</code>, <code>CAP_DAC_READ_SEARCH</code>, <code>CAP_FOWNER</code>, <code>CAP_FSETID</code> and others in <code>CAP_FS_MASK</code>) out of the effective set when the filesystem uid leaves 0, and back from the permitted set when it returns to 0, unless <code>SECBIT_NO_SETUID_FIXUP</code> is set.</p>
+<p>Every later change of the effective uid (<code>setuid</code>, <code>setreuid</code>, <code>setresuid</code>, <code>execve</code> of a set-user-ID file) resets the filesystem uid to the new effective uid. The call acts on the calling thread only, and unlike the other set-id calls, glibc's <code>setfsuid()</code> wrapper does not repeat it on other threads.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: caller has <code>CAP_SETUID</code> in its user namespace and passes a mapped uid: the filesystem uid becomes that value; the return is the previous filesystem uid</li>
+<li>F2: caller lacks <code>CAP_SETUID</code> and passes a value equal to its current real, effective, saved or filesystem uid: the filesystem uid becomes that value</li>
+<li>F3: caller lacks <code>CAP_SETUID</code> and passes any other mapped value: nothing changes; the return is the current filesystem uid and no errno is set</li>
+<li>F4: an argument with no mapping in the caller's user namespace, including <code>-1</code>: nothing changes; <code>setfsuid(-1)</code> is the query idiom (the host probe on 2026-07-24 returned 212630, the caller's uid)</li>
+<li>F5: return value: always the previous filesystem uid as seen from the caller's namespace; a filesystem uid with no mapping there is reported as the overflow uid (65534 by default); the call never returns <code>-1</code> with an errno</li>
+<li>F6: capabilities: a change of the filesystem uid from 0 to nonzero drops the <code>CAP_FS_MASK</code> capabilities from the effective set; a change back to 0 restores them from the permitted set; <code>SECBIT_NO_SETUID_FIXUP</code> suppresses both</li>
+<li>F7: side effects: a change of the filesystem uid resets the dumpable flag to the <code>fs.suid_dumpable</code> sysctl and clears the parent-death signal</li>
+<li>F8: implicit reset: every later change of the effective uid sets the filesystem uid to the new effective uid</li>
+<li>F9: thread scope: the change applies to the calling thread only; glibc does not broadcast it to other threads</li>
+<li>F10: observers: the owner of newly created files, filesystem permission checks, and the fourth field of the <code>Uid:</code> line in <code>/proc/self/status</code></li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: conditional</code>. The result depends only on the caller's current uids and capabilities, the user-namespace mapping and the argument. Nothing in the call races. It repeats when every run starts with the same identity and mapping. But with the identity passed through, the return value of the common query <code>setfsuid(-1)</code> is the host uid of whoever launched the program, so it differs between users and hosts.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>The previous filesystem uid, which is the return value (F4, F5). Without virtualization it is the launching user's uid; the 2026-07-24 host probe returned 212630.</li>
+<li><code>CAP_SETUID</code> and the current real, effective and saved uids, which decide F1/F2 against F3.</li>
+<li>The user-namespace mapping, which decides F4 and the overflow-uid report in F5.</li>
+<li>Ownership of the files the guest later creates or opens, which the filesystem uid decides (F10).</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>model</code> (owner decision 4, 2026-10-04): <code>setfsuid</code> updates the per-process credential record described under &quot;Target: the credential record&quot; below. The code at hermit f4055eb9cae4 has no such record. Today <code>setfsuid</code> is an argument-blind no-op:</p>
+<ul>
+<li><code>setfsuid</code> is classified <code>Determinized</code> at <code>detcore/src/syscall_classification.rs:654</code>. The batch-38 rationale for the whole credential-setting family is at <code>detcore/src/syscall_classification.rs:636</code> (tagged <code>TODO-HUMAN-REVIEW(#787)</code> at line 630).</li>
+<li>The dispatcher answers it before the typed match, in the arm at <code>detcore/src/lib.rs:2272</code>-<code>2276</code>: <code>SyscallClassification::Determinized if is_credential_identity_noop_syscall(call.number()) =&gt; { Ok(0) }</code>. The arm reads no argument and never reaches the host.</li>
+<li>The arm's comment states the intent for this call at <code>detcore/src/lib.rs:2268</code>-<code>2269</code>: the returned 0 is &quot;the previous fs-id, virtual 0, for setfsuid/setfsgid&quot;. It matches <code>geteuid</code>, which returns 0 (<code>detcore/src/lib.rs:2761</code>), since on Linux the filesystem uid follows the effective uid (F8).</li>
+<li>The predicate is defined at <code>detcore/src/syscall_classification.rs:974</code>, with <code>setfsuid</code> at <code>detcore/src/syscall_classification.rs:984</code>.</li>
+<li>The unit test <code>batch38_openat2_and_credential_syscalls_are_determinized</code> (<code>detcore/src/syscall_classification.rs:2265</code>, membership loop at lines 2276-2297) pins the classification and the predicate membership. It cannot see what the arm returns; the chown family's test file records the same limitation (<code>hermit-cli/tests/chown_virtual_root_identity.rs:14</code>-<code>17</code>). No test names <code>setfsuid</code> at this SHA.</li>
+</ul>
+<h3>Reconciling the two legacy filings</h3>
+<ul>
+<li>https://github.com/rrnewton/hermit/issues/426 said <strong>PASS-THRU</strong>: &quot;forwarding this process-local state is compatible with existing credential passthrough assumptions&quot;.</li>
+<li>Its duplicate https://github.com/rrnewton/hermit/issues/443 said <strong>NEEDS-HANDLER</strong>: the returned previous filesystem uid &quot;is host-dependent and hermit already virtualizes process identity (getuid etc.), so the returned/observed credential should be virtualized too&quot;.</li>
+</ul>
+<p><strong>https://github.com/rrnewton/hermit/issues/443 won.</strong> Its argument is the decisive one for this call: the return value itself carries the host uid, which a forwarded <code>setfsuid(-1)</code> would leak (212630 in the probe) while <code>geteuid</code> reports 0. The handler that 443 asked for exists, and the leak it raised is resolved: the guest now gets 0. Both filings agreed on <code>conditional</code>; that is kept.</p>
+<h3>Target: the credential record (owner decision 4)</h3>
+<p>The owner accepted this target on 2026-10-04. Every credential body (the set*id family, <code>setgroups</code>, <code>capset</code>, the get*id family, <code>getgroups</code>, <code>capget</code>) describes it the same way:</p>
+<ul>
+<li><strong>Record.</strong> Detcore keeps, per guest process, the real, effective, saved and filesystem uid and gid, the supplementary group list and the capability sets.</li>
+<li><strong>Calls.</strong> The set*id calls, <code>setgroups</code> and <code>capset</code> update the record. The get*id calls, <code>getgroups</code> and <code>capget</code> report it.</li>
+<li><strong>Starting state.</strong> Every id is 0, as <code>getuid</code> reports today, and the group list is empty. The capability sets start as the guest holds them at launch in the ptrace container, as uid 0 in a fresh user namespace: permitted and effective full, inheritable empty.</li>
+<li><strong>Inheritance.</strong> fork and clone copy the record; execve keeps it.</li>
+<li><strong>Permission rules.</strong> Each setter applies Linux's own rules against the record, never against host state, so the checks are deterministic. With the matching capability (<code>CAP_SETUID</code>, <code>CAP_SETGID</code>) in the record's effective set, a caller may set any valid id; without it, only the ids Linux allows an unprivileged caller. Linux's capability fixups for uid and filesystem-uid changes apply to the record. So once the guest has dropped to uid 1000 with no <code>CAP_SETUID</code> left, <code>setuid(0)</code> returns <code>EPERM</code>, which is what OpenSSH's <code>permanently_set_uid</code> checks.</li>
+<li><strong>Valid ids.</strong> Every id except <code>(uid_t)-1</code> and <code>(gid_t)-1</code> is valid in the record, as in the initial user namespace. Where <code>-1</code> does not mean &quot;unchanged&quot;, Linux rejects it: <code>EINVAL</code>, or for <code>setfsuid</code>/<code>setfsgid</code> no change.</li>
+<li><strong>No enforcement.</strong> The kernel goes on checking the real credentials: the guest stays root in the container's user namespace. After <code>setuid(1000)</code> the guest can still open root-only files, and new files keep the kernel's owner and group. That is the accepted cost.</li>
+<li><strong>Not covered.</strong> The <code>Uid:</code>, <code>Gid:</code>, <code>Groups:</code> and <code>Cap*:</code> lines of <code>/proc/&lt;pid&gt;/status</code> still show the kernel's credentials and disagree with the record; that stays open for <code>/proc</code> virtualization. Effects outside the record (the dumpable flag, the parent-death signal, <code>RLIMIT_NPROC</code> accounting) do not follow a change.</li>
+<li><strong>Thread scope.</strong> Linux credentials are per thread in the kernel, and glibc's set*id and <code>setgroups</code> wrappers broadcast a change to every thread through an internal signal. The record is per process (owner-approved), so a raw syscall on one thread of a multithreaded guest changes the credentials every thread reads back. That is a documented difference. <code>setfsuid</code>, <code>setfsgid</code> and <code>capset</code> have no glibc broadcast, so for them the glibc call differs from Linux too.</li>
+</ul>
+<p><strong>What `setfsuid` must do against the record.</strong></p>
+<ul>
+<li>Return the record's previous filesystem uid in every case (F5). The call never fails with an errno.</li>
+<li><code>(uid_t)-1</code> changes nothing, so <code>setfsuid(-1)</code> returns the current filesystem uid (F4).</li>
+<li>With <code>CAP_SETUID</code> in the record's effective set, set the filesystem uid to any other value (F1).</li>
+<li>Without <code>CAP_SETUID</code>, set it only if the value equals the record's real, effective, saved or filesystem uid (F2); any other value changes nothing (F3).</li>
+<li>Apply the filesystem-uid capability fixup (F6): leaving filesystem uid 0 removes the <code>CAP_FS_MASK</code> capabilities from the record's effective set, and returning to 0 restores them from the permitted set, unless the guest has set <code>SECBIT_NO_SETUID_FIXUP</code> (prctl state the model must consult).</li>
+<li>Every later change of the record's effective uid through <code>setuid</code>, <code>setreuid</code> or <code>setresuid</code> sets the filesystem uid to the new effective uid (F8).</li>
+</ul>
+<h3>Differences from Linux</h3>
+<p>Under the target (documented differences, owner decision 4):</p>
+<ul>
+<li><strong>No enforcement (F10).</strong> After <code>setfsuid(1000)</code> the kernel still checks file permissions and assigns new-file ownership with the guest's real credentials, and the fourth field of the <code>Uid:</code> line of <code>/proc/self/status</code> disagrees with <code>setfsuid(-1)</code>.</li>
+<li><strong>No overflow report (F5).</strong> Every id is valid in the record, so the previous filesystem uid is never reported as 65534.</li>
+<li><strong>No dumpable or parent-death effects (F7).</strong> The kernel's credentials do not change.</li>
+<li><strong>Per-process scope (F9).</strong> The filesystem uid is part of the per-process record, so a change on one thread is what every thread's <code>setfsuid(-1)</code> returns. On Linux only the calling thread changes, and glibc does not broadcast <code>setfsuid</code>, so this differs for the glibc call too.</li>
+</ul>
+<p>Today, until the record lands (the no-op at <code>detcore/src/lib.rs:2272</code>):</p>
+<ul>
+<li><strong>F4 and F5 match a root process with filesystem uid 0.</strong> <code>setfsuid(-1)</code> returns 0, which is what Linux returns to a process in the ptrace backend's namespace that maps the real uid to 0 (comment at <code>detcore/src/syscall_classification.rs:661</code>-<code>663</code>).</li>
+<li><strong>The change is invisible (F1, F2, F10).</strong> After <code>setfsuid(1000)</code>, <code>setfsuid(-1)</code> returns 0 under Hermit, where Linux returns 1000.</li>
+<li><strong>No capability effects (F6).</strong> <code>capget</code> is passed through (<code>detcore/src/syscall_classification.rs:716</code>) and reports the host capability sets.</li>
+<li><strong>F3 cannot arise, and F8 and F9 are moot.</strong> The guest never stops being the virtual root, and since no filesystem uid is stored, there is nothing to reset or to share between threads.</li>
+</ul>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F4, F5): under <code>hermit run --strict --verify</code> on ptrace, raw <code>syscall(SYS_setfsuid, -1)</code> returns 0 in every run, and a second call returns 0 again. This is the leak 443 raised, so the test also asserts the result is not the host uid.</li>
+<li>T2 (covers F1, F2, F10): <code>syscall(SYS_setfsuid, 1000)</code> returns 0 and <code>setfsuid(-1)</code> then returns 1000; <code>setfsuid(0)</code> returns 1000 and <code>setfsuid(-1)</code> returns 0. The fourth field of the <code>Uid:</code> line of <code>/proc/self/status</code> and the owner of a newly created file are recorded and listed as documented differences (they show the kernel's credentials). Today the second query returns 0.</li>
+<li>T3 (covers F3): after <code>setresuid(1000, 1000, 1000)</code> (which leaves the record without <code>CAP_SETUID</code>), <code>setfsuid(2000)</code> returns 1000 and <code>setfsuid(-1)</code> still returns 1000. Today both return 0.</li>
+<li>T4 (covers F6, F7): from the starting record, <code>setfsuid(1000)</code> removes the <code>CAP_FS_MASK</code> capabilities (<code>CAP_CHOWN</code>, <code>CAP_DAC_OVERRIDE</code> and the rest) from the effective set <code>capget</code> reports, and <code>setfsuid(0)</code> restores them. Set <code>prctl(PR_SET_PDEATHSIG, SIGUSR1)</code> before the change and read <code>PR_GET_PDEATHSIG</code> and <code>PR_GET_DUMPABLE</code> after it; both stay unchanged, a documented difference. Results are identical across runs.</li>
+<li>T5 (covers F8): <code>setfsuid(1000)</code>, then <code>setresuid(-1, 2000, -1)</code>, then <code>setfsuid(-1)</code> returns 2000, as on Linux. Today it returns 0.</li>
+<li>T6 (covers F9): in a process with two threads, one thread calls <code>setfsuid(1000)</code>; then <code>setfsuid(-1)</code> returns 1000 in the other thread too (the per-process record; on Linux the other thread keeps 0, a documented difference). Results are identical across runs.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/426: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy PASS-THRU, which disagrees with the code; code at this SHA: determinized, dispatch pred:is_credential_identity_noop_syscall.</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · duplicate https://github.com/rrnewton/hermit/issues/443 is retired into this issue; its text waits under Additional information for a section-by-section merge.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: merged https://github.com/rrnewton/hermit/issues/443 into this issue; target_policy passthrough -&gt; emulate (NEEDS-HANDLER from 443 wins over PASS-THRU from 426: the arm at detcore/src/lib.rs:2272 answers setfsuid with 0, the virtual root's previous fs-id, so the host-uid leak 443 raised is resolved); linux_determinism stays conditional; 10 flag behaviours, 6 tests; the invisible change listed as a difference from Linux</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d34 (owner decisions 3 and 4): target_policy emulate -&gt; model (per-process credential record; setfsuid returns the previous record fsuid, never an errno); Hermit design target, Differences from Linux and T1-T6 rewritten to assert read-back through setfsuid(-1) (T3: unprivileged change silently refused; T4: CAP_FS_MASK fixup on the record); no new F/T ids; removed the open question on modelling credentials; no reduced-fidelity line, the result does not depend on the mode</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+setfsuid&amp;amp;body=Discussion+for+the+%60setfsuid%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsetfsuid.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60setfsuid%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `setfsuid`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: setfsuid&quot; (https://github.com/rrnewton/hermit/issues/426), legacy variant A1. The duplicate https://github.com/rrnewton/hermit/issues/443 was filed the same day with the same title, also legacy variant A1, and was merged into this body section by section on 2026-10-03.</p>
+<p>Comment histories:</p>
+<ul>
+<li>https://github.com/rrnewton/hermit/issues/426: the comment history stays on that issue.</li>
+<li>https://github.com/rrnewton/hermit/issues/443: 0 comments.</li>
+</ul>
+<h3>Where the merged text went</h3>
+<ul>
+<li>Summaries: 426 &quot;Changes the calling process filesystem user ID used for permission checks&quot; and 443 &quot;Sets the filesystem user ID used for filesystem permission checks&quot; agree; both are replaced by the Summary, which also corrects the scope to the calling thread (F9).</li>
+<li>Linux notes: from 426, &quot;Passing -1 queries the current filesystem UID without changing it. The probe returned the host/container UID&quot; is now F4. From 443, &quot;Historically used by NFS servers. Verified: setfsuid(-1) (query) returned the host uid&quot; is in F4 and the Determinism analysis.</li>
+<li>Determinism: from 426, &quot;Credential transitions are deterministic given the initial credentials and capabilities&quot; and &quot;The previous filesystem UID, capability set, user namespace, and filesystem ownership affect returns and later access checks&quot;; from 443, &quot;The returned previous fsuid is the host credential; leaks host uid unless virtualized&quot;. All kept under Determinism analysis.</li>
+<li>Recommended action: 426 PASS-THRU, 443 NEEDS-HANDLER, reconciled under Hermit design.</li>
+</ul>
+<h3>2026-07-24 host strace evidence (https://github.com/rrnewton/hermit/issues/426)</h3>
+<p>Evidence was gathered on <code>the measurement host</code> (Linux 6.17, x86_64, glibc) with a direct <code>syscall()</code> harness. The probe used safe self-targeting, no-op, temporary-file, or deliberately invalid arguments and was traced with <code>strace -qq -f -e trace=setfsuid</code>. The harness exited 0, and <code>detcore/src/syscall_classification.rs</code> at <code>dd60278f</code> places <code>setfsuid</code> in the UNCLASSIFIED temporary-passthrough block.</p>
+<p>Observed strace line:</p>
+<pre><code>setfsuid(-1)                    = 212630
+</code></pre>
+<hr>
+<p>*Autonomous syscall-classification sweep, batch 5 (ranks 201-250 of the unique <code>syscall_classification.rs</code> UNCLASSIFIED list). Manual research plus host strace evidence; no code change proposed here.*</p>
+<h3>2026-07-24 host strace evidence (https://github.com/rrnewton/hermit/issues/443)</h3>
+<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) with <code>strace -f -e trace=setfsuid</code> on a direct <code>syscall()</code> harness (invoked with non-destructive query/no-op/failing arguments) and, where applicable, on common programs. Hermit currently routes <code>setfsuid</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code>.</p>
+<p>Observed strace line:</p>
+<pre><code>setfsuid(-1)                    = 212630
+</code></pre>
+<hr>
+<p>*Autonomous syscall-classification sweep (ranks 151-250 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
+</body></html>

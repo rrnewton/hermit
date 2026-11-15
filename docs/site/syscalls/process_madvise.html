@@ -1,0 +1,78 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>process_madvise | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>process_madvise</code> (440)</h1>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>sysno-guard</code> &middot; linux determinism: conditional &middot; target policy: emulate &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+process_madvise&amp;body=Discussion+for+the+%60process_madvise%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fprocess_madvise.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60process_madvise%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>process_madvise(pidfd, iovec, vlen, advice, flags)</code> applies <code>madvise</code>-style advice to address ranges of the process a pidfd names. Hermit never consults the kernel: it returns <code>EINVAL</code> for nonzero <code>flags</code>, <code>EBADF</code> for a negative <code>pidfd</code>, and <code>EPERM</code> for everything else, as if the caller had no permission over any target.</p>
+<h2>Linux semantics</h2>
+<p>Added in Linux 5.10. The kernel resolves the pidfd, requires <code>PTRACE_MODE_READ</code> access to the target and <code>CAP_SYS_NICE</code> for a target other than the caller, and applies <code>advice</code> to each range in the <code>iovec</code> array. It returns the number of bytes advised; if a later range fails after earlier ranges succeeded, it returns the partial count. For another process only non-destructive advice is accepted (<code>MADV_COLD</code>, <code>MADV_PAGEOUT</code>, <code>MADV_WILLNEED</code>, and <code>MADV_COLLAPSE</code> from Linux 6.1). Recent kernels also accept any <code>madvise</code> advice when the target is the caller itself, either through a pidfd for itself or through the negative <code>PIDFD_SELF</code> sentinels.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>MADV_COLD</code>: deactivate the target's pages so they are reclaimed first.</li>
+<li>F2: <code>MADV_PAGEOUT</code>: reclaim the target's pages now.</li>
+<li>F3: <code>MADV_WILLNEED</code>: prefetch the target's pages.</li>
+<li>F4: <code>MADV_COLLAPSE</code> (Linux 6.1): collapse the ranges into transparent huge pages synchronously.</li>
+<li>F5: Self target on recent kernels: any <code>madvise</code> advice, including destructive advice such as <code>MADV_DONTNEED</code> and <code>MADV_FREE</code>, through a pidfd for the caller or a <code>PIDFD_SELF</code> sentinel.</li>
+<li>F6: <code>flags</code>: must be 0; otherwise <code>EINVAL</code>.</li>
+<li>F7: <code>iovec</code> and <code>vlen</code>: <code>vlen</code> above <code>UIO_MAXIOV</code> (1024) returns <code>EINVAL</code>; an unreadable <code>iovec</code> returns <code>EFAULT</code>; the return value is the byte count, or a partial count when a later range fails.</li>
+<li>F8: Target and permission errors: a descriptor that is not a pidfd returns <code>EBADF</code>; an exited target returns <code>ESRCH</code>; missing ptrace access or <code>CAP_SYS_NICE</code> returns <code>EPERM</code>; advice not allowed for a remote target returns <code>EINVAL</code>.</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: conditional</code>. The non-destructive remote advice does not change memory contents, but its effect on page residency, and the outcome of the permission checks, depend on host state.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li><code>MADV_COLD</code>, <code>MADV_PAGEOUT</code> and <code>MADV_WILLNEED</code> change which pages are resident, which is visible through <code>mincore</code>, page-fault counts and timing, and depends on host memory pressure.</li>
+<li><code>MADV_FREE</code> on a self target lets the kernel discard pages lazily, so whether the old contents survive depends on memory pressure.</li>
+<li><code>MADV_COLLAPSE</code> succeeds or fails depending on whether the host can allocate huge pages.</li>
+<li><code>EPERM</code> versus success depends on the host's credentials, capabilities and ptrace policy (for example the Yama <code>ptrace_scope</code> setting).</li>
+</ul>
+<p>The call repeats for fixed credentials, a self or permitted target, and advice that does not depend on memory pressure.</p>
+<h2>Hermit design</h2>
+<p>Target policy: <code>emulate</code>. Detcore computes a fixed result from the arguments alone, the one an unprivileged caller without access to any target would see, and never lets a host pidfd change another process's memory.</p>
+<p>What the code does at hermit f4055eb9cae4:</p>
+<ul>
+<li>Dispatch: a Sysno-guarded arm calls <code>handle_process_madvise</code> with arguments 0 (<code>pidfd</code>) and 4 (<code>flags</code>) only (<code>detcore/src/lib.rs:2041-2046</code>); the pinned Reverie exposes the call only as a raw syscall (<code>detcore/src/lib.rs:2040</code>).</li>
+<li>Handler: nonzero <code>flags</code> returns <code>EINVAL</code> (<code>detcore/src/syscalls/misc.rs:461-463</code>); a <code>pidfd</code> that is negative as a C <code>int</code> returns <code>EBADF</code>; anything else returns <code>EPERM</code> (<code>detcore/src/syscalls/misc.rs:465-471</code>). The doc comment states the intent: &quot;Reject cross-process memory advice without consulting host process state&quot; (<code>detcore/src/syscalls/misc.rs:459</code>).</li>
+<li>Classification: determinized (<code>detcore/src/syscall_classification.rs:238</code>).</li>
+</ul>
+<p>Why emulate: the legacy recommendation was NEEDS-INVESTIGATION. Forwarding would expose host memory pressure and host ptrace policy, and the call's only guest-visible benefit is performance. <code>EPERM</code> is a result Linux itself returns to an unprivileged caller, so callers already handle it.</p>
+<p>Known gaps (where Hermit's fixed result differs from Linux for the same arguments):</p>
+<ul>
+<li>A non-negative descriptor that is closed or is not a pidfd returns <code>EPERM</code>; Linux returns <code>EBADF</code>.</li>
+<li>F5: a self-targeted call returns <code>EPERM</code>, where recent Linux accepts it, and the <code>PIDFD_SELF</code> sentinels are negative and so return <code>EBADF</code>.</li>
+<li><code>advice</code>, <code>iovec</code> and <code>vlen</code> are never inspected, so F7's <code>EINVAL</code> and <code>EFAULT</code> and F8's invalid-advice <code>EINVAL</code> become <code>EPERM</code>.</li>
+<li>No test calls <code>process_madvise</code>.</li>
+</ul>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F6): <code>flags = 1</code> with a self pidfd returns <code>EINVAL</code> under <code>--strict --verify</code>.</li>
+<li>T2 (covers F8): <code>pidfd = -1</code> returns <code>EBADF</code>; a pidfd for a child, a pidfd for the caller, and a closed descriptor number each return <code>EPERM</code>.</li>
+<li>T3 (covers F1, F2, F3, F4): Each of <code>MADV_COLD</code>, <code>MADV_PAGEOUT</code>, <code>MADV_WILLNEED</code> and <code>MADV_COLLAPSE</code> on a child pidfd returns <code>EPERM</code>, and the child's memory contents are unchanged.</li>
+<li>T4 (covers F5): <code>MADV_DONTNEED</code> on a self pidfd returns <code>EPERM</code> and a page written beforehand still reads back its data.</li>
+<li>T5 (covers F7): <code>vlen = 0</code>, <code>vlen = 1025</code> and a NULL <code>iovec</code> each return <code>EPERM</code>, pinning today's argument-blind result.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/380: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy NEEDS-INVESTIGATION; code at this SHA: determinized, dispatch sysno-guard.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; emulate (host-free fixed result: EINVAL for flags, EBADF for a negative pidfd, EPERM otherwise, at detcore/src/syscalls/misc.rs:460-472); linux_determinism stays conditional; 8 flag behaviours and 5 tests listed; no test calls process_madvise, so tracking_status stays todo</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+process_madvise&amp;amp;body=Discussion+for+the+%60process_madvise%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fprocess_madvise.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60process_madvise%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `process_madvise`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: process_madvise&quot; (https://github.com/rrnewton/hermit/issues/380), legacy variant A1.</p>
+<p>The legacy Determinism analysis said the pidfd identity &quot;must be virtualized&quot;. At f4055eb9cae4 the pidfd is never resolved, so no identity reaches the host.</p>
+<h3>2026-07-24 host strace evidence</h3>
+<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) with <code>strace -f -e trace=process_madvise</code> on a direct <code>syscall()</code> harness (invoked with non-destructive query/no-op/failing arguments) and, where applicable, on common programs. Hermit currently routes <code>process_madvise</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code>.</p>
+<p>Observed strace line:</p>
+<pre><code>process_madvise(5, [{iov_base=0x407000, iov_len=4096}], 1, MADV_NORMAL, 0) = 4096
+</code></pre>
+<hr>
+<p>*Autonomous syscall-classification sweep (ranks 151-250 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
+</body></html>

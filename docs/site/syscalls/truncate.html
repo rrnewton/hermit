@@ -1,0 +1,105 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>truncate | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>truncate</code> (76)</h1>
+<p>Strategy: <strong>passthrough</strong> &middot; dispatch: <code>passthrough</code> &middot; linux determinism: deterministic &middot; target policy: passthrough &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+truncate&amp;body=Discussion+for+the+%60truncate%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ftruncate.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60truncate%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>truncate(path, length)</code> sets the size of the regular file named by <code>path</code> to <code>length</code> bytes, discarding data past the new end or extending the file with zero bytes. Hermit forwards it to the host kernel unchanged. It relies on the guest's container filesystem being private and stable, and Detcore keeps no file state of its own.</p>
+<h2>Linux semantics</h2>
+<p>The kernel resolves <code>path</code> against the calling process's working directory and root, following symlinks in every component, including the last. It then checks that the target is a regular file the caller may write, takes write access on the inode, breaks any lease on the file, and calls <code>do_truncate</code>. Shrinking discards the bytes past <code>length</code>; pages of a shared mapping that now lie wholly past the end raise <code>SIGBUS</code> when touched. Extending makes the new range read as zero bytes, as a hole on filesystems that support sparse files.</p>
+<p>The call returns <code>0</code> or a negative errno. It does not report the new size, timestamps or block count; a guest sees those only through the stat family and later reads.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>length</code> smaller than the current size: data past <code>length</code> is discarded. Touching a shared mapping past the new end raises <code>SIGBUS</code>.</li>
+<li>F2: <code>length</code> larger than the current size: the file is extended, and the new range reads as zero bytes</li>
+<li>F3: <code>length</code> equal to the current size: the data is unchanged and <code>0</code> is returned</li>
+<li>F4: path resolution: a relative <code>path</code> resolves against the working directory, and symlinks are followed in every component, including the last, so a symlink's target is truncated</li>
+<li>F5: write permission on the file, or search permission on a directory in the path, is denied: <code>EACCES</code></li>
+<li>F6: <code>path</code> names a directory: <code>EISDIR</code>. It names another non-regular file, such as a FIFO, socket or device: <code>EINVAL</code>.</li>
+<li>F7: <code>length</code> is negative: <code>EINVAL</code>. F14 holds <code>EFBIG</code> past the filesystem's maximum file size.</li>
+<li>F8: growing past the caller's <code>RLIMIT_FSIZE</code>: <code>SIGXFSZ</code> is sent to the caller and the call returns <code>EFBIG</code></li>
+<li>F9: a component is missing or <code>path</code> is empty: <code>ENOENT</code>. A prefix component is not a directory: <code>ENOTDIR</code>. A component or the path is too long: <code>ENAMETOOLONG</code>. Too many symlinks: <code>ELOOP</code>. <code>path</code> points outside the address space: <code>EFAULT</code>.</li>
+<li>F10: the file is an executable that some process is running: <code>ETXTBSY</code></li>
+<li>F11: <code>EROFS</code>: the file is on a read-only mount. F15 and F16 hold the other host-dependent failures.</li>
+<li>F12: side effects the call does not return: <code>mtime</code> and <code>ctime</code> change when the size changes. Unless the caller has <code>CAP_FSETID</code> over the file, <code>S_ISUID</code> is cleared, <code>S_ISGID</code> is cleared when the group-execute bit is set, and a <code>security.capability</code> attribute is removed.</li>
+<li>F13: another open file description holds a lease on the file: the lease is broken first, and the call blocks until the holder releases it or the system's lease-break time passes. A signal during that wait gives <code>EINTR</code>.</li>
+<li>F14: <code>length</code> is larger than the maximum file size of the host filesystem behind the file: <code>EFBIG</code>.</li>
+<li>F15: the inode carries the immutable or append-only attribute, which only the host can set: <code>EPERM</code>.</li>
+<li>F16: <code>EIO</code>: an I/O error from host storage while updating the inode.</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: deterministic</code>. The result is a function of the filesystem state along the path, the file's size and type, the caller's credentials and resource limits, and the mount flags. Nothing in the call depends on timing, except the F13 wait, which ends when another process releases its lease. Under Hermit, threads run one at a time, so even two guest threads truncating and writing the same file get a fixed order. The call repeats exactly when the guest-visible filesystem starts in the same state and nothing outside the container changes it.</p>
+<p>The two filings disagreed on the class. https://github.com/rrnewton/hermit/issues/500 said deterministic; its retired duplicate https://github.com/rrnewton/hermit/issues/522 said CONDITIONAL, because &quot;errors and existing contents depend on external filesystem state&quot;. Both describe the same dependency. This body counts the filesystem state as an input, as the mkdir tracking issue does, so deterministic stands, and the external dependencies are listed below.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>Changes to the file or the path made outside the container, including concurrent writers that are not guest processes. Hermit does not try to make a changing host filesystem deterministic.</li>
+<li>Host resources and attributes behind F11, F14, F15 and F16: read-only remounts, the filesystem's maximum file size, immutable or append-only flags set by the host, and I/O errors.</li>
+<li><code>ETXTBSY</code> (F10) and lease waits (F13) caused by processes outside the guest that run or lease the same file.</li>
+<li>Values the call changes but does not return: the timestamps and block count in F12. They become visible only through <code>stat</code> and similar calls, and are handled there.</li>
+</ul>
+<h3>Cross-host variation</h3>
+<ul>
+<li>Filesystem type behind the guest's file: its maximum file size decides where <code>EFBIG</code> starts (F14).</li>
+<li>Inode attributes set on the host: immutable or append-only files give <code>EPERM</code> (F15).</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>passthrough</code>. The code already does this at hermit f4055eb9cae4:</p>
+<ul>
+<li><code>truncate</code> is classified <code>PassThrough</code> at <code>detcore/src/syscall_classification.rs:766</code>, inside the pass-through block that begins at <code>detcore/src/syscall_classification.rs:690</code>. The comment at <code>detcore/src/syscall_classification.rs:756</code> gives the condition: &quot;These synchronous extent and pathname operations are repeatable for guest-owned files in a fixed namespace with adequate space and no external mutation.&quot;</li>
+<li>The generic arm <code>SyscallClassification::PassThrough =&gt; self.passthrough(guest, call).await</code> at <code>detcore/src/lib.rs:2843</code> forwards it. <code>passthrough</code> at <code>detcore/src/lib.rs:367</code> hands the call to the record/replay layer through <code>record_or_replay_preserving_tool_errors</code>, which keeps a host errno as the guest's result.</li>
+<li>The unit test <code>representative_policies_stay_in_their_reviewed_sections</code> (<code>detcore/src/syscall_classification.rs:1899</code>) pins <code>truncate</code> as <code>PassThrough</code> in the list at <code>detcore/src/syscall_classification.rs:2089</code>.</li>
+</ul>
+<p>Why passthrough, not <code>model</code> or <code>emulate</code>:</p>
+<ul>
+<li>Hermit has no virtual filesystem. The file's contents and size live in the kernel, and every later <code>read</code>, <code>mmap</code> and <code>stat</code> sees them there. Only the kernel can apply F1 to F13 the same way those calls see them.</li>
+<li>Every input that decides the result is either container state Hermit already holds fixed (the private <code>/tmp</code>, the launch filesystem image) or another syscall's concern. Timestamps belong to the stat family; <code>RLIMIT_FSIZE</code> is set by <code>setrlimit</code>, which is handled outside this issue.</li>
+</ul>
+<p>Code facts show <code>subscribed_record_replay: false</code>, so under <code>--passthru-opt</code> Detcore never sees <code>truncate</code>. <code>hermit record</code> has its own subscriptions, in the recorder module that the comment at <code>detcore/src/lib.rs:1078</code> names; that module is not in the exported tree, so this body does not describe how record treats <code>truncate</code>.</p>
+<p>Not analysed here: F13 makes the call block in the kernel until another process acts. If the lease holder is another guest process, Hermit must still let that process run while this thread waits in the host kernel. T8 checks this.</p>
+<p>The open gap is test evidence. Two ptrace verify cells cover F1 and F2; nothing covers F3 to F13.</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F2, F3): under <code>hermit run --verify</code> on ptrace, call raw <code>syscall(SYS_truncate, ...)</code> on a file holding <code>HELLOWORLD</code> with <code>length</code> 4, 8 and 8 again. Assert <code>st_size</code> after each call, that the retained prefix is intact, and that the extended range reads as zero bytes. Existing coverage: <code>tests/c/path_file_ops.c:77</code> (shrink) and <code>tests/c/path_file_ops.c:81</code> (grow, with the zero readback at <code>tests/c/path_file_ops.c:92</code>), through glibc <code>truncate</code>, which issues <code>SYS_truncate</code> on x86_64 (cell <code>c-programs/path-file-ops</code>, <code>tests/e2e/manifests/c-programs.yaml:12961</code>, verify ci on ptrace). Raw <code>SYS_truncate</code> at <code>tests/c/syscall_file_io.c:147</code>, after a <code>fallocate</code> to 8192 bytes, so it shrinks to 4096 where <code>fallocate</code> works (cell <code>c-programs/syscall-file-io</code>, <code>tests/e2e/manifests/c-programs.yaml:9214</code>). No test covers F3.</li>
+<li>T2 (covers F1): map a file <code>MAP_SHARED</code>, shrink it with <code>truncate</code>, and touch a page past the new end inside a <code>SIGBUS</code> handler that <code>siglongjmp</code>s out. Assert that the handler runs exactly once and that the run is identical across <code>--verify</code> runs.</li>
+<li>T3 (covers F4): <code>chdir</code> into a scratch directory, then truncate by a relative path and through a symlink to a file. Assert that the symlink's target changed size and the symlink did not.</li>
+<li>T4 (covers F5, F6, F9): assert <code>EACCES</code> for a file the guest cannot write (owned by an unmapped host uid); <code>EISDIR</code> for a directory; <code>EINVAL</code> for a FIFO; <code>ENOENT</code> for a missing file and for <code>&quot;&quot;</code>; <code>ENOTDIR</code> for a regular file used as a prefix; <code>ENAMETOOLONG</code> for a 256-byte component; <code>ELOOP</code> for a symlink loop; <code>EFAULT</code> for <code>path = (char *)1</code>.</li>
+<li>T5 (covers F7, F8): assert <code>EINVAL</code> for <code>length = -1</code>. <code>EFBIG</code> from the filesystem's maximum file size is F14, recorded by U2. Lower <code>RLIMIT_FSIZE</code> to 4096 with <code>SIGXFSZ</code> caught, grow a file to 8192, and assert <code>EFBIG</code> plus exactly one <code>SIGXFSZ</code>.</li>
+<li>T6 (covers F10, F11): assert <code>ETXTBSY</code> for <code>truncate(&quot;/proc/self/exe&quot;, 0)</code>. Assert <code>EROFS</code> under a read-only mount the guest can see, recording the path in the test. Immutable-file <code>EPERM</code> and <code>EIO</code> are F15 and F16, recorded by U2 and U1.</li>
+<li>U1 (covers F16; host-transient): <code>EIO</code> depends on the health of host storage shared with other processes. The plain passthrough (<code>detcore/src/lib.rs:2843</code>) hands it to the guest today. F16 counts toward done only once Hermit hides it or reports it as an infrastructure error.</li>
+<li>U2 (covers F14, F15; host-config): the maximum file size belongs to the host filesystem, and the immutable and append-only attributes need <code>CAP_LINUX_IMMUTABLE</code> in the host's initial user namespace, which the guest lacks, so CI cannot choose these errors from inside the container. Hermit forwards the kernel's answer unchanged (<code>detcore/src/syscall_classification.rs:766</code>, <code>detcore/src/lib.rs:2843</code>).</li>
+<li>T7 (covers F12): create a file with mode <code>04755</code>, drop <code>CAP_FSETID</code> with <code>capset</code>, truncate it, and assert that <code>S_ISUID</code> is gone. Repeat with <code>CAP_FSETID</code> kept and assert that it stays. The guest runs as root in a user namespace, so it holds <code>CAP_FSETID</code> by default.</li>
+<li>T8 (covers F13): a guest child takes an <code>F_SETLEASE</code> read lease on a file it owns. The parent truncates the file; the child handles the lease signal and releases with <code>F_UNLCK</code>. Assert that the truncate completes with <code>0</code>, that the run does not hang, and that the outputs are identical across <code>--verify</code> runs.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/500: linux_determinism deterministic (from <strong>Classification:</strong>); target_policy from legacy PASS-THRU; code at this SHA: passthrough, dispatch passthrough.</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · duplicate https://github.com/rrnewton/hermit/issues/522 is retired into this issue; its text waits under Additional information for a section-by-section merge.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: kept deterministic/passthrough (the code forwards at detcore/src/lib.rs:2843; Hermit owns no file state); merged duplicate https://github.com/rrnewton/hermit/issues/522, whose CONDITIONAL class lost to deterministic because both filings name the same filesystem-state dependency; listed 13 flag behaviours and 8 tests; no coverage token is recorded, so tracking_status stays todo</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d12 (owner decisions 1 and 2): cross_host_variant true (filesystem maximum file size, host inode attributes); F7 narrowed to EINVAL, new F14 EFBIG past the filesystem maximum (host-config U2); F11 narrowed to EROFS, new F15 immutable or append-only EPERM (host-config U2) and F16 EIO (host-transient U1); T5 no longer asserts the filesystem EFBIG; the open question on unreachable host errors is resolved by decision 1</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+truncate&amp;amp;body=Discussion+for+the+%60truncate%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ftruncate.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60truncate%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `truncate`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: truncate&quot; (https://github.com/rrnewton/hermit/issues/500), legacy variant A1.</p>
+<p>Duplicate https://github.com/rrnewton/hermit/issues/522 was also filed 2026-07-24 as &quot;Syscall classification: truncate&quot; (legacy variant A1) and is retired into this issue. Its comment history (0 comments) stays on that issue; the comment history of https://github.com/rrnewton/hermit/issues/500 stays on that issue. Both recommended <strong>PASS-THRU</strong>. The only contradiction was the determinism class, reconciled under Determinism analysis. Its manual reference was <a href="https://man7.org/linux/man-pages/man2/truncate.2.html">truncate(2)</a>.</p>
+<h3>2026-07-24 host strace evidence (https://github.com/rrnewton/hermit/issues/500)</h3>
+<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) with <code>strace -f -e trace=truncate</code> on a direct <code>syscall()</code> harness (invoked with non-destructive query/no-op/failing arguments) and, where applicable, on common programs. Hermit currently routes <code>truncate</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code>. (Verbatim from 2026-07-24; superseded by Hermit design above.) The legacy body also recorded: &quot;Verified: truncating a /tmp file to 8 bytes returned 0.&quot;</p>
+<p>Observed strace line:</p>
+<pre><code>truncate(&quot;/tmp/sysclass45/tf&quot;, 8) = 0
+</code></pre>
+<hr>
+<p>*Autonomous syscall-classification sweep (ranks 151-250 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
+<h3>2026-07-24 host strace evidence (https://github.com/rrnewton/hermit/issues/522)</h3>
+<p>Evidence was gathered on <code>the measurement host</code> (Linux 6.17, x86_64, glibc) with a direct <code>syscall()</code> harness. The probe used safe self-targeting, no-op, temporary-file, or deliberately invalid arguments and was traced with <code>strace -qq -f -e trace=truncate</code>. The harness exited 0, and <code>detcore/src/syscall_classification.rs</code> at <code>dd60278f</code> places <code>truncate</code> in the UNCLASSIFIED temporary-passthrough block. (Verbatim from 2026-07-24; superseded by Hermit design above.) The temporary file was truncated from three bytes to one.</p>
+<p>Observed strace line:</p>
+<pre><code>truncate(&quot;/tmp/hermit-b5-truncate-7bGEkR&quot;, 1) = 0
+</code></pre>
+<hr>
+<p>*Autonomous syscall-classification sweep, batch 5 (ranks 201-250 of the unique <code>syscall_classification.rs</code> UNCLASSIFIED list). Manual research plus host strace evidence; no code change proposed here.*</p>
+</body></html>

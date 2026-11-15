@@ -1,0 +1,77 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>futex_wait | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>futex_wait</code> (455)</h1>
+<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_futex2_enosys_syscall</code> &middot; linux determinism: nondeterministic &middot; target policy: refuse &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+futex_wait&amp;body=Discussion+for+the+%60futex_wait%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ffutex_wait.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60futex_wait%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>futex_wait(uaddr, val, mask, flags, timeout, clockid)</code> (Linux 6.7) sleeps on a futex2 word while it still holds <code>val</code>, until a matching wake, an absolute timeout or a signal. Detcore answers every call with a fixed <code>ENOSYS</code> (<code>detcore/src/lib.rs:2100</code>), the result a kernel without futex2 gives. Callers that probe for it take their legacy <code>futex(FUTEX_WAIT_BITSET)</code> path, which Detcore models. No test in the tree names this syscall.</p>
+<p>Manual reference: Linux man-pages futex_waitv(2) / futex2.</p>
+<h2>Linux semantics</h2>
+<p>The kernel validates <code>flags</code>, <code>val</code>, <code>mask</code> and the timeout, then locks the word's hash bucket and reads the word. If it differs from <code>val</code>, the call returns <code>EAGAIN</code> without sleeping. Otherwise the task is queued with bitset <code>mask</code> and sleeps until a wake whose mask intersects it (from <code>futex_wake</code>, <code>futex_requeue</code>, or a legacy <code>FUTEX_WAKE</code>/<code>FUTEX_WAKE_BITSET</code>, since the interfaces share hash buckets), until the deadline, or until a signal. A woken call returns 0.</p>
+<p>Argument errors are deterministic: undefined <code>flags</code> bits, an unsupported size, a <code>val</code> or <code>mask</code> that does not fit the size, a zero <code>mask</code>, a misaligned <code>uaddr</code> or a bad clock give <code>EINVAL</code>. An unreadable word or timeout gives <code>EFAULT</code>. The host strace under Additional information shows the all-ones probe returning <code>EINVAL</code>.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: size <code>FUTEX2_SIZE_U8</code>, <code>FUTEX2_SIZE_U16</code>, <code>FUTEX2_SIZE_U32</code> or <code>FUTEX2_SIZE_U64</code> (values 0 to 3, mask <code>FUTEX2_SIZE_MASK</code>). Only <code>FUTEX2_SIZE_U32</code> is accepted; the others give <code>EINVAL</code>. <code>val</code> must fit in the size and <code>uaddr</code> must be aligned to it, otherwise <code>EINVAL</code>.</li>
+<li>F2: <code>FUTEX2_PRIVATE</code> (128, equal to <code>FUTEX_PRIVATE_FLAG</code>): key the word by the process's address space. Without it the key follows the underlying mapping, so a waker in another process sharing the mapping can wake the caller.</li>
+<li>F3: <code>FUTEX2_NUMA</code> (0x04) and <code>FUTEX2_MPOL</code> (0x08), on kernels that implement NUMA-aware futexes: the futex is two words, the second a node id that selects the hash bucket. Any undefined <code>flags</code> bit gives <code>EINVAL</code>.</li>
+<li>F4: <code>mask</code>: the waiter's bitset. Only wakes whose mask intersects it end the wait. A zero <code>mask</code>, or one that does not fit the size, gives <code>EINVAL</code>.</li>
+<li>F5: value check: if the word does not hold <code>val</code> when the bucket is locked, the call returns <code>EAGAIN</code> and does not sleep. An unreadable word gives <code>EFAULT</code>.</li>
+<li>F6: wake: a matching <code>futex_wake</code>, <code>futex_requeue</code> or legacy <code>FUTEX_WAKE</code>/<code>FUTEX_WAKE_BITSET</code> ends the wait and the call returns 0.</li>
+<li>F7: <code>timeout</code> NULL: wait indefinitely, and <code>clockid</code> is not examined. <code>timeout</code> non-NULL: an absolute deadline on <code>clockid</code>, which must be <code>CLOCK_MONOTONIC</code> or <code>CLOCK_REALTIME</code>, otherwise <code>EINVAL</code>. A malformed timespec gives <code>EINVAL</code>, and expiry gives <code>ETIMEDOUT</code>.</li>
+<li>F8: a signal during the sleep gives <code>EINTR</code>, or the call restarts when the handler uses <code>SA_RESTART</code>. The deadline is absolute, so a restart does not extend it.</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: nondeterministic</code>, kept from the legacy classification. Argument validation is repeatable. Whether the value check returns <code>EAGAIN</code> depends on races with other writers to the word. How long the call sleeps, and whether it ends with a wake, <code>ETIMEDOUT</code> or <code>EINTR</code>, depends on host scheduling of the waking thread, on host time and on signal timing. The call repeats only when no other thread can write or wake the word and no timeout or signal can fire.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>Concurrent writes to the futex word between the caller's read and the kernel's value check</li>
+<li>Wake and signal ordering</li>
+<li>Timeout progression on the host clock, and scheduler state</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target (owner decision 9, 6): <code>refuse</code> with a fixed <code>ENOSYS</code>, the answer of a kernel built before 6.7 (no <code>futex_wait</code> in the futex2 interface), returned before any argument is examined, so a valid wait and a garbage-argument call get the same <code>ENOSYS</code>. The real call has no outcome that a refusal must preserve as an unprivileged success, so decision 6's exceptions do not apply. The supportable fallback is legacy <code>futex(2)</code> <code>FUTEX_WAIT</code>/<code>FUTEX_WAIT_BITSET</code>, which Detcore models (<code>detcore/src/syscalls/threads.rs:1315</code>). Today's code already realizes the target, so no code change is needed:</p>
+<ul>
+<li><code>is_futex2_enosys_syscall</code> (<code>detcore/src/syscall_classification.rs:882</code>) names <code>futex_requeue</code>, <code>futex_wait</code>, <code>futex_waitv</code> and <code>futex_wake</code>. All four are classified <code>Determinized</code> (<code>detcore/src/syscall_classification.rs:101</code> to <code>detcore/src/syscall_classification.rs:107</code>), and the predicate feeds <code>is_deterministically_refused_syscall</code> (<code>detcore/src/syscall_classification.rs:1322</code>).</li>
+<li>The dispatch arm at <code>detcore/src/lib.rs:2100</code> returns <code>Err(Error::Errno(Errno::ENOSYS))</code> for every call. It inspects no argument, reads no guest memory and never forwards the call to the kernel. The arm has no strict-mode condition, so run, <code>--strict</code> and record/replay runs all get the same answer.</li>
+<li>The doc comment at <code>detcore/src/syscall_classification.rs:877</code> gives the reasoning: Detcore models the established <code>futex(2)</code> ABI but not futex2. A fixed <code>ENOSYS</code> matches a kernel without the interface, sends feature-probing runtimes to their legacy-futex fallback, does not reveal the host kernel version, and keeps every wait inside Detcore's scheduler.</li>
+</ul>
+<p>Why <code>refuse</code> and not the alternatives:</p>
+<ul>
+<li><code>passthrough</code> would break the scheduler. Detcore emulates legacy futexes and never runs them in the kernel (<code>detcore/src/syscalls/threads.rs:1255</code>). A forwarded <code>futex_wait</code> would sleep in the kernel where the sequentializing scheduler cannot see it, and a Detcore-emulated legacy <code>FUTEX_WAKE</code> would never reach it. Under sequentialization the guest would hang (reasoned from the code, not measured).</li>
+<li><code>model</code> is feasible later. <code>futex_wait</code> is legacy <code>FUTEX_WAIT_BITSET</code> with a different argument layout and a selectable clock, and the precise futex model already implements <code>FUTEX_WAIT_BITSET</code> (<code>detcore/src/syscalls/threads.rs:1315</code>). It is not worth modeling alone: a program that uses futex2 waits usually also needs <code>futex_wake</code>, and probes the family as a whole.</li>
+<li><code>ENOSYS</code> is what a kernel before 6.7 returns, and callers already handle it. An <code>emulate</code> answer such as an immediate <code>EAGAIN</code> would turn a caller's wait loop into a busy loop.</li>
+</ul>
+<p><code>linux_determinism</code> stays <code>nondeterministic</code>: that describes Linux. Under Hermit the result is a constant.</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F2, F3, F4): under <code>hermit run --strict --verify</code> on ptrace, <code>futex_wait</code> on a readable aligned <code>u32</code> word holding <code>val</code>, with <code>FUTEX2_SIZE_U32</code> and <code>mask</code> all ones, with and without <code>FUTEX2_PRIVATE</code>, plus <code>FUTEX2_SIZE_U64</code>, <code>FUTEX2_NUMA</code>, <code>FUTEX2_MPOL</code>, <code>mask</code> 0 and a NULL <code>uaddr</code>, all return -1 with <code>errno == ENOSYS</code>. No such test exists at this SHA: <code>hermit-cli/tests/futex2_refusal.rs:16</code> lists <code>futex_waitv</code>, <code>futex_wake</code> and <code>futex_requeue</code> but not <code>futex_wait</code>, and there is no <code>tests/c/futex_wait_enosys.c</code>.</li>
+<li>T2 (covers F5, F6): with a second thread ready to issue a legacy <code>FUTEX_WAKE</code>, <code>futex_wait</code> on a word whose value matches returns <code>ENOSYS</code> at once instead of sleeping; on a word whose value differs it returns <code>ENOSYS</code>, not <code>EAGAIN</code>.</li>
+<li>T3 (covers F7, F8): with <code>timeout</code> set to an absolute <code>CLOCK_MONOTONIC</code> deadline 10 ms ahead, with an invalid <code>clockid</code>, and with a <code>SIGALRM</code> handler armed, the call returns <code>ENOSYS</code> immediately and never <code>ETIMEDOUT</code> or <code>EINTR</code>.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A2 of https://github.com/rrnewton/hermit/issues/366: linux_determinism nondeterministic (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch pred:is_futex2_enosys_syscall, refused.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; refuse (Detcore returns a fixed ENOSYS for the whole futex2 family at detcore/src/lib.rs:2100, which matches a pre-6.7 kernel and keeps every wait in Detcore's scheduler); linux_determinism stays nondeterministic; 8 flag behaviours and 3 tests listed; no test in the tree exercises futex_wait at all, so tracking_status stays todo</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): decisions 9 and 6 applied (fixed ENOSYS before any argument check, already realized at detcore/src/lib.rs:2100); target_policy stays refuse; no new F/T ids; no open questions to remove</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+futex_wait&amp;amp;body=Discussion+for+the+%60futex_wait%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ffutex_wait.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60futex_wait%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `futex_wait`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: futex_wait&quot; (https://github.com/rrnewton/hermit/issues/366), legacy variant A2. It was ranked 87 in the batch-2 classification order, which excluded the 50 syscalls seen in batch-1 workloads.</p>
+<p>The futex2 refusal set came from the change tagged <code>TODO-HUMAN-REVIEW(PR-852)</code> in the code (<code>detcore/src/lib.rs:2096</code>, <code>detcore/src/syscall_classification.rs:876</code>); that human review is still open in the source. Sibling bodies: futex_waitv, futex_wake and futex_requeue share the same predicate and dispatch arm. Of the four, only <code>futex_wait</code> has no guest test; the unit test <code>futex2_syscalls_are_determinized_and_consistent</code> (<code>detcore/src/syscall_classification.rs:2251</code>) checks its classification and predicate membership but does not run a guest.</p>
+<h3>2026-07-24 host strace evidence</h3>
+<p>Test host: Linux 6.17.13 x86_64; strace 6.12.</p>
+<p>Ran a syscall-specific safe raw probe with deliberately inert/invalid arguments so privileged or mutating operations could not change host state:</p>
+<pre><code>strace -f -qq -e trace=futex_wait -s 160 python3 -c 'import ctypes; c=ctypes.CDLL(None,use_errno=True); c.syscall(455, *([ctypes.c_long(-1)]*6))'
+</code></pre>
+<p>Actual strace output:</p>
+<pre><code>futex_wait(0xffffffffffffffff, 18446744073709551615, 0xffffffffffffffff, FUTEX2_SIZE_U64|FUTEX2_NUMA|FUTEX2_PRIVATE|0xffffff78, 0xffffffffffffffff, 0xffffffff /* CLOCK_??? */) = -1 EINVAL (Invalid argument)
+</code></pre>
+<p>The trace confirms the host kernel path and observed errno/result for this ABI. The determinism recommendation also accounts for documented success-path state dependencies; an invalid-argument result alone is not treated as proof of determinism.</p>
+</body></html>

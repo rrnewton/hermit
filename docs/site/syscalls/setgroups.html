@@ -1,0 +1,140 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>setgroups | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>setgroups</code> (116)</h1>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>pred:is_credential_identity_noop_syscall</code> &middot; linux determinism: conditional &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+setgroups&amp;body=Discussion+for+the+%60setgroups%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsetgroups.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60setgroups%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>setgroups(size, list)</code> replaces the calling thread's supplementary group list, which the kernel uses for group permission checks. Hermit never forwards the call. Today it returns 0 for every argument without reading <code>list</code>, which matches the fixed virtual root (a root process may set any list). But <code>getgroups</code> is still passed through, so the guest reads back the kernel's real list, not the one it set. The target (owner decision 4) is a per-process credential record in Detcore whose supplementary group list <code>setgroups</code> replaces under Linux's permission and argument rules and <code>getgroups</code> reads back, without kernel enforcement. See <a href="https://man7.org/linux/man-pages/man2/setgroups.2.html">setgroups(2)</a>.</p>
+<h2>Linux semantics</h2>
+<p>The kernel (<code>setgroups</code> in <code>kernel/groups.c</code>) checks permission before it looks at the arguments:</p>
+<ul>
+<li>The caller needs <code>CAP_SETGID</code> in its user namespace, and the namespace must allow <code>setgroups</code>: <code>/proc/&lt;pid&gt;/setgroups</code> must read <code>allow</code> and the <code>gid_map</code> must already be written. Otherwise the call fails with <code>EPERM</code>. Both 2026-07-24 host probes, including the one with an invalid size, got <code>EPERM</code> for this reason.</li>
+<li><code>size</code> is then compared, as an unsigned value, with <code>NGROUPS_MAX</code> (65536). A larger or negative size fails with <code>EINVAL</code>.</li>
+<li>The list is copied from user memory (<code>EFAULT</code> if it cannot be read), and each gid is mapped into the caller's namespace (<code>EINVAL</code> if one has no mapping).</li>
+<li>The kernel sorts the list and installs it with <code>commit_creds</code>.</li>
+</ul>
+<p>A size of 0 clears the list, and <code>list</code> may then be <code>NULL</code>. Changing the supplementary groups does not reset the dumpable flag and does not touch capabilities.</p>
+<p>The syscall acts on the calling thread only; glibc's <code>setgroups()</code> wrapper repeats it on every thread through an internal signal. Privilege-dropping programs call it, typically as <code>setgroups(0, NULL)</code>, before <code>setgid</code> and <code>setuid</code>.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: privileged caller (F3 and F4 satisfied): the supplementary list becomes the <code>size</code> gids at <code>list</code></li>
+<li>F2: <code>size</code> 0: the list is cleared; <code>list</code> may be <code>NULL</code></li>
+<li>F3: caller lacks <code>CAP_SETGID</code> in its user namespace: <code>EPERM</code>, checked before any argument</li>
+<li>F4: user namespace whose <code>/proc/&lt;pid&gt;/setgroups</code> is <code>deny</code>, or whose <code>gid_map</code> is not yet written: <code>EPERM</code> even with <code>CAP_SETGID</code></li>
+<li>F5: <code>size</code> greater than <code>NGROUPS_MAX</code> (65536), or negative: <code>EINVAL</code></li>
+<li>F6: <code>list</code> not readable for <code>size</code> entries: <code>EFAULT</code></li>
+<li>F7: a gid in <code>list</code> with no mapping in the caller's namespace, including <code>(gid_t)-1</code>: <code>EINVAL</code></li>
+<li>F8: ordering: the kernel stores the list sorted, so <code>getgroups</code> returns the gids in ascending order, not in the order passed</li>
+<li>F9: thread scope: the raw syscall changes only the calling thread; glibc's <code>setgroups()</code> applies it to every thread through its internal set-id signal</li>
+<li>F10: observers: <code>getgroups</code> and the <code>Groups:</code> line of <code>/proc/self/status</code> report the new list; file permission checks against a file's group use it</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: conditional</code>. The result depends only on the caller's capabilities, the user namespace's <code>setgroups</code> control and gid mapping, and the arguments. Nothing in the call races. It repeats when every run starts with the same identity, namespace configuration and initial group list.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li><code>CAP_SETGID</code> and the namespace's <code>setgroups</code> control, which decide F3/F4 against F1. The 2026-07-24 host probes ran unprivileged and got <code>EPERM</code>.</li>
+<li>The gid mapping, which decides F7.</li>
+<li>The initial supplementary list, inherited from whoever launched Hermit. It is what <code>getgroups</code> reports until a forwarded <code>setgroups</code> replaces it, and it decides group permission checks on files.</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>model</code> (owner decision 4, 2026-10-04): <code>setgroups</code> updates the per-process credential record described under &quot;Target: the credential record&quot; below. The code at hermit f4055eb9cae4 has no such record. Today <code>setgroups</code> is an argument-blind no-op:</p>
+<ul>
+<li><code>setgroups</code> is classified <code>Determinized</code> at <code>detcore/src/syscall_classification.rs:653</code>. The batch-38 rationale for the whole credential-setting family is at <code>detcore/src/syscall_classification.rs:636</code> (tagged <code>TODO-HUMAN-REVIEW(#787)</code> at line 630).</li>
+<li>The dispatcher answers it before the typed match, in the arm at <code>detcore/src/lib.rs:2272</code>-<code>2276</code>: <code>SyscallClassification::Determinized if is_credential_identity_noop_syscall(call.number()) =&gt; { Ok(0) }</code>. The arm reads neither <code>size</code> nor <code>list</code> and never reaches the host; its comment is at <code>detcore/src/lib.rs:2262</code>.</li>
+<li>The predicate is defined at <code>detcore/src/syscall_classification.rs:974</code>, with <code>setgroups</code> at <code>detcore/src/syscall_classification.rs:983</code>.</li>
+<li>The unit test <code>batch38_openat2_and_credential_syscalls_are_determinized</code> (<code>detcore/src/syscall_classification.rs:2265</code>, membership loop at lines 2276-2297) pins the classification and the predicate membership. It cannot see what the arm returns; the chown family's test file records the same limitation (<code>hermit-cli/tests/chown_virtual_root_identity.rs:14</code>-<code>17</code>).</li>
+<li><code>getgroups</code> is <strong>not</strong> emulated: it is in the pass-through block at <code>detcore/src/syscall_classification.rs:718</code>, under the comment at lines 714-715 that it observes &quot;kernel credential state that starts from the fixed container identity on each run&quot;.</li>
+</ul>
+<h3>Reconciling the two legacy filings</h3>
+<ul>
+<li>https://github.com/rrnewton/hermit/issues/429 said <strong>PASS-THRU</strong>: &quot;Forwarding is acceptable only under Hermit's documented fixed container credentials and filesystem assumptions.&quot;</li>
+<li>Its duplicate https://github.com/rrnewton/hermit/issues/445 said <strong>NEEDS-HANDLER</strong>: it &quot;changes credential state that hermit virtualizes&quot;.</li>
+</ul>
+<p><strong>https://github.com/rrnewton/hermit/issues/445 won</strong>, because the handler exists and the rest of the identity is emulated: the guest is the virtual root (<code>getuid</code>/<code>getgid</code> return 0 at <code>detcore/src/lib.rs:2760</code>-<code>2763</code>). A forwarded <code>setgroups</code> would also depend on the namespace's <code>setgroups</code> control (F4), which the guest cannot see. Both filings agreed on <code>conditional</code>, and 445's point that <code>EPERM</code> without <code>CAP_SETGID</code> is itself deterministic is kept as F3.</p>
+<h3>Target: the credential record (owner decision 4)</h3>
+<p>The owner accepted this target on 2026-10-04. Every credential body (the set*id family, <code>setgroups</code>, <code>capset</code>, the get*id family, <code>getgroups</code>, <code>capget</code>) describes it the same way:</p>
+<ul>
+<li><strong>Record.</strong> Detcore keeps, per guest process, the real, effective, saved and filesystem uid and gid, the supplementary group list and the capability sets.</li>
+<li><strong>Calls.</strong> The set*id calls, <code>setgroups</code> and <code>capset</code> update the record. The get*id calls, <code>getgroups</code> and <code>capget</code> report it.</li>
+<li><strong>Starting state.</strong> Every id is 0, as <code>getuid</code> reports today, and the group list is empty. The capability sets start as the guest holds them at launch in the ptrace container, as uid 0 in a fresh user namespace: permitted and effective full, inheritable empty.</li>
+<li><strong>Inheritance.</strong> fork and clone copy the record; execve keeps it.</li>
+<li><strong>Permission rules.</strong> Each setter applies Linux's own rules against the record, never against host state, so the checks are deterministic. With the matching capability (<code>CAP_SETUID</code>, <code>CAP_SETGID</code>) in the record's effective set, a caller may set any valid id; without it, only the ids Linux allows an unprivileged caller. Linux's capability fixups for uid and filesystem-uid changes apply to the record. So once the guest has dropped to uid 1000 with no <code>CAP_SETUID</code> left, <code>setuid(0)</code> returns <code>EPERM</code>, which is what OpenSSH's <code>permanently_set_uid</code> checks.</li>
+<li><strong>Valid ids.</strong> Every id except <code>(uid_t)-1</code> and <code>(gid_t)-1</code> is valid in the record, as in the initial user namespace. Where <code>-1</code> does not mean &quot;unchanged&quot;, Linux rejects it: <code>EINVAL</code>, or for <code>setfsuid</code>/<code>setfsgid</code> no change.</li>
+<li><strong>No enforcement.</strong> The kernel goes on checking the real credentials: the guest stays root in the container's user namespace. After <code>setuid(1000)</code> the guest can still open root-only files, and new files keep the kernel's owner and group. That is the accepted cost.</li>
+<li><strong>Not covered.</strong> The <code>Uid:</code>, <code>Gid:</code>, <code>Groups:</code> and <code>Cap*:</code> lines of <code>/proc/&lt;pid&gt;/status</code> still show the kernel's credentials and disagree with the record; that stays open for <code>/proc</code> virtualization. Effects outside the record (the dumpable flag, the parent-death signal, <code>RLIMIT_NPROC</code> accounting) do not follow a change.</li>
+<li><strong>Thread scope.</strong> Linux credentials are per thread in the kernel, and glibc's set*id and <code>setgroups</code> wrappers broadcast a change to every thread through an internal signal. The record is per process (owner-approved), so a raw syscall on one thread of a multithreaded guest changes the credentials every thread reads back. That is a documented difference. <code>setfsuid</code>, <code>setfsgid</code> and <code>capset</code> have no glibc broadcast, so for them the glibc call differs from Linux too.</li>
+</ul>
+<p><strong>What `setgroups` must do against the record.</strong></p>
+<ul>
+<li>Without <code>CAP_SETGID</code> in the record's effective set, return <code>EPERM</code> before looking at any argument (F3).</li>
+<li>A <code>size</code> above <code>NGROUPS_MAX</code> (65536) as an unsigned value, which includes a negative <code>size</code>, returns <code>EINVAL</code> (F5).</li>
+<li>Read <code>size</code> gids from <code>list</code>, returning <code>EFAULT</code> if the memory cannot be read (F6). A gid of <code>(gid_t)-1</code> returns <code>EINVAL</code> (F7).</li>
+<li>Store the list sorted in ascending order (F1, F8). <code>size</code> 0 empties it, and <code>list</code> may then be <code>NULL</code> (F2).</li>
+<li><code>getgroups</code> reads the record back (F10). Its starting value is the empty list, so the KVM test <code>run_kvm_pipe_pipe2_and_getgroups_round_trip</code> (<code>hermit-cli/tests/cli.rs:4445</code>), which today expects the overflow gid 65534 (<code>hermit-cli/tests/cli.rs:4494</code>), must expect <code>[]</code> when the model lands.</li>
+</ul>
+<h3>Differences from Linux</h3>
+<p>Under the target (documented differences, owner decision 4):</p>
+<ul>
+<li><strong>No enforcement (F10).</strong> File permission checks against a file's group still use the kernel's group list, and the <code>Groups:</code> line of <code>/proc/self/status</code> disagrees with <code>getgroups</code>.</li>
+<li><strong>No user-namespace `setgroups` control (F4).</strong> The record behaves like the initial user namespace: there is no <code>/proc/&lt;pid&gt;/setgroups</code> deny and no unwritten <code>gid_map</code>, so this <code>EPERM</code> cannot arise. For the same reason the only gid with no mapping in F7 is <code>(gid_t)-1</code>.</li>
+<li><strong>Per-process scope (F9).</strong> A raw <code>SYS_setgroups</code> on one thread changes what every thread reads back. On Linux only the calling thread changes, and only glibc's wrapper reaches the others.</li>
+</ul>
+<p>Today, until the record lands (the no-op at <code>detcore/src/lib.rs:2272</code>):</p>
+<ul>
+<li><strong>The new list is invisible, and the old one leaks (F1, F2, F8, F10).</strong> After <code>setgroups(0, NULL)</code>, <code>getgroups</code> still returns the kernel's real list, because <code>getgroups</code> is passed through (<code>detcore/src/syscall_classification.rs:718</code>). That list comes from whoever launched Hermit, so it can differ between hosts and users; under the ptrace backend's user namespace, a host gid without a mapping is reported as the overflow gid.</li>
+<li>rr's <code>setgroups</code> program is run by <code>rr_setgroups</code> at <code>hermit-cli/tests/rr_suite.rs:437</code>. In the rr copy in the working hermit checkout (<code>third-party/rr/src/test/setgroups.c</code>, not part of the pinned export), it sets every current group plus one and, unless <code>setgroups</code> fails with <code>EPERM</code>, asserts that <code>getgroups</code> returns the new list. Reading the code, it should fail under Hermit: <code>setgroups</code> returns 0 and <code>getgroups</code> returns the old list. It is <code>#[ignore]</code>d by the <code>rr_test!</code> macro (<code>hermit-cli/tests/rr_suite.rs:233</code>), listed at <code>hermit-cli/tests/fail_closed_allowed_ignores.tsv:178</code>, and was not run here.</li>
+<li><strong>No argument errors (F5, F6, F7).</strong> <code>setgroups(-1, NULL)</code> and <code>setgroups(65537, list)</code> return 0 where a root process gets <code>EINVAL</code>; a bad <code>list</code> pointer returns 0 where Linux returns <code>EFAULT</code>; <code>(gid_t)-1</code> in the list returns 0 where Linux returns <code>EINVAL</code>.</li>
+<li><strong>F3 and F4 cannot arise.</strong> The guest never stops being the virtual root.</li>
+</ul>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F8, F10): under <code>hermit run --strict --verify</code> on ptrace, <code>setgroups(3, {300, 100, 200})</code> returns 0; then <code>getgroups</code> returns 3 and the list {100, 200, 300}, in ascending order. The <code>Groups:</code> line of <code>/proc/self/status</code> is recorded and listed as a documented difference (it shows the kernel's list). Results are identical across runs. Today <code>getgroups</code> returns the pre-call list. Existing candidate: <code>rr_setgroups</code> (<code>hermit-cli/tests/rr_suite.rs:437</code>), which is <code>#[ignore]</code>d and expected to fail until the record lands.</li>
+<li>T2 (covers F2): at start <code>getgroups(0, NULL)</code> returns 0 (the empty starting list). <code>setgroups(1, {5})</code> and then <code>setgroups(0, NULL)</code> both return 0, and <code>getgroups(0, NULL)</code> returns 0 again.</li>
+<li>T3 (covers F3, F4): after <code>setuid(1000)</code>, which drops <code>CAP_SETGID</code> from the record, <code>setgroups(0, NULL)</code> returns <code>EPERM</code> and <code>getgroups</code> reports the list from before the call. The test states that the namespace-control <code>EPERM</code> (F4) cannot arise, because the record has no user-namespace control. Today the call returns 0.</li>
+<li>T4 (covers F5, F6, F7): <code>setgroups(-1, NULL)</code> and <code>setgroups(65537, list)</code> return <code>EINVAL</code>, <code>setgroups(1, (gid_t *)1)</code> returns <code>EFAULT</code>, and <code>setgroups(1, {(gid_t)-1})</code> returns <code>EINVAL</code>; each leaves <code>getgroups</code> unchanged. Today Hermit returns 0 for all four, so this test fails until the model lands.</li>
+<li>T5 (covers F9): in a process with two threads, raw <code>SYS_setgroups(1, {7})</code> from one thread; then <code>getgroups</code> returns {7} in both threads (the per-process record; on Linux the other thread keeps its list, a documented difference). Repeat in a fresh process with glibc <code>setgroups()</code>. Also assert that the set-id signal broadcast does not change the run's schedule between runs.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/429: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy PASS-THRU, which disagrees with the code; code at this SHA: determinized, dispatch pred:is_credential_identity_noop_syscall.</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · duplicate https://github.com/rrnewton/hermit/issues/445 is retired into this issue; its text waits under Additional information for a section-by-section merge.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: merged https://github.com/rrnewton/hermit/issues/445 into this issue; target_policy passthrough -&gt; emulate (NEEDS-HANDLER from 445 wins over PASS-THRU from 429: the arm at detcore/src/lib.rs:2272 answers setgroups as a no-op returning 0); linux_determinism stays conditional; 10 flag behaviours, 5 tests; getgroups is still passed through so the set list is invisible and the host list leaks, and argument errors are not checked; open questions recorded</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d34 (owner decisions 3 and 4): target_policy emulate -&gt; model (per-process credential record; supplementary list starts empty, stored sorted, read back by getgroups; Linux EPERM/EINVAL/EFAULT rules against the record); Hermit design target, Differences from Linux and T1-T5 rewritten to assert read-back; the KVM test at hermit-cli/tests/cli.rs:4445 must expect [] once the model lands; no new F/T ids; removed all three open questions (getgroups passthrough, modelling credentials, argument validation); no reduced-fidelity line, the result does not depend on the mode</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+setgroups&amp;amp;body=Discussion+for+the+%60setgroups%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsetgroups.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60setgroups%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `setgroups`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: setgroups&quot; (https://github.com/rrnewton/hermit/issues/429), legacy variant A1. The duplicate https://github.com/rrnewton/hermit/issues/445 was filed the same day with the same title, also legacy variant A1, and was merged into this body section by section on 2026-10-03.</p>
+<p>Comment histories:</p>
+<ul>
+<li>https://github.com/rrnewton/hermit/issues/429: the comment history stays on that issue.</li>
+<li>https://github.com/rrnewton/hermit/issues/445: 0 comments.</li>
+</ul>
+<h3>Where the merged text went</h3>
+<ul>
+<li>Summaries: 429 &quot;Replaces the supplementary group list used for filesystem permission checks&quot; and 445 &quot;Sets the supplementary group list of the process&quot; agree; both are replaced by the Summary.</li>
+<li>Linux notes: from 429, &quot;The kernel requires privilege in the governing user namespace and may also reject writes disabled by the gid_map setgroups control. The safe oversized probe was refused&quot; is now F3, F4 and the note on check order. From 445, &quot;Used during privilege drop. Verified: setgroups(0,NULL) fails EPERM in this container&quot; is in Linux semantics and F3.</li>
+<li>Determinism: from 429, &quot;deterministic for a fixed credential and user-namespace configuration&quot; and &quot;CAP_SETGID, user namespace mappings, the initial group list, and filesystem group ownership affect the observable result&quot;; from 445, &quot;Requires CAP_SETGID (EPERM otherwise, deterministically)&quot; and &quot;mutates credential identity that should be virtualized&quot;. All kept under Determinism analysis.</li>
+<li>Recommended action: 429 PASS-THRU, 445 NEEDS-HANDLER, reconciled under Hermit design.</li>
+</ul>
+<h3>2026-07-24 host strace evidence (https://github.com/rrnewton/hermit/issues/429)</h3>
+<p>Evidence was gathered on <code>the measurement host</code> (Linux 6.17, x86_64, glibc) with a direct <code>syscall()</code> harness. The probe used safe self-targeting, no-op, temporary-file, or deliberately invalid arguments and was traced with <code>strace -qq -f -e trace=setgroups</code>. The harness exited 0, and <code>detcore/src/syscall_classification.rs</code> at <code>dd60278f</code> places <code>setgroups</code> in the UNCLASSIFIED temporary-passthrough block.</p>
+<p>Observed strace line:</p>
+<pre><code>setgroups(-1, NULL)             = -1 EPERM (Operation not permitted)
+</code></pre>
+<hr>
+<p>*Autonomous syscall-classification sweep, batch 5 (ranks 201-250 of the unique <code>syscall_classification.rs</code> UNCLASSIFIED list). Manual research plus host strace evidence; no code change proposed here.*</p>
+<h3>2026-07-24 host strace evidence (https://github.com/rrnewton/hermit/issues/445)</h3>
+<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) with <code>strace -f -e trace=setgroups</code> on a direct <code>syscall()</code> harness (invoked with non-destructive query/no-op/failing arguments) and, where applicable, on common programs. Hermit currently routes <code>setgroups</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code>.</p>
+<p>Observed strace line:</p>
+<pre><code>setgroups(0, NULL)              = -1 EPERM (Operation not permitted)
+</code></pre>
+<hr>
+<p>*Autonomous syscall-classification sweep (ranks 151-250 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
+</body></html>

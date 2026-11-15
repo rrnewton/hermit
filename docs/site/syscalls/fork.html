@@ -1,0 +1,79 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fork | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>fork</code> (57)</h1>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; linux determinism: conditional &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+fork&amp;body=Discussion+for+the+%60fork%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ffork.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60fork%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p>Creates a child process that is a copy of the caller. It behaves like <code>clone</code> with only <code>SIGCHLD</code> as the exit signal. On x86_64, glibc's <code>fork()</code> uses <code>clone</code>, so this syscall is reached only through a raw <code>syscall(SYS_fork)</code> or an older or static runtime. Detcore handles it in the same code as <code>clone</code>.</p>
+<p>Manual reference: <a href="https://man7.org/linux/man-pages/man2/fork.2.html">fork(2)</a>.</p>
+<h2>Linux semantics</h2>
+<p><code>fork()</code> takes no arguments. The parent gets the child's pid, as seen in the parent's PID namespace, and the child gets 0. The child has one thread, a copy of the calling thread, and resumes at the instruction after the syscall. When it exits, the parent receives <code>SIGCHLD</code>.</p>
+<p>The child gets a copy-on-write copy of the address space and a copy of the descriptor table; the copied descriptors refer to the same open file descriptions as the parent's. Some state is not inherited. Which of parent and child runs first is up to the host scheduler.</p>
+<p>Because <code>fork</code> has no arguments, the items below list behaviours that tests must cover rather than flags.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: the result: the child's pid to the parent and 0 to the child. The child's parent is the caller, and it sends <code>SIGCHLD</code> when it exits.</li>
+<li>F2: what the child copies: the address space (copy-on-write), the descriptor table (sharing the open file descriptions, including their offsets and <code>flock</code> locks), signal dispositions and mask, current directory, umask, resource limits and credentials.</li>
+<li>F3: what the child does not inherit: pending signals, POSIX timers, <code>fcntl</code> record locks, memory locks, timer slack set by <code>prctl</code>, and resource usage counters (which restart at 0).</li>
+<li>F4: memory mappings that do not follow the copy rule: <code>MAP_SHARED</code> mappings stay shared, <code>MADV_DONTFORK</code> ranges are absent in the child, and <code>MADV_WIPEONFORK</code> ranges read as zero in the child.</li>
+<li>F5: a multithreaded caller: only the calling thread is copied. Locks held by other threads stay held in the child.</li>
+<li>F6: failures: <code>EAGAIN</code> (<code>RLIMIT_NPROC</code> or no free pid) and <code>ENOMEM</code>. A signal that arrives during creation makes the kernel restart the call.</li>
+<li>F7: after the call, parent and child run concurrently, in an order the host scheduler chooses.</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: conditional</code>, for the same reasons as <code>clone</code>. The child's pid is allocated in the caller's PID namespace. In a fresh namespace it repeats when processes are created in the same order, but in the host namespace it depends on every other process on the machine. The post-fork order of parent and child (F7) is the host scheduler's choice. Failures (F6) depend on host limits. The call repeats when the PID namespace is private, the creation order is fixed by a deterministic scheduler, and the limits are not reached.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>Pid allocation, shared with every process in the PID namespace</li>
+<li>Which of parent and child the host scheduler runs first, and how they interleave</li>
+<li>Resource limits and host load: <code>RLIMIT_NPROC</code>, <code>pid_max</code>, memory</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>model</code>, in the same handler as <code>clone</code>. The kernel creates the child. Detcore registers it, gives it a copy of the parent's deterministic state, and decides when parent and child run.</p>
+<p>What the code does at f4055eb9:</p>
+<ul>
+<li>The arm at <code>detcore/src/lib.rs:2433</code> calls <code>handle_clone_family</code> (<code>detcore/src/syscalls/threads.rs:847</code>). For <code>fork</code> the exit signal is <code>SIGCHLD</code> (<code>detcore/src/syscalls/threads.rs:855</code>), and none of the <code>CLONE_*</code> sharing flags are set.</li>
+<li>The syscall is injected unchanged (<code>detcore/src/syscalls/threads.rs:924</code>). On ptrace the parent does not wait for the child: <code>backend_serializes_fork_children</code> is false (<code>hermit-cli/src/lib.rs:4252</code>), so <code>parent_blocks_for_child</code> is false for <code>fork</code> (<code>detcore/src/syscalls/threads.rs:870</code>).</li>
+<li>After a successful fork, Detcore forgets every known <code>flock</code> mode (<code>detcore/src/syscalls/threads.rs:963</code>), because the child shares the open file descriptions (F2). A failed fork leaves them alone.</li>
+<li>The kernel's pid is used directly as the guest-visible id (<code>detcore/src/syscalls/threads.rs:983</code>). It repeats because the guest has its own PID namespace (<code>default_container</code>, <code>hermit-cli/src/bin/hermit/container.rs:442</code>) and the scheduler fixes the creation order.</li>
+<li>The child's Detcore state matches F2 and F3 (<code>init_thread_state</code>, <code>detcore/src/lib.rs:1490</code>):</li>
+<li>memory metadata is copied (<code>detcore/src/lib.rs:1525</code>)</li>
+<li>descriptor metadata is copied for the child (<code>detcore/src/lib.rs:1544</code>)</li>
+<li>POSIX timers start empty (<code>detcore/src/lib.rs:1561</code>)</li>
+<li>resource limits are a snapshot (<code>detcore/src/lib.rs:1568</code>)</li>
+<li>process CPU time starts at 0 (<code>detcore/src/lib.rs:1579</code>)</li>
+<li>random number streams come from the creation pedigree (<code>detcore/src/lib.rs:1600</code>)</li>
+<li>Unit test: <code>common_child_rng_identity_ignores_backend_tid_for_every_clone_shape</code> (<code>detcore/src/lib.rs:3566</code>) includes a <code>fork</code> shape.</li>
+</ul>
+<p>Why <code>model</code>: the kernel has to create the process. <code>passthrough</code> would leave the post-fork race (F7) to the host, and <code>refuse</code> would break programs that call it.</p>
+<p>What remains before the code fully realizes <code>model</code>. These are hypotheses read from the code, not measurements:</p>
+<ul>
+<li><strong>No test reaches this syscall.</strong> No test under <code>tests/</code>, <code>hermit-cli/tests</code> or <code>detcore/tests</code> calls <code>SYS_fork</code>. Every program that calls glibc <code>fork()</code> goes through <code>clone</code>, so the <code>clone</code> body's tests do not cover this arm.</li>
+<li><strong>F4 and F5</strong> are left to the kernel. Detcore copies its memory metadata as a whole, and no code looks at <code>MADV_DONTFORK</code> or <code>MADV_WIPEONFORK</code> ranges for the child. Whether this matters for Detcore's own bookkeeping has not been tested.</li>
+<li><strong>Flock state after fork.</strong> Forgetting every lock mode on each successful fork makes later blocking <code>flock</code> calls on inherited descriptors fail with <code>ENOLCK</code>; the flock issue body tracks this.</li>
+</ul>
+<p><code>linux_determinism</code> stays <code>conditional</code>: Hermit removes the scheduling and pid allocation sources, but host resource limits (F6) remain.</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F7): with <code>syscall(SYS_fork)</code>, parent and child each write their <code>getpid</code>, <code>getppid</code> and the fork result to a shared pipe; the parent reaps the child and checks <code>SIGCHLD</code>. The output, including its order, must match across <code>hermit run --verify</code> runs on ptrace.</li>
+<li>T2 (covers F2, F4): after <code>SYS_fork</code>, the child writes to a private page, a <code>MAP_SHARED</code> page, a <code>MADV_WIPEONFORK</code> page and a <code>MADV_DONTFORK</code> range, and moves the offset of an inherited descriptor. Parent and child check what they see.</li>
+<li>T3 (covers F2, F3): a POSIX timer created before the fork is absent in the child (<code>timer_gettime</code> gives <code>EINVAL</code>), a pending signal is not inherited, an <code>fcntl</code> record lock is not inherited, and a <code>flock</code> lock is shared. Record what a blocking <code>flock</code> in the child returns under Hermit.</li>
+<li>T4 (covers F5): a process with two threads calls <code>SYS_fork</code>. The child must have one thread (<code>/proc/self/task</code>) and must run to exit under Hermit.</li>
+<li>T5 (covers F6): with <code>RLIMIT_NPROC</code> lowered to the current process count, <code>SYS_fork</code> must give <code>EAGAIN</code>, and a <code>flock</code> lock held before the failed call must still be known to Detcore afterwards.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · created for v1: no tracking issue existed for this pinned Sysno; code at this SHA: determinized, dispatch typed.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy model (shared clone-family handler detcore/src/syscalls/threads.rs:847: kernel forks, Detcore copies child state and orders parent and child); linux_determinism conditional; 7 behaviour items, 5 tests; no test calls SYS_fork at this SHA (glibc fork uses clone); no coverage recorded, so todo.</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+fork&amp;amp;body=Discussion+for+the+%60fork%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ffork.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60fork%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `fork`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Created by the syscall-tracking v1 migration on 2026-10-03. No tracking issue existed for <code>fork</code>: the 2026-07-24 classification campaign filed issues only for syscalls that had no Detcore handler, and Detcore already handled this one.</p>
+</body></html>

@@ -1,0 +1,128 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>setsockopt | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>setsockopt</code> (54)</h1>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; linux determinism: conditional &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+setsockopt&amp;body=Discussion+for+the+%60setsockopt%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsetsockopt.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60setsockopt%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p>Sets an option on a socket: generic <code>SOL_SOCKET</code> options such as buffer sizes, timeouts and timestamps, or options for a protocol such as <code>TCP_NODELAY</code>. The call itself returns only 0 or an error. Its effect shows up in later socket I/O and in <code>getsockopt</code>.</p>
+<p>Manual reference: <a href="https://man7.org/linux/man-pages/man2/getsockopt.2.html">setsockopt(2)</a>.</p>
+<h2>Linux semantics</h2>
+<p><code>setsockopt(fd, level, optname, optval, optlen)</code> copies <code>optlen</code> bytes from <code>optval</code> and passes them to the handler for <code>level</code>. <code>SOL_SOCKET</code> is handled by the generic socket layer. <code>IPPROTO_TCP</code>, <code>IPPROTO_IP</code>, <code>IPPROTO_IPV6</code>, <code>SOL_UDP</code>, <code>SOL_NETLINK</code> and other levels go to that protocol's own handler. An option that the level does not know gives <code>ENOPROTOOPT</code>.</p>
+<p>The option state lives on the socket in the kernel. Nothing is returned except the status. Some options are stored exactly as given; others are changed on the way in. For example, <code>SO_RCVBUF</code> and <code>SO_SNDBUF</code> are doubled and clamped to the host's <code>net.core.rmem_max</code>/<code>wmem_max</code>. Options that need a capability, such as the <code>*BUFFORCE</code> options, <code>SO_MARK</code> and <code>IP_TRANSPARENT</code>, check it against the user namespace that owns the socket's network namespace.</p>
+<p>Two host probes are on record (see Additional information): enabling <code>SO_KEEPALIVE</code> on a local UNIX socket succeeded, and real programs were seen setting <code>TCP_NODELAY</code>.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>SOL_SOCKET</code> boolean options that only change local behaviour: <code>SO_REUSEADDR</code>, <code>SO_REUSEPORT</code>, <code>SO_KEEPALIVE</code>, <code>SO_BROADCAST</code>, <code>SO_DONTROUTE</code>, <code>SO_OOBINLINE</code>, <code>SO_PASSCRED</code>, <code>SO_PASSSEC</code>, <code>SO_ZEROCOPY</code>. The value is an <code>int</code>; any non-zero value enables the option.</li>
+<li>F2: <code>SO_RCVBUF</code> / <code>SO_SNDBUF</code>: the kernel stores twice the requested size, clamped to the host's <code>rmem_max</code>/<code>wmem_max</code> and raised to a minimum. The stored size decides when later writes come back short or with <code>EAGAIN</code>.</li>
+<li>F3: <code>SO_RCVBUFFORCE</code> / <code>SO_SNDBUFFORCE</code>: like F2 but ignore the sysctl limits. They need <code>CAP_NET_ADMIN</code>; without it they fail with <code>EPERM</code>.</li>
+<li>F4: <code>SO_RCVTIMEO</code> / <code>SO_SNDTIMEO</code> (old and <code>_NEW</code> forms): timeouts for blocking receive and send. When the timeout expires, the call returns a partial count or <code>EAGAIN</code>/<code>EWOULDBLOCK</code> (<code>EINPROGRESS</code> for <code>connect</code>). A <code>timeval</code> out of range gives <code>EDOM</code>.</li>
+<li>F5: <code>SO_RCVLOWAT</code>: the minimum number of bytes before a blocking receive returns. Setting <code>SO_SNDLOWAT</code> fails with <code>ENOPROTOOPT</code> on Linux.</li>
+<li>F6: <code>SO_LINGER</code>: with <code>l_onoff</code> set, <code>close</code> on a connected stream socket waits up to <code>l_linger</code> seconds for unsent data. <code>l_linger</code> 0 resets the connection instead.</li>
+<li>F7: <code>SO_TIMESTAMP</code>, <code>SO_TIMESTAMPNS</code>, <code>SO_TIMESTAMPING</code> (old and <code>_NEW</code> forms): ask for receive timestamps, delivered later as <code>SCM_TIMESTAMP*</code> control messages from <code>recvmsg</code>.</li>
+<li>F8: routing and marking: <code>SO_PRIORITY</code>, <code>SO_MARK</code> (needs <code>CAP_NET_ADMIN</code>), <code>SO_BINDTODEVICE</code> / <code>SO_BINDTOIFINDEX</code>. A device name or index that does not exist in the namespace gives <code>ENODEV</code>.</li>
+<li>F9: socket filters: <code>SO_ATTACH_FILTER</code>, <code>SO_ATTACH_BPF</code>, <code>SO_DETACH_FILTER</code>, <code>SO_LOCK_FILTER</code>, <code>SO_ATTACH_REUSEPORT_CBPF</code> / <code>SO_ATTACH_REUSEPORT_EBPF</code>.</li>
+<li>F10: CPU, polling and pacing options: <code>SO_INCOMING_CPU</code>, <code>SO_BUSY_POLL</code>, <code>SO_PREFER_BUSY_POLL</code>, <code>SO_MAX_PACING_RATE</code>, <code>SO_TXTIME</code>.</li>
+<li>F11: <code>SO_PEEK_OFF</code>: the offset at which <code>MSG_PEEK</code> reads start.</li>
+<li>F12: TCP batching options at <code>IPPROTO_TCP</code>: <code>TCP_NODELAY</code>, <code>TCP_CORK</code>, <code>TCP_QUICKACK</code>. They change when segments are sent, not what bytes arrive.</li>
+<li>F13: TCP timer options: <code>TCP_KEEPIDLE</code>, <code>TCP_KEEPINTVL</code>, <code>TCP_KEEPCNT</code>, <code>TCP_USER_TIMEOUT</code>, <code>TCP_DEFER_ACCEPT</code>, <code>TCP_SYNCNT</code>, <code>TCP_LINGER2</code>.</li>
+<li>F14: TCP options whose success depends on the host: <code>TCP_CONGESTION</code> (an algorithm that is not available gives <code>ENOENT</code>), <code>TCP_ULP</code> (needs the module), <code>TCP_FASTOPEN</code>, <code>TCP_MAXSEG</code>.</li>
+<li>F15: IP options at <code>IPPROTO_IP</code> and <code>IPPROTO_IPV6</code>: <code>IP_TOS</code>, <code>IP_TTL</code>, <code>IP_RECVERR</code>, <code>IP_PKTINFO</code>, <code>IP_FREEBIND</code>, <code>IP_TRANSPARENT</code> (needs <code>CAP_NET_ADMIN</code>), multicast membership and loop options, <code>IPV6_V6ONLY</code>.</li>
+<li>F16: other levels, each with its own handler: <code>SOL_UDP</code> (<code>UDP_CORK</code>, <code>UDP_SEGMENT</code>), <code>SOL_NETLINK</code> (<code>NETLINK_ADD_MEMBERSHIP</code> and others), <code>SOL_PACKET</code>, <code>SOL_ALG</code>, <code>SOL_TLS</code>.</li>
+<li>F17: errors: <code>EBADF</code> (bad descriptor), <code>ENOTSOCK</code> (not a socket), <code>EFAULT</code> (bad <code>optval</code>), <code>EINVAL</code> (<code>optlen</code> too small or a bad value), <code>ENOPROTOOPT</code> (unknown level or option), <code>EPERM</code> (missing capability).</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: conditional</code>, kept from both legacy issues. The call returns only a status. That status is the same on every run for options that need no privilege and have no host-dependent input (F1, F5, F11, F12, F13, F16 with fixed arguments, F17). It depends on the host for options that check a capability (F3, F8, F15), that name a device (F8), or that need a kernel module or algorithm (F14).</p>
+<p>Most of the nondeterminism is not in this call. It shows up later, in the I/O the option affects:</p>
+<ul>
+<li>buffer sizes (F2, F3) decide when a write comes back short or with <code>EAGAIN</code></li>
+<li>timeouts (F4, F6, F13) depend on wall-clock time and peer activity</li>
+<li>timestamps (F7) carry host time in later <code>recvmsg</code> control messages</li>
+<li>batching options (F12) change segment timing, which only a host peer can see</li>
+</ul>
+<p>The call repeats when every peer is inside one deterministic schedule in a private network namespace and the options used do not depend on host configuration.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>Protocol implementation and kernel version: which options and algorithms exist</li>
+<li>The network namespace and its devices: <code>SO_BINDTODEVICE</code> targets and multicast routes</li>
+<li>Host sysctl limits: the <code>rmem_max</code>/<code>wmem_max</code> clamp on <code>SO_RCVBUF</code>/<code>SO_SNDBUF</code></li>
+<li>Credentials: the capability check on <code>CAP_NET_ADMIN</code>-gated options</li>
+<li>Peer activity and timing: whether a timeout expires and what timestamps say</li>
+</ul>
+<h3>Cross-host variation</h3>
+<ul>
+<li>Congestion-control algorithms and ULP modules the host kernel has built or loaded: whether <code>TCP_CONGESTION</code> with a real algorithm name (for example &quot;bbr&quot;) or <code>TCP_ULP</code> &quot;tls&quot; succeeds or gives <code>ENOENT</code> differs between hosts (F14). The call is forwarded unchanged (<code>detcore/src/syscalls/files.rs:3873</code>).</li>
+<li>Host kernel version: options added in newer kernels (for example <code>SO_PREFER_BUSY_POLL</code>, <code>SO_TXTIME</code>, <code>UDP_SEGMENT</code>) succeed on one host and give <code>ENOPROTOOPT</code> or <code>EINVAL</code> on an older one (F10, F16, F17).</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>model</code>. The kernel stays the owner of option state. Detcore makes the call reproducible by isolating the network and by putting every later I/O operation the option affects under its own scheduler.</p>
+<p>What the code does at f4055eb9:</p>
+<ul>
+<li>The arm at <code>detcore/src/lib.rs:2556</code> sends the call to <code>handle_setsockopt</code> (<code>detcore/src/syscalls/files.rs:3868</code>). The arm and the handler carry <code>AUTONOMOUS-BOT-IMPLEMENTED</code> and <code>TODO-HUMAN-REVIEW(#663)</code> markers.</li>
+<li>The handler body is a single <code>record_or_replay</code> (<code>detcore/src/syscalls/files.rs:3873</code>; helper at <code>detcore/src/tool_local.rs:382</code>). In run mode the kernel executes the call unchanged. Record mode saves the result. Per the doc comment at <code>detcore/src/syscalls/files.rs:3865</code>, replay re-applies a successful option before the socket I/O that follows. No option is read or rewritten.</li>
+<li>The default <code>--network=local</code> gives the guest its own network namespace with only loopback (<code>hermit-cli/src/bin/hermit/global_opts.rs:53</code>). Every peer is then a guest process, and device-dependent options (F8, F15) see the same single interface on every run. <code>--network=host</code> gives up that isolation.</li>
+<li>Later blocking I/O does not block in the kernel. Sockets are made physically nonblocking when threads are sequentialized (<code>maybe_set_nonblocking_fd</code>, <code>detcore/src/syscalls/helpers.rs:695</code>), and reads and writes are retried under the scheduler (<code>execute_nonblockable_fd_syscall</code>, <code>detcore/src/syscalls/helpers.rs:202</code>). The effect of F2 and F12 on readiness therefore reaches the guest through scheduler-ordered retries.</li>
+<li>Timestamps enabled with F7 are rewritten when they arrive: <code>recvmsg</code> finds <code>SCM_TIMESTAMP*</code> control messages (<code>detcore/src/syscalls/io.rs:272</code>, constants at <code>detcore/src/syscalls/io.rs:215</code>) and replaces their contents with Hermit time.</li>
+</ul>
+<p>Why <code>model</code> and not the alternatives:</p>
+<ul>
+<li><code>passthrough</code> alone is not enough: the option's effects have to be kept in step with the scheduler, as F4 and F7 show.</li>
+<li><code>emulate</code> would mean keeping a model of every socket option outside the kernel, which duplicates the network stack.</li>
+<li><code>refuse</code> would break almost every network server, and most clients.</li>
+</ul>
+<p>What remains before the code fully realizes <code>model</code>. These are hypotheses read from the code, not measurements:</p>
+<ul>
+<li><strong>F4 timeouts.</strong> No code in <code>detcore/src</code> reads <code>SO_RCVTIMEO</code> or <code>SO_SNDTIMEO</code>. A blocking receive on a socket is retried until it succeeds, and the retry with a logical timeout (<code>retry_nonblocking_syscall_with_timeout</code>, <code>detcore/src/syscalls/helpers.rs:1432</code>) is used by poll, epoll, futex and signal waits, not by socket reads. A guest that sets <code>SO_RCVTIMEO</code> and waits on a socket that never gets data may then wait forever under Hermit, where Linux returns <code>EAGAIN</code> once the timeout expires. T4 checks this.</li>
+<li><strong>F6 linger.</strong> A lingering <code>close</code> can sleep in the kernel, outside the scheduler, until the peer acknowledges or <code>l_linger</code> expires. With every peer in the guest this ends, but the time it takes is host time. T5 checks it.</li>
+<li><strong>F2 and F3 sizes.</strong> The kernel's clamp uses host sysctls, so the stored size, and with it the point where writes come back short, can differ between hosts. <code>tests/c/socket_options.c:12</code> already leaves <code>SO_SNDBUF</code> out for this reason. The size read back is covered by the getsockopt issue (https://github.com/rrnewton/hermit/issues/609).</li>
+<li><strong>Capability-gated options (F3, F8, F15).</strong> Inside Hermit's user namespace the guest may hold <code>CAP_NET_ADMIN</code> over its own network namespace, so a call that fails with <code>EPERM</code> natively may succeed under Hermit. That is consistent run to run, but it differs from native. T3 and T8 record both results.</li>
+</ul>
+<p><code>linux_determinism</code> stays <code>conditional</code>. Hermit removes the peer and device sources by isolating the network. Host sysctl limits and module availability stay outside its control.</p>
+<p>Target (owner decisions 14 and 13): <code>SO_RCVTIMEO</code> and <code>SO_SNDTIMEO</code> (F4) bound Detcore's scheduler wait, not a kernel sleep, and are measured on virtual time. Detcore must learn the value, either by keeping it in its fd table when this call succeeds (the kernel still validates it, so <code>EDOM</code> keeps Linux's order) or by reading it back with <code>getsockopt</code> when a wait starts. The socket waits in <code>accept</code>, <code>connect</code>, <code>recv*</code> and <code>send*</code> then end at that virtual-time deadline with Linux's result: <code>EAGAIN</code> or a partial count, and <code>EINPROGRESS</code> for <code>connect</code>. Today <code>handle_setsockopt</code> (<code>detcore/src/syscalls/files.rs:3868</code>) only forwards the value to the kernel, where it has no effect on the physically nonblocking socket in run mode and measures host time on the blocking path. <code>SO_LINGER</code> (F6) falls under the same rule: a lingering <code>close</code> must not sleep in the kernel while holding its turn, and <code>l_linger</code> is virtual time; that change belongs to <code>close</code>. <code>setsockopt</code> stays <code>model</code>.</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F17): on a UNIX socketpair, set and read back each F1 option under <code>hermit run --verify</code> on ptrace. Also check the errors: <code>EBADF</code> for a closed fd, <code>ENOTSOCK</code> for a regular file, <code>EINVAL</code> for <code>optlen</code> 0, <code>ENOPROTOOPT</code> for an unknown option, and <code>EFAULT</code> for a bad <code>optval</code>. Existing candidate: <code>tests/c/socket_options.c</code>, which round-trips <code>SO_REUSEADDR</code>, <code>SO_KEEPALIVE</code> and <code>SO_BROADCAST</code> (cell <code>c-programs/socket-options</code>, program at <code>tests/e2e/manifests/c-programs.yaml:14358</code>, verify ci on ptrace). It has no error cases.</li>
+<li>T2 (covers F1): record and replay a guest that sets <code>SO_REUSEADDR</code> and <code>SO_REUSEPORT</code> and then binds two sockets to one port. Replay must re-apply both options, so the second bind succeeds again. Existing candidate: <code>tests/c/record_replay_setsockopt.c</code> (program at <code>tests/e2e/manifests/c-programs.yaml:7177</code>), run by <code>record_c_setsockopt_replay</code> at <code>hermit-cli/tests/record_replay.rs:2316</code>.</li>
+<li>T3 (covers F2, F3): set <code>SO_RCVBUF</code>/<code>SO_SNDBUF</code> to a small and a large value, read them back, and fill the socket until <code>EAGAIN</code>. Run it twice under <code>--verify</code>; the results must match. Record what <code>SO_RCVBUFFORCE</code> returns natively and under Hermit.</li>
+<li>T4 (covers F4, F5): on a socketpair with no writer, set <code>SO_RCVTIMEO</code> to 50 ms and call a blocking <code>recv</code>. Linux returns <code>EAGAIN</code>. Record what Hermit does. A hang confirms the gap above. Also check <code>SO_RCVLOWAT</code>, and that <code>SO_SNDLOWAT</code> gives <code>ENOPROTOOPT</code>.</li>
+<li>T5 (covers F6): a loopback TCP pair with <code>SO_LINGER</code> {1, 1} and with {1, 0}. Check the <code>close</code> return value and what the peer sees (EOF or <code>ECONNRESET</code>), under <code>--verify</code>.</li>
+<li>T6 (covers F7): enable <code>SO_TIMESTAMP</code> and receive a datagram. The control message must hold Hermit time, the same in every run. Existing candidates: <code>tests/c/socket_timestamp_timeval.c:31</code> (cell <code>c-programs/socket-timestamp-timeval</code>, program at <code>tests/e2e/manifests/c-programs.yaml:9032</code>, verify ci on ptrace) and <code>tests/c/socket_timestamp_edge_cases.c:48</code> (program at <code>tests/e2e/manifests/c-programs.yaml:8911</code>).</li>
+<li>T7 (covers F12, F13, F14): on a loopback TCP pair, set <code>TCP_NODELAY</code> (the call seen in the strace from https://github.com/rrnewton/hermit/issues/466), <code>TCP_CORK</code>, <code>TCP_KEEPIDLE</code>, <code>TCP_USER_TIMEOUT</code>, <code>TCP_CONGESTION</code> &quot;reno&quot; and a name that does not exist. Check every return value and that the bytes delivered are the same under <code>--verify</code>.</li>
+<li>T8 (covers F8, F9, F10, F11, F15, F16): set <code>SO_PRIORITY</code>, <code>SO_BINDTODEVICE</code> &quot;lo&quot; and a missing device (<code>ENODEV</code>), attach an accept-all classic BPF filter, set <code>SO_PEEK_OFF</code>, <code>SO_BUSY_POLL</code>, <code>IP_TOS</code>, <code>IPV6_V6ONLY</code>, <code>UDP_SEGMENT</code> and a netlink membership. Record each return value natively and under Hermit; under <code>--verify</code> they must match run to run.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/459: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch typed.</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · duplicate https://github.com/rrnewton/hermit/issues/466 is retired into this issue; its text waits under Additional information for a section-by-section merge.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy model (kernel owns option state; record_or_replay at detcore/src/syscalls/files.rs:3873, isolated network, scheduler-mediated I/O); linux_determinism conditional kept; merged duplicate https://github.com/rrnewton/hermit/issues/466; 17 flags, 8 tests; open gaps: SO_RCVTIMEO/SO_SNDTIMEO not honoured (hypothesis, T4), lingering close, host buffer clamps; no coverage recorded, so todo.</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d12 (owner decisions 1 and 2): cross_host_variant true (host-loaded congestion algorithms and ULP modules, kernel version for newer options); no U items, since ENOENT and ENOPROTOOPT are reachable on CI with an unknown name or option; no open questions</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): decisions 13 and 14 applied (Target paragraph: SO_RCVTIMEO and SO_SNDTIMEO bound the scheduler wait on virtual time; SO_LINGER close follows the same rule); no new F/T ids; no open questions</li>
+<li>2026-10-05 · hermit f4055eb9cae4 · syscall-tracking-2 · covered: T2 covered by hermit-cli/tests/record_replay.rs (C08 review of the 2026-10-04 coverage proposals; guest source read at this SHA, not run by this agent)</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+setsockopt&amp;amp;body=Discussion+for+the+%60setsockopt%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsetsockopt.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60setsockopt%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `setsockopt`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: setsockopt&quot; (https://github.com/rrnewton/hermit/issues/459), legacy variant A1. Its duplicate https://github.com/rrnewton/hermit/issues/466 was filed the same day with the same title (legacy variant A1); its comment history (0 comments) stays on that issue. Its text was merged into this body on 2026-10-03.</p>
+<p>How the two legacy texts were reconciled:</p>
+<ul>
+<li><strong>Recommended action.</strong> https://github.com/rrnewton/hermit/issues/459 said NEEDS-HANDLER; https://github.com/rrnewton/hermit/issues/466 said NEEDS-INVESTIGATION. Both are superseded: a handler now exists (<code>detcore/src/syscalls/files.rs:3868</code>), and this body chooses <code>model</code>.</li>
+<li><strong>Classification.</strong> Both said CONDITIONAL; kept.</li>
+<li><strong>Facts kept from https://github.com/rrnewton/hermit/issues/466:</strong> the list of options that change I/O timing (<code>SO_RCVTIMEO</code>/<code>SO_SNDTIMEO</code>, <code>SO_RCVBUF</code>, <code>TCP_NODELAY</code>; now F2, F4, F12), the point that socket behaviour is part of the network I/O Hermit determinizes at read and write time, and its strace line.</li>
+<li><strong>Superseded claim in both:</strong> that the syscall went through a temporary catch-all forwarding list in <code>detcore/src/syscall_classification.rs</code>. That was true at <code>dd60278f</code>; at f4055eb9 the call has a typed handler.</li>
+</ul>
+<h3>2026-07-24 host strace evidence</h3>
+<p>Both probes ran on <code>the measurement host</code> (Linux 6.17, x86_64, glibc).</p>
+<p>From https://github.com/rrnewton/hermit/issues/459: a direct <code>syscall()</code> harness, with safe self-targeting, no-op, temporary-file or deliberately invalid arguments, traced with <code>strace -qq -f -e trace=setsockopt</code>. The harness exited 0.</p>
+<pre><code>setsockopt(3, SOL_SOCKET, SO_KEEPALIVE, [1], 4) = 0
+</code></pre>
+<p>From https://github.com/rrnewton/hermit/issues/466: <code>strace -f -e trace=setsockopt</code> on a direct <code>syscall()</code> harness and on common programs. This line came from a real program:</p>
+<pre><code>setsockopt(19, SOL_TCP, TCP_NODELAY, [1], 4) = 0
+</code></pre>
+<hr>
+<p>*Both legacy issues came from the autonomous syscall-classification sweep: https://github.com/rrnewton/hermit/issues/459 from batch 5 (ranks 201-250), https://github.com/rrnewton/hermit/issues/466 from ranks 151-250, of the list of syscalls that had no policy in <code>syscall_classification.rs</code>. Manual research plus host strace evidence; neither proposed a code change.*</p>
+</body></html>

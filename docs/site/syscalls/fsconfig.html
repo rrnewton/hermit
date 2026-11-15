@@ -1,0 +1,86 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fsconfig | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>fsconfig</code> (431)</h1>
+<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_mount_ns_admin_refused_syscall</code> &middot; linux determinism: conditional &middot; target policy: refuse &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+fsconfig&amp;body=Discussion+for+the+%60fsconfig%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ffsconfig.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60fsconfig%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>fsconfig(fd, cmd, key, value, aux)</code> sets parameters on a filesystem context made by <code>fsopen</code> or <code>fspick</code>, and runs its create and reconfigure commands (new mount API, Linux 5.2). Hermit refuses every call with a fixed <code>EPERM</code> and never forwards it to the host (<code>detcore/src/lib.rs:2215-2219</code>).</p>
+<p>Manual reference: Linux man-pages fsconfig(2).</p>
+<h2>Linux semantics</h2>
+<p>The call dispatches on <code>cmd</code>. The <code>FSCONFIG_SET_*</code> commands pass one parameter, named by <code>key</code>, to the filesystem's parameter parser, so which keys and values are accepted depends on the filesystem driver. The <code>FSCONFIG_CMD_*</code> commands act on the whole context.</p>
+<p>Unlike the other new-mount-API calls, <code>fsconfig</code> does not check privilege on entry. The kernel validates in this order:</p>
+<p>1. A negative <code>fd</code> gives <code>EINVAL</code>. The host strace under Additional information, <code>fsconfig(-1, 0xffffffff, ...) = -1 EINVAL</code>, shows this check running before the command is examined. 2. Each command checks the shape of <code>key</code>, <code>value</code> and <code>aux</code> (for example, <code>FSCONFIG_SET_FLAG</code> needs a key and no value); a mismatch is <code>EINVAL</code>. An unknown command is <code>EOPNOTSUPP</code>. 3. Then <code>fd</code> is looked up: a closed descriptor is <code>EBADF</code>, and an open descriptor that is not a filesystem context is <code>EINVAL</code>.</p>
+<p>Privilege is checked only when a command creates or reconfigures a superblock, which gives <code>EPERM</code> to a caller without it. A context in the wrong phase for a command gives <code>EBUSY</code>, and a failed create or reconfigure leaves the context unusable. Error details are queued as messages that <code>read</code> on the context descriptor returns.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>FSCONFIG_SET_FLAG</code>: set the boolean parameter <code>key</code>; <code>value</code> must be NULL and <code>aux</code> 0.</li>
+<li>F2: <code>FSCONFIG_SET_STRING</code>: set <code>key</code> to the string <code>value</code>; <code>aux</code> must be 0.</li>
+<li>F3: <code>FSCONFIG_SET_BINARY</code>: set <code>key</code> to the binary blob <code>value</code> of <code>aux</code> bytes.</li>
+<li>F4: <code>FSCONFIG_SET_PATH</code>: set <code>key</code> to the path <code>value</code>, resolved relative to the directory descriptor <code>aux</code>.</li>
+<li>F5: <code>FSCONFIG_SET_PATH_EMPTY</code>: like F4, but an empty path refers to <code>aux</code> itself.</li>
+<li>F6: <code>FSCONFIG_SET_FD</code>: set <code>key</code> to the open descriptor <code>aux</code>.</li>
+<li>F7: <code>FSCONFIG_CMD_CREATE</code>: create a superblock, or reuse a matching one, from the configured parameters. Needs privilege over the mount namespace.</li>
+<li>F8: <code>FSCONFIG_CMD_RECONFIGURE</code>: apply the parameters to the existing superblock of a context made by <code>fspick</code>. Needs privilege over that superblock.</li>
+<li>F9: <code>FSCONFIG_CMD_CREATE_EXCL</code> (Linux 6.6): like F7, but fail instead of reusing an existing superblock.</li>
+<li>F10: argument errors: a negative <code>fd</code> is <code>EINVAL</code> before anything else; a <code>key</code>/<code>value</code>/<code>aux</code> shape that does not fit the command is <code>EINVAL</code>; an unknown command is <code>EOPNOTSUPP</code>; a closed <code>fd</code> is <code>EBADF</code>; an <code>fd</code> that is not a filesystem context is <code>EINVAL</code>.</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: conditional</code>, kept from the legacy classification. The open-ended command interface mutates a kernel filesystem context, and its result depends on the filesystem driver's parser, on mount namespace and privilege for the create and reconfigure commands, and on the descriptor passed in. With the same context, driver and privileges it repeats.</p>
+<p>Under Hermit the call returns <code>EPERM</code> without consulting the host, so it is deterministic by construction.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>Filesystem-driver behaviour: which keys and values the parser accepts, and the messages it queues</li>
+<li>Mount namespace and privilege, for the create and reconfigure commands</li>
+<li>Detcore descriptor bookkeeping: the context descriptor is an object Detcore does not track</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>refuse</code>. The legacy action was NEEDS-HANDLER; the code has since chosen refusal. What the code does at hermit f4055eb9cae4:</p>
+<ul>
+<li><code>fsconfig</code> is a member of <code>is_mount_ns_admin_refused_syscall</code> (<code>detcore/src/syscall_classification.rs:939</code>, member at line 949) and is classified Determinized (<code>detcore/src/syscall_classification.rs:362</code>).</li>
+<li>The dispatch arm at <code>detcore/src/lib.rs:2215-2219</code> matches that predicate before the typed match and returns <code>Err(Error::Errno(Errno::EPERM))</code> for every argument combination. Its comment (<code>detcore/src/lib.rs:2203-2214</code>) says the call is never forwarded to the host.</li>
+<li>The predicate is part of <code>is_deterministically_refused_syscall</code> (<code>detcore/src/syscall_classification.rs:1324</code>). The arm has no <code>panic_on_unsupported_syscalls</code> branch, so the refusal is the same whether or not Hermit fails closed.</li>
+<li>The unit test <code>mount_ns_admin_syscalls_are_determinized_and_consistent</code> (<code>detcore/src/syscall_classification.rs:2666</code>, member at line 2678) checks only the classification and the predicate membership; it does not run a guest.</li>
+</ul>
+<p>Why <code>refuse</code>: the predicate's doc comment (<code>detcore/src/syscall_classification.rs:926-938</code>) says a deterministic container pins the guest's mount hierarchy for the whole run. <code>fsopen</code> and <code>fspick</code>, the only calls that create a filesystem context, are refused by the same arm, so a guest under Hermit cannot hold a context descriptor of its own making. Forwarding <code>fsconfig</code> would therefore never configure anything; on Linux such a call can only fail.</p>
+<p>Where Hermit differs from Linux: since the guest has no context descriptor, native Linux would answer every <code>fsconfig</code> the guest can make with <code>EINVAL</code>, <code>EOPNOTSUPP</code> or <code>EBADF</code> (F10), never <code>EPERM</code> and never success. Hermit answers <code>EPERM</code>. The outcome, failure, is the same; only the errno differs. The host-strace case <code>fsconfig(-1, 0xffffffff, ...)</code> gives <code>EINVAL</code> natively and <code>EPERM</code> under Hermit.</p>
+<p>Target (owner decision 6): keep the fixed <code>EPERM</code>, returned before any argument is read, which is what the code does today (<code>detcore/src/lib.rs:2215-2219</code>). Linux's own order, in <code>SYSCALL_DEFINE5(fsconfig)</code> in <code>fs/fsopen.c</code>, checks <code>fd</code>, the command and the <code>key</code>/<code>value</code>/<code>aux</code> shape before it looks up the descriptor, and checks privilege only inside the create and reconfigure commands (F10); Hermit deliberately does not reproduce it, because the call is refused, not emulated. A guest probing the new mount API with an invalid <code>fsconfig</code> sees <code>EPERM</code> where Linux gives <code>EINVAL</code>, and treats the API as unavailable: <code>fsopen</code> and <code>fspick</code>, the only sources of a context, return <code>EPERM</code> too.</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F2, F3, F4, F5, F6): under <code>hermit run --verify</code> on ptrace, call raw <code>syscall(SYS_fsconfig, ...)</code> with each <code>FSCONFIG_SET_*</code> command and well-shaped arguments, once on fd <code>-1</code> and once on an ordinary file descriptor. Each call returns -1 with <code>EPERM</code> (Linux gives <code>EINVAL</code> for both), and both runs agree.</li>
+<li>T2 (covers F7, F8, F9): <code>FSCONFIG_CMD_CREATE</code>, <code>FSCONFIG_CMD_RECONFIGURE</code> and <code>FSCONFIG_CMD_CREATE_EXCL</code> on an ordinary file descriptor return <code>EPERM</code>, and <code>/proc/self/mountinfo</code> read before and after is byte-identical.</li>
+<li>T3 (covers F10): the host-strace case <code>fsconfig(-1, 0xffffffff, -1, -1, -1)</code>, an unknown command on a valid descriptor, a shape mismatch (<code>FSCONFIG_SET_FLAG</code> with a non-NULL value), and a closed descriptor all return <code>EPERM</code> under Hermit where Linux returns <code>EINVAL</code>, <code>EOPNOTSUPP</code>, <code>EINVAL</code> and <code>EBADF</code>. The test pins the fixed errno of owner decision 6.</li>
+<li>T4 (covers none): record a guest that calls <code>fsconfig</code> and replay it; replay returns the same <code>EPERM</code> and the guest's output matches.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A2 of https://github.com/rrnewton/hermit/issues/359: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch pred:is_mount_ns_admin_refused_syscall, refused.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; refuse (Detcore returns a fixed EPERM at detcore/src/lib.rs:2215-2219; fsopen and fspick are refused too, so natively every guest call would fail anyway, with EINVAL/EOPNOTSUPP/EBADF instead of EPERM); linux_determinism stays conditional; 10 flag behaviours and 4 tests listed; no runtime test names fsconfig, so tracking_status stays todo and ptrace_verification untested; open question on native argument errnos</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): decision 6 applied (fixed EPERM before any argument check stays the target; Linux order in SYSCALL_DEFINE5(fsconfig) deliberately not reproduced); target_policy stays refuse; T3 now pins the decision-6 errno; no new F/T ids; open question on native argument errnos removed</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+fsconfig&amp;amp;body=Discussion+for+the+%60fsconfig%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ffsconfig.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60fsconfig%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `fsconfig`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: fsconfig&quot; (https://github.com/rrnewton/hermit/issues/359), legacy variant A2.</p>
+<p>It was ranked 80 in the batch-2 classification order, which excluded the 50 syscalls seen in batch-1 workloads.</p>
+<h3>Open questions</h3>
+<ul>
+<li>A context descriptor could still reach the guest from outside, for example through <code>SCM_RIGHTS</code> from a host process. Hermit would refuse <code>fsconfig</code> on it as well. This body does not treat that as a case to support.</li>
+</ul>
+<h3>Note on the strace evidence below</h3>
+<p>The strace text below was written on 2026-07-24 against the host kernel, not through Hermit. At hermit f4055eb9cae4 Hermit never forwards <code>fsconfig</code>; the same call under Hermit gives <code>EPERM</code> (<code>detcore/src/lib.rs:2215-2219</code>), not <code>EINVAL</code>.</p>
+<h3>2026-07-24 host strace evidence</h3>
+<p>Test host: Linux 6.17.13 x86_64; strace 6.12.</p>
+<p>Ran a syscall-specific safe raw probe with deliberately inert/invalid arguments so privileged or mutating operations could not change host state:</p>
+<pre><code>strace -f -qq -e trace=fsconfig -s 160 python3 -c 'import ctypes; c=ctypes.CDLL(None,use_errno=True); c.syscall(431, *([ctypes.c_long(-1)]*6))'
+</code></pre>
+<p>Actual strace output:</p>
+<pre><code>fsconfig(-1, 0xffffffff /* FSCONFIG_??? */, 0xffffffffffffffff, 0xffffffffffffffff, -1) = -1 EINVAL (Invalid argument)
+</code></pre>
+<p>The trace confirms the host kernel path and observed errno/result for this ABI. The determinism recommendation also accounts for documented success-path state dependencies; an invalid-argument result alone is not treated as proof of determinism.</p>
+</body></html>

@@ -1,0 +1,79 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rt_sigreturn | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>rt_sigreturn</code> (15)</h1>
+<p>Strategy: <strong>passthrough</strong> &middot; dispatch: <code>sysno-guard</code> &middot; linux determinism: conditional &middot; target policy: passthrough &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+rt_sigreturn&amp;body=Discussion+for+the+%60rt_sigreturn%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Frt_sigreturn.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60rt_sigreturn%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>rt_sigreturn()</code> returns from a signal handler: the kernel reads the signal frame it wrote at delivery from the user stack and restores the interrupted context from it. Hermit forwards it to the host kernel on ptrace; its result is exactly as repeatable as the signal delivery and handler that produced the frame.</p>
+<h2>Linux semantics</h2>
+<p>The call takes no arguments. It is reached through the <code>SA_RESTORER</code> trampoline that libc installs with every <code>rt_sigaction</code>, when the handler returns; programs do not normally call it directly, and doing so without a valid frame on the stack kills the process. The kernel reads an <code>rt_sigframe</code> (a <code>ucontext_t</code> plus <code>siginfo</code>) at the current stack pointer and restores registers, the signal mask, the extended FPU state and the alternate signal stack from it. The handler may have edited the frame, so the restored context is whatever is in that memory, not necessarily what was saved. The &quot;return value&quot; is the restored <code>rax</code>, which lets an interrupted syscall's result or a handler-chosen value pass through unchanged.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: general registers, <code>rip</code> and <code>rsp</code> are restored from <code>uc_mcontext</code>, including edits the handler made; <code>eflags</code> is restored through a mask of user-modifiable bits, and segment state follows F5</li>
+<li>F2: the signal mask is set from <code>uc_sigmask</code>; <code>SIGKILL</code> and <code>SIGSTOP</code> are removed, and pending signals unblocked by the new mask are delivered on return</li>
+<li>F3: extended FPU state (<code>fpstate</code>): restored from the xsave area after checking its magic numbers and size; a NULL <code>fpstate</code> pointer resets the FPU to its initial state; a malformed area resets it and raises <code>SIGSEGV</code> on some kernels</li>
+<li>F4: the alternate signal stack is restored from <code>uc_stack</code> as if by <code>sigaltstack</code>; an invalid value is ignored rather than failing the return</li>
+<li>F5: <code>uc_flags</code>: <code>UC_SIGCONTEXT_SS</code> and <code>UC_STRICT_RESTORE_SS</code> decide whether the saved <code>ss</code> is restored or fixed up to a flat user selector</li>
+<li>F6: an unreadable frame or invalid saved state makes the kernel force <code>SIGSEGV</code> on the task instead of returning</li>
+<li>F7: return value: the restored <code>rax</code>, never an errno of its own; an interrupted syscall's <code>-EINTR</code>, a restart, or a handler-written value all reach the program through it</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p>The call reads only the frame on the guest's own stack and the task's register and signal state; nothing in it depends on time or on another process. Its result therefore repeats whenever the frame repeats. The frame is written by the kernel at delivery: under Hermit, signal delivery is scheduler-serialized (<code>detcore/src/syscalls/signal.rs:674</code>), the stack addresses repeat because the guest runs with <code>ADDR_NO_RANDOMIZE</code> (stated at <code>tests/c/personality_domain.c:12</code>), and the handler is guest code run under the same scheduler. The one host-dependent part is the xsave area inside the frame, whose layout and size depend on the CPU features the host enables; it is fixed on a given host. That host dependency is why <code>linux_determinism</code> is conditional rather than deterministic.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>Host CPU features that change the size and contents of the xsave area (F3), and the kernel's choice of frame layout; both are fixed on a given host and kernel.</li>
+<li>Anything that makes delivery itself differ (which instruction was interrupted, which syscall was restarted). Those are properties of signal delivery and of the scheduler, tracked with the signal family, not with this call.</li>
+</ul>
+<h3>Cross-host variation</h3>
+<ul>
+<li>Host CPU's enabled xsave features (XCR0, for example AVX-512 or AMX state) and the kernel's frame layout: they decide the size and contents of the <code>fpstate</code> area that the call checks and restores, so which bytes of a handler-edited frame are restored differs between hosts (F3). Virtual CPUID does not change the kernel's xsave format, and the call is forwarded unchanged (<code>detcore/src/lib.rs:2843</code>).</li>
+<li>Host kernel version: whether a malformed <code>fpstate</code> area only resets the FPU or also raises <code>SIGSEGV</code> (F3).</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>passthrough</code>. The code already does this. <code>rt_sigreturn</code> is classified <code>PassThrough</code> at <code>detcore/src/syscall_classification.rs:804</code>, the last entry of the pass-through block that starts at <code>detcore/src/syscall_classification.rs:690</code>. The comment directly above it, at <code>detcore/src/syscall_classification.rs:802</code>, records the backend split: &quot;Ptrace executes rt_sigreturn directly; DBT has dedicated injected-sigreturn handling, while KVM deterministically reports its current lack of signal support&quot;. The test <code>representative_policies_stay_in_their_reviewed_sections</code> (<code>detcore/src/syscall_classification.rs:1899</code>) pins it as PassThrough at <code>detcore/src/syscall_classification.rs:2084</code>, and it is in the census at <code>detcore/src/syscall_classification.rs:1741</code>. The blanket arm <code>SyscallClassification::PassThrough =&gt; self.passthrough(guest, call).await</code> at <code>detcore/src/lib.rs:2843</code> forwards it.</p>
+<p>Why passthrough, not <code>model</code> or <code>emulate</code>:</p>
+<ul>
+<li>The state it restores (registers, FPU state, signal mask) lives in the traced task, and on ptrace the kernel already wrote the frame it reads. Emulating it would mean parsing the kernel's frame format and setting every register through ptrace, reproducing the kernel's own validation for no change in result.</li>
+<li>Its inputs are all guest-controlled memory and task state that Hermit's serialized signal delivery already makes repeatable. There is no host input to virtualize beyond the CPU's xsave format, which Hermit does not control on ptrace.</li>
+<li>Refusing it is not an option: every handler that returns uses it.</li>
+</ul>
+<p>Code facts show <code>subscribed_record_replay: false</code>: <code>rt_sigreturn</code> is not in the <code>--passthru-opt</code> list near <code>detcore/src/lib.rs:1214</code>. <code>hermit record</code> uses its own subscriptions, which the comment at <code>detcore/src/lib.rs:1078</code> places outside the exported tree; this body does not describe how record treats it.</p>
+<p>The open gap is test evidence. <code>tests_naming</code> is 0: no test names <code>SYS_rt_sigreturn</code>. Every fixture that installs a handler reaches it through the libc restorer, so evidence comes from tests that check what the return restored.</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F7): under <code>hermit run --verify</code> on ptrace, install an <code>SA_SIGINFO</code> handler that edits <code>uc_mcontext</code> (sets a callee-saved register and <code>rax</code>, and advances <code>rip</code> past a known instruction) and assert the interrupted code sees the edited values after the return. Existing partial coverage: <code>tests/c/waitid_signal_interrupt.c:86</code> and <code>tests/c/waitid_signal_interrupt.c:87</code> write <code>REG_RAX</code> and <code>REG_RIP</code> in the handler, but the case is driven only on DBT by <code>hermit-cli/tests/waitid_signal_interrupt.rs:869</code> (<code>dbt_exact_child_waits_honor_a_changed_signal_context</code>), so it is not ptrace evidence.</li>
+<li>T2 (covers F2): block <code>SIGUSR2</code> in <code>sa_mask</code>, have the <code>SIGUSR1</code> handler raise <code>SIGUSR2</code> and clear it from <code>uc_sigmask</code>, and assert <code>SIGUSR2</code> is delivered right after the return; also assert a handler that adds <code>SIGKILL</code> to <code>uc_sigmask</code> leaves it unblocked. Existing partial coverage: <code>tests/c/signal_delivery_sequence.c:442</code> and <code>tests/c/signal_delivery_sequence.c:457</code> raise <code>SIGUSR1</code> blocked and unblocked and count deliveries, which needs each handler return to restore the mask (cell <code>c-programs/signal-delivery-sequence</code>, <code>tests/e2e/manifests/c-programs.yaml:17172</code>, ptrace verify in CI).</li>
+<li>T3 (covers F3): load known values into an <code>xmm</code> register and <code>ymm</code> upper half where available, take a signal whose handler clobbers them, and assert the values are back after the return; in a second case set <code>uc_mcontext.fpregs</code> to NULL and assert the FPU control word reads its initial value.</li>
+<li>T4 (covers F4, F5): install an alternate stack, take an <code>SA_ONSTACK</code> signal whose handler changes <code>uc_stack</code>, and assert <code>sigaltstack(NULL, &amp;cur)</code> after the return reports the changed stack; print <code>uc_flags</code> from the handler and assert the expected <code>UC_SIGCONTEXT_SS</code> / <code>UC_STRICT_RESTORE_SS</code> bits. Existing partial coverage: <code>tests/c/signal_determinism.c:754</code> (<code>test_altstack_preservation</code>, two deliveries on an alternate stack); the CI cell <code>c-programs/signal-determinism</code> (<code>tests/e2e/manifests/c-programs.yaml:8132</code>) passes only the <code>itimer-delivery</code> guest argument on ptrace, so this check is not run in CI.</li>
+<li>T5 (covers F6): in a forked child, call raw <code>syscall(SYS_rt_sigreturn)</code> with a stack pointer at unmapped memory (through a small assembly stub) and assert the parent sees the child killed by <code>SIGSEGV</code>. Note that <code>--verify</code> cannot compare a signal-terminated guest, so the assertion must be made by the parent.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/408: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy NEEDS-INVESTIGATION; code at this SHA: passthrough, dispatch passthrough.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: kept conditional (the frame's xsave layout is host-CPU dependent), target_policy investigate -&gt; passthrough (ptrace executes it directly per detcore/src/syscall_classification.rs:802; forwarded at detcore/src/lib.rs:2843); listed 7 frame behaviours and 5 tests; no coverage token, so tracking_status stays todo</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d12 (owner decisions 1 and 2): cross_host_variant true (host-enabled xsave features decide the fpstate layout the call restores; kernel version decides the malformed-fpstate outcome); no U items; no open questions resolved</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+rt_sigreturn&amp;amp;body=Discussion+for+the+%60rt_sigreturn%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Frt_sigreturn.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60rt_sigreturn%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `rt_sigreturn`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: rt_sigreturn&quot; (https://github.com/rrnewton/hermit/issues/408), legacy variant A1.</p>
+<h3>Open questions</h3>
+<ul>
+<li>None that block the policy. T5 needs a fixture that kills its own child; the owner may prefer to record F6 as covered by kernel behaviour rather than add a crash fixture.</li>
+</ul>
+<h3>Legacy text (2026-07-24)</h3>
+<p>The legacy body said: &quot;Invoked by the SA_RESTORER trampoline; must not be called directly (would corrupt the stack). Verified via natural occurrence under strace (see evidence) rather than direct invocation.&quot; Its legacy recommended action was <strong>NEEDS-INVESTIGATION</strong>.</p>
+<h3>2026-07-24 host strace evidence</h3>
+<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) with <code>strace -f -e trace=rt_sigreturn</code> on a direct <code>syscall()</code> harness (invoked with non-destructive query/no-op/failing arguments) and, where applicable, on common programs. Hermit currently routes <code>rt_sigreturn</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code>.</p>
+<p>Observed strace line:</p>
+<pre><code>rt_sigreturn({mask=[]})         = 0
+</code></pre>
+<hr>
+<p>*Autonomous syscall-classification sweep (ranks 151-250 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
+</body></html>

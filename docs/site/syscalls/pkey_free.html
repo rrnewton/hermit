@@ -1,0 +1,78 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pkey_free | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>pkey_free</code> (331)</h1>
+<p>Strategy: <strong>passthrough</strong> &middot; dispatch: <code>sysno-guard</code> &middot; linux determinism: deterministic &middot; target policy: emulate &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+pkey_free&amp;body=Discussion+for+the+%60pkey_free%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fpkey_free.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60pkey_free%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>pkey_free(pkey)</code> returns a memory protection key to the calling process's pool so a later <code>pkey_alloc</code> can hand it out again. Hermit forwards it to the host kernel unchanged; the result depends only on which keys the process has allocated.</p>
+<h2>Linux semantics</h2>
+<p>Pairs with <code>pkey_alloc</code>. The kernel clears the key's bit in the per-address-space allocation bitmap under the mmap write lock and returns 0, or returns <code>EINVAL</code> if the key is not currently allocated. It does nothing else: it does not change any thread's PKRU register and does not untag pages that still carry the key. It takes no flags. The behaviours below are the argument-dependent cases. The x86 rules for which keys count as allocated are in <code>mm_pkey_is_allocated</code> in the kernel's <code>arch/x86/include/asm/pkeys.h</code>, read from the host's kernel headers for this body.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>pkey</code> was returned by <code>pkey_alloc</code> and is still allocated: returns 0 and the key becomes free. Only a CPU with PKU ever returns a key; on a CPU without PKU, which Hermit's target emulates (owner decision 8), <code>pkey_alloc</code> returns none, so the only key that can be freed is 0 (F4)</li>
+<li>F2: <code>pkey</code> is negative, at least the number of usable keys (16 with PKU, 1 without), or not currently allocated, including a second free of the same key: <code>EINVAL</code>. Without PKU this is every key except 0 while key 0 is still allocated</li>
+<li>F3: <code>pkey</code> is the key the kernel reserved for execute-only mappings (taken the first time the process maps memory with <code>PROT_EXEC</code> alone): <code>EINVAL</code>, even though its bit is set. This key exists only on a CPU with PKU; without PKU any such number is out of range and gets <code>EINVAL</code> by F2</li>
+<li>F4: <code>pkey == 0</code>: the kernel marks key 0 allocated when the address space is created, so by the x86 helper <code>pkey_free(0)</code> returns 0 and a second <code>pkey_free(0)</code> gives <code>EINVAL</code>. On a CPU with PKU a later <code>pkey_alloc</code> can return 0; without PKU that <code>pkey_alloc</code> fails with <code>EINVAL</code> instead (see <code>pkey_alloc</code> F10)</li>
+<li>F5: freeing a key that pages are still tagged with leaves them tagged and changes no PKRU; on a CPU with PKU a later <code>pkey_alloc</code> may return the same number, and those pages then follow the new owner's access rights. Without PKU no key is re-issued, so pages tagged with key 0 stay accessible as before</li>
+<li>F6: scope: the bitmap belongs to the address space, so a free by one thread is seen by all threads, and after <code>fork</code> the parent and child free keys independently</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p>The result is a function of the process's own earlier <code>pkey_alloc</code>, <code>pkey_free</code> and execute-only mappings. On a host without PKU only key 0 exists, so every other key gives <code>EINVAL</code>. The call does not depend on timing or on other processes, and Hermit runs guest threads one at a time, so frees and allocations racing between threads happen in a fixed order.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>None run to run on one host; per-process key-pool bookkeeping only.</li>
+<li>Across hosts, F2 depends on PKU support: key 1 can be freed after a successful allocation on a PKU host, while on a host without PKU the allocation already failed and the free gives <code>EINVAL</code>.</li>
+</ul>
+<h3>Cross-host variation</h3>
+<ul>
+<li>CPU feature PKU, and the <code>nopku</code> boot parameter: the number of usable keys (16 or 1), so the same allocate-then-free sequence gives 0 (F1) on a PKU host and <code>EINVAL</code> (F2) on a host without PKU.</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Current behaviour (hermit 239ca43d3092): the call still passes through, but through a Detcore wrapper instead of the blanket arm. <code>handle_protection_key_call</code> (<code>detcore/src/lib.rs:1764</code>) forwards the call, records successful key allocation or application in thread state (rendered <code>/proc</code> memory views depend on knowing keys are in use), and names a backend refusal of protection keys instead of surfacing a bare errno. The classification remains <code>passthrough</code> with a dedicated dispatch arm. The <code>emulate</code> target below (present a CPU without protection keys, matching the virtual CPUID) is still the intended policy and still unrealised inside Detcore itself, so on the default backend a host with protection keys still answers with real keys.</p>
+<p>Today the call is passed through at hermit f4055eb9cae4. <code>pkey_free</code> is classified <code>PassThrough</code> at <code>detcore/src/syscall_classification.rs:822</code>, in the issue-reviewed pass-through block that starts at <code>detcore/src/syscall_classification.rs:807</code>. The generic arm at <code>detcore/src/lib.rs:2843</code> forwards it through <code>passthrough</code> (<code>detcore/src/lib.rs:367</code>). The unit test <code>representative_policies_stay_in_their_reviewed_sections</code> (<code>detcore/src/syscall_classification.rs:1899</code>) asserts the <code>PassThrough</code> class at <code>detcore/src/syscall_classification.rs:2111</code> and <code>detcore/src/syscall_classification.rs:2119</code>.</p>
+<p>Target (owner decision 8): Detcore emulates a CPU without PKU, matching its virtual CPUID, whose leaf 7 ECX = 0 hides PKU and OSPKE (<code>detcore/src/cpuid.rs:66</code>), and never forwards the call. Without OSPKE, <code>arch_max_pkey()</code> is 1 and no execute-only key is ever reserved, so <code>mm_pkey_is_allocated</code> (<code>arch/x86/include/asm/pkeys.h</code>, called from <code>mm_pkey_free</code> in <code>SYSCALL_DEFINE1(pkey_free, ...)</code>, <code>mm/mprotect.c</code>) checks, in order: <code>pkey &lt; 0</code>, <code>pkey &gt;= 1</code>, then the key-0 bit. Detcore keeps that bit per address space, shared with <code>pkey_alloc</code> and <code>pkey_mprotect</code>: set at creation and at <code>execve</code>, copied on <code>fork</code>. <code>pkey_free(0)</code> with the bit set clears it and returns 0 (F4); every other call returns <code>EINVAL</code> (F2, F3). Today's passthrough frees real keys on a PKU host, which the virtual CPUID says cannot exist; emulating only the free while <code>pkey_alloc</code> still reached the kernel would desynchronize the two, so the three calls change together.</p>
+<p>Code facts show <code>subscribed_record_replay: false</code>, so with <code>--passthru-opt</code> the call never reaches Detcore. The recorder's own subscriptions are not in the exported tree.</p>
+<p>The open gap is test evidence: no test at this SHA names <code>pkey_free</code> (<code>tests_naming: 0</code>).</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F2): under <code>hermit run --verify</code> on ptrace, call raw <code>syscall(SYS_pkey_free, ...)</code>. Assert that <code>pkey_alloc(0, 0)</code> returns <code>ENOSPC</code>, so no key exists to free, and that <code>pkey_free</code> returns <code>EINVAL</code> for -1, 1, 15 and 16, identically on a PKU host and on a host without PKU. The test prints whether the host's <code>/proc/cpuinfo</code> lists <code>pku</code>.</li>
+<li>T2 (covers F3): map a page with <code>PROT_EXEC</code> alone, read its key from the <code>ProtectionKey:</code> line of <code>/proc/self/smaps</code> where the line is present, and assert that <code>pkey_free</code> of that key, when it is not 0, and of key 1 returns <code>EINVAL</code>.</li>
+<li>T3 (covers F4): call <code>pkey_free(0)</code>, then <code>pkey_alloc(0, 0)</code>, then <code>pkey_free(0)</code> again. Assert 0, <code>EINVAL</code>, <code>EINVAL</code> under Hermit on any host, and that both <code>--verify</code> runs agree. The expected values come from the kernel source read for this body (<code>mm_pkey_is_allocated</code>, <code>arch_set_user_pkey_access</code>); run the program natively once on a kernel booted with <code>nopku</code> to confirm them.</li>
+<li>T4 (covers F5): tag a page with key 0 through <code>pkey_mprotect</code>, call <code>pkey_free(0)</code>, and assert that the page is still readable and writable and that <code>pkey_mprotect</code> of it with key -1 still succeeds.</li>
+<li>T5 (covers F6): <code>fork</code>. The child calls <code>pkey_free(0)</code> and asserts 0. The parent then asserts that its own <code>pkey_free(0)</code> also returns 0, because its bitmap still has key 0. In a two-thread process, a <code>pkey_free(0)</code> by one thread makes the other thread's <code>pkey_free(0)</code> return <code>EINVAL</code>.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-09-28 · hermit 81ca8822f78c · hermit2 · closed under the legacy rule (an explicit <code>classify_syscall</code> arm), not the v1 done rule; closing comment https://github.com/rrnewton/hermit/issues/323#issuecomment-5872914123</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/323: linux_determinism deterministic (from <strong>Classification:</strong>); target_policy from legacy PASS-THRU; code at this SHA: passthrough, dispatch passthrough.</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · reopen: under the owner rule of 2026-10-02, closed means every flag and option is covered by a named test and the implementation works; pkey_free records no test coverage, so tracking_status is todo and https://github.com/rrnewton/hermit/issues/323 reopens.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: kept deterministic/passthrough (forwarded at detcore/src/lib.rs:2843; the key pool is kernel state shared with pkey_alloc and pkey_mprotect); listed 6 argument-dependent behaviours and 5 tests; no test names pkey_free, so tracking_status stays todo; follows the pkey_alloc CPUID question</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d12 (owner decisions 1 and 2): cross_host_variant true (CPU PKU and nopku); no U items, since the free itself is decided by the process's key bitmap; no open question resolved</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): decisions 8 and 6 applied (emulate a CPU without PKU: only key 0 can be freed, checks in mm_pkey_is_allocated order); target_policy passthrough-&gt;emulate; F1-F5 narrowed to the no-PKU target, T1-T5 rewritten to match; no new F/T ids; removed the pkey CPUID question</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · updated: protection-key calls now pass through a Detcore wrapper that records key use and names backend refusals; target stays emulate.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+pkey_free&amp;amp;body=Discussion+for+the+%60pkey_free%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fpkey_free.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60pkey_free%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `pkey_free`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: pkey_free&quot; (https://github.com/rrnewton/hermit/issues/323), legacy variant A1.</p>
+<p>Comment history: 1 comment(s) on https://github.com/rrnewton/hermit/issues/323.</p>
+<h3>Open questions</h3>
+<ul>
+<li>F4 comes from reading the kernel's x86 header, not from a run. T3 confirms or refutes it.</li>
+</ul>
+<h3>2026-07-24 host strace evidence</h3>
+<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) by tracing a direct <code>syscall()</code> harness and common programs with <code>strace -f -e trace=pkey_free</code>, and by confirming hermit currently routes <code>pkey_free</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code> (the harness ran end-to-end under <code>hermit run</code>, exit 0, so passthrough does not crash).</p>
+<p>Observed strace line:</p>
+<pre><code>pkey_free(1)                    = 0
+</code></pre>
+<hr>
+<p>*Autonomous syscall-classification sweep, batch 3 (ranks 101-150 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
+<h3>Legacy closure</h3>
+<p>Closed 2026-09-28 by the 2026-09-28 sweep, which closed issues whose syscall had an explicit <code>classify_syscall</code> arm. Closing comment: https://github.com/rrnewton/hermit/issues/323#issuecomment-5872914123</p>
+</body></html>

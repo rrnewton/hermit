@@ -1,0 +1,84 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mincore | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>mincore</code> (27)</h1>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; linux determinism: nondeterministic &middot; target policy: emulate &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+mincore&amp;body=Discussion+for+the+%60mincore%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fmincore.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60mincore%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p>Reports which pages of a mapping are currently resident in RAM (returns a per-page residency vector). Under Hermit the kernel still checks the arguments, but Detcore replaces the residency vector with a constant answer: every page resident.</p>
+<h2>Linux semantics</h2>
+<p><code>mincore(addr, length, vec)</code> writes one byte per page of <code>[addr, addr + length)</code> into <code>vec</code>. The low bit of each byte is set when the page is resident in memory; the other bits are reserved. The result is a snapshot of kernel memory-management state and can be stale by the time the caller reads it. The call has no side effect on the mapping.</p>
+<p>The kernel checks the arguments in this order: page alignment of <code>addr</code>, then that the range lies in user address space, then that <code>vec</code> is writable for the number of pages, then that every page of the range is mapped.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: residency vector: <code>vec</code> receives <code>ceil(length / page size)</code> bytes, one per page, with the low bit set for a resident page. A private anonymous page that was never touched reports not resident.</li>
+<li>F2: <code>length == 0</code> returns 0 and writes nothing.</li>
+<li>F3: an <code>addr</code> that is not page-aligned gives <code>EINVAL</code>.</li>
+<li>F4: a range that is not entirely mapped, or that extends past the user address space, gives <code>ENOMEM</code>.</li>
+<li>F5: a <code>vec</code> that cannot be written for the whole page count gives <code>EFAULT</code>.</li>
+<li>F6: file mappings: since Linux 5.0, page-cache residency of a file mapping is reported only when the caller owns the file or could open it for writing (Linux 5.2 relaxed the stricter 5.0 rule to this). Otherwise only pages mapped into the caller's own page tables count as resident.</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p>Residency depends on the host page cache, memory pressure, prior faulting, and readahead - none of which are a function of the guest's own logic - so the returned vector varies run-to-run.</p>
+<p>The checks in F2-F5 depend only on the arguments and on the process's own mappings, so they repeat whenever the address-space layout repeats. Only the bits of the vector (F1, F6) come from host state. Since the call exists to return those bits, <code>linux_determinism</code> stays <code>nondeterministic</code>.</p>
+<h3>Nondeterminism sources</h3>
+<p>The residency bitmap reflects host memory-management state (page cache, reclaim, readahead), which is not reproducible.</p>
+<h2>Hermit design</h2>
+<p>Target policy: <code>emulate</code>. Detcore synthesizes the residency answer: every mapped page reports resident. The kernel is used only for its argument and mapping checks. The dispatch arm is <code>detcore/src/lib.rs:2407</code>, and the handler is <code>handle_mincore</code> at <code>detcore/src/syscalls/memory.rs:203</code>:</p>
+<ul>
+<li>An unaligned <code>addr</code> returns <code>EINVAL</code> before any kernel call (<code>detcore/src/syscalls/memory.rs:209-212</code>), as F3 requires.</li>
+<li><code>length == 0</code> returns 0 without a kernel call (<code>detcore/src/syscalls/memory.rs:214-216</code>), as F2 requires.</li>
+<li>An <code>addr + length</code> that overflows returns <code>EINVAL</code> (<code>detcore/src/syscalls/memory.rs:218</code>).</li>
+<li>A NULL <code>vec</code> returns <code>EFAULT</code> before the kernel call (<code>detcore/src/syscalls/memory.rs:220</code>).</li>
+<li>Otherwise the real call is injected (<code>detcore/src/syscalls/memory.rs:221</code>), so the kernel's <code>ENOMEM</code> and <code>EFAULT</code> checks (F4, F5) are kept. On success Detcore overwrites <code>vec</code> with <code>ceil(length / page size)</code> bytes of 1 (<code>detcore/src/syscalls/memory.rs:219</code>, <code>detcore/src/syscalls/memory.rs:222-223</code>).</li>
+<li>The doc comment (<code>detcore/src/syscalls/memory.rs:189-200</code>) records why the handler exists: GNU grep calls <code>mincore</code> under the KVM backend, and leaving it unsupported aborted the guest under <code>--strict</code>.</li>
+<li>The handler calls <code>guest.inject</code> directly rather than <code>record_or_replay</code>. The record/replay tool layer does not subscribe to <code>mincore</code>; it reaches the catch-all live injection in the recorder (<code>hermit-cli/src/recorder.rs:648</code>) and in the replayer (<code>hermit-cli/src/replayer.rs:575</code>).</li>
+</ul>
+<p>Why <code>emulate</code> and not the alternatives:</p>
+<ul>
+<li><code>model</code> would need a deterministic account of which pages are resident, which would mean simulating the page cache and reclaim. Nothing in the guest's own actions determines residency, so there is nothing for a model to follow.</li>
+<li><code>passthrough</code> returns host state, which differs from run to run.</li>
+<li><code>refuse</code> breaks programs such as grep that call <code>mincore</code> as an optimization hint.</li>
+<li>All-resident is a legal Linux answer: a system with no memory pressure that has already faulted every page in reports exactly this. Callers use the vector only as a hint.</li>
+</ul>
+<p>What remains before the code fully realizes <code>emulate</code>:</p>
+<ul>
+<li><strong>Error order for an overflowing range.</strong> By my reading of the kernel's argument checks, an <code>addr + length</code> past the end of user address space fails the range check with <code>ENOMEM</code> (F4). Detcore returns <code>EINVAL</code> for an arithmetic overflow (<code>detcore/src/syscalls/memory.rs:218</code>). This is a hypothesis from code reading; T3 settles it.</li>
+<li><strong>NULL `vec` on an unmapped range.</strong> Linux checks <code>vec</code> only for writability of the page count, which a NULL pointer passes, and then fails the mapping check with <code>ENOMEM</code>. Detcore returns <code>EFAULT</code> before the kernel sees the call (<code>detcore/src/syscalls/memory.rs:220</code>). This is also a hypothesis from code reading; T3 settles it.</li>
+<li><strong>Never-touched pages (F1) and the file-mapping rule (F6) are not reproduced by design.</strong> Detcore reports them resident. This is the intended emulation, not a gap, but a program that uses <code>mincore</code> to detect pages it has not touched sees a different answer than on a fresh Linux run.</li>
+<li><strong>Human review.</strong> The arm and the handler are tagged <code>TODO-HUMAN-REVIEW(#775)</code> (<code>detcore/src/lib.rs:2405-2406</code>, <code>detcore/src/syscalls/memory.rs:202</code>, https://github.com/rrnewton/hermit/issues/775).</li>
+</ul>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F2, F3, F4, F5): on an anonymous mapping, check that every page reports resident, that <code>length == 0</code> returns 0, that a NULL <code>vec</code> gives <code>EFAULT</code>, that an unmapped range gives <code>ENOMEM</code>, and that an unaligned <code>addr</code> gives <code>EINVAL</code>. The run must be bitwise identical under <code>hermit run --verify</code> on ptrace. Existing candidate: <code>tests/c/mincore_residency.c</code> (cell <code>c-programs/mincore-residency</code>, <code>tests/e2e/manifests/c-programs.yaml:12511</code>, verify ci on, ptrace enabled, <code>bitwise_parity: true</code>). It makes all six checks and exits 1 unless all pass. The rr-suite entry <code>rr_mincore</code> (<code>hermit-cli/tests/rr_suite.rs:306</code>) is ignored (<code>hermit-cli/tests/fail_closed_allowed_ignores.tsv:98</code>).</li>
+<li>T2 (covers F1, F6): <code>mincore</code> on a private anonymous mapping that was never touched, and on a read-only mapping of a file the caller neither owns nor can write, and has not read. Hermit must report every page resident in both runs of <code>--verify</code>.</li>
+<li>T3 (covers F4, F5): an <code>addr + length</code> that overflows the address space, and a NULL <code>vec</code> on an unmapped range. Record what Linux returns natively and what Hermit returns; if they differ (the code suggests <code>EINVAL</code> versus <code>ENOMEM</code> and <code>EFAULT</code> versus <code>ENOMEM</code>), file the difference as an error-order defect.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-09-28 · hermit 81ca8822f78c · hermit2 · closed under the legacy rule (an explicit <code>classify_syscall</code> arm), not the v1 done rule; closing comment https://github.com/rrnewton/hermit/issues/285#issuecomment-5872828669</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/285: linux_determinism nondeterministic (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch typed.</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · reopen: under the owner rule of 2026-10-02, closed means every flag and option is covered by a named test and the implementation works; mincore records no test coverage, so tracking_status is todo and https://github.com/rrnewton/hermit/issues/285 reopens.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; emulate (the kernel validates the arguments, then Detcore reports every page resident); linux_determinism stays nondeterministic; 6 behaviours and 3 tests listed; two error-order differences are code-reading hypotheses; no coverage token recorded, so tracking_status stays todo</li>
+<li>2026-10-05 · hermit f4055eb9cae4 · syscall-tracking-2 · covered: T1 covered by tests/c/mincore_residency.c (C08 review of the 2026-10-04 coverage proposals; guest source read at this SHA, not run by this agent)</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+mincore&amp;amp;body=Discussion+for+the+%60mincore%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fmincore.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60mincore%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `mincore`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: mincore&quot; (https://github.com/rrnewton/hermit/issues/285), legacy variant A1.</p>
+<p>Comment history: 1 comment(s) on https://github.com/rrnewton/hermit/issues/285.</p>
+<h3>2026-07-24 host strace evidence</h3>
+<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) by tracing a direct <code>syscall()</code> harness and common programs with <code>strace -f -e trace=mincore</code>, and by confirming hermit currently routes <code>mincore</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code> (the harness ran end-to-end under <code>hermit run</code>, exit 0, so passthrough does not crash).</p>
+<p>Observed strace line:</p>
+<pre><code>mincore(0x406000, 4096, [0])    = 0
+</code></pre>
+<hr>
+<p>*Autonomous syscall-classification sweep, batch 3 (ranks 101-150 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
+<h3>Legacy closure</h3>
+<p>Closed 2026-09-28 by the 2026-09-28 sweep, which closed issues whose syscall had an explicit <code>classify_syscall</code> arm. Closing comment: https://github.com/rrnewton/hermit/issues/285#issuecomment-5872828669</p>
+</body></html>

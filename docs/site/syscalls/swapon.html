@@ -1,0 +1,89 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>swapon | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>swapon</code> (167)</h1>
+<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_privileged_admin_refused_syscall</code> &middot; linux determinism: conditional &middot; target policy: refuse &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+swapon&amp;body=Discussion+for+the+%60swapon%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fswapon.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60swapon%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>swapon(path, swapflags)</code> enables a file or block device as a swap area, optionally with a priority and discard policy. Hermit refuses it: Detcore returns a fixed <code>EPERM</code> without forwarding the call or reading its arguments (<code>detcore/src/lib.rs:2164</code>).</p>
+<p>Manual reference: <a href="https://man7.org/linux/man-pages/man2/swapon.2.html">swapon(2)</a>.</p>
+<h2>Linux semantics</h2>
+<ul>
+<li>The kernel first rejects flag bits outside <code>SWAP_FLAGS_VALID</code> with <code>EINVAL</code>, and only then checks <code>CAP_SYS_ADMIN</code> with <code>capable()</code>, that is, in the initial user namespace. A 2026-10-03 probe on Linux 7.1.3, unprivileged, returned <code>EINVAL</code> for <code>swapon(&quot;/nonexistent-swap&quot;, 0x7fffffff)</code> and <code>EPERM</code> for the same path with flags 0. Root inside a user namespace never passes the capability check.</li>
+<li>With the capability, the kernel opens <code>path</code>, checks the swap signature and header, and adds the area to the host's global swap set, visible in <code>/proc/swaps</code> and to every process on the machine.</li>
+<li>The legacy probes on Linux 6.17 returned <code>EPERM</code> for nonexistent paths with flags 0, before any mutation.</li>
+</ul>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>SWAP_FLAG_PREFER</code> (0x8000) with a priority in <code>SWAP_FLAG_PRIO_MASK</code> (0x7fff): use that priority. Without it the kernel assigns the next lower negative priority, which depends on how many swap areas the host enabled earlier.</li>
+<li>F2: <code>SWAP_FLAG_DISCARD</code> (0x10000): discard (TRIM) swap space on the device.</li>
+<li>F3: <code>SWAP_FLAG_DISCARD_ONCE</code> (0x20000), used with <code>SWAP_FLAG_DISCARD</code>: discard the whole area once, at <code>swapon</code> time.</li>
+<li>F4: <code>SWAP_FLAG_DISCARD_PAGES</code> (0x40000), used with <code>SWAP_FLAG_DISCARD</code>: discard freed swap pages as they are released.</li>
+<li>F5: undefined flag bits: <code>EINVAL</code>, checked before the capability.</li>
+<li>F6: no <code>CAP_SYS_ADMIN</code> in the initial user namespace: <code>EPERM</code>.</li>
+<li>F7: privileged path and state errors: <code>ENOENT</code> (missing path), <code>EINVAL</code> (no swap signature or a bad header), <code>EBUSY</code> (already in use as swap or otherwise), <code>EPERM</code> (the <code>MAX_SWAPFILES</code> limit is reached), <code>ENOMEM</code>.</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: conditional</code>. For an unprivileged caller the result is fixed by the arguments: <code>EINVAL</code> for undefined flag bits, otherwise <code>EPERM</code>. For a privileged caller it depends on the host's swap configuration, on the file or device contents, and on the default priority sequence, and success changes host-wide memory behaviour. Both legacy reports note that swap has no effect on computed results; that holds for program output, but a successful call still changes global state that every host process shares.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li><code>CAP_SYS_ADMIN</code> in the initial user namespace</li>
+<li>The host's active swap areas, which decide <code>EBUSY</code>, the <code>MAX_SWAPFILES</code> limit and the default priority</li>
+<li>The swap file or device layout and header</li>
+<li>Host memory policy and pressure once the area is active</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>refuse</code>. At hermit f4055eb9cae4 the dispatch arm at <code>detcore/src/lib.rs:2164-2168</code> returns <code>Err(Error::Errno(Errno::EPERM))</code> for every syscall in <code>is_privileged_admin_refused_syscall</code> (<code>detcore/src/syscall_classification.rs:902</code>), which lists <code>swapon</code> among 16 privileged administration calls. The arm runs before the typed match and before any <code>record_or_replay</code> call: it reads neither the path nor the flags, never forwards the call, and record, replay and both <code>--verify</code> runs compute the same <code>EPERM</code>. The refusal applies in every mode, not only when Hermit fails closed. The rationale comments are at <code>detcore/src/lib.rs:2154-2163</code> and <code>detcore/src/syscall_classification.rs:889-901</code>, tagged <code>TODO-HUMAN-REVIEW(#722)</code> (https://github.com/rrnewton/hermit/issues/722).</p>
+<p>Why <code>refuse</code>:</p>
+<ul>
+<li>Swap is host-global. No guest-local model of it exists, and a forwarded privileged call would change memory behaviour for every process on the machine.</li>
+<li>The capability is checked in the initial user namespace, so <code>EPERM</code> is what Linux returns to every process that is root only inside a user namespace, which is the identity Hermit presents (virtual uid 0, <code>detcore/src/syscall_classification.rs:657-668</code>).</li>
+<li><code>emulate</code> (reporting success) would claim an operation the guest's credentials could not perform.</li>
+</ul>
+<p>Target (owner decision 6): keep the one fixed <code>EPERM</code>, returned before any argument check. Linux's order (<code>SYSCALL_DEFINE2(swapon)</code> in <code>mm/swapfile.c</code>: <code>swap_flags &amp; ~SWAP_FLAGS_VALID</code> gives <code>EINVAL</code>, then <code>capable(CAP_SYS_ADMIN)</code> gives <code>EPERM</code>) puts the flag check first, so for undefined flag bits (F5) the target deliberately answers <code>EPERM</code> where an unprivileged Linux caller gets <code>EINVAL</code>. Linux allows no unprivileged form of <code>swapon</code>, so the decision's exception does not apply. A guest sees what a container without <code>CAP_SYS_ADMIN</code> sees; <code>swapon(8)</code> reports the error. The code already does this (<code>detcore/src/lib.rs:2164-2168</code>), so no Hermit change is needed.</p>
+<p>The unit test <code>privileged_admin_syscalls_are_determinized_and_consistent</code> (<code>detcore/src/syscall_classification.rs:2535</code>) checks only that <code>swapon</code> is classified Determinized and is in the refusal set; it does not execute the syscall, and as a unit test it cannot serve as a coverage path.</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F2, F3, F4, F6): under <code>hermit run --verify</code> on ptrace, a guest calls <code>swapon</code> on a temporary regular file with flags 0, <code>SWAP_FLAG_PREFER | 5</code>, <code>SWAP_FLAG_DISCARD</code>, <code>SWAP_FLAG_DISCARD | SWAP_FLAG_DISCARD_ONCE</code> and <code>SWAP_FLAG_DISCARD | SWAP_FLAG_DISCARD_PAGES</code>. Each must return -1 with <code>EPERM</code>, and the guest's <code>/proc/swaps</code> must read the same before and after.</li>
+<li>T2 (covers F5): <code>swapon</code> with an undefined flag bit (0x100000). It must return -1 with <code>EPERM</code> (owner decision 6). Linux returns <code>EINVAL</code> to an unprivileged caller, so this case also tells the refusal from forwarding.</li>
+<li>T3 (covers F7): <code>swapon</code> on a nonexistent path, on a NULL path and on a file with no swap signature, with flags 0: all must return <code>EPERM</code>.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/486: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch pred:is_privileged_admin_refused_syscall, refused.</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · duplicate https://github.com/rrnewton/hermit/issues/488 is retired into this issue; its text waits under Additional information for a section-by-section merge.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; refuse (fixed EPERM at detcore/src/lib.rs:2164-2168, never forwarded); linux_determinism stays conditional; merged duplicate https://github.com/rrnewton/hermit/issues/488; 7 flag behaviours and 3 tests listed; open question whether undefined flag bits should give EINVAL as on Linux; no coverage token, so tracking_status stays todo</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): decision 6 applied: the fixed EPERM before any argument check is the target, so undefined flag bits (F5) get EPERM, not Linux's EINVAL (code already realizes it, detcore/src/lib.rs:2164-2168); target_policy stays refuse; T2 now asserts EPERM; open question on the errno order removed</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+swapon&amp;amp;body=Discussion+for+the+%60swapon%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fswapon.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60swapon%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `swapon`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: swapon&quot; (https://github.com/rrnewton/hermit/issues/486), legacy variant A1.</p>
+<h3>2026-07-24 host strace evidence</h3>
+<p>Evidence was gathered on <code>the measurement host</code> (Linux 6.17, x86_64, glibc) with a direct <code>syscall()</code> harness. The probe used safe self-targeting, no-op, temporary-file, or deliberately invalid arguments and was traced with <code>strace -qq -f -e trace=swapon</code>. The harness exited 0, and <code>detcore/src/syscall_classification.rs</code> at <code>dd60278f</code> places <code>swapon</code> in the UNCLASSIFIED temporary-passthrough block.</p>
+<p>Observed strace line:</p>
+<pre><code>swapon(&quot;/tmp/hermit-no-swap-b5&quot;, 0) = -1 EPERM (Operation not permitted)
+</code></pre>
+<hr>
+<p>*Autonomous syscall-classification sweep, batch 5 (ranks 201-250 of the unique <code>syscall_classification.rs</code> UNCLASSIFIED list). Manual research plus host strace evidence; no code change proposed here.*</p>
+<h3>Merged duplicate https://github.com/rrnewton/hermit/issues/488</h3>
+<p>Filed 2026-07-24 as &quot;Syscall classification: swapon&quot; (legacy variant A1); its comment history (0 comments) stays on that issue. Merged 2026-10-03 by syscall-tracking-p3:</p>
+<ul>
+<li>Both issues classified the call CONDITIONAL; that is kept.</li>
+<li>Its recommended action NEEDS-INVESTIGATION, and NEEDS-HANDLER from https://github.com/rrnewton/hermit/issues/486, are both superseded by the refusal arm Detcore already has.</li>
+<li>Its &quot;no effect on results&quot; note is kept, qualified under Determinism analysis.</li>
+<li>Its host evidence, on Linux 6.17 x86_64 with glibc, traced with <code>strace -f -e trace=swapon</code>, matches the evidence above:</li>
+</ul>
+<pre><code>swapon(&quot;/nonexistent-swap&quot;, 0)  = -1 EPERM (Operation not permitted)
+</code></pre>
+<h3>2026-10-03 host probe (syscall-tracking-p3)</h3>
+<p>Linux 7.1.3, uid 212630 with an empty effective capability set, raw <code>syscall(167, ...)</code> through Python ctypes:</p>
+<pre><code>swapon(&quot;/nonexistent-swap&quot;, 0x7fffffff) = -1 EINVAL
+swapon(&quot;/nonexistent-swap&quot;, 0)          = -1 EPERM
+</code></pre>
+</body></html>

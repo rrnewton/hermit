@@ -1,0 +1,79 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>socketpair | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>socketpair</code> (53)</h1>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; linux determinism: conditional &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+socketpair&amp;body=Discussion+for+the+%60socketpair%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsocketpair.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60socketpair%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>socketpair(2)</code> creates two connected, unnamed AF_UNIX sockets. Detcore forwards it to the kernel with <code>SOCK_NONBLOCK</code> added, registers both descriptors with the flags the guest asked for, and schedules later I/O on them itself. Record mode does not record the call; replay runs it again.</p>
+<h2>Linux semantics</h2>
+<p><code>socketpair(domain, type, protocol, sv)</code> creates two sockets connected to each other and writes their descriptors to <code>sv[0]</code> and <code>sv[1]</code>. Linux supports this only for AF_UNIX. The descriptors are the two lowest free numbers. Neither socket has a name, and each reports the creating process's credentials as its peer's (<code>SO_PEERCRED</code>). <code>SOCK_NONBLOCK</code> and <code>SOCK_CLOEXEC</code> in <code>type</code> apply to both ends.</p>
+<p>If writing <code>sv</code> fails, the kernel discards both new sockets and returns <code>EFAULT</code>. No descriptor is installed. Data ordering, short writes and readiness on the pair are properties of the later <code>read</code>/<code>write</code>/<code>sendmsg</code>/<code>recvmsg</code> calls.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>domain</code>: only AF_UNIX (AF_LOCAL) creates a pair. A known family without pair support, such as AF_INET, gives <code>EOPNOTSUPP</code>; an unknown family gives <code>EAFNOSUPPORT</code>.</li>
+<li>F2: <code>SOCK_STREAM</code>: a connected byte-stream pair.</li>
+<li>F3: <code>SOCK_DGRAM</code>, and <code>SOCK_RAW</code>, which AF_UNIX treats as <code>SOCK_DGRAM</code>: a datagram pair that preserves message boundaries.</li>
+<li>F4: <code>SOCK_SEQPACKET</code>: a connection-oriented pair that preserves message boundaries.</li>
+<li>F5: <code>SOCK_NONBLOCK</code>: both ends start with <code>O_NONBLOCK</code>.</li>
+<li>F6: <code>SOCK_CLOEXEC</code>: both ends start with <code>FD_CLOEXEC</code>.</li>
+<li>F7: invalid arguments: a <code>protocol</code> other than 0 or <code>PF_UNIX</code> gives <code>EPROTONOSUPPORT</code>; an unknown socket type gives <code>ESOCKTNOSUPPORT</code>; a stray flag bit in <code>type</code> gives <code>EINVAL</code>.</li>
+<li>F8: <code>sv</code> not writable: <code>EFAULT</code>, and no descriptors are created.</li>
+<li>F9: descriptor and memory limits: <code>EMFILE</code> when the process has fewer than two free descriptors under <code>RLIMIT_NOFILE</code>; <code>ENFILE</code> or <code>ENOMEM</code> from system limits.</li>
+<li>F10: results: the two lowest free descriptor numbers, an unnamed address on both ends (<code>getsockname</code> returns only the family), and <code>SO_PEERCRED</code> naming the creator.</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: conditional</code>, kept. The descriptor numbers, flags and connection are fixed by the arguments and the process's descriptor table. The socket inode numbers, visible through <code>fstat</code> and <code>/proc/self/fd</code> as <code>socket:[N]</code>, come from a host-wide counter. The <code>SO_PEERCRED</code> pid is the creator's pid in its namespace. Both repeat only if the run controls them.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>Host-assigned socket inode numbers</li>
+<li>The creator's pid and credentials, reported through <code>SO_PEERCRED</code></li>
+<li>Later I/O on the pair: which writer's data arrives first, and how much a stream write accepts, depend on scheduling and on the host's socket buffer sysctls. These belong to the I/O calls but are why this pair is a common source of guest nondeterminism.</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>model</code>. The kernel creates and owns the pair. Detcore keeps both ends physically nonblocking so that no guest thread sleeps inside the kernel, and it presents the guest's own flags.</p>
+<p>What the code does now:</p>
+<ul>
+<li>The typed dispatch arm at <code>detcore/src/lib.rs:2551</code> calls <code>handle_socketpair</code> (<code>detcore/src/syscalls/files.rs:3822</code>).</li>
+<li>When threads are sequentialized and <code>debug_externalize_sockets</code> is off, the call is sent with <code>SOCK_NONBLOCK</code> added (<code>detcore/src/syscalls/files.rs:3827</code>-<code>3831</code>).</li>
+<li>After the call, Detcore reads both descriptors from <code>sv</code> (<code>detcore/src/syscalls/files.rs:3833</code>-<code>3835</code>) and registers each as <code>FdType::Socket</code> with the logical flags <code>type &amp; (SOCK_NONBLOCK | SOCK_CLOEXEC)</code> (<code>detcore/src/syscalls/files.rs:3838</code>-<code>3855</code>). <code>F_GETFL</code> therefore shows <code>O_NONBLOCK</code> only when the guest asked for it (F5).</li>
+<li>Both ends are then marked physically nonblocking (<code>maybe_set_nonblocking_fd</code>, <code>detcore/src/syscalls/helpers.rs:695</code>; called at <code>detcore/src/syscalls/files.rs:3857</code>-<code>3858</code>).</li>
+<li>Record mode does not record <code>socketpair</code>: the recorder has no arm for it and injects it live (<code>hermit-cli/src/recorder.rs:648</code>), and the replayer re-executes it (<code>hermit-cli/src/replayer.rs:575</code>). Descriptor numbering is deterministic, so replay gets the same numbers.</li>
+</ul>
+<p>Why <code>model</code>: code facts rule out <code>passthrough</code> for a determinized syscall, and plain forwarding would let reads block inside the kernel, out of the scheduler's sight. <code>emulate</code> would need Detcore to implement AF_UNIX sockets. <code>refuse</code> would break shells, process supervisors and most IPC libraries.</p>
+<p>Gaps between the code and <code>model</code>:</p>
+<ul>
+<li><strong>Socketpair ends count as external.</strong> <code>syscall_targets_internal_fd</code> treats only pipes as container-internal (<code>detcore/src/syscalls/helpers.rs:797</code>-<code>808</code>). Its comment at <code>detcore/src/syscalls/helpers.rs:792</code> says sockets stay external because Hermit cannot tell internal sockets from external ones. Both ends of a <code>socketpair</code> are internal by construction, and Detcore knows that at <code>detcore/src/syscalls/files.rs:3838</code>.</li>
+<li><strong>Possible spurious `EAGAIN` in record mode.</strong> This is a hypothesis from the code, not a measurement at this SHA. In record and replay modes, I/O on a non-internal descriptor goes through the blocking external path (<code>detcore/src/syscalls/helpers.rs:239</code>-<code>250</code>). <code>handle_socket</code> keeps sockets blocking in those modes (<code>detcore/src/syscalls/files.rs:3758</code>), but <code>handle_socketpair</code>'s <code>SOCK_NONBLOCK</code> condition at <code>detcore/src/syscalls/files.rs:3827</code> does not check <code>recordreplay_modes</code>. If record mode sequentializes threads, a guest's blocking read on an empty end would reach the kernel on a nonblocking socket and get <code>EAGAIN</code>, which Linux would not return. T8 checks this.</li>
+</ul>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F2, F5, F6): <code>socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK)</code>: both ends have <code>FD_CLOEXEC</code> and <code>O_NONBLOCK</code>, and <code>SO_TYPE</code>, <code>SO_DOMAIN</code> and <code>SO_ACCEPTCONN</code> are right. Existing candidate: <code>tests/c/socketpair_flags.c</code> (call at line 29; cell <code>c-programs/socketpair-flags</code>, <code>tests/e2e/manifests/c-programs.yaml:15509</code>, verify ci on ptrace). It checks <code>O_NONBLOCK</code> only on the first end (lines 46-49).</li>
+<li>T2 (covers F2, F5): a pair created without <code>SOCK_NONBLOCK</code> must not show <code>O_NONBLOCK</code>, <code>F_SETFL</code> must round-trip, and data from several writer threads must arrive in the same order in every run. Existing candidate: <code>tests/c/ipc_determinism.c</code> (<code>socketpair_order</code> at lines 207-240; flag check at line 212; cell <code>c-programs/ipc-determinism</code>, <code>tests/e2e/manifests/c-programs.yaml:2603</code>, verify ci on ptrace).</li>
+<li>T3 (covers F3): a datagram pair preserves message boundaries and passes descriptors with <code>SCM_RIGHTS</code>. Add a <code>SOCK_RAW</code> pair, which must behave as <code>SOCK_DGRAM</code>. Existing candidates: <code>tests/c/shutdown_socketpair.c</code> (datagram pair at line 48; cell at <code>tests/e2e/manifests/c-programs.yaml:14410</code>) and <code>tests/c/recvmsg_scm_rights_mmap.c</code> (datagram pair at line 28; cell at <code>tests/e2e/manifests/c-programs.yaml:7225</code>).</li>
+<li>T4 (covers F4): a <code>SOCK_SEQPACKET</code> pair preserves record boundaries, and a short read truncates the record identically in every run. No <code>SOCK_SEQPACKET</code> socketpair test exists in <code>tests/c</code> at this SHA.</li>
+<li>T5 (covers F1, F7): <code>EOPNOTSUPP</code> for AF_INET, <code>EAFNOSUPPORT</code> for family 255, <code>EPROTONOSUPPORT</code> for protocol 1, <code>ESOCKTNOSUPPORT</code> for type 99, and <code>EINVAL</code> for a stray high flag bit.</li>
+<li>T6 (covers F8, F9): an unwritable <code>sv</code> returns <code>EFAULT</code>, and the next <code>open</code> still gets the lowest free number, proving no descriptor leaked. With <code>RLIMIT_NOFILE</code> leaving one free slot, the call returns <code>EMFILE</code>.</li>
+<li>T7 (covers F10): print both descriptor numbers, both <code>getsockname</code> lengths and the <code>SO_PEERCRED</code> pid. All must be identical across <code>--verify</code> runs. Existing partial coverage: <code>tests/c/sockname_unnamed.c</code> checks the family-only <code>getsockname</code> length on a pair (line 46; cell at <code>tests/e2e/manifests/c-programs.yaml:14472</code>).</li>
+<li>T8 (covers F2, F3): under <code>hermit record</code> and replay, a thread blocks reading an empty stream end and a second thread writes later. The read must return the data, never <code>EAGAIN</code>, and replay must match the recording.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · created for v1: no tracking issue existed for this pinned Sysno; code at this SHA: determinized, dispatch typed.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; model (Detcore forces physical SOCK_NONBLOCK and keeps the guest's logical flags); linux_determinism conditional kept; F1-F10 inventoried, T1-T8 proposed; gaps: socketpair ends are classified external, possible record-mode EAGAIN (hypothesis, T8).</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+socketpair&amp;amp;body=Discussion+for+the+%60socketpair%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsocketpair.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60socketpair%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `socketpair`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Created by the syscall-tracking v1 migration on 2026-10-03. No tracking issue existed for <code>socketpair</code>: the 2026-07-24 classification campaign filed issues only for syscalls in the old temporary pass-through block, and Detcore already handled this one.</p>
+<h3>Open questions</h3>
+<ul>
+<li>Should <code>syscall_targets_internal_fd</code> (<code>detcore/src/syscalls/helpers.rs:797</code>) treat descriptors created by <code>socketpair</code> as container-internal, as it does pipes?</li>
+<li>Should <code>handle_socketpair</code> skip the forced <code>SOCK_NONBLOCK</code> in record and replay modes, as <code>handle_socket</code> does at <code>detcore/src/syscalls/files.rs:3758</code>, or should record mode route socketpair I/O through the internal polling path?</li>
+</ul>
+</body></html>

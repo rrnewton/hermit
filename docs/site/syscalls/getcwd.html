@@ -1,0 +1,125 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>getcwd | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>getcwd</code> (79)</h1>
+<p>Strategy: <strong>passthrough</strong> &middot; dispatch: <code>passthrough</code> &middot; linux determinism: conditional &middot; target policy: passthrough &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+getcwd&amp;body=Discussion+for+the+%60getcwd%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fgetcwd.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60getcwd%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>getcwd(buf, size)</code> copies the absolute path of the calling process's working directory into <code>buf</code>. Hermit forwards the call to the host kernel, and <code>chdir</code>/<code>fchdir</code> are forwarded as well. The working directory Hermit starts the guest in is treated as an input to the run, like <code>argv</code>.</p>
+<h2>Linux semantics</h2>
+<p>The kernel builds the path by walking from the working directory's dentry up to the process root, crossing mount points in the caller's mount namespace. The result is the path as that namespace sees it at the moment of the call:</p>
+<ul>
+<li>If an ancestor directory has been renamed, by any process, the path shows the new name.</li>
+<li>A symlink used in an earlier <code>chdir</code> never appears; the path names the directory it resolved to.</li>
+</ul>
+<p>The success return value is the path length including the terminating NUL. glibc's <code>getcwd()</code> turns that into a pointer and adds <code>getcwd(NULL, 0)</code> allocation, which happens in the library, not in the kernel.</p>
+<p>The working directory is shared by threads created with <code>CLONE_FS</code>, copied at <code>fork</code>, and kept across <code>execve</code>.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>size</code> at least the path length plus one: the NUL-terminated absolute path is copied and its length, including the NUL, is returned</li>
+<li>F2: <code>size</code> smaller than that, including <code>size == 0</code>: <code>ERANGE</code>, and <code>buf</code> is not written</li>
+<li>F3: <code>buf</code> not writable while <code>size</code> would be large enough: <code>EFAULT</code></li>
+<li>F4: the working directory has been removed (unlinked): <code>ENOENT</code></li>
+<li>F5: the working directory cannot be reached from the process root, for example after a <code>chroot</code> to a subdirectory: the path starts with <code>(unreachable)</code></li>
+<li>F6: the path is longer than <code>PATH_MAX</code> (4096): <code>ENAMETOOLONG</code></li>
+<li>F7: path spelling: renames of ancestors are reflected at the time of the call, bind mounts appear as the namespace mounts them, and symlinks used to reach the directory are already resolved</li>
+<li>F8: inheritance: threads created with <code>CLONE_FS</code> share the working directory, a <code>fork</code>ed child starts with a copy, and <code>execve</code> keeps it</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: conditional</code>. The result is a pure function of three things: the working directory's position in the caller's mount namespace, the names of its ancestors, and <code>size</code>. Nothing in the call depends on timing.</p>
+<p>It repeats when four conditions hold:</p>
+<ul>
+<li>the run starts in the same directory,</li>
+<li>the mount layout is the same,</li>
+<li>no process outside the guest renames or removes an ancestor during the run,</li>
+<li>the guest's own <code>chdir</code>/<code>rename</code>/<code>rmdir</code> calls happen in the same order. Hermit runs threads one at a time, so they do, including for threads that share a working directory through <code>CLONE_FS</code>.</li>
+</ul>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>The directory the guest is started in. It is chosen by whoever runs Hermit, and its path text often contains a random temporary name.</li>
+<li>Renames or removals of ancestor directories by processes outside the container.</li>
+<li>The mount layout of the host and the container.</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>passthrough</code>. This matches the code:</p>
+<ul>
+<li><code>getcwd</code> is classified <code>PassThrough</code> at <code>detcore/src/syscall_classification.rs:697</code>, inside the pass-through block that begins at <code>detcore/src/syscall_classification.rs:690</code>. Its comment says these calls are &quot;conditionally repeatable under Hermit's fixed-container, stable-filesystem, and serialization assumptions&quot;.</li>
+<li>The generic arm at <code>detcore/src/lib.rs:2843</code> forwards it.</li>
+<li><code>chdir</code> and <code>fchdir</code> are pass-through too (<code>detcore/src/syscall_classification.rs:721</code> and <code>detcore/src/syscall_classification.rs:723</code>), so the kernel's working directory is the only one that exists.</li>
+</ul>
+<p>The 2026-08-07 strategy draft (under Additional information) proposed producing <code>getcwd</code> from a virtual working directory that Hermit would keep itself. This body rejects that draft, for these reasons:</p>
+<ul>
+<li><strong>The answer must agree with the kernel.</strong> The text <code>getcwd</code> returns has to name the same directory the kernel uses for every relative path: <code>openat(AT_FDCWD, ...)</code>, <code>stat(&quot;.&quot;)</code>, and <code>/proc/self/cwd</code>. A virtual working directory would need Hermit to own path resolution for every syscall that takes a path, or the two would drift apart. That is a filesystem model Hermit does not have.</li>
+<li><strong>Determinism comes from fixing the inputs.</strong> The way to get determinism is to fix the starting directory and the namespace (the private <code>/tmp</code> mount and <code>--workdir</code>), not to rewrite the answer.</li>
+<li><strong>Rewriting would hide a real input.</strong> If two runs start in different directories, the guest may legitimately behave differently. Hiding that difference in <code>getcwd</code> alone would make the guest's view inconsistent with the kernel's.</li>
+</ul>
+<p>Record and replay:</p>
+<ul>
+<li>Code facts show <code>subscribed_record_replay: false</code>. Under <code>--passthru-opt</code> Detcore does not see <code>getcwd</code>.</li>
+<li>The unit test <code>passthru_opt_leaves_io_buffer_hashing_blind_only_for_getcwd</code> at <code>detcore/src/lib.rs:3234</code> pins this. It records <code>getcwd</code> as the one I/O-buffer-hashed syscall, listed at <code>detcore/src/io_buffers.rs:344</code>, that <code>--passthru-opt</code> cannot reach.</li>
+<li><code>hermit record</code> has its own subscriptions, in a recorder module that the comment at <code>detcore/src/lib.rs:1078</code> names. That module is not in the exported tree.</li>
+<li>The integration test <code>record_path_queries_and_legacy_mutations</code> at <code>hermit-cli/tests/record_replay.rs:2171</code> requires <code>chdir</code>/<code>getcwd</code> to replay from the recording, including a path longer than the replayer's 512-byte injection buffer.</li>
+<li><code>record_refuses_a_removed_working_directory</code> at <code>hermit-cli/tests/record_replay.rs:2200</code> requires record to refuse an <code>fchdir</code> into a removed directory.</li>
+</ul>
+<p>Known gap. The working directory the guest inherits is not moved into Hermit's namespace. Hermit applies <code>--workdir</code> after it sets up its mounts. A working directory inherited from the launcher stays bound to the host directory, even when Hermit mounts a private directory over that same path, for example <code>/tmp</code>. So when the guest is launched from inside a path Hermit later mounts over, <code>getcwd</code> may return text such as <code>/tmp/x</code> that names a different directory from the one relative paths use. T8 checks this.</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F7): under <code>hermit run --verify</code> on ptrace, make these <code>chdir</code> calls, then call raw <code>syscall(SYS_getcwd, buf, size)</code> with <code>size</code> exactly equal to the path length plus one:</li>
+<li>to <code>/</code>,</li>
+<li>to a nested directory by an absolute path,</li>
+<li>to a nested directory by a relative path,</li>
+<li>to a directory through a symlink.</li>
+</ul>
+<p>Assert:</p>
+<ul>
+<li>the return value equals <code>strlen + 1</code>;</li>
+<li>no symlink component appears;</li>
+<li>the bytes are identical across runs.</li>
+</ul>
+<p>Then rename an ancestor from inside the guest and assert that <code>getcwd</code> shows the new name. Existing partial coverage, record mode only: <code>tests/c/record_replay_path_queries.c:213</code>, driven by <code>hermit-cli/tests/record_replay.rs:2171</code>.</p>
+<ul>
+<li>T2 (covers F2): <code>size</code> of 0, 1, and the path length (one short of the NUL) each return <code>ERANGE</code>, and a canary in <code>buf</code> is untouched. Existing partial coverage: <code>tests/c/errno_path_identity.c:127</code> (<code>size</code> 1; cell <code>system-utils/errno-path-identity</code>, <code>tests/e2e/manifests/system-utils.yaml:1777</code>, verify ci on ptrace) and <code>tests/c/record_replay_path_queries.c:222</code> (<code>size</code> 2, record mode).</li>
+<li>T3 (covers F3): <code>buf = (char *)1</code> and <code>buf = NULL</code>, each with <code>size</code> 4096, return <code>EFAULT</code>.</li>
+<li>T4 (covers F4): <code>mkdir d; chdir d; rmdir ../d</code>, then <code>getcwd</code> returns <code>ENOENT</code> under <code>hermit run --verify</code>. The record-mode refusal is already covered by <code>hermit-cli/tests/record_replay.rs:2200</code>, using <code>tests/c/record_replay_path_queries.c</code> <code>--removed-cwd</code>. Run mode has no test.</li>
+<li>T5 (covers F5): <code>chroot</code> into a subdirectory while the working directory is outside it. The guest has <code>CAP_SYS_CHROOT</code> as root in its user namespace. Assert that the returned path starts with <code>(unreachable)</code>.</li>
+<li>T6 (covers F6): build a directory chain whose absolute path is over 4096 bytes, using <code>mkdirat</code> and <code>fchdir</code> one step at a time, and assert <code>ENAMETOOLONG</code>. Also assert that a 4000-byte path succeeds. The existing record test reaches only about 600 bytes (<code>hermit-cli/tests/record_replay.rs:2171</code>).</li>
+<li>T7 (covers F8): <code>getcwd</code> in a forked child, after the child calls <code>execve</code> on itself, and in a <code>CLONE_FS</code> thread after a sibling thread calls <code>chdir</code>. The results must match Linux and be identical across runs.</li>
+<li>T8 (covers F1, F7): start Hermit from a fixed directory, with and without <code>--workdir</code>, and check that <code>stat(&quot;.&quot;)</code> and <code>stat(&lt;getcwd result&gt;)</code> give the same device and inode. Repeat with the launch directory under a path Hermit mounts over, if Hermit accepts such a launch. This measures the known gap described under Hermit design.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-08-07 · hermit 303113c10522 · orc-coord-014 · filed (legacy variant C): The pinned x86-64 Sysno denominator is 373/373 classified: 289 DETERMINIZED, 83 PASSTHROUGH, and 1 UNSUPPORTED. The release tracking denominator is the 84/373 non-determinized rows. getcwd is PASSTHROUGH. It reaches the host through the blanket pass-through dispatcher; it must not be counted as determinized coverage.</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant C of https://github.com/rrnewton/hermit/issues/1946: linux_determinism not stated in the legacy body; target_policy from no legacy recommended action; code at this SHA: passthrough, dispatch passthrough.</li>
+<li>2026-10-03 · hermit fe5d48903806 · p3-samples · p3: linux_determinism conditional (the result depends only on the start directory, the namespace and the guest's own chdir order); target_policy investigate -&gt; passthrough (the answer must agree with the kernel's relative-path resolution, so the 2026-08-07 virtual-cwd draft is rejected); 8 flag behaviours and 8 tests; the inherited-cwd namespace gap is listed for T8</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+getcwd&amp;amp;body=Discussion+for+the+%60getcwd%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fgetcwd.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60getcwd%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `getcwd`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-08-07 as &quot;Syscall classification: getcwd&quot; (https://github.com/rrnewton/hermit/issues/1946), legacy variant C.</p>
+<p>Original filing tag: <code>[orc-coord-014] [coordinator, gpt-5.6-sol] [orc-coord-014]</code>.</p>
+<h3>Inherited working directory and the guest namespace</h3>
+<p>A measurement on 2026-08-10, filed under https://github.com/rrnewton/hermit/issues/2109 (umbrella https://github.com/rrnewton/hermit/issues/2111), found that bash stats every ancestor of its inherited <code>$PWD</code> at startup. A guest whose working directory sits under a shared host directory therefore observes changes that other processes make there.</p>
+<p><code>--workdir</code> avoids this because Hermit resolves it after its mounts. Running <code>cd /tmp</code> before launching makes it worse, because the inherited working directory binds to the host <code>/tmp</code> that Hermit's mount hides.</p>
+<p>This agent did not re-check those issues; it has no GitHub access. The finding concerns <code>stat</code> of the ancestors rather than the <code>getcwd</code> text, but T8 covers the part that touches <code>getcwd</code>.</p>
+<h3>Legacy strategy draft (2026-08-07), rejected above</h3>
+<p>Determinism analysis: getcwd exposes cwd pathname spelling, mount namespace, rename history, deleted-directory state, buffer sizing, and backend cwd. Host path text can differ even when guest logical state is intended to match.</p>
+<p>Hermit design: Render cwd from Hermit's virtual cwd identity and deterministic namespace history. Define Linux-compatible handling for renamed/deleted directories and exact buffer/error semantics without consulting backend cwd text.</p>
+<p>Legacy required tests (2026-08-07), now T1 to T8:</p>
+<ul>
+<li>Cover root, nested and relative chdir, renamed ancestors, deleted cwd, mount boundaries, and symlinks.</li>
+<li>Exercise zero/small/exact/large buffers and invalid pointers with exact errno checks.</li>
+<li>Assert byte-identical paths across strict repeats and record/replay.</li>
+<li>Test clone/exec inheritance and every backend claiming support.</li>
+</ul>
+<p>The last item's &quot;every backend&quot; part is dropped: tracking is ptrace only.</p>
+<p>Legacy acceptance text (2026-08-07): Move this row out of PASSTHROUGH only when implementation and tests bind the result to deterministic state. A future implementation is new syscall support and must follow the repository's human-review audit-tag policy.</p>
+<h3>Legacy state and denominator (2026-08-07)</h3>
+<p>Source authority: rrnewton/hermit main at 303113c10522360de9051e21ed2d777c3436e17b.</p>
+<p>The pinned x86-64 Sysno denominator is 373/373 classified: 289 DETERMINIZED, 83 PASSTHROUGH, and 1 UNSUPPORTED. The release tracking denominator is the 84/373 non-determinized rows.</p>
+<p>getcwd is PASSTHROUGH. It reaches the host through the blanket pass-through dispatcher; it must not be counted as determinized coverage.</p>
+</body></html>

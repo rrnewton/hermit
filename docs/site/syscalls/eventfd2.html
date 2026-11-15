@@ -1,0 +1,85 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>eventfd2 | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>eventfd2</code> (290)</h1>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; linux determinism: deterministic &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+eventfd2&amp;body=Discussion+for+the+%60eventfd2%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Feventfd2.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60eventfd2%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>eventfd2(initval, flags)</code> creates an event counter: a kernel object holding a 64-bit unsigned value, used through a new file descriptor. A <code>write</code> adds to the counter and a <code>read</code> takes from it. Detcore handles creation at <code>detcore/src/syscalls/files.rs:4184</code>. The kernel creates the object. Under the sequentialized scheduler, Detcore secretly makes the descriptor nonblocking, so that a later blocking <code>read</code> or <code>write</code> is retried by the scheduler instead of sleeping in the kernel. Detcore records the flags the guest asked for, and those are what the guest sees.</p>
+<p>Manual reference: Linux man-pages eventfd(2).</p>
+<h2>Linux semantics</h2>
+<p>The call returns the lowest free descriptor. The counter starts at <code>initval</code>, which is an <code>unsigned int</code>.</p>
+<p><code>read</code> needs a buffer of at least 8 bytes, or it fails with <code>EINVAL</code>.</p>
+<ul>
+<li>In counter mode it returns the whole value and resets the counter to 0.</li>
+<li>With <code>EFD_SEMAPHORE</code> it returns 1 and subtracts 1.</li>
+<li>If the counter is 0, <code>read</code> waits, or fails with <code>EAGAIN</code> when the descriptor is nonblocking.</li>
+</ul>
+<p><code>write</code> takes an 8-byte value and adds it.</p>
+<ul>
+<li>Writing <code>0xffffffffffffffff</code> is <code>EINVAL</code>.</li>
+<li>A write that would push the counter above <code>0xfffffffffffffffe</code> waits for a <code>read</code>, or fails with <code>EAGAIN</code> when nonblocking.</li>
+</ul>
+<p><code>poll</code>, <code>select</code> and <code>epoll</code> report the descriptor readable when the counter is above 0, and writable when at least 1 can be added without waiting.</p>
+<p>The older <code>eventfd(initval)</code> (nr 284) has no flags argument and behaves like <code>eventfd2</code> with <code>flags = 0</code>.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>initval</code>: the counter's starting value (0 to 2^32-1)</li>
+<li>F2: <code>EFD_CLOEXEC</code>: the new descriptor is close-on-exec</li>
+<li>F3: <code>EFD_NONBLOCK</code>: the description is <code>O_NONBLOCK</code>, so a <code>read</code> of a zero counter and an overflowing <code>write</code> fail with <code>EAGAIN</code> instead of waiting</li>
+<li>F4: <code>EFD_SEMAPHORE</code>: <code>read</code> returns 1 and decrements, instead of returning the whole value and resetting it to 0</li>
+<li>F5: without <code>EFD_NONBLOCK</code>: a <code>read</code> of a zero counter waits for a <code>write</code>, and an overflowing <code>write</code> waits for a <code>read</code></li>
+<li>F6: any other bit in <code>flags</code>: <code>EINVAL</code></li>
+<li>F7: resource errors: <code>EMFILE</code> (per-process limit), <code>ENFILE</code> (system-wide limit), <code>ENODEV</code> (the anonymous inode cannot be mounted), <code>ENOMEM</code></li>
+<li>F8: <code>eventfd</code> (nr 284): no flags argument; the same as <code>eventfd2</code> with <code>flags = 0</code></li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: deterministic</code>. The new descriptor number, the starting counter and the descriptor's flags depend only on the arguments and on the calling process's descriptor table. Hermit serializes the table's changes. The resource errors in F7 depend on host limits, as they do for every call that creates a descriptor.</p>
+<p>The counter can also be a source of nondeterminism. Which thread's <code>read</code> sees which <code>write</code>, and when a waiting <code>read</code> wakes up, depends on thread scheduling. That comes from the later <code>read</code>, <code>write</code> and <code>epoll_wait</code> calls, not from <code>eventfd2</code>. Under Hermit's sequentialized scheduler the order is fixed by the schedule, as long as every reader and writer is a guest thread.</p>
+<h2>Hermit design</h2>
+<p>Target policy: <code>model</code>. The kernel holds the counter. Detcore controls how threads wait on it, and it keeps the guest-visible descriptor state in its mirror.</p>
+<ul>
+<li><strong>Hidden nonblocking.</strong> In <code>hermit run</code> with thread sequentialization on, <code>internally_nonblocking</code> is true (<code>detcore/src/syscalls/files.rs:4189</code>; <code>use_nonblocking_sockets</code> at <code>detcore-model/src/config.rs:872</code>). The handler then adds <code>EFD_NONBLOCK</code> to the call (<code>detcore/src/syscalls/files.rs:4192</code>) and afterwards marks the description physically nonblocking (<code>detcore/src/syscalls/files.rs:4207</code>, <code>detcore/src/syscalls/helpers.rs:695</code>). In record and replay this is off, and the descriptor is created exactly as asked.</li>
+<li><strong>Guest-visible flags.</strong> The descriptor is registered with the guest's own <code>EFD_CLOEXEC|EFD_NONBLOCK</code> bits, taken from the original call, not the modified one (<code>detcore/src/syscalls/files.rs:4197</code> to <code>detcore/src/syscalls/files.rs:4205</code>; <code>DetFd::new</code> splits them at <code>detcore/src/fd.rs:204</code>). <code>fcntl(F_GETFL)</code> answers from that logical state (<code>detcore/src/syscalls/files.rs:3097</code>), so the injected <code>O_NONBLOCK</code> stays hidden (F2, F3). The doc comment at <code>detcore/src/syscalls/files.rs:4181</code> states this intent.</li>
+<li><strong>Waiting (F3, F5).</strong> A <code>read</code> on an event counter always goes through <code>execute_nonblockable_fd_syscall</code> (<code>detcore/src/syscalls/files.rs:1854</code>). A <code>write</code> takes that path when the descriptor is physically nonblocking (<code>detcore/src/syscalls/files.rs:2283</code>). There, <code>ioaction_based_on_fd_status</code> (<code>detcore/src/syscalls/helpers.rs:745</code>) chooses between three strategies:</li>
+<li>The guest asked for blocking but the descriptor is physically nonblocking: Detcore converts the wait into scheduler-owned polling under <code>InternalIOPolling</code> (<code>detcore/src/syscalls/helpers.rs:778</code>, <code>detcore/src/syscalls/helpers.rs:260</code>).</li>
+<li>The guest asked for <code>EFD_NONBLOCK</code>: one attempt, and <code>EAGAIN</code> is returned as is.</li>
+<li>Record and replay, or a run without thread sequentialization: the call blocks in the kernel through <code>record_or_replay_blocking</code> (<code>detcore/src/syscalls/helpers.rs:250</code>).</li>
+<li><strong>Everything else</strong> (F1, F4, F6, F7) is decided by the kernel through <code>record_or_replay</code>. <code>EFD_SEMAPHORE</code> reaches the kernel unchanged, and Detcore does not need to track it. If Detcore cannot read the new descriptor's metadata when metadata virtualization is on, <code>add_fd</code> closes the descriptor and returns the error, so no untracked descriptor is left behind (<code>detcore/src/syscalls/files.rs:927</code>).</li>
+<li><code>eventfd</code> uses the same handler through a conversion that sets <code>flags = 0</code> (<code>detcore/src/lib.rs:2574</code>) (F8).</li>
+</ul>
+<p><code>passthrough</code> would let a blocking <code>read</code> sleep in the kernel where the scheduler cannot see it. <code>refuse</code> and <code>emulate</code> would break every event loop that uses an event counter. So <code>model</code> is what the code already does.</p>
+<p>Target (owner decision 14): a blocking <code>read</code> or <code>write</code> on an event counter is a non-blocking probe plus a scheduler wait. Sequentialized <code>hermit run</code> already realizes it (<code>detcore/src/syscalls/files.rs:4189-4207</code>, <code>detcore/src/syscalls/helpers.rs:778</code>); record and replay do not, as the next item says.</p>
+<p>What remains before the code fully realizes <code>model</code>:</p>
+<ul>
+<li><strong>Record and replay</strong> create the descriptor as a blocking one and wait in the kernel through <code>record_or_replay_blocking</code>. The Recorder's subscription list (<code>hermit-cli/src/recorder.rs:384</code> to <code>hermit-cli/src/recorder.rs:474</code>) contains <code>read</code> and <code>write</code>, but neither <code>eventfd2</code> nor <code>eventfd</code>. On replay, creation therefore runs live again, which is harmless because creation is deterministic. No test listed here checks a producer and consumer of an event counter under record and replay; T5 does.</li>
+<li><strong>`/proc/self/fdinfo`</strong> shows the kernel's real flags, including the injected <code>O_NONBLOCK</code>. Whether Detcore filters that is outside this body; T2 should check it.</li>
+</ul>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F2, F4): counter mode and semaphore mode, under <code>hermit run --verify</code> on ptrace, both with <code>initval = 0</code> and with a non-zero <code>initval</code>. Check <code>F_GETFD</code> for <code>EFD_CLOEXEC</code>. Existing candidate: <code>tests/c/eventfd_probe.c</code> (cell <code>c-programs/eventfd-semantics</code>, <code>tests/e2e/manifests/c-programs.yaml:15196</code>, verify ci on ptrace). It covers counter mode and <code>EFD_SEMAPHORE</code>, but only with <code>initval = 0</code> (<code>tests/c/eventfd_probe.c:66</code>, <code>tests/c/eventfd_probe.c:80</code>), and it does not read <code>F_GETFD</code>.</li>
+<li>T2 (covers F3, F5): a blocking <code>read</code> in one thread must be woken by a <code>write</code> in another, with the same result on every <code>--verify</code> run. An <code>EFD_NONBLOCK</code> descriptor must give <code>EAGAIN</code> on a zero counter. <code>F_GETFL</code> and <code>/proc/self/fdinfo/&lt;fd&gt;</code> must show <code>O_NONBLOCK</code> only when the guest asked for it. A blocking <code>write</code> that would overflow must wait for a <code>read</code>. Existing partial coverage: <code>mixed_epoll_sources_are_deterministic</code> (<code>detcore/tests/misc/notification_fds.rs:322</code>, cargo test target <code>tests_misc</code>) uses an <code>EFD_NONBLOCK</code> event counter as one of four <code>epoll</code> sources (<code>detcore/tests/misc/notification_fds.rs:255</code>).</li>
+<li>T3 (covers F6, F7): <code>eventfd2(0, 0x1)</code> returns <code>EINVAL</code>. With <code>RLIMIT_NOFILE</code> lowered to the number of open descriptors, the call returns <code>EMFILE</code> and opens nothing.</li>
+<li>T4 (covers F8): a raw <code>syscall(SYS_eventfd, 3)</code> returns a working blocking counter that starts at 3 and is not close-on-exec.</li>
+<li>T5 (covers F3, F5): <code>hermit record</code> and then <code>hermit replay</code> of a two-thread producer and consumer over a blocking event counter. Replay must finish and give the same output.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · created for v1: no tracking issue existed for this pinned Sysno; code at this SHA: determinized, dispatch typed.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy model (kernel counter; Detcore injects hidden EFD_NONBLOCK in run mode and turns blocking reads and writes into scheduler-owned polling); linux_determinism deterministic; 8 flag behaviours and 5 tests listed; no coverage token, tracking_status stays todo</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): applied decision 14 (already realized in sequentialized run; record/replay gap kept); target_policy unchanged; no new F/T ids; no questions removed.</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+eventfd2&amp;amp;body=Discussion+for+the+%60eventfd2%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Feventfd2.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60eventfd2%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `eventfd2`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Created by the syscall-tracking v1 migration on 2026-10-03. No tracking issue existed for <code>eventfd2</code>: the 2026-07-24 classification campaign filed issues only for syscalls in the old temporary pass-through block, and Detcore already handled this one.</p>
+<h3>Open questions</h3>
+<ul>
+<li>None that need an owner decision. T2 checks whether <code>/proc/self/fdinfo/&lt;fd&gt;</code> shows the injected <code>O_NONBLOCK</code>; that is a question about procfs filtering, not about this handler.</li>
+</ul>
+</body></html>

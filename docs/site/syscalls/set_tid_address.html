@@ -1,0 +1,83 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>set_tid_address | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>set_tid_address</code> (218)</h1>
+<p>Strategy: <strong>passthrough</strong> &middot; dispatch: <code>sysno-guard</code> &middot; linux determinism: conditional &middot; target policy: passthrough &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+set_tid_address&amp;body=Discussion+for+the+%60set_tid_address%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fset_tid_address.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60set_tid_address%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>set_tid_address(tidptr)</code> sets the calling thread's <code>clear_child_tid</code> address and returns the caller's thread ID. Hermit forwards the call to the kernel as a reviewed pass-through. It also copies the address into the scheduler, so that the scheduler's modeled CHILD_CLEARTID futex wake at thread exit targets the same word that the kernel clears.</p>
+<h2>Linux semantics</h2>
+<p>The call takes a single <code>int *tidptr</code> and cannot fail. It stores the pointer in the calling task's <code>clear_child_tid</code> field and returns the caller's TID, as seen in the caller's PID namespace. The pointer is not dereferenced at call time.</p>
+<p>The registration takes effect when the thread's memory is released, which happens at exit (normal exit, <code>exit_group</code>, or a fatal signal) and during a successful <code>execve</code>. At that point, if the address is non-NULL and the address space is still shared with another task, the kernel writes 0 to the address and does a <code>FUTEX_WAKE</code> of one waiter. It then resets <code>clear_child_tid</code> to NULL. A failed store is ignored silently. <code>clone</code> with <code>CLONE_CHILD_CLEARTID</code> sets the same field for the new task, and glibc's <code>pthread_join</code> relies on that clear and wake. <code>set_tid_address</code> replaces whatever value is there.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: Non-NULL <code>tidptr</code>: registers the address as <code>clear_child_tid</code> and returns the caller's TID.</li>
+<li>F2: NULL <code>tidptr</code>: removes any registration (no exit-time store or wake), and still returns the caller's TID.</li>
+<li>F3: Replacement: the last registration wins. A call replaces an earlier call's address, and the <code>ctid</code> that <code>clone(CLONE_CHILD_CLEARTID)</code> installed.</li>
+<li>F4: Exit-time clear and wake: when the thread exits and the address space is shared with another task, the kernel stores 0 at the address and wakes at most one futex waiter on it. A thread that is the last user of its address space gets no store.</li>
+<li>F5: Invalid or unmapped <code>tidptr</code>: accepted without error at call time. The exit-time store faults silently, and nothing else changes.</li>
+<li>F6: Per-task lifetime: a new task starts registered only if <code>clone</code> passed <code>CLONE_CHILD_CLEARTID</code>, and unregistered otherwise. A successful <code>execve</code> performs the F4 clear and wake for a shared address space, then resets the registration to NULL.</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: conditional</code>. The call has no inputs other than the pointer and always succeeds. The guest sees two things: the returned TID, and the exit-time store and wake.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>The returned TID is whatever the kernel allocated. Under Hermit's container PID namespace, with thread creation sequentialized, TIDs are allocated in a fixed order. Outside a fresh PID namespace they depend on host activity.</li>
+<li>Which waiter the exit-time <code>FUTEX_WAKE</code> releases, and when the woken thread runs relative to its siblings, depends on host scheduling.</li>
+<li>The F4 store happens during kernel teardown of the exiting task. The order of that store relative to other threads' memory accesses is fixed only if the guest's threads are serialized.</li>
+</ul>
+<p>The call repeats when TIDs come from a deterministic PID namespace and thread exit and waking are ordered by a deterministic scheduler.</p>
+<h2>Hermit design</h2>
+<p>Target policy: <code>passthrough</code>. The kernel owns the registration and the return value, and Detcore keeps a scheduler-side copy of the address so its modeled wake matches the kernel's.</p>
+<p>What the code does at hermit f4055eb9cae4:</p>
+<ul>
+<li>Classification: a reviewed pass-through (<code>detcore/src/syscall_classification.rs:712</code>). The block comment at <code>detcore/src/syscall_classification.rs:691-692</code> scopes these pass-throughs as &quot;conditionally repeatable under Hermit's fixed-container, stable-filesystem, and serialization assumptions&quot;.</li>
+<li>Dispatch: a dedicated PassThrough arm calls <code>handle_set_tid_address</code> (<code>detcore/src/lib.rs:2819-2824</code>). The call is subscribed even under record/replay's pass-through optimization, so the scheduler always sees address changes (<code>detcore/src/lib.rs:1150-1153</code>).</li>
+<li>Handler: &quot;Linux owns the guest-visible registration and return value&quot; (<code>detcore/src/syscalls/threads.rs:1009-1011</code>). The call is forwarded through <code>record_or_replay</code> (<code>detcore/src/syscalls/threads.rs:1018-1020</code>). When <code>sequentialize_threads</code> is on, the address (0 for NULL) is copied into the scheduler (<code>detcore/src/syscalls/threads.rs:1017</code>, <code>detcore/src/syscalls/threads.rs:1021-1022</code>; the scheduler stores it at <code>detcore/src/scheduler.rs:2173-2179</code>).</li>
+<li>Exit: when the scheduler logically kills a thread with a non-zero copied address, it wakes the modeled futex waiter at that address (<code>detcore/src/scheduler.rs:2330-2335</code>). It wakes one waiter, matching the man page (<code>detcore/src/scheduler.rs:2896-2905</code>).</li>
+<li>Clone: a new thread's address is copied only when <code>CLONE_CHILD_CLEARTID</code> is set (<code>detcore/src/tool_global.rs:3412-3418</code>).</li>
+<li>Exec: a successful exec resets the copy to 0 (<code>detcore/src/lib.rs:1766-1770</code>).</li>
+</ul>
+<p>The returned TID is the raw kernel TID, because Detcore does not virtualize TIDs (<code>detcore/src/lib.rs:1492</code>). <code>gettid</code> is also a reviewed pass-through (<code>detcore/src/syscall_classification.rs:705</code>), so the two calls agree. The value is deterministic because of the container PID namespace and sequentialized creation, not because of any translation.</p>
+<p>Why not model or emulate: the 2026-08-07 strategy draft (kept below under Additional information) asked for a logical TID and a Detcore-performed clear and wake at a deterministic exit point. The current code covers the part of that draft that affects determinism. The kernel's return value already equals the TID that every other guest-visible interface reports. The scheduler supplies the wake that releases the modeled waiter at the deterministic exit point. A separate logical TID would only be meaningful as part of TID virtualization, which is tracked as <code>T78538674</code> at <code>detcore/src/lib.rs:1492</code> and is outside this syscall.</p>
+<p>Known gaps:</p>
+<ul>
+<li>The header comment of the existing fixture says &quot;Hermit virtualizes thread IDs&quot; (<code>tests/c/set_tid_address.c:8</code>). That is inaccurate at this SHA, although the fixture's assertions do not depend on it.</li>
+<li>No test today exercises F3 through F6 under Hermit.</li>
+</ul>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F2): Raw <code>SYS_set_tid_address</code> with a valid pointer, a second valid pointer, then NULL. Each call returns the same positive TID, equal to <code>gettid()</code>. Existing candidate: <code>tests/c/set_tid_address.c</code> (cell <code>c-programs/set-tid-address</code>, <code>tests/e2e/manifests/c-programs.yaml:10996</code>, verify CI on ptrace at <code>tests/e2e/manifests/c-programs.yaml:11013-11015</code>, with <code>bitwise_parity</code> at <code>tests/e2e/manifests/c-programs.yaml:11023</code>).</li>
+<li>T2 (covers F3, F4): A thread created with <code>CLONE_CHILD_CLEARTID</code> calls <code>set_tid_address</code> on a second word and then exits. A joiner waiting on the second word with <code>FUTEX_WAIT</code> is woken and observes 0, and the original <code>ctid</code> word is left unchanged. Run under <code>--verify</code>.</li>
+<li>T3 (covers F4): Two waiters on one cleared word: exactly one is woken by the exit, and the other times out deterministically on a virtual-time timeout. A single-threaded process that registers an address and exits produces no store, checked through a shared mapping by the parent.</li>
+<li>T4 (covers F5): Register an unmapped address (for example a page that was just unmapped), then exit the thread. The process continues and the sibling threads observe no fault.</li>
+<li>T5 (covers F6): A <code>CLONE_VM</code> child (not a thread) registers the parent's word and execs. The parent's futex wait on that word returns with the word cleared. A plain <code>fork</code> child reports no inherited registration: its exit does not clear the parent's word.</li>
+<li>T6 (covers F1, F4): Record and replay T2. The replay reports the same TID and the same wake order.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-08-07 · hermit 303113c10522 · orc-coord-014 · filed (legacy variant C): The pinned x86-64 Sysno denominator is 373/373 classified: 289 DETERMINIZED, 83 PASSTHROUGH, and 1 UNSUPPORTED. The release tracking denominator is the 84/373 non-determinized rows. set_tid_address is PASSTHROUGH. It reaches the host through the blanket pass-through dispatcher; it must not be counted as determinized coverage.</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant C of https://github.com/rrnewton/hermit/issues/1954: linux_determinism not stated in the legacy body; target_policy from no legacy recommended action; code at this SHA: passthrough, dispatch sysno-guard.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; passthrough (the kernel owns the registration and the raw namespaced TID; Detcore copies the address into the scheduler for its modeled CHILD_CLEARTID wake and resets it on exec, which supersedes the 2026-08-07 logical-TID draft); linux_determinism stays conditional; 6 flag behaviours and 6 tests listed; only T1 has an existing candidate (tests/c/set_tid_address.c), no coverage token recorded, so tracking_status stays todo</li>
+<li>2026-10-05 · hermit f4055eb9cae4 · syscall-tracking-2 · covered: T1 covered by tests/c/set_tid_address.c (C08 review of the 2026-10-04 coverage proposals; guest source read at this SHA, not run by this agent)</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+set_tid_address&amp;amp;body=Discussion+for+the+%60set_tid_address%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fset_tid_address.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60set_tid_address%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `set_tid_address`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-08-07 as &quot;Syscall classification: set_tid_address&quot; (https://github.com/rrnewton/hermit/issues/1954), legacy variant C.</p>
+<p>Original filing tag: <code>[orc-coord-014] [coordinator, gpt-5.6-sol] [orc-coord-014]</code>.</p>
+<h3>Legacy strategy draft (2026-08-07)</h3>
+<p>The legacy body's Hermit design read: &quot;Return the logical TID, store the guest clear-child address in logical-thread state, and perform clear-plus-wake at the deterministic exit point with explicit memory/futex ordering.&quot; Its determinism note read: &quot;Host forwarding can expose a host TID and couples exit-time memory clearing and futex wakeup to backend teardown order.&quot; Hermit design above explains how the code at f4055eb9cae4 handles each point.</p>
+<p>Legacy required tests (2026-08-07), now folded into T1-T6: null and valid addresses, replacement, invalid or unmapped memory at exit, main and child threads; returned TID, zeroing, futex wake count, and ordering relative to wait and exit; clone flags that also set child-tid addresses, and exec; identical strict-repeat and record/replay behaviour.</p>
+<h3>Legacy acceptance text (2026-08-07)</h3>
+<p>Move this row out of PASSTHROUGH only when implementation and tests bind the result to deterministic state. A future implementation is new syscall support and must follow the repository's human-review audit-tag policy.</p>
+<h3>Legacy state and denominator (2026-08-07)</h3>
+<p>Source authority: rrnewton/hermit main at 303113c10522360de9051e21ed2d777c3436e17b.</p>
+<p>The pinned x86-64 Sysno denominator is 373/373 classified: 289 DETERMINIZED, 83 PASSTHROUGH, and 1 UNSUPPORTED. The release tracking denominator is the 84/373 non-determinized rows.</p>
+<p>set_tid_address is PASSTHROUGH. It reaches the host through the blanket pass-through dispatcher; it must not be counted as determinized coverage.</p>
+</body></html>

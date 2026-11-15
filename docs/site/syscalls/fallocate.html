@@ -1,0 +1,96 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fallocate | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>fallocate</code> (285)</h1>
+<p>Strategy: <strong>passthrough</strong> &middot; dispatch: <code>passthrough</code> &middot; linux determinism: conditional &middot; target policy: passthrough &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+fallocate&amp;body=Discussion+for+the+%60fallocate%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ffallocate.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60fallocate%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>fallocate(fd, mode, offset, len)</code> allocates, deallocates, zeroes or shifts file space over a byte range of an open file. Hermit forwards it to the host kernel unchanged. For a given file on a given filesystem type the result repeats. Which modes succeed, and what <code>st_blocks</code> reports afterwards, depend on the host filesystem behind the guest's file.</p>
+<p>Manual reference: Linux man-pages fallocate(2).</p>
+<h2>Linux semantics</h2>
+<p>The VFS (<code>vfs_fallocate</code>) validates the arguments and the descriptor, then hands the mode to the filesystem's <code>-&gt;fallocate</code> method. Filesystems differ in which modes they support. For example, tmpfs implements only mode 0, <code>KEEP_SIZE</code> and <code>PUNCH_HOLE|KEEP_SIZE</code>, while ext4 and xfs implement most modes. A mode the filesystem does not implement fails with <code>EOPNOTSUPP</code>. A successful call can change the file size, its allocated blocks (<code>st_blocks</code>) and, for the hole, zero, collapse and insert modes, the bytes a later read returns. The call writes no memory in the caller.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>mode == 0</code> (allocate): reserve blocks for <code>[offset, offset+len)</code> and extend <code>st_size</code> if the range ends past EOF. Newly allocated ranges read back as zeros.</li>
+<li>F2: <code>FALLOC_FL_KEEP_SIZE</code> (0x01) with mode 0: allocate, but never change <code>st_size</code>, so blocks past EOF are preallocated and <code>st_blocks</code> grows</li>
+<li>F3: <code>FALLOC_FL_PUNCH_HOLE</code> (0x02): deallocate the range so it reads back as zeros. It must be combined with <code>KEEP_SIZE</code>; without it the call fails with <code>EOPNOTSUPP</code>.</li>
+<li>F4: <code>FALLOC_FL_NO_HIDE_STALE</code> (0x04): reserved. No mainline filesystem implements it, so it fails with <code>EOPNOTSUPP</code>.</li>
+<li>F5: <code>FALLOC_FL_COLLAPSE_RANGE</code> (0x08): remove the range and shift the following data down, shrinking the file. It must be used alone. <code>offset</code> and <code>len</code> must be multiples of the filesystem block size, and the range must end before EOF; otherwise <code>EINVAL</code>.</li>
+<li>F6: <code>FALLOC_FL_ZERO_RANGE</code> (0x10): make the range read as zeros, typically by converting it to unwritten extents. <code>KEEP_SIZE</code> controls whether the size may grow.</li>
+<li>F7: <code>FALLOC_FL_INSERT_RANGE</code> (0x20): insert a hole at <code>offset</code> and shift the following data up, growing the file. It must be used alone, with the same block-alignment rule as F5, and <code>offset</code> must be before EOF.</li>
+<li>F8: <code>FALLOC_FL_UNSHARE_RANGE</code> (0x40): break shared (reflinked) extents in the range so later writes cannot fail for lack of space. It works only on filesystems with reflink support, such as xfs and btrfs.</li>
+<li>F9: <code>FALLOC_FL_WRITE_ZEROES</code> (0x80, newer kernels; Linux 6.17 is believed to be the first): zero the range by writing zeros on the device. It must be used alone, and filesystems and devices without support return <code>EOPNOTSUPP</code>. On older kernels the bit is unknown and gives <code>EOPNOTSUPP</code>.</li>
+<li>F10: argument validation: <code>offset &lt; 0</code> or <code>len &lt;= 0</code> gives <code>EINVAL</code>. An invalid combination of mode bits gives <code>EINVAL</code> or <code>EOPNOTSUPP</code>, as F3 to F9 say. Unknown bits give <code>EOPNOTSUPP</code>. <code>offset + len</code> beyond the filesystem's maximum file size, or overflowing, gives <code>EFBIG</code>.</li>
+<li>F11: descriptor and file type: a bad fd, or one not open for writing, gives <code>EBADF</code>. A directory gives <code>EISDIR</code>. A pipe or FIFO gives <code>ESPIPE</code>. Other non-regular files, apart from block devices, give <code>ENODEV</code>.</li>
+<li>F12: file state: an append-only inode refuses every mode except F1 and F2, and an immutable inode refuses every mode; both give <code>EPERM</code>. A memfd sealed against writes or growth gives <code>EPERM</code>. An active swapfile gives <code>ETXTBSY</code>.</li>
+<li>F13: host-transient failures: <code>ENOSPC</code> or <code>EDQUOT</code> when the host filesystem's free space or quota runs out, and <code>EIO</code> from failing storage. All three depend on host state shared with other processes.</li>
+<li>F14: host-config failure: <code>EOPNOTSUPP</code> for a mode the host filesystem behind the guest's file does not implement (F3 to F9 say which modes; tmpfs implements only mode 0, <code>KEEP_SIZE</code> and <code>PUNCH_HOLE|KEEP_SIZE</code>).</li>
+<li>F15: <code>EINTR</code> when a signal interrupts a long allocation.</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>fallocate</code> repeats when the guest's file lives on the same filesystem type with the same block size and enough free space, and nothing outside the container modifies the file. Those are the assumptions Hermit documents for the whole synchronous extent-operation group. Under them, the return value, the new <code>st_size</code> and the bytes read back are functions of the guest's own earlier operations.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>Filesystem mode support (F3 to F9, F13). The same program succeeds on ext4 and gets <code>EOPNOTSUPP</code> on tmpfs. Within one host configuration the outcome is fixed.</li>
+<li>Block size, which decides whether F5 and F7 accept a range and how much <code>st_blocks</code> grows.</li>
+<li>Free space and quotas (<code>ENOSPC</code>, <code>EDQUOT</code>), which are host state shared with other processes.</li>
+<li>Extent and page-cache state. These affect latency only, and Detcore charges every syscall a fixed virtual cost (<code>detcore/src/lib.rs:1936</code>). <code>fallocate</code> has no entry in the cost table, so it falls back to <code>detcore/src/syscall_time.rs:156</code>.</li>
+<li><code>st_blocks</code> passes through raw. <code>determinize_stat</code> (<code>detcore/src/syscalls/files.rs:2981</code>) rewrites the timestamps (<code>detcore/src/syscalls/files.rs:3021</code>, <code>detcore/src/syscalls/files.rs:3025</code>) but leaves <code>st_blocks</code> and <code>st_size</code> as the host reports them.</li>
+</ul>
+<h3>Cross-host variation</h3>
+<ul>
+<li>Filesystem type behind the guest's file: which of F3 to F9 succeed and which give <code>EOPNOTSUPP</code> (F14).</li>
+<li>Filesystem block size: whether F5 and F7 accept a range, and how much <code>st_blocks</code> grows after F1, F2 and F6.</li>
+<li>Kernel version: F9 (<code>FALLOC_FL_WRITE_ZEROES</code>) exists only on newer kernels; older ones return <code>EOPNOTSUPP</code>.</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>passthrough</code>, changed from <code>investigate</code>. The legacy issue asked for a handler (NEEDS-HANDLER). The code at the cited SHA already decides otherwise, and this body agrees:</p>
+<ul>
+<li><code>fallocate</code> is classified <code>PassThrough</code> at <code>detcore/src/syscall_classification.rs:760</code>, under the group comment at <code>detcore/src/syscall_classification.rs:756</code>. That comment states that synchronous extent and pathname operations &quot;are repeatable for guest-owned files in a fixed namespace with adequate space and no external mutation&quot;. The block carries <code>TODO-HUMAN-REVIEW(PR-675)</code> at <code>detcore/src/syscall_classification.rs:758</code>.</li>
+<li>The generic arm <code>SyscallClassification::PassThrough =&gt; self.passthrough(guest, call).await</code> at <code>detcore/src/lib.rs:2843</code> forwards it. <code>representative_policies_stay_in_their_reviewed_sections</code> asserts the classification at <code>detcore/src/syscall_classification.rs:2053</code>.</li>
+</ul>
+<p>Why not the alternatives:</p>
+<ul>
+<li><code>model</code>/<code>emulate</code>: Hermit has no model of file extents. Emulating <code>fallocate</code> would mean reimplementing per-filesystem mode support and block-size rules, only to give an answer the real filesystem already gives the same way every time under the stated assumptions.</li>
+<li><code>refuse</code>: real programs call <code>fallocate</code> routinely (databases, <code>posix_fallocate</code>, package managers). Refusing it would break them for no determinism gain.</li>
+</ul>
+<p>There is one gap between the passthrough and Detcore's metadata virtualization. A successful <code>write</code> calls <code>touch_file</code> when <code>virtualize_metadata</code> is set (<code>detcore/src/syscalls/files.rs:2428</code>), which advances the file's logical mtime. A passthrough <code>fallocate</code> never reaches that code. After F1, F3, F5, F6 or F7 changes the size or the contents, the guest's <code>stat</code> still shows the old logical mtime, because <code>determinize_stat</code> takes mtime from the per-inode logical clock (<code>detcore/src/syscalls/files.rs:3025</code>; a file first seen gets the epoch, <code>detcore/src/tool_global.rs:2524</code>). Linux would update mtime and ctime. The value is deterministic but not faithful. Whether to fix it is an open question below.</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F2, F3, F10): on a fresh <code>mkstemp</code> file under <code>hermit run --verify</code> on ptrace, use raw <code>syscall(SYS_fallocate, ...)</code>. Check that mode 0 extends the file to 8192. Check that <code>KEEP_SIZE</code> past EOF keeps <code>st_size</code>. Check that <code>PUNCH_HOLE|KEEP_SIZE</code> in the middle reads back as zeros with the size unchanged. Check that <code>PUNCH_HOLE</code> without <code>KEEP_SIZE</code> gives <code>EOPNOTSUPP</code>, and that <code>offset = -1</code>, <code>len = 0</code> and <code>offset = LLONG_MAX</code> with <code>len = 2</code> give <code>EINVAL</code>, <code>EINVAL</code> and <code>EFBIG</code>. Existing partial coverage: <code>tests/c/fallocate_extents.c:43</code> (mode 0 to 8192), <code>tests/c/fallocate_extents.c:55</code> (punch hole keeps the size), <code>tests/c/fallocate_extents.c:61</code> (the hole reads back as zeros) and <code>tests/c/fallocate_extents.c:77</code> (<code>KEEP_SIZE</code> past EOF), through the glibc wrapper (cell <code>c-programs/fallocate-extents</code>, <code>tests/e2e/manifests/c-programs.yaml:11699</code>, verify ci on ptrace). Also raw mode 0 at <code>tests/c/syscall_file_io.c:134</code>, which accepts <code>EOPNOTSUPP</code> (<code>tests/c/syscall_file_io.c:141</code>), run by cell <code>c-programs/syscall-file-io</code> (<code>tests/e2e/manifests/c-programs.yaml:9214</code>) and by the cargo test <code>deterministic_file_io_syscalls_verify</code> (<code>hermit-cli/tests/syscall_file_io.rs:51</code>, which passes <code>--backend=ptrace</code>).</li>
+<li>T2 (covers F4, F5, F6, F7, F8, F9): for each of <code>NO_HIDE_STALE</code>, <code>COLLAPSE_RANGE</code>, <code>ZERO_RANGE</code>, <code>ZERO_RANGE|KEEP_SIZE</code>, <code>INSERT_RANGE</code>, <code>UNSHARE_RANGE</code> and <code>WRITE_ZEROES</code>, issue the call with block-aligned and misaligned ranges. Assert the documented contents and size where it succeeds, and the exact errno where the test filesystem lacks the mode. Record the filesystem type in the output, so <code>--verify</code> compares like with like.</li>
+<li>T3 (covers F11, F12): assert <code>EBADF</code> on fd <code>-1</code> and on an <code>O_RDONLY</code> descriptor, <code>EISDIR</code> on a directory descriptor and <code>ESPIPE</code> on a pipe. Seal a <code>memfd_create(MFD_ALLOW_SEALING)</code> with <code>F_SEAL_GROW</code> and assert that a size-extending <code>fallocate</code> gives <code>EPERM</code>.</li>
+<li>T4 (covers none): fill a small size-limited tmpfs, if the test harness can mount one inside the container, and assert <code>ENOSPC</code> from a mode-0 <code>fallocate</code> past the limit. A container-owned filesystem of fixed size makes this <code>ENOSPC</code> guest-determined; it does not cover F13, which is the host's own free space.</li>
+<li>U1 (covers F13; host-transient): <code>ENOSPC</code>, <code>EDQUOT</code> and <code>EIO</code> from the host filesystem depend on free space, quotas and storage health shared with other processes. The plain passthrough (<code>detcore/src/lib.rs:2843</code>) hands them to the guest today. F13 counts toward done only once Hermit hides these errors or reports them as an infrastructure error.</li>
+<li>U2 (covers F14; host-config): the CI host's filesystem decides which modes are missing, so CI cannot produce <code>EOPNOTSUPP</code> for every mode. Hermit forwards the kernel's answer unchanged (<code>detcore/src/syscall_classification.rs:760</code>, <code>detcore/src/lib.rs:2843</code>).</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A2 of https://github.com/rrnewton/hermit/issues/347: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: passthrough, dispatch passthrough.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; passthrough, matching the reviewed classification at detcore/src/syscall_classification.rs:760; kept conditional (mode support, block size, free space and raw st_blocks depend on the host filesystem); 13 flag behaviours and 4 tests listed; an open question (passthrough fallocate does not advance the virtual mtime) keeps tracking_status todo</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d12 (owner decisions 1 and 2): cross_host_variant true (filesystem type, block size, kernel version); F13 narrowed to host-transient errors (U1); new F14, EOPNOTSUPP from the host filesystem (host-config U2), and F15, EINTR; T4 no longer claims F13; the two open questions on unreachable errors and host filesystems are resolved by the owner decisions</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+fallocate&amp;amp;body=Discussion+for+the+%60fallocate%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ffallocate.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60fallocate%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `fallocate`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: fallocate&quot; (https://github.com/rrnewton/hermit/issues/347), legacy variant A2. It was rank 68 in the batch-2 classification sequence, which excluded the 50 syscalls already seen in batch-1 workloads.</p>
+<h3>Open questions</h3>
+<ul>
+<li>Should Detcore advance the virtual mtime (<code>touch_file</code>) after a successful size- or content-changing <code>fallocate</code>, as it does for <code>write</code> (<code>detcore/src/syscalls/files.rs:2428</code>)? Today the guest sees a stale but deterministic mtime. Fixing it needs a typed post-hook instead of the plain passthrough. <code>ftruncate</code> would raise the same question.</li>
+<li>F15: whether a passthrough <code>fallocate</code> can return <code>EINTR</code> under Hermit depends on when Detcore delivers guest signals relative to the host call. No test exercises it.</li>
+</ul>
+<h3>2026-07-24 host strace evidence</h3>
+<p>Test host: Linux 6.17.13 x86_64; strace 6.12.</p>
+<p>Ran a syscall-specific safe raw probe with deliberately inert/invalid arguments so privileged or mutating operations could not change host state:</p>
+<pre><code>strace -f -qq -e trace=fallocate -s 160 python3 -c 'import ctypes; c=ctypes.CDLL(None,use_errno=True); c.syscall(285, *([ctypes.c_long(-1)]*6))'
+</code></pre>
+<p>Actual strace output:</p>
+<pre><code>fallocate(-1, FALLOC_FL_KEEP_SIZE|FALLOC_FL_PUNCH_HOLE|FALLOC_FL_NO_HIDE_STALE|FALLOC_FL_COLLAPSE_RANGE|FALLOC_FL_ZERO_RANGE|FALLOC_FL_INSERT_RANGE|FALLOC_FL_UNSHARE_RANGE|0xffffff80, -1, -1) = -1 EBADF (Bad file descriptor)
+</code></pre>
+<p>The trace confirms the host kernel path and observed errno/result for this ABI. The determinism recommendation also accounts for documented success-path state dependencies; an invalid-argument result alone is not treated as proof of determinism.</p>
+</body></html>

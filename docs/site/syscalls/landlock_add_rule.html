@@ -1,0 +1,68 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>landlock_add_rule | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>landlock_add_rule</code> (445)</h1>
+<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_landlock_sandbox_syscall</code> &middot; linux determinism: conditional &middot; target policy: refuse &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+landlock_add_rule&amp;body=Discussion+for+the+%60landlock_add_rule%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Flandlock_add_rule.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60landlock_add_rule%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>landlock_add_rule(ruleset_fd, rule_type, rule_attr, flags)</code> adds one allow rule (a file hierarchy or a TCP port) to a Landlock ruleset created by <code>landlock_create_ruleset</code>. Detcore never forwards it to the host: at hermit f4055eb9cae4 it returns a fixed <code>ENOSYS</code> (<code>detcore/src/lib.rs:2322-2324</code>), the answer of a kernel built without Landlock.</p>
+<p>Manual reference: Linux man-pages landlock_add_rule(2); UAPI header <code>linux/landlock.h</code>.</p>
+<h2>Linux semantics</h2>
+<p>The call changes only the ruleset object behind <code>ruleset_fd</code>; nothing is enforced until <code>landlock_restrict_self</code>. A rule grants <code>allowed_access</code> rights, which must be a non-empty subset of the rights the ruleset handles, on either a file hierarchy or a TCP port. glibc has no wrapper.</p>
+<p>In current kernels the checks run in this order: Landlock availability (<code>ENOSYS</code> when not built, <code>EOPNOTSUPP</code> when built but not enabled at boot), then <code>flags</code>, then <code>ruleset_fd</code>, then the rule type and its attribute.</p>
+<p>A path-beneath rule names its hierarchy by an open descriptor (<code>parent_fd</code>, typically opened with <code>O_PATH</code>). The kernel ties the rule to that inode, so its later effect depends on which host objects the descriptor refers to, not on the path string.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>rule_type == LANDLOCK_RULE_PATH_BENEATH</code>, <code>rule_attr</code> is <code>struct landlock_path_beneath_attr { allowed_access, parent_fd }</code>: grants <code>allowed_access</code> (a subset of the ruleset's <code>handled_access_fs</code>, else <code>EINVAL</code>) on the hierarchy under <code>parent_fd</code>. <code>parent_fd</code> not open gives <code>EBADF</code>; a descriptor on an internal filesystem such as a pipe or socket gives <code>EBADFD</code>.</li>
+<li>F2: <code>rule_type == LANDLOCK_RULE_NET_PORT</code>, <code>rule_attr</code> is <code>struct landlock_net_port_attr { allowed_access, port }</code> (ABI 4): grants <code>BIND_TCP</code> and/or <code>CONNECT_TCP</code> on one port. <code>allowed_access</code> outside <code>handled_access_net</code> or a <code>port</code> above 65535 gives <code>EINVAL</code>; <code>EAFNOSUPPORT</code> when the kernel has no TCP/IP support.</li>
+<li>F3: <code>allowed_access == 0</code> for either rule type: <code>ENOMSG</code>.</li>
+<li>F4: any other <code>rule_type</code>: <code>EINVAL</code>.</li>
+<li>F5: <code>flags != 0</code>: <code>EINVAL</code> (no flags are defined).</li>
+<li>F6: <code>ruleset_fd</code> checks: not an open descriptor gives <code>EBADF</code>; a descriptor that is not a Landlock ruleset gives <code>EBADFD</code>; a ruleset descriptor without write access gives <code>EPERM</code>.</li>
+<li>F7: <code>rule_attr</code> not readable: <code>EFAULT</code>.</li>
+<li>F8: availability: <code>ENOSYS</code> on a kernel without Landlock, <code>EOPNOTSUPP</code> when Landlock is built but not enabled at boot; returned before any other check.</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: conditional</code>. For one kernel and one set of descriptors, the result is fixed: the call mutates only a private ruleset object and its errors are functions of the arguments. Across hosts it differs:</p>
+<ul>
+<li>availability (F8) depends on the kernel build and the boot LSM list. On the measurement host, measured 2026-10-03 (kernel 7.1.3, <code>CONFIG_SECURITY_LANDLOCK</code> not set), a native <code>syscall(445, -1, 1, NULL, 0)</code> returned <code>-1</code>/<code>ENOSYS</code>; on a Landlock kernel the same call returns <code>EBADF</code>;</li>
+<li>the net rule type (F2) and the valid <code>allowed_access</code> bits depend on the kernel's ABI version;</li>
+<li>a path rule binds to whatever inode <code>parent_fd</code> names on the host filesystem, so the effect after enforcement depends on host filesystem layout.</li>
+</ul>
+<p>Under Hermit the answer is a constant <code>ENOSYS</code>.</p>
+<h2>Hermit design</h2>
+<p>Target policy: <code>refuse</code>, which is what the code does at hermit f4055eb9cae4.</p>
+<ul>
+<li><code>classify_syscall</code> lists <code>landlock_add_rule</code> as Determinized (<code>detcore/src/syscall_classification.rs:465</code>), and <code>is_landlock_sandbox_syscall</code> (<code>detcore/src/syscall_classification.rs:1121-1125</code>) selects it.</li>
+<li>The arm at <code>detcore/src/lib.rs:2322-2324</code> returns <code>ENOSYS</code> before the typed match, independent of <code>panic_on_unsupported_syscalls</code> (<code>detcore/src/lib.rs:1915</code>) and without a host call. <code>is_deterministically_refused_syscall</code> includes it (<code>detcore/src/syscall_classification.rs:1327</code>), so backends that run guest syscalls outside Detcore's dispatcher apply the same refusal (comment at <code>detcore/src/syscall_classification.rs:2714-2717</code>).</li>
+<li><code>ENOSYS</code> comes before every argument check, matching a kernel without Landlock: a call with a bad <code>ruleset_fd</code> (F6), bad flags (F5) or a bad type (F4) also gets <code>ENOSYS</code>. This is consistent with <code>landlock_create_ruleset</code> also returning <code>ENOSYS</code>, so a guest can never hold a ruleset descriptor to pass here.</li>
+</ul>
+<p>Why not the alternatives: <code>passthrough</code> is unusable on its own because Hermit never lets the guest obtain a ruleset descriptor, and forwarding would expose host ABI and filesystem identity; <code>emulate</code> (accepting rules into a fake ruleset) only makes sense together with a fake <code>landlock_restrict_self</code>, which would claim a sandbox that is not enforced; <code>model</code> would require Detcore to enforce rules itself. See landlock_create_ruleset (https://github.com/rrnewton/hermit/issues/627) for the family decision.</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F6, F8): under <code>hermit run --verify</code> on ptrace, <code>landlock_add_rule(-1, LANDLOCK_RULE_PATH_BENEATH, NULL, 0)</code> returns <code>-1</code>/<code>ENOSYS</code> in both runs, and so does the same call with a valid <code>O_PATH</code> <code>parent_fd</code> and a non-ruleset <code>ruleset_fd</code> (a regular file). Existing guest: <code>tests/rust/landlock.rs:54-65</code> (cargo bin <code>rustbin_landlock</code>, <code>tests/Cargo.toml:86-89</code>), which covers only the <code>-1</code> case. At this SHA no cargo integration test and no e2e manifest program runs it (only the internal Buck glob at <code>tests/BUCK:415</code>), so it needs a ptrace runner before it can be recorded as coverage.</li>
+<li>T2 (covers F2, F3, F4, F5, F7): <code>LANDLOCK_RULE_NET_PORT</code> with <code>port = 70000</code>, <code>allowed_access = 0</code>, <code>rule_type = 99</code>, <code>flags = 1</code>, and a <code>rule_attr</code> pointing to an unmapped page: each returns <code>ENOSYS</code>, never <code>EINVAL</code>, <code>ENOMSG</code> or <code>EFAULT</code>.</li>
+<li>T3 (covers F1): after a refused path-beneath call naming a directory, the guest can still create and read files under that directory, showing that no host restriction was recorded or installed.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant B of https://github.com/rrnewton/hermit/issues/626: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch pred:is_landlock_sandbox_syscall, refused.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; refuse (detcore/src/lib.rs:2322-2324 returns a fixed ENOSYS before any argument check, matching a kernel without Landlock); linux_determinism stays conditional (availability, ABI version and host inode identity decide the native result); 8 flag behaviours and 3 tests listed; tests/rust/landlock.rs has no ptrace runner at this SHA, so no coverage token and tracking_status stays todo</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+landlock_add_rule&amp;amp;body=Discussion+for+the+%60landlock_add_rule%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Flandlock_add_rule.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60landlock_add_rule%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `landlock_add_rule`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: landlock_add_rule&quot; (https://github.com/rrnewton/hermit/issues/626), legacy variant B. The determinized ENOSYS arm carries <code>TODO-HUMAN-REVIEW(#827)</code> in the code (https://github.com/rrnewton/hermit/issues/827). Sibling bodies: landlock_create_ruleset (https://github.com/rrnewton/hermit/issues/627) and landlock_restrict_self (https://github.com/rrnewton/hermit/issues/628) share the same dispatch arm.</p>
+<h3>Notes from the P3 reading (2026-10-03)</h3>
+<ul>
+<li><code>tests/e2e/manifests/inventory/test-files.json:3593-3595</code> says <code>tests/rust/landlock.rs</code> is &quot;selected by a Rust integration test&quot;, but no file under <code>hermit-cli/tests/</code> or <code>detcore/tests/</code> names <code>rustbin_landlock</code> at f4055eb9cae4.</li>
+<li>The unit test <code>landlock_sandbox_syscalls_are_determinized_and_consistent</code> (<code>detcore/src/syscall_classification.rs:2344</code>) checks classification only and starts no Hermit run.</li>
+</ul>
+<h3>Legacy tracking note (2026-07-24)</h3>
+<p>Filed by the complete syscall-classification audit. The implementation classifies <code>PASS-THRU</code> entries under fixed-container/stable-state assumptions and routes all other entries through the explicit unsupported policy until a deterministic handler is implemented.</p>
+</body></html>

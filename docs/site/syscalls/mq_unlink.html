@@ -1,0 +1,76 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mq_unlink | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>mq_unlink</code> (241)</h1>
+<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_unsupported_async_ipc_syscall</code> &middot; linux determinism: conditional &middot; target policy: refuse &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+mq_unlink&amp;body=Discussion+for+the+%60mq_unlink%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fmq_unlink.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60mq_unlink%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>mq_unlink(name)</code> removes the name of a POSIX message queue; the queue itself is destroyed once its last descriptor is closed. Detcore refuses it with a fixed <code>ENOSYS</code> before the kernel sees it (<code>detcore/src/lib.rs:2237-2241</code>), as it refuses the whole <code>mq_*</code> family; that is what a kernel built without <code>CONFIG_POSIX_MQUEUE</code> returns.</p>
+<h2>Linux semantics</h2>
+<p>The name lives in the IPC namespace, on the internal <code>mqueue</code> filesystem. The glibc wrapper requires a leading slash and strips it; the raw syscall takes the name without it. Removing the name does not affect processes that already hold descriptors: they keep using the queue until they close it. A new <code>mq_open</code> of the same name afterwards creates or opens a different queue. Queue names persist across runs, so the outcome depends on what earlier runs and other processes left behind.</p>
+<p>The host strace under Additional information shows a nonexistent name failing with <code>EACCES</code> on that host, where <code>/dev/mqueue</code> access was restricted; on a host with an accessible <code>mqueue</code> filesystem the same call gives <code>ENOENT</code>.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>name</code> names an existing queue the caller may remove: the name is removed and the call returns 0; the queue persists until its last descriptor closes.</li>
+<li>F2: <code>name</code> does not exist: <code>ENOENT</code>.</li>
+<li>F3: the caller lacks permission to remove the name: <code>EACCES</code>.</li>
+<li>F4: name checks: <code>ENAMETOOLONG</code> for a name longer than <code>NAME_MAX</code>; <code>EFAULT</code> for a bad pointer.</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: conditional</code>, changed from the legacy <code>deterministic</code>. The call reads no clock and returns no value beyond success or an errno, so it repeats given the same IPC namespace state. That state is not under the guest's control: queue names persist across runs and can be created or removed by any process in the namespace, including processes outside the guest, and host permissions on the <code>mqueue</code> filesystem decide between <code>ENOENT</code> and <code>EACCES</code>, as the strace evidence shows. The legacy text itself conditions determinism on &quot;fixed IPC namespace state&quot;, which is what <code>conditional</code> means in this schema.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>Queue names shared with every process in the IPC namespace, and persisting across runs</li>
+<li>Host permissions on the <code>mqueue</code> filesystem</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target (owner decision 9, 6): <code>refuse</code> with a fixed <code>ENOSYS</code>, the answer of a kernel built without <code>CONFIG_POSIX_MQUEUE</code>, returned before any argument is examined, so a well-formed call and a garbage-argument call get the same <code>ENOSYS</code>. No unprivileged success case needs preserving, so decision 6's exceptions do not apply. A program that needs a message queue has to fall back to another IPC channel, such as a pipe, a Unix-domain socket or a mutex-guarded queue in shared memory; this body names no specific program that does so. Today's code already realizes the target (<code>detcore/src/lib.rs:2237-2241</code>), so no code change is needed:</p>
+<ul>
+<li><code>classify_syscall</code> lists <code>mq_unlink</code> (<code>detcore/src/syscall_classification.rs:410</code>) in the arm that returns <code>SyscallClassification::Determinized</code> (<code>detcore/src/syscall_classification.rs:688</code>).</li>
+<li><code>is_unsupported_async_ipc_syscall</code> includes it (<code>detcore/src/syscall_classification.rs:1061</code>), with the rest of the <code>mq_*</code> family (<code>detcore/src/syscall_classification.rs:1060-1065</code>).</li>
+<li>In <code>handle_syscall_event</code>, the match on the classification (<code>detcore/src/lib.rs:2028</code>) reaches the arm at <code>detcore/src/lib.rs:2237-2241</code>, which returns <code>Err(Error::Errno(Errno::ENOSYS))</code> without injecting the syscall. The host kernel never runs it, so a guest cannot remove a host queue name. The arm does not consult <code>panic_on_unsupported_syscalls</code>, so the result is the same with or without fail-closed mode.</li>
+<li><code>is_deterministically_refused_syscall</code> includes the predicate (<code>detcore/src/syscall_classification.rs:1325</code>).</li>
+</ul>
+<p>Why <code>refuse</code> and not the alternatives:</p>
+<ul>
+<li><code>mq_open</code> is refused too (<code>detcore/src/syscall_classification.rs:1060</code>), so no guest can create a queue under Hermit. The only names <code>mq_unlink</code> could reach are host queues, and removing them would let a guest change state outside its container. The predicate's doc comment (<code>detcore/src/syscall_classification.rs:1034-1047</code>) calls the legacy pass-through a container-isolation hole.</li>
+<li><code>model</code> is meaningful only together with a modelled <code>mq_open</code>, a private queue namespace and the rest of the family. Until that exists, refusing the whole family keeps it consistent.</li>
+<li><code>ENOSYS</code> matches a real kernel without <code>CONFIG_POSIX_MQUEUE</code>, so a program cleaning up queues sees a coherent configuration in which no queue call works.</li>
+</ul>
+<p>Guest-visible difference from Linux: F1-F4 all return <code>ENOSYS</code>, including the <code>ENOENT</code> and <code>EACCES</code> cases. This is the intended refusal.</p>
+<p>Existing test evidence at f4055eb9cae4: the unit test <code>representative_policies_stay_in_their_reviewed_sections</code> (<code>detcore/src/syscall_classification.rs:1899</code>) asserts, in its loop at <code>detcore/src/syscall_classification.rs:2143</code>, that <code>mq_unlink</code> classifies as Determinized and is in the predicate. It does not run a guest and does not check the errno. No e2e program or integration test calls <code>mq_unlink</code>.</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F2, F3, F4): under <code>hermit run --verify</code> on ptrace, call raw <code>syscall(SYS_mq_unlink, ...)</code> with a short valid name, a name that does not exist, a name longer than <code>NAME_MAX</code>, and a NULL pointer. Each call must return -1 with <code>errno == ENOSYS</code>, and the output must be identical across both runs.</li>
+<li>T2 (covers F1): create a queue on the host before the run (where the host allows it), run a guest that calls <code>mq_unlink</code> on its name under Hermit, and check after the run that the host queue still exists. Remove it on the host afterwards.</li>
+<li>T3 (covers none): record and replay a guest that calls <code>mq_unlink</code>; replay must produce the same <code>ENOSYS</code>.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-09-28 · hermit 81ca8822f78c · hermit2 · closed under the legacy rule (an explicit <code>classify_syscall</code> arm), not the v1 done rule; closing comment https://github.com/rrnewton/hermit/issues/303#issuecomment-5872868701</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/303: linux_determinism deterministic (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch pred:is_unsupported_async_ipc_syscall, refused.</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · reopen: under the owner rule of 2026-10-02, closed means every flag and option is covered by a named test and the implementation works; mq_unlink records no test coverage, so tracking_status is todo and https://github.com/rrnewton/hermit/issues/303 reopens.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy refuse (Detcore returns a fixed ENOSYS for every mq_* call at detcore/src/lib.rs:2237-2241, the result of a kernel without CONFIG_POSIX_MQUEUE); linux_determinism deterministic -&gt; conditional (the result depends on host-shared, run-persistent queue names and mqueue permissions); 4 behaviours and 3 tests listed; no guest-level test calls mq_unlink yet, so tracking_status stays todo</li>
+<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): decisions 9 and 6 applied (fixed ENOSYS, as without CONFIG_POSIX_MQUEUE, before any argument check, already realized at detcore/src/lib.rs:2237-2241); target_policy stays refuse; no new F/T ids; no questions removed</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+mq_unlink&amp;amp;body=Discussion+for+the+%60mq_unlink%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fmq_unlink.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60mq_unlink%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `mq_unlink`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: mq_unlink&quot; (https://github.com/rrnewton/hermit/issues/303), legacy variant A1.</p>
+<p>Comment history: 1 comment(s) on https://github.com/rrnewton/hermit/issues/303.</p>
+<p>The 2026-07-24 evidence below says Hermit routed <code>mq_unlink</code> through a temporary pass-through block. That was true then; at f4055eb9cae4 the call is refused with <code>ENOSYS</code> (see Hermit design).</p>
+<h3>2026-07-24 host strace evidence</h3>
+<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) by tracing a direct <code>syscall()</code> harness and common programs with <code>strace -f -e trace=mq_unlink</code>, and by confirming hermit currently routes <code>mq_unlink</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code> (the harness ran end-to-end under <code>hermit run</code>, exit 0, so passthrough does not crash).</p>
+<p>Observed strace line:</p>
+<pre><code>mq_unlink(&quot;/nonexist-q-xyz&quot;)    = -1 EACCES (Permission denied)
+</code></pre>
+<hr>
+<p>*Autonomous syscall-classification sweep, batch 3 (ranks 101-150 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
+<h3>Legacy closure</h3>
+<p>Closed 2026-09-28 by the 2026-09-28 sweep, which closed issues whose syscall had an explicit <code>classify_syscall</code> arm. Closing comment: https://github.com/rrnewton/hermit/issues/303#issuecomment-5872868701</p>
+</body></html>

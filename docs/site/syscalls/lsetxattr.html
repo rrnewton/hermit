@@ -1,0 +1,81 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lsetxattr | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>lsetxattr</code> (189)</h1>
+<p>Strategy: <strong>passthrough</strong> &middot; dispatch: <code>passthrough</code> &middot; linux determinism: conditional &middot; target policy: passthrough &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+lsetxattr&amp;body=Discussion+for+the+%60lsetxattr%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Flsetxattr.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60lsetxattr%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>lsetxattr(path, name, value, size, flags)</code> is <code>setxattr</code> without following a symlink in the last path component: when <code>path</code> names a symlink, the attribute is set on the link itself. Hermit forwards it to the host kernel unchanged, with the container filesystem as the attribute store; Detcore keeps no xattr state.</p>
+<h2>Linux semantics</h2>
+<p>Identical to <code>setxattr(2)</code> except for path resolution: symlinks in earlier components are followed, the last component is not. That matters most for the <code>user.</code> namespace, which Linux allows only on regular files and directories: <code>lsetxattr</code> of a <code>user.*</code> name on any symlink, dangling or not, fails with <code>EPERM</code> (host probe). Namespaces that can label symlinks are <code>security.</code> (LSM labels) and <code>trusted.</code> (with privilege). When <code>path</code> does not end in a symlink, the call behaves exactly like <code>setxattr</code>. On success it returns 0 and changes the target inode's ctime. Namespace support and value limits depend on the filesystem type and mount options.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>flags = 0</code>: create the attribute if absent, replace its value if present</li>
+<li>F2: <code>XATTR_CREATE</code> (1): <code>EEXIST</code> if the attribute already exists</li>
+<li>F3: <code>XATTR_REPLACE</code> (2): <code>ENODATA</code> if the attribute does not exist</li>
+<li>F4: <code>XATTR_CREATE | XATTR_REPLACE</code> (3) always fails (<code>EEXIST</code> or <code>ENODATA</code>); any other bit in <code>flags</code>: <code>EINVAL</code></li>
+<li>F5: the last component is a symlink: the link itself is the target. A <code>user.*</code> name gives <code>EPERM</code> on a symlink, whether it points anywhere or not (host probe). <code>trusted.*</code> gives <code>EPERM</code> without <code>CAP_SYS_ADMIN</code> in the initial user namespace (host probe, on a symlink). <code>security.*</code> on a link is decided by the LSM.</li>
+<li>F6: the last component is not a symlink: same result as <code>setxattr</code>, including <code>user.*</code> succeeding on a regular file (host probe)</li>
+<li>F7: namespace from the name prefix on a non-symlink target: <code>user.</code> (regular files and directories only, sticky-directory owner rule), <code>trusted.</code> (<code>CAP_SYS_ADMIN</code>), <code>security.</code> (LSM or capability rules), <code>system.</code> (POSIX ACLs; an unknown <code>system.</code> name gives <code>EOPNOTSUPP</code>); no recognised prefix: <code>EOPNOTSUPP</code>. Setting <code>system.posix_acl_access</code> also rewrites the mode's permission bits.</li>
+<li>F8: <code>name</code> empty or longer than 255 bytes: <code>ERANGE</code>; a bare prefix such as <code>user.</code>: <code>EINVAL</code></li>
+<li>F9: <code>size = 0</code> stores an empty value; <code>size &gt; 65536</code>: <code>E2BIG</code>; a smaller filesystem limit gives <code>ENOSPC</code> or <code>E2BIG</code>; no space or quota: <code>ENOSPC</code> or <code>EDQUOT</code></li>
+<li>F10: resolution of the earlier components: <code>ENOENT</code> for a missing path, <code>ENOTDIR</code>, <code>ENAMETOOLONG</code>, <code>ELOOP</code>, and <code>EACCES</code> without search permission</li>
+<li>F11: permission on the target inode: write access required (<code>EACCES</code>), immutable or append-only inode <code>EPERM</code>, read-only mount <code>EROFS</code></li>
+<li>F12: the filesystem does not support extended attributes or this namespace: <code>EOPNOTSUPP</code></li>
+<li>F13: <code>path</code>, <code>name</code> or <code>value</code> points outside the address space: <code>EFAULT</code></li>
+<li>F14: side effects on success: the target inode's ctime changes, an <code>IN_ATTRIB</code> inotify event is generated, and the value persists in the filesystem</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p>As for <code>setxattr</code>, the result is a function of the path, the name, the value, <code>flags</code>, the credentials, and the filesystem's xattr support and limits. It repeats under fixed credentials and a stable, isolated filesystem state with the same filesystem type and mount options. Hermit runs threads one at a time, so racing guest writers get a fixed order. The extra symlink rule (F5) is a fixed kernel rule and adds no nondeterminism. The call is <code>conditional</code> because F7, F9, F11 and F12 change with the host's filesystem, mount options and security policy.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>Filesystem type and mount options (namespace support, value limits, ACL support, read-only mounts).</li>
+<li>Security modules and their policy, which decide <code>security.*</code> on symlinks (F5, F7).</li>
+<li>Credentials, including the privilege of the guest's root inside Hermit's user namespace (<code>trusted.*</code>, F11).</li>
+<li>Free space and quota.</li>
+<li>Changes made outside the container, including a host process replacing the symlink between the guest's calls.</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>passthrough</code>. The code already does this at hermit f4055eb9cae4. <code>lsetxattr</code> is classified <code>PassThrough</code> at <code>detcore/src/syscall_classification.rs:793</code>, in the block that opens at <code>detcore/src/syscall_classification.rs:690</code> and ends at <code>detcore/src/syscall_classification.rs:804</code>, under the group comment at <code>detcore/src/syscall_classification.rs:767</code> (&quot;Stable guest-owned metadata and synchronous writeback operations are repeatable in Hermit's fixed mount namespace and filesystem image.&quot;). The census lists it in <code>PASSTHROUGH_SYSCALLS</code> at <code>detcore/src/syscall_classification.rs:1718</code>, and <code>representative_policies_stay_in_their_reviewed_sections</code> (<code>detcore/src/syscall_classification.rs:1899</code>) asserts the classification at <code>detcore/src/syscall_classification.rs:2094</code>. The generic arm at <code>detcore/src/lib.rs:2843</code> sends it to <code>Detcore::passthrough</code> (<code>detcore/src/lib.rs:367</code>), which forwards it unchanged.</p>
+<p>Why passthrough: Hermit has no virtual filesystem, and every one of the twelve path, symlink and fd xattr syscalls is passed through (<code>setxattr</code>/<code>getxattr</code> at <code>detcore/src/syscall_classification.rs:739</code> to <code>detcore/src/syscall_classification.rs:742</code>, the <code>f</code> and <code>l</code> variants between <code>detcore/src/syscall_classification.rs:777</code> and <code>detcore/src/syscall_classification.rs:793</code>). Modelling the symlink variant alone would make it disagree with <code>lgetxattr</code> and <code>llistxattr</code>. The kernel already applies the symlink rule (F5) the same way on every run.</p>
+<p>Run mode subscribes every syscall (<code>Subscription::all_syscalls()</code> at <code>detcore/src/lib.rs:1094</code>). Code facts show <code>subscribed_record_replay: false</code>: under <code>--passthru-opt</code>, which the comment at <code>detcore/src/lib.rs:3140</code> says <code>hermit record</code> and <code>hermit replay</code> turn on, the call never reaches Detcore and runs directly against the replay host's filesystem.</p>
+<p>Existing evidence: <code>tests/c/syscall_file_metadata.c:195</code> calls glibc <code>lsetxattr(symlink_path, &quot;user.hermit&quot;, ...)</code> on a symlink to a regular file. By F5 that always returns <code>EPERM</code>, which the program accepts (<code>tests/c/syscall_file_metadata.c:37</code>); <code>must_exist</code> is then 0 and the follow-up <code>lgetxattr</code>, <code>llistxattr</code> and <code>lremovexattr</code> checks accept failure too. So the program, run on ptrace under <code>run --strict --verify</code> by <code>hermit-cli/tests/syscall_file_metadata.rs:51</code> and by the cell <code>c-programs/syscall-file-metadata</code> (<code>tests/e2e/manifests/c-programs.yaml:9275</code>), exercises only the <code>EPERM</code> path of F5 and requires only that it repeats. verification on the default backend stays untested: no test names <code>SYS_lsetxattr</code> or asserts a specific result.</p>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F2, F3, F4, F6): on a regular file reached by a path with no trailing symlink, call raw <code>syscall(SYS_lsetxattr, ...)</code> with <code>flags = 0</code>, <code>XATTR_CREATE</code>, <code>XATTR_REPLACE</code>, <code>3</code> and <code>4</code>, and assert 0/<code>EEXIST</code>/<code>ENODATA</code>/<code>EINVAL</code> as listed, reading each value back with <code>lgetxattr</code>.</li>
+<li>T2 (covers F5): on a symlink to a regular file and on a dangling symlink, assert <code>EPERM</code> for <code>user.k</code> and for <code>trusted.k</code> (record what the ptrace guest's root gets), and assert that the target file gained no attribute. Existing partial coverage of the <code>user.*</code> case through glibc: <code>tests/c/syscall_file_metadata.c:195</code>, which accepts the <code>EPERM</code> without asserting it.</li>
+<li>T3 (covers F7, F12): on a regular file, assert success for <code>user.k</code>, <code>EOPNOTSUPP</code> for <code>noprefix</code> and <code>system.bogus</code>, and <code>EOPNOTSUPP</code> for a file under <code>/proc</code>.</li>
+<li>T4 (covers F8, F9): assert <code>ERANGE</code> for an empty and a 256-byte name, <code>EINVAL</code> for <code>user.</code>, an empty value stored with <code>size = 0</code>, and <code>E2BIG</code> for <code>size = 65537</code>.</li>
+<li>T5 (covers F10, F13): assert <code>ENOENT</code>, <code>ENOTDIR</code>, <code>ELOOP</code> (a loop in an earlier component) and <code>ENAMETOOLONG</code>, and <code>EFAULT</code> for <code>path</code>, <code>name</code> or <code>value</code> set to <code>(void *)1</code>.</li>
+<li>T6 (covers F11): assert <code>EACCES</code> on a mode-000 regular file owned by the guest and <code>EROFS</code> under a read-only mount the guest can see.</li>
+<li>T7 (covers F14): assert an inotify <code>IN_ATTRIB</code> event after a successful call on a regular file, and that <code>st_ctime</code> before and after matches across the two runs of <code>hermit run --verify</code> on ptrace.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant B of https://github.com/rrnewton/hermit/issues/637: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy PASS-THRU; code at this SHA: passthrough, dispatch passthrough.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: kept conditional/passthrough (forwarded at detcore/src/lib.rs:2843, consistent with the other eleven xattr calls); listed 14 flag behaviours and 7 tests; noted that tests/c/syscall_file_metadata.c:195 only reaches the user.* EPERM path on a symlink, so ptrace_verification stays untested and tracking_status stays todo</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+lsetxattr&amp;amp;body=Discussion+for+the+%60lsetxattr%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Flsetxattr.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60lsetxattr%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `lsetxattr`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: lsetxattr&quot; (https://github.com/rrnewton/hermit/issues/637), legacy variant B. Comment history stays on that issue.</p>
+<p>The legacy Summary (&quot;Audit the x86_64 <code>lsetxattr(2)</code> syscall and replace its temporary catch-all policy with an explicit Detcore classification&quot;) is superseded: the classification is explicit at <code>detcore/src/syscall_classification.rs:793</code>.</p>
+<p>Open questions:</p>
+<ul>
+<li>F11: an <code>EPERM</code> from an immutable inode needs <code>CAP_LINUX_IMMUTABLE</code>, which the ptrace CI lane may not have. The owner decides whether an unreachable host error must be covered before <code>done</code>.</li>
+</ul>
+<h3>2026-10-03 host probe (syscall-tracking-p3)</h3>
+<p>Raw <code>syscall(189, ...)</code> through Python <code>ctypes</code> on this host (Linux 7.1.3, unprivileged uid, btrfs). Not run under Hermit.</p>
+<pre><code>lsetxattr user.k on symlink           -&gt; -1 EPERM
+lsetxattr user.k on regular file      -&gt; 0
+lsetxattr dangling symlink (user.k)   -&gt; -1 EPERM
+lsetxattr trusted.k on symlink        -&gt; -1 EPERM
+</code></pre>
+<h3>Legacy tracking note (2026-07-24)</h3>
+<p>Filed by the complete syscall-classification audit. The implementation classifies <code>PASS-THRU</code> entries under fixed-container/stable-state assumptions and routes all other entries through the explicit unsupported policy until a deterministic handler is implemented.</p>
+</body></html>

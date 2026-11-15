@@ -1,0 +1,79 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>map_shadow_stack | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>map_shadow_stack</code> (453)</h1>
+<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_optional_memory_feature_syscall</code> &middot; linux determinism: conditional &middot; target policy: refuse &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+map_shadow_stack&amp;body=Discussion+for+the+%60map_shadow_stack%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fmap_shadow_stack.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60map_shadow_stack%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Summary</h2>
+<p><code>map_shadow_stack(addr, size, flags)</code> maps a new shadow stack for x86 CET (Control-flow Enforcement Technology) user shadow stacks and returns its address; glibc uses it for user-created contexts when shadow stacks are enabled. Hermit refuses it: Detcore returns <code>ENOSYS</code> for every argument without consulting the host (<code>detcore/src/lib.rs:2343-2347</code> at hermit f4055eb9cae4), consistent with its <code>arch_prctl</code> policy that keeps shadow stacks disabled.</p>
+<h2>Linux semantics</h2>
+<p>Added in Linux 6.6, x86 only, and present only in kernels built with <code>CONFIG_X86_USER_SHADOW_STACK</code>. The 2026-07-24 trace under Additional information (Linux 6.17) shows <code>ENOSYS</code>, and the current measurement host (Linux 7.1.3) is built with <code># CONFIG_X86_USER_SHADOW_STACK is not set</code> in <code>/boot/config-7.1.3-0_fbk0_0_g295ad0959f34</code>.</p>
+<p>On a kernel that has the feature, the checks run in this order: the CPU must support user shadow stacks (<code>EOPNOTSUPP</code> otherwise), then the flags, then the token size, then the address, then size overflow. The mapping is then created like a private anonymous <code>mmap</code> above 4 GiB, with shadow-stack page protections, so ordinary stores cannot write it. The call does not require the calling thread to have shadow stacks enabled.</p>
+<h3>Flags and options</h3>
+<ul>
+<li>F1: <code>addr == 0</code>: the kernel chooses the placement, above 4 GiB, and returns the address.</li>
+<li>F2: <code>addr != 0</code>: the mapping is placed exactly at <code>addr</code> without replacing anything (<code>MAP_FIXED_NOREPLACE</code> semantics): an occupied range fails with <code>EEXIST</code>, and a nonzero <code>addr</code> below 4 GiB fails with <code>ERANGE</code>.</li>
+<li>F3: <code>size</code>: rounded up to a page multiple; a <code>size</code> whose rounding overflows fails with <code>EOVERFLOW</code>.</li>
+<li>F4: <code>SHADOW_STACK_SET_TOKEN</code>: write a restore token at the top of the new shadow stack, so a thread can switch to it with <code>RSTORSSP</code>. With this flag, <code>size &lt; 8</code> fails with <code>ENOSPC</code>.</li>
+<li>F5: any other bit in <code>flags</code>: <code>EINVAL</code>. On x86_64 only <code>SHADOW_STACK_SET_TOKEN</code> is accepted.</li>
+<li>F6: availability: <code>ENOSYS</code> on kernels before 6.6 or built without <code>CONFIG_X86_USER_SHADOW_STACK</code>; <code>EOPNOTSUPP</code> on a kernel that has the code when the CPU lacks user shadow stacks or they are disabled at boot. The availability check runs before every other check.</li>
+</ul>
+<h2>Determinism analysis</h2>
+<p><code>linux_determinism: conditional</code>, kept from the legacy classification.</p>
+<h3>Nondeterminism sources</h3>
+<ul>
+<li>The returned address (F1) comes from the host's mmap layout, which address-space randomization and earlier mappings change from run to run, as for <code>mmap</code>.</li>
+<li>Availability (F6) depends on the host CPU, the kernel configuration and boot parameters, and the error differs: <code>ENOSYS</code> or <code>EOPNOTSUPP</code>.</li>
+<li>With a fixed <code>addr</code> (F2), success depends on what is already mapped there.</li>
+<li>The call repeats on one host when the address space layout repeats and the CPU and kernel support stay the same.</li>
+</ul>
+<h2>Hermit design</h2>
+<p>Target policy: <code>refuse</code>. The code at hermit f4055eb9cae4 already realizes it:</p>
+<ul>
+<li><code>classify_syscall</code> (<code>detcore/src/syscall_classification.rs:52</code>) lists <code>Sysno::map_shadow_stack</code> among the Determinized calls (<code>detcore/src/syscall_classification.rs:543</code>), under the comment tag <code>TODO-HUMAN-REVIEW(PR-839)</code>, which says a fixed <code>ENOSYS</code> keeps guest behaviour host-independent and lets callers use their portable fallbacks.</li>
+<li><code>is_optional_memory_feature_syscall</code> (<code>detcore/src/syscall_classification.rs:1263</code>) selects it; its doc comment says <code>map_shadow_stack</code> &quot;depends on CET support&quot;.</li>
+<li>The dispatch arm in <code>handle_syscall_event</code> (<code>detcore/src/lib.rs:2343-2347</code>) returns <code>Err(Error::Errno(Errno::ENOSYS))</code> for that predicate, before the typed match and without a condition on fail-closed mode. No mapping is created.</li>
+<li>The predicate is one term of <code>is_deterministically_refused_syscall</code> (<code>detcore/src/syscall_classification.rs:1319</code>, term at <code>detcore/src/syscall_classification.rs:1333</code>), which is why the code facts show <code>refused: true</code>.</li>
+<li>The refusal is consistent with <code>arch_prctl</code>. The handler keeps shadow stacks disabled in its virtual policy (comment at <code>detcore/src/syscalls/misc.rs:343</code>): <code>ARCH_SHSTK_STATUS</code> reports 0 (<code>detcore/src/syscalls/misc.rs:345</code>), disabling a valid feature set is an idempotent success (<code>detcore/src/syscalls/misc.rs:348</code>), and <code>ARCH_SHSTK_ENABLE</code>, <code>ARCH_SHSTK_LOCK</code> and <code>ARCH_SHSTK_UNLOCK</code> fail with <code>EINVAL</code> (<code>detcore/src/syscalls/misc.rs:353-356</code>). A guest therefore sees one coherent machine without user shadow stacks.</li>
+</ul>
+<p>Every behaviour (F1-F6) collapses into the <code>ENOSYS</code> outcome of F6. On a host whose kernel has the feature but whose CPU lacks it, Linux returns <code>EOPNOTSUPP</code> where Hermit returns <code>ENOSYS</code>. Both mean &quot;unavailable&quot;; Hermit picks the result of a kernel without the code, which is the same on every host.</p>
+<p>Why <code>refuse</code> and not the alternatives:</p>
+<ul>
+<li><code>model</code> would require Hermit to support CET shadow stacks end to end: enabling them through <code>arch_prctl</code>, placing the new mapping through Detcore's deterministic address-space handling, and making sure every backend preserves shadow-stack semantics across signals and context switches. The <code>arch_prctl</code> policy above deliberately does not offer that, so a shadow stack mapped by this call could never be used.</li>
+<li><code>passthrough</code> would let host CPU and kernel support leak into the guest (see Determinism analysis), and the returned address would bypass Detcore's placement.</li>
+</ul>
+<h2>Recommended tests</h2>
+<ul>
+<li>T1 (covers F1, F6): <code>syscall(SYS_map_shadow_stack, 0, 4096, 0)</code> returns <code>-1</code> with <code>errno == ENOSYS</code> under <code>hermit run --strict --verify --panic-on-unsupported-syscalls</code> on ptrace, and the verify run reports determinism. Existing candidates: <code>tests/c/map_shadow_stack_enosys.c</code> (cell <code>c-programs/map-shadow-stack-enosys</code>, <code>tests/e2e/manifests/c-programs.yaml:3391</code>, verify with <code>ci</code> true on ptrace) and <code>optional_memory_features_fall_back_deterministically</code> at <code>hermit-cli/tests/optional_memory_features.rs:30</code>, which runs it with <code>--backend=ptrace</code> (<code>hermit-cli/tests/optional_memory_features.rs:68</code>). Both use only <code>(0, 4096, 0)</code>.</li>
+<li>T2 (covers F2, F3, F4, F5): each of these returns <code>ENOSYS</code>, never <code>EEXIST</code>, <code>ERANGE</code>, <code>EOVERFLOW</code>, <code>ENOSPC</code> or <code>EINVAL</code>: a fixed <code>addr</code> above 4 GiB, a fixed <code>addr</code> below 4 GiB, <code>size == ~0UL</code>, <code>SHADOW_STACK_SET_TOKEN</code> with <code>size == 4096</code> and with <code>size == 4</code>, and <code>flags == 0x2</code>. After the calls, an <code>mmap</code> with <code>MAP_FIXED_NOREPLACE</code> at the fixed <code>addr</code> still succeeds, which shows no mapping was created.</li>
+<li>T3 (covers F6): in the same guest, <code>arch_prctl(ARCH_SHSTK_STATUS)</code> writes 0 and <code>arch_prctl(ARCH_SHSTK_ENABLE, ARCH_SHSTK_SHSTK)</code> fails with <code>EINVAL</code>, so a CET-aware runtime sees shadow stacks off consistently with T1.</li>
+</ul>
+<h2>Done criteria</h2>
+<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<h2>Status</h2>
+<ul>
+<li>2026-09-28 · hermit 81ca8822f78c · hermit2 · closed under the legacy rule (an explicit <code>classify_syscall</code> arm), not the v1 done rule; closing comment https://github.com/rrnewton/hermit/issues/280#issuecomment-5872817447</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/280: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy NEEDS-INVESTIGATION; code at this SHA: determinized, dispatch pred:is_optional_memory_feature_syscall, refused.</li>
+<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · reopen: under the owner rule of 2026-10-02, closed means every flag and option is covered by a named test and the implementation works; map_shadow_stack records no test coverage, so tracking_status is todo and https://github.com/rrnewton/hermit/issues/280 reopens.</li>
+<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; refuse (Detcore returns ENOSYS for every argument at detcore/src/lib.rs:2343-2347, consistent with the arch_prctl policy that keeps shadow stacks disabled at detcore/src/syscalls/misc.rs:343-356); linux_determinism stays conditional; 6 flag behaviours and 3 tests listed; existing ptrace tests cover (0, 4096, 0) only and no coverage token is recorded, so tracking_status stays todo</li>
+<li>2026-10-05 · hermit f4055eb9cae4 · syscall-tracking-2 · covered: T1 covered by hermit-cli/tests/optional_memory_features.rs (C08 review of the 2026-10-04 coverage proposals; guest source read at this SHA, not run by this agent)</li>
+</ul>
+<ul>
+<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+map_shadow_stack&amp;amp;body=Discussion+for+the+%60map_shadow_stack%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fmap_shadow_stack.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60map_shadow_stack%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `map_shadow_stack`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Additional information</h2>
+<p>Originally filed 2026-07-24 as &quot;Syscall classification: map_shadow_stack&quot; (https://github.com/rrnewton/hermit/issues/280), legacy variant A1.</p>
+<p>Comment history: 1 comment(s) on https://github.com/rrnewton/hermit/issues/280.</p>
+<h3>2026-07-24 host strace evidence</h3>
+<p>The routing described in this subsection is historical. At hermit f4055eb9cae4 the call no longer passes through; Detcore refuses it with <code>ENOSYS</code> (see Hermit design).</p>
+<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) by tracing a direct <code>syscall()</code> harness and common programs with <code>strace -f -e trace=map_shadow_stack</code>, and by confirming hermit currently routes <code>map_shadow_stack</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code> (the harness ran end-to-end under <code>hermit run</code>, exit 0, so passthrough does not crash).</p>
+<p>Observed strace line:</p>
+<pre><code>map_shadow_stack(NULL, 4096, 0) = -1 ENOSYS (Function not implemented)
+</code></pre>
+<hr>
+<p>*Autonomous syscall-classification sweep, batch 3 (ranks 101-150 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
+<h3>Legacy closure</h3>
+<p>Closed 2026-09-28 by the 2026-09-28 sweep, which closed issues whose syscall had an explicit <code>classify_syscall</code> arm. Closing comment: https://github.com/rrnewton/hermit/issues/280#issuecomment-5872817447</p>
+</body></html>
