@@ -165,10 +165,15 @@ pub fn validate_source_sha(sha: &str) -> Result<(), String> {
 /// override both. A root with no `.git` at or above it (an RE worker's input
 /// tree, whether or not git is installed there) is accepted, and so is a
 /// snapshot extracted inside a checkout but not tracked by it
-/// (ci/buck-e2e/staged/src). Inside a checkout, a git that cannot answer
-/// (a corrupt index, an unusable `.git`, no git to run) is refused: the files
-/// might be tracked. The search for `.git` starts from the resolved root, so
-/// a symlink to tracked files is looked up where the files are.
+/// (ci/buck-e2e/staged/src). Git, not that lexical `.git` walk, is the
+/// authority on being inside a checkout: the walk can find an enclosing
+/// `.git` across a filesystem boundary Git's discovery will not cross (an
+/// EdenFS staged snapshot under a checkout), where Git answers that this is
+/// not a git repository, and that is accepted as not-in-Git too. Inside a
+/// checkout Git did discover, a git that cannot answer (a corrupt index, no
+/// git to run) is refused: the files might be tracked. The search for `.git`
+/// starts from the resolved root, so a symlink to tracked files is looked up
+/// where the files are.
 ///
 /// The SHA cannot stand in for this check: it is the claim being checked, and
 /// nothing in it says whether an enclosing checkout tracks the root.
@@ -204,6 +209,11 @@ fn validate_source_snapshot_with(root: &Path, sha: &str, git: &Path) -> Result<(
     match tracked {
         // `--error-unmatch` exits 1 when Git tracks nothing under the path.
         Ok(output) if output.status.code() == Some(1) => Ok(()),
+        // Git's discovery stopped before the enclosing `.git` the lexical
+        // walk found (a filesystem boundary it will not cross), so Git
+        // tracks nothing here: the same not-in-Git answer as no `.git`
+        // ancestor. A 128 for any other reason falls through to refusal.
+        Ok(output) if git_reports_not_a_repository(&output) => Ok(()),
         Ok(output) if output.status.success() => Err(format!(
             "--source-sha names the commit of a Git-less `git archive` snapshot, but Git \
              tracks files under {}, and Git reports their commit and whether they are dirty; \
@@ -225,6 +235,17 @@ fn validate_source_snapshot_with(root: &Path, sha: &str, git: &Path) -> Result<(
             root.display()
         )),
     }
+}
+
+/// Whether a failed `git ls-files` failed only because Git found no
+/// repository at all: exit 128 with its "not a git repository" message
+/// (including the "Stopping at filesystem boundary" form). Other 128s, such
+/// as a corrupt index in a repository Git did discover, do not say this.
+fn git_reports_not_a_repository(output: &std::process::Output) -> bool {
+    output.status.code() == Some(128)
+        && String::from_utf8_lossy(&output.stderr)
+            .to_ascii_lowercase()
+            .contains("not a git repository")
 }
 
 /// The git that [`validate_source_snapshot`] asks whether a snapshot's files
@@ -12098,6 +12119,52 @@ mod tests {
         assert_eq!(accepted, Ok(()));
         assert!(refused.unwrap_err().contains("Git tracks files under"));
         assert!(absent.unwrap_err().contains("git cannot run"));
+    }
+
+    /// Git is the authority on being inside a checkout, not the lexical
+    /// `.git` walk: that walk can find an enclosing `.git` across a
+    /// filesystem boundary Git's discovery will not cross (an EdenFS staged
+    /// snapshot), where `ls-files` exits 128 saying this is not a git
+    /// repository. That answer is accepted as not-in-Git, while a 128 for
+    /// any other reason (a corrupt index in a discovered repository) is
+    /// still refused.
+    #[test]
+    fn a_snapshot_is_accepted_when_git_says_not_a_repository() {
+        let base = std::env::temp_dir().join(format!("runner-not-a-repo-{}", std::process::id()));
+        let checkout = base.join("checkout");
+        let snapshot = checkout.join("snapshot");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::create_dir_all(checkout.join(".git")).unwrap();
+        let says = |name: &str, stderr: &str| {
+            let path = base.join(name);
+            crate::exec_safe_fs::write_executable(
+                &path,
+                format!("#!/bin/sh\nprintf '%s\\n' '{stderr}' >&2\nexit 128\n"),
+                0o755,
+            )
+            .unwrap();
+            path
+        };
+        let not_a_repo = says(
+            "not-a-repo-git",
+            "fatal: not a git repository (or any parent up to mount point /) \
+             Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).",
+        );
+        let broken = says(
+            "broken-git",
+            "fatal: .git/index: index file smaller than expected",
+        );
+        let sha = "03bbb83581fad247251df6363f50e61e24c2957e";
+        let accepted = validate_source_snapshot_with(&snapshot, sha, &not_a_repo);
+        let refused = validate_source_snapshot_with(&snapshot, sha, &broken);
+        fs::remove_dir_all(&base).unwrap();
+        assert_eq!(accepted, Ok(()));
+        let error = refused.unwrap_err();
+        assert!(
+            error.contains("`git ls-files` there failed")
+                && error.contains("whether Git tracks its files is unknown"),
+            "{error}"
+        );
     }
 
     #[test]
