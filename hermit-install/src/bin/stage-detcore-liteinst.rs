@@ -45,7 +45,8 @@ fn close<T>(result: proof::Result<T>, closing: proof::Result<()>) -> proof::Resu
 
 /// One finalizer invocation: either a Cargo mode (`--git` / `--source-copy`,
 /// optionally staging byte-identical `--prebuilt` output) or the `--buck`
-/// mode that qualifies a supplied Buck `.so` directly. The modes never mix:
+/// plumbing mode for a supplied Buck `.so`, which validates its explicit
+/// inputs and refuses by name, qualifying nothing yet. The modes never mix:
 /// the byte-identity gate belongs to `--prebuilt` Cargo mode only, and Buck
 /// mode never runs a Cargo build.
 #[derive(Debug, PartialEq)]
@@ -81,10 +82,18 @@ struct BuckArgs {
 
 /// Buck literals pinned with exact equality by the verifier's Buck arm in
 /// `ci/verify-packaged-detcore.py`. The finalizer refuses any other spelling
-/// rather than emitting a receipt its own reader would reject.
-const BUCK_TARGET: &str = "//hermetic_infra/hermit:detcore-liteinst[cdylib]";
+/// rather than emitting a receipt its own reader would reject. The target
+/// is the profiled `detcore-liteinst-liteinst-runtime` alias at its
+/// `[cdylib]` output; the constraints, sorted, are the runtime target's
+/// declared cpu/os compatibility plus that alias's opt build-mode
+/// constraint (`fb-only/liteinst-runtime-profile.bzl`).
+const BUCK_TARGET: &str = "//hermetic_infra/hermit:detcore-liteinst-liteinst-runtime[cdylib]";
 const BUCK_PLATFORM: &str = "ovr_config//platform/linux:x86_64-fbcode";
-const BUCK_CONSTRAINTS: [&str; 2] = ["ovr_config//cpu:x86_64", "ovr_config//os:linux"];
+const BUCK_CONSTRAINTS: [&str; 3] = [
+    "ovr_config//build_mode/constraints:opt",
+    "ovr_config//cpu:x86_64",
+    "ovr_config//os:linux",
+];
 /// The reviewed Buck `liteinst-runtime` flag set: release opt 3 with debug
 /// assertions and overflow checks on, and no `-Clto` at all (matching the
 /// Cargo profile's `lto = false`, which also passes no flag).
@@ -114,6 +123,12 @@ fn parse_args(args: &[String]) -> proof::Result<Mode> {
         .next()
         .ok_or("expected --git, --source-copy or --buck")?
         .clone();
+    // The mode is judged before the target is consumed, so a misspelled
+    // mode reports itself rather than a missing target.
+    require(
+        matches!(authority.as_str(), "--git" | "--source-copy" | "--buck"),
+        "expected --git, --source-copy or --buck",
+    )?;
     let target = args
         .next()
         .ok_or("expected existing target directory")?
@@ -268,8 +283,46 @@ fn validate_buck_args(args: &BuckArgs) -> proof::Result<()> {
     Ok(())
 }
 
+/// The `LITEINST_RUNTIME_RUSTC_FLAGS` string list a profile `.bzl` actually
+/// defines: the quoted literals of its first `[...]` list after that name.
+/// Anything else — no such definition, or a list this cannot read — refuses
+/// by name rather than trusting the file's name alone.
+fn profile_bzl_flags(contents: &str) -> proof::Result<Vec<String>> {
+    let missing = "--profile-bzl does not define LITEINST_RUNTIME_RUSTC_FLAGS";
+    let after_name = contents
+        .split_once("LITEINST_RUNTIME_RUSTC_FLAGS")
+        .ok_or(missing)?
+        .1;
+    let list = after_name
+        .split_once('[')
+        .ok_or(missing)?
+        .1
+        .split_once(']')
+        .ok_or(missing)?
+        .0;
+    let mut flags = Vec::new();
+    let mut rest = list;
+    while let Some((_, after_quote)) = rest.split_once('"') {
+        let (flag, tail) = after_quote.split_once('"').ok_or(missing)?;
+        flags.push(flag.to_owned());
+        rest = tail;
+    }
+    Ok(flags)
+}
+
+/// The supplied profile must define exactly the pinned flag list, in order.
+fn validate_profile_bzl(contents: &str) -> proof::Result<()> {
+    let flags = profile_bzl_flags(contents)?;
+    require(
+        flags.iter().map(String::as_str).collect::<Vec<_>>() == BUCK_RUSTC_FLAGS,
+        "--profile-bzl LITEINST_RUNTIME_RUSTC_FLAGS do not match the pinned \
+         liteinst-runtime flags",
+    )
+}
+
 fn buck_argv() -> Vec<String> {
     vec![
+        "buck2".into(),
         "build".into(),
         BUCK_TARGET.into(),
         "--target-platforms".into(),
@@ -297,45 +350,61 @@ fn buck_artifact(package: serde_json::Value, reported_path: &Path) -> serde_json
     })
 }
 
-/// The `builder=buck2` receipt body, before publication adds `installed`,
-/// `source_close_completed` and the executed `commands` (the qualifier's
-/// readelf/objdump runs). It carries no `cargo_*` key and synthesizes no
-/// Cargo value; `profile_inputs` is the profile `.bzl` identity, which is
-/// also the Buck compiled-sources manifest slot, and `rustc_version` is the
-/// ELF `.comment` identity read at qualification time.
+/// The produced sections of the `builder=buck2` receipt: the qualification
+/// evidence plus the publication outcome (the installed identity and the
+/// executed `commands` — the `buck2` producer run and the qualifier's
+/// readelf/objdump runs, which the verifier binds exactly).
 #[allow(dead_code)] // Wired by run_buck at the Reverie pin bump; unit-tested now.
-fn buck_receipt(
-    args: &BuckArgs,
+struct BuckReceiptSections {
     profile_inputs: serde_json::Value,
     artifact: serde_json::Value,
     qualifier_source: serde_json::Value,
     compiled_sources: serde_json::Value,
     qualification: serde_json::Value,
+    installed: serde_json::Value,
+    commands: serde_json::Value,
+}
+
+/// The complete `builder=buck2` receipt body, including the installed
+/// identity, the executed commands and the source-close outcome. It
+/// carries no `cargo_*` key and synthesizes no Cargo value;
+/// `profile_inputs` is the profile `.bzl` identity, which is also the Buck
+/// compiled-sources manifest slot, and `rustc_version` is the ELF
+/// `.comment` identity read at qualification time.
+#[allow(dead_code)] // Wired by run_buck at the Reverie pin bump; unit-tested now.
+fn buck_receipt(
+    args: &BuckArgs,
+    sections: BuckReceiptSections,
     rustc_version: &str,
+    source_close_completed: bool,
 ) -> serde_json::Value {
     json!({
         "schema": "hermit-packaged-detcore/v1",
         "builder": "buck2",
         "reverie_pin": args.reverie_pin,
         "profile_name": "liteinst-runtime",
-        "profile_inputs": profile_inputs,
+        "profile_inputs": sections.profile_inputs,
         "profile_objects": buck_profile_objects(),
         "buck_target": BUCK_TARGET,
         "buck_platform": BUCK_PLATFORM,
         "buck_constraints": BUCK_CONSTRAINTS,
         "buck_argv": buck_argv(),
-        "buck_artifact": artifact,
+        "buck_artifact": sections.artifact,
         "rustc_version": rustc_version,
-        "qualifier_source": qualifier_source,
+        "qualifier_source": sections.qualifier_source,
         "compiled_qualifier_sha256": proof::qualifier_source_sha256(),
-        "compiled_sources": compiled_sources,
-        "qualification": qualification,
+        "compiled_sources": sections.compiled_sources,
+        "qualification": sections.qualification,
+        "installed": sections.installed,
+        "commands": sections.commands,
+        "source_close_completed": source_close_completed,
     })
 }
 
-/// Buck mode: qualify the supplied Buck `.so` directly against Buck-declared
-/// sources — no Cargo build and no byte-identity gate. The qualification
-/// sequence, once the pinned Reverie carries the Buck authority, is:
+/// Buck mode (plumbing): the supplied Buck `.so` would be qualified
+/// directly against Buck-declared sources — no Cargo build and no
+/// byte-identity gate. The qualification sequence, once the pinned
+/// Reverie carries the Buck authority, is:
 /// `VerifiedCompiledSources::resolve_buck` over the declared roots/files,
 /// `with_buck_build(artifact)` for the `BuildWitness::Buck` witness,
 /// `qualify_detcore_constructor_with_sources` on the supplied artifact, then
@@ -357,6 +426,10 @@ fn run_buck(args: &BuckArgs) -> proof::Result<()> {
             "Buck input must be a regular non-symlink file",
         )?;
     }
+    // The profile is judged by its contents, not its filename: only the
+    // exact pinned flag list may proceed even as far as the authority
+    // refusal below.
+    validate_profile_bzl(&fs::read_to_string(&args.profile_bzl).map_err(|e| e.to_string())?)?;
     Err(BUCK_UNAVAILABLE.into())
 }
 
@@ -661,6 +734,9 @@ mod tests {
                 vec!["--prebuilt", "x"],
                 "expected --git, --source-copy or --buck",
             ),
+            // Mode precedence: a misspelled mode with no target at all
+            // still reports the mode, not the missing target.
+            (vec!["--bogus"], "expected --git, --source-copy or --buck"),
             (vec!["--git"], "expected existing target directory"),
             (vec!["--buck"], "expected existing target directory"),
             (
@@ -715,6 +791,8 @@ mod tests {
             BUCK_CONSTRAINTS[0],
             "--buck-constraint",
             BUCK_CONSTRAINTS[1],
+            "--buck-constraint",
+            BUCK_CONSTRAINTS[2],
             "--workspace-file",
             "detcore-liteinst/src/lib.rs",
             "--workspace-file",
@@ -850,17 +928,113 @@ mod tests {
         );
     }
 
+    /// A profile `.bzl` text in the shape `fb-only/liteinst-runtime-profile.bzl`
+    /// defines, over the given flag literals.
+    fn profile_bzl_text(flags: &[&str]) -> String {
+        let list = flags
+            .iter()
+            .map(|flag| format!("    \"{flag}\",\n"))
+            .collect::<String>();
+        format!("LITEINST_RUNTIME_RUSTC_FLAGS = [\n{list}]\n")
+    }
+
+    /// Buck arguments over real on-disk inputs, so `run_buck` passes every
+    /// path and profile check and reaches the refusal each test names.
+    /// Returns the scratch root for cleanup.
+    fn buck_disk_fixture(profile: &str) -> (PathBuf, BuckArgs) {
+        let serial = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "stage-detcore-liteinst-buck-{}-{serial}",
+            std::process::id()
+        ));
+        let mut args = buck_args_fixture();
+        args.target = root.join("target");
+        args.workspace_root = root.join("hermit");
+        args.reverie_root = root.join("reverie");
+        args.artifact = root.join("libdetcore_liteinst.so");
+        args.profile_bzl = root.join("liteinst-runtime-profile.bzl");
+        for dir in [&args.target, &args.workspace_root, &args.reverie_root] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::write(&args.artifact, b"synthetic fixture, not an ELF proof").unwrap();
+        fs::write(&args.profile_bzl, profile).unwrap();
+        (root, args)
+    }
+
     #[test]
     fn buck_mode_refuses_by_name_at_the_pinned_reverie() {
-        // Valid arguments whose paths do not exist stop at path checks; the
-        // authority refusal itself is exercised end to end by the dress
-        // rehearsal against real roots. Here the named refusal text is the
-        // contract: it must keep identifying the missing authority.
+        // The named refusal text is the contract: it must keep identifying
+        // the missing authority, and valid on-disk inputs must actually
+        // reach it (past argument, path and profile-content checks).
         assert!(BUCK_UNAVAILABLE.starts_with("Buck authority unavailable at pinned Reverie"));
         assert!(BUCK_UNAVAILABLE.contains("resolve_buck"));
         assert!(BUCK_UNAVAILABLE.contains("PLUMBING ONLY"));
-        let error = run_buck(&buck_args_fixture()).unwrap_err();
-        assert!(!error.is_empty());
+        let (root, args) = buck_disk_fixture(&profile_bzl_text(&BUCK_RUSTC_FLAGS));
+        let error = run_buck(&args).unwrap_err();
+        assert!(
+            error.contains("Buck authority unavailable at pinned Reverie"),
+            "{error}"
+        );
+        assert!(error.contains("resolve_buck"), "{error}");
+        assert!(error.contains("PLUMBING ONLY"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn buck_mode_refuses_a_profile_whose_flags_differ() {
+        let mut flags = BUCK_RUSTC_FLAGS;
+        flags[0] = "-Copt-level=2";
+        let (root, args) = buck_disk_fixture(&profile_bzl_text(&flags));
+        let error = run_buck(&args).unwrap_err();
+        assert!(
+            error.contains("LITEINST_RUNTIME_RUSTC_FLAGS do not match"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("Buck authority unavailable"),
+            "profile refusal precedes the authority refusal: {error}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn profile_bzl_contents_must_define_the_pinned_flags_exactly() {
+        let exact = profile_bzl_text(&[
+            "-Copt-level=3",
+            "-Cdebuginfo=0",
+            "-Cdebug-assertions=yes",
+            "-Coverflow-checks=yes",
+            "-Ccodegen-units=16",
+            "-Cembed-bitcode=no",
+            "-Cpanic=unwind",
+            "-Cstrip=none",
+        ]);
+        validate_profile_bzl(&exact).unwrap();
+        // Missing definition refuses by that name.
+        let error = validate_profile_bzl("# no profile here\n").unwrap_err();
+        assert!(
+            error.contains("does not define LITEINST_RUNTIME_RUSTC_FLAGS"),
+            "{error}"
+        );
+        // Dropped, appended, reordered and respelled lists all refuse.
+        let mut dropped = BUCK_RUSTC_FLAGS.to_vec();
+        dropped.pop();
+        let mut appended = BUCK_RUSTC_FLAGS.to_vec();
+        appended.push("-Clto=off");
+        let mut reordered = BUCK_RUSTC_FLAGS.to_vec();
+        reordered.reverse();
+        let mut respelled = BUCK_RUSTC_FLAGS.to_vec();
+        respelled[3] = "-Coverflow-checks=no";
+        for flags in [&dropped, &appended, &reordered, &respelled] {
+            let error = validate_profile_bzl(&profile_bzl_text(flags)).unwrap_err();
+            assert!(
+                error.contains("LITEINST_RUNTIME_RUSTC_FLAGS do not match"),
+                "{flags:?}: {error}"
+            );
+        }
     }
 
     /// The receipt body must match the verifier's Buck arm exactly: same
@@ -874,18 +1048,30 @@ mod tests {
         let profile_inputs = json!({"path": "/fixture/fb-only/liteinst-runtime-profile.bzl", "sha256": "1".repeat(64)});
         let record = buck_receipt(
             &args,
-            profile_inputs.clone(),
-            buck_artifact(
-                package.clone(),
-                Path::new("/fixture/buck-out/libdetcore_liteinst.so"),
-            ),
-            json!({"path": "/fixture/reverie/reverie-liteinst-artifact/src/lib.rs",
-                   "sha256": proof::qualifier_source_sha256()}),
-            json!({"image_kind": "Detcore", "reverie_pin": args.reverie_pin,
-                   "manifest": profile_inputs, "leaf": package,
-                   "reverie_root": "/fixture/reverie"}),
-            json!({"artifact": {"path": "/fixture/buck-out/libdetcore_liteinst.so"}}),
+            BuckReceiptSections {
+                profile_inputs: profile_inputs.clone(),
+                artifact: buck_artifact(
+                    package.clone(),
+                    Path::new("/fixture/buck-out/libdetcore_liteinst.so"),
+                ),
+                qualifier_source: json!({"path": "/fixture/reverie/reverie-liteinst-artifact/src/lib.rs",
+                       "sha256": proof::qualifier_source_sha256()}),
+                compiled_sources: json!({"image_kind": "Detcore", "reverie_pin": args.reverie_pin,
+                       "manifest": profile_inputs, "leaf": package,
+                       "reverie_root": "/fixture/reverie"}),
+                qualification: json!({"artifact": {"path": "/fixture/buck-out/libdetcore_liteinst.so"}}),
+                installed: json!({"sha256": "5".repeat(64)}),
+                commands: json!([
+                    {"status": 0, "program": "buck2",
+                     "arguments": ["build", BUCK_TARGET, "--target-platforms", BUCK_PLATFORM]},
+                    {"status": 0, "program": "readelf",
+                     "arguments": ["--version-info", "--wide", "/fixture/buck-out/libdetcore_liteinst.so"]},
+                    {"status": 0, "program": "objdump",
+                     "arguments": ["--disassemble", "/fixture/buck-out/libdetcore_liteinst.so"]},
+                ]),
+            },
             "rustc fixture",
+            true,
         );
         let object = record.as_object().unwrap();
         let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
@@ -899,8 +1085,10 @@ mod tests {
                 "buck_platform",
                 "buck_target",
                 "builder",
+                "commands",
                 "compiled_qualifier_sha256",
                 "compiled_sources",
+                "installed",
                 "profile_inputs",
                 "profile_name",
                 "profile_objects",
@@ -909,6 +1097,7 @@ mod tests {
                 "reverie_pin",
                 "rustc_version",
                 "schema",
+                "source_close_completed",
             ]
         );
         assert!(keys.iter().all(|key| !key.starts_with("cargo_")));
@@ -924,8 +1113,24 @@ mod tests {
         );
         assert_eq!(
             record["buck_argv"],
+            json!([
+                "buck2",
+                "build",
+                BUCK_TARGET,
+                "--target-platforms",
+                BUCK_PLATFORM
+            ])
+        );
+        // The executed producer entry is buck_argv without its program, as
+        // the verifier's Buck arm binds it; the installed identity and the
+        // source-close outcome are carried, not deferred to publication.
+        assert_eq!(record["commands"][0]["program"], "buck2");
+        assert_eq!(
+            record["commands"][0]["arguments"],
             json!(["build", BUCK_TARGET, "--target-platforms", BUCK_PLATFORM])
         );
+        assert_eq!(record["installed"], json!({"sha256": "5".repeat(64)}));
+        assert_eq!(record["source_close_completed"], json!(true));
         assert_eq!(record["buck_target"], BUCK_TARGET);
         assert_eq!(record["buck_platform"], BUCK_PLATFORM);
         assert_eq!(record["buck_constraints"], json!(BUCK_CONSTRAINTS));

@@ -27,18 +27,40 @@ def require(ok, message):
 
 # Buck liteinst-runtime pins: the reviewed flag set for the Buck closure
 # (release opt 3 with assertions and overflow checks on, and no -Clto at
-# all, matching Cargo's lto=false), the runtime target requested at its
-# [cdylib] output, the fbcode x86_64 Linux platform, and that target's
-# declared compatibility constraints.
+# all, matching Cargo's lto=false), the profiled runtime alias requested at
+# its [cdylib] output, the fbcode x86_64 Linux platform that alias pins, and
+# the exact constraint set of that request, sorted: the runtime target's
+# declared cpu/os compatibility plus the alias's opt build-mode constraint.
 BUCK_RUSTC_FLAGS = ["-Copt-level=3", "-Cdebuginfo=0", "-Cdebug-assertions=yes",
                     "-Coverflow-checks=yes", "-Ccodegen-units=16",
                     "-Cembed-bitcode=no", "-Cpanic=unwind", "-Cstrip=none"]
-BUCK_TARGET = "//hermetic_infra/hermit:detcore-liteinst[cdylib]"
+BUCK_TARGET = "//hermetic_infra/hermit:detcore-liteinst-liteinst-runtime[cdylib]"
 BUCK_PLATFORM = "ovr_config//platform/linux:x86_64-fbcode"
-BUCK_CONSTRAINTS = ["ovr_config//cpu:x86_64", "ovr_config//os:linux"]
+BUCK_CONSTRAINTS = ["ovr_config//build_mode/constraints:opt",
+                    "ovr_config//cpu:x86_64", "ovr_config//os:linux"]
+BUCK_ARGV = ["buck2", "build", BUCK_TARGET, "--target-platforms", BUCK_PLATFORM]
+
+
+def _receipt_builder(install):
+    try:
+        record = json.loads((Path(install) / "rsrcs" / "libdetcore_liteinst.package.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return record.get("builder", "cargo") if isinstance(record, dict) else None
 
 
 def verify(install, *, core=False):
+    try:
+        return _verify(install, core=core)
+    except (KeyError, IndexError, TypeError) as error:
+        # A malformed Buck receipt is a refusal, not a leaked lookup error.
+        # The Cargo arm keeps its original behavior.
+        if _receipt_builder(install) != "buck2":
+            raise
+        raise ValueError(f"malformed Buck packaging receipt: {error!r}") from None
+
+
+def _verify(install, *, core=False):
     resources = Path(install) / "rsrcs"
     runtime = resources / "libdetcore_liteinst.so"
     receipt = resources / "libdetcore_liteinst.package.json"
@@ -115,15 +137,17 @@ def verify(install, *, core=False):
                 "receipt does not identify the fixed Buck runtime platform")
         require(record["buck_constraints"] == BUCK_CONSTRAINTS,
                 "receipt does not identify the fixed Buck runtime constraints")
-        require(record["buck_argv"] == ["build", BUCK_TARGET, "--target-platforms", BUCK_PLATFORM],
+        require(record["buck_argv"] == BUCK_ARGV,
                 "receipt does not identify the fixed Buck runtime build")
     commands = record["commands"]
     require(commands and all(command["status"] == 0 for command in commands), "unsuccessful producer command")
     if builder == "cargo":
         require(any(command["program"] == "cargo" and command["arguments"] == args for command in commands), "actual producer command absent")
     else:
-        require(any(command["program"] == "readelf" for command in commands)
-                and any(command["program"] == "objdump" for command in commands),
+        require(any(command["program"] == "buck2" and command["arguments"] == record["buck_argv"][1:] for command in commands), "actual producer command absent")
+        staged = artifact["reported_path"]
+        require(any(command["program"] == "readelf" and isinstance(command["arguments"], list) and staged in command["arguments"] for command in commands)
+                and any(command["program"] == "objdump" and isinstance(command["arguments"], list) and staged in command["arguments"] for command in commands),
                 "actual qualification commands absent")
     require(record["source_close_completed"] is True, "source transaction did not close")
     return record
