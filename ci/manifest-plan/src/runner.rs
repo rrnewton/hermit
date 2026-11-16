@@ -168,16 +168,17 @@ pub fn validate_source_sha(sha: &str) -> Result<(), String> {
 /// (ci/buck-e2e/staged/src). Git, not that lexical `.git` walk, is the
 /// authority on being inside a checkout: the walk can find an enclosing
 /// `.git` across a filesystem boundary Git's discovery will not cross (an
-/// EdenFS staged snapshot under a checkout), where Git answers that this is
-/// not a git repository, and that is accepted as not-in-Git too — but only
-/// when the nearest `.git` that walk finds still looks like a repository
-/// (a directory holding `HEAD`, or a worktree's `.git` file). A damaged
-/// checkout whose `.git` lost its `HEAD` makes Git give that same answer,
-/// and accepting it would bless the damage as a snapshot, so a HEAD-less
-/// nearest `.git` is refused by name. Inside a checkout Git did discover, a
-/// git that cannot answer (a corrupt index, no git to run) is refused: the
-/// files might be tracked. The search for `.git` starts from the resolved
-/// root, so a symlink to tracked files is looked up where the files are.
+/// EdenFS staged snapshot under a checkout), where Git exits 128 saying it
+/// stopped at that boundary. That one answer is not accepted as not-in-Git —
+/// a damaged or concealed `.git` can produce a not-a-repository answer too —
+/// it earns one retry with discovery across filesystems and any inherited
+/// ceiling removed, and the retry is judged by the same rule as the first
+/// answer (tracked refused, untracked accepted, any other failure refused).
+/// Every other failure to answer (a plain not-a-repository from a damaged,
+/// dangling, or ceiling-hidden `.git`, a corrupt index, no git to run) is
+/// refused: the files might be tracked. The search for `.git` starts from
+/// the resolved root, so a symlink to tracked files is looked up where the
+/// files are.
 ///
 /// The SHA cannot stand in for this check: it is the claim being checked, and
 /// nothing in it says whether an enclosing checkout tracks the root.
@@ -197,42 +198,55 @@ fn validate_source_snapshot_with(root: &Path, sha: &str, git: &Path) -> Result<(
             root.display()
         )
     })?;
-    let Some(nearest_git) = resolved.ancestors().find_map(|dir| {
-        let candidate = dir.join(".git");
-        candidate.symlink_metadata().is_ok().then_some(candidate)
-    }) else {
+    if !resolved
+        .ancestors()
+        .any(|dir| dir.join(".git").symlink_metadata().is_ok())
+    {
         return Ok(());
-    };
-    let nearest_git_is_a_repository = git_path_looks_like_a_repository(&nearest_git);
-    let tracked = crate::git_environment::git_command_at(git)
+    }
+    match snapshot_ls_files(git, root, false) {
+        // The only 128 that is not refused outright: Git's discovery stopped
+        // at a filesystem boundary before the enclosing `.git` the lexical
+        // walk found. Ask again across that boundary, with no inherited
+        // ceiling to stop the search short of the same `.git` a second
+        // time, and judge that answer by the ordinary rule below.
+        Ok(output) if git_stopped_at_filesystem_boundary(&output) => {
+            snapshot_ls_files_verdict(root, snapshot_ls_files(git, root, true))
+        }
+        tracked => snapshot_ls_files_verdict(root, tracked),
+    }
+}
+
+/// One `git ls-files --error-unmatch` at `root`, optionally with repository
+/// discovery allowed across filesystems and no inherited ceiling stopping it.
+fn snapshot_ls_files(
+    git: &Path,
+    root: &Path,
+    across_filesystem: bool,
+) -> std::io::Result<std::process::Output> {
+    let mut command = crate::git_environment::git_command_at(git);
+    if across_filesystem {
+        command.env("GIT_DISCOVERY_ACROSS_FILESYSTEM", "1");
+        command.env_remove("GIT_CEILING_DIRECTORIES");
+    }
+    command
         .arg("-C")
         .arg(root)
         .args(["ls-files", "--error-unmatch", "--", "."])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .output();
+        .output()
+}
+
+/// The snapshot rule for one `ls-files` answer: untracked accepted, tracked
+/// refused, and every failure to answer refused as unknown.
+fn snapshot_ls_files_verdict(
+    root: &Path,
+    tracked: std::io::Result<std::process::Output>,
+) -> Result<(), String> {
     match tracked {
         // `--error-unmatch` exits 1 when Git tracks nothing under the path.
         Ok(output) if output.status.code() == Some(1) => Ok(()),
-        // Git's discovery stopped before the enclosing `.git` the lexical
-        // walk found (a filesystem boundary it will not cross), so Git
-        // tracks nothing here: the same not-in-Git answer as no `.git`
-        // ancestor. That holds only while the `.git` Git stopped short of
-        // still looks like a repository; the next arm refuses the HEAD-less
-        // one a damaged checkout leaves, for which Git gives this same
-        // answer. A 128 for any other reason falls through to refusal.
-        Ok(output) if git_reports_not_a_repository(&output) && nearest_git_is_a_repository => {
-            Ok(())
-        }
-        Ok(output) if git_reports_not_a_repository(&output) => Err(format!(
-            "--source-sha names the commit of a Git-less snapshot, but the nearest `.git` at \
-             {} has no `HEAD`, so it is not a usable repository directory and {} looks like a \
-             damaged checkout rather than a snapshot Git cannot discover across a filesystem \
-             boundary; repair or remove that `.git`, or pass --repo-root naming an archive \
-             outside it",
-            nearest_git.display(),
-            root.display()
-        )),
         Ok(output) if output.status.success() => Err(format!(
             "--source-sha names the commit of a Git-less `git archive` snapshot, but Git \
              tracks files under {}, and Git reports their commit and whether they are dirty; \
@@ -256,33 +270,20 @@ fn validate_source_snapshot_with(root: &Path, sha: &str, git: &Path) -> Result<(
     }
 }
 
-/// Whether the `.git` at `path` still looks like a repository Git could
-/// have discovered had its search reached it: a directory holding a `HEAD`
-/// file, or a linked worktree's `.git` file naming its gitdir. A directory
-/// without `HEAD` is what a damaged checkout leaves, not a repository
-/// across a filesystem boundary.
-fn git_path_looks_like_a_repository(path: &Path) -> bool {
-    match std::fs::metadata(path) {
-        Ok(metadata) if metadata.is_dir() => path.join("HEAD").is_file(),
-        Ok(metadata) if metadata.is_file() => std::fs::read_to_string(path)
-            .is_ok_and(|contents| contents.trim_start().starts_with("gitdir:")),
-        _ => false,
-    }
-}
-
-/// Whether a failed `git ls-files` failed only because Git found no
-/// repository at all: exit 128 with its "not a git repository" message
-/// (including the "Stopping at filesystem boundary" form). Other 128s, such
-/// as a corrupt index in a repository Git did discover, do not say this.
+/// Whether a failed `git ls-files` failed only because Git's repository
+/// discovery stopped at a filesystem boundary: exit 128 with its "Stopping
+/// at filesystem boundary" message. A plain not-a-repository 128 and every
+/// other 128, such as a corrupt index in a repository Git did discover,
+/// do not say this and earn no retry.
 ///
 /// The match is on Git's English stderr text. A Git running under a locale
 /// that translates its messages will not match and falls through to refusal:
 /// localized Git fails closed rather than being read as not-in-Git.
-fn git_reports_not_a_repository(output: &std::process::Output) -> bool {
+fn git_stopped_at_filesystem_boundary(output: &std::process::Output) -> bool {
     output.status.code() == Some(128)
         && String::from_utf8_lossy(&output.stderr)
             .to_ascii_lowercase()
-            .contains("not a git repository")
+            .contains("stopping at filesystem boundary")
 }
 
 /// The git that [`validate_source_snapshot`] asks whether a snapshot's files
@@ -12158,104 +12159,221 @@ mod tests {
         assert!(absent.unwrap_err().contains("git cannot run"));
     }
 
-    /// Git is the authority on being inside a checkout, not the lexical
-    /// `.git` walk: that walk can find an enclosing `.git` across a
-    /// filesystem boundary Git's discovery will not cross (an EdenFS staged
-    /// snapshot), where `ls-files` exits 128 saying this is not a git
-    /// repository. That answer is accepted as not-in-Git while the enclosing
-    /// `.git` still looks like a repository (here, a `HEAD` file), while a
-    /// 128 for any other reason (a corrupt index in a discovered repository)
-    /// is still refused.
+    /// A filesystem-boundary refusal is not accepted as not-in-Git: it is
+    /// retried once with discovery across filesystems, and the retry is
+    /// judged by the ordinary rule. The retry below is the real git acting
+    /// on a real checkout (the named fake delegates to it once discovery
+    /// across filesystems is enabled), so an untracked snapshot is accepted
+    /// and tracked files are refused. A refusal that stays a refusal on
+    /// retry, a plain not-a-repository answer without the boundary phrase,
+    /// and a corrupt index are all refused.
     #[test]
-    fn a_snapshot_is_accepted_when_git_says_not_a_repository() {
-        let base = std::env::temp_dir().join(format!("runner-not-a-repo-{}", std::process::id()));
+    fn a_snapshot_boundary_refusal_is_retried_across_filesystems() {
+        let base = std::env::temp_dir().join(format!("runner-boundary-{}", std::process::id()));
         let checkout = base.join("checkout");
         let snapshot = checkout.join("snapshot");
         fs::create_dir_all(&snapshot).unwrap();
-        fs::create_dir_all(checkout.join(".git")).unwrap();
-        fs::write(checkout.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
-        let says = |name: &str, stderr: &str| {
+        fs::create_dir_all(checkout.join("src")).unwrap();
+        fs::write(checkout.join("src/lib.rs"), "").unwrap();
+        let git = |args: &[&str]| {
+            crate::git_environment::git_command()
+                .arg("-C")
+                .arg(&checkout)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        };
+        let tracking = git(&["init", "-q"]) && git(&["add", "src/lib.rs"]);
+        let boundary = "printf '%s\\n' 'fatal: not a git repository (or any parent up to \
+             mount point /) Stopping at filesystem boundary \
+             (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).' >&2\nexit 128\n";
+        let retrying = base.join("retrying-git");
+        crate::exec_safe_fs::write_executable(
+            &retrying,
+            format!(
+                "#!/bin/sh\nif [ \"$GIT_DISCOVERY_ACROSS_FILESYSTEM\" = \"1\" ]; then\n\
+                 exec git \"$@\"\nfi\n{boundary}"
+            ),
+            0o755,
+        )
+        .unwrap();
+        let says = |name: &str, script: String| {
             let path = base.join(name);
-            crate::exec_safe_fs::write_executable(
-                &path,
-                format!("#!/bin/sh\nprintf '%s\\n' '{stderr}' >&2\nexit 128\n"),
-                0o755,
-            )
-            .unwrap();
+            crate::exec_safe_fs::write_executable(&path, script, 0o755).unwrap();
             path
         };
-        let not_a_repo = says(
-            "not-a-repo-git",
-            "fatal: not a git repository (or any parent up to mount point /) \
-             Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).",
+        let always_boundary = says("always-boundary-git", format!("#!/bin/sh\n{boundary}"));
+        let plain = says(
+            "plain-git",
+            "#!/bin/sh\nprintf '%s\\n' 'fatal: not a git repository (or any of the parent \
+             directories): .git' >&2\nexit 128\n"
+                .to_string(),
         );
         let broken = says(
             "broken-git",
-            "fatal: .git/index: index file smaller than expected",
+            "#!/bin/sh\nprintf '%s\\n' 'fatal: .git/index: index file smaller than \
+             expected' >&2\nexit 128\n"
+                .to_string(),
         );
         let sha = "03bbb83581fad247251df6363f50e61e24c2957e";
-        let accepted = validate_source_snapshot_with(&snapshot, sha, &not_a_repo);
-        let refused = validate_source_snapshot_with(&snapshot, sha, &broken);
+        let accepted = validate_source_snapshot_with(&snapshot, sha, &retrying);
+        let refused_tracked = validate_source_snapshot_with(&checkout.join("src"), sha, &retrying);
+        let refused = [
+            validate_source_snapshot_with(&snapshot, sha, &always_boundary),
+            validate_source_snapshot_with(&snapshot, sha, &plain),
+            validate_source_snapshot_with(&snapshot, sha, &broken),
+        ];
         fs::remove_dir_all(&base).unwrap();
+        assert!(tracking);
         assert_eq!(accepted, Ok(()));
-        let error = refused.unwrap_err();
         assert!(
-            error.contains("`git ls-files` there failed")
-                && error.contains("whether Git tracks its files is unknown"),
-            "{error}"
+            refused_tracked
+                .unwrap_err()
+                .contains("Git tracks files under")
         );
+        for refused in refused {
+            let error = refused.unwrap_err();
+            assert!(
+                error.contains("`git ls-files` there failed")
+                    && error.contains("whether Git tracks its files is unknown"),
+                "{error}"
+            );
+        }
     }
 
-    /// The not-a-repository acceptance above must not bless a damaged
-    /// checkout: a `.git` directory that lost its `HEAD` makes Git give the
-    /// same 128 answer as a filesystem boundary, so the HEAD-less nearest
-    /// `.git` is refused by name, under a named fake git and under the real
-    /// one. A nearest `.git` that still looks like a repository — a `HEAD`
-    /// file, or a linked worktree's `.git` file — keeps the acceptance.
+    /// Damage that makes the real git answer not-a-repository is refused,
+    /// not blessed as a snapshot across a filesystem boundary: a real
+    /// `git init` checkout stripped to a `HEAD`-only `.git`, the same
+    /// checkout with its `HEAD` removed, and a worktree `.git` file whose
+    /// gitdir is gone. None earns acceptance — where this host's git words
+    /// the first answer with the boundary phrase, the one retry still
+    /// fails — so all are refused as unknown.
     #[test]
-    fn a_snapshot_under_a_headless_git_directory_is_refused() {
-        let base = std::env::temp_dir().join(format!("runner-headless-git-{}", std::process::id()));
-        let layout = |name: &str| {
-            let snapshot = base.join(name).join("snapshot");
+    fn a_snapshot_under_a_damaged_git_is_refused() {
+        let base = std::env::temp_dir().join(format!("runner-damaged-git-{}", std::process::id()));
+        let mut inited = true;
+        let mut init = |name: &str| {
+            let root = base.join(name);
+            let snapshot = root.join("snapshot");
             fs::create_dir_all(&snapshot).unwrap();
-            snapshot
+            inited &= crate::git_environment::git_command()
+                .arg("-C")
+                .arg(&root)
+                .args(["init", "-q"])
+                .status()
+                .unwrap()
+                .success();
+            (root, snapshot)
         };
-        let damaged = layout("damaged");
-        fs::create_dir_all(damaged.join("../.git")).unwrap();
-        let intact = layout("intact");
-        fs::create_dir_all(intact.join("../.git")).unwrap();
-        fs::write(intact.join("../.git/HEAD"), "ref: refs/heads/main\n").unwrap();
-        let worktree = layout("worktree");
-        fs::write(worktree.join("../.git"), "gitdir: ../elsewhere/worktree\n").unwrap();
-        let not_a_repo = base.join("not-a-repo-git");
+        let (head_only_root, head_only) = init("head-only");
+        for entry in fs::read_dir(head_only_root.join(".git")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.file_name().is_some_and(|name| name != "HEAD") {
+                if path.is_dir() {
+                    fs::remove_dir_all(&path).unwrap();
+                } else {
+                    fs::remove_file(&path).unwrap();
+                }
+            }
+        }
+        let (headless_root, headless) = init("headless");
+        fs::remove_file(headless_root.join(".git/HEAD")).unwrap();
+        let dangling_root = base.join("dangling");
+        let dangling = dangling_root.join("snapshot");
+        fs::create_dir_all(&dangling).unwrap();
+        fs::write(
+            dangling_root.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                base.join("gone/.git/worktrees/dangling").display()
+            ),
+        )
+        .unwrap();
+        let sha = "03bbb83581fad247251df6363f50e61e24c2957e";
+        let refused = [
+            source_identity(&head_only, Some(sha)),
+            source_identity(&headless, Some(sha)),
+            source_identity(&dangling, Some(sha)),
+        ];
+        fs::remove_dir_all(&base).unwrap();
+        assert!(inited);
+        for refused in refused {
+            let error = refused.unwrap_err();
+            assert!(
+                error.contains("`git ls-files` there failed")
+                    && error.contains("whether Git tracks its files is unknown"),
+                "{error}"
+            );
+        }
+    }
+
+    /// An inherited ceiling that hides the enclosing repository is not a
+    /// snapshot either: under the real git its plain not-a-repository
+    /// answer is refused for tracked and untracked roots alike. The one
+    /// retry a boundary refusal earns runs without that ceiling, shown by
+    /// the delegating fake: with the ceiling still set in this process,
+    /// the retry's real git finds the repository, refusing the tracked
+    /// root and accepting the untracked snapshot.
+    #[test]
+    fn a_snapshot_hidden_by_a_ceiling_directory_is_refused() {
+        let base = std::env::temp_dir().join(format!("runner-ceiling-{}", std::process::id()));
+        let checkout = base.join("checkout");
+        let snapshot = checkout.join("snapshot");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::create_dir_all(checkout.join("src")).unwrap();
+        fs::write(checkout.join("src/lib.rs"), "").unwrap();
+        let git = |args: &[&str]| {
+            crate::git_environment::git_command()
+                .arg("-C")
+                .arg(&checkout)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        };
+        let tracking = git(&["init", "-q"]) && git(&["add", "src/lib.rs"]);
+        let retrying = base.join("retrying-git");
         crate::exec_safe_fs::write_executable(
-            &not_a_repo,
-            "#!/bin/sh\nprintf '%s\\n' 'fatal: not a git repository (or any parent up to \
-             mount point /) Stopping at filesystem boundary \
-             (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).' >&2\nexit 128\n",
+            &retrying,
+            "#!/bin/sh\nif [ \"$GIT_DISCOVERY_ACROSS_FILESYSTEM\" = \"1\" ]; then\n\
+             exec git \"$@\"\nfi\n\
+             printf '%s\\n' 'fatal: not a git repository (or any parent up to mount point /) \
+             Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).' >&2\n\
+             exit 128\n",
             0o755,
         )
         .unwrap();
         let sha = "03bbb83581fad247251df6363f50e61e24c2957e";
-        let refused_fake = validate_source_snapshot_with(&damaged, sha, &not_a_repo);
-        let accepted_intact = validate_source_snapshot_with(&intact, sha, &not_a_repo);
-        let accepted_worktree = validate_source_snapshot_with(&worktree, sha, &not_a_repo);
-        // The real git answers the same way for the HEAD-less `.git`, and is
-        // refused through the unnamed entry point as the fake one is.
-        let refused_real = source_identity(&damaged, Some(sha));
+        let ceiling = fs::canonicalize(&checkout).unwrap();
+        let saved = std::env::var_os("GIT_CEILING_DIRECTORIES");
+        std::env::set_var("GIT_CEILING_DIRECTORIES", &ceiling);
+        let hidden = [
+            source_identity(&checkout.join("src"), Some(sha)),
+            source_identity(&snapshot, Some(sha)),
+        ];
+        let retry_tracked = validate_source_snapshot_with(&checkout.join("src"), sha, &retrying);
+        let retry_snapshot = validate_source_snapshot_with(&snapshot, sha, &retrying);
+        match saved {
+            Some(value) => std::env::set_var("GIT_CEILING_DIRECTORIES", value),
+            None => std::env::remove_var("GIT_CEILING_DIRECTORIES"),
+        }
         fs::remove_dir_all(&base).unwrap();
-        for refused in [
-            refused_fake.map(|()| (sha.to_string(), false)),
-            refused_real,
-        ] {
-            let error = refused.unwrap_err();
+        assert!(tracking);
+        for hidden in hidden {
+            let error = hidden.unwrap_err();
             assert!(
-                error.contains("has no `HEAD`") && error.contains("damaged checkout"),
+                error.contains("`git ls-files` there failed")
+                    && error.contains("whether Git tracks its files is unknown"),
                 "{error}"
             );
         }
-        assert_eq!(accepted_intact, Ok(()));
-        assert_eq!(accepted_worktree, Ok(()));
+        assert!(
+            retry_tracked
+                .unwrap_err()
+                .contains("Git tracks files under")
+        );
+        assert_eq!(retry_snapshot, Ok(()));
     }
 
     #[test]
