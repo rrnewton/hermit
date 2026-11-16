@@ -22,7 +22,7 @@ code_facts:
 
 Detcore classifies `get_robust_list` (274) as passthrough via passthrough dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: false.
 
-- Classification: `detcore/src/syscall_classification.rs:1948`
+- Reviewed list: `detcore/src/syscall_classification.rs:1948`
 
 This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.
 
@@ -32,4 +32,4 @@ This facts-only page was generated from Detcore code facts. Checked analysis pro
 
 ## Status
 
-- 2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.
+- 2026-11-15 · rev 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.

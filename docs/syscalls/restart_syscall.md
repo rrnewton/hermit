@@ -22,8 +22,8 @@ code_facts:
 
 Detcore classifies `restart_syscall` (219) as unsupported via unsupported dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.
 
-- Classification: `detcore/src/syscall_classification.rs:2016`
-- Dispatch: `detcore/src/lib.rs:8476`
+- Reviewed list: `detcore/src/syscall_classification.rs:2016`
+- Dispatch: `detcore/src/lib.rs:8627`
 
 This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.
 
@@ -33,4 +33,4 @@ This facts-only page was generated from Detcore code facts. Checked analysis pro
 
 ## Status
 
-- 2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.
+- 2026-11-15 · rev 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.

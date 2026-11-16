@@ -21,8 +21,8 @@ code_facts:
 
 Detcore classifies `read` (0) as determinized via typed dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.
 
-- Classification: `detcore/src/syscall_classification.rs:1779`
-- Dispatch: `detcore/src/lib.rs:7736`
+- Reviewed list: `detcore/src/syscall_classification.rs:1779`
+- Dispatch: `detcore/src/lib.rs:7887`
 
 This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.
 
@@ -32,4 +32,4 @@ This facts-only page was generated from Detcore code facts. Checked analysis pro
 
 ## Status
 
-- 2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.
+- 2026-11-15 · rev 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.

@@ -24,7 +24,8 @@ Scope rules:
   fields.
 - Test coverage is a separate concept. It is linked, never merged:
   generated indexes link the
-  [syscall coverage audit](https://github.com/facebookexperimental/hermit/blob/main/docs/SYSCALL_COVERAGE.md),
+  [test-coverage measurement](https://github.com/facebookexperimental/hermit/blob/main/docs/SYSCALL_TEST_COVERAGE.md)
+  (not `SYSCALL_COVERAGE.md`, which audits trap dispositions),
   and no page, JSON row, or table column carries a coverage count.
 - Facts on a page were exported or derived at the revision in its
   `code_facts.as_of`. Every Status log carries an entry at that
@@ -87,7 +88,7 @@ only from code facts: `determinized`, `determinized-refused`,
 ## Status entries
 
 ```text
-- 2026-11-15 · hermit 0123456789ab · <text>
+- 2026-11-15 · rev 0123456789ab · <text>
 ```
 
 One bullet per entry (P12), at least one entry, dates never decrease

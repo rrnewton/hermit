@@ -22,8 +22,8 @@ code_facts:
 
 Detcore classifies `remap_file_pages` (216) as determinized-refused via pred:is_remap_file_pages_enosys_syscall dispatch; deterministic refusal: true; run subscription: true; record/replay subscription: true.
 
-- Classification: `detcore/src/syscall_classification.rs:1790`
-- Dispatch: `detcore/src/lib.rs:7572`
+- Reviewed list: `detcore/src/syscall_classification.rs:1790`
+- Dispatch: `detcore/src/lib.rs:7723`
 
 This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.
 
@@ -33,4 +33,4 @@ This facts-only page was generated from Detcore code facts. Checked analysis pro
 
 ## Status
 
-- 2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.
+- 2026-11-15 · rev 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.

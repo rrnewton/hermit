@@ -22,8 +22,8 @@ code_facts:
 
 Detcore classifies `perf_event_open` (298) as determinized-refused via pred:is_perf_event_enosys_syscall dispatch; deterministic refusal: true; run subscription: true; record/replay subscription: true.
 
-- Classification: `detcore/src/syscall_classification.rs:1744`
-- Dispatch: `detcore/src/lib.rs:7504`
+- Reviewed list: `detcore/src/syscall_classification.rs:1744`
+- Dispatch: `detcore/src/lib.rs:7655`
 
 This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.
 
@@ -33,4 +33,4 @@ This facts-only page was generated from Detcore code facts. Checked analysis pro
 
 ## Status
 
-- 2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.
+- 2026-11-15 · rev 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.

@@ -2,11 +2,11 @@
 
 One facts-only page per Linux syscall in this tree's pinned x86-64 Detcore census: the code-derived strategy and a discussion link. Checked analysis prose returns in later batches. The machine-readable form is [syscalls.json](syscalls.json); the page format is [SCHEMA.md](SCHEMA.md). Regenerate with `scripts/syscall-pages.rs generate` and `aggregate`; verify with `scripts/syscall-pages.rs check`.
 
-These pages track Detcore strategy only. Which backends can run a syscall is tracked with the backends, not here. Which syscalls the test matrix exercises is a separate measurement in the [syscall coverage audit](https://github.com/facebookexperimental/hermit/blob/main/docs/SYSCALL_COVERAGE.md), linked here and never merged into the strategy table.
+These pages track Detcore strategy only. Which backends can run a syscall is tracked with the backends, not here. Which syscalls the test matrix exercises is a separate measurement in the [syscall coverage audit](https://github.com/facebookexperimental/hermit/blob/main/docs/SYSCALL_TEST_COVERAGE.md), linked here and never merged into the strategy table.
 
 Facts on every page were exported or derived at the revision in its `code_facts.as_of`; source citations in generated strategy text are line numbers in that source tree, not permanent addresses.
 
-Code facts as of hermit `239ca43d3092fe64884782ff3166baf34059e41c`.
+Code facts as of source revision `239ca43d3092fe64884782ff3166baf34059e41c`.
 
 | strategy | count |
 |---|---:|

@@ -62,12 +62,13 @@ const SCHEMA: &str = "syscall-pages/v2";
 const PAGES_DIR: &str = "docs/syscalls";
 const JSON_FILE: &str = "docs/syscalls/syscalls.json";
 const INDEX_FILE: &str = "docs/syscalls/README.md";
-/// Public syscall-coverage audit linked (never merged) from generated
-/// indexes. The in-tree coverage page is `docs/SYSCALL_COVERAGE.md`;
-/// generated Markdown and HTML link the public Hermit repository path so
-/// links resolve from both trees.
+/// Public test-coverage measurement linked (never merged) from
+/// generated indexes: `docs/SYSCALL_TEST_COVERAGE.md`, the exercised
+/// count from the published validation series. This is deliberately not
+/// `docs/SYSCALL_COVERAGE.md`, which audits trap dispositions, a
+/// different measurement.
 const COVERAGE_URL: &str =
-    "https://github.com/facebookexperimental/hermit/blob/main/docs/SYSCALL_COVERAGE.md";
+    "https://github.com/facebookexperimental/hermit/blob/main/docs/SYSCALL_TEST_COVERAGE.md";
 /// Facts-only page sections, in order. Analysis prose returns in batches
 /// after each paragraph is checked against Detcore; until then a page has
 /// the generated strategy, discussion link, and append-only status log.
@@ -458,7 +459,7 @@ fn strategy_body(page: &Page, classification_line: usize, dispatch_line: Option<
     let mut s = format!("\n{}\n", strategy_sentence(page));
     let _ = writeln!(
         s,
-        "\n- Classification: `detcore/src/syscall_classification.rs:{classification_line}`"
+        "\n- Reviewed list: `detcore/src/syscall_classification.rs:{classification_line}`"
     );
     if let Some(line) = dispatch_line {
         let _ = writeln!(s, "- Dispatch: `detcore/src/lib.rs:{line}`");
@@ -696,7 +697,7 @@ fn lint_page(name_hint: &str, text: &str, root: &Path) -> (Report, Option<Page>)
             .chars()
             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
     {
-        rep.err("P09", "`code_facts.as_of` must be a 40-hex hermit SHA");
+        rep.err("P09", "`code_facts.as_of` must be a 40-hex source revision");
     }
     let dispatch_ok = [
         "typed",
@@ -766,7 +767,7 @@ fn lint_status(page: &Page, rep: &mut Report) {
         if parts.len() < 3 {
             rep.err(
                 "P12",
-                format!("Status entry is not `- date · hermit <sha> · text`: {e:?}"),
+                format!("Status entry is not `- date · rev <sha> · text`: {e:?}"),
             );
             continue;
         }
@@ -783,7 +784,7 @@ fn lint_status(page: &Page, rep: &mut Report) {
         }
         last = date;
         let sha_ok = parts[1]
-            .strip_prefix("hermit ")
+            .strip_prefix("rev ")
             .map(|s| {
                 (12..=40).contains(&s.len())
                     && s.chars()
@@ -793,7 +794,7 @@ fn lint_status(page: &Page, rep: &mut Report) {
         if !sha_ok {
             rep.err(
                 "P12",
-                format!("Status entry does not name `hermit <12-40 hex>`: {e:?}"),
+                format!("Status entry does not name `rev <12-40 hex>`: {e:?}"),
             );
         }
     }
@@ -1628,6 +1629,128 @@ fn parse_census(src: &str) -> Result<Census, String> {
 /// census, deterministic refusal from the refusal predicates, and the
 /// record/replay subscription rule. Numbers (`nr`) stay -1 placeholders;
 /// the exporter or an existing page must supply them.
+/// Every explicitly named syscall in the `passthru_opt` branch of
+/// Detcore's subscriptions, evaluating the branch for the generation
+/// configuration (sequentialized, virtual time and metadata on, default
+/// descriptor-naming backend). Every list counts, including
+/// `#[cfg(target_arch = "x86_64")]` lists; aarch64 lists and the
+/// backend-conditional memory-lock list are skipped, matching that
+/// configuration. Unknown conditional shapes still contribute their
+/// names only when their guard is one this function knows is true
+/// under the generation configuration.
+fn passthru_explicit_names(lib: &str) -> Result<BTreeSet<String>, String> {
+    // Scan the original text: masking would blank the architecture
+    // strings inside `#[cfg(target_arch = "...")]`, which are exactly
+    // what distinguishes the lists that count here.
+    let m = lib;
+    let Some(branch) = m.find("let mut subscription = Subscription::none();") else {
+        return Err("source facts parser-failed: passthru_opt branch not found".into());
+    };
+    let Some(sweep_rel) = m[branch..].find("crate::all_pinned_syscalls()") else {
+        return Err("source facts parser-failed: passthru_opt sweep not found".into());
+    };
+    let region = &m[branch..branch + sweep_rel];
+    let mut names = BTreeSet::new();
+    let mut skip_call = false;
+    let mut pending_skip = false;
+    for line in region.lines() {
+        let t = line.trim();
+        if t.starts_with("//") {
+            continue;
+        }
+        if t.contains("#[cfg(") {
+            pending_skip = t.contains("aarch64") && !t.contains("not(");
+            continue;
+        }
+        if t.contains("if !crate::procfs_inode::tool_can_name_guest_descriptors") {
+            skip_call = true;
+            continue;
+        }
+        if t.contains("subscription.syscall") {
+            if skip_call {
+                skip_call = false;
+                pending_skip = false;
+                continue;
+            }
+            if !pending_skip {
+                let mut rest = line.to_string();
+                while let Some(i) = rest.find("Sysno::") {
+                    match ident_after(&rest, i + 7) {
+                        Some((name, end)) => {
+                            names.insert(name);
+                            rest.replace_range(i..end, " ");
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+        if t.contains("Sysno::") {
+            // A list continues over following lines; the pending cfg was
+            // consumed by the call line itself or by these member lines.
+            if !pending_skip && !t.contains("subscription.syscall") {
+                let mut rest = line.to_string();
+                while let Some(i) = rest.find("Sysno::") {
+                    match ident_after(&rest, i + 7) {
+                        Some((name, end)) => {
+                            names.insert(name);
+                            rest.replace_range(i..end, " ");
+                        }
+                        None => break,
+                    }
+                }
+            }
+            if t.contains("]);") || t.trim_end().ends_with(");") {
+                pending_skip = false;
+            }
+        }
+    }
+    if names.is_empty() {
+        return Err("source facts parser-failed: no passthru_opt subscriptions found".into());
+    }
+    Ok(names)
+}
+
+/// Independent quick-check read of the class the generation parser once
+/// missed: names in x86_64-cfg-gated subscription calls, found by a plain
+/// line scan rather than the generation parser's list walk.
+fn x86_cfg_subscription_names(lib: &str) -> BTreeSet<String> {
+    let lines: Vec<&str> = lib.lines().collect();
+    let mut names = BTreeSet::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].contains("#[cfg(target_arch = \"x86_64\")]") {
+            // Scan the gated statement: up to its closing `]);` or `);`.
+            let mut j = i + 1;
+            let mut saw_call = false;
+            while j < lines.len() && j <= i + 40 {
+                if lines[j].contains("subscription.syscall") {
+                    saw_call = true;
+                }
+                if saw_call {
+                    let mut rest = lines[j].to_string();
+                    while let Some(at) = rest.find("Sysno::") {
+                        match ident_after(&rest, at + 7) {
+                            Some((name, end)) => {
+                                names.insert(name);
+                                rest.replace_range(at..end, " ");
+                            }
+                            None => break,
+                        }
+                    }
+                    if lines[j].contains("]);") || lines[j].trim_end().ends_with(");") {
+                        break;
+                    }
+                }
+                j += 1;
+            }
+            i = j;
+        }
+        i += 1;
+    }
+    names
+}
+
 fn source_fact_rows(
     lib: &str,
     cls: &str,
@@ -1653,31 +1776,15 @@ fn source_fact_rows(
     if !errors.is_empty() {
         return Err(format!("source facts parser-failed: {}", errors.join("; ")));
     }
-    // Explicit passthrough subscriptions under `passthru_opt`: syscalls in
-    // the first `vec![...]` of that branch (the determinized and
-    // unsupported sweeps below it follow from class).
-    let m = mask_rust(lib);
-    let mut explicit: BTreeSet<String> = BTreeSet::new();
-    let Some(branch) = m.find("let mut subscription = Subscription::none();") else {
-        return Err("source facts parser-failed: passthru_opt branch not found".into());
-    };
-    let Some(list_rel) = m[branch..].find("subscription.syscalls([") else {
-        return Err("source facts parser-failed: passthru_opt subscription list not found".into());
-    };
-    let open = branch + list_rel + "subscription.syscalls(".len();
-    let Some(close) = matching(m.as_bytes(), open) else {
-        return Err("source facts parser-failed: unbalanced subscription list".into());
-    };
-    let mut rest = m[open + 1..close].to_string();
-    while let Some(i) = rest.find("Sysno::") {
-        match ident_after(&rest, i + 7) {
-            Some((name, end)) => {
-                explicit.insert(name);
-                rest.replace_range(i..end, " ");
-            }
-            None => break,
-        }
+    // Run-mode subscription is the non-passthru branch's blanket
+    // `all_syscalls` today; if that shape goes, fail rather than keep
+    // stamping a constant `true` the source no longer supports.
+    if !mask_rust(lib).contains("Subscription::all_syscalls()") {
+        return Err(
+            "source facts parser-failed: run-mode all_syscalls subscription not found".into(),
+        );
     }
+    let explicit = passthru_explicit_names(lib)?;
     let mut rows = BTreeMap::new();
     for (name, (class, _line)) in &census.classes {
         rows.insert(
@@ -1745,7 +1852,7 @@ fn parse_facts_tsv(text: &str) -> Result<(String, BTreeMap<String, FactRow>), St
         );
     }
     if sha.is_empty() {
-        return Err("facts TSV does not name its hermit SHA".into());
+        return Err("facts TSV does not name its source revision".into());
     }
     Ok((sha, rows))
 }
@@ -1943,7 +2050,7 @@ fn index_md(pages: &[Page], sha: &str) -> String {
         "Facts on every page were exported or derived at the revision in its `code_facts.as_of`; source citations in generated strategy text are line numbers in that source tree, not permanent addresses."
     );
     let _ = writeln!(s);
-    let _ = writeln!(s, "Code facts as of hermit `{sha}`.");
+    let _ = writeln!(s, "Code facts as of source revision `{sha}`.");
     let _ = writeln!(s);
     let _ = writeln!(s, "| strategy | count |");
     let _ = writeln!(s, "|---|---:|");
@@ -2218,7 +2325,7 @@ fn cmd_facts(root: &Path, args: &[String]) -> i32 {
         q.sections.insert("Strategy".into(), body);
         if facts_changed {
             let entry = format!(
-                "- {date} · hermit {} · facts: code_facts refreshed by `facts --apply` at this SHA.",
+                "- {date} · rev {} · facts: code_facts refreshed by `facts --apply` at this SHA.",
                 &sha[..12]
             );
             let status = q.sections.entry("Status".into()).or_default();
@@ -2379,7 +2486,7 @@ fn cmd_check(root: &Path, quick: bool) -> i32 {
             as_ofs.insert(&p.code_facts.as_of);
             let prefix = &p.code_facts.as_of[..12.min(p.code_facts.as_of.len())];
             let status = p.sections.get("Status").cloned().unwrap_or_default();
-            if !status.contains(&format!("hermit {prefix}")) {
+            if !status.contains(&format!("rev {prefix}")) {
                 eprintln!(
                     "check: {}: Status has no entry at its code_facts.as_of prefix {prefix}",
                     p.syscall
@@ -2448,6 +2555,55 @@ fn cmd_check(root: &Path, quick: bool) -> i32 {
                             p.nr_x86_64, p.syscall
                         );
                         rc = 1;
+                    }
+                }
+                // Source-derived refused/subscription facts are compared
+                // too: deriving them at generation time but never
+                // re-checking them is how a missed subscription list
+                // shipped a wrong `access` fact. The independent cfg-list
+                // scan below is a second read of that same class.
+                let lib_src = read(&root.join("detcore/src/lib.rs"));
+                let cls_src = read(&root.join("detcore/src/syscall_classification.rs"));
+                match source_fact_rows(&lib_src, &cls_src, &census) {
+                    Ok(rows) => {
+                        for p in &pages {
+                            let Some(row) = rows.get(&p.syscall) else {
+                                continue;
+                            };
+                            let f = &p.code_facts;
+                            if f.refused != row.refused
+                                || f.refused_only_when_fail_closed
+                                    != row.refused_only_when_fail_closed
+                                || f.subscribed_run != row.subscribed_run
+                                || f.subscribed_record_replay != row.subscribed_record_replay
+                            {
+                                eprintln!(
+                                    "check: {}: refused/subscription facts disagrees with source derivation (refused {}, strict {}, run {}, record/replay {})",
+                                    p.syscall,
+                                    row.refused,
+                                    row.refused_only_when_fail_closed,
+                                    row.subscribed_run,
+                                    row.subscribed_record_replay
+                                );
+                                rc = 1;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("check: {e}");
+                        rc = 1;
+                    }
+                }
+                for name in x86_cfg_subscription_names(&lib_src) {
+                    if let Some(p) = pages.iter().find(|p| p.syscall == name) {
+                        if p.code_facts.detcore_class == "passthrough"
+                            && !p.code_facts.subscribed_record_replay
+                        {
+                            eprintln!(
+                                "check: {name}: x86_64 subscription list subscribes it under passthru_opt but page says subscribed_record_replay: false"
+                            );
+                            rc = 1;
+                        }
                     }
                 }
                 let classes: BTreeMap<String, String> = census
@@ -2571,6 +2727,7 @@ fn existing_page_bits(
         split_sections(split_front_matter(&text).map(|x| x.1).unwrap_or(""))
             .get("Status")
             .cloned()
+            .map(|s| s.replace(" · hermit ", " · rev "))
     } else {
         None
     };
@@ -2729,7 +2886,7 @@ fn cmd_generate(root: &Path, args: &[String]) -> i32 {
         );
         let status = existing_status.unwrap_or_else(|| {
             format!(
-                "\n- {date} · hermit {} · facts-only page generated from Detcore code facts at this revision.\n",
+                "\n- {date} · rev {} · facts-only page generated from Detcore code facts at this revision.\n",
                 &sha[..12]
             )
         });
@@ -2954,7 +3111,7 @@ fn site_index_html(pages: &[Page], sha: &str) -> String {
     );
     let _ = writeln!(
         s,
-        "<p>The code-derived Detcore strategy for each Linux syscall in this tree's census. Code facts as of hermit <code>{}</code>. The machine-readable table is <a href=\"https://github.com/facebookexperimental/hermit/blob/main/docs/syscalls/syscalls.json\">syscalls.json</a>; test-matrix coverage is a separate measurement in the <a href=\"{COVERAGE_URL}\">syscall coverage audit</a>.</p></header>",
+        "<p>The code-derived Detcore strategy for each Linux syscall in this tree's census. Code facts as of source revision <code>{}</code>. The machine-readable table is <a href=\"https://github.com/facebookexperimental/hermit/blob/main/docs/syscalls/syscalls.json\">syscalls.json</a>; test-matrix coverage is a separate measurement in the <a href=\"{COVERAGE_URL}\">syscall coverage audit</a>.</p></header>",
         html_escape(sha)
     );
     let _ = writeln!(s, "<p>");
@@ -3157,7 +3314,7 @@ mod tests {
         );
         page.sections.insert(
             "Status".into(),
-            "\n- 2026-11-15 · hermit 0123456789ab · facts-only page generated from Detcore code facts at this revision.\n".into(),
+            "\n- 2026-11-15 · rev 0123456789ab · facts-only page generated from Detcore code facts at this revision.\n".into(),
         );
         page
     }
@@ -3272,7 +3429,14 @@ mod tests {
 
     #[test]
     fn aggregate_and_render_are_order_independent_and_repeatable() {
-        let pages = vec![sample_page_for("write", 1), sample_page_for("read", 0)];
+        // nr order differs from name order (access 21 after read 0), so a
+        // sort-by-name or descending regression fails this test too.
+        let pages = vec![sample_page_for("access", 21), sample_page_for("read", 0)];
+        let json = syscalls_json(&pages, "0123456789abcdef0123456789abcdef01234567");
+        assert!(
+            json.find("\"read\"").unwrap() < json.find("\"access\"").unwrap(),
+            "rows must be nr-ordered: {json}"
+        );
         let mut shuffled = pages.clone();
         shuffled.reverse();
         let sha = "0123456789abcdef0123456789abcdef01234567";
@@ -3281,6 +3445,21 @@ mod tests {
         // Standing determinism check: build the render twice, compare.
         assert_eq!(render_outputs(&pages, sha), render_outputs(&shuffled, sha));
         assert_eq!(render_outputs(&pages, sha), render_outputs(&pages, sha));
+    }
+
+    #[test]
+    fn passthru_lists_include_arch_gated_second_list() {
+        // Red twin for the access finding: the old reader stopped at the
+        // first list and never saw the x86_64-only one.
+        let lib = "let mut subscription = Subscription::none();\nsubscription.syscalls([Sysno::read]);\n#[cfg(target_arch = \"x86_64\")]\nsubscription.syscalls([\n    Sysno::access,\n]);\n#[cfg(target_arch = \"aarch64\")]\nsubscription.syscalls([Sysno::fstatat]);\nsubscription.syscalls(crate::all_pinned_syscalls().filter(|_| true));\n";
+        let names = passthru_explicit_names(lib).expect("lists parse");
+        assert!(names.contains("read"), "{names:?}");
+        assert!(
+            names.contains("access"),
+            "second x86_64 list missed: {names:?}"
+        );
+        assert!(!names.contains("fstatat"), "aarch64 list leaked: {names:?}");
+        assert!(x86_cfg_subscription_names(lib).contains("access"));
     }
 
     #[test]

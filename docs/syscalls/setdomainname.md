@@ -23,8 +23,8 @@ code_facts:
 
 Detcore classifies `setdomainname` (171) as determinized-refused via pred:is_privileged_admin_refused_syscall dispatch; deterministic refusal: true; run subscription: true; record/replay subscription: true.
 
-- Classification: `detcore/src/syscall_classification.rs:1831`
-- Dispatch: `detcore/src/lib.rs:7484`
+- Reviewed list: `detcore/src/syscall_classification.rs:1831`
+- Dispatch: `detcore/src/lib.rs:7635`
 
 This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.
 
@@ -34,4 +34,4 @@ This facts-only page was generated from Detcore code facts. Checked analysis pro
 
 ## Status
 
-- 2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.
+- 2026-11-15 · rev 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.
