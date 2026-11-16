@@ -235,7 +235,7 @@ hermit_host_test(
             # write order to keep the endpoints distinct (as OSS
             # hermit-cli/tests/analyze.rs does).
             "--selfcheck --run-arg=--base-env=empty --target-exit-code=0 --target-stdout=foobar",
-            "simple/racewrite_nostdlib.c:35",
+            "racewrite_nostdlib.c:35",
         ),
         # TODO: enable more analyze tests:
         # ("cas_sequence", "$(location //hermetic_infra/hermit/tests:chaos_cas_sequence_bin)"),
