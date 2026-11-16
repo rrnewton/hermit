@@ -155,6 +155,24 @@ _RUST_RELEASE_FLAGS = select({
     "DEFAULT": [],
 })
 
+# hermit.rustc_version (.buckconfig [hermit], kept equal to
+# rust-toolchain.toml's channel by scripts/check-rustc-version.rs) stamps
+# the configured pin into every rust action key. It is the pin, not a
+# measurement of the compiler that runs. The system toolchain runs
+# whatever rustc is on PATH, so without this stamp no action key names
+# the compiler and a shared action cache serves rlibs across rustc
+# versions (measured failure: a 1.99-nightly serde served to the pinned
+# 1.97.1 build, rejected with E0514). -Cmetadata only joins the key and
+# the crate disambiguator; it changes no code generation flags.
+_RUSTC_VERSION = read_root_config("hermit", "rustc_version", "")
+
+_RUSTC_VERSION_FLAGS = ["-Cmetadata=hermit-rustc-" + _RUSTC_VERSION]
+
+# An unset pin must stop the build at load time, before any cached rust
+# action can be served under a versionless key. BUCK files have no
+# top-level if, hence the comprehension.
+[fail("hermit.rustc_version is unset: set it in [hermit] in .buckconfig (see scripts/check-rustc-version.rs)") for _ in ([None] if not _RUSTC_VERSION else [])]
+
 
 [
     export_file(
@@ -173,7 +191,7 @@ _RUST_RELEASE_FLAGS = select({
         # execute inside the pinned root. The nix interp keeps the same
         # flags runnable on the build host (its /nix/store holds the
         # pinned closure), so build scripts stay consistent too.
-        rustc_flags = _RUST_RELEASE_FLAGS + (PINNED_LINK_ARGS if _RUST_SYSROOT == "pinned-rust-sysroot" else []),
+        rustc_flags = _RUST_RELEASE_FLAGS + _RUSTC_VERSION_FLAGS + (PINNED_LINK_ARGS if _RUST_SYSROOT == "pinned-rust-sysroot" else []),
         sysroot = ":rust-sysroot",
         visibility = ["PUBLIC"],
     )
@@ -184,7 +202,7 @@ _RUST_RELEASE_FLAGS = select({
     system_rust_toolchain(
         name = "rust",
         default_edition = "2024",
-        rustc_flags = _RUST_RELEASE_FLAGS,
+        rustc_flags = _RUST_RELEASE_FLAGS + _RUSTC_VERSION_FLAGS,
         visibility = ["PUBLIC"],
     )
     for _ in ([] if _RUST_SYSROOT else [None])

@@ -737,6 +737,22 @@ How it fits together:
   the same isolation-dir name (the default `v2` — a custom name changes
   output paths embedded in commands and defeats reuse), the same pinned
   Buck2 binary (`bootstrap/buck2`), project config, and toolchain.
+- The configured compiler pin is part of every rust action key:
+  `[hermit] rustc_version` in `.buckconfig` (kept equal to
+  `rust-toolchain.toml`'s channel by `scripts/check-rustc-version.rs`,
+  run in preflight) is stamped into rustc invocations as
+  `-Cmetadata=hermit-rustc-<version>` by the shim toolchain. What enters
+  the key is that configured pin, not a measurement of the binary that
+  runs: the shim still executes PATH rustc, so a cache-linked checkout
+  must run the pinned compiler. Preflight enforces it there (the
+  checker compares full `rustc -vV` against the pinned channel when
+  `.buckconfig.local` links this checkout to the shared cache); an
+  ad-hoc build on a mismatched PATH rustc is outside that guard. Before the stamp existed, the system toolchain
+  ran PATH rustc under versionless keys and a shared cache could serve
+  an rlib built by another rustc, which the pinned compiler then refused
+  (E0514). Bump the pin in the same change as the toolchain channel;
+  `ci/test_rustc_cache_key.sh` proves a version flip misses the cache
+  instead of being served from it.
 - The OSS release-provenance path is unaffected: it passes
   `--no-remote-cache` and refuses remote results, and the binary is
   byte-identical in linked and truly unlinked checkouts (measured

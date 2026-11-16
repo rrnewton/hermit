@@ -32,6 +32,20 @@ execution_platforms = prelude//platforms:default
 [parser]
 target_platform_detector_spec = target:root//...->prelude//platforms:default target:shim//...->prelude//platforms:default target:reverie//...->prelude//platforms:default target:reverie_shim//...->prelude//platforms:default
 
+[hermit]
+# The rustc this tree builds with (rust-toolchain.toml channel). The shim
+# Rust toolchain stamps this pin into every rust action key
+# (-Cmetadata=hermit-rustc-<version>, shim/BUCK), so cache entries are
+# selected by pin and a shared action cache no longer serves an rlib
+# built under another pin: before this stamp, the localhost cache served
+# a 1.99-nightly serde to the pinned 1.97.1 build and rustc refused it
+# with E0514. The stamp is the configured pin, not a measurement of the
+# compiler that runs; keeping PATH rustc equal to the pin on
+# cache-linked hosts is the preflight host check's job.
+# Bump in the same change as rust-toolchain.toml;
+# scripts/check-rustc-version.rs (preflight) refuses any disagreement.
+rustc_version = 1.97.1
+
 [oss]
 # This tree vendors no folly cell, so shim cpp_unittest must link the
 # googletest main, not folly's test_main_lib (shim/shims.bzl).
