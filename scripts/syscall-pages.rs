@@ -7,53 +7,44 @@
 //!
 //! ```cargo
 //! [dependencies]
-//! serde_json = "1"
+//! serde_json = "=1.0.154"
 //! ```
 //!
-//! Per-syscall Detcore pages: lint, facts, aggregate, check, and the one-time
-//! conversion of the recovered `syscall-tracking/v1` bodies into pages.
+//! Per-syscall Detcore pages: lint, generate, facts, aggregate, render,
+//! and check.
 //!
-//! The pages in `docs/syscalls/<name>.md` are the source of truth for what
-//! Detcore does with each Linux syscall and why: its determinization
-//! strategy (modelled, emulated, refused with a fixed errno, passed
-//! through, or unsupported). Which backends can run a syscall is not tracked
-//! here; that is a Reverie/backend question. Test coverage (which syscalls
-//! the validate matrix exercises) is likewise separate: the generated index
-//! links to it and never merges its numbers into the strategy table. The
-//! normative page format is `docs/syscalls/SCHEMA.md`.
+//! The facts-only pages in `docs/syscalls/<name>.md` record the
+//! code-derived Detcore strategy for each syscall in this tree's
+//! Detcore census. Checked analysis prose is not in them yet; it returns
+//! in batches. Which backends can run a syscall is not tracked here.
+//! Test coverage is likewise separate: generated indexes link the
+//! coverage audit and never merge its numbers into the strategy table.
+//! The normative page format is `docs/syscalls/SCHEMA.md`.
 //!
 //! Subcommands:
-//! - `lint` — schema, sections, flag/test inventories, Status format, the
-//!   public-text scrub, and discussion-link shape. No build, runs in
-//!   seconds.
+//! - `lint` — schema, sections, Status format, public-text rules, and
+//!   discussion-link shape. No build, runs in seconds.
+//! - `generate` — (re)generate every facts-only page from this tree's
+//!   Detcore sources, optionally overlaying an exporter TSV for exact
+//!   numbers and refused/subscription facts.
 //! - `facts [--apply]` — export per-syscall policy from Detcore itself
 //!   (public API only, through `scripts/syscall-pages-facts.rs`) plus the
-//!   dispatch parse and the tests-naming count. Bare `facts` prints a diff
-//!   against the pages' `code_facts`; `--apply` rewrites those blocks.
-//! - `aggregate [--check]` — regenerate `docs/syscalls/syscalls.json` (the
-//!   machine-readable strategy table a website indexes) and the counts and
-//!   table in `docs/syscalls/README.md` from the pages.
-//! - `check [--quick]` — lint + census + generated-file freshness + the
-//!   dispatch parse; full `check` also compares every page's `code_facts`
-//!   against a facts export at HEAD. `--quick` skips that build and takes
-//!   each page's class from its own front matter, so it proves
-//!   self-consistency and that every page claiming `determinized` has an
-//!   explicit dispatch arm in today's source, but it cannot prove the
-//!   claimed class is today's. Only full `check` proves that.
-//! - `convert --from DIR --mapping JSON --facts TSV --sha SHA` — the
-//!   one-time import of the recovered v1 bodies into page form. The input
-//!   bodies are not in this repository; the converted pages are.
+//!   dispatch parse. Needs a git checkout with the `reverie/` submodule.
+//! - `aggregate [--check]`, `render [--check]` — regenerate or verify
+//!   the JSON table, index, and static site, byte for byte.
+//! - `check [--quick]` — lint + derived census + classes + dispatch +
+//!   citations + generated-output freshness and public-text scan, all
+//!   from this tree's sources; full `check` also compares exporter facts
+//!   (the git-only part, named as such in SCHEMA.md).
 //!
-//! What the dispatch parse cannot understand is `parser-failed`, never a
-//! pass. What `lint` cannot parse is an error, never a skip.
+//! What the census or dispatch parse cannot understand is
+//! `parser-failed`, never a pass. What `lint` cannot parse is an error,
+//! never a skip.
 //!
-//! Not yet ported from the dev-hermit predecessor tool: the C08 rule that
-//! resolves a recorded `T<n> covered by <path>` token to a strict-container
-//! ptrace manifest cell or hermit-cli integration test. This tool checks
-//! token shape, that the named test ids exist, and that every cited path
-//! exists in the tree; it does not yet prove the cited test runs Hermit in
-//! the default strict container. That gap is recorded in SCHEMA.md so a
-//! `done` claim is never read as C08-verified by this tool alone.
+//! Not ported from the predecessor system: its C08 rule resolving a
+//! recorded coverage token to a strict-container test. Facts-only pages
+//! record no coverage tokens at all, and SCHEMA.md states that no page
+//! claim is machine-verified coverage until that check exists.
 
 #[path = "lib/rust_script_prelude.rs"]
 mod rust_script_prelude;
@@ -67,26 +58,20 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::process::exit;
 
-const SCHEMA: &str = "syscall-pages/v1";
+const SCHEMA: &str = "syscall-pages/v2";
 const PAGES_DIR: &str = "docs/syscalls";
 const JSON_FILE: &str = "docs/syscalls/syscalls.json";
 const INDEX_FILE: &str = "docs/syscalls/README.md";
-/// Headings of a page body, in order. The v1 `## Tracking data` section
-/// became YAML front matter; `## Discussion` is new in page form.
-const SECTIONS: [&str; 9] = [
-    "Summary",
-    "Linux semantics",
-    "Determinism analysis",
-    "Hermit design",
-    "Recommended tests",
-    "Done criteria",
-    "Status",
-    "Discussion",
-    "Additional information",
-];
-const LINUX_DETERMINISM: [&str; 3] = ["deterministic", "conditional", "nondeterministic"];
-const TARGET_POLICY: [&str; 5] = ["model", "emulate", "refuse", "passthrough", "investigate"];
-const TRACKING_STATUS: [&str; 5] = ["todo", "in-progress", "blocked", "done", "wontfix"];
+/// Public syscall-coverage audit linked (never merged) from generated
+/// indexes. The in-tree coverage page is `docs/SYSCALL_COVERAGE.md`;
+/// generated Markdown and HTML link the public Hermit repository path so
+/// links resolve from both trees.
+const COVERAGE_URL: &str =
+    "https://github.com/facebookexperimental/hermit/blob/main/docs/SYSCALL_COVERAGE.md";
+/// Facts-only page sections, in order. Analysis prose returns in batches
+/// after each paragraph is checked against Detcore; until then a page has
+/// the generated strategy, discussion link, and append-only status log.
+const SECTIONS: [&str; 3] = ["Strategy", "Discussion", "Status"];
 const DETCORE_CLASS: [&str; 3] = ["determinized", "passthrough", "unsupported"];
 
 fn repo_root() -> PathBuf {
@@ -134,17 +119,12 @@ struct CodeFacts {
     refused_only_when_fail_closed: bool,
     subscribed_run: bool,
     subscribed_record_replay: bool,
-    tests_naming: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 struct Page {
     syscall: String,
     nr_x86_64: i32,
-    linux_determinism: String,
-    target_policy: String,
-    tracking_status: String,
-    cross_host_variant: bool,
     related: Vec<String>,
     discussion_kind: String,
     discussion_url: String,
@@ -167,9 +147,6 @@ impl Report {
     }
     fn err(&mut self, rule: &str, msg: impl Into<String>) {
         self.errors.push(format!("{rule}: {}", msg.into()));
-    }
-    fn warn(&mut self, rule: &str, msg: impl Into<String>) {
-        self.warnings.push(format!("{rule}: {}", msg.into()));
     }
 }
 
@@ -237,10 +214,6 @@ fn parse_front_matter(fm: &str) -> Result<FrontMatter, String> {
         "schema",
         "syscall",
         "nr_x86_64",
-        "linux_determinism",
-        "target_policy",
-        "tracking_status",
-        "cross_host_variant",
         "related",
         "discussion",
         "code_facts",
@@ -254,7 +227,6 @@ fn parse_front_matter(fm: &str) -> Result<FrontMatter, String> {
         "refused_only_when_fail_closed",
         "subscribed_run",
         "subscribed_record_replay",
-        "tests_naming",
     ];
     let mut out = FrontMatter {
         scalars: BTreeMap::new(),
@@ -304,8 +276,14 @@ fn parse_front_matter(fm: &str) -> Result<FrontMatter, String> {
                 out.unknown.push(key.to_string());
                 continue;
             }
-            out.scalars
-                .insert((String::new(), key.to_string()), value.to_string());
+            let value = value.split(" #").next().unwrap_or("").trim();
+            if out
+                .scalars
+                .insert((String::new(), key.to_string()), value.to_string())
+                .is_some()
+            {
+                return Err(format!("duplicate front-matter key `{key}`"));
+            }
         } else {
             let known = match block.as_str() {
                 "discussion" => discussion_keys.contains(&key),
@@ -322,8 +300,13 @@ fn parse_front_matter(fm: &str) -> Result<FrontMatter, String> {
                 .unwrap_or("")
                 .trim()
                 .trim_matches('"');
-            out.scalars
-                .insert((block.clone(), key.to_string()), value.to_string());
+            if out
+                .scalars
+                .insert((block.clone(), key.to_string()), value.to_string())
+                .is_some()
+            {
+                return Err(format!("duplicate front-matter key `{block}.{key}`"));
+            }
         }
     }
     Ok(out)
@@ -386,10 +369,6 @@ fn parse_page(text: &str, rep: &mut Report) -> Option<Page> {
     let page = Page {
         syscall: get("", "syscall", rep),
         nr_x86_64: get("", "nr_x86_64", rep).parse().unwrap_or(-1),
-        linux_determinism: get("", "linux_determinism", rep),
-        target_policy: get("", "target_policy", rep),
-        tracking_status: get("", "tracking_status", rep),
-        cross_host_variant: b("", "cross_host_variant", rep),
         related: fm.related.clone(),
         discussion_kind: get("discussion", "kind", rep),
         discussion_url: get("discussion", "url", rep),
@@ -401,7 +380,6 @@ fn parse_page(text: &str, rep: &mut Report) -> Option<Page> {
             refused_only_when_fail_closed: b("code_facts", "refused_only_when_fail_closed", rep),
             subscribed_run: b("code_facts", "subscribed_run", rep),
             subscribed_record_replay: b("code_facts", "subscribed_record_replay", rep),
-            tests_naming: get("code_facts", "tests_naming", rep).parse().unwrap_or(0),
         },
         sections: split_sections(body),
     };
@@ -418,14 +396,6 @@ fn emit_page(page: &Page) -> String {
     let _ = writeln!(s, "schema: {SCHEMA}");
     let _ = writeln!(s, "syscall: {}", page.syscall);
     let _ = writeln!(s, "nr_x86_64: {}", page.nr_x86_64);
-    let _ = writeln!(s, "linux_determinism: {}", page.linux_determinism);
-    let _ = writeln!(s, "target_policy: {}", page.target_policy);
-    let _ = writeln!(s, "tracking_status: {}", page.tracking_status);
-    let _ = writeln!(
-        s,
-        "cross_host_variant: {}",
-        bool_str(page.cross_host_variant)
-    );
     if page.related.is_empty() {
         let _ = writeln!(s, "related: []");
     } else {
@@ -458,7 +428,6 @@ fn emit_page(page: &Page) -> String {
         "  subscribed_record_replay: {}",
         bool_str(f.subscribed_record_replay)
     );
-    let _ = writeln!(s, "  tests_naming: {}", f.tests_naming);
     let _ = writeln!(s, "---");
     for h in SECTIONS {
         let _ = writeln!(s, "\n## {h}\n");
@@ -482,58 +451,48 @@ fn strategy(f: &CodeFacts) -> &'static str {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Public-text scrub (P30) and its one-time converter form. Pages live in a
-// public repository: no host names, home or scratch paths, internal diff or
-// task ids, or internal URLs. `scrub_text` rewrites the forms measured in
-// the recovered bodies; `lint` then refuses anything it still recognises,
-// so a new form is a visible failure to extend here, not a quiet leak.
-// ---------------------------------------------------------------------------
-
-fn scrub_text(t: &str) -> String {
-    let t = t
-        .replace("this devbig host", "the measurement host")
-        .replace("devbig host", "measurement host");
-    // Hostname runs anywhere, including inside quoted strace payloads.
-    let mut scrubbed = String::with_capacity(t.len());
-    let mut rest = t.as_str();
-    while let Some(i) = rest.find("devbig") {
-        let run_len = rest[i..]
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-')
-            .map(|c| c.len_utf8())
-            .sum::<usize>();
-        scrubbed.push_str(&rest[..i]);
-        if rest[..i].ends_with('"') {
-            scrubbed.push_str("measurement-host");
-        } else {
-            scrubbed.push_str("the measurement host");
-        }
-        rest = &rest[i + run_len..];
+/// The single prose sentence a facts-only page is allowed to assert about
+/// strategy. It is a pure function of `code_facts`, so lint can hold every
+/// page to it exactly.
+fn strategy_body(page: &Page, classification_line: usize, dispatch_line: Option<usize>) -> String {
+    let mut s = format!("\n{}\n", strategy_sentence(page));
+    let _ = writeln!(
+        s,
+        "\n- Classification: `detcore/src/syscall_classification.rs:{classification_line}`"
+    );
+    if let Some(line) = dispatch_line {
+        let _ = writeln!(s, "- Dispatch: `detcore/src/lib.rs:{line}`");
     }
-    scrubbed.push_str(rest);
-    let mut out = String::with_capacity(scrubbed.len());
-    for word_or_space in scrubbed.split_inclusive(|c: char| c.is_whitespace()) {
-        out.push_str(&scrub_token(word_or_space));
-    }
-    out.replace("on the coordinator host", "on the measurement host")
-        .replace("under `/var/tmp`", "in a scratch directory")
-        .replace("`/var/tmp/syscall-tracking/", "`a scratch directory (")
+    s.push_str(
+        "\nThis facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.\n",
+    );
+    s
 }
 
-fn scrub_token(tok: &str) -> String {
-    let core = tok.trim_matches(|c: char| !c.is_alphanumeric() && c != '.' && c != '-' && c != '/');
-    if is_devbig_host(core) {
-        return tok.replace(core, "the measurement host");
-    }
-    if core.starts_with("/var/tmp/") {
-        return tok.replace(core, "a scratch directory");
-    }
-    tok.to_string()
+fn strategy_sentence(page: &Page) -> String {
+    let f = &page.code_facts;
+    format!(
+        "Detcore classifies `{}` ({}) as {} via {} dispatch; deterministic refusal: {}; run subscription: {}; record/replay subscription: {}.",
+        page.syscall,
+        page.nr_x86_64,
+        strategy(f),
+        f.dispatch,
+        bool_str(f.refused),
+        bool_str(f.subscribed_run),
+        bool_str(f.subscribed_record_replay)
+    )
 }
+
+// ---------------------------------------------------------------------------
+// Public-text findings (P30). Pages and generated outputs live in a
+// public repository: no host names, home or scratch paths, internal diff
+// or task ids, private-workspace references, or internal URLs. Lint
+// refuses every recognised form, so a new form is a visible failure to
+// extend here, not a quiet leak.
+// ---------------------------------------------------------------------------
 
 fn is_devbig_host(s: &str) -> bool {
-    let s = s.strip_suffix("\'s").unwrap_or(s);
+    let s = s.strip_suffix("'s").unwrap_or(s);
     if let Some(rest) = s.strip_prefix("devbig") {
         return rest.chars().take_while(|c| c.is_ascii_digit()).count() >= 3
             && rest[rest.chars().take_while(|c| c.is_ascii_digit()).count()..]
@@ -556,26 +515,106 @@ fn scrub_findings(text: &str) -> Vec<String> {
         out.push(run.clone());
         at = start + run.len();
     }
+    let lower = text.to_lowercase();
+    for needle in [
+        "from the checkout at",
+        "from our checkout",
+        "from my checkout",
+        "in our slot",
+        "in my slot",
+        "in our worktree",
+        "in my worktree",
+        "in our lane",
+        "in my lane",
+        "author:",
+    ] {
+        if lower.contains(needle) {
+            out.push(needle.to_string());
+        }
+    }
     for tok in text.split(|c: char| c.is_whitespace() || c == '`' || c == '(' || c == ')') {
         let core = tok.trim_matches(|c: char| {
             !c.is_alphanumeric() && c != '.' && c != '-' && c != '/' && c != ':'
         });
+        let lc = core.to_lowercase();
+        let dc_host = [
+            "prn", "frc", "ftw", "atn", "cln", "odn", "lla", "ash", "vll", "nao", "rva", "pnb",
+            "cco", "snc", "eag",
+        ]
+        .iter()
+        .any(|dc| {
+            lc.split('.').any(|part| {
+                part.strip_prefix(dc)
+                    .map(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+                    .unwrap_or(false)
+            })
+        });
         if is_devbig_host(core)
             || core.starts_with("/home/")
             || core.starts_with("/data/users/")
-            || core.starts_with("/var/tmp/")
-            || core.contains(".internalfb.com")
-            || core.contains(".atn") && core.contains(".facebook.com")
+            || core.starts_with("/var/tmp")
+            || lc.contains(".internalfb.com")
+            || lc.contains(".facebook.com")
+            || lc.contains(".fb.com")
+            || lc.contains("fburl")
+            || lc.contains("tfbnw")
+            || lc.contains("thefacebook")
+            || lc.contains("/intern/")
+            || lc.contains("dev-hermit/")
+            || lc.contains("work/dev-hermit")
+            || lc.contains("worktrees/slots/")
+            || lc.contains("ai_docs/")
+            || lc.contains("ignored/")
+            || lc.contains("github.com/rrnewton/dev-hermit")
+            || lc.contains("githubusercontent.com/rrnewton/dev-hermit")
+            || (lc.contains("temp/") && lc.contains("-status.md"))
+            || dc_host
         {
             out.push(core.to_string());
         }
     }
-    // Internal diff and task ids: a capital D or a dh- prefix followed by a
-    // long digit/id run, as a standalone token.
-    for tok in text.split(|c: char| !(c.is_alphanumeric() || c == '-')) {
-        if (tok.starts_with('D') && tok.len() >= 8 && tok[1..].chars().all(|c| c.is_ascii_digit()))
-            || (tok.starts_with("dh-") && tok.len() >= 8)
-        {
+    // Internal diff, task, tracker, agent/lane and model identifiers, as
+    // standalone tokens. The private-workspace script
+    // (`scripts/check-private-workspace-refs.sh`) defines the path/link
+    // classes above; these are the people-and-tracking classes it does not.
+    // Built by concatenation: this file is processed by tools that would
+    // otherwise rewrite the lowercase model name in the source text.
+    let claude_name = concat!("cla", "ude");
+    for tok in text.split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_')) {
+        let lc = tok.to_lowercase();
+        let tracker = (tok.len() >= 7
+            && ['D', 'P', 'S', 'T'].contains(&tok.chars().next().unwrap_or(' '))
+            && tok[1..].chars().all(|c| c.is_ascii_digit()))
+            || (lc.starts_with("dh-") && tok.len() >= 6)
+            || lc.starts_with("tbh-")
+            || ["bead", "minibeads", "agentctl", "herdr"].contains(&lc.as_str());
+        let agent_or_lane = lc.starts_with("syscall-tracking")
+            || lc.starts_with("orc-coord")
+            || lc == "orc"
+            || lc.starts_with("muse-")
+            || lc == "muse"
+            || lc.starts_with(claude_name)
+            || lc.starts_with("codex")
+            || lc.starts_with("coord")
+                && lc[5..]
+                    .chars()
+                    .next()
+                    .map(|c| c.is_ascii_digit())
+                    .unwrap_or(false)
+            || [
+                "hermit2",
+                "hermit-bot",
+                "hermit-bot3",
+                "hermit-bots",
+                "facts-bot",
+                "p3-samples",
+            ]
+            .contains(&lc.as_str());
+        let model_name = lc.starts_with("gpt-")
+            || lc.starts_with("tbh-")
+            || ["opus", "sonnet", "haiku"].contains(&lc.as_str())
+            || (lc.contains(claude_name) && lc.chars().any(|c| c.is_ascii_digit()));
+        if tracker || agent_or_lane || model_name {
             out.push(tok.to_string());
         }
     }
@@ -588,23 +627,6 @@ fn scrub_findings(text: &str) -> Vec<String> {
 // Lint. Rule ids are P-prefixed (page form); the SCHEMA.md rule index is the
 // normative text for each id.
 // ---------------------------------------------------------------------------
-
-fn parse_id_list<'a>(prefix: char, lines: impl Iterator<Item = &'a str>) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    for line in lines {
-        if let Some(rest) = line.trim().strip_prefix("- ") {
-            if let Some(id) = rest.split([':', ' ']).next() {
-                if id.starts_with(prefix)
-                    && id[1..].chars().all(|c| c.is_ascii_digit())
-                    && id.len() > 1
-                {
-                    out.insert(id.to_string());
-                }
-            }
-        }
-    }
-    out
-}
 
 fn lint_page(name_hint: &str, text: &str, root: &Path) -> (Report, Option<Page>) {
     let mut rep = Report::new();
@@ -634,14 +656,8 @@ fn lint_page(name_hint: &str, text: &str, root: &Path) -> (Report, Option<Page>)
             }
         }
     }
-    // P03: prose sections non-empty.
-    for h in [
-        "Summary",
-        "Linux semantics",
-        "Determinism analysis",
-        "Hermit design",
-        "Done criteria",
-    ] {
+    // P03: facts sections non-empty.
+    for h in ["Strategy"] {
         if page
             .sections
             .get(h)
@@ -661,24 +677,17 @@ fn lint_page(name_hint: &str, text: &str, root: &Path) -> (Report, Option<Page>)
             ),
         );
     }
-    if !(0..=461).contains(&page.nr_x86_64) {
+    if page.nr_x86_64 < 0 {
+        rep.err("P07", format!("nr_x86_64 {} is negative", page.nr_x86_64));
+    }
+    if !DETCORE_CLASS.contains(&page.code_facts.detcore_class.as_str()) {
         rep.err(
-            "P07",
+            "P09",
             format!(
-                "nr_x86_64 {} outside the pinned table range",
-                page.nr_x86_64
+                "value {:?} is not one of {DETCORE_CLASS:?}",
+                page.code_facts.detcore_class
             ),
         );
-    }
-    for (rule, v, set) in [
-        ("P08", &page.linux_determinism, &LINUX_DETERMINISM[..]),
-        ("P08", &page.target_policy, &TARGET_POLICY[..]),
-        ("P08", &page.tracking_status, &TRACKING_STATUS[..]),
-        ("P09", &page.code_facts.detcore_class, &DETCORE_CLASS[..]),
-    ] {
-        if !set.contains(&v.as_str()) {
-            rep.err(rule, format!("value {v:?} is not one of {set:?}"));
-        }
     }
     let f = &page.code_facts;
     if f.as_of.len() != 40
@@ -720,182 +729,18 @@ fn lint_page(name_hint: &str, text: &str, root: &Path) -> (Report, Option<Page>)
             );
         }
     }
-    lint_flags_tests(&page, &mut rep);
-    lint_status(&page, root, &mut rep);
-    lint_done(&page, &mut rep);
-    lint_discussion(&page, &mut rep);
-    // W01: stale issue-era denominators. W02: nondet passthrough surprise.
-    let prose: String = [
-        "Summary",
-        "Linux semantics",
-        "Determinism analysis",
-        "Hermit design",
-    ]
-    .iter()
-    .filter_map(|h| page.sections.get(*h))
-    .cloned()
-    .collect();
-    for needle in [
-        "UNCLASSIFIED (TEMPORARY PASS-THRU)",
-        "temporary pass-through",
-    ] {
-        if prose.contains(needle) {
-            rep.warn("W01", format!("stale text mentions {needle:?}"));
-        }
-    }
-    if page.linux_determinism == "nondeterministic"
-        && page.code_facts.detcore_class == "passthrough"
-        && page.tracking_status != "blocked"
-    {
-        rep.warn(
-            "W02",
-            "nondeterministic under Linux but passed through while not blocked",
-        );
-    }
-    (rep, Some(page))
-}
-
-/// Does the text cite a `path:line` (a source path with an extension, a
-/// colon, and a line number)? Used for U items and design citations.
-fn has_path_line(text: &str) -> bool {
-    for tok in text.split(|c: char| c.is_whitespace() || c == '`' || c == '(' || c == ')') {
-        for ext in [".rs:", ".c:", ".h:", ".yaml:", ".toml:", ".md:"] {
-            if let Some(i) = tok.find(ext) {
-                let after = &tok[i + ext.len()..];
-                if after.chars().take_while(|c| c.is_ascii_digit()).count() > 0 {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
-fn subsection<'a>(body: &'a str, heading: &str) -> Option<&'a str> {
-    let marker = format!("### {heading}");
-    let start = body.find(&marker)? + marker.len();
-    let rest = &body[start..];
-    let end = rest.find("\n### ").unwrap_or(rest.len());
-    Some(&rest[..end])
-}
-
-fn lint_flags_tests(page: &Page, rep: &mut Report) {
-    let linux = page
-        .sections
-        .get("Linux semantics")
-        .cloned()
-        .unwrap_or_default();
-    // P10/P29: exactly one flags inventory; cross-host subsection iff flag.
-    let flags_count = linux.matches("### Flags and options").count();
-    if flags_count != 1 {
-        rep.err("P10", format!("`## Linux semantics` must hold exactly one `### Flags and options`, found {flags_count}"));
-    }
-    let flags_body = subsection(&linux, "Flags and options").unwrap_or("");
-    let f_ids = parse_id_list('F', flags_body.lines());
-    let sentinel = flags_body.trim() == "_None: the syscall takes no flags or options._";
-    if f_ids.is_empty() && !sentinel {
+    let _ = root;
+    let want_strategy = strategy_sentence(&page);
+    let got_strategy = page.sections.get("Strategy").cloned().unwrap_or_default();
+    if !got_strategy.contains(&want_strategy) {
         rep.err(
-            "P10",
-            "flags inventory is empty and is not the `_None_` sentinel",
+            "P35",
+            format!("`## Strategy` must contain the code-derived line: {want_strategy:?}"),
         );
     }
-    for line in flags_body.lines() {
-        let t = line.trim();
-        if !t.is_empty() && !t.starts_with("- ") && !sentinel && !line.starts_with("  ") {
-            rep.err("P10", format!("stray line in flags inventory: {t:?}"));
-        }
-    }
-    let det = page
-        .sections
-        .get("Determinism analysis")
-        .cloned()
-        .unwrap_or_default();
-    let xh = subsection(&det, "Cross-host variation");
-    let xh_items = xh
-        .map(|b| b.lines().filter(|l| l.trim().starts_with("- ")).count())
-        .unwrap_or(0);
-    if page.cross_host_variant != (xh.is_some() && xh_items > 0) {
-        rep.err("P29", "`cross_host_variant` is true iff one `### Cross-host variation` lists the host properties");
-    }
-    // P11: T/U items reference defined F ids; ids unique.
-    let tests = page
-        .sections
-        .get("Recommended tests")
-        .cloned()
-        .unwrap_or_default();
-    if tests.trim() == "_None proposed yet._" {
-        if page.tracking_status != "todo" {
-            rep.err(
-                "P11",
-                "`_None proposed yet._` is only allowed while `tracking_status: todo`",
-            );
-        }
-        return;
-    }
-    let mut seen: BTreeSet<String> = BTreeSet::new();
-    for line in tests.lines() {
-        // Indented `- ` lines are sub-cases of the item above them.
-        let Some(rest) = line.strip_prefix("- ") else {
-            continue;
-        };
-        let Some(id) = rest.split([' ', ':']).next() else {
-            continue;
-        };
-        if !(id.starts_with(['T', 'U'])
-            && id.len() > 1
-            && id[1..].chars().all(|c| c.is_ascii_digit()))
-        {
-            rep.err(
-                "P11",
-                format!("recommended-test item does not start with a T/U id: {rest:?}"),
-            );
-            continue;
-        }
-        if !seen.insert(id.to_string()) {
-            rep.err("P11", format!("repeated test id {id}"));
-        }
-        let Some(open) = rest.find("(covers ") else {
-            rep.err("P11", format!("{id} has no `(covers ...)` list"));
-            continue;
-        };
-        let Some(close) = rest[open..].find(')') else {
-            continue;
-        };
-        let covers = &rest[open + 8..open + close];
-        if id.starts_with('U') {
-            if !covers.contains("host-config") && !covers.contains("host-transient") {
-                rep.err(
-                    "P11",
-                    format!("{id} U item must be host-config or host-transient"),
-                );
-            }
-            if covers.contains("host-config") && !page.cross_host_variant {
-                rep.err(
-                    "P32",
-                    format!("{id} host-config U item requires `cross_host_variant: true`"),
-                );
-            }
-            if !has_path_line(rest) {
-                rep.err(
-                    "P11",
-                    format!("{id} U item must cite the `path:line` that forwards the error"),
-                );
-            }
-        }
-        for c in covers.split([',', ';']) {
-            let c = c.trim();
-            if c.starts_with('F')
-                && c.len() > 1
-                && c[1..].chars().all(|x| x.is_ascii_digit())
-                && !f_ids.contains(c)
-            {
-                rep.err("P11", format!("{id} covers undefined flag {c}"));
-            }
-        }
-    }
-    if seen.is_empty() {
-        rep.err("P11", "`## Recommended tests` has no T or U items");
-    }
+    lint_status(&page, &mut rep);
+    lint_discussion(&page, &mut rep);
+    (rep, Some(page))
 }
 
 fn status_entries(page: &Page) -> Vec<String> {
@@ -910,58 +755,18 @@ fn status_entries(page: &Page) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Coverage tokens a Status log actually asserts: `T<n> covered by <path>`
-/// inside an entry whose text starts `covered:` or `done:`, minus any T id a
-/// later `uncovered:` entry withdraws.
-fn coverage_tokens(page: &Page) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
-    for e in status_entries(page) {
-        let text = e.rsplit(" · ").next().unwrap_or("");
-        if text.starts_with("uncovered:") {
-            for tok in text.split(|c: char| !(c.is_alphanumeric())) {
-                if tok.starts_with('T')
-                    && tok.len() > 1
-                    && tok[1..].chars().all(|c| c.is_ascii_digit())
-                {
-                    out.retain(|(t, _)| t != tok);
-                }
-            }
-            continue;
-        }
-        if !(text.starts_with("covered:") || text.starts_with("done:")) {
-            continue;
-        }
-        let mut rest = text;
-        while let Some(i) = rest.find(" covered by ") {
-            let before = &rest[..i];
-            let Some(tid) = before.rsplit(|c: char| !(c.is_alphanumeric())).next() else {
-                break;
-            };
-            let path = rest[i + 12..]
-                .split(|c: char| c.is_whitespace() || c == ',' || c == ';' || c == ')')
-                .next()
-                .unwrap_or("");
-            if tid.starts_with('T') && tid.len() > 1 && !path.is_empty() {
-                out.push((tid.to_string(), path.trim_matches('`').to_string()));
-            }
-            rest = &rest[i + 12..];
-        }
-    }
-    out
-}
-
-fn lint_status(page: &Page, root: &Path, rep: &mut Report) {
+fn lint_status(page: &Page, rep: &mut Report) {
     let entries = status_entries(page);
     if entries.is_empty() {
         rep.err("P12", "`## Status` needs at least one dated entry");
     }
     let mut last = "";
     for e in &entries {
-        let parts: Vec<&str> = e.trim_start_matches("- ").split(" · ").collect();
-        if parts.len() < 4 {
+        let parts: Vec<&str> = e.trim_start_matches("- ").splitn(3, " · ").collect();
+        if parts.len() < 3 {
             rep.err(
                 "P12",
-                format!("Status entry is not `- date · hermit <sha> · agent · text`: {e:?}"),
+                format!("Status entry is not `- date · hermit <sha> · text`: {e:?}"),
             );
             continue;
         }
@@ -989,116 +794,6 @@ fn lint_status(page: &Page, root: &Path, rep: &mut Report) {
             rep.err(
                 "P12",
                 format!("Status entry does not name `hermit <12-40 hex>`: {e:?}"),
-            );
-        }
-    }
-    // P33 (existence half of the old C08): every asserted coverage path
-    // exists and the T id is defined. The strict-container half is the
-    // recorded follow-up in the file header and SCHEMA.md.
-    let tests = page
-        .sections
-        .get("Recommended tests")
-        .cloned()
-        .unwrap_or_default();
-    let t_ids = parse_id_list('T', tests.lines());
-    for (tid, path) in coverage_tokens(page) {
-        if !t_ids.contains(&tid) {
-            rep.err("P33", format!("coverage token names undefined {tid}"));
-        }
-        if !root.join(&path).exists() {
-            rep.err(
-                "P33",
-                format!("coverage path {path} for {tid} does not exist in the tree"),
-            );
-        }
-    }
-}
-
-fn lint_done(page: &Page, rep: &mut Report) {
-    let entries = status_entries(page);
-    let last_text = entries
-        .last()
-        .map(|e| e.rsplit(" · ").next().unwrap_or("").to_string())
-        .unwrap_or_default();
-    if page.tracking_status == "wontfix" && !last_text.starts_with("wontfix:") {
-        rep.err(
-            "P18",
-            "`wontfix` needs a last Status entry starting `wontfix:`",
-        );
-    }
-    if page.tracking_status != "done" {
-        return;
-    }
-    let f = &page.code_facts;
-    let realises = match page.target_policy.as_str() {
-        "refuse" => f.refused,
-        "model" | "emulate" => f.detcore_class == "determinized" && !f.refused,
-        "passthrough" => f.detcore_class == "passthrough",
-        _ => false,
-    };
-    if !realises {
-        rep.err(
-            "P14",
-            format!(
-                "`done` needs code facts to realise target_policy {}",
-                page.target_policy
-            ),
-        );
-    }
-    if !last_text.starts_with("done:") {
-        rep.err("P16", "`done` needs a last Status entry starting `done:`");
-    }
-    let linux = page
-        .sections
-        .get("Linux semantics")
-        .cloned()
-        .unwrap_or_default();
-    let f_ids = parse_id_list(
-        'F',
-        subsection(&linux, "Flags and options")
-            .unwrap_or("")
-            .lines(),
-    );
-    let tests = page
-        .sections
-        .get("Recommended tests")
-        .cloned()
-        .unwrap_or_default();
-    let covered_t: BTreeSet<String> = coverage_tokens(page).into_iter().map(|(t, _)| t).collect();
-    let mut covered_f: BTreeSet<String> = BTreeSet::new();
-    for line in tests.lines() {
-        let Some(rest) = line.trim().strip_prefix("- ") else {
-            continue;
-        };
-        let Some(id) = rest.split([' ', ':']).next() else {
-            continue;
-        };
-        let Some(open) = rest.find("(covers ") else {
-            continue;
-        };
-        let Some(close) = rest[open..].find(')') else {
-            continue;
-        };
-        let covers = &rest[open + 8..open + close];
-        let counts =
-            covered_t.contains(id) || (id.starts_with('U') && covers.contains("host-config"));
-        if counts {
-            for c in covers.split([',', ';']) {
-                let c = c.trim();
-                if c.starts_with('F') {
-                    covered_f.insert(c.to_string());
-                }
-            }
-        }
-    }
-    if covered_t.is_empty() {
-        rep.err("P17", "`done` needs at least one recorded coverage token");
-    }
-    for fid in &f_ids {
-        if !covered_f.contains(fid) {
-            rep.err(
-                "P17",
-                format!("`done` but flag {fid} has no covered test or host-config U item"),
             );
         }
     }
@@ -1555,7 +1250,14 @@ struct DispatchReport {
     status: String,
     errors: Vec<String>,
     dispatch: BTreeMap<String, String>,
+    /// 1-based line in `detcore/src/lib.rs` of the arm that assigned each
+    /// dispatch label, where an explicit arm exists.
+    lines: BTreeMap<String, usize>,
     missing_arm: Vec<String>,
+}
+
+fn line_at(src: &str, byte: usize) -> usize {
+    src[..byte.min(src.len())].matches('\n').count() + 1
 }
 
 /// Assign each pinned syscall the dispatch arm that handles it. `classes`
@@ -1575,6 +1277,7 @@ fn parse_dispatch(
             .keys()
             .map(|k| (k.clone(), "parser-failed".into()))
             .collect(),
+        lines: BTreeMap::new(),
         missing_arm: Vec::new(),
     };
     let m = mask_rust(lib);
@@ -1601,6 +1304,7 @@ fn parse_dispatch(
     };
     let preds = merge_predicates(preds_src);
     let mut dispatch: BTreeMap<String, String> = BTreeMap::new();
+    let mut dispatch_lines: BTreeMap<String, usize> = BTreeMap::new();
     let mut typed_arm: Option<Arm> = None;
     for a in &arms {
         match arm_arch(&a.attrs) {
@@ -1660,7 +1364,12 @@ fn parse_dispatch(
                 match ident_after(&rest, i + 7) {
                     Some((name, end)) => {
                         if classes.contains_key(&name) {
-                            dispatch.insert(name, "sysno-guard".into());
+                            // Rust takes the first matching arm; a later
+                            // arm naming the same syscall must not relabel it.
+                            dispatch_lines
+                                .entry(name.clone())
+                                .or_insert_with(|| line_at(&m, a.start));
+                            dispatch.entry(name).or_insert("sysno-guard".into());
                         }
                         rest.replace_range(i..end, " ");
                     }
@@ -1672,7 +1381,12 @@ fn parse_dispatch(
         for term in split_top(guard, "||") {
             if let Some(name) = term.strip_prefix("call.number() == Sysno::") {
                 if is_syscall_name(name) {
-                    dispatch.insert(name.to_string(), "sysno-guard".into());
+                    dispatch_lines
+                        .entry(name.to_string())
+                        .or_insert_with(|| line_at(&m, a.start));
+                    dispatch
+                        .entry(name.to_string())
+                        .or_insert("sysno-guard".into());
                 } else {
                     errors.push(format!("bad sysno guard term {term:?}"));
                 }
@@ -1685,7 +1399,10 @@ fn parse_dispatch(
                 if pred_ok {
                     for member in expand_pred(pred, &preds, &mut Vec::new(), &mut errors) {
                         if classes.contains_key(&member) {
-                            dispatch.insert(member, format!("pred:{pred}"));
+                            dispatch_lines
+                                .entry(member.clone())
+                                .or_insert_with(|| line_at(&m, a.start));
+                            dispatch.entry(member).or_insert(format!("pred:{pred}"));
                         }
                     }
                 } else {
@@ -1753,6 +1470,9 @@ fn parse_dispatch(
                                     };
                                     match variants.get(&variant) {
                                         Some(name) => {
+                                            dispatch_lines
+                                                .entry(name.clone())
+                                                .or_insert_with(|| line_at(&m, a.start));
                                             dispatch.entry(name.clone()).or_insert("typed".into());
                                         }
                                         None => {
@@ -1797,15 +1517,191 @@ fn parse_dispatch(
         status: "ok".into(),
         errors,
         dispatch,
+        lines: dispatch_lines,
         missing_arm: missing,
     }
 }
 
+/// The x86_64 syscall census Detcore itself asserts in
+/// `detcore/src/syscall_classification.rs`: the reviewed name lists plus
+/// the compile-time count and last-id assertions. This is the census the
+/// in-tree gate uses; it is derived from the tree being checked, so a
+/// pinned-table bump changes it without any number changing here.
+struct Census {
+    expected_count: usize,
+    last_id: i32,
+    /// name -> (detcore_class, 1-based line of its reviewed-list entry)
+    classes: BTreeMap<String, (String, usize)>,
+}
+
+fn parse_census(src: &str) -> Result<Census, String> {
+    let lines: Vec<&str> = src.lines().collect();
+    let mut expected_count = None;
+    let mut last_id = None;
+    for (i, line) in lines.iter().enumerate() {
+        if line.contains("const EXPECTED_SYSNO_COUNT") {
+            let prev = lines[..i]
+                .iter()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .copied()
+                .unwrap_or("");
+            if prev.contains("x86_64") {
+                expected_count = line
+                    .split('=')
+                    .nth(1)
+                    .map(|v| v.trim().trim_end_matches(';').trim().parse::<usize>())
+                    .transpose()
+                    .map_err(|_| "census: unparsable EXPECTED_SYSNO_COUNT".to_string())?;
+            }
+        }
+        if let Some(rest) = line.split("Sysno::last().id() == ").nth(1) {
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if !digits.is_empty() {
+                last_id = digits.parse::<i32>().ok();
+            }
+        }
+    }
+    let expected_count = expected_count.ok_or("census: x86_64 EXPECTED_SYSNO_COUNT not found")?;
+    let last_id = last_id.ok_or("census: Sysno::last().id() assertion not found")?;
+    let mut classes: BTreeMap<String, (String, usize)> = BTreeMap::new();
+    for (const_name, class) in [
+        ("DETERMINIZED_SYSCALLS", "determinized"),
+        ("PASSTHROUGH_SYSCALLS", "passthrough"),
+        ("UNSUPPORTED_SYSCALLS", "unsupported"),
+    ] {
+        let Some(start) = lines
+            .iter()
+            .position(|l| l.contains(&format!("const {const_name}")))
+        else {
+            return Err(format!("census: {const_name} not found"));
+        };
+        let mut skip_next = false;
+        for (off, line) in lines.iter().enumerate().skip(start) {
+            let t = line.trim();
+            if off > start && t.starts_with("];") {
+                break;
+            }
+            if t.contains("#[cfg(") {
+                skip_next = t.contains("aarch64") && !t.contains("not(");
+                continue;
+            }
+            let mut at = 0;
+            while let Some(rel) = line[at..].find('"') {
+                let begin = at + rel + 1;
+                let Some(end_rel) = line[begin..].find('"') else {
+                    break;
+                };
+                let name = &line[begin..begin + end_rel];
+                if is_syscall_name(name) && !skip_next {
+                    if classes
+                        .insert(name.to_string(), (class.to_string(), off + 1))
+                        .is_some()
+                    {
+                        return Err(format!("census: {name} listed twice"));
+                    }
+                }
+                at = begin + end_rel + 1;
+            }
+            if line.contains('"') {
+                skip_next = false;
+            }
+            if off == start && t.contains("];") {
+                break;
+            }
+        }
+    }
+    if classes.len() != expected_count {
+        return Err(format!(
+            "census parser-failed: reviewed lists hold {} x86_64 names, EXPECTED_SYSNO_COUNT is {expected_count}",
+            classes.len()
+        ));
+    }
+    Ok(Census {
+        expected_count,
+        last_id,
+        classes,
+    })
+}
+
+/// Facts derivable from Detcore source alone (no build): class from the
+/// census, deterministic refusal from the refusal predicates, and the
+/// record/replay subscription rule. Numbers (`nr`) stay -1 placeholders;
+/// the exporter or an existing page must supply them.
+fn source_fact_rows(
+    lib: &str,
+    cls: &str,
+    census: &Census,
+) -> Result<BTreeMap<String, FactRow>, String> {
+    let preds = merge_predicates(&[
+        ("detcore/src/lib.rs", lib),
+        ("detcore/src/syscall_classification.rs", cls),
+    ]);
+    let mut errors = Vec::new();
+    let refused = expand_pred(
+        "is_deterministically_refused_syscall",
+        &preds,
+        &mut Vec::new(),
+        &mut errors,
+    );
+    let strict_only = expand_pred(
+        "is_strict_only_deterministic_refusal_syscall",
+        &preds,
+        &mut Vec::new(),
+        &mut errors,
+    );
+    if !errors.is_empty() {
+        return Err(format!("source facts parser-failed: {}", errors.join("; ")));
+    }
+    // Explicit passthrough subscriptions under `passthru_opt`: syscalls in
+    // the first `vec![...]` of that branch (the determinized and
+    // unsupported sweeps below it follow from class).
+    let m = mask_rust(lib);
+    let mut explicit: BTreeSet<String> = BTreeSet::new();
+    let Some(branch) = m.find("let mut subscription = Subscription::none();") else {
+        return Err("source facts parser-failed: passthru_opt branch not found".into());
+    };
+    let Some(list_rel) = m[branch..].find("subscription.syscalls([") else {
+        return Err("source facts parser-failed: passthru_opt subscription list not found".into());
+    };
+    let open = branch + list_rel + "subscription.syscalls(".len();
+    let Some(close) = matching(m.as_bytes(), open) else {
+        return Err("source facts parser-failed: unbalanced subscription list".into());
+    };
+    let mut rest = m[open + 1..close].to_string();
+    while let Some(i) = rest.find("Sysno::") {
+        match ident_after(&rest, i + 7) {
+            Some((name, end)) => {
+                explicit.insert(name);
+                rest.replace_range(i..end, " ");
+            }
+            None => break,
+        }
+    }
+    let mut rows = BTreeMap::new();
+    for (name, (class, _line)) in &census.classes {
+        rows.insert(
+            name.clone(),
+            FactRow {
+                nr: -1,
+                detcore_class: class.clone(),
+                refused: refused.contains(name),
+                refused_only_when_fail_closed: strict_only.contains(name),
+                subscribed_run: true,
+                subscribed_record_replay: class != "passthrough" || explicit.contains(name),
+            },
+        );
+    }
+    Ok(rows)
+}
+
 // ---------------------------------------------------------------------------
-// Facts: the TSV the exporter prints, the dispatch parse, and the C9 count
-// of test files naming a syscall. Facts are bound to an exact HEAD: the
-// exporter binary carries the SHA it was built against and refuses others,
-// and this tool refuses to build it from a dirty tree.
+// Facts: the TSV the exporter prints and the dispatch parse. Facts are
+// bound to an exact HEAD: the exporter binary carries the SHA it was built
+// against and refuses others, and this tool refuses to build it from a
+// dirty tree. The exporter path needs a git checkout with the `reverie/`
+// submodule; the census, dispatch, lint and freshness checks above it do
+// not, and run in an fbsource tree as-is.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
@@ -1952,48 +1848,6 @@ fn export_facts(root: &Path) -> Result<(String, BTreeMap<String, FactRow>), Stri
     parse_facts_tsv(&tsv)
 }
 
-/// C9: for each syscall, how many test files name it via SYS_, __NR_ or
-/// Sysno::. Advisory only; it under-counts libc wrapper use by design.
-fn tests_naming(root: &Path, names: &BTreeSet<String>) -> BTreeMap<String, u32> {
-    let mut per_file: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let out = run_cmd(Command::new("git").arg("-C").arg(root).args([
-        "grep",
-        "-E",
-        "SYS_[a-z0-9_]+|__NR_[a-z0-9_]+|Sysno::[a-z0-9_]+",
-        "--",
-        "tests",
-        "hermit-cli/tests",
-        "detcore/tests",
-    ]));
-    if let Ok(out) = out {
-        for line in out.lines() {
-            let Some((file, text)) = line.split_once(':') else {
-                continue;
-            };
-            for name in names {
-                if text.contains(&format!("SYS_{name}"))
-                    || text.contains(&format!("__NR_{name}"))
-                    || text.contains(&format!("Sysno::{name}"))
-                {
-                    per_file
-                        .entry(name.clone())
-                        .or_default()
-                        .insert(file.to_string());
-                }
-            }
-        }
-    }
-    names
-        .iter()
-        .map(|n| {
-            (
-                n.clone(),
-                per_file.get(n).map(|s| s.len() as u32).unwrap_or(0),
-            )
-        })
-        .collect()
-}
-
 // ---------------------------------------------------------------------------
 // Loading pages, aggregate outputs, and the facts comparison.
 // ---------------------------------------------------------------------------
@@ -2019,7 +1873,18 @@ fn load_pages(root: &Path) -> Vec<(String, String, Report, Option<Page>)> {
     out
 }
 
+fn sorted_pages(pages: &[Page]) -> Vec<Page> {
+    let mut sorted = pages.to_vec();
+    sorted.sort_by(|a, b| {
+        a.nr_x86_64
+            .cmp(&b.nr_x86_64)
+            .then_with(|| a.syscall.cmp(&b.syscall))
+    });
+    sorted
+}
+
 fn syscalls_json(pages: &[Page], sha: &str) -> String {
+    let pages = sorted_pages(pages);
     let rows: Vec<serde_json::Value> = pages
         .iter()
         .map(|p| {
@@ -2034,21 +1899,17 @@ fn syscalls_json(pages: &[Page], sha: &str) -> String {
                 "dispatch": f.dispatch,
                 "subscribed_run": f.subscribed_run,
                 "subscribed_record_replay": f.subscribed_record_replay,
-                "linux_determinism": p.linux_determinism,
-                "target_policy": p.target_policy,
-                "tracking_status": p.tracking_status,
-                "cross_host_variant": p.cross_host_variant,
                 "discussion": {"kind": p.discussion_kind, "url": p.discussion_url},
                 "page": format!("docs/syscalls/{}.md", p.syscall),
             })
         })
         .collect();
     let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
-    for p in pages {
+    for p in &pages {
         *counts.entry(strategy(&p.code_facts)).or_default() += 1;
     }
     let doc = serde_json::json!({
-        "schema": "syscalls.json/v1",
+        "schema": "syscalls.json/v2",
         "generated_by": "scripts/syscall-pages.rs aggregate",
         "code_facts_as_of": sha,
         "total": pages.len(),
@@ -2059,8 +1920,9 @@ fn syscalls_json(pages: &[Page], sha: &str) -> String {
 }
 
 fn index_md(pages: &[Page], sha: &str) -> String {
+    let pages = sorted_pages(pages);
     let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
-    for p in pages {
+    for p in &pages {
         *counts.entry(strategy(&p.code_facts)).or_default() += 1;
     }
     let mut s = String::new();
@@ -2068,12 +1930,17 @@ fn index_md(pages: &[Page], sha: &str) -> String {
     let _ = writeln!(s);
     let _ = writeln!(
         s,
-        "One page per Linux syscall in the pinned x86-64 table: what Detcore does with it, and why. The machine-readable form is [syscalls.json](syscalls.json); the page format is [SCHEMA.md](SCHEMA.md). Regenerate both with `scripts/syscall-pages.rs aggregate`; verify with `scripts/syscall-pages.rs check`."
+        "One facts-only page per Linux syscall in this tree's pinned x86-64 Detcore census: the code-derived strategy and a discussion link. Checked analysis prose returns in later batches. The machine-readable form is [syscalls.json](syscalls.json); the page format is [SCHEMA.md](SCHEMA.md). Regenerate with `scripts/syscall-pages.rs generate` and `aggregate`; verify with `scripts/syscall-pages.rs check`."
     );
     let _ = writeln!(s);
     let _ = writeln!(
         s,
-        "These pages track Detcore strategy only. Which backends can run a syscall is tracked with the backends, not here. Which syscalls the test matrix exercises is a coverage measurement linked from the syscall-coverage audit, not a column below."
+        "These pages track Detcore strategy only. Which backends can run a syscall is tracked with the backends, not here. Which syscalls the test matrix exercises is a separate measurement in the [syscall coverage audit]({COVERAGE_URL}), linked here and never merged into the strategy table."
+    );
+    let _ = writeln!(s);
+    let _ = writeln!(
+        s,
+        "Facts on every page were exported or derived at the revision in its `code_facts.as_of`; source citations in generated strategy text are line numbers in that source tree, not permanent addresses."
     );
     let _ = writeln!(s);
     let _ = writeln!(s, "Code facts as of hermit `{sha}`.");
@@ -2085,23 +1952,17 @@ fn index_md(pages: &[Page], sha: &str) -> String {
     }
     let _ = writeln!(s, "| **total** | **{}** |", pages.len());
     let _ = writeln!(s);
-    let _ = writeln!(
-        s,
-        "| syscall | nr | strategy | dispatch | linux determinism | target policy | status | discussion |"
-    );
-    let _ = writeln!(s, "|---|---:|---|---|---|---|---|---|");
-    for p in pages {
+    let _ = writeln!(s, "| syscall | nr | strategy | dispatch | discussion |");
+    let _ = writeln!(s, "|---|---:|---|---|---|");
+    for p in &pages {
         let _ = writeln!(
             s,
-            "| [{}]({}.md) | {} | {} | {} | {} | {} | {} | [{}]({}) |",
+            "| [{}]({}.md) | {} | {} | {} | [{}]({}) |",
             p.syscall,
             p.syscall,
             p.nr_x86_64,
             strategy(&p.code_facts),
             p.code_facts.dispatch,
-            p.linux_determinism,
-            p.target_policy,
-            p.tracking_status,
             p.discussion_kind,
             p.discussion_url
         );
@@ -2114,7 +1975,6 @@ fn facts_diff(
     sha: &str,
     rows: &BTreeMap<String, FactRow>,
     dispatch: &BTreeMap<String, String>,
-    naming: &BTreeMap<String, u32>,
 ) -> Vec<String> {
     let mut out = Vec::new();
     let want = |p: &Page| CodeFacts {
@@ -2125,7 +1985,6 @@ fn facts_diff(
         refused_only_when_fail_closed: rows[&p.syscall].refused_only_when_fail_closed,
         subscribed_run: rows[&p.syscall].subscribed_run,
         subscribed_record_replay: rows[&p.syscall].subscribed_record_replay,
-        tests_naming: naming.get(&p.syscall).copied().unwrap_or(0),
     };
     for p in pages {
         if !rows.contains_key(&p.syscall) {
@@ -2138,6 +1997,10 @@ fn facts_diff(
         let w = want(p);
         let f = &p.code_facts;
         let mut diffs = Vec::new();
+        // `as_of` is the generation revision, not required to equal the
+        // exporter HEAD: docs-only commits after generation must not make
+        // every page stale. Quick check ties it to the aggregate and to
+        // the Status hermit prefix instead (see SCHEMA.md).
         if f.detcore_class != w.detcore_class {
             diffs.push(format!(
                 "detcore_class {} -> {}",
@@ -2158,12 +2021,6 @@ fn facts_diff(
         }
         if f.subscribed_record_replay != w.subscribed_record_replay {
             diffs.push("subscribed_record_replay changed".into());
-        }
-        if f.tests_naming != w.tests_naming {
-            diffs.push(format!(
-                "tests_naming {} -> {}",
-                f.tests_naming, w.tests_naming
-            ));
         }
         if p.nr_x86_64 != rows[&p.syscall].nr {
             diffs.push(format!(
@@ -2229,116 +2086,6 @@ fn discussion_url(name: &str) -> String {
     format!("https://github.com/facebookexperimental/hermit/issues/new?title={title}&body={body}")
 }
 
-fn fix_done_criteria(t: &str) -> String {
-    t.replace(
-        "each such test exists at the cited hermit SHA and runs on ptrace in CI; the code realizes `target_policy`; and `ptrace_verification` is `verified`.",
-        "each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes `target_policy`; and the Status log records that evidence.",
-    )
-    .replace(
-        "If a problem is later found with this syscall, the issue reopens: `tracking_status` returns to `todo` or `in-progress` with a Status entry saying why.",
-        "If a problem is later found with this syscall, `tracking_status` returns to `todo` or `in-progress` with a Status entry saying why.",
-    )
-    .replace("Closed means `done` (owner rule, 2026-10-02):", "`done` means (owner rule, 2026-10-02):")
-}
-
-/// One scalar from a v1 Tracking-data YAML block (top level or indented).
-fn v1_grab(yaml: &str, key: &str) -> Option<String> {
-    for line in yaml.lines() {
-        let t = line.trim_start();
-        if let Some(v) = t.strip_prefix(&format!("{key}:")) {
-            return Some(v.trim().trim_matches('"').to_string());
-        }
-    }
-    None
-}
-
-fn convert_body(
-    name: &str,
-    text: &str,
-    mapping: &BTreeMap<String, Vec<u64>>,
-    facts: &BTreeMap<String, FactRow>,
-    dispatch: &BTreeMap<String, String>,
-    naming: &BTreeMap<String, u32>,
-    sha: &str,
-    date: &str,
-) -> Result<Page, String> {
-    let yaml_start = text.find("```yaml\n").ok_or("no v1 yaml block")? + 8;
-    let yaml_end = text[yaml_start..]
-        .find("```")
-        .ok_or("unterminated v1 yaml block")?
-        + yaml_start;
-    let yaml = &text[yaml_start..yaml_end];
-    let fact = facts
-        .get(name)
-        .ok_or_else(|| format!("{name} has no facts row"))?;
-    let grab = |k: &str| v1_grab(yaml, k).unwrap_or_default();
-    let mut related: Vec<String> = Vec::new();
-    for n in mapping.get(name).cloned().unwrap_or_default() {
-        related.push(format!("https://github.com/rrnewton/hermit/issues/{n}"));
-    }
-    // The ppoll one-off tracker used a different title pattern, so it is in
-    // no plan file: https://github.com/rrnewton/hermit/issues/26.
-    if name == "ppoll" {
-        related.push("https://github.com/rrnewton/hermit/issues/26".into());
-    }
-    let body = &text[yaml_end + 3..];
-    let mut sections = split_sections(body);
-    sections.remove("Tracking data");
-    if let Some(done) = sections.get("Done criteria").cloned() {
-        sections.insert("Done criteria".into(), fix_done_criteria(&done));
-    }
-    for (h, b) in sections.iter_mut() {
-        *b = scrub_text(b);
-        // The dropped verification key survives only in historical Status
-        // entries; live prose says the same thing without naming the key.
-        if h != "Status" {
-            *b = b
-                .replace(
-                    "`ptrace_verification` stays `untested`",
-                    "verification on the default backend stays untested",
-                )
-                .replace("`ptrace_verification`", "verification")
-                .replace("ptrace_verification", "verification");
-        }
-    }
-    let disc = discussion_url(name);
-    sections.insert(
-        "Discussion".into(),
-        format!("\n[Start a discussion about `{name}`]({disc}) (opens a prefilled issue form; nothing is filed until you submit it).\n"),
-    );
-    let entry = format!(
-        "- {date} · hermit {} · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.",
-        &sha[..12.min(sha.len())]
-    );
-    let status = sections.entry("Status".into()).or_default();
-    if !status.trim_end().ends_with(&entry) {
-        status.push_str(&entry);
-        status.push('\n');
-    }
-    Ok(Page {
-        syscall: name.to_string(),
-        nr_x86_64: fact.nr,
-        linux_determinism: grab("linux_determinism"),
-        target_policy: grab("target_policy"),
-        tracking_status: grab("tracking_status"),
-        cross_host_variant: grab("cross_host_variant") == "true",
-        related,
-        discussion_kind: "new".into(),
-        discussion_url: disc,
-        code_facts: CodeFacts {
-            as_of: sha.to_string(),
-            detcore_class: fact.detcore_class.clone(),
-            dispatch: dispatch.get(name).cloned().unwrap_or_default(),
-            refused: fact.refused,
-            refused_only_when_fail_closed: fact.refused_only_when_fail_closed,
-            subscribed_run: fact.subscribed_run,
-            subscribed_record_replay: fact.subscribed_record_replay,
-            tests_naming: naming.get(name).copied().unwrap_or(0),
-        },
-        sections,
-    })
-}
-
 // ---------------------------------------------------------------------------
 // Commands.
 // ---------------------------------------------------------------------------
@@ -2359,6 +2106,10 @@ fn print_reports(loaded: &[(String, String, Report, Option<Page>)]) -> usize {
 
 fn good_pages(loaded: &[(String, String, Report, Option<Page>)]) -> Vec<Page> {
     loaded.iter().filter_map(|(_, _, _, p)| p.clone()).collect()
+}
+
+fn census_at(root: &Path) -> Result<Census, String> {
+    parse_census(&read(&root.join("detcore/src/syscall_classification.rs")))
 }
 
 fn dispatch_at(root: &Path, classes: &BTreeMap<String, String>) -> DispatchReport {
@@ -2388,15 +2139,7 @@ fn cmd_lint(root: &Path) -> i32 {
 fn facts_context(
     root: &Path,
     pages: &[Page],
-) -> Result<
-    (
-        String,
-        BTreeMap<String, FactRow>,
-        DispatchReport,
-        BTreeMap<String, u32>,
-    ),
-    String,
-> {
+) -> Result<(String, BTreeMap<String, FactRow>, DispatchReport), String> {
     let (sha, rows) = export_facts(root)?;
     let classes: BTreeMap<String, String> = rows
         .iter()
@@ -2409,20 +2152,19 @@ fn facts_context(
             dispatch.errors.join("; ")
         ));
     }
-    let names: BTreeSet<String> = rows.keys().cloned().collect();
-    let naming = tests_naming(root, &names);
     let _ = pages;
-    Ok((sha, rows, dispatch, naming))
+    Ok((sha, rows, dispatch))
 }
 
-fn cmd_facts(root: &Path, apply: bool) -> i32 {
+fn cmd_facts(root: &Path, args: &[String]) -> i32 {
+    let apply = args.iter().any(|a| a == "--apply");
     let loaded = load_pages(root);
     let pages = good_pages(&loaded);
-    let (sha, rows, dispatch, naming) = match facts_context(root, &pages) {
+    let (sha, rows, dispatch) = match facts_context(root, &pages) {
         Ok(v) => v,
         Err(e) => fail(&e),
     };
-    let diffs = facts_diff(&pages, &sha, &rows, &dispatch.dispatch, &naming);
+    let diffs = facts_diff(&pages, &sha, &rows, &dispatch.dispatch);
     if !apply {
         for d in &diffs {
             println!("{d}");
@@ -2435,7 +2177,7 @@ fn cmd_facts(root: &Path, apply: bool) -> i32 {
         );
         return if diffs.is_empty() { 0 } else { 1 };
     }
-    let date = today_utc();
+    let date = arg_value(args, "--date").unwrap_or_else(today_utc);
     let mut changed = 0;
     for p in &pages {
         let Some(row) = rows.get(&p.syscall) else {
@@ -2453,27 +2195,38 @@ fn cmd_facts(root: &Path, apply: bool) -> i32 {
             refused_only_when_fail_closed: row.refused_only_when_fail_closed,
             subscribed_run: row.subscribed_run,
             subscribed_record_replay: row.subscribed_record_replay,
-            tests_naming: naming.get(&p.syscall).copied().unwrap_or(0),
         };
-        let values_differ = p.code_facts.detcore_class != want.detcore_class
+        let values_differ = p.code_facts != want;
+        if !values_differ {
+            continue;
+        }
+        let facts_changed = p.code_facts.detcore_class != want.detcore_class
             || p.code_facts.dispatch != want.dispatch
             || p.code_facts.refused != want.refused
             || p.code_facts.refused_only_when_fail_closed != want.refused_only_when_fail_closed
             || p.code_facts.subscribed_run != want.subscribed_run
-            || p.code_facts.subscribed_record_replay != want.subscribed_record_replay
-            || p.code_facts.tests_naming != want.tests_naming;
-        if !values_differ {
-            continue;
-        }
+            || p.code_facts.subscribed_record_replay != want.subscribed_record_replay;
         let mut q = p.clone();
         q.code_facts = want;
-        let entry = format!(
-            "- {date} · hermit {} · syscall-pages · facts: code_facts refreshed by `facts --apply` at this SHA.",
-            &sha[..12]
-        );
-        let status = q.sections.entry("Status".into()).or_default();
-        status.push_str(&entry);
-        status.push('\n');
+        let body = match census_at(root) {
+            Ok(census) => {
+                let class_line = census.classes.get(&p.syscall).map(|(_, l)| *l).unwrap_or(0);
+                strategy_body(&q, class_line, dispatch.lines.get(&p.syscall).copied())
+            }
+            Err(_) => format!("\n{}\n", strategy_sentence(&q)),
+        };
+        q.sections.insert("Strategy".into(), body);
+        if facts_changed {
+            let entry = format!(
+                "- {date} · hermit {} · facts: code_facts refreshed by `facts --apply` at this SHA.",
+                &sha[..12]
+            );
+            let status = q.sections.entry("Status".into()).or_default();
+            if !status.trim_end().ends_with(&entry) {
+                status.push_str(&entry);
+                status.push('\n');
+            }
+        }
         let path = root.join(PAGES_DIR).join(format!("{}.md", p.syscall));
         if fs::write(&path, emit_page(&q)).is_err() {
             fail(&format!("cannot write {}", path.display()));
@@ -2549,43 +2302,193 @@ fn cmd_check(root: &Path, quick: bool) -> i32 {
     }
     let pages = good_pages(&loaded);
     {
-        let mut sorted = pages.clone();
-        sorted.sort_by_key(|p| p.nr_x86_64);
+        let sorted = sorted_pages(&pages);
         let sha = aggregate_sha(&sorted);
-        if read(&root.join(JSON_FILE)) != syscalls_json(&sorted, &sha) {
-            eprintln!("check: {JSON_FILE} is stale; run `scripts/syscall-pages.rs aggregate`");
-            rc = 1;
+        for (rel, want) in [
+            (JSON_FILE, syscalls_json(&sorted, &sha)),
+            (INDEX_FILE, index_md(&sorted, &sha)),
+        ] {
+            let got = read(&root.join(rel));
+            if got != want {
+                eprintln!("check: {rel} is stale; run `scripts/syscall-pages.rs aggregate`");
+                rc = 1;
+            }
+            for hit in scrub_findings(&got) {
+                eprintln!(
+                    "check: {rel}: internal or host-specific text in generated output: {hit:?}"
+                );
+                rc = 1;
+            }
         }
-        if read(&root.join(INDEX_FILE)) != index_md(&sorted, &sha) {
-            eprintln!("check: {INDEX_FILE} is stale; run `scripts/syscall-pages.rs aggregate`");
-            rc = 1;
+        // Site freshness is checked when the rendered tree exists (it is
+        // added by the site change on top of the pages change); stale or
+        // orphan HTML then fails, byte for byte.
+        let site_dir = root.join("docs/site/syscalls");
+        if site_dir.exists() {
+            let want = render_outputs(&sorted, &sha);
+            let mut seen_files: BTreeSet<String> = BTreeSet::new();
+            if let Ok(entries) = fs::read_dir(&site_dir) {
+                for e in entries.filter_map(|e| e.ok()) {
+                    if let Ok(name) = e.file_name().into_string() {
+                        if name.ends_with(".html") {
+                            seen_files.insert(name);
+                        }
+                    }
+                }
+            }
+            for (rel, html) in &want {
+                let name = rel.to_string_lossy().into_owned();
+                if !seen_files.contains(&name) {
+                    eprintln!(
+                        "check: docs/site/syscalls/{name} is missing; run `scripts/syscall-pages.rs render`"
+                    );
+                    rc = 1;
+                    continue;
+                }
+                let got = read(&site_dir.join(rel));
+                if got != *html {
+                    eprintln!(
+                        "check: docs/site/syscalls/{name} is stale; run `scripts/syscall-pages.rs render`"
+                    );
+                    rc = 1;
+                }
+                for hit in scrub_findings(&got) {
+                    eprintln!(
+                        "check: docs/site/syscalls/{name}: internal or host-specific text in generated output: {hit:?}"
+                    );
+                    rc = 1;
+                }
+            }
+            for orphan in seen_files
+                .iter()
+                .filter(|n| !want.contains_key(&PathBuf::from(n.as_str())))
+            {
+                eprintln!(
+                    "check: docs/site/syscalls/{orphan} is orphaned rendered output; run `scripts/syscall-pages.rs render`"
+                );
+                rc = 1;
+            }
         }
     }
     if quick {
-        let classes: BTreeMap<String, String> = pages
-            .iter()
-            .map(|p| (p.syscall.clone(), p.code_facts.detcore_class.clone()))
-            .collect();
-        let dispatch = dispatch_at(root, &classes);
-        if dispatch.status != "ok" {
-            eprintln!(
-                "check: dispatch parser-failed: {}",
-                dispatch.errors.join("; ")
-            );
-            rc = 1;
-        } else {
-            for name in &dispatch.missing_arm {
-                eprintln!("check: {name}: determinized but reaches the fallback arm");
+        // One generation revision across the page set, echoed by every
+        // Status log: ties `as_of` to the recorded generation instead of
+        // leaving it a free per-page claim.
+        let mut as_ofs: BTreeSet<&str> = BTreeSet::new();
+        for p in &pages {
+            as_ofs.insert(&p.code_facts.as_of);
+            let prefix = &p.code_facts.as_of[..12.min(p.code_facts.as_of.len())];
+            let status = p.sections.get("Status").cloned().unwrap_or_default();
+            if !status.contains(&format!("hermit {prefix}")) {
+                eprintln!(
+                    "check: {}: Status has no entry at its code_facts.as_of prefix {prefix}",
+                    p.syscall
+                );
                 rc = 1;
             }
-            for p in &pages {
-                if let Some(d) = dispatch.dispatch.get(&p.syscall) {
-                    if d != &p.code_facts.dispatch {
+        }
+        if as_ofs.len() > 1 {
+            eprintln!("check: pages do not share one code_facts.as_of: {as_ofs:?}");
+            rc = 1;
+        }
+        // The in-tree gate: census, classes, dispatch, citations and
+        // generated-output freshness are all derived from this tree's
+        // Detcore sources, with no build and no VCS access. Exact syscall
+        // numbers and refused/subscription facts are proven by the full
+        // facts export (see SCHEMA.md); quick mode cannot see those.
+        match census_at(root) {
+            Err(e) => {
+                eprintln!("check: census parser-failed: {e}");
+                rc = 1;
+            }
+            Ok(census) => {
+                let page_names: BTreeSet<String> =
+                    pages.iter().map(|p| p.syscall.clone()).collect();
+                for name in census.classes.keys() {
+                    if !page_names.contains(name) {
+                        eprintln!("check: {name}: in Detcore census but has no page");
+                        rc = 1;
+                    }
+                }
+                for p in &pages {
+                    let Some((class, class_line)) = census.classes.get(&p.syscall) else {
+                        eprintln!("check: {}: page is not in Detcore census", p.syscall);
+                        rc = 1;
+                        continue;
+                    };
+                    if &p.code_facts.detcore_class != class {
                         eprintln!(
-                            "check: {}: dispatch {} disagrees with source parse {d}",
-                            p.syscall, p.code_facts.dispatch
+                            "check: {}: detcore_class {} disagrees with census {class}",
+                            p.syscall, p.code_facts.detcore_class
                         );
                         rc = 1;
+                    }
+                    if p.nr_x86_64 > census.last_id {
+                        eprintln!(
+                            "check: {}: nr_x86_64 {} exceeds census last id {}",
+                            p.syscall, p.nr_x86_64, census.last_id
+                        );
+                        rc = 1;
+                    }
+                    let strategy_text = p.sections.get("Strategy").cloned().unwrap_or_default();
+                    let want_cite = format!("detcore/src/syscall_classification.rs:{class_line}");
+                    if !strategy_text.contains(&want_cite) {
+                        eprintln!(
+                            "check: {}: Strategy does not cite its classification at {want_cite}",
+                            p.syscall
+                        );
+                        rc = 1;
+                    }
+                }
+                let mut nrs: BTreeMap<i32, String> = BTreeMap::new();
+                for p in &pages {
+                    if let Some(other) = nrs.insert(p.nr_x86_64, p.syscall.clone()) {
+                        eprintln!(
+                            "check: nr_x86_64 {} is claimed by both {other} and {}",
+                            p.nr_x86_64, p.syscall
+                        );
+                        rc = 1;
+                    }
+                }
+                let classes: BTreeMap<String, String> = census
+                    .classes
+                    .iter()
+                    .map(|(k, (v, _))| (k.clone(), v.clone()))
+                    .collect();
+                let dispatch = dispatch_at(root, &classes);
+                if dispatch.status != "ok" {
+                    eprintln!(
+                        "check: dispatch parser-failed: {}",
+                        dispatch.errors.join("; ")
+                    );
+                    rc = 1;
+                } else {
+                    for name in &dispatch.missing_arm {
+                        eprintln!("check: {name}: determinized but reaches the fallback arm");
+                        rc = 1;
+                    }
+                    for p in &pages {
+                        if let Some(d) = dispatch.dispatch.get(&p.syscall) {
+                            if d != &p.code_facts.dispatch {
+                                eprintln!(
+                                    "check: {}: dispatch {} disagrees with source parse {d}",
+                                    p.syscall, p.code_facts.dispatch
+                                );
+                                rc = 1;
+                            }
+                        }
+                        if let Some(line) = dispatch.lines.get(&p.syscall) {
+                            let strategy_text =
+                                p.sections.get("Strategy").cloned().unwrap_or_default();
+                            let want_cite = format!("detcore/src/lib.rs:{line}");
+                            if !strategy_text.contains(&want_cite) {
+                                eprintln!(
+                                    "check: {}: Strategy does not cite its dispatch at {want_cite}",
+                                    p.syscall
+                                );
+                                rc = 1;
+                            }
+                        }
                     }
                 }
             }
@@ -2594,8 +2497,8 @@ fn cmd_check(root: &Path, quick: bool) -> i32 {
         return rc;
     }
     match facts_context(root, &pages) {
-        Ok((sha, rows, dispatch, naming)) => {
-            let diffs = facts_diff(&pages, &sha, &rows, &dispatch.dispatch, &naming);
+        Ok((sha, rows, dispatch)) => {
+            let diffs = facts_diff(&pages, &sha, &rows, &dispatch.dispatch);
             for d in &diffs {
                 eprintln!("check: {d}");
             }
@@ -2620,91 +2523,234 @@ fn arg_value(args: &[String], flag: &str) -> Option<String> {
     args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
 }
 
-fn cmd_convert(root: &Path, args: &[String]) -> i32 {
-    let from = arg_value(args, "--from")
-        .unwrap_or_else(|| fail("convert needs --from DIR (recovered v1 bodies)"));
-    let mapping_path =
-        arg_value(args, "--mapping").unwrap_or_else(|| fail("convert needs --mapping JSON"));
-    let only: BTreeSet<String> = args
-        .iter()
-        .skip_while(|a| *a != "--only")
-        .skip(1)
-        .take_while(|a| !a.starts_with("--"))
-        .cloned()
-        .collect();
-    let mapping_text = read(Path::new(&mapping_path));
-    let mapping_v: serde_json::Value = serde_json::from_str(&mapping_text)
-        .unwrap_or_else(|e| fail(&format!("bad --mapping JSON: {e}")));
-    let mut mapping: BTreeMap<String, Vec<u64>> = BTreeMap::new();
-    if let Some(obj) = mapping_v.as_object() {
-        for (k, v) in obj {
-            let nums = v
-                .as_array()
-                .map(|a| a.iter().filter_map(|x| x.as_u64()).collect())
-                .unwrap_or_default();
-            mapping.insert(k.clone(), nums);
+/// Bits a facts-only regeneration preserves from a previous page version:
+/// its number, public related links, discussion link, and (for v2 pages)
+/// its Status log. Read with line grabs so v1 pages migrate too.
+fn existing_page_bits(
+    root: &Path,
+    name: &str,
+) -> (
+    Option<i32>,
+    Vec<String>,
+    Option<(String, String)>,
+    Option<String>,
+) {
+    let path = root.join(PAGES_DIR).join(format!("{name}.md"));
+    let Ok(text) = fs::read_to_string(&path) else {
+        return (None, Vec::new(), None, None);
+    };
+    let mut nr = None;
+    let mut related = Vec::new();
+    let mut in_related = false;
+    let mut kind = None;
+    let mut url = None;
+    for line in text.lines() {
+        let t = line.trim();
+        if let Some(v) = t.strip_prefix("nr_x86_64:") {
+            nr = v.trim().parse().ok();
+        }
+        if t == "related:" {
+            in_related = true;
+            continue;
+        }
+        if in_related {
+            if let Some(item) = t.strip_prefix("- ") {
+                related.push(item.trim().to_string());
+                continue;
+            }
+            in_related = false;
+        }
+        if let Some(v) = t.strip_prefix("kind:") {
+            kind = Some(v.trim().to_string());
+        }
+        if let Some(v) = t.strip_prefix("url:") {
+            url = Some(v.trim().to_string());
         }
     }
-    let (sha, rows) = match export_facts(root) {
-        Ok(v) => v,
-        Err(e) => fail(&e),
+    let status = if text.contains(&format!("schema: {SCHEMA}")) {
+        split_sections(split_front_matter(&text).map(|x| x.1).unwrap_or(""))
+            .get("Status")
+            .cloned()
+    } else {
+        None
     };
-    let classes: BTreeMap<String, String> = rows
+    (
+        nr,
+        related,
+        match (kind, url) {
+            (Some(k), Some(u)) => Some((k, u)),
+            _ => None,
+        },
+        status,
+    )
+}
+
+/// (Re)generate every facts-only page from this tree's Detcore sources.
+/// Numbers come from `--facts` (an exporter TSV), then `--nr-map`
+/// (`name<TAB>nr` lines), then an existing page; a census name with none
+/// fails closed rather than guessing a number.
+fn cmd_generate(root: &Path, args: &[String]) -> i32 {
+    let census = match census_at(root) {
+        Ok(c) => c,
+        Err(e) => fail(&format!("generate: census parser-failed: {e}")),
+    };
+    let lib = read(&root.join("detcore/src/lib.rs"));
+    let cls = read(&root.join("detcore/src/syscall_classification.rs"));
+    let classes: BTreeMap<String, String> = census
+        .classes
         .iter()
-        .map(|(k, v)| (k.clone(), v.detcore_class.clone()))
+        .map(|(k, (v, _))| (k.clone(), v.clone()))
         .collect();
     let dispatch = dispatch_at(root, &classes);
     if dispatch.status != "ok" {
         fail(&format!(
-            "dispatch parse failed: {}",
+            "generate: dispatch parser-failed: {}",
             dispatch.errors.join("; ")
         ));
     }
-    let names: BTreeSet<String> = rows.keys().cloned().collect();
-    let naming = tests_naming(root, &names);
+    if !dispatch.missing_arm.is_empty() {
+        fail(&format!(
+            "generate: determinized syscalls reach the fallback arm: {}",
+            dispatch.missing_arm.join(", ")
+        ));
+    }
+    let mut rows = match source_fact_rows(&lib, &cls, &census) {
+        Ok(r) => r,
+        Err(e) => fail(&format!("generate: {e}")),
+    };
+    let mut sha = arg_value(args, "--as-of").unwrap_or_default();
+    if let Some(facts_path) = arg_value(args, "--facts") {
+        let text = read(Path::new(&facts_path));
+        let (facts_sha, facts) = match parse_facts_tsv(&text) {
+            Ok(v) => v,
+            Err(e) => fail(&format!("generate: --facts: {e}")),
+        };
+        if sha.is_empty() {
+            sha = facts_sha;
+        } else if sha != facts_sha {
+            fail("generate: --as-of disagrees with the --facts TSV revision");
+        }
+        for (name, row) in facts {
+            if let Some(slot) = rows.get_mut(&name) {
+                *slot = row;
+            }
+        }
+    }
+    if sha.len() != 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        fail("generate: need --as-of <40-hex source revision> or --facts TSV with one");
+    }
+    let mut nr_map: BTreeMap<String, i32> = BTreeMap::new();
+    if let Some(map_path) = arg_value(args, "--nr-map") {
+        for line in read(Path::new(&map_path)).lines() {
+            let Some((name, nr)) = line.split_once('\t') else {
+                continue;
+            };
+            if let Ok(n) = nr.trim().parse::<i32>() {
+                nr_map.insert(name.trim().to_string(), n);
+            }
+        }
+    }
+    let mut mapping: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+    if let Some(mapping_path) = arg_value(args, "--mapping") {
+        let v: serde_json::Value = serde_json::from_str(&read(Path::new(&mapping_path)))
+            .unwrap_or_else(|e| fail(&format!("generate: bad --mapping JSON: {e}")));
+        if let Some(obj) = v.as_object() {
+            for (k, val) in obj {
+                let nums = val
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|x| x.as_u64()).collect())
+                    .unwrap_or_default();
+                mapping.insert(k.clone(), nums);
+            }
+        }
+    }
     let date = arg_value(args, "--date").unwrap_or_else(today_utc);
-    let out_dir = root.join(PAGES_DIR);
-    if fs::create_dir_all(&out_dir).is_err() {
-        fail("cannot create docs/syscalls");
+    let dir = root.join(PAGES_DIR);
+    if fs::create_dir_all(&dir).is_err() {
+        fail("generate: cannot create docs/syscalls");
     }
     let mut written = 0;
-    let mut failed = 0;
-    for name in rows.keys() {
-        if !only.is_empty() && !only.contains(name) {
+    let mut unresolved = Vec::new();
+    for (name, row) in &rows {
+        let (existing_nr, mut related, existing_discussion, existing_status) =
+            existing_page_bits(root, name);
+        let nr = if row.nr >= 0 {
+            row.nr
+        } else if let Some(n) = nr_map.get(name) {
+            *n
+        } else if let Some(n) = existing_nr {
+            n
+        } else {
+            unresolved.push(name.clone());
             continue;
-        }
-        let src = Path::new(&from).join(format!("{name}.md"));
-        if !src.exists() {
-            eprintln!("convert: {name}: no recovered body at {}", src.display());
-            failed += 1;
-            continue;
-        }
-        let text = read(&src);
-        match convert_body(
-            name,
-            &text,
-            &mapping,
-            &rows,
-            &dispatch.dispatch,
-            &naming,
-            &sha,
-            &date,
-        ) {
-            Ok(page) => {
-                let out = out_dir.join(format!("{name}.md"));
-                if fs::write(&out, emit_page(&page)).is_err() {
-                    fail(&format!("cannot write {}", out.display()));
-                }
-                written += 1;
-            }
-            Err(e) => {
-                eprintln!("convert: {name}: {e}");
-                failed += 1;
+        };
+        for n in mapping.get(name).cloned().unwrap_or_default() {
+            let u = format!("https://github.com/rrnewton/hermit/issues/{n}");
+            if !related.contains(&u) {
+                related.push(u);
             }
         }
+        if name == "ppoll"
+            && !related.contains(&"https://github.com/rrnewton/hermit/issues/26".to_string())
+        {
+            // The one-off ppoll tracker used a different title pattern, so
+            // it appears in no per-syscall mapping input.
+            related.push("https://github.com/rrnewton/hermit/issues/26".into());
+        }
+        let (discussion_kind, discussion_url) =
+            existing_discussion.unwrap_or_else(|| ("new".into(), discussion_url(name)));
+        let mut page = Page {
+            syscall: name.clone(),
+            nr_x86_64: nr,
+            related,
+            discussion_kind: discussion_kind.clone(),
+            discussion_url: discussion_url.clone(),
+            code_facts: CodeFacts {
+                as_of: sha.clone(),
+                detcore_class: row.detcore_class.clone(),
+                dispatch: dispatch.dispatch.get(name).cloned().unwrap_or_default(),
+                refused: row.refused,
+                refused_only_when_fail_closed: row.refused_only_when_fail_closed,
+                subscribed_run: row.subscribed_run,
+                subscribed_record_replay: row.subscribed_record_replay,
+            },
+            sections: BTreeMap::new(),
+        };
+        let class_line = census.classes.get(name).map(|(_, l)| *l).unwrap_or(0);
+        page.sections.insert(
+            "Strategy".into(),
+            strategy_body(&page, class_line, dispatch.lines.get(name).copied()),
+        );
+        page.sections.insert(
+            "Discussion".into(),
+            format!(
+                "\n[Start a discussion about `{name}`]({discussion_url}) (opens a prefilled issue form; nothing is filed until you submit it).\n"
+            ),
+        );
+        let status = existing_status.unwrap_or_else(|| {
+            format!(
+                "\n- {date} · hermit {} · facts-only page generated from Detcore code facts at this revision.\n",
+                &sha[..12]
+            )
+        });
+        page.sections.insert("Status".into(), status);
+        if fs::write(dir.join(format!("{name}.md")), emit_page(&page)).is_err() {
+            fail(&format!("generate: cannot write {name}.md"));
+        }
+        written += 1;
     }
-    println!("convert: {written} pages written at {sha}, {failed} failed");
-    if failed > 0 { 1 } else { 0 }
+    if !unresolved.is_empty() {
+        eprintln!(
+            "generate: no syscall number known for: {} (supply --facts or --nr-map)",
+            unresolved.join(", ")
+        );
+        return 1;
+    }
+    println!(
+        "generate: {written} facts-only pages at {sha} (census {}..={})",
+        census.expected_count, census.last_id
+    );
+    0
 }
 
 /// Escape text for HTML. Rendered pages are generated, never hand-edited.
@@ -2769,8 +2815,18 @@ fn inline_md(escaped: &str) -> String {
                         || url.ends_with(".md")
                         || url.ends_with(".html") =>
                 {
-                    let url = url.replace(".md", ".html");
-                    out.push_str(&format!("<a href=\"{}\">{}</a>", html_escape(&url), label));
+                    // `url` is already HTML-escaped (the parser runs on
+                    // escaped text), so escaping it again would corrupt
+                    // every `&` into `&amp;amp;`. Rewrite only a trailing
+                    // `.md` on a relative link, never inside absolute URLs
+                    // or query strings.
+                    let mut href = url.clone();
+                    if !url.contains("://") {
+                        if let Some(stripped) = url.strip_suffix(".md") {
+                            href = format!("{stripped}.html");
+                        }
+                    }
+                    out.push_str(&format!("<a href=\"{}\">{}</a>", href, label));
                     rest = &rest[len..];
                 }
                 _ => {
@@ -2873,8 +2929,9 @@ fn md_to_html(body: &str) -> String {
 const SITE_STYLE: &str = "body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}";
 
 fn site_index_html(pages: &[Page], sha: &str) -> String {
+    let pages = sorted_pages(pages);
     let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
-    for p in pages {
+    for p in &pages {
         *counts.entry(strategy(&p.code_facts)).or_default() += 1;
     }
     let mut s = String::new();
@@ -2897,7 +2954,7 @@ fn site_index_html(pages: &[Page], sha: &str) -> String {
     );
     let _ = writeln!(
         s,
-        "<p>What Detcore does with each Linux syscall, and why. Code facts as of hermit <code>{}</code>. The machine-readable table is <a href=\"https://github.com/facebookexperimental/hermit/blob/main/docs/syscalls/syscalls.json\">syscalls.json</a>.</p></header>",
+        "<p>The code-derived Detcore strategy for each Linux syscall in this tree's census. Code facts as of hermit <code>{}</code>. The machine-readable table is <a href=\"https://github.com/facebookexperimental/hermit/blob/main/docs/syscalls/syscalls.json\">syscalls.json</a>; test-matrix coverage is a separate measurement in the <a href=\"{COVERAGE_URL}\">syscall coverage audit</a>.</p></header>",
         html_escape(sha)
     );
     let _ = writeln!(s, "<p>");
@@ -2919,21 +2976,18 @@ fn site_index_html(pages: &[Page], sha: &str) -> String {
     let _ = writeln!(s, "</select></label>");
     let _ = writeln!(
         s,
-        "<table><thead><tr><th>syscall</th><th>nr</th><th>strategy</th><th>dispatch</th><th>linux determinism</th><th>target policy</th><th>status</th><th>discussion</th></tr></thead><tbody id=\"rows\">"
+        "<table><thead><tr><th>syscall</th><th>nr</th><th>strategy</th><th>dispatch</th><th>discussion</th></tr></thead><tbody id=\"rows\">"
     );
-    for p in pages {
+    for p in &pages {
         let _ = writeln!(
             s,
-            "<tr data-strategy=\"{}\"><td><a href=\"{}.html\">{}</a></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><a href=\"{}\">{}</a></td></tr>",
+            "<tr data-strategy=\"{}\"><td><a href=\"{}.html\">{}</a></td><td>{}</td><td>{}</td><td>{}</td><td><a href=\"{}\">{}</a></td></tr>",
             html_escape(strategy(&p.code_facts)),
             html_escape(&p.syscall),
             html_escape(&p.syscall),
             p.nr_x86_64,
             html_escape(strategy(&p.code_facts)),
             html_escape(&p.code_facts.dispatch),
-            html_escape(&p.linux_determinism),
-            html_escape(&p.target_policy),
-            html_escape(&p.tracking_status),
             html_escape(&p.discussion_url),
             html_escape(&p.discussion_kind),
         );
@@ -2974,12 +3028,9 @@ fn site_page_html(page: &Page) -> String {
     );
     let _ = writeln!(
         s,
-        "<p>Strategy: <strong>{}</strong> &middot; dispatch: <code>{}</code> &middot; linux determinism: {} &middot; target policy: {} &middot; status: {} &middot; <a href=\"{}\">discussion ({})</a></p></header>",
+        "<p>Strategy: <strong>{}</strong> &middot; dispatch: <code>{}</code> &middot; <a href=\"{}\">discussion ({})</a></p></header>",
         html_escape(strategy(&page.code_facts)),
         html_escape(&page.code_facts.dispatch),
-        html_escape(&page.linux_determinism),
-        html_escape(&page.target_policy),
-        html_escape(&page.tracking_status),
         html_escape(&page.discussion_url),
         html_escape(&page.discussion_kind),
     );
@@ -2993,26 +3044,73 @@ fn site_page_html(page: &Page) -> String {
     s
 }
 
-fn cmd_render(root: &Path) -> i32 {
+/// Every file `render` owns under `docs/site/syscalls/`, as a pure
+/// function of the page set. `check` compares this map byte for byte.
+fn render_outputs(pages: &[Page], sha: &str) -> BTreeMap<PathBuf, String> {
+    let pages = sorted_pages(pages);
+    let mut out = BTreeMap::new();
+    out.insert(PathBuf::from("index.html"), site_index_html(&pages, sha));
+    for p in &pages {
+        out.insert(
+            PathBuf::from(format!("{}.html", p.syscall)),
+            site_page_html(p),
+        );
+    }
+    out
+}
+
+fn cmd_render(root: &Path, check_only: bool) -> i32 {
     let loaded = load_pages(root);
     let errors = print_reports(&loaded);
     if errors > 0 {
         eprintln!("syscall-pages: render refuses while lint has {errors} errors");
         return 1;
     }
-    let mut pages = good_pages(&loaded);
-    pages.sort_by_key(|p| p.nr_x86_64);
+    let pages = sorted_pages(&good_pages(&loaded));
     let sha = aggregate_sha(&pages);
+    let want = render_outputs(&pages, &sha);
     let out = root.join("docs/site/syscalls");
+    if check_only {
+        let mut bad = 0;
+        for (rel, html) in &want {
+            let path = out.join(rel);
+            if !path.exists() || read(&path) != *html {
+                eprintln!(
+                    "syscall-pages: docs/site/syscalls/{} is stale; run `scripts/syscall-pages.rs render`",
+                    rel.display()
+                );
+                bad += 1;
+            }
+        }
+        if let Ok(entries) = fs::read_dir(&out) {
+            for e in entries.filter_map(|e| e.ok()) {
+                if let Ok(name) = e.file_name().into_string() {
+                    if name.ends_with(".html") && !want.contains_key(&PathBuf::from(&name)) {
+                        eprintln!(
+                            "syscall-pages: docs/site/syscalls/{name} is orphaned rendered output"
+                        );
+                        bad += 1;
+                    }
+                }
+            }
+        }
+        return if bad > 0 { 1 } else { 0 };
+    }
     if fs::create_dir_all(&out).is_err() {
         fail("cannot create docs/site/syscalls");
     }
-    if fs::write(out.join("index.html"), site_index_html(&pages, &sha)).is_err() {
-        fail("cannot write site index");
+    for (rel, html) in &want {
+        if fs::write(out.join(rel), html).is_err() {
+            fail(&format!("cannot write site file {}", rel.display()));
+        }
     }
-    for p in &pages {
-        if fs::write(out.join(format!("{}.html", p.syscall)), site_page_html(p)).is_err() {
-            fail(&format!("cannot write site page for {}", p.syscall));
+    if let Ok(entries) = fs::read_dir(&out) {
+        for e in entries.filter_map(|e| e.ok()) {
+            if let Ok(name) = e.file_name().into_string() {
+                if name.ends_with(".html") && !want.contains_key(&PathBuf::from(&name)) {
+                    let _ = fs::remove_file(e.path());
+                }
+            }
         }
     }
     println!("render: {} pages -> docs/site/syscalls/", pages.len());
@@ -3021,7 +3119,7 @@ fn cmd_render(root: &Path) -> i32 {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: syscall-pages.rs <lint|facts [--apply]|aggregate [--check]|check [--quick]|render|convert --from DIR --mapping JSON [--date YYYY-MM-DD] [--only NAME...]>"
+        "usage: syscall-pages.rs <lint|facts [--apply] [--date YYYY-MM-DD]|generate [--facts TSV|--as-of SHA] [--nr-map TSV] [--mapping JSON] [--date YYYY-MM-DD]|aggregate [--check]|check [--quick]|render [--check]>"
     );
     exit(2)
 }
@@ -3030,44 +3128,13 @@ fn usage() -> ! {
 mod tests {
     use super::*;
 
-    fn sample_page() -> String {
-        let mut sections = BTreeMap::new();
-        sections.insert(
-            "Summary".into(),
-            "`read` reads bytes. Detcore models the deterministic parts.\n".into(),
-        );
-        sections.insert(
-            "Linux semantics".into(),
-            "Reads from a descriptor.\n\n### Flags and options\n\n- F1: the descriptor is a pipe at end of file: returns 0\n".into(),
-        );
-        sections.insert(
-            "Determinism analysis".into(),
-            "Repeats given fixed file contents.\n".into(),
-        );
-        sections.insert("Hermit design".into(), "Modelled in Detcore.\n".into());
-        sections.insert(
-            "Recommended tests".into(),
-            "- T1 (covers F1): read a pipe at end of file\n".into(),
-        );
-        sections.insert(
-            "Done criteria".into(),
-            "`done` means (owner rule, 2026-10-02): every flag covered.\n".into(),
-        );
-        sections.insert(
-            "Status".into(),
-            "- 2026-11-15 · hermit 0123456789ab · test · converted: sample.\n".into(),
-        );
-        sections.insert("Additional information".into(), "None.\n".into());
-        let page = Page {
-            syscall: "read".into(),
-            nr_x86_64: 0,
-            linux_determinism: "conditional".into(),
-            target_policy: "model".into(),
-            tracking_status: "todo".into(),
-            cross_host_variant: false,
+    fn sample_page_for(name: &str, nr: i32) -> Page {
+        let mut page = Page {
+            syscall: name.into(),
+            nr_x86_64: nr,
             related: vec![],
             discussion_kind: "new".into(),
-            discussion_url: discussion_url("read"),
+            discussion_url: discussion_url(name),
             code_facts: CodeFacts {
                 as_of: "0123456789abcdef0123456789abcdef01234567".into(),
                 detcore_class: "determinized".into(),
@@ -3076,20 +3143,27 @@ mod tests {
                 refused_only_when_fail_closed: false,
                 subscribed_run: true,
                 subscribed_record_replay: true,
-                tests_naming: 1,
             },
-            sections,
+            sections: BTreeMap::new(),
         };
-        let mut s = emit_page(&page);
-        // Discussion section is authored prose, generated here for the fixture.
-        s = s.replace(
-            "## Discussion\n",
-            &format!(
-                "## Discussion\n\n[Start a discussion]({}) (prefilled form).\n",
+        page.sections
+            .insert("Strategy".into(), strategy_body(&page, 11, Some(22)));
+        page.sections.insert(
+            "Discussion".into(),
+            format!(
+                "\n[Start a discussion]({}) (prefilled form).\n",
                 page.discussion_url
             ),
         );
-        s
+        page.sections.insert(
+            "Status".into(),
+            "\n- 2026-11-15 · hermit 0123456789ab · facts-only page generated from Detcore code facts at this revision.\n".into(),
+        );
+        page
+    }
+
+    fn sample_page() -> String {
+        emit_page(&sample_page_for("read", 0))
     }
 
     #[test]
@@ -3103,8 +3177,11 @@ mod tests {
     }
 
     #[test]
-    fn lint_rejects_internal_hostname_and_unknown_key() {
-        let bad = sample_page().replace("Reads from a descriptor.", "Measured on devbig030 today.");
+    fn lint_rejects_internal_hostname_unknown_and_duplicate_keys() {
+        let bad = sample_page().replace(
+            "facts-only page generated",
+            "Measured on devbig030 today; facts-only page generated",
+        );
         let (rep, _) = lint_page("read", &bad, Path::new("."));
         assert!(
             rep.errors.iter().any(|e| e.starts_with("P30")),
@@ -3112,8 +3189,8 @@ mod tests {
             rep.errors
         );
         let bad = sample_page().replace(
-            "tracking_status: todo",
-            "tracking_status: todo\nptrace_verification: untested",
+            "nr_x86_64: 0",
+            "nr_x86_64: 0\nptrace_verification: untested",
         );
         let (rep, _) = lint_page("read", &bad, Path::new("."));
         assert!(
@@ -3121,17 +3198,49 @@ mod tests {
             "{:?}",
             rep.errors
         );
+        let bad = sample_page().replace("nr_x86_64: 0", "nr_x86_64: 0\nnr_x86_64: 1");
+        let (rep, _) = lint_page("read", &bad, Path::new("."));
+        assert!(
+            rep.errors.iter().any(|e| e.starts_with("P01")),
+            "duplicate key must fail: {:?}",
+            rep.errors
+        );
     }
 
     #[test]
-    fn lint_rejects_undefined_flag_and_bad_status_date() {
-        let bad = sample_page().replace("(covers F1)", "(covers F9)");
-        let (rep, _) = lint_page("read", &bad, Path::new("."));
-        assert!(
-            rep.errors.iter().any(|e| e.starts_with("P11")),
-            "{:?}",
-            rep.errors
-        );
+    fn lint_rejects_each_public_text_leak_class() {
+        // One red twin per P30 class the seat enumerated.
+        for leak in [
+            "T78538674",
+            "P123456789",
+            "S123456789",
+            "dh-86rp6",
+            "tbh-1005a",
+            "orc-coord-014",
+            "syscall-tracking-p3",
+            "hermit2",
+            "gpt-5.6-sol",
+            "claude-3-5-sonnet",
+            "host.example.facebook.com",
+            "host.internalfb.com",
+            "host.fb.com",
+            "ai_docs/plans/x.md",
+            "ignored/syscall-tracking/x.md",
+            "dev-hermit/experiments/x",
+            "worktrees/slots/lane",
+            "/home/someone/file",
+            "Author: Someone",
+        ] {
+            assert!(
+                !scrub_findings(&format!("evidence {leak} end")).is_empty(),
+                "leak class not refused: {leak}"
+            );
+        }
+        assert!(scrub_findings("model policy text about a model").is_empty());
+    }
+
+    #[test]
+    fn lint_rejects_bad_status_discussion_and_dropped_key() {
         let bad = sample_page().replace("2026-11-15", "15 Nov 2026");
         let (rep, _) = lint_page("read", &bad, Path::new("."));
         assert!(
@@ -3139,22 +3248,68 @@ mod tests {
             "{:?}",
             rep.errors
         );
+        let bad = sample_page().replace(
+            "This facts-only page was generated",
+            "`ptrace_verification` note. This facts-only page was generated",
+        );
+        let (rep, _) = lint_page("read", &bad, Path::new("."));
+        assert!(
+            rep.errors.iter().any(|e| e.starts_with("P31")),
+            "P31 must bite outside Status: {:?}",
+            rep.errors
+        );
+        let bad = sample_page().replace(
+            "https://github.com/facebookexperimental/hermit/issues/new?",
+            "https://example.com/issues/new?",
+        );
+        let (rep, _) = lint_page("read", &bad, Path::new("."));
+        assert!(
+            rep.errors.iter().any(|e| e.starts_with("P34")),
+            "P34 must bite: {:?}",
+            rep.errors
+        );
     }
 
     #[test]
-    fn scrub_rewrites_measured_forms() {
-        let out =
-            scrub_text("Evidence was gathered on `devbig030` (Linux 6.17) under `/var/tmp/foo`.");
-        assert!(!out.contains("devbig030"), "{out}");
-        assert!(scrub_findings(&out).is_empty(), "{out}");
-        // Forms measured in the recovered bodies after the first conversion:
-        // a bare "devbig host", and a hostname inside a quoted strace buffer.
-        let out = scrub_text(
-            "On this devbig host, measured 2026-10-03, readv(3, [{iov_base=\"devbig030.atn3.f\", iov_len=16}], 1) = 16",
+    fn aggregate_and_render_are_order_independent_and_repeatable() {
+        let pages = vec![sample_page_for("write", 1), sample_page_for("read", 0)];
+        let mut shuffled = pages.clone();
+        shuffled.reverse();
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(syscalls_json(&pages, sha), syscalls_json(&shuffled, sha));
+        assert_eq!(index_md(&pages, sha), index_md(&shuffled, sha));
+        // Standing determinism check: build the render twice, compare.
+        assert_eq!(render_outputs(&pages, sha), render_outputs(&shuffled, sha));
+        assert_eq!(render_outputs(&pages, sha), render_outputs(&pages, sha));
+    }
+
+    #[test]
+    fn census_parse_counts_and_classes() {
+        let src = "#[cfg(target_arch = \"x86_64\")]\nconst EXPECTED_SYSNO_COUNT: usize = 3;\nconst _: () = { assert!(Sysno::last().id() == 469); };\nconst DETERMINIZED_SYSCALLS: &[&str] = &[\n    \"read\",\n    #[cfg(target_arch = \"aarch64\")]\n    \"io_pgetevents\",\n];\nconst PASSTHROUGH_SYSCALLS: &[&str] = &[\"mkdir\"];\nconst UNSUPPORTED_SYSCALLS: &[&str] = &[\"restart_syscall\"];\n";
+        let census = parse_census(src).expect("census parses");
+        assert_eq!(census.expected_count, 3);
+        assert_eq!(census.last_id, 469);
+        assert_eq!(census.classes["read"].0, "determinized");
+        assert!(!census.classes.contains_key("io_pgetevents"));
+    }
+
+    #[test]
+    fn site_outputs_cover_search_filter_and_discussion() {
+        let pages = vec![sample_page_for("read", 0)];
+        let out = render_outputs(&pages, "0123456789abcdef0123456789abcdef01234567");
+        let index = &out[&PathBuf::from("index.html")];
+        assert!(index.contains("<input id=\"q\" type=\"search\""), "{index}");
+        assert!(index.contains("<select id=\"s\">"), "{index}");
+        assert!(index.contains("addEventListener('input',f)"), "{index}");
+        assert!(index.contains("addEventListener('change',f)"), "{index}");
+        let page = &out[&PathBuf::from("read.html")];
+        assert!(page.contains("discussion (new)</a>"), "{page}");
+        assert!(page.contains("&amp;body="), "{page}");
+        assert!(!page.contains("&amp;amp;"), "double-escaped: {page}");
+        assert!(
+            page.contains("docs%2Fsyscalls%2Fread.md"),
+            "encoded .md must survive: {page}"
         );
-        assert!(!out.contains("devbig"), "{out}");
-        assert!(scrub_findings(&out).is_empty(), "{out}");
-        assert!(!scrub_findings("readv(3, [{iov_base=\"devbig030.atn3.f\"}], 1)").is_empty());
     }
 
     #[test]
@@ -3200,12 +3355,17 @@ mod tests {
     #[test]
     fn render_escapes_and_links() {
         let html = md_to_html(
-            "A <b>raw</b> `code` and **bold** [page](read.md) [ext](https://example.com).\n\n- F1: item\n  continuation\n",
+            "A <b>raw</b> `code` and **bold** [page](read.md) [ext](https://example.com/a.md?x=1&y=2).\n\n- F1: item\n  continuation\n",
         );
         assert!(html.contains("&lt;b&gt;raw&lt;/b&gt;"), "{html}");
         assert!(html.contains("<code>code</code>"), "{html}");
         assert!(html.contains("<strong>bold</strong>"), "{html}");
         assert!(html.contains("href=\"read.html\""), "{html}");
+        assert!(
+            html.contains("href=\"https://example.com/a.md?x=1&amp;y=2\""),
+            "absolute .md and single-escaped &: {html}"
+        );
+        assert!(!html.contains("&amp;amp;"), "{html}");
         assert!(html.contains("continuation</li>"), "{html}");
     }
 
@@ -3224,11 +3384,11 @@ fn main() {
     let root = repo_root();
     let rc = match args.first().map(|s| s.as_str()) {
         Some("lint") => cmd_lint(&root),
-        Some("facts") => cmd_facts(&root, args.iter().any(|a| a == "--apply")),
+        Some("facts") => cmd_facts(&root, &args[1..]),
         Some("aggregate") => cmd_aggregate(&root, args.iter().any(|a| a == "--check")),
         Some("check") => cmd_check(&root, args.iter().any(|a| a == "--quick")),
-        Some("convert") => cmd_convert(&root, &args[1..]),
-        Some("render") => cmd_render(&root),
+        Some("generate") => cmd_generate(&root, &args[1..]),
+        Some("render") => cmd_render(&root, args.iter().any(|a| a == "--check")),
         _ => usage(),
     };
     exit(rc);
