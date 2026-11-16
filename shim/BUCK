@@ -72,6 +72,35 @@ config_setting(
     constraint_values = [":hermit_rust_release"],
 )
 
+# The open-source counterpart of fbsource's liteinst-runtime-flags
+# constraint (fbcode//hermetic_infra/hermit/constraints), one more value of
+# the hermit_rust_profile setting above, exactly as the internal LiteInst
+# stack models it. Shared BUCK files gate the liteinst-runtime rustc flags
+# on it through the select names in
+# hermetic_infra/hermit/constraints/liteinst-runtime-flags.bzl (this tree's
+# stand-in is under shim/hermetic_infra/). No default shim platform
+# selects this value, so outside hermit_liteinst_runtime_platform the
+# target-level select stays at its default; the toolchain itself passes
+# none of those flags in this tree.
+constraint_value(
+    name = "hermit_liteinst_runtime",
+    constraint_setting = ":hermit_rust_profile",
+    visibility = ["PUBLIC"],
+)
+
+config_setting(
+    name = "hermit_liteinst_runtime_enabled",
+    constraint_values = [":hermit_liteinst_runtime"],
+    visibility = ["PUBLIC"],
+)
+
+platform(
+    name = "hermit_liteinst_runtime_platform",
+    constraint_values = [":hermit_liteinst_runtime"],
+    deps = ["prelude//platforms:default"],
+    visibility = ["PUBLIC"],
+)
+
 platform(
     name = "hermit_rust_release_platform",
     constraint_values = [":hermit_rust_release"],
