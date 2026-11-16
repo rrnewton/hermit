@@ -3,90 +3,17 @@
 <title>sync_file_range | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>sync_file_range</code> (277)</h1>
-<p>Strategy: <strong>passthrough</strong> &middot; dispatch: <code>passthrough</code> &middot; linux determinism: deterministic &middot; target policy: passthrough &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+sync_file_range&amp;body=Discussion+for+the+%60sync_file_range%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsync_file_range.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60sync_file_range%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>sync_file_range(fd, offset, nbytes, flags)</code> starts writeback of the dirty page-cache pages in a byte range of an open file, waits for it, or both. Hermit forwards it to the host kernel unchanged. The guest sees only the return value, and that value depends on the arguments and the descriptor type, not on timing.</p>
-<h2>Linux semantics</h2>
-<p>On x86_64 the argument order is <code>(fd, offset, nbytes, flags)</code>. The variant with <code>flags</code> second, <code>sync_file_range2</code>, exists only on some other architectures. The kernel resolves <code>fd</code> first, so a bad descriptor gives <code>EBADF</code> before any other check. It then validates the flags and the range, and accepts only regular files, block devices, directories and symlinks. The descriptor does not need to be open for writing.</p>
-<p>The call never changes file data, and it does not flush metadata, so it gives no durability guarantee on its own. Once a wait flag is set, the call can block for as long as the storage takes. A wait-after step returns any writeback error recorded on the file's mapping. The call returns 0 or a negative errno and writes no memory in the caller.</p>
-<h3>Flags and options</h3>
+<p>Strategy: <strong>passthrough</strong> &middot; dispatch: <code>passthrough</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+sync_file_range&amp;body=Discussion+for+the+%60sync_file_range%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsync_file_range.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60sync_file_range%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>sync_file_range</code> (277) as passthrough via passthrough dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: false.</p>
 <ul>
-<li>F1: <code>flags == 0</code>: nothing is done; once fd and range validate, the call returns 0</li>
-<li>F2: <code>SYNC_FILE_RANGE_WRITE</code> (2) alone: start asynchronous writeback of the dirty pages in the range that are not already under writeback. It can still block briefly when the device queue is full.</li>
-<li>F3: <code>SYNC_FILE_RANGE_WAIT_BEFORE</code> (1): first wait for writeback already in progress on pages in the range</li>
-<li>F4: <code>SYNC_FILE_RANGE_WAIT_AFTER</code> (4): after the write step, wait for writeback of the range to finish and report writeback errors</li>
-<li>F5: <code>WAIT_BEFORE|WRITE|WAIT_AFTER</code> (7, named <code>SYNC_FILE_RANGE_WRITE_AND_WAIT</code> in newer uapi headers): a data-integrity flush of the range, like <code>fdatasync</code> limited to the range and without metadata. The other combinations (3, 5, 6) do the listed steps in order.</li>
-<li>F6: range: <code>nbytes == 0</code> means from <code>offset</code> to the end of the file. A range wholly past EOF succeeds and writes nothing.</li>
-<li>F7: invalid arguments: unknown flag bits, a negative <code>offset</code>, a negative <code>nbytes</code>, or <code>offset + nbytes</code> overflowing gives <code>EINVAL</code></li>
-<li>F8: descriptor: a bad fd, a closed fd or an <code>O_PATH</code> fd gives <code>EBADF</code>, checked before F7. A pipe, FIFO or socket gives <code>ESPIPE</code>. An <code>O_RDONLY</code> fd on a regular file is accepted.</li>
-<li>F9: host-dependent blocking time under F3 to F5. F10 holds the host-dependent errors.</li>
-<li>F10: host-transient failures: <code>EIO</code> (a writeback error), <code>ENOSPC</code> (writeback that runs out of space, for example on a delayed-allocation filesystem) and <code>ENOMEM</code> from the host</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:2004</code></li>
 </ul>
-<h2>Determinism analysis</h2>
-<p>The return value is a function of the arguments, the descriptor's type and open state, and the storage's health. None of those depend on timing or on another guest thread. The call repeats whenever the guest opens the same kind of file and the host storage does not fail.</p>
-<h3>Nondeterminism sources</h3>
-<ul>
-<li>Writeback errors (F10). They come from the host storage, not from guest state, and Hermit does not try to make a failing disk deterministic.</li>
-<li>Blocking time under the wait flags. The guest does not see it in virtual time: Detcore charges every syscall a fixed cost (<code>detcore/src/lib.rs:1936</code>). <code>sync_file_range</code> has no entry in the cost table, so it gets the fallback at <code>detcore/src/syscall_time.rs:156</code>, however long the host waits.</li>
-<li>When pages actually reach the disk. The guest cannot observe this except through a crash, which is outside Hermit's model.</li>
-</ul>
-<h2>Hermit design</h2>
-<p>Target policy: <code>passthrough</code>. The code already does this. <code>sync_file_range</code> is classified <code>PassThrough</code> at <code>detcore/src/syscall_classification.rs:801</code>, inside the pass-through block that starts at <code>detcore/src/syscall_classification.rs:690</code>. Its group comment at <code>detcore/src/syscall_classification.rs:767</code> calls these &quot;synchronous writeback operations&quot; that &quot;are repeatable in Hermit's fixed mount namespace and filesystem image&quot;. The generic arm <code>SyscallClassification::PassThrough =&gt; self.passthrough(guest, call).await</code> at <code>detcore/src/lib.rs:2843</code> forwards it. The unit test <code>representative_policies_stay_in_their_reviewed_sections</code> (<code>detcore/src/syscall_classification.rs:1899</code>) asserts the classification at <code>detcore/src/syscall_classification.rs:2088</code>.</p>
-<p>Why passthrough, not <code>emulate</code>:</p>
-<ul>
-<li>The call has no data effect, and Hermit has no page-cache model, so there is nothing for a model to keep.</li>
-<li>The only guest-visible outputs are the errors in F7 and F8, and the kernel computes them from the guest's own arguments and descriptors. An emulation that returned 0 would have to reimplement those checks to stay faithful, for no determinism gain.</li>
-<li>Real writeback on the host is harmless to the guest. Its cost appears in wall time only.</li>
-</ul>
-<p>Code facts show <code>subscribed_record_replay: false</code>, so Detcore's record/replay subscription does not intercept the call.</p>
-<p>The gap is test evidence. <code>tests/c/sync_file_range.c</code> exercises F2, F5 and the <code>EBADF</code> case of F8 through glibc's <code>sync_file_range()</code> wrapper. <code>tests/c/syscall_file_metadata.c:220</code> is the only test that issues raw <code>SYS_sync_file_range</code>, and only with <code>SYNC_FILE_RANGE_WRITE</code>. No test exercises F1, F3, F4 or F7, or the <code>ESPIPE</code> and <code>O_PATH</code> cases of F8.</p>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F1, F2, F3, F4, F5, F6): under <code>hermit run --verify</code> on ptrace, write 8 KiB to a fresh <code>mkstemp</code> file. Then call raw <code>syscall(SYS_sync_file_range, ...)</code> with each <code>flags</code> value from 0 to 7, over the ranges <code>(0, 0)</code>, <code>(0, 4096)</code>, <code>(4096, 4096)</code> and <code>(1 &lt;&lt; 20, 4096)</code> (past EOF). Assert that every call returns 0 and that the file contents are unchanged. Existing partial coverage: <code>tests/c/sync_file_range.c:68</code> (<code>WRITE</code> over the whole file), <code>tests/c/sync_file_range.c:77</code> (all three flags on the first page) and <code>tests/c/sync_file_range.c:91</code> (<code>WRITE</code> on the second page), through the glibc wrapper (cell <code>c-programs/sync-file-range</code>, <code>tests/e2e/manifests/c-programs.yaml:13971</code>, verify ci on ptrace). Also raw <code>WRITE</code> at <code>tests/c/syscall_file_metadata.c:220</code> (cell <code>c-programs/syscall-file-metadata</code>, <code>tests/e2e/manifests/c-programs.yaml:9275</code>, and the cargo test <code>deterministic_file_metadata_syscalls_verify</code> at <code>hermit-cli/tests/syscall_file_metadata.rs:51</code>, which passes <code>--backend=ptrace</code>).</li>
-<li>T2 (covers F7): assert <code>EINVAL</code> for <code>flags = 8</code>, for <code>flags = 0xffffffff</code>, for <code>offset = -1</code>, for <code>nbytes = -1</code>, and for <code>offset = LLONG_MAX</code> with <code>nbytes = 2</code>.</li>
-<li>T3 (covers F8): assert <code>EBADF</code> for fd <code>-1</code>, for a closed fd and for an <code>O_PATH</code> fd, the last also with <code>flags = 8</code> to show that <code>EBADF</code> wins over <code>EINVAL</code>. Assert <code>ESPIPE</code> on a pipe and on a socketpair, and success on an <code>O_RDONLY</code> descriptor. Existing partial coverage: <code>tests/c/sync_file_range.c:100</code> (fd <code>-1</code>).</li>
-<li>T4 (covers F9): run a full <code>WAIT_BEFORE|WRITE|WAIT_AFTER</code> flush over a 64 MiB file and assert 0, so a long host wait is exercised under <code>--verify</code>. <code>EIO</code>, <code>ENOSPC</code> and host <code>ENOMEM</code> are F10, recorded by U1.</li>
-<li>U1 (covers F10; host-transient): writeback <code>EIO</code> and <code>ENOSPC</code>, and <code>ENOMEM</code>, depend on host storage health, free space and memory shared with other processes. The plain passthrough (<code>detcore/src/syscall_classification.rs:801</code>, <code>detcore/src/lib.rs:2843</code>) hands them to the guest today. F10 counts toward done only once Hermit hides these errors or reports them as an infrastructure error.</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+sync_file_range&amp;body=Discussion+for+the+%60sync_file_range%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsync_file_range.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60sync_file_range%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `sync_file_range`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/492: linux_determinism deterministic (from <strong>Classification:</strong>); target_policy from legacy PASS-THRU; code at this SHA: passthrough, dispatch passthrough.</li>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · duplicate https://github.com/rrnewton/hermit/issues/513 is retired into this issue; its text waits under Additional information for a section-by-section merge.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: kept deterministic/passthrough (forwarded at detcore/src/lib.rs:2843; no data effect, errors depend only on arguments and descriptor type); merged duplicate https://github.com/rrnewton/hermit/issues/513, whose CONDITIONAL rating lost because its sources are host storage failures and latency, which virtual time does not see; 9 flag behaviours and 4 tests listed; no coverage token yet, so tracking_status stays todo</li>
-<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d12 (owner decisions 1 and 2): cross_host_variant stays false (blocking time is hidden by the fixed syscall cost, and writeback errors are transient); F9 narrowed to blocking time, new F10 EIO/ENOSPC/ENOMEM (host-transient U1); the open question on unreachable storage errors is resolved by decision 1</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+sync_file_range&amp;amp;body=Discussion+for+the+%60sync_file_range%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsync_file_range.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60sync_file_range%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `sync_file_range`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Originally filed 2026-07-24 as &quot;Syscall classification: sync_file_range&quot; (https://github.com/rrnewton/hermit/issues/492), legacy variant A1. Manual reference: <a href="https://man7.org/linux/man-pages/man2/sync_file_range.2.html">sync_file_range(2)</a>.</p>
-<p>Duplicate https://github.com/rrnewton/hermit/issues/513 (filed 2026-07-24 as &quot;Syscall classification: sync_file_range&quot;, legacy variant A1) is merged into this body. Its comment history (0 comments) stays on that issue, and this issue's comment history stays on https://github.com/rrnewton/hermit/issues/492.</p>
-<h3>Merge reconciliation</h3>
-<ul>
-<li>Classification: https://github.com/rrnewton/hermit/issues/492 said deterministic and https://github.com/rrnewton/hermit/issues/513 said CONDITIONAL. Deterministic won. The duplicate's sources are dirty-page state, writeback congestion, filesystem support, storage errors and signals. Dirty-page state and congestion change only latency, which Hermit's virtual time does not observe. Filesystem support is not a factor: every filesystem goes through the same generic range-writeback path, and only the descriptor type matters (F8). Storage errors are host failures (F9), which this set treats as nondeterminism sources without changing the rating; see mkdir. The duplicate also lists signals, but the kernel does not interrupt the writeback wait with <code>EINTR</code>, and none of its evidence shows such a return.</li>
-<li>Both issues recommended PASS-THRU, and the code agrees.</li>
-<li>Both noted that the call gives no general durability guarantee, because metadata may stay unsynced. That point is kept in Linux semantics.</li>
-</ul>
-<h3>Open questions</h3>
-<ul>
-<li><code>rr_sync_file_range</code> at <code>hermit-cli/tests/rr_suite.rs:512</code> runs rr's own <code>sync_file_range</code> program, but the <code>rr_test!</code> macro marks it <code>#[ignore]</code> (<code>hermit-cli/tests/rr_suite.rs:233</code>), so it cannot be cited as CI coverage.</li>
-</ul>
-<h3>2026-07-24 host strace evidence (https://github.com/rrnewton/hermit/issues/492)</h3>
-<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) with <code>strace -f -e trace=sync_file_range</code> on a direct <code>syscall()</code> harness (invoked with non-destructive query/no-op/failing arguments) and, where applicable, on common programs. Hermit currently routes <code>sync_file_range</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code>.</p>
-<p>Observed strace line:</p>
-<pre><code>sync_file_range(4, 0, 0, 0)     = 0
-</code></pre>
-<hr>
-<p>*Autonomous syscall-classification sweep (ranks 151-250 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
-<h3>2026-07-24 host strace evidence (https://github.com/rrnewton/hermit/issues/513)</h3>
-<p>Evidence was gathered on <code>the measurement host</code> (Linux 6.17, x86_64, glibc) with a direct <code>syscall()</code> harness. The probe used safe self-targeting, no-op, temporary-file, or deliberately invalid arguments and was traced with <code>strace -qq -f -e trace=sync_file_range</code>. The harness exited 0, and <code>detcore/src/syscall_classification.rs</code> at <code>dd60278f</code> places <code>sync_file_range</code> in the UNCLASSIFIED temporary-passthrough block. A one-byte temporary-file range completed successfully.</p>
-<p>Observed strace line:</p>
-<pre><code>sync_file_range(3, 0, 1, SYNC_FILE_RANGE_WAIT_BEFORE|SYNC_FILE_RANGE_WRITE|SYNC_FILE_RANGE_WAIT_AFTER) = 0
-</code></pre>
-<hr>
-<p>*Autonomous syscall-classification sweep, batch 5 (ranks 201-250 of the unique <code>syscall_classification.rs</code> UNCLASSIFIED list). Manual research plus host strace evidence; no code change proposed here.*</p>
 </body></html>

@@ -3,113 +3,17 @@
 <title>unlinkat | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>unlinkat</code> (263)</h1>
-<p>Strategy: <strong>passthrough</strong> &middot; dispatch: <code>passthrough</code> &middot; linux determinism: deterministic &middot; target policy: passthrough &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+unlinkat&amp;body=Discussion+for+the+%60unlinkat%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Funlinkat.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60unlinkat%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>unlinkat(dirfd, pathname, flags)</code> removes a directory entry, resolved against <code>dirfd</code> or the working directory. With <code>flags</code> 0 it behaves like <code>unlink</code>; with <code>AT_REMOVEDIR</code> it removes an empty directory, like <code>rmdir</code>. Hermit forwards it to the host kernel unchanged. It relies on the guest's container filesystem being private and stable, and Detcore keeps no filesystem state of its own.</p>
-<h2>Linux semantics</h2>
-<p>The kernel accepts only <code>AT_REMOVEDIR</code> in <code>flags</code>; any other bit gives <code>EINVAL</code>. It looks up the parent of the last component, starting from <code>dirfd</code> for a relative path and ignoring it for an absolute one, and never follows the last component: a symlink is removed as a link and its target is untouched. With <code>flags</code> 0 the entry must not be a directory. Removing a name decrements the inode's link count; the inode and its data are freed only when the count reaches zero and no process still has the file open or mapped, so a file can be unlinked while open and remain readable through the descriptor. With <code>AT_REMOVEDIR</code> the directory must be empty, and <code>.</code> and <code>..</code> as the last component are refused. On success the parent's mtime and ctime change, and the removed inode's ctime changes if it survives. The call returns 0 or a negative errno and reports nothing else. On the host, coreutils <code>rm</code> issues <code>unlinkat(AT_FDCWD, path, 0)</code> (strace evidence below), so most shell-driven file removal reaches this syscall.</p>
-<h3>Flags and options</h3>
+<p>Strategy: <strong>passthrough</strong> &middot; dispatch: <code>passthrough</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+unlinkat&amp;body=Discussion+for+the+%60unlinkat%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Funlinkat.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60unlinkat%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>unlinkat</code> (263) as passthrough via passthrough dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: false.</p>
 <ul>
-<li>F1: <code>flags == 0</code> on a non-directory (regular file, FIFO, socket, device, symlink): removes the name and decrements the link count. A hard-linked file survives under its other names.</li>
-<li>F2: <code>flags == 0</code> on a directory: <code>EISDIR</code></li>
-<li>F3: <code>AT_REMOVEDIR</code> on an empty directory: removes it. A trailing slash on the last component is accepted. Host check: <code>&quot;m2/&quot;</code> was removed.</li>
-<li>F4: <code>AT_REMOVEDIR</code> on a non-directory: <code>ENOTDIR</code></li>
-<li>F5: <code>AT_REMOVEDIR</code> on a non-empty directory: <code>ENOTEMPTY</code> (POSIX also allows <code>EEXIST</code>; Linux filesystems return <code>ENOTEMPTY</code>)</li>
-<li>F6: <code>AT_REMOVEDIR</code> with <code>.</code> as the last component: <code>EINVAL</code>. With <code>..</code> as the last component: <code>ENOTEMPTY</code>.</li>
-<li>F7: any other bit in <code>flags</code>, including <code>AT_SYMLINK_NOFOLLOW</code> (0x100), <code>AT_EMPTY_PATH</code> (0x1000) and bit 0: <code>EINVAL</code></li>
-<li>F8: the last component is a symlink, whether to a file or a directory, with <code>flags</code> 0: the link is removed and its target is unchanged</li>
-<li>F9: <code>flags == 0</code> with a trailing slash on a non-directory name: <code>ENOTDIR</code></li>
-<li>F10: the entry is still open in this or another guest process: the name is removed, and the inode stays readable and writable through the open descriptor until the last close</li>
-<li>F11: the parent directory is sticky (<code>S_ISVTX</code>) and the caller owns neither the parent nor the entry and lacks <code>CAP_FOWNER</code>: <code>EPERM</code>. F22 holds immutable and append-only entries.</li>
-<li>F12: the target is a mount point, or is in use by the system in a way the filesystem refuses: <code>EBUSY</code></li>
-<li>F13: the name does not exist, or <code>pathname</code> is empty: <code>ENOENT</code>. An intermediate component is not a directory: <code>ENOTDIR</code>.</li>
-<li>F14: write or search permission is denied on the path: <code>EACCES</code></li>
-<li>F15: a component is longer than <code>NAME_MAX</code>, or the path is longer than <code>PATH_MAX</code>: <code>ENAMETOOLONG</code>. Too many symlinks in the prefix: <code>ELOOP</code>.</li>
-<li>F16: <code>pathname</code> points outside the address space: <code>EFAULT</code></li>
-<li>F17: the entry is on a read-only mount: <code>EROFS</code></li>
-<li>F18: <code>dirfd == AT_FDCWD</code>: a relative <code>pathname</code> resolves against the calling process's working directory, inside its root and mount namespace</li>
-<li>F19: <code>dirfd</code> is an open directory, including an <code>O_PATH</code> one: a relative <code>pathname</code> resolves against it</li>
-<li>F20: <code>dirfd</code> is open but not a directory, with a relative <code>pathname</code>: <code>ENOTDIR</code>. <code>dirfd</code> is not open: <code>EBADF</code>.</li>
-<li>F21: an absolute <code>pathname</code> ignores <code>dirfd</code></li>
-<li>F22: the entry or its parent carries the immutable or append-only attribute, which only the host can set: <code>EPERM</code>.</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:2012</code></li>
 </ul>
-<h2>Determinism analysis</h2>
-<p>The result is a function of the directory <code>dirfd</code> names, the filesystem state along the path, <code>flags</code>, the caller's credentials and capabilities, and the mount table. Nothing in the call depends on timing, and it does not block. Under Hermit, threads run one at a time, so two guest threads racing to remove or recreate the same name get a fixed order. F10 depends on which guest processes still hold the file open, which is itself guest state that Hermit's scheduler fixes. The call repeats exactly when the guest-visible filesystem starts in the same state, the guest runs with the same credentials, and nothing outside the container changes it.</p>
-<p><code>linux_determinism</code> stays <code>deterministic</code>. The merged duplicate said CONDITIONAL because results depend on external filesystem state (see the reconciliation under Additional information). That dependency is real, but it is the stable-state assumption Detcore states for this whole group at <code>detcore/src/syscall_classification.rs:725</code> (&quot;repeat given stable guest-visible filesystem state with no external mutation&quot;), and the siblings <code>unlink</code>, <code>rmdir</code>, <code>mkdir</code> and <code>mkdirat</code> carry <code>deterministic</code> under the same assumption. Unlike <code>fremovexattr</code>, no flag here has a result that changes with host kernel or LSM configuration while the container's files stay the same.</p>
-<h3>Nondeterminism sources</h3>
-<ul>
-<li>Changes to the filesystem made outside the container: the entry appearing, disappearing or changing type between guest calls. Hermit does not try to make a changing host filesystem deterministic.</li>
-<li>The mount table behind F12 and F17, which Hermit fixes for the container but which the host can change.</li>
-<li>The merged duplicate also listed directory-descriptor identity, flags, permissions and path state. Those are inputs the guest controls, not nondeterminism sources: given the same guest state they give the same result.</li>
-</ul>
-<h3>Cross-host variation</h3>
-<ul>
-<li>Host mount layout visible in the guest: which entries are mount points and give <code>EBUSY</code> (F12).</li>
-<li>Inode attributes set on the host: immutable or append-only entries give <code>EPERM</code> (F22).</li>
-</ul>
-<h2>Hermit design</h2>
-<p>Target policy: <code>passthrough</code>. The code already does this. <code>unlinkat</code> is classified <code>PassThrough</code> at <code>detcore/src/syscall_classification.rs:736</code>, next to <code>rmdir</code> (line 733) and <code>unlink</code> (line 735), inside the pass-through block that starts at <code>detcore/src/syscall_classification.rs:690</code>. The group comment at <code>detcore/src/syscall_classification.rs:725</code> gives the condition quoted above. The generic arm <code>SyscallClassification::PassThrough =&gt; self.passthrough(guest, call).await</code> at <code>detcore/src/lib.rs:2843</code> forwards it. <code>passthrough</code> at <code>detcore/src/lib.rs:367</code> only delegates to the record/replay helper, so in run mode the host kernel executes the call as issued. The unit test <code>representative_policies_stay_in_their_reviewed_sections</code> (<code>detcore/src/syscall_classification.rs:1899</code>; <code>unlinkat</code> at line 2092) pins the classification, not guest behaviour.</p>
-<p>Why passthrough, not <code>model</code> or <code>emulate</code>:</p>
-<ul>
-<li>Hermit has no virtual filesystem. Directory entries live in the guest's container mount namespace, and only the kernel can apply F1 to F21 consistently with what <code>stat</code>, <code>open</code>, <code>getdents</code> and the deferred-free rule of F10 later see.</li>
-<li>The call creates no kernel object and does not block, so there is no scheduling or time interaction for Detcore to control.</li>
-<li>Every sibling that changes the namespace (<code>unlink</code>, <code>rmdir</code>, <code>mkdir</code>, <code>mkdirat</code>, <code>linkat</code>, <code>renameat2</code>, <code>symlinkat</code>) is passed through on the same assumption. Handling <code>unlinkat</code> differently would split one filesystem view across two mechanisms.</li>
-</ul>
-<p>Code facts show <code>subscribed_record_replay: false</code>: Detcore's <code>--passthru-opt</code> subscription leaves <code>unlinkat</code> out, so in that mode the call never reaches Detcore. <code>hermit record</code> has its own subscriptions in a recorder module that is not in the exported tree (comment at <code>detcore/src/lib.rs:1078</code>), so this body does not describe how record captures it.</p>
-<p>The open gap is test evidence, not code. <code>tests_naming</code> is 0: no test names <code>SYS_unlinkat</code>. Existing run-mode coverage goes through glibc in <code>tests/c/linkat_flags.c</code>: removing a hard link with <code>flags</code> 0 and checking the link count returns to 1 (line 50), removing an empty directory with <code>AT_REMOVEDIR</code> and checking <code>lstat</code> gives <code>ENOENT</code> (line 53), and <code>ENOENT</code> for a missing name (line 58). That fixture runs in the ptrace verify cell <code>c-programs/linkat-flags</code> (<code>tests/e2e/manifests/c-programs.yaml:12263</code>) and exits nonzero unless all five of its checks pass (<code>tests/c/linkat_flags.c:74</code>).</p>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F1, F2, F3, F18, F19, F21): under <code>hermit run --verify</code> on ptrace, call raw <code>syscall(SYS_unlinkat, ...)</code> with <code>AT_FDCWD</code> after a <code>chdir</code>, with an <code>O_RDONLY|O_DIRECTORY</code> descriptor, with an <code>O_PATH</code> descriptor, and with an absolute path and a closed descriptor number. Remove a regular file, a hard-linked file (assert the other name's <code>st_nlink</code>), a FIFO and a socket node with <code>flags</code> 0; remove an empty directory with <code>AT_REMOVEDIR</code>, once with a trailing slash; assert <code>EISDIR</code> for a directory with <code>flags</code> 0. Existing partial coverage via glibc: <code>tests/c/linkat_flags.c:50</code> and <code>:53</code>.</li>
-<li>T2 (covers F4, F5, F6, F7): assert <code>ENOTDIR</code> for <code>AT_REMOVEDIR</code> on a regular file, <code>ENOTEMPTY</code> on a non-empty directory, <code>EINVAL</code> for <code>&quot;.&quot;</code> and <code>ENOTEMPTY</code> for <code>&quot;sub/..&quot;</code> with <code>AT_REMOVEDIR</code>, and <code>EINVAL</code> for <code>flags</code> 0x1, 0x100 and 0x1000.</li>
-<li>T3 (covers F8, F9): create a symlink to a file and one to a directory, remove each with <code>flags</code> 0, and assert the targets still exist. Assert <code>ENOTDIR</code> for <code>&quot;file/&quot;</code> with <code>flags</code> 0.</li>
-<li>T4 (covers F10): open a file, write to it, unlink it, then read the bytes back through the open descriptor and assert <code>fstat</code> reports <code>st_nlink == 0</code>. Repeat with a child process holding the descriptor, so the scheduler orders the unlink against the child's reads.</li>
-<li>T5 (covers F11, F12): in a sticky directory owned by a second mapped uid, assert <code>EPERM</code> for removing an entry the guest does not own. Assert <code>EBUSY</code> for removing a mount point the guest can see. If the guest cannot reach a second uid or a mount point, the test fails and says so rather than skipping.</li>
-<li>T6 (covers F13, F14, F15, F16): assert <code>ENOENT</code> for a missing name and for <code>&quot;&quot;</code>; <code>ENOTDIR</code> for a regular file used as an intermediate component; <code>EACCES</code> under a directory the guest cannot write; <code>ENAMETOOLONG</code> for a 256-byte component and a path over 4096 bytes; <code>ELOOP</code> for a symlink loop in the prefix; and <code>EFAULT</code> for <code>pathname = (char *)1</code>. Existing partial coverage via glibc: <code>tests/c/linkat_flags.c:58</code> (a missing name).</li>
-<li>T7 (covers F17, F20): assert <code>EROFS</code> under a read-only mount the guest can see; <code>ENOTDIR</code> for a relative path with a regular-file descriptor; <code>EBADF</code> for a relative path with a closed descriptor number.</li>
-<li>U1 (covers F22; host-config): the immutable and append-only attributes need <code>CAP_LINUX_IMMUTABLE</code> in the host's initial user namespace, which the guest lacks, so CI cannot produce this error from inside the container. Hermit forwards the kernel's answer unchanged (<code>detcore/src/syscall_classification.rs:736</code>, <code>detcore/src/lib.rs:2843</code>).</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+unlinkat&amp;body=Discussion+for+the+%60unlinkat%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Funlinkat.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60unlinkat%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `unlinkat`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/506: linux_determinism deterministic (from <strong>Classification:</strong>); target_policy from legacy PASS-THRU; code at this SHA: passthrough, dispatch passthrough.</li>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · duplicate https://github.com/rrnewton/hermit/issues/527 is retired into this issue; its text waits under Additional information for a section-by-section merge.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: kept deterministic/passthrough (forwarded at detcore/src/lib.rs:2843; same stable-state assumption as unlink/rmdir/mkdirat at syscall_classification.rs:725); merged duplicate https://github.com/rrnewton/hermit/issues/527, whose CONDITIONAL is reconciled to deterministic; 21 flag behaviours, 7 tests; no coverage token, because tests/c/linkat_flags.c reaches unlinkat only through glibc, so tracking_status stays todo</li>
-<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d12 (owner decisions 1 and 2): cross_host_variant true (host mount layout for EBUSY, host inode attributes); F11 narrowed to the sticky-directory rule, new F22 immutable or append-only EPERM (host-config U1); no open question is answered by these decisions</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+unlinkat&amp;amp;body=Discussion+for+the+%60unlinkat%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Funlinkat.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60unlinkat%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `unlinkat`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Originally filed 2026-07-24 as &quot;Syscall classification: unlinkat&quot; (https://github.com/rrnewton/hermit/issues/506), legacy variant A1. Manual reference: <a href="https://man7.org/linux/man-pages/man2/unlinkat.2.html">unlinkat(2)</a>.</p>
-<p>Merged duplicate: https://github.com/rrnewton/hermit/issues/527, filed 2026-07-24 as &quot;Syscall classification: unlinkat&quot; (legacy variant A1). Comment histories: https://github.com/rrnewton/hermit/issues/506 (this issue) and https://github.com/rrnewton/hermit/issues/527 (0 comments when it was retired).</p>
-<p>Merge reconciliation:</p>
-<ul>
-<li>Determinism: this issue said <strong>deterministic</strong> (&quot;Same as unlink/rmdir; deterministic given fixed FS state&quot;); the duplicate said <strong>CONDITIONAL</strong> (&quot;The requested filesystem mutation is input-determined. Results depend on external filesystem state, so forwarding is consistent with Hermit's filesystem limitation.&quot;). Deterministic wins, for the reasons under Determinism analysis: the external-state dependency is the stable-state assumption the whole Detcore group shares, and the siblings carry <code>deterministic</code> under it.</li>
-<li>Nondeterminism sources: this issue said &quot;None from the syscall; only external concurrent FS mutation&quot;; the duplicate listed &quot;Directory-fd identity, flags, permissions, path state, mounts, and concurrent mutations&quot;. Both are kept above: external mutation and mounts as sources, the rest as guest-controlled inputs.</li>
-<li>Semantics: both said <code>AT_REMOVEDIR</code> selects directory removal and <code>flags</code> 0 gives unlink behaviour (F1, F3). Both recorded success removing a temporary file relative to <code>AT_FDCWD</code>; both strace lines are kept below.</li>
-<li>Both recommended PASS-THRU; kept.</li>
-</ul>
-<h3>2026-10-03 host probes</h3>
-<p>Run by syscall-tracking-p3 on the measurement host (Linux 7.1.3, glibc 2.34, btrfs, unprivileged uid). This was the host, not Hermit.</p>
-<ul>
-<li><code>strace -f</code> of coreutils <code>rm file</code> showed <code>unlinkat(AT_FDCWD, path, 0) = 0</code>.</li>
-<li>Probes against scratch entries in a scratch directory: a file 0; a directory with <code>flags</code> 0 <code>EISDIR</code>; <code>AT_REMOVEDIR</code> on a file <code>ENOTDIR</code>; on a non-empty directory <code>ENOTEMPTY</code>; <code>AT_REMOVEDIR</code> <code>&quot;.&quot;</code> <code>EINVAL</code>; <code>&quot;m1/..&quot;</code> <code>ENOTEMPTY</code>; <code>&quot;file/&quot;</code> with <code>flags</code> 0 <code>ENOTDIR</code>; <code>AT_REMOVEDIR</code> <code>&quot;m2/&quot;</code> 0; a symlink to a directory with <code>flags</code> 0 removed the link and left the directory; <code>flags</code> 0x1, 0x100 and 0x1000 <code>EINVAL</code>; <code>pathname = (char *)1</code> <code>EFAULT</code>.</li>
-</ul>
-<h3>2026-07-24 host strace evidence</h3>
-<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) with <code>strace -f -e trace=unlinkat</code> on a direct <code>syscall()</code> harness (invoked with non-destructive query/no-op/failing arguments) and, where applicable, on common programs. Hermit currently routes <code>unlinkat</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code>.</p>
-<p>Observed strace line:</p>
-<pre><code>unlinkat(AT_FDCWD, &quot;/tmp/sysclass45/sl2&quot;, 0) = 0
-</code></pre>
-<hr>
-<p>*Autonomous syscall-classification sweep (ranks 151-250 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
-<h3>Duplicate https://github.com/rrnewton/hermit/issues/527 host strace evidence</h3>
-<p>Evidence was gathered on <code>the measurement host</code> (Linux 6.17, x86_64, glibc) with a direct <code>syscall()</code> harness. The probe used safe self-targeting, no-op, temporary-file, or deliberately invalid arguments and was traced with <code>strace -qq -f -e trace=unlinkat</code>. The harness exited 0, and <code>detcore/src/syscall_classification.rs</code> at <code>dd60278f</code> places <code>unlinkat</code> in the UNCLASSIFIED temporary-passthrough block.</p>
-<p>Observed strace line:</p>
-<pre><code>unlinkat(AT_FDCWD, &quot;/tmp/hermit-b5-unlink-Ovjdeh&quot;, 0) = 0
-</code></pre>
-<hr>
-<p>*Autonomous syscall-classification sweep, batch 5 (ranks 201-250 of the unique <code>syscall_classification.rs</code> UNCLASSIFIED list). Manual research plus host strace evidence; no code change proposed here.*</p>
 </body></html>

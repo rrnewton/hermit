@@ -3,93 +3,18 @@
 <title>readv | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>readv</code> (19)</h1>
-<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; linux determinism: conditional &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+readv&amp;body=Discussion+for+the+%60readv%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Freadv.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60readv%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>readv(fd, iov, iovcnt)</code> reads from a file descriptor into several buffers in order (a scatter read). Detcore models it: it orders file reads through a resource, puts internal pipes and sockets through its deterministic nonblocking retry path, serves <code>/dev/urandom</code> and <code>/dev/random</code> from the canonical random stream, and records and replays the rest (<code>detcore/src/syscalls/files.rs:2561-2629</code> at hermit f4055eb9cae4). It returns <code>ENOSYS</code> on Detcore procfs snapshot fds, a known gap.</p>
-<h2>Linux semantics</h2>
-<p><code>readv</code> behaves like <code>read</code> into the concatenation of the iovec buffers, filled in array order. On a seekable file it reads at the file offset and advances it by the count returned.</p>
-<p>Validation and return values:</p>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+readv&amp;body=Discussion+for+the+%60readv%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Freadv.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60readv%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>readv</code> (19) as determinized via typed dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.</p>
 <ul>
-<li><code>iovcnt</code> above <code>IOV_MAX</code> (1024), or a total length above <code>SSIZE_MAX</code>, gives <code>EINVAL</code>.</li>
-<li>An unreadable iovec array, or a first buffer that cannot be written, gives <code>EFAULT</code>.</li>
-<li>A bad buffer after some data was copied gives the partial count.</li>
-<li>At end of file it returns 0.</li>
-<li>On a pipe, socket or tty it blocks until some data is available unless the fd is <code>O_NONBLOCK</code>, in which case it gives <code>EAGAIN</code>. It returns whatever is available, up to the total length.</li>
-<li>A signal before any data gives <code>EINTR</code>, or the call restarts under <code>SA_RESTART</code>.</li>
-<li><code>EBADF</code> for a closed fd or one not open for reading; <code>EISDIR</code> for a directory.</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1783</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:7768</code></li>
 </ul>
-<h3>Flags and options</h3>
-<ul>
-<li>F1: <code>iovcnt</code> 0 returns 0 without touching the fd.</li>
-<li>F2: <code>iovcnt</code> greater than <code>IOV_MAX</code> (1024), or a summed length that overflows <code>SSIZE_MAX</code>, gives <code>EINVAL</code>.</li>
-<li>F3: a bad iovec array or first buffer gives <code>EFAULT</code>; a bad later buffer after progress returns the partial count.</li>
-<li>F4: regular file: buffers are filled in order, the file offset advances by the count, and end of file returns 0.</li>
-<li>F5: pipe, socket or tty that is logically blocking: waits for data, then returns what is available (a short count).</li>
-<li>F6: <code>O_NONBLOCK</code> pipe or socket with no data gives <code>EAGAIN</code>.</li>
-<li>F7: signal delivery while blocked: <code>EINTR</code>, or a restart under <code>SA_RESTART</code>.</li>
-<li>F8: <code>/dev/urandom</code> and <code>/dev/random</code> (Detcore <code>FdType::Rng</code>): data from Detcore's canonical random stream.</li>
-<li>F9: a Detcore procfs snapshot fd (one with a procfs cursor): Hermit returns <code>ENOSYS</code>, whereas Linux reads the file.</li>
-<li>F10: a <code>sock_diag</code> or <code>NETLINK_ROUTE</code> netlink socket with metadata virtualization: the reply segments are sanitized.</li>
-<li>F11: a Detcore timer-slack procfs fd (<code>/proc/&lt;pid&gt;/timerslack_ns</code>): emulated vector read of the virtual value.</li>
-<li>F12: <code>EBADF</code> for a closed fd or one not open for reading; <code>EISDIR</code> for a directory.</li>
-</ul>
-<h2>Determinism analysis</h2>
-<p>A regular-file <code>readv</code> repeats given the same file contents and offset, but the order against concurrent writers of the same file depends on host scheduling.</p>
-<p>Reads from pipes, sockets and ttys depend on when the other endpoint wrote. The count returned, whether the call blocks, and whether a signal interrupts it (F5, F6, F7) all vary from run to run. External data such as network peers and the terminal varies outright.</p>
-<p><code>/dev/urandom</code> and <code>/dev/random</code> are nondeterministic by design (F8). Procfs and netlink replies carry host state such as pids, inodes and counters (F9, F10). Hence <code>conditional</code>.</p>
-<h2>Hermit design</h2>
-<p>Current behaviour (hermit 239ca43d3092): inotify rename cookies are virtualized on every read path, and blocking reads wait in the scheduler. Linux draws the cookie pairing <code>IN_MOVED_FROM</code> with <code>IN_MOVED_TO</code> from one host-wide counter, so after a successful <code>read</code>, <code>readv</code>, or current-offset <code>preadv2</code> on an inotify descriptor Detcore replaces each nonzero cookie with a run-wide virtual one, numbered from 1 in first-observation order (<code>detcore/src/syscalls/inotify.rs:9</code>); a pair keeps one value however far apart its halves are read, including events copied before a fault and descriptors received from another process. Instances Detcore creates are physically nonblocking with the guest's blocking mode kept by Detcore, so a blocking read that finds nothing queued waits in Detcore's turns instead of in the kernel. The text below predates the renumbering where it says events are not rewritten; event contents other than the cookie fields still come from the kernel.</p>
-<p>The policy is <code>model</code>, as implemented at hermit f4055eb9cae4:</p>
-<ul>
-<li><strong>Dispatch</strong> (<code>detcore/src/lib.rs:2382-2387</code>, with <code>TODO-HUMAN-REVIEW(#794)</code> at <code>detcore/src/lib.rs:2380</code>):</li>
-<li>when <code>sock_diag_reply_fd</code> holds (metadata virtualization on, and a <code>sock_diag</code> or <code>NETLINK_ROUTE</code> fd: <code>detcore/src/syscalls/io.rs:1529-1535</code>), the call goes to <code>handle_sock_diag_readv</code>, which reads and then sanitizes the segments (<code>detcore/src/syscalls/io.rs:1698-1710</code>) (F10);</li>
-<li>otherwise it goes to <code>handle_readv_with_output</code>. The random bytes it produces are kept for the detlog (<code>detcore/src/lib.rs:2027</code>, <code>detcore/src/lib.rs:2905</code>).</li>
-<li><strong>Timer-slack procfs fds</strong> are emulated (<code>detcore/src/syscalls/files.rs:2567-2573</code>, <code>readv_timer_slack</code> at <code>detcore/src/syscalls/files.rs:622</code>). Iovec validation (<code>detcore/src/syscalls/files.rs:191-224</code>) mirrors Linux: <code>EINVAL</code> above <code>UIO_MAXIOV</code>, empty for 0, <code>EFAULT</code> for a NULL array, <code>EINVAL</code> on length overflow (F11, F1, F2, F3).</li>
-<li><strong>Procfs snapshot fds</strong> return <code>ENOSYS</code> (<code>detcore/src/syscalls/files.rs:2575-2580</code>). <code>read</code> and <code>pread64</code> serve the same snapshot (see the unit tests at <code>detcore/src/syscalls/files.rs:4703-4715</code>), so this is a compatibility gap rather than a determinism hole: the guest gets a fixed <code>ENOSYS</code> and no host data (F9).</li>
-<li><strong>Ordering:</strong> a <code>Permission::R</code> resource is taken on the file's contents (<code>detcore/src/syscalls/files.rs:2593-2604</code>).</li>
-<li><strong>Random devices:</strong> <code>FdType::Rng</code> goes to <code>read_random_vectors</code> (<code>detcore/src/syscalls/files.rs:2606-2617</code>). It checks read access, imports and validates the iovecs, and fills them from the canonical stream through the shared cursor (<code>detcore/src/syscalls/files.rs:2527-2559</code>) (F8).</li>
-<li><strong>Pipes, sockets and eventfds</strong> that are physically nonblocking go through <code>execute_nonblockable_fd_syscall</code> (<code>detcore/src/syscalls/files.rs:2618-2621</code>, <code>detcore/src/syscalls/helpers.rs:196-278</code>):</li>
-<li>an internal fd under sequentialization is made nonblocking and retried on the deterministic schedule with an InternalIOPolling resource (<code>detcore/src/syscalls/helpers.rs:254-267</code>);</li>
-<li>external fds, and record/replay on external fds, take the blocking path (<code>detcore/src/syscalls/helpers.rs:241-250</code>), whose completion time is host-decided and is captured by record/replay (F5, F6, F7).</li>
-<li><strong>Everything else</strong> uses <code>record_or_replay</code> (<code>detcore/src/syscalls/files.rs:2622-2625</code>) (F4, F12).</li>
-</ul>
-<p>Why not <code>emulate</code> or <code>refuse</code>: <code>readv</code> is used by glibc stdio and by many programs, and the data has to come from the real file or endpoint. The open item is F9: whether <code>readv</code> on a procfs snapshot fd should be served like <code>read</code> instead of <code>ENOSYS</code>. It is listed under Open questions.</p>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F8): repeated <code>readv</code> from <code>/dev/urandom</code> returns the canonical stream identically across runs and in replay. Existing candidate: <code>tests/c/random_readv_stream.c</code> (manifest cell <code>c-programs/random-readv-stream</code>, <code>tests/e2e/manifests/c-programs.yaml:4</code>, verify on ptrace and kvm, replay on ptrace).</li>
-<li>T2 (covers F4, F5): <code>readv</code> over a pipe into several iovecs fills them in order, identically across runs. Existing candidates: <code>tests/c/vectored_io.c</code> (cell <code>c-programs/vectored-io</code>) and <code>tests/c/ppoll_readv.c</code> (cell <code>c-programs/ppoll-readv</code>), both verify on ptrace.</li>
-<li>T3 (covers F3, F11): on a timer-slack procfs fd, a bad second iovec returns the partial count, as Linux does. Existing candidate: <code>timer_slack_procfs_vector_io_matches_linux</code> in <code>detcore/tests/misc/mod.rs:434</code> (lines 514-518).</li>
-<li>T4 (covers F1, F2, F12): <code>iovcnt</code> 0, <code>iovcnt</code> 1025, a summed length that overflows <code>SSIZE_MAX</code>, a closed fd, an <code>O_WRONLY</code> fd and a directory fd each return the Linux result on a regular file.</li>
-<li>T5 (covers F6, F7): <code>readv</code> on an empty <code>O_NONBLOCK</code> pipe gives <code>EAGAIN</code>; a blocking <code>readv</code> interrupted by a timer signal gives <code>EINTR</code> without <code>SA_RESTART</code> and completes with it, identically across runs under <code>--verify</code>.</li>
-<li>T6 (covers F9): <code>readv</code> on a procfs snapshot fd (for example <code>/proc/self/stat</code>) pins today's <code>ENOSYS</code>, or the snapshot bytes if the open question is resolved that way.</li>
-<li>T7 (covers F10): a <code>sock_diag</code> dump read with <code>readv</code> under metadata virtualization yields sanitized inode fields identically across runs.</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+readv&amp;body=Discussion+for+the+%60readv%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Freadv.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60readv%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `readv`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/395: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch typed.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; model (resource-ordered file reads, nonblocking retry for internal pipes, canonical RNG stream, sock_diag sanitizing, record/replay); linux_determinism stays conditional; 12 flags, T1-T7 proposed; open question: ENOSYS on procfs snapshot fds; tracking_status stays todo.</li>
-<li>2026-10-05 · hermit f4055eb9cae4 · syscall-tracking-2 · covered: T1 covered by tests/c/random_readv_stream.c, T2 covered by tests/c/ppoll_readv.c, T6 covered by tests/c/proc_locks.c (C08 review of the 2026-10-04 coverage proposals; guest source read at this SHA, not run by this agent)</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · updated: inotify cookie renumbering now applies to this read path; code facts also refreshed at conversion.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+readv&amp;amp;body=Discussion+for+the+%60readv%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Freadv.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60readv%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `readv`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Originally filed 2026-07-24 as &quot;Syscall classification: readv&quot; (https://github.com/rrnewton/hermit/issues/395), legacy variant A1.</p>
-<p>The 2026-07-24 evidence below describes how the call was routed at that time. At hermit f4055eb9cae4, <code>readv</code> has its own typed handler (see Hermit design), and the &quot;temporary-passthrough&quot; wording no longer applies.</p>
-<h3>Open questions</h3>
-<ul>
-<li>Should <code>readv</code> on a Detcore procfs snapshot fd be served from the snapshot, as <code>read</code> and <code>pread64</code> are, instead of returning <code>ENOSYS</code> (<code>detcore/src/syscalls/files.rs:2575-2580</code>)? Programs that read <code>/proc</code> files with <code>readv</code> (for example through some stdio implementations) fail under Hermit today. The behaviour is deterministic either way.</li>
-</ul>
-<h3>2026-07-24 host strace evidence</h3>
-<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) with <code>strace -f -e trace=readv</code> on a direct <code>syscall()</code> harness (invoked with non-destructive query/no-op/failing arguments) and, where applicable, on common programs. Hermit currently routes <code>readv</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code>.</p>
-<p>Observed strace line:</p>
-<pre><code>readv(3, [{iov_base=&quot;measurement-host&quot;, iov_len=16}], 1) = 16
-</code></pre>
-<hr>
-<p>*Autonomous syscall-classification sweep (ranks 151-250 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
 </body></html>

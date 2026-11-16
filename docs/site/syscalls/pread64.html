@@ -3,90 +3,18 @@
 <title>pread64 | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>pread64</code> (17)</h1>
-<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; linux determinism: conditional &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+pread64&amp;body=Discussion+for+the+%60pread64%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fpread64.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60pread64%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>pread64</code> reads from a file at an explicit offset without moving the file position. Hermit serves <code>/proc/&lt;tid&gt;/timerslack_ns</code>, other procfs files and the random devices from its own deterministic state, fills regular-file reads to the full count or end of file, and forwards everything else to the kernel through record/replay.</p>
-<h2>Linux semantics</h2>
-<p><code>pread64(fd, buf, count, offset)</code> copies up to <code>count</code> bytes, starting at byte <code>offset</code> of the file, into <code>buf</code>, and returns the number of bytes copied, 0 at end of file, or <code>-1</code> with <code>errno</code>. The file position shared by duplicates of the open file description is neither read nor changed, so threads can read the same file concurrently without <code>lseek</code>. The data is whatever the file holds at the time of the read; for generated files (procfs, sysfs, devices) the driver produces it on demand.</p>
-<h3>Flags and options</h3>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+pread64&amp;body=Discussion+for+the+%60pread64%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fpread64.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60pread64%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>pread64</code> (17) as determinized via typed dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.</p>
 <ul>
-<li>F1: the read starts at <code>offset</code> and leaves the file position unchanged.</li>
-<li>F2: a negative <code>offset</code> gives <code>EINVAL</code>; Linux checks it before it looks up the descriptor.</li>
-<li>F3: a <code>count</code> of 0 returns 0 without touching <code>buf</code>, but still reports descriptor errors.</li>
-<li>F4: the result can be shorter than <code>count</code>: at end of file (0 when <code>offset</code> is at or past it), and on filesystems or devices that return what they have.</li>
-<li>F5: a descriptor that cannot seek (pipe, FIFO, socket, terminal) gives <code>ESPIPE</code>.</li>
-<li>F6: a directory gives <code>EISDIR</code>.</li>
-<li>F7: a descriptor that is not open, not open for reading, or opened with <code>O_PATH</code> gives <code>EBADF</code>.</li>
-<li>F8: a <code>buf</code> that is NULL or unmapped gives <code>EFAULT</code>; if the fault comes after some bytes were copied, Linux returns that shorter count instead.</li>
-<li>F9: <code>count</code> above <code>MAX_RW_COUNT</code> (2 GiB minus one page) is cut to that limit, and an <code>offset + count</code> that overflows a signed 64-bit file offset gives <code>EINVAL</code>.</li>
-<li>F10: on a descriptor opened with <code>O_DIRECT</code>, a <code>buf</code>, <code>offset</code> or <code>count</code> that is not aligned to the device's logical block size gives <code>EINVAL</code>.</li>
-<li>F11: procfs and sysfs files are generated when they are read; a positioned read of a <code>seq_file</code> regenerates the content and returns the bytes at <code>offset</code> of the new text.</li>
-<li>F12: <code>/proc/&lt;tid&gt;/timerslack_ns</code> returns the target thread's timer slack in nanoseconds as decimal text.</li>
-<li>F13: <code>/dev/urandom</code> and <code>/dev/random</code> ignore <code>offset</code> and return fresh random bytes on every call.</li>
-<li>F14: a device or special file that can block may give <code>EINTR</code> when a signal arrives before any data, or <code>EAGAIN</code> when it is non-blocking and has no data.</li>
-<li>F15: a <code>pread64</code> concurrent with a <code>write</code>, <code>pwrite</code> or <code>ftruncate</code> of the same range by another thread or process may see the old data, the new data, or a mix.</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1758</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:7757</code></li>
 </ul>
-<h2>Determinism analysis</h2>
-<p><code>linux_determinism</code> is <code>conditional</code>. The result is a function of the file's contents at <code>offset</code> when the read happens. It repeats when the program reads the same file with the same contents, and no other writer races with it. The sources that break this:</p>
-<ul>
-<li>Generated files. F11 and F12 report live kernel state (process times, memory use, scheduler counters), which differs between runs.</li>
-<li>Randomness. F13 returns different bytes every time by design.</li>
-<li>Concurrent writers. F15 depends on how the reader and the writers interleave.</li>
-<li>Host and filesystem behaviour. F4 short reads on network or FUSE filesystems and devices, F10 block sizes, and F14 interruptions depend on the host and on signal timing.</li>
-<li>Host files. A file that the guest did not create, such as a system library, differs between hosts and over time.</li>
-</ul>
-<h3>Cross-host variation</h3>
-<ul>
-<li>Device logical block size and filesystem <code>O_DIRECT</code> support behind the guest's file: which <code>buf</code>, <code>offset</code> and <code>count</code> alignments an <code>O_DIRECT</code> read accepts and which give <code>EINVAL</code> (F10). Hermit forwards these reads to the kernel (<code>detcore/src/syscalls/files.rs:1936-1942</code>).</li>
-<li>Contents of host files the guest did not create (system libraries, files under <code>/etc</code>): the bytes and counts F1 and F4 return differ between hosts and are stable on one host.</li>
-</ul>
-<h2>Hermit design</h2>
-<p>Target policy: <code>model</code>. Detcore answers the reads whose content is host state from its own deterministic state, makes regular-file reads return a repeatable count, and orders concurrent access to the same file. The kernel still reads ordinary file data.</p>
-<ul>
-<li>Dispatch. The typed arm (<code>detcore/src/lib.rs:2370</code>) calls <code>handle_pread64</code> (<code>detcore/src/syscalls/files.rs:1881</code>). <code>pread64</code> stays in the subscription list of the opt-in fast path as well (<code>detcore/src/lib.rs:1124</code>), and is charged <code>IO_NS</code> of logical time (<code>detcore/src/syscall_time.rs:16</code>, <code>detcore/src/syscall_time.rs:79</code>).</li>
-<li>F12. A descriptor bound to <code>/proc/&lt;tid&gt;/timerslack_ns</code> goes to <code>pread_timer_slack</code> (<code>detcore/src/syscalls/files.rs:1886-1890</code>, defined at <code>detcore/src/syscalls/files.rs:592</code>). It returns <code>EINVAL</code> for a negative offset, checks read access, returns 0 for a zero count, and copies the decimal text of the thread's logical <code>timer_slack_ns</code> from the requested offset (<code>detcore/src/syscalls/files.rs:600-619</code>).</li>
-<li>F3. A zero count is injected directly, so the kernel reports descriptor errors (<code>detcore/src/syscalls/files.rs:1892-1896</code>).</li>
-<li>F2. Any other negative offset returns <code>EINVAL</code> (<code>detcore/src/syscalls/files.rs:1898</code>).</li>
-<li>F11. A procfs descriptor takes a sanitized snapshot on first use (<code>detcore/src/syscalls/files.rs:1899-1908</code>, <code>detcore/src/fd.rs:415</code>), and every positioned read returns bytes of that snapshot without moving its shared cursor (<code>detcore/src/syscalls/files.rs:1910-1917</code>, <code>detcore/src/fd.rs:474-475</code>), so repeated reads see the same text.</li>
-<li>F15. Before reading, Detcore requests a read permission on the file's resource and releases it afterwards (<code>detcore/src/syscalls/files.rs:1919-1926</code>, <code>detcore/src/syscalls/files.rs:1945</code>), so the scheduler orders the read against writers in the guest.</li>
-<li>F13. For a random device, Detcore fills the buffer from the canonical stream seeded by <code>rng_seed</code>, at a stream position equal to <code>offset</code> (<code>detcore/src/syscalls/files.rs:1929-1935</code>, <code>detcore/src/syscalls/misc.rs:478-520</code>).</li>
-<li>F4. For a regular file with deterministic I/O on (<code>detcore/src/syscalls/files.rs:1936-1938</code>), <code>deterministic_pread64</code> repeats the read with an advancing offset until the buffer is full or end of file, and returns <code>EOVERFLOW</code> if the offset would overflow (<code>detcore/src/syscalls/files.rs:2100-2141</code>). <code>hermit run</code> turns deterministic I/O on unless <code>--no-deterministic-io</code> or <code>--strace-only</code> is given (<code>hermit-cli/src/bin/hermit/run.rs:3668</code>, <code>hermit-cli/src/bin/hermit/run.rs:3759</code>); recording turns it off (<code>hermit-cli/src/bin/hermit/record_start.rs:191-194</code>).</li>
-<li>Everything else (F5 to F10, F14, and regular files without deterministic I/O) goes through <code>record_or_replay</code> (<code>detcore/src/syscalls/files.rs:1939-1942</code>), so the kernel produces the errors. The recorder injects the call and stores the bytes it returned (<code>hermit-cli/src/recorder/fs.rs:516-534</code>, reached from <code>hermit-cli/src/recorder.rs:500</code>); the replayer writes those bytes back and returns their length (<code>hermit-cli/src/replayer/fs.rs:794-808</code>, reached from <code>hermit-cli/src/replayer.rs:404</code>).</li>
-</ul>
-<p>Why <code>model</code> and not the alternatives: <code>passthrough</code> would expose live procfs values, real random bytes and host-dependent short reads. <code>emulate</code> would mean reimplementing filesystem reads that the kernel already does deterministically for guest-created files. <code>refuse</code> would break nearly every program.</p>
-<p>Differences from Linux found by reading the code, not measured:</p>
-<ul>
-<li>F13: Linux ignores <code>offset</code> on the random devices, but Detcore uses it as the stream position, so two <code>pread64</code> calls at the same offset return the same bytes in one run.</li>
-<li>F8: <code>deterministic_pread64</code> returns the error when a later fragment fails after earlier bytes were copied (<code>detcore/src/syscalls/files.rs:2138</code>), where Linux, and Detcore's own <code>deterministic_read</code> (<code>detcore/src/syscalls/files.rs:2090-2093</code>), return the bytes already read.</li>
-<li>F2 and F7: for a descriptor that is not open and a negative offset, Detcore's descriptor lookup returns <code>EBADF</code> first (<code>detcore/src/syscalls/files.rs:1886</code>, <code>detcore/src/tool_local.rs:2559-2567</code>, <code>detcore/src/tool_local.rs:740</code>), where Linux returns <code>EINVAL</code>.</li>
-<li>F4 and F8 under record: when the kernel returns 0 and <code>buf</code> is NULL, the recorder stores <code>EFAULT</code> as the event (<code>hermit-cli/src/recorder/fs.rs:525-529</code>), so replay would report an error that the recorded run did not see.</li>
-</ul>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F1, F4): write a known file, <code>pread64</code> from the middle and at end of file, and check the bytes, the counts (including 0 past the end), and that <code>lseek(fd, 0, SEEK_CUR)</code> is unchanged. Existing partial coverage: <code>tests/c/simple/pread64_nostdlib.c</code> line 50 reads 4096 bytes of <code>/bin/true</code> at offset 0 and checks only for a positive result (cell <code>c-programs/pread64-nostdlib</code>, <code>tests/e2e/manifests/c-programs.yaml:5603</code>, verify ci on ptrace). <code>tests/c/dup_shared_offset.c</code> (helper at lines 71-81, used at line 134; cell <code>c-programs/dup-shared-offset</code>, <code>tests/e2e/manifests/c-programs.yaml:15923</code>) and <code>tests/c/lseek_positioning.c</code> (helper at lines 75-85, used at line 148; cell <code>c-programs/lseek-positioning</code>, <code>tests/e2e/manifests/c-programs.yaml:15991</code>) use <code>pread</code> to read back whole files, both verify ci on ptrace.</li>
-<li>T2 (covers F2, F3, F7): with raw <code>syscall(SYS_pread64, ...)</code>, check <code>EINVAL</code> for offset -1 on an open file, <code>EBADF</code> for a zero count on a closed descriptor, <code>EBADF</code> on an <code>O_WRONLY</code> and an <code>O_PATH</code> descriptor, and the error for a closed descriptor with offset -1, which pins the precedence question above.</li>
-<li>T3 (covers F5, F6): <code>ESPIPE</code> on a pipe and on a socketpair, <code>EISDIR</code> on a directory descriptor.</li>
-<li>T4 (covers F8): <code>EFAULT</code> for a NULL buffer with a non-zero count; then a buffer whose second page is <code>PROT_NONE</code>, which on Linux returns the count of the first page.</li>
-<li>T5 (covers F9, F10): a count above 2 GiB on a small file returns the file size; <code>offset = INT64_MAX</code> with count 2 gives <code>EINVAL</code>; on a filesystem that supports <code>O_DIRECT</code>, an unaligned buffer gives <code>EINVAL</code> (skip with a stated reason when <code>O_DIRECT</code> is refused).</li>
-<li>T6 (covers F11): <code>pread64</code> of <code>/proc/self/stat</code> returns the sanitized snapshot, and a second read at the same offset returns the same bytes. Existing coverage: <code>tests/c/procfs_positioned_probe.c</code> (<code>check_pread_sanitized</code> at line 56, <code>pread</code> at line 64; cell <code>c-programs/procfs-positioned-probe</code>, <code>tests/e2e/manifests/c-programs.yaml:6208</code>, verify ci on ptrace). The repeated-read half is still missing.</li>
-<li>T7 (covers F12): set the timer slack with <code>prctl(PR_SET_TIMERSLACK)</code>, then <code>pread64</code> <code>/proc/self/task/&lt;tid&gt;/timerslack_ns</code> at offsets 0 and 2 and check the text.</li>
-<li>T8 (covers F13): two <code>pread64</code> calls of <code>/dev/urandom</code> at offset 0 in one run, printing both; under <code>hermit run --verify</code> the output must match across runs, and the test records whether the two reads are equal, which pins the difference noted above.</li>
-<li>T9 (covers F14): where a file source that can block is available (for example a FUSE mount the test creates), block a <code>pread64</code> on it, deliver a signal whose handler was installed without <code>SA_RESTART</code>, and check <code>EINTR</code>, identically in both runs of <code>hermit run --verify</code>; skip with a stated reason when no such source exists.</li>
-<li>T10 (covers F15): one thread <code>pwrite</code>s a pattern while another <code>pread64</code>s the same range in a loop, printing what it saw, under <code>hermit run --verify</code>.</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+pread64&amp;body=Discussion+for+the+%60pread64%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fpread64.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60pread64%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `pread64`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · created for v1: no tracking issue existed for this pinned Sysno; code at this SHA: determinized, dispatch typed.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy model (Detcore serves timerslack_ns, procfs snapshots and the random devices itself, fills regular-file reads under deterministic I/O, orders reads with a resource lock, forwards the rest through record/replay); linux_determinism stays conditional (live procfs, randomness, concurrent writers, host files); 15 flag behaviours and 10 tests listed; four code-read differences from Linux noted for tests to confirm; no coverage token yet, so tracking_status stays todo</li>
-<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d12 (owner decisions 1 and 2): cross_host_variant true (device block size and O_DIRECT support for F10, host file contents for F1 and F4); no U items, since no listed error is host-only; no open questions to resolve</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+pread64&amp;amp;body=Discussion+for+the+%60pread64%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fpread64.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60pread64%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `pread64`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Created by the syscall-tracking v1 migration on 2026-10-03. No tracking issue existed for <code>pread64</code>: the 2026-07-24 classification campaign filed issues only for syscalls in the old temporary pass-through block, and Detcore already handled this one.</p>
 </body></html>

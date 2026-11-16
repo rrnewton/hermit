@@ -3,108 +3,18 @@
 <title>accept4 | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>accept4</code> (288)</h1>
-<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; linux determinism: nondeterministic &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+accept4&amp;body=Discussion+for+the+%60accept4%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Faccept4.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60accept4%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>accept4(sockfd, addr, addrlen, flags)</code> takes the first pending connection off a listening stream socket. It returns a new connected socket, can write the peer's address, and sets <code>SOCK_NONBLOCK</code> and <code>SOCK_CLOEXEC</code> on the new socket. Detcore handles the call at <code>detcore/src/syscalls/files.rs:4526</code>, for <code>accept</code> as well.</p>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+accept4&amp;body=Discussion+for+the+%60accept4%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Faccept4.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60accept4%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>accept4</code> (288) as determinized via typed dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.</p>
 <ul>
-<li>Under the sequentialized scheduler, Detcore makes the returned socket nonblocking in the kernel, and turns a blocking wait into polling that the scheduler controls.</li>
-<li>It records the flags the guest asked for, and those are what the guest sees.</li>
-<li>The peer address is passed through as the kernel wrote it.</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1538</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:8086</code></li>
 </ul>
-<p>Manual reference: Linux man-pages accept(2).</p>
-<h2>Linux semantics</h2>
-<p><code>sockfd</code> must be a socket that is listening and connection-oriented (<code>SOCK_STREAM</code> or <code>SOCK_SEQPACKET</code>).</p>
-<p><strong>The pending queue.</strong> The kernel removes the oldest fully established connection from the queue and installs it as the lowest free descriptor. If the queue is empty, the call waits, or fails with <code>EAGAIN</code> when <code>sockfd</code> is <code>O_NONBLOCK</code>. A blocking wait can end with <code>EINTR</code>. Linux restarts the call after an <code>SA_RESTART</code> handler, unless the socket has a receive timeout (<code>SO_RCVTIMEO</code>), which makes it fail with <code>EAGAIN</code> when the timeout expires.</p>
-<p><strong>The returned socket.</strong> It does not inherit file status flags such as <code>O_NONBLOCK</code> from the listener. Its nonblocking and close-on-exec state come only from <code>flags</code>.</p>
-<p><strong>The peer address.</strong> If <code>addr</code> is not NULL, the kernel writes the peer's address there, cut to <code>*addrlen</code> bytes, and stores the full length in <code>*addrlen</code>. For TCP the address is the peer's IP and port. If the peer called <code>connect</code> without <code>bind</code>, that port is an ephemeral port the peer's kernel chose. For an AF_UNIX peer that never bound, the address is only <code>sun_family</code>, and <code>*addrlen</code> is <code>sizeof(sa_family_t)</code>.</p>
-<p><strong>Errors.</strong></p>
-<ul>
-<li>On the listener: <code>EBADF</code>, <code>ENOTSOCK</code>, <code>EINVAL</code> (not listening, or a bad <code>flags</code> or <code>addrlen</code>), <code>EOPNOTSUPP</code> (not a stream socket).</li>
-<li>On the user buffers: <code>EFAULT</code>.</li>
-<li>Resources: <code>EMFILE</code>, <code>ENFILE</code>, <code>ENOBUFS</code>, <code>ENOMEM</code>.</li>
-<li><code>ECONNABORTED</code> when a queued connection was aborted.</li>
-</ul>
-<p><strong>`accept`.</strong> The older <code>accept(sockfd, addr, addrlen)</code> (nr 43) is <code>accept4</code> with <code>flags = 0</code>.</p>
-<h3>Flags and options</h3>
-<ul>
-<li>F1: <code>flags = 0</code>: the new socket is blocking and not close-on-exec. This is also <code>accept</code> (nr 43).</li>
-<li>F2: <code>SOCK_NONBLOCK</code>: the new socket's description is <code>O_NONBLOCK</code></li>
-<li>F3: <code>SOCK_CLOEXEC</code>: the new descriptor is close-on-exec</li>
-<li>F4: any other bit in <code>flags</code>: <code>EINVAL</code></li>
-<li>F5: <code>addr</code> and <code>addrlen</code> are NULL: no peer address is returned</li>
-<li>F6: <code>addr</code> is a buffer: the peer address is written, cut to <code>*addrlen</code> bytes, and <code>*addrlen</code> is set to the full length. A negative <code>*addrlen</code> is <code>EINVAL</code>; unwritable <code>addr</code> or <code>addrlen</code> memory is <code>EFAULT</code>.</li>
-<li>F7: blocking listener with an empty queue: the call waits for a connection. A signal gives <code>EINTR</code>, or a restart after an <code>SA_RESTART</code> handler; an expired <code>SO_RCVTIMEO</code> gives <code>EAGAIN</code>.</li>
-<li>F8: <code>O_NONBLOCK</code> listener with an empty queue: <code>EAGAIN</code></li>
-<li>F9: invalid listener: <code>EBADF</code> (not open), <code>ENOTSOCK</code> (not a socket), <code>EINVAL</code> (not listening), <code>EOPNOTSUPP</code> (not a stream socket)</li>
-<li>F10: <code>ECONNABORTED</code> for an aborted queued connection; resource errors <code>EMFILE</code>, <code>ENFILE</code>, <code>ENOBUFS</code>, <code>ENOMEM</code></li>
-<li>F11: the new socket does not inherit <code>O_NONBLOCK</code> (or <code>O_ASYNC</code>) from the listener; only <code>flags</code> sets them</li>
-<li>F12: shape of the peer address: the IP and port for AF_INET and AF_INET6 (an ephemeral port when the peer did not <code>bind</code>); only <code>sun_family</code>, or the peer's bound path or abstract name, for AF_UNIX</li>
-</ul>
-<h2>Determinism analysis</h2>
-<p><code>linux_determinism: nondeterministic</code>. There are four sources:</p>
-<ul>
-<li><strong>Arrival order.</strong> When several clients connect, the order of the queue, and so which client a given <code>accept4</code> returns, depends on when each <code>connect</code> completed. That depends on host scheduling.</li>
-<li><strong>Time of the wait.</strong> When a blocking <code>accept4</code> returns depends on when a peer connects.</li>
-<li><strong>Outside peers.</strong> A peer outside the guest, or on the host network, can connect at any time and from any address.</li>
-<li><strong>The ephemeral port in `addr` (F12).</strong> For a TCP peer that called <code>connect</code> without <code>bind</code>, the port in <code>addr</code> was chosen by the kernel's ephemeral port allocator. On Linux that choice uses a per-boot secret and per-boot random state, and it depends on which ports other host sockets hold. So the port differs between runs even between two processes in one container.</li>
-</ul>
-<p>The call repeats only when every peer is inside one deterministic schedule and the peer address is either not requested or has no kernel-chosen part.</p>
-<h2>Hermit design</h2>
-<p>Target policy: <code>model</code>. The kernel holds the connection queue. Detcore owns waiting and the guest-visible socket state, and it should own every value in the result that the kernel chose.</p>
-<p><strong>What the handler already does:</strong></p>
-<ul>
-<li><strong>Hidden nonblocking.</strong> With thread sequentialization on (<code>use_nonblocking_sockets</code>, <code>detcore-model/src/config.rs:872</code>), Detcore adds <code>SOCK_NONBLOCK</code> to the call (<code>detcore/src/syscalls/files.rs:4534</code> to <code>detcore/src/syscalls/files.rs:4536</code>). After the call it marks the new socket physically nonblocking (<code>detcore/src/syscalls/files.rs:4552</code>, <code>detcore/src/syscalls/helpers.rs:695</code>).</li>
-<li><strong>Guest-visible flags.</strong> The new socket is registered with only the guest's <code>SOCK_CLOEXEC|SOCK_NONBLOCK</code> bits, taken from the original call (<code>detcore/src/syscalls/files.rs:4547</code>, <code>detcore/src/syscalls/files.rs:70</code>). <code>fcntl(F_GETFL)</code> answers from that logical state (<code>detcore/src/syscalls/files.rs:3097</code>), so the guest sees F1, F2, F3 and F11 as on Linux.</li>
-<li><strong>Waiting (F7, F8).</strong> The call goes through <code>execute_nonblockable_fd_syscall</code> (<code>detcore/src/syscalls/files.rs:4541</code>). There <code>ioaction_based_on_fd_status</code> looks at the listener's logical and physical nonblocking state (<code>detcore/src/syscalls/helpers.rs:745</code>):</li>
-<li>Logically blocking but physically nonblocking: Detcore polls with retries under <code>InternalIOPolling</code> (<code>detcore/src/syscalls/helpers.rs:260</code>), so the scheduler stays in control.</li>
-<li>Logically nonblocking: one attempt, and <code>EAGAIN</code> is passed through.</li>
-<li>A run without sequentialization, or record and replay: the call blocks in the kernel through <code>record_or_replay_blocking</code> (<code>detcore/src/syscalls/helpers.rs:250</code>). Sockets always count as external here, because Detcore has no way yet to tell a connection inside the container from one outside it (<code>detcore/src/syscalls/helpers.rs:229</code>, and the doc comment at <code>detcore/src/syscalls/files.rs:4521</code>).</li>
-<li><strong>Invalid listener (F9).</strong> If Detcore cannot classify the listener at all, it lets the kernel decide the errno through the blocking path (<code>detcore/src/syscalls/helpers.rs:212</code> to <code>detcore/src/syscalls/helpers.rs:226</code>), so F9 errors keep Linux's order of checks.</li>
-<li><strong>Arrival order between guest threads</strong> is fixed by the sequentialized schedule: each <code>connect</code> inside the guest finishes at a point the schedule chooses, before the polling <code>accept4</code> sees it.</li>
-</ul>
-<p><strong>What remains before the code fully realizes `model`:</strong></p>
-<ul>
-<li><strong>The peer address is not canonicalized (F6, F12).</strong> The handler leaves <code>addr</code> exactly as the kernel wrote it. <code>connect</code> assigns no port of its own (<code>detcore/src/syscalls/io.rs:1336</code>); Detcore assigns ports only on an explicit <code>bind</code> to port 0 (<code>detcore/src/syscalls/files.rs:4158</code>) and for AF_UNIX autobind (<code>detcore/src/syscalls/files.rs:4043</code>). <code>getpeername</code> and <code>getsockname</code> are plain <code>record_or_replay</code> (<code>detcore/src/syscalls/files.rs:3890</code>, <code>detcore/src/syscalls/files.rs:3901</code>). So a guest TCP server that prints its client's address should see a host-chosen ephemeral port that changes from run to run. This is a hypothesis from the code and from Linux's port allocator, not a measurement; T3 measures it. Owner decision 12 makes that fix the target: <code>connect</code> on an unbound socket gets a Detcore-assigned port, as <code>bind</code> to port 0 already does (see below).</li>
-<li><strong>Peers outside the guest</strong> are not controlled. Hermit's stance on external network input is the run's environment policy, not this handler's.</li>
-<li><strong>Record and replay do not capture `accept`.</strong> The Recorder's subscription list (<code>hermit-cli/src/recorder.rs:384</code> to <code>hermit-cli/src/recorder.rs:474</code>) has no <code>accept</code>, <code>accept4</code> or <code>bind</code>. The parent-repository report <code>ai_docs/hermit-record-mode-current-state-20260915.md</code> (section 4, measured at an earlier hermit SHA, not re-run here) found that every accepting server therefore hangs on replay in a live <code>accept</code> that replay never satisfies.</li>
-</ul>
-<p>Target (owner decision 12): every local port the kernel would choose for an unbound AF_INET or AF_INET6 socket comes from Detcore's global port allocator, the one an explicit <code>bind</code> to port 0 already uses. <code>handle_bind</code> requests the port with <code>GlobalRequest::RequestPort</code> (<code>detcore/src/syscalls/files.rs:4119</code> for AF_INET, <code>detcore/src/syscalls/files.rs:4158</code> for AF_INET6); the global tool serves the request at <code>detcore/src/tool_global.rs:1731</code> from the range in the host's <code>ip_local_port_range</code> (<code>detcore/src/tool_global.rs:2783</code>); and <code>release_port_for_open_file</code> (<code>detcore/src/syscalls/files.rs:952</code>) frees the port when the socket's last descriptor closes. An implicit bind, meaning <code>connect</code>, <code>listen</code>, <code>sendto</code>, <code>sendmsg</code> or <code>sendmmsg</code> on an unbound socket, must take its port the same way and bind the socket to it before the call reaches the kernel, so that <code>getsockname</code>, the peer's <code>getpeername</code> and the peer's <code>accept</code> report the same port in every run. <code>accept4</code> itself needs no change: the peer port written into <code>addr</code> (F6, F12) becomes the allocator's once the client's <code>connect</code> takes one. Today <code>handle_connect</code> (<code>detcore/src/syscalls/io.rs:1336</code>) forwards an unbound socket to the kernel, which picks a random port.</p>
-<p>Target (owner decision 14, with decision 13 for the timeout): a guest-blocking <code>accept4</code> waits in Detcore's scheduler, never in the kernel, through a nonblocking probe plus a scheduler wait. <code>hermit run</code> already does this through <code>NonblockizeRetry</code> (<code>detcore/src/syscalls/helpers.rs:254</code>, retry loop <code>retry_nonblocking_syscall</code> at <code>detcore/src/syscalls/helpers.rs:1414</code>). Two parts are missing. First, the cases that still block in the kernel while holding the turn, through <code>record_or_replay_blocking</code> (<code>detcore/src/syscalls/helpers.rs:225</code> and <code>detcore/src/syscalls/helpers.rs:250</code>): no scheduler, record and replay, and a descriptor Detcore cannot classify. Second, a deadline: with <code>SO_RCVTIMEO</code> set, the wait must end with <code>EAGAIN</code> once that much virtual time has passed (F7), as Linux's <code>inet_csk_accept</code> does when <code>sock_rcvtimeo</code> expires. <code>retry_nonblocking_syscall_with_timeout</code> (<code>detcore/src/syscalls/helpers.rs:1432</code>) already takes a logical deadline for poll, epoll, futex and signal waits, but Detcore must first learn the timeout: nothing in <code>detcore/src</code> reads <code>SO_RCVTIMEO</code> or <code>SO_SNDTIMEO</code> today (see the <code>setsockopt</code> body). <code>accept4</code> stays <code>model</code>, not <code>refuse</code>, because every server calls it.</p>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F1, F3, F5): a server thread calls <code>accept4(listener, NULL, NULL, SOCK_CLOEXEC)</code> and plain <code>accept(listener, NULL, NULL)</code> against a client inside the guest, under <code>hermit run --verify</code> on ptrace. Check <code>F_GETFD</code> on both new sockets, and check that data flows. Existing candidates:</li>
-<li><code>tests/c/tcp_info_accept4.c</code> (cell <code>c-programs/tcp-info-accept4</code>, <code>tests/e2e/manifests/c-programs.yaml:9797</code>, verify ci on ptrace). It calls <code>accept(listener, NULL, NULL)</code> (<code>tests/c/tcp_info_accept4.c:71</code>), not <code>accept4</code>.</li>
-<li><code>tcp_info_hides_host_transport_counters_under_strict_verify</code> (<code>hermit-cli/tests/tcp_info_determinism.rs:30</code>) runs that program on ptrace.</li>
-<li><code>tests/compat/localhost_http_server.c:105</code> calls <code>accept4(listener, NULL, NULL, SOCK_CLOEXEC)</code>. It is a fixture for the real-application compat scripts, and no ptrace CI cell was confirmed for it here.</li>
-<li>T2 (covers F2, F11): accept from a listener the guest made nonblocking, once with <code>flags = 0</code> and once with <code>SOCK_NONBLOCK</code>. <code>F_GETFL</code> on the new socket must show <code>O_NONBLOCK</code> only in the second case. With <code>flags = 0</code>, a <code>recv</code> on the new socket must wait for the client's data rather than fail with <code>EAGAIN</code>.</li>
-<li>T3 (covers F6, F12): a TCP loopback client that does not <code>bind</code> connects to a guest server. The server prints the port and address from <code>accept4</code>'s <code>addr</code> and from <code>getpeername</code>. The output must be identical on every <code>--verify</code> run, and the expectation is that it is not. Repeat with <code>*addrlen</code> set to 4 to check truncation and the returned full length, and with an unbound AF_UNIX client, which must give <code>*addrlen == sizeof(sa_family_t)</code>.</li>
-<li>T4 (covers F7, F8): a blocking <code>accept4</code> in one thread, with a client thread that connects later; the call returns the connection, with the same result on every run. On a nonblocking listener with an empty queue the call returns <code>EAGAIN</code>. With <code>SO_RCVTIMEO</code> set on a blocking listener, the call returns <code>EAGAIN</code> after the timeout.</li>
-<li>T5 (covers F4, F9, F10): with a raw <code>syscall(SYS_accept4, ...)</code>, check the errnos:</li>
-<li><code>EINVAL</code> for <code>flags = 1</code>;</li>
-<li><code>EINVAL</code> on a bound socket that is not listening;</li>
-<li><code>EOPNOTSUPP</code> on a UDP socket;</li>
-<li><code>ENOTSOCK</code> on a pipe;</li>
-<li><code>EBADF</code> on a closed descriptor;</li>
-<li><code>EMFILE</code> with <code>RLIMIT_NOFILE</code> lowered while a connection is pending.</li>
-<li>T6 (covers F1, F7): <code>hermit record</code> and then <code>hermit replay</code> of a TCP server and client inside the guest. Replay must finish with the recorded output. Expect a hang at this SHA, given the Recorder's subscription list.</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+accept4&amp;body=Discussion+for+the+%60accept4%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Faccept4.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60accept4%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `accept4`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · created for v1: no tracking issue existed for this pinned Sysno; code at this SHA: determinized, dispatch typed.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy model (hidden SOCK_NONBLOCK plus scheduler-owned polling; guest flags kept logically); linux_determinism nondeterministic (arrival order, external peers, kernel-chosen peer port); 12 flag behaviours and 6 tests listed; open owner question on canonicalizing the peer port; record mode does not subscribe accept; no coverage token, tracking_status stays todo</li>
-<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): decisions 12, 13 and 14 applied (Target paragraphs: the peer's implicit-bind port comes from Detcore's allocator; a blocking accept4 waits under the scheduler in every mode, with SO_RCVTIMEO on virtual time giving EAGAIN); no new F/T ids; removed the owner-policy question on canonicalizing the peer port</li>
-</ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+accept4&amp;amp;body=Discussion+for+the+%60accept4%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Faccept4.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60accept4%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `accept4`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Created by the syscall-tracking v1 migration on 2026-10-03. No tracking issue existed for <code>accept4</code>: the 2026-07-24 classification campaign filed issues only for syscalls in the old temporary pass-through block, and Detcore already handled this one.</p>
-<h3>Open questions</h3>
-<ul>
-<li>Record and replay of <code>accept</code>/<code>accept4</code>: the parent report <code>ai_docs/hermit-record-mode-current-state-20260915.md</code> measured replay hanging, at an earlier SHA. The Recorder's subscription list at this SHA (<code>hermit-cli/src/recorder.rs:384</code>) still omits both calls. That is a product defect and should have a GitHub issue in rrnewton/hermit if none exists; this read-only task could not search for or file one.</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
 </body></html>

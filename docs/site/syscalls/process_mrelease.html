@@ -3,74 +3,18 @@
 <title>process_mrelease | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>process_mrelease</code> (448)</h1>
-<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_optional_memory_feature_syscall</code> &middot; linux determinism: conditional &middot; target policy: refuse &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+process_mrelease&amp;body=Discussion+for+the+%60process_mrelease%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fprocess_mrelease.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60process_mrelease%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>process_mrelease(pidfd, flags)</code> frees the address space of a process that is already dying, referenced by a pidfd, so a userspace out-of-memory killer gets the memory back without waiting for the victim to finish exiting. Hermit refuses it: Detcore returns <code>ENOSYS</code> for every argument without consulting the host (<code>detcore/src/lib.rs:2343-2347</code> at hermit f4055eb9cae4), which is what a kernel older than 5.15 returns.</p>
-<h2>Linux semantics</h2>
-<p>Added in Linux 5.15 for userspace out-of-memory killers. The call only speeds up reclaim; it never changes what the target computed, because the target already has a fatal signal pending or is exiting. The kernel checks <code>flags</code> first, then resolves the pidfd to a task, then decides whether that task's memory can be reaped. Reaping runs the same code as the kernel's own OOM reaper, under the target's mmap lock taken for reading.</p>
-<p>The 2026-07-24 trace under Additional information shows a bad pidfd failing with <code>EBADF</code> on Linux 6.17.</p>
-<h3>Flags and options</h3>
+<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_optional_memory_feature_syscall</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+process_mrelease&amp;body=Discussion+for+the+%60process_mrelease%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fprocess_mrelease.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60process_mrelease%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>process_mrelease</code> (448) as determinized-refused via pred:is_optional_memory_feature_syscall dispatch; deterministic refusal: true; run subscription: true; record/replay subscription: true.</p>
 <ul>
-<li>F1: <code>flags != 0</code>: <code>EINVAL</code>. No flag is defined, and this check runs before the pidfd is examined.</li>
-<li>F2: <code>pidfd</code> is not an open descriptor, or is a descriptor that is not a pidfd: <code>EBADF</code>.</li>
-<li>F3: the pidfd's process has already been reaped (exited and waited for), so no task remains: <code>ESRCH</code>.</li>
-<li>F4: the target is alive and not exiting, or shares its address space with a process that is not exiting: <code>EINVAL</code>. If the OOM reaper has already finished with that address space, the call returns 0 instead.</li>
-<li>F5: the target is dying and still has its address space: the memory is reaped and the call returns 0. It returns <code>EAGAIN</code> when the reap could not complete, and <code>EINTR</code> when a fatal signal reaches the caller while it waits for the target's mmap lock.</li>
-<li>F6: the target is dying and has already released its address space: 0.</li>
-<li>F7: availability: <code>ENOSYS</code> on kernels before 5.15.</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1763</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:7678</code></li>
 </ul>
-<h2>Determinism analysis</h2>
-<p><code>linux_determinism: conditional</code>, kept from the legacy classification. The argument errors (F1, F2) repeat. Everything that involves a real target races with that target's exit.</p>
-<h3>Nondeterminism sources</h3>
-<ul>
-<li>How far the target's exit has progressed when the call runs decides between 0, <code>EINVAL</code>, <code>ESRCH</code> and <code>EAGAIN</code> (F3-F6). That depends on host scheduling of the target, of the kernel OOM reaper, and of the parent that waits for it.</li>
-<li>Contention on the target's mmap lock (<code>EAGAIN</code>, <code>EINTR</code>).</li>
-<li>A pidfd names a host process; its identity must be virtualized as it is for every other pidfd call.</li>
-<li>Kernel version decides whether the call exists (F7).</li>
-</ul>
-<h2>Hermit design</h2>
-<p>Target policy: <code>refuse</code>. The code at hermit f4055eb9cae4 already realizes it:</p>
-<ul>
-<li><code>classify_syscall</code> (<code>detcore/src/syscall_classification.rs:52</code>) lists <code>Sysno::process_mrelease</code> among the Determinized calls (<code>detcore/src/syscall_classification.rs:541</code>), under the comment tag <code>TODO-HUMAN-REVIEW(PR-839)</code>, which says a fixed <code>ENOSYS</code> keeps guest behaviour host-independent and lets callers use their portable fallbacks.</li>
-<li><code>is_optional_memory_feature_syscall</code> (<code>detcore/src/syscall_classification.rs:1263</code>) selects it, and its doc comment names the reason for this call: it &quot;operates on a dying process through a pidfd&quot; and would expose host process lifecycle.</li>
-<li>The dispatch arm in <code>handle_syscall_event</code> (<code>detcore/src/lib.rs:2343-2347</code>) returns <code>Err(Error::Errno(Errno::ENOSYS))</code> for that predicate, before the typed match and without a condition on fail-closed mode.</li>
-<li>The predicate is one term of <code>is_deterministically_refused_syscall</code> (<code>detcore/src/syscall_classification.rs:1319</code>, term at <code>detcore/src/syscall_classification.rs:1333</code>), which is why the code facts show <code>refused: true</code>.</li>
-</ul>
-<p>Every behaviour (F1-F7) therefore collapses into the F7 outcome. One visible difference from a 5.15+ kernel: <code>process_mrelease(-1, 1)</code> gets <code>ENOSYS</code> under Hermit where Linux returns <code>EINVAL</code> (F1), because Hermit presents the pre-5.15 kernel and not a kernel that checks flags.</p>
-<p>Why <code>refuse</code> and not the alternatives:</p>
-<ul>
-<li>The call has no effect on any result a guest can compute; it only changes how fast host memory comes back. Under Hermit the guest's memory pressure is not the host's, so the call has nothing useful to do.</li>
-<li><code>model</code> would need Detcore to track a target's exit progress deterministically, so that 0, <code>EINVAL</code> and <code>ESRCH</code> come out in a fixed order. That is possible in principle, since Detcore schedules every guest thread, but it buys nothing a guest needs: an OOM killer that gets <code>ENOSYS</code> still kills its victim with <code>kill</code> or <code>pidfd_send_signal</code> and simply does not speed up reclaim.</li>
-<li><code>passthrough</code> exposes the host race described under Determinism analysis.</li>
-</ul>
-<p>The pidfd itself comes from <code>pidfd_open</code>, which Detcore handles in its typed match (<code>detcore/src/lib.rs:2591</code>), so refusing <code>process_mrelease</code> does not prevent a guest from creating or using pidfds for other calls.</p>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F2, F7): <code>syscall(SYS_process_mrelease, -1, 0)</code> returns <code>-1</code> with <code>errno == ENOSYS</code> under <code>hermit run --strict --verify --panic-on-unsupported-syscalls</code> on ptrace, and the verify run reports determinism. Existing candidates: <code>tests/c/process_mrelease_enosys.c</code> (cell <code>c-programs/process-mrelease-enosys</code>, <code>tests/e2e/manifests/c-programs.yaml:6011</code>, verify with <code>ci</code> true on ptrace) and <code>optional_memory_features_fall_back_deterministically</code> at <code>hermit-cli/tests/optional_memory_features.rs:30</code>, which runs it with <code>--backend=ptrace</code> (<code>hermit-cli/tests/optional_memory_features.rs:68</code>). Both use only <code>(-1, 0)</code>.</li>
-<li>T2 (covers F1): <code>process_mrelease(-1, 1)</code> and <code>process_mrelease(valid_pidfd, 0x80000000)</code> return <code>ENOSYS</code> under Hermit. Natively on 5.15+ both are <code>EINVAL</code>; the test records that Hermit presents the pre-5.15 result.</li>
-<li>T3 (covers F3, F4, F5, F6): a guest forks a child that blocks, obtains a pidfd with <code>pidfd_open</code>, and calls <code>process_mrelease</code> three times: while the child is alive, after <code>kill(child, SIGKILL)</code> but before <code>waitpid</code>, and after <code>waitpid</code>. Every call returns <code>ENOSYS</code>, <code>waitpid</code> still reports death by <code>SIGKILL</code>, and the output is identical across the <code>--verify</code> runs.</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+process_mrelease&amp;body=Discussion+for+the+%60process_mrelease%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fprocess_mrelease.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60process_mrelease%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `process_mrelease`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/381: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy NEEDS-INVESTIGATION; code at this SHA: determinized, dispatch pred:is_optional_memory_feature_syscall, refused.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; refuse (Detcore returns ENOSYS for every argument at detcore/src/lib.rs:2343-2347, presenting a pre-5.15 kernel; the call only speeds host reclaim and its result races with the target's exit); linux_determinism stays conditional; 7 flag behaviours and 3 tests listed; existing ptrace tests cover (-1, 0) only and no coverage token is recorded, so tracking_status stays todo</li>
-<li>2026-10-05 · hermit f4055eb9cae4 · syscall-tracking-2 · covered: T1 covered by hermit-cli/tests/optional_memory_features.rs (C08 review of the 2026-10-04 coverage proposals; guest source read at this SHA, not run by this agent)</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+process_mrelease&amp;amp;body=Discussion+for+the+%60process_mrelease%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fprocess_mrelease.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60process_mrelease%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `process_mrelease`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Originally filed 2026-07-24 as &quot;Syscall classification: process_mrelease&quot; (https://github.com/rrnewton/hermit/issues/381), legacy variant A1.</p>
-<h3>2026-07-24 host strace evidence</h3>
-<p>The routing described in this subsection is historical. At hermit f4055eb9cae4 the call no longer passes through; Detcore refuses it with <code>ENOSYS</code> (see Hermit design).</p>
-<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) with <code>strace -f -e trace=process_mrelease</code> on a direct <code>syscall()</code> harness (invoked with non-destructive query/no-op/failing arguments) and, where applicable, on common programs. Hermit currently routes <code>process_mrelease</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code>.</p>
-<p>Observed strace line:</p>
-<pre><code>process_mrelease(-1, 0)         = -1 EBADF (Bad file descriptor)
-</code></pre>
-<hr>
-<p>*Autonomous syscall-classification sweep (ranks 151-250 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
 </body></html>

@@ -3,70 +3,18 @@
 <title>finit_module | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>finit_module</code> (313)</h1>
-<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_privileged_admin_refused_syscall</code> &middot; linux determinism: conditional &middot; target policy: refuse &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+finit_module&amp;body=Discussion+for+the+%60finit_module%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ffinit_module.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60finit_module%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>finit_module(fd, param_values, flags)</code> loads a kernel module whose image the kernel reads from the open file <code>fd</code>, runs its init function, and leaves it loaded host-wide. Hermit refuses it: Detcore answers every call with a fixed <code>EPERM</code> and never forwards it to the host kernel (<code>detcore/src/lib.rs:2164</code>).</p>
-<p>Manual reference: Linux man-pages finit_module(2).</p>
-<h2>Linux semantics</h2>
-<p>The kernel's first check is <code>may_init_module()</code>, as for <code>init_module</code>: the caller needs <code>CAP_SYS_MODULE</code> in the initial user namespace and <code>kernel.modules_disabled</code> must be 0, otherwise <code>EPERM</code>. Only after that does the kernel reject unknown <code>flags</code> bits (<code>EINVAL</code>) and look at <code>fd</code>. The host strace under Additional information shows the order: <code>fd = -1</code>, an all-ones <code>param_values</code> pointer and every undefined flag bit still give <code>EPERM</code>.</p>
-<p>With the capability, the kernel reads the whole file through <code>fd</code>, optionally decompresses it, and then validates and loads it exactly as <code>init_module</code> does: signature and lockdown policy, ELF and version-magic checks, symbol resolution against the running kernel, parameter parsing, and the module's init function. The result is global to the host.</p>
-<h3>Flags and options</h3>
+<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_privileged_admin_refused_syscall</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+finit_module&amp;body=Discussion+for+the+%60finit_module%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ffinit_module.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60finit_module%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>finit_module</code> (313) as determinized-refused via pred:is_privileged_admin_refused_syscall dispatch; deterministic refusal: true; run subscription: true; record/replay subscription: true.</p>
 <ul>
-<li>F1: privilege gate: without <code>CAP_SYS_MODULE</code> in the initial user namespace, or with <code>kernel.modules_disabled=1</code>, the call returns <code>EPERM</code> before <code>fd</code>, <code>param_values</code> or <code>flags</code> are examined.</li>
-<li>F2: <code>MODULE_INIT_IGNORE_MODVERSIONS</code> (1): skip the symbol version (modversions) checks.</li>
-<li>F3: <code>MODULE_INIT_IGNORE_VERMAGIC</code> (2): skip the kernel version-magic check.</li>
-<li>F4: <code>MODULE_INIT_COMPRESSED_FILE</code> (4): the file is compressed and the kernel decompresses it. A kernel built without in-kernel module decompression rejects it.</li>
-<li>F5: any other flag bit: <code>EINVAL</code>, checked after F1.</li>
-<li>F6: <code>fd</code>: not an open descriptor, or not open for reading, gives <code>EBADF</code>; a file that is open for writing elsewhere gives <code>ETXTBSY</code>. Reachable only past F1.</li>
-<li>F7: <code>param_values</code>: a NUL-terminated string of <code>name=value</code> assignments parsed against the module's declared parameters. A malformed value fails the load; an unknown name is logged and ignored.</li>
-<li>F8: image and load outcome: a malformed ELF or version mismatch gives <code>ENOEXEC</code>, a rejected signature <code>EKEYREJECTED</code>, a module of the same name already loaded <code>EEXIST</code>. On success the init function runs and the module stays loaded for the whole host.</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1608</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:7484</code></li>
 </ul>
-<h2>Determinism analysis</h2>
-<p><code>linux_determinism: conditional</code>, changed from the legacy <code>nondeterministic</code>. The legacy classification described the privileged success path, which does depend on host state. For a caller without <code>CAP_SYS_MODULE</code> in the initial user namespace, which includes root inside a container's user namespace, Linux returns <code>EPERM</code> before it reads any argument (F1; the host strace under Additional information confirms it for an all-invalid argument set), so the call repeats exactly. <code>conditional</code> states both halves, and matches <code>init_module</code>.</p>
-<h3>Nondeterminism sources</h3>
-<ul>
-<li>Loaded-module and exported-symbol state of the running kernel (F2, F3, F8)</li>
-<li>Host signature and lockdown policy, the <code>kernel.modules_disabled</code> sysctl, and kernel configuration such as in-kernel decompression (F1, F4)</li>
-<li>The contents of the file behind <code>fd</code> and concurrent writers to it (F6)</li>
-<li>Concurrent loaders of the same module name, and the module's init function (F8)</li>
-</ul>
-<h2>Hermit design</h2>
-<p>Target policy: <code>refuse</code>. The code at hermit f4055eb9cae4 already realizes it. <code>classify_syscall</code> lists <code>finit_module</code> as Determinized with the rest of the privileged system-administration family (<code>detcore/src/syscall_classification.rs:289</code> to <code>detcore/src/syscall_classification.rs:315</code>). <code>Detcore::handle_syscall_event</code> then matches it on the <code>Sysno</code>, before the typed match, with the guard <code>is_privileged_admin_refused_syscall</code> (<code>detcore/src/lib.rs:2164</code> to <code>detcore/src/lib.rs:2168</code>; the set itself is at <code>detcore/src/syscall_classification.rs:902</code>), and returns <code>Err(Error::Errno(Errno::EPERM))</code> (<code>detcore/src/lib.rs:2167</code>). The arm reads no argument and never forwards the call to the host kernel. It does not consult <code>panic_on_unsupported_syscalls</code>, so the answer is the same with and without fail-closed mode, and the comment above the arm (<code>detcore/src/lib.rs:2154</code>) states the intent that it be identical across <code>--verify</code> and record/replay. The same set feeds <code>is_deterministically_refused_syscall</code> (<code>detcore/src/syscall_classification.rs:1319</code>), which is what <code>code_facts.refused: true</code> reports.</p>
-<p>Classification-only evidence: the unit test <code>privileged_admin_syscalls_are_determinized_and_consistent</code> (<code>detcore/src/syscall_classification.rs:2535</code>) checks that <code>finit_module</code> is Determinized and in the refusal set, and that the set holds nothing else. It does not start Hermit, so it is not coverage for any test below.</p>
-<p>How close this is to Linux: <code>EPERM</code> is the kernel's first answer for a caller without the capability, before flag validation and before <code>fd</code> is checked, so Hermit's fixed answer matches what an unprivileged caller sees natively for F1 to F8. The host strace under Additional information is a concrete case: Linux and Hermit both return <code>EPERM</code> for <code>fd = -1</code> with undefined flag bits.</p>
-<p>Why <code>refuse</code>:</p>
-<ul>
-<li>Under ptrace the guest runs as root inside the container's user namespace (the comment at <code>detcore/src/syscall_classification.rs:2298</code> to <code>detcore/src/syscall_classification.rs:2303</code> describes the <code>CLONE_NEWUSER</code> uid map). Linux checks <code>CAP_SYS_MODULE</code> against the initial user namespace, which such a root never holds, so a fixed <code>EPERM</code> is what the guest would see from the kernel in that container anyway. The refusal removes the dependency on how Hermit itself was launched.</li>
-<li><code>passthrough</code> would let a guest change host-global kernel state if Hermit ever ran with the capability, which is an isolation hole, not a determinism feature.</li>
-<li><code>model</code> or <code>emulate</code> would mean pretending that a kernel module was loaded or unloaded. A container has no kernel of its own, so there is no guest-visible state such an emulation could keep consistent (<code>/proc/modules</code>, the module's own side effects), and no workload that Hermit targets needs it.</li>
-</ul>
-<p>Nothing is missing in the code. The gap is evidence: no test names <code>SYS_finit_module</code> (<code>tests_naming: 0</code>), so verification on the default backend stays untested.</p>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F1, F2, F3, F4, F5, F6, F7, F8): under <code>hermit run --verify</code> on ptrace, call raw <code>syscall(SYS_finit_module, ...)</code> with: a readable regular file that is not a module and flags 0; the same file with each of <code>MODULE_INIT_IGNORE_MODVERSIONS</code>, <code>MODULE_INIT_IGNORE_VERMAGIC</code> and <code>MODULE_INIT_COMPRESSED_FILE</code>; flags <code>0x8</code>; <code>fd = -1</code>; a write-only descriptor; and a non-empty <code>param_values</code>. Assert every call returns -1 with <code>errno == EPERM</code> and both verify runs print identical output.</li>
-<li>T2 (covers F1): record a guest that calls <code>finit_module</code> under <code>hermit record</code>, replay it, and assert the replay returns <code>EPERM</code> at the same point and the run reproduces.</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+finit_module&amp;body=Discussion+for+the+%60finit_module%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ffinit_module.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60finit_module%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `finit_module`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A2 of https://github.com/rrnewton/hermit/issues/355: linux_determinism nondeterministic (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch pred:is_privileged_admin_refused_syscall, refused.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy refuse (code returns a fixed EPERM before reading arguments, detcore/src/lib.rs:2164-2168; Linux's first check is the same EPERM, host strace confirms it for fd=-1 and invalid flags); linux_determinism nondeterministic -&gt; conditional (unprivileged callers always get EPERM; only the privileged load depends on host state); 8 flag behaviours and 2 tests listed; no test names the syscall, so tracking_status stays todo</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+finit_module&amp;amp;body=Discussion+for+the+%60finit_module%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ffinit_module.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60finit_module%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `finit_module`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Originally filed 2026-07-24 as &quot;Syscall classification: finit_module&quot; (https://github.com/rrnewton/hermit/issues/355), legacy variant A2.</p>
-<h3>2026-07-24 host strace evidence</h3>
-<p>Test host: Linux 6.17.13 x86_64; strace 6.12.</p>
-<p>Ran a syscall-specific safe raw probe with deliberately inert/invalid arguments so privileged or mutating operations could not change host state:</p>
-<pre><code>strace -f -qq -e trace=finit_module -s 160 python3 -c 'import ctypes; c=ctypes.CDLL(None,use_errno=True); c.syscall(313, *([ctypes.c_long(-1)]*6))'
-</code></pre>
-<p>Actual strace output:</p>
-<pre><code>finit_module(-1, 0xffffffffffffffff, MODULE_INIT_IGNORE_MODVERSIONS|MODULE_INIT_IGNORE_VERMAGIC|MODULE_INIT_COMPRESSED_FILE|0xfffffff8) = -1 EPERM (Operation not permitted)
-</code></pre>
-<p>The trace confirms the host kernel path and observed errno/result for this ABI. The determinism recommendation also accounts for documented success-path state dependencies; an invalid-argument result alone is not treated as proof of determinism.</p>
 </body></html>

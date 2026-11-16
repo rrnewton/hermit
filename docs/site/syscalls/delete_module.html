@@ -3,72 +3,18 @@
 <title>delete_module | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>delete_module</code> (176)</h1>
-<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_privileged_admin_refused_syscall</code> &middot; linux determinism: conditional &middot; target policy: refuse &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+delete_module&amp;body=Discussion+for+the+%60delete_module%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fdelete_module.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60delete_module%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>delete_module(name, flags)</code> unloads a loaded kernel module by name. Hermit refuses it: Detcore answers every call with a fixed <code>EPERM</code> and never forwards it to the host kernel (<code>detcore/src/lib.rs:2164</code>).</p>
-<p>Rank 65 in the batch-2 classification sequence after excluding the 50 workload-observed batch-1 syscalls.</p>
-<p>Manual reference: Linux man-pages delete_module(2).</p>
-<h2>Linux semantics</h2>
-<p>The module subsystem first checks <code>CAP_SYS_MODULE</code> in the initial user namespace and the <code>kernel.modules_disabled</code> sysctl; without the capability, or with modules disabled, the call returns <code>EPERM</code> before <code>name</code> is read. The host strace under Additional information shows an all-ones <code>name</code> pointer with every flag bit set still getting <code>EPERM</code>.</p>
-<p>With the capability, the kernel copies <code>name</code>, looks up the live module, refuses if other modules depend on it, and checks its reference count. Since Linux 3.13 the kernel never waits for references to drop: a module in use fails at once with <code>EWOULDBLOCK</code>, unless a forced unload is requested and allowed. On success the module's exit function runs and the module disappears for the whole host.</p>
-<h3>Flags and options</h3>
+<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_privileged_admin_refused_syscall</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+delete_module&amp;body=Discussion+for+the+%60delete_module%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fdelete_module.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60delete_module%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>delete_module</code> (176) as determinized-refused via pred:is_privileged_admin_refused_syscall dispatch; deterministic refusal: true; run subscription: true; record/replay subscription: true.</p>
 <ul>
-<li>F1: privilege gate: without <code>CAP_SYS_MODULE</code> in the initial user namespace, or with <code>kernel.modules_disabled=1</code>, the call returns <code>EPERM</code> before <code>name</code> or <code>flags</code> are examined.</li>
-<li>F2: <code>O_NONBLOCK</code>: do not wait for the module's references to drop. Since Linux 3.13 this is the only behaviour, so a module in use gives <code>EWOULDBLOCK</code> with or without the flag.</li>
-<li>F3: <code>O_TRUNC</code>: force the unload even if the module is in use or has no exit function. Honoured only in kernels built with <code>CONFIG_MODULE_FORCE_UNLOAD</code>; it taints the kernel.</li>
-<li>F4: <code>name</code>: a bad pointer gives <code>EFAULT</code>; no loaded module of that name gives <code>ENOENT</code>; a module that others depend on, or that is not in the live state, gives <code>EBUSY</code>. Reachable only past F1.</li>
-<li>F5: success: the module's exit function runs and the module is removed for every process on the host.</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1578</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:7484</code></li>
 </ul>
-<h2>Determinism analysis</h2>
-<p><code>linux_determinism: conditional</code>, changed from the legacy <code>nondeterministic</code>. The legacy classification described the privileged path, which does depend on module references, load state and concurrent users. For a caller without <code>CAP_SYS_MODULE</code> in the initial user namespace, which includes root inside a container's user namespace, Linux returns <code>EPERM</code> before it reads any argument (F1; the host strace under Additional information confirms it for an all-invalid argument set), so the call repeats exactly. <code>conditional</code> states both halves.</p>
-<h3>Nondeterminism sources</h3>
-<ul>
-<li>Loaded-module and reference state (F2, F4)</li>
-<li>Host privilege and lockdown policy, and kernel configuration such as <code>CONFIG_MODULE_FORCE_UNLOAD</code> (F1, F3)</li>
-<li>Concurrent kernel users of the module, which decide whether it is in use at the moment of the call (F2, F5)</li>
-</ul>
-<h2>Hermit design</h2>
-<p>Target policy: <code>refuse</code>. The code at hermit f4055eb9cae4 already realizes it. <code>classify_syscall</code> lists <code>delete_module</code> as Determinized with the rest of the privileged system-administration family (<code>detcore/src/syscall_classification.rs:289</code> to <code>detcore/src/syscall_classification.rs:315</code>). <code>Detcore::handle_syscall_event</code> then matches it on the <code>Sysno</code>, before the typed match, with the guard <code>is_privileged_admin_refused_syscall</code> (<code>detcore/src/lib.rs:2164</code> to <code>detcore/src/lib.rs:2168</code>; the set itself is at <code>detcore/src/syscall_classification.rs:902</code>), and returns <code>Err(Error::Errno(Errno::EPERM))</code> (<code>detcore/src/lib.rs:2167</code>). The arm reads no argument and never forwards the call to the host kernel. It does not consult <code>panic_on_unsupported_syscalls</code>, so the answer is the same with and without fail-closed mode, and the comment above the arm (<code>detcore/src/lib.rs:2154</code>) states the intent that it be identical across <code>--verify</code> and record/replay. The same set feeds <code>is_deterministically_refused_syscall</code> (<code>detcore/src/syscall_classification.rs:1319</code>), which is what <code>code_facts.refused: true</code> reports.</p>
-<p>Classification-only evidence: the unit test <code>privileged_admin_syscalls_are_determinized_and_consistent</code> (<code>detcore/src/syscall_classification.rs:2535</code>) checks that <code>delete_module</code> is Determinized and in the refusal set, and that the set holds nothing else. It does not start Hermit, so it is not coverage for any test below.</p>
-<p>How close this is to Linux: the capability check is the kernel's first one, so Linux itself returns <code>EPERM</code> for every argument value when the caller lacks <code>CAP_SYS_MODULE</code>. Hermit's fixed answer therefore matches what an unprivileged caller sees natively for F1 to F5; the host strace under Additional information is a concrete case.</p>
-<p>Why <code>refuse</code>:</p>
-<ul>
-<li>Under ptrace the guest runs as root inside the container's user namespace (the comment at <code>detcore/src/syscall_classification.rs:2298</code> to <code>detcore/src/syscall_classification.rs:2303</code> describes the <code>CLONE_NEWUSER</code> uid map). Linux checks <code>CAP_SYS_MODULE</code> against the initial user namespace, which such a root never holds, so a fixed <code>EPERM</code> is what the guest would see from the kernel in that container anyway. The refusal removes the dependency on how Hermit itself was launched.</li>
-<li><code>passthrough</code> would let a guest change host-global kernel state if Hermit ever ran with the capability, which is an isolation hole, not a determinism feature.</li>
-<li><code>model</code> or <code>emulate</code> would mean pretending that a kernel module was loaded or unloaded. A container has no kernel of its own, so there is no guest-visible state such an emulation could keep consistent (<code>/proc/modules</code>, the module's own side effects), and no workload that Hermit targets needs it.</li>
-</ul>
-<p>Nothing is missing in the code. The gap is evidence: no test names <code>SYS_delete_module</code> (<code>tests_naming: 0</code>), so verification on the default backend stays untested.</p>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F1, F2, F3, F4, F5): under <code>hermit run --verify</code> on ptrace, call raw <code>syscall(SYS_delete_module, ...)</code> with: the name of a module that is commonly loaded (for example <code>&quot;loop&quot;</code>) and flags 0; the same name with <code>O_NONBLOCK</code>, with <code>O_TRUNC</code>, and with both; a name no module has (<code>&quot;hermit_no_such_module&quot;</code>); and <code>name = (char *)1</code>. Assert every call returns -1 with <code>errno == EPERM</code>, that both verify runs print identical output, and that a guest-side read of <code>/proc/modules</code> is unchanged afterwards.</li>
-<li>T2 (covers F1): record a guest that calls <code>delete_module</code> under <code>hermit record</code>, replay it, and assert the replay returns <code>EPERM</code> at the same point and the run reproduces.</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+delete_module&amp;body=Discussion+for+the+%60delete_module%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fdelete_module.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60delete_module%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `delete_module`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-09-28 · hermit 81ca8822f78c · hermit2 · closed under the legacy rule (an explicit <code>classify_syscall</code> arm), not the v1 done rule; closing comment https://github.com/rrnewton/hermit/issues/344#issuecomment-5872962546</li>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A2 of https://github.com/rrnewton/hermit/issues/344: linux_determinism nondeterministic (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch pred:is_privileged_admin_refused_syscall, refused.</li>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · reopen: under the owner rule of 2026-10-02, closed means every flag and option is covered by a named test and the implementation works; delete_module records no test coverage, so tracking_status is todo and https://github.com/rrnewton/hermit/issues/344 reopens.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy refuse (code returns a fixed EPERM before reading arguments, detcore/src/lib.rs:2164-2168; Linux's first check is the same EPERM, host strace confirms it); linux_determinism nondeterministic -&gt; conditional (unprivileged callers always get EPERM; only the privileged unload depends on host state); 5 flag behaviours and 2 tests listed; no test names the syscall, so tracking_status stays todo</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+delete_module&amp;amp;body=Discussion+for+the+%60delete_module%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fdelete_module.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60delete_module%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `delete_module`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Originally filed 2026-07-24 as &quot;Syscall classification: delete_module&quot; (https://github.com/rrnewton/hermit/issues/344), legacy variant A2.</p>
-<p>Comment history: 1 comment(s) on https://github.com/rrnewton/hermit/issues/344.</p>
-<h3>2026-07-24 host strace evidence</h3>
-<p>Test host: Linux 6.17.13 x86_64; strace 6.12.</p>
-<p>Ran a syscall-specific safe raw probe with deliberately inert/invalid arguments so privileged or mutating operations could not change host state:</p>
-<pre><code>strace -f -qq -e trace=delete_module -s 160 python3 -c 'import ctypes; c=ctypes.CDLL(None,use_errno=True); c.syscall(176, *([ctypes.c_long(-1)]*6))'
-</code></pre>
-<p>Actual strace output:</p>
-<pre><code>delete_module(0xffffffffffffffff, O_NONBLOCK|O_TRUNC|0xfffff5ff) = -1 EPERM (Operation not permitted)
-</code></pre>
-<p>The trace confirms the host kernel path and observed errno/result for this ABI. The determinism recommendation also accounts for documented success-path state dependencies; an invalid-argument result alone is not treated as proof of determinism.</p>
-<h3>Legacy closure</h3>
-<p>Closed 2026-09-28 by the 2026-09-28 sweep, which closed issues whose syscall had an explicit <code>classify_syscall</code> arm. Closing comment: https://github.com/rrnewton/hermit/issues/344#issuecomment-5872962546</p>
 </body></html>

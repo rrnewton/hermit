@@ -3,75 +3,18 @@
 <title>timer_gettime | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>timer_gettime</code> (224)</h1>
-<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; linux determinism: nondeterministic &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+timer_gettime&amp;body=Discussion+for+the+%60timer_gettime%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ftimer_gettime.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60timer_gettime%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>timer_gettime(timerid, curr_value)</code> reports how long remains until a POSIX timer's next expiration and its reload interval. Detcore emulates it (<code>detcore/src/syscalls/time.rs:568</code>): it computes both from its own per-process timer table and the virtual clock, so the reported time depends only on virtual time, never on the host clock.</p>
-<p>Manual reference: Linux man-pages timer_gettime(2).</p>
-<h2>Linux semantics</h2>
-<p><code>curr_value-&gt;it_value</code> receives the time left until the next expiration, and <code>curr_value-&gt;it_interval</code> the reload period, both as relative times even when the timer was armed with <code>TIMER_ABSTIME</code>. A disarmed timer, or a one-shot timer that has already expired, reports zero for <code>it_value</code>. A periodic timer reports the time to its next period. A <code>SIGEV_NONE</code> timer is reported the same way; it just never signals.</p>
-<p>The kernel looks up the timer id first and then writes the result, so an unknown or deleted id gives <code>EINVAL</code> even when <code>curr_value</code> is bad, and a valid id with a bad <code>curr_value</code> gives <code>EFAULT</code>. Timer ids belong to the process: a forked child has none of its parent's timers, and after a successful <code>execve</code> every old id is invalid.</p>
-<h3>Flags and options</h3>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+timer_gettime&amp;body=Discussion+for+the+%60timer_gettime%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ftimer_gettime.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60timer_gettime%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>timer_gettime</code> (224) as determinized via typed dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.</p>
 <ul>
-<li>F1: armed one-shot timer: <code>it_value</code> is the time left until expiration and <code>it_interval</code> is zero.</li>
-<li>F2: periodic timer: <code>it_value</code> is the time to the next period and <code>it_interval</code> is the reload period.</li>
-<li>F3: disarmed timer, or a one-shot timer that has already expired: <code>it_value</code> is zero.</li>
-<li>F4: <code>SIGEV_NONE</code> timer: reported the same way as a signalling timer.</li>
-<li>F5: unknown or deleted timer id: <code>EINVAL</code>, checked before <code>curr_value</code> is written.</li>
-<li>F6: <code>curr_value</code> NULL or pointing at bad memory, with a valid id: <code>EFAULT</code>.</li>
-<li>F7: process scope: ids from the parent are invalid in a forked child, and every id is invalid after a successful <code>execve</code>.</li>
-<li>F8: timer on a CPU-time clock: <code>it_value</code> is the CPU time the target process or thread must still consume before expiration, which does not shrink while the target is blocked.</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1879</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:8381</code></li>
 </ul>
-<h2>Determinism analysis</h2>
-<p><code>linux_determinism: nondeterministic</code>. The remaining time is measured on a host clock, so it reflects however much real time passed since the timer was armed, which depends on host load and scheduling. The call repeats only for a disarmed or expired timer and for its error results.</p>
-<h3>Nondeterminism sources</h3>
-<ul>
-<li>Remaining time (F1, F2, F4): elapsed real time since arming.</li>
-<li>Whether a one-shot timer has already expired when the call runs (F1, F3): host timing.</li>
-</ul>
-<h2>Hermit design</h2>
-<p>Target policy: <code>model</code>. The handler at <code>detcore/src/syscalls/time.rs:568</code> (dispatch arm <code>detcore/src/lib.rs:2787</code>) never forwards the call:</p>
-<ul>
-<li>It reads the virtual time (<code>detcore/src/syscalls/time.rs:575</code>), looks the timer up in the per-process table (<code>detcore/src/syscalls/time.rs:576-579</code>, <code>detcore/src/tool_local.rs:234-240</code>) and writes <code>it_value</code> and <code>it_interval</code> (<code>detcore/src/syscalls/time.rs:581-585</code>).</li>
-<li>The remaining time comes from <code>remaining_ns</code> (<code>detcore/src/tool_local.rs:312-322</code>): the gap to the deadline while it is in the future, the time to the next period for an expired periodic timer, and zero for a disarmed or expired one-shot timer (F1, F2, F3). Timers without a deliverable signal use the same computation (F4).</li>
-<li>An unknown id gives <code>EINVAL</code> (<code>detcore/src/syscalls/time.rs:580</code>, F5).</li>
-<li>The table is per process: shared by threads, empty in a new process (<code>detcore/src/lib.rs:1561-1564</code>), and cleared by a successful exec (<code>detcore/src/lib.rs:1760-1765</code>) (F7).</li>
-</ul>
-<p>Why <code>model</code> and not the alternatives: the timer lives only in Detcore's table, so there is no host timer to forward to, and refusing would break every program that reads its timers.</p>
-<p>What remains before the code fully realizes <code>model</code>:</p>
-<ul>
-<li><strong>Error order (F5, F6).</strong> A NULL <code>curr_value</code> is checked before the id (<code>detcore/src/syscalls/time.rs:574</code>), so a NULL pointer with an unknown id gives <code>EFAULT</code> where Linux gives <code>EINVAL</code>.</li>
-<li><strong>Periodic timer exactly at a deadline.</strong> When the virtual time equals the deadline of a periodic timer, <code>remaining_ns</code> returns the full interval (<code>detcore/src/tool_local.rs:315-317</code>), treating that period as already passed. This is consistent and deterministic, but the boundary has no test.</li>
-</ul>
-<p>Target (owner decisions 13 and 6): the remaining time is measured on the timer's own clock, as the <code>timer_settime</code> body describes. The clock names are those defined in the <code>clock_gettime</code> body.</p>
-<ul>
-<li>A virtual realtime or virtual uptime timer reports the gap to its deadline on that clock. Both clocks advance with the same logical time, so the relative value is today's.</li>
-<li>A CPU-time timer reports the virtual CPU time its target still has to consume (F8). Today it reports elapsed virtual time (<code>detcore/src/syscalls/time.rs:575</code>).</li>
-</ul>
-<p>Kernel order (<code>SYSCALL_DEFINE2(timer_gettime)</code> in <code>kernel/time/posix-timers.c</code>): <code>lock_timer</code> gives <code>EINVAL</code> for an unknown id, then <code>put_itimerspec64</code> gives <code>EFAULT</code>. So the target moves the <code>curr_value</code> check after the lookup (<code>detcore/src/syscalls/time.rs:574</code> before <code>detcore/src/syscalls/time.rs:580</code> today).</p>
-<p><code>linux_determinism</code> is <code>nondeterministic</code> for the native call; under Hermit the result is a function of virtual time.</p>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F1, F3): arm a one-shot timer for 300 s and check that <code>it_value</code> is positive and <code>it_interval</code> zero; arm one for 10 ms, wait for it, and check <code>it_value</code> is zero, under <code>hermit run --strict --verify</code> on ptrace. Existing candidate for the first half: <code>tests/c/timer_create_determinism.c</code> (cell <code>c-programs/timer-create-determinism</code>, <code>tests/e2e/manifests/c-programs.yaml:10299</code>, verify ci on ptrace), which prints only whether time remains.</li>
-<li>T2 (covers F2, F7): a periodic timer keeps its interval and stays armed across a failed exec, and every id gives <code>EINVAL</code> after a successful exec. Existing candidate: <code>run_ptrace_exec_deletes_posix_timers_and_preserves_itimer</code> at <code>hermit-cli/tests/cli.rs:11505</code>, driving <code>hermit-cli/tests/fixtures/exec_posix_timers.c</code>. Unit tests: <code>settime_reports_previous_arming_and_remaining_uses_virtual_clock</code> at <code>detcore/src/tool_local.rs:877</code> and <code>periodic_remaining_advances_past_each_deadline</code> at <code>detcore/src/tool_local.rs:908</code>.</li>
-<li>T3 (covers F4): a <code>SIGEV_NONE</code> timer armed for 50 ms reports a decreasing <code>it_value</code> across two reads separated by a sleep, then zero after the deadline.</li>
-<li>T4 (covers F5, F6): a deleted id gives <code>EINVAL</code>; a deleted id with NULL <code>curr_value</code> gives <code>EINVAL</code>; a valid id with NULL or unmapped <code>curr_value</code> gives <code>EFAULT</code>. The second case is expected to fail at this SHA.</li>
-<li>T5 (covers F7): a forked child calling <code>timer_gettime</code> on a parent timer id gets <code>EINVAL</code>, and a second thread reads a timer the first thread armed.</li>
-<li>T6 (covers F8): arm a <code>CLOCK_THREAD_CPUTIME_ID</code> timer for 50 ms, then sleep 1 s of virtual time and read it. <code>it_value</code> must still be 50 ms minus the CPU time consumed before the sleep. After 20 ms of spinning it must have dropped by 20 ms. The values must be identical across <code>hermit run --verify</code> runs.</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+timer_gettime&amp;body=Discussion+for+the+%60timer_gettime%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ftimer_gettime.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60timer_gettime%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `timer_gettime`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · created for v1: no tracking issue existed for this pinned Sysno; code at this SHA: determinized, dispatch typed.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy model (remaining time and interval computed from Detcore's per-process timer table and the virtual clock); linux_determinism nondeterministic; gap: NULL curr_value checked before the id (EFAULT where Linux gives EINVAL); 7 flag behaviours and 5 tests listed; tracking_status stays todo</li>
-<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): applied 13 and 6 (remaining time on the timer's own clock, virtual CPU time for CPU-time timers; kernel order id EINVAL before curr_value EFAULT); target_policy stays model; new F8, T6; no open questions existed</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+timer_gettime&amp;amp;body=Discussion+for+the+%60timer_gettime%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ftimer_gettime.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60timer_gettime%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `timer_gettime`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Created by the syscall-tracking v1 migration on 2026-10-03. No tracking issue existed for <code>timer_gettime</code>: the 2026-07-24 classification campaign filed issues only for syscalls in the old temporary pass-through block, and Detcore already handled this one.</p>
-<p>The timer table and its unit tests (<code>posix_timers_tests</code>, <code>detcore/src/tool_local.rs:861</code>) were added by commit 208f574f1a (2026-07-22, &quot;Land missing --strict syscall handlers: identity/fs + POSIX timers + membarrier&quot;); signal delivery was added by commit 5687ea1683 (2026-07-27), whose subject names https://github.com/rrnewton/hermit/pull/869. The sibling bodies <code>timer_create.md</code> and <code>timer_settime.md</code> describe creation, arming and the notification gaps; this call is unaffected by them because it never sends a signal.</p>
 </body></html>

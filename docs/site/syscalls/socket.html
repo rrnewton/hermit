@@ -3,104 +3,18 @@
 <title>socket | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>socket</code> (41)</h1>
-<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; linux determinism: conditional &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+socket&amp;body=Discussion+for+the+%60socket%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsocket.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60socket%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p>Creates a socket of a given domain, type and protocol and returns a new file descriptor. Hermit lets the kernel create the socket, registers it in Detcore's fd table, and in <code>hermit run</code> makes it physically nonblocking so later <code>connect</code>, <code>accept</code> and I/O calls never block inside the kernel. The guest still sees the blocking or nonblocking mode it asked for.</p>
-<h2>Linux semantics</h2>
-<p><code>socket(domain, type, protocol)</code> returns the lowest unused file descriptor, bound to a new socket inode on the kernel's socket filesystem. <code>type</code> carries the socket type in its low bits and two creation flags, <code>SOCK_NONBLOCK</code> and <code>SOCK_CLOEXEC</code>. <code>protocol</code> 0 selects the default protocol for the domain and type. The call itself never blocks and sends no traffic. Whether a domain or type exists depends on the host kernel's configuration and on the caller's capabilities in its network namespace.</p>
-<h3>Flags and options</h3>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+socket&amp;body=Discussion+for+the+%60socket%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsocket.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60socket%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>socket</code> (41) as determinized via typed dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.</p>
 <ul>
-<li>F1: <code>domain = AF_UNIX</code> (<code>AF_LOCAL</code>): local sockets, named by a filesystem path, an abstract name or nothing.</li>
-<li>F2: <code>domain = AF_INET</code> or <code>AF_INET6</code>: IP sockets in the caller's network namespace.</li>
-<li>F3: <code>domain = AF_NETLINK</code>, with a netlink protocol such as <code>NETLINK_ROUTE</code> or <code>NETLINK_SOCK_DIAG</code>: kernel-to-user messaging that reports live kernel state.</li>
-<li>F4: other domains (<code>AF_PACKET</code>, <code>AF_VSOCK</code>, <code>AF_ALG</code> and others): available only if the host kernel supports them; otherwise <code>EAFNOSUPPORT</code>.</li>
-<li>F5: <code>type = SOCK_STREAM</code>.</li>
-<li>F6: <code>type = SOCK_DGRAM</code>, including unprivileged ICMP sockets, which are gated by <code>net.ipv4.ping_group_range</code>.</li>
-<li>F7: <code>type = SOCK_SEQPACKET</code>, <code>SOCK_RAW</code> or <code>SOCK_RDM</code>. <code>SOCK_RAW</code> needs <code>CAP_NET_RAW</code> and otherwise gives <code>EPERM</code>.</li>
-<li>F8: <code>SOCK_NONBLOCK</code> in <code>type</code>: the new open file description has <code>O_NONBLOCK</code>.</li>
-<li>F9: <code>SOCK_CLOEXEC</code> in <code>type</code>: the new descriptor has <code>FD_CLOEXEC</code>.</li>
-<li>F10: <code>protocol</code>: 0 for the default, or an explicit protocol. A protocol the domain does not support gives <code>EPROTONOSUPPORT</code>, and a type the domain does not support gives <code>ESOCKTNOSUPPORT</code> or <code>EPROTOTYPE</code>.</li>
-<li>F11: unknown bits in <code>type</code> give <code>EINVAL</code>.</li>
-<li>F12: resource error: <code>EMFILE</code> when the descriptor table is full under <code>RLIMIT_NOFILE</code>.</li>
-<li>F13: identity of the result: the descriptor number is the lowest unused one, and the socket inode number, visible through <code>fstat</code> and <code>/proc/self/fd</code>, comes from a host-wide counter.</li>
-<li>F14: host-transient resource errors: <code>ENFILE</code> at the system-wide file limit, and <code>ENOBUFS</code> or <code>ENOMEM</code> when the host cannot allocate.</li>
-<li>F15: host-config error: <code>EACCES</code> when the host's security policy (an LSM) refuses the socket.</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1858</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:8025</code></li>
 </ul>
-<h2>Determinism analysis</h2>
-<p><code>linux_determinism: conditional</code>. For fixed descriptor state and a fixed host, the return value is deterministic: the lowest free descriptor, or the same errno. It is not deterministic in three ways:</p>
-<ul>
-<li>the socket's inode number is drawn from a counter shared by every process on the host (F13);</li>
-<li>whether a domain, type or protocol exists depends on the host kernel's configuration and capabilities (F4, F7, F10, F12);</li>
-<li>a netlink socket opened here later returns live kernel state (F3). That nondeterminism shows up in later <code>recvmsg</code> calls, not in <code>socket</code> itself.</li>
-</ul>
-<h3>Nondeterminism sources</h3>
-<ul>
-<li>The host-wide socket inode counter.</li>
-<li>Host kernel configuration, loaded modules, capabilities and security policy.</li>
-<li>The network namespace: with host networking the guest's sockets reach real interfaces and real peers.</li>
-</ul>
-<h3>Cross-host variation</h3>
-<ul>
-<li>Host <code>RLIMIT_NOFILE</code> inherited by Hermit's guest: the kernel enforces that limit, not the virtual 1048576 that Detcore reports (<code>detcore/src/tool_local.rs:289</code>), so the descriptor count at which F12's <code>EMFILE</code> appears differs between hosts.</li>
-<li>Host kernel configuration and loaded modules: whether a domain such as <code>AF_VSOCK</code> or <code>AF_ALG</code>, or a protocol such as <code>IPPROTO_SCTP</code>, exists, so the same call succeeds on one host and gives <code>EAFNOSUPPORT</code> or <code>EPROTONOSUPPORT</code> on another (F4, F10). The guest cannot load modules from its user namespace.</li>
-<li>Host LSM policy: whether a socket is refused with <code>EACCES</code> (F15).</li>
-</ul>
-<h2>Hermit design</h2>
-<p>Target policy: <code>model</code>. The kernel creates the socket, and Detcore owns its blocking behaviour, its place in the fd table and the sanitizing of what netlink sockets return. The dispatch arm at <code>detcore/src/lib.rs:2550</code> calls <code>handle_socket</code> at <code>detcore/src/syscalls/files.rs:3751</code>. The handler has two paths:</p>
-<ul>
-<li><strong>No sequentializing scheduler, or a record or replay run</strong> (<code>detcore/src/syscalls/files.rs:3758</code>): the call goes through <code>record_or_replay</code> exactly as written, and the descriptor is added to the fd table (<code>detcore/src/syscalls/files.rs:3761</code>). The socket is not made nonblocking, so later blocking calls on it take the blocking path.</li>
-<li><strong>`hermit run` with the scheduler</strong>: when <code>use_nonblocking_sockets()</code> is true (<code>detcore-model/src/config.rs:872</code>: <code>sequentialize_threads &amp;&amp; !debug_externalize_sockets</code>), <code>SOCK_NONBLOCK</code> is added to the real call (<code>detcore/src/syscalls/files.rs:3772</code>). The fd table records only the flags the guest asked for, <code>SOCK_NONBLOCK</code> and <code>SOCK_CLOEXEC</code> (<code>detcore/src/syscalls/files.rs:3782</code>), and <code>maybe_set_nonblocking_fd</code> marks the descriptor as physically nonblocking (<code>detcore/src/syscalls/files.rs:3787</code>; helper at <code>detcore/src/syscalls/helpers.rs:695</code>). Later blocking calls are then retried under the scheduler instead of sleeping in the kernel (see the <code>connect</code> and <code>accept</code> bodies).</li>
-<li>On both paths, <code>mark_sock_diag_fd</code> (<code>detcore/src/syscalls/files.rs:3800</code>) flags <code>AF_NETLINK</code> sockets with <code>NETLINK_SOCK_DIAG</code>, so their dump replies get determinized inode numbers, and with <code>NETLINK_ROUTE</code> (<code>detcore/src/syscalls/files.rs:3814</code>), whose link dumps carry live interface counters.</li>
-<li>No domain, type or protocol is refused; host errors come back unchanged.</li>
-</ul>
-<p>The network the socket sees is set by <code>hermit run --network</code> (<code>hermit-cli/src/bin/hermit/run.rs:495</code>). The default, <code>local</code>, gives the guest a private network namespace with only a loopback interface (<code>hermit-cli/src/bin/hermit/run.rs:905</code>). <code>host</code> exposes the host network, and the option's help text says it &quot;compromises isolation and deterministic reproducibility&quot;. AF_UNIX sockets bound to paths on host-visible filesystems are not scoped by the network namespace and can still reach host services.</p>
-<p>Why <code>model</code> and not the alternatives:</p>
-<ul>
-<li><code>passthrough</code> would leave sockets blocking, so a later <code>accept</code> or <code>connect</code> would sleep in the kernel where the deterministic scheduler cannot see it.</li>
-<li><code>refuse</code> would break every networked program, including local AF_UNIX clients.</li>
-<li><code>emulate</code> (a user-space socket implementation) is far more work than the kernel-backed model and is not needed for loopback traffic inside the private namespace.</li>
-</ul>
-<p>What remains before the code fully realizes <code>model</code>:</p>
-<ul>
-<li><strong>F13:</strong> I found no code in this handler that hides the host socket inode number. Whether <code>fstat</code> or <code>/proc/self/fd</code> show it deterministically depends on other handlers; T7 checks it.</li>
-<li><strong>Record and replay path:</strong> the flags stored in the fd table come from <code>OFlag::from_bits_truncate(type)</code> (<code>detcore/src/syscalls/files.rs:3764</code>), which reads the socket-type bits as open-mode bits (<code>SOCK_STREAM</code> = 1 = <code>O_WRONLY</code>, <code>SOCK_DGRAM</code> = 2 = <code>O_RDWR</code>). The run-mode path masks them out. Whether any later code reads those bits is not checked here; see Open questions.</li>
-<li><strong>F3:</strong> only <code>NETLINK_SOCK_DIAG</code> and <code>NETLINK_ROUTE</code> replies are sanitized. Other netlink protocols that report live kernel state are forwarded as is.</li>
-</ul>
-<p>Target (owner decision 14): every guest socket is physically nonblocking whenever Detcore schedules threads, so that later <code>accept</code>, <code>connect</code>, <code>recv*</code> and <code>send*</code> calls can always use a nonblocking probe plus a scheduler wait. Run mode does this today (<code>detcore/src/syscalls/files.rs:3772</code>-<code>3787</code>). On the record and replay path the socket stays blocking (<code>detcore/src/syscalls/files.rs:3758</code>), so those calls block in the kernel while holding their turn. The target removes that difference, recording each retried attempt as internal pipes already are (<code>retry_nonblocking_syscall</code>, <code>detcore/src/syscalls/helpers.rs:1414</code>). <code>socket</code> stays <code>model</code>.</p>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F2, F5, F13): create <code>AF_INET</code> and <code>AF_INET6</code> <code>SOCK_STREAM</code> sockets in a loopback listen, connect and accept flow under <code>hermit run --verify</code> on ptrace, and check the descriptor numbers are identical across runs. Existing candidates: <code>tests/c/socket_epoll_ordering.c:65</code> (cell <code>c-programs/socket-epoll-ordering</code>, <code>tests/e2e/manifests/c-programs.yaml:13718</code>, verify ci on ptrace); <code>tests/c/tcp_info_accept4.c:45</code> (cell <code>c-programs/tcp-info-accept4</code>, <code>tests/e2e/manifests/c-programs.yaml:9797</code>, verify ci on ptrace); <code>tests/c/tcp_info_accept6.c</code> (cell at <code>tests/e2e/manifests/c-programs.yaml:9855</code>).</li>
-<li>T2 (covers F1, F5): an <code>AF_UNIX</code> <code>SOCK_STREAM</code> socket, bound and queried. Existing candidate: <code>tests/c/bind_getsockname.c:43</code> (cell <code>c-programs/bind-getsockname</code>, <code>tests/e2e/manifests/c-programs.yaml:14534</code>, verify ci on ptrace).</li>
-<li>T3 (covers F6, F9): an <code>AF_INET</code> <code>SOCK_DGRAM | SOCK_CLOEXEC</code> socket; <code>fcntl(F_GETFD)</code> must report <code>FD_CLOEXEC</code>, and a plain <code>SOCK_DGRAM</code> socket must not. Existing partial candidate: <code>tests/c/ioctl_siocethtool.c:21</code> (cell <code>c-programs/ioctl-siocethtool</code>, <code>tests/e2e/manifests/c-programs.yaml:2535</code>) creates such a socket but does not check its flags.</li>
-<li>T4 (covers F8): <code>fcntl(F_GETFL)</code> reports <code>O_NONBLOCK</code> for a <code>SOCK_NONBLOCK</code> socket and does not report it for a plain socket, even though Hermit made the plain socket physically nonblocking. An <code>accept</code> on the plain socket must still wait for a connection instead of returning <code>EAGAIN</code>.</li>
-<li>T5 (covers F3): <code>AF_NETLINK</code> sockets with <code>NETLINK_ROUTE</code> and <code>NETLINK_SOCK_DIAG</code>; dump replies must be identical across runs. Existing candidate: <code>tests/c/netlink_autobind_route.c:4</code> (cell <code>c-programs/netlink-autobind-route</code>, <code>tests/e2e/manifests/c-programs.yaml:4417</code>, verify ci on ptrace).</li>
-<li>T6 (covers F4, F7, F10, F11): a raw <code>syscall(SYS_socket, ...)</code> error matrix, compared with native results: an unknown domain (<code>EAFNOSUPPORT</code>), <code>SOCK_STREAM</code> with <code>IPPROTO_UDP</code> (<code>EPROTONOSUPPORT</code>), <code>SOCK_RAW</code> without <code>CAP_NET_RAW</code> (<code>EPERM</code>), an undefined flag bit in <code>type</code> (<code>EINVAL</code>), and a successful <code>AF_UNIX</code> <code>SOCK_SEQPACKET</code>.</li>
-<li>T7 (covers F12, F13): close a low descriptor and check <code>socket</code> reuses it; lower <code>RLIMIT_NOFILE</code> and check <code>EMFILE</code>; print <code>fstat</code> <code>st_ino</code> and the <code>/proc/self/fd/N</code> link text (<code>socket:[N]</code>) and check both are identical across two runs.</li>
-<li>T8 (covers F1, F2, F5, F8): record and replay a guest that creates blocking and nonblocking sockets and runs a loopback exchange. Replay must return the same descriptors and the guest must see the same blocking modes.</li>
-<li>U1 (covers F14; host-transient): <code>ENFILE</code>, <code>ENOBUFS</code> and <code>ENOMEM</code> depend on host-wide state shared with other processes. The host call at <code>detcore/src/syscalls/files.rs:3777</code> returns the error to the guest unchanged today. F14 counts toward done only once Hermit hides these errors or reports them as an infrastructure error.</li>
-<li>U2 (covers F15; host-config): the CI host's LSM policy decides whether any socket is refused, so CI cannot produce <code>EACCES</code>. Hermit forwards the kernel's answer unchanged (<code>detcore/src/syscalls/files.rs:3777</code>).</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+socket&amp;body=Discussion+for+the+%60socket%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsocket.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60socket%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `socket`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · created for v1: no tracking issue existed for this pinned Sysno; code at this SHA: determinized, dispatch typed.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; model (kernel creates, Detcore forces physical nonblocking in run mode and keeps the guest's logical flags); linux_determinism stays conditional (host socket inode counter, host kernel config); left todo with open questions on socket inode exposure and record-mode fd flags.</li>
-<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d12 (owner decisions 1 and 2): cross_host_variant true (the kernel enforces the host RLIMIT_NOFILE, not the virtual one, so the EMFILE point of F12 differs between hosts; host kernel configuration and modules decide which domains and protocols exist; host LSM); F12 split into F12 (EMFILE), F14 (ENFILE, ENOBUFS, ENOMEM; U1 host-transient) and F15 (LSM EACCES; U2 host-config); no open questions resolved</li>
-<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): decision 14 applied (Target paragraph: sockets are physically nonblocking in record and replay too, so later blocking calls use the probe plus scheduler wait); no new F/T ids; no open questions removed</li>
-<li>2026-10-05 · hermit f4055eb9cae4 · syscall-tracking-2 · covered: T2 covered by tests/c/bind_getsockname.c (C08 review of the 2026-10-04 coverage proposals; guest source read at this SHA, not run by this agent)</li>
-</ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+socket&amp;amp;body=Discussion+for+the+%60socket%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsocket.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60socket%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `socket`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Created by the syscall-tracking v1 migration on 2026-10-03. No tracking issue existed for <code>socket</code>: the 2026-07-24 classification campaign filed issues only for syscalls in the old temporary pass-through block, and Detcore already handled this one.</p>
-<p><code>socketpair</code> has its own handler (<code>detcore/src/syscalls/files.rs:3822</code>) and its own body.</p>
-<h3>Open questions</h3>
-<ul>
-<li>Is the host socket inode number visible to the guest through <code>fstat</code> or <code>/proc/self/fd</code>, and if so, should Detcore virtualize it the way the sock_diag path does for netlink dumps? T7 answers the first half.</li>
-<li>On the record and replay path, <code>OFlag::from_bits_truncate(type)</code> (<code>detcore/src/syscalls/files.rs:3764</code>) stores the socket type as if it were an access mode. If any later handler reads the access mode of a socket descriptor, this is a defect; the run-mode path's mask (<code>detcore/src/syscalls/files.rs:3782</code>) is probably the intended behaviour.</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
 </body></html>

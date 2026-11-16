@@ -3,90 +3,18 @@
 <title>lsm_set_self_attr | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>lsm_set_self_attr</code> (460)</h1>
-<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_host_security_identity_probe_syscall</code> &middot; linux determinism: conditional &middot; target policy: refuse &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+lsm_set_self_attr&amp;body=Discussion+for+the+%60lsm_set_self_attr%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Flsm_set_self_attr.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60lsm_set_self_attr%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>lsm_set_self_attr(attr, ctx, size, flags)</code> (Linux 6.8+) sets one Linux Security Module (LSM) attribute of the calling thread, such as its SELinux or AppArmor context or the label for files it creates. Hermit refuses it: Detcore returns <code>ENOSYS</code> for every argument combination, in every mode, without forwarding the call to the host (<code>detcore/src/lib.rs:2149-2153</code> at hermit f4055eb9cae4), so the guest sees the same answer as on a kernel older than 6.8 and never changes the host-enforced label.</p>
-<h2>Linux semantics</h2>
-<p>Prototype: <code>int lsm_set_self_attr(unsigned int attr, struct lsm_ctx *ctx, u32 size, u32 flags)</code>. Constants are in <code>&lt;linux/lsm.h&gt;</code>. There is no glibc wrapper; callers use <code>syscall(2)</code>.</p>
+<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_host_security_identity_probe_syscall</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+lsm_set_self_attr&amp;body=Discussion+for+the+%60lsm_set_self_attr%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Flsm_set_self_attr.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60lsm_set_self_attr%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>lsm_set_self_attr</code> (460) as determinized-refused via pred:is_host_security_identity_probe_syscall dispatch; deterministic refusal: true; run subscription: true; record/replay subscription: true.</p>
 <ul>
-<li><code>ctx</code> points to one <code>struct lsm_ctx</code>: the target module's id (<code>LSM_ID_SELINUX</code> 101, <code>LSM_ID_SMACK</code> 102, <code>LSM_ID_APPARMOR</code> 104, ...), the entry length, the context length and the context bytes (for example an SELinux type transition or an AppArmor <code>changeprofile</code> request).</li>
-<li>The kernel checks the generic arguments in a fixed order before any module sees them: nonzero <code>flags</code> gives <code>EINVAL</code>; <code>size</code> smaller than <code>struct lsm_ctx</code> gives <code>EINVAL</code>; <code>size</code> larger than a page gives <code>E2BIG</code>; an unreadable <code>ctx</code> gives <code>EFAULT</code>; inconsistent <code>len</code>/<code>ctx_len</code> fields give <code>EINVAL</code>. The host strace under Additional information, <code>lsm_set_self_attr(LSM_ATTR_UNDEF, NULL, 0, 0) = -1 EINVAL</code>, is the <code>size</code> check winning.</li>
-<li>The request then goes only to the module whose id matches <code>ctx-&gt;id</code>. If no active module has that id, the call fails with <code>EOPNOTSUPP</code>. The module decides whether <code>attr</code> is writable and whether policy permits the change, and returns its own error otherwise (typically <code>EINVAL</code>, <code>EACCES</code> or <code>EPERM</code>).</li>
-<li>On success the call changes kernel state for the calling thread: its current label, or the label applied at its next <code>execve</code>, or the labels given to files, keys or sockets it creates. Later host permission checks for the guest are decided against that new label.</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1699</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:7469</code></li>
 </ul>
-<h3>Flags and options</h3>
-<ul>
-<li>F1: <code>attr = LSM_ATTR_CURRENT</code> (100): change the thread's current context, if the module and policy allow a dynamic transition.</li>
-<li>F2: <code>attr = LSM_ATTR_EXEC</code> (101): set the context applied at the thread's next <code>execve</code>.</li>
-<li>F3: <code>attr = LSM_ATTR_FSCREATE</code> (102): set the label for files the thread creates.</li>
-<li>F4: <code>attr = LSM_ATTR_KEYCREATE</code> (103): set the label for keys the thread creates.</li>
-<li>F5: <code>attr = LSM_ATTR_SOCKCREATE</code> (105): set the label for sockets the thread creates.</li>
-<li>F6: <code>attr = LSM_ATTR_PREV</code> (104), <code>LSM_ATTR_UNDEF</code> (0), an undefined value, or an attribute the target module does not let callers write: rejected by the module with an error it chooses.</li>
-<li>F7: <code>ctx-&gt;id</code> selects the one module that handles the request; an id that names no active module gives <code>EOPNOTSUPP</code>.</li>
-<li>F8: size validation: <code>size &lt; sizeof(struct lsm_ctx)</code> (including <code>ctx = NULL, size = 0</code>) gives <code>EINVAL</code>; <code>size</code> above one page gives <code>E2BIG</code>; <code>len</code>/<code>ctx_len</code> fields that do not fit <code>size</code> give <code>EINVAL</code>.</li>
-<li>F9: any nonzero <code>flags</code> gives <code>EINVAL</code>; no flag is defined for this call.</li>
-<li>F10: an unreadable <code>ctx</code> pointer gives <code>EFAULT</code>.</li>
-<li>F11: the loaded policy refuses the transition: the module returns a permission error (<code>EACCES</code> or <code>EPERM</code>, depending on the module).</li>
-</ul>
-<h2>Determinism analysis</h2>
-<p><code>linux_determinism: conditional</code>, kept from the legacy classification. Given identical inputs, one host and an unchanged policy, the call returns the same result and makes the same change. Whether it succeeds, and which errno it returns when it fails, depends on host state that differs between machines.</p>
-<h3>Nondeterminism sources</h3>
-<ul>
-<li>The active LSM stack: the same request gets <code>EOPNOTSUPP</code> on a host without the named module and succeeds or fails by policy on a host with it (F6, F7).</li>
-<li>The loaded policy and the label the Hermit process itself runs under, inherited from the user's login, systemd unit or container runtime (F1-F5, F11).</li>
-<li>The call writes nothing into guest memory, so it cannot inject host data directly, but the return code is host-dependent. A successful call would also change the host label that governs the guest's later file, socket and <code>execve</code> permission checks, so later, otherwise deterministic calls could start failing differently on different hosts.</li>
-</ul>
-<h2>Hermit design</h2>
-<p>Target policy: <code>refuse</code>, which the code at hermit f4055eb9cae4 already realizes.</p>
-<ul>
-<li><code>classify_syscall</code> (<code>detcore/src/syscall_classification.rs:52</code>) lists <code>lsm_set_self_attr</code> as Determinized (<code>detcore/src/syscall_classification.rs:514</code>), so Detcore intercepts it in run mode and in record/replay.</li>
-<li>The predicate <code>is_host_security_identity_probe_syscall</code> (<code>detcore/src/syscall_classification.rs:1207-1215</code>) holds exactly <code>lsm_get_self_attr</code> and <code>lsm_set_self_attr</code>. Its doc comment states the reason: LSM self-attributes depend on the kernel's configured and active security modules, so Detcore reports the standard feature-absence errno.</li>
-<li>The dispatch arm (<code>detcore/src/lib.rs:2149-2153</code>) returns <code>Err(Error::Errno(Errno::ENOSYS))</code> before reading any argument, so F1-F11 all collapse to one result and the host label never changes. It does not consult <code>panic_on_unsupported_syscalls</code>, unlike the zero-copy pipe arm just above it (<code>detcore/src/lib.rs:2138-2144</code>), so the answer is the same with and without fail-closed mode; this matches <code>refused_only_when_fail_closed: false</code>.</li>
-<li>The predicate is part of <code>is_deterministically_refused_syscall</code> (<code>detcore/src/syscall_classification.rs:1319</code>, membership at <code>detcore/src/syscall_classification.rs:1332</code>), which is why <code>code_facts.refused</code> is true.</li>
-<li>The unit test <code>host_security_identity_probes_are_determinized_and_consistent</code> (<code>detcore/src/syscall_classification.rs:2406</code>) pins the classification and that the predicate holds exactly these two syscalls.</li>
-</ul>
-<p>Why <code>refuse</code> and not the alternatives:</p>
-<ul>
-<li><code>passthrough</code> would let the guest change the host-enforced label of a traced thread, with host-dependent results; the legacy 2026-07-24 note below found the call passed through without crashing, but that is not a determinism argument.</li>
-<li><code>emulate</code> (accept and pretend) would report a label change the host kernel does not make, so later permission checks would contradict what the guest was told.</li>
-<li><code>model</code> would need a virtual LSM, which Detcore does not have and the owner has not asked for.</li>
-<li><code>ENOSYS</code> is what a kernel older than 6.8 returns, so callers that support older kernels keep their existing path (the classic <code>/proc/self/attr/&lt;name&gt;</code> write interface).</li>
-</ul>
-<p>Remaining gap, not in this syscall's arm: that <code>/proc/self/attr/&lt;name&gt;</code> write interface performs the same label changes. No code under <code>detcore/src</code> or <code>hermit-cli/src</code> at this SHA mentions <code>/attr/</code>, so a guest can presumably still change its host label through <code>/proc</code>; this body records that as a follow-up, not as part of this syscall's policy.</p>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F1, F8): <code>lsm_set_self_attr(LSM_ATTR_CURRENT, NULL, 0, 0)</code> returns -1 with <code>errno == ENOSYS</code> under <code>hermit run --strict --verify --panic-on-unsupported-syscalls</code> on ptrace, where Linux would return <code>EINVAL</code>. Existing: <code>tests/c/lsm_set_self_attr_enosys.c</code>, run by <code>host_security_identity_probes_fall_back_deterministically</code> at <code>hermit-cli/tests/host_security_identity.rs:30</code> (ptrace only, <code>hermit-cli/tests/host_security_identity.rs:68</code>) and by the manifest cell <code>c-programs/lsm-set-self-attr-enosys</code> (<code>tests/e2e/manifests/c-programs.yaml:3253</code>, verify mode with <code>ci: ptrace: true</code>).</li>
-<li>T2 (covers F2, F3, F4, F5, F6, F7, F9, F10, F11): sweep the arguments with a raw <code>syscall()</code> and a well-formed <code>struct lsm_ctx</code>: every <code>LSM_ATTR_*</code> value, <code>LSM_ATTR_UNDEF</code>, an undefined attr, <code>ctx-&gt;id</code> set to <code>LSM_ID_SELINUX</code>, <code>LSM_ID_APPARMOR</code> and an unused id, <code>flags = 1</code>, a <code>ctx</code> pointer of <code>(void *)1</code>, and a context string the host policy would reject. Every call must return <code>ENOSYS</code>. Run under <code>hermit run --verify</code> on ptrace, with and without <code>--strict</code>.</li>
-<li>T3 (covers F1, F3): after the refused call, the guest reads <code>/proc/self/attr/current</code> and creates a file whose label it reads back with <code>getxattr(&quot;security.selinux&quot;)</code> or equivalent; the label must equal the one read before the call, showing the refusal had no host side effect.</li>
-<li>T4 (covers F1): under <code>hermit record</code> and then <code>hermit replay</code> on ptrace, a guest calling <code>lsm_set_self_attr(LSM_ATTR_CURRENT, ...)</code> sees <code>ENOSYS</code> in both runs and replay does not diverge.</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+lsm_set_self_attr&amp;body=Discussion+for+the+%60lsm_set_self_attr%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Flsm_set_self_attr.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60lsm_set_self_attr%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `lsm_set_self_attr`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-09-28 · hermit 81ca8822f78c · hermit2 · closed under the legacy rule (an explicit <code>classify_syscall</code> arm), not the v1 done rule; closing comment https://github.com/rrnewton/hermit/issues/279#issuecomment-5872815172</li>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/279: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy NEEDS-INVESTIGATION; code at this SHA: determinized, dispatch pred:is_host_security_identity_probe_syscall, refused.</li>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · reopen: under the owner rule of 2026-10-02, closed means every flag and option is covered by a named test and the implementation works; lsm_set_self_attr records no test coverage, so tracking_status is todo and https://github.com/rrnewton/hermit/issues/279 reopens.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; refuse (detcore/src/lib.rs:2149-2153 returns ENOSYS for every argument in every mode, the pre-6.8 answer, and never changes the host label); linux_determinism stays conditional; 11 flag behaviours and 4 tests listed; T2-T4 do not exist yet and nothing was run, so tracking_status stays todo and ptrace_verification untested</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · covered: T1 covered by hermit-cli/tests/host_security_identity.rs and T1 covered by tests/c/lsm_set_self_attr_enosys.c (read at this SHA, not run by this agent; it exercises only LSM_ATTR_CURRENT, NULL ctx, size 0, flags 0)</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+lsm_set_self_attr&amp;amp;body=Discussion+for+the+%60lsm_set_self_attr%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Flsm_set_self_attr.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60lsm_set_self_attr%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `lsm_set_self_attr`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Originally filed 2026-07-24 as &quot;Syscall classification: lsm_set_self_attr&quot; (https://github.com/rrnewton/hermit/issues/279), legacy variant A1.</p>
-<p>Comment history: 1 comment(s) on https://github.com/rrnewton/hermit/issues/279.</p>
-<p>The legacy recommended action was <strong>NEEDS-INVESTIGATION</strong>. The refusal arm landed later under <code>TODO-HUMAN-REVIEW(PR-860)</code> (<code>detcore/src/lib.rs:2146</code>); the companion <code>lsm_get_self_attr</code> is https://github.com/rrnewton/hermit/issues/638, and <code>lsm_list_modules</code> is refused with the same <code>ENOSYS</code> by <code>is_host_kernel_probe_syscall</code> (<code>detcore/src/syscall_classification.rs:1277</code>).</p>
-<p>The inventory row for <code>tests/c/lsm_set_self_attr_enosys.c</code> in <code>tests/e2e/manifests/inventory/test-files.json:857-859</code> describes the program as <code>ci=false</code>, while its verify mode in <code>tests/e2e/manifests/c-programs.yaml:3270-3272</code> sets <code>ci: ptrace: true</code>; the manifest is what runs, so the inventory text looks stale.</p>
-<h3>2026-07-24 host strace evidence</h3>
-<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) by tracing a direct <code>syscall()</code> harness and common programs with <code>strace -f -e trace=lsm_set_self_attr</code>, and by confirming hermit currently routes <code>lsm_set_self_attr</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code> (the harness ran end-to-end under <code>hermit run</code>, exit 0, so passthrough does not crash).</p>
-<p>Observed strace line:</p>
-<pre><code>lsm_set_self_attr(LSM_ATTR_UNDEF, NULL, 0, 0) = -1 EINVAL (Invalid argument)
-</code></pre>
-<hr>
-<p>*Autonomous syscall-classification sweep, batch 3 (ranks 101-150 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
-<h3>Legacy closure</h3>
-<p>Closed 2026-09-28 by the 2026-09-28 sweep, which closed issues whose syscall had an explicit <code>classify_syscall</code> arm. Closing comment: https://github.com/rrnewton/hermit/issues/279#issuecomment-5872815172</p>
 </body></html>

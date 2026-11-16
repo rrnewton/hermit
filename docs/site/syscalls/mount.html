@@ -3,95 +3,18 @@
 <title>mount | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>mount</code> (165)</h1>
-<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_mount_ns_admin_refused_syscall</code> &middot; linux determinism: conditional &middot; target policy: refuse &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+mount&amp;body=Discussion+for+the+%60mount%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fmount.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60mount%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>mount(source, target, fstype, mountflags, data)</code> attaches a filesystem, or bind-mounts, remounts, moves or changes the propagation of an existing mount. Hermit refuses every call with a fixed <code>EPERM</code> and never forwards it to the host (<code>detcore/src/lib.rs:2215-2219</code> at hermit f4055eb9cae4), so the guest's mount table stays the one Hermit's container set up.</p>
-<p>Manual reference: <a href="https://man7.org/linux/man-pages/man2/mount.2.html">mount(2)</a>.</p>
-<h2>Linux semantics</h2>
-<p>The kernel resolves the <code>target</code> path first, so a bad or missing target gives <code>EFAULT</code> or <code>ENOENT</code> before any privilege check. The host probe under Additional information, <code>mount(&quot;&quot;, &quot;&quot;, &quot;&quot;, 0, NULL) = -1 ENOENT</code>, shows this. The caller then needs <code>CAP_SYS_ADMIN</code> in the user namespace that owns its mount namespace, otherwise <code>EPERM</code>. A process that is root in its own user namespace with its own mount namespace, as Hermit's ptrace guest is (<code>detcore/src/syscalls/misc.rs:672</code>), passes that check on Linux.</p>
-<p>Which operation runs is decided by <code>mountflags</code> in a fixed order: <code>MS_REMOUNT</code>, then <code>MS_BIND</code>, then a propagation flag, then <code>MS_MOVE</code>, and otherwise a new mount. The legacy magic value <code>MS_MGC_VAL</code> in the top 16 bits is stripped first.</p>
-<p>Inside a non-initial user namespace, a new mount is allowed only for filesystem types marked mountable there (for example <code>tmpfs</code>, <code>proc</code>, <code>sysfs</code>, <code>devpts</code>, <code>mqueue</code>, <code>overlay</code>, <code>fuse</code>). Mount flags inherited from a more privileged namespace are locked: a remount that tries to clear <code>MS_RDONLY</code>, <code>MS_NOSUID</code>, <code>MS_NODEV</code>, <code>MS_NOEXEC</code> or the atime flags on such a mount fails with <code>EPERM</code>.</p>
-<p>A successful mount changes the mount table of every process in the same mount namespace, appears in <code>/proc/*/mountinfo</code>, and can propagate to peer mounts.</p>
-<h3>Flags and options</h3>
+<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_mount_ns_admin_refused_syscall</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+mount&amp;body=Discussion+for+the+%60mount%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fmount.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60mount%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>mount</code> (165) as determinized-refused via pred:is_mount_ns_admin_refused_syscall dispatch; deterministic refusal: true; run subscription: true; record/replay subscription: true.</p>
 <ul>
-<li>F1: new mount (no operation flag): <code>fstype</code> names the filesystem, <code>source</code> the device or a placeholder, and <code>data</code> a filesystem-specific option string. Unknown <code>fstype</code>: <code>ENODEV</code>. In a non-initial user namespace only user-namespace-mountable types are allowed.</li>
-<li>F2: per-mount flags on a new mount or remount: <code>MS_RDONLY</code>, <code>MS_NOSUID</code>, <code>MS_NODEV</code>, <code>MS_NOEXEC</code>, <code>MS_NOSYMFOLLOW</code>, and the atime family <code>MS_NOATIME</code>, <code>MS_NODIRATIME</code>, <code>MS_RELATIME</code>, <code>MS_STRICTATIME</code>.</li>
-<li>F3: superblock flags: <code>MS_SYNCHRONOUS</code>, <code>MS_DIRSYNC</code>, <code>MS_LAZYTIME</code>, <code>MS_SILENT</code>, <code>MS_I_VERSION</code>, <code>MS_POSIXACL</code>, and <code>MS_MANDLOCK</code> (mandatory locking was removed in Linux 5.15; the flag is ignored with a warning). Kernel-internal bits such as <code>MS_KERNMOUNT</code> and <code>MS_ACTIVE</code> are cleared, and <code>MS_NOUSER</code> gives <code>EINVAL</code>.</li>
-<li>F4: <code>MS_REMOUNT</code>: change the flags and <code>data</code> of an existing mount; with <code>MS_BIND</code>, change only the per-mount flags. Clearing a locked flag gives <code>EPERM</code>; a target that is not a mount point gives <code>EINVAL</code>.</li>
-<li>F5: <code>MS_BIND</code>, optionally with <code>MS_REC</code>: make <code>source</code> visible at <code>target</code>, recursively with <code>MS_REC</code>.</li>
-<li>F6: propagation change: <code>MS_SHARED</code>, <code>MS_PRIVATE</code>, <code>MS_SLAVE</code> or <code>MS_UNBINDABLE</code>, optionally with <code>MS_REC</code>; <code>source</code>, <code>fstype</code> and <code>data</code> are ignored.</li>
-<li>F7: <code>MS_MOVE</code>: move an existing mount from <code>source</code> to <code>target</code>; <code>EINVAL</code> if <code>source</code> is not a mount point.</li>
-<li>F8: <code>MS_MGC_VAL</code> (<code>0xC0ED0000</code>) in the top 16 bits: legacy magic, stripped and otherwise ignored.</li>
-<li>F9: errors: <code>ENOENT</code>, <code>ENOTDIR</code>, <code>ELOOP</code> or <code>EFAULT</code> while resolving the paths (before the privilege check), <code>EPERM</code> without <code>CAP_SYS_ADMIN</code> over the mount namespace, and <code>EBUSY</code>, <code>ENOTBLK</code>, <code>EACCES</code> or <code>EROFS</code> from the filesystem.</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1711</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:7540</code></li>
 </ul>
-<h2>Determinism analysis</h2>
-<p><code>linux_determinism: conditional</code>, kept from the legacy classification. Without privilege the call fails with an error that depends only on the arguments and on the paths, so it repeats. With privilege it succeeds and changes mount-namespace state that every later path lookup by every process in that namespace sees. The result then depends on which filesystems the host kernel provides, on the existing mount table, and on any concurrent mounts. A new superblock also gets host-allocated identity: an anonymous device number (<code>st_dev</code>) from a global allocator, fresh inode numbers, and the mount ID shown in <code>/proc/self/mountinfo</code>. None of these repeat across runs or hosts.</p>
-<h3>Nondeterminism sources</h3>
-<ul>
-<li><code>CAP_SYS_ADMIN</code> over the caller's mount namespace, and the user-namespace layout the host provides</li>
-<li>Filesystem types compiled into or loaded by the host kernel, and the existing mount table and its propagation</li>
-<li>Host-allocated device numbers, inode numbers and mount IDs for each new mount</li>
-<li>Concurrent mounts and unmounts by other processes in the same namespace or its peers</li>
-</ul>
-<h2>Hermit design</h2>
-<p>Target policy: <code>refuse</code>. At hermit f4055eb9cae4 the code already realizes it:</p>
-<ul>
-<li><code>classify_syscall</code> marks <code>mount</code> Determinized in the mount and namespace administration group (<code>detcore/src/syscall_classification.rs:339-369</code>, reviewed under the code tag <code>TODO-HUMAN-REVIEW(#724)</code>, https://github.com/rrnewton/hermit/issues/724). The comment there gives the reason: the container pins the guest's namespaces and mount hierarchy for the whole run.</li>
-<li><code>is_mount_ns_admin_refused_syscall</code> (<code>detcore/src/syscall_classification.rs:939</code>) includes it, and <code>handle_syscall_event</code> returns <code>Err(Errno::EPERM)</code> before the typed match (<code>detcore/src/lib.rs:2215-2219</code>). The arm reads no argument and is not gated by <code>--strict</code>.</li>
-<li>The predicate is part of <code>is_deterministically_refused_syscall</code> (<code>detcore/src/syscall_classification.rs:1324</code>), so <code>code_facts.refused</code> is true.</li>
-<li>The only test is the unit test <code>mount_ns_admin_syscalls_are_determinized_and_consistent</code> (<code>detcore/src/syscall_classification.rs:2666</code>), which checks classification and membership but runs no guest.</li>
-</ul>
-<p>Why <code>refuse</code>:</p>
-<ul>
-<li>Detcore's view of files (inodes, device numbers, the procfs and mountinfo it presents) assumes the mount table Hermit set up at start. A guest mount would bring in host-allocated device and inode numbers and change path resolution behind Detcore's back.</li>
-<li><code>passthrough</code>, the legacy behaviour, would let a guest that is root in its user namespace succeed for <code>tmpfs</code> and bind mounts, with the host-dependent identity listed above.</li>
-<li><code>model</code> (a virtual mount table, for example allowing <code>tmpfs</code> and bind mounts with deterministic device numbers) would serve sandboxing tools, but nothing in the code at this SHA supports it. It remains a possible future target, listed under Open questions.</li>
-</ul>
-<p>Known differences from Linux:</p>
-<ul>
-<li>On Linux the Hermit guest, being root of its own user and mount namespaces, could mount <code>tmpfs</code> or bind-mount a directory. Under Hermit every request fails with <code>EPERM</code>, as for an unprivileged process on a host without user namespaces. Programs that try to mount (sandboxing tools, <code>mount(8)</code>, some test suites) see that error.</li>
-<li><code>capget</code> is passed through (<code>detcore/src/syscall_classification.rs:716</code>, in the PassThrough list that ends at line 804), so the guest may see <code>CAP_SYS_ADMIN</code> in its effective set and still get <code>EPERM</code> from <code>mount</code>.</li>
-<li>Hermit returns <code>EPERM</code> before resolving any path, where Linux returns <code>ENOENT</code>, <code>EFAULT</code> or <code>ENODEV</code> first (F9).</li>
-</ul>
-<p>Target (owner decision 6): keep the fixed <code>EPERM</code>, returned before any argument is read, which is what the code does today (<code>detcore/src/lib.rs:2215-2219</code>). Linux's order is <code>SYSCALL_DEFINE5(mount)</code> in <code>fs/namespace.c</code>: the <code>type</code>, <code>source</code> and <code>data</code> strings are copied in (<code>EFAULT</code>), <code>do_mount</code> resolves <code>target</code> (<code>ENOENT</code>, <code>ENOTDIR</code>, <code>ELOOP</code>, <code>EFAULT</code>), and only then does <code>path_mount</code> check <code>may_mount()</code> (<code>EPERM</code>) before the per-operation work that gives <code>ENODEV</code>, <code>EBUSY</code> or <code>EINVAL</code>. Hermit deliberately does not reproduce the path errors that come before the privilege check, because the call is refused, not emulated. Guests that mount (<code>mount(8)</code>, sandboxing tools, test suites) see the permission error an unprivileged Linux caller gets for an existing target.</p>
-<p>The test helper <code>hermit-cli/tests/common/readonly_proc.rs:12</code> (<code>deny_writable_mounts</code>) installs a seccomp filter that fails flags-zero <code>mount</code> calls with <code>EPERM</code>. It runs in the test's own child before Hermit starts (<code>hermit-cli/tests/cli.rs:1283</code>, <code>hermit-cli/tests/procfs_determinism.rs:1194</code>), to force Hermit's container setup onto its read-only <code>/proc</code> fallback. It does not exercise a guest <code>mount</code>.</p>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F1, F2, F3, F8): under <code>hermit run --verify</code> on ptrace, a guest calls <code>syscall(SYS_mount, ...)</code> to mount <code>tmpfs</code> on a directory it created, once with flags 0, once with <code>MS_NOSUID|MS_NODEV|MS_NOEXEC|MS_RDONLY|MS_NOATIME</code>, once with <code>MS_SYNCHRONOUS|MS_LAZYTIME</code>, and once with <code>MS_MGC_VAL</code> in the top bits. Each call must return -1 with <code>EPERM</code>. <code>/proc/self/mountinfo</code> read before and after must be identical, and a file the guest wrote in the directory must still be there.</li>
-<li>T2 (covers F4, F5, F6, F7): the same guest tries <code>MS_REMOUNT|MS_RDONLY</code> on <code>/</code>, <code>MS_REMOUNT|MS_BIND|MS_RDONLY</code> on its directory, <code>MS_BIND|MS_REC</code> of a directory onto another, <code>MS_PRIVATE|MS_REC</code> on <code>/</code>, and <code>MS_MOVE</code>. Each returns <code>EPERM</code>, and <code>/proc/self/mountinfo</code> is unchanged.</li>
-<li>T3 (covers F9): a missing target, <code>target = (char *)-1</code>, and an unknown <code>fstype</code> each return the fixed <code>EPERM</code> of owner decision 6 (Linux gives <code>ENOENT</code> and <code>EFAULT</code> for the first two to any caller, and <code>ENODEV</code> for the third to a privileged caller), and both <code>--verify</code> runs agree.</li>
-<li>T4 (covers F1, F5): <code>hermit record</code> then <code>hermit replay</code> a shell guest that runs <code>mount -t tmpfs none &quot;$d&quot;</code> and <code>mount --bind &quot;$d&quot; &quot;$e&quot;</code> (util-linux) and prints their exit status and stderr. Both runs must report the permission error identically, and replay must match the recording.</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+mount&amp;body=Discussion+for+the+%60mount%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fmount.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60mount%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `mount`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-09-28 · hermit 81ca8822f78c · hermit2 · closed under the legacy rule (an explicit <code>classify_syscall</code> arm), not the v1 done rule; closing comment https://github.com/rrnewton/hermit/issues/294#issuecomment-5872848511</li>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/294: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy NEEDS-INVESTIGATION; code at this SHA: determinized, dispatch pred:is_mount_ns_admin_refused_syscall, refused.</li>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · reopen: under the owner rule of 2026-10-02, closed means every flag and option is covered by a named test and the implementation works; mount records no test coverage, so tracking_status is todo and https://github.com/rrnewton/hermit/issues/294 reopens.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; refuse (Detcore returns a fixed EPERM at detcore/src/lib.rs:2215 for every mount request, never forwarded); linux_determinism stays conditional; 9 flag behaviours and 4 tests listed; no coverage token because no test runs a guest that calls mount (hermit-cli/tests/common/readonly_proc.rs filters Hermit's own setup mount, not a guest call), so tracking_status stays todo; open questions on sandboxing tools and errno order under Additional information</li>
-<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): decision 6 applied (fixed EPERM before any argument check stays the target; Linux order in SYSCALL_DEFINE5(mount)/do_mount/path_mount deliberately not reproduced); target_policy stays refuse; T3 now asserts the decision-6 errno; no new F/T ids; open question on checking paths first removed (the private-mount-table scope question stays)</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+mount&amp;amp;body=Discussion+for+the+%60mount%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fmount.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60mount%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `mount`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Originally filed 2026-07-24 as &quot;Syscall classification: mount&quot; (https://github.com/rrnewton/hermit/issues/294), legacy variant A1.</p>
-<p>Comment history: 1 comment(s) on https://github.com/rrnewton/hermit/issues/294.</p>
-<h3>Open questions</h3>
-<ul>
-<li>Should Hermit ever <code>model</code> a private mount table, so sandboxing tools (bubblewrap, the Nix build sandbox, <code>unshare -m</code> scripts) work inside the guest? That needs deterministic device numbers, inode numbers and mount IDs for new mounts, and a mountinfo view that follows them. This is an owner decision about scope.</li>
-</ul>
-<h3>2026-07-24 host strace evidence</h3>
-<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) by tracing a direct <code>syscall()</code> harness and common programs with <code>strace -f -e trace=mount</code>, and by confirming hermit currently routes <code>mount</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code> (the harness ran end-to-end under <code>hermit run</code>, exit 0, so passthrough does not crash).</p>
-<p>Observed strace line:</p>
-<pre><code>mount(&quot;&quot;, &quot;&quot;, &quot;&quot;, 0, NULL)      = -1 ENOENT (No such file or directory)
-</code></pre>
-<hr>
-<p>*Autonomous syscall-classification sweep, batch 3 (ranks 101-150 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
-<p>The pass-through routing described in that evidence was true when it was filed. At hermit f4055eb9cae4 <code>mount</code> is Determinized and refused (see Hermit design).</p>
-<h3>Legacy closure</h3>
-<p>Closed 2026-09-28 by the 2026-09-28 sweep, which closed issues whose syscall had an explicit <code>classify_syscall</code> arm. Closing comment: https://github.com/rrnewton/hermit/issues/294#issuecomment-5872848511</p>
 </body></html>

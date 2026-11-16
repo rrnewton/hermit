@@ -3,107 +3,18 @@
 <title>setns | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>setns</code> (308)</h1>
-<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_mount_ns_admin_refused_syscall</code> &middot; linux determinism: conditional &middot; target policy: refuse &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+setns&amp;body=Discussion+for+the+%60setns%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsetns.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60setns%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>setns(fd, nstype)</code> moves the calling thread into an existing namespace named by a namespace file descriptor (from <code>/proc/&lt;pid&gt;/ns/*</code>), or, since Linux 5.8, into several namespaces of another process at once through a pidfd. Hermit refuses every call with a fixed <code>EPERM</code> and never forwards it to the host (<code>detcore/src/lib.rs:2215-2219</code> at hermit f4055eb9cae4), so the guest stays in the namespaces Hermit's container set up.</p>
-<p>Manual reference: <a href="https://man7.org/linux/man-pages/man2/setns.2.html">setns(2)</a>.</p>
-<h2>Linux semantics</h2>
-<p>The kernel (<code>kernel/nsproxy.c</code>) looks up <code>fd</code> first: a bad descriptor gives <code>EBADF</code>, as both host probes show with <code>setns(-1, 0)</code>. A namespace file is joined as the namespace it names; <code>nstype</code> 0 accepts any kind, and a non-zero <code>nstype</code> must match it, otherwise <code>EINVAL</code>. A pidfd is joined through a mask of <code>CLONE_NEW*</code> bits in <code>nstype</code>, all applied together or none; the mask must be non-zero, and a target that has exited gives <code>ESRCH</code>. Any other kind of descriptor gives <code>EINVAL</code>.</p>
-<p>Joining needs <code>CAP_SYS_ADMIN</code> over the target namespace's owning user namespace, and for most kinds also in the caller's own user namespace, otherwise <code>EPERM</code>. Hermit's ptrace guest is root only of its own user namespace (<code>detcore/src/syscalls/misc.rs:672</code>), so it could join namespaces that namespace owns (for example ones created by its own children) but not the host's.</p>
-<p>Kind-specific rules:</p>
+<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_mount_ns_admin_refused_syscall</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+setns&amp;body=Discussion+for+the+%60setns%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsetns.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60setns%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>setns</code> (308) as determinized-refused via pred:is_mount_ns_admin_refused_syscall dispatch; deterministic refusal: true; run subscription: true; record/replay subscription: true.</p>
 <ul>
-<li>Mount namespace: also needs <code>CAP_SYS_CHROOT</code>; the caller must not share its filesystem context (<code>CLONE_FS</code>) with another process, otherwise <code>EINVAL</code>; root and current directory are reset to the target namespace's root.</li>
-<li>User namespace: the caller must be single-threaded and not share its filesystem context, and cannot re-enter its own current user namespace (<code>EINVAL</code>); it gains full capabilities in the target.</li>
-<li>PID and time namespaces: only children created afterwards are placed in the target.</li>
-<li>Network, UTS, IPC and cgroup namespaces: take effect for the calling thread at once.</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1838</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:7540</code></li>
 </ul>
-<p>The legacy note that this is used by container tooling (<code>nsenter</code>, <code>ip netns exec</code>, container runtimes) holds.</p>
-<h3>Flags and options</h3>
-<ul>
-<li>F1: namespace file descriptor with <code>nstype = 0</code>: join whatever namespace kind <code>fd</code> refers to.</li>
-<li>F2: namespace file descriptor with one <code>CLONE_NEW*</code> value in <code>nstype</code>: join only if the kinds match, otherwise <code>EINVAL</code>.</li>
-<li>F3: pidfd with a non-zero mask of <code>CLONE_NEWUSER</code>, <code>CLONE_NEWNS</code>, <code>CLONE_NEWPID</code>, <code>CLONE_NEWTIME</code>, <code>CLONE_NEWNET</code>, <code>CLONE_NEWUTS</code>, <code>CLONE_NEWIPC</code>, <code>CLONE_NEWCGROUP</code> (Linux 5.8 and later): join that process's namespaces atomically. A zero mask gives <code>EINVAL</code>; an exited target gives <code>ESRCH</code>.</li>
-<li>F4: mount namespace target: needs <code>CAP_SYS_ADMIN</code> and <code>CAP_SYS_CHROOT</code>, an unshared filesystem context, and resets root and current directory.</li>
-<li>F5: user namespace target: single-threaded caller only, cannot rejoin its own namespace, grants full capabilities in the target.</li>
-<li>F6: PID or time namespace target: affects children created afterwards, not the caller.</li>
-<li>F7: network, UTS, IPC or cgroup namespace target: affects the calling thread at once.</li>
-<li>F8: errors: <code>EBADF</code> for a bad descriptor (both host probes), <code>EINVAL</code> for a descriptor that is neither a namespace file nor a pidfd or for a kind mismatch, <code>EPERM</code> without the capabilities, <code>ENOMEM</code>.</li>
-<li>F9: Hermit's refusal (owner decisions 6 and 15): every call returns <code>EPERM</code> before <code>fd</code> or <code>nstype</code> is looked at, and nothing is forwarded to the kernel. The caller's namespaces, root and current directory are unchanged.</li>
-</ul>
-<h2>Determinism analysis</h2>
-<p><code>linux_determinism: conditional</code>, kept from both legacy issues. With a bad descriptor or without privilege it fails with an error that depends only on the arguments, so it repeats; the probes show <code>EBADF</code> with no state change. On success it replaces part of the thread's kernel-visible environment: mount table, network devices, PIDs seen by later children, hostname, IPC objects, cgroup view, clock offsets, credentials. All of that is the contents of a namespace that exists outside the call, so later observations depend on host namespace state and on whoever else is changing it.</p>
-<h3>Nondeterminism sources</h3>
-<ul>
-<li>The identity of the namespace behind the descriptor, and the host namespaces it refers to</li>
-<li>Capabilities, and the ancestry of user namespaces that decides which namespaces the caller may join</li>
-<li>The contents of the joined namespaces (mounts, network configuration, processes, hostname, IPC objects), which other processes may change concurrently</li>
-<li>Thread count and filesystem-context sharing, which decide <code>EINVAL</code> for F4 and F5</li>
-</ul>
-<h2>Hermit design</h2>
-<p>Target policy: <code>refuse</code>. At hermit f4055eb9cae4 the code already realizes it:</p>
-<ul>
-<li><code>classify_syscall</code> marks <code>setns</code> Determinized in the mount and namespace administration group (<code>detcore/src/syscall_classification.rs:339-369</code>, reviewed under the code tag <code>TODO-HUMAN-REVIEW(#724)</code>, https://github.com/rrnewton/hermit/issues/724). The comment there says the container pins the guest's namespaces for the run and that entering a namespace is global kernel state.</li>
-<li><code>is_mount_ns_admin_refused_syscall</code> (<code>detcore/src/syscall_classification.rs:939</code>) includes it, and <code>handle_syscall_event</code> returns <code>Err(Errno::EPERM)</code> before the typed match (<code>detcore/src/lib.rs:2215-2219</code>). The arm reads neither argument and is not gated by <code>--strict</code>.</li>
-<li>The predicate is part of <code>is_deterministically_refused_syscall</code> (<code>detcore/src/syscall_classification.rs:1324</code>), so <code>code_facts.refused</code> is true.</li>
-<li>The only test is the unit test <code>mount_ns_admin_syscalls_are_determinized_and_consistent</code> (<code>detcore/src/syscall_classification.rs:2666</code>), which checks classification and membership and runs no guest.</li>
-</ul>
-<p>Why <code>refuse</code>:</p>
-<ul>
-<li>A joined namespace is external state Detcore does not model: its mount table, network devices, PIDs and IPC objects are whatever exists on the host.</li>
-<li>The guest can obtain pidfds under Hermit (<code>pidfd_open</code> has a handler, <code>detcore/src/lib.rs:2591</code>), so F3 would be reachable if the call were forwarded.</li>
-<li>The duplicate's note that &quot;fd must be virtualized&quot; applies: a <code>model</code> policy would need Detcore to know which namespace each descriptor names, and nothing at this SHA tracks that. With refusal no namespace descriptor is ever acted on.</li>
-<li><code>model</code> would only become meaningful if Hermit also let the guest create namespaces (owner decision 15 keeps it from doing so).</li>
-</ul>
-<p>Known differences from Linux:</p>
-<ul>
-<li>On Linux the guest could join namespaces its own user namespace owns, for example ones a child created. Under Hermit every request fails with <code>EPERM</code>; <code>nsenter(1)</code> and container runtimes see that error.</li>
-<li>Hermit returns <code>EPERM</code> before looking at <code>fd</code>, so the host probe's <code>setns(-1, 0)</code> gives <code>EPERM</code> under Hermit instead of <code>EBADF</code>, and a kind mismatch gives <code>EPERM</code> instead of <code>EINVAL</code> (F8).</li>
-<li><code>clone</code> and <code>clone3</code> pass namespace flags through (<code>detcore/src/syscalls/threads.rs:924</code>), so a guest can still create namespaces for a child but cannot then <code>setns</code> into them. Owner decision 15 closes this: the <code>clone</code> and <code>clone3</code> bodies give <code>CLONE_NEW*</code> <code>EPERM</code> (https://github.com/rrnewton/hermit/issues/3676), so the guest has no namespace of its own making to join.</li>
-</ul>
-<p>Target (owner decisions 6 and 15): today's code is the target. <code>detcore/src/lib.rs:2215-2219</code> returns the one fixed <code>EPERM</code> before reading either argument (F9). Decision 6 keeps that errno ahead of the argument checks Linux makes first in <code>SYSCALL_DEFINE2(setns)</code> (<code>kernel/nsproxy.c</code>): the descriptor lookup (<code>EBADF</code>), then the namespace-file or pidfd test and the <code>nstype</code> checks (<code>EINVAL</code>). Decision 6's exception does not apply, because Linux never lets a caller join a namespace without <code>CAP_SYS_ADMIN</code> over it. Decision 15 names this call among those whose refusal the clone filter protects. Fallback: glibc and language runtimes do not call <code>setns</code>; <code>nsenter(1)</code>, <code>ip netns exec</code> and container runtimes report the <code>EPERM</code>, as they do for an unprivileged user.</p>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F1, F2, F4, F5, F6, F7, F9): under <code>hermit run --verify</code> on ptrace, a guest opens each <code>/proc/self/ns/*</code> entry (<code>mnt</code>, <code>user</code>, <code>pid</code>, <code>time</code>, <code>net</code>, <code>uts</code>, <code>ipc</code>, <code>cgroup</code>) and calls <code>syscall(SYS_setns, fd, 0)</code> and <code>syscall(SYS_setns, fd, &lt;matching CLONE_NEW*&gt;)</code>. Each must return -1 with <code>EPERM</code>, and <code>readlink</code> of every <code>/proc/self/ns/*</code> entry, <code>uname(2)</code> and <code>getcwd(3)</code> give identical results before and after.</li>
-<li>T2 (covers F3): the guest obtains a pidfd for itself with <code>pidfd_open(getpid(), 0)</code> and calls <code>setns(pidfd, CLONE_NEWNET|CLONE_NEWUTS)</code> and <code>setns(pidfd, 0)</code>. Record the results (<code>EPERM</code> for both at f4055eb9cae4, where Linux would give success-or-<code>EPERM</code> and <code>EINVAL</code>) and assert both <code>--verify</code> runs agree.</li>
-<li>T3 (covers F8, F9): <code>setns(-1, 0)</code> (the host probe), and <code>setns</code> on a regular file descriptor. Assert -1 with <code>EPERM</code> for both (Linux gives <code>EBADF</code> and <code>EINVAL</code>; owner decision 6 keeps the fixed errno ahead of the argument checks) and that both runs agree; then <code>hermit record</code> and <code>hermit replay</code> the same guest and require identical output.</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+setns&amp;body=Discussion+for+the+%60setns%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsetns.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60setns%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `setns`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/433: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch pred:is_mount_ns_admin_refused_syscall, refused.</li>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · duplicate https://github.com/rrnewton/hermit/issues/448 is retired into this issue; its text waits under Additional information for a section-by-section merge.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; refuse (Detcore returns a fixed EPERM at detcore/src/lib.rs:2215 for every setns request, never forwarded); linux_determinism stays conditional; duplicate https://github.com/rrnewton/hermit/issues/448 merged (its NEEDS-INVESTIGATION and this issue's NEEDS-HANDLER both resolved as refuse); 8 flag behaviours and 3 tests listed; no coverage token because no test runs a guest that calls setns, so tracking_status stays todo; open questions on errno order and on clone/clone3 namespace flags under Additional information</li>
-<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): decisions 6 and 15 applied (fixed EPERM before the fd lookup stays, no unprivileged exception; the clone side door is closed in the clone and clone3 bodies); target_policy stays refuse; new F9; T1 and T3 now cover F9 and T3 asserts EPERM; removed both open questions (errno order, clone namespace flags) and the Open questions heading</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+setns&amp;amp;body=Discussion+for+the+%60setns%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsetns.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60setns%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `setns`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Originally filed 2026-07-24 as &quot;Syscall classification: setns&quot; (https://github.com/rrnewton/hermit/issues/433), legacy variant A1. Its comment history stays on that issue.</p>
-<p>Merged duplicate: https://github.com/rrnewton/hermit/issues/448, filed 2026-07-24 as &quot;Syscall classification: setns&quot; (legacy variant A1), retired into this issue. Its comment history (0 comments at migration) stays on that issue.</p>
-<h3>Merge notes</h3>
-<ul>
-<li>Both issues classified the call CONDITIONAL; the merged body keeps <code>conditional</code>.</li>
-<li>This issue recommended NEEDS-HANDLER (&quot;must be refused or explicitly modeled&quot;) and the duplicate NEEDS-INVESTIGATION. Both resolve to <code>refuse</code>, which the code at f4055eb9cae4 does.</li>
-<li>The duplicate's facts kept here: the call reassociates the thread with a host namespace, which is host-configuration dependent and usually privileged; it fails deterministically without privilege or with a bad descriptor; the namespace descriptor would have to be virtualized for any model (Hermit design); it is used by container tooling (Linux semantics).</li>
-<li>The duplicate said it &quot;usually requires CAP_SYS_ADMIN&quot;. The merged body is more precise: <code>CAP_SYS_ADMIN</code> over the target's owning user namespace, plus <code>CAP_SYS_CHROOT</code> for mount namespaces (F4).</li>
-<li>Both issues said Hermit routed <code>setns</code> through the UNCLASSIFIED temporary pass-through block (this issue at <code>dd60278f</code>). That was true when filed and is superseded by the refusal at f4055eb9cae4.</li>
-</ul>
-<h3>2026-07-24 host strace evidence (https://github.com/rrnewton/hermit/issues/433)</h3>
-<p>Evidence was gathered on <code>the measurement host</code> (Linux 6.17, x86_64, glibc) with a direct <code>syscall()</code> harness. The probe used safe self-targeting, no-op, temporary-file, or deliberately invalid arguments and was traced with <code>strace -qq -f -e trace=setns</code>. The harness exited 0, and <code>detcore/src/syscall_classification.rs</code> at <code>dd60278f</code> places <code>setns</code> in the UNCLASSIFIED temporary-passthrough block.</p>
-<p>Observed strace line:</p>
-<pre><code>setns(-1, 0)                    = -1 EBADF (Bad file descriptor)
-</code></pre>
-<hr>
-<p>*Autonomous syscall-classification sweep, batch 5 (ranks 201-250 of the unique <code>syscall_classification.rs</code> UNCLASSIFIED list). Manual research plus host strace evidence; no code change proposed here.*</p>
-<h3>2026-07-24 host strace evidence (duplicate https://github.com/rrnewton/hermit/issues/448)</h3>
-<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) with <code>strace -f -e trace=setns</code> on a direct <code>syscall()</code> harness (invoked with non-destructive query/no-op/failing arguments) and, where applicable, on common programs. Hermit then routed <code>setns</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code>.</p>
-<p>Observed strace line:</p>
-<pre><code>setns(-1, 0)                    = -1 EBADF (Bad file descriptor)
-</code></pre>
-<hr>
-<p>*Autonomous syscall-classification sweep (ranks 151-250 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
 </body></html>

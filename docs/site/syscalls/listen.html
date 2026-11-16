@@ -3,78 +3,18 @@
 <title>listen | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>listen</code> (50)</h1>
-<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; linux determinism: conditional &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+listen&amp;body=Discussion+for+the+%60listen%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Flisten.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60listen%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>listen(2)</code> marks a stream socket as passive, so it accepts connections. Detcore forwards it to the kernel unchanged. That is deterministic for a socket that is already bound. On an unbound AF_INET/AF_INET6 socket, the kernel autobinds a port that Detcore's port allocator never sees.</p>
-<h2>Linux semantics</h2>
-<p><code>listen(fd, backlog)</code> moves a bound connection-oriented socket into the listening state and sizes its accept queue. The kernel silently clamps <code>backlog</code> to <code>net.core.somaxconn</code>; the comparison is unsigned, so a negative <code>backlog</code> becomes <code>somaxconn</code>. Calling <code>listen</code> again on a listening socket only changes the backlog. Nothing is copied to or from user memory.</p>
-<p>An unbound AF_INET or AF_INET6 TCP socket is autobound by <code>listen</code> to an ephemeral port from <code>ip_local_port_range</code>, chosen from a random starting offset. An unbound AF_UNIX socket cannot listen (<code>EINVAL</code>).</p>
-<p>Which later connections fit in the accept queue, and when a full queue drops or delays a SYN, depends on how <code>connect</code> and <code>accept</code> interleave. That is a property of those calls; <code>listen</code> only sets the queue size.</p>
-<h3>Flags and options</h3>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+listen&amp;body=Discussion+for+the+%60listen%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Flisten.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60listen%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>listen</code> (50) as determinized via typed dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.</p>
 <ul>
-<li>F1: <code>backlog</code> in <code>1..=somaxconn</code> on a bound TCP, SCTP or AF_UNIX STREAM/SEQPACKET socket: the socket listens with that queue size.</li>
-<li>F2: <code>backlog</code> of 0, negative, or greater than <code>somaxconn</code>: accepted. A negative value or one above the limit is clamped to <code>somaxconn</code>; 0 gives the smallest queue.</li>
-<li>F3: <code>listen</code> on an already listening socket: returns 0 and updates the backlog.</li>
-<li>F4: <code>listen</code> on an unbound AF_INET/AF_INET6 socket: the kernel autobinds an ephemeral port. <code>EADDRINUSE</code> if no port is free.</li>
-<li>F5: <code>listen</code> on an unbound AF_UNIX socket: <code>EINVAL</code>.</li>
-<li>F6: socket type without a listening state (SOCK_DGRAM, SOCK_RAW): <code>EOPNOTSUPP</code>. A TCP socket that is connected or connecting: <code>EINVAL</code>.</li>
-<li>F7: address conflict found at listen time, for example two sockets bound to one port with <code>SO_REUSEADDR</code> but not <code>SO_REUSEPORT</code>: <code>EADDRINUSE</code> on the second <code>listen</code>.</li>
-<li>F8: bad descriptors: <code>EBADF</code> for a closed fd, <code>ENOTSOCK</code> for a non-socket fd.</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1693</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:8044</code></li>
 </ul>
-<h2>Determinism analysis</h2>
-<p><code>linux_determinism: nondeterministic -&gt; conditional</code>. <code>listen</code>'s own result depends only on the socket's state, its arguments and the <code>somaxconn</code> sysctl; it reads no clock and returns no host identity. The one nondeterministic effect is F4: the port the kernel autobinds is randomized and becomes visible through <code>getsockname(2)</code> and through the peer's <code>getpeername(2)</code>. On a socket that was bound first, <code>listen</code> repeats.</p>
-<p>The legacy text blamed &quot;backlog and observable readiness&quot; on peer timing. Accept-queue overflow and readiness belong to <code>connect</code>, <code>accept</code> and the polling calls, and repeat when Hermit schedules every peer. A peer outside the guest is only possible with <code>--network=host</code>.</p>
-<h3>Nondeterminism sources</h3>
-<ul>
-<li>The ephemeral port the kernel chooses when <code>listen</code> autobinds an unbound INET socket (F4)</li>
-<li>The host's <code>net.core.somaxconn</code> and <code>ip_local_port_range</code> sysctls</li>
-<li>Connections from outside the guest, only with <code>--network=host</code></li>
-</ul>
-<h2>Hermit design</h2>
-<p>Target policy: <code>model</code>. The kernel owns the listening state inside the guest's private network namespace, and Detcore must own any port the kernel would choose.</p>
-<p>What the code does now:</p>
-<ul>
-<li>The typed dispatch arm at <code>detcore/src/lib.rs:2559</code> calls <code>handle_listen</code> (<code>detcore/src/syscalls/files.rs:3879</code>), which forwards the call unchanged through <code>record_or_replay</code> (<code>detcore/src/syscalls/files.rs:3884</code>). Both carry an autonomous-bot &quot;needs human review&quot; tag.</li>
-<li><code>listen</code> never blocks, so it needs no nonblocking conversion. Detcore schedules the blocking half, <code>accept</code>, separately.</li>
-<li>Socket descriptors are tracked: <code>get_fd</code> lists <code>Listen</code> among the single-fd syscalls (<code>detcore/src/syscalls/helpers.rs:815</code>).</li>
-<li>By default the guest has its own network namespace with only loopback (<code>hermit-cli/src/bin/hermit/global_opts.rs:53</code>), so no host socket can collide with a guest port (F7) or connect to a guest listener.</li>
-<li>Record mode does not record <code>listen</code>. The recorder injects it live (<code>hermit-cli/src/recorder.rs:648</code>) and the replayer re-executes it (<code>hermit-cli/src/replayer.rs:575</code>). Replay therefore needs the socket to be really bound, which is true because <code>bind</code> is re-executed the same way.</li>
-</ul>
-<p>Why <code>model</code>: code facts rule out <code>passthrough</code> for a determinized syscall. <code>emulate</code> would need a listening-socket model outside the kernel for no gain. <code>refuse</code> would break every server.</p>
-<p>Gap between the code and <code>model</code>:</p>
-<ul>
-<li><strong>Autobind at `listen` bypasses the allocator (F4).</strong> Only <code>handle_bind</code> asks the global allocator for a port (<code>GlobalRequest::RequestPort</code> at <code>detcore/src/syscalls/files.rs:4119</code>; no other caller in <code>detcore/src</code>). <code>handle_listen</code> forwards an unbound INET socket straight to the kernel, which picks a random port. A fix is to detect an unbound AF_INET/AF_INET6 socket and issue a port-0 bind through <code>handle_bind</code>'s allocator path before forwarding <code>listen</code>. Owner decision 12 makes this the target; see below.</li>
-</ul>
-<p><code>linux_determinism</code> becomes <code>conditional</code> because <code>listen</code> repeats exactly when the socket was bound first, which is the common server pattern.</p>
-<p>Target (owner decision 12): every local port the kernel would choose for an unbound AF_INET or AF_INET6 socket comes from Detcore's global port allocator, the one an explicit <code>bind</code> to port 0 already uses. <code>handle_bind</code> requests the port with <code>GlobalRequest::RequestPort</code> (<code>detcore/src/syscalls/files.rs:4119</code> for AF_INET, <code>detcore/src/syscalls/files.rs:4158</code> for AF_INET6); the global tool serves the request at <code>detcore/src/tool_global.rs:1731</code> from the range in the host's <code>ip_local_port_range</code> (<code>detcore/src/tool_global.rs:2783</code>); and <code>release_port_for_open_file</code> (<code>detcore/src/syscalls/files.rs:952</code>) frees the port when the socket's last descriptor closes. An implicit bind, meaning <code>connect</code>, <code>listen</code>, <code>sendto</code>, <code>sendmsg</code> or <code>sendmmsg</code> on an unbound socket, must take its port the same way and bind the socket to it before the call reaches the kernel, so that <code>getsockname</code>, the peer's <code>getpeername</code> and the peer's <code>accept</code> report the same port in every run. Today <code>handle_listen</code> (<code>detcore/src/syscalls/files.rs:3879</code>) forwards an unbound socket to the kernel, which picks the port in <code>inet_csk_get_port</code> from a random offset in that range (F4). How Detcore learns that a socket is unbound is an implementation choice: it can keep a bound flag in its fd table, set when <code>bind</code> or an implicit bind succeeds, or probe with <code>getsockname</code> for port 0 before forwarding.</p>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F1): bind a loopback TCP socket to port 0, <code>listen</code> with a small backlog, then connect and accept several clients under <code>hermit run --verify</code> on ptrace. Existing candidates: <code>tests/c/socket_epoll_ordering.c</code> (<code>listen(srv, NCONN + 1)</code> at line 93; cell <code>c-programs/socket-epoll-ordering</code>, <code>tests/e2e/manifests/c-programs.yaml:13718</code>), <code>tests/c/tcp_info_accept4.c</code> (<code>listen(listener, 1)</code> at line 60; cell at <code>tests/e2e/manifests/c-programs.yaml:9797</code>), and <code>tests/c/record_replay_setsockopt.c</code> (two <code>listen</code> calls at line 62; cell at <code>tests/e2e/manifests/c-programs.yaml:7167</code>), all verify ci on ptrace.</li>
-<li>T2 (covers F2, F3): <code>listen</code> with backlog 0, -1 and <code>INT_MAX</code> each returns 0, and a second <code>listen</code> on a listening socket returns 0. A client can still connect after each.</li>
-<li>T3 (covers F4): <code>listen</code> on an unbound AF_INET socket, then <code>getsockname</code>. The port must be nonzero and identical across <code>--verify</code> runs. This is expected to fail until the gap above is fixed.</li>
-<li>T4 (covers F5, F6, F8): <code>EINVAL</code> for an unbound AF_UNIX stream socket, <code>EOPNOTSUPP</code> for a UDP socket, <code>EINVAL</code> for a connected TCP socket, <code>EBADF</code> for a closed fd, and <code>ENOTSOCK</code> for a pipe.</li>
-<li>T5 (covers F7): two sockets with <code>SO_REUSEADDR</code> bound to one port. The first <code>listen</code> succeeds and the second returns <code>EADDRINUSE</code>.</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+listen&amp;body=Discussion+for+the+%60listen%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Flisten.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60listen%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `listen`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant B of https://github.com/rrnewton/hermit/issues/631: linux_determinism nondeterministic (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch typed.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; model; linux_determinism nondeterministic -&gt; conditional (listen repeats on a bound socket; only the kernel's autobind port at listen is random); F1-F8 inventoried, T1-T5 proposed; gap: autobind at listen bypasses Detcore's port allocator.</li>
-<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): decision 12 applied (Target paragraph: listen on an unbound INET socket takes its port from Detcore's allocator; how to detect an unbound socket is left as an implementation choice); no new F/T ids; removed the open question on routing listen through the allocator</li>
-<li>2026-10-05 · hermit f4055eb9cae4 · syscall-tracking-2 · covered: T1 covered by tests/c/socket_epoll_ordering.c (C08 review of the 2026-10-04 coverage proposals; guest source read at this SHA, not run by this agent)</li>
-</ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+listen&amp;amp;body=Discussion+for+the+%60listen%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Flisten.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60listen%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `listen`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Originally filed 2026-07-24 as &quot;Syscall classification: listen&quot; (https://github.com/rrnewton/hermit/issues/631), legacy variant B.</p>
-<h3>Legacy tracking note (2026-07-24)</h3>
-<p>Filed by the complete syscall-classification audit. The implementation classifies <code>PASS-THRU</code> entries under fixed-container/stable-state assumptions and routes all other entries through the explicit unsupported policy until a deterministic handler is implemented.</p>
-<h3>Open questions</h3>
-<ul>
-<li>Should record mode record <code>listen</code>, or is live re-execution on replay (<code>hermit-cli/src/replayer.rs:575</code>) the intended design?</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
 </body></html>

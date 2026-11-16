@@ -3,129 +3,18 @@
 <title>pwritev | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>pwritev</code> (296)</h1>
-<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; linux determinism: conditional &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+pwritev&amp;body=Discussion+for+the+%60pwritev%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fpwritev.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60pwritev%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>pwritev(fd, iov, iovcnt, pos_l, pos_h)</code> writes several buffers at an explicit file offset, without using or moving the file offset. Detcore has a typed handler (<code>detcore/src/syscalls/files.rs:2779</code>) that:</p>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+pwritev&amp;body=Discussion+for+the+%60pwritev%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fpwritev.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60pwritev%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>pwritev</code> (296) as determinized via typed dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.</p>
 <ul>
-<li>refuses <code>/proc/self/timerslack_ns</code> the way Linux does</li>
-<li>takes a write permit on the file's resource</li>
-<li>sends the write to the kernel</li>
-<li>bumps the file's virtual mtime after a successful non-empty write</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1773</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:7821</code></li>
 </ul>
-<h2>Linux semantics</h2>
-<p><code>do_pwritev</code> checks the arguments in this order:</p>
-<p>1. A negative offset gives <code>EINVAL</code>, before the descriptor is looked up. 2. The descriptor is looked up. A missing descriptor or an <code>O_PATH</code> one gives <code>EBADF</code>. 3. A file without positional-write support gives <code>ESPIPE</code>. That covers pipes, FIFOs, sockets, terminals and <code>seq_file</code> procfs files. 4. <code>vfs_writev</code> checks that the file was opened for writing (<code>EBADF</code> if not), imports the iovec array, and checks the range.</p>
-<p>The write takes the buffers in order. It can extend the file and leave a hole, it updates <code>mtime</code> and <code>ctime</code>, and it returns the number of bytes written. On x86_64 the whole 64-bit offset is <code>pos_l</code>, and <code>pos_h</code> is ignored. The 2026-07-24 host strace under Additional information shows a 3-byte write to a <code>/tmp</code> file returning 3.</p>
-<h3>Flags and options</h3>
-<ul>
-<li>F1: explicit offset: the buffers are written in order starting at <code>offset</code>. The file offset is neither used nor changed.</li>
-<li>F2: offset encoding on x86_64: the 64-bit offset is <code>pos_l</code>, and <code>pos_h</code> is ignored</li>
-<li>F3: negative offset: <code>EINVAL</code>. This is checked before the descriptor lookup, so <code>pwritev(-1, ..., -1)</code> gives <code>EINVAL</code>, not <code>EBADF</code>.</li>
-<li>F4: descriptor not open, or opened with <code>O_PATH</code>: <code>EBADF</code></li>
-<li>F5: descriptor not opened for writing (<code>O_RDONLY</code>): <code>EBADF</code></li>
-<li>F6: the iovec array:</li>
-<li><code>iovcnt</code> is truncated to 32 bits.</li>
-<li><code>iovcnt == 0</code> returns 0 and writes nothing.</li>
-<li><code>iovcnt</code> above <code>IOV_MAX</code> (1024) gives <code>EINVAL</code>.</li>
-<li>An unreadable array or first buffer gives <code>EFAULT</code>.</li>
-<li>A fault in a later buffer, after some bytes were written, returns the short count.</li>
-<li>F7: descriptor that does not support positional writes (pipe, FIFO, socket, terminal): <code>ESPIPE</code></li>
-<li>F8: <code>O_APPEND</code>: on Linux the data is appended at end of file whatever <code>offset</code> says, as pwrite(2) documents under BUGS. A per-call <code>RWF_APPEND</code> exists only in <code>pwritev2</code>.</li>
-<li>F9: growth and overflow:</li>
-<li>Writing past end of file extends it, and the gap reads as zeros.</li>
-<li>A non-empty request with <code>offset + length</code> past <code>INT64_MAX</code> gives <code>EINVAL</code>.</li>
-<li>F16 holds <code>EFBIG</code> past the filesystem's maximum file size.</li>
-<li>F10: <code>RLIMIT_FSIZE</code>: a write that starts at or past the limit raises <code>SIGXFSZ</code> and fails with <code>EFBIG</code>. A write that crosses the limit is cut short at it.</li>
-<li>F11: refusals from seals: <code>EPERM</code> on a memfd sealed with <code>F_SEAL_WRITE</code> or <code>F_SEAL_FUTURE_WRITE</code>, or for growth past the size on one sealed with <code>F_SEAL_GROW</code>. F17 and F18 hold the storage refusals.</li>
-<li>F12: side effects of a successful write: <code>mtime</code> and <code>ctime</code> are updated. Set-user-ID and set-group-ID bits are cleared when the writer lacks <code>CAP_FSETID</code>.</li>
-<li>F13: <code>/proc/self/timerslack_ns</code> and the other <code>seq_file</code> procfs files: <code>ESPIPE</code>, or <code>EINVAL</code> for a negative offset</li>
-<li>F14: <code>O_DIRECT</code> descriptors: the filesystem requires an aligned buffer, length and offset, and gives <code>EINVAL</code> otherwise</li>
-<li>F15: a signal during a slow write can make it return a short count or <code>EINTR</code>. F19 holds FUSE and network filesystems.</li>
-<li>F16: a write past the maximum file size of the host filesystem behind the guest's file: <code>EFBIG</code>.</li>
-<li>F17: <code>ENOSPC</code> when the host filesystem is full, <code>EDQUOT</code> when a host quota is exceeded.</li>
-<li>F18: <code>ETXTBSY</code> on a file the host has activated as swap.</li>
-<li>F19: on FUSE and network filesystems, a write can return a short count or an error that depends on the server and the network.</li>
-</ul>
-<h2>Determinism analysis</h2>
-<p><code>linux_determinism: conditional</code>. For a regular file the count returned and the resulting contents depend only on the arguments, the file's prior contents and size, and the guest's own limits, so the call repeats when nothing outside the guest touches the file. It stops repeating when processes outside the guest write the same file, when the host filesystem runs short of space or quota, or where a slow filesystem returns timing-dependent short counts. Pipes and sockets are not a source here: they give <code>ESPIPE</code> (F7), so the earlier wording that compared this call with ordering on pipes and sockets did not apply.</p>
-<h3>Nondeterminism sources</h3>
-<ul>
-<li>Processes outside the guest writing the same file. They change where <code>O_APPEND</code> writes land (F8) and what later reads see.</li>
-<li>Host free space and quota (F17)</li>
-<li>Short counts and <code>EINTR</code> on slow filesystems (F15, F19)</li>
-<li>Real <code>mtime</code>/<code>ctime</code> values (F12), which Hermit replaces with virtual time when metadata is virtualized</li>
-</ul>
-<h3>Cross-host variation</h3>
-<ul>
-<li>Filesystem type behind the guest's file: its maximum file size decides where <code>EFBIG</code> starts (F16).</li>
-<li>Device logical block size and filesystem <code>O_DIRECT</code> support: which alignments an <code>O_DIRECT</code> write accepts and which give <code>EINVAL</code> (F14).</li>
-<li>Host swap configuration: which files are active swap files and give <code>ETXTBSY</code> (F18).</li>
-</ul>
-<h2>Hermit design</h2>
-<p>Target policy: <code>model</code>. The kernel performs the write, and Detcore orders it against other access to the same file and owns the timestamps the guest sees. What the handler at f4055eb9cae4 does, in order:</p>
-<ul>
-<li>A descriptor bound to timer slack gives <code>EINVAL</code> for a negative offset and <code>ESPIPE</code> otherwise (<code>detcore/src/syscalls/files.rs:2784</code>). That matches Linux for F13: <code>timer_slack_procfs_vector_io_matches_linux</code> asserts both results (<code>detcore/tests/misc/mod.rs:540</code> and <code>detcore/tests/misc/mod.rs:561</code>). The offset is decoded by <code>vectored_offset</code>, which on 64-bit uses <code>pos_l</code> alone (<code>detcore/src/syscalls/files.rs:137</code>), as F2 requires.</li>
-<li>The handler picks a resource: the descriptor's own resource, or else <code>ResourceID::FileContents</code> of the determinized inode (<code>detcore/src/syscalls/files.rs:2800</code>). It takes a write permit on that resource (<code>detcore/src/syscalls/files.rs:2810</code>), so guest readers that take the read permit, such as <code>preadv</code>, are ordered with the write.</li>
-<li>The write goes to the kernel through <code>record_or_replay_preserving_tool_errors</code> (<code>detcore/src/syscalls/files.rs:2815</code>). That gives Linux's own F1, F3 to F11 and F14 to F19.</li>
-<li>With <code>virtualize_metadata</code> on, a write that returns more than 0 calls <code>touch_file</code> (<code>detcore/src/syscalls/files.rs:2819</code>), which asks the global state to advance the file's virtual mtime (<code>detcore/src/tool_global.rs:3763</code>). That gives F12's timestamps in virtual time.</li>
-</ul>
-<p>The handler and its sibling <code>preadv</code> were added by https://github.com/rrnewton/hermit/pull/794, and the code tag <code>TODO-HUMAN-REVIEW(#794)</code> at <code>detcore/src/syscalls/files.rs:2773</code> refers to it. Its doc comment says &quot;Positioned writes target seekable files and do not block&quot; (<code>detcore/src/syscalls/files.rs:2776</code>). That holds for local filesystems, but not for F15.</p>
-<p>Why <code>model</code> and not the alternatives: <code>passthrough</code> would expose real <code>mtime</code> values and skip the resource ordering. <code>emulate</code> would duplicate the filesystem. <code>refuse</code> would break databases and archivers that write with <code>pwritev</code>.</p>
-<p>What remains before the code fully realizes <code>model</code>:</p>
-<ul>
-<li><strong>Error precedence for a bad descriptor with a negative offset (F3).</strong> Unlike <code>preadv</code>, which checks the offset first (<code>detcore/src/syscalls/files.rs:2651</code>), <code>handle_pwritev</code> starts with a descriptor lookup through <code>timer_slack_binding</code> (<code>detcore/src/syscalls/files.rs:2784</code>, which calls <code>with_detfd</code> at <code>detcore/src/syscalls/files.rs:517</code>). Detcore returns <code>EBADF</code> for a descriptor missing from its table (<code>detcore/src/tool_local.rs:740</code>). By this reading of the code, <code>pwritev(-1, iov, 1, -1)</code> gives <code>EBADF</code> under Hermit where Linux gives <code>EINVAL</code>. This is not measured yet; T2 measures it. The fix is to move the negative-offset check ahead of the lookup, as <code>preadv</code> does.</li>
-<li><strong>Mode bits after a write (F12).</strong> <code>touch_file</code> advances only the virtual mtime. This body did not find whether the virtual metadata reflects the kernel clearing set-user-ID and set-group-ID bits after a write. T8 checks it.</li>
-</ul>
-<p><code>linux_determinism</code> stays <code>conditional</code>. Hermit removes the timestamp source and orders writes within the guest. Writers outside the guest and host free space remain.</p>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F1, F2): <code>pwritev</code> of two buffers at an explicit offset returns their total length, overwrites exactly that range, and leaves <code>lseek(fd, 0, SEEK_CUR)</code> unchanged. A raw <code>syscall(SYS_pwritev, ...)</code> with garbage in <code>pos_h</code> writes at the same place. Existing partial coverage: <code>tests/c/vectored_file_io.c:87</code> and <code>tests/c/vectored_file_io.c:89</code> (cell <code>c-programs/vectored-file-io</code>, <code>tests/e2e/manifests/c-programs.yaml:15323</code>, verify ci). It writes <code>&quot;WX&quot;</code> and <code>&quot;YZ&quot;</code> at offset 4, checks the count and the unchanged offset, and reads the result back at line 96. It does not test <code>pos_h</code>.</li>
-<li>T2 (covers F3, F4, F5): check:</li>
-<li><code>pwritev(-1, iov, 1, -1)</code> gives <code>EINVAL</code> (Hermit is expected to give <code>EBADF</code> today)</li>
-<li><code>pwritev(-1, iov, 1, 0)</code> gives <code>EBADF</code></li>
-<li><code>O_RDONLY</code> and <code>O_PATH</code> descriptors give <code>EBADF</code></li>
-<li>T3 (covers F6): on a regular file, check:</li>
-<li><code>iovcnt</code> 0, <code>1UL &lt;&lt; 32</code> and <code>(1UL &lt;&lt; 32) | 1</code> write 0, 0 and one buffer</li>
-<li>1025 and <code>~0UL</code> give <code>EINVAL</code></li>
-<li>an invalid array gives <code>EFAULT</code></li>
-<li>a valid first buffer followed by an invalid second one returns the first buffer's length</li>
-<li>T4 (covers F7): <code>pwritev</code> on a pipe, a FIFO, an <code>AF_UNIX</code> socketpair and a pseudo-terminal gives <code>ESPIPE</code>, and nothing reaches the reader.</li>
-<li>T5 (covers F8): on a file opened with <code>O_APPEND</code>, <code>pwritev</code> at offset 0 appends at end of file. Check the file size and contents.</li>
-<li>T6 (covers F9, F10): a write at <code>size + 4096</code> extends the file, and the gap reads as zeros. A 1-byte write at <code>INT64_MAX</code> gives <code>EINVAL</code>. With <code>SIGXFSZ</code> ignored and <code>RLIMIT_FSIZE</code> set, a write starting at the limit gives <code>EFBIG</code>, and one crossing it returns the short count.</li>
-<li>T7 (covers F11): on a memfd sealed with <code>F_SEAL_WRITE</code>, <code>pwritev</code> gives <code>EPERM</code>. With <code>F_SEAL_GROW</code>, a write inside the current size succeeds and one past it gives <code>EPERM</code>. <code>ENOSPC</code>, <code>EDQUOT</code> and <code>ETXTBSY</code> are not portable in CI; they are F17 and F18, recorded by U1 and U2.</li>
-<li>T8 (covers F12): after <code>pwritev</code>, <code>stat</code> shows a later <code>mtime</code> and <code>ctime</code>, with the same values in every <code>--verify</code> run. A zero-length <code>pwritev</code> leaves them unchanged. For a guest without <code>CAP_FSETID</code>, check that the set-user-ID bit is cleared and that Hermit's <code>stat</code> agrees with the kernel.</li>
-<li>T9 (covers F13): <code>pwritev</code> on <code>/proc/self/timerslack_ns</code> gives <code>EINVAL</code> for offset -1 and <code>ESPIPE</code> for offset 0. Existing candidate: <code>timer_slack_procfs_vector_io_matches_linux</code> at <code>detcore/tests/misc/mod.rs:434</code> (the <code>pwritev</code> checks are at lines 540 and 561).</li>
-<li>T10 (covers F14, F15): on a filesystem that supports <code>O_DIRECT</code>, an unaligned buffer gives <code>EINVAL</code>. Record the filesystem in the output, because this is filesystem-dependent. Short counts on FUSE and network filesystems are not reproducible in CI (F19, recorded by U3), so this test only records the regular-file path.</li>
-<li>U1 (covers F17; host-transient): <code>ENOSPC</code> and <code>EDQUOT</code> depend on the host filesystem's free space and quotas, shared with other processes. Hermit forwards the write to the kernel (<code>detcore/src/syscalls/files.rs:2815</code>) and hands these errors to the guest today. F17 counts toward done only once Hermit hides these errors or reports them as an infrastructure error.</li>
-<li>U2 (covers F16, F18; host-config): the maximum file size of the host filesystem and the host's swap configuration decide <code>EFBIG</code> and <code>ETXTBSY</code>; a container guest can neither choose the filesystem nor activate swap. Hermit forwards the kernel's answer unchanged (<code>detcore/src/syscalls/files.rs:2815</code>).</li>
-<li>U3 (covers F19; host-transient): short counts and errors on FUSE and network filesystems depend on the server and the network. Hermit forwards the write (<code>detcore/src/syscalls/files.rs:2815</code>) and hands the result to the guest today. F19 counts toward done only once Hermit hides these results or reports them as an infrastructure error.</li>
-<li>T11 (covers F1, F12): record a guest that writes a file with <code>pwritev</code> and then reads it back with <code>preadv</code>, and replay it. Replay must give the same output and the same virtual <code>mtime</code>.</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+pwritev&amp;body=Discussion+for+the+%60pwritev%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fpwritev.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60pwritev%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `pwritev`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/388: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch typed.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; model (kernel performs the write under a W permit on the file resource; virtual mtime via touch_file; timerslack_ns refused like Linux); linux_determinism stays conditional; 15 flag behaviours and 11 tests listed; open question: by code reading pwritev(-1, iov, 1, -1) gives EBADF under Hermit where Linux gives EINVAL; no coverage token, so tracking_status stays todo</li>
-<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d12 (owner decisions 1 and 2): cross_host_variant true (filesystem maximum file size, O_DIRECT block size, host swap configuration); F9 narrowed, new F16 EFBIG (host-config U2); F11 narrowed to memfd seals, new F17 ENOSPC/EDQUOT (host-transient U1) and F18 ETXTBSY on swap (host-config U2); F15 narrowed to the signal case, new F19 FUSE and network filesystems (host-transient U3); no open question is answered by these decisions</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+pwritev&amp;amp;body=Discussion+for+the+%60pwritev%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fpwritev.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60pwritev%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `pwritev`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Originally filed 2026-07-24 as &quot;Syscall classification: pwritev&quot; (https://github.com/rrnewton/hermit/issues/388), legacy variant A1.</p>
-<h3>Open questions</h3>
-<ul>
-<li>Error precedence (F3): <code>handle_pwritev</code> looks the descriptor up in Detcore's table (<code>detcore/src/syscalls/files.rs:2784</code>) before it checks the offset, so by this reading <code>pwritev(-1, iov, 1, -1)</code> gives <code>EBADF</code> where Linux gives <code>EINVAL</code>. <code>preadv</code> checks the offset first (<code>detcore/src/syscalls/files.rs:2651</code>). Should the offset check move ahead of the lookup? T2 would measure the current result first.</li>
-<li>Mode bits (F12): does Hermit's virtual metadata track the kernel clearing set-user-ID and set-group-ID bits after a write by a guest without <code>CAP_FSETID</code>? This body did not find the answer in the code.</li>
-</ul>
-<h3>2026-07-24 host strace evidence</h3>
-<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) with <code>strace -f -e trace=pwritev</code> on a direct <code>syscall()</code> harness (invoked with non-destructive query/no-op/failing arguments) and, where applicable, on common programs. Hermit currently routes <code>pwritev</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code>.</p>
-<p>Observed strace line:</p>
-<pre><code>pwritev(4, [{iov_base=&quot;vec&quot;, iov_len=3}], 1, 0) = 3
-</code></pre>
-<hr>
-<p>*Autonomous syscall-classification sweep (ranks 151-250 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
 </body></html>

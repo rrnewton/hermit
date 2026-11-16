@@ -3,83 +3,18 @@
 <title>io_setup | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>io_setup</code> (206)</h1>
-<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_unsupported_async_ipc_syscall</code> &middot; linux determinism: conditional &middot; target policy: refuse &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+io_setup&amp;body=Discussion+for+the+%60io_setup%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fio_setup.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60io_setup%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>io_setup(nr_events, ctx_idp)</code> creates a Linux native AIO context able to hold <code>nr_events</code> in-flight requests and stores its handle in <code>*ctx_idp</code>. Hermit refuses it: Detcore returns a fixed <code>ENOSYS</code> without forwarding the call (<code>detcore/src/lib.rs:2237-2241</code>), as on a kernel built without <code>CONFIG_AIO</code>.</p>
-<p>Manual reference: Linux man-pages io_setup(2).</p>
-<h2>Linux semantics</h2>
-<p>On success the kernel maps a completion ring into the caller's address space and returns the ring's user-space address as the context handle (<code>aio_context_t</code>). The address is chosen by the kernel's mmap placement. The kernel raises the requested capacity to at least four events per possible CPU and then doubles it; the ring header, readable in guest memory, records that capacity. Every context counts against a host-wide budget: <code>/proc/sys/fs/aio-nr</code> must stay within <code>/proc/sys/fs/aio-max-nr</code>.</p>
-<p>A context is a kernel object owned by the caller's address space (its <code>mm</code>), not by a file descriptor. A forked child does not inherit it: the child's lookup fails with <code>EINVAL</code>. All contexts are destroyed when the address space goes away, at exit or <code>execve</code>. A kernel built without <code>CONFIG_AIO</code> returns <code>ENOSYS</code> for every <code>io_*</code> call.</p>
-<h3>Flags and options</h3>
+<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_unsupported_async_ipc_syscall</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+io_setup&amp;body=Discussion+for+the+%60io_setup%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fio_setup.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60io_setup%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>io_setup</code> (206) as determinized-refused via pred:is_unsupported_async_ipc_syscall dispatch; deterministic refusal: true; run subscription: true; record/replay subscription: true.</p>
 <ul>
-<li>F1: success: <code>nr_events &gt; 0</code> and <code>*ctx_idp == 0</code> on entry. The kernel creates the context and its ring mapping and stores the ring address in <code>*ctx_idp</code>. The capacity is raised to at least 4 per possible CPU, then doubled.</li>
-<li>F2: <code>*ctx_idp</code> not zero on entry: <code>EINVAL</code></li>
-<li>F3: <code>nr_events == 0</code>, or so large that the doubled capacity overflows the kernel's limit: <code>EINVAL</code></li>
-<li>F4: <code>nr_events</code> (the requested value, not the raised capacity) exceeds <code>/proc/sys/fs/aio-max-nr</code>, or would push the host-wide <code>/proc/sys/fs/aio-nr</code> past it: <code>EAGAIN</code></li>
-<li>F5: <code>ctx_idp</code> not readable or not writable: <code>EFAULT</code>. If the handle cannot be stored, the new context is torn down.</li>
-<li>F6: kernel without <code>CONFIG_AIO</code>: <code>ENOSYS</code>. Kernel memory exhausted: <code>ENOMEM</code>.</li>
-<li>F7: lifetime: the context belongs to the address space; a forked child cannot use it (<code>EINVAL</code>), and exit or <code>execve</code> destroys it</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1671</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:7563</code></li>
 </ul>
-<h2>Determinism analysis</h2>
-<p><code>linux_determinism: conditional</code>, kept from the legacy classification. The error paths (F2, F3, F5) depend only on the arguments. A successful call does not repeat across hosts and often not across runs:</p>
-<ul>
-<li>the handle is a kernel-chosen mmap address, so it changes with address-space randomization and with every other mapping in the process;</li>
-<li><code>EAGAIN</code> depends on the host-wide <code>aio-nr</code>, which other processes on the host raise and lower;</li>
-<li>the ring capacity depends on the host's possible-CPU count.</li>
-</ul>
-<p>The call repeats when address layout is fixed, the host budget is not contended, and the CPU count is the same.</p>
-<h3>Nondeterminism sources</h3>
-<ul>
-<li>The mmap placement of the ring, which is the handle value</li>
-<li>The host-wide <code>aio-nr</code> budget, shared with every process on the host</li>
-<li>The host's possible-CPU count, visible through the ring capacity</li>
-<li>A new mapping (<code>[aio]</code>) in <code>/proc/self/maps</code></li>
-</ul>
-<h2>Hermit design</h2>
-<p>Target (owner decision 9, 6): <code>refuse</code> with a fixed <code>ENOSYS</code>, the answer of a kernel built without <code>CONFIG_AIO</code>, returned before any argument is examined, so a well-formed call and a garbage-argument call get the same <code>ENOSYS</code>. No unprivileged success case needs preserving, so decision 6's exceptions do not apply. The supportable fallback is synchronous or thread-based I/O: glibc's POSIX AIO (<code>aio_read</code>, <code>aio_write</code>) runs requests on user-space threads and never calls the native AIO syscalls, and callers of native AIO such as MySQL InnoDB switch to their own simulated AIO when <code>io_setup</code> fails (recalled, not re-checked in the InnoDB source for this body). Today's code already realizes the target (<code>detcore/src/lib.rs:2237-2241</code>), so no code change is needed:</p>
-<ul>
-<li><code>classify_syscall</code> lists <code>io_setup</code> as Determinized (<code>detcore/src/syscall_classification.rs:403</code>, in the arm that ends at <code>detcore/src/syscall_classification.rs:688</code>).</li>
-<li><code>is_unsupported_async_ipc_syscall</code> (<code>detcore/src/syscall_classification.rs:1051</code>) names it at <code>detcore/src/syscall_classification.rs:1054</code>.</li>
-<li>The guard arm in <code>handle_syscall_event</code> (<code>detcore/src/lib.rs:2237-2241</code>) returns <code>Err(Error::Errno(Errno::ENOSYS))</code> for every syscall that predicate names. The arm never injects the call, so the host kernel never sees it, whatever the arguments are, and no argument is validated first.</li>
-<li>The arm does not consult <code>panic_on_unsupported_syscalls</code>, so fail-closed mode and the compatibility opt-out return the same <code>ENOSYS</code> (<code>refused_only_when_fail_closed: false</code>).</li>
-<li><code>is_deterministically_refused_syscall</code> includes the predicate (<code>detcore/src/syscall_classification.rs:1325</code>), so backends that consult that boundary see the same refusal.</li>
-<li>The unit test <code>representative_policies_stay_in_their_reviewed_sections</code> (<code>detcore/src/syscall_classification.rs:1899</code>, batch-7 loop at <code>detcore/src/syscall_classification.rs:2139-2171</code>) asserts the classification and the predicate membership. It does not launch Hermit, so it is not coverage for the flags below.</li>
-</ul>
-<p>The doc comment (<code>detcore/src/syscall_classification.rs:1034-1047</code>) gives the reason: Linux native AIO completion is driven by the kernel and the device, outside the guest's logical time. Forwarding these calls, as the legacy pass-through did, is nondeterministic and a container-isolation hole. <code>ENOSYS</code> is exactly what a kernel built without <code>CONFIG_AIO</code> returns, so a guest sees a consistent, if smaller, kernel.</p>
-<p>Why <code>refuse</code> and not the alternatives:</p>
-<ul>
-<li><code>io_setup</code> creates every context. Refusing it means no guest ever holds a valid context, and the refusals of <code>io_submit</code>, <code>io_getevents</code>, <code>io_cancel</code> and <code>io_destroy</code> keep a guessed handle from reaching the host. Programs that probe <code>io_setup</code> and fall back to synchronous or thread-based I/O on failure keep working; programs that require native AIO fail with a clear <code>ENOSYS</code>.</li>
-<li><code>model</code> would need Detcore-owned contexts at a deterministic address, every request executed at a deterministic point (for example synchronously inside <code>io_submit</code>), completions queued in a deterministic order, and <code>io_getevents</code> waits and timeouts owned by the scheduler and virtual time. None of that exists at this SHA. It stays a possible later upgrade if a workload needs this interface; it is not today's target.</li>
-<li><code>emulate</code> (for example, returning success without doing anything) would silently lose data or hand back invented state, which is worse than a clear <code>ENOSYS</code>.</li>
-<li><code>passthrough</code> reintroduces the host-dependent behaviour described under Determinism analysis, and the isolation hole.</li>
-</ul>
-<p>Under <code>refuse</code>, every behaviour in <code>### Flags and options</code> is replaced by the same <code>-1</code>/<code>ENOSYS</code> with no side effect. The flags inventory still lists the Linux behaviours, because a test of the refusal must show that no argument shape gets past it, and because a later <code>model</code> would have to implement them.</p>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F1, F2, F3, F4, F6): under <code>hermit run --verify</code> on ptrace, call raw <code>syscall(SYS_io_setup, ...)</code> with one argument shape per flag: 128 events with <code>ctx == 0</code>, a nonzero <code>ctx</code>, 0 events, and <code>0xffffffff</code> events. Every call must return -1 with <code>errno == ENOSYS</code>, and both runs must print the same output. Existing candidate: <code>tests/c/aio_refusal.c</code> (cell <code>c-programs/aio-refusal</code>, <code>tests/e2e/manifests/c-programs.yaml:10929</code>, verify mode with ci on ptrace). It calls only the first shape (<code>tests/c/aio_refusal.c:34</code>).</li>
-<li>T2 (covers F1, F5, F7): the refusal has no side effect. <code>*ctx_idp</code> stays 0 (<code>tests/c/aio_refusal.c:48</code> checks this), no <code>[aio]</code> mapping appears in <code>/proc/self/maps</code>, a <code>NULL</code> <code>ctx_idp</code> gives <code>ENOSYS</code> and not <code>EFAULT</code> (the refusal comes before argument validation), and a forked child gets the same <code>ENOSYS</code>.</li>
-<li>T3 (covers none): the same <code>ENOSYS</code> in fail-closed mode and under the compatibility opt-out, and a record followed by a replay reproduces it.</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+io_setup&amp;body=Discussion+for+the+%60io_setup%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fio_setup.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60io_setup%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `io_setup`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant B of https://github.com/rrnewton/hermit/issues/615: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch pred:is_unsupported_async_ipc_syscall, refused.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy refuse (detcore/src/lib.rs:2237-2241 returns a fixed ENOSYS for the native AIO family without forwarding, so no guest ever holds a context); linux_determinism stays conditional; 7 flag behaviours and 3 tests listed; tests/c/aio_refusal.c (cell c-programs/aio-refusal) is a candidate for T1/T2 but exercises one argument shape, so no coverage token yet and tracking_status stays todo</li>
-<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): decisions 9 and 6 applied (fixed ENOSYS, as without CONFIG_AIO, before any argument check, already realized at detcore/src/lib.rs:2237-2241); target_policy stays refuse; no new F/T ids; no open questions to remove</li>
-</ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+io_setup&amp;amp;body=Discussion+for+the+%60io_setup%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fio_setup.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60io_setup%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `io_setup`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Originally filed 2026-07-24 as &quot;Syscall classification: io_setup&quot; (https://github.com/rrnewton/hermit/issues/615), legacy variant B.</p>
-<h3>Legacy tracking note (2026-07-24)</h3>
-<p>Filed by the complete syscall-classification audit. The implementation classifies <code>PASS-THRU</code> entries under fixed-container/stable-state assumptions and routes all other entries through the explicit unsupported policy until a deterministic handler is implemented.</p>
-<h3>P3 review notes (2026-10-03, hermit f4055eb9cae4)</h3>
-<ul>
-<li>The legacy recommended action <strong>NEEDS-HANDLER</strong> predates the deterministic <code>ENOSYS</code> refusal whose code is tagged <code>TODO-HUMAN-REVIEW(#731)</code> (https://github.com/rrnewton/hermit/issues/731). At this SHA the native AIO family is refused by <code>is_unsupported_async_ipc_syscall</code>, so the target is <code>refuse</code>, not a new handler.</li>
-<li>A later upgrade to <code>model</code> remains possible if a workload needs this interface; Hermit design lists what it would need.</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
 </body></html>

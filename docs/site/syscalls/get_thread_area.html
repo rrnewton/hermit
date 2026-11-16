@@ -3,66 +3,17 @@
 <title>get_thread_area | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>get_thread_area</code> (211)</h1>
-<p>Strategy: <strong>passthrough</strong> &middot; dispatch: <code>passthrough</code> &middot; linux determinism: deterministic &middot; target policy: passthrough &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+get_thread_area&amp;body=Discussion+for+the+%60get_thread_area%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fget_thread_area.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60get_thread_area%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>get_thread_area(u_info)</code> reads back one of the calling thread's thread-local-storage (TLS) segment descriptors, an interface of the 32-bit x86 ABI. On native x86_64, syscall 211 is not implemented and always returns <code>ENOSYS</code>. Hermit forwards it to the host kernel unchanged.</p>
-<h2>Linux semantics</h2>
-<p>The 64-bit syscall table maps number 211 to <code>sys_ni_syscall</code>, which returns <code>-ENOSYS</code> without reading or writing any argument. The host's generated table (<code>arch/x86/include/generated/asm/syscalls_64.h</code> for Linux 7.1.3) has <code>__SYSCALL(211, sys_ni_syscall)</code>. The real <code>sys_get_thread_area</code> is reachable only through the 32-bit table, as i386 number 244 (<code>__SYSCALL(244, sys_get_thread_area)</code> in <code>syscalls_32.h</code>). There it takes <code>entry_number</code> from the caller's <code>struct user_desc</code> and fills in the rest from the thread's TLS slot. That is a different syscall number; on the 32-bit table, number 211 is <code>getresgid</code>. For the x86_64 Sysno tracked here, the result is <code>-ENOSYS</code> whatever the argument holds, and the caller's buffer is left unchanged.</p>
-<h3>Flags and options</h3>
+<p>Strategy: <strong>passthrough</strong> &middot; dispatch: <code>passthrough</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+get_thread_area&amp;body=Discussion+for+the+%60get_thread_area%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fget_thread_area.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60get_thread_area%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>get_thread_area</code> (211) as passthrough via passthrough dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: false.</p>
 <ul>
-<li>F1: any <code>u_info</code> that points at a <code>struct user_desc</code>, whatever its <code>entry_number</code> (a valid TLS slot index, an out-of-range index or -1): <code>ENOSYS</code>. The structure is neither read nor written.</li>
-<li>F2: <code>u_info</code> is NULL or points outside the address space: still <code>ENOSYS</code>, not <code>EFAULT</code>, because the argument is never dereferenced</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1950</code></li>
 </ul>
-<h2>Determinism analysis</h2>
-<p>On native x86_64 the call has no inputs that matter: <code>sys_ni_syscall</code> ignores its arguments and touches no state, so every invocation returns <code>-ENOSYS</code> and writes nothing to guest memory. The call repeats on every x86_64 host kernel whose 64-bit table leaves 211 unimplemented, which is every kernel the evidence covers (6.17 and 7.1). On the 32-bit ABI the call would return the thread's descriptor, a function of earlier <code>set_thread_area</code> calls, but that is i386 number 244, not this Sysno.</p>
-<h3>Nondeterminism sources</h3>
-<ul>
-<li>None for native x86_64 callers: the entry is an unconditional <code>ENOSYS</code>.</li>
-<li>Outside this Sysno: a 32-bit-ABI entry (<code>int $0x80</code> with i386 number 244) would read the thread's TLS descriptors. See the open question about how the ptrace backend numbers such entries.</li>
-</ul>
-<h2>Hermit design</h2>
-<p>Target policy: <code>passthrough</code>. The code already does this. <code>get_thread_area</code> is classified <code>PassThrough</code> at <code>detcore/src/syscall_classification.rs:813</code>, in the issue-reviewed pass-through block whose comment at <code>detcore/src/syscall_classification.rs:806</code> says every matching classification issue recommends PASS-THRU. The generic arm at <code>detcore/src/lib.rs:2843</code> forwards it, and the host kernel returns <code>ENOSYS</code>. The unit test <code>representative_policies_stay_in_their_reviewed_sections</code> (<code>detcore/src/syscall_classification.rs:1899</code>; <code>get_thread_area</code> at line 2102) pins the classification, not guest behaviour.</p>
-<p>Why passthrough:</p>
-<ul>
-<li>Forwarding gives the guest exactly what a native x86_64 process gets, a fixed <code>ENOSYS</code> with no memory write. There is nothing to model.</li>
-<li>64-bit TLS goes through <code>arch_prctl</code>, which Detcore determinizes (<code>detcore/src/syscall_classification.rs:59</code>).</li>
-<li>Alternative not taken: the fixed-<code>ENOSYS</code> refusal set <code>is_unimplemented_enosys_syscall</code> (<code>detcore/src/syscall_classification.rs:855</code>, applied at <code>detcore/src/lib.rs:2091</code>) covers syscalls &quot;the pinned modern x86_64 kernel leaves unimplemented&quot;, which describes <code>get_thread_area</code>, but it is not in that set. Moving it would make the <code>ENOSYS</code> independent of the host kernel without changing today's guest-visible result. That is a code change and is left as an open question.</li>
-</ul>
-<p>Code facts show <code>subscribed_record_replay: false</code>: Detcore's <code>--passthru-opt</code> subscription leaves it out, so in that mode the call never reaches Detcore.</p>
-<p>No test calls <code>SYS_get_thread_area</code> (<code>tests_naming</code> is 0).</p>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F1): under <code>hermit run --verify</code> on ptrace, fill a <code>struct user_desc</code> with a sentinel byte pattern and <code>entry_number</code> set to 12 (<code>GDT_ENTRY_TLS_MIN</code> on an x86_64 kernel), then to 0 and to -1. Call raw <code>syscall(SYS_get_thread_area, &amp;desc)</code> each time. Assert <code>-1</code>/<code>ENOSYS</code> and that every byte of <code>desc</code> still holds the sentinel.</li>
-<li>T2 (covers F2): call it with <code>NULL</code> and with <code>(void *)1</code> and assert <code>ENOSYS</code>, not <code>EFAULT</code>.</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+get_thread_area&amp;body=Discussion+for+the+%60get_thread_area%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fget_thread_area.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60get_thread_area%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `get_thread_area`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A2 of https://github.com/rrnewton/hermit/issues/372: linux_determinism deterministic (from <strong>Classification:</strong>); target_policy from legacy PASS-THRU; code at this SHA: passthrough, dispatch passthrough.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: kept deterministic/passthrough (x86_64 nr 211 is sys_ni_syscall; forwarded at detcore/src/lib.rs:2843); 2 flags, 2 tests; open questions on the ENOSYS refusal set and int 0x80 numbering; tracking_status stays todo</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+get_thread_area&amp;amp;body=Discussion+for+the+%60get_thread_area%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fget_thread_area.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60get_thread_area%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `get_thread_area`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Originally filed 2026-07-24 as &quot;Syscall classification: get_thread_area&quot; (https://github.com/rrnewton/hermit/issues/372), legacy variant A2. The legacy body ranked it 93rd in the batch-2 classification sequence, after excluding the 50 workload-observed batch-1 syscalls. Manual reference: Linux man-pages get_thread_area(2).</p>
-<h3>Open questions</h3>
-<ul>
-<li>Should <code>get_thread_area</code> (and <code>set_thread_area</code>) join <code>is_unimplemented_enosys_syscall</code> (<code>detcore/src/syscall_classification.rs:855</code>), so that the <code>ENOSYS</code> is Detcore's and not the host kernel's? Today's guest-visible result is the same. This body keeps <code>passthrough</code> until the owner or the classification reviewer decides.</li>
-<li>Detcore classifies by x86_64 Sysno. A 64-bit guest can execute <code>int $0x80</code> and reach the 32-bit table, where 244 is the real <code>get_thread_area</code> and 211 is <code>getresgid</code>. The ptrace backend lives in Reverie, which is not in the exported tree, so this body cannot say whether such an entry is reported under its i386 number with an ABI marker or misread as the x86_64 syscall with the same number.</li>
-</ul>
-<h3>2026-10-03 host probe</h3>
-<p>Run by syscall-tracking-p3 on the measurement host (Linux 7.1.3): raw <code>syscall(211, NULL)</code> returned <code>ENOSYS</code>. The host's generated tables show <code>__SYSCALL(211, sys_ni_syscall)</code> in <code>syscalls_64.h</code>, and <code>__SYSCALL(244, sys_get_thread_area)</code> and <code>__SYSCALL(211, sys_getresgid)</code> in <code>syscalls_32.h</code>. This was the host, not Hermit.</p>
-<h3>2026-07-24 host strace evidence</h3>
-<p>Test host: Linux 6.17.13 x86_64; strace 6.12.</p>
-<p>Ran a syscall-specific safe raw probe with deliberately inert/invalid arguments so privileged or mutating operations could not change host state:</p>
-<pre><code>strace -f -qq -e trace=get_thread_area -s 160 python3 -c 'import ctypes; c=ctypes.CDLL(None,use_errno=True); c.syscall(211, *([ctypes.c_long(-1)]*6))'
-</code></pre>
-<p>Actual strace output:</p>
-<pre><code>get_thread_area(0xffffffffffffffff) = -1 ENOSYS (Function not implemented)
-</code></pre>
-<p>The trace confirms the host kernel path and observed errno/result for this ABI. The determinism recommendation also accounts for documented success-path state dependencies; an invalid-argument result alone is not treated as proof of determinism.</p>
 </body></html>

@@ -3,93 +3,18 @@
 <title>statmount | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>statmount</code> (457)</h1>
-<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_mount_introspection_enosys_syscall</code> &middot; linux determinism: nondeterministic &middot; target policy: refuse &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+statmount&amp;body=Discussion+for+the+%60statmount%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fstatmount.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60statmount%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>statmount(req, buf, bufsize, flags)</code> (Linux 6.8 and later) returns attributes and strings of one mount, named by its 64-bit unique mount id, for the fields selected in a request mask. Hermit refuses it: Detcore answers every call with <code>ENOSYS</code> before looking at the arguments and never calls the kernel (<code>detcore/src/lib.rs:2110-2114</code> at hermit f4055eb9cae4), which is what a pre-6.8 kernel returns and sends callers to <code>/proc/self/mountinfo</code>, a file Hermit sanitizes.</p>
-<p>Manual reference: Linux man-pages statmount(2).</p>
-<h2>Linux semantics</h2>
-<p><code>statmount</code> and its companion <code>listmount</code> replace parsing <code>/proc/self/mountinfo</code>. The caller passes a <code>struct mnt_id_req</code> (<code>size</code>, <code>spare</code>, <code>mnt_id</code>, <code>param</code>, <code>mnt_ns_id</code>); for <code>statmount</code>, <code>param</code> is the request mask. The kernel fills a <code>struct statmount</code>: fixed fields first, then NUL-terminated strings in a variable tail whose offsets are stored in the fixed fields. On return, <code>buf-&gt;mask</code> says which groups were written and <code>buf-&gt;size</code> how much space was used. The call is read-only.</p>
-<p>Layouts and constants below are from <code>/usr/include/linux/mount.h</code> (kernel-headers 6.17.4 on this host): <code>struct statmount</code> at line 155, <code>struct mnt_id_req</code> at line 198, the request sizes at lines 207-208 and the mask bits at lines 213-227.</p>
-<p>The mount id is the 64-bit unique id (also reported by <code>statx</code> with <code>STATX_MNT_ID_UNIQUE</code>), not the reusable id printed in <code>mountinfo</code>; the old reusable ids are returned too, as <code>mnt_id_old</code> and <code>mnt_parent_id_old</code>. A mount the caller cannot reach from its root, or a mount in another namespace, needs privilege over that namespace.</p>
-<p>The duplicate issue described <code>statmount</code> as taking &quot;a mount ID or file descriptor&quot;. The 6.17.4 header on this host defines no flag for a file-descriptor form and no other <code>flags</code> value, so this body lists only the mount-id form. If a later kernel adds one, it is a new flag to add to the inventory.</p>
-<h3>Flags and options</h3>
+<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_mount_introspection_enosys_syscall</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+statmount&amp;body=Discussion+for+the+%60statmount%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fstatmount.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60statmount%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>statmount</code> (457) as determinized-refused via pred:is_mount_introspection_enosys_syscall dispatch; deterministic refusal: true; run subscription: true; record/replay subscription: true.</p>
 <ul>
-<li>F1: <code>req-&gt;size</code> is <code>MNT_ID_REQ_SIZE_VER0</code> (24) or <code>MNT_ID_REQ_SIZE_VER1</code> (32, which adds <code>mnt_ns_id</code>); any other size, or a nonzero reserved <code>spare</code>, gives <code>EINVAL</code>.</li>
-<li>F2: <code>req-&gt;mnt_id</code> names a mount by its unique id; an id that names no mount in the target namespace gives <code>ENOENT</code>.</li>
-<li>F3: <code>req-&gt;mnt_ns_id</code> (VER1 only) selects another mount namespace by its id; 0 means the caller's namespace. Querying another namespace, or a mount outside the caller's root, without privilege over it gives <code>EPERM</code>.</li>
-<li>F4: <code>STATMOUNT_SB_BASIC</code> (0x1): superblock device major/minor, <code>sb_magic</code>, <code>sb_flags</code>.</li>
-<li>F5: <code>STATMOUNT_MNT_BASIC</code> (0x2): <code>mnt_id</code>, <code>mnt_parent_id</code>, the old reusable ids, <code>mnt_attr</code>, <code>mnt_propagation</code>, <code>mnt_peer_group</code>, <code>mnt_master</code>.</li>
-<li>F6: <code>STATMOUNT_PROPAGATE_FROM</code> (0x4): the propagation source in the current namespace.</li>
-<li>F7: <code>STATMOUNT_MNT_ROOT</code> (0x8): string, the mount's root relative to the filesystem root.</li>
-<li>F8: <code>STATMOUNT_MNT_POINT</code> (0x10): string, the mount point relative to the caller's root.</li>
-<li>F9: <code>STATMOUNT_FS_TYPE</code> (0x20): string, the filesystem type.</li>
-<li>F10: <code>STATMOUNT_MNT_NS_ID</code> (0x40): the id of the mount's namespace.</li>
-<li>F11: <code>STATMOUNT_MNT_OPTS</code> (0x80): string, comma-separated mount options.</li>
-<li>F12: <code>STATMOUNT_FS_SUBTYPE</code> (0x100): string, the filesystem subtype, if any.</li>
-<li>F13: <code>STATMOUNT_SB_SOURCE</code> (0x200): string, the mount source.</li>
-<li>F14: <code>STATMOUNT_OPT_ARRAY</code> (0x400): count and array of filesystem options.</li>
-<li>F15: <code>STATMOUNT_OPT_SEC_ARRAY</code> (0x800): count and array of security options.</li>
-<li>F16: <code>STATMOUNT_SUPPORTED_MASK</code> (0x1000): the mask bits this kernel supports.</li>
-<li>F17: <code>STATMOUNT_MNT_UIDMAP</code> (0x2000) and <code>STATMOUNT_MNT_GIDMAP</code> (0x4000): the mount's id-mapping arrays as seen from the caller's namespace.</li>
-<li>F18: <code>bufsize</code> too small for the fixed part plus the requested strings: <code>EOVERFLOW</code>.</li>
-<li>F19: <code>flags</code> must be 0; any other value gives <code>EINVAL</code>.</li>
-<li>F20: <code>req</code> or <code>buf</code> not accessible: <code>EFAULT</code> (host evidence: <code>statmount(NULL, NULL, 0, 0)</code> returned <code>EFAULT</code>).</li>
-<li>F21: kernel older than 6.8: <code>ENOSYS</code>, the same errno Hermit returns for every call.</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1864</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:7400</code></li>
 </ul>
-<h2>Determinism analysis</h2>
-<p><code>linux_determinism: nondeterministic</code>. Unique mount ids and mount-namespace ids come from kernel-wide counters that only grow, so any mount or namespace created at the start of a run, by a container setup or by the guest, gets a different id in every run, even on one host. The remaining fields describe the host's mount table: sources, options, device numbers, propagation peers and id maps differ across hosts and change whenever any process mounts or unmounts. Error results (F1, F19, F20) repeat, but the success path does not, for any argument.</p>
-<p>The duplicate issue https://github.com/rrnewton/hermit/issues/483 classified <code>statmount</code> as CONDITIONAL, while this issue said nondeterministic. Nondeterministic is kept, because of the ever-increasing ids: no request mask that returns ids or mount-table state repeats across runs.</p>
-<h3>Nondeterminism sources</h3>
-<ul>
-<li>Unique mount ids and mount-namespace ids, allocated from kernel-wide increasing counters</li>
-<li>Mount-namespace contents: sources, options, filesystem types, propagation, id maps and device numbers</li>
-<li>Concurrent mounts and unmounts by any process sharing the namespace</li>
-<li>Capability checks against the caller's namespace (F3) and kernel version (F16, F21)</li>
-</ul>
-<h2>Hermit design</h2>
-<p>Target policy: <code>refuse</code>. The code at hermit f4055eb9cae4 already realizes it:</p>
-<ul>
-<li><code>classify_syscall</code> lists <code>statmount</code> among the Determinized syscalls (<code>detcore/src/syscall_classification.rs:379</code>), and <code>is_mount_introspection_enosys_syscall</code> includes it (<code>detcore/src/syscall_classification.rs:1190-1200</code>). The doc comment (<code>detcore/src/syscall_classification.rs:1182-1189</code>) says <code>statmount</code> reads mount ids and topology, which are not part of a deterministic guest's modeled state.</li>
-<li>In <code>handle_syscall_event</code> (<code>detcore/src/lib.rs:1892</code>), the dispatch match (<code>detcore/src/lib.rs:2028</code>) returns <code>Err(Errno::ENOSYS)</code> for this predicate (<code>detcore/src/lib.rs:2110-2114</code>). It does not read <code>req</code> and does not inject the syscall, so <code>buf</code> is never written and the answer is the same for F1-F21.</li>
-<li>The arm does not consult <code>panic_on_unsupported_syscalls</code> (contrast the <code>rseq</code> arm at <code>detcore/src/lib.rs:2031-2037</code>), so the answer is <code>ENOSYS</code> with and without fail-closed mode, matching <code>refused_only_when_fail_closed: false</code>.</li>
-<li>The predicate is in the deterministic refusal set (<code>detcore/src/syscall_classification.rs:1331</code>); the unit test <code>mount_introspection_syscalls_are_determinized_and_consistent</code> (<code>detcore/src/syscall_classification.rs:2377</code>) pins the classification and the membership.</li>
-</ul>
-<p>Why <code>refuse</code>:</p>
-<ul>
-<li><code>ENOSYS</code> is what every kernel before 6.8 returns (F21), so callers such as libraries that prefer <code>statmount</code> must already fall back to <code>/proc/self/mountinfo</code>. Hermit sanitizes that file: reads of <code>/proc/&lt;pid&gt;/mountinfo</code> are recognized (<code>detcore/src/procfs.rs:684</code>) and rewritten by <code>sanitize_mountinfo</code> (<code>detcore/src/procfs.rs:3429</code>), with device numbers taken from the same run-global pool as <code>stat</code>/<code>statx</code> (<code>detcore/src/procfs.rs:491-498</code>). The fallback therefore gets a determinized view, and the refusal steers callers to it.</li>
-<li><code>passthrough</code> would expose ever-increasing unique ids and host mount state.</li>
-<li><code>model</code> would need a virtual mount table with stable unique ids, namespace ids and string fields, kept consistent with the <code>mountinfo</code> sanitizer and with <code>statx</code>'s <code>STATX_MNT_ID_UNIQUE</code>. That is a large design that no known workload needs while the fallback exists.</li>
-</ul>
-<p>The legacy recommendation from both issues was NEEDS-HANDLER, and the duplicate said the output needs &quot;sanitization, deterministic refusal, or recording&quot;. Deterministic refusal is what the code does. If a workload appears that needs <code>statmount</code> without a fallback, <code>model</code> built on the <code>mountinfo</code> snapshot is the path, and this body would be revisited.</p>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F1, F2, F5, F19): a VER1 request for mount id 1 with an empty request mask and <code>flags</code> 0 returns <code>ENOSYS</code> under <code>hermit run --verify</code> on ptrace, in both default and fail-closed (<code>--panic-on-unsupported-syscalls</code>) runs. Existing candidates: <code>tests/c/statmount_enosys.c</code> (it sends a 32-byte request with <code>mount_id = 1</code> and <code>request_mask = 0</code>) through cell <code>c-programs/statmount-enosys</code> (<code>tests/e2e/manifests/c-programs.yaml:9147</code>, verify <code>ci: ptrace: true</code>), and <code>mount_introspection_syscalls_fall_back_deterministically</code> at <code>hermit-cli/tests/mount_introspection.rs:30</code>, which runs that guest with <code>--backend=ptrace</code>, <code>--strict</code>, <code>--verify</code> and <code>--panic-on-unsupported-syscalls</code>. F5 is only nominally covered here, since the existing guest requests no mask bits.</li>
-<li>T2 (covers F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15, F16, F17): obtain the root's unique mount id with <code>statx(STATX_MNT_ID_UNIQUE)</code> and call <code>statmount</code> once per mask bit and once with all bits, on a buffer pre-filled with a sentinel, with <code>mnt_ns_id</code> 0 and with a made-up namespace id. Every call must return <code>ENOSYS</code>, the sentinel must be unchanged, and the two <code>--verify</code> runs must agree.</li>
-<li>T3 (covers F1, F18, F19, F20, F21): a 16-byte request, a 1-byte buffer, <code>flags</code> 1, and NULL <code>req</code>/<code>buf</code> each return <code>ENOSYS</code> rather than <code>EINVAL</code>, <code>EOVERFLOW</code> or <code>EFAULT</code>, and no buffer is written.</li>
-<li>T4 (covers F5, F8): a guest that tries <code>statmount</code> first and falls back to parsing <code>/proc/self/mountinfo</code> on <code>ENOSYS</code> prints the same mount list in both <code>--verify</code> runs.</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+statmount&amp;body=Discussion+for+the+%60statmount%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fstatmount.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60statmount%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `statmount`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/481: linux_determinism nondeterministic (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch pred:is_mount_introspection_enosys_syscall, refused.</li>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · duplicate https://github.com/rrnewton/hermit/issues/483 is retired into this issue; its text waits under Additional information for a section-by-section merge.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; refuse (Detcore returns ENOSYS for every call without touching the kernel, detcore/src/lib.rs:2110-2114, as a pre-6.8 kernel does; callers fall back to /proc/self/mountinfo, which detcore/src/procfs.rs:3429 sanitizes); linux_determinism stays nondeterministic (duplicate's CONDITIONAL reconciled); merged https://github.com/rrnewton/hermit/issues/483; 21 flag behaviours and 4 tests listed; existing ptrace candidates for T1 named but no run result seen and one request shape exercised, so tracking_status stays todo and ptrace_verification untested</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+statmount&amp;amp;body=Discussion+for+the+%60statmount%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fstatmount.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60statmount%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `statmount`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Originally filed 2026-07-24 as &quot;Syscall classification: statmount&quot; (https://github.com/rrnewton/hermit/issues/481), legacy variant A1. The duplicate https://github.com/rrnewton/hermit/issues/483, filed 2026-07-24 with the same title (legacy variant A1, batch 5 of the classification sweep), was merged into this body on 2026-10-03; its comment history (0 comments) stays on that issue, and this issue's comment history stays here.</p>
-<p>Both legacy bodies said Hermit routed <code>statmount</code> through the UNCLASSIFIED temporary pass-through block of <code>detcore/src/syscall_classification.rs</code> (the duplicate cites <code>dd60278f</code>). That was true when they were filed and is superseded: at hermit f4055eb9cae4 <code>statmount</code> is Determinized and refused, as described under Hermit design.</p>
-<h3>2026-07-24 host strace evidence</h3>
-<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) with <code>strace -f -e trace=statmount</code> on a direct <code>syscall()</code> harness (invoked with non-destructive query/no-op/failing arguments) and, where applicable, on common programs. Hermit currently routes <code>statmount</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code>.</p>
-<p>Observed strace line:</p>
-<pre><code>statmount(NULL, NULL, 0, 0)     = -1 EFAULT (Bad address)
-</code></pre>
-<hr>
-<p>*Autonomous syscall-classification sweep (ranks 151-250 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
-<p>The duplicate https://github.com/rrnewton/hermit/issues/483 recorded the identical strace line (<code>statmount(NULL, NULL, 0, 0) = -1 EFAULT (Bad address)</code>) on <code>the measurement host</code> (Linux 6.17, x86_64, glibc), traced with <code>strace -qq -f -e trace=statmount</code>. Manual reference from the duplicate: <a href="https://man7.org/linux/man-pages/man2/statmount.2.html">statmount(2)</a>.</p>
 </body></html>

@@ -3,77 +3,18 @@
 <title>getpeername | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>getpeername</code> (52)</h1>
-<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; linux determinism: conditional &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+getpeername&amp;body=Discussion+for+the+%60getpeername%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fgetpeername.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60getpeername%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>getpeername(2)</code> returns the address of the socket's connected peer. Detcore forwards it to the kernel. The result is deterministic when the peer's address was itself chosen deterministically, which holds for peers bound through Detcore's <code>bind(2)</code> handler. A client port the kernel autobinds during <code>connect</code> is still host-chosen.</p>
-<h2>Linux semantics</h2>
-<p><code>getpeername(fd, addr, addrlen)</code> asks the protocol for the remote address of a connected socket and copies it to <code>addr</code>. <code>*addrlen</code> is the buffer size on entry and the address's full size on return. A short buffer truncates the copy, and the returned length is larger than the buffer. The call does not change socket state.</p>
-<p>The peer address exists only while the socket is connected. A TCP socket keeps it through an orderly shutdown by the peer, but a reset moves the socket to a closed state, after which the call returns <code>ENOTCONN</code>. A datagram socket has a peer only after <code>connect</code>. An AF_UNIX socket reports the name its peer was bound to, which is empty for an unnamed peer such as the other end of a <code>socketpair</code>.</p>
-<h3>Flags and options</h3>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+getpeername&amp;body=Discussion+for+the+%60getpeername%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fgetpeername.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60getpeername%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>getpeername</code> (52) as determinized via typed dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.</p>
 <ul>
-<li>F1: <code>*addrlen</code> in/out: the input is the buffer size; the output is the real address length. A short buffer truncates the copy, and the returned length exceeds the buffer.</li>
-<li>F2: connected AF_INET/AF_INET6 stream socket: the peer's address and port. On a socket returned by <code>accept</code>, that is the client's port, which the kernel chose if the client did not bind.</li>
-<li>F3: AF_INET/AF_INET6 datagram socket after <code>connect</code>: the default destination. After <code>connect</code> with <code>AF_UNSPEC</code> there is no peer, giving <code>ENOTCONN</code>.</li>
-<li>F4: connected AF_UNIX socket, including either end of a <code>socketpair</code>: the peer's pathname, abstract or autobind name. An unnamed peer gives length <code>sizeof(sa_family_t)</code>.</li>
-<li>F5: AF_NETLINK: the destination port ID and groups set by <code>connect</code>, or zeros when not connected. Netlink does not return <code>ENOTCONN</code>.</li>
-<li>F6: socket not connected (never connected, listening, or after a TCP reset): <code>ENOTCONN</code>.</li>
-<li>F7: errors: <code>EBADF</code> for a closed fd, <code>ENOTSOCK</code> for a non-socket fd, <code>EFAULT</code> for an unreadable <code>addrlen</code> or unwritable <code>addr</code>, <code>EINVAL</code> for a negative <code>*addrlen</code>.</li>
-<li>F8: other families (AF_VSOCK, ...): family-specific peer addresses, returned by the kernel.</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1640</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:8050</code></li>
 </ul>
-<h2>Determinism analysis</h2>
-<p><code>linux_determinism: nondeterministic -&gt; conditional</code>. The call reports state the socket already has, so it repeats whenever the peer's address repeats and the connection was set up, shut down or reset at the same point relative to the call. Inside one deterministic run with explicitly bound peers, both hold. The legacy sources still apply as conditions, not as reasons the call can never repeat:</p>
-<h3>Nondeterminism sources</h3>
-<ul>
-<li>External peer and network state: a peer outside the guest, possible only with <code>--network=host</code>, has an address and port the guest does not control</li>
-<li>Namespace-assigned addresses: kernel-chosen client ports from an implicit autobind during <code>connect</code>, and AF_UNIX autobind names</li>
-<li>Concurrent connect, disconnect and reset timing, which decides between a peer address and <code>ENOTCONN</code> (F6)</li>
-</ul>
-<h2>Hermit design</h2>
-<p>Target policy: <code>model</code>. The kernel reports the peer, and Detcore makes peer addresses deterministic where they are assigned and schedules the threads that connect and disconnect.</p>
-<p>What the code does now:</p>
-<ul>
-<li>The typed dispatch arm at <code>detcore/src/lib.rs:2565</code> calls <code>handle_getpeername</code> (<code>detcore/src/syscalls/files.rs:3901</code>), which forwards the call through <code>record_or_replay</code> (<code>detcore/src/syscalls/files.rs:3906</code>). Both carry an autonomous-bot &quot;needs human review&quot; tag.</li>
-<li><code>handle_bind</code> (<code>detcore/src/syscalls/files.rs:4014</code>) makes port-0 ports and AF_UNIX autobind names deterministic, so a peer that bound through it has a repeatable address. See the <code>bind</code> body.</li>
-<li>By default the guest has a private network namespace with only loopback (<code>hermit-cli/src/bin/hermit/global_opts.rs:53</code>), so every peer is another guest process and its IP address repeats.</li>
-<li>Record mode captures the output buffer: the recorder sends <code>Getpeername</code> to <code>handle_sockopt_family</code> (<code>hermit-cli/src/recorder.rs:628</code>), and the replayer returns the recorded bytes (<code>hermit-cli/src/replayer.rs:535</code>).</li>
-</ul>
-<p>Why <code>model</code>: code facts rule out <code>passthrough</code> for a determinized syscall. <code>emulate</code> would need Detcore to track every connection's peer. <code>refuse</code> would break servers that log client addresses.</p>
-<p>Gap between the code and <code>model</code>:</p>
-<ul>
-<li><strong>Kernel-chosen client ports (F2).</strong> <code>connect</code> (<code>detcore/src/syscalls/io.rs:1336</code>) forwards an unbound socket to the kernel without asking the port allocator; only <code>handle_bind</code> sends <code>GlobalRequest::RequestPort</code> (<code>detcore/src/syscalls/files.rs:4119</code>). A server's <code>getpeername</code> on an accepted connection then reports a random client port. Like <code>getsockname</code>'s F4 gap, the fix belongs in <code>connect</code>.</li>
-</ul>
-<p>Target (owner decision 12): every local port the kernel would choose for an unbound AF_INET or AF_INET6 socket comes from Detcore's global port allocator, the one an explicit <code>bind</code> to port 0 already uses. <code>handle_bind</code> requests the port with <code>GlobalRequest::RequestPort</code> (<code>detcore/src/syscalls/files.rs:4119</code> for AF_INET, <code>detcore/src/syscalls/files.rs:4158</code> for AF_INET6); the global tool serves the request at <code>detcore/src/tool_global.rs:1731</code> from the range in the host's <code>ip_local_port_range</code> (<code>detcore/src/tool_global.rs:2783</code>); and <code>release_port_for_open_file</code> (<code>detcore/src/syscalls/files.rs:952</code>) frees the port when the socket's last descriptor closes. An implicit bind, meaning <code>connect</code>, <code>listen</code>, <code>sendto</code>, <code>sendmsg</code> or <code>sendmmsg</code> on an unbound socket, must take its port the same way and bind the socket to it before the call reaches the kernel, so that <code>getsockname</code>, the peer's <code>getpeername</code> and the peer's <code>accept</code> report the same port in every run. <code>getpeername</code> itself needs no change: the client port it reports for F2 becomes the allocator's once <code>connect</code> takes one. Today <code>handle_connect</code> (<code>detcore/src/syscalls/io.rs:1336</code>) forwards an unbound socket to the kernel, which picks a random port.</p>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F4): <code>getpeername</code> on one end of an AF_UNIX <code>socketpair</code> returns AF_UNIX with the family-only length. Add a connected pair where the listener has an abstract name. Existing candidate: <code>tests/c/sockname_unnamed.c</code> (getpeername at line 53; cell <code>c-programs/sockname-unnamed</code>, <code>tests/e2e/manifests/c-programs.yaml:14472</code>, verify ci on ptrace). It checks the family but not the length.</li>
-<li>T2 (covers F2): a loopback TCP server and a client that binds port 0 before <code>connect</code>. Both <code>getpeername</code> results must be identical across <code>--verify</code> runs on ptrace. Repeat with a client that does not bind; that part is expected to fail until <code>connect</code> uses the allocator.</li>
-<li>T3 (covers F3, F6): a UDP socket reports <code>ENOTCONN</code>, then its peer after <code>connect</code>, then <code>ENOTCONN</code> after <code>connect(AF_UNSPEC)</code>. A listening TCP socket reports <code>ENOTCONN</code>. After the peer closes with <code>SO_LINGER</code> 0 (a reset), the call returns <code>ENOTCONN</code> in every run.</li>
-<li>T4 (covers F5): netlink socket: zeros before <code>connect</code>, then the destination after <code>connect</code> to the kernel (<code>nl_pid</code> 0).</li>
-<li>T5 (covers F1): a 4-byte buffer for an AF_INET6 peer: the returned length is 28, and bytes past the fourth are untouched.</li>
-<li>T6 (covers F7, F8): <code>EBADF</code> for fd -1, <code>ENOTSOCK</code> for a pipe, <code>EFAULT</code> for a bad <code>addrlen</code>, <code>EINVAL</code> for <code>*addrlen == -1</code>. An AF_VSOCK peer passes through where the host allows it.</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+getpeername&amp;body=Discussion+for+the+%60getpeername%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fgetpeername.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60getpeername%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `getpeername`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A2 of https://github.com/rrnewton/hermit/issues/373: linux_determinism nondeterministic (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch typed.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; model; linux_determinism nondeterministic -&gt; conditional (the call reports existing state; repeats when peer addresses and connect/reset order repeat); F1-F8 inventoried, T1-T6 proposed; gap: kernel-chosen client ports from connect without bind.</li>
-<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): decision 12 applied (Target paragraph: connect on an unbound socket takes an allocator port, so the F2 client port repeats with no change here); no new F/T ids; removed the open question on the connect allocator and the empty heading</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+getpeername&amp;amp;body=Discussion+for+the+%60getpeername%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fgetpeername.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60getpeername%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `getpeername`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Originally filed 2026-07-24 as &quot;Syscall classification: getpeername&quot; (https://github.com/rrnewton/hermit/issues/373), legacy variant A2.</p>
-<h3>2026-07-24 host strace evidence</h3>
-<p>Test host: Linux 6.17.13 x86_64; strace 6.12.</p>
-<p>Ran a syscall-specific safe raw probe with deliberately inert/invalid arguments so privileged or mutating operations could not change host state:</p>
-<pre><code>strace -f -qq -e trace=getpeername -s 160 python3 -c 'import ctypes; c=ctypes.CDLL(None,use_errno=True); c.syscall(52, *([ctypes.c_long(-1)]*6))'
-</code></pre>
-<p>Actual strace output:</p>
-<pre><code>getpeername(-1, 0xffffffffffffffff, 0xffffffffffffffff) = -1 EBADF (Bad file descriptor)
-</code></pre>
-<p>The trace confirms the host kernel path and observed errno/result for this ABI. The determinism recommendation also accounts for documented success-path state dependencies; an invalid-argument result alone is not treated as proof of determinism.</p>
 </body></html>

@@ -3,75 +3,18 @@
 <title>sysfs | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>sysfs</code> (139)</h1>
-<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_mount_introspection_enosys_syscall</code> &middot; linux determinism: conditional &middot; target policy: refuse &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+sysfs&amp;body=Discussion+for+the+%60sysfs%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsysfs.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60sysfs%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>sysfs(option, ...)</code> is the obsolete System V interface for enumerating the filesystem types registered in the kernel (it is unrelated to the <code>/sys</code> filesystem). Hermit refuses it: Detcore answers every call with <code>ENOSYS</code> before looking at the arguments and never calls the kernel (<code>detcore/src/lib.rs:2110-2114</code> at hermit f4055eb9cae4), which is also what a kernel built without <code>CONFIG_SYSFS_SYSCALL</code> returns.</p>
-<p>Manual reference: Linux man-pages sysfs(2).</p>
-<h2>Linux semantics</h2>
-<p><code>sysfs</code> multiplexes three read-only queries on <code>option</code>. The kernel walks its list of registered filesystem types, the same list <code>/proc/filesystems</code> prints. An index is a position in that list: built-in types in registration order, then module-provided types in the order their modules were loaded. Option 2 copies the name without a length argument, so the caller's buffer must be large enough. glibc provides no wrapper; callers use <code>syscall(SYS_sysfs, ...)</code>.</p>
-<p>The syscall exists only when the kernel is built with <code>CONFIG_SYSFS_SYSCALL</code>. Without it, every call fails with <code>ENOSYS</code>. On the 2026-07-24 host (Linux 6.17), option 3 returned <code>ENOSYS</code> (strace under Additional information), so that kernel was built without it.</p>
-<h3>Flags and options</h3>
+<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_mount_introspection_enosys_syscall</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+sysfs&amp;body=Discussion+for+the+%60sysfs%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsysfs.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60sysfs%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>sysfs</code> (139) as determinized-refused via pred:is_mount_introspection_enosys_syscall dispatch; deterministic refusal: true; run subscription: true; record/replay subscription: true.</p>
 <ul>
-<li>F1: option 1, <code>sysfs(1, const char *fsname)</code>: returns the index of the registered filesystem type named <code>fsname</code>; <code>EINVAL</code> if no such type is registered; <code>EFAULT</code> if <code>fsname</code> is not readable.</li>
-<li>F2: option 2, <code>sysfs(2, unsigned fs_index, char *buf)</code>: copies the NUL-terminated name of the type at <code>fs_index</code> into <code>buf</code> and returns 0; <code>EINVAL</code> if <code>fs_index</code> is out of range; <code>EFAULT</code> if <code>buf</code> is not writable.</li>
-<li>F3: option 3, <code>sysfs(3)</code>: returns the number of registered filesystem types.</li>
-<li>F4: any other <code>option</code>: <code>EINVAL</code>.</li>
-<li>F5: kernel built without <code>CONFIG_SYSFS_SYSCALL</code>: every option fails with <code>ENOSYS</code>, the same errno Hermit returns for every call.</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1869</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:7400</code></li>
 </ul>
-<h2>Determinism analysis</h2>
-<p><code>linux_determinism: conditional</code>. For one kernel build with a fixed set of loaded modules, every option repeats exactly. Across hosts the answers differ with kernel version, configuration and module set. Within one run they can change too: loading a filesystem module, which the kernel can do automatically on the first mount of a new type, appends a type, shifting the count (F3) and adding an index (F1, F2). Both legacy bodies said CONDITIONAL; they agree.</p>
-<h3>Nondeterminism sources</h3>
-<ul>
-<li>Kernel version and configuration (which types are built in, and whether <code>CONFIG_SYSFS_SYSCALL</code> is set at all)</li>
-<li>Module loading, by administrators or on demand, which adds types and changes indices during a run</li>
-<li>The command index chosen by the caller, which selects which of the above is observed</li>
-</ul>
-<h2>Hermit design</h2>
-<p>Target policy: <code>refuse</code>. The code at hermit f4055eb9cae4 already realizes it:</p>
-<ul>
-<li><code>classify_syscall</code> lists <code>sysfs</code> among the Determinized syscalls (<code>detcore/src/syscall_classification.rs:377</code>), and <code>is_mount_introspection_enosys_syscall</code> includes it (<code>detcore/src/syscall_classification.rs:1190-1200</code>). The doc comment (<code>detcore/src/syscall_classification.rs:1182-1189</code>) says <code>sysfs</code> reads the host's filesystem-type table, which is not part of a deterministic guest's modeled state.</li>
-<li>In <code>handle_syscall_event</code> (<code>detcore/src/lib.rs:1892</code>), the dispatch match (<code>detcore/src/lib.rs:2028</code>) returns <code>Err(Errno::ENOSYS)</code> for this predicate (<code>detcore/src/lib.rs:2110-2114</code>). It does not decode <code>option</code> or the pointers and does not inject the syscall, so no guest buffer is written and the answer is the same for F1-F5.</li>
-<li>The arm does not consult <code>panic_on_unsupported_syscalls</code> (contrast the <code>rseq</code> arm at <code>detcore/src/lib.rs:2031-2037</code>), so the answer is <code>ENOSYS</code> with and without fail-closed mode, matching <code>refused_only_when_fail_closed: false</code>.</li>
-<li>The predicate is in the deterministic refusal set (<code>detcore/src/syscall_classification.rs:1331</code>); the unit test <code>mount_introspection_syscalls_are_determinized_and_consistent</code> (<code>detcore/src/syscall_classification.rs:2377</code>) pins the classification and the membership.</li>
-</ul>
-<p>Why <code>refuse</code>:</p>
-<ul>
-<li><code>ENOSYS</code> is exactly what a kernel without <code>CONFIG_SYSFS_SYSCALL</code> returns (F5), and the 2026-07-24 host kernel already behaves that way, so callers must already cope with it.</li>
-<li><code>passthrough</code> would expose the host's type table, which differs across hosts and changes with module loading.</li>
-<li><code>model</code> or <code>emulate</code> would need a fixed canonical type table, for an interface glibc does not wrap and that no known workload uses.</li>
-</ul>
-<p>The legacy recommendations were NEEDS-INVESTIGATION (this issue) and NEEDS-HANDLER (the duplicate, which said &quot;Hermit should return a fixed refusal rather than depend on kernel configuration&quot;). The duplicate's stated intent is what the code now does.</p>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F1, F5): <code>syscall(SYS_sysfs, 1, &quot;ext4&quot;)</code> returns <code>ENOSYS</code> under <code>hermit run --verify</code> on ptrace, in both default and fail-closed (<code>--panic-on-unsupported-syscalls</code>) runs. Existing candidates: <code>tests/c/sysfs_enosys.c</code> through cell <code>c-programs/sysfs-enosys</code> (<code>tests/e2e/manifests/c-programs.yaml:9403</code>, verify <code>ci: ptrace: true</code>), and <code>mount_introspection_syscalls_fall_back_deterministically</code> at <code>hermit-cli/tests/mount_introspection.rs:30</code>, which runs that guest with <code>--backend=ptrace</code>, <code>--strict</code>, <code>--verify</code> and <code>--panic-on-unsupported-syscalls</code>.</li>
-<li>T2 (covers F2, F3, F4): call options 2 (index 0, with a buffer pre-filled with a sentinel), 3, and an undefined option such as 7. Every call must return <code>ENOSYS</code>, the sentinel must be unchanged, and the two <code>--verify</code> runs must agree.</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+sysfs&amp;body=Discussion+for+the+%60sysfs%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsysfs.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60sysfs%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `sysfs`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/494: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy NEEDS-INVESTIGATION; code at this SHA: determinized, dispatch pred:is_mount_introspection_enosys_syscall, refused.</li>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · duplicate https://github.com/rrnewton/hermit/issues/515 is retired into this issue; its text waits under Additional information for a section-by-section merge.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; refuse (Detcore returns ENOSYS for every call without touching the kernel, detcore/src/lib.rs:2110-2114, the same answer as a kernel without CONFIG_SYSFS_SYSCALL); linux_determinism stays conditional; merged https://github.com/rrnewton/hermit/issues/515; 5 flag behaviours and 2 tests listed; existing ptrace candidates for T1 named but no run result seen and only option 1 exercised, so tracking_status stays todo and ptrace_verification untested</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+sysfs&amp;amp;body=Discussion+for+the+%60sysfs%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsysfs.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60sysfs%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `sysfs`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Originally filed 2026-07-24 as &quot;Syscall classification: sysfs&quot; (https://github.com/rrnewton/hermit/issues/494), legacy variant A1. The duplicate https://github.com/rrnewton/hermit/issues/515, filed 2026-07-24 with the same title (legacy variant A1, batch 5 of the classification sweep), was merged into this body on 2026-10-03; its comment history (0 comments) stays on that issue, and this issue's comment history stays here.</p>
-<p>Both legacy bodies said Hermit routed <code>sysfs</code> through the UNCLASSIFIED temporary pass-through block of <code>detcore/src/syscall_classification.rs</code> (the duplicate cites <code>dd60278f</code>). That was true when they were filed and is superseded: at hermit f4055eb9cae4 <code>sysfs</code> is Determinized and refused, as described under Hermit design.</p>
-<h3>2026-07-24 host strace evidence</h3>
-<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) with <code>strace -f -e trace=sysfs</code> on a direct <code>syscall()</code> harness (invoked with non-destructive query/no-op/failing arguments) and, where applicable, on common programs. Hermit currently routes <code>sysfs</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code>.</p>
-<p>Observed strace line:</p>
-<pre><code>sysfs(0x3, 0, 0)                = -1 ENOSYS (Function not implemented)
-</code></pre>
-<hr>
-<p>*Autonomous syscall-classification sweep (ranks 151-250 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
-<h3>Host strace evidence from the duplicate https://github.com/rrnewton/hermit/issues/515</h3>
-<p>Evidence was gathered on <code>the measurement host</code> (Linux 6.17, x86_64, glibc) with a direct <code>syscall()</code> harness, traced with <code>strace -qq -f -e trace=sysfs</code>. Command 3 returned <code>ENOSYS</code>, consistent with a kernel built without <code>CONFIG_SYSFS_SYSCALL</code>:</p>
-<pre><code>sysfs(0x3, 0x7ffe4ba2f7d0, 0)   = -1 ENOSYS (Function not implemented)
-</code></pre>
-<p>Manual reference from the duplicate: <a href="https://man7.org/linux/man-pages/man2/sysfs.2.html">sysfs(2)</a>.</p>
 </body></html>

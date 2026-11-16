@@ -3,86 +3,17 @@
 <title>fremovexattr | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>fremovexattr</code> (199)</h1>
-<p>Strategy: <strong>passthrough</strong> &middot; dispatch: <code>passthrough</code> &middot; linux determinism: conditional &middot; target policy: passthrough &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+fremovexattr&amp;body=Discussion+for+the+%60fremovexattr%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ffremovexattr.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60fremovexattr%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>fremovexattr(fd, name)</code> removes the extended attribute <code>name</code> from the inode behind the open descriptor <code>fd</code>. Hermit forwards it to the host kernel unchanged. It relies on the guest's container filesystem being private and stable; Detcore keeps no extended-attribute state of its own.</p>
-<h2>Linux semantics</h2>
-<p>The kernel resolves <code>fd</code> to its file, copies <code>name</code> from user memory, and splits it into a namespace prefix and a suffix. It then hands the removal to the xattr handler that the inode's filesystem registers for that prefix, after the generic permission check and the LSM hook. The call returns 0 or a negative errno and returns no data. On success the inode's ctime changes. Removing <code>system.posix_acl_access</code> also drops the access ACL, which changes what later permission checks and <code>getxattr</code> return; the mode bits are not rewritten. The descriptor's open mode does not matter: a read-only descriptor can remove an attribute. The name is copied before the descriptor is checked, so a bad descriptor with a bad name pointer gives <code>EFAULT</code> (the 2026-07-24 trace below). Errors depend on the descriptor, the name, the inode type, the caller's credentials, the filesystem's xattr support and the loaded LSMs.</p>
-<h3>Flags and options</h3>
+<p>Strategy: <strong>passthrough</strong> &middot; dispatch: <code>passthrough</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+fremovexattr&amp;body=Discussion+for+the+%60fremovexattr%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ffremovexattr.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60fremovexattr%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>fremovexattr</code> (199) as passthrough via passthrough dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: false.</p>
 <ul>
-<li>F1: <code>user.*</code> namespace on a regular file or directory: the caller needs write permission on the inode. A missing attribute gives <code>ENODATA</code> (glibc spells it <code>ENOATTR</code>).</li>
-<li>F2: <code>user.*</code> namespace on any other inode type (FIFO, socket, symlink, device): <code>EPERM</code>. Host check: a pipe descriptor gave <code>EPERM</code>.</li>
-<li>F3: <code>trusted.*</code> namespace: needs <code>CAP_SYS_ADMIN</code> in the initial user namespace, otherwise <code>EPERM</code>.</li>
-<li>F4: <code>security.*</code> namespace: decided by the loaded LSM. Without a privileged caller or an LSM that allows it, <code>EPERM</code>.</li>
-<li>F5: <code>system.posix_acl_access</code> and <code>system.posix_acl_default</code>: remove the access ACL or the directory's default ACL. Needs inode ownership or <code>CAP_FOWNER</code>. Whether removing an absent ACL succeeds or gives <code>ENODATA</code> is up to the filesystem; on the host's btrfs it succeeded.</li>
-<li>F6: a namespace prefix the kernel does not know: <code>EOPNOTSUPP</code> (<code>ENOTSUP</code>). A filesystem with no handler for the prefix is F11.</li>
-<li>F7: an empty <code>name</code>, or a name longer than <code>XATTR_NAME_MAX</code> (255 bytes): <code>ERANGE</code></li>
-<li>F8: <code>name</code> points outside the address space: <code>EFAULT</code></li>
-<li>F9: <code>fd</code> is not open, or is an <code>O_PATH</code> descriptor: <code>EBADF</code>. Both checked on the host's Linux 7.1 kernel.</li>
-<li>F10: host-config failures: <code>EROFS</code> (read-only mount) and <code>EPERM</code> on an immutable or append-only inode. <code>EDQUOT</code> and <code>ENOSPC</code> are F12.</li>
-<li>F11: host-config failure: a filesystem with no handler for the prefix, for example tmpfs before Linux 6.6 for <code>user.*</code>: <code>EOPNOTSUPP</code>.</li>
-<li>F12: host-transient failures: <code>EDQUOT</code> and <code>ENOSPC</code> on filesystems that rewrite xattr blocks, which depend on host quota and free space shared with other processes.</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1944</code></li>
 </ul>
-<h2>Determinism analysis</h2>
-<p>The result is a function of the inode's attribute set, the name, the caller's credentials, the descriptor, the filesystem type and the LSM policy. Nothing in the call depends on timing. Under Hermit, threads run one at a time, so two guest threads racing to set and remove the same attribute get a fixed order. The call repeats exactly when the guest-visible filesystem starts with the same attributes on the same filesystem type, under the same kernel and LSM configuration, and nothing outside the container changes it. The result is <code>conditional</code> rather than <code>deterministic</code> because F4, F5 and F6 depend on host configuration that varies across machines even when the container's files do not: for example <code>tmpfs</code> gained <code>user.*</code> support only in Linux 6.6, so the same guest gets <code>EOPNOTSUPP</code> or <code>ENODATA</code> depending on the host kernel.</p>
-<h3>Nondeterminism sources</h3>
-<ul>
-<li>External xattr mutation: another process outside the container changes the inode's attributes.</li>
-<li>Filesystem and LSM policy: which namespaces the filesystem supports (F5, F6) and what the LSM allows for <code>security.*</code> (F4) differ by host.</li>
-<li>Host resources and mount state behind F10.</li>
-</ul>
-<h3>Cross-host variation</h3>
-<ul>
-<li>Host security module: what removal of a <code>security.*</code> name returns is decided by the loaded LSM and its policy (F4).</li>
-<li>Filesystem type and kernel version: which namespaces have a handler decides <code>EOPNOTSUPP</code> (F11), and whether removing an absent ACL succeeds or gives <code>ENODATA</code> is up to the filesystem (F5).</li>
-<li>Host mount flags and inode flags: a read-only mount gives <code>EROFS</code> and an immutable or append-only inode gives <code>EPERM</code> (F10).</li>
-</ul>
-<h2>Hermit design</h2>
-<p>Target policy: <code>passthrough</code>. The code already does this. <code>fremovexattr</code> is classified <code>PassThrough</code> at <code>detcore/src/syscall_classification.rs:781</code>, inside the pass-through block that starts at <code>detcore/src/syscall_classification.rs:690</code>. The group comment at <code>detcore/src/syscall_classification.rs:767</code> gives the condition: &quot;Stable guest-owned metadata and synchronous writeback operations are repeatable in Hermit's fixed mount namespace and filesystem image.&quot; The generic arm <code>SyscallClassification::PassThrough =&gt; self.passthrough(guest, call).await</code> at <code>detcore/src/lib.rs:2843</code> forwards it. <code>passthrough</code> at <code>detcore/src/lib.rs:367</code> only delegates to the record/replay helper, so in run mode the host kernel executes the call as issued.</p>
-<p>Why passthrough, not <code>model</code> or <code>emulate</code>:</p>
-<ul>
-<li>Extended attributes live in the inode, on the guest's container filesystem. Hermit has no virtual filesystem, so only the kernel can apply F1 to F10 consistently with what the path-based siblings <code>removexattr</code> (<code>detcore/src/syscall_classification.rs:741</code>) and <code>lremovexattr</code>, and the readers <code>fgetxattr</code> and <code>flistxattr</code>, see. All of them are passed through too.</li>
-<li>The call creates no kernel object, returns no data and does not block, so it has no scheduling or time interaction for Detcore to control.</li>
-<li>The host-dependent part (F4 to F6) is a property of the container's filesystem and the host kernel, the same boundary every passed-through filesystem call already accepts. Emulating it would mean faking xattr support Hermit does not have.</li>
-</ul>
-<p>Code facts show <code>subscribed_record_replay: false</code>: Detcore's <code>--passthru-opt</code> subscription leaves <code>fremovexattr</code> out, so in that mode the call never reaches Detcore. <code>hermit record</code> has its own subscriptions, which the comment at <code>detcore/src/lib.rs:1078</code> places in a recorder module that is not in the exported tree, so this body does not describe how record captures <code>fremovexattr</code>.</p>
-<p>The open gap is test evidence, not code. <code>tests_naming</code> is 0: no test names <code>SYS_fremovexattr</code>. The only existing caller is glibc <code>fremovexattr()</code> at <code>tests/c/syscall_file_metadata.c:191</code>, run by the ptrace verify cell <code>c-programs/syscall-file-metadata</code> (<code>tests/e2e/manifests/c-programs.yaml:9275</code>). That check is weak: if the preceding <code>fsetxattr</code> fails, the removal passes with any of <code>EACCES</code>, <code>ENODATA</code>, <code>ENOTSUP</code>, <code>EOPNOTSUPP</code> or <code>EPERM</code> (<code>tests/c/syscall_file_metadata.c:37</code>), so it does not pin F1 on a filesystem without <code>user.*</code> support.</p>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F1): under <code>hermit run --verify</code> on ptrace, on a guest-owned regular file and a directory, <code>fsetxattr</code> a <code>user.*</code> attribute and remove it with raw <code>syscall(SYS_fremovexattr, ...)</code>. Assert 0, then <code>ENODATA</code> for a second removal, and assert that <code>flistxattr</code> no longer lists it. The fixture must sit on a filesystem with <code>user.*</code> support; if it has none, the test fails rather than skips.</li>
-<li>T2 (covers F2): open a FIFO with <code>O_RDWR</code> and a socket, and assert <code>EPERM</code> for removing a <code>user.*</code> name from each.</li>
-<li>T3 (covers F3, F4): assert <code>EPERM</code> for <code>trusted.hermit</code> and for <code>security.hermit</code>. Record the guest's credentials and the host LSM in the test, because both results depend on them.</li>
-<li>T4 (covers F5): set an access ACL and a default ACL on a guest-owned directory through <code>fsetxattr</code>, remove each through <code>fremovexattr</code>, and assert that <code>fgetxattr</code> then reports <code>ENODATA</code>. Assert that removing an absent ACL gives the same result in both verify runs and record which result the CI filesystem gives.</li>
-<li>T5 (covers F6, F7, F8): assert <code>EOPNOTSUPP</code> for <code>bogus.name</code>, <code>ERANGE</code> for <code>&quot;&quot;</code> and for a 300-byte <code>user.</code> name, and <code>EFAULT</code> for <code>name = (char *)1</code>.</li>
-<li>T6 (covers F9): assert <code>EBADF</code> for a closed descriptor number and for an <code>O_PATH</code> descriptor of an existing file.</li>
-<li>T7 (covers none): assert <code>EROFS</code> on a read-only mount the guest can see, and record the mount. That error comes from the host's mount flags (host-config, U1), as do immutable inodes, and quota and space are host-transient (U2), so this test documents F10 but does not cover it.</li>
-<li>U1 (covers F10, F11; host-config): the host's mount flags, inode flags and filesystem decide whether <code>EROFS</code>, the immutable or append-only <code>EPERM</code> (F10) and the missing-handler <code>EOPNOTSUPP</code> (F11) occur, so CI cannot produce them on every host. Hermit forwards the kernel's answer unchanged (<code>detcore/src/syscall_classification.rs:781</code>, <code>detcore/src/lib.rs:2843</code>).</li>
-<li>U2 (covers F12; host-transient): <code>EDQUOT</code> and <code>ENOSPC</code> depend on host quota and free space shared with other processes. The plain passthrough (<code>detcore/src/lib.rs:2843</code>) hands them to the guest today. F12 counts toward done only once Hermit hides these errors or reports them as an infrastructure error.</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+fremovexattr&amp;body=Discussion+for+the+%60fremovexattr%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ffremovexattr.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60fremovexattr%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `fremovexattr`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A2 of https://github.com/rrnewton/hermit/issues/358: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy PASS-THRU; code at this SHA: passthrough, dispatch passthrough.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: kept conditional/passthrough (forwarded at detcore/src/lib.rs:2843; namespace support and LSM policy are host-dependent); listed 10 flag behaviours and 7 tests; no coverage token, because the only caller (tests/c/syscall_file_metadata.c:191) uses glibc and accepts five errnos, so tracking_status stays todo</li>
-<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d12 (owner decisions 1 and 2): cross_host_variant true (host LSM policy, filesystem namespace support and ACL handling, mount and inode flags); split F6 into F6 and new host-config F11, split F10 into host-config F10 and new host-transient F12, U1 host-config covers F10 and F11, U2 host-transient covers F12, T7 now covers none; resolved the open question on unreachable host errors</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+fremovexattr&amp;amp;body=Discussion+for+the+%60fremovexattr%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ffremovexattr.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60fremovexattr%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `fremovexattr`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Originally filed 2026-07-24 as &quot;Syscall classification: fremovexattr&quot; (https://github.com/rrnewton/hermit/issues/358), legacy variant A2. The legacy body ranked it 79th in the batch-2 classification sequence, after excluding the 50 workload-observed batch-1 syscalls. Manual reference: Linux man-pages removexattr(2).</p>
-<h3>2026-10-03 host errno probe</h3>
-<p>Run by syscall-tracking-p3 on the measurement host (Linux 7.1.3, btrfs <code>/var/tmp</code>, unprivileged uid, Python <code>os.removexattr</code> on a descriptor): existing <code>user.a</code> gave 0; a second removal <code>ENODATA</code>; <code>bogus.a</code> <code>ENOTSUP</code>; <code>&quot;&quot;</code> and a 305-byte name <code>ERANGE</code>; <code>trusted.a</code> and <code>security.a</code> <code>EPERM</code>; <code>system.posix_acl_access</code> with no ACL set 0; an <code>O_PATH</code> descriptor <code>EBADF</code>; a closed descriptor <code>EBADF</code>; a pipe descriptor <code>EPERM</code>; a write-only descriptor 0; raw <code>syscall(199, fd, (void *)1)</code> <code>EFAULT</code>. This was the host, not Hermit.</p>
-<h3>2026-07-24 host strace evidence</h3>
-<p>Test host: Linux 6.17.13 x86_64; strace 6.12.</p>
-<p>Ran a syscall-specific safe raw probe with deliberately inert/invalid arguments so privileged or mutating operations could not change host state:</p>
-<pre><code>strace -f -qq -e trace=fremovexattr -s 160 python3 -c 'import ctypes; c=ctypes.CDLL(None,use_errno=True); c.syscall(199, *([ctypes.c_long(-1)]*6))'
-</code></pre>
-<p>Actual strace output:</p>
-<pre><code>fremovexattr(-1, 0xffffffffffffffff) = -1 EFAULT (Bad address)
-</code></pre>
-<p>The trace confirms the host kernel path and observed errno/result for this ABI. The determinism recommendation also accounts for documented success-path state dependencies; an invalid-argument result alone is not treated as proof of determinism.</p>
 </body></html>

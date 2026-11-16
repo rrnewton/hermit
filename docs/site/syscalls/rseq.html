@@ -3,62 +3,18 @@
 <title>rseq | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>rseq</code> (334)</h1>
-<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>sysno-guard</code> &middot; linux determinism: nondeterministic &middot; target policy: refuse &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+rseq&amp;body=Discussion+for+the+%60rseq%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Frseq.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60rseq%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>rseq(rseq, rseq_len, flags, sig)</code> registers a per-thread restartable-sequences area that the kernel keeps updated with the current CPU and uses to abort critical sections on preemption, migration or signal delivery. Under the default fail-closed policy Hermit returns <code>ENOSYS</code> without consulting the kernel, so no area is ever registered; only the explicit <code>--allow-unsupported-syscalls</code> opt-out forwards the call.</p>
-<h2>Linux semantics</h2>
-<p>A successful registration (flags 0) ties <code>struct rseq</code> to the calling thread. From then on, on every return to user space after the thread was preempted, migrated or interrupted by a signal, the kernel writes <code>cpu_id_start</code> and <code>cpu_id</code> (and <code>node_id</code> and <code>mm_cid</code> when the registered length covers them). If the thread was inside a critical section described by <code>rseq_cs</code>, the kernel checks that the 32-bit <code>sig</code> value precedes the abort handler and moves the instruction pointer to <code>abort_ip</code>; a signature mismatch kills the thread with <code>SIGSEGV</code>. glibc 2.35 and later registers an area for every thread at startup and exports <code>__rseq_offset</code> and <code>__rseq_size</code>; it treats <code>ENOSYS</code> as &quot;not available&quot; and sets <code>__rseq_size</code> to 0.</p>
-<h3>Flags and options</h3>
+<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>sysno-guard</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+rseq&amp;body=Discussion+for+the+%60rseq%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Frseq.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60rseq%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>rseq</code> (334) as determinized-refused via sysno-guard dispatch; deterministic refusal: true; run subscription: true; record/replay subscription: true.</p>
 <ul>
-<li>F1: Register (<code>flags == 0</code>): <code>rseq_len</code> must be the original 32-byte size or a supported extended size, and <code>rseq</code> must be suitably aligned; returns 0 and starts the CPU-id updates described above.</li>
-<li>F2: Re-registration: the same arguments as the current registration return <code>EBUSY</code>; different arguments return <code>EINVAL</code>.</li>
-<li>F3: <code>RSEQ_FLAG_UNREGISTER</code> (1): unregisters when <code>rseq</code> and <code>rseq_len</code> match the registration (<code>EINVAL</code> otherwise) and <code>sig</code> matches (<code>EPERM</code> otherwise).</li>
-<li>F4: Invalid arguments: unknown flag bits, a misaligned pointer or an unsupported length return <code>EINVAL</code>; an unmapped area returns <code>EFAULT</code>.</li>
-<li>F5: Critical-section abort: with <code>rseq_cs</code> set, preemption, migration or signal delivery inside <code>[start_ip, start_ip + post_commit_offset)</code> moves the thread to <code>abort_ip</code>; a wrong signature delivers <code>SIGSEGV</code>.</li>
-<li>F6: <code>rseq_cs</code> flags <code>RSEQ_CS_FLAG_NO_RESTART_ON_PREEMPT</code>, <code>RSEQ_CS_FLAG_NO_RESTART_ON_SIGNAL</code> and <code>RSEQ_CS_FLAG_NO_RESTART_ON_MIGRATE</code>: deprecated; recent kernels reject them and the thread gets <code>SIGSEGV</code>.</li>
-<li>F7: Lifetime: a <code>fork</code> child keeps the registration, a new thread (<code>CLONE_VM</code>) starts unregistered, and <code>execve</code> clears it.</li>
-<li>F8: Extended fields <code>node_id</code> and <code>mm_cid</code>: written only when <code>rseq_len</code> covers them (the supported size is reported through <code>AT_RSEQ_FEATURE_SIZE</code>).</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1792</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:7295</code></li>
 </ul>
-<h2>Determinism analysis</h2>
-<p><code>linux_determinism: nondeterministic</code>. The return value depends only on the arguments and the current registration, but a successful registration makes the kernel write host state into guest memory asynchronously.</p>
-<h3>Nondeterminism sources</h3>
-<ul>
-<li><code>cpu_id</code>, <code>cpu_id_start</code>, <code>node_id</code> and <code>mm_cid</code> report the host CPU, NUMA node and concurrency id the thread last ran on, which depends on the host scheduler and the CPU affinity.</li>
-<li>Whether a critical section completes or aborts to <code>abort_ip</code> depends on when the host preempts the thread, migrates it, or delivers a signal.</li>
-<li>glibc's own startup registration means any glibc program reads these values (for example through <code>sched_getcpu</code>) without making a syscall.</li>
-</ul>
-<p>Pinning the guest to one CPU fixes the CPU ids but not the preemption-dependent aborts, so the call does not repeat under any host configuration Hermit controls.</p>
-<h2>Hermit design</h2>
-<p>Target policy: <code>refuse</code>. Hermit cannot make the kernel's asynchronous writes and aborts repeat, and <code>ENOSYS</code> is an outcome that glibc and other runtimes handle by falling back to ordinary syscalls.</p>
-<p>What the code does at hermit f4055eb9cae4:</p>
-<ul>
-<li>Dispatch: a Sysno-guarded arm returns <code>ENOSYS</code> when <code>panic_on_unsupported_syscalls</code> is set and forwards the call to the kernel otherwise (<code>detcore/src/lib.rs:2031-2037</code>; dispatch is by Sysno because Rseq is not typed in the pinned Reverie revision, <code>detcore/src/lib.rs:2029-2030</code>). The flag is the fail-closed policy that ordinary <code>hermit run</code> enables; <code>--allow-unsupported-syscalls</code> is the opt-out (<code>detcore-model/src/config.rs:447-451</code>).</li>
-<li>Classification: listed with the determinized rows (<code>detcore/src/syscall_classification.rs:183</code>) and as a strict-only deterministic refusal, which &quot;preserve native behavior only under the explicit compatibility opt-out, and fail closed otherwise&quot; (<code>detcore/src/syscall_classification.rs:1311-1317</code>). Backends that run guest syscalls outside the dispatcher consult the same predicate; the unit test <code>deterministic_refusal_aggregate_includes_fixed_error_families</code> pins rseq in both sets (<code>detcore/src/syscall_classification.rs:2709-2719</code>, <code>detcore/src/syscall_classification.rs:2766-2775</code>).</li>
-<li>The call is subscribed even under record/replay's pass-through optimization (<code>detcore/src/lib.rs:1217</code>), and charged the synchronizing-syscall virtual-time cost (<code>detcore/src/syscall_time.rs:65-76</code>).</li>
-</ul>
-<p>The refusal happens before any argument check, so F2, F3 and F4 all report <code>ENOSYS</code> under the default policy rather than Linux's <code>EBUSY</code>, <code>EPERM</code> or <code>EINVAL</code>. That is intended: the area is never registered, so none of F5 through F8 can occur. Under the opt-out the call reaches the kernel and all the sources above apply; that mode is outside the determinism guarantee.</p>
-<p>Why not emulate: an emulation would have to write a fixed <code>cpu_id</code> into the area and never abort a critical section. That is reachable for the CPU ids but would silently change F5 semantics for code that relies on aborts for correctness, so a clean <code>ENOSYS</code> is the safer contract.</p>
-<p>Known gaps: no guest test exercises the refusal; the only coverage is the classification unit test above.</p>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F1, F4, F8): Under default <code>hermit run --strict</code>, raw <code>syscall(SYS_rseq, area, 32, 0, sig)</code> with a valid area, with an extended length, with an unknown flag bit and with a misaligned pointer each return <code>ENOSYS</code>; the area's <code>cpu_id</code> keeps its initial sentinel value. Run under <code>--verify</code>.</li>
-<li>T2 (covers F2, F3): Register twice and then unregister with <code>RSEQ_FLAG_UNREGISTER</code>, once with a wrong <code>sig</code>; every call returns <code>ENOSYS</code>.</li>
-<li>T3 (covers F5, F6, F7): A glibc program that starts threads, forks and execs, reads <code>__rseq_size</code> (expect 0), and calls <code>sched_getcpu</code>; it completes under <code>--strict --verify</code> with identical output and no <code>SIGSEGV</code>.</li>
-<li>T4 (covers none): With <code>--allow-unsupported-syscalls</code>, the same raw call reaches the kernel (it returns <code>EBUSY</code> or <code>EINVAL</code> because glibc already registered), documenting that the opt-out leaves the guarantee.</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+rseq&amp;body=Discussion+for+the+%60rseq%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Frseq.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60rseq%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `rseq`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · created for v1: no tracking issue existed for this pinned Sysno; code at this SHA: determinized, dispatch sysno-guard, refused only when fail-closed.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; refuse (fail-closed ENOSYS before the kernel at detcore/src/lib.rs:2031-2037; forwarded only under --allow-unsupported-syscalls); linux_determinism conditional -&gt; nondeterministic (kernel writes host CPU ids and aborts critical sections on host preemption); 8 flag behaviours and 4 tests listed; no guest test exists, so tracking_status stays todo</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+rseq&amp;amp;body=Discussion+for+the+%60rseq%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Frseq.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60rseq%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `rseq`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Created by the syscall-tracking v1 migration on 2026-10-03. No tracking issue existed for <code>rseq</code>: the 2026-07-24 classification campaign filed issues only for syscalls in that campaign's pass-through block, and Detcore already handled this one.</p>
-<p><code>tests/standalone/strict_timer_create.sh:10</code> records that CPython got further under <code>--strict</code> &quot;after the rseq + syscall-cascade fixes&quot;, which is the history behind the fail-closed arm.</p>
 </body></html>

@@ -3,95 +3,18 @@
 <title>sched_setaffinity | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>sched_setaffinity</code> (203)</h1>
-<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; linux determinism: conditional &middot; target policy: emulate &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+sched_setaffinity&amp;body=Discussion+for+the+%60sched_setaffinity%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsched_setaffinity.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60sched_setaffinity%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>sched_setaffinity(pid, cpusetsize, mask)</code> restricts the set of CPUs a thread may run on. Detcore emulates it as a no-op (<code>detcore/src/syscalls/threads.rs:2114</code> at hermit f4055eb9cae4). It checks the size and the mask pointer, reads up to 16 bytes of the mask, and returns 0 without touching the host scheduler. Every guest thread stays on virtual CPU 0, so a later <code>sched_getaffinity</code> still reports CPU 0 only.</p>
-<h2>Linux semantics</h2>
-<p><code>pid</code> is a thread ID; 0 means the calling thread. The raw syscall returns 0 on success.</p>
-<p>The kernel copies at most <code>cpumask_size()</code> bytes of <code>mask</code>. That size depends on the kernel configuration and the host's CPU count (<code>nr_cpu_ids</code>). A shorter <code>cpusetsize</code> leaves the missing high bits clear. Extra bytes past the kernel's size are ignored and never read.</p>
-<p>The mask that takes effect is the request intersected with the thread's cgroup cpuset and the active CPUs. If nothing is left, the call fails with <code>EINVAL</code>. Other errors:</p>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+sched_setaffinity&amp;body=Discussion+for+the+%60sched_setaffinity%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsched_setaffinity.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60sched_setaffinity%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>sched_setaffinity</code> (203) as determinized via typed dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.</p>
 <ul>
-<li><code>ESRCH</code>: no thread <code>pid</code> exists.</li>
-<li><code>EPERM</code>: the caller lacks <code>CAP_SYS_NICE</code> and its effective UID matches neither the real nor the effective UID of the target.</li>
-<li><code>EINVAL</code>: the target cannot be re-pinned, for example a per-CPU kernel thread, or a <code>SCHED_DEADLINE</code> thread whose root domain the mask does not cover.</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1809</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:8133</code></li>
 </ul>
-<p>On success the kernel may migrate the thread at once. A child created by <code>fork</code> or <code>clone</code> inherits the mask, and <code>execve</code> keeps it. The mask is visible through <code>sched_getaffinity</code>, through the <code>Cpus_allowed</code> lines of <code>/proc/&lt;pid&gt;/status</code>, and indirectly through <code>getcpu</code>.</p>
-<p>Host probe on the 316-CPU agent host (Linux 7.1.3, python ctypes, 2026-10-03), recorded by this body's author:</p>
-<ul>
-<li><code>cpusetsize</code> 0 gave <code>EINVAL</code>.</li>
-<li>An 8-byte all-zero mask gave <code>EINVAL</code>.</li>
-<li>pid 999999999 gave <code>ESRCH</code>.</li>
-</ul>
-<h3>Flags and options</h3>
-<ul>
-<li>F1: <code>pid</code> 0: change the calling thread's mask</li>
-<li>F2: <code>pid</code> naming another thread, in this or another process: change that thread's mask. <code>ESRCH</code> if no such thread exists; <code>EPERM</code> without permission.</li>
-<li>F3: <code>cpusetsize</code> shorter than the kernel cpumask: the missing high bits are treated as clear. <code>cpusetsize</code> 0 gives an empty mask and therefore <code>EINVAL</code>.</li>
-<li>F4: <code>cpusetsize</code> longer than the kernel cpumask: bytes past <code>cpumask_size()</code> are not read</li>
-<li>F5: a mask that selects at least one CPU the thread is allowed to use and that is online: returns 0, and from then on the thread runs only on those CPUs</li>
-<li>F6: a mask that selects no permitted online CPU (all zero, or only CPUs outside the cpuset or offline): <code>EINVAL</code></li>
-<li>F7: <code>mask</code> NULL or unreadable: <code>EFAULT</code></li>
-<li>F8: inheritance: children created by <code>fork</code>/<code>clone</code> inherit the mask, and <code>execve</code> keeps it</li>
-</ul>
-<h2>Determinism analysis</h2>
-<p><code>linux_determinism: conditional</code>. For one host and one launch configuration, a given request gets the same answer every time. Across hosts and launches the answer changes.</p>
-<h3>Nondeterminism sources</h3>
-<ul>
-<li>Host topology: the CPU count, the online CPUs (hotplug), and <code>cpumask_size()</code>. These decide whether a request for a fixed CPU number succeeds (F5) or gets <code>EINVAL</code> (F6), and how many bytes are read (F4).</li>
-<li>The cgroup cpuset and the affinity inherited from whatever launched the program (for example <code>taskset</code>). An outside process can change the cpuset while the guest runs. The header comment of <code>tests/c/fixture_cpuset_shim.c:12</code> records a real case: the dev-hermit validate launcher keeps cells off the CPUs the host PMU drivers use, CPU 0 among them (https://github.com/rrnewton/hermit/issues/3265). A fixture that asks for a fixed CPU therefore passes on one host and fails on another.</li>
-<li><code>pid</code>: on the host it is a host thread ID. Whether it exists, and whose credentials it carries, depends on what else runs on the host.</li>
-<li>Placement: after a successful call, which CPU the thread actually runs on is up to the host scheduler. The guest can observe it through <code>getcpu</code>.</li>
-</ul>
-<h2>Hermit design</h2>
-<p>Target policy: <code>emulate</code>. Detcore replaces the Linux scheduler with its own and runs every guest thread on one virtual CPU. The comment at <code>detcore/src/syscalls/threads.rs:78</code> says this &quot;represents one virtual CPU in a fixed 128-bit kernel mask&quot;. A host affinity mask therefore has no guest-visible meaning under Hermit. Forwarding the call would leak host topology through F5 and F6.</p>
-<p>What the handler does today (<code>handle_sched_setaffinity</code>, <code>detcore/src/syscalls/threads.rs:2114</code>, reached from the typed arm at <code>detcore/src/lib.rs:2636</code>):</p>
-<ul>
-<li><code>cpusetsize</code> 0 returns <code>EINVAL</code> (<code>detcore/src/syscalls/threads.rs:2120</code>). This matches Linux, where an empty mask is <code>EINVAL</code> (F3).</li>
-<li>A NULL mask returns <code>EFAULT</code> (<code>detcore/src/syscalls/threads.rs:2124</code>).</li>
-<li>It reads <code>min(cpusetsize, 16)</code> bytes of the mask (<code>detcore/src/syscalls/threads.rs:2126</code>-<code>2130</code>), so an unreadable first part of the buffer also gives <code>EFAULT</code> (F7).</li>
-<li>It logs the request and returns 0 (<code>detcore/src/syscalls/threads.rs:2131</code>-<code>2135</code>). The kernel is never called, and <code>pid</code> is never read.</li>
-<li>The handler never injects a syscall, so record and replay run the same emulation. The syscall stays in the record/replay subscription (<code>detcore/src/lib.rs:1174</code>).</li>
-</ul>
-<p>Related surfaces agree with the virtual CPU: <code>sched_getaffinity</code> always reports CPU 0 only (see that syscall's body), and <code>getcpu</code> reports CPU 0 (<code>detcore/src/syscalls/misc.rs:652</code>). <code>/proc/&lt;pid&gt;/status</code> has its <code>Cpus_allowed</code> and <code>Cpus_allowed_list</code> lines rewritten (<code>detcore/src/procfs.rs:1365</code>; unit test <code>status_normalizes_affinity_and_context_switches</code> at <code>detcore/src/procfs.rs:5360</code>). F8 therefore holds trivially: no mask is stored, so a child or an exec'd image sees the same CPU 0 answer.</p>
-<p>Where the emulation differs from Linux. Each difference is deterministic, but a program can observe it:</p>
-<ul>
-<li><strong>F6 is never reported.</strong> An all-zero mask, or a mask that names only CPU 1, returns 0. On a real one-CPU machine both would get <code>EINVAL</code>. The existing test asserts this on purpose: &quot;even an empty requested set is normalized to virtual CPU 0&quot; (<code>detcore/tests/misc/mod.rs:1022</code>). Under the alternative, a mask without CPU 0 would get <code>EINVAL</code>, matching the one-CPU machine the other surfaces describe. The current rule is more permissive: a program that pins to a CPU number it learned elsewhere keeps running. Owner decision 6 chose <code>EINVAL</code>; see the Target paragraph below.</li>
-<li><strong>F2 ignores `pid`.</strong> An unknown thread ID returns 0 instead of <code>ESRCH</code>, and <code>EPERM</code> never happens. A modeled version would look the guest's virtual TID up in Detcore's thread table and return <code>ESRCH</code> when it is absent. The host is not consulted, so the answer stays deterministic.</li>
-<li><strong>F4 reads only 16 bytes.</strong> Linux reads <code>cpumask_size()</code> bytes (40 on the 316-CPU agent host), so a buffer that becomes unreadable after 16 bytes gives <code>EFAULT</code> there and 0 under Hermit.</li>
-</ul>
-<p><code>emulate</code> fits better than the alternatives:</p>
-<ul>
-<li><code>model</code> would need per-thread mask state, which would only matter if Hermit ever exposed more than one virtual CPU.</li>
-<li><code>refuse</code> would break every runtime that pins threads at startup (thread pools, <code>taskset</code>, numactl).</li>
-<li><code>passthrough</code> leaks host topology.</li>
-</ul>
-<p>Target (owner decisions 6 and 7): <code>target_policy</code> stays <code>emulate</code>. Decision 7 asks that <code>sched_getaffinity</code> report what <code>sched_setaffinity</code> set. On Linux the stored mask is the request intersected with the CPUs the thread may use (kernel <code>__sched_setaffinity()</code>), and the reported mask is the stored one intersected with the active CPUs (kernel <code>sched_getaffinity()</code>). On the one-CPU virtual machine every accepted request therefore reads back as CPU 0 alone, which <code>handle_sched_getaffinity</code> already writes (<code>detcore/src/syscalls/threads.rs:2156</code>-<code>2157</code>), so no per-thread mask is needed while Hermit exposes one virtual CPU. A per-thread mask, inherited at fork and kept across <code>execve</code> (F8), becomes necessary only if Hermit exposes more virtual CPUs. Decision 6 brings the kernel's check order (sched_setaffinity(2); kernel <code>get_user_cpu_mask()</code>, then <code>sched_setaffinity()</code>): 1. Copy <code>min(cpusetsize, 16)</code> bytes, 16 being the virtual <code>cpumask_size()</code>. A failed copy is <code>EFAULT</code>, mapping the backend's <code>EIO</code> as <code>handle_sched_setattr</code> does (<code>detcore/src/syscalls/threads.rs:2336</code>). <code>cpusetsize</code> 0 copies nothing, so a NULL mask with size 0 is not <code>EFAULT</code> (F3, F4, F7). 2. <code>ESRCH</code> when <code>pid</code> names no live guest thread, from <code>thread_is_live</code> (<code>detcore/src/syscalls/threads.rs:2423</code>); any thread of any guest process is accepted (F1, F2). 3. <code>EINVAL</code> when the copied mask does not include CPU 0, which covers an all-zero mask and <code>cpusetsize</code> 0 (F3, F6). 4. Return 0 with no effect on the host or on Detcore's scheduler (F5).</p>
-<p><code>EPERM</code> (F2) stays unreported, under the privilege rule at <code>detcore/src/syscalls/threads.rs:2294</code>. This replaces the empty-mask normalization: the assertions at <code>detcore/tests/misc/mod.rs:973</code>-<code>983</code> (a mask naming only CPU 1 returns 0) and <code>detcore/tests/misc/mod.rs:1012</code>-<code>1022</code> (an all-zero mask returns 0) change to expect <code>EINVAL</code>. Today <code>cpusetsize</code> 0 is refused before any lookup (<code>detcore/src/syscalls/threads.rs:2120</code>), a NULL mask is refused before the copy (<code>detcore/src/syscalls/threads.rs:2124</code>), and <code>pid</code> is never read.</p>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F1, F3, F5, F7): on the calling thread, check that a mask selecting CPUs 0 and 1 returns 0, <code>cpusetsize</code> 0 gives <code>EINVAL</code>, and a NULL mask gives <code>EFAULT</code>. Afterwards <code>sched_getaffinity</code> must still report CPU 0 only. Existing candidate: <code>sched_affinity_is_normalized_to_virtual_cpu_zero</code> at <code>detcore/tests/misc/mod.rs:885</code> (test target <code>tests_misc</code>, run through <code>det_test_fn_sequential_without_pmu</code>). It asserts each of these at <code>detcore/tests/misc/mod.rs:973</code>-<code>1023</code>, but with a CPU-1-only mask returning 0, which changes to <code>EINVAL</code> under the target (T4).</li>
-<li>T2 (covers F2): pass the TID of another guest thread, the PID of another guest process, a TID that does not exist, and a negative pid. Today every case returns 0. Under the target the unknown and negative cases give <code>ESRCH</code>, and the other thread and the other process return 0.</li>
-<li>T3 (covers F3, F4): try <code>cpusetsize</code> 1, 8, 16, 128 and 1024 with a readable buffer of that size. Also try <code>cpusetsize</code> 1024 with a 16-byte mask placed at the end of a mapped page, followed by an unmapped page. Pin the results under <code>hermit run --verify</code>.</li>
-<li>T4 (covers F6): an all-zero mask and a mask naming only CPU 5. Today both return 0 (<code>detcore/tests/misc/mod.rs:1022</code> covers the all-zero case). Under the target (owner decision 6) both give <code>EINVAL</code>, as on a one-CPU Linux machine.</li>
-<li>T5 (covers F8): call <code>sched_setaffinity</code> asking for CPU 1, then fork a child that execs a program calling <code>sched_getaffinity</code> and <code>getcpu</code> and reading <code>Cpus_allowed_list</code> from <code>/proc/self/status</code>. Under <code>hermit run --verify</code> all three must report CPU 0 only.</li>
-<li>T6 (covers F5, F6): host independence. Run a guest that asks for CPU 0, prints the return value, then prints the <code>sched_getaffinity</code> mask. Run it under <code>hermit run --verify</code> twice, once directly and once under a <code>taskset -c 3</code> launcher, and require byte-identical output. Natively the printed mask differs between the two launches. (A process may widen its own mask to any CPU in its cpuset, as <code>tests/c/fixture_cpuset_shim.c:20</code>-<code>22</code> notes, so the request for CPU 0 itself succeeds natively in both launches; only a real cpuset makes it fail.)</li>
-<li>T7 (covers F2, F3, F7): check order. <code>cpusetsize</code> 0 with a NULL mask gives <code>EINVAL</code>, not <code>EFAULT</code>; <code>cpusetsize</code> 0 with a TID that does not exist gives <code>ESRCH</code>; an unmapped mask with a TID that does not exist gives <code>EFAULT</code>; a mask naming only CPU 5 with a TID that does not exist gives <code>ESRCH</code>. Today the first two give <code>EINVAL</code> and the last returns 0.</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+sched_setaffinity&amp;body=Discussion+for+the+%60sched_setaffinity%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsched_setaffinity.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60sched_setaffinity%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `sched_setaffinity`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · created for v1: no tracking issue existed for this pinned Sysno; code at this SHA: determinized, dispatch typed.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy emulate (accept-and-discard on one virtual CPU; threads.rs:2114 returns 0 after the size and pointer checks without calling the kernel); linux_determinism stays conditional (host topology, cpuset and launcher affinity decide F5/F6); 8 flags and 6 tests listed; tracking_status stays todo: no coverage recorded, and the F6 normalization and ignored pid (F2) are open questions for the owner</li>
-<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): decisions 6 and 7 applied (kernel order EFAULT copy, ESRCH from Detcore's task table, then EINVAL for a mask without CPU 0, replacing the empty-mask normalization; decision 7's read-back already holds on one virtual CPU, so no per-thread mask yet); target_policy stays emulate; new T7; T1, T2 and T4 expectations updated to the target; removed both open questions (EINVAL for a mask without CPU 0; pid ESRCH)</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+sched_setaffinity&amp;amp;body=Discussion+for+the+%60sched_setaffinity%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsched_setaffinity.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60sched_setaffinity%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `sched_setaffinity`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Created by the syscall-tracking v1 migration on 2026-10-03. No tracking issue existed for <code>sched_setaffinity</code>: the 2026-07-24 classification campaign filed issues only for syscalls in the old temporary pass-through block, and Detcore already handled this one.</p>
-<p>The handler carries <code>TODO-HUMAN-REVIEW(#546)</code>. That tag names https://github.com/rrnewton/hermit/pull/546 (&quot;Determinize scheduler affinity masks&quot;, commit f6f4d78992, 2026-07-24), which added both affinity handlers.</p>
-<p><code>tests/c/fixture_cpuset_shim.c</code> names this syscall, but it is not a Hermit test. It is a link-time wrapper the fixture-mutation harness uses to simulate a host cpuset (<code>tests/c/fixture_cpuset_shim.c:23</code>-<code>28</code>).</p>
 </body></html>

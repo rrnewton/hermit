@@ -3,91 +3,18 @@
 <title>sched_getattr | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>sched_getattr</code> (315)</h1>
-<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; linux determinism: conditional &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+sched_getattr&amp;body=Discussion+for+the+%60sched_getattr%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsched_getattr.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60sched_getattr%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>sched_getattr(pid, attr, size, flags)</code> reads a thread's scheduling policy and parameters into an extensible <code>struct sched_attr</code>. Detcore handles it (<code>detcore/src/lib.rs:2680</code>, <code>detcore/src/syscalls/threads.rs:2223</code>): after checking <code>flags</code>, <code>size</code> and <code>attr</code>, it writes a fixed 48-byte record that says <code>SCHED_OTHER</code> with every parameter zero, for any thread, and never asks the host.</p>
-<p>Manual reference: Linux man-pages sched_getattr(2), sched(7).</p>
-<h2>Linux semantics</h2>
-<p>The kernel first rejects, all with <code>EINVAL</code> from one test: <code>attr</code> NULL, <code>pid &lt; 0</code>, <code>size</code> larger than one page, <code>size</code> smaller than 48 (<code>SCHED_ATTR_SIZE_VER0</code>), and nonzero <code>flags</code>. It then resolves <code>pid</code> (0 means the caller), returning <code>ESRCH</code> when no such thread exists; a security module can refuse with <code>EPERM</code>.</p>
-<p>It fills a kernel <code>struct sched_attr</code> from the target thread: the policy; <code>SCHED_FLAG_RESET_ON_FORK</code> if set; the deadline runtime, deadline and period for <code>SCHED_DEADLINE</code>; the real-time priority for <code>SCHED_FIFO</code>/<code>SCHED_RR</code>; the nice value for the other policies; on recent kernels (6.12 and later) the custom time slice of a fair-class thread in <code>sched_runtime</code>; and, when the kernel has <code>CONFIG_UCLAMP_TASK</code>, the utilization clamps in <code>sched_util_min</code>/<code>sched_util_max</code>.</p>
-<p>Finally it copies <code>min(size, 56)</code> bytes to user space, storing that copied length in the <code>size</code> field, so a caller with a 48-byte buffer sees <code>size=48</code> and one with a larger buffer sees <code>size=56</code>. A failed copy is <code>EFAULT</code>.</p>
-<h3>Flags and options</h3>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+sched_getattr&amp;body=Discussion+for+the+%60sched_getattr%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsched_getattr.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60sched_getattr%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>sched_getattr</code> (315) as determinized via typed dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.</p>
 <ul>
-<li>F1: nonzero <code>flags</code>: <code>EINVAL</code>.</li>
-<li>F2: <code>attr</code> NULL: <code>EINVAL</code>.</li>
-<li>F3: <code>pid &lt; 0</code>: <code>EINVAL</code>.</li>
-<li>F4: <code>size</code> below 48 or above 4096: <code>EINVAL</code>.</li>
-<li>F5: <code>size</code> 48 to 55: the first <code>size</code> bytes are copied and <code>attr-&gt;size</code> is set to <code>size</code>. <code>size</code> 56 or more: 56 bytes are copied, including <code>sched_util_min</code>/<code>sched_util_max</code>, and <code>attr-&gt;size</code> is 56.</li>
-<li>F6: <code>pid</code> 0 (the caller) or the tid of another live thread; a pid that names no thread is <code>ESRCH</code>.</li>
-<li>F7: reported policy, priority and nice value: whatever the thread currently has, as set by <code>sched_setattr</code>, <code>sched_setscheduler</code>, <code>setpriority</code> or inheritance from the parent.</li>
-<li>F8: reported <code>sched_flags</code>: <code>SCHED_FLAG_RESET_ON_FORK</code> when the thread has it.</li>
-<li>F9: reported <code>SCHED_DEADLINE</code> parameters (runtime, deadline, period) for a deadline thread.</li>
-<li>F10: reported <code>sched_runtime</code> for a fair-class thread on recent kernels: its time slice, which defaults to a value derived from the host CPU count.</li>
-<li>F11: reported <code>sched_util_min</code>/<code>sched_util_max</code>: the thread's clamps when <code>CONFIG_UCLAMP_TASK</code> is enabled.</li>
-<li>F12: <code>attr</code> that cannot be written: <code>EFAULT</code>.</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1803</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:8176</code></li>
 </ul>
-<h2>Determinism analysis</h2>
-<p><code>linux_determinism: conditional</code>, kept from the legacy classification. The argument checks (F1-F4) are pure functions of the arguments. The answer for a valid call is host state: the policy and nice value inherited from whatever launched the program, the default slice derived from the host's CPU count (the 2026-07-24 strace below shows <code>sched_runtime=2800000</code> for a <code>SCHED_OTHER</code> thread), the kernel's clamp configuration, and whether the pid is live in the host process table. The call repeats when the thread's scheduling state is unchanged and the host is the same.</p>
-<h3>Nondeterminism sources</h3>
-<ul>
-<li>Policy and nice value inherited from the launching environment, for example a parent run under <code>chrt</code> or <code>nice</code></li>
-<li>The default fair-class slice, which scales with the host CPU count, and the kernel version that decides whether it is reported</li>
-<li>Kernel build options (<code>CONFIG_UCLAMP_TASK</code>) and the host's default clamp values</li>
-<li>The host process table, when the target pid is resolved against it</li>
-</ul>
-<h2>Hermit design</h2>
-<p>Target policy: <code>model</code> (owner decision 7, 2026-10-04). The p3 plan in the next paragraphs was <code>emulate</code> with one fixed record; the Target paragraph at the end of this section replaces it. Detcore's scheduler replaces Linux scheduling, so a guest thread's host attributes are inert, and the handler reports one fixed record instead. <code>handle_sched_getattr</code> (<code>detcore/src/syscalls/threads.rs:2223-2255</code>):</p>
-<ul>
-<li>returns <code>EINVAL</code> for nonzero <code>flags</code> (F1, <code>:2229-2231</code>), for <code>size</code> smaller than <code>sizeof(libc::sched_attr)</code>, which is 48 bytes (F4 lower bound, <code>:2233-2236</code>), and for a NULL <code>attr</code> (F2, <code>:2237</code>);</li>
-<li>builds a zeroed <code>sched_attr</code> with <code>size</code> 48 and policy <code>SCHED_OTHER</code> (<code>:2240-2242</code>), so priority, nice, flags, deadline parameters and slice all read 0 (F7-F10);</li>
-<li>writes those 48 bytes to <code>attr</code> (<code>:2249</code>); a failed write propagates the memory layer's errno, <code>EFAULT</code> for an unmapped buffer (F12);</li>
-<li>returns 0 and logs the pid, which it otherwise ignores (<code>:2250-2254</code>).</li>
-</ul>
-<p>The fixed record matches the rest of Detcore's virtual scheduling state: <code>sched_setattr</code> accepts well-formed requests as no-ops (see the <code>sched_setattr</code> body), the virtual current policy is <code>SCHED_OTHER</code> (<code>detcore/src/syscalls/threads.rs:107-112</code>), and <code>getpriority</code> reports nice 0 for every thread (<code>getpriority_result</code>, <code>detcore/src/syscalls/misc.rs:150-156</code>).</p>
-<p>Why the p3 plan chose <code>emulate</code> and not the alternatives:</p>
-<ul>
-<li><code>passthrough</code> reports the host's slice, inherited policy and clamps, all of which vary with the host and the launcher.</li>
-<li><code>refuse</code> breaks <code>chrt -p</code> and other scheduling queries; the handler's doc comment says it exists to re-enable <code>chrt</code> under <code>--strict</code> (<code>detcore/src/syscalls/threads.rs:2220</code>). The compat cell labelled <code>chrt</code> (<code>tests/e2e/manifests/compat.yaml:185</code>) runs <code>chrt -p $$</code>.</li>
-<li><code>model</code>, a per-thread virtual policy that this call reads back, is the open question recorded in the <code>sched_setattr</code> body. It would change this handler and that one together.</li>
-</ul>
-<p>Known gaps against Linux, each a guest-visible difference:</p>
-<ul>
-<li><strong>pid is ignored (F3, F6).</strong> A negative pid succeeds instead of <code>EINVAL</code>, and a pid that names no thread succeeds instead of <code>ESRCH</code>. The <code>sched_setattr</code> handler already resolves pids against Detcore's task table with <code>thread_is_live</code> (<code>detcore/src/syscalls/threads.rs:2423-2425</code>); this handler could do the same.</li>
-<li><strong>size above one page is accepted (F4 upper bound).</strong> Linux returns <code>EINVAL</code> for <code>size &gt; 4096</code>.</li>
-<li><strong>The copy length and the size field are fixed (F5).</strong> The handler always writes 48 bytes and stores <code>size=48</code>. Linux copies <code>min(size, 56)</code> bytes and stores that length, so a caller with a 56-byte buffer sees <code>size=56</code> and zeroed clamp fields natively, but <code>size=48</code> and untouched clamp fields under Hermit.</li>
-<li>The code tag <code>TODO-HUMAN-REVIEW(#791)</code> at <code>detcore/src/syscalls/threads.rs:2222</code> (https://github.com/rrnewton/hermit/pull/791) asks for human review of this handler.</li>
-</ul>
-<p>Target (owner decision 7, with decision 6): report the target thread's virtual scheduling record, the per-thread state that <code>sched_setattr</code>, <code>sched_setscheduler</code>, <code>sched_setparam</code> and <code>setpriority</code> write (kept in Detcore's thread state next to <code>timer_slack_ns</code>, <code>detcore/src/tool_local.rs:1795</code>), and close the three gaps above, in the kernel's order (sched_getattr(2); kernel <code>sys_sched_getattr()</code>): first <code>EINVAL</code> for a NULL <code>attr</code>, a negative <code>pid</code>, a <code>size</code> above 4096 or below 48, or nonzero <code>flags</code> (F1-F4); then <code>ESRCH</code> when <code>pid</code> names no live guest thread, from <code>thread_is_live</code> (<code>detcore/src/syscalls/threads.rs:2423</code>) (F6); then fill the record as <code>get_params()</code> does: the policy, <code>SCHED_FLAG_RESET_ON_FORK</code> when set (F8), the deadline runtime, deadline and period for <code>SCHED_DEADLINE</code> (F9), <code>sched_priority</code> for <code>SCHED_FIFO</code> and <code>SCHED_RR</code>, and nice for the other policies (F7), plus the recorded clamps, which start at 0 and 1024 (F11); last, copy <code>min(size, 56)</code> bytes with <code>attr-&gt;size</code> set to that length, where a failed copy is <code>EFAULT</code> (F5, F12; kernel <code>sched_attr_copy_to_user()</code>). A fair thread's <code>sched_runtime</code> reads 0, the behaviour before Linux 6.12, so the slice no longer reflects the host CPU count (F10). A thread that never set anything reads <code>SCHED_OTHER</code> with zero parameters and clamps 0 and 1024, whatever the launcher's policy. Today the handler ignores <code>pid</code> and writes a fixed 48-byte record (<code>detcore/src/syscalls/threads.rs:2240-2249</code>).</p>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F1, F2, F3, F4): with raw <code>syscall(SYS_sched_getattr, ...)</code>, check <code>EINVAL</code> for nonzero <code>flags</code>, a NULL <code>attr</code>, <code>pid</code> -1, <code>size</code> 47 and <code>size</code> 4097. Compare against native, and expect the pid and large-size cases to differ until the gaps above are fixed. No test file at this SHA names <code>sched_getattr</code>, so T1-T4 have no existing candidate.</li>
-<li>T2 (covers F5, F7, F8, F9, F10, F11): with poisoned 48-byte and 64-byte buffers, call for pid 0 and check the record under <code>hermit run --verify</code> on ptrace: policy <code>SCHED_OTHER</code>, every parameter 0, the bytes past the copied length untouched, and the <code>size</code> field. Assert Linux's rule (48 for the small buffer, 56 for the large one), so the test records the F5 gap until it is fixed. Repeat after <code>sched_setattr</code> sets <code>SCHED_BATCH</code> with <code>SCHED_FLAG_RESET_ON_FORK</code>, and after it sets a valid <code>SCHED_DEADLINE</code> request: under the target the answer reports what was set (T6).</li>
-<li>T3 (covers F6): call for the tid of a second live guest thread, which must succeed, and for that tid after the thread has exited, which Linux answers with <code>ESRCH</code>.</li>
-<li>T4 (covers F12): call with <code>attr</code> pointing at an unmapped page and expect <code>EFAULT</code>.</li>
-<li>T5 (covers F7): run <code>chrt -p $$</code> under <code>--strict --verify</code> on ptrace and require identical output across runs. Existing candidate: the compat cell labelled <code>chrt</code> at <code>tests/e2e/manifests/compat.yaml:185</code>. This body did not confirm which <code>chrt</code> versions call <code>sched_getattr</code> rather than <code>sched_getscheduler</code> and <code>sched_getparam</code>.</li>
-<li>T6 (covers F5, F7, F8, F9, F10, F11): read-back under <code>hermit run --verify</code> on ptrace with a 56-byte buffer. A fresh thread reads <code>SCHED_OTHER</code>, zero parameters and clamps 0 and 1024. After <code>sched_setattr</code> sets <code>SCHED_BATCH</code> with nice 7 and <code>SCHED_FLAG_RESET_ON_FORK</code>, it reads policy 3, nice 7 and the flag; a forked child reads <code>SCHED_OTHER</code>, nice 7, no flag. After <code>SCHED_FIFO</code> priority 10 it reads priority 10 and nice 0; after <code>SCHED_DEADLINE</code> (100000, 200000, 200000) it reads those three values; after clamps 100 and 900 it reads 100 and 900. A second thread reading the first thread's TID sees the same record. A <code>SCHED_OTHER</code> request with <code>sched_runtime</code> 2000000 reads back runtime 0. Today Hermit reads <code>SCHED_OTHER</code> with zero fields every time.</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+sched_getattr&amp;body=Discussion+for+the+%60sched_getattr%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsched_getattr.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60sched_getattr%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `sched_getattr`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/413: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch typed.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; emulate (fixed 48-byte SCHED_OTHER record with zero parameters, threads.rs:2223); linux_determinism stays conditional; 12 flag behaviours and 5 tests listed; gaps recorded (pid ignored, size &gt; 4096 accepted, copy length and size field fixed at 48); open question on emulate versus a modelled per-thread policy, shared with sched_setattr; no coverage token recorded, so tracking_status stays todo</li>
-<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): decisions 7 and 6 applied (report the per-thread scheduling record as get_params does, fair sched_runtime 0 as before Linux 6.12; Linux order EINVAL incl. size &gt; 4096, then ESRCH, then a min(size, 56) copy); target_policy emulate -&gt; model; new T6; T2's stays-SCHED_OTHER clause replaced by T6; removed both open questions (emulate or model; fix the three gaps)</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+sched_getattr&amp;amp;body=Discussion+for+the+%60sched_getattr%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsched_getattr.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60sched_getattr%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `sched_getattr`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Originally filed 2026-07-24 as &quot;Syscall classification: sched_getattr&quot; (https://github.com/rrnewton/hermit/issues/413), legacy variant A1.</p>
-<h3>2026-07-24 host strace evidence</h3>
-<p>This section is history. At hermit f4055eb9cae4 the call is dispatched by its own typed arm (<code>detcore/src/lib.rs:2680</code>), not by the old classification pass-through it describes.</p>
-<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) with <code>strace -f -e trace=sched_getattr</code> on a direct <code>syscall()</code> harness (invoked with non-destructive query/no-op/failing arguments) and, where applicable, on common programs. Hermit currently routes <code>sched_getattr</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code>.</p>
-<p>Observed strace line:</p>
-<pre><code>sched_getattr(0, {size=48, sched_policy=SCHED_OTHER, sched_flags=0, sched_nice=0, sched_priority=0, sched_runtime=2800000, sched_deadline=0, sched_period=0}, 48, 0) = 0
-</code></pre>
-<hr>
-<p>*Autonomous syscall-classification sweep (ranks 151-250 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
 </body></html>

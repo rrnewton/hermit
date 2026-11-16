@@ -3,81 +3,18 @@
 <title>landlock_create_ruleset | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>landlock_create_ruleset</code> (444)</h1>
-<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_landlock_sandbox_syscall</code> &middot; linux determinism: conditional &middot; target policy: refuse &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+landlock_create_ruleset&amp;body=Discussion+for+the+%60landlock_create_ruleset%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Flandlock_create_ruleset.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60landlock_create_ruleset%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>landlock_create_ruleset(attr, size, flags)</code> creates a Landlock ruleset and returns a file descriptor for it, or, with a query flag, reports the kernel's Landlock ABI version or errata. Detcore never forwards it to the host: at hermit f4055eb9cae4 it returns a fixed <code>ENOSYS</code> (<code>detcore/src/lib.rs:2322-2324</code>), which is what a kernel built without Landlock answers, so a guest always sees &quot;Landlock unavailable&quot;.</p>
-<p>Manual reference: Linux man-pages landlock_create_ruleset(2); UAPI header <code>linux/landlock.h</code>.</p>
-<h2>Linux semantics</h2>
-<p>Landlock is an unprivileged, stackable LSM. A process builds a ruleset (this call), adds rules to it (<code>landlock_add_rule</code>), and enforces it on itself (<code>landlock_restrict_self</code>). glibc has no wrapper; programs call it through <code>syscall(2)</code> or a library such as the <code>landlock</code> Rust crate.</p>
-<p>Availability is decided by the host kernel, before any argument is examined:</p>
+<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_landlock_sandbox_syscall</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+landlock_create_ruleset&amp;body=Discussion+for+the+%60landlock_create_ruleset%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Flandlock_create_ruleset.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60landlock_create_ruleset%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>landlock_create_ruleset</code> (444) as determinized-refused via pred:is_landlock_sandbox_syscall dispatch; deterministic refusal: true; run subscription: true; record/replay subscription: true.</p>
 <ul>
-<li>built without <code>CONFIG_SECURITY_LANDLOCK</code>: the syscall is not implemented and returns <code>ENOSYS</code>;</li>
-<li>built with Landlock but Landlock not in the active LSM list (<code>lsm=</code> boot parameter or the build default): <code>EOPNOTSUPP</code>;</li>
-<li>otherwise the call proceeds, and the set of access bits the kernel knows depends on its Landlock ABI version (roughly: ABI 1 in Linux 5.13, 2 adds <code>REFER</code>, 3 adds <code>TRUNCATE</code>, 4 adds TCP network rights, 5 adds <code>IOCTL_DEV</code>, 6 adds scopes, 7 adds the logging flags and the errata query).</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1689</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:7653</code></li>
 </ul>
-<p>With <code>flags == 0</code>, <code>attr</code> points to a <code>struct landlock_ruleset_attr</code> of <code>size</code> bytes, read as an extensible struct: <code>size</code> smaller than the first field (<code>handled_access_fs</code>, 8 bytes) is <code>EINVAL</code>, a struct larger than the kernel knows must have zero trailing bytes or the call fails with <code>E2BIG</code>, and a bad pointer is <code>EFAULT</code>. The new descriptor is an anonymous inode (<code>[landlock-ruleset]</code>) opened read-write with close-on-exec, at the lowest free descriptor number.</p>
-<h3>Flags and options</h3>
-<ul>
-<li>F1: <code>flags == 0</code>, ruleset creation: copies <code>struct landlock_ruleset_attr</code> (extensible-struct rules: <code>size</code> below 8 gives <code>EINVAL</code>, unknown non-zero trailing bytes or a size above one page give <code>E2BIG</code>, a bad pointer gives <code>EFAULT</code>) and returns a new close-on-exec ruleset descriptor.</li>
-<li>F2: <code>handled_access_fs</code> bitmask: the <code>LANDLOCK_ACCESS_FS_*</code> rights (<code>EXECUTE</code>, <code>WRITE_FILE</code>, <code>READ_FILE</code>, <code>READ_DIR</code>, <code>REMOVE_DIR</code>, <code>REMOVE_FILE</code>, <code>MAKE_CHAR</code>, <code>MAKE_DIR</code>, <code>MAKE_REG</code>, <code>MAKE_SOCK</code>, <code>MAKE_FIFO</code>, <code>MAKE_BLOCK</code>, <code>MAKE_SYM</code>, <code>REFER</code>, <code>TRUNCATE</code>, <code>IOCTL_DEV</code>) that the ruleset denies by default. A bit the running kernel does not know gives <code>EINVAL</code>. For historical reasons <code>REFER</code> is denied by default even when its bit is not set (UAPI header comment); a rule can grant it only if the bit is set here.</li>
-<li>F3: <code>handled_access_net</code> bitmask: <code>LANDLOCK_ACCESS_NET_BIND_TCP</code> and <code>LANDLOCK_ACCESS_NET_CONNECT_TCP</code> (ABI 4). Unknown bits give <code>EINVAL</code>.</li>
-<li>F4: <code>scoped</code> bitmask: <code>LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET</code> and <code>LANDLOCK_SCOPE_SIGNAL</code> (ABI 6), which stop the domain from connecting to abstract UNIX sockets or signalling processes outside it. Unknown bits give <code>EINVAL</code>.</li>
-<li>F5: all three masks zero: <code>ENOMSG</code> (a ruleset that handles nothing is refused).</li>
-<li>F6: <code>LANDLOCK_CREATE_RULESET_VERSION</code> with <code>attr == NULL</code> and <code>size == 0</code>: returns the highest supported ABI version (1 or more) and creates nothing. This is the canonical availability probe.</li>
-<li>F7: <code>LANDLOCK_CREATE_RULESET_ERRATA</code> with <code>attr == NULL</code> and <code>size == 0</code>: returns a bitmask of fixed issues for the running ABI version (recent kernels only; older ones give <code>EINVAL</code>).</li>
-<li>F8: any other <code>flags</code> value, both query flags at once, or a query flag with a non-NULL <code>attr</code> or non-zero <code>size</code>: <code>EINVAL</code>.</li>
-<li>F9: availability: <code>ENOSYS</code> on a kernel without Landlock, <code>EOPNOTSUPP</code> when Landlock is built but not enabled at boot. Both are returned before any argument check.</li>
-<li>F10: resource failure while creating the descriptor: <code>EMFILE</code> (descriptor table full) or <code>ENOMEM</code>.</li>
-</ul>
-<h2>Determinism analysis</h2>
-<p><code>linux_determinism: conditional</code>. On one host with a fixed kernel build, boot LSM list and descriptor table, the call is deterministic: the version, errata and error results are constants of the kernel, and the new descriptor takes the lowest free number. It does not repeat across hosts:</p>
-<ul>
-<li>whether Landlock exists (<code>ENOSYS</code>) or is enabled (<code>EOPNOTSUPP</code>) is a property of the kernel build and boot command line. Measured on the measurement host on 2026-10-03 (kernel 7.1.3, <code>/boot/config-7.1.3-...</code> says <code># CONFIG_SECURITY_LANDLOCK is not set</code>, <code>/sys/kernel/security/lsm</code> reads <code>capability,bpf,ima</code>): a raw <code>syscall(444, NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)</code> and the <code>ERRATA</code> probe both returned <code>-1</code>/<code>ENOSYS</code> natively;</li>
-<li>the ABI version (F6) and errata bitmask (F7) differ between kernel releases, and the same mask (F2-F4) is valid on one kernel and <code>EINVAL</code> on an older one;</li>
-<li>programs branch on these answers (best-effort sandboxing picks the rights to handle from the reported ABI), so the rest of the run diverges with them.</li>
-</ul>
-<p>Under Hermit the answer is a constant <code>ENOSYS</code>, so these host differences are removed.</p>
-<h2>Hermit design</h2>
-<p>Target policy: <code>refuse</code>, which is what the code does at hermit f4055eb9cae4.</p>
-<ul>
-<li><code>classify_syscall</code> lists <code>landlock_create_ruleset</code> as Determinized (<code>detcore/src/syscall_classification.rs:464</code>), and <code>is_landlock_sandbox_syscall</code> selects the three Landlock syscalls (<code>detcore/src/syscall_classification.rs:1121-1125</code>).</li>
-<li>In <code>handle_syscall_event</code>, the arm at <code>detcore/src/lib.rs:2322-2324</code> returns <code>Err(Error::Errno(Errno::ENOSYS))</code> before the typed match. It does not read <code>panic_on_unsupported_syscalls</code> (loaded at <code>detcore/src/lib.rs:1915</code>), so the answer is the same with and without <code>--strict</code>, and nothing reaches the host: no ruleset is created and no descriptor number is consumed.</li>
-<li><code>is_deterministically_refused_syscall</code> includes the family (<code>detcore/src/syscall_classification.rs:1327</code>). Per the comment at <code>detcore/src/syscall_classification.rs:2714-2717</code>, backends that execute guest syscalls outside Detcore's dispatcher consult that predicate to apply the same fixed refusal.</li>
-<li><code>ENOSYS</code> is checked before any argument, as on a kernel without Landlock, so malformed calls (F1, F5, F8) also get <code>ENOSYS</code> rather than <code>EINVAL</code>, <code>E2BIG</code>, <code>EFAULT</code> or <code>ENOMSG</code>. Library code written for best-effort sandboxing (for example the <code>landlock</code> crate's best-effort mode) treats <code>ENOSYS</code> as &quot;not supported&quot; and continues unsandboxed.</li>
-</ul>
-<p>Why not the alternatives:</p>
-<ul>
-<li><code>passthrough</code> makes the result a property of the host (F9, F6, F7), and a created ruleset would later let the guest install a real host LSM domain that Detcore cannot see (see landlock_restrict_self).</li>
-<li><code>emulate</code> with a fake success (a descriptor and a fixed ABI version) would tell the guest it is sandboxed when no restriction is enforced; that is a security lie, not a compatibility shim.</li>
-<li><code>model</code> would mean Detcore enforcing Landlock rules itself on every path, port, signal and socket operation. Nothing in the code plans this, and no workload so far needs it.</li>
-</ul>
-<p>Cost of <code>refuse</code>: a program that requires Landlock (not best effort) exits or refuses to run under Hermit. That failure is deterministic.</p>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F6, F9): under <code>hermit run --verify</code> on ptrace, a guest probes <code>syscall(SYS_landlock_create_ruleset, NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)</code> and must see <code>-1</code> with <code>errno == ENOSYS</code>, identically in both runs and on a host whose kernel does support Landlock. Existing guest: <code>tests/rust/landlock.rs:43-52</code> (cargo bin <code>rustbin_landlock</code>, <code>tests/Cargo.toml:86-89</code>). At this SHA no cargo integration test and no e2e manifest program runs it; it is only picked up by the internal Buck glob at <code>tests/BUCK:415</code>. It needs a ptrace runner before it can be recorded as coverage.</li>
-<li>T2 (covers F7, F8): <code>LANDLOCK_CREATE_RULESET_ERRATA</code> with NULL/0, <code>flags == 3</code>, <code>flags == 0x80</code>, and <code>VERSION</code> with a non-NULL <code>attr</code> all return <code>ENOSYS</code>, not a version, a bitmask or <code>EINVAL</code>.</li>
-<li>T3 (covers F1, F2, F3, F4, F5, F10): <code>flags == 0</code> with a valid attr handling every known filesystem, network and scope bit, with all masks zero, with <code>size == 4</code>, with a 2-page struct, and with a bad <code>attr</code> pointer: each returns <code>ENOSYS</code>. After these calls the guest's next <code>open()</code> returns the same descriptor number as it would have before them, showing that no ruleset descriptor was allocated.</li>
-<li>T4 (covers F9): a best-effort sandboxing program (one that probes the ABI version and falls back when it gets <code>ENOSYS</code>) runs to completion under <code>hermit run --verify</code> with identical output in both runs.</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+landlock_create_ruleset&amp;body=Discussion+for+the+%60landlock_create_ruleset%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Flandlock_create_ruleset.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60landlock_create_ruleset%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `landlock_create_ruleset`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant B of https://github.com/rrnewton/hermit/issues/627: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch pred:is_landlock_sandbox_syscall, refused.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; refuse (detcore/src/lib.rs:2322-2324 returns a fixed ENOSYS, the no-Landlock kernel answer, before any argument check and without consulting the host); linux_determinism stays conditional (host kernel build, boot LSM list and ABI version decide the native answer); 10 flag behaviours and 4 tests listed; the only guest, tests/rust/landlock.rs, has no ptrace runner in cargo tests or the e2e manifest at this SHA, so no coverage token and tracking_status stays todo</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+landlock_create_ruleset&amp;amp;body=Discussion+for+the+%60landlock_create_ruleset%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Flandlock_create_ruleset.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60landlock_create_ruleset%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `landlock_create_ruleset`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Originally filed 2026-07-24 as &quot;Syscall classification: landlock_create_ruleset&quot; (https://github.com/rrnewton/hermit/issues/627), legacy variant B. The determinized ENOSYS arm carries <code>TODO-HUMAN-REVIEW(#827)</code> in the code (https://github.com/rrnewton/hermit/issues/827). Sibling bodies: landlock_add_rule (https://github.com/rrnewton/hermit/issues/626) and landlock_restrict_self (https://github.com/rrnewton/hermit/issues/628) share the same dispatch arm.</p>
-<h3>Notes from the P3 reading (2026-10-03)</h3>
-<ul>
-<li><code>tests/e2e/manifests/inventory/test-files.json:3593-3595</code> says <code>tests/rust/landlock.rs</code> is &quot;selected by a Rust integration test&quot;. No file under <code>hermit-cli/tests/</code> or <code>detcore/tests/</code> names <code>rustbin_landlock</code> or <code>landlock</code> at f4055eb9cae4, so that inventory entry is not true for this guest. Wiring it into an existing ptrace runner (for example the <code>default_cargo_*</code> list in <code>hermit-cli/tests/hermit_modes.rs</code>) would give T1 a citable path.</li>
-<li>The unit test <code>landlock_sandbox_syscalls_are_determinized_and_consistent</code> (<code>detcore/src/syscall_classification.rs:2344</code>) checks only the classification and the predicate, not the guest-visible result; it starts no Hermit run, so it cannot carry a coverage token.</li>
-</ul>
-<h3>Legacy tracking note (2026-07-24)</h3>
-<p>Filed by the complete syscall-classification audit. The implementation classifies <code>PASS-THRU</code> entries under fixed-container/stable-state assumptions and routes all other entries through the explicit unsupported policy until a deterministic handler is implemented.</p>
 </body></html>

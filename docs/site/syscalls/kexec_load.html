@@ -3,65 +3,18 @@
 <title>kexec_load | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>kexec_load</code> (246)</h1>
-<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_privileged_admin_refused_syscall</code> &middot; linux determinism: conditional &middot; target policy: refuse &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+kexec_load&amp;body=Discussion+for+the+%60kexec_load%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fkexec_load.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60kexec_load%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>kexec_load(entry, nr_segments, segments, flags)</code> stages a new kernel image in memory, for a later <code>reboot(LINUX_REBOOT_CMD_KEXEC)</code> or, with <code>KEXEC_ON_CRASH</code>, for the crash path. Hermit refuses it: Detcore answers every call with a fixed <code>EPERM</code> and never forwards it to the host kernel (<code>detcore/src/lib.rs:2164</code>).</p>
-<p>Manual reference: Linux man-pages kexec_load(2).</p>
-<h2>Linux semantics</h2>
-<p>The kernel's first check is <code>kexec_load_permitted()</code>: the caller needs <code>CAP_SYS_BOOT</code> in the initial user namespace, and the <code>kernel.kexec_load_disabled</code> sysctl (and the per-type load limits of recent kernels) must still allow a load. Otherwise the call returns <code>EPERM</code> before it looks at <code>flags</code>, <code>nr_segments</code> or <code>segments</code>. Kernel lockdown also forbids <code>kexec_load</code> with <code>EPERM</code>, because it loads an unverified image. Without <code>CONFIG_KEXEC</code> the syscall does not exist and returns <code>ENOSYS</code>.</p>
-<p>Past the permission checks, the kernel validates <code>flags</code> and the architecture field, limits <code>nr_segments</code> to <code>KEXEC_SEGMENT_MAX</code> (16), takes the global kexec lock (<code>EBUSY</code> if another load holds it), copies the segments into the destination memory ranges (the crash kernel must fit the memory reserved with <code>crashkernel=</code>), and replaces any image previously staged. <code>nr_segments == 0</code> unloads the staged image instead. Nothing runs until a later <code>reboot</code> or a crash; the effect is host-global.</p>
-<h3>Flags and options</h3>
+<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_privileged_admin_refused_syscall</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+kexec_load&amp;body=Discussion+for+the+%60kexec_load%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fkexec_load.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60kexec_load%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>kexec_load</code> (246) as determinized-refused via pred:is_privileged_admin_refused_syscall dispatch; deterministic refusal: true; run subscription: true; record/replay subscription: true.</p>
 <ul>
-<li>F1: privilege gate: without <code>CAP_SYS_BOOT</code> in the initial user namespace, when <code>kernel.kexec_load_disabled</code> forbids loads, or under kernel lockdown, the call returns <code>EPERM</code> before any other argument is checked.</li>
-<li>F2: <code>KEXEC_ON_CRASH</code> (0x1): stage the image as the crash kernel, run on a panic. The segments must lie inside the reserved crash memory.</li>
-<li>F3: <code>KEXEC_PRESERVE_CONTEXT</code> (0x2): preserve hardware and software state across the kexec jump, so the new kernel can return.</li>
-<li>F4: <code>KEXEC_UPDATE_ELFCOREHDR</code> (0x4): the crash image's ELF core header may be updated by the kernel on CPU or memory hotplug.</li>
-<li>F5: <code>KEXEC_CRASH_HOTPLUG_SUPPORT</code> (0x8): the crash image supports hotplug updates (recent kernels).</li>
-<li>F6: architecture field (<code>flags &amp; KEXEC_ARCH_MASK</code>): must be <code>KEXEC_ARCH_DEFAULT</code> or the native <code>KEXEC_ARCH_X86_64</code>; any other value gives <code>EINVAL</code>.</li>
-<li>F7: any other flag bit: <code>EINVAL</code>, checked after F1.</li>
-<li>F8: <code>nr_segments</code>: more than <code>KEXEC_SEGMENT_MAX</code> (16) gives <code>EINVAL</code>; 0 unloads the currently staged image of that type.</li>
-<li>F9: <code>segments</code>: a bad pointer gives <code>EFAULT</code>; overlapping or out-of-range destinations give <code>EINVAL</code> or <code>EADDRNOTAVAIL</code>. Reachable only past F1.</li>
-<li>F10: concurrency: another load or unload in progress gives <code>EBUSY</code>.</li>
-<li>F11: kernel built without <code>CONFIG_KEXEC</code>: <code>ENOSYS</code> for every call.</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1685</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:7484</code></li>
 </ul>
-<h2>Determinism analysis</h2>
-<p><code>linux_determinism: conditional</code>, kept from the migration. For a caller without <code>CAP_SYS_BOOT</code> in the initial user namespace, which includes root inside a container's user namespace, Linux returns <code>EPERM</code> before it examines any argument (F1), so the call repeats exactly. With the capability, the outcome depends on host state.</p>
-<h3>Nondeterminism sources</h3>
-<ul>
-<li>Host kernel configuration (F11), the <code>kernel.kexec_load_disabled</code> sysctl and lockdown state (F1)</li>
-<li>The memory reserved for a crash kernel and the physical memory layout (F2, F9)</li>
-<li>A previously staged image and concurrent loaders (F8, F10)</li>
-</ul>
-<h2>Hermit design</h2>
-<p>Target policy: <code>refuse</code>. The code at hermit f4055eb9cae4 already realizes it. <code>classify_syscall</code> lists <code>kexec_load</code> as Determinized with the rest of the privileged system-administration family (<code>detcore/src/syscall_classification.rs:289</code> to <code>detcore/src/syscall_classification.rs:315</code>). <code>Detcore::handle_syscall_event</code> then matches it on the <code>Sysno</code>, before the typed match, with the guard <code>is_privileged_admin_refused_syscall</code> (<code>detcore/src/lib.rs:2164</code> to <code>detcore/src/lib.rs:2168</code>; the set itself is at <code>detcore/src/syscall_classification.rs:902</code>), and returns <code>Err(Error::Errno(Errno::EPERM))</code> (<code>detcore/src/lib.rs:2167</code>). The arm reads no argument and never forwards the call to the host kernel. It does not consult <code>panic_on_unsupported_syscalls</code>, so the answer is the same with and without fail-closed mode, and the comment above the arm (<code>detcore/src/lib.rs:2154</code>) states the intent that it be identical across <code>--verify</code> and record/replay. The same set feeds <code>is_deterministically_refused_syscall</code> (<code>detcore/src/syscall_classification.rs:1319</code>), which is what <code>code_facts.refused: true</code> reports.</p>
-<p>Classification-only evidence: the unit test <code>privileged_admin_syscalls_are_determinized_and_consistent</code> (<code>detcore/src/syscall_classification.rs:2535</code>) checks that <code>kexec_load</code> is Determinized and in the refusal set, and that the set holds nothing else. It does not start Hermit, so it is not coverage for any test below.</p>
-<p>How close this is to Linux: the permission check is the kernel's first one, so for a caller without <code>CAP_SYS_BOOT</code> Linux itself returns <code>EPERM</code> for every argument value. Hermit's answer matches that for F1 to F10. The one difference is F11: on a host kernel without <code>CONFIG_KEXEC</code>, Linux gives <code>ENOSYS</code> and Hermit still gives <code>EPERM</code>. That makes the guest's result independent of the host kernel's configuration, which is the point of the refusal.</p>
-<p>Why <code>refuse</code>:</p>
-<ul>
-<li>Under ptrace the guest runs as root inside the container's user namespace (the comment at <code>detcore/src/syscall_classification.rs:2298</code> to <code>detcore/src/syscall_classification.rs:2303</code> describes the <code>CLONE_NEWUSER</code> uid map). Linux checks <code>CAP_SYS_BOOT</code> against the initial user namespace, which such a root never holds, so a fixed <code>EPERM</code> is what the guest would see from the kernel in that container anyway. The refusal removes the dependency on how Hermit itself was launched.</li>
-<li><code>passthrough</code> would let a guest change host-global kernel state if Hermit ever ran with the capability, which is an isolation hole, not a determinism feature.</li>
-<li><code>model</code> or <code>emulate</code> would mean pretending that a replacement kernel was staged. A guest can never act on it: the matching <code>reboot(LINUX_REBOOT_CMD_KEXEC)</code> is refused by the same arm, and a container has no kernel to replace, so an emulated success would only report a state that does not exist.</li>
-</ul>
-<p>Nothing is missing in the code. The gap is evidence: no test names <code>SYS_kexec_load</code> (<code>tests_naming: 0</code>), so verification on the default backend stays untested.</p>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11): under <code>hermit run --verify</code> on ptrace, call raw <code>syscall(SYS_kexec_load, ...)</code> with <code>nr_segments = 0</code> and each of these <code>flags</code>: 0, <code>KEXEC_ON_CRASH</code>, <code>KEXEC_PRESERVE_CONTEXT</code>, <code>KEXEC_UPDATE_ELFCOREHDR</code>, <code>KEXEC_CRASH_HOTPLUG_SUPPORT</code>, <code>KEXEC_ARCH_X86_64</code>, an unsupported architecture value (<code>KEXEC_ARCH_ARM</code>), and an undefined bit (<code>0x10</code>). Add <code>nr_segments = 17</code>, and <code>nr_segments = 1</code> with <code>segments = (void *)1</code>. Assert every call returns -1 with <code>errno == EPERM</code> and both verify runs print identical output. Two back-to-back calls cover the F10 case only in the sense that neither returns <code>EBUSY</code>; the test should say so. F11 is covered by asserting <code>EPERM</code>, not <code>ENOSYS</code>, on whatever host CI runs.</li>
-<li>T2 (covers F1): record a guest that calls <code>kexec_load</code> under <code>hermit record</code>, replay it, and assert the replay returns <code>EPERM</code> at the same point and the run reproduces.</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+kexec_load&amp;body=Discussion+for+the+%60kexec_load%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fkexec_load.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60kexec_load%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `kexec_load`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant B of https://github.com/rrnewton/hermit/issues/623: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch pred:is_privileged_admin_refused_syscall, refused.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy refuse (code returns a fixed EPERM before reading arguments, detcore/src/lib.rs:2164-2168; Linux's first check is the same EPERM without CAP_SYS_BOOT; only a no-CONFIG_KEXEC host differs, ENOSYS natively); linux_determinism stays conditional; 11 flag behaviours and 2 tests listed; no test names the syscall, so tracking_status stays todo</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+kexec_load&amp;amp;body=Discussion+for+the+%60kexec_load%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fkexec_load.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60kexec_load%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `kexec_load`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Originally filed 2026-07-24 as &quot;Syscall classification: kexec_load&quot; (https://github.com/rrnewton/hermit/issues/623), legacy variant B.</p>
-<h3>Legacy tracking note (2026-07-24)</h3>
-<p>Filed by the complete syscall-classification audit. The implementation classifies <code>PASS-THRU</code> entries under fixed-container/stable-state assumptions and routes all other entries through the explicit unsupported policy until a deterministic handler is implemented.</p>
 </body></html>

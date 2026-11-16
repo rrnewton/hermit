@@ -3,97 +3,18 @@
 <title>umount2 | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>umount2</code> (166)</h1>
-<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_mount_ns_admin_refused_syscall</code> &middot; linux determinism: conditional &middot; target policy: refuse &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+umount2&amp;body=Discussion+for+the+%60umount2%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fumount2.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60umount2%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>umount2(target, flags)</code> detaches the mount at <code>target</code>, optionally forcing it (<code>MNT_FORCE</code>), detaching it lazily (<code>MNT_DETACH</code>), expiring it (<code>MNT_EXPIRE</code>) or refusing to follow a final symlink (<code>UMOUNT_NOFOLLOW</code>). Hermit refuses every call with a fixed <code>EPERM</code> and never forwards it to the host (<code>detcore/src/lib.rs:2215-2219</code> at hermit f4055eb9cae4), so the guest cannot change the mount table Hermit's container set up.</p>
-<p>Manual reference: <a href="https://man7.org/linux/man-pages/man2/umount.2.html">umount2(2)</a>.</p>
-<h2>Linux semantics</h2>
-<p>The kernel (<code>fs/namespace.c</code>, <code>ksys_umount</code>/<code>path_umount</code>) checks in this order:</p>
-<p>1. Unknown bits in <code>flags</code> give <code>EINVAL</code>. 2. <code>target</code> is resolved, following a final symlink unless <code>UMOUNT_NOFOLLOW</code> is set. A bad pointer gives <code>EFAULT</code>; a missing path gives <code>ENOENT</code>. Both host probes under Additional information stop here. 3. The caller needs <code>CAP_SYS_ADMIN</code> over its mount namespace (<code>may_mount</code>), otherwise <code>EPERM</code>. Hermit's ptrace guest is root of its own user namespace (<code>detcore/src/syscalls/misc.rs:672</code>), so on Linux it would pass this check for mounts in its own mount namespace. 4. <code>target</code> must be the root of a mount in the caller's namespace, otherwise <code>EINVAL</code>. A mount locked by a less privileged namespace boundary (one the guest inherited from Hermit's parent namespace) gives <code>EINVAL</code>. 5. <code>MNT_FORCE</code> additionally needs <code>CAP_SYS_ADMIN</code> in the initial user namespace, otherwise <code>EPERM</code>.</p>
-<p>Then the mount is detached. Without <code>MNT_DETACH</code>, a mount still in use (open files, a working directory, child mounts) gives <code>EBUSY</code>. With <code>MNT_DETACH</code> it disappears from the namespace at once and is freed when the last reference goes. Unmounting a shared mount also unmounts its propagated copies in peer namespaces.</p>
-<h3>Flags and options</h3>
+<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_mount_ns_admin_refused_syscall</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+umount2&amp;body=Discussion+for+the+%60umount2%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fumount2.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60umount2%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>umount2</code> (166) as determinized-refused via pred:is_mount_ns_admin_refused_syscall dispatch; deterministic refusal: true; run subscription: true; record/replay subscription: true.</p>
 <ul>
-<li>F1: <code>flags = 0</code>: plain unmount; <code>EBUSY</code> if the mount is in use.</li>
-<li>F2: <code>MNT_FORCE</code>: ask the filesystem to abort pending I/O (meaningful for NFS and FUSE); needs <code>CAP_SYS_ADMIN</code> in the initial user namespace, otherwise <code>EPERM</code>.</li>
-<li>F3: <code>MNT_DETACH</code>: lazy unmount; the mount leaves the namespace immediately and is torn down when no longer busy.</li>
-<li>F4: <code>MNT_EXPIRE</code>: mark the mount expired; the first call returns <code>EAGAIN</code>, and a second call with no use in between unmounts it. Combined with <code>MNT_FORCE</code> or <code>MNT_DETACH</code> it gives <code>EINVAL</code>.</li>
-<li>F5: <code>UMOUNT_NOFOLLOW</code>: do not follow a symlink as the last component of <code>target</code>.</li>
-<li>F6: any other bit in <code>flags</code>: <code>EINVAL</code> before the path is resolved.</li>
-<li>F7: target errors: <code>ENOENT</code> for a missing path (both host probes, with flags 0 and with <code>MNT_DETACH</code>), <code>EFAULT</code> for a bad pointer, <code>ENAMETOOLONG</code>, <code>EINVAL</code> when <code>target</code> is not a mount point or is locked, and <code>EPERM</code> without the capability.</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1896</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:7540</code></li>
 </ul>
-<h2>Determinism analysis</h2>
-<p><code>linux_determinism: conditional</code>, kept from both legacy issues. Without privilege, or with a bad path or bad flags, the call fails with an error that depends only on the arguments and the paths, so it repeats; the probes show <code>ENOENT</code> with no state change. With privilege it succeeds and changes the mount-namespace topology and path resolution for every process in the namespace, and through propagation for peer namespaces. Whether it succeeds then depends on whether the filesystem is busy, which depends on what other processes have open, and <code>MNT_EXPIRE</code> depends on use since the previous call.</p>
-<h3>Nondeterminism sources</h3>
-<ul>
-<li>Mount namespace contents and propagation (shared, slave and private peers)</li>
-<li>Capabilities: <code>CAP_SYS_ADMIN</code> over the mount namespace, and in the initial namespace for <code>MNT_FORCE</code></li>
-<li>Open references and working directories on the mount, which decide <code>EBUSY</code>, and use since the last <code>MNT_EXPIRE</code> call</li>
-<li>Concurrent mounts and unmounts by other processes</li>
-</ul>
-<h2>Hermit design</h2>
-<p>Target policy: <code>refuse</code>. At hermit f4055eb9cae4 the code already realizes it:</p>
-<ul>
-<li><code>classify_syscall</code> marks <code>umount2</code> Determinized in the mount and namespace administration group (<code>detcore/src/syscall_classification.rs:339-369</code>, reviewed under the code tag <code>TODO-HUMAN-REVIEW(#724)</code>, https://github.com/rrnewton/hermit/issues/724). The comment there says the container pins the guest's namespaces and mount hierarchy for the run.</li>
-<li><code>is_mount_ns_admin_refused_syscall</code> (<code>detcore/src/syscall_classification.rs:939</code>) includes it, and <code>handle_syscall_event</code> returns <code>Err(Errno::EPERM)</code> before the typed match (<code>detcore/src/lib.rs:2215-2219</code>). The arm reads neither argument and is not gated by <code>--strict</code>.</li>
-<li>The predicate is part of <code>is_deterministically_refused_syscall</code> (<code>detcore/src/syscall_classification.rs:1324</code>), so <code>code_facts.refused</code> is true.</li>
-<li>The only test is the unit test <code>mount_ns_admin_syscalls_are_determinized_and_consistent</code> (<code>detcore/src/syscall_classification.rs:2666</code>), which checks classification and membership and runs no guest.</li>
-</ul>
-<p>Why <code>refuse</code>:</p>
-<ul>
-<li><code>umount2</code> is the inverse of <code>mount</code>, which Hermit also refuses (same arm). Allowing unmounts alone would let a guest remove the <code>/proc</code>, <code>/tmp</code> or other mounts Hermit set up, changing what later path lookups reach, while giving it no way to put them back.</li>
-<li>Success would depend on host-visible state (<code>EBUSY</code> from open references, <code>EAGAIN</code> from expiry), which Detcore does not track.</li>
-<li><code>model</code> would only make sense together with a modelled mount table for <code>mount</code>; see the open question on <code>mount</code>.</li>
-</ul>
-<p>Known differences from Linux:</p>
-<ul>
-<li>On Linux the guest, as root of its own namespaces, could unmount a mount it created or one not locked by the namespace boundary. Under Hermit every request fails with <code>EPERM</code>. <code>umount(8)</code> and cleanup code in test suites see that error.</li>
-<li>Hermit returns <code>EPERM</code> before checking <code>flags</code> or resolving <code>target</code>, so F6 and the <code>ENOENT</code>/<code>EFAULT</code>/<code>EINVAL</code> cases of F7 give <code>EPERM</code> under Hermit.</li>
-<li><code>capget</code> is passed through (<code>detcore/src/syscall_classification.rs:716</code>), so the guest may see <code>CAP_SYS_ADMIN</code> and still get <code>EPERM</code>.</li>
-</ul>
-<p>Target (owner decision 6): keep the fixed <code>EPERM</code>, returned before <code>flags</code> or <code>target</code> is read, which is what the code does today (<code>detcore/src/lib.rs:2215-2219</code>). Linux's order is <code>ksys_umount</code> in <code>fs/namespace.c</code>: unknown <code>flags</code> bits give <code>EINVAL</code>, <code>user_path_at</code> resolves <code>target</code> (<code>ENOENT</code>, <code>EFAULT</code>), then <code>path_umount</code> calls <code>can_umount</code>, which checks <code>may_mount()</code> (<code>EPERM</code>) before &quot;not a mount point&quot;, &quot;not in this namespace&quot; and <code>MNT_LOCKED</code> (all <code>EINVAL</code>) and the <code>MNT_FORCE</code> capability check (<code>EPERM</code>); the <code>MNT_EXPIRE</code> combinations are rejected later, in <code>do_umount</code>. Hermit deliberately does not reproduce the flag and path errors that come before the privilege check. <code>umount(8)</code> and cleanup code in test suites see the permission error an unprivileged Linux caller gets for an existing path.</p>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F1, F2, F3, F4, F5): under <code>hermit run --verify</code> on ptrace, a guest calls <code>syscall(SYS_umount2, ...)</code> on <code>/proc</code> and on <code>/tmp</code> with flags 0, <code>MNT_FORCE</code>, <code>MNT_DETACH</code>, <code>MNT_EXPIRE</code> and <code>UMOUNT_NOFOLLOW</code>. Each must return -1 with <code>EPERM</code>, <code>/proc/self/mountinfo</code> read before and after must be identical, and <code>/proc/self/status</code> must still be readable afterwards.</li>
-<li>T2 (covers F6, F7): call it with an unknown flag bit (<code>0x80000000</code>), <code>MNT_EXPIRE|MNT_DETACH</code>, a missing path such as <code>/nonexistent-mnt</code>, <code>target = (char *)-1</code>, and a directory that is not a mount point. Each returns the fixed <code>EPERM</code> of owner decision 6 (Linux gives <code>EINVAL</code>, <code>ENOENT</code> and <code>EFAULT</code> for the first, third and fourth to any caller, and <code>EINVAL</code> for the second and fifth only to a caller that passes <code>may_mount()</code>), and both <code>--verify</code> runs agree.</li>
-<li>T3 (covers F1, F3): <code>hermit record</code> then <code>hermit replay</code> a shell guest that runs <code>umount /tmp</code> and <code>umount -l /tmp</code> (util-linux) and prints their exit status and stderr; both runs and the replay must match, and <code>/tmp</code> must still be mounted.</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+umount2&amp;body=Discussion+for+the+%60umount2%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fumount2.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60umount2%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `umount2`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/504: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy NEEDS-INVESTIGATION; code at this SHA: determinized, dispatch pred:is_mount_ns_admin_refused_syscall, refused.</li>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · duplicate https://github.com/rrnewton/hermit/issues/525 is retired into this issue; its text waits under Additional information for a section-by-section merge.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; refuse (Detcore returns a fixed EPERM at detcore/src/lib.rs:2215 for every umount2 request, never forwarded); linux_determinism stays conditional; duplicate https://github.com/rrnewton/hermit/issues/525 merged (its NEEDS-HANDLER and this issue's NEEDS-INVESTIGATION both resolved as refuse); 7 flag behaviours and 3 tests listed; no coverage token because no test runs a guest that calls umount2, so tracking_status stays todo; open question on errno order under Additional information</li>
-<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): decision 6 applied (fixed EPERM before any argument check stays the target; Linux order in ksys_umount/can_umount deliberately not reproduced); target_policy stays refuse; T2 now asserts the decision-6 errno; no new F/T ids; open question on checking flags and path first removed</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+umount2&amp;amp;body=Discussion+for+the+%60umount2%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fumount2.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60umount2%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `umount2`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Originally filed 2026-07-24 as &quot;Syscall classification: umount2&quot; (https://github.com/rrnewton/hermit/issues/504), legacy variant A1. Its comment history stays on that issue.</p>
-<p>Merged duplicate: https://github.com/rrnewton/hermit/issues/525, filed 2026-07-24 as &quot;Syscall classification: umount2&quot; (legacy variant A1), retired into this issue. Its comment history (0 comments at migration) stays on that issue.</p>
-<h3>Merge notes</h3>
-<ul>
-<li>Both issues classified the call CONDITIONAL; the merged body keeps <code>conditional</code>.</li>
-<li>This issue recommended NEEDS-INVESTIGATION and the duplicate NEEDS-HANDLER, adding &quot;Hermit should refuse or explicitly model it&quot;. Both are resolved as <code>refuse</code>, which is what the code at f4055eb9cae4 does.</li>
-<li>The duplicate's facts kept here: the call changes mount-namespace topology and path resolution and can affect other processes; its nondeterminism sources (mount namespace contents, capabilities, open references, propagation, busy state, concurrent mounts) are under Nondeterminism sources; the flag families it names (lazy detach, force, expiration, no-follow) are F2-F5; its <code>MNT_DETACH</code> probe is in F7.</li>
-<li>Both issues said Hermit routed <code>umount2</code> through the UNCLASSIFIED temporary pass-through block (the duplicate at <code>dd60278f</code>). That was true when filed and is superseded: at f4055eb9cae4 the call is Determinized and refused. The code at the cited SHA wins.</li>
-<li>This issue's note &quot;Usually EPERM/EINVAL/ENOENT under hermit&quot; described the pass-through era; at f4055eb9cae4 the answer is always <code>EPERM</code>.</li>
-</ul>
-<h3>2026-07-24 host strace evidence (https://github.com/rrnewton/hermit/issues/504)</h3>
-<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) with <code>strace -f -e trace=umount2</code> on a direct <code>syscall()</code> harness (invoked with non-destructive query/no-op/failing arguments) and, where applicable, on common programs. Hermit then routed <code>umount2</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code>.</p>
-<p>Observed strace line:</p>
-<pre><code>umount2(&quot;/nonexistent-mnt&quot;, 0)  = -1 ENOENT (No such file or directory)
-</code></pre>
-<hr>
-<p>*Autonomous syscall-classification sweep (ranks 151-250 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
-<h3>2026-07-24 host strace evidence (duplicate https://github.com/rrnewton/hermit/issues/525)</h3>
-<p>Evidence was gathered on <code>the measurement host</code> (Linux 6.17, x86_64, glibc) with a direct <code>syscall()</code> harness. The probe used safe self-targeting, no-op, temporary-file, or deliberately invalid arguments and was traced with <code>strace -qq -f -e trace=umount2</code>. The harness exited 0, and <code>detcore/src/syscall_classification.rs</code> at <code>dd60278f</code> places <code>umount2</code> in the UNCLASSIFIED temporary-passthrough block. The nonexistent mount probe returned ENOENT without changing state.</p>
-<p>Observed strace line:</p>
-<pre><code>umount2(&quot;/tmp/hermit-no-mount-b5&quot;, MNT_DETACH) = -1 ENOENT (No such file or directory)
-</code></pre>
-<hr>
-<p>*Autonomous syscall-classification sweep, batch 5 (ranks 201-250 of the unique <code>syscall_classification.rs</code> UNCLASSIFIED list). Manual research plus host strace evidence; no code change proposed here.*</p>
 </body></html>

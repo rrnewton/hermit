@@ -3,103 +3,18 @@
 <title>epoll_pwait | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>epoll_pwait</code> (281)</h1>
-<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; linux determinism: nondeterministic &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+epoll_pwait&amp;body=Discussion+for+the+%60epoll_pwait%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fepoll_pwait.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60epoll_pwait%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize)</code> waits for events on an epoll instance, as <code>epoll_wait</code> does, and optionally swaps in a temporary signal mask atomically for the wait. On x86_64, glibc's <code>epoll_wait()</code> uses the plain <code>epoll_wait</code> syscall. This one is reached by <code>epoll_pwait()</code> callers and by libraries that issue it directly, such as libuv.</p>
-<p>Detcore models a NULL-mask call (<code>detcore/src/syscalls/io.rs:1187-1234</code>). Under sequentialized run it becomes zero-timeout probes against a virtual-time deadline. A non-NULL mask is still injected raw and blocks in the kernel while holding the scheduler turn.</p>
-<p>Manual reference: Linux man-pages epoll_wait(2) (section &quot;epoll_pwait&quot;), epoll(7), signal(7).</p>
-<h2>Linux semantics</h2>
-<p>The kernel works in this order:</p>
-<p>1. install the temporary mask, if one is given 2. check <code>maxevents</code> and the <code>events</code> buffer 3. resolve <code>epfd</code> 4. wait until the ready list is non-empty, the timeout expires, or a signal handler runs</p>
-<p>It then copies up to <code>maxevents</code> ready events out and restores the original mask. The return value is the number of events, or 0 on timeout. Which events are reported, and how often, follows the per-descriptor settings made with <code>epoll_ctl</code>. The timeout is in milliseconds and is never written back. Per signal(7), <code>epoll_pwait</code> is never restarted after a handler, even with <code>SA_RESTART</code>.</p>
-<h3>Flags and options</h3>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+epoll_pwait&amp;body=Discussion+for+the+%60epoll_pwait%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fepoll_pwait.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60epoll_pwait%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>epoll_pwait</code> (281) as determinized via typed dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.</p>
 <ul>
-<li>F1: <code>epfd</code>: a descriptor that is not open gives <code>EBADF</code>. A descriptor that is not an epoll instance gives <code>EINVAL</code>.</li>
-<li>F2: <code>maxevents</code>: must be greater than 0 and at most <code>EP_MAX_EVENTS</code> (<code>EINVAL</code> otherwise). The <code>events</code> buffer must be writable for <code>maxevents</code> entries (<code>EFAULT</code>).</li>
-<li>F3: <code>timeout &lt; 0</code>: wait without a time limit.</li>
-<li>F4: <code>timeout == 0</code>: return immediately with whatever is ready.</li>
-<li>F5: <code>timeout &gt; 0</code>: wait up to that many milliseconds, rounded up to the clock granularity. Nothing is written back.</li>
-<li>F6: <code>sigmask == NULL</code>: behaves exactly like <code>epoll_wait</code>.</li>
-<li>F7: <code>sigmask != NULL</code>: <code>sigsetsize</code> must be 8 (<code>EINVAL</code>). An unreadable mask gives <code>EFAULT</code>. The mask is applied atomically for the wait and restored on return.</li>
-<li>F8: ready-list semantics set by <code>epoll_ctl</code>:</li>
-<li>level-triggered entries are reported while ready</li>
-<li><code>EPOLLET</code> entries are reported once per new edge</li>
-<li><code>EPOLLONESHOT</code> entries are disabled after one report</li>
-<li><code>EPOLLEXCLUSIVE</code> wakes one of several waiters</li>
-<li>more ready entries than <code>maxevents</code> are returned across later calls in round-robin order</li>
-<li>F9: a signal handler runs during the wait: <code>EINTR</code>, never restarted even with <code>SA_RESTART</code>.</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1589</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:8118</code></li>
 </ul>
-<h2>Determinism analysis</h2>
-<p><code>linux_determinism: nondeterministic</code> (changed from the migration's placeholder <code>conditional</code>). When an event becomes ready relative to the timeout, which events are reported in one call, their order, and whether a signal ends the wait all depend on host scheduling, peer activity and the real clock. The call repeats only for a zero timeout against an epoll set whose state is already settled.</p>
-<h3>Nondeterminism sources</h3>
-<ul>
-<li>Readiness timing of the watched descriptors, and ready-list order</li>
-<li>Timeout expiry against the real clock</li>
-<li>Signal arrival relative to the wait; the temporary mask decides which signals can interrupt it</li>
-</ul>
-<h2>Hermit design</h2>
-<p>Target policy: <code>model</code>, matching <code>epoll_wait</code>. <code>handle_epoll_pwait</code> (<code>detcore/src/syscalls/io.rs:1187-1234</code>, dispatched at <code>detcore/src/lib.rs:2624</code>) chooses a path as follows.</p>
-<ul>
-<li><strong>Non-NULL mask</strong> (<code>detcore/src/syscalls/io.rs:1217-1221</code>): Detcore makes an empty resource request (one scheduler turn), then calls <code>record_or_replay</code> on the unchanged call. With a non-zero timeout the thread blocks in the kernel while holding the turn. The comment at <code>detcore/src/syscalls/io.rs:1212-1216</code> calls this &quot;a known remaining gap&quot;. It applies in sequentialized run and in record/replay.</li>
-<li><strong>NULL mask, record/replay, zero timeout</strong> (<code>detcore/src/syscalls/io.rs:1222-1226</code>): the call takes a turn and is recorded.</li>
-<li><strong>NULL mask, unsequentialized run or record/replay with a timeout</strong> (<code>detcore/src/syscalls/io.rs:1227-1230</code>): <code>record_or_replay_blocking</code>, so the host decides when the call completes.</li>
-<li><strong>NULL mask, sequentialized run</strong> (<code>handle_internal_epoll_pwait</code>, <code>detcore/src/syscalls/io.rs:1238-1271</code>):</li>
-<li>A zero timeout takes a <code>zero_timeout_poll_request</code> turn, so a polling loop cannot starve its producer (<code>detcore/src/syscalls/io.rs:1254-1262</code>), then injects the call.</li>
-<li>Any other timeout runs <code>retry_nonblocking_syscall_with_timeout</code> under <code>InternalIOPolling</code> (<code>detcore/src/syscalls/io.rs:1264-1269</code>). The deadline comes from <code>millis_duration_to_absolute_timeout</code> (<code>detcore/src/syscalls/helpers.rs:1593-1601</code>). A negative timeout has no deadline (<code>positive_millis_as_nanos</code>, <code>detcore/src/syscalls/helpers.rs:1612-1614</code>).</li>
-<li>The nonblocking form is defined at <code>detcore/src/syscalls/helpers.rs:1069</code>, with its rationale at <code>detcore/src/syscalls/helpers.rs:1058-1067</code>.</li>
-</ul>
-<p>The comment at <code>detcore/src/syscalls/io.rs:1192-1200</code> records why this routing exists. <code>cmake</code> hung forever because libuv's <code>epoll_pwait(..., -1, NULL, 8)</code> blocked in the kernel while holding the only turn.</p>
-<p>Why <code>model</code> and not the alternatives:</p>
-<ul>
-<li><code>passthrough</code> is exactly the deadlock above.</li>
-<li><code>emulate</code> cannot judge readiness without the kernel.</li>
-<li><code>refuse</code> would break libuv, which is used by Node.js and cmake.</li>
-</ul>
-<p>What remains before the code fully realizes <code>model</code>:</p>
-<ul>
-<li><strong>Masked waits</strong> (F7, F9) can still deadlock a sequentialized guest, by the same mechanism as the documented <code>cmake</code> hang. This is a hypothesis from reading the code; no test exercises a blocking masked <code>epoll_pwait</code>. The masked path also passes the guest's mask through without clearing Hermit's perf-event signal bit. <code>ppoll</code> and <code>pselect6</code> clear it (<code>sanitize_ppoll_signal_mask</code>, <code>detcore/src/syscalls/io.rs:386-389</code>). Not measured.</li>
-<li><strong>Inconsistent mask policy across the family.</strong> For a masked wait that would block:</li>
-<li><code>pselect6</code> carries the mask on every zero-timeout probe (<code>detcore/src/syscalls/io.rs:614-625</code>)</li>
-<li><code>ppoll</code> fails closed with <code>ENOSYS</code> (<code>detcore/src/syscalls/io.rs:1046-1048</code>)</li>
-<li><code>epoll_pwait</code> blocks in the kernel</li>
-</ul>
-<p>Target (owner decisions 13, 14): every <code>epoll_pwait</code> whose wait could block is a zero-timeout probe plus a scheduler wait, with the timeout measured on virtual time. For a non-NULL mask, the snapshotted mask, with Hermit's perf-event signal bit cleared by <code>sanitize_ppoll_signal_mask</code>, rides on every zero-timeout probe so the kernel applies it atomically, as <code>pselect6</code> already does (<code>detcore/src/syscalls/io.rs:614-625</code>). The NULL-mask sequentialized path already has this form (<code>detcore/src/syscalls/io.rs:1238-1271</code>). The masked path does not: it takes one turn and then waits in the kernel holding it (<code>detcore/src/syscalls/io.rs:1217-1221</code>), the class of the documented <code>cmake</code> hang. <code>epoll_pwait</code> is used directly by libuv, so it is not refused while the masked probe is built.</p>
-<ul>
-<li><strong>Record mode with a timeout</strong> uses <code>record_or_replay_blocking</code>, whose completion point the host decides. That is acceptable for record, because the outputs are recorded.</li>
-</ul>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F4, F6): a zero-timeout NULL-mask polling loop on an eventfd must let its worker run under <code>--strict --max-timeslice=disabled</code>. Existing candidates: <code>tests/c/epoll_pwait_zero_timeout_progress.c</code> (default mode), <code>zero_timeout_epoll_pwait_yields_without_timer_preemption</code> (<code>hermit-cli/tests/epoll_pwait_zero_timeout_progress.rs:145</code>), and <code>zero_timeout_epoll_pwait_ordinary_strict_smoke</code> (<code>hermit-cli/tests/epoll_pwait_zero_timeout_progress.rs:159</code>).</li>
-<li>T2 (covers F3, F6): an infinite-timeout NULL-mask wait, satisfied by a worker that sleeps 50 ms first, completes under plain <code>--strict</code>. Existing candidate: <code>run_blocking_mode</code> (<code>tests/c/epoll_pwait_zero_timeout_progress.c:133</code>) and <code>blocking_epoll_pwait_does_not_deadlock_the_scheduler</code> (<code>hermit-cli/tests/epoll_pwait_zero_timeout_progress.rs:181</code>). These tests run <code>hermit run --strict</code> without <code>--verify</code>, and no manifest cell names this program. Add a <code>c-programs</code> cell with verify on ptrace.</li>
-<li>T3 (covers F5): a 20 ms timeout on an empty epoll set returns 0 with output identical across <code>--verify</code> runs. No existing test.</li>
-<li>T4 (covers F1, F2): the error cases:</li>
-<li>a closed <code>epfd</code> gives <code>EBADF</code></li>
-<li>a pipe <code>epfd</code> gives <code>EINVAL</code></li>
-<li><code>maxevents = 0</code> gives <code>EINVAL</code></li>
-<li>an <code>events</code> pointer of 1 gives <code>EFAULT</code> No existing test.</li>
-<li>T5 (covers F7): masked calls:</li>
-<li><code>sigsetsize = 4</code> gives <code>EINVAL</code></li>
-<li>an inaccessible mask gives <code>EFAULT</code></li>
-<li>a masked call with a ready descriptor returns it</li>
-<li>a masked infinite wait satisfied by a sleeping worker must complete under <code>--strict</code>; today this is expected to hang (hypothesis), so write it as the test for the fix No existing test.</li>
-<li>T6 (covers F8): level-triggered, <code>EPOLLET</code> and <code>EPOLLONESHOT</code> entries on pipes, with <code>maxevents = 1</code> across three ready descriptors. Assert the report sequence is identical across <code>--verify</code> runs. No existing test calls <code>epoll_pwait</code> this way.</li>
-<li>T7 (covers F9): a NULL-mask wait interrupted by a handled signal returns <code>EINTR</code> even with <code>SA_RESTART</code>, identically across <code>--verify</code> runs. No existing test.</li>
-<li>T8 (covers F4, F6, F7): record and replay of a zero-timeout call and a masked ready call reproduce the return values and <code>events</code> contents. No existing test.</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+epoll_pwait&amp;body=Discussion+for+the+%60epoll_pwait%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fepoll_pwait.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60epoll_pwait%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `epoll_pwait`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · created for v1: no tracking issue existed for this pinned Sysno; code at this SHA: determinized, dispatch typed.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; model (NULL-mask waits are zero-timeout probes against a virtual-time deadline); linux_determinism conditional -&gt; nondeterministic (readiness, timeout and signal timing); masked waits still block in the kernel holding the scheduler turn, and the masked-wait policy differs from ppoll and pselect6, left as an open question for the owner; 9 flag behaviours and 8 tests listed; no coverage token, so tracking_status stays todo</li>
-<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): decisions 13 and 14 applied (Target paragraph: masked waits carry the sanitized mask on each zero-timeout probe, as pselect6 does; today the masked path waits in the kernel holding the turn); target_policy stays model; no new F/T ids; removed the masked-wait family-policy question, which emptied Open questions</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+epoll_pwait&amp;amp;body=Discussion+for+the+%60epoll_pwait%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fepoll_pwait.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60epoll_pwait%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `epoll_pwait`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Created by the syscall-tracking v1 migration on 2026-10-03. No tracking issue existed for <code>epoll_pwait</code>: the 2026-07-24 classification campaign filed issues only for syscalls in the old temporary pass-through block, and Detcore already handled this one.</p>
-<p>The NULL-mask routing and its regression test came from hermit commit 2d4c80d868 (&quot;Determinize null-mask epoll_pwait progress&quot;). The sibling <code>epoll_pwait2</code> has its own cell, <code>c-programs/epoll-pwait2</code> (<code>tests/e2e/manifests/c-programs.yaml:11446</code>).</p>
 </body></html>

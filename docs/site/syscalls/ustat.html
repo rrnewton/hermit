@@ -3,77 +3,18 @@
 <title>ustat | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>ustat</code> (136)</h1>
-<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_mount_introspection_enosys_syscall</code> &middot; linux determinism: nondeterministic &middot; target policy: refuse &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+ustat&amp;body=Discussion+for+the+%60ustat%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fustat.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60ustat%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>ustat(dev, ubuf)</code> is the obsolete interface that returns the free-block and free-inode counts of the mounted filesystem whose device number is <code>dev</code>. Hermit refuses it: Detcore answers every call with <code>ENOSYS</code> before looking at the arguments and never calls the kernel (<code>detcore/src/lib.rs:2110-2114</code> at hermit f4055eb9cae4), which sends callers to <code>statfs</code>/<code>fstatfs</code>.</p>
-<p>Manual reference: Linux man-pages ustat(2).</p>
-<h2>Linux semantics</h2>
-<p><code>statfs(2)</code> and <code>fstatfs(2)</code> replaced <code>ustat</code> long ago; glibc stopped providing the <code>ustat</code> wrapper and <code>&lt;ustat.h&gt;</code> in 2.28, so only raw <code>syscall(SYS_ustat, ...)</code> callers and old binaries reach it. The kernel takes <code>dev</code> as a 32-bit value, decodes it into a device number, looks for a mounted superblock with that device, and asks that filesystem for its <code>statfs</code> data. Only <code>f_tfree</code> (free blocks) and <code>f_tinode</code> (free inodes) carry information; <code>f_fname</code> and <code>f_fpack</code> are always zero. The call has no side effects.</p>
-<p>The device lookup comes first. A device number that names no mounted superblock fails with <code>EINVAL</code> before <code>ubuf</code> is checked. Host strace on Linux 6.17 shows this both for device 0 and for the root directory's <code>st_dev</code> (<code>makedev(0, 0x20)</code>), so a device number taken from <code>stat()</code> does not always name a superblock <code>ustat</code> can find. Both strace lines are under Additional information.</p>
-<h3>Flags and options</h3>
+<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_mount_introspection_enosys_syscall</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+ustat&amp;body=Discussion+for+the+%60ustat%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fustat.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60ustat%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>ustat</code> (136) as determinized-refused via pred:is_mount_introspection_enosys_syscall dispatch; deterministic refusal: true; run subscription: true; record/replay subscription: true.</p>
 <ul>
-<li>F1: <code>dev</code> names a mounted filesystem whose superblock implements <code>statfs</code>: returns 0 and writes the live free-block count (<code>f_tfree</code>) and free-inode count (<code>f_tinode</code>); <code>f_fname</code> and <code>f_fpack</code> are zeroed.</li>
-<li>F2: <code>dev</code> names no mounted superblock, including device 0 and a <code>st_dev</code> the kernel cannot map back to a superblock: <code>EINVAL</code>. This check runs before <code>ubuf</code> is touched.</li>
-<li>F3: <code>dev</code> is valid but <code>ubuf</code> is not writable: <code>EFAULT</code>.</li>
-<li>F4: the filesystem behind <code>dev</code> does not implement <code>statfs</code>: <code>ENOSYS</code>, the same errno Hermit returns for every call.</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1903</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:7400</code></li>
 </ul>
-<h2>Determinism analysis</h2>
-<p><code>linux_determinism: nondeterministic</code>. The success result (F1) is a snapshot of how full a host filesystem is. Any write, deletion or allocation on that filesystem, by any process inside or outside the guest, changes it between runs and within one run. Which device numbers succeed at all depends on the host's mount table and on how its filesystems assign device numbers. The error results (F2, F3) repeat for a fixed host, but a program calls <code>ustat</code> for its success value, so the classification follows that path.</p>
-<p>The duplicate issue https://github.com/rrnewton/hermit/issues/530 classified <code>ustat</code> as CONDITIONAL, while this issue said nondeterministic. Nondeterministic is kept: no argument value makes the success path repeatable, and &quot;conditional&quot; there meant only that the error paths repeat.</p>
-<h3>Nondeterminism sources</h3>
-<ul>
-<li>Free-block and free-inode counts, which change with any concurrent allocation on the host filesystem, and with quotas and reserved blocks</li>
-<li>The host mount table and device-number assignment, which decide whether a given <code>dev</code> finds a superblock (F2)</li>
-<li>Whether the filesystem implements <code>statfs</code> (F4)</li>
-</ul>
-<h2>Hermit design</h2>
-<p>Target policy: <code>refuse</code>. The code at hermit f4055eb9cae4 already realizes it:</p>
-<ul>
-<li><code>classify_syscall</code> lists <code>ustat</code> among the Determinized syscalls (<code>detcore/src/syscall_classification.rs:385</code>), and <code>is_mount_introspection_enosys_syscall</code> includes it (<code>detcore/src/syscall_classification.rs:1190-1200</code>). The doc comment at <code>detcore/src/syscall_classification.rs:1182-1189</code> gives the reason: the live capacity counters are host state outside the guest's model, and a fixed <code>ENOSYS</code> directs callers to <code>statfs</code>.</li>
-<li>In <code>handle_syscall_event</code> (<code>detcore/src/lib.rs:1892</code>), the dispatch match (<code>detcore/src/lib.rs:2028</code>) returns <code>Err(Errno::ENOSYS)</code> for this predicate (<code>detcore/src/lib.rs:2110-2114</code>). It does not decode <code>dev</code> or <code>ubuf</code> and does not inject the syscall, so the guest's buffer is never written and the result is the same for every argument (F1-F4).</li>
-<li>Unlike the <code>rseq</code> arm (<code>detcore/src/lib.rs:2031-2037</code>), this arm does not consult <code>panic_on_unsupported_syscalls</code>: the answer is <code>ENOSYS</code> with and without fail-closed mode, matching <code>refused_only_when_fail_closed: false</code>.</li>
-<li>The predicate is part of the deterministic refusal set (<code>detcore/src/syscall_classification.rs:1331</code>), and the unit test <code>mount_introspection_syscalls_are_determinized_and_consistent</code> (<code>detcore/src/syscall_classification.rs:2377</code>) pins both the classification and the predicate membership.</li>
-</ul>
-<p>Why <code>refuse</code>:</p>
-<ul>
-<li><code>ENOSYS</code> is a result a real kernel gives (F4), and the replacement interface is handled: <code>statfs</code> and <code>fstatfs</code> run the real call and canonicalize the host-varying fields, including free blocks and inodes (<code>detcore/src/lib.rs:2794-2801</code>). A caller that falls back from <code>ustat</code> to <code>statfs</code> therefore gets a deterministic answer.</li>
-<li><code>passthrough</code> would leak live host capacity (F1).</li>
-<li><code>model</code> or <code>emulate</code> would mean inventing canonical free counts for an interface glibc no longer exposes. The <code>statfs</code> canonicalization could be reused, but no known workload needs it.</li>
-</ul>
-<p>The legacy recommendations were NEEDS-INVESTIGATION (this issue) and NEEDS-HANDLER (the duplicate, which suggested &quot;deterministically refuse or record&quot;). The refusal branch of that suggestion is what the code does; recording is not needed because the refusal never consults the host.</p>
-<p>Note: <code>ENOSYS</code> from <code>ustat</code> usually means &quot;not supported by this filesystem&quot; (F4), whereas natively a bad device gives <code>EINVAL</code> (F2). A program that treats <code>EINVAL</code> specially sees a different errno under Hermit. No such program is known.</p>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F2): <code>syscall(SYS_ustat, 0, NULL)</code>, which natively fails with <code>EINVAL</code>, returns <code>ENOSYS</code> under <code>hermit run --verify</code> on ptrace, in both default and fail-closed (<code>--panic-on-unsupported-syscalls</code>) runs. Existing candidates: <code>tests/c/ustat_enosys.c</code> through cell <code>c-programs/ustat-enosys</code> (<code>tests/e2e/manifests/c-programs.yaml:10599</code>, verify <code>ci: ptrace: true</code>), and <code>sysv_and_legacy_filesystem_features_fall_back_deterministically</code> at <code>hermit-cli/tests/sysv_legacy_fallbacks.rs:30</code>, which runs that guest with <code>--backend=ptrace</code>, <code>--strict</code>, <code>--verify</code> and <code>--panic-on-unsupported-syscalls</code>.</li>
-<li>T2 (covers F1, F3, F4): call <code>ustat</code> with the <code>st_dev</code> of <code>/</code>, of the current directory and of a <code>/proc</code> file, each with a writable buffer pre-filled with a sentinel, and once with an unwritable buffer. Every call must return <code>ENOSYS</code>, the sentinel must be unchanged, and the two <code>--verify</code> runs must agree.</li>
-<li>T3 (covers F1): a guest that tries <code>ustat</code> on the root <code>st_dev</code>, falls back to <code>statfs(&quot;/&quot;)</code> on <code>ENOSYS</code>, and prints the free counts. Under <code>--verify</code> both runs must print the same values.</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+ustat&amp;body=Discussion+for+the+%60ustat%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fustat.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60ustat%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `ustat`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/509: linux_determinism nondeterministic (from <strong>Classification:</strong>); target_policy from legacy NEEDS-INVESTIGATION; code at this SHA: determinized, dispatch pred:is_mount_introspection_enosys_syscall, refused.</li>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · duplicate https://github.com/rrnewton/hermit/issues/530 is retired into this issue; its text waits under Additional information for a section-by-section merge.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; refuse (Detcore returns ENOSYS for every call without touching the kernel, detcore/src/lib.rs:2110-2114, and statfs/fstatfs are the canonicalized replacement); linux_determinism stays nondeterministic (duplicate's CONDITIONAL reconciled); merged https://github.com/rrnewton/hermit/issues/530; 4 flag behaviours and 3 tests listed; existing ptrace candidates for T1 named but no run result seen and only one argument shape exercised, so tracking_status stays todo and ptrace_verification untested</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+ustat&amp;amp;body=Discussion+for+the+%60ustat%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fustat.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60ustat%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `ustat`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Originally filed 2026-07-24 as &quot;Syscall classification: ustat&quot; (https://github.com/rrnewton/hermit/issues/509), legacy variant A1. The duplicate https://github.com/rrnewton/hermit/issues/530, filed 2026-07-24 with the same title (legacy variant A1, batch 5 of the classification sweep), was merged into this body on 2026-10-03; its comment history (0 comments) stays on that issue, and this issue's comment history stays here.</p>
-<p>Both legacy bodies said Hermit routed <code>ustat</code> through the UNCLASSIFIED temporary pass-through block of <code>detcore/src/syscall_classification.rs</code> (the duplicate cites <code>dd60278f</code>). That was true when they were filed and is superseded: at hermit f4055eb9cae4 <code>ustat</code> is Determinized and refused, as described under Hermit design.</p>
-<h3>2026-07-24 host strace evidence</h3>
-<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) with <code>strace -f -e trace=ustat</code> on a direct <code>syscall()</code> harness (invoked with non-destructive query/no-op/failing arguments) and, where applicable, on common programs. Hermit currently routes <code>ustat</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code>.</p>
-<p>Observed strace line:</p>
-<pre><code>ustat(makedev(0, 0), 0x407000)  = -1 EINVAL (Invalid argument)
-</code></pre>
-<hr>
-<p>*Autonomous syscall-classification sweep (ranks 151-250 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
-<h3>Host strace evidence from the duplicate https://github.com/rrnewton/hermit/issues/530</h3>
-<p>Evidence was gathered on <code>the measurement host</code> (Linux 6.17, x86_64, glibc) with a direct <code>syscall()</code> harness, traced with <code>strace -qq -f -e trace=ustat</code>. The probe passed the root directory's <code>st_dev</code>, which reached the kernel and returned <code>EINVAL</code>:</p>
-<pre><code>ustat(makedev(0, 0x20), 0x7ffe3f78e270) = -1 EINVAL (Invalid argument)
-</code></pre>
-<p>Manual reference from the duplicate: <a href="https://man7.org/linux/man-pages/man2/ustat.2.html">ustat(2)</a>.</p>
 </body></html>

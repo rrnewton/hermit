@@ -3,71 +3,18 @@
 <title>reboot | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>reboot</code> (169)</h1>
-<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_privileged_admin_refused_syscall</code> &middot; linux determinism: conditional &middot; target policy: refuse &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+reboot&amp;body=Discussion+for+the+%60reboot%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Freboot.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60reboot%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>reboot(magic1, magic2, cmd, arg)</code> restarts, halts or powers off the machine, switches Ctrl-Alt-Del handling, or starts kexec or hibernation; in a child PID namespace it terminates that namespace instead. Hermit refuses it: Detcore returns a fixed <code>EPERM</code> without forwarding the call or reading its arguments (<code>detcore/src/lib.rs:2164</code>), so a guest can never reboot the host.</p>
-<p>Manual reference: <a href="https://man7.org/linux/man-pages/man2/reboot.2.html">reboot(2)</a>.</p>
-<h2>Linux semantics</h2>
-<p>The kernel checks in this order:</p>
-<p>1. <code>CAP_SYS_BOOT</code> in the user namespace that owns the caller's PID namespace; otherwise <code>EPERM</code>. This comes before the magic numbers are examined. 2. <code>magic1</code> must be <code>LINUX_REBOOT_MAGIC1</code> (0xfee1dead) and <code>magic2</code> one of <code>LINUX_REBOOT_MAGIC2</code> (672274793), <code>MAGIC2A</code> (85072278), <code>MAGIC2B</code> (369367448) or <code>MAGIC2C</code> (537993216); otherwise <code>EINVAL</code>. 3. In a child PID namespace the command is handled by the namespace (see F9). In the initial PID namespace it acts on the whole machine.</p>
-<p>The legacy sweep did not invoke <code>reboot</code> for safety, and neither did the 2026-10-03 probes for this body; the order above is from the kernel source, and the legacy report records that an unprivileged container receives <code>EPERM</code>.</p>
-<h3>Flags and options</h3>
+<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_privileged_admin_refused_syscall</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+reboot&amp;body=Discussion+for+the+%60reboot%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Freboot.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60reboot%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>reboot</code> (169) as determinized-refused via pred:is_privileged_admin_refused_syscall dispatch; deterministic refusal: true; run subscription: true; record/replay subscription: true.</p>
 <ul>
-<li>F1: magic numbers: a wrong <code>magic1</code> or <code>magic2</code> gives <code>EINVAL</code>, for a privileged caller only.</li>
-<li>F2: <code>LINUX_REBOOT_CMD_RESTART</code> (0x01234567): restart the machine.</li>
-<li>F3: <code>LINUX_REBOOT_CMD_RESTART2</code> (0xa1b2c3d4): restart with the command string in <code>arg</code>.</li>
-<li>F4: <code>LINUX_REBOOT_CMD_HALT</code> (0xcdef0123): halt the machine.</li>
-<li>F5: <code>LINUX_REBOOT_CMD_POWER_OFF</code> (0x4321fedc): power off, or halt if the machine cannot power off.</li>
-<li>F6: <code>LINUX_REBOOT_CMD_CAD_ON</code> (0x89abcdef) and <code>LINUX_REBOOT_CMD_CAD_OFF</code> (0): make Ctrl-Alt-Del reboot immediately, or send <code>SIGINT</code> to init instead. This is host-global state.</li>
-<li>F7: <code>LINUX_REBOOT_CMD_KEXEC</code> (0x45584543): boot a kernel previously loaded with <code>kexec_load</code>; <code>EINVAL</code> when none is loaded.</li>
-<li>F8: <code>LINUX_REBOOT_CMD_SW_SUSPEND</code> (0xd000fce2): hibernate; fails when hibernation is unavailable. An unknown <code>cmd</code> gives <code>EINVAL</code>.</li>
-<li>F9: child PID namespace: <code>RESTART</code> and <code>RESTART2</code> kill the namespace's init with <code>SIGHUP</code>, <code>HALT</code> and <code>POWER_OFF</code> with <code>SIGINT</code>, and the caller exits; any other command gives <code>EINVAL</code>.</li>
-<li>F10: no <code>CAP_SYS_BOOT</code> over the PID namespace: <code>EPERM</code>, before the magic numbers are checked.</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1784</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:7484</code></li>
 </ul>
-<h2>Determinism analysis</h2>
-<p><code>linux_determinism: conditional</code>. For a caller without <code>CAP_SYS_BOOT</code> the result is always <code>EPERM</code> and nothing happens. A privileged call either ends the machine, which ends every process outside any deterministic schedule, changes host-global Ctrl-Alt-Del state, or, in a child PID namespace, kills that namespace's init at a time decided by host signal delivery. None of these can repeat under a deterministic run.</p>
-<h3>Nondeterminism sources</h3>
-<ul>
-<li><code>CAP_SYS_BOOT</code> over the caller's PID namespace</li>
-<li>Whether the caller is in the initial PID namespace or a child one</li>
-<li>Host state: a loaded kexec image, hibernation support, power-off support</li>
-<li>A successful call in the initial PID namespace halts or reboots the host, which is catastrophic and must never be forwarded</li>
-</ul>
-<h2>Hermit design</h2>
-<p>Target policy: <code>refuse</code>. At hermit f4055eb9cae4 the dispatch arm at <code>detcore/src/lib.rs:2164-2168</code> returns <code>Err(Error::Errno(Errno::EPERM))</code> for every syscall in <code>is_privileged_admin_refused_syscall</code> (<code>detcore/src/syscall_classification.rs:902</code>), which lists <code>reboot</code> among 16 privileged administration calls. The arm runs before the typed match and before any <code>record_or_replay</code> call: it reads none of the four arguments, never forwards the call, and record, replay and both <code>--verify</code> runs compute the same <code>EPERM</code>. The refusal applies in every mode, not only when Hermit fails closed. The rationale comments are at <code>detcore/src/lib.rs:2154-2163</code> and <code>detcore/src/syscall_classification.rs:889-901</code>, tagged <code>TODO-HUMAN-REVIEW(#722)</code> (https://github.com/rrnewton/hermit/issues/722).</p>
-<p>Why <code>refuse</code>:</p>
-<ul>
-<li>Forwarding is never safe: in the initial PID namespace a privileged success ends the host, and in a child PID namespace it kills the namespace's init, outside Detcore's scheduler.</li>
-<li>The kernel checks the capability before the magic numbers, so <code>EPERM</code> for every argument is exactly what Linux returns to a caller without <code>CAP_SYS_BOOT</code> over its PID namespace. Hermit presents virtual uid 0 (<code>detcore/src/syscall_classification.rs:657-668</code>); a uid 0 process whose PID namespace belongs to another user namespace gets the same <code>EPERM</code>, so the result is a coherent Linux state.</li>
-<li><code>emulate</code> (for example, ending the guest as if the machine had restarted) would need a Hermit-level definition of what &quot;reboot&quot; means for a guest, and success would claim a capability the guest does not have.</li>
-</ul>
-<p>The code already realizes the policy. The unit test <code>privileged_admin_syscalls_are_determinized_and_consistent</code> (<code>detcore/src/syscall_classification.rs:2535</code>) checks only that <code>reboot</code> is classified Determinized and is in the refusal set; it does not execute the syscall, and as a unit test it cannot serve as a coverage path.</p>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F1, F10): under <code>hermit run --verify</code> on ptrace, a guest calls <code>reboot</code> with a wrong <code>magic1</code> and a valid command, and with a wrong <code>magic2</code>: each must return -1 with <code>EPERM</code>.</li>
-<li>T2 (covers F2, F3, F4, F5, F6, F7, F8, F9): run only under Hermit, never natively, and only on a CI host where the test user has no <code>CAP_SYS_BOOT</code> in the initial user namespace, so that even a regression to forwarding cannot reboot the host. With the valid magic numbers, the guest calls <code>reboot</code> with each command (<code>RESTART</code>, <code>RESTART2</code> with a short string, <code>HALT</code>, <code>POWER_OFF</code>, <code>CAD_ON</code>, <code>CAD_OFF</code>, <code>KEXEC</code>, <code>SW_SUSPEND</code>) and an unknown command. Each must return -1 with <code>EPERM</code>; afterwards the guest and a child it forked first must still be running (a forwarded <code>RESTART</code> in a child PID namespace whose user namespace grants <code>CAP_SYS_BOOT</code> would kill them, per F9), and the guest prints a marker that both runs must match.</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+reboot&amp;body=Discussion+for+the+%60reboot%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Freboot.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60reboot%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `reboot`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/396: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy NEEDS-INVESTIGATION; code at this SHA: determinized, dispatch pred:is_privileged_admin_refused_syscall, refused.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; refuse (fixed EPERM at detcore/src/lib.rs:2164-2168, never forwarded; the kernel checks CAP_SYS_BOOT before the magic numbers, so EPERM matches Linux for every argument); linux_determinism stays conditional; 10 flag behaviours and 2 tests listed; no coverage token, so tracking_status stays todo</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+reboot&amp;amp;body=Discussion+for+the+%60reboot%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Freboot.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60reboot%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `reboot`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Originally filed 2026-07-24 as &quot;Syscall classification: reboot&quot; (https://github.com/rrnewton/hermit/issues/396), legacy variant A1.</p>
-<h3>2026-07-24 host strace evidence</h3>
-<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) with <code>strace -f -e trace=reboot</code> on a direct <code>syscall()</code> harness (invoked with non-destructive query/no-op/failing arguments) and, where applicable, on common programs. Hermit currently routes <code>reboot</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code>.</p>
-<p>Observed strace line:</p>
-<pre><code>(not invoked directly for safety; classification from man page + kernel behavior)
-</code></pre>
-<hr>
-<p>*Autonomous syscall-classification sweep (ranks 151-250 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
-<h3>Note on the test hazard</h3>
-<p><code>reboot</code> is the only syscall in this refusal set where a forwarding regression could take the CI host down. T1 and T2 are safe only because the CI user lacks <code>CAP_SYS_BOOT</code> in the initial user namespace; a reviewer adding them should confirm that for the runner.</p>
 </body></html>

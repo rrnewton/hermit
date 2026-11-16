@@ -3,110 +3,18 @@
 <title>tkill | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>tkill</code> (200)</h1>
-<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; linux determinism: nondeterministic &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+tkill&amp;body=Discussion+for+the+%60tkill%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ftkill.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60tkill%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>tkill(tid, sig)</code> is the obsolete two-argument form of <code>tgkill</code>: it sends a signal to one thread, named by thread ID only. Detcore models it (<code>detcore/src/syscalls/signal.rs:704</code>). The kernel performs the delivery, the call is issued only when the deterministic scheduler runs the sender, its result goes through record and replay, and a successful send to another thread is reported to the scheduler so a parked target is woken.</p>
-<p>Manual reference: <a href="https://man7.org/linux/man-pages/man2/tgkill.2.html">tkill(2)</a>.</p>
-<h2>Linux semantics</h2>
-<p><code>tkill</code> looks up <code>tid</code> in the caller's PID namespace and queues <code>sig</code> on that thread. It is deprecated in favor of <code>tgkill(tgid, tid, sig)</code>, which Linux documents as the safer replacement: <code>tkill</code> does not verify the thread-group ID, so if the intended thread exits and its ID is reused, the signal reaches an unrelated thread, possibly in another process. glibc has no wrapper; programs call it through <code>syscall(SYS_tkill, ...)</code>.</p>
-<p>The kernel checks arguments in this order:</p>
-<p>1. <code>tid &lt;= 0</code> is <code>EINVAL</code>. 2. The thread is looked up; if none has that ID in the caller's PID namespace, the result is <code>ESRCH</code>. 3. <code>sig</code> must be 0 or a valid signal number (1 to 64 on x86_64); otherwise <code>EINVAL</code>. Because the lookup comes first, an invalid signal sent to a missing thread gives <code>ESRCH</code>. 4. The caller needs permission to signal the target: the same user, or <code>CAP_KILL</code>; otherwise <code>EPERM</code>. A security module can also refuse.</p>
-<p>Signal 0 performs the checks and queues nothing, so it is an existence and permission probe; both host probes under Additional information sent signal 0 to the calling thread and got 0.</p>
-<p>A thread-directed signal goes on the target thread's private pending set. A standard signal (1 to 31) that is already pending is not queued twice. A real-time signal (34 to 64) is queued every time, with <code>si_code</code> <code>SI_TKILL</code>, until the real user's <code>RLIMIT_SIGPENDING</code> is reached, after which the send fails with <code>EAGAIN</code>. Delivery to another thread is asynchronous: <code>tkill</code> returns before the handler runs, and a target blocked in an interruptible system call is woken with <code>EINTR</code> or a restart. A signal sent to the calling thread and not blocked is delivered before <code>tkill</code> returns to user space. Signals whose action is to stop, continue or kill (<code>SIGKILL</code>, <code>SIGSTOP</code>, <code>SIGCONT</code>, and default-fatal signals) act on the whole thread group even though one thread was named.</p>
-<h3>Flags and options</h3>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+tkill&amp;body=Discussion+for+the+%60tkill%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ftkill.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60tkill%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>tkill</code> (200) as determinized via typed dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.</p>
 <ul>
-<li>F1: <code>sig == 0</code>: no signal is sent; returns 0 if the thread exists and the caller may signal it, otherwise the error of the failed check.</li>
-<li>F2: a standard signal sent to the calling thread: delivered before the call returns unless blocked; a second copy while one is pending is merged.</li>
-<li>F3: a signal sent to another thread of the same process: queued on that thread and delivered asynchronously; a target blocked in an interruptible call is woken with <code>EINTR</code> or a restart.</li>
-<li>F4: a signal sent to a thread of another process, which <code>tkill</code> permits because it does not check the thread-group ID.</li>
-<li>F5: a real-time signal: queued once per send with <code>si_code</code> <code>SI_TKILL</code>, <code>si_pid</code> and <code>si_uid</code> of the sender; <code>EAGAIN</code> once <code>RLIMIT_SIGPENDING</code> is reached.</li>
-<li>F6: <code>SIGKILL</code>, <code>SIGSTOP</code>, <code>SIGCONT</code> and default-fatal signals: they act on the whole thread group, including when the named thread is not the leader.</li>
-<li>F7: invalid signal number (negative, or above 64): <code>EINVAL</code> when the thread exists, <code>ESRCH</code> when it does not, because the lookup runs first.</li>
-<li>F8: <code>tid &lt;= 0</code>: <code>EINVAL</code>.</li>
-<li>F9: no thread with that ID in the caller's PID namespace: <code>ESRCH</code>.</li>
-<li>F10: the caller may not signal the target (different user, no <code>CAP_KILL</code>): <code>EPERM</code>.</li>
-<li>F11: the target blocks or ignores the signal: the call still returns 0; a blocked signal stays pending, and an ignored one is discarded.</li>
-<li>F12: thread ID reuse: if the intended thread has exited and its ID is reused, the signal reaches the new thread, which may belong to another process.</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1893</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:8292</code></li>
 </ul>
-<h2>Determinism analysis</h2>
-<p><code>linux_determinism: nondeterministic</code>, kept from both legacy classifications. On the host the call shares <code>tgkill</code>'s nondeterminism: when the signal arrives relative to the target's progress depends on host scheduling, and the thread ID a program can name is the host's, reused without warning after the thread exits. The result itself (0, <code>ESRCH</code>, <code>EPERM</code>) depends on whether the target is still alive and on credentials and signal masks at the moment of the call. Programs must translate thread IDs and deliver deterministically to repeat.</p>
-<h3>Nondeterminism sources</h3>
-<ul>
-<li>Asynchronous delivery timing: where in its execution the target thread is when the signal arrives.</li>
-<li>Thread ID allocation and reuse: host thread IDs differ between runs (the host probes saw 3069897 and 3143669), and a reused ID retargets the signal.</li>
-<li>Target lifetime: whether the target has exited, which decides between 0 and <code>ESRCH</code>.</li>
-<li>Credentials, which decide <code>EPERM</code>.</li>
-<li>Signal masks and dispositions of the target, which decide whether the signal is delivered, kept pending or discarded.</li>
-<li>Concurrent signals from other senders, which decide merging of standard signals and the order of real-time signals.</li>
-</ul>
-<h2>Hermit design</h2>
-<p>Target policy: <code>model</code>. The arm <code>Syscall::Tkill(s) =&gt; self.handle_tkill(guest, s)</code> (<code>detcore/src/lib.rs:2738</code>) forwards the call to the kernel, which keeps the pending sets and performs delivery, while Detcore owns the identities and the moment of every send. Code at hermit f4055eb9cae4:</p>
-<ul>
-<li>The guest runs in a fresh PID namespace, so the <code>tid</code> the guest passes is the guest's own stable thread ID, and the kernel translates it. The handler's doc comment (<code>detcore/src/syscalls/signal.rs:700-703</code>) states this and argues that, because delivery is scheduler-serialized, forwarding is deterministic.</li>
-<li>The call is issued through <code>record_or_replay</code> (<code>detcore/src/syscalls/signal.rs:717</code>), so the kernel's answer is recorded and replayed. A failed call returns its errno through <code>?</code> and skips the notification below.</li>
-<li>After a successful send, <code>notify_cross_task_signal</code> (<code>detcore/src/syscalls/signal.rs:720</code>, defined at <code>detcore/src/syscalls/signal.rs:734</code>) tells the scheduler that a signal is pending for the target, which wakes a target parked in a wait the scheduler owns (F3). It does so only when the signal is nonzero and the target is not the sender (<code>should_notify_cross_task_signal</code>, <code>detcore/src/syscalls/signal.rs:831-833</code>), so a probe (F1) and a self-send (F2) queue no wakeup. The comment at <code>detcore/src/syscalls/signal.rs:741-748</code> records why there is no <code>Signal::try_from</code> gate: it once dropped the notification for every real-time signal and left a waiting target hung, so real-time sends (F5) are notified like the rest. <code>kill</code>, <code>tgkill</code> and <code>tkill</code> share this function so the three cannot drift (<code>detcore/src/syscalls/signal.rs:728-733</code>).</li>
-<li>On the KVM backend, a <code>SIGKILL</code> addressed to the calling thread first reserves a group exit with the scheduler (<code>detcore/src/syscalls/signal.rs:709-716</code>, <code>reserve_kvm_self_sigkill_exit</code> at <code>detcore/src/syscalls/signal.rs:571</code>). On ptrace that reservation returns at once, because it requires <code>kvm_shared_dequeue_timers</code> (<code>detcore/src/syscalls/signal.rs:578</code>).</li>
-</ul>
-<p>Why <code>model</code> and not the alternatives:</p>
-<ul>
-<li><code>emulate</code> would mean reimplementing signal queueing, masks and group-wide actions in Detcore; the kernel already does that exactly once the sender's timing and the thread IDs are deterministic.</li>
-<li><code>refuse</code> would break programs and runtimes that still issue <code>tkill</code> directly, and the Rust regression guest <code>tests/rust/tkill.rs</code> exists because <code>--strict</code> once aborted on it (<code>tests/rust/tkill.rs:9-12</code>).</li>
-<li>A plain forward without the notification would let a target parked in a scheduler-owned wait miss the signal and hang, the failure the comment at <code>detcore/src/syscalls/signal.rs:728-733</code> describes.</li>
-</ul>
-<p>What the code does not settle:</p>
-<ul>
-<li><strong>Thread ID reuse (F12).</strong> Detcore does not refuse a <code>tkill</code> to a thread ID that belonged to an exited thread; the kernel resolves the ID at the moment of the call. Inside the guest PID namespace the allocation order is set by the deterministic schedule, so reuse repeats from run to run, but it can still retarget a signal exactly as on Linux. Hermit makes the race deterministic; it does not remove it.</li>
-<li><strong>Threads outside the guest (F4, F10).</strong> Guest IDs are confined to the guest PID namespace, so a thread outside the container cannot be named and gives <code>ESRCH</code>. Credentials inside the namespace are the guest's, so <code>EPERM</code> from a different-user target needs a guest that changes user.</li>
-</ul>
-<p><code>linux_determinism</code> stays <code>nondeterministic</code>: it describes the raw call on Linux. Under Hermit the timing and identity sources are removed by the scheduler and the PID namespace.</p>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F2): a single-threaded guest sends <code>SIGUSR1</code> to itself with raw <code>syscall(SYS_tkill, gettid(), SIGUSR1)</code> and checks the handler has run when the call returns. Existing candidate: <code>tests/rust/tkill.rs:107-115</code>, built as the cargo binary <code>rustbin_tkill</code> (<code>tests/Cargo.toml:187-188</code>) and listed in <code>tests/BUCK:378</code>. No manifest cell or <code>hermit-cli</code> test runs it at this SHA (Open questions), so it does not yet count as running on ptrace in CI.</li>
-<li>T2 (covers F1, F7, F8, F9): under <code>hermit run --verify</code> on ptrace, check <code>tkill(gettid(), 0) == 0</code>; <code>tkill(0, SIGUSR1)</code> and <code>tkill(-1, SIGUSR1)</code> give <code>EINVAL</code>; <code>tkill(gettid(), 65)</code> and <code>tkill(gettid(), -1)</code> give <code>EINVAL</code>; a thread ID that was never allocated gives <code>ESRCH</code> for signal 0, <code>SIGUSR1</code> and 65.</li>
-<li>T3 (covers F3, F11): a thread blocked in <code>read</code> on an empty pipe, with a handler installed without <code>SA_RESTART</code>, is woken by <code>tkill</code> from a sibling and sees <code>EINTR</code>; repeat with the signal blocked in the target and check it stays pending (<code>sigpending</code>) and is delivered on unblock; repeat with <code>SIG_IGN</code> and check the call returns 0 and nothing is delivered. Run under <code>--verify</code> so the wakeup order must repeat.</li>
-<li>T4 (covers F5): send <code>SIGRTMIN</code> three times to a sibling thread that blocks it, then unblock and count three deliveries with <code>si_code == SI_TKILL</code> and <code>si_pid</code> equal to the sender's process ID; send a standard signal three times and count one.</li>
-<li>T5 (covers F6): <code>tkill(nonleader_tid, SIGKILL)</code> from a non-leader thread ends the whole process with signal 9. Existing candidate on KVM only: the <code>thread-tkill</code> case of <code>tests/c/kvm_exact_child_waits.c:172</code> (raw <code>SYS_tkill</code> at <code>tests/c/kvm_exact_child_waits.c:120</code>), run by <code>run_kvm_self_sigkill_from_nonleader_is_group_fatal</code> at <code>hermit-cli/tests/cli.rs:3218</code> with <code>--backend=kvm</code>. A ptrace run of the same guest is still needed.</li>
-<li>T6 (covers F4, F10): a parent sends <code>SIGUSR1</code> with <code>tkill</code> to a thread of its forked child, which the child observes; then a child that changed its user ID with <code>setresuid</code> gets <code>EPERM</code> from <code>tkill</code> on its parent's thread, if the guest's user namespace allows the change.</li>
-<li>T7 (covers F12): a thread exits and is joined; the program spawns new threads until one reuses the old ID, or a bounded number has been created, then sends <code>tkill</code> to the old ID. Under <code>--verify</code> both runs must report the same outcome (delivery to the new thread, or <code>ESRCH</code>).</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+tkill&amp;body=Discussion+for+the+%60tkill%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ftkill.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60tkill%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `tkill`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/499: linux_determinism nondeterministic (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch typed.</li>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · duplicate https://github.com/rrnewton/hermit/issues/520 is retired into this issue; its text waits under Additional information for a section-by-section merge.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; model (the kernel delivers; Detcore issues the call in scheduler order through record_or_replay and notifies the scheduler of every successful cross-thread send, real-time signals included); linux_determinism stays nondeterministic; merged duplicate https://github.com/rrnewton/hermit/issues/520 and reconciled its stale pass-through claim; 12 flag behaviours and 7 tests listed; open question: the existing guest tests/rust/tkill.rs has no ptrace runner, so tracking_status stays todo</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+tkill&amp;amp;body=Discussion+for+the+%60tkill%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ftkill.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60tkill%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `tkill`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Originally filed 2026-07-24 as &quot;Syscall classification: tkill&quot; (https://github.com/rrnewton/hermit/issues/499), legacy variant A1. The duplicate https://github.com/rrnewton/hermit/issues/520, filed the same day under the same title (legacy variant A1), is merged into the sections above. Its comment history (0 comments) stays on that issue, as does that of https://github.com/rrnewton/hermit/issues/499 (0 comments).</p>
-<h3>Open questions</h3>
-<ul>
-<li><code>tests/rust/tkill.rs</code> is built as <code>rustbin_tkill</code> and listed in <code>tests/BUCK:378</code>, but no manifest cell and no <code>hermit-cli</code> test runs it: the cargo-binary list at <code>hermit-cli/tests/hermit_modes.rs:897</code> onward does not include it. The inventory entry in <code>tests/e2e/manifests/inventory/test-files.json:3717-3722</code> says a Rust integration test selects it, which this search did not confirm. It needs a ptrace runner before T1 can count.</li>
-<li>The only multi-thread <code>tkill</code> test (<code>tests/c/kvm_exact_child_waits.c</code>, through <code>hermit-cli/tests/cli.rs:3218</code>) runs on KVM only. Should the same guest also run on ptrace for T5?</li>
-</ul>
-<h3>Reconciled claims from the legacy texts</h3>
-<ul>
-<li>Both legacy texts say Hermit routes <code>tkill</code> through the temporary pass-through block of <code>detcore/src/syscall_classification.rs</code>, which was true at <code>dd60278f</code>. At hermit f4055eb9cae4 the typed arm at <code>detcore/src/lib.rs:2738</code> sends it to <code>handle_tkill</code>, which forwards through <code>record_or_replay</code> and adds the scheduler notification. The code wins, and Hermit design describes it.</li>
-<li>Both texts say the thread ID must be virtualized or translated. At this SHA that is done by the fresh PID namespace rather than by Detcore rewriting the argument (<code>detcore/src/syscalls/signal.rs:700-703</code>). Thread ID reuse remains possible, but repeats under the deterministic schedule (Hermit design).</li>
-<li>Both texts recommended NEEDS-HANDLER. The handler exists; the policy it realizes is <code>model</code>.</li>
-</ul>
-<h3>2026-07-24 host strace evidence (https://github.com/rrnewton/hermit/issues/499)</h3>
-<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) with <code>strace -f -e trace=tkill</code> on a direct <code>syscall()</code> harness (invoked with non-destructive query/no-op/failing arguments) and, where applicable, on common programs. Hermit currently routes <code>tkill</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code>.</p>
-<p>Observed strace line:</p>
-<pre><code>tkill(3069897, 0)               = 0
-</code></pre>
-<hr>
-<p>*Autonomous syscall-classification sweep (ranks 151-250 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
-<h3>2026-07-24 host strace evidence (https://github.com/rrnewton/hermit/issues/520)</h3>
-<p>Evidence was gathered on <code>the measurement host</code> (Linux 6.17, x86_64, glibc) with a direct <code>syscall()</code> harness. The probe used safe self-targeting, no-op, temporary-file, or deliberately invalid arguments and was traced with <code>strace -qq -f -e trace=tkill</code>. The harness exited 0, and <code>detcore/src/syscall_classification.rs</code> at <code>dd60278f</code> places <code>tkill</code> in the UNCLASSIFIED temporary-passthrough block.</p>
-<p>Observed strace line:</p>
-<pre><code>tkill(3143669, 0)               = 0
-</code></pre>
-<hr>
-<p>*Autonomous syscall-classification sweep, batch 5 (ranks 201-250 of the unique <code>syscall_classification.rs</code> UNCLASSIFIED list). Manual research plus host strace evidence; no code change proposed here.*</p>
 </body></html>

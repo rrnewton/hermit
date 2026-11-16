@@ -3,87 +3,18 @@
 <title>memfd_create | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>memfd_create</code> (319)</h1>
-<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; linux determinism: conditional &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+memfd_create&amp;body=Discussion+for+the+%60memfd_create%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fmemfd_create.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60memfd_create%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>memfd_create(2)</code> creates an anonymous, memory-backed file and returns a descriptor for it. The file has no path in any mounted file system. The kernel creates the file. Detcore then adds the descriptor to its own descriptor table as a <code>Memfd</code> entry. At this SHA that entry gets the wrong close-on-exec and status flags when <code>MFD_CLOEXEC</code> is passed (see Hermit design).</p>
-<h2>Linux semantics</h2>
-<p>The call takes a name and a flag word. It creates a file of size 0 on the kernel's internal tmpfs mount, or on hugetlbfs when <code>MFD_HUGETLB</code> is given, and returns the lowest free descriptor number. The descriptor is opened read-write with <code>O_LARGEFILE</code>. The name appears only as <code>memfd:&lt;name&gt;</code> in <code>/proc/&lt;pid&gt;/fd</code> links and in <code>/proc/&lt;pid&gt;/maps</code>. Later calls use the descriptor like any file: <code>ftruncate</code>, <code>write</code>, <code>mmap</code>, <code>fcntl(F_ADD_SEALS)</code>. The memory is freed when the last reference goes away.</p>
-<h3>Flags and options</h3>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+memfd_create&amp;body=Discussion+for+the+%60memfd_create%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fmemfd_create.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60memfd_create%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>memfd_create</code> (319) as determinized via typed dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.</p>
 <ul>
-<li>F1: <code>name</code>: a NUL-terminated string of at most 249 bytes, shown as <code>memfd:&lt;name&gt;</code>. A longer name gives <code>EINVAL</code>; a bad pointer gives <code>EFAULT</code>.</li>
-<li>F2: <code>MFD_CLOEXEC</code>: the new descriptor has <code>FD_CLOEXEC</code> set, so <code>execve</code> closes it.</li>
-<li>F3: <code>MFD_ALLOW_SEALING</code>: <code>fcntl(F_ADD_SEALS)</code> is allowed. Without it the file starts with <code>F_SEAL_SEAL</code> set, and adding a seal fails with <code>EPERM</code>.</li>
-<li>F4: <code>MFD_HUGETLB</code>, optionally with a page-size encoding (<code>MFD_HUGE_2MB</code>, <code>MFD_HUGE_1GB</code> and the other <code>MFD_HUGE_*</code> values): the file is backed by huge pages (F11 covers a page size the host does not support). Whether later faults or <code>fallocate</code> succeed depends on the host's huge page pool.</li>
-<li>F5: <code>MFD_NOEXEC_SEAL</code> (Linux 6.3): the file is created without execute permission and sealed with <code>F_SEAL_EXEC</code>; sealing is implied. <code>MFD_EXEC</code> (Linux 6.3) asks for an executable file. Passing both gives <code>EINVAL</code>.</li>
-<li>F6: neither <code>MFD_EXEC</code> nor <code>MFD_NOEXEC_SEAL</code>: the per-PID-namespace <code>vm.memfd_noexec</code> sysctl decides. 0 means executable. 1 means the call behaves as if <code>MFD_NOEXEC_SEAL</code> were given. 2 also rejects <code>MFD_EXEC</code> (F12), and how it treats a call naming neither flag has changed between kernel releases. Kernels before 6.3 have no such sysctl and create an executable file.</li>
-<li>F7: invalid flag words give <code>EINVAL</code>: an unknown bit, or an <code>MFD_HUGE_*</code> size without <code>MFD_HUGETLB</code>.</li>
-<li>F8: <code>EMFILE</code> at <code>RLIMIT_NOFILE</code>.</li>
-<li>F9: the returned object: the lowest free descriptor number, file size 0, status flags <code>O_RDWR | O_LARGEFILE</code>. <code>st_ino</code> and <code>st_dev</code> come from the kernel's internal mount.</li>
-<li>F10: host-transient errors: <code>ENFILE</code> when the host's system-wide file limit is reached, and <code>ENOMEM</code> from host memory. Both depend on what other host processes hold.</li>
-<li>F11: host-config error: <code>MFD_HUGETLB</code> with an <code>MFD_HUGE_*</code> page size the host CPU or kernel does not support gives <code>EINVAL</code>.</li>
-<li>F12: host-config errors: <code>MFD_EXEC</code> gives <code>EACCES</code> when <code>vm.memfd_noexec</code> is 2, and kernels before 6.3, which do not know <code>MFD_EXEC</code> or <code>MFD_NOEXEC_SEAL</code>, give <code>EINVAL</code> for either.</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1706</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:8076</code></li>
 </ul>
-<h2>Determinism analysis</h2>
-<p>With a fixed descriptor table, flags and name, the descriptor number, the error for a bad argument, and the file's contents and seals all repeat. Three things can differ:</p>
-<ul>
-<li><code>st_ino</code> comes from a host-global inode counter, so it differs between runs.</li>
-<li>The results of <code>MFD_HUGETLB</code> (F4) depend on the host's huge page configuration.</li>
-<li>The default execute permission (F6) depends on the host kernel version and the <code>vm.memfd_noexec</code> sysctl.</li>
-</ul>
-<p><code>linux_determinism</code> is <code>conditional</code>: deterministic for a fixed host configuration, apart from the inode number.</p>
-<h3>Cross-host variation</h3>
-<ul>
-<li>Huge page support (CPU page sizes and the kernel's hugetlb configuration): which <code>MFD_HUGE_*</code> sizes are accepted (F4, F11).</li>
-<li>Sysctl <code>vm.memfd_noexec</code>: the default execute mode and seals of a file created with neither exec flag (F6), and whether <code>MFD_EXEC</code> is rejected (F12).</li>
-<li>Kernel version: whether <code>MFD_EXEC</code> and <code>MFD_NOEXEC_SEAL</code> exist (F5, F12), and how <code>vm.memfd_noexec=2</code> treats a call naming neither flag (F6).</li>
-</ul>
-<h2>Hermit design</h2>
-<p><code>target_policy</code> is <code>model</code>: the kernel creates the file, and Detcore tracks the descriptor in its own table so that later descriptor operations, exec and stat virtualization stay consistent. Code at hermit f4055eb9cae4:</p>
-<ul>
-<li>Dispatch: the arm at <code>detcore/src/lib.rs:2588</code> runs <code>handle_memfd_create</code> (<code>detcore/src/syscalls/files.rs:4317-4332</code>). <code>lib.rs:1184</code> subscribes the syscall.</li>
-<li>F1, F3, F4, F5, F6, F7, F8: <code>files.rs:4323</code> passes the call to the kernel through <code>record_or_replay</code> unchanged. The name, the flags, the error and the descriptor number are therefore the host kernel's.</li>
-<li>F9: <code>files.rs:4324-4330</code> registers the descriptor with <code>add_fd</code> as <code>FdType::Memfd</code>. When metadata virtualization is on, <code>add_fd</code> (<code>files.rs:916-950</code>) runs an <code>fstat</code> on the new descriptor and stores the result. If that <code>fstat</code> fails, it closes the descriptor and returns the error.</li>
-<li>F2, suspected defect: the flag-mapping bug is described in the Open questions below.</li>
-<li>Later operations on the descriptor:</li>
-<li><code>read</code> passes straight to the kernel (<code>files.rs:1862-1864</code>).</li>
-<li>The seal commands go to the kernel through the default arm of <code>handle_fcntl</code> (<code>files.rs:3179-3185</code>).</li>
-<li><code>sendfile</code> treats memfd endpoints like regular files (<code>files.rs:2187-2188</code>).</li>
-<li>The <code>/proc/&lt;pid&gt;/fdinfo</code> handling keeps the kernel's mount ID of 0 for anonymous objects such as memfd (<code>files.rs:1537-1540</code>, <code>detcore/src/tool_global.rs:349-353</code>).</li>
-<li>F4 and F6 pass host configuration through to the guest. <code>F_GET_SEALS</code> and the <code>fstat</code> mode bits differ between hosts with different <code>vm.memfd_noexec</code> settings, and <code>MFD_HUGETLB</code> succeeds or fails depending on the huge page setup.</li>
-</ul>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F1, F9): create memfds with a short name, a 249-byte name, a 250-byte name (<code>EINVAL</code>) and an unmapped name pointer (<code>EFAULT</code>). Print each descriptor number, the <code>/proc/self/fd</code> link text, the <code>fstat</code> size and inode, and the fdinfo <code>mnt_id</code>, and require two runs under <code>hermit run --verify</code> on ptrace to match. Existing candidate: <code>tests/c/remap_file_pages_memfd_enosys.c</code> (cell <code>c-programs/remap-file-pages-memfd-enosys</code> at <code>tests/e2e/manifests/c-programs.yaml:7350</code>, verify ci on ptrace). It creates, sizes and maps an <code>MFD_CLOEXEC</code> memfd but asserts only the <code>remap_file_pages</code> result.</li>
-<li>T2 (covers F2): create one memfd with <code>MFD_CLOEXEC</code> and one without, then exec a helper. In the helper, the first descriptor number must be closed (<code>fcntl(F_GETFD)</code> gives <code>EBADF</code>), and the next <code>open</code> must reuse it; the second descriptor must still be open. This targets the suspected model defect.</li>
-<li>T3 (covers F3): without <code>MFD_ALLOW_SEALING</code>, <code>F_GET_SEALS</code> returns <code>F_SEAL_SEAL</code> and <code>F_ADD_SEALS</code> gives <code>EPERM</code>. With it, add <code>F_SEAL_WRITE</code>, <code>F_SEAL_SHRINK</code> and <code>F_SEAL_GROW</code>; then <code>write</code>, <code>ftruncate</code> and a shared writable <code>mmap</code> all give <code>EPERM</code>.</li>
-<li>T4 (covers F4): <code>MFD_HUGETLB | MFD_HUGE_2MB</code> followed by <code>ftruncate</code> and a touch of the mapping. The result must match across runs on one host; the cell records which result the host gives.</li>
-<li>T5 (covers F5, F6): <code>MFD_NOEXEC_SEAL</code> gives <code>F_SEAL_EXEC</code> in <code>F_GET_SEALS</code>, and <code>fchmod(0755)</code> gives <code>EPERM</code>. <code>MFD_EXEC | MFD_NOEXEC_SEAL</code> gives <code>EINVAL</code>. With neither flag, print the <code>fstat</code> mode bits and the seals.</li>
-<li>T6 (covers F7, F8): an unknown flag bit and <code>MFD_HUGE_2MB</code> without <code>MFD_HUGETLB</code> both give <code>EINVAL</code>. After lowering <code>RLIMIT_NOFILE</code> to the current descriptor count, the call gives <code>EMFILE</code>.</li>
-<li>U1 (covers F10; host-transient): <code>ENFILE</code> and <code>ENOMEM</code> depend on the host's file table and memory, shared with other processes. <code>handle_memfd_create</code> passes the call to the kernel through <code>record_or_replay</code> (<code>detcore/src/syscalls/files.rs:4323</code>) and hands these errors to the guest today. F10 counts toward done only once Hermit hides them or reports them as an infrastructure error.</li>
-<li>U2 (covers F11, F12; host-config): the CI host's huge page sizes, kernel version and <code>vm.memfd_noexec</code> setting are fixed, so CI cannot produce every outcome. Hermit forwards the call and returns the kernel's error unchanged (<code>detcore/src/syscalls/files.rs:4323</code>).</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+memfd_create&amp;body=Discussion+for+the+%60memfd_create%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fmemfd_create.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60memfd_create%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `memfd_create`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · created for v1: no tracking issue existed for this pinned Sysno; code at this SHA: determinized, dispatch typed.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; model (kernel creates the file; Detcore tracks the descriptor as Memfd); linux_determinism stays conditional; 9 flag behaviours and 6 tests listed; suspected defect, found by reading the code: MFD_CLOEXEC is recorded as O_WRONLY, not close-on-exec, in Detcore's descriptor model; open question on host-dependent noexec and hugetlb results; no coverage token, so tracking_status stays todo</li>
-<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d12 (owner decisions 1 and 2): cross_host_variant true (huge page support, vm.memfd_noexec, kernel version); F8 narrowed to EMFILE; new F10, ENFILE and ENOMEM (host-transient U1), F11, unsupported huge page size, and F12, the MFD_EXEC EACCES and old-kernel EINVAL (host-config U2); the open question on pinning host-configuration results is resolved by decision 2</li>
-</ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+memfd_create&amp;amp;body=Discussion+for+the+%60memfd_create%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fmemfd_create.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60memfd_create%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `memfd_create`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Created by the syscall-tracking v1 migration on 2026-10-03. No tracking issue existed for <code>memfd_create</code>: the 2026-07-24 classification campaign filed issues only for syscalls in the old temporary pass-through block, and Detcore already handled this one.</p>
-<h3>Open questions</h3>
-<ul>
-<li>Suspected defect, found by reading the code and not measured: <code>files.rs:4327</code> builds the modelled flags as <code>OFlag::from_bits_truncate((call.flags() &amp; libc::MFD_CLOEXEC) as i32)</code>.</li>
-<li><code>MFD_CLOEXEC</code> is <code>0x1</code>, which as an <code>OFlag</code> is <code>O_WRONLY</code>, not <code>O_CLOEXEC</code> (<code>0x80000</code>).</li>
-<li><code>DetFd::new</code> (<code>detcore/src/fd.rs:204-213</code>) keeps only the <code>O_CLOEXEC</code> bit as the descriptor flag and stores the rest as status flags. A memfd created with <code>MFD_CLOEXEC</code> is therefore modelled as not close-on-exec, with status <code>O_WRONLY</code>.</li>
-<li><code>for_exec</code> (<code>detcore/src/tool_local.rs:572-582</code>) keeps every descriptor that is not close-on-exec, so after an exec Detcore's table still lists a memfd that the kernel has closed.</li>
-<li><code>F_GETFL</code> takes its result from the kernel (<code>files.rs:3097-3108</code>), so the guest does not see the wrong status flags there.</li>
-<li>The fix looks mechanical: map <code>MFD_CLOEXEC</code> to <code>O_CLOEXEC</code>. It needs a hermit issue and T2 as a regression test.</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
 </body></html>

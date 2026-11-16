@@ -3,90 +3,18 @@
 <title>cachestat | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>cachestat</code> (451)</h1>
-<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_host_kernel_probe_syscall</code> &middot; linux determinism: nondeterministic &middot; target policy: refuse &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+cachestat&amp;body=Discussion+for+the+%60cachestat%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fcachestat.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60cachestat%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>cachestat(fd, cstat_range, cstat, flags)</code> (Linux 6.5 and later) reports how many pages of a file range are in the page cache, dirty, under writeback, evicted, and recently evicted. Hermit refuses it with a fixed <code>ENOSYS</code> before anything reaches the host (<code>detcore/src/lib.rs:2329</code>), which is what a kernel without the syscall returns, and leaves the caller's <code>struct cachestat</code> untouched.</p>
-<p>Manual reference: Linux man-pages cachestat(2).</p>
-<h2>Linux semantics</h2>
-<p>The kernel resolves <code>fd</code>, reads a <code>struct cachestat_range { off, len }</code> from <code>cstat_range</code>, converts it to page indices (<code>len == 0</code> means from <code>off</code> to the end of the file), walks the file's page-cache entries in that range, and writes a <code>struct cachestat { nr_cache, nr_dirty, nr_writeback, nr_evicted, nr_recently_evicted }</code> to <code>cstat</code>. It returns 0 on success.</p>
-<p><code>nr_evicted</code> counts pages that were cached and later reclaimed, read from the shadow entries the page cache leaves behind; <code>nr_recently_evicted</code> is the subset that the workingset code would treat as refaults, judged against current memory pressure. For shmem and tmpfs files, pages that have gone to swap are reported as evicted.</p>
-<p>The checks run in this order: <code>fd</code> first (the host strace under Additional information shows <code>EBADF</code> winning over a non-zero <code>flags</code>), then the hugetlbfs check, then, on kernels with the 2025 permission fix (Linux 6.14 and later), a write-permission check, then <code>flags</code>, then the pointer copies. The permission check mirrors the one <code>mincore</code> uses for page-cache side channels: the caller must have the file open for writing, own it or be capable, or be allowed to open it for writing.</p>
-<p>The call does not change the page cache; it only observes it.</p>
-<h3>Flags and options</h3>
+<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_host_kernel_probe_syscall</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+cachestat&amp;body=Discussion+for+the+%60cachestat%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fcachestat.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60cachestat%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>cachestat</code> (451) as determinized-refused via pred:is_host_kernel_probe_syscall dispatch; deterministic refusal: true; run subscription: true; record/replay subscription: true.</p>
 <ul>
-<li>F1: <code>fd</code> is not an open descriptor: <code>EBADF</code>. This check runs first.</li>
-<li>F2: <code>fd</code> refers to a hugetlbfs file: <code>EOPNOTSUPP</code>.</li>
-<li>F3: permission check on Linux 6.14 and later: <code>EPERM</code> unless the file is open for writing, the caller owns it or has the capability, or the caller could open it for writing. Older kernels skip this check.</li>
-<li>F4: <code>flags</code> must be 0; any other value is <code>EINVAL</code>.</li>
-<li>F5: range selection: <code>off</code> and <code>len</code> in bytes, rounded out to whole pages; <code>len == 0</code> means through end of file. A range past end of file counts no pages.</li>
-<li>F6: an unreadable <code>cstat_range</code> or unwritable <code>cstat</code>: <code>EFAULT</code>.</li>
-<li>F7: the five output counters <code>nr_cache</code>, <code>nr_dirty</code>, <code>nr_writeback</code>, <code>nr_evicted</code> and <code>nr_recently_evicted</code>, including the shmem/tmpfs rule that swapped-out pages count as evicted.</li>
-<li>F8: descriptor kinds: any file with a page-cache mapping, including regular files, directories and memfd/shmem files, is accepted; the header of <code>tests/c/cachestat_refusal.c</code> records that native Linux succeeds on both a directory and a regular file.</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1550</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:7662</code></li>
 </ul>
-<h2>Determinism analysis</h2>
-<p><code>linux_determinism: nondeterministic</code>, kept from the legacy classification. The counters describe live host page-cache state, which changes without any action by the caller.</p>
-<h3>Nondeterminism sources</h3>
-<ul>
-<li>Asynchronous reclaim and writeback: pages leave the cache, and dirty pages become clean, on the host's schedule (F7).</li>
-<li>Host memory pressure decides what is evicted and what counts as recently evicted (F7).</li>
-<li>Other processes on the host, and earlier runs, read and write the same files and warm or evict their pages; the result for a file the guest has just written still depends on whether the host has flushed it (F7, F8).</li>
-<li>Host kernel version and patches decide whether the call exists at all and whether the F3 permission check applies.</li>
-</ul>
-<p>The call repeats only on a quiescent host with no memory pressure and no other access to the file, which a container cannot guarantee.</p>
-<h2>Hermit design</h2>
-<p>Target policy: <code>refuse</code>. The code already does this at hermit f4055eb9cae4:</p>
-<ul>
-<li><code>cachestat</code> is classified <code>Determinized</code> (<code>detcore/src/syscall_classification.rs:554</code>); the comment at <code>detcore/src/syscall_classification.rs:544</code> gives the reason: it exposes mutable host page-cache residency.</li>
-<li><code>is_host_kernel_probe_syscall</code> (<code>detcore/src/syscall_classification.rs:1277</code>) matches it, and the dispatch arm at <code>detcore/src/lib.rs:2329</code> returns <code>Err(Error::Errno(Errno::ENOSYS))</code>. Nothing is forwarded, no argument is read, <code>cstat</code> is not written, and the answer does not depend on <code>--strict</code> or <code>--panic-on-unsupported-syscalls</code>.</li>
-<li>The predicate is part of <code>is_deterministically_refused_syscall</code> (<code>detcore/src/syscall_classification.rs:1334</code>), hence <code>refused: true</code>, so backends that execute syscalls outside Detcore's dispatcher apply the same refusal.</li>
-</ul>
-<p>Under Hermit every row of F1 to F8 therefore gives <code>-1</code>/<code>ENOSYS</code>: a bad <code>fd</code>, a non-zero <code>flags</code> and a bad pointer included. That matches a kernel from before 6.5, so callers that use <code>cachestat</code> as an optimisation already need a fallback.</p>
-<p>Why <code>refuse</code> and not the alternatives:</p>
-<ul>
-<li><code>passthrough</code> exposes exactly the host state listed under Determinism analysis.</li>
-<li><code>emulate</code> with fixed counters is possible. Hermit already emulates the neighbouring residency probe <code>mincore</code> by reporting every page resident (<code>detcore/src/syscall_classification.rs:131</code>, dispatched at <code>detcore/src/lib.rs:2407</code>). An analogous <code>cachestat</code> would report <code>nr_cache</code> as the page count of the range clipped to the file size and zero for the other four counters. It would need the file size at the time of the call, and it would claim that every page is cached even for a file the guest never read. The code chose refusal instead; this body keeps that choice, and owner decision 9 settles the consistency question with <code>mincore</code> (below).</li>
-<li><code>model</code> would need a virtual page cache, which Hermit does not have.</li>
-</ul>
-<p>Target (owner decision 9): <code>cachestat</code> stays refused with <code>ENOSYS</code>. The decision's rule is to model a family only where a named workload breaks under refusal, and none is known here: callers already need a fallback for kernels before 6.5, which have no <code>cachestat</code> at all. The <code>mincore</code> emulation (<code>detcore/src/syscall_classification.rs:131</code>) is not a reason to emulate <code>cachestat</code> too; the two answers do not contradict each other, because a guest that sees <code>ENOSYS</code> from <code>cachestat</code> sees a kernel without the call. Under owner decision 6, the refusal keeps its one fixed errno before any argument check, which the arm at <code>detcore/src/lib.rs:2329</code> already does, so no code change is needed.</p>
-<p>What remains is test evidence. The existing tests call <code>cachestat</code> with <code>fd = -1</code> and a zero range (<code>tests/c/cachestat_enosys.c:29</code>), and on a directory and a freshly written regular file with a sentinel-filled result (<code>tests/c/cachestat_refusal.c:63</code>, <code>tests/c/cachestat_refusal.c:79</code>, <code>tests/c/cachestat_refusal.c:88</code>). Non-zero <code>flags</code>, bad pointers, a hugetlbfs or shmem file and non-zero ranges are not exercised.</p>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F1, F5): <code>cachestat(-1, &amp;zero_range, &amp;result, 0)</code> returns <code>-1</code>/<code>ENOSYS</code>, not <code>EBADF</code>, under <code>hermit run --strict --verify</code> on ptrace. Existing candidates: <code>tests/c/cachestat_enosys.c</code> in cell <code>c-programs/cachestat-enosys</code> (<code>tests/e2e/manifests/c-programs.yaml:451</code>, verify ci on ptrace at <code>tests/e2e/manifests/c-programs.yaml:470</code>), and <code>host_kernel_probes_fall_back_deterministically</code> (<code>hermit-cli/tests/host_kernel_probes.rs:30</code>), which compiles that guest and runs it with <code>--backend=ptrace</code> (<code>hermit-cli/tests/host_kernel_probes.rs:62</code>).</li>
-<li>T2 (covers F7, F8): on a directory and on a regular file the guest has just written, <code>cachestat</code> returns <code>ENOSYS</code> and leaves a sentinel-filled <code>struct cachestat</code> byte-identical, so no host counter leaks. Existing candidate: <code>tests/c/cachestat_refusal.c</code> in cell <code>c-programs/cachestat-refusal</code> (<code>tests/e2e/manifests/c-programs.yaml:11132</code>, verify <code>ci: true</code> with ptrace enabled at <code>tests/e2e/manifests/c-programs.yaml:11150</code>).</li>
-<li>T3 (covers F4, F6): <code>flags = 1</code>, <code>flags = 0xffffffff</code>, a NULL <code>cstat_range</code> and a NULL <code>cstat</code> on a valid fd all return <code>ENOSYS</code>, never <code>EINVAL</code> or <code>EFAULT</code>.</li>
-<li>T4 (covers F2, F3, F8): <code>cachestat</code> on a memfd, on a file opened <code>O_RDONLY</code> that the guest cannot write, and, where the host has hugetlbfs mounted, on a hugetlbfs file all return <code>ENOSYS</code>, never <code>EOPNOTSUPP</code> or <code>EPERM</code>.</li>
-<li>T5 (covers F5, F7): a range with non-zero <code>off</code>, a <code>len</code> that ends past end of file, and <code>len = 0</code> from a non-zero <code>off</code>, each on a file whose pages were just written and <code>fsync</code>ed, all return <code>ENOSYS</code> with the result untouched.</li>
-<li>T6 (covers F1, F7): record and replay a guest that calls <code>cachestat</code> and branches on the result; replay reproduces <code>ENOSYS</code> without a host call. Both existing cells have replay disabled (<code>tests/e2e/manifests/c-programs.yaml:489</code>, <code>tests/e2e/manifests/c-programs.yaml:11164</code>).</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+cachestat&amp;body=Discussion+for+the+%60cachestat%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fcachestat.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60cachestat%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `cachestat`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-09-28 · hermit 81ca8822f78c · hermit2 · closed under the legacy rule (an explicit <code>classify_syscall</code> arm), not the v1 done rule; closing comment https://github.com/rrnewton/hermit/issues/336#issuecomment-5872941963</li>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A2 of https://github.com/rrnewton/hermit/issues/336: linux_determinism nondeterministic (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch pred:is_host_kernel_probe_syscall, refused.</li>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · reopen: under the owner rule of 2026-10-02, closed means every flag and option is covered by a named test and the implementation works; cachestat records no test coverage, so tracking_status is todo and https://github.com/rrnewton/hermit/issues/336 reopens.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; refuse (detcore/src/lib.rs:2329 returns a fixed ENOSYS and never writes the result; counters are live host page-cache state); linux_determinism stays nondeterministic; 8 flag behaviours and 6 tests listed; open question on consistency with the all-resident mincore emulation; no coverage token recorded, so tracking_status stays todo and ptrace_verification untested</li>
-<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): decisions 6 and 9 applied: target stays refuse with a fixed ENOSYS before any argument check (detcore/src/lib.rs:2329), because no named workload breaks under refusal; no code change; the mincore consistency open question removed</li>
-<li>2026-10-05 · hermit f4055eb9cae4 · syscall-tracking-2 · covered: T1 covered by tests/c/cachestat_enosys.c, T2 covered by tests/c/cachestat_refusal.c (C08 review of the 2026-10-04 coverage proposals; guest source read at this SHA, not run by this agent)</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+cachestat&amp;amp;body=Discussion+for+the+%60cachestat%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fcachestat.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60cachestat%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `cachestat`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Originally filed 2026-07-24 as &quot;Syscall classification: cachestat&quot; (https://github.com/rrnewton/hermit/issues/336), legacy variant A2. It was ranked 57 in the batch-2 classification order, which excluded the 50 syscalls seen in batch-1 workloads.</p>
-<p>Comment history: 1 comment(s) on https://github.com/rrnewton/hermit/issues/336.</p>
-<p>The dispatch arm and the predicate carry <code>TODO-HUMAN-REVIEW(PR-847)</code> tags (<code>detcore/src/lib.rs:2326</code>, <code>detcore/src/syscall_classification.rs:1271</code>); the human review they ask for has not been recorded in the code.</p>
-<h3>2026-07-24 host strace evidence</h3>
-<p>Test host: Linux 6.17.13 x86_64; strace 6.12.</p>
-<p>Ran a syscall-specific safe raw probe with deliberately inert/invalid arguments so privileged or mutating operations could not change host state:</p>
-<pre><code>strace -f -qq -e trace=cachestat -s 160 python3 -c 'import ctypes; c=ctypes.CDLL(None,use_errno=True); c.syscall(451, *([ctypes.c_long(-1)]*6))'
-</code></pre>
-<p>Actual strace output:</p>
-<pre><code>cachestat(-1, 0xffffffffffffffff, 0xffffffffffffffff, 0xffffffff) = -1 EBADF (Bad file descriptor)
-</code></pre>
-<p>The trace confirms the host kernel path and observed errno/result for this ABI. The determinism recommendation also accounts for documented success-path state dependencies; an invalid-argument result alone is not treated as proof of determinism.</p>
-<h3>Legacy closure</h3>
-<p>Closed 2026-09-28 by the 2026-09-28 sweep, which closed issues whose syscall had an explicit <code>classify_syscall</code> arm. Closing comment: https://github.com/rrnewton/hermit/issues/336#issuecomment-5872941963</p>
 </body></html>

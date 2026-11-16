@@ -3,72 +3,18 @@
 <title>gettimeofday | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>gettimeofday</code> (96)</h1>
-<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; linux determinism: nondeterministic &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+gettimeofday&amp;body=Discussion+for+the+%60gettimeofday%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fgettimeofday.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60gettimeofday%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>gettimeofday(tv, tz)</code> writes the wall-clock time as seconds and microseconds into <code>tv</code>, and the kernel's timezone record into <code>tz</code>. With virtual time on (the default), Detcore lets the host call run and then overwrites <code>tv</code> with the guest's virtual clock (<code>detcore/src/syscalls/time.rs:167</code>). With <code>--no-virtualize-time</code>, and in record/replay, the call goes to the host and the value is recorded (<code>detcore/src/lib.rs:2447</code>).</p>
-<p>Manual reference: Linux man-pages gettimeofday(2).</p>
-<h2>Linux semantics</h2>
-<p>The kernel reads <code>CLOCK_REALTIME</code> and truncates it to microseconds. Each argument is independent and may be NULL. The kernel handles <code>tv</code> first: it copies the time out and returns <code>EFAULT</code> if that copy fails, before it looks at <code>tz</code>. Then it copies the global <code>sys_tz</code> record (minutes west of Greenwich and the obsolete DST type) to <code>tz</code>. <code>sys_tz</code> is host state, set only by <code>settimeofday(NULL, tz)</code> with <code>CAP_SYS_TIME</code>, and is normally zero.</p>
-<p>glibc normally serves <code>gettimeofday(3)</code> from the vDSO without entering the kernel. With a bad pointer, the vDSO faults with <code>SIGSEGV</code> where the syscall would return <code>EFAULT</code>. The ptrace backend replaces the vDSO entry with a real syscall, so under Hermit the libc wrapper reaches the handler as well.</p>
-<h3>Flags and options</h3>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+gettimeofday&amp;body=Discussion+for+the+%60gettimeofday%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fgettimeofday.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60gettimeofday%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>gettimeofday</code> (96) as determinized via typed dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.</p>
 <ul>
-<li>F1: <code>tv</code> non-NULL: filled with the current <code>CLOCK_REALTIME</code> time, truncated to microseconds</li>
-<li>F2: <code>tv</code> NULL: no time is written; the call still succeeds and still handles <code>tz</code></li>
-<li>F3: <code>tz</code> non-NULL: filled with the kernel's <code>sys_tz</code> (<code>tz_minuteswest</code>, <code>tz_dsttime</code>), host state that is normally all zeros</li>
-<li>F4: <code>tz</code> NULL: the usual call; nothing is written for the timezone</li>
-<li>F5: a bad <code>tv</code> or <code>tz</code> pointer gives <code>EFAULT</code>. The kernel writes <code>tv</code> before it checks <code>tz</code>, so a valid <code>tv</code> with a bad <code>tz</code> returns <code>EFAULT</code> after <code>tv</code> has been written.</li>
-<li>F6: the vDSO path: glibc's wrapper normally runs <code>__vdso_gettimeofday</code> in user space; under the ptrace backend that entry is replaced by the real syscall</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1657</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:7913</code></li>
 </ul>
-<h2>Determinism analysis</h2>
-<p><code>linux_determinism: nondeterministic</code> (changed from the rendered <code>conditional</code>). Every successful call with <code>tv</code> non-NULL returns the live wall clock, which differs on every run and between calls. Only the <code>tv</code> NULL case repeats, and its <code>tz</code> result still reads host state.</p>
-<h3>Nondeterminism sources</h3>
-<ul>
-<li>The host wall clock: absolute value, rate, and NTP or administrator adjustments</li>
-<li>The timing of the call relative to the rest of the program</li>
-<li>The host's <code>sys_tz</code> record, copied into <code>tz</code> (F3)</li>
-</ul>
-<h2>Hermit design</h2>
-<p>Target policy: <code>model</code> (changed from <code>investigate</code>). The guest sees a virtual wall clock derived from the configured epoch and Detcore's logical time. The code at this SHA mostly realizes it:</p>
-<ul>
-<li>With virtual time on, the typed arm at <code>detcore/src/lib.rs:2447</code> calls <code>handle_gettimeofday</code>. The handler samples the virtual clock first (<code>guest_clock_time</code>, <code>detcore/src/syscalls/time.rs:172</code>), lets the host call run through <code>record_or_replay</code> (<code>detcore/src/syscalls/time.rs:174</code>; in run mode that tool injects the real syscall, <code>detcore/src/record_or_replay.rs:47</code>), then overwrites <code>tv</code> with the virtual time when <code>tv</code> is non-NULL (<code>detcore/src/syscalls/time.rs:179</code>). F1 and F2 are modelled, and a bad <code>tv</code> still gets the kernel's <code>EFAULT</code> (F5).</li>
-<li>With <code>--no-virtualize-time</code>, the same arm passes the call through (<code>detcore/src/lib.rs:2451</code>, <code>passthrough</code> at <code>detcore/src/lib.rs:367</code>), so the guest reads the host clock. Record/replay never virtualizes time (header comment of <code>hermit-cli/tests/clock_passthrough.rs:9</code>): the recording keeps the host value and replay returns it.</li>
-<li>The epoch is the one intentionally nondeterministic input of <code>hermit run</code>. When <code>--epoch</code> is omitted, it is sampled once from the host clock before the guest starts and given to both halves of <code>--verify</code> (<code>capture_default_epoch</code>, <code>hermit-cli/src/bin/hermit/run.rs:3026</code>; the config field is documented at <code>detcore-model/src/config.rs:205</code>). So a single <code>--verify</code> run compares identical values, but two separate <code>hermit run</code> invocations see different absolute times unless <code>--epoch</code> is pinned.</li>
-<li>F6: the ptrace backend turns the vDSO entry into a real syscall (<code>reverie-ptrace/src/vdso.rs</code> in the Reverie checkout, outside this export), so the libc wrapper is handled the same way as the raw call.</li>
-</ul>
-<p>What remains before the code fully realizes <code>model</code>, both from reading the code and not measured:</p>
-<ul>
-<li><strong>`tz` is passed through (F3).</strong> The handler never writes <code>tz</code>, so the guest receives the host's <code>sys_tz</code>. That is almost always zero, but it is host state. Writing zeros when <code>tz</code> is non-NULL would make it a model.</li>
-<li><strong>Host time can leak on the error path (F5).</strong> If <code>tv</code> is valid and <code>tz</code> is bad, the host call writes host time into <code>tv</code> and returns <code>EFAULT</code>. The <code>?</code> at <code>detcore/src/syscalls/time.rs:174</code> returns before the overwrite, so the guest's <code>tv</code> keeps the real host time.</li>
-</ul>
-<p><code>passthrough</code> would expose the host clock, and <code>refuse</code> would break almost every program, so neither is an alternative.</p>
-<p>Target (owner decisions 13 and 6): <code>tv</code> reads virtual realtime, which is the clock the handler already writes (<code>detcore/src/syscalls/time.rs:172</code>, <code>detcore/src/syscalls/time.rs:179</code>; the clock names are those defined in the <code>clock_gettime</code> body). The checks follow the kernel's order (<code>SYSCALL_DEFINE2(gettimeofday)</code> in <code>kernel/time/time.c</code>):</p>
-<p>1. A non-NULL <code>tv</code> is written; an unwritable one gives <code>EFAULT</code> and nothing else happens. 2. Then a non-NULL <code>tz</code> is written; an unwritable one gives <code>EFAULT</code>, and <code>tv</code> stays written.</p>
-<p>So a valid <code>tv</code> with a bad <code>tz</code> returns <code>EFAULT</code> with the virtual time in <code>tv</code>. Today the host call writes host time into <code>tv</code>, and the <code>?</code> at <code>detcore/src/syscalls/time.rs:174</code> returns <code>EFAULT</code> before the virtual overwrite at <code>detcore/src/syscalls/time.rs:179</code>, so the host clock leaks. Under the target the handler writes <code>tv</code> from virtual realtime before it handles <code>tz</code>, and the host call never writes <code>tv</code>.</p>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F1, F4): repeated raw and libc <code>gettimeofday(&amp;tv, NULL)</code> calls under <code>hermit run --verify</code> on ptrace with a pinned <code>--epoch</code> give identical output across runs and stay within the bounds of neighbouring <code>clock_gettime(CLOCK_REALTIME)</code> reads. Existing candidates: <code>clock_apis_are_deterministic_across_five_runs</code> at <code>hermit-cli/tests/clock_determinism.rs:290</code>, whose guest <code>tests/c/clock_determinism.c:79</code> checks the bounds; cell <code>system-utils/clock-determinism</code> (<code>tests/e2e/manifests/system-utils.yaml:4</code>); and <code>explicit_virtual_epoch_reproduces_identical_observed_time</code> at <code>hermit-cli/tests/clock_determinism.rs:266</code>.</li>
-<li>T2 (covers F1): without virtual time, and in record/replay, the guest reads the host clock and replay returns the recorded value. Existing candidates: <code>run_without_virtual_time_reads_the_host_clock</code> at <code>hermit-cli/tests/clock_passthrough.rs:170</code> and <code>record_captures_host_clock_reads_and_replay_returns_them</code> at <code>hermit-cli/tests/clock_passthrough.rs:126</code>; the guest calls <code>syscall(SYS_gettimeofday, &amp;tv, NULL)</code> at <code>tests/c/clock_passthrough.c:66</code>.</li>
-<li>T3 (covers F2, F3): <code>gettimeofday(NULL, &amp;tz)</code> and <code>gettimeofday(&amp;tv, &amp;tz)</code> succeed, and <code>tz</code> reads as all zeros under Hermit. The second assertion fails at this SHA if the host <code>sys_tz</code> is non-zero.</li>
-<li>T4 (covers F5): with a raw syscall, a bad <code>tv</code> returns <code>EFAULT</code>, and a valid <code>tv</code> with a bad <code>tz</code> returns <code>EFAULT</code>. In the second case, assert that <code>tv</code> holds the virtual time, as Linux leaves <code>tv</code> written and the target requires (owner decision 6), never the host time; that assertion should fail at this SHA.</li>
-<li>T5 (covers F6): call glibc <code>gettimeofday</code> (the vDSO path) and the raw syscall back to back on ptrace and check that both read the same virtual clock.</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+gettimeofday&amp;body=Discussion+for+the+%60gettimeofday%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fgettimeofday.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60gettimeofday%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `gettimeofday`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · created for v1: no tracking issue existed for this pinned Sysno; code at this SHA: determinized, dispatch typed.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; model (virtual wall clock overwrites tv after the host call); linux_determinism conditional -&gt; nondeterministic (live wall clock); 6 flag behaviours and 5 tests listed; gaps: tz is passed from the host and a valid tv with a bad tz leaks host time on EFAULT; tracking_status stays todo</li>
-<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): applied 13 (tv reads virtual realtime, as today) and 6 (kernel order tv then tz: a bad tz returns EFAULT with the virtual time already in tv, closing the host-time leak at the ? on time.rs:174); target_policy stays model; no new F/T ids (T4 now asserts the virtual time); removed the open question on writing tv before the tz EFAULT</li>
-</ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+gettimeofday&amp;amp;body=Discussion+for+the+%60gettimeofday%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fgettimeofday.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60gettimeofday%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `gettimeofday`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Created by the syscall-tracking v1 migration on 2026-10-03. No tracking issue existed for <code>gettimeofday</code>: the 2026-07-24 classification campaign filed issues only for syscalls in the old temporary pass-through block, and Detcore already handled this one.</p>
-<h3>Open questions</h3>
-<ul>
-<li>Should the handler write a fixed <code>tz</code> (all zeros) instead of passing the host's <code>sys_tz</code> through? That is the smallest change that makes F3 a model.</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
 </body></html>

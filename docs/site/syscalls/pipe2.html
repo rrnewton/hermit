@@ -3,149 +3,18 @@
 <title>pipe2 | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>pipe2</code> (293)</h1>
-<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; linux determinism: conditional &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+pipe2&amp;body=Discussion+for+the+%60pipe2%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fpipe2.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60pipe2%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>pipe2(pipefd, flags)</code> creates an anonymous pipe and stores its read and write descriptors in <code>pipefd[0]</code> and <code>pipefd[1]</code>. Detcore handles it in <code>handle_pipe2</code>, which <code>pipe</code> also uses:</p>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+pipe2&amp;body=Discussion+for+the+%60pipe2%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fpipe2.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60pipe2%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>pipe2</code> (293) as determinized via typed dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.</p>
 <ul>
-<li>it forwards the creation;</li>
-<li>it pins the pipe's capacity to 8192 bytes;</li>
-<li>it records both descriptors in its own descriptor model;</li>
-<li>it makes them physically nonblocking, while the guest sees the <code>O_NONBLOCK</code> state it asked for.</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1750</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:8007</code></li>
 </ul>
-<h2>Linux semantics</h2>
-<p>The kernel allocates one pipe inode on the internal pipefs mount and opens two separate open file descriptions on it, one read-only and one write-only. It installs them in the two lowest free descriptor slots, read end first, and writes both numbers to <code>pipefd</code> with a single copy.</p>
-<p>Order of checks:</p>
-<ul>
-<li><code>flags</code> is checked before anything is allocated.</li>
-<li>A failed copy to <code>pipefd</code> releases both descriptors and returns <code>EFAULT</code>, so no descriptor leaks.</li>
-</ul>
-<p>Capacity:</p>
-<ul>
-<li>Normally 16 pages (65536 bytes on x86_64).</li>
-<li>When the creating user already holds more than <code>fs.pipe-user-pages-soft</code> pages of pipe buffers, the kernel silently creates 2 pages instead.</li>
-<li>An unprivileged user over <code>fs.pipe-user-pages-hard</code> gets <code>ENFILE</code>.</li>
-</ul>
-<p>The capacity decides how much a writer can put in before it blocks, gets a short write, or gets <code>EAGAIN</code>. <code>F_GETPIPE_SZ</code> reports it.</p>
-<p><code>pipe(fds)</code> is the same call with <code>flags == 0</code>.</p>
-<h3>Flags and options</h3>
-<ul>
-<li>F1: <code>flags == 0</code>: both descriptors are blocking and not close-on-exec, exactly like <code>pipe</code></li>
-<li>F2: <code>O_CLOEXEC</code>: <code>FD_CLOEXEC</code> is set on both descriptors</li>
-<li>F3: <code>O_NONBLOCK</code>: <code>O_NONBLOCK</code> is set on both open file descriptions. Reads of an empty pipe and writes to a full pipe return <code>EAGAIN</code> instead of blocking.</li>
-<li>F4: <code>O_DIRECT</code> (Linux 3.4+): packet mode. Each <code>write</code> of up to <code>PIPE_BUF</code> bytes is one packet, and a <code>read</code> smaller than the packet discards the rest of it. The number of packets that fit equals the number of capacity pages.</li>
-<li>F5: <code>O_NOTIFICATION_PIPE</code> (Linux 5.8+, same bit as <code>O_EXCL</code>): creates a kernel notification pipe. It returns <code>ENOPKG</code> when the kernel is built without <code>CONFIG_WATCH_QUEUE</code>.</li>
-<li>F6: any other bit in <code>flags</code>: <code>EINVAL</code>, checked before <code>pipefd</code>, so a bad pointer with bad flags is <code>EINVAL</code></li>
-<li>F7: <code>pipefd</code> not writable while <code>flags</code> is valid: <code>EFAULT</code>, and no descriptor is left open</li>
-<li>F8: descriptor or file limits: <code>EMFILE</code> when <code>RLIMIT_NOFILE</code> leaves fewer than two free slots. <code>ENFILE</code> at the system-wide file limit, or when an unprivileged user is over <code>fs.pipe-user-pages-hard</code>.</li>
-<li>F9: descriptor allocation: the two lowest free descriptors, with <code>pipefd[0]</code> the read end and <code>pipefd[1]</code> the write end</li>
-<li>F10: capacity: 65536 bytes by default, or 8192 bytes when the creating user is over <code>fs.pipe-user-pages-soft</code>. Visible through <code>F_GETPIPE_SZ</code>, through when writes block or return <code>EAGAIN</code>, and through the packet count in F4.</li>
-<li>F11: identity: both descriptors name one pipefs inode. <code>fstat</code> reports <code>S_IFIFO</code> and a host-assigned <code>st_ino</code>, and <code>readlink(&quot;/proc/self/fd/N&quot;)</code> reports <code>pipe:[&lt;ino&gt;]</code>.</li>
-</ul>
-<h2>Determinism analysis</h2>
-<p><code>linux_determinism: conditional</code>. Most of the result follows from process-local state:</p>
-<ul>
-<li>the descriptor numbers (F9) follow from the descriptor table;</li>
-<li>the flags (F1 to F6) follow from the argument;</li>
-<li>the <code>EFAULT</code> result follows from the guest's own memory map.</li>
-</ul>
-<p>Three outputs come from host-wide state, so <code>pipe2</code> repeats only when that state is fixed or hidden:</p>
-<ul>
-<li><strong>Capacity (F10).</strong> It depends on how many pipe pages every process of the same host user holds. Another job on the host can push the user over <code>fs.pipe-user-pages-soft</code> between two runs. The guest then gets a 2-page pipe, and the same write that succeeded before now blocks or returns short.</li>
-<li><strong>Inode number (F11).</strong> It is assigned from a host-global counter.</li>
-<li><strong>`ENFILE` (F8).</strong> It depends on system-wide file counts and per-user pipe accounting. <code>EMFILE</code> depends only on the guest's own limit and table.</li>
-</ul>
-<h3>Nondeterminism sources</h3>
-<ul>
-<li>The host user's pipe-buffer accounting against <code>fs.pipe-user-pages-soft</code> and <code>fs.pipe-user-pages-hard</code> (F8, F10).</li>
-<li>The host-global pipefs inode counter and pipefs mount ID (F11).</li>
-<li>The system-wide open-file count (F8).</li>
-<li><code>CONFIG_WATCH_QUEUE</code> in the host kernel (F5).</li>
-</ul>
-<h2>Hermit design</h2>
-<p>Target policy: <code>model</code>. Detcore already models the parts of a pipe a guest can see.</p>
-<p>Dispatch: the typed arms at <code>detcore/src/lib.rs:2536</code> (<code>pipe</code>) and <code>detcore/src/lib.rs:2537</code> (<code>pipe2</code>) both go to <code>handle_pipe2</code> at <code>detcore/src/syscalls/files.rs:3569</code>, which works in five steps.</p>
-<p><strong>1. Physical nonblocking.</strong> When threads are sequentialized, the handler adds <code>O_NONBLOCK</code> to the real call (<code>detcore/src/syscalls/files.rs:3584</code>; <code>use_nonblocking_sockets</code> at <code>detcore-model/src/config.rs:872</code>). The comment at <code>detcore/src/syscalls/files.rs:3574</code> explains why, and says this includes record and replay:</p>
-<ul>
-<li>a blocking read on an internal pipe takes the deterministic retry path instead of being treated as external blocking I/O;</li>
-<li>treating it as external blocking I/O deadlocks the sequentialized scheduler.</li>
-</ul>
-<p><strong>2. No pre-call read of `pipefd`.</strong> The comment at <code>detcore/src/syscalls/files.rs:3590</code> explains this. The kernel touches <code>pipefd</code> first, which keeps the F6/F7 precedence. The call is forwarded through <code>record_or_replay</code> at <code>detcore/src/syscalls/files.rs:3602</code>.</p>
-<p><strong>3. Capacity pin.</strong> After success, the handler sets <code>F_SETPIPE_SZ(8192)</code> on the read end (<code>detcore/src/syscalls/files.rs:3612</code>). One call sizes the whole pipe, because both ends share one pipe.</p>
-<ul>
-<li>The constant <code>DETERMINISTIC_PIPE_CAPACITY_BYTES</code> is at <code>detcore/src/syscalls/files.rs:256</code>. Its rationale, at <code>detcore/src/syscalls/files.rs:244</code>, is the soft-limit fallback in F10.</li>
-<li>Only an exact 8192 counts as success (<code>pipe_capacity_failure</code>, <code>detcore/src/syscalls/files.rs:295</code>).</li>
-<li>On failure the handler closes both new descriptors and stops the run with the policy-refusal exit (<code>detcore/src/syscalls/files.rs:3644</code>). It never invents an errno for the guest.</li>
-<li>The same constant is the ceiling for guest <code>F_SETPIPE_SZ</code>: a request above it gets <code>EPERM</code> (<code>detcore/src/syscalls/files.rs:3172</code>).</li>
-<li><code>/proc/sys/fs/pipe-max-size</code> reports the same value (<code>sanitize_pipe_max_size</code>, <code>detcore/src/procfs.rs:2100</code>).</li>
-</ul>
-<p><strong>4. Descriptor model.</strong> Both descriptors are added with the guest's own <code>flags</code> and <code>FdType::Pipe</code> (<code>detcore/src/syscalls/files.rs:3647</code>), then marked physically nonblocking (<code>detcore/src/syscalls/files.rs:3652</code>). <code>F_GETFL</code> then reports the logical <code>O_NONBLOCK</code> bit, not the forced one (<code>detcore/src/syscalls/files.rs:3097</code>).</p>
-<p><strong>5. Identity.</strong> <code>readlink</code> of a <code>pipe:[N]</code> descriptor link is virtualized (<code>anonymous_proc_fd_identity</code>, <code>detcore/src/syscalls/namespace.rs:167</code>). Pipefs mount IDs in fdinfo are mapped to run-global values (<code>detcore/src/tool_global.rs:264</code>).</p>
-<h3>Why <code>model</code> and not <code>passthrough</code> or <code>emulate</code></h3>
-<ul>
-<li><strong>Not `passthrough`.</strong> It would expose the capacity fallback (F10), and the scheduler could not use its retry path on pipes.</li>
-<li><strong>Not `emulate`.</strong> A pipe has to be a real kernel object, because the guest passes it to <code>read</code>, <code>write</code>, <code>splice</code>, <code>poll</code> and <code>execve</code>'d children.</li>
-</ul>
-<p>So the model keeps the kernel object and fixes the host-dependent parts around it.</p>
-<h3>Gaps and open points</h3>
-<ul>
-<li><strong>Packet count under `O_DIRECT` (F4).</strong> The pin gives 2 packet slots where a default host gives 16. This is deterministic, but a writer of many small packets blocks sooner than natively. No test covers <code>O_DIRECT</code> under Hermit.</li>
-<li><strong>`O_NOTIFICATION_PIPE` (F5).</strong> This hypothesis was not tested. In the upstream kernel, <code>F_SETPIPE_SZ</code> on a notification pipe returns <code>EBUSY</code> (recalled from <code>pipe_set_size</code>, not checked here). On a host with <code>CONFIG_WATCH_QUEUE</code>, <code>pipe2(fds, O_NOTIFICATION_PIPE)</code> would then make the pin fail and stop the run at <code>detcore/src/syscalls/files.rs:3644</code>. The comment at <code>detcore/src/syscalls/files.rs:3632</code> says <code>EBUSY</code> &quot;cannot hold here&quot;, and this case would contradict it. T4 measures it.</li>
-<li><strong>`F_SETFL` under record and replay.</strong> <code>pipe2</code> forces physical nonblocking in record and replay, but <code>F_SETFL</code> forces it only outside record and replay (<code>detcore/src/syscalls/files.rs:3112</code>). A guest that clears <code>O_NONBLOCK</code> on a pipe while recording would make the pipe physically blocking again, which is the case the comment at <code>detcore/src/syscalls/files.rs:3574</code> says deadlocks. This belongs to <code>fcntl</code>'s tracking issue and is noted here because the two must agree.</li>
-<li><strong>`ENFILE` (F8).</strong> Hermit does not hide host-wide <code>ENFILE</code>. It is reachable only under host pressure.</li>
-</ul>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F1, F2, F9): under <code>hermit run --verify</code> on ptrace, call <code>pipe2</code> with <code>0</code> and with <code>O_CLOEXEC</code>, then check:</li>
-<li><code>F_GETFD</code>;</li>
-<li>that <code>pipefd[0]</code> is readable and <code>pipefd[1]</code> is writable;</li>
-<li>that after closing descriptor 0 the next pipe's read end is 0.</li>
-</ul>
-<p>Existing candidates:</p>
-<ul>
-<li><code>tests/c/pipe2_flags.c</code> (cell <code>c-programs/pipe2-flags</code>, <code>tests/e2e/manifests/c-programs.yaml:13088</code>, verify ci on ptrace) checks <code>F_GETFD</code>/<code>F_GETFL</code> for flags 0, <code>O_CLOEXEC</code>, <code>O_NONBLOCK</code> and both together, through glibc <code>pipe2</code>.</li>
-<li>The lowest-descriptor check exists in <code>tests/c/fixtures/stdio_inode_identity.c:289</code>, but that fixture is driven only by the KVM test <code>run_kvm_preserves_closed_standard_input</code> in <code>hermit-cli/tests/cli.rs</code>, not on ptrace.</li>
-<li>T2 (covers F3): <code>pipe2(fds, O_NONBLOCK)</code>, then:</li>
-<li><code>read</code> of the empty pipe returns <code>EAGAIN</code>;</li>
-<li>filling the pipe ends in <code>EAGAIN</code> after exactly 8192 bytes;</li>
-<li><code>F_GETFL</code> reports <code>O_NONBLOCK</code>.</li>
-</ul>
-<p>Without <code>O_NONBLOCK</code>, <code>F_GETFL</code> must not report it, even though Detcore forces it physically. The flag readback is covered by <code>tests/c/pipe2_flags.c</code>; the <code>EAGAIN</code> behaviour is not.</p>
-<ul>
-<li>T3 (covers F4, F10): <code>F_GETPIPE_SZ</code> on both ends is 8192 on any host, and <code>/proc/sys/fs/pipe-max-size</code> reads 8192. Under <code>O_DIRECT</code>, three 100-byte writes to a nonblocking pipe give two packets and then <code>EAGAIN</code>, and a 50-byte read discards the rest of the packet. Existing candidates: <code>tests/c/pipe_capacity.c</code> (cell <code>c-programs/pipe-capacity</code>, <code>tests/e2e/manifests/c-programs.yaml:16062</code>) and <code>tests/c/pipe_capacity_pin.c</code> (cell <code>c-programs/pipe-capacity-pin</code>, <code>tests/e2e/manifests/c-programs.yaml:16132</code>, using glibc <code>pipe</code>). Both are verify ci on ptrace, and neither covers <code>O_DIRECT</code>.</li>
-<li>T4 (covers F5): <code>pipe2(fds, O_NOTIFICATION_PIPE)</code> returns what Linux returns on the same host: either <code>ENOPKG</code>, or success followed by <code>EXDEV</code> on <code>write</code>. The run must not stop with the policy-refusal exit. The test records which kernel configuration the CI host has.</li>
-<li>T5 (covers F6, F7): raw <code>syscall(SYS_pipe2, ...)</code> checks:</li>
-<li>a bad pointer with valid flags, and a null pointer, return <code>EFAULT</code>;</li>
-<li>a bad pointer with <code>-1</code> or <code>O_APPEND</code> returns <code>EINVAL</code>;</li>
-<li>after each failure, the next <code>open</code> returns the same descriptor as before, so nothing leaked.</li>
-</ul>
-<p>Existing candidates: <code>tests/c/pipe2_errno_precedence.c</code> (cell <code>c-programs/pipe2-errno-precedence</code>, <code>tests/e2e/manifests/c-programs.yaml:5284</code>, verify ci on ptrace with guest argument <code>8192</code>) covers the errno precedence and the capacity, but not the leak check. <code>tests/c/errno_path_identity.c:128</code> passes flags <code>0x7fffffff</code>.</p>
-<ul>
-<li>T6 (covers F8): set <code>RLIMIT_NOFILE</code> so that one or zero slots are free. <code>pipe2</code> returns <code>EMFILE</code> and leaves the table unchanged. The result is identical across runs.</li>
-<li>T7 (covers F11): <code>fstat</code> on both ends reports <code>S_IFIFO</code> and the same <code>st_ino</code>, which matches <code>readlink(&quot;/proc/self/fd/N&quot;)</code> as <code>pipe:[&lt;st_ino&gt;]</code>. The value is identical across runs. A ptrace cell for <code>tests/c/fixtures/stdio_inode_identity.c</code> would cover this; its check is at <code>tests/c/fixtures/stdio_inode_identity.c:205</code>.</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+pipe2&amp;body=Discussion+for+the+%60pipe2%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fpipe2.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60pipe2%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `pipe2`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · created for v1: no tracking issue existed for this pinned Sysno; code at this SHA: determinized, dispatch typed.</li>
-<li>2026-10-03 · hermit fe5d48903806 · p3-samples · p3: linux_determinism conditional (capacity, pipefs inode and ENFILE depend on host-wide accounting); target_policy investigate -&gt; model (Detcore pins capacity to 8192, forces physical nonblocking behind a logical F_GETFL and records both fds); 11 flag behaviours and 7 tests; O_NOTIFICATION_PIPE may stop the run through the capacity pin (untested hypothesis)</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+pipe2&amp;amp;body=Discussion+for+the+%60pipe2%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fpipe2.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60pipe2%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `pipe2`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Created by the syscall-tracking v1 migration on 2026-10-03. No tracking issue existed for <code>pipe2</code>: the 2026-07-24 classification campaign filed issues only for syscalls in the old temporary pass-through block, and Detcore already handled this one.</p>
-<h3>Related unit tests at this SHA</h3>
-<ul>
-<li><code>the_pipe_ceiling_admits_exactly_the_pinned_capacity</code> (<code>detcore/src/syscalls/files.rs:4779</code>)</li>
-<li><code>pipe_capacity_failure_classifies_the_errno</code> (<code>detcore/src/syscalls/files.rs:4845</code>)</li>
-<li><code>pipe_capacity_failure_closes_both_created_descriptors</code> (<code>detcore/src/syscalls/files.rs:4876</code>)</li>
-<li><code>pipe_max_size_reports_the_enforced_ceiling_not_the_host</code> (<code>detcore/src/procfs.rs:5546</code>)</li>
-<li><code>recognizes_only_anonymous_pipe_and_socket_targets</code> (<code>detcore/src/syscalls/namespace.rs:608</code>)</li>
-</ul>
-<p>These are unit tests of helpers, not ptrace runs. They do not count as coverage tokens.</p>
-<h3>Stale comment</h3>
-<p>The comment at <code>detcore/src/syscalls/files.rs:3601</code> says &quot;A C guest asserting that precedence directly is being added separately&quot;. That guest exists at this SHA as <code>tests/c/pipe2_errno_precedence.c</code>.</p>
 </body></html>

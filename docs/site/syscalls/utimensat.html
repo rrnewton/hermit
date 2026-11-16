@@ -3,127 +3,18 @@
 <title>utimensat | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>utimensat</code> (280)</h1>
-<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; linux determinism: conditional &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+utimensat&amp;body=Discussion+for+the+%60utimensat%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Futimensat.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60utimensat%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>utimensat(dirfd, pathname, times, flags)</code> sets a file's access and modification times with nanosecond precision. It can set either time to an explicit value, to &quot;now&quot; (<code>UTIME_NOW</code>), or leave it unchanged (<code>UTIME_OMIT</code>). glibc's <code>futimens(fd, times)</code> is this syscall with a NULL path.</p>
-<p>Detcore lets the kernel perform the change and records the return value (<code>detcore/src/syscalls/files.rs:3742-3748</code>). The guest's view of file times comes from <code>determinize_stat</code>, which ignores what <code>utimensat</code> stored. <code>utime</code> and <code>utimes</code> substitute virtual time before forwarding here. A direct <code>utimensat</code> with &quot;now&quot; does not.</p>
-<p>Manual reference: Linux man-pages utimensat(2), inode(7).</p>
-<h2>Linux semantics</h2>
-<p><code>times</code> is NULL or an array of two <code>timespec</code> values, <code>[0]</code> for atime and <code>[1]</code> for mtime. Each entry is an explicit time, <code>UTIME_NOW</code> or <code>UTIME_OMIT</code>, the last two given in <code>tv_nsec</code>. The kernel resolves the target, checks permission, and sets the requested times, truncated to the filesystem's granularity. Unless both entries are <code>UTIME_OMIT</code>, it also sets ctime to the current time. &quot;Now&quot; is the kernel's current coarse realtime clock.</p>
-<p>Permission depends on what is set:</p>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+utimensat&amp;body=Discussion+for+the+%60utimensat%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Futimensat.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60utimensat%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>utimensat</code> (280) as determinized via typed dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.</p>
 <ul>
-<li>Setting both times to now needs ownership, write access, or <code>CAP_FOWNER</code>.</li>
-<li>Any explicit value needs ownership or <code>CAP_FOWNER</code>.</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1906</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:8014</code></li>
 </ul>
-<h3>Flags and options</h3>
-<ul>
-<li>F1: <code>times == NULL</code>: set both atime and mtime to the current time.</li>
-<li>F2: explicit <code>times[0]</code> and <code>times[1]</code>: set the given atime and mtime. Each <code>tv_nsec</code> must be in <code>[0, 1e9)</code>, or be one of the two special values (<code>EINVAL</code> otherwise).</li>
-<li>F3: <code>UTIME_NOW</code> in either <code>tv_nsec</code>: set that timestamp to the current time; its <code>tv_sec</code> is ignored.</li>
-<li>F4: <code>UTIME_OMIT</code> in either <code>tv_nsec</code>: leave that timestamp unchanged. If both are <code>UTIME_OMIT</code>, the call returns 0 without resolving the path, and ctime is not changed.</li>
-<li>F5: <code>AT_SYMLINK_NOFOLLOW</code>: change a symbolic link itself rather than its target.</li>
-<li>F6: <code>AT_EMPTY_PATH</code>: with an empty <code>pathname</code>, act on <code>dirfd</code> itself. Any flag bit other than F5 and F6 gives <code>EINVAL</code>.</li>
-<li>F7: <code>pathname == NULL</code> (the Linux extension behind <code>futimens</code>): act on the file <code>dirfd</code> refers to. <code>flags</code> must be 0 (<code>EINVAL</code> otherwise), and <code>dirfd == AT_FDCWD</code> gives <code>EFAULT</code>.</li>
-<li>F8: <code>dirfd</code>: a relative <code>pathname</code> is resolved against <code>dirfd</code>, or against the cwd for <code>AT_FDCWD</code>. A bad descriptor gives <code>EBADF</code>, and a descriptor that is not a directory gives <code>ENOTDIR</code>.</li>
-<li>F9: permission: explicit times without ownership or <code>CAP_FOWNER</code> give <code>EPERM</code>. &quot;Now&quot; without ownership or write access gives <code>EACCES</code>. Immutable, append-only and read-only cases are F12.</li>
-<li>F10: side effects: ctime becomes the current time whenever anything is set, and stored times are truncated to the filesystem's granularity.</li>
-<li>F11: path and pointer errors: <code>ENOENT</code>, <code>ENOTDIR</code>, <code>ELOOP</code>, <code>ENAMETOOLONG</code> and <code>EACCES</code> (search permission) come from path resolution. An unreadable <code>times</code> or <code>pathname</code> gives <code>EFAULT</code>.</li>
-<li>F12: host-config failures: an immutable or append-only file gives <code>EPERM</code>, and a read-only filesystem gives <code>EROFS</code>.</li>
-</ul>
-<h2>Determinism analysis</h2>
-<p><code>linux_determinism: conditional</code> (kept from the migration, now justified).</p>
-<ul>
-<li>An explicit time stores exactly the requested value, rounded to the filesystem's granularity, and the return value depends only on file state and credentials. That part repeats.</li>
-<li>F1 and F3 store the host's realtime clock. F10 sets ctime from the same clock on every successful call.</li>
-<li><code>stat</code> after the call therefore reads host time unless something virtualizes it.</li>
-</ul>
-<h3>Nondeterminism sources</h3>
-<ul>
-<li>The current time stored by <code>times == NULL</code>, <code>UTIME_NOW</code>, and the unconditional ctime update.</li>
-<li>Filesystem granularity, which depends on the host filesystem, affects what is stored for an explicit nanosecond value.</li>
-</ul>
-<h3>Cross-host variation</h3>
-<ul>
-<li>Host inode flags and mount flags on files the guest did not create: an immutable or append-only file gives <code>EPERM</code> and a read-only mount gives <code>EROFS</code> (F12). The guest's root in a user namespace cannot set or clear these flags, so the same guest gets success on a host whose files and mounts lack them.</li>
-</ul>
-<h2>Hermit design</h2>
-<p>Target policy: <code>model</code>. The kernel validates arguments, resolves the path and checks permission. Detcore owns the times the guest can observe. The code at f4055eb9cae4:</p>
-<ul>
-<li><code>handle_utimensat</code> (<code>detcore/src/syscalls/files.rs:3742-3748</code>, dispatched at <code>detcore/src/lib.rs:2542</code>) is only <code>record_or_replay</code>. In run mode it injects the call unchanged. In record/replay it records the return value.</li>
-<li><code>handle_utime</code> and <code>handle_utimes</code> (<code>detcore/src/syscalls/files.rs:3661-3700</code>, <code>detcore/src/syscalls/files.rs:3703-3739</code>) replace a NULL <code>times</code> with the thread's virtual time from <code>thread_observe_time</code> (<code>detcore/src/syscalls/files.rs:3670-3674</code>, <code>detcore/src/syscalls/files.rs:3710-3717</code>). They then forward to <code>handle_utimensat</code> (<code>detcore/src/syscalls/files.rs:3699</code>, <code>detcore/src/syscalls/files.rs:3738</code>).</li>
-<li>With <code>virtualize_metadata</code> on (the default; it is turned off with <code>--no-virtualize-metadata</code>, <code>detcore-model/src/config.rs:253</code>), <code>stat</code>/<code>fstat</code>/<code>statx</code> results go through <code>determinize_stat</code> (<code>detcore/src/syscalls/files.rs:2981-3028</code>; gates at <code>detcore/src/syscalls/files.rs:3036</code> and <code>detcore/src/syscalls/files.rs:3069</code>).</li>
-<li>atime, ctime and btime become the configured epoch (<code>detcore/src/syscalls/files.rs:3021-3023</code>).</li>
-<li>mtime becomes the per-inode logical time (<code>detcore/src/syscalls/files.rs:3025</code>). It starts at the configured epoch when Detcore first sees the inode (<code>detcore/src/tool_global.rs:2524-2535</code>) and advances only through <code>touch_file</code> (<code>detcore/src/tool_global.rs:3763</code>), which data writes call (for example <code>detcore/src/syscalls/files.rs:2428-2431</code>).</li>
-<li><code>utimensat</code> never calls <code>touch_file</code>.</li>
-</ul>
-<p>Why <code>model</code> and not the alternatives:</p>
-<ul>
-<li><code>passthrough</code> leaks host time.</li>
-<li><code>emulate</code> would have to reimplement path resolution and permission checks that the kernel already does correctly.</li>
-<li><code>refuse</code> would break <code>touch</code>, <code>cp -p</code>, <code>tar</code>, <code>rsync</code> and <code>make</code>.</li>
-</ul>
-<p>What remains before the code fully realizes <code>model</code>:</p>
-<ul>
-<li><strong>Explicit times are invisible.</strong> Under virtualized metadata, a guest that sets mtime to a fixed value reads back the logical mtime, not its request. <code>tests/c/utimensat_determinism.c</code> pins this override as intended. <code>tests/c/file_timestamp_identity.c:173-175</code> states the opposite contract (&quot;utimensat with a fixed value must land exactly&quot;). See Open questions.</li>
-<li><strong>`UTIME_NOW` and NULL `times` do not use virtual time.</strong> A direct call stores the host clock. Under virtualized metadata <code>stat</code> hides it, but the call does not advance the logical mtime either.</li>
-<li>Hypothesis: <code>touch file</code> therefore does not make <code>file</code> newer to the guest, so <code>make</code> rules that compare timestamps may decide differently than on Linux. Not measured.</li>
-<li>The fix that matches <code>handle_utime</code> would substitute <code>thread_observe_time</code> for NULL and <code>UTIME_NOW</code>, and call <code>touch_file</code> when mtime is set.</li>
-<li><strong>`--no-virtualize-metadata`.</strong> With virtualized metadata off, F1, F3 and the F10 ctime update leak the host clock straight to <code>stat</code>.</li>
-<li><strong>Record/replay.</strong> Only the return value is recorded. The file system state the call changed is not part of the recording, which matches other path syscalls.</li>
-</ul>
-<p>Target (owner decision 13): &quot;now&quot; is virtual realtime. The clock names are those defined in the <code>clock_gettime</code> body, and <code>guest_clock_time</code> (<code>detcore/src/syscalls/time.rs:95</code>) is the reading <code>clock_gettime(CLOCK_REALTIME)</code> returns.</p>
-<ul>
-<li>A NULL <code>times</code> (F1), and each <code>UTIME_NOW</code> entry (F3), are replaced with that reading before the call reaches the kernel, as <code>handle_utime</code> and <code>handle_utimes</code> already do for NULL (<code>detcore/src/syscalls/files.rs:3670</code>, <code>detcore/src/syscalls/files.rs:3710</code>).</li>
-<li>An entry that is <code>UTIME_OMIT</code>, or an explicit value, is passed through unchanged.</li>
-<li>Today <code>handle_utimensat</code> forwards both forms unchanged (<code>detcore/src/syscalls/files.rs:3747</code>), so the kernel stores the host clock.</li>
-<li>The ctime update (F10) is the kernel's own write and still reads the host clock. Under virtualized metadata <code>determinize_stat</code> hides it (<code>detcore/src/syscalls/files.rs:3021</code>).</li>
-<li>Replacing NULL with explicit values changes the kernel's permission rule from &quot;owner or writer&quot; to &quot;owner only&quot;. That is the same problem the <code>utime</code> body raises as an open question, and the substitution must not land without an answer to it.</li>
-<li>Whether the stored virtual time becomes visible through <code>stat</code>, and whether it advances the logical mtime through <code>touch_file</code>, follows the open question on explicit times below. Decision 13 fixes only the clock source.</li>
-</ul>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F2, F4): explicit atime and mtime <code>{1111111111, 2222222222}</code> are accepted, then a <code>UTIME_OMIT</code> atime with a new mtime is accepted. Under Hermit, atime and mtime read back collapsed and overridden. Existing candidate: <code>tests/c/utimensat_determinism.c</code>, cell <code>c-programs/utimensat-determinism</code> (<code>tests/e2e/manifests/c-programs.yaml:14286</code>), verify ci on ptrace, kvm and liteinst. If the open question is resolved toward exact explicit times, change its expectation.</li>
-<li>T2 (covers F2, F3, F10): files that the guest writes get ordered, reproducible mtimes. Then <code>utimensat</code> with fixed values (<code>tests/c/file_timestamp_identity.c:180</code>) and with <code>UTIME_NOW</code> (<code>tests/c/file_timestamp_identity.c:191</code>), with the stat output printed and compared across <code>--verify</code> runs. Existing candidate: <code>tests/c/file_timestamp_identity.c</code>, cell <code>system-utils/file-timestamp-identity</code> (<code>tests/e2e/manifests/system-utils.yaml:1456</code>), verify ci on ptrace and kvm, with naked native as the negative control.</li>
-<li>T3 (covers F1, F3): write file A, then <code>utimensat(B, NULL)</code> and <code>utimensat(B, {UTIME_NOW, UTIME_NOW})</code>. Assert that B's mtime is not older than A's, and that the value is identical across <code>--verify</code> runs. This is the <code>make</code> ordering contract. No existing test.</li>
-<li>T4 (covers F4): both entries <code>UTIME_OMIT</code> on a path that does not exist returns 0. No existing test.</li>
-<li>T5 (covers F2, F6, F11): the error cases:</li>
-<li><code>tv_nsec = 1e9</code> gives <code>EINVAL</code></li>
-<li>an unknown flag bit gives <code>EINVAL</code></li>
-<li>a missing path gives <code>ENOENT</code></li>
-<li><code>times</code> pointer 1 gives <code>EFAULT</code> No existing test.</li>
-<li>T6 (covers F5, F6, F7, F8): target selection:</li>
-<li><code>AT_SYMLINK_NOFOLLOW</code> changes the link and leaves its target</li>
-<li><code>AT_EMPTY_PATH</code> and <code>futimens</code> act on an open descriptor</li>
-<li>a NULL path with <code>AT_FDCWD</code> gives <code>EFAULT</code></li>
-<li>a relative path against a directory fd works, and a non-directory fd gives <code>ENOTDIR</code> No existing test.</li>
-<li>T7 (covers F9): an unprivileged guest on a file it does not own:</li>
-<li>explicit times give <code>EPERM</code></li>
-<li><code>UTIME_NOW</code> without write access gives <code>EACCES</code></li>
-<li>a read-only bind mount, where the guest can see one, gives <code>EROFS</code>; this documents F12 (host-config, U1) and does not cover it No existing test.</li>
-<li>T8 (covers F1, F3, F10): under <code>--no-virtualize-metadata</code>, measure whether <code>stat</code> after <code>utimensat(NULL)</code> differs between two runs. This documents the leak until the code substitutes virtual time. No existing test.</li>
-<li>T9 (covers F2, F11): record and replay of a successful call and of an <code>ENOENT</code> call reproduce the return values. No existing test.</li>
-<li>U1 (covers F12; host-config): host inode flags and mount flags decide whether the immutable or append-only <code>EPERM</code> and <code>EROFS</code> occur, so CI cannot produce them on every host. Hermit forwards the kernel's answer unchanged (<code>detcore/src/syscalls/files.rs:3747</code>).</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+utimensat&amp;body=Discussion+for+the+%60utimensat%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Futimensat.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60utimensat%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `utimensat`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · created for v1: no tracking issue existed for this pinned Sysno; code at this SHA: determinized, dispatch typed.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; model (kernel validates and stores; guest-visible times come from determinize_stat); linux_determinism stays conditional (explicit times repeat; UTIME_NOW, NULL times and ctime read the host clock); 11 flag behaviours and 9 tests listed; open question for the owner on whether explicit times must be visible to the guest, because two existing tests state opposite contracts; no coverage token, so tracking_status stays todo</li>
-<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d12 (owner decisions 1 and 2): cross_host_variant true (host inode flags and read-only mounts); split immutable, append-only and read-only errors out of F9 into new F12 with U1 host-config; T7 EROFS case marked as documenting F12; no open question resolved</li>
-<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): applied 13 (NULL times and UTIME_NOW take virtual realtime before forwarding, instead of the host clock stored today; visibility through stat stays with the explicit-times question); target_policy stays model; no new F/T ids; removed the open question on whether NULL and UTIME_NOW take virtual time</li>
-<li>2026-10-05 · hermit f4055eb9cae4 · syscall-tracking-2 · covered: T1 covered by tests/c/utimensat_determinism.c (C08 review of the 2026-10-04 coverage proposals; guest source read at this SHA, not run by this agent)</li>
-</ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+utimensat&amp;amp;body=Discussion+for+the+%60utimensat%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Futimensat.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60utimensat%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `utimensat`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Created by the syscall-tracking v1 migration on 2026-10-03. No tracking issue existed for <code>utimensat</code>: the 2026-07-24 classification campaign filed issues only for syscalls in the old temporary pass-through block, and Detcore already handled this one.</p>
-<p>The header of <code>tests/c/file_timestamp_identity.c</code> (lines 12-17) says <code>c-programs/utimensat-determinism</code> is ci=false in every mode. That is stale at f4055eb9cae4: the cell runs verify in CI on ptrace, kvm and liteinst, and it is listed in <code>tests/e2e/parity-selection.yaml:230</code>.</p>
-<h3>Open questions</h3>
-<ul>
-<li>Must a guest see the explicit times it sets with <code>utimensat</code>? <code>tests/c/utimensat_determinism.c</code> requires the override, with requested times invisible and atime collapsed to mtime. <code>tests/c/file_timestamp_identity.c:173-175</code> says a fixed value &quot;must land exactly&quot;. Exact explicit times are deterministic on Linux, so honoring them is safe. Tools such as <code>tar -x</code>, <code>cp -p</code>, <code>rsync -t</code> and <code>make</code> depend on them, but the virtual-metadata design deliberately hides stored times. This is a policy decision for the owner, and the T1 expectation follows from it.</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
 </body></html>

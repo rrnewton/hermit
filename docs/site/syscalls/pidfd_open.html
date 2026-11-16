@@ -3,91 +3,18 @@
 <title>pidfd_open | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>pidfd_open</code> (434)</h1>
-<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; linux determinism: conditional &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+pidfd_open&amp;body=Discussion+for+the+%60pidfd_open%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fpidfd_open.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60pidfd_open%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p>Returns a file descriptor that refers to a process (by PID), usable for polling exit and sending signals. Hermit models it: Detcore checks the flags itself, lets the kernel create the pidfd (recorded in record mode), and registers the result in its descriptor table as a pidfd naming the target process, so that <code>pidfd_send_signal</code>, <code>pidfd_getfd</code> and <code>waitid(P_PIDFD)</code> can use it.</p>
-<p>Manual reference: <a href="https://man7.org/linux/man-pages/man2/pidfd_open.2.html">pidfd_open(2)</a>.</p>
-<h2>Linux semantics</h2>
-<p>Added in Linux 5.3. Pollable for process exit. Verified: opening the caller's own pid returns an fd deterministically.</p>
-<p>The raw signature is <code>pidfd_open(pid, flags)</code>; glibc has no wrapper before 2.36, so programs often issue it with <code>syscall()</code>. <code>pid</code> is interpreted in the caller's PID namespace. The kernel checks <code>flags</code> first, then looks up the process. The new descriptor always has close-on-exec set and takes the lowest free number. It holds a reference to the process, not to the number, so it keeps naming the same process even after the number is reused. It becomes readable (<code>POLLIN</code>) when the process exits, and a pidfd can be opened on a zombie that has not been reaped.</p>
-<h3>Flags and options</h3>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+pidfd_open&amp;body=Discussion+for+the+%60pidfd_open%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fpidfd_open.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60pidfd_open%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>pidfd_open</code> (434) as determinized via typed dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.</p>
 <ul>
-<li>F1: <code>pid</code>: a positive process id in the caller's PID namespace. Zero or negative gives <code>EINVAL</code>; no such process gives <code>ESRCH</code>. The id of a thread that is not a thread-group leader gives <code>EINVAL</code> unless F4 is set.</li>
-<li>F2: <code>flags</code> = 0: a blocking pidfd. <code>waitid(P_PIDFD)</code> on it waits for the process to exit.</li>
-<li>F3: <code>PIDFD_NONBLOCK</code> (equal to <code>O_NONBLOCK</code>, Linux 5.10): a non-blocking pidfd. <code>waitid(P_PIDFD)</code> without <code>WNOHANG</code> returns <code>EAGAIN</code> while the process is still running.</li>
-<li>F4: <code>PIDFD_THREAD</code> (equal to <code>O_EXCL</code>, Linux 6.9): the pidfd names a thread; <code>pid</code> may be any thread id, and the pidfd becomes readable when that thread exits.</li>
-<li>F5: any other flag bit gives <code>EINVAL</code>.</li>
-<li>F6: the result: the lowest free descriptor number, always close-on-exec; <code>/proc/self/fdinfo/&lt;fd&gt;</code> shows the target's <code>Pid:</code> and <code>NSpid:</code>.</li>
-<li>F7: poll and read readiness: <code>POLLIN</code> once the target has exited, whether or not it has been reaped; never ready while it runs.</li>
-<li>F8: resource errors: <code>EMFILE</code> (<code>RLIMIT_NOFILE</code>), <code>ENFILE</code>, <code>ENOMEM</code>, and <code>ENODEV</code> if the kernel cannot create the pidfd file.</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1746</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:8079</code></li>
 </ul>
-<h2>Determinism analysis</h2>
-<p><code>linux_determinism: conditional</code>. The operation itself is deterministic given its inputs. Its inputs and outputs are numbers from two shared allocators: the PID namespace and the descriptor table. In the host PID namespace, the pid a program opens depends on every other process on the machine, and whether the target is still alive depends on scheduling. The descriptor number repeats whenever the caller's descriptor table is in the same state. F7 readiness depends on when the target exits relative to the poll, which is a scheduling question. F8 depends on host limits.</p>
-<p>The call repeats when the PID namespace is private and its processes are created in a fixed order, the descriptor table evolves the same way, and a deterministic scheduler orders the target's exit against the caller.</p>
-<h3>Nondeterminism sources</h3>
-<p>The PID input and returned fd must be virtualized to hermit's deterministic namespaces; otherwise host pid/fd numbers leak.</p>
-<ul>
-<li>Whether the target is alive, a zombie or gone at the time of the call (F1, F7), which is decided by scheduling</li>
-<li>Host limits for F8</li>
-<li>The kernel version: F3 needs 5.10 and F4 needs 6.9</li>
-</ul>
-<h2>Hermit design</h2>
-<p>Target policy: <code>model</code>. The kernel creates the pidfd, because only the kernel can hold a reference to a process. Detcore decides which flags are accepted, records the result, and keeps its own model of the descriptor and the process it names, which later pidfd calls consult.</p>
-<p>What the code does at f4055eb9:</p>
-<ul>
-<li>The dispatch arm (<code>detcore/src/lib.rs:2591</code>, under the tag <code>TODO-HUMAN-REVIEW(PR-862)</code>, which is https://github.com/rrnewton/hermit/pull/862) calls <code>handle_pidfd_open</code> (<code>detcore/src/syscalls/files.rs:4338</code>).</li>
-<li>Only <code>O_NONBLOCK</code> is allowed (<code>detcore/src/syscalls/files.rs:4343</code>); any other bit gives <code>EINVAL</code> before the kernel sees the call (<code>detcore/src/syscalls/files.rs:4344</code>-<code>4345</code>). That covers F5, and it also rejects F4 <code>PIDFD_THREAD</code>, which Linux 6.9 and later accept. See Open questions.</li>
-<li>The call goes through <code>record_or_replay</code> (<code>detcore/src/syscalls/files.rs:4348</code>), so in record mode the result is recorded and in replay mode it is returned from the recording.</li>
-<li>The new descriptor is added to Detcore's table as <code>FdType::Pidfd</code> with <code>O_CLOEXEC</code> and the guest's <code>O_NONBLOCK</code> bit (<code>detcore/src/syscalls/files.rs:4349</code>-<code>4350</code>), and its target is stored as <code>DetPid::from_raw(pid)</code> (<code>detcore/src/syscalls/files.rs:4351</code>-<code>4354</code>). The target is kept in the open-file record that descriptor aliases share (<code>detcore/src/fd.rs:91</code>-<code>97</code>, setter at line 343).</li>
-<li>The guest's pid is passed to the kernel unchanged. That repeats because the guest runs in its own PID namespace (<code>default_container</code>, <code>hermit-cli/src/bin/hermit/container.rs:442</code>), where creation order is fixed by the scheduler; <code>detcore/src/syscalls/signal.rs:674</code> relies on the same property for signal targets.</li>
-<li>Later calls use the model. <code>pidfd_send_signal</code> refuses any descriptor that is not a registered <code>FdType::Pidfd</code> with <code>EBADF</code> (<code>detcore/src/syscalls/files.rs:4388</code>-<code>4395</code>). <code>waitid(P_PIDFD)</code> reads the descriptor's <code>O_NONBLOCK</code> status and returns <code>EAGAIN</code> for a non-blocking pidfd (F3); a blocking <code>waitid</code> on a blocking pidfd returns <code>EOPNOTSUPP</code> (<code>detcore/src/syscalls/threads.rs:1824</code>-<code>1841</code>), because Detcore cannot yet keep the pidfd's identity while it waits.</li>
-<li>Classification: <code>Determinized</code> (<code>detcore/src/syscall_classification.rs:565</code>-<code>569</code>), with unit test <code>pidfd_family_is_determinized</code> (<code>detcore/src/syscall_classification.rs:2182</code>). It is also in the record/replay subscription (<code>detcore/src/lib.rs:1187</code>).</li>
-</ul>
-<p>Why <code>model</code>: <code>emulate</code> is not possible, because the descriptor must be a real kernel object for <code>poll</code> and for the kernel side of <code>waitid</code>. <code>passthrough</code> would leave the descriptor unknown to Detcore, and <code>pidfd_send_signal</code> would then fail with <code>EBADF</code>. <code>refuse</code> would break programs such as service managers and process supervisors that use pidfds.</p>
-<p>What remains before the code fully realizes <code>model</code>. These are hypotheses read from the code, not measurements:</p>
-<ul>
-<li><strong>F4 `PIDFD_THREAD`</strong> is refused with <code>EINVAL</code>, which matches a kernel older than 6.9 but not the host kernel. See Open questions.</li>
-<li><strong>F2 blocking `waitid`</strong> returns <code>EOPNOTSUPP</code>, which Linux never returns there. A program that opens a blocking pidfd and waits on it fails under Hermit.</li>
-<li><strong>F7 readiness</strong> is decided by the kernel when the guest polls; no Detcore code for polling pidfds was found at this SHA, so whether a poll that races the target's exit is ordered by the scheduler has not been checked.</li>
-</ul>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F1, F2, F6): open a pidfd on the caller's own pid with flags 0, check close-on-exec, then open a second one and check the two descriptors differ; the output must match across <code>--verify</code> runs. Existing candidates: <code>tests/c/pidfd_open_self.c:18</code> (cell <code>c-programs/pidfd-open-self</code>, program at <code>tests/e2e/manifests/c-programs.yaml:5113</code>, verify ci on ptrace) and <code>tests/c/pidfd_open_self_pair.c:29</code> (cell <code>c-programs/pidfd-open-self-pair</code>, program at <code>tests/e2e/manifests/c-programs.yaml:15581</code>, verify ci on ptrace).</li>
-<li>T2 (covers F5): flags <code>1</code> and <code>0xFFFFFFFF</code> return <code>EINVAL</code>. Existing candidates: <code>tests/c/pidfd_open_self.c:33</code> and <code>tests/c/pidfd_open_self_pair.c:44</code>, in the same cells as T1.</li>
-<li>T3 (covers F3): open a child's pidfd with <code>O_NONBLOCK</code>; <code>waitid(P_PIDFD)</code> returns <code>EAGAIN</code> while the child runs, then the exit status after it exits. Existing candidates: <code>tests/c/pidfd_waitid_child.c:44</code> (cell <code>c-programs/pidfd-waitid-child</code>, program at <code>tests/e2e/manifests/c-programs.yaml:5229</code>, verify ci on ptrace), and <code>waitid_polls_until_child_exit_and_supports_wnohang</code> (<code>detcore/tests/misc/mod.rs:1043</code>; the <code>O_NONBLOCK</code> open is at line 1102 and the blocking open at line 1123).</li>
-<li>T4 (covers F7): poll a live self pidfd and find it not ready; poll a child's pidfd until the child exits and find it ready, both before and after the child is reaped. Existing candidate for the first half: <code>tests/c/pidfd_poll_self.c:18</code> (cell <code>c-programs/pidfd-poll-self</code>, program at <code>tests/e2e/manifests/c-programs.yaml:5171</code>, verify ci on ptrace).</li>
-<li>T5 (covers F1, F8): pid 0 and pid -1 return <code>EINVAL</code>; a pid with no process returns <code>ESRCH</code>; a non-leader thread id with flags 0 returns <code>EINVAL</code>; with <code>RLIMIT_NOFILE</code> lowered to the current count the call returns <code>EMFILE</code>.</li>
-<li>T6 (covers F4): <code>PIDFD_THREAD</code> on a thread id. Today Hermit returns <code>EINVAL</code>; the expected result depends on the open question below.</li>
-<li>T7 (covers F2, F6): record a program that opens a pidfd on a child and sends it a signal through <code>pidfd_send_signal</code>, then replay it. Replay must return the same descriptor number and the signal must succeed, which shows the descriptor was registered in replay as well. Related: <code>replay_reissues_pidfd_getfd_success_and_failure</code> (<code>hermit-cli/tests/flock_exclusion.rs:849</code>) records and replays a scenario that opens a self pidfd at <code>tests/c/flock_exclusion.c:891</code>.</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+pidfd_open&amp;body=Discussion+for+the+%60pidfd_open%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fpidfd_open.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60pidfd_open%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `pidfd_open`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-09-28 · hermit 81ca8822f78c · hermit2 · closed under the legacy rule (an explicit <code>classify_syscall</code> arm), not the v1 done rule; closing comment https://github.com/rrnewton/hermit/issues/319#issuecomment-5872904456</li>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/319: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch typed.</li>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · reopen: under the owner rule of 2026-10-02, closed means every flag and option is covered by a named test and the implementation works; pidfd_open records no test coverage, so tracking_status is todo and https://github.com/rrnewton/hermit/issues/319 reopens.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; model (flags checked in Detcore, kernel pidfd recorded and registered as FdType::Pidfd with its target, detcore/src/syscalls/files.rs:4338); linux_determinism conditional; 8 flags, 7 tests; open question: should Hermit accept PIDFD_THREAD (refused with EINVAL at files.rs:4343-4345); no coverage recorded, so todo.</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+pidfd_open&amp;amp;body=Discussion+for+the+%60pidfd_open%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fpidfd_open.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60pidfd_open%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `pidfd_open`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Originally filed 2026-07-24 as &quot;Syscall classification: pidfd_open&quot; (https://github.com/rrnewton/hermit/issues/319), legacy variant A1.</p>
-<p>Comment history: 1 comment(s) on https://github.com/rrnewton/hermit/issues/319.</p>
-<h3>Open questions</h3>
-<ul>
-<li><strong>Should Hermit accept `PIDFD_THREAD`?</strong> Linux 6.9 added <code>PIDFD_THREAD</code> (<code>O_EXCL</code>), and the host kernel accepts it. Detcore allows only <code>O_NONBLOCK</code> (<code>detcore/src/syscalls/files.rs:4343</code>-<code>4345</code>), so a guest gets <code>EINVAL</code>, as from a kernel older than 6.9. Accepting it would also mean teaching <code>pidfd_send_signal</code> and <code>waitid</code> about thread pidfds. The owner should decide whether Hermit presents a pre-6.9 pidfd interface on purpose, or should support thread pidfds. T6 waits on this answer.</li>
-</ul>
-<h3>2026-07-24 host strace evidence</h3>
-<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) by tracing a direct <code>syscall()</code> harness and common programs with <code>strace -f -e trace=pidfd_open</code>, and by confirming hermit currently routes <code>pidfd_open</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code> (the harness ran end-to-end under <code>hermit run</code>, exit 0, so passthrough does not crash).</p>
-<p>Observed strace line:</p>
-<pre><code>pidfd_open(1549764, 0)          = 3
-</code></pre>
-<hr>
-<p>*Autonomous syscall-classification sweep, batch 3 (ranks 101-150 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
-<h3>Legacy closure</h3>
-<p>Closed 2026-09-28 by the 2026-09-28 sweep, which closed issues whose syscall had an explicit <code>classify_syscall</code> arm. Closing comment: https://github.com/rrnewton/hermit/issues/319#issuecomment-5872904456</p>
 </body></html>

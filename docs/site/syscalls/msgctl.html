@@ -3,111 +3,18 @@
 <title>msgctl | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>msgctl</code> (71)</h1>
-<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_unsupported_async_ipc_syscall</code> &middot; linux determinism: conditional &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+msgctl&amp;body=Discussion+for+the+%60msgctl%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fmsgctl.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60msgctl%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>msgctl(msqid, cmd, buf)</code> reads or changes the metadata of a System V message queue, removes it, or reports system-wide limits and usage. Hermit refuses it: Detcore returns a fixed <code>ENOSYS</code> without forwarding the call (<code>detcore/src/lib.rs:2237-2241</code>), as on a kernel built without <code>CONFIG_SYSVIPC</code>. Owner decision 9 (2026-10-04) makes the target <code>model</code>: Detcore keeps its own System V IPC namespace for the run.</p>
-<p>Manual reference: Linux man-pages msgctl(2).</p>
-<h2>Linux semantics</h2>
-<p><code>cmd</code> selects one of seven operations, listed below. The queue operations act on a host kernel object addressed by an integer id and shared with every process in the caller's IPC namespace. <code>IPC_INFO</code> and <code>MSG_INFO</code> need no queue at all: they report the limits and usage of the whole IPC namespace.</p>
-<p><code>struct msqid_ds</code> holds the owner and mode (<code>msg_perm</code>), the wall-clock times of the last send, receive and change (<code>msg_stime</code>, <code>msg_rtime</code>, <code>msg_ctime</code>), the current byte and message counts (<code>msg_cbytes</code>, <code>msg_qnum</code>), the byte limit (<code>msg_qbytes</code>), and the pids of the last sender and receiver (<code>msg_lspid</code>, <code>msg_lrpid</code>).</p>
-<p>The 2026-07-24 host strace under Additional information, <code>msgctl(-1, IPC_RMID, NULL) = -1 EINVAL</code>, shows the invalid-id path on the host.</p>
-<h3>Flags and options</h3>
+<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_unsupported_async_ipc_syscall</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+msgctl&amp;body=Discussion+for+the+%60msgctl%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fmsgctl.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60msgctl%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>msgctl</code> (71) as determinized-refused via pred:is_unsupported_async_ipc_syscall dispatch; deterministic refusal: true; run subscription: true; record/replay subscription: true.</p>
 <ul>
-<li>F1: <code>IPC_STAT</code>: copy the queue's <code>msqid_ds</code> to <code>buf</code>. Needs read permission (<code>EACCES</code> otherwise).</li>
-<li>F2: <code>IPC_SET</code>: set <code>msg_perm.uid</code>, <code>msg_perm.gid</code>, the low 9 bits of <code>msg_perm.mode</code>, and <code>msg_qbytes</code> from <code>buf</code>, and update <code>msg_ctime</code>. The caller must be the owner or creator, or have <code>CAP_SYS_ADMIN</code> (<code>EPERM</code> otherwise). Raising <code>msg_qbytes</code> above <code>MSGMNB</code> needs <code>CAP_SYS_RESOURCE</code> (<code>EPERM</code> otherwise).</li>
-<li>F3: <code>IPC_RMID</code>: remove the queue at once and wake every waiting sender and receiver with <code>EIDRM</code>. Same permission rule as <code>IPC_SET</code>.</li>
-<li>F4: <code>IPC_INFO</code>: fill <code>buf</code>, read as a <code>struct msginfo</code>, with the system-wide limits (<code>msgmax</code>, <code>msgmnb</code>, <code>msgmni</code>, ...). Returns the index of the highest used entry in the kernel's queue array.</li>
-<li>F5: <code>MSG_INFO</code>: like <code>IPC_INFO</code>, but <code>msgpool</code>, <code>msgmap</code> and <code>msgtql</code> report the number of queues, messages and bytes in use across the IPC namespace</li>
-<li>F6: <code>MSG_STAT</code>: like <code>IPC_STAT</code>, but <code>msqid</code> is an index into the kernel's queue array, and the call returns the id of the queue at that index</li>
-<li>F7: <code>MSG_STAT_ANY</code> (Linux 4.17): like <code>MSG_STAT</code>, without the read-permission check</li>
-<li>F8: errors: an unknown <code>cmd</code>, or a <code>msqid</code> naming no queue: <code>EINVAL</code> (<code>EIDRM</code> in a race with removal). <code>buf</code> not accessible for <code>IPC_STAT</code>, <code>IPC_SET</code>, <code>MSG_STAT</code> or the info commands: <code>EFAULT</code>.</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1726</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:7563</code></li>
 </ul>
-<h2>Determinism analysis</h2>
-<p><code>linux_determinism: conditional</code>, kept from the legacy classification. The answer depends on <code>cmd</code>:</p>
-<ul>
-<li><code>IPC_RMID</code> and <code>IPC_SET</code> depend only on the queue's existence and permissions, which a guest that owns the queue controls. They repeat when nothing outside the guest touches the queue, although <code>IPC_RMID</code> wakes waiting processes in an order the host scheduler chooses.</li>
-<li><code>IPC_STAT</code>, <code>MSG_STAT</code> and <code>MSG_STAT_ANY</code> return wall-clock times (<code>msg_ctime</code> is always set) and host pids, so their output does not repeat across runs.</li>
-<li><code>IPC_INFO</code> and <code>MSG_INFO</code> report host-wide limits and usage that other processes change.</li>
-</ul>
-<h3>Nondeterminism sources</h3>
-<ul>
-<li>Wall-clock times and host pids in <code>msqid_ds</code> (<code>msg_stime</code>, <code>msg_rtime</code>, <code>msg_ctime</code>, <code>msg_lspid</code>, <code>msg_lrpid</code>)</li>
-<li>Message and byte counts that depend on the progress of other senders and receivers</li>
-<li>System-wide limits (<code>/proc/sys/kernel/msgmax</code>, <code>msgmnb</code>, <code>msgmni</code>) and namespace-wide usage counts, which include queues owned by processes outside the guest</li>
-<li>Array indices and ids, which depend on every queue created in the namespace</li>
-</ul>
-<h2>Hermit design</h2>
-<p>Today (hermit f4055eb9cae4) Detcore refuses the call with a fixed <code>ENOSYS</code>. That is not the target; the target is under <code>Target (owner decision 9)</code> below. Today's refusal:</p>
-<ul>
-<li><code>classify_syscall</code> lists <code>msgctl</code> as Determinized (<code>detcore/src/syscall_classification.rs:418</code>, in the arm that ends at <code>detcore/src/syscall_classification.rs:688</code>).</li>
-<li><code>is_unsupported_async_ipc_syscall</code> (<code>detcore/src/syscall_classification.rs:1051</code>) names it at <code>detcore/src/syscall_classification.rs:1069</code>.</li>
-<li>The guard arm in <code>handle_syscall_event</code> (<code>detcore/src/lib.rs:2237-2241</code>) returns <code>Err(Error::Errno(Errno::ENOSYS))</code> for every syscall that predicate names. The arm never injects the call, so the host kernel never sees it, whatever the arguments are, and no argument is validated first.</li>
-<li>The arm does not consult <code>panic_on_unsupported_syscalls</code>, so fail-closed mode and the compatibility opt-out return the same <code>ENOSYS</code> (<code>refused_only_when_fail_closed: false</code>).</li>
-<li><code>is_deterministically_refused_syscall</code> includes the predicate (<code>detcore/src/syscall_classification.rs:1325</code>), so backends that consult that boundary see the same refusal.</li>
-<li>The unit test <code>representative_policies_stay_in_their_reviewed_sections</code> (<code>detcore/src/syscall_classification.rs:1899</code>, batch-7 loop at <code>detcore/src/syscall_classification.rs:2139-2171</code>) asserts the classification and the predicate membership. It does not launch Hermit, so it is not coverage for the flags below.</li>
-</ul>
-<p>The doc comment (<code>detcore/src/syscall_classification.rs:1034-1047</code>) gives the reason: System V message queues are global, key-addressed kernel objects that persist across runs and are shared with the whole host. Forwarding these calls, as the legacy pass-through did, is nondeterministic and a container-isolation hole. <code>ENOSYS</code> is exactly what a kernel built without <code>CONFIG_SYSVIPC</code> returns, so a guest sees a consistent, if smaller, kernel.</p>
-<p>Target (owner decision 9): <code>model</code>. On 2026-10-04 the owner accepted modelling the whole System V IPC family (<code>shmget</code>, <code>shmat</code>, <code>shmdt</code>, <code>shmctl</code>, <code>semget</code>, <code>semop</code>, <code>semtimedop</code>, <code>semctl</code>, <code>msgget</code>, <code>msgsnd</code>, <code>msgrcv</code>, <code>msgctl</code>) inside Detcore. The named workload is PostgreSQL, which needs a System V shared-memory segment, and the standing least-common-denominator policy forbids refusing an interface such a guest has no fallback for. Passthrough is ruled out because the guest shares the host's IPC namespace: at the pin, <code>default_container</code> unshares only <code>Namespace::PID</code> (<code>hermit-cli/src/bin/hermit/container.rs:442</code>-<code>453</code>, the call at line 445), <code>image_container</code> does the same (<code>hermit-cli/src/bin/hermit/container.rs:482</code>), and nothing under <code>hermit-cli/src</code> asks for <code>CLONE_NEWIPC</code>. The family shares one model:</p>
-<ul>
-<li>One Detcore-owned IPC namespace per run, empty at start and seen by every guest process. Objects exist only in Detcore and only for the run. Nothing is created in the host's namespace, so the host's <code>/proc/sysvipc/*</code> never changes, and a host identifier a guest guesses names nothing.</li>
-<li>Identifiers follow the kernel's rule for a fresh namespace with <code>kernel.*_next_id</code> unset (<code>ipc_idr_alloc</code>, Linux <code>ipc/util.c</code>): the slot index is allocated cyclically starting at 0, the sequence number advances when an allocation reuses an index not above the last one, and the identifier is sequence * 32768 + index. The first object of each kind gets identifier 0, and every later identifier depends only on the guest's call order.</li>
-<li>Limits are the compiled-in defaults of a fresh Linux IPC namespace, never the host's sysctls (<code>include/uapi/linux/shm.h</code>, <code>sem.h</code>, <code>msg.h</code>): SHMMIN 1, SHMMAX 18446744073692774399 bytes, SHMALL 18446744073692774399 pages, SHMMNI 4096; SEMMSL 32000, SEMMNS 1024000000, SEMOPM 500, SEMMNI 32000, SEMVMX 32767; MSGMAX 8192, MSGMNB 16384, MSGMNI 32000.</li>
-<li>Owner and creator uid and gid in <code>ipc_perm</code>, and the permission rules (<code>EACCES</code> from the mode bits unless the caller has <code>CAP_IPC_OWNER</code>; <code>EPERM</code> unless the caller is the owner or creator or has <code>CAP_SYS_ADMIN</code>), use the per-process credential record of owner decision 4. The default guest is uid 0 with every capability, so those errors appear only after a guest changes its recorded credentials.</li>
-<li>Pids in status structures are virtual pids, and times are virtual time (owner decision 13).</li>
-</ul>
-<p>Per-call target for <code>msgctl</code>:</p>
-<ul>
-<li><code>IPC_STAT</code>, <code>MSG_STAT</code> and <code>MSG_STAT_ANY</code> (F1, F6, F7) return Detcore's queue record with virtual pids and times and the decision-4 uid and gid. <code>MSG_STAT</code> takes a slot index of the Detcore namespace.</li>
-<li><code>IPC_INFO</code> (F4) returns the defaults above (<code>msgmax</code> 8192, <code>msgmnb</code> 16384, <code>msgmni</code> 32000, and the other <code>struct msginfo</code> constants Linux reports), never the host's. <code>MSG_INFO</code> (F5) counts only guest queues, messages and bytes. Both return the highest slot index in use.</li>
-<li><code>IPC_SET</code> (F2) changes only Detcore's record. <code>IPC_RMID</code> (F3) removes the queue at once and makes every parked sender and receiver return <code>EIDRM</code>. <code>msgctl</code> itself never waits, but it should land with <code>msgsnd</code> and <code>msgrcv</code>, which need the scheduler wait of owner decision 14.</li>
-</ul>
-<p>Errno order (owner decision 6), following <code>ksys_msgctl</code>, <code>msgctl_stat</code> and <code>msgctl_down</code> in Linux <code>ipc/msg.c</code>: a negative <code>msqid</code> or <code>cmd</code> gives <code>EINVAL</code> before anything else. <code>IPC_INFO</code> and <code>MSG_INFO</code> can then fail only with <code>EFAULT</code> on the copy-out. The stat commands look the queue up (<code>EINVAL</code>), check read permission (<code>EACCES</code>, skipped for <code>MSG_STAT_ANY</code>) and copy out last (<code>EFAULT</code>). <code>IPC_SET</code> copies <code>buf</code> in first (<code>EFAULT</code>); <code>IPC_SET</code> and <code>IPC_RMID</code> then look the queue up (<code>EINVAL</code>) and require the owner, the creator or <code>CAP_SYS_ADMIN</code> (<code>EPERM</code>); <code>IPC_SET</code> then rejects a <code>msg_qbytes</code> above MSGMNB without <code>CAP_SYS_RESOURCE</code> (<code>EPERM</code>). Any other <code>cmd</code> gives <code>EINVAL</code>.</p>
-<p>Why not the other policies:</p>
-<ul>
-<li><code>refuse</code>, today's code, is deterministic but breaks PostgreSQL, the workload decision 9 names, and the standing policy forbids refusing an interface a common guest needs and has no fallback for.</li>
-<li><code>passthrough</code> was the legacy behaviour (the 2026-07-24 evidence under Additional information was gathered while the call was still forwarded). It hands the guest identifiers allocated in the host's IPC namespace, which the guest shares (see above), so results depend on every other process using System V IPC. Identifiers are small guessable integers, so a forwarded call could also reach objects the guest did not create.</li>
-<li><code>emulate</code> with a fake success would hand out objects that do not behave as shared state between cooperating processes.</li>
-<li>A forwarded <code>IPC_INFO</code> or <code>MSG_INFO</code> needs no queue and would report the host's limits and usage; the model reports the defaults and the guest's own counts instead.</li>
-</ul>
-<p>Today every behaviour in <code>### Flags and options</code> is replaced by the same <code>-1</code>/<code>ENOSYS</code> with no side effect. Under the target each one behaves as on Linux, against the Detcore namespace.</p>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F1, F4, F5, F6, F7, F8): under <code>hermit run --verify</code> on ptrace, on a guest queue holding two 10-byte messages: <code>IPC_STAT</code> gives the expected mode, <code>msg_qnum</code> 2, <code>msg_cbytes</code> 20 and <code>msg_qbytes</code> 16384; <code>IPC_INFO</code> gives <code>msgmax</code> 8192, <code>msgmnb</code> 16384 and <code>msgmni</code> 32000; <code>MSG_INFO</code> gives <code>msgpool</code> 1, <code>msgmap</code> 2 and <code>msgtql</code> 20; <code>MSG_STAT</code> and <code>MSG_STAT_ANY</code> on index 0 return the queue's id; <code>cmd</code> 99 and <code>cmd</code> -1 give <code>EINVAL</code>; <code>IPC_STAT</code> with a <code>NULL</code> buffer gives <code>EFAULT</code>. Compare with the native run in a fresh IPC namespace, except pids and times.</li>
-<li>T2 (covers F2, F3, F4): <code>IPC_SET</code> changes the mode and lowers <code>msg_qbytes</code>; raising it above 16384 succeeds as uid 0 and gives <code>EPERM</code> after the guest drops to uid 1000 with no capabilities (owner decision 4), as do <code>IPC_SET</code> and <code>IPC_RMID</code> on a queue owned by uid 0. <code>IPC_RMID</code> wakes a blocked receiver with <code>EIDRM</code>. The harness creates a queue outside Hermit and passes its id: the guest's <code>IPC_RMID</code> on it gives <code>EINVAL</code>, and the host queue still exists afterwards. The guest's <code>IPC_INFO</code> shows the defaults even when the host's <code>kernel.msgmnb</code> differs.</li>
-<li>T3 (covers none): the same results in fail-closed mode and under the compatibility opt-out, and a record followed by a replay reproduces them.</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+msgctl&amp;body=Discussion+for+the+%60msgctl%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fmsgctl.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60msgctl%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `msgctl`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-09-28 · hermit 81ca8822f78c · hermit2 · closed under the legacy rule (an explicit <code>classify_syscall</code> arm), not the v1 done rule; closing comment https://github.com/rrnewton/hermit/issues/304#issuecomment-5872870971</li>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/304: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch pred:is_unsupported_async_ipc_syscall, refused.</li>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · reopen: under the owner rule of 2026-10-02, closed means every flag and option is covered by a named test and the implementation works; msgctl records no test coverage, so tracking_status is todo and https://github.com/rrnewton/hermit/issues/304 reopens.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy refuse (detcore/src/lib.rs:2237-2241 returns a fixed ENOSYS for the whole System V message-queue family without forwarding, which also keeps IPC_INFO/MSG_INFO host limits out of the guest); linux_determinism stays conditional (depends on cmd); 8 flag behaviours and 3 tests listed; no test calls msgctl at this SHA, so no coverage token and tracking_status stays todo</li>
-<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): decisions 9, 6, 4 and 13 applied, decision 14 noted (msgctl lands with the waiting message-queue calls); target_policy refuse-&gt;model; Target (owner decision 9) block in Hermit design with the shared model, the msgctl target and the kernel errno order (decision 6); T1-T3 rewritten as behaviour tests, ids and covers kept except T2 now also covers F4; no new F/T ids; P3 review notes marked superseded; no open questions existed</li>
-</ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+msgctl&amp;amp;body=Discussion+for+the+%60msgctl%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fmsgctl.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60msgctl%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `msgctl`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Originally filed 2026-07-24 as &quot;Syscall classification: msgctl&quot; (https://github.com/rrnewton/hermit/issues/304), legacy variant A1.</p>
-<p>Comment history: 1 comment(s) on https://github.com/rrnewton/hermit/issues/304.</p>
-<h3>2026-07-24 host strace evidence</h3>
-<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) by tracing a direct <code>syscall()</code> harness and common programs with <code>strace -f -e trace=msgctl</code>, and by confirming hermit currently routes <code>msgctl</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code> (the harness ran end-to-end under <code>hermit run</code>, exit 0, so passthrough does not crash).</p>
-<p>Observed strace line:</p>
-<pre><code>msgctl(-1, IPC_RMID, NULL)      = -1 EINVAL (Invalid argument)
-</code></pre>
-<hr>
-<p>*Autonomous syscall-classification sweep, batch 3 (ranks 101-150 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
-<h3>Legacy closure</h3>
-<p>Closed 2026-09-28 by the 2026-09-28 sweep, which closed issues whose syscall had an explicit <code>classify_syscall</code> arm. Closing comment: https://github.com/rrnewton/hermit/issues/304#issuecomment-5872870971</p>
-<h3>P3 review notes (2026-10-03, hermit f4055eb9cae4)</h3>
-<ul>
-<li>The legacy recommended action <strong>NEEDS-HANDLER</strong> predates the deterministic <code>ENOSYS</code> refusal whose code is tagged <code>TODO-HUMAN-REVIEW(#731)</code> (https://github.com/rrnewton/hermit/issues/731). At this SHA the System V message-queue family is refused by <code>is_unsupported_async_ipc_syscall</code>, so the target is <code>refuse</code>, not a new handler.</li>
-<li>The 2026-07-24 strace section above says Hermit routed this call through a temporary pass-through and that a harness reached the host kernel under <code>hermit run</code>. That is history: at this SHA Detcore refuses the call before it reaches the host.</li>
-<li>A later upgrade to <code>model</code> remains possible if a workload needs this interface; Hermit design lists what it would need.</li>
-<li>Superseded 2026-10-04 by owner decision 9: the System V message-queue family is to be modelled, so the first and third notes no longer describe the target; see <code>Target (owner decision 9)</code> under Hermit design.</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
 </body></html>

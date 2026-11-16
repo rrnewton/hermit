@@ -3,93 +3,18 @@
 <title>open_tree | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>open_tree</code> (428)</h1>
-<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_mount_ns_admin_refused_syscall</code> &middot; linux determinism: conditional &middot; target policy: refuse &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+open_tree&amp;body=Discussion+for+the+%60open_tree%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fopen_tree.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60open_tree%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>open_tree(dfd, path, flags)</code> returns a file descriptor for a location in the mount tree; with <code>OPEN_TREE_CLONE</code> the descriptor holds a new detached copy of the mount there, which <code>move_mount</code> can attach elsewhere (new mount API, Linux 5.2). Hermit refuses every call with a fixed <code>EPERM</code> and never forwards it to the host (<code>detcore/src/lib.rs:2215-2219</code>).</p>
-<h2>Linux semantics</h2>
-<p><code>open_tree</code> resolves <code>path</code> relative to <code>dfd</code> and returns a descriptor, which is always the lowest free descriptor number.</p>
+<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_mount_ns_admin_refused_syscall</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+open_tree&amp;body=Discussion+for+the+%60open_tree%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fopen_tree.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60open_tree%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>open_tree</code> (428) as determinized-refused via pred:is_mount_ns_admin_refused_syscall dispatch; deterministic refusal: true; run subscription: true; record/replay subscription: true.</p>
 <ul>
-<li>Without <code>OPEN_TREE_CLONE</code> the descriptor is an <code>O_PATH</code> descriptor for the resolved location. No privilege is needed.</li>
-<li>With <code>OPEN_TREE_CLONE</code> the kernel copies the mount at that location (with <code>AT_RECURSIVE</code>, the whole mount subtree below it) into a new detached tree and returns a descriptor that holds it. The clone needs <code>CAP_SYS_ADMIN</code> over the caller's mount namespace; without it the call fails with <code>EPERM</code>. The tree can be attached with <code>move_mount</code>; if the last reference to an unattached tree closes, the kernel unmounts it.</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1739</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:7540</code></li>
 </ul>
-<p>Errors: undefined flag bits, or <code>AT_RECURSIVE</code> without <code>OPEN_TREE_CLONE</code>, give <code>EINVAL</code>. Path resolution gives the usual <code>ENOENT</code>, <code>ENOTDIR</code>, <code>ELOOP</code> and <code>EACCES</code>. An empty <code>path</code> without <code>AT_EMPTY_PATH</code> gives <code>ENOENT</code>, which the host strace under Additional information shows: <code>open_tree(-1, &quot;&quot;, 0) = -1 ENOENT</code>. Descriptor exhaustion gives <code>EMFILE</code> or <code>ENFILE</code>.</p>
-<h3>Flags and options</h3>
-<ul>
-<li>F1: no <code>OPEN_TREE_CLONE</code>: return an <code>O_PATH</code> descriptor for the resolved location. Unprivileged.</li>
-<li>F2: <code>OPEN_TREE_CLONE</code>: clone the mount at the location into a detached tree. Needs <code>CAP_SYS_ADMIN</code> over the caller's mount namespace, otherwise <code>EPERM</code>.</li>
-<li>F3: <code>AT_RECURSIVE</code> with <code>OPEN_TREE_CLONE</code>: clone the whole mount subtree. <code>AT_RECURSIVE</code> without <code>OPEN_TREE_CLONE</code> is <code>EINVAL</code>.</li>
-<li>F4: <code>OPEN_TREE_CLOEXEC</code> (equal to <code>O_CLOEXEC</code>): set close-on-exec on the returned descriptor.</li>
-<li>F5: <code>AT_EMPTY_PATH</code>: an empty <code>path</code> refers to <code>dfd</code> itself. Without it an empty path is <code>ENOENT</code>.</li>
-<li>F6: <code>AT_SYMLINK_NOFOLLOW</code>: do not follow a trailing symlink in <code>path</code>.</li>
-<li>F7: <code>AT_NO_AUTOMOUNT</code>: do not trigger an automount on the final component.</li>
-<li>F8: <code>dfd</code>: <code>AT_FDCWD</code> or a directory descriptor that a relative <code>path</code> is resolved against; ignored for an absolute <code>path</code>.</li>
-<li>F9: any other flag bit: <code>EINVAL</code>. The 7.1 kernel headers on this host also define <code>OPEN_TREE_NAMESPACE</code> (<code>/usr/src/kernels/7.1.3-0_fbk0_0_g295ad0959f34/include/uapi/linux/mount.h:65</code>), which clones the tree into a new mount namespace; kernels without it reject the bit with <code>EINVAL</code>.</li>
-</ul>
-<h2>Determinism analysis</h2>
-<p><code>linux_determinism: conditional</code>, kept from the legacy classification. Natively the result depends on the host mount namespace (what exists and what is mounted at <code>path</code>), on the caller's capabilities for the clone mode, on automount triggers, and on the lowest free descriptor number. With the same filesystem and mount state, the same privileges and the same descriptor table, the call repeats.</p>
-<p>Under Hermit none of these sources reach the guest: the call returns <code>EPERM</code> without consulting the host, so it is deterministic by construction.</p>
-<h3>Nondeterminism sources</h3>
-<ul>
-<li>The returned descriptor number, which must be virtualized if the call were ever forwarded</li>
-<li>The mount tree at <code>path</code>, which is host mount-namespace state</li>
-<li>Privilege: <code>OPEN_TREE_CLONE</code> needs <code>CAP_SYS_ADMIN</code></li>
-<li>Automount triggers on the final component, unless <code>AT_NO_AUTOMOUNT</code></li>
-</ul>
-<h2>Hermit design</h2>
-<p>Target policy: <code>refuse</code> (from <code>investigate</code>). What the code does at hermit f4055eb9cae4:</p>
-<ul>
-<li><code>open_tree</code> is a member of <code>is_mount_ns_admin_refused_syscall</code> (<code>detcore/src/syscall_classification.rs:939</code>, member at line 946) and is classified Determinized (<code>detcore/src/syscall_classification.rs:359</code>).</li>
-<li>The dispatch arm at <code>detcore/src/lib.rs:2215-2219</code> matches that predicate before the typed match and returns <code>Err(Error::Errno(Errno::EPERM))</code> for every argument combination. Its comment (<code>detcore/src/lib.rs:2203-2214</code>) says the call is never forwarded to the host.</li>
-<li>The predicate is part of <code>is_deterministically_refused_syscall</code> (<code>detcore/src/syscall_classification.rs:1324</code>). The arm has no <code>panic_on_unsupported_syscalls</code> branch, so the refusal is the same whether or not Hermit fails closed.</li>
-<li>The unit test <code>mount_ns_admin_syscalls_are_determinized_and_consistent</code> (<code>detcore/src/syscall_classification.rs:2666</code>, member at line 2675) checks only the classification and the predicate membership; it does not run a guest.</li>
-</ul>
-<p>Why <code>refuse</code>: the predicate's doc comment (<code>detcore/src/syscall_classification.rs:926-938</code>) says a deterministic container pins the guest's mount hierarchy for the whole run, and that the non-clone mode is refused deliberately because it would otherwise perturb that pinned state. Forwarding a clone would hand the guest a kernel mount object Detcore does not track, and its result would depend on host privilege and host mounts. Modelling the call would need a virtual mount table that Detcore does not have.</p>
-<p>Where Hermit differs from Linux:</p>
-<ul>
-<li>F1: natively an unprivileged non-clone call succeeds and returns an <code>O_PATH</code> descriptor. Hermit returns <code>EPERM</code>, which Linux never returns for this mode.</li>
-<li>F3, F5, F9: natively a malformed call fails with <code>EINVAL</code> or <code>ENOENT</code>; Hermit returns <code>EPERM</code>.</li>
-<li>F2: under the ptrace backend the guest runs as uid 0 inside a user namespace (<code>detcore/src/syscalls/misc.rs:672</code>). If that namespace owns the guest's mount namespace, the kernel would grant the clone, so <code>EPERM</code> is a policy refusal there rather than the kernel's answer.</li>
-</ul>
-<p>Target (owner decision 6): the clone mode stays refused and the non-clone mode becomes the decision's Linux-unprivileged exception. The kernel order relied on is <code>vfs_open_tree</code> in <code>fs/namespace.c</code> (called from <code>SYSCALL_DEFINE3(open_tree)</code>): undefined flag bits give <code>EINVAL</code>, then <code>AT_RECURSIVE</code> without <code>OPEN_TREE_CLONE</code> gives <code>EINVAL</code>, then, for the clone mode only, <code>may_mount()</code> gives <code>EPERM</code>, then <code>path</code> is resolved (<code>ENOENT</code>, <code>ENOTDIR</code>, <code>ELOOP</code>, <code>EACCES</code>), and the non-clone mode returns <code>dentry_open(path, O_PATH)</code> on a new descriptor.</p>
-<ul>
-<li>Any call with <code>OPEN_TREE_CLONE</code> set returns the fixed <code>EPERM</code> before any other check, as today (<code>detcore/src/lib.rs:2215-2219</code>), so <code>OPEN_TREE_CLONE</code> with an undefined bit also gets <code>EPERM</code>, where Linux gives <code>EINVAL</code>. A guest that clones a tree (a bind mount through the new mount API, as <code>mount(8)</code> or a container runtime does) gets the permission error an unprivileged Linux caller gets; <code>mount(2)</code>, the old route, is refused with the same <code>EPERM</code>.</li>
-<li>A call without <code>OPEN_TREE_CLONE</code> must succeed or fail as Linux does, with Linux's argument checks in the kernel order above: F1 returns an <code>O_PATH</code> descriptor, F3 and F9 give <code>EINVAL</code>, F5 and F8 resolve the path as Linux does, and F4, F6 and F7 behave as listed. This mode needs no privilege and creates no mount object, so it can go through the same path permission, <code>record_or_replay</code> and descriptor bookkeeping that <code>handle_openat</code> gives an <code>O_PATH</code> open (<code>detcore/src/syscalls/files.rs:979-1008</code>), so that later descriptor calls (<code>fstat</code>, <code>openat</code> relative to it, <code>move_mount</code> with <code>MOVE_MOUNT_F_EMPTY_PATH</code>) see a descriptor Detcore knows.</li>
-<li>Today the predicate <code>is_mount_ns_admin_refused_syscall</code> holds the whole syscall (<code>detcore/src/syscall_classification.rs:946</code>) and its doc comment calls the non-clone refusal deliberate (<code>detcore/src/syscall_classification.rs:926-938</code>); both change with this target. <code>target_policy</code> stays <code>refuse</code> because the clone mode, the mount-changing half, is refused.</li>
-</ul>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F1, F4, F5, F6, F7, F8): under <code>hermit run --verify</code> on ptrace, call raw <code>syscall(SYS_open_tree, ...)</code> without <code>OPEN_TREE_CLONE</code>: <code>AT_FDCWD, &quot;/&quot;, 0</code>; a relative path against an open directory descriptor; that descriptor with <code>&quot;&quot;</code> plus <code>AT_EMPTY_PATH</code>; <code>AT_SYMLINK_NOFOLLOW</code> and <code>AT_NO_AUTOMOUNT</code> on a symlink and on a directory; and <code>OPEN_TREE_CLOEXEC</code>. Each call returns the lowest free descriptor; <code>fcntl(F_GETFL)</code> shows <code>O_PATH</code>, <code>fcntl(F_GETFD)</code> shows <code>FD_CLOEXEC</code> only for the <code>OPEN_TREE_CLOEXEC</code> call, <code>fstat</code> on the descriptor matches <code>stat</code> (or <code>lstat</code> for the <code>AT_SYMLINK_NOFOLLOW</code> symlink case) of the path, and both runs agree.</li>
-<li>T2 (covers F2, F3, F4): <code>OPEN_TREE_CLONE</code>, <code>OPEN_TREE_CLONE|AT_RECURSIVE</code> and <code>OPEN_TREE_CLONE|OPEN_TREE_CLOEXEC</code> on <code>/</code> return <code>EPERM</code>, and <code>/proc/self/mountinfo</code> read before and after the calls is byte-identical.</li>
-<li>T3 (covers F3, F5, F9): malformed calls without <code>OPEN_TREE_CLONE</code> keep Linux's errno: <code>AT_RECURSIVE</code> alone and an undefined bit such as <code>0x80000000</code> return <code>EINVAL</code>, <code>&quot;&quot;</code> without <code>AT_EMPTY_PATH</code> and a missing path return <code>ENOENT</code>. With <code>OPEN_TREE_CLONE</code>, the same undefined bit returns the fixed <code>EPERM</code> (owner decision 6). No descriptor is allocated by any failing call.</li>
-<li>T4 (covers none): record a guest that calls <code>open_tree</code> with and without <code>OPEN_TREE_CLONE</code> and replay it; replay returns the same descriptor numbers and the same <code>EPERM</code>, and the guest's output matches.</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+open_tree&amp;body=Discussion+for+the+%60open_tree%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fopen_tree.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60open_tree%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `open_tree`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-09-28 · hermit 81ca8822f78c · hermit2 · closed under the legacy rule (an explicit <code>classify_syscall</code> arm), not the v1 done rule; closing comment https://github.com/rrnewton/hermit/issues/314#issuecomment-5872892729</li>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/314: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy NEEDS-INVESTIGATION; code at this SHA: determinized, dispatch pred:is_mount_ns_admin_refused_syscall, refused.</li>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · reopen: under the owner rule of 2026-10-02, closed means every flag and option is covered by a named test and the implementation works; open_tree records no test coverage, so tracking_status is todo and https://github.com/rrnewton/hermit/issues/314 reopens.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; refuse (Detcore returns a fixed EPERM for every argument combination at detcore/src/lib.rs:2215-2219 and never forwards the call); linux_determinism stays conditional; 9 flag behaviours and 4 tests listed; no runtime test names open_tree, so tracking_status stays todo and ptrace_verification untested; open questions on emulating the non-clone mode and on native argument errnos</li>
-<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): decision 6 applied (clone mode keeps the fixed EPERM before any check; non-clone mode is the Linux-unprivileged exception and must return an O_PATH descriptor with Linux's checks in vfs_open_tree order); target_policy stays refuse; T1, T3 and T4 rewritten for the target, T1 now also covers F4; no new F/T ids; both open questions removed</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+open_tree&amp;amp;body=Discussion+for+the+%60open_tree%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fopen_tree.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60open_tree%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `open_tree`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Originally filed 2026-07-24 as &quot;Syscall classification: open_tree&quot; (https://github.com/rrnewton/hermit/issues/314), legacy variant A1.</p>
-<h3>Note on the strace evidence below</h3>
-<p>The strace text below was written on 2026-07-24, when <code>open_tree</code> was forwarded to the kernel. At hermit f4055eb9cae4 Hermit no longer forwards it; it returns <code>EPERM</code> (<code>detcore/src/lib.rs:2215-2219</code>), so the same call under Hermit gives <code>EPERM</code>, not <code>ENOENT</code>.</p>
-<p>Comment history: 1 comment(s) on https://github.com/rrnewton/hermit/issues/314.</p>
-<h3>2026-07-24 host strace evidence</h3>
-<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) by tracing a direct <code>syscall()</code> harness and common programs with <code>strace -f -e trace=open_tree</code>, and by confirming hermit currently routes <code>open_tree</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code> (the harness ran end-to-end under <code>hermit run</code>, exit 0, so passthrough does not crash).</p>
-<p>Observed strace line:</p>
-<pre><code>open_tree(-1, &quot;&quot;, 0)            = -1 ENOENT (No such file or directory)
-</code></pre>
-<hr>
-<p>*Autonomous syscall-classification sweep, batch 3 (ranks 101-150 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
-<h3>Legacy closure</h3>
-<p>Closed 2026-09-28 by the 2026-09-28 sweep, which closed issues whose syscall had an explicit <code>classify_syscall</code> arm. Closing comment: https://github.com/rrnewton/hermit/issues/314#issuecomment-5872892729</p>
 </body></html>

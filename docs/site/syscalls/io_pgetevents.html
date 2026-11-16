@@ -3,70 +3,18 @@
 <title>io_pgetevents | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>io_pgetevents</code> (333)</h1>
-<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_unsupported_async_ipc_syscall</code> &middot; linux determinism: nondeterministic &middot; target policy: refuse &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+io_pgetevents&amp;body=Discussion+for+the+%60io_pgetevents%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fio_pgetevents.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60io_pgetevents%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>io_pgetevents(ctx_id, min_nr, nr, events, timeout, usig)</code> collects completion events from a Linux native AIO context, like <code>io_getevents</code>, and can install a temporary signal mask for the wait, as <code>ppoll</code> and <code>pselect6</code> do. Detcore refuses it with a fixed <code>ENOSYS</code> before the kernel sees it (<code>detcore/src/lib.rs:2237-2241</code>), as it refuses all of native AIO; that is what a kernel built without AIO support returns.</p>
-<h2>Linux semantics</h2>
-<p>An AIO context is created by <code>io_setup</code>, which returns <code>ctx_id</code>, and requests are queued with <code>io_submit</code>. The kernel completes those requests asynchronously, in an order and at times set by the device, the filesystem and host scheduling, and places one <code>struct io_event</code> per completion in the context's ring. <code>io_pgetevents</code> waits until at least <code>min_nr</code> completions are available, the timeout expires or a signal arrives, then copies up to <code>nr</code> events into <code>events</code> and returns how many it copied.</p>
-<p><code>usig</code> points to a <code>struct __aio_sigset</code> holding a signal-mask pointer and its size. When the mask pointer is not NULL, the kernel installs that mask for the duration of the wait and restores the old one afterwards, atomically, so a signal blocked outside the call can be delivered only while it waits. A signal ends the wait with <code>EINTR</code>; the call is not restarted.</p>
-<h3>Flags and options</h3>
+<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_unsupported_async_ipc_syscall</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+io_pgetevents&amp;body=Discussion+for+the+%60io_pgetevents%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fio_pgetevents.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60io_pgetevents%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>io_pgetevents</code> (333) as determinized-refused via pred:is_unsupported_async_ipc_syscall dispatch; deterministic refusal: true; run subscription: true; record/replay subscription: true.</p>
 <ul>
-<li>F1: <code>min_nr</code> and <code>nr</code>: wait for at least <code>min_nr</code> completions, return at most <code>nr</code>. <code>nr &lt; 0</code> or <code>min_nr &gt; nr</code> gives <code>EINVAL</code>; <code>min_nr == 0</code> returns whatever is available without waiting for more.</li>
-<li>F2: <code>timeout</code> non-NULL: a relative <code>timespec</code> bounding the wait; on expiry the call returns the number of events collected so far, possibly 0. A zero timeout polls. An invalid <code>timespec</code> gives <code>EINVAL</code>.</li>
-<li>F3: <code>timeout</code> NULL: wait without a bound until <code>min_nr</code> events are available.</li>
-<li>F4: <code>usig</code> non-NULL with a non-NULL mask pointer: install that signal mask for the wait. A <code>sigsetsize</code> other than <code>sizeof(sigset_t)</code> (8 on x86_64) gives <code>EINVAL</code>.</li>
-<li>F5: <code>usig</code> NULL, or a <code>__aio_sigset</code> whose mask pointer is NULL: no mask change; the call behaves like <code>io_getevents</code>.</li>
-<li>F6: completion contents and order: each returned <code>io_event</code> carries the request's <code>data</code>, its <code>iocb</code> pointer and its result, in the order the kernel completed them.</li>
-<li>F7: errors: <code>EINVAL</code> for an unknown or destroyed <code>ctx_id</code>; <code>EFAULT</code> for a bad <code>events</code>, <code>timeout</code> or <code>usig</code> pointer.</li>
-<li>F8: a signal during the wait: <code>EINTR</code>, never restarted.</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1668</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:7563</code></li>
 </ul>
-<h2>Determinism analysis</h2>
-<p><code>linux_determinism: nondeterministic</code>, kept from the legacy classification. The number of events available, their order and the moment they become available are set by asynchronous kernel and device work that runs outside the caller's control, and the timeout is measured on the host clock. Two runs of the same program can collect different numbers of events, in a different order, from the same submissions. Signal timing decides whether the wait ends with <code>EINTR</code>, and the temporary mask (F4) changes which signals can end it.</p>
-<h3>Nondeterminism sources</h3>
-<ul>
-<li>Asynchronous completion of AIO requests by the kernel and the device</li>
-<li>The timeout, compared against the host clock</li>
-<li>Signal timing during the wait, under the temporary mask</li>
-</ul>
-<h2>Hermit design</h2>
-<p>Target (owner decision 9, 6): <code>refuse</code> with a fixed <code>ENOSYS</code>, the answer of a kernel built without <code>CONFIG_AIO</code>, returned before any argument is examined, so a well-formed call and a garbage-argument call get the same <code>ENOSYS</code>. No unprivileged success case needs preserving, so decision 6's exceptions do not apply. The supportable fallback is synchronous or thread-based I/O: glibc's POSIX AIO (<code>aio_read</code>, <code>aio_write</code>) runs requests on user-space threads and never calls the native AIO syscalls, and callers of native AIO such as MySQL InnoDB switch to their own simulated AIO when <code>io_setup</code> fails (recalled, not re-checked in the InnoDB source for this body). Today's code already realizes the target (<code>detcore/src/lib.rs:2237-2241</code>), so no code change is needed:</p>
-<ul>
-<li><code>classify_syscall</code> lists <code>io_pgetevents</code> (<code>detcore/src/syscall_classification.rs:408</code>) in the arm that returns <code>SyscallClassification::Determinized</code> (<code>detcore/src/syscall_classification.rs:688</code>).</li>
-<li><code>is_unsupported_async_ipc_syscall</code> includes it (<code>detcore/src/syscall_classification.rs:1059</code>), with <code>io_setup</code> (<code>detcore/src/syscall_classification.rs:1054</code>) and the other native AIO calls.</li>
-<li>In <code>handle_syscall_event</code>, the match on the classification (<code>detcore/src/lib.rs:2028</code>) reaches the arm at <code>detcore/src/lib.rs:2237-2241</code>, which returns <code>Err(Error::Errno(Errno::ENOSYS))</code> without injecting the syscall. The host kernel never runs it, so the guest never waits on host AIO completions and no signal mask is changed. The arm does not consult <code>panic_on_unsupported_syscalls</code>, so the result is the same with or without fail-closed mode.</li>
-<li><code>is_deterministically_refused_syscall</code> includes the predicate (<code>detcore/src/syscall_classification.rs:1325</code>).</li>
-</ul>
-<p>Why <code>refuse</code> and not the alternatives:</p>
-<ul>
-<li><code>io_setup</code> is refused (<code>detcore/src/syscall_classification.rs:1054</code>), so no guest can hold a valid <code>ctx_id</code> under Hermit. Refusing <code>io_pgetevents</code> as well keeps native AIO consistently absent.</li>
-<li><code>passthrough</code> would expose completion timing and order, which the predicate's doc comment (<code>detcore/src/syscall_classification.rs:1034-1047</code>) describes as kernel-driven and outside the guest's logical time.</li>
-<li><code>model</code> would need Detcore to run AIO requests itself and deliver completions at deterministic points in virtual time. That is a feature for the whole AIO family, not a handler for this one call. The legacy NEEDS-HANDLER recommendation predates this family-wide refusal.</li>
-<li><code>ENOSYS</code> is what a kernel built without AIO support returns. A program that uses native AIO meets the refusal first at <code>io_setup</code>, where it can treat AIO as unavailable.</li>
-</ul>
-<p>Guest-visible difference from Linux: F1-F8 all return <code>ENOSYS</code>, including the <code>EINVAL</code> and <code>EFAULT</code> cases, because the refusal precedes every check. Nothing is written to <code>events</code>. This is the intended refusal.</p>
-<p>Existing test evidence at f4055eb9cae4: the unit test <code>representative_policies_stay_in_their_reviewed_sections</code> (<code>detcore/src/syscall_classification.rs:1899</code>) asserts, in its loop at <code>detcore/src/syscall_classification.rs:2143</code>, that <code>io_pgetevents</code> classifies as Determinized and is in the predicate. It does not run a guest and does not check the errno. The guest-level contract <code>tests/c/aio_refusal.c</code> (cell <code>c-programs/aio-refusal</code>, <code>tests/e2e/manifests/c-programs.yaml:10929</code>, verify with ptrace in CI) checks that <code>io_setup</code>, <code>io_submit</code>, <code>io_getevents</code> and <code>io_destroy</code> return <code>ENOSYS</code>, but it does not call <code>io_pgetevents</code>, so it is not coverage for this syscall.</p>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F1, F2, F3, F4, F5, F6, F7, F8): extend <code>tests/c/aio_refusal.c</code> (or add a sibling) with raw <code>syscall(SYS_io_pgetevents, ...)</code> calls under <code>hermit run --verify</code> on ptrace: <code>ctx_id</code> 0 and an arbitrary value; <code>min_nr</code> greater than <code>nr</code> and <code>nr</code> negative; a NULL, a zero and an invalid <code>timeout</code>; a NULL <code>usig</code>, a <code>usig</code> with a NULL mask pointer, and a <code>usig</code> with a mask and a wrong <code>sigsetsize</code>; and a bad <code>events</code> pointer. Each call must return -1 with <code>errno == ENOSYS</code>, the <code>events</code> buffer must keep its sentinel bytes, and the output must be identical across both runs.</li>
-<li>T2 (covers F4, F8): with <code>SIGUSR1</code> blocked and pending, a raw call whose <code>usig</code> mask unblocks <code>SIGUSR1</code> must return <code>ENOSYS</code> at once; the handler must not run during the call, and <code>SIGUSR1</code> must still be blocked and pending afterwards.</li>
-<li>T3 (covers none): record and replay a guest that calls <code>io_pgetevents</code>; replay must produce the same <code>ENOSYS</code>.</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+io_pgetevents&amp;body=Discussion+for+the+%60io_pgetevents%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fio_pgetevents.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60io_pgetevents%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `io_pgetevents`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant B of https://github.com/rrnewton/hermit/issues/614: linux_determinism nondeterministic (from <strong>Classification:</strong>); target_policy from legacy NEEDS-HANDLER; an agent chooses model, emulate or refuse; code at this SHA: determinized, dispatch pred:is_unsupported_async_ipc_syscall, refused.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy refuse (Detcore returns a fixed ENOSYS for all native AIO at detcore/src/lib.rs:2237-2241, the result of a kernel without AIO; io_setup is refused too, so no guest holds a ctx_id); linux_determinism stays nondeterministic; 8 flag behaviours and 3 tests listed; tests/c/aio_refusal.c does not call io_pgetevents, so tracking_status stays todo</li>
-<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): decisions 9 and 6 applied (fixed ENOSYS, as without CONFIG_AIO, before any argument check, already realized at detcore/src/lib.rs:2237-2241); target_policy stays refuse; no new F/T ids; no open questions to remove</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+io_pgetevents&amp;amp;body=Discussion+for+the+%60io_pgetevents%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fio_pgetevents.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60io_pgetevents%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `io_pgetevents`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Originally filed 2026-07-24 as &quot;Syscall classification: io_pgetevents&quot; (https://github.com/rrnewton/hermit/issues/614), legacy variant B.</p>
-<p>The legacy Summary asked to &quot;replace its temporary catch-all policy with an explicit Detcore classification&quot;. That is done at f4055eb9cae4: the call has an explicit classification and dispatch arm (see Hermit design).</p>
-<h3>Legacy tracking note (2026-07-24)</h3>
-<p>Filed by the complete syscall-classification audit. The implementation classifies <code>PASS-THRU</code> entries under fixed-container/stable-state assumptions and routes all other entries through the explicit unsupported policy until a deterministic handler is implemented.</p>
 </body></html>

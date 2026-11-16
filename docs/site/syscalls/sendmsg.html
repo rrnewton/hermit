@@ -3,154 +3,18 @@
 <title>sendmsg | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>sendmsg</code> (46)</h1>
-<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; linux determinism: conditional &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+sendmsg&amp;body=Discussion+for+the+%60sendmsg%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsendmsg.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60sendmsg%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>sendmsg</code> sends one message from a gather list of buffers, with an optional destination address and ancillary data (file descriptors, credentials, per-packet options). Hermit models it:</p>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+sendmsg&amp;body=Discussion+for+the+%60sendmsg%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsendmsg.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60sendmsg%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>sendmsg</code> (46) as determinized via typed dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.</p>
 <ul>
-<li>the kernel moves the data and installs passed descriptors;</li>
-<li>Detcore orders when a call that would block is retried;</li>
-<li>after any successful send, Detcore forgets its cached <code>flock</code> modes, because descriptors may have left the process.</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1827</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:8234</code></li>
 </ul>
-<h2>Linux semantics</h2>
-<p><code>sendmsg(sockfd, msg, flags)</code> reads a <code>struct msghdr</code> from guest memory:</p>
-<ul>
-<li><code>msg_name</code>/<code>msg_namelen</code> give the destination;</li>
-<li><code>msg_iov</code>/<code>msg_iovlen</code> give the data to gather;</li>
-<li><code>msg_control</code>/<code>msg_controllen</code> give the ancillary messages.</li>
-</ul>
-<p>It queues the data and returns the number of bytes accepted. The data path follows <code>sendto</code>:</p>
-<ul>
-<li>a datagram goes whole or not at all;</li>
-<li>a stream send on a blocking socket waits until every byte is queued;</li>
-<li>a broken stream raises <code>SIGPIPE</code> and <code>EPIPE</code>, unless <code>MSG_NOSIGNAL</code> is passed;</li>
-<li>an unbound <code>AF_INET</code>/<code>AF_INET6</code> datagram socket binds to an ephemeral port on its first send.</li>
-</ul>
-<p><code>SCM_RIGHTS</code> puts references to the sender's open file descriptions in flight; the receiver gets new descriptors for the same descriptions. The message buffers stay in guest memory, which other threads can change while the call is blocked.</p>
-<h3>Flags and options</h3>
-<ul>
-<li>F1: <code>msg_name</code>/<code>msg_namelen</code>, used like <code>sendto</code>'s <code>dest_addr</code>:</li>
-<li><code>EISCONN</code> for an explicit destination on a connected <code>AF_UNIX</code> stream;</li>
-<li><code>EDESTADDRREQ</code> or <code>ENOTCONN</code> when no destination is known.</li>
-<li>F2: <code>msg_iov</code>/<code>msg_iovlen</code>: gather from several buffers. An empty list sends 0 bytes; more than <code>IOV_MAX</code> entries gives <code>EMSGSIZE</code>. <code>msg_flags</code> is ignored on input.</li>
-<li>F3: <code>SCM_RIGHTS</code>: pass up to <code>SCM_MAX_FD</code> (253) descriptors. A bad descriptor gives <code>EBADF</code>; exceeding the in-flight limit gives <code>ETOOMANYREFS</code>.</li>
-<li>F4: <code>SCM_CREDENTIALS</code>: the sender states its pid, uid and gid. Claiming ids the caller is not allowed to use gives <code>EPERM</code>.</li>
-<li>F5: Protocol ancillary messages:</li>
-<li><code>IP_PKTINFO</code>, <code>IP_TTL</code>, <code>IP_TOS</code> and <code>IPV6_PKTINFO</code>;</li>
-<li><code>UDP_SEGMENT</code>, <code>SO_MARK</code> and <code>SCM_TXTIME</code>;</li>
-<li><code>SO_TIMESTAMPING</code> requests.</li>
-<li>F6: <code>MSG_DONTWAIT</code>: nonblocking for this call only.</li>
-<li>F7: <code>MSG_NOSIGNAL</code>: suppresses <code>SIGPIPE</code>.</li>
-<li>F8: <code>MSG_MORE</code>: more data follows.</li>
-<li>F9: <code>MSG_OOB</code>: urgent data.</li>
-<li>F10: <code>MSG_CONFIRM</code> and <code>MSG_DONTROUTE</code>: hints to the IP layer.</li>
-<li>F11: <code>MSG_EOR</code>: ends a record on <code>SOCK_SEQPACKET</code>.</li>
-<li>F12: <code>MSG_FASTOPEN</code>: TCP Fast Open with data in the SYN.</li>
-<li>F13: <code>MSG_ZEROCOPY</code>: completion notices arrive on the error queue.</li>
-<li>F14: Blocking versus nonblocking descriptor. A blocking stream send waits until all bytes are queued; a nonblocking one returns a short count or <code>EAGAIN</code>.</li>
-<li>F15: <code>SO_SNDTIMEO</code>: a blocking send gives up after the timeout.</li>
-<li>F16: Signal interruption: <code>EINTR</code> or a partial count; a restart under <code>SA_RESTART</code> when no send timeout is set.</li>
-<li>F17: Datagram size: <code>EMSGSIZE</code>; a zero-length datagram is legal.</li>
-<li>F18: Implicit autobind: a kernel-chosen ephemeral port on the first send.</li>
-<li>F19: Errors:</li>
-<li><code>EBADF</code> and <code>ENOTSOCK</code>;</li>
-<li><code>EFAULT</code>, for the header, the iovecs or the control buffer;</li>
-<li><code>EINVAL</code>, for malformed ancillary messages;</li>
-<li><code>EACCES</code>, <code>ECONNREFUSED</code>, <code>ECONNRESET</code>, <code>ENOBUFS</code> and <code>EPIPE</code>.</li>
-</ul>
-<h2>Determinism analysis</h2>
-<p>As with <code>sendto</code>, the result depends on the peer's buffer occupancy, and so on the schedule. <code>SCM_RIGHTS</code> adds state shared between processes: after a descriptor is passed, another process can change that open file description (its offset, its locks) without the sender seeing it. Under one fixed schedule with every peer inside the guest, the call repeats.</p>
-<h3>Nondeterminism sources</h3>
-<ul>
-<li>Peer progress, which decides short counts and blocking (F14, F6).</li>
-<li>External peers, ICMP errors (F19), and kernel-chosen ephemeral ports (F18).</li>
-<li>Host buffer sizes and configuration (F12).</li>
-<li>Real-time timeouts and the arrival time of signals (F15, F16).</li>
-<li>Shared kernel state for passed descriptors (F3). Credentials carry host ids unless the container maps them (F4).</li>
-<li>Guest memory that another thread rewrites while the call is blocked, which changes what is actually sent.</li>
-</ul>
-<p><code>linux_determinism: conditional</code>.</p>
-<h2>Hermit design</h2>
-<p><code>target_policy: model</code>. Dispatch: <code>Syscall::Sendmsg(s) =&gt; self.handle_sendmsg(guest, s)</code> at detcore/src/lib.rs:2710. <code>handle_sendmsg</code> (detcore/src/syscalls/io.rs:1420-1434) runs <code>execute_nonblockable_fd_syscall</code>, then on success calls <code>forget_flock_modes()</code> (io.rs:1431-1432). Its doc comment (io.rs:1422-1425) gives the reason: the guest can change message and control memory while the call is descheduled, so parsing the control buffer beforehand would not prove which descriptors were sent, and every cached lock mode is made unknown. <code>handle_flock</code> refuses a blocking conversion while the lock state is unknown, because the state may have changed through <code>SCM_RIGHTS</code> (detcore/src/syscalls/files.rs:1263-1269). <code>Sendmsg</code> counts <code>EAGAIN</code>/<code>EWOULDBLOCK</code> as &quot;would have blocked&quot; (helpers.rs:1362-1373).</p>
-<p>Shared send/receive path at hermit f4055eb9 (run mode with <code>sequentialize_threads</code>, the default for <code>hermit run</code>):</p>
-<ul>
-<li>Socket creation makes every guest socket physically nonblocking while the guest-visible flags stay as requested. <code>socket</code> adds <code>SOCK_NONBLOCK</code> and records the guest's own <code>SOCK_NONBLOCK | SOCK_CLOEXEC</code> bits (detcore/src/syscalls/files.rs:3772-3787, gated by <code>use_nonblocking_sockets</code> at detcore-model/src/config.rs:872-874). <code>socketpair</code> does the same (files.rs:3827-3828), and so does <code>accept4</code> for the connection it returns (files.rs:4531-4536).</li>
-<li><code>execute_nonblockable_fd_syscall</code> (detcore/src/syscalls/helpers.rs:202) reads the descriptor's logical and physical nonblocking bits and picks a strategy (helpers.rs:745-778):</li>
-<li>logically blocking on a physically nonblocking socket gives <code>NonblockizeRetry</code>;</li>
-<li>logically nonblocking gives <code>PassThru</code>, a single kernel call (helpers.rs:268-275);</li>
-<li>both blocking gives <code>Blocking</code>.</li>
-<li><code>NonblockizeRetry</code> requests the scheduler resource <code>InternalIOPolling</code> and calls <code>retry_nonblocking_syscall</code> (helpers.rs:254-267). The helper re-issues the call at scheduler-chosen points while the result is <code>EAGAIN</code> or <code>EWOULDBLOCK</code> (helpers.rs:1501-1530). Any other result is returned to the guest (helpers.rs:1531-1534). A signal that arrives while the call waits returns <code>ERESTARTSYS</code> (helpers.rs:1476-1484, default at helpers.rs:953-954). The kernel still moves the bytes; Detcore decides when a blocked call is retried, so a blocking wait becomes a deterministic scheduling point.</li>
-<li>If Detcore cannot classify the descriptor, the call runs through the blocking path so the kernel's errno precedence is kept (helpers.rs:212-226).</li>
-<li>In record/replay mode, sockets from <code>socket</code> stay physically blocking (files.rs:3758-3769), while <code>socketpair</code> endpoints are still made physically nonblocking (the condition at files.rs:3827 does not check for record/replay). Sockets are never treated as container-internal, because Hermit cannot yet tell a socket between two guests from one to a host peer (helpers.rs:782-797). The call therefore goes through <code>record_or_replay_blocking</code> with the <code>BlockingExternalIO</code> resource (helpers.rs:241-250, 111-120). <code>tests/rust/shutdown.rs:26-31</code> skips record mode because socketpair guests currently hang there.</li>
-<li>No <code>MSG_*</code> flag passed by the guest is inspected anywhere in <code>detcore/src</code>; <code>MSG_TRUNC</code> appears only in comments. <code>setsockopt</code> is forwarded unchanged (files.rs:3868-3875), so <code>SO_RCVTIMEO</code> and <code>SO_SNDTIMEO</code> are never modelled.</li>
-</ul>
-<p>Why <code>model</code>. Detcore owns when a blocked send resumes, and keeps its own descriptor-related state (the <code>flock</code> cache) consistent with what <code>SCM_RIGHTS</code> may have moved. The kernel keeps the data and the descriptor transfer. <code>passthrough</code> would let a blocking send stall the sequentialized scheduler.</p>
-<p>Existing ptrace coverage at f4055eb9: <code>c-programs/recvmsg-scm-rights-mmap</code> (tests/e2e/manifests/c-programs.yaml:7225, program at :7235, <code>verify</code> <code>ci: true</code> on ptrace) passes one descriptor with <code>SCM_RIGHTS</code> over an <code>AF_UNIX</code> datagram socketpair (tests/c/recvmsg_scm_rights_mmap.c:46-52). The same guest is in <code>BASELINE_RECORD_WORKLOADS</code> (hermit-cli/tests/record_replay.rs:310-321).</p>
-<p>What remains: hypotheses from reading the code, not yet measured.</p>
-<ul>
-<li>H1 (F6). <code>MSG_DONTWAIT</code> on a logically blocking socket is retried rather than returned as <code>EAGAIN</code>, as for <code>sendto</code>.</li>
-<li>H2 (F14). A blocking stream <code>sendmsg</code> larger than the free buffer space returns the kernel's short count.</li>
-<li>H3 (F15). <code>SO_SNDTIMEO</code> never fires in run mode.</li>
-<li>H4 (F18). The implicit autobind gives a host-chosen port.</li>
-<li>H5 (F4). The pid, uid and gid in <code>SCM_CREDENTIALS</code> reach the peer unchanged. Whether they match the guest's virtual ids has not been checked.</li>
-</ul>
-<p>Target (owner decision 12): every local port the kernel would choose for an unbound AF_INET or AF_INET6 socket comes from Detcore's global port allocator, the one an explicit <code>bind</code> to port 0 already uses. <code>handle_bind</code> requests the port with <code>GlobalRequest::RequestPort</code> (<code>detcore/src/syscalls/files.rs:4119</code> for AF_INET, <code>detcore/src/syscalls/files.rs:4158</code> for AF_INET6); the global tool serves the request at <code>detcore/src/tool_global.rs:1731</code> from the range in the host's <code>ip_local_port_range</code> (<code>detcore/src/tool_global.rs:2783</code>); and <code>release_port_for_open_file</code> (<code>detcore/src/syscalls/files.rs:952</code>) frees the port when the socket's last descriptor closes. An implicit bind, meaning <code>connect</code>, <code>listen</code>, <code>sendto</code>, <code>sendmsg</code> or <code>sendmmsg</code> on an unbound socket, must take its port the same way and bind the socket to it before the call reaches the kernel, so that <code>getsockname</code>, the peer's <code>getpeername</code> and the peer's <code>accept</code> report the same port in every run. Today <code>handle_sendmsg</code> (<code>detcore/src/syscalls/io.rs:1426</code>) forwards an unbound socket to the kernel, which autobinds it at a random port in <code>inet_autobind</code>, called from <code>inet_send_prepare</code> (F18, H4); a <code>MSG_FASTOPEN</code> send on an unbound TCP socket gets its port through the connect path, <code>inet_hash_connect</code> (F12).</p>
-<p>Target (owner decision 14, with decision 13 for the timeout): a guest-blocking <code>sendmsg</code> waits in Detcore's scheduler, never in the kernel, through a nonblocking probe plus a scheduler wait. Run mode already does this through <code>NonblockizeRetry</code> (<code>detcore/src/syscalls/helpers.rs:254</code>, retry loop <code>retry_nonblocking_syscall</code> at <code>detcore/src/syscalls/helpers.rs:1414</code>). Four parts are missing. First, the cases that still block in the kernel while holding the turn, through <code>record_or_replay_blocking</code> (<code>detcore/src/syscalls/helpers.rs:225</code> and <code>detcore/src/syscalls/helpers.rs:250</code>): no scheduler, record and replay, and a descriptor Detcore cannot classify. Second, <code>MSG_DONTWAIT</code> must return the kernel's <code>EAGAIN</code> at once (F6, H1); no code in <code>detcore/src</code> reads it today. Third, a blocking stream send keeps probing and waiting until every byte is queued, as Linux does, and returns a short count only for a signal, an error or a timeout (F14, F16, H2). Fourth, a deadline: with <code>SO_SNDTIMEO</code> set, the wait ends with the partial count or <code>EAGAIN</code> once that much virtual time has passed (F15, H3). <code>retry_nonblocking_syscall_with_timeout</code> (<code>detcore/src/syscalls/helpers.rs:1432</code>) already takes a logical deadline for poll, epoll, futex and signal waits, but nothing in <code>detcore/src</code> reads <code>SO_RCVTIMEO</code> or <code>SO_SNDTIMEO</code> today (see the <code>setsockopt</code> body). <code>sendmsg</code> stays <code>model</code>, not <code>refuse</code>, because nearly every networked program sends on sockets.</p>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F1, F2, F17): on <code>AF_UNIX</code> datagram and UDP loopback pairs:</li>
-<li><code>sendmsg</code> with <code>msg_name</code> set, and null after <code>connect</code>;</li>
-<li><code>EISCONN</code> on a connected <code>AF_UNIX</code> stream;</li>
-<li>a three-element iovec gathered in order;</li>
-<li>an empty iovec;</li>
-<li>more than <code>IOV_MAX</code> entries, expecting <code>EMSGSIZE</code>;</li>
-<li>a zero-length datagram;</li>
-<li>an oversized UDP payload, expecting <code>EMSGSIZE</code>.</li>
-</ul>
-<p>Run under <code>--verify</code>.</p>
-<ul>
-<li>T2 (covers F3): pass 1, 2 and 253 descriptors with <code>SCM_RIGHTS</code>; a bad descriptor fails with <code>EBADF</code>. Then, in the sender, attempt a blocking <code>flock</code> conversion on a descriptor it locked earlier. Record whether Hermit refuses it, as files.rs:1263-1269 documents. Extends <code>tests/c/recvmsg_scm_rights_mmap.c</code>.</li>
-<li>T3 (covers F4, F5): send <code>SCM_CREDENTIALS</code> with the caller's own ids, and with ids it may not claim (<code>EPERM</code>); compare what the receiver sees with the guest's <code>getpid</code>/<code>getuid</code> (H5). Send <code>IP_PKTINFO</code> and <code>IP_TTL</code> on UDP loopback, and <code>SO_MARK</code> where permitted. Two runs must match.</li>
-<li>T4 (covers F6, F14): on a logically blocking socketpair with a full buffer, <code>MSG_DONTWAIT</code> must return <code>EAGAIN</code> (H1). A blocking send larger than the free space, with a draining reader, must return the full length (H2).</li>
-<li>T5 (covers F7, F19): after the peer closes, <code>sendmsg</code> without <code>MSG_NOSIGNAL</code> raises <code>SIGPIPE</code> and returns <code>EPIPE</code>; with <code>MSG_NOSIGNAL</code> it returns only <code>EPIPE</code>. Also:</li>
-<li><code>EBADF</code> and <code>ENOTSOCK</code>;</li>
-<li><code>EFAULT</code> for bad <code>msg_iov</code> and bad <code>msg_control</code>;</li>
-<li><code>EINVAL</code> for a <code>cmsg_len</code> that is too small.</li>
-<li>T6 (covers F8, F9, F10, F11): per-call send hints, each on the socket type that supports it:</li>
-<li><code>MSG_MORE</code> then a plain send, on TCP;</li>
-<li><code>MSG_OOB</code> on TCP;</li>
-<li><code>MSG_CONFIRM</code> and <code>MSG_DONTROUTE</code> on UDP;</li>
-<li><code>MSG_EOR</code> on <code>SOCK_SEQPACKET</code>, keeping the record boundary.</li>
-</ul>
-<p>Two runs must match.</p>
-<ul>
-<li>T7 (covers F12, F13): <code>MSG_FASTOPEN</code> on loopback TCP behaves the same in every run. <code>MSG_ZEROCOPY</code> with <code>SO_ZEROCOPY</code> produces an error-queue completion.</li>
-<li>T8 (covers F15, F16): send timeouts and signals:</li>
-<li>With <code>SO_SNDTIMEO</code> set and a full buffer, the send times out in logical time (H3).</li>
-<li>A signal during a blocked <code>sendmsg</code> gives <code>EINTR</code> without <code>SA_RESTART</code>, or restarts with it.</li>
-<li>T9 (covers F18): an unbound UDP sender uses <code>sendmsg</code>, and the receiver prints the source port. It must be identical across two runs (H4).</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+sendmsg&amp;body=Discussion+for+the+%60sendmsg%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsendmsg.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60sendmsg%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `sendmsg`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · created for v1: no tracking issue existed for this pinned Sysno; code at this SHA: determinized, dispatch typed.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy investigate -&gt; model (handle_sendmsg: nonblockable retry, then forget_flock_modes after a successful send because SCM_RIGHTS may move descriptors). linux_determinism stays conditional. 19 flags and 9 tests. The MSG_DONTWAIT, short-send, SO_SNDTIMEO, autobind and SCM_CREDENTIALS hypotheses are under Open questions for measurement. Stays todo; no coverage recorded.</li>
-<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d615 (owner decisions 6-15): decisions 12, 13 and 14 applied (Target paragraphs: the implicit bind on first send takes an allocator port; blocking sends wait under the scheduler in every mode, honour MSG_DONTWAIT, queue every byte, and end at a virtual-time SO_SNDTIMEO deadline); no new F/T ids; no open questions removed (H1-H5 are measurements)</li>
-</ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+sendmsg&amp;amp;body=Discussion+for+the+%60sendmsg%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fsendmsg.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60sendmsg%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `sendmsg`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Created by the syscall-tracking v1 migration on 2026-10-03. No tracking issue existed for <code>sendmsg</code>: the 2026-07-24 classification campaign filed issues only for syscalls in the old temporary pass-through block, and Detcore already handled this one.</p>
-<h3>Open questions</h3>
-<p>These questions need a measurement, not an owner decision, and none of them changes the <code>target_policy</code> choice. Each is a hypothesis under Hermit design and names the test that answers it.</p>
-<ul>
-<li>H1: on a logically blocking socket, does <code>MSG_DONTWAIT</code> wait instead of returning <code>EAGAIN</code>? (T4)</li>
-<li>H2: does a blocking stream <code>sendmsg</code> larger than the free buffer space return a short count? (T4)</li>
-<li>H3: does <code>SO_SNDTIMEO</code> never fire in run mode? (T8)</li>
-<li>H4: is the port chosen by the implicit autobind host-chosen? (T9)</li>
-<li>H5: do the <code>SCM_CREDENTIALS</code> values match the guest's virtual pid, uid and gid? (T3)</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
 </body></html>

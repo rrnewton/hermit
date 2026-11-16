@@ -3,79 +3,17 @@
 <title>lremovexattr | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>lremovexattr</code> (198)</h1>
-<p>Strategy: <strong>passthrough</strong> &middot; dispatch: <code>passthrough</code> &middot; linux determinism: deterministic &middot; target policy: passthrough &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+lremovexattr&amp;body=Discussion+for+the+%60lremovexattr%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Flremovexattr.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60lremovexattr%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>lremovexattr(path, name)</code> deletes one extended attribute from the file at <code>path</code> itself: a final symlink is not followed. Hermit forwards it to the host kernel unchanged. The attribute lives in the guest's container filesystem, and Detcore keeps no extended-attribute state of its own.</p>
-<h2>Linux semantics</h2>
-<p>The kernel resolves <code>path</code>, following symlinks in every component except the last, copies <code>name</code> from guest memory, checks permission for the name's namespace, and asks the filesystem's handler to delete the attribute. On success the call returns 0 and updates the inode's ctime. It never reports anything else; a guest sees the effect only through the getxattr, listxattr and stat families. Errors are checked in path-walk order, then name, then permission, so the errno is a function of the path, the attribute state, the credentials and the mount flags.</p>
-<h3>Flags and options</h3>
+<p>Strategy: <strong>passthrough</strong> &middot; dispatch: <code>passthrough</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+lremovexattr&amp;body=Discussion+for+the+%60lremovexattr%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Flremovexattr.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60lremovexattr%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>lremovexattr</code> (198) as passthrough via passthrough dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.</p>
 <ul>
-<li>F1: <code>user.*</code> names: the caller needs write permission on the inode, and the inode must be a regular file or a directory; on any other type the kernel answers <code>EPERM</code>. On a sticky directory, only the owner (or a caller with <code>CAP_FOWNER</code>) may remove <code>user.*</code> names.</li>
-<li>F2: <code>trusted.*</code> names: removal needs <code>CAP_SYS_ADMIN</code> in the initial user namespace; without it, <code>EPERM</code>. Hermit's guest root inside a user namespace is in this case.</li>
-<li>F3: <code>security.*</code> names: the security module decides. Removing <code>security.capability</code> needs <code>CAP_SETFCAP</code> over the file's user namespace.</li>
-<li>F4: <code>system.posix_acl_access</code> and <code>system.posix_acl_default</code>: removal deletes the ACL. The caller must own the file or hold <code>CAP_FOWNER</code>; <code>ENODATA</code> if the ACL is absent. Missing ACL support is F13.</li>
-<li>F5: a name with no known namespace prefix: <code>EOPNOTSUPP</code></li>
-<li>F6: an empty name, or a name longer than <code>XATTR_NAME_MAX</code> (255 bytes): <code>ERANGE</code></li>
-<li>F7: the attribute does not exist: <code>ENODATA</code>. Missing filesystem support is F13.</li>
-<li>F8: the file is immutable or append-only: <code>EPERM</code>. The mount is read-only: <code>EROFS</code>.</li>
-<li>F9: a final symlink is not followed: the call acts on the symlink itself. A <code>user.*</code> name on a symlink gives <code>EPERM</code> (F1; host probe under Additional information), while <code>trusted.*</code> and <code>security.*</code> names on a symlink follow F2 and F3. On any other file type the call behaves like <code>removexattr</code>.</li>
-<li>F10: path resolution errors: <code>ENOENT</code> (a missing component or empty path), <code>ENOTDIR</code>, <code>EACCES</code> (search permission), <code>ENAMETOOLONG</code>, <code>ELOOP</code></li>
-<li>F11: <code>path</code> or <code>name</code> points outside the address space: <code>EFAULT</code></li>
-<li>F12: side effect: the inode's ctime changes on success</li>
-<li>F13: host-config failure: a filesystem without extended-attribute support, or without ACL support for <code>system.posix_acl_*</code>: <code>EOPNOTSUPP</code>.</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1961</code></li>
 </ul>
-<h2>Determinism analysis</h2>
-<p>The result is a function of the attribute state along the path, the caller's credentials, the mount flags and the host's security-module policy. Nothing in the call depends on timing. Under Hermit, threads run one at a time, so two guest threads removing or setting the same attribute get a fixed order. The call repeats exactly when the guest-visible file starts with the same attributes and nothing outside the container changes them.</p>
-<h3>Nondeterminism sources</h3>
-<ul>
-<li>Changes to extended attributes made outside the container. Hermit does not try to make a changing host filesystem deterministic.</li>
-<li>Host configuration behind F3, F4, F7 and F8: the active security module and its policy, ACL and xattr support on the backing filesystem, file flags and read-only remounts.</li>
-<li>The new ctime (F12): the call creates it but does not return it. It becomes visible through the stat family and is handled there.</li>
-</ul>
-<h3>Cross-host variation</h3>
-<ul>
-<li>Host security module: what removal of a <code>security.*</code> name returns is decided by the loaded LSM and its policy (F3).</li>
-<li>Filesystem type, kernel version and mount options: whether the filesystem supports the namespace and ACLs decides <code>EOPNOTSUPP</code> (F13).</li>
-<li>Host mount flags and inode flags: an immutable or append-only file gives <code>EPERM</code> and a read-only mount gives <code>EROFS</code> (F8). The guest's root in a user namespace cannot set or clear these flags.</li>
-</ul>
-<h2>Hermit design</h2>
-<p>Target policy: <code>passthrough</code>. The code already does this. <code>lremovexattr</code> is classified <code>PassThrough</code> at <code>detcore/src/syscall_classification.rs:791</code>, inside the pass-through block that starts at <code>detcore/src/syscall_classification.rs:690</code>. The block comment at <code>detcore/src/syscall_classification.rs:767</code> gives the condition: &quot;Stable guest-owned metadata ... are repeatable in Hermit's fixed mount namespace and filesystem image&quot;, and the line at <code>detcore/src/syscall_classification.rs:769</code> leaves that boundary open for human review. Its path-following twin <code>removexattr</code> sits under the comment at <code>detcore/src/syscall_classification.rs:737</code>, which states the same condition more directly: these calls &quot;are deterministic for stable objects and do not introduce asynchronous state or new kernel objects&quot;. The generic arm at <code>detcore/src/lib.rs:2843</code> forwards the call through <code>passthrough</code> at <code>detcore/src/lib.rs:367</code>. The census unit test <code>representative_policies_stay_in_their_reviewed_sections</code> (<code>detcore/src/syscall_classification.rs:1899</code>) pins the classification at <code>detcore/src/syscall_classification.rs:2075</code>; it checks the table, not the behaviour.</p>
-<p>Why passthrough, not <code>model</code> or <code>emulate</code>:</p>
-<ul>
-<li>Hermit has no virtual filesystem. The attributes live in the container's filesystem, and only the kernel applies F1 to F8 the same way the guest's other xattr calls see them.</li>
-<li>The call returns only 0 or an errno, and every input to that answer is container state or host configuration that Hermit treats as fixed in run mode.</li>
-<li>The one value it creates, the ctime, is the stat family's concern.</li>
-</ul>
-<p>Code facts show <code>subscribed_record_replay: false</code>, so in <code>--passthru-opt</code> mode the call never reaches Detcore. <code>hermit record</code> has its own subscriptions, which the comment at <code>detcore/src/lib.rs:1078</code> places in a recorder module that is not in the exported tree, so this body does not describe how record handles the call.</p>
-<p>The open gap is test evidence, not code. <code>tests_naming</code> is 0: no test names <code>SYS_lremovexattr</code>.</p>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F1, F7, F9): under <code>hermit run --verify</code> on ptrace, set <code>user.a</code> on a regular file and on a directory in the guest's <code>/tmp</code> and remove each with raw <code>syscall(SYS_lremovexattr, ...)</code>; assert 0, then <code>ENODATA</code> on a second removal. Call it with <code>user.a</code> on a symlink to the file and assert <code>EPERM</code>, and that the target still has <code>user.a</code>. Assert <code>EPERM</code> for <code>user.a</code> on a FIFO. The test must fail, not skip, if the backing filesystem rejects <code>user.*</code> attributes. Existing partial coverage: <code>tests/c/syscall_file_metadata.c:205</code> calls the glibc wrapper on a symlink, run by <code>hermit-cli/tests/syscall_file_metadata.rs:51</code> and by manifest cell <code>c-programs/syscall-file-metadata</code> (<code>tests/e2e/manifests/c-programs.yaml:9275</code>). It requires 0 only when the preceding <code>lsetxattr</code> succeeded (<code>tests/c/syscall_file_metadata.c:197</code>), and otherwise accepts <code>EACCES</code>, <code>ENODATA</code>, <code>ENOTSUP</code>, <code>EOPNOTSUPP</code> and <code>EPERM</code> (<code>tests/c/syscall_file_metadata.c:37</code>). <code>lsetxattr</code> of a <code>user.*</code> name on a symlink fails with <code>EPERM</code>, so only the tolerated-error path ever runs.</li>
-<li>T2 (covers F2, F3): assert <code>EPERM</code> for <code>trusted.x</code> on a regular file and on a symlink. Write a version-2 <code>security.capability</code> value, remove it, and assert it is gone; then drop <code>CAP_SETFCAP</code> with <code>capset</code> and assert that removal fails.</li>
-<li>T3 (covers F4): set an access ACL and a default ACL on a directory, remove each, and assert that the ACL is gone and the mode bits are unchanged. Assert <code>ENODATA</code> for a second removal.</li>
-<li>T4 (covers F5, F6): assert <code>EOPNOTSUPP</code> for <code>bogus.a</code>, and <code>ERANGE</code> for <code>&quot;&quot;</code> and for a 256-byte name.</li>
-<li>T5 (covers none): assert <code>EPERM</code> on a file with the immutable flag set (<code>FS_IOC_SETFLAGS</code>), where the guest can set it, and <code>EROFS</code> under a read-only mount the guest can see. The test must say whether ptrace CI can reach each case. Both errors come from host inode and mount flags (host-config, U1), so this test documents F8 but does not cover it.</li>
-<li>T6 (covers F10, F11): assert <code>ENOENT</code> for a missing path and for <code>&quot;&quot;</code>, <code>ENOTDIR</code>, <code>ENAMETOOLONG</code> for a 256-byte component, <code>ELOOP</code> for a symlink loop, and <code>EFAULT</code> for <code>path = (char *)1</code> and for <code>name = (char *)1</code>.</li>
-<li>T7 (covers F12): <code>stat</code> the file before and after a successful removal, and assert that the ctime the guest sees is identical in both <code>--verify</code> runs.</li>
-<li>U1 (covers F8, F13; host-config): the host's inode flags, mount flags and filesystem decide whether the immutable or append-only <code>EPERM</code>, <code>EROFS</code> (F8) and the missing-support <code>EOPNOTSUPP</code> (F13) occur, so CI cannot produce them on every host. Hermit forwards the kernel's answer unchanged (<code>detcore/src/syscall_classification.rs:791</code>, <code>detcore/src/lib.rs:2843</code>).</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+lremovexattr&amp;body=Discussion+for+the+%60lremovexattr%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Flremovexattr.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60lremovexattr%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `lremovexattr`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant B of https://github.com/rrnewton/hermit/issues/636: linux_determinism conditional (from <strong>Classification:</strong>); target_policy from legacy PASS-THRU; code at this SHA: passthrough, dispatch passthrough.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: linux_determinism conditional -&gt; deterministic, to match removexattr (same inputs, no timing dependence); kept passthrough (forwarded at detcore/src/lib.rs:2843, classified at detcore/src/syscall_classification.rs:791); 12 flag items, 7 tests; the existing test only reaches the tolerated EPERM path on a symlink, so no coverage token and tracking_status stays todo</li>
-<li>2026-10-04 · hermit f4055eb9cae4 · syscall-tracking · p3-d12 (owner decisions 1 and 2): cross_host_variant true (host LSM policy, filesystem namespace and ACL support, mount and inode flags); split filesystem-support EOPNOTSUPP out of F4 and F7 into new F13, U1 host-config covers F8 and F13, T5 now covers none; no open questions section</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+lremovexattr&amp;amp;body=Discussion+for+the+%60lremovexattr%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Flremovexattr.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60lremovexattr%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `lremovexattr`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Originally filed 2026-07-24 as &quot;Syscall classification: lremovexattr&quot; (https://github.com/rrnewton/hermit/issues/636), legacy variant B.</p>
-<h3>Legacy tracking note (2026-07-24)</h3>
-<p>Filed by the complete syscall-classification audit. The implementation classifies <code>PASS-THRU</code> entries under fixed-container/stable-state assumptions and routes all other entries through the explicit unsupported policy until a deterministic handler is implemented.</p>
-<h3>2026-10-03 host probe (syscall-tracking-p3)</h3>
-<p>Raw <code>syscall(197, ...)</code> and <code>syscall(198, ...)</code> through Python <code>ctypes</code> on the measurement host (kernel 7.1.3, btrfs, unprivileged user, not under Hermit), against a file holding <code>user.a</code>, <code>user.b</code> and <code>user.c</code> and a symlink to it: <code>lremovexattr(symlink, &quot;user.a&quot;)</code> gave <code>EPERM</code>; <code>removexattr(symlink, &quot;user.a&quot;)</code> returned 0 and removed the target's attribute; a second <code>removexattr</code> gave <code>ENODATA</code>; <code>bogus.a</code> gave <code>ENOTSUP</code> (the same value as <code>EOPNOTSUPP</code>); an empty name and a 305-byte name gave <code>ERANGE</code>; <code>trusted.x</code> gave <code>EPERM</code>.</p>
 </body></html>

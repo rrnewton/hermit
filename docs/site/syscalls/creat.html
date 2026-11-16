@@ -3,77 +3,18 @@
 <title>creat | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>creat</code> (85)</h1>
-<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; linux determinism: conditional &middot; target policy: model &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+creat&amp;body=Discussion+for+the+%60creat%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fcreat.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60creat%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>creat(path, mode)</code> is the historical spelling of <code>open(path, O_CREAT|O_WRONLY|O_TRUNC, mode)</code>: it creates a file or truncates an existing one and returns a write-only descriptor. Detcore handles it by converting the call to <code>openat(AT_FDCWD, path, O_CREAT|O_WRONLY|O_TRUNC, mode)</code> at the dispatch arm (<code>detcore/src/lib.rs:2364</code>) and running its <code>openat</code> handler (<code>detcore/src/syscalls/files.rs:979</code>), so the kernel sees <code>openat</code> and Detcore records the new descriptor in its fd table. No test at this SHA calls <code>creat</code>.</p>
-<p>Manual reference: Linux man-pages open(2), which documents <code>creat</code>.</p>
-<h2>Linux semantics</h2>
-<p>The kernel resolves <code>path</code> relative to the current directory, follows a final symlink, and either creates a regular file or opens the existing object. A new file gets the permission bits of <code>mode</code> with the process umask (or the parent's default ACL) applied, the caller's filesystem uid, and either the caller's filesystem gid or the parent directory's gid when that directory is set-group-ID. Creating a file updates the parent directory's modification and change times; truncating an existing file updates the file's. The descriptor is the lowest free number, is opened write-only, has no close-on-exec flag, and on x86_64 carries <code>O_LARGEFILE</code>.</p>
-<h3>Flags and options</h3>
+<p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+creat&amp;body=Discussion+for+the+%60creat%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fcreat.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60creat%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>creat</code> (85) as determinized via typed dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.</p>
 <ul>
-<li>F1: create-or-truncate: a missing regular file is created; an existing regular file is opened and truncated to length 0; the result is a write-only descriptor at the lowest free number</li>
-<li>F2: <code>mode</code>: the permission bits (including <code>S_ISUID</code>, <code>S_ISGID</code>, <code>S_ISVTX</code>) for a newly created file, reduced by the umask or by the parent's default ACL; ignored when the file already exists. The kernel clears <code>S_ISGID</code> on the new file when the caller is not in its group.</li>
-<li>F3: metadata side effects: a new file's owner, group and three timestamps come from the caller and the clock; the parent directory's mtime and ctime change; truncating an existing file sets its mtime and ctime</li>
-<li>F4: existing non-regular targets: a directory gives <code>EISDIR</code>; a device is opened and the truncation is ignored; a FIFO open blocks until a reader opens the other end (a signal interrupts it with <code>EINTR</code>); a dangling final symlink creates its target</li>
-<li>F5: path and permission errors: <code>EFAULT</code> for an unreadable path, <code>ENOENT</code> for a missing directory component or an empty path, <code>ENOTDIR</code>, <code>ENAMETOOLONG</code>, <code>ELOOP</code>, <code>EACCES</code> without search permission on a component or write permission on the file or parent, <code>EROFS</code>, <code>ETXTBSY</code> when truncating a running executable, <code>EPERM</code> for an append-only or immutable file, <code>ENOSPC</code> or <code>EDQUOT</code>, <code>EMFILE</code> or <code>ENFILE</code> when no descriptor is available</li>
-<li>F6: no flags argument: <code>creat</code> cannot ask for <code>O_CLOEXEC</code>, <code>O_EXCL</code>, <code>O_NONBLOCK</code> or <code>O_APPEND</code>, so the descriptor always has those clear</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1575</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:7734</code></li>
 </ul>
-<h2>Determinism analysis</h2>
-<p><code>linux_determinism: conditional</code>. Given the same filesystem contents, umask, credentials and descriptor table, <code>creat</code> makes the same decisions every time. What it writes into the filesystem includes the current time and a fresh host inode number, and whether it creates or truncates depends on what is already on disk, which other processes can change. A FIFO target makes the call wait for another process.</p>
-<h3>Nondeterminism sources</h3>
-<ul>
-<li>Prior filesystem state: whether the file exists, its type, permissions and whether a running process maps it (<code>ETXTBSY</code>)</li>
-<li>Host clock values written into the new or truncated file's timestamps and the parent directory's</li>
-<li>Host inode numbers for new files</li>
-<li>Other processes creating, removing or opening the same path, and the arrival of a reader on a FIFO</li>
-<li>Free space and quota</li>
-</ul>
-<h2>Hermit design</h2>
-<p>Target policy: <code>model</code>. The kernel creates the file; Detcore keeps the descriptor's type, flags and path in its fd table and determinizes the metadata the guest later reads through <code>stat</code> and <code>getdents</code>.</p>
-<p>What the code does today:</p>
-<ul>
-<li>The dispatch arm converts <code>Creat</code> into <code>Openat</code> (<code>detcore/src/lib.rs:2364</code>) using reverie's conversion, so everything below is the <code>openat</code> handler with flags <code>O_CREAT|O_WRONLY|O_TRUNC</code>.</li>
-<li>The handler reads the path, returning <code>EFAULT</code> for NULL (<code>detcore/src/syscalls/files.rs:984</code>), and resolves a relative spelling through the guest's root and cwd so later classification sees the real object (<code>detcore/src/syscalls/files.rs:993</code>).</li>
-<li>It asks the scheduler for the path resource with <code>Permission::R</code> (<code>detcore/src/syscalls/files.rs:1005</code>), then sends <code>Syscall::Openat(call)</code> through <code>record_or_replay</code> (<code>detcore/src/syscalls/files.rs:1008</code>; <code>detcore/src/tool_local.rs:382</code>).</li>
-<li>On success it types the descriptor: <code>/dev/random</code> and <code>/dev/urandom</code> become <code>FdType::Rng</code> (<code>detcore/src/syscalls/files.rs:1013</code>); a reopened scheduler-managed pipe becomes <code>FdType::Pipe</code> with a hidden physical <code>O_NONBLOCK</code> (comment at <code>detcore/src/syscalls/files.rs:1020</code>, https://github.com/rrnewton/hermit/issues/1850); everything else is regular. It registers the descriptor with <code>add_fd</code> (<code>detcore/src/syscalls/files.rs:1050</code>), classifies procfs spellings, stores the observed path (<code>detcore/src/syscalls/files.rs:1120</code>), and releases the resource.</li>
-<li>Errors are returned as the kernel produced them; the arm carries <code>// TODO: audit for error-nondeterminism:</code> (<code>detcore/src/syscalls/files.rs:1129</code>).</li>
-<li>Timestamps and inode numbers are not changed by this call. They are virtualized when read: <code>determinize_inode</code> assigns a deterministic inode and an epoch first-seen time (<code>detcore/src/tool_global.rs:2522</code>).</li>
-</ul>
-<p>Why <code>model</code> and not the alternatives: the descriptor must enter Detcore's fd table or later <code>read</code>, <code>write</code>, <code>fcntl</code> and <code>close</code> handling would not know it, which rules out <code>passthrough</code> (unavailable anyway for a <code>determinized</code> syscall). <code>emulate</code> would mean running a private filesystem. <code>refuse</code> would break old programs and build tools that still call <code>creat</code>.</p>
-<p>What remains before the code fully realizes <code>model</code>:</p>
-<ul>
-<li><strong>Resource permission.</strong> <code>creat</code> creates and truncates, but the handler asks for read permission on the path (<code>detcore/src/syscalls/files.rs:1005</code>) because it serves every <code>openat</code>. If the scheduler uses this permission to order conflicting file operations, a truncating <code>creat</code> racing a reader of the same path would be treated as non-conflicting. Whether that matters depends on how the scheduler uses <code>Permission</code>, which has not been checked for this body.</li>
-<li><strong>FIFO targets (F4).</strong> The <code>/dev/fd</code> pipe reopen path covers only pipes Detcore already manages; a named FIFO keeps regular handling (comment at <code>detcore/src/syscalls/files.rs:1030</code>). A blocking open of a FIFO waits inside the kernel where the sequentialized scheduler cannot see it. By the same reasoning as the known FIFO-open deadlock under <code>--strict</code>, a <code>creat</code> on an existing FIFO whose reader is another guest process can hang the container. Inferred, not measured.</li>
-<li><strong>Recorded call name.</strong> Record and replay see <code>openat</code>, not <code>creat</code>. Replay correctness is the same as for <code>openat</code>; anything that reports the syscall by name (logs, <code>--verify</code> diffs) shows <code>openat</code>.</li>
-</ul>
-<p><code>linux_determinism</code> stays <code>conditional</code>.</p>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F1, F6): <code>creat</code> a new file; the descriptor is the lowest free number, <code>F_GETFL &amp; O_ACCMODE</code> is <code>O_WRONLY</code>, <code>F_GETFD</code> has no <code>FD_CLOEXEC</code>, <code>O_APPEND</code> and <code>O_NONBLOCK</code> are clear, and <code>read</code> on it gives <code>EBADF</code>; <code>write</code> then <code>stat</code> reports the written size.</li>
-<li>T2 (covers F2, F3): with umask 022, <code>creat(path, 0777)</code> yields mode 0755; a second <code>creat</code> with mode 0600 on the existing file leaves 0755; <code>stat</code> of the file and its parent gives the same timestamps and inode number in both runs of <code>run --verify</code>.</li>
-<li>T3 (covers F1, F3): write data into an existing file, <code>creat</code> it again, and check length 0 and that the old data is gone; the file's mtime as Hermit reports it is the same in both runs.</li>
-<li>T4 (covers F4): <code>creat</code> on a directory gives <code>EISDIR</code>; on <code>/dev/null</code> it succeeds and the file stays a character device; through a dangling symlink it creates the target. Separately, with a bounded timeout, <code>creat</code> a FIFO in one guest process while another opens it for reading, and record whether Hermit completes, refuses or hangs.</li>
-<li>T5 (covers F5): <code>EFAULT</code> for a NULL path, <code>ENOENT</code> for a missing parent and for <code>&quot;&quot;</code>, <code>ENOTDIR</code> through a regular-file component, <code>ENAMETOOLONG</code>, <code>ELOOP</code> through a symlink loop, and <code>EMFILE</code> after lowering <code>RLIMIT_NOFILE</code>; native and Hermit must agree.</li>
-<li>T6 (covers F1, F2): record a guest that calls <code>creat</code> and writes to the file, then replay it, and check that replay reproduces the guest-visible results.</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+creat&amp;body=Discussion+for+the+%60creat%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fcreat.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60creat%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `creat`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · created for v1: no tracking issue existed for this pinned Sysno; code at this SHA: determinized, dispatch typed.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: target_policy model (dispatch rewrites creat to openat; kernel creates the file and Detcore registers the descriptor); linux_determinism stays conditional; 6 flag behaviours and 6 tests listed, none existing; open questions on the read-only resource request and FIFO targets recorded; tracking_status stays todo</li>
-</ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+creat&amp;amp;body=Discussion+for+the+%60creat%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fcreat.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60creat%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `creat`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Created by the syscall-tracking v1 migration on 2026-10-03. No tracking issue existed for <code>creat</code>: the 2026-07-24 classification campaign filed issues only for syscalls in the old temporary pass-through block, and Detcore already handled this one.</p>
-<p><code>creat</code> is in Detcore's optional pass-through subscription list (<code>detcore/src/lib.rs:1121</code>) and is charged in the open/close time group (<code>detcore/src/syscall_time.rs:99</code>). No file under <code>tests/</code> or <code>hermit-cli/tests</code> at this SHA calls <code>creat</code> or <code>SYS_creat</code>, so every test above is new.</p>
-<h3>Open questions</h3>
-<ul>
-<li>Should the <code>openat</code> handler request write permission when the flags include <code>O_CREAT</code>, <code>O_TRUNC</code> or a write access mode, so the scheduler treats <code>creat</code> as a writer of the path? It requests <code>Permission::R</code> for every open today.</li>
-<li>Should a blocking open of a named FIFO (through <code>creat</code> or <code>openat</code>) be probed or refused instead of waiting in the kernel?</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
 </body></html>

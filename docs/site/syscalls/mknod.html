@@ -3,81 +3,17 @@
 <title>mknod | Per-syscall Detcore pages</title>
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>mknod</code> (133)</h1>
-<p>Strategy: <strong>passthrough</strong> &middot; dispatch: <code>passthrough</code> &middot; linux determinism: deterministic &middot; target policy: passthrough &middot; status: todo &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+mknod&amp;body=Discussion+for+the+%60mknod%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fmknod.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60mknod%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Summary</h2>
-<p><code>mknod(pathname, mode, dev)</code> creates one filesystem node at <code>pathname</code>: a regular file, a FIFO, a Unix-socket inode, or (with privilege) a character or block device. It is the legacy form of <code>mknodat(AT_FDCWD, ...)</code>. Detcore passes it straight to the kernel: the generic arm at <code>detcore/src/lib.rs:2843</code> forwards it unchanged.</p>
-<h2>Linux semantics</h2>
-<p>The kernel resolves <code>pathname</code> relative to the caller's working directory and root, takes the file type from <code>mode &amp; S_IFMT</code> and the permission bits from <code>mode &amp; 07777</code>, applies the umask (or the parent directory's default ACL), and creates the node. The call returns 0 or an errno; it creates nothing on failure and returns no inode or descriptor. <code>dev</code> is used only for character and block devices.</p>
-<p>Device nodes need <code>CAP_MKNOD</code> in the initial user namespace. Root inside an unprivileged user namespace, which is what a container usually has, gets <code>EPERM</code>. The one exception is a character device with device number 0:0, the overlayfs &quot;whiteout&quot;, which any user may create.</p>
-<p>Host results measured for this issue on Linux 7.1.3 as an unprivileged user: type 0, <code>S_IFREG</code>, <code>S_IFIFO</code> and <code>S_IFSOCK</code> succeed; <code>S_IFCHR</code> and <code>S_IFBLK</code> give <code>EPERM</code> except <code>S_IFCHR</code> with <code>dev == 0</code>, which succeeds; <code>S_IFDIR</code> gives <code>EPERM</code>; <code>S_IFLNK</code> and <code>0170000</code> give <code>EINVAL</code>; an existing path gives <code>EEXIST</code>; mode 0777 under umask 077 creates 0700; a FIFO created with a nonzero <code>dev</code> has <code>st_rdev == 0</code>.</p>
-<h3>Flags and options</h3>
+<p>Strategy: <strong>passthrough</strong> &middot; dispatch: <code>passthrough</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+mknod&amp;body=Discussion+for+the+%60mknod%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fmknod.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60mknod%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>mknod</code> (133) as passthrough via passthrough dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: false.</p>
 <ul>
-<li>F1: file type 0 or <code>S_IFREG</code>: creates an empty regular file</li>
-<li>F2: <code>S_IFIFO</code>: creates a named pipe; <code>dev</code> is ignored and the node's <code>st_rdev</code> is 0</li>
-<li>F3: <code>S_IFSOCK</code>: creates a socket inode that no socket is bound to</li>
-<li>F4: <code>S_IFCHR</code> or <code>S_IFBLK</code> with a nonzero <code>dev</code>: creates a device node with that major and minor only with <code>CAP_MKNOD</code> in the initial user namespace; otherwise <code>EPERM</code></li>
-<li>F5: <code>S_IFCHR</code> with <code>dev == 0</code> (whiteout): created without <code>CAP_MKNOD</code></li>
-<li>F6: <code>S_IFDIR</code> returns <code>EPERM</code>; <code>S_IFLNK</code> and any other invalid type (for example <code>0170000</code>) return <code>EINVAL</code></li>
-<li>F7: permission bits: <code>mode &amp; 07777</code> filtered through the umask, or through the parent's default ACL when it has one; setuid, setgid and sticky bits follow the filesystem's rules</li>
-<li>F8: <code>pathname</code> already exists (including a dangling symlink): <code>EEXIST</code>, nothing changes</li>
-<li>F9: path errors: <code>ENOENT</code> (missing parent or empty path), <code>ENOTDIR</code>, <code>ENAMETOOLONG</code>, <code>ELOOP</code>, <code>EACCES</code> (no write or search permission), <code>EFAULT</code> (bad pointer)</li>
-<li>F10: filesystem errors: <code>EROFS</code>, <code>ENOSPC</code>, <code>EDQUOT</code>, and <code>EPERM</code> from filesystems that do not support the node type</li>
-<li>F11: relative <code>pathname</code> resolves against the calling thread's working directory and root</li>
+<li>Classification: <code>detcore/src/syscall_classification.rs:1967</code></li>
 </ul>
-<h2>Determinism analysis</h2>
-<p><code>linux_determinism: deterministic</code>. The result is a function of the arguments, the caller's credentials and umask, and the state of the directory it writes into. The container identity is fixed at start (<code>detcore/src/syscall_classification.rs:714</code>), and so is the container's file tree, so two runs that reach the call with the same tree get the same result. The created node's inode number and timestamps are read later through <code>stat</code>, not returned here; they belong to <code>stat</code> and the filesystem.</p>
-<h3>Nondeterminism sources</h3>
-<ul>
-<li>None from the call itself; <code>dev</code> and <code>mode</code> come from the caller.</li>
-<li>Host filesystem state outside the guest's control (free space for <code>ENOSPC</code>, quotas for <code>EDQUOT</code>, a read-only mount for <code>EROFS</code>) changes the result only if the host changes between runs, which is outside Hermit's model.</li>
-<li><code>CAP_MKNOD</code> in the initial namespace (F4) is a property of how Hermit is launched; it is the same for every run from the same launch configuration.</li>
-</ul>
-<h2>Hermit design</h2>
-<p>Target policy: <code>passthrough</code>. This matches the code at hermit f4055eb9cae4.</p>
-<ul>
-<li><code>classify_syscall</code> returns <code>PassThrough</code> for <code>mknod</code> in the &quot;ISSUE-REVIEWED PASS-THROUGH SYSCALLS&quot; block (<code>detcore/src/syscall_classification.rs:814</code>). The block's comment at <code>detcore/src/syscall_classification.rs:808</code> says these remain conditional on Hermit's fixed-container and stable-state assumptions, and <code>detcore/src/syscall_classification.rs:811</code> still carries <code>TODO-HUMAN-REVIEW(PR-643)</code>.</li>
-<li>The unit test <code>representative_policies_stay_in_their_reviewed_sections</code> checks that classification (<code>detcore/src/syscall_classification.rs:2103</code>).</li>
-<li>Dispatch is the generic arm at <code>detcore/src/lib.rs:2843</code>, which calls <code>passthrough</code> (<code>detcore/src/lib.rs:367</code>), which forwards through <code>record_or_replay_preserving_tool_errors</code>. In <code>hermit run</code> the call is intercepted (so logical time is charged) and forwarded unchanged.</li>
-<li>Under <code>hermit record</code> and <code>hermit replay</code>, <code>passthru_opt</code> is on (<code>detcore/src/lib.rs:3140</code>), and Detcore does not subscribe pass-through syscalls (<code>detcore/src/lib.rs:1084</code>; unit test <code>passthru_opt_leaves_unlisted_passthrough_syscalls_unsubscribed</code> at <code>detcore/src/lib.rs:3185</code>).</li>
-</ul>
-<p>Why not <code>model</code>: nothing the call returns depends on host state that Detcore hides elsewhere. The node becomes part of the guest's file tree, which Hermit already treats as guest-owned. Device nodes fail with <code>EPERM</code> inside the container without any help from Detcore.</p>
-<h3>Gaps and open points</h3>
-<ul>
-<li>No ptrace test reaches <code>SYS_mknod</code> directly. <code>tests/c/mknod_special.c</code> uses glibc <code>mkfifo</code>, <code>mknodat</code> and <code>mknod</code>; on x86_64 glibc's <code>mknod</code> wrapper is expected to issue <code>mknodat</code>, not <code>mknod</code> (inferred, not traced here), so that test probably exercises <code>mknodat</code>.</li>
-<li><code>tests/c/record_replay_path_queries.c:243</code> calls <code>syscall(SYS_mknod, &quot;p&quot;, S_IFIFO | 0600, 0)</code>, but it is driven only by the record/replay test <code>record_path_queries_and_legacy_mutations</code> (<code>hermit-cli/tests/record_replay.rs:2170</code>), not by a <code>hermit run</code> ptrace cell.</li>
-</ul>
-<h2>Recommended tests</h2>
-<ul>
-<li>T1 (covers F1, F2, F3, F7): raw <code>syscall(SYS_mknod, ...)</code> under <code>hermit run --verify</code> on ptrace with type 0, <code>S_IFREG</code>, <code>S_IFIFO</code> (with a nonzero <code>dev</code>) and <code>S_IFSOCK</code>, under umask 022 and 077. <code>lstat</code> each node and print the file type, permission bits and <code>st_rdev</code>. Existing candidate: <code>tests/c/mknod_special.c</code> (cell <code>c-programs/mknod-special</code>, <code>tests/e2e/manifests/c-programs.yaml:12642</code>, verify ci on ptrace) covers FIFO and regular nodes through glibc, which probably reaches <code>mknodat</code>, not <code>mknod</code>.</li>
-<li>T2 (covers F4, F5, F6): raw <code>SYS_mknod</code> with <code>S_IFCHR</code> 1:3, <code>S_IFBLK</code> 7:0, <code>S_IFCHR</code> 0:0, <code>S_IFDIR</code>, <code>S_IFLNK</code> and <code>0170000</code>. Expect <code>EPERM</code>, <code>EPERM</code>, success, <code>EPERM</code>, <code>EINVAL</code>, <code>EINVAL</code> inside the container, identical across runs.</li>
-<li>T3 (covers F8, F9): <code>EEXIST</code> on an existing file and on a dangling symlink; <code>ENOENT</code> for a missing parent and for <code>&quot;&quot;</code>; <code>ENOTDIR</code> through a regular file; <code>ENAMETOOLONG</code>; <code>ELOOP</code> through a symlink loop; <code>EFAULT</code> for a bad pointer. Existing candidate for <code>EEXIST</code>: <code>tests/c/mknod_special.c</code>, through glibc.</li>
-<li>T4 (covers F10): <code>mknod</code> on a read-only filesystem gives <code>EROFS</code>, and on a filesystem that rejects the node type gives <code>EPERM</code>; each result is identical across runs.</li>
-<li>T5 (covers F11): <code>chdir</code> into a subdirectory, then <code>mknod(&quot;rel&quot;, S_IFIFO | 0600, 0)</code>; the node appears in that subdirectory. <code>tests/c/record_replay_path_queries.c:243</code> does this under record and replay only.</li>
-</ul>
-<h2>Done criteria</h2>
-<p><code>done</code> means (owner rule, 2026-10-02): every flag and option listed under <code>### Flags and options</code> is covered by a named test, recorded in Status as <code>T&lt;n&gt; covered by &lt;path&gt;</code>, or, for an error only the host's configuration can produce, by a <code>host-config</code> U item that cites where Hermit forwards the error unchanged (owner decision 1, 2026-10-04); a <code>host-transient</code> U item does not count until Hermit hides that error or reports it as an infrastructure error; each such test exists at the cited hermit SHA and runs in CI on the default backend in the strict container; the code realizes <code>target_policy</code>; and the Status log records that evidence. If a problem is later found with this syscall, <code>tracking_status</code> returns to <code>todo</code> or <code>in-progress</code> with a Status entry saying why.</p>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+mknod&amp;body=Discussion+for+the+%60mknod%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fmknod.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60mknod%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `mknod`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
 <h2>Status</h2>
 <ul>
-<li>2026-09-28 · hermit 81ca8822f78c · hermit2 · closed under the legacy rule (an explicit <code>classify_syscall</code> arm), not the v1 done rule; closing comment https://github.com/rrnewton/hermit/issues/288#issuecomment-5872835168</li>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · migrated to v1 from legacy variant A1 of https://github.com/rrnewton/hermit/issues/288: linux_determinism deterministic (from <strong>Classification:</strong>); target_policy from legacy PASS-THRU; code at this SHA: passthrough, dispatch passthrough.</li>
-<li>2026-10-03 · hermit fe5d48903806 · syscall-tracking · reopen: under the owner rule of 2026-10-02, closed means every flag and option is covered by a named test and the implementation works; mknod records no test coverage, so tracking_status is todo and https://github.com/rrnewton/hermit/issues/288 reopens.</li>
-<li>2026-10-03 · hermit f4055eb9cae4 · syscall-tracking-p3 · p3: linux_determinism deterministic and target_policy passthrough kept (PassThrough at syscall_classification.rs:814; the result depends only on the arguments, the fixed container identity and the guest's file tree); 11 flag behaviours and 5 tests; no ptrace run test reaches SYS_mknod directly (mknod_special.c goes through glibc, record_replay_path_queries.c runs only under record/replay)</li>
+<li>2026-11-15 · hermit 239ca43d3092 · facts-only page generated from Detcore code facts at this revision.</li>
 </ul>
-<ul>
-<li>2026-11-15 · hermit 239ca43d3092 · syscall-pages · converted: moved from the syscall-tracking/v1 issue body to this page; code facts refreshed at this SHA; per-backend verification fields are not carried in page form.</li>
-</ul>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+mknod&amp;amp;body=Discussion+for+the+%60mknod%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fmknod.html%0A%0AWhat+should+change+in+how+Detcore+handles+%60mknod%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `mknod`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
-<h2>Additional information</h2>
-<p>Originally filed 2026-07-24 as &quot;Syscall classification: mknod&quot; (https://github.com/rrnewton/hermit/issues/288), legacy variant A1.</p>
-<p>Comment history: 1 comment(s) on https://github.com/rrnewton/hermit/issues/288.</p>
-<h3>2026-07-24 host strace evidence</h3>
-<p>Evidence gathered on this host (Linux 6.17 x86_64, glibc) by tracing a direct <code>syscall()</code> harness and common programs with <code>strace -f -e trace=mknod</code>, and by confirming hermit currently routes <code>mknod</code> through the UNCLASSIFIED temporary-passthrough block in <code>detcore/src/syscall_classification.rs</code> (the harness ran end-to-end under <code>hermit run</code>, exit 0, so passthrough does not crash).</p>
-<p>Observed strace line:</p>
-<pre><code>mknod(&quot;/tmp/sysclass/hf&quot;, S_IFREG|0644) = 0
-</code></pre>
-<hr>
-<p>*Autonomous syscall-classification sweep, batch 3 (ranks 101-150 of the <code>syscall_classification.rs</code> UNCLASSIFIED list). Host testing + analysis only; no code change proposed here.*</p>
-<h3>Legacy closure</h3>
-<p>Closed 2026-09-28 by the 2026-09-28 sweep, which closed issues whose syscall had an explicit <code>classify_syscall</code> arm. Closing comment: https://github.com/rrnewton/hermit/issues/288#issuecomment-5872835168</p>
 </body></html>
