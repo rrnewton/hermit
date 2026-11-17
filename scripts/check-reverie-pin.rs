@@ -2678,6 +2678,9 @@ fn reverie_url_literal_violations(text: &str) -> Vec<usize> {
         .collect()
 }
 
+/// The generated tree copy `ci/buck-e2e/stage` writes, relative to the root.
+const BUCK_E2E_STAGED_COPY: &str = "ci/buck-e2e/staged";
+
 fn check_reverie_repository_literals(root: &Path) -> Result<i32, String> {
     const TREES: [&str; 4] = [
         "liteinst-runtime-build",
@@ -2695,7 +2698,14 @@ fn check_reverie_repository_literals(root: &Path) -> Result<i32, String> {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                if path.file_name().is_some_and(|name| name != "target") {
+                // ci/buck-e2e/staged/ is the gitignored copy of the whole tree
+                // (src/ is `git archive HEAD`) that ci/buck-e2e/stage leaves for
+                // the Buck cells; it repeats every tracked script, so a checkout
+                // that once staged would refuse here on every later run. The
+                // tracked sources themselves are scanned.
+                if path.file_name().is_some_and(|name| name != "target")
+                    && path != root.join(BUCK_E2E_STAGED_COPY)
+                {
                     stack.push(path);
                 }
             } else if path.extension().is_some_and(|ext| ext == "rs") {
@@ -3533,6 +3543,28 @@ mod tests {
         assert_eq!(reverie_url_literal_violations(stray), vec![1]);
         let link = "// see https://github.com/rrnewton/reverie/issues/1063\n";
         assert!(reverie_url_literal_violations(link).is_empty());
+    }
+
+    #[test]
+    fn the_staged_tree_copy_is_not_scanned_for_repository_literals() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "check-reverie-pin-staged-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let stray =
+            "let r = CargoGitRepository::new(\"https://github.com/rrnewton/reverie.git\");\n";
+        let staged = root.join(BUCK_E2E_STAGED_COPY).join("src/scripts");
+        fs::create_dir_all(&staged).expect("create staged copy");
+        fs::write(staged.join("copy.rs"), stray).expect("write staged copy");
+        assert_eq!(check_reverie_repository_literals(&root), Ok(0));
+        // The same line in a scanned tree is still refused.
+        fs::write(root.join("ci/tracked.rs"), stray).expect("write tracked source");
+        assert_eq!(check_reverie_repository_literals(&root), Ok(1));
+        fs::remove_dir_all(&root).expect("remove fixture directory");
     }
 
     #[test]
