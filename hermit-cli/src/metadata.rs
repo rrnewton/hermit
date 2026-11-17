@@ -1604,6 +1604,7 @@ fn record_or_replay_config_with_timer_support(
         uname_nodename: default_config.uname_nodename.clone(),
         uname_release: default_config.uname_release.clone(),
         uname_version: default_config.uname_version.clone(),
+        dirent_tmpfs_host_order: default_config.dirent_tmpfs_host_order,
         proc_level: default_config.proc_level,
         interrupt_at: vec![],
         happens_before: None,

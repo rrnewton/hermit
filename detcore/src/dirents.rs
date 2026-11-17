@@ -380,6 +380,9 @@ fn compare_dir_entries(a: &DirEntry, b: &DirEntry) -> std::cmp::Ordering {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum DirectoryOrder {
     NameBytes,
+    /// Experimental (provrepro, `--dirent-tmpfs-host-order`): keep the host
+    /// kernel's order, for a directory on a tmpfs that lists newest first.
+    Host,
     ProcfsIds,
     /// A process's directory, or a thread's (`thread`), which Detcore lists
     /// from its model in Linux's order (`procfs::levels::process_entry_rank`,
@@ -394,6 +397,8 @@ impl DirectoryOrder {
     fn compare(self, a: &DirEntry, b: &DirEntry) -> std::cmp::Ordering {
         match self {
             Self::NameBytes => compare_dir_entries(a, b),
+            // `install` sorts stably, so equal keys keep the host order.
+            Self::Host => std::cmp::Ordering::Equal,
             Self::ProcfsIds => {
                 fn key(name: &[u8]) -> (u8, i32, &[u8]) {
                     match name {

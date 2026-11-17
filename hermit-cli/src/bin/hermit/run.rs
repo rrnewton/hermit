@@ -11886,6 +11886,39 @@ pub(super) fn path_resolution_visits_prefix(path: &Path, prefix: &Path) -> Resul
 /// can leave a CPU out of the listing, but cannot add one the host does not
 /// have, nor the `topology` directory Linux removes from an offline CPU's
 /// (`topology_remove_dev`).
+/// Experimental (provrepro): `--dirent-tmpfs-host-order` serves a tmpfs
+/// directory in the host kernel's order, which is newest first on the
+/// kernels that build hosts such as Debian's buildds ran (before 6.6) and
+/// again from 6.14, and oldest first in between. Refuse a host whose tmpfs
+/// does not list newest first, by creating three names in a scratch
+/// directory under `tmpfs_root` and reading them back.
+fn check_host_tmpfs_lists_newest_first(tmpfs_root: &Path) -> Result<(), Error> {
+    let scratch = tempfile::Builder::new()
+        .prefix("hermit-dirent-order-")
+        .tempdir_in(tmpfs_root)
+        .with_context(|| {
+            format!(
+                "--dirent-tmpfs-host-order: cannot create a scratch directory in {}",
+                tmpfs_root.display()
+            )
+        })?;
+    for name in ["b", "c", "a"] {
+        fs::write(scratch.path().join(name), b"")?;
+    }
+    let listed: Vec<String> = fs::read_dir(scratch.path())?
+        .map(|entry| entry.map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect::<Result<_, _>>()?;
+    if listed != ["a", "c", "b"] {
+        anyhow::bail!(
+            "--dirent-tmpfs-host-order needs a host tmpfs that lists the newest entry first; \
+             {} listed {:?} for names created in the order b, c, a",
+            tmpfs_root.display(),
+            listed
+        );
+    }
+    Ok(())
+}
+
 fn check_host_lists_virtual_cpus(cpus: u32, directory: &Path) -> Result<(), Error> {
     let listed = (0..cpus)
         .take_while(|cpu| directory.join(format!("cpu{cpu}/topology")).is_dir())
@@ -15256,6 +15289,16 @@ impl RunOpts {
                 );
             }
             check_host_lists_virtual_cpus(cpus.get(), Path::new("/sys/devices/system/cpu"))?;
+        }
+        if config.dirent_tmpfs_host_order {
+            if !matches!(backend, Backend::Ptrace) {
+                anyhow::bail!(
+                    "--dirent-tmpfs-host-order is experimental and checked on the ptrace backend \
+                     only; backend `{}` is refused",
+                    backend.as_str()
+                );
+            }
+            check_host_tmpfs_lists_newest_first(Path::new("/dev/shm"))?;
         }
         config.deterministic_io = self.strict || !self.no_deterministic_io;
         // An unmodeled host syscall makes a successful result unqualified.

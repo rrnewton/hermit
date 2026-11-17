@@ -1913,6 +1913,18 @@ pub struct Config {
     #[clap(long, value_name = "string")]
     pub uname_version: Option<String>,
 
+    /// Experimental (provrepro): list a directory that lives on a tmpfs in
+    /// the host kernel's own order instead of sorting its names. Linux's
+    /// tmpfs lists the newest entry first (before 6.6, and again from 6.14),
+    /// which is what a build on a tmpfs, such as Debian's sbuild, saw. The
+    /// order follows from the sequence of creations, renames and removals in
+    /// the directory, so it repeats when the guest repeats. `hermit run`
+    /// checks that the host's tmpfs lists newest first before it starts.
+    /// Directories on any other filesystem are sorted by name as before.
+    #[serde(default)]
+    #[clap(long)]
+    pub dirent_tmpfs_host_order: bool,
+
     /// How much of `/proc` the guest sees. Every level is the same on every
     /// backend and host. `minimal` (the default) shows a small set, modelled
     /// on gVisor's; `standard` shows every system-wide name Detcore serves or
@@ -3009,6 +3021,9 @@ impl fmt::Display for Config {
         }
         if let Some(version) = &self.uname_version {
             write!(f, " --uname-version={version:?}")?;
+        }
+        if self.dirent_tmpfs_host_order {
+            write!(f, " --dirent-tmpfs-host-order")?;
         }
         match self.proc_level {
             ProcLevel::Minimal => {}
@@ -4485,7 +4500,7 @@ mod legacy_backend_json {
     /// `allow_unresolved_restart_codes` came after it too: only the ptrace
     /// backend on aarch64 asks Detcore about restart codes, so it is never
     /// written and reads as false.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 70] = [
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 71] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -4528,6 +4543,7 @@ mod legacy_backend_json {
         "uname_nodename",
         "uname_release",
         "uname_version",
+        "dirent_tmpfs_host_order",
         "notice_host_network_abstract_binds",
         "notice_autofs_eloop",
         "replay_edited_preemptions",
@@ -4705,6 +4721,7 @@ mod legacy_backend_json {
                     | "replay_edited_preemptions"
                     | "lenient_replay"
                     | "eager_lone_preemptions"
+                    | "dirent_tmpfs_host_order"
                     | "replay_continue_fairly"
                     | "strict_binder"
                     | "strict_unknown_syscalls"
@@ -5092,6 +5109,7 @@ mod legacy_backend_json {
                 | "replay_edited_preemptions"
                 | "lenient_replay"
                 | "eager_lone_preemptions"
+                | "dirent_tmpfs_host_order"
                 | "chaos_timeslice_range"
                 | "chaos_timeslice_draw"
                 | "chaos_timeslice"
@@ -6179,6 +6197,7 @@ mod tests {
                 | "replay_edited_preemptions"
                 | "lenient_replay"
                 | "eager_lone_preemptions"
+                | "dirent_tmpfs_host_order"
                 | "chaos_timeslice_range"
                 | "chaos_timeslice_draw"
                 | "chaos_timeslice"

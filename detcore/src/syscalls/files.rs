@@ -19401,6 +19401,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // procfs directory loses its name once its task exits (see
         // `DirectoryStream`).
         let inodes = self.directory_inodes(guest, call.fd).await?;
+        let host_order = self.ordinary_directory_order(guest, call.fd).await;
         match self.snapshot_directory_privately(guest, call).await {
             Ok(Some(entries)) => {
                 let mut entries = Some(entries);
@@ -19409,7 +19410,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         entries.take().unwrap_or_default(),
                         mark,
                         inodes.clone(),
-                        DirectoryOrder::NameBytes,
+                        host_order,
                     )
                 })?;
                 self.serve_next_batch(guest, call).await
@@ -19523,10 +19524,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                     Some((entries, inodes, order)) => (Ok(Some(entries)), inodes, order),
                     None => {
                         let inodes = self.directory_inodes(guest, call.fd).await?;
+                        let order = self.ordinary_directory_order(guest, call.fd).await;
                         (
                             self.snapshot_directory_privately(guest, call).await,
                             inodes,
-                            DirectoryOrder::NameBytes,
+                            order,
                         )
                     }
                 };
@@ -20416,6 +20418,68 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// fail so; serving the directory in host order would make the order
     /// depend on the host. This divergence is tracked in
     /// https://github.com/rrnewton/hermit/issues/3723.
+    /// Experimental (provrepro): how to order an ordinary host directory's
+    /// snapshot. By name, unless `--dirent-tmpfs-host-order` is set and the
+    /// directory is on a tmpfs, whose newest-first order `hermit run` checked.
+    async fn ordinary_directory_order<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: i32,
+    ) -> DirectoryOrder {
+        if guest.config().dirent_tmpfs_host_order && self.directory_on_tmpfs(guest, fd).await {
+            DirectoryOrder::Host
+        } else {
+            DirectoryOrder::NameBytes
+        }
+    }
+
+    /// Whether the guest's descriptor `fd` is on a tmpfs, from an injected
+    /// `fstatfs` into a private scratch page. Any failure reads as no.
+    async fn directory_on_tmpfs<G: Guest<Self>>(&self, guest: &mut G, fd: i32) -> bool {
+        const TMPFS_MAGIC: i64 = 0x0102_1994;
+        let len = DIRECTORY_PAGE;
+        let mapped = guest
+            .inject_with_retry(Syscall::Mmap(
+                syscalls::Mmap::new()
+                    .with_addr(None)
+                    .with_len(len)
+                    .with_prot(ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
+                    .with_flags(MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS)
+                    .with_fd(-1)
+                    .with_offset(0),
+            ))
+            .await;
+        let Some(scratch) = mapped
+            .ok()
+            .and_then(|addr| usize::try_from(addr).ok())
+            .and_then(AddrMut::<u8>::from_raw)
+        else {
+            return false;
+        };
+        let stat = guest
+            .inject_with_retry(Syscall::Fstatfs(
+                syscalls::Fstatfs::new()
+                    .with_fd(fd)
+                    .with_buf(Some(scratch.cast())),
+            ))
+            .await;
+        let f_type = match stat {
+            Ok(_) => {
+                let at: Addr<i64> = Addr::from(scratch).cast();
+                guest.memory().read_value(at).ok()
+            }
+            Err(_) => None,
+        };
+        let _ = guest
+            .inject_with_retry(Syscall::Munmap(
+                syscalls::Munmap::new()
+                    .with_addr(Some(Addr::from(scratch).cast()))
+                    .with_len(len),
+            ))
+            .await;
+        f_type == Some(TMPFS_MAGIC)
+    }
+
     async fn snapshot_directory_privately<G: Guest<Self>>(
         &self,
         guest: &mut G,
