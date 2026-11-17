@@ -2285,10 +2285,12 @@ const BUCK_S0_SUFFIX: &str = "_s0";
 /// The staged Buck-built harness the `--buck-s0` import twins judge with,
 /// written by `ci/buck-e2e/stage --from-buck` (there is no target/debug).
 const BUCK_S0_HARNESS: &str = "ci/buck-e2e/staged/bin/test-harness run ";
-/// Where `pre.reverie_pin` compiles its two rustc checkers in a `--buck-s0`
-/// run: the run's state, not the checkout's target/ (ci/run-reverie-pin-check.sh
-/// compiles into ${CARGO_TARGET_DIR:-target}/ci; no cargo runs).
-const BUCK_S0_PIN_CHECK_ROOT: &str = "CARGO_TARGET_DIR=\"$VALIDATE_RUN_STATE/rustc-checkers\" ";
+/// Where `pre.reverie_pin` compiles its two rustc checkers and keeps its
+/// Reverie graph cache in a `--buck-s0` run: ignored/validation/pin-check, not
+/// the checkout's target/ (ci/run-reverie-pin-check.sh and
+/// scripts/check-reverie-pin.rs use ${CARGO_TARGET_DIR:-target}/ci; no cargo
+/// runs). Stable across runs, so the graph cache is fetched incrementally.
+const BUCK_S0_PIN_CHECK_ROOT: &str = "CARGO_TARGET_DIR=\"$PWD/ignored/validation/pin-check\" ";
 
 /// A Buck-only E2E subset: the plan cells in every one of its lists.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]

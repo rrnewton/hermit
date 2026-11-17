@@ -721,10 +721,41 @@ fn classify_cache_path(cache: &Path) -> Result<CacheState, String> {
     ))
 }
 
+/// The target directory ci/run-reverie-pin-check.sh compiled the checkers in,
+/// as `main` read it from `CARGO_TARGET_DIR`. Unset in the unit tests, which
+/// call the checks directly and so always see the checkout's `target/`,
+/// whatever environment runs them.
+static CHECKER_TARGET_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// The Reverie graph cache: `ci/reverie-graph.git` below the target directory
+/// ci/run-reverie-pin-check.sh compiles the checkers in, `CARGO_TARGET_DIR`
+/// (relative to the checkout when relative) or the checkout's `target/`. A
+/// Buck-only validation (scripts/validate.rs --buck-s0) names one outside the
+/// checkout's `target/`, which must not exist there.
+fn reverie_graph_cache(root: &Path) -> Result<PathBuf, String> {
+    reverie_graph_cache_in(root, CHECKER_TARGET_DIR.get().cloned().flatten())
+}
+
+fn reverie_graph_cache_in(root: &Path, target_dir: Option<PathBuf>) -> Result<PathBuf, String> {
+    match target_dir.filter(|dir| !dir.as_os_str().is_empty()) {
+        Some(dir) if dir.is_absolute() => {
+            fs::create_dir_all(&dir).map_err(|error| {
+                format!(
+                    "could not create the Reverie graph cache's target directory {}: {error}",
+                    dir.display()
+                )
+            })?;
+            resolve_cache_path(&dir, "ci/reverie-graph.git")
+        }
+        Some(dir) => resolve_cache_path(root, &format!("{}/ci/reverie-graph.git", dir.display())),
+        None => resolve_cache_path(root, "target/ci/reverie-graph.git"),
+    }
+}
+
 fn reverie_graph(root: &Path, remote: &str, branch: &str) -> Result<GuardedGitRepo, String> {
     // Resolved BEFORE anything is created, so `git init` and the guard below
     // both act on the same object.
-    let cache = resolve_cache_path(root, "target/ci/reverie-graph.git")?;
+    let cache = reverie_graph_cache(root)?;
     // Classified from the filesystem BEFORE any Git command is aimed at the
     // path, so a `.git`-file carrier or foreign contents can never be
     // initialised into and judged afterwards.
@@ -3125,6 +3156,9 @@ fn run() -> Result<i32, String> {
 
 fn main() {
     rust_script_prelude::init();
+    CHECKER_TARGET_DIR
+        .set(std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from))
+        .expect("main sets the checker target directory once");
     match run() {
         Ok(code) => std::process::exit(code),
         Err(error) => {
@@ -3543,6 +3577,46 @@ mod tests {
         assert_eq!(reverie_url_literal_violations(stray), vec![1]);
         let link = "// see https://github.com/rrnewton/reverie/issues/1063\n";
         assert!(reverie_url_literal_violations(link).is_empty());
+    }
+
+    #[test]
+    fn the_reverie_graph_cache_follows_the_checkers_target_directory() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos();
+        let base = env::temp_dir().join(format!(
+            "check-reverie-pin-graph-cache-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let root = base.join("checkout");
+        fs::create_dir_all(&root).expect("create checkout");
+        let root = fs::canonicalize(&root).expect("canonical checkout");
+        let outside = base.join("state/pin-check");
+        assert_eq!(
+            reverie_graph_cache_in(&root, None).unwrap(),
+            root.join("target/ci/reverie-graph.git")
+        );
+        assert_eq!(
+            reverie_graph_cache_in(&root, Some(PathBuf::new())).unwrap(),
+            root.join("target/ci/reverie-graph.git")
+        );
+        assert_eq!(
+            reverie_graph_cache_in(&root, Some(PathBuf::from("ignored/pin"))).unwrap(),
+            root.join("ignored/pin/ci/reverie-graph.git")
+        );
+        let cache = reverie_graph_cache_in(&root, Some(outside.clone())).unwrap();
+        assert_eq!(
+            cache,
+            fs::canonicalize(&outside)
+                .unwrap()
+                .join("ci/reverie-graph.git")
+        );
+        assert!(
+            !root.join("target").exists(),
+            "an outside target directory created target/"
+        );
+        fs::remove_dir_all(&base).expect("remove fixture directory");
     }
 
     #[test]
