@@ -36,6 +36,12 @@ if [[ $mode == test ]]; then
     fi
     RUSTUP_TOOLCHAIN=stable rustc --edition=2021 --test \
         scripts/check-reverie-pin.rs -o "$checker"
+    rustc_version_checker="$compile_dir/check-rustc-version-test"
+    RUSTUP_TOOLCHAIN=stable rustc --edition=2021 --test \
+        scripts/check-rustc-version.rs -o "$rustc_version_checker"
+    "$checker"
+    "$rustc_version_checker"
+    exit $?
 else
     RUSTUP_TOOLCHAIN=stable rustc --edition=2021 \
         scripts/check-reverie-pin.rs -o "$checker"
@@ -67,4 +73,25 @@ if [[ $mode == run ]]; then
     # belong on stderr, where they are still shown and still gate via the exit
     # status, without corrupting a value another program parses.
     "$uniformity" >&2
+
+    # Same preflight node, same reason as the uniformity check above:
+    # [hermit] rustc_version in both .buckconfig files must equal the
+    # rust-toolchain.toml channel, or the Buck toolchain stamp (shim/BUCK)
+    # names a compiler the tree does not build with and a shared action
+    # cache serves rlibs across rustc versions again (E0514). Findings on
+    # stderr for the same --print-pin reason as above. With --host when
+    # this checkout is linked to the shared action cache: a linked build
+    # UPLOADS under the stamped key, so the compiler that will actually
+    # run must be the pinned one, full -vV (release and commit hash)
+    # against `rustup run <channel>`. Portable images have no
+    # .buckconfig.local, so they keep the file-equality check only and
+    # their floating stable rustc stays legitimate.
+    rustc_version="$compile_dir/check-rustc-version"
+    RUSTUP_TOOLCHAIN=stable rustc --edition=2021 \
+        scripts/check-rustc-version.rs -o "$rustc_version"
+    if [[ -e .buckconfig.local ]]; then
+        "$rustc_version" --host >&2
+    else
+        "$rustc_version" >&2
+    fi
 fi
