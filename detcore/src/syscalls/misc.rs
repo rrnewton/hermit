@@ -982,6 +982,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                 un.domainname = from_str(DEFAULT_HOSTNAME.split('.').next_back().unwrap_or(""));
             }
 
+            // Experimental (provrepro): a witnessed build machine's name.
+            if let Some(name) = &guest.config().uname_nodename {
+                un.nodename = from_str(name);
+            }
+
             // The kernel procfs describes too (`procfs::fixed`).
             un.sysname = from_str(&kernel.sysname);
             un.release = from_str(&kernel.release);

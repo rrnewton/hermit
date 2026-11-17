@@ -1890,6 +1890,29 @@ pub struct Config {
     #[clap(long, value_name = "count", value_parser = parse_virtual_cpus)]
     pub virtual_cpus: Option<NonZeroU32>,
 
+    /// Experimental (post-facto reproduction, provrepro branch): the host
+    /// name the guest reads from `uname().nodename`, instead of
+    /// `hermetic-container.local`. A witnessed build machine's name, for
+    /// builds that bake `uname -a` or `hostname` into their output.
+    #[serde(default)]
+    #[clap(long, value_name = "name")]
+    pub uname_nodename: Option<String>,
+
+    /// Experimental (provrepro): the kernel release the guest reads from
+    /// `uname().release`, `/proc/sys/kernel/osrelease` and `/proc/version`,
+    /// instead of `5.2.0`. It must still pass glibc's ABI-tag check for the
+    /// libraries the guest loads.
+    #[serde(default)]
+    #[clap(long, value_name = "string")]
+    pub uname_release: Option<String>,
+
+    /// Experimental (provrepro): the kernel version string the guest reads
+    /// from `uname().version`, `/proc/sys/kernel/version` and
+    /// `/proc/version`, instead of `#1 SMP <epoch>`.
+    #[serde(default)]
+    #[clap(long, value_name = "string")]
+    pub uname_version: Option<String>,
+
     /// How much of `/proc` the guest sees. Every level is the same on every
     /// backend and host. `minimal` (the default) shows a small set, modelled
     /// on gVisor's; `standard` shows every system-wide name Detcore serves or
@@ -2977,6 +3000,15 @@ impl fmt::Display for Config {
         }
         if let Some(cpus) = self.virtual_cpus {
             write!(f, " --virtual-cpus={cpus}")?;
+        }
+        if let Some(name) = &self.uname_nodename {
+            write!(f, " --uname-nodename={name:?}")?;
+        }
+        if let Some(release) = &self.uname_release {
+            write!(f, " --uname-release={release:?}")?;
+        }
+        if let Some(version) = &self.uname_version {
+            write!(f, " --uname-version={version:?}")?;
         }
         match self.proc_level {
             ProcLevel::Minimal => {}
@@ -4453,7 +4485,7 @@ mod legacy_backend_json {
     /// `allow_unresolved_restart_codes` came after it too: only the ptrace
     /// backend on aarch64 asks Detcore about restart codes, so it is never
     /// written and reads as false.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 67] = [
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 70] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -4493,6 +4525,9 @@ mod legacy_backend_json {
         "in_guest_signal_delivery",
         "annotated_priority_replay",
         "virtual_cpus",
+        "uname_nodename",
+        "uname_release",
+        "uname_version",
         "notice_host_network_abstract_binds",
         "notice_autofs_eloop",
         "replay_edited_preemptions",
@@ -4721,6 +4756,9 @@ mod legacy_backend_json {
                     | "work_span_report"
                     | "signal_at"
                     | "virtual_cpus"
+                    | "uname_nodename"
+                    | "uname_release"
+                    | "uname_version"
                     | "chaos_timeslice_range"
                     | "chaos_timeslice"
                     | "access_trace"
@@ -5046,6 +5084,9 @@ mod legacy_backend_json {
                 | "in_guest_signal_delivery"
                 | "annotated_priority_replay"
                 | "virtual_cpus"
+                | "uname_nodename"
+                | "uname_release"
+                | "uname_version"
                 | "notice_host_network_abstract_binds"
                 | "notice_autofs_eloop"
                 | "replay_edited_preemptions"
@@ -6130,6 +6171,9 @@ mod tests {
                 | "in_guest_signal_delivery"
                 | "annotated_priority_replay"
                 | "virtual_cpus"
+                | "uname_nodename"
+                | "uname_release"
+                | "uname_version"
                 | "notice_host_network_abstract_binds"
                 | "notice_autofs_eloop"
                 | "replay_edited_preemptions"

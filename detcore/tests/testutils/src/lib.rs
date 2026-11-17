@@ -254,6 +254,9 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| {
         sysinfo_uptime_offset: 60,
         memory: 1024 * 1024 * 1024, //1 GiB
         virtual_cpus: None,
+        uname_nodename: None,
+        uname_release: None,
+        uname_version: None,
         proc_level: Default::default(),
         interrupt_at: vec![],
         happens_before: None,
@@ -411,6 +414,9 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| {
         sysinfo_uptime_offset: 60,
         memory: 1024 * 1024 * 1024, //1 GiB
         virtual_cpus: None,
+        uname_nodename: None,
+        uname_release: None,
+        uname_version: None,
         proc_level: Default::default(),
         interrupt_at: vec![],
         happens_before: None,
@@ -568,6 +574,9 @@ pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| {
         sysinfo_uptime_offset: 60,
         memory: 1024 * 1024 * 1024, //1 GiB
         virtual_cpus: None,
+        uname_nodename: None,
+        uname_release: None,
+        uname_version: None,
         proc_level: Default::default(),
         interrupt_at: vec![],
         happens_before: None,

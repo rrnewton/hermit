@@ -80,11 +80,17 @@ impl MachineDescription {
 
     /// The machine of a run with configuration `config`.
     pub fn of(config: &crate::config::Config) -> Self {
-        Self {
+        let mut machine = Self {
             memory: config.memory,
             cpus: config.virtual_cpu_count(),
             ..Self::new(config.epoch)
+        };
+        // Experimental (provrepro): a witnessed build machine's kernel.
+        if let Some(release) = &config.uname_release {
+            machine.kernel.release = release.clone();
         }
+        machine.kernel.version_override = config.uname_version.clone();
+        machine
     }
 }
 
@@ -104,6 +110,9 @@ pub struct Kernel {
     /// `kernel/random/boot_id`: one UUID for every run, version 4 in form;
     /// its first bytes spell `hermit` in hex.
     pub boot_id: String,
+    /// Experimental (provrepro): `--uname-version`, a witnessed kernel's
+    /// version string, used verbatim instead of the epoch-dated one.
+    pub version_override: Option<String>,
 }
 
 impl Default for Kernel {
@@ -114,6 +123,7 @@ impl Default for Kernel {
             built: DateTime::<Utc>::default(),
             boot_options: "quiet".to_owned(),
             boot_id: "6865726d-6974-4000-8000-000000000000".to_owned(),
+            version_override: None,
         }
     }
 }
@@ -124,6 +134,9 @@ impl Kernel {
     /// unavailable while a DynamoRIO application thread is executing a
     /// client callback.
     pub fn version(&self) -> String {
+        if let Some(version) = &self.version_override {
+            return version.clone();
+        }
         format!("#1 SMP {}", self.built.format("%a %b %d %T %Z %Y"))
     }
 
