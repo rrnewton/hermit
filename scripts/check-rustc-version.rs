@@ -95,8 +95,14 @@ fn parse_channel(text: &str) -> Option<String> {
     None
 }
 
-/// (release, commit-hash) from `rustc -vV` output.
-fn parse_verbose_version(text: &str) -> Option<(String, String)> {
+/// (release, commit-hash) from one `rustc -vV`.
+type VerboseVersion = (String, String);
+
+/// Outcome of probing the host and the pinned channel's compilers.
+type HostProbeResult = Result<(VerboseVersion, VerboseVersion), String>;
+
+/// Parse (release, commit-hash) out of `rustc -vV` output.
+fn parse_verbose_version(text: &str) -> Option<VerboseVersion> {
     let mut release = None;
     let mut hash = None;
     for line in text.lines() {
@@ -143,17 +149,15 @@ fn evaluate(
             _ => {}
         }
     }
-    if let (Some(eff), Some((_, base))) = (
+    if let (Some(eff), Some((_, Some(base)))) = (
         effective_pin,
         base_pins.iter().find(|(_, p)| p.is_some()),
     ) {
-        if let Some(base) = base {
-            if eff != base.as_str() {
+        if eff != base.as_str() {
                 errors.push(format!(
                     "effective pin {eff} (after .buckconfig.local) != checked-in pin {base}: \
                      this checkout stamps a pin the tree does not record"
                 ));
-            }
         }
     }
     if let (Some((h_rel, h_hash)), Some((e_rel, e_hash))) = (host, expected_host) {
@@ -167,7 +171,7 @@ fn evaluate(
     errors
 }
 
-fn verbose_of(cmd: &mut Command, what: &str) -> Result<(String, String), String> {
+fn verbose_of(cmd: &mut Command, what: &str) -> Result<VerboseVersion, String> {
     let out = cmd
         .output()
         .map_err(|e| format!("{what}: cannot run: {e}"))?;
@@ -204,7 +208,7 @@ fn run(root: &Path, check_host: bool) -> Result<String, Vec<String>> {
 fn run_io(
     root: &Path,
     check_host: bool,
-    host_probe: &dyn Fn(&str) -> Result<((String, String), (String, String)), String>,
+    host_probe: &dyn Fn(&str) -> HostProbeResult,
 ) -> Result<String, Vec<String>> {
     let mut errors = Vec::new();
     let channel = match std::fs::read_to_string(root.join("rust-toolchain.toml")) {
@@ -381,7 +385,7 @@ mod tests {
         dir
     }
 
-    fn no_host(_: &str) -> Result<((String, String), (String, String)), String> {
+    fn no_host(_: &str) -> HostProbeResult {
         Err("host probe must not run".to_owned())
     }
 
