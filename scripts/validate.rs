@@ -30480,7 +30480,7 @@ fn validation_run_state_path(
                 "nested validation did not inherit VALIDATE_RUN_STATE from its outer run"
                     .to_string()
             })?;
-        let run_root = run_state_base(root);
+        let run_root = validate_runtime::validation_state_root(root);
         if !path.starts_with(&run_root) {
             return Err(format!(
                 "nested validation inherited VALIDATE_RUN_STATE={} outside {}",
@@ -30503,19 +30503,7 @@ fn validation_run_state_path(
     {
         return Err(format!("validation profile is not path-safe: {profile:?}"));
     }
-    Ok(run_state_base(root).join(format!("run-{profile}-{pid}-{nonce}")))
-}
-
-/// Where a run keeps its state: target/validation, or ignored/validation for a
-/// Buck-only run (`--buck-s0`, runner buck-stock), whose checkout must hold no
-/// Cargo target directory. Decided from the runner environment, which the
-/// run-state scope re-exec and every node inherit.
-fn run_state_base(root: &Path) -> PathBuf {
-    if std::env::var(E2E_RUNNER_ENV).is_ok_and(|runner| runner == E2E_RUNNER_BUCK_STOCK) {
-        root.join("ignored/validation")
-    } else {
-        root.join("target/validation")
-    }
+    Ok(validate_runtime::validation_state_root(root).join(format!("run-{profile}-{pid}-{nonce}")))
 }
 
 fn run_state_path_bracket() -> Result<(), String> {
@@ -30615,7 +30603,7 @@ fn verified_run_state_scope_reexec(root: &Path, inherited: Option<&OsStr>) -> bo
         return false;
     };
     if std::env::var_os(RUN_STATE_SCOPE_REEXEC_ENV).as_deref() != Some(inherited.as_os_str())
-        || !inherited.starts_with(run_state_base(root))
+        || !inherited.starts_with(validate_runtime::validation_state_root(root))
         || !is_in_scope()
     {
         return false;
@@ -30895,7 +30883,7 @@ fn install_fixture_first_hop(root: &Path) -> Result<(), String> {
         }
         fixtures.push((name.clone(), host));
     }
-    let dir = run_state_base(root).join("podman-fixtures");
+    let dir = validate_runtime::validation_state_root(root).join("podman-fixtures");
     std::fs::create_dir_all(&dir)
         .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
     let conf = dir.join("containers.conf");

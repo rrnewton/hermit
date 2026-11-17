@@ -867,13 +867,28 @@ fn flock_unlock(fd: i32) {
 /// definition, so the writer, the refusal reader, and the log-path update
 /// cannot drift onto different files.
 fn invocation_holder_path(root: &Path) -> PathBuf {
-    root.join("target/validation")
-        .join("validate-invocation.holder")
+    validation_state_root(root).join("validate-invocation.holder")
 }
 
 fn invocation_holder_guard_path(root: &Path) -> PathBuf {
-    root.join("target/validation")
-        .join("validate-invocation-holder.lock")
+    validation_state_root(root).join("validate-invocation-holder.lock")
+}
+
+/// The directory that holds a checkout's validation state: the invocation lock
+/// and its holder record, every run's state directory and the podman fixture
+/// configuration. It is target/validation, except for a Buck-only run
+/// (`--buck-s0`, runner buck-stock), whose checkout must hold no Cargo target
+/// directory: ignored/validation. Decided from the runner environment, which
+/// the driver sets before it creates any of this state and which the run-state
+/// scope re-exec and every node inherit.
+pub(crate) fn validation_state_root(root: &Path) -> PathBuf {
+    if std::env::var(crate::E2E_RUNNER_ENV)
+        .is_ok_and(|runner| runner == crate::E2E_RUNNER_BUCK_STOCK)
+    {
+        root.join("ignored/validation")
+    } else {
+        root.join("target/validation")
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1059,7 +1074,7 @@ fn acquire_invocation_lock_with_hook(
     commit: &str,
     after_lock_acquired: impl FnOnce(),
 ) -> LockOutcome {
-    let dir = root.join("target/validation");
+    let dir = validation_state_root(root);
     if let Err(e) = std::fs::create_dir_all(&dir) {
         return LockOutcome::Unavailable(format!("cannot create {}: {e}", dir.display()));
     }
