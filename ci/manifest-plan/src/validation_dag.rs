@@ -2276,6 +2276,214 @@ pub fn buck_e2e_selection(committed: &DagConfig) -> Result<DagConfig, String> {
     Ok(selected)
 }
 
+/// The Buck-only subset `scripts/validate.rs --buck-s0` runs, relative to the
+/// checkout: lanes, backends and categories whose every input Buck builds.
+pub const BUCK_S0_SUBSET: &str = "ci/buck-e2e/subsets/s0.json";
+/// The label of every node of the `--buck-s0` selection.
+pub const BUCK_S0_LABEL: &str = "buck-s0";
+const BUCK_S0_SUFFIX: &str = "_s0";
+/// The staged Buck-built harness the `--buck-s0` import twins judge with,
+/// written by `ci/buck-e2e/stage --from-buck` (there is no target/debug).
+const BUCK_S0_HARNESS: &str = "ci/buck-e2e/staged/bin/test-harness run ";
+/// Where `pre.reverie_pin` compiles its two rustc checkers in a `--buck-s0`
+/// run: the run's state, not the checkout's target/ (ci/run-reverie-pin-check.sh
+/// compiles into ${CARGO_TARGET_DIR:-target}/ci; no cargo runs).
+const BUCK_S0_PIN_CHECK_ROOT: &str = "CARGO_TARGET_DIR=\"$VALIDATE_RUN_STATE/rustc-checkers\" ";
+
+/// A Buck-only E2E subset: the plan cells in every one of its lists.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct BuckSubset {
+    pub lanes: Vec<String>,
+    pub backends: Vec<String>,
+    pub categories: Vec<String>,
+}
+
+impl BuckSubset {
+    pub fn from_json(text: &str) -> Result<Self, String> {
+        #[derive(Deserialize)]
+        struct File {
+            lanes: Vec<String>,
+            backends: Vec<String>,
+            categories: Vec<String>,
+        }
+        let file: File =
+            serde_json::from_str(text).map_err(|error| format!("{BUCK_S0_SUBSET}: {error}"))?;
+        let subset = BuckSubset {
+            lanes: file.lanes,
+            backends: file.backends,
+            categories: file.categories,
+        };
+        if subset.lanes.is_empty() || subset.backends.is_empty() || subset.categories.is_empty() {
+            return Err(format!(
+                "{BUCK_S0_SUBSET}: lanes, backends and categories must each name at least one"
+            ));
+        }
+        Ok(subset)
+    }
+}
+
+/// Whether a node command runs cargo, a rust-script (which cargo compiles, or
+/// the ci/rust-script-bin wrapper reads from target/ci/rust-scripts) or a Cargo
+/// build product, which a `--buck-s0` plan must never do.
+fn runs_cargo(cmd: &str) -> bool {
+    cmd.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+        .any(|word| word == "cargo" || word == "rust-script")
+        || cmd
+            .split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')'))
+            .any(|word| word.ends_with(".rs"))
+        || cmd.contains("target/debug/")
+        || cmd.contains("target/release/")
+        || cmd.contains("target/validate/")
+}
+
+/// The plan of `scripts/validate.rs --buck-s0`: a Buck-only validation of one
+/// subset with ZERO cargo nodes, in a checkout that needs no Cargo target
+/// directory. It keeps the two preflight nodes (pre.submodules, and
+/// pre.reverie_pin with its rustc checkers compiled into the run's state), adds
+/// a stage and a cells node built from the committed e2e.buck_stage and
+/// e2e.buck_cells (ci/buck-e2e/validate-node under
+/// HERMIT_VALIDATE_E2E_RUNNER=buck-stock: ci/buck-e2e/stage --from-buck, then
+/// the public buck2's stock test runner over the subset's cells), and one
+/// import twin per (lane, category) of the subset, cloned from the committed
+/// `<bucket>_buck` twin with the staged Buck-built harness and the plan's other
+/// backends excluded, so each twin selects exactly the subset's cells of its
+/// bucket and writes that bucket's result files. Every other node is left out.
+///
+/// `plan_backends` is every backend of ci/expected-e2e-plan.json. Refuses a
+/// subset that names a backend outside them, a category or lane without a
+/// committed twin, and any selected node whose command still runs cargo.
+pub fn buck_s0_selection(
+    committed: &DagConfig,
+    subset: &BuckSubset,
+    plan_backends: &BTreeSet<String>,
+) -> Result<DagConfig, String> {
+    let find = |tag: &str| {
+        committed
+            .steps
+            .iter()
+            .find(|step| step.tag() == tag)
+            .cloned()
+            .ok_or_else(|| format!("the --buck-s0 selection needs committed node {tag}"))
+    };
+    let unknown = subset
+        .backends
+        .iter()
+        .filter(|backend| !plan_backends.contains(*backend))
+        .collect::<Vec<_>>();
+    if !unknown.is_empty() {
+        return Err(format!(
+            "{BUCK_S0_SUBSET} names backends {unknown:?} the plan does not hold"
+        ));
+    }
+    let excluded = plan_backends
+        .iter()
+        .filter(|backend| !subset.backends.contains(*backend))
+        .map(|backend| format!(" --exclude-backend {backend}"))
+        .collect::<String>();
+    let relabel = |step: &mut Step| {
+        step.labels = vec![BUCK_S0_LABEL.into()];
+        step.fail_fast_family = Some(step.tag());
+    };
+    let mut steps = Vec::new();
+
+    let mut submodules = find("pre.submodules")?;
+    relabel(&mut submodules);
+    steps.push(submodules);
+    let mut pin = find("pre.reverie_pin")?;
+    let pin_call = "hermit_run_pin_check ./ci/run-reverie-pin-check.sh";
+    if pin.cmd.matches(pin_call).count() != 1 {
+        return Err("pre.reverie_pin lost its one ci/run-reverie-pin-check.sh call".into());
+    }
+    pin.cmd = pin
+        .cmd
+        .replace(pin_call, &format!("{BUCK_S0_PIN_CHECK_ROOT}{pin_call}"));
+    relabel(&mut pin);
+    steps.push(pin);
+
+    let mut stage = find(BUCK_STAGE_TAG)?;
+    stage.job.push_str(BUCK_S0_SUFFIX);
+    stage.desc = "Stage the Buck-only subset's inputs with Buck (no cargo)".into();
+    stage.description = format!(
+        "Selected only by scripts/validate.rs --buck-s0. On the host it runs ci/buck-e2e/stage --from-buck (ci/buck-e2e/validate-node --stage-only under HERMIT_VALIDATE_E2E_RUNNER=buck-stock): //ci/buck-e2e:harness-bin built by the given buck2, `git archive HEAD`, the subset's fixtures built by that Buck-built harness, and the libunwind runtime closure the Buck-built hermit loads. No cargo runs and nothing is written to target/. It writes ci/buck-e2e/staged/ for HEAD, SOURCE_SHA last, and refuses a tree with uncommitted changes to tracked files. Subset: {BUCK_S0_SUBSET}."
+    );
+    stage.deps = vec!["pre.reverie_pin".into()];
+    relabel(&mut stage);
+    steps.push(stage.clone());
+
+    let mut cells = find(BUCK_CELLS_TAG)?;
+    cells.job.push_str(BUCK_S0_SUFFIX);
+    cells.desc = "Run the Buck-only subset's cells under the stock buck2 test runner".into();
+    cells.description = format!(
+        "Selected only by scripts/validate.rs --buck-s0. On the host (ci/buck-e2e/validate-node --cells-only under HERMIT_VALIDATE_E2E_RUNNER=buck-stock) it refuses with exit 2 unless {} staged the inputs for HEAD, runs no cargo (the third-party rules shim/third-party/rust/BUCK are the checkout's setup and must already exist), runs the subset's shell-test twins (//ci/buck-e2e:stock-local, every cell on this host, the Buck-built //hermit-cli:hermit-release) and ingests their artifacts into $VALIDATE_RUN_STATE/buck-e2e/results with ci/buck-e2e/ingest.py --local-listing. It judges nothing: the import twins own the verdicts. Subset: {BUCK_S0_SUBSET}.",
+        stage.tag()
+    );
+    cells.deps = vec![stage.tag()];
+    relabel(&mut cells);
+    steps.push(cells.clone());
+
+    for lane in &subset.lanes {
+        let group = match lane.as_str() {
+            "portable" => "e2e",
+            "privileged" => "privileged-e2e",
+            other => {
+                return Err(format!(
+                    "{BUCK_S0_SUBSET} names lane {other}, which has no E2E group"
+                ));
+            }
+        };
+        for category in &subset.categories {
+            let tag = format!(
+                "{group}.manifest_{}{BUCK_TWIN_SUFFIX}",
+                category.replace('-', "_")
+            );
+            let mut twin = find(&tag)?;
+            let launcher = format!("{BUCK_IMPORT_ASSIGNMENT}target/debug/test-harness run ");
+            if twin.cmd.matches(&launcher).count() != 1 {
+                return Err(format!(
+                    "{tag} lost its one import-mode test-harness launcher"
+                ));
+            }
+            twin.cmd = format!(
+                "{}{excluded}",
+                twin.cmd.replace(
+                    &launcher,
+                    &format!("{BUCK_IMPORT_ASSIGNMENT}{BUCK_S0_HARNESS}")
+                )
+            );
+            twin.job.push_str(BUCK_S0_SUFFIX);
+            twin.desc = format!("{} (Buck-only subset)", twin.desc);
+            twin.description = format!(
+                "The --buck-s0 import twin of {tag}: the same bucket's result files from the rows {} wrote, judged by the staged Buck-built test-harness, with the plan's backends outside the subset excluded ({}), so it owns exactly the subset's cells of the bucket.",
+                cells.tag(),
+                excluded.trim()
+            );
+            twin.deps = vec![cells.tag()];
+            relabel(&mut twin);
+            let owner = twin.tag();
+            for result in twin.result_manifests.iter_mut().flatten() {
+                if let ResultManifest::StructuredTestResults(result) = result {
+                    result.owner = owner.clone();
+                }
+            }
+            steps.push(twin);
+        }
+    }
+
+    let cargo = steps
+        .iter()
+        .filter(|step| runs_cargo(&step.cmd))
+        .map(Step::tag)
+        .collect::<Vec<_>>();
+    if !cargo.is_empty() {
+        return Err(format!(
+            "the --buck-s0 selection must run no cargo, but {cargo:?} would"
+        ));
+    }
+    let mut selected = committed.clone();
+    selected.steps = steps;
+    Ok(selected)
+}
+
 /// The cargo nodes a Buck full run replaces: every bucket and scorecard that
 /// has a `_buck` twin, and the producers only they consume.
 fn buck_replaced_tags(cfg: &DagConfig) -> Result<BTreeSet<String>, String> {
@@ -8320,6 +8528,85 @@ sys.exit(37)
         let mut subset = exact.clone();
         subset.remove("e2e.manifest_gvisor");
         assert!(check_buck_e2e_extension_dropped(&subset).is_err());
+    }
+
+    #[test]
+    fn buck_s0_selection_runs_no_cargo_and_judges_exactly_the_subset() {
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let subset = BuckSubset::from_json(include_str!("../../buck-e2e/subsets/s0.json")).unwrap();
+        let plan: serde_json::Value =
+            serde_json::from_str(include_str!("../../expected-e2e-plan.json")).unwrap();
+        let backends = plan["cells"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|cell| cell["backend"].as_str().unwrap().to_string())
+            .collect::<BTreeSet<_>>();
+        let selected = buck_s0_selection(&committed, &subset, &backends).unwrap();
+        let tags = selected.steps.iter().map(Step::tag).collect::<Vec<_>>();
+        let mut expected = vec![
+            "pre.submodules".to_string(),
+            "pre.reverie_pin".into(),
+            "e2e.buck_stage_s0".into(),
+            "e2e.buck_cells_s0".into(),
+        ];
+        for category in &subset.categories {
+            expected.push(format!(
+                "e2e.manifest_{}_buck_s0",
+                category.replace('-', "_")
+            ));
+        }
+        assert_eq!(tags, expected);
+        for step in &selected.steps {
+            assert!(
+                !runs_cargo(&step.cmd),
+                "{} runs cargo: {}",
+                step.tag(),
+                step.cmd
+            );
+            assert_eq!(step.labels, vec![BUCK_S0_LABEL.to_string()]);
+            for dep in &step.deps {
+                assert!(tags.contains(dep), "{} needs unselected {dep}", step.tag());
+            }
+        }
+        let excluded = backends
+            .iter()
+            .filter(|backend| !subset.backends.contains(*backend))
+            .collect::<Vec<_>>();
+        assert!(!excluded.is_empty());
+        for twin in selected
+            .steps
+            .iter()
+            .filter(|step| step.job.ends_with("_buck_s0"))
+        {
+            assert!(twin.cmd.contains(BUCK_S0_HARNESS), "{}", twin.cmd);
+            for backend in &excluded {
+                assert!(
+                    twin.cmd.contains(&format!("--exclude-backend {backend}")),
+                    "{} does not exclude {backend}",
+                    twin.tag()
+                );
+            }
+            assert_eq!(twin.deps, vec!["e2e.buck_cells_s0".to_string()]);
+        }
+        let pin = &selected.steps[1];
+        assert!(pin.cmd.contains(BUCK_S0_PIN_CHECK_ROOT), "{}", pin.cmd);
+        // A subset naming a backend the plan lacks is refused, never shrunk.
+        let mut typo = subset.clone();
+        typo.backends.push("ptrace2".into());
+        assert!(buck_s0_selection(&committed, &typo, &backends).is_err());
+        // The cargo check sees cargo however it is spelled in a command.
+        assert!(runs_cargo("export X=1; cargo build --locked"));
+        assert!(runs_cargo("target/debug/test-harness run"));
+        assert!(runs_cargo("x && ./scripts/check-no-v3.rs --all"));
+        assert!(runs_cargo("rust-script scripts/x"));
+        assert!(!runs_cargo(
+            "CARGO_TARGET_DIR=x ./ci/run-reverie-pin-check.sh"
+        ));
+        // Every node keeps the committed rust-script PATH prefix, which runs nothing.
+        assert!(!runs_cargo(
+            "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; ./ci/verify-submodules.sh"
+        ));
     }
 
     #[test]
