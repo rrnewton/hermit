@@ -2283,8 +2283,10 @@ pub const BUCK_S0_SUBSET: &str = "ci/buck-e2e/subsets/s0.json";
 pub const BUCK_S0_LABEL: &str = "buck-s0";
 const BUCK_S0_SUFFIX: &str = "_s0";
 /// The staged Buck-built harness the `--buck-s0` import twins judge with,
-/// written by `ci/buck-e2e/stage --from-buck` (there is no target/debug).
-const BUCK_S0_HARNESS: &str = "ci/buck-e2e/staged/bin/test-harness run ";
+/// written by `ci/buck-e2e/stage --from-buck` (there is no target/debug), over
+/// the staged source the cells ran: a Buck-built harness has no compiled-in
+/// checkout root, and the rows record the staged `git archive` of SOURCE_SHA.
+const BUCK_S0_HARNESS: &str = "ci/buck-e2e/staged/bin/test-harness run --repo-root \"$PWD/ci/buck-e2e/staged/src\" --source-sha \"$(cat ci/buck-e2e/staged/SOURCE_SHA)\" ";
 /// Where `pre.reverie_pin` compiles its two rustc checkers and keeps its
 /// Reverie graph cache in a `--buck-s0` run: ignored/validation/pin-check, not
 /// the checkout's target/ (ci/run-reverie-pin-check.sh and
