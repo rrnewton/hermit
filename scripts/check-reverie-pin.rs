@@ -721,19 +721,22 @@ fn classify_cache_path(cache: &Path) -> Result<CacheState, String> {
     ))
 }
 
-/// The target directory ci/run-reverie-pin-check.sh compiled the checkers in,
-/// as `main` read it from `CARGO_TARGET_DIR`. Unset in the unit tests, which
+/// The variable that moves the Reverie graph cache out of the checkout's
+/// `target/`. Only a Buck-only validation (scripts/validate.rs --buck-s0) sets
+/// it, because its checkout must hold no `target/`; every other caller keeps
+/// `target/ci/reverie-graph.git`, whatever its `CARGO_TARGET_DIR`.
+const GRAPH_CACHE_ROOT_ENV: &str = "HERMIT_REVERIE_GRAPH_CACHE_ROOT";
+
+/// [`GRAPH_CACHE_ROOT_ENV`] as `main` read it. Unset in the unit tests, which
 /// call the checks directly and so always see the checkout's `target/`,
 /// whatever environment runs them.
-static CHECKER_TARGET_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+static GRAPH_CACHE_ROOT: OnceLock<Option<PathBuf>> = OnceLock::new();
 
-/// The Reverie graph cache: `ci/reverie-graph.git` below the target directory
-/// ci/run-reverie-pin-check.sh compiles the checkers in, `CARGO_TARGET_DIR`
-/// (relative to the checkout when relative) or the checkout's `target/`. A
-/// Buck-only validation (scripts/validate.rs --buck-s0) names one outside the
-/// checkout's `target/`, which must not exist there.
+/// The Reverie graph cache: `ci/reverie-graph.git` below
+/// [`GRAPH_CACHE_ROOT_ENV`] (relative to the checkout when relative), or below
+/// the checkout's `target/`.
 fn reverie_graph_cache(root: &Path) -> Result<PathBuf, String> {
-    reverie_graph_cache_in(root, CHECKER_TARGET_DIR.get().cloned().flatten())
+    reverie_graph_cache_in(root, GRAPH_CACHE_ROOT.get().cloned().flatten())
 }
 
 fn reverie_graph_cache_in(root: &Path, target_dir: Option<PathBuf>) -> Result<PathBuf, String> {
@@ -741,7 +744,7 @@ fn reverie_graph_cache_in(root: &Path, target_dir: Option<PathBuf>) -> Result<Pa
         Some(dir) if dir.is_absolute() => {
             fs::create_dir_all(&dir).map_err(|error| {
                 format!(
-                    "could not create the Reverie graph cache's target directory {}: {error}",
+                    "could not create the Reverie graph cache's root {}: {error}",
                     dir.display()
                 )
             })?;
@@ -3156,9 +3159,9 @@ fn run() -> Result<i32, String> {
 
 fn main() {
     rust_script_prelude::init();
-    CHECKER_TARGET_DIR
-        .set(std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from))
-        .expect("main sets the checker target directory once");
+    GRAPH_CACHE_ROOT
+        .set(std::env::var_os(GRAPH_CACHE_ROOT_ENV).map(PathBuf::from))
+        .expect("main sets the graph cache root once");
     match run() {
         Ok(code) => std::process::exit(code),
         Err(error) => {
@@ -3580,7 +3583,7 @@ mod tests {
     }
 
     #[test]
-    fn the_reverie_graph_cache_follows_the_checkers_target_directory() {
+    fn the_reverie_graph_cache_follows_its_dedicated_root() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock before epoch")

@@ -221,10 +221,18 @@ if [[ $mode == buck ]]; then
         { echo "ci/buck-e2e/stage: cannot read the status of $root" >&2; exit 2; }
     [[ -z $dirty ]] ||
         { echo "ci/buck-e2e/stage: commit first; cells record SOURCE_SHA=$sha" >&2; exit 2; }
-    mapfile -t lanes < <(python3 "$here/subset.py" "$subset" "$root/ci/expected-e2e-plan.json" lanes)
-    mapfile -t categories < <(python3 "$here/subset.py" "$subset" "$root/ci/expected-e2e-plan.json" categories)
-    mapfile -t excluded < <(python3 "$here/subset.py" "$subset" "$root/ci/expected-e2e-plan.json" excluded-backends)
-    mapfile -t buck_flags < <(python3 "$here/subset.py" "$subset" "$root/ci/expected-e2e-plan.json" buck-config)
+    # Each list is read whole before it is used, so a refusing subset.py (it names why)
+    # stops the stage: `mapfile < <(...)` drops its status and goes on with what it printed.
+    subset_lines() { # $1: a subset.py action; $2: the array to fill (empty for no lines)
+        local out
+        out=$(python3 "$here/subset.py" "$subset" "$root/ci/expected-e2e-plan.json" "$1") || exit 2
+        if [[ -n $out ]]; then mapfile -t "$2" <<<"$out"; else mapfile -t "$2" </dev/null; fi
+    }
+    lanes=() categories=() excluded=() buck_flags=()
+    subset_lines lanes lanes
+    subset_lines categories categories
+    subset_lines excluded-backends excluded
+    subset_lines buck-config buck_flags
     tmp=$(mktemp -d)
     trap 'rm -rf "${tmp:?}"' EXIT
     env -C "$root" "$buck2" build -c hermit_release.unstamped=true "${buck_flags[@]}" \

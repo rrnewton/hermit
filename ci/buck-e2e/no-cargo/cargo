@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+#
+# The cargo of a Buck-only run: scripts/validate.rs --buck-s0 puts this directory first on
+# every node's PATH (validation_dag.rs BUCK_S0_NO_CARGO_PATH). It runs nothing, exits 97,
+# and appends the refused call to $VALIDATE_RUN_STATE/cargo-refused.log, which
+# gate.manifest_s0 refuses on, so a cargo call fails the run even where its caller
+# tolerates the failure.
+echo "cargo: refused: a Buck-only run (scripts/validate.rs --buck-s0) runs no cargo: cargo $*" >&2
+if [[ -n ${VALIDATE_RUN_STATE:-} ]]; then
+    printf '%s\tcargo %s\t(from %s)\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" \
+        "$(tr '\0' ' ' </proc/$PPID/cmdline 2>/dev/null | cut -c1-300)" \
+        >>"$VALIDATE_RUN_STATE/cargo-refused.log" || true
+fi
+exit 97

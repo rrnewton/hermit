@@ -2289,10 +2289,24 @@ const BUCK_S0_SUFFIX: &str = "_s0";
 const BUCK_S0_HARNESS: &str = "ci/buck-e2e/staged/bin/test-harness run --repo-root \"$PWD/ci/buck-e2e/staged/src\" --source-sha \"$(cat ci/buck-e2e/staged/SOURCE_SHA)\" ";
 /// Where `pre.reverie_pin` compiles its two rustc checkers and keeps its
 /// Reverie graph cache in a `--buck-s0` run: ignored/validation/pin-check, not
-/// the checkout's target/ (ci/run-reverie-pin-check.sh and
-/// scripts/check-reverie-pin.rs use ${CARGO_TARGET_DIR:-target}/ci; no cargo
-/// runs). Stable across runs, so the graph cache is fetched incrementally.
-const BUCK_S0_PIN_CHECK_ROOT: &str = "CARGO_TARGET_DIR=\"$PWD/ignored/validation/pin-check\" ";
+/// the checkout's target/. ci/run-reverie-pin-check.sh compiles in
+/// ${CARGO_TARGET_DIR:-target}/ci (rustc; no cargo runs), and
+/// scripts/check-reverie-pin.rs keeps the cache below
+/// HERMIT_REVERIE_GRAPH_CACHE_ROOT, which only this plan sets, so no other
+/// caller of CARGO_TARGET_DIR moves its cache. Stable across runs, so the graph
+/// cache is fetched incrementally.
+const BUCK_S0_PIN_CHECK_ROOT: &str = "CARGO_TARGET_DIR=\"$PWD/ignored/validation/pin-check\" HERMIT_REVERIE_GRAPH_CACHE_ROOT=\"$PWD/ignored/validation/pin-check\" ";
+/// Put first on every `--buck-s0` node's PATH: ci/buck-e2e/no-cargo/cargo runs
+/// nothing, exits 97 and appends the refused call to
+/// [`BUCK_S0_CARGO_REFUSED_LOG`], so a cargo call fails the run even where a
+/// caller tolerates its failure ([`runs_cargo`] only lints command strings).
+const BUCK_S0_NO_CARGO_PATH: &str = "export PATH=\"$PWD/ci/buck-e2e/no-cargo:$PATH\"; ";
+const BUCK_S0_CARGO_REFUSED_LOG: &str = "$VALIDATE_RUN_STATE/cargo-refused.log";
+/// The `--buck-s0` stand-in for gate.manifest, which runs the Cargo-built
+/// target/debug/test-harness validate.
+const BUCK_S0_GATE_JOB: &str = "manifest_s0";
+/// What the `--buck-s0` stage and cells nodes say about their bounds.
+const BUCK_S0_UNBOUNDED_DAEMON: &str = "The buck2 daemon, and every cell it runs, lives in the daemon's own systemd scope (buck2.slice), outside this node's cgroup, so this node's memory box and CPU budget do not cover them; only the node's wall bound and dagrun's reap of the node's processes when it ends do.";
 
 /// A Buck-only E2E subset: the plan cells in every one of its lists.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -2328,7 +2342,9 @@ impl BuckSubset {
 
 /// Whether a node command runs cargo, a rust-script (which cargo compiles, or
 /// the ci/rust-script-bin wrapper reads from target/ci/rust-scripts) or a Cargo
-/// build product, which a `--buck-s0` plan must never do.
+/// build product, which a `--buck-s0` plan must never do. A cheap lint on the
+/// command strings, which cannot see inside the scripts a command runs; the
+/// enforcement is [`BUCK_S0_NO_CARGO_PATH`].
 fn runs_cargo(cmd: &str) -> bool {
     cmd.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
         .any(|word| word == "cargo" || word == "rust-script")
@@ -2347,15 +2363,19 @@ fn runs_cargo(cmd: &str) -> bool {
 /// a stage and a cells node built from the committed e2e.buck_stage and
 /// e2e.buck_cells (ci/buck-e2e/validate-node under
 /// HERMIT_VALIDATE_E2E_RUNNER=buck-stock: ci/buck-e2e/stage --from-buck, then
-/// the public buck2's stock test runner over the subset's cells), and one
-/// import twin per (lane, category) of the subset, cloned from the committed
-/// `<bucket>_buck` twin with the staged Buck-built harness and the plan's other
-/// backends excluded, so each twin selects exactly the subset's cells of its
-/// bucket and writes that bucket's result files. Every other node is left out.
+/// the public buck2's stock test runner over the subset's cells);
+/// gate.manifest_s0, which refuses if any node ran cargo and runs the staged
+/// Buck-built harness's inventory check (sync-cells --check) in place of
+/// gate.manifest; and one import twin per (lane, category) of the subset,
+/// cloned from the committed `<bucket>_buck` twin with the staged Buck-built
+/// harness and the plan's other backends excluded, so each twin selects exactly
+/// the subset's cells of its bucket and writes that bucket's result files.
+/// Every other node is left out. Every node runs with the refusing cargo shim
+/// first on its PATH ([`BUCK_S0_NO_CARGO_PATH`]).
 ///
 /// `plan_backends` is every backend of ci/expected-e2e-plan.json. Refuses a
 /// subset that names a backend outside them, a category or lane without a
-/// committed twin, and any selected node whose command still runs cargo.
+/// committed twin, and any selected node whose command string runs cargo.
 pub fn buck_s0_selection(
     committed: &DagConfig,
     subset: &BuckSubset,
@@ -2408,7 +2428,7 @@ pub fn buck_s0_selection(
     stage.job.push_str(BUCK_S0_SUFFIX);
     stage.desc = "Stage the Buck-only subset's inputs with Buck (no cargo)".into();
     stage.description = format!(
-        "Selected only by scripts/validate.rs --buck-s0. On the host it runs ci/buck-e2e/stage --from-buck (ci/buck-e2e/validate-node --stage-only under HERMIT_VALIDATE_E2E_RUNNER=buck-stock): //ci/buck-e2e:harness-bin built by the given buck2, `git archive HEAD`, the subset's fixtures built by that Buck-built harness, and the libunwind runtime closure the Buck-built hermit loads. No cargo runs and nothing is written to target/. It writes ci/buck-e2e/staged/ for HEAD, SOURCE_SHA last, and refuses a tree with uncommitted changes to tracked files. It runs beside the preflight nodes, which change nothing it reads; the cells wait for both. Subset: {BUCK_S0_SUBSET}."
+        "Selected only by scripts/validate.rs --buck-s0. On the host it runs ci/buck-e2e/stage --from-buck (ci/buck-e2e/validate-node --stage-only under HERMIT_VALIDATE_E2E_RUNNER=buck-stock): //ci/buck-e2e:harness-bin built by the given buck2, `git archive HEAD`, the subset's fixtures built by that Buck-built harness, and the libunwind runtime closure the Buck-built hermit loads. No cargo runs and nothing is written to target/. It writes ci/buck-e2e/staged/ for HEAD, SOURCE_SHA last, and refuses a tree with uncommitted changes to tracked files. It runs beside the preflight nodes, which change nothing it reads; the cells wait for both. {BUCK_S0_UNBOUNDED_DAEMON} Subset: {BUCK_S0_SUBSET}."
     );
     // Beside the preflight, not after it: pre.submodules and pre.reverie_pin
     // only read the checkout (the pin check skips the staged copy this writes),
@@ -2425,12 +2445,35 @@ pub fn buck_s0_selection(
     cells.job.push_str(BUCK_S0_SUFFIX);
     cells.desc = "Run the Buck-only subset's cells under the stock buck2 test runner".into();
     cells.description = format!(
-        "Selected only by scripts/validate.rs --buck-s0. It waits for the preflight (pre.reverie_pin, after pre.submodules) and the stage. On the host (ci/buck-e2e/validate-node --cells-only under HERMIT_VALIDATE_E2E_RUNNER=buck-stock) it refuses with exit 2 unless {} staged the inputs for HEAD, runs no cargo (the third-party rules shim/third-party/rust/BUCK are the checkout's setup and must already exist), runs the subset's shell-test twins (//ci/buck-e2e:stock-local, every cell on this host, the Buck-built //hermit-cli:hermit-release) and ingests their artifacts into $VALIDATE_RUN_STATE/buck-e2e/results with ci/buck-e2e/ingest.py --local-listing. It judges nothing: the import twins own the verdicts. Subset: {BUCK_S0_SUBSET}.",
+        "Selected only by scripts/validate.rs --buck-s0. It waits for the preflight (pre.reverie_pin, after pre.submodules) and the stage. On the host (ci/buck-e2e/validate-node --cells-only under HERMIT_VALIDATE_E2E_RUNNER=buck-stock) it refuses with exit 2 unless {} staged the inputs for HEAD, runs no cargo (the third-party rules shim/third-party/rust/BUCK are the checkout's setup, generated once by bootstrap/regenerate-rust-deps for this checkout's inputs, and refused on a stamp mismatch), runs the subset's shell-test twins (//ci/buck-e2e:stock-local, every cell on this host, the Buck-built //hermit-cli:hermit-release) and ingests their artifacts into $VALIDATE_RUN_STATE/buck-e2e/results with ci/buck-e2e/ingest.py --local-listing, which refuses unless the cells Buck ran are exactly the subset plan's. {BUCK_S0_UNBOUNDED_DAEMON} It judges nothing: the import twins own the verdicts. Subset: {BUCK_S0_SUBSET}.",
         stage.tag()
     );
     cells.deps = vec![stage.tag(), "pre.reverie_pin".into()];
     relabel(&mut cells);
     steps.push(cells.clone());
+
+    // gate.manifest runs the Cargo-built target/debug/test-harness validate.
+    // Its inventory check, the expected plan and the optional cells against the
+    // manifests, runs here with the staged Buck-built harness; its other
+    // audits (DAG correspondence, budget ordering, determinism-stress evidence,
+    // CLI brackets, and the generated footprints, a Cargo-built
+    // target/debug/generate-test-footprints) do not run in this mode.
+    let mut gate = find("gate.manifest")?;
+    gate.job = BUCK_S0_GATE_JOB.into();
+    gate.cmd = format!(
+        "if [ -e \"{BUCK_S0_CARGO_REFUSED_LOG}\" ]; then echo \"gate.manifest_s0: the no-cargo shim refused these calls from --buck-s0 nodes:\" >&2; cat \"{BUCK_S0_CARGO_REFUSED_LOG}\" >&2; exit 1; fi; ci/buck-e2e/staged/bin/test-harness sync-cells --check --repo-root \"$PWD/ci/buck-e2e/staged/src\""
+    );
+    gate.desc =
+        "Buck-only gate: no node ran cargo, and the staged harness's inventory check".into();
+    gate.description = format!(
+        "Selected only by scripts/validate.rs --buck-s0, in place of gate.manifest (the Cargo-built target/debug/test-harness validate). After {}, which runs after every other node before it: it refuses if any --buck-s0 node ran cargo ({BUCK_S0_CARGO_REFUSED_LOG}, which ci/buck-e2e/no-cargo/cargo appends to), then runs the staged Buck-built harness's ci/buck-e2e/staged/bin/test-harness sync-cells --check over the staged source, so manifests that drifted from ci/expected-e2e-plan.json or ci/optional-e2e-cells.txt fail the run as gate.manifest would (every harness command, the twins' included, also runs the front-door manifest schema and inventory authority). gate.manifest's other audits do not run in this mode: DAG correspondence, budget ordering, determinism-stress evidence, CLI brackets, and the generated test footprints (a Cargo-built target/debug/generate-test-footprints).",
+        cells.tag()
+    );
+    gate.deps = vec![cells.tag()];
+    gate.env.clear();
+    relabel(&mut gate);
+    let gate_tag = gate.tag();
+    steps.push(gate);
 
     for lane in &subset.lanes {
         let group = match lane.as_str() {
@@ -2468,7 +2511,7 @@ pub fn buck_s0_selection(
                 cells.tag(),
                 excluded.trim()
             );
-            twin.deps = vec![cells.tag()];
+            twin.deps = vec![cells.tag(), gate_tag.clone()];
             relabel(&mut twin);
             let owner = twin.tag();
             for result in twin.result_manifests.iter_mut().flatten() {
@@ -2489,6 +2532,9 @@ pub fn buck_s0_selection(
         return Err(format!(
             "the --buck-s0 selection must run no cargo, but {cargo:?} would"
         ));
+    }
+    for step in &mut steps {
+        step.cmd = format!("{BUCK_S0_NO_CARGO_PATH}{}", step.cmd);
     }
     let mut selected = committed.clone();
     selected.steps = steps;
@@ -8560,6 +8606,7 @@ sys.exit(37)
             "pre.reverie_pin".into(),
             "e2e.buck_stage_s0".into(),
             "e2e.buck_cells_s0".into(),
+            "gate.manifest_s0".into(),
         ];
         for category in &subset.categories {
             expected.push(format!(
@@ -8576,6 +8623,13 @@ sys.exit(37)
                 step.cmd
             );
             assert_eq!(step.labels, vec![BUCK_S0_LABEL.to_string()]);
+            // The refusing cargo shim is first on every node's PATH.
+            assert!(
+                step.cmd.starts_with(BUCK_S0_NO_CARGO_PATH),
+                "{}: {}",
+                step.tag(),
+                step.cmd
+            );
             for dep in &step.deps {
                 assert!(tags.contains(dep), "{} needs unselected {dep}", step.tag());
             }
@@ -8598,10 +8652,19 @@ sys.exit(37)
                     twin.tag()
                 );
             }
-            assert_eq!(twin.deps, vec!["e2e.buck_cells_s0".to_string()]);
+            assert_eq!(
+                twin.deps,
+                vec!["e2e.buck_cells_s0".to_string(), "gate.manifest_s0".into()],
+                "{}: its verdict waits on the cells and the gate",
+                twin.tag()
+            );
         }
         let pin = &selected.steps[1];
         assert!(pin.cmd.contains(BUCK_S0_PIN_CHECK_ROOT), "{}", pin.cmd);
+        assert!(
+            BUCK_S0_PIN_CHECK_ROOT.contains("HERMIT_REVERIE_GRAPH_CACHE_ROOT="),
+            "the graph cache follows its own variable, not CARGO_TARGET_DIR"
+        );
         // The stage runs beside the preflight; the cells wait for both, so no
         // cell runs on a checkout whose submodules or Reverie pin are refused.
         assert_eq!(pin.deps, vec!["pre.submodules".to_string()]);
@@ -8610,6 +8673,33 @@ sys.exit(37)
         assert_eq!(
             cells.deps,
             vec!["e2e.buck_stage_s0".to_string(), "pre.reverie_pin".into()]
+        );
+        // Both say that their budgets do not cover the buck2 daemon's scope.
+        for step in [stage, cells] {
+            assert!(
+                step.description.contains(BUCK_S0_UNBOUNDED_DAEMON),
+                "{}",
+                step.tag()
+            );
+        }
+        // The gate runs after the cells, with the staged harness, and refuses
+        // on any refused cargo call, which the shim records where it reads.
+        let gate = &selected.steps[4];
+        assert_eq!(gate.deps, vec!["e2e.buck_cells_s0".to_string()]);
+        for needle in [
+            "ci/buck-e2e/staged/bin/test-harness sync-cells --check",
+            BUCK_S0_CARGO_REFUSED_LOG,
+        ] {
+            assert!(
+                gate.cmd.contains(needle),
+                "gate lost {needle}: {}",
+                gate.cmd
+            );
+        }
+        assert!(
+            include_str!("../../buck-e2e/no-cargo/cargo")
+                .contains("$VALIDATE_RUN_STATE/cargo-refused.log"),
+            "the shim writes the log gate.manifest_s0 reads"
         );
         // A subset naming a backend the plan lacks is refused, never shrunk.
         let mut typo = subset.clone();
@@ -8622,6 +8712,10 @@ sys.exit(37)
         assert!(runs_cargo("rust-script scripts/x"));
         assert!(!runs_cargo(
             "CARGO_TARGET_DIR=x ./ci/run-reverie-pin-check.sh"
+        ));
+        // A command naming the shim's directory or its log runs no cargo.
+        assert!(!runs_cargo(
+            "export PATH=\"$PWD/ci/buck-e2e/no-cargo:$PATH\"; cat \"$VALIDATE_RUN_STATE/cargo-refused.log\""
         ));
         // Every node keeps the committed rust-script PATH prefix, which runs nothing.
         assert!(!runs_cargo(

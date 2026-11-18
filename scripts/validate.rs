@@ -38378,6 +38378,15 @@ mod scorecard_cutover_tests {
     }
 
     #[test]
+    fn the_invocation_lock_is_one_lock_across_runners() {
+        // A Buck-only run and a run of any other runner refuse each other, a
+        // Buck-only claim creates no target/, and the other runner still holds
+        // the target/validation lock the writeback below checks for.
+        let sandbox = tempfile::tempdir().unwrap();
+        assert_eq!(validate_runtime::runner_lock_self_test(sandbox.path()), Ok(3));
+    }
+
+    #[test]
     fn versioned_parent_delegation_preserves_old_callers_and_the_held_local_lock() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();

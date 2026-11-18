@@ -31,7 +31,9 @@
 # --stage-only stages with ci/buck-e2e/stage --from-buck; --cells-only does not
 # regenerate the third-party rules (Reindeer runs cargo metadata, so generating
 # shim/third-party/rust/BUCK is the slot's setup, done once with
-# bootstrap/regenerate-rust-deps, and this refuses without it), runs the subset's
+# bootstrap/regenerate-rust-deps, and this refuses without it, or when the stamp that
+# script writes, shim/third-party/rust/BUCK.inputs, does not match this checkout's
+# inputs: bootstrap/rust-deps-stamp.py check), runs the subset's
 # shell-test twins (//ci/buck-e2e:stock-local, -c hermit_e2e.stock_runner=true, every cell
 # on this host) and ingests their artifacts with ci/buck-e2e/ingest.py --local-listing.
 #   HERMIT_VALIDATE_BUCK2       the absolute path of the internal buck2 (a DotSlash file),
@@ -317,7 +319,13 @@ if [[ $mode == stock ]]; then
         echo "validate-node: buck-stock runs no cargo, so it does not generate the third-party rules; shim/third-party/rust/BUCK is missing: generate it once in this checkout with bootstrap/regenerate-rust-deps (slot setup)" >&2
         exit 2
     fi
-    step "using the third-party rules already generated in this checkout (sha256 $(sha256sum shim/third-party/rust/BUCK | cut -c1-16))"
+    # Generated for this checkout's inputs, or refused: rules generated for another
+    # Cargo.lock would build another commit's crates under this commit's SOURCE_SHA.
+    if ! python3 ./bootstrap/rust-deps-stamp.py check "$root"; then
+        echo "validate-node: shim/third-party/rust/BUCK was not generated from this checkout's inputs (above): regenerate it once with bootstrap/regenerate-rust-deps (slot setup)" >&2
+        exit 2
+    fi
+    step "using the third-party rules already generated in this checkout for its inputs (sha256 $(sha256sum shim/third-party/rust/BUCK | cut -c1-16))"
 else
     step "regenerating the Buck third-party rules"
     "${proxy[@]}" ./bootstrap/regenerate-rust-deps
@@ -360,8 +368,15 @@ if [[ $mode == stock ]]; then
     stock_root=$state/stock-execution
     rm -rf -- "${stock_root:?}"
     mkdir -p "$stock_root"
+    # Read whole, so a refusing subset.py stops the node under set -e (a process
+    # substitution would drop its status). ingest.py below refuses unless the cells Buck ran
+    # are exactly the subset plan's, none missing and none more, so the -c flags that define
+    # the subset in Buck (ci/buck-e2e/subset.bzl) and subset.py cannot silently disagree.
     python3 ./ci/buck-e2e/subset.py "$subset" ci/expected-e2e-plan.json plan "$state/subset-plan.json" >/dev/null
-    mapfile -t subset_flags < <(python3 ./ci/buck-e2e/subset.py "$subset" ci/expected-e2e-plan.json buck-config)
+    subset_counts=$(python3 ./ci/buck-e2e/subset.py "$subset" ci/expected-e2e-plan.json counts)
+    subset_config=$(python3 ./ci/buck-e2e/subset.py "$subset" ci/expected-e2e-plan.json buck-config)
+    mapfile -t subset_flags <<<"$subset_config"
+    step "subset $subset_counts"
     step "running the $(basename "$subset") cells under the stock buck2 test runner, HERMIT_EPOCH=$epoch"
     date +%s >"$state/work/stock.times"
     stock_status=0
