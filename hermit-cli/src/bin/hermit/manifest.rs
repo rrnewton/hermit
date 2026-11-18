@@ -130,6 +130,7 @@ const RUN_OUTPUTS: &[&str] = &[
     "record-networking",
     "fatal-core-dir",
     "preemption-stacktrace-log-file",
+    "choice-record",
     "record-preemptions-to",
     "summary-json",
     "verify-json",
