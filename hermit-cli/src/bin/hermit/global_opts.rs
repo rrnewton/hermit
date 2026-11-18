@@ -216,6 +216,9 @@ impl GlobalOpts {
                 .with_context(|| {
                     format!("cannot open --log-file {} for writing", path.display())
                 })?;
+            // Host-fork timelines (PROTOTYPE): each copy of the run logs to a
+            // file of its own, and the template keeps this one.
+            detcore::timelines::register_output(std::os::fd::AsRawFd::as_raw_fd(&file), "log");
             self.log_file_handle = Some(Arc::new(file));
         }
         if let Some(path) = &self.log_ring_file {

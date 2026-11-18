@@ -2901,6 +2901,9 @@ pub struct Scheduler {
     /// `Config::signal_at`: the turn after whose commit the run's root
     /// process is sent the signal, until it is sent.
     signal_at: Option<detcore_model::config::SignalAt>,
+    /// `HERMIT_TIMELINE_FORK_AT` (`crate::timelines`): the turn after whose
+    /// commit the run forks copies of itself, until it has (PROTOTYPE).
+    timeline_fork_at: Option<crate::timelines::ForkSpec>,
     /// The post-crash timeslice switch (`crate::post_crash`).
     post_crash: crate::post_crash::PostCrashState,
     /// The number of the last `COMMIT turn`, set where `unblock_guest`
@@ -6274,6 +6277,7 @@ impl Scheduler {
             stacktrace_at_schedule_positions: cfg.stacktrace_at_schedule_positions,
             stop_after_turn: cfg.stop_after_turn,
             signal_at: cfg.signal_at,
+            timeline_fork_at: crate::timelines::spec_from_env(),
             post_crash: crate::post_crash::PostCrashState::new(
                 cfg.post_crash_timeslice_in_effect(),
                 // A preemption replay of a record its own run wrote with the
@@ -11852,6 +11856,22 @@ impl Scheduler {
         }
     }
 
+    /// `HERMIT_TIMELINE_FORK_AT` (`crate::timelines`): once a turn numbered N
+    /// or later has been committed, fork the copies of the run it asks for.
+    /// It runs where `send_signal_at` runs, so the copies start at the same
+    /// point of every run.
+    fn fork_timelines_at(&mut self) {
+        let Some(at) = self.timeline_fork_at.as_ref().map(|spec| spec.turn) else {
+            return;
+        };
+        let Some(committed) = self.last_committed_turn.filter(|turn| *turn >= at) else {
+            return;
+        };
+        if let Some(spec) = self.timeline_fork_at.take() {
+            crate::timelines::fork_copies(&spec, committed);
+        }
+    }
+
     /// Step: Before we select which thread to run, first we check if some internal data
     /// structure maintenance is necessary, i.e. moving timed events from the waiting pool
     /// to the run queue. It manipulates scheduler data structures accordingly.
@@ -11947,6 +11967,8 @@ impl Scheduler {
         // way into a background call under a temporary mask has installed
         // it, so host timing cannot choose which thread takes the signal.
         self.send_signal_at();
+        // At the same point, where every thread is parked: copies of the run.
+        self.fork_timelines_at();
         // After every barrier too: a wait under a temporary mask that the
         // backend's own calls serve ends when its reported state shows a
         // signal that ends it (SIGSHARE S2b, `backend_signal_waits`).

@@ -106,6 +106,7 @@ mod sigalrm_phase1;
 mod signal_announcement_tests;
 pub mod signal_restart;
 mod signal_state;
+pub mod timelines;
 pub mod skid_overshoots;
 pub mod slice_boundary;
 mod sock_diag;

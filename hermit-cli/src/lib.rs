@@ -3609,6 +3609,12 @@ async fn run_kvm(
             .map_err(|error| anyhow!("failed to configure KVM metadata timestamps: {error}"))?;
     }
 
+    // Host-fork timelines (PROTOTYPE): what a copy of this run repairs.
+    detcore::timelines::install_backend_hooks(detcore::timelines::BackendHooks {
+        name: "kvm",
+        prepare: || reverie_kvm::host_fork::prepare().map(|report| format!("{report:?}")),
+        repair: || reverie_kvm::host_fork::repair_in_child().map(|report| format!("{report:?}")),
+    });
     let execution_started = Instant::now();
     let completion = hermit_run_kvm::run_detcore(&mut backend, config, capture_output)
         .await
@@ -3621,6 +3627,16 @@ async fn run_kvm(
     drop(backend);
     let teardown_finished = Instant::now();
     let (status, stdout, stderr) = result?;
+    if detcore::timelines::timeline_index().is_some() {
+        if !capture_output {
+            std::io::stdout().write_all(&stdout)?;
+            std::io::stderr().write_all(&stderr)?;
+        }
+        let code = status
+            .code()
+            .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
+        detcore::timelines::exit_timeline(code);
+    }
 
     // Every field below is a host wall-clock duration. Keep this diagnostic at
     // DEBUG so it remains available for backend profiling without entering the
