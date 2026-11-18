@@ -917,10 +917,9 @@ fn main_application<A: backend_hook::BackendAdapter>(adapter: A, selected_by_exe
     // and a container child must not gain a thread that outlives its entry
     // point (`hermit::launch_on_calling_thread`).
     hermit::launch_on_calling_thread();
-    // PROTOTYPE (fuzzpoc M2): with HERMIT_FORK_SERVER set, serve runs by
-    // forking here, before any per-process initialization below; only a
-    // forked child returns, and continues as an ordinary invocation.
-    fork_server::maybe_serve();
+    // PROTOTYPE (fuzzpoc): take HERMIT_FORK_SERVER out of the environment
+    // while single-threaded; `hermit run` serves runs after its setup.
+    fork_server::capture();
     if let Some(status) = cli_owned_lifecycle::maybe_run() {
         std::process::exit(status);
     }

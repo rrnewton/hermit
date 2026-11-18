@@ -25,6 +25,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicI32;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use anyhow::anyhow;
@@ -4975,27 +4976,54 @@ pub(super) fn stall_container_init_before_arming_if_asked() {
 }
 
 /// A pidfd for this hermit process, opened in `main` before anything can fork,
-/// with the device and inode it had then. Every container init this process
-/// forks inherits the descriptor (it is closed only at exec), so the init can
-/// tell whether the process that forked it is still alive: a pidfd becomes
-/// readable once its process has exited. `None` when the kernel has no
-/// `pidfd_open` (before Linux 5.3); the death signal is then all there is.
-static PARENT_PIDFD: OnceLock<Option<(OwnedFd, u64, u64)>> = OnceLock::new();
+/// with the device and inode it had then ([`PARENT_PIDFD_DEV`],
+/// [`PARENT_PIDFD_INO`]). Every container init this process forks inherits the
+/// descriptor (it is closed only at exec), so the init can tell whether the
+/// process that forked it is still alive: a pidfd becomes readable once its
+/// process has exited. -1 when the kernel has no `pidfd_open` (before Linux
+/// 5.3); the death signal is then all there is. Atomics rather than a
+/// `OnceLock`, so that a run the fork server forks can renew it for itself
+/// ([`reopen_parent_pidfd_after_fork`]); the init reads them
+/// async-signal-safely.
+static PARENT_PIDFD: AtomicI32 = AtomicI32::new(-1);
+static PARENT_PIDFD_DEV: AtomicU64 = AtomicU64::new(0);
+static PARENT_PIDFD_INO: AtomicU64 = AtomicU64::new(0);
 
 /// Open [`PARENT_PIDFD`]. Called from `main` before anything can fork.
 pub(super) fn open_parent_pidfd_for_container_inits() {
-    PARENT_PIDFD.get_or_init(|| {
-        // SAFETY: `pidfd_open` takes a pid and flags and touches no caller
-        // memory. The descriptor it returns is close-on-exec.
-        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) };
-        if fd < 0 {
-            return None;
-        }
+    if PARENT_PIDFD.load(Ordering::Acquire) < 0 {
+        store_parent_pidfd();
+    }
+}
+
+/// PROTOTYPE (fork server): a run forked from the fork server is the process
+/// its container inits must watch, not the server, so it replaces the pidfd it
+/// inherited with one for itself. Called in the forked child, single-threaded,
+/// before the run forks anything.
+pub(super) fn reopen_parent_pidfd_after_fork() {
+    let inherited = PARENT_PIDFD.swap(-1, Ordering::AcqRel);
+    if inherited >= 0 {
+        // SAFETY: the static owned `inherited`; nothing else refers to it.
+        unsafe { libc::close(inherited) };
+    }
+    store_parent_pidfd();
+}
+
+fn store_parent_pidfd() {
+    // SAFETY: `pidfd_open` takes a pid and flags and touches no caller
+    // memory. The descriptor it returns is close-on-exec.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) } as libc::c_int;
+    if fd < 0 {
+        return;
+    }
+    let Some((dev, ino)) = fd_identity(fd) else {
         // SAFETY: `fd` was just returned by `pidfd_open` and nothing else owns it.
-        let fd = unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) };
-        let (dev, ino) = fd_identity(fd.as_raw_fd())?;
-        Some((fd, dev, ino))
-    });
+        unsafe { libc::close(fd) };
+        return;
+    };
+    PARENT_PIDFD_DEV.store(dev, Ordering::Relaxed);
+    PARENT_PIDFD_INO.store(ino, Ordering::Relaxed);
+    PARENT_PIDFD.store(fd, Ordering::Release);
 }
 
 /// The device and inode of `fd`, by `fstat`, which is async-signal-safe.
@@ -5008,9 +5036,15 @@ fn fd_identity(fd: libc::c_int) -> Option<(u64, u64)> {
 
 /// The inherited [`PARENT_PIDFD`], if this process still holds that very file.
 fn inherited_parent_pidfd() -> Option<libc::c_int> {
-    let (fd, dev, ino) = PARENT_PIDFD.get()?.as_ref()?;
-    let fd = fd.as_raw_fd();
-    (fd_identity(fd) == Some((*dev, *ino))).then_some(fd)
+    let fd = PARENT_PIDFD.load(Ordering::Acquire);
+    if fd < 0 {
+        return None;
+    }
+    let identity = (
+        PARENT_PIDFD_DEV.load(Ordering::Relaxed),
+        PARENT_PIDFD_INO.load(Ordering::Relaxed),
+    );
+    (fd_identity(fd) == Some(identity)).then_some(fd)
 }
 
 /// Wait up to `timeout` for the process that forked this one to exit, and say

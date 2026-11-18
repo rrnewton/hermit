@@ -356,6 +356,19 @@ pub fn init_shared_stderr_deadline_origin() {
     });
 }
 
+/// PROTOTYPE (fork server): forget the invocation's stderr origin, so the
+/// next run the fork server forks measures its deadline from its own first
+/// blocked write, as a fresh `hermit run` would. Each forked run is its own
+/// invocation that happens to share the server's mapping. Sound only while no
+/// other process of a previous run can still write: the server forks one run
+/// at a time and reaps it (with its process group) before forking the next.
+#[doc(hidden)]
+pub fn reset_shared_stderr_deadline_origin() {
+    if let Some(cell) = shared_origin_cell() {
+        cell.store(0, Ordering::Release);
+    }
+}
+
 fn shared_origin_cell() -> Option<&'static AtomicU64> {
     match STDERR_ORIGIN_ADDR.get() {
         None | Some(0) => None,

@@ -9,16 +9,24 @@
 //! PROTOTYPE (fuzzpoc lane, M2): a fork server inside Hermit, so that one
 //! launch serves many runs.
 //!
-//! With `HERMIT_FORK_SERVER=<socket path>` in its environment, `hermit` does
-//! not start a run. It listens on that Unix socket. For each request it forks;
-//! the child takes the request's stdin, stdout and stderr files and continues
-//! as an ordinary invocation of the same command line, so every run is a fresh
-//! run of that command, initialized exactly as a new process would be. The
-//! parent waits for the child and reports its status. The variable is removed
-//! before anything else reads the environment, so a run sees the environment a
-//! plain invocation sees. Per-run inputs are files the command line already
-//! names (a `--choice-tape`, the stdin file), rewritten by the client between
-//! requests.
+//! With `HERMIT_FORK_SERVER=<socket path>` in its environment, `hermit run`
+//! does its whole setup once (argument handling and validation, CPU-profile
+//! admission, PMU configuration and validation, program and output checks),
+//! then, where it would start the run's container, listens on that Unix socket
+//! instead. For each request it forks; the child takes the request's stdin,
+//! stdout and stderr files, renews the per-process handles a run owns (the
+//! pidfd its container inits watch, the stderr deadline origin), and continues
+//! into the run, so each run pays only for its container and guest. The parent
+//! waits for the child and reports its status. The variable is removed at
+//! entry, before anything else reads the environment ([`capture`]), so a run
+//! sees the environment a plain invocation sees. Per-run inputs are files the
+//! command line already names (a `--choice-tape`, the stdin file), rewritten by
+//! the client between requests; everything else is fixed when the server
+//! starts.
+//!
+//! Only an ordinary ptrace run is served; `hermit run` refuses the other modes
+//! and any per-invocation output that cannot describe many runs (see
+//! [`refuse_unserved`]).
 //!
 //! The server is launched once under `bin/safehermit`, whose deadline and
 //! byte cap bound the whole process tree; an execution then costs a fork
@@ -32,20 +40,25 @@
 //!   request  `QUIT` ends the server.
 
 use std::ffi::CString;
+use std::ffi::OsString;
 use std::io::BufRead;
 use std::io::BufReader;
 use std::io::Write;
 use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
+use std::sync::OnceLock;
 use std::time::Duration;
 use std::time::Instant;
 
 /// The environment variable that turns `hermit` into a fork server.
 pub const ENV: &str = "HERMIT_FORK_SERVER";
 
-/// Become a fork server if [`ENV`] is set. Returns only in a forked child,
-/// which then continues as an ordinary run; the server itself exits.
-pub fn maybe_serve() {
+/// The socket path [`ENV`] named at entry, if it was set.
+static REQUESTED: OnceLock<OsString> = OnceLock::new();
+
+/// Take [`ENV`] out of the environment at entry, while the process is still
+/// single-threaded, and remember its socket path for [`serve_here`].
+pub fn capture() {
     let Some(path) = std::env::var_os(ENV) else {
         return;
     };
@@ -59,17 +72,56 @@ pub fn maybe_serve() {
     // SAFETY: the process is single-threaded (checked above), so nothing
     // reads the environment concurrently.
     unsafe { std::env::remove_var(ENV) };
-    let _ = std::fs::remove_file(&path);
-    let listener = UnixListener::bind(&path).unwrap_or_else(|error| {
+    let _ = REQUESTED.set(path);
+}
+
+/// Whether this invocation is to serve runs.
+pub fn requested() -> bool {
+    REQUESTED.get().is_some()
+}
+
+/// Refuse a served invocation that names any of `unserved`: a mode that never
+/// reaches [`serve_here`], or an output made once per invocation, which cannot
+/// describe many runs.
+pub fn refuse_unserved(unserved: &[(&str, bool)]) -> anyhow::Result<()> {
+    let named: Vec<&str> = unserved
+        .iter()
+        .filter(|(_, present)| *present)
+        .map(|(name, _)| *name)
+        .collect();
+    anyhow::ensure!(
+        named.is_empty(),
+        "{ENV} serves only an ordinary ptrace run; this invocation has {}",
+        named.join(", ")
+    );
+    Ok(())
+}
+
+/// Become a fork server if [`capture`] found [`ENV`]. Called where the run is
+/// about to start, after its setup. Returns only in a forked child, which then
+/// continues into the run; the server itself exits.
+pub fn serve_here() {
+    let Some(path) = REQUESTED.get() else {
+        return;
+    };
+    let threads = thread_count();
+    if threads != 1 {
+        eprintln!(
+            "hermit fork server: refusing, {threads} threads exist after setup (fork needs one)"
+        );
+        std::process::exit(125);
+    }
+    let _ = std::fs::remove_file(path);
+    let listener = UnixListener::bind(path).unwrap_or_else(|error| {
         eprintln!(
             "hermit fork server: cannot listen on {}: {error}",
-            std::path::Path::new(&path).display()
+            std::path::Path::new(path).display()
         );
         std::process::exit(125);
     });
     eprintln!(
         "hermit fork server: listening on {}",
-        std::path::Path::new(&path).display()
+        std::path::Path::new(path).display()
     );
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
@@ -149,6 +201,8 @@ fn fork_run(stdin: &str, stdout: &str, stderr: &str, timeout: Duration) -> Forke
             redirect(&stderr, flags, libc::STDERR_FILENO);
         }
         super::replace_startup_stdin();
+        super::container::reopen_parent_pidfd_after_fork();
+        detcore::util::reset_shared_stderr_deadline_origin();
         return Forked::Child;
     }
     // Wait on a pidfd, not by polling waitpid: on a loaded host each wait4
