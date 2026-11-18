@@ -146,6 +146,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "flock_exclusion",
             "--test",
+            "fork_server",
+            "--test",
             "fp_reduction_determinism",
             "--test",
             "frontier_app_benchmarks",
