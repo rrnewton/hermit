@@ -1085,7 +1085,7 @@ pub struct Config {
     /// (timeslice lengths and priority redraws) from this byte tape, one byte per
     /// choice in run order. Byte 0, or an exhausted tape, takes the default
     /// (seeded) choice, so an empty tape is the ordinary `--chaos` run. ptrace
-    /// backend only.
+    /// and KVM backends only.
     #[serde(default)]
     #[clap(
         long,
@@ -1097,7 +1097,7 @@ pub struct Config {
 
     /// PROTOTYPE (choice-driver lane): ask an external controller listening on
     /// this Unix stream socket for each chaos choice point, one JSON line per
-    /// request and per answer. ptrace backend only.
+    /// request and per answer. ptrace and KVM backends only.
     #[serde(default)]
     #[clap(
         long,

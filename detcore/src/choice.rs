@@ -27,8 +27,9 @@
 //! A source that always answers the default reproduces the seeded run, so an
 //! empty tape is the ordinary `--chaos --sched-seed` run.
 //!
-//! Scope of the prototype: the ptrace backend, where Detcore runs in the
-//! Hermit process, so the controller is one process-wide value. Two kinds are
+//! Scope of the prototype: the ptrace and KVM backends, where Detcore runs in
+//! the Hermit process and one process runs one guest, so the controller is one
+//! process-wide value (not the in-guest backends). Two kinds are
 //! wired: timeslice lengths and priority redraws. `--choice-record` writes
 //! every request and answer as JSON lines.
 
@@ -100,6 +101,12 @@ pub struct ChoiceRefusal {
 pub trait ChoiceSource: Send {
     /// The value to use for `req`, within `[req.lo, req.hi]`, or a refusal.
     fn answer(&mut self, req: &ChoiceRequest) -> Result<u64, ChoiceRefusal>;
+
+    /// `req` was answered without asking this source (a pause hook's
+    /// [`PauseAction::Answer`]). A source that reads its answers positionally
+    /// moves past `req`, so that answering request `i` from the hook equals
+    /// a tape whose byte `i` was replaced.
+    fn skip(&mut self, _req: &ChoiceRequest) {}
 }
 
 /// Decodes answers from a byte tape, one byte per choice, front to back, in the
@@ -137,6 +144,10 @@ impl TapeSource {
 }
 
 impl ChoiceSource for TapeSource {
+    fn skip(&mut self, _req: &ChoiceRequest) {
+        self.pos += 1;
+    }
+
     fn answer(&mut self, req: &ChoiceRequest) -> Result<u64, ChoiceRefusal> {
         let b = self.bytes.get(self.pos).copied().unwrap_or(0);
         self.pos += 1;
@@ -255,7 +266,7 @@ struct Controller {
 }
 
 /// The controller of the current guest run: `None` when no choice flag was
-/// given. Process-wide, which is sound only on the ptrace backend, where
+/// given. Process-wide, which is sound on the ptrace and KVM backends, where
 /// Detcore runs in the Hermit process and one process runs one guest at a time
 /// (`--verify` runs its two guests one after the other). A later version keeps
 /// it in per-run Detcore state instead.
@@ -290,6 +301,18 @@ pub fn start_run(cfg: &crate::config::Config) {
         next_index: 0,
         record,
     });
+}
+
+/// Continue the current run's choice record in a new file, truncating it, from
+/// the next index on. A Timeline copy made by forking the Hermit process calls
+/// this before its first choice, so that parent and copy do not share one file
+/// offset; the copy's full record is the parent's prefix followed by this file.
+pub fn reopen_record(path: &Path) -> std::io::Result<()> {
+    let file = File::create(path)?;
+    if let Some(c) = CONTROLLER.lock().unwrap().as_mut() {
+        c.record = Some(file);
+    }
+    Ok(())
 }
 
 /// Whether a controller answers choice points in this run.
@@ -353,7 +376,10 @@ pub fn choose(point: ChoicePoint) -> u64 {
         None => PauseAction::Continue,
     };
     let v = match action {
-        PauseAction::Answer(v) => v.clamp(req.lo, req.hi),
+        PauseAction::Answer(v) => {
+            c.source.skip(&req);
+            v.clamp(req.lo, req.hi)
+        }
         PauseAction::Continue => match c.source.answer(&req) {
             Ok(v) => v,
             Err(refusal) => panic!(
@@ -417,6 +443,13 @@ mod tests {
         let r = req(ChoiceKind::SchedPriority, 1);
         assert_eq!(TapeSource::decode(&r, 1), r.lo);
         assert_eq!(TapeSource::decode(&r, 255), r.hi);
+    }
+
+    #[test]
+    fn a_skipped_request_moves_the_tape_past_its_byte() {
+        let mut tape = TapeSource::new(vec![7, 128]);
+        tape.skip(&req(ChoiceKind::SchedSlice, 1));
+        assert_eq!(tape.answer(&req(ChoiceKind::SchedSlice, 1)).unwrap(), 1000);
     }
 
     #[test]

@@ -32,6 +32,7 @@ mod dispatch_input;
 #[cfg(all(test, target_arch = "x86_64"))]
 mod exec_stop_launch_tests;
 mod executable_probe;
+mod fork_server;
 mod gdb_client;
 mod gdb_watch_helper;
 mod global_opts;
@@ -167,6 +168,26 @@ pub unsafe extern "C" fn capture_startup_stdin() {
         -errno - 1
     };
     STARTUP_STDIN.store(value, Ordering::Relaxed);
+}
+
+/// PROTOTYPE (fork server): a forked run has just taken its own descriptor 0,
+/// so the startup reservation is replaced by a fresh duplicate of it, made as
+/// [`capture_startup_stdin`] makes the original.
+fn replace_startup_stdin() {
+    // SAFETY: called in a forked, single-threaded child before anything takes
+    // the reservation.
+    let fd = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
+    let value = if fd >= 0 {
+        fd
+    } else {
+        // SAFETY: fcntl failed in this thread, so errno contains its error.
+        -unsafe { *libc::__errno_location() } - 1
+    };
+    let old = STARTUP_STDIN.swap(value, Ordering::AcqRel);
+    if old >= 0 {
+        // SAFETY: the reservation owned `old`, and nothing else refers to it.
+        unsafe { libc::close(old) };
+    }
 }
 
 fn startup_stdin() -> io::Result<Option<File>> {
@@ -896,6 +917,10 @@ fn main_application<A: backend_hook::BackendAdapter>(adapter: A, selected_by_exe
     // and a container child must not gain a thread that outlives its entry
     // point (`hermit::launch_on_calling_thread`).
     hermit::launch_on_calling_thread();
+    // PROTOTYPE (fuzzpoc M2): with HERMIT_FORK_SERVER set, serve runs by
+    // forking here, before any per-process initialization below; only a
+    // forked child returns, and continues as an ordinary invocation.
+    fork_server::maybe_serve();
     if let Some(status) = cli_owned_lifecycle::maybe_run() {
         std::process::exit(status);
     }
