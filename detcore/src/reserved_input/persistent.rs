@@ -50,7 +50,7 @@ use super::Span;
 use super::capability;
 use super::effective_spans;
 use crate::Detcore;
-use crate::record_or_replay::RecordOrReplay;
+use crate::run_mode::RunMode;
 
 const PROC_SUPER_MAGIC: u64 = 0x9fa0;
 const PR_SET_MEMORY_MERGE: usize = 67;
@@ -100,10 +100,7 @@ fn is_known_uffd_import(request: usize) -> bool {
 /// descriptor read/write, alongside its ordinary local buffers, and retains
 /// it through actual native completion, decoder/copyout and deterministic
 /// readmission. This is not a permanent taint on every read or write.
-pub(crate) fn background_descriptor_effect_is_unverified<
-    T: RecordOrReplay,
-    G: Guest<Detcore<T>>,
->(
+pub(crate) fn background_descriptor_effect_is_unverified<T: RunMode, G: Guest<Detcore<T>>>(
     guest: &G,
     call: Syscall,
 ) -> bool {
@@ -169,7 +166,7 @@ fn proc_write_may_reach(call: Syscall, reserved: Span) -> bool {
 /// effects. The actual final-stopped Tool observation below runs after native
 /// preparation, including any caught-signal instruction. Caller removal is a
 /// separate mechanical cleanup; retaining this seam publishes no cause.
-pub(crate) fn before_native_call<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+pub(crate) fn before_native_call<T: RunMode, G: Guest<Detcore<T>>>(
     _guest: &G,
     _call: Syscall,
 ) -> Result<(), reverie::Error> {
@@ -179,7 +176,7 @@ pub(crate) fn before_native_call<T: RecordOrReplay, G: Guest<Detcore<T>>>(
 /// Scheduler export bookkeeping may still inspect an early ancillary snapshot;
 /// it does not certify what the native kernel will import. The final observer
 /// independently classifies sendmsg/sendmmsg, including a readable empty list.
-pub(crate) fn before_descriptor_export<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+pub(crate) fn before_descriptor_export<T: RunMode, G: Guest<Detcore<T>>>(
     _guest: &G,
     _descriptors: &[i32],
     _unread: bool,

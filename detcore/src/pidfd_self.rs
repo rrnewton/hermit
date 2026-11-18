@@ -40,7 +40,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::Detcore;
-use crate::record_or_replay::RecordOrReplay;
+use crate::run_mode::RunMode;
 
 /// `PIDFD_SELF_THREAD` as the guest spells it (Linux 6.17's ABI).
 pub(crate) const GUEST_SELF_THREAD: RawFd = reverie::pidfd_self::PIDFD_SELF_THREAD;
@@ -642,13 +642,13 @@ where
 ///
 /// The guard owns the handler's Guest, which the handler borrows back from it,
 /// so no borrow of the thread state is held across the handler's awaits.
-pub(crate) struct ArmedRespelling<'g, T: RecordOrReplay, G: Guest<Detcore<T>>> {
+pub(crate) struct ArmedRespelling<'g, T: RunMode, G: Guest<Detcore<T>>> {
     guest: &'g mut G,
     previous: Option<PhysicalRespelling>,
     _tool: std::marker::PhantomData<fn() -> T>,
 }
 
-impl<'g, T: RecordOrReplay, G: Guest<Detcore<T>>> ArmedRespelling<'g, T, G> {
+impl<'g, T: RunMode, G: Guest<Detcore<T>>> ArmedRespelling<'g, T, G> {
     /// Arms `respelling` on `guest`'s thread.
     pub(crate) fn arm(guest: &'g mut G, respelling: Option<PhysicalRespelling>) -> Self {
         let previous =
@@ -661,7 +661,7 @@ impl<'g, T: RecordOrReplay, G: Guest<Detcore<T>>> ArmedRespelling<'g, T, G> {
     }
 }
 
-impl<T: RecordOrReplay, G: Guest<Detcore<T>>> std::ops::Deref for ArmedRespelling<'_, T, G> {
+impl<T: RunMode, G: Guest<Detcore<T>>> std::ops::Deref for ArmedRespelling<'_, T, G> {
     type Target = G;
 
     fn deref(&self) -> &G {
@@ -669,13 +669,13 @@ impl<T: RecordOrReplay, G: Guest<Detcore<T>>> std::ops::Deref for ArmedRespellin
     }
 }
 
-impl<T: RecordOrReplay, G: Guest<Detcore<T>>> std::ops::DerefMut for ArmedRespelling<'_, T, G> {
+impl<T: RunMode, G: Guest<Detcore<T>>> std::ops::DerefMut for ArmedRespelling<'_, T, G> {
     fn deref_mut(&mut self) -> &mut G {
         self.guest
     }
 }
 
-impl<T: RecordOrReplay, G: Guest<Detcore<T>>> Drop for ArmedRespelling<'_, T, G> {
+impl<T: RunMode, G: Guest<Detcore<T>>> Drop for ArmedRespelling<'_, T, G> {
     fn drop(&mut self) {
         self.guest.thread_state_mut().pidfd_respelling = self.previous;
     }
@@ -713,7 +713,7 @@ impl std::fmt::Display for PidfdSelfQualificationRefusal {
 
 impl std::error::Error for PidfdSelfQualificationRefusal {}
 
-impl<T: RecordOrReplay> Detcore<T> {
+impl<T: RunMode> Detcore<T> {
     /// The answer to a self-sentinel `pidfd_send_signal` whose backend
     /// declares that its executor does not perform the call
     /// (`PidfdSelfSpelling::Unsupported`): named on stderr, which reaches the

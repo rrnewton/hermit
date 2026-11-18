@@ -36,8 +36,11 @@ use crate::types::DetPid;
 /// placeholder, and the thread's process is known. The kernel's answer to
 /// any call Detcore forwards is `reply`. With `proc_fd`, the thread also
 /// holds that descriptor open on `/proc`, served on a placeholder.
-fn kvm_thread(reply: Result<i64, Errno>, proc_fd: Option<RawFd>) -> InjectGuest<NoopTool> {
-    let mut guest = InjectGuest::<NoopTool>::new(reply);
+fn kvm_thread(
+    reply: Result<i64, Errno>,
+    proc_fd: Option<RawFd>,
+) -> InjectGuest<crate::SeededMode<NoopTool>> {
+    let mut guest = InjectGuest::<crate::SeededMode>::new(reply);
     guest.config = Config {
         directory_placeholder: Some(std::path::PathBuf::from("/placeholder")),
         ..Config::default()
@@ -86,7 +89,7 @@ fn readlinks_holding(
 ) -> Vec<(Result<i64, Errno>, Vec<Sysno>)> {
     let path = CString::new(path).unwrap();
     let mut buffer = [0u8; 256];
-    let tool = detcore::<NoopTool>();
+    let tool = detcore::<crate::SeededMode<NoopTool>>();
     let mut answers = Vec::new();
     // x86_64 exercises readlink and readlinkat; aarch64 has readlinkat alone.
     #[cfg(target_arch = "x86_64")]

@@ -137,10 +137,10 @@ impl Guest<Detcore> for ExecInputGuest<'_> {
     fn memory(&self) -> Self::Memory {
         Default::default()
     }
-    fn thread_state(&self) -> &crate::ThreadState<()> {
+    fn thread_state(&self) -> &crate::ThreadState<crate::SeededMode> {
         &self.inner.thread
     }
-    fn thread_state_mut(&mut self) -> &mut crate::ThreadState<()> {
+    fn thread_state_mut(&mut self) -> &mut crate::ThreadState<crate::SeededMode> {
         &mut self.inner.thread
     }
     fn reserved_input_control(&self) -> Option<ReservedInputControl> {

@@ -95,7 +95,7 @@ impl GlobalRPC<GlobalState> for ExecRpc<'_> {
 
 struct ExecGuest<'a> {
     rpc: ExecRpc<'a>,
-    thread: ThreadState<()>,
+    thread: ThreadState<crate::SeededMode>,
 }
 
 #[reverie::tool]
@@ -129,10 +129,10 @@ impl Guest<Detcore> for ExecGuest<'_> {
     fn memory(&self) -> Self::Memory {
         panic!("exec identity handoff must not access guest memory")
     }
-    fn thread_state(&self) -> &ThreadState<()> {
+    fn thread_state(&self) -> &ThreadState<crate::SeededMode> {
         &self.thread
     }
-    fn thread_state_mut(&mut self) -> &mut ThreadState<()> {
+    fn thread_state_mut(&mut self) -> &mut ThreadState<crate::SeededMode> {
         &mut self.thread
     }
     async fn regs(&mut self) -> libc::user_regs_struct {
@@ -167,8 +167,8 @@ impl Guest<Detcore> for ExecGuest<'_> {
 struct Fixture {
     state: GlobalState,
     tool: Detcore,
-    parent: ThreadState<()>,
-    worker: ThreadState<()>,
+    parent: ThreadState<crate::SeededMode>,
+    worker: ThreadState<crate::SeededMode>,
     before_tail: LogicalTime,
 }
 
@@ -180,7 +180,12 @@ fn child_wait() -> ChildWaitSpec {
     }
 }
 
-async fn consume(state: &GlobalState, tool: &Detcore, sender: DetTid, thread: ThreadState<()>) {
+async fn consume(
+    state: &GlobalState,
+    tool: &Detcore,
+    sender: DetTid,
+    thread: ThreadState<crate::SeededMode>,
+) {
     consume_with_status(state, tool, sender, thread, ExitStatus::Exited(73)).await;
 }
 
@@ -188,7 +193,7 @@ async fn consume_with_status(
     state: &GlobalState,
     tool: &Detcore,
     sender: DetTid,
-    thread: ThreadState<()>,
+    thread: ThreadState<crate::SeededMode>,
     status: ExitStatus,
 ) {
     let rpc = ExecRpc::new(state, sender, Gate::None);
@@ -442,7 +447,7 @@ impl Fixture {
     }
 }
 
-fn deregistration(thread: &ThreadState<()>) -> ThreadDeregistration {
+fn deregistration(thread: &ThreadState<crate::SeededMode>) -> ThreadDeregistration {
     ThreadDeregistration {
         dettid: thread.dettid,
         detpid: thread.detpid.unwrap(),
@@ -1645,7 +1650,7 @@ async fn reused_exec_worker_start_waits_for_parent_registration_before_clock_or_
         startup.await,
         (
             None,
-            GlobalResponse::Granted(Box::new(GlobalResponse::StartNewThread(None, None)))
+            GlobalResponse::Granted(Box::new(GlobalResponse::StartNewThread(None, None, None)))
         )
     );
     assert_eq!(fixture.state.sched.lock().unwrap().turn, 2);
@@ -1923,7 +1928,7 @@ async fn reused_exec_worker_vfork_registration_requires_creation_mode(
         startup.await,
         (
             None,
-            GlobalResponse::Granted(Box::new(GlobalResponse::StartNewThread(None, None)))
+            GlobalResponse::Granted(Box::new(GlobalResponse::StartNewThread(None, None, None)))
         )
     );
     assert_eq!(fixture.state.sched.lock().unwrap().turn, 3);

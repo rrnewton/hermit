@@ -55,7 +55,7 @@ fn assert_declarations<T: RecordOrReplay>(expected: NativeMmOwnership) {
     let config = Config::default();
     assert_eq!(<T as Tool>::native_mm_ownership(&config), expected);
     assert_eq!(
-        <Detcore<T> as Tool>::native_mm_ownership(&config),
+        <Detcore<crate::SeededMode<T>> as Tool>::native_mm_ownership(&config),
         expected,
         "the outer Tool cannot strengthen the inner Tool's declaration"
     );

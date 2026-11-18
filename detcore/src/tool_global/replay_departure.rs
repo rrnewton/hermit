@@ -17,7 +17,7 @@ use super::GlobalRequest as Q;
 use super::GlobalResponse as R;
 use super::GlobalState;
 use crate::Detcore;
-use crate::record_or_replay::RecordOrReplay;
+use crate::run_mode::RunMode;
 use crate::types::DetTid;
 use crate::types::LogicalTime;
 
@@ -166,7 +166,7 @@ pub(crate) async fn publish<G, T>(
     slice: u64,
 ) where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     assert_eq!(
         DetTid::from_raw(guest.tid().as_raw()),

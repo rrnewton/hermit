@@ -195,7 +195,7 @@ impl GlobalState {
 pub(crate) async fn reconnect_exec<G, T>(guest: &mut G) -> Result<(), Errno>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let current = DetTid::from_raw(guest.tid().as_raw());
     let former = guest.thread_state().dettid;

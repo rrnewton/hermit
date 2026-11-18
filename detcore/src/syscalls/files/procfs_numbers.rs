@@ -48,7 +48,7 @@ use super::procfs_levels::path_operands;
 use super::procfs_levels::raw_args;
 use super::procfs_levels::unmap_transient;
 use crate::procfs::ids;
-use crate::record_or_replay::RecordOrReplay;
+use crate::run_mode::RunMode;
 use crate::tool_local::Detcore;
 
 /// A call whose paths are respelled (with the kernel's numbers, or below a
@@ -85,7 +85,7 @@ const SCRATCH_GAP: usize = 1024 + 64;
 /// (`/proc/self/fd/N`).
 const SCRATCH_LIMIT: usize = 512;
 
-impl<T: RecordOrReplay> Detcore<T> {
+impl<T: RunMode> Detcore<T> {
     /// Whether this guest thread's `/proc` paths may need translating: where
     /// its backend registered the thread's kernel ids (DBT, and an in-guest
     /// native exec, whose numberings agree, so its paths come back

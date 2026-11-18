@@ -15,7 +15,6 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use procfs::process::Process;
-use rand::Rng;
 use reverie::BackendCapabilities;
 use reverie::Error;
 use reverie::GlobalRPC;
@@ -43,11 +42,11 @@ use crate::config::BlockingMode;
 use crate::config::Config;
 use crate::config::SchedHeuristic;
 use crate::memory::MemoryMetadata;
-use crate::record_or_replay::RecordOrReplay;
 use crate::resources::ExternalOpId;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::run_mode::RunMode;
 use crate::scheduler::FutexSignalWatch;
 use crate::scheduler::HostTimedSignalScope;
 use crate::scheduler::SchedValue;
@@ -486,7 +485,7 @@ fn finish_waitid_result<T, G>(
     child: DetPid,
 ) -> Result<i64, Error>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     // SAFETY: waitid writes either zeroed output or the SIGCHLD siginfo_t
@@ -621,7 +620,7 @@ pub(super) async fn await_selected_child_cpu_publication<G, T>(
 ) -> Result<(), Error>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     if guest
         .thread_state()
@@ -646,7 +645,7 @@ pub(super) async fn retire_selected_child<G, T>(
 ) -> Result<(), Error>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     guest.thread_state_mut().reap_child_process_cpu_time(child);
     if consume_child_wait(guest, child).await {
@@ -665,7 +664,7 @@ pub(super) async fn complete_selected_emulated_wait4<G, T>(
 ) -> Result<i64, Error>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     await_selected_child_cpu_publication(guest, child, "wait4").await?;
     // Selection already applied `__WNOTHREAD` through the logical owner
@@ -772,7 +771,7 @@ pub(crate) fn fatal_default_delivery<G, T>(
 ) -> Option<bool>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     match fatal_delivery_observation(guest, signal, may_retire_others) {
         FatalDeliveryObservation::Fatal { may_retire_others } => Some(may_retire_others),
@@ -796,7 +795,7 @@ pub(crate) fn fatal_delivery_observation<G, T>(
 ) -> FatalDeliveryObservation
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let copied = super::signal_shadow::copied_dispositions_for(guest, signal)
         .map(|copied| default_action_ends_process(copied.ignored, copied.caught, signal));
@@ -829,7 +828,7 @@ pub(super) async fn wait_signal_disposition<G, T>(
 ) -> Result<Option<WaitSignalDisposition>, Error>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let ResumeStatus::Signaled(signals) = status else {
         return Ok(None);
@@ -909,7 +908,7 @@ pub(crate) async fn futex_wait_pending_signals<G, T>(
 ) -> KernelSigset
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let pending = without_discarded(guest, state, interrupting & !held, committed).await;
     let sigchld = kernel_sigset_bit(libc::SIGCHLD) & !host_timed;
@@ -949,7 +948,7 @@ pub(crate) async fn without_discarded<G, T>(
 ) -> KernelSigset
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     use crate::scheduler::discarded_at_send::DiscardedSignalAnswer;
     use crate::scheduler::discarded_at_send::DiscardedSignalControl;
@@ -1807,7 +1806,7 @@ pub(crate) fn signal_sets_errno(error: reverie::FactError) -> Errno {
 fn backend_signal_state_of_caller<G, T>(guest: &G) -> Option<Result<KernelSignalState, Errno>>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     backend_signal_state_of(guest, guest.tid())
 }
@@ -1820,7 +1819,7 @@ where
 fn backend_signal_state_of<G, T>(guest: &G, tid: Pid) -> Option<Result<KernelSignalState, Errno>>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     reads_signal_state_from_backend(&guest.config().backend).then(|| {
         guest
@@ -1843,7 +1842,7 @@ pub(crate) fn read_guest_task_signal_state<G, T>(
 ) -> Result<KernelSignalState, Errno>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     backend_signal_state_of(guest, tid).unwrap_or_else(|| read_thread_signal_state(pid, tid))
 }
@@ -1859,7 +1858,7 @@ pub(crate) fn read_guest_group_wait_signal_state<G, T>(
 ) -> Result<KernelSignalState, Error>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     match backend_signal_state_of_caller(guest) {
         None => read_wait_signal_state(guest.pid(), guest.tid()),
@@ -1892,7 +1891,7 @@ fn backend_wait_answer(
 pub(crate) fn read_guest_signal_state<G, T>(guest: &G) -> Result<KernelSignalState, Errno>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     backend_signal_state_of_caller(guest)
         .unwrap_or_else(|| read_kernel_signal_state(guest.pid(), guest.tid()))
@@ -1905,7 +1904,7 @@ where
 pub(crate) fn read_guest_thread_signal_state<G, T>(guest: &G) -> Result<KernelSignalState, Errno>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     backend_signal_state_of_caller(guest)
         .unwrap_or_else(|| read_thread_signal_state(guest.pid(), guest.tid()))
@@ -1919,7 +1918,7 @@ where
 pub(crate) fn read_guest_wait_signal_state<G, T>(guest: &G) -> Result<KernelSignalState, Error>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     match backend_signal_state_of_caller(guest) {
         None => read_thread_wait_signal_state(guest.pid(), guest.tid()),
@@ -2008,7 +2007,7 @@ pub(super) async fn block_signals_for_disposition<G, T>(
 ) -> Result<KernelSigset, Error>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let block_signals = syscalls::RtSigprocmask::new()
         .with_how(libc::SIG_SETMASK)
@@ -2034,7 +2033,7 @@ pub(super) async fn restore_signals_after_disposition<G, T>(
 ) -> Result<(), Error>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     if !reads_mask_in_place(guest.config()) {
         let old_mask: Addr<'_, KernelSigset> = old_mask_addr.into();
@@ -2070,7 +2069,7 @@ async fn interrupted_child_wait_result<G, T, S>(
 ) -> Result<i64, Error>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
     S: SyscallInfo,
 {
     if !guest
@@ -2267,7 +2266,7 @@ fn sched_yield_route(cfg: &Config) -> SchedYieldRoute {
     }
 }
 
-impl<T: RecordOrReplay> Detcore<T> {
+impl<T: RunMode> Detcore<T> {
     async fn futex_timeout_deadline<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2543,13 +2542,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         ts.clone_flags = Some(flags);
 
         let parent_dettid = ts.dettid;
-        let child_priority_entropy = if is_vfork
+        let child_priority = if is_vfork
             && self.cfg.chaos
             && self.cfg.replay_preemptions_from.is_none()
             && self.cfg.replay_schedule_from.is_none()
         {
-            let mut parent_chaos_prng = ts.chaos_prng.clone();
-            Some(parent_chaos_prng.next_u64())
+            Some(ts.prepare_vfork_child_priority())
         } else {
             None
         };
@@ -2562,7 +2560,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 child_tid_addr: ctid,
                 flags,
                 exit_signal,
-                child_priority_entropy,
+                child_priority,
                 user_namespace_owner_may_differ,
             });
         }
@@ -3199,7 +3197,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     pub(crate) async fn sigkill_robust_list_wakes<R: GlobalRPC<GlobalState>>(
         &self,
         global_state: &R,
-        thread_state: &ThreadState<T::ThreadState>,
+        thread_state: &ThreadState<T>,
         exit_signal: Option<i32>,
     ) {
         if exit_signal != Some(libc::SIGKILL)
@@ -6952,7 +6950,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 fn robust_list_holds_an_entry<G, T>(guest: &G, head: usize) -> bool
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let read = |offset: usize| {
         head.checked_add(offset)
@@ -7013,7 +7011,7 @@ struct GuestRobustEffects<'a, G, T> {
 impl<G, T> robust_list::RobustDeathEffects for GuestRobustEffects<'_, G, T>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     fn read_u64(&mut self, address: usize) -> Option<u64> {
         let at = Addr::<u64>::from_raw(address)?;
@@ -7307,10 +7305,7 @@ fn pi_lock_command_name(command: i32) -> Option<&'static str> {
 /// which a process outside Hermit can update concurrently. Detcore changes a
 /// word with a separate read and write, which Linux's locked instruction does
 /// not, so the commands that change their word refuse such a one.
-fn futex_word_is_file_backed<T: RecordOrReplay, G: Guest<Detcore<T>>>(
-    guest: &G,
-    address: usize,
-) -> bool {
+fn futex_word_is_file_backed<T: RunMode, G: Guest<Detcore<T>>>(guest: &G, address: usize) -> bool {
     matches!(
         guest.thread_state().futex_id(address, false),
         FutexID::Shared {
@@ -7324,7 +7319,7 @@ fn futex_word_is_file_backed<T: RecordOrReplay, G: Guest<Detcore<T>>>(
 /// `futex_cmpxchg_value_locked` and `futex_atomic_op_inuser` do: exactly four
 /// bytes with the guest's own permissions, `-EFAULT` if the word cannot be
 /// written.
-fn write_futex_word<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+fn write_futex_word<T: RunMode, G: Guest<Detcore<T>>>(
     guest: &mut G,
     address: usize,
     value: u32,
@@ -7426,7 +7421,7 @@ pub(crate) fn user_ptr_max() -> usize {
 ///   page past the end of a truncated file, a read-only anonymous page) is not
 ///   visible in `/proc` metadata, so the kernel is asked with an effect-free
 ///   probe on the guest's own address (`probe_shared_futex_key`).
-async fn futex_key<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+async fn futex_key<G: Guest<Detcore<T>>, T: RunMode>(
     guest: &mut G,
     address: usize,
     private: bool,
@@ -7457,7 +7452,7 @@ async fn futex_key<G: Guest<Detcore<T>>, T: RecordOrReplay>(
 ///   the unknown operation before it touches the word or wakes anyone.
 ///
 /// Linux's refusal (-EFAULT, or -EINVAL) is returned as is.
-async fn probe_shared_futex_key<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+async fn probe_shared_futex_key<G: Guest<Detcore<T>>, T: RunMode>(
     guest: &mut G,
     address: usize,
     access: KeyAccess,
@@ -7541,7 +7536,7 @@ async fn run_shared_futex_key_probe<C>(
 /// the unsupported-operation policy, since `--allow-unsupported-syscalls` has
 /// no errno to offer here either. A signal must arrive at exactly that
 /// instruction, which is rare.
-async fn refuse_interrupted_shared_key_probe<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+async fn refuse_interrupted_shared_key_probe<G: Guest<Detcore<T>>, T: RunMode>(
     guest: &mut G,
     address: usize,
     errno: Errno,
@@ -7572,7 +7567,7 @@ async fn refuse_interrupted_shared_key_probe<G: Guest<Detcore<T>>, T: RecordOrRe
 /// containing it is read instead. That cannot cross into the next page, unlike a
 /// debugger read at the word's own address. A debugger read alone would also
 /// ignore `PROT_NONE`.
-fn read_futex_word<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+fn read_futex_word<G: Guest<Detcore<T>>, T: RunMode>(
     guest: &mut G,
     address: usize,
 ) -> Result<i32, Error> {
@@ -7653,7 +7648,7 @@ fn mapping_permissions(pid: i32, address: usize) -> Option<[u8; 4]> {
 /// host `/proc/<pid>/maps` decides; elsewhere the backend's user-access read. The bytes are then read through the tracer, which is only
 /// safe because every page they span was checked first: the tracer's own read
 /// would force its way through a PROT_NONE page.
-fn read_user_timespec<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+fn read_user_timespec<G: Guest<Detcore<T>>, T: RunMode>(
     guest: &mut G,
     address: usize,
 ) -> Result<Timespec, Error> {
@@ -8412,7 +8407,7 @@ mod tests {
     struct FailedExecGuest<'a> {
         config: &'a Config,
         global: &'a GlobalState,
-        thread: crate::ThreadState<()>,
+        thread: crate::ThreadState<crate::SeededMode>,
         sender: Tid,
         process: Tid,
         old_mm: MmId,
@@ -8456,10 +8451,10 @@ mod tests {
         fn memory(&self) -> Self::Memory {
             panic!("failed exec rollback must not read guest memory")
         }
-        fn thread_state(&self) -> &crate::ThreadState<()> {
+        fn thread_state(&self) -> &crate::ThreadState<crate::SeededMode> {
             &self.thread
         }
-        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<()> {
+        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<crate::SeededMode> {
             &mut self.thread
         }
         async fn regs(&mut self) -> libc::user_regs_struct {
@@ -8556,7 +8551,7 @@ mod tests {
             };
             let global = GlobalState::init_global_state(&config).await;
             let tool = Detcore::new(Tid::from_raw(process.as_raw()), &config);
-            let mut thread = crate::ThreadState::new(caller, &config, ());
+            let mut thread = crate::ThreadState::<crate::SeededMode>::new(caller, &config, ());
             thread.detpid = Some(process);
             thread.mm_id = MmId::initial(process);
             thread.record_robust_list_head(Some(0x12340));
@@ -8625,7 +8620,7 @@ mod tests {
     struct FailedCloneGuest<'a> {
         config: &'a Config,
         global: &'a GlobalState,
-        thread: crate::ThreadState<()>,
+        thread: crate::ThreadState<crate::SeededMode>,
         sender: Tid,
         errno: Errno,
         backend_refuses: bool,
@@ -8666,10 +8661,10 @@ mod tests {
         fn memory(&self) -> Self::Memory {
             reverie::syscalls::LocalMemory::new()
         }
-        fn thread_state(&self) -> &crate::ThreadState<()> {
+        fn thread_state(&self) -> &crate::ThreadState<crate::SeededMode> {
             &self.thread
         }
-        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<()> {
+        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<crate::SeededMode> {
             &mut self.thread
         }
         async fn regs(&mut self) -> libc::user_regs_struct {
@@ -8734,7 +8729,7 @@ mod tests {
             };
             let global = GlobalState::init_global_state(&config).await;
             let tool = Detcore::new(Tid::from_raw(process.as_raw()), &config);
-            let mut thread = crate::ThreadState::new(process, &config, ());
+            let mut thread = crate::ThreadState::<crate::SeededMode>::new(process, &config, ());
             thread.detpid = Some(process);
             let mut guest = FailedCloneGuest {
                 config: &config,
@@ -10189,7 +10184,7 @@ enum CloneInjection {
 /// natively. A backend that does not trace children ignores the flag, so the
 /// call is the same there. `flags` are the call's, as
 /// [`Detcore::handle_clone_family`] read them.
-async fn inject_traced_clone<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+async fn inject_traced_clone<T: RunMode, G: Guest<Detcore<T>>>(
     guest: &mut G,
     clone_family: syscalls::family::CloneFamily,
     flags: CloneFlags,
@@ -10231,7 +10226,7 @@ async fn inject_traced_clone<T: RecordOrReplay, G: Guest<Detcore<T>>>(
 /// size it refuses) is injected as the guest made it and fails as natively.
 /// Two calls are refused by name rather than run untraced: one whose nonzero
 /// bytes do not fit the scratch, and one whose pointers lead into it.
-async fn inject_traced_clone3<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+async fn inject_traced_clone3<T: RunMode, G: Guest<Detcore<T>>>(
     guest: &mut G,
     clone: syscalls::Clone3,
 ) -> CloneInjection {
@@ -10331,7 +10326,7 @@ async fn inject_traced_clone3<T: RecordOrReplay, G: Guest<Detcore<T>>>(
 
 /// Puts back the guest bytes that [`inject_traced_clone3`] staged its copy
 /// over.
-fn restore_staged_clone_args<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+fn restore_staged_clone_args<T: RunMode, G: Guest<Detcore<T>>>(
     guest: &mut G,
     scratch: Addr<[u8; CLONE3_STAGED_MAX]>,
     saved: &[u8; CLONE3_STAGED_MAX],
@@ -10741,7 +10736,7 @@ mod disposition_mask_tests {
     /// `(how, set given)` of each.
     struct MaskGuest {
         config: Config,
-        thread: crate::ThreadState<()>,
+        thread: crate::ThreadState<crate::SeededMode>,
         mask: KernelSigset,
         calls: Mutex<Vec<(i32, bool)>>,
     }
@@ -10775,10 +10770,10 @@ mod disposition_mask_tests {
         fn memory(&self) -> LocalMemory {
             LocalMemory::new()
         }
-        fn thread_state(&self) -> &crate::ThreadState<()> {
+        fn thread_state(&self) -> &crate::ThreadState<crate::SeededMode> {
             &self.thread
         }
-        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<()> {
+        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<crate::SeededMode> {
             &mut self.thread
         }
         async fn regs(&mut self) -> libc::user_regs_struct {
@@ -10832,7 +10827,7 @@ mod disposition_mask_tests {
         };
         config.backend = reverie::BackendCapabilities::LITEINST_IN_GUEST;
         let detpid = DetPid::from_raw(41);
-        let mut thread = crate::ThreadState::new(detpid, &config, ());
+        let mut thread = crate::ThreadState::<crate::SeededMode>::new(detpid, &config, ());
         thread.detpid = Some(detpid);
         MaskGuest {
             config,

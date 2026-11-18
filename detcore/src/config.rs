@@ -454,6 +454,12 @@ mod tests {
         // access to the guest. 60 on its own base, then 61, then 62 at its
         // rebase onto main's 61. Digests measured at this head.
         (62, "faab2e5b78560755", "878bf500cb907b38"),
+        // `GlobalResponse::StartNewThread` carries the run's choice-session
+        // handle in a serde-skipped field, an in-process capability, and
+        // `GlobalRequest::ChoiceSession` asks for it (answered by
+        // `GlobalResponse::ChoiceSession`) for a thread that registers itself
+        // before its start grant. Digests measured at this head.
+        (63, "bd13796c85e3e88a", "878bf500cb907b38"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that

@@ -32,7 +32,7 @@ const GONE: i32 = 23;
 struct AliasGuest<'a> {
     config: &'a Config,
     global: &'a GlobalState,
-    thread: crate::ThreadState<()>,
+    thread: crate::ThreadState<crate::SeededMode>,
     sender: Tid,
     reply: Result<i64, Errno>,
     injected: Vec<(Sysno, reverie::syscalls::SyscallArgs)>,
@@ -92,10 +92,10 @@ impl Guest<Detcore> for AliasGuest<'_> {
     fn memory(&self) -> Self::Memory {
         reverie::syscalls::LocalMemory::new()
     }
-    fn thread_state(&self) -> &crate::ThreadState<()> {
+    fn thread_state(&self) -> &crate::ThreadState<crate::SeededMode> {
         &self.thread
     }
-    fn thread_state_mut(&mut self) -> &mut crate::ThreadState<()> {
+    fn thread_state_mut(&mut self) -> &mut crate::ThreadState<crate::SeededMode> {
         &mut self.thread
     }
     async fn regs(&mut self) -> libc::user_regs_struct {
@@ -159,7 +159,7 @@ async fn open(
 ) {
     let (config, global) = record_sourced_state();
     let tool = <Detcore as reverie::Tool>::new(Tid::from_raw(LEADER.as_raw()), &config);
-    let mut thread = crate::ThreadState::new(WORKER, &config, ());
+    let mut thread = crate::ThreadState::<crate::SeededMode>::new(WORKER, &config, ());
     thread.detpid = Some(LEADER);
     let mut guest = AliasGuest {
         config: &config,

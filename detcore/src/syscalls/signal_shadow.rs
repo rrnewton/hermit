@@ -43,7 +43,7 @@ use super::threads::KernelSigaction;
 use super::threads::KernelSigset;
 use super::threads::host_signal_state_reads_refused;
 use crate::Detcore;
-use crate::record_or_replay::RecordOrReplay;
+use crate::run_mode::RunMode;
 use crate::signal_state::Action;
 use crate::signal_state::Dispositions;
 use crate::signal_state::SignalShadow;
@@ -117,7 +117,7 @@ fn compare(kernel: KernelSigset, copy: KernelSigset) -> Compared {
 fn forced_changed<G, T>(guest: &mut G, at: &str)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     debug!(
         "[dtid {}] signal-state copy dropped at {at}: a force-delivered signal's kernel state \
@@ -150,7 +150,7 @@ impl From<KernelSigaction> for Action {
 fn kernel_state_is_the_guests<G, T>(guest: &G) -> bool
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let config = guest.config();
     config.signal_state_copy
@@ -169,7 +169,7 @@ fn with_copy<G, T, R>(
 ) -> Option<R>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let shadow = guest.thread_state_mut().signal_shadow.as_mut()?;
     let actions = std::sync::Arc::clone(&shadow.dispositions);
@@ -193,7 +193,7 @@ where
 pub(crate) fn give_up<G, T>(guest: &mut G, reason: &str)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     if guest.thread_state().signal_shadow.is_some() {
         debug!(
@@ -213,13 +213,13 @@ where
 fn drop_copy<G, T>(guest: &mut G)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     drop_thread_copy(guest.thread_state_mut());
 }
 
 /// [`drop_copy`] given only the thread's state.
-fn drop_thread_copy<T>(thread: &mut crate::tool_local::ThreadState<T>) {
+fn drop_thread_copy<T: crate::RunMode>(thread: &mut crate::tool_local::ThreadState<T>) {
     if let Some(shadow) = thread.signal_shadow.as_ref() {
         shadow.forget_dispositions();
     }
@@ -236,7 +236,7 @@ fn drop_thread_copy<T>(thread: &mut crate::tool_local::ThreadState<T>) {
 pub(crate) fn at_syscall_entry<G, T>(guest: &mut G)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     take_unreported(guest);
     let Some(shadow) = guest.thread_state_mut().signal_shadow.as_mut() else {
@@ -341,7 +341,7 @@ pub(crate) fn unreported_pending() -> bool {
 fn take_unreported<G, T>(guest: &mut G)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     if !any_notes() {
         return;
@@ -368,7 +368,7 @@ where
 fn reconcile_returns<G, T>(guest: &mut G, before: &str)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let open_frames = guest
         .thread_state()
@@ -501,7 +501,7 @@ where
 pub(crate) fn at_exec<G, T>(guest: &mut G)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     // A nonleader exec takes the leader's tid, whose entry the scheduler
     // drops with the old leader, and the copy may not survive the exec: what
@@ -555,7 +555,7 @@ pub(super) fn record_rt_sigaction<G, T>(
     result: &Result<i64, Errno>,
 ) where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let committed = result.is_ok() || (new.is_some() && *result == Err(Errno::EFAULT));
     if !committed {
@@ -649,7 +649,7 @@ pub(super) fn record_rt_sigprocmask<G, T>(
     result: &Result<i64, Errno>,
 ) where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let valid_how = matches!(how, libc::SIG_BLOCK | libc::SIG_UNBLOCK | libc::SIG_SETMASK);
     let set = match (set, result) {
@@ -746,7 +746,7 @@ pub(super) fn record_rt_sigprocmask<G, T>(
 pub(crate) async fn check_and_record_delivery<G, T>(guest: &mut G, signal: i32)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     if check_delivery_to_record(guest, signal).await {
         record_checked_delivery(guest, signal);
@@ -765,7 +765,7 @@ where
 pub(crate) async fn check_delivery_to_record<G, T>(guest: &mut G, signal: i32) -> bool
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let had_copy = guest.thread_state().signal_shadow.is_some();
     // At a delivery stop the kernel has not installed the handler mask yet.
@@ -791,7 +791,7 @@ where
 pub(crate) fn record_checked_delivery<G, T>(guest: &mut G, signal: i32)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     #[cfg(test)]
     crate::signal_announcement_tests::note_phase("recorded");
@@ -804,7 +804,7 @@ where
 fn record_delivery<G, T>(guest: &mut G, signal: i32)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     take_unreported(guest);
     futures::executor::block_on(take_wait_outcome(guest));
@@ -817,7 +817,7 @@ where
 fn commit_delivery<G, T>(guest: &mut G, signal: i32)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let Some(delivered) = with_copy(guest, |dispositions, thread| {
         crate::signal_state::deliver(dispositions, thread, signal)
@@ -1083,7 +1083,7 @@ async fn delivery_interruption<G, T>(
 ) -> (reverie::Interruption, bool, i64)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     use reverie::Interruption;
     let record = guest.thread_state().delivery_interruption;
@@ -1180,7 +1180,7 @@ where
 async fn check_delivery<G, T>(guest: &mut G, signal: i32, had_copy: bool) -> bool
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     if !kernel_state_is_the_guests(guest) {
         return true;
@@ -1365,7 +1365,7 @@ where
 async fn take_wait_outcome<G, T>(guest: &mut G)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let Some((wait_mask, saved, blocked)) =
         guest.thread_state().signal_shadow.as_ref().map(|shadow| {
@@ -1449,7 +1449,7 @@ where
 async fn kernel_ran_the_wait<G, T>(guest: &mut G) -> bool
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     const ERESTARTNOHAND: i64 = 514;
     let ran = guest
@@ -1535,7 +1535,7 @@ pub struct PublicationAnswer {
 pub(crate) fn copied_dispositions<G, T>(guest: &G) -> Option<CopiedDispositions>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     if any_notes() {
         return None;
@@ -1546,7 +1546,9 @@ where
 /// The dispositions `thread`'s copy holds for the actions it shares, whether
 /// or not an unreported signal is noted: `None` without a copy, or with the
 /// shared actions unknown.
-fn table_dispositions<T>(thread: &crate::tool_local::ThreadState<T>) -> Option<CopiedDispositions> {
+fn table_dispositions<T: crate::RunMode>(
+    thread: &crate::tool_local::ThreadState<T>,
+) -> Option<CopiedDispositions> {
     let shadow = thread.signal_shadow.as_ref()?;
     let actions = shadow.dispositions.lock().unwrap();
     let dispositions = actions.as_ref()?;
@@ -1562,7 +1564,7 @@ fn table_dispositions<T>(thread: &crate::tool_local::ThreadState<T>) -> Option<C
 pub(crate) fn copied_dispositions_for<G, T>(guest: &G, signal: i32) -> Option<CopiedDispositions>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     if !models(signal) {
         return None;
@@ -1586,7 +1588,7 @@ fn models(signal: i32) -> bool {
 fn next_publication<G, T>(guest: &G) -> Option<(u64, Option<CopiedDispositions>)>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     if !kernel_state_is_the_guests(guest) {
         return None;
@@ -1668,7 +1670,7 @@ fn settle_publication(
 pub(crate) async fn publish_dispositions<G, T>(guest: &mut G)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     // A publication that was not taken is made again once, with a
     // generation past the one the scheduler holds, so it is taken.
@@ -1719,7 +1721,7 @@ pub(crate) fn published_dispositions_decide(signal: i32) -> bool {
 /// admission and real-time timer fate take the guest's mask from
 /// `Scheduler::saved_guest_sigmasks`, and the choice of a process-directed
 /// signal's thread and the first SIGCHLD taker read the kernel's.
-fn mask_to_publish<T>(
+fn mask_to_publish<T: crate::RunMode>(
     thread: &crate::tool_local::ThreadState<T>,
     observes_returns: bool,
 ) -> Option<KernelSigset> {
@@ -1744,7 +1746,7 @@ fn mask_to_publish<T>(
 pub(crate) async fn publish_mask<G, T>(guest: &mut G)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     if !kernel_state_is_the_guests(guest) {
         return;
@@ -1775,7 +1777,7 @@ where
 pub(crate) async fn before_clone<G, T>(guest: &mut G, flags: u64)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let shares_actions = flags & libc::CLONE_SIGHAND as u64 != 0;
     let new_process = flags & libc::CLONE_THREAD as u64 == 0;
@@ -1838,7 +1840,7 @@ const USER_ADDRESS_LIMIT_4_LEVEL: u64 = 0x7fff_ffff_f000;
 /// that keeps the copy, the next syscall entry compares the copy with the
 /// kernel ([`reconcile_returns`]), so a report the kernel did not follow (a
 /// protection key, say) fails closed there.
-pub(crate) fn record_sigreturn_report<T>(
+pub(crate) fn record_sigreturn_report<T: crate::RunMode>(
     thread: &mut crate::tool_local::ThreadState<T>,
     report: reverie::SigreturnReport,
 ) {
@@ -1902,7 +1904,7 @@ pub(crate) fn record_sigreturn_report<T>(
 pub(crate) async fn record_rt_sigreturn<G, T>(guest: &mut G)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     if guest.thread_state().signal_shadow.is_none() {
         return;
@@ -1920,7 +1922,7 @@ where
 fn check_against_kernel<G, T>(guest: &mut G, after: &str)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     take_unreported(guest);
     if !kernel_state_is_the_guests(guest) || guest.thread_state().signal_shadow.is_none() {
@@ -2010,7 +2012,7 @@ thread_local! {
 fn read_or_give_up<G, T>(guest: &mut G, at: &str) -> Option<super::threads::KernelSignalState>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     match crate::syscalls::read_guest_thread_signal_state(guest) {
         Ok(state) => Some(state),
@@ -2032,7 +2034,7 @@ where
 pub(crate) fn note_wait_mask<G, T>(guest: &mut G, mask: KernelSigset)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     if let Some(shadow) = guest.thread_state_mut().signal_shadow.as_mut() {
         shadow.thread.wait_mask = Some(super::signal::kernel_installed_signal_mask(mask));
@@ -2046,7 +2048,7 @@ where
 pub(crate) fn note_wait_ran<G, T>(guest: &mut G, ran: bool)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     if let Some(shadow) = guest.thread_state_mut().signal_shadow.as_mut()
         && shadow.thread.wait_mask.is_some()
@@ -2063,7 +2065,7 @@ where
 fn diverged<G, T>(guest: &mut G, after: &str, what: &str)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     #[cfg(test)]
     DIVERGENCES.with(|count| count.set(count.get() + 1));
@@ -2098,7 +2100,7 @@ mod tests {
     /// state is scripted; anything else it is asked to do fails the test.
     struct ShadowGuest {
         config: Config,
-        thread: ThreadState<()>,
+        thread: ThreadState<crate::SeededMode>,
         delivery: DeliveryScript,
     }
 
@@ -2178,10 +2180,10 @@ mod tests {
         fn memory(&self) -> Self::Memory {
             LocalMemory::new()
         }
-        fn thread_state_mut(&mut self) -> &mut ThreadState<()> {
+        fn thread_state_mut(&mut self) -> &mut ThreadState<crate::SeededMode> {
             &mut self.thread
         }
-        fn thread_state(&self) -> &ThreadState<()> {
+        fn thread_state(&self) -> &ThreadState<crate::SeededMode> {
             &self.thread
         }
         async fn regs(&mut self) -> libc::user_regs_struct {
@@ -2289,7 +2291,7 @@ mod tests {
             inherited_seccomp: detcore_model::config::InheritedSeccomp::Disabled,
             ..Config::default()
         };
-        let thread = ThreadState::new(DetPid::from_raw(1), &config, ());
+        let thread = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ());
         let mut guest = ShadowGuest {
             config,
             thread,
@@ -3538,7 +3540,7 @@ mod tests {
             backend: reverie::BackendCapabilities::KVM,
             ..Config::default()
         };
-        let thread = ThreadState::new(DetPid::from_raw(1), &config, ());
+        let thread = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ());
         let guest = ShadowGuest {
             config,
             thread,
@@ -4014,7 +4016,7 @@ mod tests {
                 ..ptrace.clone()
             },
         ] {
-            let thread = ThreadState::new(DetPid::from_raw(1), &config, ());
+            let thread = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ());
             let mut guest = ShadowGuest {
                 config,
                 thread,
@@ -4034,7 +4036,7 @@ mod tests {
             backend: reverie::BackendCapabilities::KVM,
             ..Config::default()
         };
-        let thread = ThreadState::new(DetPid::from_raw(1), &config, ());
+        let thread = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ());
         let mut guest = ShadowGuest {
             config,
             thread,

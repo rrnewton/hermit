@@ -29,7 +29,14 @@ use crate::tool_global::replay_departure::Refusal;
 use crate::types::DetTid;
 use crate::types::LogicalTime;
 
-async fn fixture(edited: bool) -> (tempfile::TempDir, Config, GlobalState, ThreadState<()>) {
+async fn fixture(
+    edited: bool,
+) -> (
+    tempfile::TempDir,
+    Config,
+    GlobalState,
+    ThreadState<crate::SeededMode>,
+) {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("input.json");
     let config = crate::clock_identity::test_sources::qualified(Config {
@@ -44,7 +51,7 @@ async fn fixture(edited: bool) -> (tempfile::TempDir, Config, GlobalState, Threa
         ..Config::default()
     });
     let tid = DetTid::from_raw(3);
-    let mut thread = ThreadState::new(tid, &config, ());
+    let mut thread = ThreadState::<crate::SeededMode>::new(tid, &config, ());
     thread.detpid = Some(tid);
     let epoch = thread.thread_logical_time.as_nanos();
     let history = ThreadHistory::new()
@@ -95,7 +102,7 @@ fn report() -> Q {
     }
 }
 
-async fn deregister(state: &GlobalState, thread: &ThreadState<()>) {
+async fn deregister(state: &GlobalState, thread: &ThreadState<crate::SeededMode>) {
     assert_eq!(
         state
             .receive_rpc(
@@ -129,13 +136,18 @@ fn bytes<T: serde::Serialize>(value: &T) -> Vec<u8> {
     bincode::serde::encode_to_vec(value, bincode::config::legacy()).unwrap()
 }
 
-async fn neutral(state: &GlobalState, thread: &ThreadState<()>, request: Q, direct: bool) -> R {
+async fn neutral(
+    state: &GlobalState,
+    thread: &ThreadState<crate::SeededMode>,
+    request: Q,
+    direct: bool,
+) -> R {
     neutral_from(state, thread, request, direct, thread.dettid).await
 }
 
 async fn neutral_from(
     state: &GlobalState,
-    thread: &ThreadState<()>,
+    thread: &ThreadState<crate::SeededMode>,
     request: Q,
     direct: bool,
     sender: DetTid,
@@ -355,7 +367,8 @@ async fn rejected_reports_refuse_cleanup_without_accepting_or_marking_a_finding(
 #[test]
 fn complete_legacy_codec_preserves_bare_counted_findings_and_neutral_acknowledgments() {
     let config = Config::default();
-    let thread: ThreadState<()> = ThreadState::new(DetTid::from_raw(7), &config, ());
+    let thread: ThreadState<crate::SeededMode> =
+        ThreadState::<crate::SeededMode>::new(DetTid::from_raw(7), &config, ());
     for request in [report(), Q::WithForwardedCount(17, Box::new(report()))] {
         let actual = (thread.thread_logical_time.clone(), thread.mm_id, request);
         let encoded = bytes(&actual);
@@ -390,7 +403,7 @@ async fn a_fresh_registered_child_without_exec_history_can_publish_in_its_grant(
         ppid: None,
         private_memory: None,
     };
-    let mut thread = ThreadState::new(child, &config, ());
+    let mut thread = ThreadState::<crate::SeededMode>::new(child, &config, ());
     thread.detpid = Some(child);
     let mut guest = ExternalRegistrationGuest {
         global: &state,
@@ -477,7 +490,8 @@ async fn terminal_lifecycle_wins_over_malformed_reports_without_a_refusal_latch(
                 });
                 let (config, state, tid, pid) = cancellation_test_state_with_config(config);
                 install_test_registration(&state, tid, Ivar::new());
-                let mut thread: ThreadState<()> = ThreadState::new(tid, &config, ());
+                let mut thread: ThreadState<crate::SeededMode> =
+                    ThreadState::<crate::SeededMode>::new(tid, &config, ());
                 state
                     .sched
                     .lock()
@@ -836,7 +850,8 @@ async fn publication_sender_preserves_terminal_nonresumption_and_retirement() {
         });
         let (config, state, tid, pid) = cancellation_test_state_with_config(config);
         install_test_registration(&state, tid, Ivar::new());
-        let mut thread: ThreadState<()> = ThreadState::new(tid, &config, ());
+        let mut thread: ThreadState<crate::SeededMode> =
+            ThreadState::<crate::SeededMode>::new(tid, &config, ());
         thread.detpid = Some(pid);
         state
             .sched

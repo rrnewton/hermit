@@ -63,7 +63,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::Detcore;
-use crate::RecordOrReplay;
+use crate::run_mode::RunMode;
 use crate::tool_global;
 
 /// One step of the switch, sent by a guest thread
@@ -384,7 +384,7 @@ pub fn is_crash_signal(signal: i32, si_code: Option<i32>) -> bool {
 fn si_code<G, T>(guest: &G) -> Option<i32>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let info = guest.signal_info()?;
     Some(i32::from_ne_bytes(info.get(8..12)?.try_into().ok()?))
@@ -434,7 +434,7 @@ pub fn admission_refusal(config: &crate::Config) -> Option<String> {
 fn signal_blocked<G, T>(guest: &G, signal: i32) -> bool
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let bit = crate::syscalls::kernel_sigset_bit(signal);
     crate::syscalls::read_guest_thread_signal_state(guest)
@@ -443,7 +443,10 @@ where
 
 /// Records what the scheduler answered a step: the bound, once the thread's
 /// process takes it.
-fn learn(state: &mut crate::tool_local::ThreadState<impl Sized>, bound: Option<NonZeroU64>) {
+fn learn(
+    state: &mut crate::tool_local::ThreadState<impl crate::RunMode>,
+    bound: Option<NonZeroU64>,
+) {
     state.post_crash_bound = state.post_crash_bound.or(bound);
     if state.post_crash_bound.is_some() {
         state.crash_armed = None;
@@ -465,7 +468,7 @@ fn learn(state: &mut crate::tool_local::ThreadState<impl Sized>, bound: Option<N
 pub(crate) async fn note_stop<G, T>(guest: &mut G)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     if guest.thread_state().replaying_lone_slice_end.is_some() {
         return;
@@ -488,7 +491,7 @@ where
 pub(crate) async fn note_delivery<G, T>(guest: &mut G, signal: i32)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     if guest.config().post_crash_timeslice_in_effect().is_none()
         || guest.thread_state().post_crash_bound.is_some()
@@ -528,7 +531,7 @@ where
 pub(crate) async fn note_exec<G, T>(guest: &mut G)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     if guest.config().post_crash_timeslice_in_effect().is_none()
         || guest.thread_state().post_crash_bound.is_some()

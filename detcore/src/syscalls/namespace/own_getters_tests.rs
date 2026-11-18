@@ -72,7 +72,7 @@ impl Tool for InnerTool {
 
 struct GetterGuest {
     config: Config,
-    thread: ThreadState<InnerState>,
+    thread: ThreadState<crate::SeededMode<InnerTool>>,
     physical_pid: Pid,
     physical_tid: Pid,
 }
@@ -115,7 +115,7 @@ impl GlobalRPC<GlobalState> for GetterGuest {
 }
 
 #[reverie::tool]
-impl Guest<Detcore<InnerTool>> for GetterGuest {
+impl Guest<Detcore<crate::SeededMode<InnerTool>>> for GetterGuest {
     type Memory = LocalMemory;
     type Stack = UnusedStack;
     fn pid(&self) -> Pid {
@@ -130,10 +130,10 @@ impl Guest<Detcore<InnerTool>> for GetterGuest {
     fn memory(&self) -> LocalMemory {
         LocalMemory::new()
     }
-    fn thread_state(&self) -> &ThreadState<InnerState> {
+    fn thread_state(&self) -> &ThreadState<crate::SeededMode<InnerTool>> {
         &self.thread
     }
-    fn thread_state_mut(&mut self) -> &mut ThreadState<InnerState> {
+    fn thread_state_mut(&mut self) -> &mut ThreadState<crate::SeededMode<InnerTool>> {
         &mut self.thread
     }
     async fn regs(&mut self) -> libc::user_regs_struct {
@@ -165,18 +165,22 @@ impl Guest<Detcore<InnerTool>> for GetterGuest {
     }
 }
 
-fn setup(pid: i32, tid: i32, nested: bool) -> (Detcore<InnerTool>, GetterGuest) {
+fn setup(pid: i32, tid: i32, nested: bool) -> (Detcore<crate::SeededMode<InnerTool>>, GetterGuest) {
     let config = Config {
         sequentialize_threads: false,
         max_timeslice: None,
         ..Config::default()
     };
-    let mut thread = ThreadState::new(DetPid::from_raw(tid), &config, InnerState::default());
+    let mut thread = ThreadState::<crate::SeededMode<InnerTool>>::new(
+        DetPid::from_raw(tid),
+        &config,
+        InnerState::default(),
+    );
     thread.detpid = Some(DetPid::from_raw(pid));
     thread.physical_tid = Some(509);
     thread.nested_pid_namespace = nested;
     // Keep the original process-local Tool ID even when this is a child.
-    let tool = Detcore::<InnerTool>::new(Pid::from_raw(3), &config);
+    let tool = Detcore::<crate::SeededMode<InnerTool>>::new(Pid::from_raw(3), &config);
     (
         tool,
         GetterGuest {
@@ -189,7 +193,7 @@ fn setup(pid: i32, tid: i32, nested: bool) -> (Detcore<InnerTool>, GetterGuest) 
 }
 
 async fn dispatch(
-    tool: &Detcore<InnerTool>,
+    tool: &Detcore<crate::SeededMode<InnerTool>>,
     guest: &mut GetterGuest,
     call: Syscall,
     answer: Answer,

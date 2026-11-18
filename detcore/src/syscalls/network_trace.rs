@@ -105,10 +105,10 @@ use super::io::select_timeout_duration;
 use super::io::write_pselect6_fd_set;
 use crate::fd::FdType;
 use crate::fd::NetworkSocketKind;
-use crate::record_or_replay::RecordOrReplay;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::run_mode::RunMode;
 use crate::syscalls::helpers::NonblockableSyscall;
 use crate::syscalls::helpers::PollProbe;
 use crate::syscalls::helpers::RestartBlock;
@@ -597,7 +597,7 @@ fn arrival_from_pull(result: Result<i64, Errno>, buffer: &[u8]) -> Option<Networ
     }
 }
 
-impl<T: RecordOrReplay> Detcore<T> {
+impl<T: RunMode> Detcore<T> {
     fn network_mode(&self) -> NetworkTraceMode {
         self.cfg.network_trace.mode
     }

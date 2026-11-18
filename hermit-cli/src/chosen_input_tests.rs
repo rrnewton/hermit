@@ -86,27 +86,55 @@ fn binary_chosen_wrappers_and_raw_typed_spawns_refuse_before_target_start() {
         .unwrap();
     runtime.block_on(async move {
         match route.as_str() {
-            "record-wrapper" => { let _ = hermit_record::spawn_tracer(guest(), config).await; }
-            "replay-wrapper" => { let _ = hermit_replay::spawn_tracer(guest(), config, None, false).await; }
+            "record-wrapper" => {
+                let _ = hermit_record::spawn_tracer(guest(), config).await;
+            }
+            "replay-wrapper" => {
+                let _ = hermit_replay::spawn_tracer(guest(), config, None, false).await;
+            }
             "record-raw" => {
-                let _ = reverie_ptrace::TracerBuilder::<detcore::Detcore<hermit_record::Recorder>>::new(guest())
-                    .config(config).spawn().await;
+                let _ = reverie_ptrace::TracerBuilder::<
+                    detcore::Detcore<detcore::SeededMode<hermit_record::Recorder>>,
+                >::new(guest())
+                .config(config)
+                .spawn()
+                .await;
             }
             "replay-raw" => {
-                let _ = reverie_ptrace::TracerBuilder::<detcore::Detcore<hermit_replay::Replayer>>::new(guest())
-                    .config(config).spawn().await;
+                let _ = reverie_ptrace::TracerBuilder::<
+                    detcore::Detcore<detcore::SeededMode<hermit_replay::Replayer>>,
+                >::new(guest())
+                .config(config)
+                .spawn()
+                .await;
             }
             "record-closure" => {
                 let marker = std::env::var_os(MARKER).unwrap();
-                let _ = reverie_ptrace::spawn_fn_with_config::<detcore::Detcore<hermit_record::Recorder>, _>(
-                    move || { std::fs::write(marker, b"started").unwrap(); }, config, true,
-                ).await;
+                let _ = reverie_ptrace::spawn_fn_with_config::<
+                    detcore::Detcore<detcore::SeededMode<hermit_record::Recorder>>,
+                    _,
+                >(
+                    move || {
+                        std::fs::write(marker, b"started").unwrap();
+                    },
+                    config,
+                    true,
+                )
+                .await;
             }
             "replay-closure" => {
                 let marker = std::env::var_os(MARKER).unwrap();
-                let _ = reverie_ptrace::spawn_fn_with_config::<detcore::Detcore<hermit_replay::Replayer>, _>(
-                    move || { std::fs::write(marker, b"started").unwrap(); }, config, true,
-                ).await;
+                let _ = reverie_ptrace::spawn_fn_with_config::<
+                    detcore::Detcore<detcore::SeededMode<hermit_replay::Replayer>>,
+                    _,
+                >(
+                    move || {
+                        std::fs::write(marker, b"started").unwrap();
+                    },
+                    config,
+                    true,
+                )
+                .await;
             }
             _ => panic!("unknown route {route}"),
         }

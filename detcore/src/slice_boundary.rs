@@ -70,7 +70,10 @@ pub struct ClosedSlice {
 impl Observations {
     /// Construct counters from an authenticated scheduler lifecycle identity.
     /// This path never consumes an expected boundary to choose an owner.
-    fn from_owner<T>(thread: &ThreadState<T>, owner: Owner) -> anyhow::Result<Self> {
+    fn from_owner<T: crate::RunMode>(
+        thread: &ThreadState<T>,
+        owner: Owner,
+    ) -> anyhow::Result<Self> {
         if owner.tid != thread.dettid
             || owner.birth_tid.as_raw() <= 0
             || owner.address_space_creator != thread.mm_id.creator()
@@ -86,7 +89,7 @@ impl Observations {
     /// Bind a fresh observation state to the actual thread and address-space
     /// generation. The thread-generation allocator remains a scheduler
     /// integration obligation; this API does not infer it from host timing.
-    pub fn new<T>(thread: &ThreadState<T>, thread_generation: u64) -> Self {
+    pub fn new<T: crate::RunMode>(thread: &ThreadState<T>, thread_generation: u64) -> Self {
         Self {
             owner: Owner {
                 tid: thread.dettid,
@@ -109,7 +112,7 @@ impl Observations {
         }
     }
 
-    fn require_owner<T>(&self, thread: &ThreadState<T>) -> anyhow::Result<()> {
+    fn require_owner<T: crate::RunMode>(&self, thread: &ThreadState<T>) -> anyhow::Result<()> {
         if self.owner.tid != thread.dettid || self.mm != thread.mm_id {
             bail!(
                 "slice-boundary protocol refusal: stale observation owner {:?}",
@@ -119,7 +122,7 @@ impl Observations {
         Ok(())
     }
 
-    fn publish<T>(
+    fn publish<T: crate::RunMode>(
         &mut self,
         thread: &ThreadState<T>,
         entry: Entry,
@@ -143,7 +146,7 @@ impl Observations {
     /// Observe an actual syscall check-in. The prehook allocates its own
     /// occurrence; its posthook must name that same syscall. Hidden backend
     /// stops and injected-call retries must not invoke this method.
-    pub fn syscall<T>(
+    pub fn syscall<T: crate::RunMode>(
         &mut self,
         thread: &ThreadState<T>,
         syscall: Sysno,
@@ -183,7 +186,7 @@ impl Observations {
     /// Observe a non-syscall callback delivered to Detcore. Timer mechanisms
     /// must be distinguished by the actual callback, not RIP or expectations.
     /// Signal delivery identity is the already selected logical delivery.
-    pub fn callback<T>(
+    pub fn callback<T: crate::RunMode>(
         &mut self,
         thread: &ThreadState<T>,
         entry: Entry,
@@ -205,7 +208,7 @@ impl Observations {
     /// Snapshot the completed identity and reset the actual thread exactly
     /// once. No replay expectation is accepted as an observation. Refusals
     /// precede any reset, RNG draw, clock change, or occurrence advancement.
-    pub fn close_slice<T>(
+    pub fn close_slice<T: crate::RunMode>(
         &mut self,
         thread: &mut ThreadState<T>,
         config: &Config,
@@ -239,7 +242,7 @@ impl Observations {
         })
     }
 
-    fn current_identity<T>(
+    fn current_identity<T: crate::RunMode>(
         &self,
         thread: &ThreadState<T>,
         explicit_yield: bool,
@@ -289,7 +292,10 @@ impl Observations {
     /// Whether the next expected boundary belongs at this actual check-in.
     /// Expected fields select a point, never fill the observed identity.
     /// Explicit yield and no-RCB maximum bodies keep their existing callers.
-    fn replay_expiration<T>(&self, thread: &ThreadState<T>) -> anyhow::Result<Option<bool>> {
+    fn replay_expiration<T: crate::RunMode>(
+        &self,
+        thread: &ThreadState<T>,
+    ) -> anyhow::Result<Option<bool>> {
         let Some(budget) = self.expected_budget else {
             return Ok(None);
         };
@@ -328,14 +334,16 @@ impl Observations {
     }
 }
 
-pub(crate) fn replay_expiration<T>(thread: &ThreadState<T>) -> anyhow::Result<Option<bool>> {
+pub(crate) fn replay_expiration<T: crate::RunMode>(
+    thread: &ThreadState<T>,
+) -> anyhow::Result<Option<bool>> {
     match &thread.slice_boundary {
         Some(observed) => observed.replay_expiration(thread),
         None => Ok(None),
     }
 }
 
-pub(crate) fn no_rcb_maximum<T>(thread: &mut ThreadState<T>) -> anyhow::Result<()> {
+pub(crate) fn no_rcb_maximum<T: crate::RunMode>(thread: &mut ThreadState<T>) -> anyhow::Result<()> {
     if let Some(mut observed) = thread.slice_boundary.take() {
         let result = observed.publish(thread, Entry::NoRcbTimer, Phase::TimerMaximum);
         thread.slice_boundary = Some(observed);
@@ -348,7 +356,7 @@ pub(crate) fn no_rcb_maximum<T>(thread: &mut ThreadState<T>) -> anyhow::Result<(
 /// Repeated ordinary grants leave every counter and pending budget intact.
 /// Exec invalidates only observation state, never ThreadState's clocks,
 /// committed turns, reset statistics, PRNG or configured timer maximum.
-pub(crate) fn adopt_owner<T>(
+pub(crate) fn adopt_owner<T: crate::RunMode>(
     thread: &mut ThreadState<T>,
     owner: Owner,
     starts_thread: bool,
@@ -386,12 +394,12 @@ mod tests {
     use super::*;
     use crate::types::DetTid;
 
-    fn fixture() -> (Config, ThreadState<()>, Observations) {
+    fn fixture() -> (Config, ThreadState<crate::SeededMode>, Observations) {
         let cfg = Config {
             max_timeslice: NonZeroU64::new(200_000_000),
             ..Default::default()
         };
-        let mut thread = ThreadState::new(DetTid::from_raw(3), &cfg, ());
+        let mut thread = ThreadState::<crate::SeededMode>::new(DetTid::from_raw(3), &cfg, ());
         thread.next_timeslice(&cfg);
         let observations = Observations::new(&thread, 0);
         (cfg, thread, observations)
@@ -402,9 +410,9 @@ mod tests {
         let cfg = Config::default();
         let parent = DetTid::from_raw(3);
         let child = DetTid::from_raw(4);
-        let mut shared = ThreadState::new(child, &cfg, ());
+        let mut shared = ThreadState::<crate::SeededMode>::new(child, &cfg, ());
         shared.mm_id = MmId::for_clone(MmId::initial(parent), child, true);
-        let mut copied = ThreadState::new(child, &cfg, ());
+        let mut copied = ThreadState::<crate::SeededMode>::new(child, &cfg, ());
         copied.mm_id = MmId::for_clone(MmId::initial(parent), child, false);
         let mut a = Observations::new(&shared, 0);
         let mut b = Observations::new(&copied, 0);
@@ -573,7 +581,7 @@ mod tests {
         #[cfg(not(target_arch = "x86_64"))]
         let sysno = Sysno::ppoll;
         observed.syscall(&thread, sysno, Phase::Prehook).unwrap();
-        let mut recorded_thread = ThreadState::new(thread.dettid, &config, ());
+        let mut recorded_thread = ThreadState::<crate::SeededMode>::new(thread.dettid, &config, ());
         let mut recorded = observed.clone();
         recorded
             .syscall(&recorded_thread, sysno, Phase::Posthook)
@@ -629,7 +637,7 @@ mod tests {
             .syscall(&thread, Sysno::sched_yield, Phase::Prehook)
             .unwrap();
         let mut copy = observed.clone();
-        let mut record_thread = ThreadState::new(thread.dettid, &config, ());
+        let mut record_thread = ThreadState::<crate::SeededMode>::new(thread.dettid, &config, ());
         let marker = copy
             .close_slice(&mut record_thread, &config, true, None)
             .unwrap()
@@ -659,7 +667,7 @@ mod tests {
             .callback(&thread, Entry::NoRcbTimer, Phase::Prehook)
             .unwrap();
         let mut copy = observed.clone();
-        let mut record_thread = ThreadState::new(thread.dettid, &config, ());
+        let mut record_thread = ThreadState::<crate::SeededMode>::new(thread.dettid, &config, ());
         copy.publish(&record_thread, Entry::NoRcbTimer, Phase::TimerMaximum)
             .unwrap();
         let marker = copy

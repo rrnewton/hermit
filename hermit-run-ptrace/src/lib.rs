@@ -48,9 +48,39 @@ pub fn spawn_tracer(
     sequentialized_guest: bool,
     stats: BackendStatsRequest,
 ) -> SpawnTracer {
+    // The run mode is chosen here, once, by type: a run with a choice source
+    // instantiates Detcore with the controlled scheduling-choice policy; every
+    // other run keeps the seeded instantiation, which does no choice work.
+    if config.choice_tape.is_some() || config.choice_controller.is_some() {
+        spawn_tracer_in_mode::<detcore::ControlledMode>(
+            command,
+            config,
+            gdbserver,
+            sequentialized_guest,
+            stats,
+        )
+    } else {
+        spawn_tracer_in_mode::<detcore::SeededMode>(
+            command,
+            config,
+            gdbserver,
+            sequentialized_guest,
+            stats,
+        )
+    }
+}
+
+/// [`spawn_tracer`] with Detcore in run mode `M`.
+fn spawn_tracer_in_mode<M: detcore::RunMode + 'static>(
+    command: Command,
+    config: detcore::Config,
+    gdbserver: Option<GdbConnection>,
+    sequentialized_guest: bool,
+    stats: BackendStatsRequest,
+) -> SpawnTracer {
     Box::pin(async move {
         let mut builder =
-            reverie_ptrace::TracerBuilder::<detcore::Detcore>::new(command).config(config);
+            reverie_ptrace::TracerBuilder::<detcore::Detcore<M>>::new(command).config(config);
         if let Some(connection) = gdbserver {
             builder = builder.gdbserver(connection);
             if sequentialized_guest {

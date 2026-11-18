@@ -138,7 +138,7 @@ use crate::procfs::fdinfo::FdinfoKind;
 use crate::procfs::fdinfo::FdinfoLock;
 use crate::procfs::fdinfo::TimerfdLines;
 use crate::procfs_inode;
-use crate::record_or_replay::RecordOrReplay;
+use crate::run_mode::RunMode;
 use crate::stat::DetStat;
 use crate::tool_local::Detcore;
 
@@ -172,7 +172,7 @@ fn fdinfo_position(text: &[u8]) -> Option<i64> {
         .and_then(|position| position.parse().ok())
 }
 
-impl<T: RecordOrReplay> Detcore<T> {
+impl<T: RunMode> Detcore<T> {
     /// Whether Detcore renders the fdinfo of the caller's own descriptors
     /// (package K slice K8-h): where the guest's procfs is not the kernel's
     /// (`procfs_inode::tool_can_name_guest_descriptors`, KVM), so no kernel
@@ -690,7 +690,7 @@ fn driver_prints_fdinfo(rdev: u64) -> bool {
     (major, minor) == (5, 2) || (major, minor) == (10, 200) || major == 226
 }
 
-impl<T: RecordOrReplay> Detcore<T> {
+impl<T: RunMode> Detcore<T> {
     /// The device a lock line shows for the superblock device `raw_device`
     /// the backend reported, as the guest's `mountinfo` shows that file
     /// system's device: through a proven mountinfo-to-metadata rewrite

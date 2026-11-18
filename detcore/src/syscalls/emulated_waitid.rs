@@ -158,7 +158,7 @@ async fn finish_without_event<G, T>(
 ) -> Result<i64, Error>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     // Invalid options cannot select a child. The backend still performs Linux's
     // six ordered zero stores, including on ECHILD/EINVAL/ERESTARTSYS; a copy
@@ -183,7 +183,7 @@ async fn complete_child<G, T>(
 ) -> Result<i64, Error>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     if call.options() & libc::WNOWAIT == 0
         && !guest
@@ -212,7 +212,7 @@ async fn complete_proven_child<G, T>(
 ) -> Result<i64, Error>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     // The backend publishes waitability before the owner's exit hook inserts
     // final CPU. Wait only for our registered birth-owned publication; the
@@ -235,7 +235,7 @@ async fn wait_terminal<G, T>(
 ) -> Result<i64, Error>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let nonblocking = call.options() & libc::WNOHANG != 0 || pidfd_nonblocking;
     let mut request_turn = true;
@@ -327,7 +327,7 @@ async fn signal_after_wait<G, T>(
 ) -> Result<Option<WaitSignalDisposition>, Error>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     match status {
         ResumeStatus::InGuestFatalAlarm => Err(failure(
@@ -376,7 +376,7 @@ where
 pub(super) async fn handle<G, T>(guest: &mut G, call: syscalls::Waitid) -> Result<i64, Error>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let dettid = guest.thread_state().dettid;
     let mut rsrc = Resources::new(dettid);
@@ -670,7 +670,7 @@ mod tests {
     // memory access, restoration or unrelated RPC here fails the test.
     struct CompletionGuest {
         config: Config,
-        thread: crate::ThreadState<()>,
+        thread: crate::ThreadState<crate::SeededMode>,
         scheduler: Mutex<Scheduler>,
         result: Result<i64, Errno>,
         injected: Vec<syscalls::Waitid>,
@@ -749,10 +749,10 @@ mod tests {
         fn memory(&self) -> Self::Memory {
             panic!("must not read caller outputs")
         }
-        fn thread_state(&self) -> &crate::ThreadState<()> {
+        fn thread_state(&self) -> &crate::ThreadState<crate::SeededMode> {
             &self.thread
         }
-        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<()> {
+        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<crate::SeededMode> {
             &mut self.thread
         }
         async fn regs(&mut self) -> libc::user_regs_struct {
@@ -792,9 +792,9 @@ mod tests {
             let config = Config::default();
             let parent = DetPid::from_raw(3);
             let child = DetPid::from_raw(7);
-            let mut thread = crate::ThreadState::new(parent, &config, ());
+            let mut thread = crate::ThreadState::<crate::SeededMode>::new(parent, &config, ());
             thread.detpid = Some(parent);
-            let mut exited = crate::ThreadState::new(child, &config, ());
+            let mut exited = crate::ThreadState::<crate::SeededMode>::new(child, &config, ());
             exited.parent_process_cpu_time = Some(Arc::clone(&thread.process_cpu_time));
             // Fix the component's CPU units independently of Config's optional
             // clock/RCB multipliers; this is a real saved 123us child snapshot.
@@ -832,7 +832,7 @@ mod tests {
 
     // Use the actual child-state initializer, including its emulated-wait/serial gate,
     // rather than manufacturing a ready notification in the component.
-    fn unpublished_child(guest: &mut CompletionGuest) -> crate::ThreadState<()> {
+    fn unpublished_child(guest: &mut CompletionGuest) -> crate::ThreadState<crate::SeededMode> {
         // The two behaviours the old `backend_is_kvm` identity flag selected
         // that remain capabilities.
         guest.config.backend.provides_process_signal_control = true;

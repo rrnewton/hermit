@@ -82,7 +82,7 @@ struct PolicyRefused(String);
 
 struct CloneGuest {
     config: Config,
-    thread: ThreadState<()>,
+    thread: ThreadState<crate::SeededMode>,
     original_args: Box<[u8; CLONE_ARGS_SIZE_VER2]>,
     original_expected: [u8; CLONE_ARGS_SIZE_VER2],
     original_set_tid: Option<Box<[i32; 1]>>,
@@ -113,7 +113,7 @@ impl CloneGuest {
         original_args[32..40].copy_from_slice(&(libc::SIGCHLD as u64).to_ne_bytes());
         let (input_control, input_task) = Self::input_owner(5000);
         Self {
-            thread: ThreadState::new(DetPid::from_raw(5000), &config, ()),
+            thread: ThreadState::<crate::SeededMode>::new(DetPid::from_raw(5000), &config, ()),
             config,
             original_expected: *original_args,
             original_args,
@@ -179,7 +179,7 @@ impl CloneGuest {
         self.config.sequentialize_threads = true;
         self.config.inherited_seccomp = detcore_model::config::InheritedSeccomp::Disabled;
         self.proof_context = true;
-        self.thread = ThreadState::new(
+        self.thread = ThreadState::<crate::SeededMode>::new(
             DetPid::from_raw(std::process::id() as i32),
             &self.config,
             (),
@@ -198,7 +198,7 @@ impl CloneGuest {
         if !self.real_identity {
             assert!(self.attempts.is_empty());
             self.real_identity = true;
-            self.thread = ThreadState::new(
+            self.thread = ThreadState::<crate::SeededMode>::new(
                 DetPid::from_raw(std::process::id() as i32),
                 &self.config,
                 (),
@@ -284,10 +284,10 @@ impl Guest<Detcore> for CloneGuest {
     fn memory(&self) -> Self::Memory {
         LocalMemory::new()
     }
-    fn thread_state(&self) -> &ThreadState<()> {
+    fn thread_state(&self) -> &ThreadState<crate::SeededMode> {
         &self.thread
     }
-    fn thread_state_mut(&mut self) -> &mut ThreadState<()> {
+    fn thread_state_mut(&mut self) -> &mut ThreadState<crate::SeededMode> {
         &mut self.thread
     }
     async fn regs(&mut self) -> libc::user_regs_struct {

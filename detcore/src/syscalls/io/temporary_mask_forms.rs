@@ -86,10 +86,10 @@ use super::pselect6_fd_set_len;
 use super::read_pselect6_fd_set;
 use super::stage_private_cells;
 use super::write_pselect6_fd_set;
-use crate::record_or_replay::RecordOrReplay;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::run_mode::RunMode;
 use crate::syscalls::helpers::GuestHeldPollProof;
 use crate::syscalls::helpers::NonblockableSyscall;
 use crate::syscalls::helpers::TemporaryMaskCheck;
@@ -150,7 +150,7 @@ async fn unreadable_argument<T, G>(
     len: usize,
 ) -> Error
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     if crate::syscalls::signal::user_copy_faults(guest.tid().as_raw(), start, len) == Some(true) {
@@ -177,7 +177,7 @@ async fn read_argument<V: Copy, T, G>(
     address: usize,
 ) -> Result<V, Error>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let value = Addr::<V>::from_raw(address).and_then(|at| guest.memory().read_value(at).ok());
@@ -201,7 +201,7 @@ async fn read_temporary_mask<T, G>(
     first: bool,
 ) -> Result<KernelSigset, Error>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let Some(at) = Addr::<libc::sigset_t>::from_raw(address) else {
@@ -238,7 +238,7 @@ pub(super) async fn read_gated_fd_set<T, G>(
     len: usize,
 ) -> Result<Option<Vec<u8>>, Error>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     match read_pselect6_fd_set(guest, set, len) {
@@ -260,7 +260,7 @@ pub(super) async fn read_gated_fd_sets<T, G>(
     len: usize,
 ) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>), Error>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let readfds = read_gated_fd_set(guest, caller, call.readfds(), len).await?;
@@ -282,7 +282,7 @@ where
 /// from entry stay pending under it (IR-7 row (A)).
 pub(super) async fn yield_after_in_turn_result<T, G>(guest: &mut G)
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let dettid = guest.thread_state().dettid;
@@ -307,7 +307,7 @@ pub(super) async fn observe_deadline<T, G>(
     timeout: Option<Duration>,
 ) -> Option<(LogicalTime, LogicalTime)>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let timeout = timeout?;
@@ -417,7 +417,7 @@ impl TemporaryMaskCall {
         timeout: Option<Duration>,
     ) -> Result<Self, Error>
     where
-        T: RecordOrReplay,
+        T: RunMode,
         G: Guest<Detcore<T>>,
     {
         let mut call = Self {
@@ -531,7 +531,7 @@ impl TemporaryMaskCall {
         result: &Result<i64, Error>,
     ) -> Result<(), Error>
     where
-        T: RecordOrReplay,
+        T: RunMode,
         G: Guest<Detcore<T>>,
     {
         if self.finished {
@@ -557,7 +557,7 @@ impl TemporaryMaskCall {
     /// which is then the own mask.
     async fn put_back_own_mask<T, G>(guest: &mut G)
     where
-        T: RecordOrReplay,
+        T: RunMode,
         G: Guest<Detcore<T>>,
     {
         let own = crate::tool_global::publish_request_guest_mask(
@@ -574,7 +574,7 @@ impl TemporaryMaskCall {
         result: &Result<i64, Error>,
     ) -> Result<(), Error>
     where
-        T: RecordOrReplay,
+        T: RunMode,
         G: Guest<Detcore<T>>,
     {
         let dettid = guest.thread_state().dettid;
@@ -743,7 +743,7 @@ fn check_result(check: TemporaryMaskCheck, restart: Errno) -> Option<Errno> {
     }
 }
 
-impl<T: RecordOrReplay> Detcore<T> {
+impl<T: RunMode> Detcore<T> {
     /// `pselect6` under the in-guest delivery gate, threads sequentialized,
     /// in run mode (D39, D50 reader (3), IR-9), in Linux's order
     /// (fs/select.c at v6.12):

@@ -39,6 +39,7 @@
 pub mod aarch64_lse;
 pub mod access_trace;
 mod arch;
+pub mod choice;
 pub mod clock_identity;
 mod commit_creds;
 mod config;
@@ -97,6 +98,7 @@ mod record_or_replay;
 pub mod refused_signal_controls;
 mod reserved_input;
 mod resources;
+pub mod run_mode;
 mod scheduler;
 mod secure_exec;
 mod shared_open_files;
@@ -468,6 +470,7 @@ use raw_cpuid::CpuIdResult;
 #[cfg(target_arch = "x86_64")]
 use raw_cpuid::cpuid;
 pub use record_or_replay::ChosenBinaryInputRefusal;
+pub use record_or_replay::NoopTool;
 pub use record_or_replay::RecordOrReplay;
 pub use record_or_replay::admit_chosen_input_stream;
 pub use record_or_replay::require_chosen_input_stream;
@@ -499,6 +502,11 @@ use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
+pub use run_mode::ControlledMode;
+pub use run_mode::Mode;
+pub use run_mode::RecordReplayState;
+pub use run_mode::RunMode;
+pub use run_mode::SeededMode;
 pub use scheduler::Priority;
 pub use scheduler::ReplayRefusalExitHook;
 pub use scheduler::TerminalDeadlockHook;
@@ -859,7 +867,7 @@ const LONE_BACKSTOP_RCBS: u64 = 2_000_000;
 fn arm_lone_backstop<G, T>(guest: &mut G, rcbs_to_end: u64)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     guest
         .set_timer(TimerSchedule::Rcbs(LONE_BACKSTOP_RCBS.max(rcbs_to_end)))
@@ -874,7 +882,7 @@ where
 pub(crate) fn stop_skipping_lone_slice_end<G, T>(guest: &mut G)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let Some(end) = guest.thread_state_mut().lone_slice_end.take() else {
         return;
@@ -1019,7 +1027,7 @@ pub fn two_phase_refusal(cfg: &Config) -> Option<&'static str> {
 fn delivery_takes_default_action<G, T>(guest: &G, signal: i32) -> bool
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     // SIGKILL and SIGSTOP always take their default action: Linux refuses any
     // other action for them (`do_sigaction`), so nothing is read.
@@ -1046,7 +1054,7 @@ where
 fn delivery_runs_handler<G, T>(guest: &G, signal: i32) -> bool
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     // SIGKILL and SIGSTOP never run a handler (`do_sigaction` refuses one), so
     // nothing is read: on a backend whose callbacks see a SIGKILL (a
@@ -1073,7 +1081,7 @@ fn traced_disposition<G, T>(
 ) -> detcore_model::access_trace::ObservedSignalDisposition
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let dispositions = match crate::syscalls::signal_shadow::copied_dispositions_for(guest, signal)
     {
@@ -1179,7 +1187,7 @@ pub fn observes_sigreturns(cfg: &Config) -> bool {
     syscalls::signal_shadow::observes_sigreturns(cfg)
 }
 
-impl<T: RecordOrReplay> Detcore<T> {
+impl<T: RunMode> Detcore<T> {
     /// A5 step 3c.1e A, IR-15 (Detcore's half): whether the calling thread's
     /// process is the init of a PID namespace it created with `CLONE_NEWPID`
     /// (`Scheduler`'s `pid_namespace_inits`, through
@@ -2474,7 +2482,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// (`--chaos-instruction-offset`): the offset is stepped from a stop at
     /// its branch target, which a record of the option always has
     /// (`Config::slice_ends_need_a_stop`), whatever this run's flags say.
-    fn replay_allows_stopless_end<U>(&self, thread_state: &ThreadState<U>, end: u64) -> bool {
+    fn replay_allows_stopless_end<U: RunMode>(
+        &self,
+        thread_state: &ThreadState<U>,
+        end: u64,
+    ) -> bool {
         stopless_end_allowed(self.cfg.replay_schedule_from.is_some(), thread_state, end)
     }
 
@@ -4979,12 +4991,12 @@ fn posthook_checkpoint(
 }
 
 #[reverie::tool]
-impl<T: RecordOrReplay> Tool for Detcore<T> {
+impl<T: RunMode> Tool for Detcore<T> {
     type GlobalState = GlobalState;
-    type ThreadState = ThreadState<T::ThreadState>;
+    type ThreadState = ThreadState<T>;
 
     fn stream_role() -> reverie::ToolStreamRole {
-        T::stream_role()
+        T::RecordReplay::stream_role()
     }
 
     fn observes_native_syscalls(config: &Config) -> bool {
@@ -5014,9 +5026,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // passes, and not only by `hermit run`'s validation.
         untrap_passthrough_admission(config)
             .map_err(|refusal| reverie::Error::Tool(anyhow::Error::new(refusal)))?;
-        if let Err(refusal) =
-            crate::record_or_replay::require_chosen_input_stream(config, T::stream_role())
-        {
+        if let Err(refusal) = crate::record_or_replay::require_chosen_input_stream(
+            config,
+            T::RecordReplay::stream_role(),
+        ) {
             crate::scheduler::exit_on_scheduler_refusal(&refusal);
         }
         // Rewriting exclusive loops in the guest's memory needs a host
@@ -5036,7 +5049,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         if let Some(refusal) = crate::syscalls::binder::kvm_strict_binder_admission(config) {
             crate::scheduler::exit_on_scheduler_refusal(&refusal);
         }
-        T::facility_admission(config)
+        T::RecordReplay::facility_admission(config)
     }
 
     fn reserved_input_requirement(
@@ -5056,7 +5069,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // io_uring remains intercepted and refused, including passthru_opt.
         // This guarantee must also be supplied by the inner Tool: recording,
         // replay, and arbitrary extensions do not inherit it implicitly.
-        T::native_mm_ownership(config)
+        T::RecordReplay::native_mm_ownership(config)
     }
 
     /// Only a sequentialized run on a backend with process signal control
@@ -5138,7 +5151,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         Self {
             detpid,
             cfg: cfg.clone(),
-            record_or_replay: T::new(pid, cfg),
+            record_or_replay: T::RecordReplay::new(pid, cfg),
         }
     }
 
@@ -5519,7 +5532,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
             // Make sure we also intercept everything that the record-or-replay tool
             // wants.
-            subscription | T::subscriptions(config)
+            subscription | T::RecordReplay::subscriptions(config)
         }
     }
 
@@ -6500,6 +6513,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     replay_backstop: None,
 
                     record_or_replay,
+                    // Attached to the run's choice session, if any, when
+                    // the child starts (`thread_start_request`).
+                    choices: T::Choices::default(),
                     preemption_points: None,
 
                     // We only get to the point of creating child threads if we're past the first execve.
@@ -6598,6 +6614,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             } else {
                 None
             };
+            // The registration below draws this thread's own starting
+            // priority, before its start grant: the run mode's policy first
+            // takes from the run what it needs to draw.
+            <T::Choices as choice::SchedulingChoices>::init_thread::<T, G>(guest).await;
             if let Some(post_exec_mm) =
                 create_child_thread(guest, new_dettid, 0, None, libc::SIGCHLD, physical_ids).await
             {
@@ -9474,7 +9494,7 @@ mod group_signal_tests {
 /// The memory `call` copied when it began, if its handler kept it because
 /// another thread has rewritten it since (`ThreadState::entry_import`), for a
 /// reader of the call's arguments after it returns.
-fn entry_view<T: crate::record_or_replay::RecordOrReplay, G: Guest<Detcore<T>>>(
+fn entry_view<T: crate::run_mode::RunMode, G: Guest<Detcore<T>>>(
     guest: &G,
     call: &Syscall,
 ) -> Option<Box<crate::syscalls::entry_import::EntryImport>> {
@@ -10725,7 +10745,11 @@ mod timeslice_timer_tests {
 /// arms an end, and the catch-up after a skipped end asks again for the end
 /// it leaves armed (`Detcore::catch_up_lone_slice_ends`'s last step), so both
 /// refuse alike.
-fn stopless_end_allowed<U>(schedule_replay: bool, thread_state: &ThreadState<U>, end: u64) -> bool {
+fn stopless_end_allowed<U: RunMode>(
+    schedule_replay: bool,
+    thread_state: &ThreadState<U>,
+    end: u64,
+) -> bool {
     if thread_state
         .preemption_points
         .as_ref()
@@ -10759,7 +10783,7 @@ mod stopless_end_permission_tests {
     #[test]
     fn a_replay_allows_a_stopless_end_only_where_its_record_does() {
         let config = Config::default();
-        let mut thread = ThreadState::new(DetPid::from_raw(5), &config, ());
+        let mut thread = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(5), &config, ());
         assert!(stopless_end_allowed(false, &thread, 100), "past the record");
         assert!(!stopless_end_allowed(true, &thread, 100), "no marked end");
 
@@ -10794,7 +10818,7 @@ mod stopless_end_permission_tests {
     fn a_replay_of_instruction_offset_rows_takes_no_stopless_end() {
         use crate::preemptions::InstructionOffset;
         let config = Config::default();
-        let mut thread = ThreadState::new(DetPid::from_raw(5), &config, ());
+        let mut thread = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(5), &config, ());
         thread.replay_rcb_end = Some(100);
         let rows = |offset: Option<InstructionOffset>| {
             Some(
@@ -10824,7 +10848,7 @@ mod process_tree_guest_clock_tests {
     fn forked_process_shares_guest_clock_domain() {
         let config = Config::default();
         let tool = <Detcore as Tool>::new(Pid::from_raw(1), &config);
-        let mut parent = ThreadState::new(DetPid::from_raw(1), &config, ());
+        let mut parent = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ());
         parent.clone_flags = Some(CloneFlags::empty());
 
         let child = <Detcore as Tool>::init_thread_state(
@@ -10843,10 +10867,10 @@ mod process_files_tests {
 
     fn child(
         tool: &Detcore,
-        parent: &mut ThreadState<()>,
+        parent: &mut ThreadState<crate::SeededMode>,
         tid: i32,
         clone_flags: CloneFlags,
-    ) -> ThreadState<()> {
+    ) -> ThreadState<crate::SeededMode> {
         parent.clone_flags = Some(clone_flags);
         let mut child = <Detcore as Tool>::init_thread_state(
             tool,
@@ -10876,7 +10900,7 @@ mod process_files_tests {
             | CloneFlags::CLONE_FILES
             | CloneFlags::CLONE_SIGHAND
             | CloneFlags::CLONE_THREAD;
-        let mut root = ThreadState::new(DetPid::from_raw(3), &config, ());
+        let mut root = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(3), &config, ());
         root.detpid = Some(DetPid::from_raw(3));
         assert!(root.holds_process_files());
 
@@ -10935,10 +10959,10 @@ mod child_rng_identity_tests {
 
     fn child_state(
         tool: &Detcore,
-        parent: &mut ThreadState<()>,
+        parent: &mut ThreadState<crate::SeededMode>,
         host_tid: i32,
         clone_flags: CloneFlags,
-    ) -> ThreadState<()> {
+    ) -> ThreadState<crate::SeededMode> {
         parent.clone_flags = Some(clone_flags);
         <Detcore as Tool>::init_thread_state(
             tool,
@@ -10947,12 +10971,12 @@ mod child_rng_identity_tests {
         )
     }
 
-    fn rng_sample(child: &ThreadState<()>) -> [u64; 4] {
+    fn rng_sample(child: &ThreadState<crate::SeededMode>) -> [u64; 4] {
         let mut rng = child.prng.clone();
         std::array::from_fn(|_| rng.random())
     }
 
-    fn chaos_rng_sample(child: &ThreadState<()>) -> [u64; 4] {
+    fn chaos_rng_sample(child: &ThreadState<crate::SeededMode>) -> [u64; 4] {
         let mut rng = child.chaos_prng.clone();
         std::array::from_fn(|_| rng.random())
     }
@@ -10970,8 +10994,10 @@ mod child_rng_identity_tests {
                 CloneFlags::CLONE_VM | CloneFlags::CLONE_THREAD,
             ),
         ] {
-            let mut low_tid_parent = ThreadState::new(DetPid::from_raw(1), &config, ());
-            let mut high_tid_parent = ThreadState::new(DetPid::from_raw(1), &config, ());
+            let mut low_tid_parent =
+                ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ());
+            let mut high_tid_parent =
+                ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ());
             let low_tid_child = child_state(&tool, &mut low_tid_parent, 2, clone_flags);
             let high_tid_child = child_state(&tool, &mut high_tid_parent, 42_002, clone_flags);
 
@@ -11000,7 +11026,7 @@ mod child_rng_identity_tests {
     fn serialized_siblings_receive_distinct_child_rng_streams() {
         let config = Config::default();
         let tool = <Detcore as Tool>::new(Pid::from_raw(1), &config);
-        let mut parent = ThreadState::new(DetPid::from_raw(1), &config, ());
+        let mut parent = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ());
 
         let first = child_state(&tool, &mut parent, 2, CloneFlags::empty());
         let first_pedigree = parent.pedigree.fork_mut();
@@ -11100,7 +11126,8 @@ mod thread_cpu_time_tests {
         ] {
             let config = Config::default();
             let tool = <Detcore as Tool>::new(Pid::from_raw(1), &config);
-            let mut parent = ThreadState::new(DetPid::from_raw(1), &config, ());
+            let mut parent =
+                ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ());
             parent.thread_logical_time.add_rcbs(7);
             parent.thread_logical_time.add_syscall_with_cost(101);
             parent.clone_flags = Some(clone_flags);
@@ -11135,7 +11162,8 @@ mod thread_cpu_time_tests {
         for clone_flags in [CloneFlags::CLONE_THREAD, CloneFlags::empty()] {
             let config = Config::default();
             let tool = <Detcore as Tool>::new(Pid::from_raw(1), &config);
-            let mut parent = ThreadState::new(DetPid::from_raw(1), &config, ());
+            let mut parent =
+                ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ());
 
             // Give the parent nonzero CPU before the child exists. The child's
             // absolute logical clock inherits this position for scheduler
@@ -11173,20 +11201,21 @@ mod thread_cpu_time_tests {
     fn the_per_thread_table_follows_each_threads_accounting() {
         let config = Config::default();
         let tool = <Detcore as Tool>::new(Pid::from_raw(1), &config);
-        let mut parent = ThreadState::new(DetPid::from_raw(1), &config, ());
+        let mut parent = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ());
         parent.thread_logical_time.add_rcbs(30);
         parent.thread_logical_time.add_syscall_with_cost(700);
         let zero = (LogicalTime::ZERO, LogicalTime::ZERO);
-        let new_child = |parent: &mut ThreadState<()>, tid: i32, flags: CloneFlags| {
-            parent.clone_flags = Some(flags);
-            let child = <Detcore as Tool>::init_thread_state(
-                &tool,
-                Tid::from_raw(tid),
-                Some((Tid::from_raw(1), &*parent)),
-            );
-            parent.clone_flags = None;
-            child
-        };
+        let new_child =
+            |parent: &mut ThreadState<crate::SeededMode>, tid: i32, flags: CloneFlags| {
+                parent.clone_flags = Some(flags);
+                let child = <Detcore as Tool>::init_thread_state(
+                    &tool,
+                    Tid::from_raw(tid),
+                    Some((Tid::from_raw(1), &*parent)),
+                );
+                parent.clone_flags = None;
+                child
+            };
         let mut thread = new_child(&mut parent, 2, CloneFlags::CLONE_THREAD);
         let mut fork = new_child(&mut parent, 3, CloneFlags::empty());
         let thread_id = DetPid::from_raw(2);
@@ -11232,7 +11261,7 @@ mod thread_cpu_time_tests {
     fn an_exited_leaders_clock_keeps_its_final_time() {
         let config = Config::default();
         let tool = <Detcore as Tool>::new(Pid::from_raw(1), &config);
-        let mut leader = ThreadState::new(DetPid::from_raw(1), &config, ());
+        let mut leader = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ());
         leader.detpid = Some(DetPid::from_raw(1));
         leader.clone_flags = Some(CloneFlags::CLONE_THREAD);
         let sibling = <Detcore as Tool>::init_thread_state(
