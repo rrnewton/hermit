@@ -17,6 +17,15 @@ branches from 0.5.0.
   stops the run as a policy refusal (exit 122). ptrace backend only; the
   other backends refuse the options. See "Choice points for an external
   controller" in docs/USER_GUIDE.md.
+- Experimental: `HERMIT_FORK_SERVER=SOCKET hermit run ...` does the run's
+  setup once and then serves runs of the same command line, one per `RUN`
+  request on the Unix socket, each with its own stdin, stdout, stderr and
+  timeout, so a search tool pays for a fork instead of a launch per run. Only
+  ordinary ptrace runs are served; the other modes, a run manifest,
+  `--backend-engagement-json` and `--fatal-core-dir` are refused as a policy
+  refusal (exit 122), as is a `SOCKET` that names another file (left as it
+  is) or a socket another server listens on. See "Fork server" in
+  docs/USER_GUIDE.md.
 - Determinism loss: a run that claims determinism (Hermit's default thread
   sequentialization, with or without `--strict`) and records a determinism
   loss is now refused with exit 122, after the guest's output, which is

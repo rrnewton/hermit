@@ -14470,6 +14470,33 @@ impl RunOpts {
                 None
             }
         };
+        // The fork server (`fork_server`) forks at the ordinary run below,
+        // after this setup. Refuse what never reaches it, and outputs made
+        // once per invocation, before stdin is read.
+        if super::fork_server::requested() {
+            super::fork_server::refuse_unserved(&[
+                ("--verify", self.verify),
+                ("--verify-run", self.verify_run.is_some()),
+                ("--namespace-only", self.namespace_only),
+                (
+                    "an executable-selected backend",
+                    self.application_backend.is_some(),
+                ),
+                (
+                    "a backend other than ptrace",
+                    self.selected_backend() != Backend::Ptrace,
+                ),
+                (
+                    "a run manifest (pin its host-drawn inputs, or pass --manifest never)",
+                    recording.is_some(),
+                ),
+                (
+                    "--backend-engagement-json",
+                    self.backend_engagement_json.is_some(),
+                ),
+                ("--fatal-core-dir", self.fatal_core_dir.is_some()),
+            ])?;
+        }
         self.warn_of_host_drawn_inputs(global, recording)?;
         // After every refusal above, which holds in every build, so a build
         // without the feature refuses those runs the way a feature build does;
@@ -14732,6 +14759,9 @@ impl RunOpts {
         } else if let Some(directory) = &self.verify_run {
             self.verify_run(directory, global)
         } else {
+            // With HERMIT_FORK_SERVER, serve runs from here; only a forked
+            // child returns, and runs once (`fork_server::serve_here`).
+            super::fork_server::serve_here()?;
             let (status, _, _) = self.run(global, false)?;
             self.write_backend_engagement_after_run()?;
             drop(private_engagement_summary);
