@@ -32,6 +32,7 @@ mod dispatch_input;
 #[cfg(all(test, target_arch = "x86_64"))]
 mod exec_stop_launch_tests;
 mod executable_probe;
+mod fork_server;
 mod gdb_client;
 mod gdb_watch_helper;
 mod global_opts;
@@ -896,6 +897,9 @@ fn main_application<A: backend_hook::BackendAdapter>(adapter: A, selected_by_exe
     // and a container child must not gain a thread that outlives its entry
     // point (`hermit::launch_on_calling_thread`).
     hermit::launch_on_calling_thread();
+    // Take HERMIT_FORK_SERVER out of the environment while single-threaded;
+    // `hermit run` serves runs after its setup (`fork_server`).
+    fork_server::capture();
     if let Some(status) = cli_owned_lifecycle::maybe_run() {
         std::process::exit(status);
     }
