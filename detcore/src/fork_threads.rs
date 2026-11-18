@@ -393,12 +393,17 @@ pub(crate) fn park_others(timeout: std::time::Duration) -> Result<Parked, String
             libc::syscall(libc::SYS_gettid) as libc::pid_t,
         )
     };
-    let tids: Vec<libc::pid_t> = std::fs::read_dir("/proc/self/task")
-        .map_err(|e| format!("/proc/self/task: {e}"))?
-        .flatten()
-        .filter_map(|entry| entry.file_name().to_string_lossy().parse().ok())
-        .filter(|&tid| tid != me && !is_user_worker(tid))
-        .collect();
+    // Listed with raw getdents64 (util::find_in_directory), never glibc's
+    // opendir, whose buffer would come from the C library's heap.
+    let mut tids: Vec<libc::pid_t> = Vec::new();
+    crate::util::find_in_directory(std::path::Path::new("/proc/self/task"), |name| {
+        if let Some(tid) = name.to_str().and_then(|name| name.parse().ok()) {
+            tids.push(tid);
+        }
+        None::<()>
+    })
+    .map_err(|e| format!("/proc/self/task: {e}"))?;
+    tids.retain(|&tid| tid != me && !is_user_worker(tid));
     if tids.len() > MAX_THREADS {
         return Err(format!("{} threads; at most {MAX_THREADS}", tids.len()));
     }

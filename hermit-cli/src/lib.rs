@@ -76,6 +76,7 @@ pub mod physical_exit_watch;
 pub mod preemption_admission;
 pub mod proc_mount;
 pub mod sleep_registration_admission;
+pub mod timelines;
 
 /// Re-runs the named test alone in a fresh process of this test binary and
 /// requires it to pass; returns false in that fresh process so the caller

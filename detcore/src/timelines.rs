@@ -145,6 +145,14 @@ static HOOKS: OnceLock<BackendHooks> = OnceLock::new();
 /// that forks at a choice point, the choice pause hook that takes the copies.
 pub fn install_backend_hooks(hooks: BackendHooks) {
     let _ = HOOKS.set(hooks);
+    if let Some(control) = control_from_env() {
+        // A driver decides everything; a static fork spec would compete.
+        if spec_from_env().is_some() {
+            tracing::warn!("{TIMELINE_FORK_ENV} is ignored under {TIMELINE_CONTROL_ENV}");
+        }
+        install_control(control);
+        return;
+    }
     if let Some(spec) = spec_from_env().filter(|spec| spec.choice.is_some()) {
         install_choice_fork(spec);
     }
@@ -179,6 +187,419 @@ fn install_choice_fork(spec: ForkSpec) {
             }
         },
     )));
+}
+
+// ---- Control mode: KVM timelines driven through the Timelines trait ----
+
+/// The environment variable that puts a run under a timeline driver's
+/// control: `socket=PATH,id=N,dir=DIR[,stop=J][,cpus=A:B]`. The run pauses at
+/// choice request J (if given), connects to the driver's Unix socket and
+/// waits for a command, one JSON object per line: `{"answer":V,"until":J'}`
+/// answers the request, `{"source":true,"until":J'}` lets the run's own
+/// source answer it (each naming the next request to pause at, or null),
+/// and `{"capture":true}` turns the run into a template. A template reports
+/// `{"captured":...}` and then serves `{"fork":{"ids":[...]}}`, forking one
+/// copy per id, and `{"release":true}`, after which it ends without running
+/// on. Each copy connects back with `{"hello":{"timeline":id,...}}` and is
+/// paused at the template's request. A copy reports `{"exit":code}` when its
+/// guest ends.
+pub const TIMELINE_CONTROL_ENV: &str = "HERMIT_TIMELINE_CONTROL";
+
+/// What [`TIMELINE_CONTROL_ENV`] says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ControlSpec {
+    /// The driver's socket.
+    pub socket: PathBuf,
+    /// This run's timeline number; each copy gets its own from the driver.
+    pub id: u64,
+    /// Where copies write their outputs and measurements.
+    pub dir: PathBuf,
+    /// The choice request to pause at.
+    pub stop: Option<u64>,
+    /// Pin copy k to CPU `cpus[k % len]` (empty: keep the template's CPU).
+    pub cpus: Vec<usize>,
+}
+
+impl ControlSpec {
+    /// Parses `socket=PATH,id=N,dir=DIR[,stop=J][,cpus=A:B]`.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let mut socket = None;
+        let mut id = None;
+        let mut dir = None;
+        let mut stop = None;
+        let mut cpus = Vec::new();
+        for part in text.split(',') {
+            let (key, value) = part
+                .split_once('=')
+                .ok_or_else(|| format!("{TIMELINE_CONTROL_ENV}: {part:?} is not key=value"))?;
+            match key {
+                "socket" => socket = Some(PathBuf::from(value)),
+                "id" => id = Some(value.parse().map_err(|e| format!("id: {e}"))?),
+                "dir" => dir = Some(PathBuf::from(value)),
+                "stop" => stop = Some(value.parse().map_err(|e| format!("stop: {e}"))?),
+                "cpus" => {
+                    cpus = value
+                        .split(':')
+                        .map(|cpu| cpu.parse::<usize>().map_err(|e| format!("cpus: {e}")))
+                        .collect::<Result<_, _>>()?
+                }
+                other => return Err(format!("{TIMELINE_CONTROL_ENV}: unknown key {other:?}")),
+            }
+        }
+        Ok(Self {
+            socket: socket.ok_or_else(|| format!("{TIMELINE_CONTROL_ENV}: socket= is required"))?,
+            id: id.ok_or_else(|| format!("{TIMELINE_CONTROL_ENV}: id= is required"))?,
+            dir: dir.ok_or_else(|| format!("{TIMELINE_CONTROL_ENV}: dir= is required"))?,
+            stop,
+            cpus,
+        })
+    }
+}
+
+/// The control spec in the environment, if set and valid; an invalid one is
+/// reported and ignored.
+pub fn control_from_env() -> Option<ControlSpec> {
+    let text = std::env::var(TIMELINE_CONTROL_ENV).ok()?;
+    match ControlSpec::parse(&text) {
+        Ok(spec) => Some(spec),
+        Err(error) => {
+            tracing::warn!("{error}");
+            None
+        }
+    }
+}
+
+/// One process's connection to the driver.
+struct Connection {
+    reader: std::io::BufReader<std::os::unix::net::UnixStream>,
+    writer: std::os::unix::net::UnixStream,
+}
+
+impl Connection {
+    fn open(socket: &std::path::Path) -> std::io::Result<Self> {
+        let stream = std::os::unix::net::UnixStream::connect(socket)?;
+        let writer = stream.try_clone()?;
+        Ok(Self {
+            reader: std::io::BufReader::new(stream),
+            writer,
+        })
+    }
+
+    fn send(&mut self, message: &serde_json::Value) -> std::io::Result<()> {
+        let mut line = message.to_string();
+        line.push('\n');
+        self.writer.write_all(line.as_bytes())
+    }
+
+    /// The next message, or `None` at the end of the stream.
+    fn receive(&mut self) -> std::io::Result<Option<serde_json::Value>> {
+        use std::io::BufRead;
+        let mut line = String::new();
+        if self.reader.read_line(&mut line)? == 0 {
+            return Ok(None);
+        }
+        serde_json::from_str(&line)
+            .map(Some)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+}
+
+struct Control {
+    spec: ControlSpec,
+    connection: Option<Connection>,
+    /// The template this process was copied from, and the request at which.
+    parent: Option<(u64, u64)>,
+}
+
+static CONTROL: std::sync::Mutex<Option<Control>> = std::sync::Mutex::new(None);
+
+fn control() -> std::sync::MutexGuard<'static, Option<Control>> {
+    CONTROL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A driver's command to a paused run.
+enum Command {
+    Answer { value: u64, until: Option<u64> },
+    Source { until: Option<u64> },
+    Capture,
+}
+
+fn parse_command(message: &serde_json::Value) -> Result<Command, String> {
+    let until = message.get("until").and_then(|until| until.as_u64());
+    if let Some(value) = message.get("answer").and_then(|value| value.as_u64()) {
+        return Ok(Command::Answer { value, until });
+    }
+    if message.get("source").is_some() {
+        return Ok(Command::Source { until });
+    }
+    if message.get("capture").is_some() {
+        return Ok(Command::Capture);
+    }
+    Err(format!("unknown command {message}"))
+}
+
+/// Connects if this process has not yet, reports the pause at `request`,
+/// and waits for the driver's command.
+fn pause_at(request: &crate::choice::ChoiceRequest) -> Result<Command, String> {
+    let mut guard = control();
+    let control = guard.as_mut().ok_or("no control")?;
+    if control.connection.is_none() {
+        let mut connection = Connection::open(&control.spec.socket)
+            .map_err(|e| format!("connect {}: {e}", control.spec.socket.display()))?;
+        connection
+            .send(&serde_json::json!({
+                "hello": {
+                    "timeline": control.spec.id,
+                    "parent": control.parent.map(|(parent, _)| parent),
+                    "at": control.parent.map(|(_, at)| at),
+                }
+            }))
+            .map_err(|e| format!("hello: {e}"))?;
+        control.connection = Some(connection);
+    }
+    let connection = control.connection.as_mut().ok_or("no connection")?;
+    let request: serde_json::Value =
+        serde_json::from_str(&crate::choice::request_json(request)).map_err(|e| e.to_string())?;
+    connection
+        .send(&serde_json::json!({ "paused": request }))
+        .map_err(|e| format!("paused: {e}"))?;
+    let message = connection
+        .receive()
+        .map_err(|e| format!("command: {e}"))?
+        .ok_or("the driver closed the connection")?;
+    parse_command(&message)
+}
+
+fn stop_index() -> Option<u64> {
+    control().as_ref().and_then(|control| control.spec.stop)
+}
+
+fn set_stop(until: Option<u64>) {
+    if let Some(control) = control().as_mut() {
+        control.spec.stop = until;
+    }
+}
+
+fn install_control(spec: ControlSpec) {
+    use crate::choice::PauseAction;
+    *control() = Some(Control {
+        spec,
+        connection: None,
+        parent: None,
+    });
+    crate::choice::set_pause_hook(Some(Box::new(
+        move |request: &crate::choice::ChoiceRequest| {
+            // A copy comes back around this loop, paused at the same request.
+            loop {
+                if stop_index() != Some(request.index) {
+                    return PauseAction::Continue;
+                }
+                match pause_at(request) {
+                    Ok(Command::Answer { value, until }) => {
+                        set_stop(until);
+                        return PauseAction::Answer(value);
+                    }
+                    Ok(Command::Source { until }) => {
+                        set_stop(until);
+                        return PauseAction::Continue;
+                    }
+                    Ok(Command::Capture) => serve_template(request),
+                    Err(error) => {
+                        tracing::warn!("{TIMELINE_CONTROL_ENV}: {error}");
+                        // SAFETY: _exit ends the process at once.
+                        unsafe { libc::_exit(96) };
+                    }
+                }
+            }
+        },
+    )));
+}
+
+fn send_control(message: &serde_json::Value) {
+    if let Some(connection) = control()
+        .as_mut()
+        .and_then(|control| control.connection.as_mut())
+    {
+        let _ = connection.send(message);
+    }
+}
+
+enum Received {
+    Message(serde_json::Value),
+    Timeout,
+    Closed,
+}
+
+fn receive_control(timeout: std::time::Duration) -> Received {
+    let mut guard = control();
+    let Some(connection) = guard
+        .as_mut()
+        .and_then(|control| control.connection.as_mut())
+    else {
+        return Received::Closed;
+    };
+    let _ = connection.reader.get_ref().set_read_timeout(Some(timeout));
+    let received = match connection.receive() {
+        Ok(Some(message)) => Received::Message(message),
+        Ok(None) => Received::Closed,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            Received::Timeout
+        }
+        Err(_) => Received::Closed,
+    };
+    let _ = connection.reader.get_ref().set_read_timeout(None);
+    received
+}
+
+/// Reaps exited copies (every one of them when `block`), reporting each.
+fn reap_children(children: &mut Vec<(u64, libc::pid_t)>, block: bool) {
+    while !children.is_empty() {
+        let mut status = 0;
+        let flags = if block { 0 } else { libc::WNOHANG };
+        // SAFETY: waits for a child of this template.
+        let pid = unsafe { libc::waitpid(-1, &mut status, flags) };
+        if pid == 0 {
+            return;
+        }
+        if pid < 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            children.clear();
+            return;
+        }
+        if let Some(at) = children.iter().position(|&(_, child)| child == pid) {
+            let (id, _) = children.remove(at);
+            send_control(&serde_json::json!({
+                "reaped": {
+                    "timeline": id,
+                    "exit_code": libc::WIFEXITED(status).then(|| libc::WEXITSTATUS(status)),
+                    "signal": libc::WIFSIGNALED(status).then(|| libc::WTERMSIG(status)),
+                }
+            }));
+        }
+    }
+}
+
+/// This run becomes a template at `request`: it reports the capture, then
+/// forks copies on request until the driver releases it, and never runs on
+/// (a checkpoint is a template). Returns only in a copy, which is then
+/// paused at the same request with a connection of its own.
+fn serve_template(request: &crate::choice::ChoiceRequest) {
+    let place = serde_json::json!({
+        "choice": request.index,
+        "request": crate::choice::request_json(request),
+    });
+    let Some(hooks) = HOOKS.get().copied() else {
+        send_control(
+            &serde_json::json!({ "refused": "this backend installed no host-fork hooks" }),
+        );
+        return;
+    };
+    let (template_id, dir, cpus) = match control().as_ref() {
+        Some(control) => (
+            control.spec.id,
+            control.spec.dir.clone(),
+            control.spec.cpus.clone(),
+        ),
+        None => return,
+    };
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        send_control(&serde_json::json!({ "refused": format!("{}: {error}", dir.display()) }));
+        return;
+    }
+    let template = match capture_template(hooks) {
+        Ok(template) => template,
+        Err(error) => {
+            send_control(&serde_json::json!({ "refused": error }));
+            return;
+        }
+    };
+    send_control(&serde_json::json!({
+        "captured": {
+            "timeline": template_id,
+            "park_us": template.park_us,
+            "prepare_us": template.prepare_us,
+            "records_us": template.records_us,
+            "parked_threads": template.parked.count(),
+            "offsets": template.offsets,
+        }
+    }));
+    let mut children: Vec<(u64, libc::pid_t)> = Vec::new();
+    loop {
+        reap_children(&mut children, false);
+        let message = match receive_control(std::time::Duration::from_millis(20)) {
+            Received::Message(message) => message,
+            Received::Timeout => continue,
+            Received::Closed => {
+                // The driver is gone: no copy outlives it unsupervised.
+                for &(_, pid) in &children {
+                    // SAFETY: signals a copy this template forked.
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+                reap_children(&mut children, true);
+                // SAFETY: _exit ends the template at once.
+                unsafe { libc::_exit(1) };
+            }
+        };
+        if let Some(fork) = message.get("fork") {
+            let ids: Vec<u64> = fork
+                .get("ids")
+                .and_then(|ids| ids.as_array())
+                .map(|ids| ids.iter().filter_map(|id| id.as_u64()).collect())
+                .unwrap_or_default();
+            let mut forked = Vec::new();
+            for id in ids {
+                let started = Instant::now();
+                match fork_for_copy() {
+                    Ok(0) => {
+                        become_timeline(
+                            &dir,
+                            &cpus,
+                            id as usize,
+                            &place,
+                            &template.hooks,
+                            &template.records,
+                            &template.parked,
+                            started,
+                        );
+                        if let Some(control) = control().as_mut() {
+                            // Dropping closes this copy's descriptors of the
+                            // template's connection; the template keeps its own.
+                            control.connection = None;
+                            control.parent = Some((template_id, request.index));
+                            control.spec.id = id;
+                            control.spec.stop = Some(request.index);
+                        }
+                        return;
+                    }
+                    Ok(pid) => {
+                        children.push((id, pid));
+                        forked.push(serde_json::json!({
+                            "timeline": id,
+                            "fork_us": micros(started),
+                        }));
+                    }
+                    Err(error) => {
+                        forked.push(serde_json::json!({ "timeline": id, "error": error }));
+                    }
+                }
+            }
+            send_control(&serde_json::json!({ "forked": forked }));
+        } else if message.get("release").is_some() {
+            reap_children(&mut children, true);
+            send_control(&serde_json::json!({ "released": template_id }));
+            // SAFETY: _exit ends the template at once; it never runs on.
+            unsafe { libc::_exit(0) };
+        } else {
+            send_control(&serde_json::json!({ "error": format!("unknown command {message}") }));
+        }
+    }
 }
 
 /// Descriptors, besides standard output and standard error, that each
@@ -322,6 +743,7 @@ pub fn exit_timeline(code: i32) {
             format!("{code}\n"),
         );
     }
+    send_control(&serde_json::json!({ "exit": code }));
     // SAFETY: _exit ends the process at once; nothing runs after it.
     unsafe { libc::_exit(code) };
 }
@@ -346,14 +768,14 @@ fn same_description(a: RawFd, b: RawFd) -> bool {
 }
 
 fn open_fds() -> Vec<RawFd> {
-    let mut fds: Vec<RawFd> = std::fs::read_dir("/proc/self/fd")
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter_map(|entry| entry.file_name().to_string_lossy().parse().ok())
-                .collect()
-        })
-        .unwrap_or_default();
+    // Raw getdents64 (util::find_in_directory), never glibc's opendir.
+    let mut fds: Vec<RawFd> = Vec::new();
+    let _ = crate::util::find_in_directory(std::path::Path::new("/proc/self/fd"), |name| {
+        if let Some(fd) = name.to_str().and_then(|name| name.parse().ok()) {
+            fds.push(fd);
+        }
+        None::<()>
+    });
     fds.sort_unstable();
     fds
 }
@@ -636,6 +1058,60 @@ fn fork_for_copy() -> Result<libc::pid_t, String> {
     crate::fork_threads::fork_process()
 }
 
+/// A run frozen for copying: every other thread parked with its context
+/// saved, the backend's state read, and the positions of its files.
+struct Template {
+    hooks: BackendHooks,
+    parked: crate::fork_threads::Parked,
+    park_us: u64,
+    prepare_us: u64,
+    prepared: String,
+    records: Vec<FileRecord>,
+    records_us: u64,
+    /// Each output's offset at the cut, as `<name>_offset`.
+    offsets: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Freezes this run as a template. Nothing may log from here until the
+/// parked threads are released: a parked thread could hold the log
+/// writer's lock.
+fn capture_template(hooks: BackendHooks) -> Result<Template, String> {
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    // Every other thread stops in a signal handler with its context saved,
+    // so the copies can re-create it.
+    let park_started = Instant::now();
+    let parked = crate::fork_threads::park_others(std::time::Duration::from_secs(5))?;
+    let park_us = micros(park_started);
+    let prepare_started = Instant::now();
+    let prepared = (hooks.prepare)();
+    let prepare_us = micros(prepare_started);
+    let prepared = match prepared {
+        Ok(description) => description,
+        Err(error) => {
+            parked.release();
+            return Err(error);
+        }
+    };
+    let records_started = Instant::now();
+    let records = record_files();
+    let records_us = micros(records_started);
+    let offsets = outputs()
+        .into_iter()
+        .map(|(fd, name)| (format!("{name}_offset"), offset_of(fd).into()))
+        .collect();
+    Ok(Template {
+        hooks,
+        parked,
+        park_us,
+        prepare_us,
+        prepared,
+        records,
+        records_us,
+        offsets,
+    })
+}
+
 /// Takes the copies `spec` asks for, at `place` (a description, for the
 /// measurements). Returns `None` in the template once every copy has exited,
 /// and `Some(k)` in copy k once it is repaired, so that the caller goes on
@@ -649,40 +1125,24 @@ pub(crate) fn fork_copies(spec: &ForkSpec, place: serde_json::Value) -> Option<u
         tracing::warn!("{TIMELINE_FORK_ENV}: {}: {error}", spec.dir.display());
         return None;
     }
-    let _ = std::io::stdout().flush();
-    let _ = std::io::stderr().flush();
-    // Every other thread stops in a signal handler with its context saved,
-    // so the copies can re-create it. Nothing below logs until they are
-    // released: a parked thread could hold the log writer's lock.
-    let park_started = Instant::now();
-    let parked = match crate::fork_threads::park_others(std::time::Duration::from_secs(5)) {
-        Ok(parked) => parked,
+    let template = match capture_template(hooks) {
+        Ok(template) => template,
         Err(error) => {
             let _ = std::fs::write(spec.dir.join("refused.txt"), format!("{error}\n"));
             tracing::warn!("{TIMELINE_FORK_ENV}: capture refused: {error}");
             return None;
         }
     };
-    let park_us = micros(park_started);
-    let prepare_started = Instant::now();
-    let prepared = (hooks.prepare)();
-    let prepare_us = micros(prepare_started);
-    let prepared = match prepared {
-        Ok(description) => description,
-        Err(error) => {
-            parked.release();
-            let _ = std::fs::write(spec.dir.join("refused.txt"), format!("{error}\n"));
-            tracing::warn!("{TIMELINE_FORK_ENV}: capture refused: {error}");
-            return None;
-        }
-    };
-    let records_started = Instant::now();
-    let records = record_files();
-    let records_us = micros(records_started);
-    let offsets: serde_json::Map<String, serde_json::Value> = outputs()
-        .into_iter()
-        .map(|(fd, name)| (format!("{name}_offset"), offset_of(fd).into()))
-        .collect();
+    let Template {
+        hooks,
+        parked,
+        park_us,
+        prepare_us,
+        prepared,
+        records,
+        records_us,
+        offsets,
+    } = template;
     let mut children = Vec::new();
     let all_started = Instant::now();
     if spec.parallel {
@@ -699,7 +1159,9 @@ pub(crate) fn fork_copies(spec: &ForkSpec, place: serde_json::Value) -> Option<u
                 }
             };
             if pid == 0 {
-                become_timeline(spec, index, &place, &hooks, &records, &parked, forked);
+                become_timeline(
+                    &spec.dir, &spec.cpus, index, &place, &hooks, &records, &parked, forked,
+                );
                 return Some(index);
             }
             running.push((index, pid, forked, micros(forked)));
@@ -747,7 +1209,9 @@ pub(crate) fn fork_copies(spec: &ForkSpec, place: serde_json::Value) -> Option<u
             }
         };
         if pid == 0 {
-            become_timeline(spec, index, &place, &hooks, &records, &parked, forked);
+            become_timeline(
+                &spec.dir, &spec.cpus, index, &place, &hooks, &records, &parked, forked,
+            );
             return Some(index);
         }
         let fork_us = micros(forked);
@@ -811,8 +1275,10 @@ pub(crate) fn fork_copies(spec: &ForkSpec, place: serde_json::Value) -> Option<u
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 fn become_timeline(
-    spec: &ForkSpec,
+    dir: &std::path::Path,
+    cpus: &[usize],
     index: usize,
     place: &serde_json::Value,
     hooks: &BackendHooks,
@@ -822,10 +1288,10 @@ fn become_timeline(
 ) {
     let started = Instant::now();
     TIMELINE.store(index as i64, Ordering::Relaxed);
-    let _ = TIMELINE_DIR.set(spec.dir.clone());
+    let _ = TIMELINE_DIR.set(dir.to_path_buf());
     let fail = |what: &str, error: String| -> ! {
         let _ = std::fs::write(
-            spec.dir.join(format!("timeline-{index}.error")),
+            dir.join(format!("timeline-{index}.error")),
             format!("{what}: {error}\n"),
         );
         // SAFETY: _exit ends the process at once.
@@ -834,7 +1300,7 @@ fn become_timeline(
     // First, so that copies started together repair on their own CPUs
     // rather than queueing on the template's pinned CPU; the re-created
     // threads get the same set below.
-    let cpu = (!spec.cpus.is_empty()).then(|| spec.cpus[index % spec.cpus.len()]);
+    let cpu = (!cpus.is_empty()).then(|| cpus[index % cpus.len()]);
     let affinity = cpu.map(|cpu| {
         // SAFETY: a zeroed set with one CPU.
         unsafe {
@@ -855,7 +1321,7 @@ fn become_timeline(
         Err(error) => fail("backend repair", error),
     };
     let repair_us = micros(repair_started);
-    install_fault_report(&spec.dir, index);
+    install_fault_report(dir, index);
     let objects_started = Instant::now();
     let objects = match privatize_kernel_objects() {
         Ok(objects) => objects,
@@ -865,7 +1331,7 @@ fn become_timeline(
     let files_started = Instant::now();
     let reopened = reopen_files(records);
     let files_us = micros(files_started);
-    if let Err(error) = redirect_outputs(&spec.dir, index) {
+    if let Err(error) = redirect_outputs(dir, index) {
         fail("redirecting output", error.to_string());
     }
     let summary = serde_json::json!({
@@ -884,7 +1350,7 @@ fn become_timeline(
         "ready_us": micros(forked),
     });
     let _ = std::fs::write(
-        spec.dir.join(format!("timeline-{index}.json")),
+        dir.join(format!("timeline-{index}.json")),
         format!(
             "{}\n",
             serde_json::to_string_pretty(&summary).unwrap_or_default()
@@ -898,7 +1364,7 @@ fn become_timeline(
     match parked.resurrect(affinity.as_ref()) {
         Ok(threads) => {
             let _ = std::fs::write(
-                spec.dir.join(format!("timeline-{index}.threads")),
+                dir.join(format!("timeline-{index}.threads")),
                 format!("{threads} {}\n", micros(threads_started)),
             );
         }
@@ -942,5 +1408,49 @@ mod tests {
         assert_eq!(parallel.cpus, vec![3, 5]);
         assert!(ForkSpec::parse("copies=3,dir=/tmp/x").is_err());
         assert!(ForkSpec::parse("turn=4,dir=/tmp/x,colour=red").is_err());
+    }
+
+    #[test]
+    fn parses_a_control_spec() {
+        assert_eq!(
+            ControlSpec::parse("socket=/d/c.sock,id=2,dir=/d,stop=3,cpus=4:9").unwrap(),
+            ControlSpec {
+                socket: PathBuf::from("/d/c.sock"),
+                id: 2,
+                dir: PathBuf::from("/d"),
+                stop: Some(3),
+                cpus: vec![4, 9],
+            }
+        );
+        let plain = ControlSpec::parse("socket=/s,id=0,dir=/d").unwrap();
+        assert_eq!(plain.stop, None);
+        assert!(plain.cpus.is_empty());
+        assert!(ControlSpec::parse("id=1,dir=/d").is_err());
+        assert!(ControlSpec::parse("socket=/s,dir=/d").is_err());
+        assert!(ControlSpec::parse("socket=/s,id=1").is_err());
+        assert!(ControlSpec::parse("socket=/s,id=x,dir=/d").is_err());
+        assert!(ControlSpec::parse("socket=/s,id=1,dir=/d,turn=3").is_err());
+    }
+
+    #[test]
+    fn parses_commands() {
+        let command = |text: &str| parse_command(&serde_json::from_str(text).unwrap());
+        assert!(matches!(
+            command(r#"{"answer":7,"until":12}"#),
+            Ok(Command::Answer {
+                value: 7,
+                until: Some(12)
+            })
+        ));
+        assert!(matches!(
+            command(r#"{"source":true,"until":null}"#),
+            Ok(Command::Source { until: None })
+        ));
+        assert!(matches!(
+            command(r#"{"capture":true}"#),
+            Ok(Command::Capture)
+        ));
+        assert!(command(r#"{"answer":"seven"}"#).is_err());
+        assert!(command(r#"{"fork":{"ids":[1]}}"#).is_err());
     }
 }
