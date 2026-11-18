@@ -7,6 +7,16 @@ branches from 0.5.0.
 
 ## Unreleased
 
+- Experimental: `hermit run --chaos` can take its scheduling decisions from
+  an external search tool. `--choice-tape FILE` answers each chaos choice
+  point (timeslice lengths and priority redraws) from a byte tape, where byte 0
+  or the end of the tape keeps the seeded choice. `--choice-controller SOCKET`
+  asks a controller over a Unix socket, one JSON line each way.
+  `--choice-record FILE` writes every request and answer as JSON lines
+  (`"schema":1`). The same answers give the same run. A controller's refusal
+  stops the run as a policy refusal (exit 122). ptrace backend only; the
+  other backends refuse the options. See "Choice points for an external
+  controller" in docs/USER_GUIDE.md.
 - Determinism loss: a run that claims determinism (Hermit's default thread
   sequentialization, with or without `--strict`) and records a determinism
   loss is now refused with exit 122, after the guest's output, which is

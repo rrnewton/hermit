@@ -8711,6 +8711,33 @@ impl<T> ThreadState<T> {
     pub fn chaos_prng_next_u64(&mut self, msg: &str) -> u64 {
         let r = self.chaos_prng.next_u64();
         detlog!("[dtid {}] CHAOSRAND({}): u64 => {}", self.dettid, msg, r);
+        // Every caller turns this entropy into a priority (`entropy_to_priority`).
+        // A choice controller may pick that priority instead; the seeded draw
+        // above is still consumed, so its default is the seeded value.
+        if crate::choice::active() {
+            use crate::scheduler::runqueue::FIRST_PRIORITY;
+            use crate::scheduler::runqueue::LAST_PRIORITY;
+            let range = LAST_PRIORITY - FIRST_PRIORITY + 1;
+            let default_offset = r % range;
+            let chosen = crate::choice::choose(crate::choice::ChoicePoint {
+                kind: crate::choice::ChoiceKind::SchedPriority,
+                lo: FIRST_PRIORITY,
+                hi: LAST_PRIORITY,
+                default: FIRST_PRIORITY + default_offset,
+                scale: 0,
+                dtid: self.dettid,
+                thread_rcbs: self.committed_clock_value,
+                site: "chaos_priority",
+            });
+            let r = r - default_offset + (chosen - FIRST_PRIORITY);
+            detlog!(
+                "[dtid {}] CHOICE({}): priority => {}",
+                self.dettid,
+                msg,
+                chosen
+            );
+            return r;
+        }
         r
     }
 
@@ -10193,6 +10220,24 @@ impl<T> ThreadState<T> {
                     // Add one to prevent generating a zero time slice:
                     let rcbs = 1 + exp.sample(&mut self.chaos_prng) as u64;
                     detlog!("[dtid {}] CHAOSRAND => next_rcbs = {}", self.dettid, rcbs);
+                    // A choice controller may pick this slice's length instead
+                    // (the seeded draw above stays consumed as the default).
+                    let rcbs = if crate::choice::active() {
+                        let chosen = crate::choice::choose(crate::choice::ChoicePoint {
+                            kind: crate::choice::ChoiceKind::SchedSlice,
+                            lo: 1,
+                            hi: u64::from(u32::MAX),
+                            default: rcbs,
+                            scale: target_timeout_rcbs.round().max(1.0) as u64,
+                            dtid: self.dettid,
+                            thread_rcbs: self.committed_clock_value,
+                            site: "chaos_slice",
+                        });
+                        detlog!("[dtid {}] CHOICE => next_rcbs = {}", self.dettid, chosen);
+                        chosen
+                    } else {
+                        rcbs
+                    };
                     if cfg.chaos_instruction_offset > 0 {
                         let offset = chaos_instruction_offset_draw(
                             cfg.sched_seed(),

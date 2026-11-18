@@ -829,6 +829,45 @@ backend; the others refuse them), and conflict with an explicit
 nanoseconds (one RCB at the default clock multiplier), and MIN no larger than
 MAX.
 
+#### Choice points for an external controller (experimental)
+
+Under `--chaos`, every scheduling decision Detcore draws from its seeded
+streams (a thread's timeslice length, and a thread's priority at a redraw or
+at its creation) is a *choice point*. An external search tool, such as a
+fuzzer, can answer them instead:
+
+```bash
+hermit run --chaos --sched-seed=0 --choice-tape=tape.bin --choice-record=choices.jsonl -- PROGRAM
+hermit run --chaos --sched-seed=0 --choice-controller=/path/to/socket -- PROGRAM
+```
+
+- `--choice-tape FILE` answers from a byte tape, one byte per choice in run
+  order. Byte 0, or the end of the tape, takes the value the seeded run would
+  use, so an empty tape is the ordinary `--chaos --sched-seed` run. A slice
+  byte `b` picks the mean slice times 2^((b-128)/16); a priority byte spreads
+  255 levels over the priority range. A fuzzer can mutate the tape like any
+  other input.
+- `--choice-controller SOCKET` connects to a controller listening on a Unix
+  stream socket, sends one JSON line per choice point, and reads one line per
+  answer: `{"i":N,"v":V}`, `{"i":N,"default":true}` or
+  `{"i":N,"refuse":"reason"}`. A refusal stops the run as a policy refusal
+  (exit 122, `class=policy-refusal`), names the choice on stderr
+  (`HERMIT_CHOICE_REFUSED: choice N: ...`) and ends the record with the refused
+  request and its `"refused"` reason, which locates the first divergence of a
+  replay to one choice.
+- `--choice-record FILE` writes every choice request and the answer used, one
+  JSON line each. Feeding the answers back reproduces the run.
+
+Every request line is
+`{"schema":1,"i":N,"kind":K,"lo":L,"hi":H,"default":D,"scale":S,"ctx":{"dtid":T,"thread_rcbs":R,"site":W}}`.
+`kind` is `sched.slice` (RCBs) or `sched.priority`, and `default` is the value
+the seeded run would use. A record line adds `"v":V`. The same tape or the same
+controller answers give the same run; the run stays deterministic and can be
+verified at L2 (`--verify --verify-strict`). The options need `--chaos`, and
+conflict with each other and with `--replay-preemptions-from` and
+`--replay-schedule-from`. They have been tested on the ptrace backend, and
+the other backends refuse them.
+
 ### Verify Mode
 
 Verification is an option to `run`, not a separate top-level command:
