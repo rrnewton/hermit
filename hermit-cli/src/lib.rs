@@ -3637,14 +3637,31 @@ async fn run_kvm(
         // the copy's VMs and memory as the process exits. MEASURED (memtouch,
         // 5 copies each, resume to exit message): 60-266 ms became 16-23 ms
         // for a 16 MiB guest, and 548-835 ms became 236-413 ms at 1 GiB.
+        //
+        // As a run's own end does (`SkidOvershootReport::finish`), a copy
+        // whose precise PMU timer passed its target is refused: its
+        // preemption point moved, so it is no evidence of its future (P7).
+        // The count includes the template's reports from before the cut,
+        // which every copy inherits.
+        let overshoots = SkidOvershoots::take().counts.reports;
         let (status, stdout, stderr) = result?;
         if !capture_output {
             std::io::stdout().write_all(&stdout)?;
             std::io::stderr().write_all(&stderr)?;
         }
-        let code = status
+        let mut code = status
             .code()
             .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
+        if overshoots > 0 {
+            let refusal = SkidOvershootError::new(overshoots);
+            let mut err = std::io::stderr();
+            let _ = writeln!(
+                err,
+                "HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count={overshoots}"
+            );
+            let _ = writeln!(err, "Error: {refusal}");
+            code = detcore_model::HERMIT_POLICY_REFUSAL_EXIT;
+        }
         detcore::timelines::exit_timeline(code);
         std::process::exit(code);
     }

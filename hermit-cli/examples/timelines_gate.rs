@@ -158,6 +158,21 @@ struct Gate {
     launcher: Vec<String>,
     dir: PathBuf,
     failures: usize,
+    /// Runs refused for a skid overshoot and run again (never silently).
+    retried: usize,
+}
+
+/// How many times a run Hermit refused for a skid overshoot is run again.
+const OVERSHOOT_RETRIES: usize = 2;
+
+/// Whether Hermit refused this run because a precise PMU timer event passed
+/// its target (`HERMIT_POLICY_REFUSAL ... cause=skid-overshoot`, exit 122): a
+/// host timer event, after which the run is no evidence either way. A copy
+/// is refused the same way as a fresh run.
+fn overshot(outcome: &RunOutcome) -> bool {
+    outcome.code == 122
+        && String::from_utf8_lossy(&Gate::bytes(&outcome.observation.stderr))
+            .contains("cause=skid-overshoot")
 }
 
 impl Gate {
@@ -280,13 +295,22 @@ fn run_kvm(options: &Options, gate: &mut Gate) -> Result<(), String> {
 
     // The reference: a fresh run, START copy resumed with its own source.
     let start = timelines.start(&base).map_err(|e| e.to_string())?;
-    let mut fresh = timelines.fork(&start, 1).map_err(|e| e.to_string())?;
-    let reference = exited(
-        timelines
-            .resume(&mut fresh[0], None, StopAt::End)
-            .map_err(|e| e.to_string())?,
-        "reference",
-    )?;
+    let mut attempt = 0;
+    let reference = loop {
+        let mut fresh = timelines.fork(&start, 1).map_err(|e| e.to_string())?;
+        let outcome = exited(
+            timelines
+                .resume(&mut fresh[0], None, StopAt::End)
+                .map_err(|e| e.to_string())?,
+            "reference",
+        )?;
+        if !overshot(&outcome) || attempt == OVERSHOOT_RETRIES {
+            break outcome;
+        }
+        attempt += 1;
+        gate.retried += 1;
+        println!("reference: refused for a skid overshoot; run again ({attempt})");
+    };
     println!(
         "reference: exit {} in {}",
         reference.code,
@@ -363,8 +387,27 @@ fn run_kvm(options: &Options, gate: &mut Gate) -> Result<(), String> {
     );
     let mut outcomes = Vec::new();
     for (k, result) in results.into_iter().enumerate() {
-        let outcome = exited(result.map_err(|e| e.to_string())?, &format!("copy {k}"))?;
+        let mut outcome = exited(result.map_err(|e| e.to_string())?, &format!("copy {k}"))?;
         println!("copy {k}: exit {} in {}", outcome.code, ms(outcome.wall));
+        // A copy Hermit refused for a skid overshoot proves nothing: copy the
+        // checkpoint again for the same future, a bounded number of times.
+        let mut attempt = 0;
+        while overshot(&outcome) && attempt < OVERSHOOT_RETRIES {
+            attempt += 1;
+            gate.retried += 1;
+            let mut again = timelines.fork(&checkpoint, 1).map_err(|e| e.to_string())?;
+            println!(
+                "copy {k}: refused for a skid overshoot; copied again as timeline {} ({attempt})",
+                again[0].timeline()
+            );
+            outcome = exited(
+                timelines
+                    .resume(&mut again[0], answers[k], StopAt::End)
+                    .map_err(|e| e.to_string())?,
+                &format!("copy {k} again"),
+            )?;
+            println!("copy {k}: exit {} in {}", outcome.code, ms(outcome.wall));
+        }
         outcomes.push(outcome);
     }
 
@@ -385,13 +428,24 @@ fn run_kvm(options: &Options, gate: &mut Gate) -> Result<(), String> {
                 bytes.push(b);
                 let own = spec(tape(&format!("tape-{k}"), &bytes)?);
                 let own_start = timelines.start(&own).map_err(|e| e.to_string())?;
-                let mut fresh = timelines.fork(&own_start, 1).map_err(|e| e.to_string())?;
-                let fresh = exited(
-                    timelines
-                        .resume(&mut fresh[0], None, StopAt::End)
-                        .map_err(|e| e.to_string())?,
-                    "reference",
-                )?;
+                let mut attempt = 0;
+                let fresh = loop {
+                    let mut fresh = timelines.fork(&own_start, 1).map_err(|e| e.to_string())?;
+                    let outcome = exited(
+                        timelines
+                            .resume(&mut fresh[0], None, StopAt::End)
+                            .map_err(|e| e.to_string())?,
+                        "reference",
+                    )?;
+                    if !overshot(&outcome) || attempt == OVERSHOOT_RETRIES {
+                        break outcome;
+                    }
+                    attempt += 1;
+                    gate.retried += 1;
+                    println!(
+                        "copy {k}'s fresh run: refused for a skid overshoot; run again ({attempt})"
+                    );
+                };
                 (
                     fresh.observation,
                     fresh.code,
@@ -574,6 +628,7 @@ fn main() {
         launcher: options.launcher.clone(),
         dir: options.dir.clone(),
         failures: 0,
+        retried: 0,
     };
     let result = match options.mode.as_str() {
         "kvm" => run_kvm(&options, &mut gate),
@@ -585,9 +640,10 @@ fn main() {
         std::process::exit(2);
     }
     println!(
-        "{}: {} failure(s)",
+        "{}: {} failure(s); {} run(s) refused for a skid overshoot and run again",
         if gate.failures == 0 { "PASS" } else { "FAIL" },
-        gate.failures
+        gate.failures,
+        gate.retried
     );
     std::process::exit(if gate.failures == 0 { 0 } else { 1 });
 }

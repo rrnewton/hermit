@@ -774,11 +774,24 @@ fn outputs() -> Vec<(RawFd, &'static str)> {
 static TIMELINE: AtomicI64 = AtomicI64::new(-1);
 
 /// PROTOTYPE debugging switches in `HERMIT_TIMELINE_DEBUG` (comma list):
-/// `libcfork` forks through glibc, `noresurrect` re-creates no thread.
+/// `libcfork` forks through glibc, `noresurrect` re-creates no thread,
+/// `overshoot=N` records one skid overshoot in timeline N as it starts, as if
+/// its precise timer had passed its target (to test that such a copy is
+/// refused, as a fresh run is).
 fn debug_switch(name: &str) -> bool {
     std::env::var("HERMIT_TIMELINE_DEBUG")
         .map(|value| value.split(',').any(|part| part == name))
         .unwrap_or(false)
+}
+
+/// The value of a `name=value` switch in `HERMIT_TIMELINE_DEBUG`.
+fn debug_value(name: &str) -> Option<String> {
+    let value = std::env::var("HERMIT_TIMELINE_DEBUG").ok()?;
+    value.split(',').find_map(|part| {
+        part.strip_prefix(name)
+            .and_then(|rest| rest.strip_prefix('='))
+            .map(str::to_string)
+    })
 }
 
 static SEGV_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
@@ -2091,6 +2104,9 @@ fn become_timeline(
     let started = Instant::now();
     TIMELINE.store(index as i64, Ordering::Relaxed);
     let _ = TIMELINE_DIR.set(dir.to_path_buf());
+    if debug_value("overshoot").and_then(|value| value.parse::<usize>().ok()) == Some(index) {
+        reverie::record_skid_overshoot();
+    }
     let fail = |what: &str, error: String| -> ! {
         let _ = std::fs::write(
             dir.join(format!("timeline-{index}.error")),
