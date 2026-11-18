@@ -52,8 +52,12 @@ pub struct ForkSpec {
     /// At a choice point: copy k answers it as tape byte `bytes[k]` would
     /// (0 or absent: the run's own answer).
     pub bytes: Vec<u8>,
-    /// How many copies, run one after another.
+    /// How many copies.
     pub copies: usize,
+    /// Run the copies at the same time instead of one after another.
+    pub parallel: bool,
+    /// Pin copy k to CPU `cpus[k % len]` (empty: keep the template's CPU).
+    pub cpus: Vec<usize>,
     /// Where each copy's output and measurements go.
     pub dir: PathBuf,
 }
@@ -65,6 +69,8 @@ impl ForkSpec {
         let mut choice = None;
         let mut bytes = Vec::new();
         let mut copies = 1;
+        let mut parallel = false;
+        let mut cpus = Vec::new();
         let mut dir = None;
         for part in text.split(',') {
             let (key, value) = part
@@ -80,6 +86,13 @@ impl ForkSpec {
                         .collect::<Result<_, _>>()?
                 }
                 "copies" => copies = value.parse().map_err(|e| format!("copies: {e}"))?,
+                "parallel" => parallel = value == "1" || value == "true",
+                "cpus" => {
+                    cpus = value
+                        .split(':')
+                        .map(|cpu| cpu.parse::<usize>().map_err(|e| format!("cpus: {e}")))
+                        .collect::<Result<_, _>>()?
+                }
                 "dir" => dir = Some(PathBuf::from(value)),
                 other => return Err(format!("{TIMELINE_FORK_ENV}: unknown key {other:?}")),
             }
@@ -94,6 +107,8 @@ impl ForkSpec {
             choice,
             bytes,
             copies,
+            parallel,
+            cpus,
             dir: dir.ok_or_else(|| format!("{TIMELINE_FORK_ENV}: dir= is required"))?,
         })
     }
@@ -376,6 +391,146 @@ fn micros(since: Instant) -> u64 {
     since.elapsed().as_micros() as u64
 }
 
+fn fdinfo(fd: RawFd) -> String {
+    std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}")).unwrap_or_default()
+}
+
+fn fdinfo_field(info: &str, key: &str) -> Option<String> {
+    info.lines()
+        .find_map(|line| line.strip_prefix(key))
+        .map(|rest| rest.trim_start_matches(':').trim().to_string())
+}
+
+/// Gives this copy its own eventfds and epoll instances, which `fork()`
+/// shares with the template and every other copy: an event one copy waits
+/// for could otherwise be taken by another. An eventfd is re-created with
+/// its count and flags; an epoll instance with every registration its
+/// fdinfo lists, against the copy's own descriptors (re-created first).
+/// Descriptors that shared one object share its replacement.
+fn privatize_kernel_objects() -> Result<serde_json::Value, String> {
+    let fds = open_fds();
+    let kind = |fd: RawFd| {
+        std::fs::read_link(format!("/proc/self/fd/{fd}"))
+            .map(|target| target.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    let groups = |wanted: &str| {
+        let mut groups: Vec<Vec<RawFd>> = Vec::new();
+        for &fd in &fds {
+            if kind(fd) != wanted {
+                continue;
+            }
+            match groups
+                .iter_mut()
+                .find(|group| same_description(group[0], fd))
+            {
+                Some(group) => group.push(fd),
+                None => groups.push(vec![fd]),
+            }
+        }
+        groups
+    };
+    let flags_of = |fd: RawFd| {
+        // SAFETY: fcntl on a live descriptor.
+        unsafe { libc::fcntl(fd, libc::F_GETFL) }
+    };
+    let mut eventfds = 0;
+    for group in groups("anon_inode:[eventfd]") {
+        let info = fdinfo(group[0]);
+        let count: u64 = fdinfo_field(&info, "eventfd-count")
+            .and_then(|count| u64::from_str_radix(&count, 16).ok())
+            .unwrap_or(0);
+        let semaphore = fdinfo_field(&info, "eventfd-semaphore").as_deref() == Some("1");
+        let mut flags = libc::EFD_CLOEXEC;
+        if flags_of(group[0]) & libc::O_NONBLOCK != 0 {
+            flags |= libc::EFD_NONBLOCK;
+        }
+        if semaphore {
+            flags |= libc::EFD_SEMAPHORE;
+        }
+        // SAFETY: a new descriptor, closed below after its duplicates.
+        let new = unsafe { libc::eventfd(0, flags) };
+        if new < 0 {
+            return Err(format!("eventfd: {}", std::io::Error::last_os_error()));
+        }
+        if count > 0 {
+            // SAFETY: writes the 8-byte count to the new eventfd.
+            unsafe { libc::write(new, (&count as *const u64).cast(), 8) };
+        }
+        for &fd in &group {
+            if !dup_onto(new, fd) {
+                return Err(format!(
+                    "dup3 eventfd onto {fd}: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+        // SAFETY: the object lives on behind the group's numbers.
+        unsafe { libc::close(new) };
+        eventfds += 1;
+    }
+    let mut epolls = 0;
+    let mut registrations = 0;
+    for group in groups("anon_inode:[eventpoll]") {
+        let info = fdinfo(group[0]);
+        // SAFETY: a new descriptor, closed below after its duplicates.
+        let new = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if new < 0 {
+            return Err(format!(
+                "epoll_create1: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        for line in info.lines().filter(|line| line.starts_with("tfd:")) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let value = |key: &str| {
+                fields
+                    .iter()
+                    .position(|field| *field == key)
+                    .and_then(|at| fields.get(at + 1))
+                    .copied()
+            };
+            let (Some(target), Some(events), Some(data)) =
+                (value("tfd:"), value("events:"), value("data:"))
+            else {
+                continue;
+            };
+            let (Ok(target), Ok(events), Ok(data)) = (
+                target.parse::<RawFd>(),
+                u32::from_str_radix(events, 16),
+                u64::from_str_radix(data, 16),
+            ) else {
+                continue;
+            };
+            let mut event = libc::epoll_event { events, u64: data };
+            // SAFETY: registers a live descriptor of this process.
+            if unsafe { libc::epoll_ctl(new, libc::EPOLL_CTL_ADD, target, &mut event) } < 0 {
+                return Err(format!(
+                    "epoll_ctl ADD {target}: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            registrations += 1;
+        }
+        for &fd in &group {
+            if !dup_onto(new, fd) {
+                return Err(format!(
+                    "dup3 epoll onto {fd}: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+        // SAFETY: the object lives on behind the group's numbers.
+        unsafe { libc::close(new) };
+        epolls += 1;
+    }
+    Ok(serde_json::json!({
+        "eventfds": eventfds,
+        "epolls": epolls,
+        "registrations": registrations,
+    }))
+}
+
 /// Takes the copies `spec` asks for, at `place` (a description, for the
 /// measurements). Returns `None` in the template once every copy has exited,
 /// and `Some(k)` in copy k once it is repaired, so that the caller goes on
@@ -410,7 +565,58 @@ pub(crate) fn fork_copies(spec: &ForkSpec, place: serde_json::Value) -> Option<u
         .map(|(fd, name)| (format!("{name}_offset"), offset_of(fd).into()))
         .collect();
     let mut children = Vec::new();
+    let all_started = Instant::now();
+    if spec.parallel {
+        // Every copy starts now; the template waits for all of them. Copies
+        // only read the template's memory, which stays still while it waits.
+        let mut running = Vec::new();
+        for index in 0..spec.copies {
+            let forked = Instant::now();
+            // SAFETY: as in the sequential case below.
+            let pid = unsafe { libc::fork() };
+            if pid == 0 {
+                become_timeline(spec, index, &place, &hooks, &records, forked);
+                return Some(index);
+            }
+            if pid < 0 {
+                let error = std::io::Error::last_os_error();
+                children.push(serde_json::json!({ "index": index, "error": error.to_string() }));
+                break;
+            }
+            running.push((index, pid, forked, micros(forked)));
+        }
+        while !running.is_empty() {
+            running.retain(|&(index, pid, forked, fork_us)| {
+                let mut status = 0;
+                // SAFETY: polls one copy forked above.
+                let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+                if waited == 0
+                    || (waited < 0
+                        && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR))
+                {
+                    return true;
+                }
+                children.push(serde_json::json!({
+                    "index": index,
+                    "pid": pid,
+                    "fork_us": fork_us,
+                    "wall_us": micros(forked),
+                    "exit_code": (waited == pid && libc::WIFEXITED(status))
+                        .then(|| libc::WEXITSTATUS(status)),
+                    "signal": (waited == pid && libc::WIFSIGNALED(status))
+                        .then(|| libc::WTERMSIG(status)),
+                }));
+                false
+            });
+            if !running.is_empty() {
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+        }
+    }
     for index in 0..spec.copies {
+        if spec.parallel {
+            break;
+        }
         let forked = Instant::now();
         // SAFETY: every guest thread is parked and the scheduler runs on the
         // run's only supervisor thread (the backend's prepare hook refused
@@ -464,6 +670,8 @@ pub(crate) fn fork_copies(spec: &ForkSpec, place: serde_json::Value) -> Option<u
         "spec": format!("{spec:?}"),
         "place": place,
         "copies": spec.copies,
+        "parallel": spec.parallel,
+        "all_copies_wall_us": micros(all_started),
         "prepare_us": prepare_us,
         "prepare": prepared,
         "file_records": records.len(),
@@ -506,9 +714,27 @@ fn become_timeline(
         Err(error) => fail("backend repair", error),
     };
     let repair_us = micros(repair_started);
+    let objects_started = Instant::now();
+    let objects = match privatize_kernel_objects() {
+        Ok(objects) => objects,
+        Err(error) => fail("private kernel objects", error),
+    };
+    let objects_us = micros(objects_started);
     let files_started = Instant::now();
     let reopened = reopen_files(records);
     let files_us = micros(files_started);
+    let cpu = (!spec.cpus.is_empty()).then(|| spec.cpus[index % spec.cpus.len()]);
+    if let Some(cpu) = cpu {
+        // SAFETY: a zeroed set with one CPU, for this (the copy's only) thread.
+        let pinned = unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            libc::CPU_SET(cpu, &mut set);
+            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set)
+        };
+        if pinned != 0 {
+            fail("pinning", std::io::Error::last_os_error().to_string());
+        }
+    }
     if let Err(error) = redirect_outputs(&spec.dir, index) {
         fail("redirecting output", error.to_string());
     }
@@ -520,8 +746,11 @@ fn become_timeline(
         "fork_to_child_us": started.duration_since(forked).as_micros() as u64,
         "repair_us": repair_us,
         "repair": repaired,
+        "kernel_objects": objects,
+        "kernel_objects_us": objects_us,
         "files_reopened": reopened,
         "files_us": files_us,
+        "cpu": cpu,
         "ready_us": micros(forked),
     });
     let _ = std::fs::write(
@@ -546,6 +775,8 @@ mod tests {
                 choice: None,
                 bytes: vec![],
                 copies: 3,
+                parallel: false,
+                cpus: vec![],
                 dir: PathBuf::from("/tmp/x"),
             }
         );
@@ -556,10 +787,15 @@ mod tests {
                 choice: Some(7),
                 bytes: vec![0, 144],
                 copies: 2,
+                parallel: false,
+                cpus: vec![],
                 dir: PathBuf::from("/d"),
             }
         );
         assert!(ForkSpec::parse("turn=1,choice=2,dir=/d").is_err());
+        let parallel = ForkSpec::parse("turn=5,copies=4,parallel=1,cpus=3:5,dir=/d").unwrap();
+        assert!(parallel.parallel);
+        assert_eq!(parallel.cpus, vec![3, 5]);
         assert!(ForkSpec::parse("copies=3,dir=/tmp/x").is_err());
         assert!(ForkSpec::parse("turn=4,dir=/tmp/x,colour=red").is_err());
     }
