@@ -36,10 +36,17 @@
 
 pub mod fork_server;
 pub mod kvm;
+pub mod policy;
 
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
+
+pub use policy::Batch;
+pub use policy::CopyMode;
+pub use policy::CopyPolicy;
+pub use policy::Placement;
+pub use policy::PlacementHint;
 
 /// An answer to a choice request (detcore::choice answers are `u64`).
 pub type Value = u64;
@@ -61,6 +68,12 @@ pub struct RunSpec {
     pub dir: PathBuf,
     /// Wall-clock bound for one copy.
     pub timeout: Duration,
+    /// How this run's copies get their resources, unless a [`Batch`] says
+    /// otherwise. Default: [`CopyPolicy::FORK_AND_RUN`].
+    pub copy: CopyPolicy,
+    /// Where this run's copies run, unless a [`Batch`] says otherwise.
+    /// Default: [`Placement::SelfPlaced`].
+    pub placement: Placement,
 }
 
 /// What an implementation can do (amendment (d), d4).
@@ -249,6 +262,10 @@ pub fn refuse_answer_at_start() -> Refusal {
     )
 }
 
+/// What [`Timelines::keep`] gives back: the checkpoint and the run that goes
+/// on, or a refusal with the run, still paused.
+pub type Kept<C, P> = Result<(C, P), (Refusal, P)>;
+
 pub trait Checkpoint {
     fn cut(&self) -> &Cut;
     /// The prefix length: 0 at START.
@@ -275,8 +292,62 @@ pub trait Timelines {
         run: Self::PausedRun,
     ) -> Result<Self::Checkpoint, (Refusal, Self::PausedRun)>;
 
-    /// `n` independent copies of `cp`; lazy at START (d5).
+    /// `n` independent copies of `cp`, under the run's policies; lazy at
+    /// START (d5).
     fn fork(&mut self, cp: &Self::Checkpoint, n: usize) -> Result<Vec<Self::Timeline>, Refusal>;
+
+    /// Whether copies made under `copy` and placed by `placement` can be had
+    /// here. A refusal names what cannot (P7); nothing is served another way.
+    /// The default honors only the defaults.
+    fn honors(&self, copy: &CopyPolicy, placement: &Placement) -> Result<(), Refusal> {
+        if *copy != CopyPolicy::default() {
+            return Err(Refusal::new(
+                "timeline-copy-policy-unsupported",
+                format!(
+                    "copies here are made only as {}",
+                    CopyPolicy::default().describe()
+                ),
+            ));
+        }
+        if *placement != Placement::default() {
+            return Err(Refusal::new(
+                "timeline-placement-unsupported",
+                "copies here place themselves as fresh runs do",
+            ));
+        }
+        Ok(())
+    }
+
+    /// `n` copies of `cp` under `batch`'s policies, the run's where `batch`
+    /// leaves one unset. The default serves only the run's own.
+    fn fork_batch(
+        &mut self,
+        cp: &Self::Checkpoint,
+        n: usize,
+        batch: &Batch,
+    ) -> Result<Vec<Self::Timeline>, Refusal> {
+        if *batch != Batch::default() {
+            return Err(Refusal::new(
+                "timeline-batch-policy-unsupported",
+                "this implementation takes no per-batch policy",
+            ));
+        }
+        self.fork(cp, n)
+    }
+
+    /// rr's way: freeze the paused run as a checkpoint and keep running it.
+    /// The checkpoint is a copy that stays dormant (nothing but the fork),
+    /// and the run goes on with its own resources, so the run never pays for
+    /// a copy it may never use. The default refuses.
+    fn keep(&mut self, run: Self::PausedRun) -> Kept<Self::Checkpoint, Self::PausedRun> {
+        Err((
+            Refusal::new(
+                "timeline-keep-unsupported",
+                "capture the run and resume a copy of it instead",
+            ),
+            run,
+        ))
+    }
 
     /// Runs the copy until `until`; `None` lets its own source answer its
     /// pending request too (d2).

@@ -136,8 +136,10 @@ pub struct BackendHooks {
     pub name: &'static str,
     /// In the template, before the first fork: read what the copies need.
     pub prepare: fn() -> Result<String, String>,
-    /// In each copy, before anything else: rebuild what fork did not copy.
-    pub repair: fn() -> Result<String, String>,
+    /// In each copy, before anything else: rebuild what fork did not copy,
+    /// giving the copy its guest memory as its driver chose (`None`: the
+    /// backend's default).
+    pub repair: fn(Option<MemoryCopy>) -> Result<String, String>,
     /// In each copy, as it ends: what the backend did while it ran.
     pub at_exit: fn() -> String,
 }
@@ -148,18 +150,92 @@ static HOOKS: OnceLock<BackendHooks> = OnceLock::new();
 /// template's CPU.
 pub type PlacedCpu = Option<(usize, String)>;
 
-/// How a copy chooses its CPU when its driver names none: the embedding
-/// program's CPU placement (Hermit's pinned-CPU placement and reservation).
-/// Without it, or when it answers `None`, a copy keeps the template's CPU, so
-/// copies resumed at once share that one CPU.
+/// Where a copy runs, as its driver chose for the copy's batch (the driver's
+/// placement policy, minus what only a driver handles).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CopyCpu {
+    /// Pinned to `cpus[position % cpus.len()]`, CPUs the driver owns.
+    Pool(Vec<usize>),
+    /// Pinned to an idle CPU the installed [`CopyPlacement`] chooses and
+    /// reserves, as a fresh pinned run does; without one, the template's.
+    SelfPlaced,
+    /// Not pinned: any CPU the run may use ([`CopyPlacement::allowed`]), and
+    /// the Linux scheduler places the copy.
+    Unpinned,
+}
+
+impl CopyCpu {
+    /// The pool `cpus`, or [`CopyCpu::SelfPlaced`] when it is empty.
+    pub fn from_cpus(cpus: &[usize]) -> Self {
+        if cpus.is_empty() {
+            CopyCpu::SelfPlaced
+        } else {
+            CopyCpu::Pool(cpus.to_vec())
+        }
+    }
+
+    /// Parses `pool:A:B`, `self` or `unpinned`.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        match text {
+            "self" => Ok(CopyCpu::SelfPlaced),
+            "unpinned" => Ok(CopyCpu::Unpinned),
+            _ => {
+                let cpus = text.strip_prefix("pool:").ok_or_else(|| {
+                    format!("placement {text:?} is not pool:CPUS, self or unpinned")
+                })?;
+                cpus.split(':')
+                    .map(|cpu| {
+                        cpu.parse::<usize>()
+                            .map_err(|e| format!("placement {text:?}: {e}"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(CopyCpu::Pool)
+            }
+        }
+    }
+}
+
+/// How a copy gets its guest memory, as its driver chose for its batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryCopy {
+    /// Shared with the template until the copy writes it (copy-on-write).
+    Lazy,
+    /// Copied in full while the copy repairs.
+    Eager,
+}
+
+impl MemoryCopy {
+    /// Parses `lazy` or `eager`.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        match text {
+            "lazy" => Ok(MemoryCopy::Lazy),
+            "eager" => Ok(MemoryCopy::Eager),
+            _ => Err(format!("memory {text:?} is not lazy or eager")),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            MemoryCopy::Lazy => "lazy",
+            MemoryCopy::Eager => "eager",
+        }
+    }
+}
+
+/// The embedding program's CPU placement for copies (Hermit's pinned-CPU
+/// placement and reservation). Without it, a [`CopyCpu::SelfPlaced`] copy
+/// keeps the template's CPU, so copies resumed at once share that one CPU.
 #[derive(Clone, Copy)]
 pub struct CopyPlacement {
-    /// In the template, before each batch of forks: refresh what copies
-    /// choose from (a load sample).
+    /// In the template, before each batch of self-placed forks: refresh what
+    /// copies choose from (a load sample).
     pub before_fork: fn(),
-    /// In each copy, first: choose and reserve a CPU for the copy at this
-    /// position in its batch, and say how.
+    /// In each self-placed copy, first: choose and reserve a CPU for the copy
+    /// at this position in its batch, and say how.
     pub place: fn(usize) -> Result<PlacedCpu, String>,
+    /// In each unpinned copy, first: every CPU the run may use, as it could
+    /// before it pinned itself.
+    pub allowed: fn() -> Vec<usize>,
 }
 
 static COPY_PLACEMENT: OnceLock<CopyPlacement> = OnceLock::new();
@@ -169,10 +245,9 @@ pub fn install_copy_placement(placement: CopyPlacement) {
     let _ = COPY_PLACEMENT.set(placement);
 }
 
-/// Refreshes the copy placement's sample before forking copies that name no
-/// CPU.
-fn before_placed_forks(cpus: &[usize]) {
-    if cpus.is_empty()
+/// Refreshes the copy placement's sample before forking self-placed copies.
+fn before_placed_forks(cpu: &CopyCpu) {
+    if *cpu == CopyCpu::SelfPlaced
         && let Some(placement) = COPY_PLACEMENT.get()
     {
         (placement.before_fork)();
@@ -593,15 +668,34 @@ fn serve_template(request: &crate::choice::ChoiceRequest) {
                 .and_then(|ids| ids.as_array())
                 .map(|ids| ids.iter().filter_map(|id| id.as_u64()).collect())
                 .unwrap_or_default();
+            // The batch's policies; absent, the run's CPUs and the backend's
+            // memory default.
+            let policies = (
+                fork.get("placement")
+                    .and_then(|placement| placement.as_str())
+                    .map_or_else(|| Ok(CopyCpu::from_cpus(&cpus)), CopyCpu::parse),
+                fork.get("memory")
+                    .and_then(|memory| memory.as_str())
+                    .map(MemoryCopy::parse)
+                    .transpose(),
+            );
+            let (cpu, memory) = match policies {
+                (Ok(cpu), Ok(memory)) => (cpu, memory),
+                (Err(error), _) | (_, Err(error)) => {
+                    send_control(&serde_json::json!({ "forked": [{ "error": error }] }));
+                    continue;
+                }
+            };
             let mut forked = Vec::new();
-            before_placed_forks(&cpus);
+            before_placed_forks(&cpu);
             for (position, id) in ids.into_iter().enumerate() {
                 let started = Instant::now();
                 match fork_for_copy() {
                     Ok(0) => {
                         become_timeline(
                             &dir,
-                            &cpus,
+                            &cpu,
+                            memory,
                             id as usize,
                             position,
                             &place,
@@ -1749,7 +1843,8 @@ pub(crate) fn fork_copies(spec: &ForkSpec, place: serde_json::Value) -> Option<u
     } = template;
     let mut children = Vec::new();
     let all_started = Instant::now();
-    before_placed_forks(&spec.cpus);
+    let cpu = CopyCpu::from_cpus(&spec.cpus);
+    before_placed_forks(&cpu);
     if spec.parallel {
         // Every copy starts now; the template waits for all of them. Copies
         // only read the template's memory, which stays still while it waits.
@@ -1765,7 +1860,7 @@ pub(crate) fn fork_copies(spec: &ForkSpec, place: serde_json::Value) -> Option<u
             };
             if pid == 0 {
                 become_timeline(
-                    &spec.dir, &spec.cpus, index, index, &place, &hooks, &records, &parked, forked,
+                    &spec.dir, &cpu, None, index, index, &place, &hooks, &records, &parked, forked,
                 );
                 return Some(index);
             }
@@ -1815,7 +1910,7 @@ pub(crate) fn fork_copies(spec: &ForkSpec, place: serde_json::Value) -> Option<u
         };
         if pid == 0 {
             become_timeline(
-                &spec.dir, &spec.cpus, index, index, &place, &hooks, &records, &parked, forked,
+                &spec.dir, &cpu, None, index, index, &place, &hooks, &records, &parked, forked,
             );
             return Some(index);
         }
@@ -1885,7 +1980,8 @@ pub(crate) fn fork_copies(spec: &ForkSpec, place: serde_json::Value) -> Option<u
 #[allow(clippy::too_many_arguments)]
 fn become_timeline(
     dir: &std::path::Path,
-    cpus: &[usize],
+    cpu: &CopyCpu,
+    memory: Option<MemoryCopy>,
     index: usize,
     position: usize,
     place: &serde_json::Value,
@@ -1907,28 +2003,44 @@ fn become_timeline(
     };
     // First, so that copies started together repair on their own CPUs
     // rather than queueing on the template's pinned CPU; the re-created
-    // threads get the same set below. The driver's CPUs win; else the
-    // placement chooses and reserves one, as for a fresh run, by the copy's
-    // position in its batch, so that copy j of every batch goes back to the
-    // CPU copy j had before when it is still free.
-    let (cpu, placement) = if !cpus.is_empty() {
-        (Some(cpus[index % cpus.len()]), "the driver's".to_string())
-    } else {
-        match COPY_PLACEMENT
+    // threads get the same set below. A pool gives copy j of a batch the
+    // pool's CPU j; self-placement chooses and reserves one, as for a fresh
+    // run, by the copy's position in its batch, so that copy j of every batch
+    // goes back to the CPU copy j had before when it is still free; an
+    // unpinned copy may run on every CPU the run may use.
+    let (cpus, placement): (Option<Vec<usize>>, String) = match cpu {
+        CopyCpu::Pool(pool) if !pool.is_empty() => (
+            Some(vec![pool[position % pool.len()]]),
+            "the driver's pool".into(),
+        ),
+        CopyCpu::Pool(_) => (None, "the template's: an empty pool".into()),
+        CopyCpu::SelfPlaced => match COPY_PLACEMENT
             .get()
             .map(|placement| (placement.place)(position))
         {
-            Some(Ok(Some((cpu, how)))) => (Some(cpu), how),
+            Some(Ok(Some((cpu, how)))) => (Some(vec![cpu]), how),
             Some(Ok(None)) => (None, "the template's: placement chose none".into()),
             Some(Err(error)) => (None, format!("the template's: placement failed: {error}")),
             None => (None, "the template's: no placement".into()),
-        }
+        },
+        CopyCpu::Unpinned => match COPY_PLACEMENT.get().map(|placement| (placement.allowed)()) {
+            Some(allowed) if !allowed.is_empty() => {
+                let how = format!("unpinned: the {} CPUs the run may use", allowed.len());
+                (Some(allowed), how)
+            }
+            _ => (
+                None,
+                "unpinned: the template's affinity, as the run did not pin itself".into(),
+            ),
+        },
     };
-    let affinity = cpu.map(|cpu| {
-        // SAFETY: a zeroed set with one CPU.
+    let affinity = cpus.as_ref().map(|cpus| {
+        // SAFETY: a zeroed set with these CPUs.
         unsafe {
             let mut set: libc::cpu_set_t = std::mem::zeroed();
-            libc::CPU_SET(cpu, &mut set);
+            for &cpu in cpus {
+                libc::CPU_SET(cpu, &mut set);
+            }
             set
         }
     });
@@ -1938,8 +2050,13 @@ fn become_timeline(
             fail("pinning", std::io::Error::last_os_error().to_string());
         }
     }
+    // A single CPU, for the summary.
+    let cpu = cpus
+        .as_ref()
+        .filter(|cpus| cpus.len() == 1)
+        .map(|cpus| cpus[0]);
     let repair_started = Instant::now();
-    let repaired = match (hooks.repair)() {
+    let repaired = match (hooks.repair)(memory) {
         Ok(description) => description,
         Err(error) => fail("backend repair", error),
     };
@@ -1970,7 +2087,9 @@ fn become_timeline(
         "files_reopened": reopened,
         "files_us": files_us,
         "cpu": cpu,
+        "cpus": cpus.as_ref().map(Vec::len),
         "placement": placement,
+        "memory": memory.map_or("the backend's default", MemoryCopy::name),
         "ready_us": micros(forked),
     });
     let _ = std::fs::write(

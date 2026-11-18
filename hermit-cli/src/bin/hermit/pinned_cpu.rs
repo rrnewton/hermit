@@ -395,7 +395,19 @@ pub(crate) fn enable_copy_placement() {
     detcore::timelines::install_copy_placement(detcore::timelines::CopyPlacement {
         before_fork: copy_before_fork,
         place: place_copy,
+        allowed: copy_allowed,
     });
+}
+
+/// The CPUs the run was allowed before it pinned itself: an unpinned copy's
+/// affinity. Empty when the run kept nothing for copies.
+fn copy_allowed() -> Vec<usize> {
+    FOR_COPIES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|kept| kept.allowed.clone())
+        .unwrap_or_default()
 }
 
 fn keep_for_copies(allowed: &[usize], sampled: Option<Observation>, dir: Option<&OwnedFd>) {

@@ -12,7 +12,10 @@
 //!
 //! ```text
 //! timelines_gate kvm|fork-server dir=DIR launcher=CMD global=ARGS run=ARGS
-//!     [at=I] [bytes=B1:B2:...] [copies=K] [cpus=A:B:...] [parallel=1] -- GUEST...
+//!     [at=I] [bytes=B1:B2:...] [copies=K] [placement=P] [copy=C] [parallel=1] -- GUEST...
+//!
+//! `placement=` (`self`, `unpinned`, `pool:A:B`; `cpus=A:B` is that pool) and
+//! `copy=` (`fork-and-run`, `eager`) are the KVM copies' policies.
 //! ```
 //!
 //! `launcher`, `global` and `run` are space-separated argument lists (the
@@ -33,9 +36,11 @@ use std::time::Duration;
 use std::time::Instant;
 
 use hermit::timelines::Checkpoint;
+use hermit::timelines::CopyPolicy;
 use hermit::timelines::Observation;
 use hermit::timelines::Part;
 use hermit::timelines::PendingRequest;
+use hermit::timelines::Placement;
 use hermit::timelines::RunOutcome;
 use hermit::timelines::RunSpec;
 use hermit::timelines::Stop;
@@ -53,7 +58,8 @@ struct Options {
     at: u64,
     bytes: Vec<u8>,
     copies: usize,
-    cpus: Vec<usize>,
+    placement: Placement,
+    copy: CopyPolicy,
     parallel: bool,
     guest: Vec<String>,
 }
@@ -76,7 +82,8 @@ fn options() -> Result<Options, String> {
         at: 3,
         bytes: vec![1, 255],
         copies: 3,
-        cpus: Vec::new(),
+        placement: Placement::default(),
+        copy: CopyPolicy::default(),
         parallel: false,
         guest: Vec::new(),
     };
@@ -100,11 +107,14 @@ fn options() -> Result<Options, String> {
                     .collect::<Result<_, _>>()?
             }
             "copies" => options.copies = value.parse().map_err(|e| format!("copies: {e}"))?,
-            "cpus" => {
-                options.cpus = value
-                    .split(':')
-                    .map(|c| c.parse::<usize>().map_err(|e| format!("cpus: {e}")))
-                    .collect::<Result<_, _>>()?
+            "cpus" => options.placement = Placement::parse(&format!("pool:{value}"))?,
+            "placement" => options.placement = Placement::parse(value)?,
+            "copy" => {
+                options.copy = match value {
+                    "fork-and-run" => CopyPolicy::FORK_AND_RUN,
+                    "eager" => CopyPolicy::EAGER,
+                    other => return Err(format!("copy: {other:?} is not fork-and-run or eager")),
+                }
             }
             "parallel" => options.parallel = value == "1",
             other => return Err(format!("unknown key {other:?}")),
@@ -240,7 +250,6 @@ fn ms(duration: Duration) -> String {
 
 fn run_kvm(options: &Options, gate: &mut Gate) -> Result<(), String> {
     let mut timelines = KvmTimelines::new(options.dir.clone()).map_err(|e| e.to_string())?;
-    timelines.cpus = options.cpus.clone();
     let tape = |name: &str, bytes: &[u8]| -> Result<String, String> {
         let path = options.dir.join(name);
         std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
@@ -253,7 +262,14 @@ fn run_kvm(options: &Options, gate: &mut Gate) -> Result<(), String> {
         guest: options.guest.clone(),
         dir: options.dir.clone(),
         timeout: Duration::from_secs(600),
+        copy: options.copy,
+        placement: options.placement.clone(),
     };
+    println!(
+        "policies: placement {}, copy {}",
+        options.placement.describe(),
+        options.copy.describe()
+    );
     let base = spec(tape("tape-default", &[])?);
 
     // The reference: a fresh run, START copy resumed with its own source.
@@ -487,6 +503,8 @@ fn run_fork_server(options: &Options, gate: &mut Gate) -> Result<(), String> {
         guest: options.guest.clone(),
         dir: options.dir.clone(),
         timeout: Duration::from_secs(600),
+        copy: CopyPolicy::default(),
+        placement: Placement::default(),
     };
     let started = Instant::now();
     let start = timelines.start(&spec).map_err(|e| e.to_string())?;

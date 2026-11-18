@@ -11,8 +11,20 @@
 //!
 //! ```text
 //! timelines_bench dir=DIR launcher=CMD global=ARGS run=ARGS
-//!     [at=I] [copies=N] [rounds=R] [cpus=A:B:...] [fresh=1] [settle=MS] -- GUEST...
+//!     [at=I] [copies=N] [rounds=R] [placement=P] [copy=C] [fresh=1] [settle=MS]
+//!     [backups=N1:N2:... [resume=K]] [chain=K] -- GUEST...
 //! ```
+//!
+//! `placement=` is the copies' placement policy: `self` (the default),
+//! `unpinned`, or `pool:A:B` (`cpus=A:B` is the same pool). `copy=` is
+//! their copy policy: `fork-and-run` (the default), `eager` or `backup`.
+//! `backups=` measures dormant backups instead of rounds: at request I, for
+//! each N, it makes N copies under `copy=` and waits until every one is
+//! ready, reading the fork's wall time and the run's cgroup memory before and
+//! after; then it resumes K of them (default 2) to the end and discards the
+//! rest. `chain=K` measures checkpoints along one run instead, rr's way: it
+//! captures the run at request I, 2I, ... KI, each time running on in a copy
+//! of the last checkpoint, then goes back to the first and the middle one.
 //!
 //! `launcher`, `global` and `run` are as for `timelines_gate`. The bench
 //! captures a run paused at choice request I, then runs R rounds; a round
@@ -35,15 +47,19 @@ use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
 
+use hermit::timelines::Batch;
 use hermit::timelines::Checkpoint;
+use hermit::timelines::CopyPolicy;
 use hermit::timelines::Observation;
 use hermit::timelines::Part;
 use hermit::timelines::PendingRequest;
+use hermit::timelines::Placement;
 use hermit::timelines::RunOutcome;
 use hermit::timelines::RunSpec;
 use hermit::timelines::Stop;
 use hermit::timelines::StopAt;
 use hermit::timelines::Timelines;
+use hermit::timelines::kvm::KvmCheckpoint;
 use hermit::timelines::kvm::KvmTimelines;
 
 struct Options {
@@ -54,7 +70,11 @@ struct Options {
     at: u64,
     copies: usize,
     rounds: usize,
-    cpus: Vec<usize>,
+    placement: Placement,
+    copy: CopyPolicy,
+    backups: Vec<usize>,
+    resume: usize,
+    chain: usize,
     fresh: bool,
     /// A pause after each round, not counted: lets the round's processes
     /// finish exiting before the next round starts.
@@ -75,7 +95,11 @@ fn options() -> Result<Options, String> {
         at: 3,
         copies: 4,
         rounds: 5,
-        cpus: Vec::new(),
+        placement: Placement::default(),
+        copy: CopyPolicy::default(),
+        backups: Vec::new(),
+        resume: 2,
+        chain: 0,
         fresh: false,
         settle: Duration::ZERO,
         guest: Vec::new(),
@@ -99,12 +123,28 @@ fn options() -> Result<Options, String> {
             "at" => options.at = number("at")? as u64,
             "copies" => options.copies = number("copies")?,
             "rounds" => options.rounds = number("rounds")?,
-            "cpus" => {
-                options.cpus = value
+            "cpus" => options.placement = Placement::parse(&format!("pool:{value}"))?,
+            "placement" => options.placement = Placement::parse(value)?,
+            "copy" => {
+                options.copy = match value {
+                    "fork-and-run" => CopyPolicy::FORK_AND_RUN,
+                    "eager" => CopyPolicy::EAGER,
+                    "backup" => CopyPolicy::BACKUP,
+                    other => {
+                        return Err(format!(
+                            "copy: {other:?} is not fork-and-run, eager or backup"
+                        ));
+                    }
+                }
+            }
+            "backups" => {
+                options.backups = value
                     .split(':')
-                    .map(|c| c.parse::<usize>().map_err(|e| format!("cpus: {e}")))
+                    .map(|n| n.parse::<usize>().map_err(|e| format!("backups: {e}")))
                     .collect::<Result<_, _>>()?
             }
+            "resume" => options.resume = number("resume")?,
+            "chain" => options.chain = number("chain")?,
             "fresh" => options.fresh = value == "1",
             "settle" => options.settle = Duration::from_millis(number("settle")? as u64),
             other => return Err(format!("unknown key {other:?}")),
@@ -203,9 +243,230 @@ impl Tally {
     }
 }
 
+/// A counter of the run's cgroup now (`memory.current`, `pids.current`): the
+/// bench, hermit and every copy, which safehermit runs in place inside a
+/// boxed scope.
+fn cgroup_counter(name: &str) -> Result<u64, String> {
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").map_err(|e| e.to_string())?;
+    let path = cgroup
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .ok_or("no cgroup v2 line in /proc/self/cgroup")?;
+    let file = format!("/sys/fs/cgroup{path}/{name}");
+    std::fs::read_to_string(&file)
+        .map_err(|e| format!("{file}: {e}"))?
+        .trim()
+        .parse()
+        .map_err(|e| format!("{file}: {e}"))
+}
+
+fn memory_current() -> Result<u64, String> {
+    cgroup_counter("memory.current")
+}
+
+fn mib(bytes: i64) -> String {
+    format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+}
+
+/// Waits until each copy in `ids` has written its summary (it is repaired
+/// and placed), and returns the largest fork-to-ready time they report.
+fn wait_ready(dir: &std::path::Path, ids: &[u64]) -> Result<Duration, String> {
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let mut slowest = 0;
+    for id in ids {
+        let path = dir.join(format!("timeline-{id}.json"));
+        let summary: serde_json::Value = loop {
+            if let Ok(text) = std::fs::read_to_string(&path)
+                && let Ok(summary) = serde_json::from_str(&text)
+            {
+                break summary;
+            }
+            if Instant::now() > deadline {
+                return Err(format!("{}: no summary within 300 s", path.display()));
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        slowest = slowest.max(summary["ready_us"].as_u64().unwrap_or(0));
+    }
+    Ok(Duration::from_micros(slowest))
+}
+
+/// Dormant backups: for each N, N copies of `checkpoint` kept, K resumed.
+fn backups(
+    timelines: &mut KvmTimelines,
+    checkpoint: &KvmCheckpoint,
+    request: &PendingRequest,
+    options: &Options,
+    same: &dyn Fn(&Observation, i32) -> bool,
+) -> Result<usize, String> {
+    let mut failures = 0;
+    for (batch_number, &n) in options.backups.iter().enumerate() {
+        std::thread::sleep(Duration::from_millis(500));
+        let before = memory_current()? as i64;
+        let tasks_before = cgroup_counter("pids.current")?;
+        let started = Instant::now();
+        let mut kept = timelines
+            .fork_batch(
+                checkpoint,
+                n,
+                &Batch {
+                    copy: Some(options.copy),
+                    placement: None,
+                },
+            )
+            .map_err(|e| e.to_string())?;
+        let fork_wall = started.elapsed();
+        let ready = if options.copy == CopyPolicy::BACKUP {
+            None
+        } else {
+            let ids: Vec<u64> = kept.iter().map(|t| t.timeline()).collect();
+            Some(wait_ready(&options.dir, &ids)?)
+        };
+        let all_ready = started.elapsed();
+        std::thread::sleep(Duration::from_millis(200));
+        let held = memory_current()? as i64 - before;
+        let tasks = cgroup_counter("pids.current")? as i64 - tasks_before as i64;
+        let k = options.resume.min(n);
+        let resumed_at = Instant::now();
+        let work = kept
+            .iter_mut()
+            .take(k)
+            .enumerate()
+            .map(|(j, t)| {
+                let answer = (j > 0)
+                    .then(|| tape_answer(request, ((batch_number * 31 + j * 7) % 255 + 1) as u8));
+                (t, answer, StopAt::End)
+            })
+            .collect::<Vec<_>>();
+        let results = timelines.resume_many(work);
+        let resume_wall = resumed_at.elapsed();
+        let mut codes = Vec::new();
+        for (j, result) in results.into_iter().enumerate() {
+            let outcome = exited(
+                result.map_err(|e| e.to_string())?,
+                &format!("backup {j} of {n}"),
+            )?;
+            codes.push(outcome.code);
+            if j == 0 {
+                let joined = checkpoint
+                    .observation()
+                    .join(
+                        &outcome.observation,
+                        &options.dir,
+                        &format!("joined-backups-{n}"),
+                    )
+                    .map_err(|e| e.to_string())?;
+                if !same(&joined, outcome.code) {
+                    failures += 1;
+                    println!("backups {n}: copy 0 FAIL differs from the reference");
+                }
+            }
+        }
+        for t in kept.drain(k..) {
+            timelines.discard(t);
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        let after = memory_current()? as i64 - before;
+        println!(
+            "backups {n} ({}): fork {} returned, all ready {} (slowest copy's fork to ready {}); \
+             memory held {} ({} per copy), tasks held {tasks}; resumed {k} in {} (exits {codes:?}); \
+             after discarding the rest {}",
+            options.copy.describe(),
+            ms(fork_wall),
+            ms(all_ready),
+            ready.map_or("none: dormant".into(), ms),
+            mib(held),
+            mib(held / n as i64),
+            ms(resume_wall),
+            mib(after),
+        );
+    }
+    Ok(failures)
+}
+
+/// Checkpoints along one run, rr's way: capture at request I, 2I, ... KI,
+/// each time running on in a copy of the last checkpoint; then go back to
+/// the first and to the middle one, each with an answer of its own.
+fn chain(
+    timelines: &mut KvmTimelines,
+    start: &KvmCheckpoint,
+    options: &Options,
+) -> Result<usize, String> {
+    let before = memory_current()? as i64;
+    let mut checkpoints: Vec<(KvmCheckpoint, PendingRequest)> = Vec::new();
+    let mut run = timelines.fork(start, 1).map_err(|e| e.to_string())?;
+    let mut copy = run.remove(0);
+    for i in 1..=options.chain {
+        let stepped = Instant::now();
+        let stop = timelines
+            .resume(&mut copy, None, StopAt::Index(options.at * i as u64))
+            .map_err(|e| e.to_string())?;
+        let paused = match stop {
+            Stop::Paused(paused) => paused,
+            Stop::Exited(outcome) => {
+                println!(
+                    "chain: the run ended (exit {}) before checkpoint {i}",
+                    outcome.code
+                );
+                break;
+            }
+        };
+        let request = paused.request().clone();
+        let ran = stepped.elapsed();
+        let captured_at = Instant::now();
+        let checkpoint = timelines
+            .capture(paused)
+            .map_err(|(refusal, _)| refusal.to_string())?;
+        let captured = captured_at.elapsed();
+        std::thread::sleep(Duration::from_millis(200));
+        let held = memory_current()? as i64 - before;
+        println!(
+            "chain checkpoint {i} at request {}: ran there in {}, captured in {}; memory held {}",
+            request.index,
+            ms(ran),
+            ms(captured),
+            mib(held)
+        );
+        let mut next = timelines.fork(&checkpoint, 1).map_err(|e| e.to_string())?;
+        copy = next.remove(0);
+        checkpoints.push((checkpoint, request));
+    }
+    timelines.discard(copy);
+    let mut failures = 0;
+    let picks: Vec<usize> = [0, checkpoints.len() / 2]
+        .into_iter()
+        .filter(|&j| j < checkpoints.len())
+        .collect();
+    for j in picks {
+        let (checkpoint, request) = &checkpoints[j];
+        let started = Instant::now();
+        let mut back = timelines.fork(checkpoint, 1).map_err(|e| e.to_string())?;
+        let answer = tape_answer(request, (j * 37 % 255 + 1) as u8);
+        let outcome = exited(
+            timelines
+                .resume(&mut back[0], Some(answer), StopAt::End)
+                .map_err(|e| e.to_string())?,
+            &format!("back to checkpoint {}", j + 1),
+        )?;
+        if outcome.code != 0 {
+            failures += 1;
+        }
+        println!(
+            "chain: back to checkpoint {} (request {}) and on to the end with answer {answer}: {} (exit {})",
+            j + 1,
+            request.index,
+            ms(started.elapsed()),
+            outcome.code
+        );
+    }
+    for (checkpoint, _) in checkpoints.into_iter().rev() {
+        timelines.release(checkpoint);
+    }
+    Ok(failures)
+}
+
 fn bench(options: &Options) -> Result<usize, String> {
     let mut timelines = KvmTimelines::new(options.dir.clone()).map_err(|e| e.to_string())?;
-    timelines.cpus = options.cpus.clone();
     let tape = options.dir.join("tape-default");
     std::fs::write(&tape, []).map_err(|e| e.to_string())?;
     let spec = RunSpec {
@@ -220,7 +481,18 @@ fn bench(options: &Options) -> Result<usize, String> {
         guest: options.guest.clone(),
         dir: options.dir.clone(),
         timeout: Duration::from_secs(600),
+        copy: if options.backups.is_empty() {
+            options.copy
+        } else {
+            CopyPolicy::default()
+        },
+        placement: options.placement.clone(),
     };
+    println!(
+        "policies: placement {}, copy {}",
+        spec.placement.describe(),
+        options.copy.describe()
+    );
     let start = timelines.start(&spec).map_err(|e| e.to_string())?;
 
     // The reference: one fresh run with its own answers.
@@ -240,6 +512,9 @@ fn bench(options: &Options) -> Result<usize, String> {
     let same = |observation: &Observation, code: i32| {
         bytes(&observation.stdout) == want && code == reference.code
     };
+    if options.chain > 0 {
+        return chain(&mut timelines, &start, options);
+    }
 
     // The template: a fresh run paused at request `at`, then captured.
     let mut first = timelines.fork(&start, 1).map_err(|e| e.to_string())?;
@@ -267,6 +542,11 @@ fn bench(options: &Options) -> Result<usize, String> {
         request.kind,
         ms(to_pause)
     );
+    if !options.backups.is_empty() {
+        let failures = backups(&mut timelines, &checkpoint, &request, options, &same)?;
+        timelines.release(checkpoint);
+        return Ok(failures);
+    }
 
     let mut copies = Tally::new();
     for round in 0..options.rounds {

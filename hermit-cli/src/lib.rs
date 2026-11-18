@@ -3614,7 +3614,14 @@ async fn run_kvm(
     detcore::timelines::install_backend_hooks(detcore::timelines::BackendHooks {
         name: "kvm",
         prepare: || reverie_kvm::host_fork::prepare().map(|report| format!("{report:?}")),
-        repair: || reverie_kvm::host_fork::repair_in_child().map(|report| format!("{report:?}")),
+        repair: |memory| {
+            if let Some(memory) = memory {
+                reverie_kvm::host_fork::set_private_arenas(
+                    memory == detcore::timelines::MemoryCopy::Lazy,
+                );
+            }
+            reverie_kvm::host_fork::repair_in_child().map(|report| format!("{report:?}"))
+        },
         at_exit: reverie_kvm::host_fork::exit_report,
     });
     let execution_started = Instant::now();

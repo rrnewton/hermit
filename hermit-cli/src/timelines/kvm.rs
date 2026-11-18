@@ -27,16 +27,21 @@ use std::path::PathBuf;
 use std::process::Child;
 use std::process::Command;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 use std::time::Instant;
 
+use super::Batch;
 use super::Capabilities;
 use super::Checkpoint;
+use super::CopyMode;
+use super::CopyPolicy;
 use super::Cut;
 use super::Observation;
 use super::Part;
 use super::PendingRequest;
+use super::Placement;
 use super::Refusal;
 use super::RunOutcome;
 use super::RunSpec;
@@ -157,11 +162,6 @@ pub struct KvmTimelines {
     next_id: u64,
     /// Connections that said hello before anyone waited for them.
     arrived: HashMap<u64, Connection>,
-    /// CPUs for copies, round robin by timeline number. Empty: each copy
-    /// chooses and reserves an idle CPU the way a fresh pinned run does
-    /// (`detcore::timelines::CopyPlacement`, Hermit's pinned-CPU placement),
-    /// so copies resumed at once run on CPUs of their own.
-    pub cpus: Vec<usize>,
 }
 
 /// A START checkpoint (no process) or a template paused at a request.
@@ -170,7 +170,7 @@ pub struct KvmCheckpoint {
     index: u64,
     observation: Observation,
     run: RunSpec,
-    template: Option<Mutex<Template>>,
+    template: Option<Arc<Mutex<Template>>>,
 }
 
 struct Template {
@@ -190,6 +190,9 @@ enum CopyState {
     /// A process forked by a template, paused at its request; it connects
     /// when it is ready.
     Forked(RunSpec, Option<Connection>),
+    /// A dormant copy ([`CopyPolicy::BACKUP`]): no process yet. Its template
+    /// forks it when it is first resumed, placed as its batch chose.
+    Dormant(RunSpec, Arc<Mutex<Template>>, Placement),
     Done,
 }
 
@@ -239,7 +242,6 @@ impl KvmTimelines {
             dir,
             next_id: 0,
             arrived: HashMap::new(),
-            cpus: Vec::new(),
         })
     }
 
@@ -282,10 +284,6 @@ impl KvmTimelines {
         );
         if let Some(stop) = stop {
             value.push_str(&format!(",stop={stop}"));
-        }
-        if !self.cpus.is_empty() {
-            let cpus: Vec<String> = self.cpus.iter().map(|cpu| cpu.to_string()).collect();
-            value.push_str(&format!(",cpus={}", cpus.join(":")));
         }
         value
     }
@@ -388,7 +386,22 @@ impl KvmTimelines {
             StopAt::End => None,
             StopAt::Index(j) => Some(j),
         };
+        if let CopyState::Dormant(..) = t.state {
+            let CopyState::Dormant(run, template, placement) =
+                std::mem::replace(&mut t.state, CopyState::Done)
+            else {
+                unreachable!("matched above");
+            };
+            // Made now, the way a fork-and-run copy is made at fork.
+            let made = CopyPolicy::FORK_AND_RUN;
+            if let Err(refusal) = fork_from(&template, &[t.id], &made, &placement) {
+                t.state = CopyState::Dormant(run, template, placement);
+                return Err(refusal);
+            }
+            t.state = CopyState::Forked(run, None);
+        }
         match std::mem::replace(&mut t.state, CopyState::Done) {
+            CopyState::Dormant(..) => unreachable!("made above"),
             CopyState::Unstarted(run) => {
                 if answer.is_some() {
                     t.state = CopyState::Unstarted(run);
@@ -505,6 +518,32 @@ impl KvmTimelines {
     }
 }
 
+/// Asks `template` to fork one copy per id, made under `copy` and placed by
+/// `placement`.
+fn fork_from(
+    template: &Mutex<Template>,
+    ids: &[u64],
+    copy: &CopyPolicy,
+    placement: &Placement,
+) -> Result<(), Refusal> {
+    let mut template = template.lock().unwrap_or_else(|e| e.into_inner());
+    template.connection.send(&serde_json::json!({
+        "fork": {
+            "ids": ids,
+            "memory": copy.memory.name(),
+            "placement": placement.describe(),
+        }
+    }))?;
+    let forked = template.connection.expect("forked", REPLY_BOUND)?;
+    if let Some(error) = forked
+        .as_array()
+        .and_then(|copies| copies.iter().find_map(|copy| copy.get("error")))
+    {
+        return Err(Refusal::new("timeline-fork-failed", error.to_string()));
+    }
+    Ok(())
+}
+
 impl Checkpoint for KvmCheckpoint {
     fn cut(&self) -> &Cut {
         &self.cut
@@ -563,47 +602,87 @@ impl Timelines for KvmTimelines {
             index: run.request.index,
             observation: self.files(run.id, Some(&offsets)),
             run: run.run,
-            template: Some(Mutex::new(Template {
+            template: Some(Arc::new(Mutex::new(Template {
                 connection: run.connection,
                 child: run.child,
-            })),
+            }))),
         })
     }
 
     fn fork(&mut self, cp: &KvmCheckpoint, n: usize) -> Result<Vec<KvmTimeline>, Refusal> {
+        self.fork_batch(cp, n, &Batch::default())
+    }
+
+    /// Copies made at fork take eager or lazy memory with eager descriptors
+    /// and kernel objects; [`CopyPolicy::BACKUP`] makes nothing until a copy
+    /// is resumed. Placement: a pool, self-placed or unpinned; hints wait for
+    /// a scheduler that takes them.
+    fn honors(&self, copy: &CopyPolicy, placement: &Placement) -> Result<(), Refusal> {
+        let made_at_fork = matches!(copy.memory, CopyMode::Eager | CopyMode::Lazy)
+            && copy.descriptors == CopyMode::Eager
+            && copy.kernel_objects == CopyMode::Eager;
+        if !made_at_fork && *copy != CopyPolicy::BACKUP {
+            return Err(Refusal::new(
+                "timeline-copy-policy-unsupported",
+                format!(
+                    "{}: KVM copies are made at fork (memory eager or lazy, descriptors and \
+                     kernel objects eager) or wholly dormant",
+                    copy.describe()
+                ),
+            ));
+        }
+        match placement {
+            Placement::Pool(cpus) if cpus.is_empty() => Err(Refusal::new(
+                "timeline-placement-unsupported",
+                "a pool needs a CPU",
+            )),
+            Placement::Hinted(_) => Err(Refusal::new(
+                "timeline-placement-unsupported",
+                format!(
+                    "{}: no scheduler here takes placement hints yet",
+                    placement.describe()
+                ),
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    fn fork_batch(
+        &mut self,
+        cp: &KvmCheckpoint,
+        n: usize,
+        batch: &Batch,
+    ) -> Result<Vec<KvmTimeline>, Refusal> {
+        let copy = batch.copy.unwrap_or(cp.run.copy);
+        let placement = batch
+            .placement
+            .clone()
+            .unwrap_or_else(|| cp.run.placement.clone());
+        self.honors(&copy, &placement)?;
         let ids: Vec<u64> = (0..n)
             .map(|_| {
                 self.next_id += 1;
                 self.next_id
             })
             .collect();
-        let Some(template) = &cp.template else {
-            return Ok(ids
-                .into_iter()
-                .map(|id| KvmTimeline {
-                    id,
-                    state: CopyState::Unstarted(cp.run.clone()),
-                })
-                .collect());
+        let copies = |state: &dyn Fn() -> CopyState| {
+            ids.iter()
+                .map(|&id| KvmTimeline { id, state: state() })
+                .collect::<Vec<_>>()
         };
-        let mut template = template.lock().unwrap_or_else(|e| e.into_inner());
-        template
-            .connection
-            .send(&serde_json::json!({ "fork": { "ids": ids } }))?;
-        let forked = template.connection.expect("forked", REPLY_BOUND)?;
-        if let Some(error) = forked
-            .as_array()
-            .and_then(|copies| copies.iter().find_map(|copy| copy.get("error")))
-        {
-            return Err(Refusal::new("timeline-fork-failed", error.to_string()));
+        let Some(template) = &cp.template else {
+            // A START copy is a fresh run, launched when it is resumed: it has
+            // nothing to copy, and it places itself as a fresh run does
+            // (policies apply to copies forked from a captured run).
+            return Ok(copies(&|| CopyState::Unstarted(cp.run.clone())));
+        };
+        if copy == CopyPolicy::BACKUP {
+            return Ok(copies(&|| {
+                CopyState::Dormant(cp.run.clone(), Arc::clone(template), placement.clone())
+            }));
         }
-        Ok(ids
-            .into_iter()
-            .map(|id| KvmTimeline {
-                id,
-                state: CopyState::Forked(cp.run.clone(), None),
-            })
-            .collect())
+        fork_from(template, &ids, &copy, &placement)?;
+        Ok(copies(&|| CopyState::Forked(cp.run.clone(), None)))
     }
 
     fn resume(
@@ -658,7 +737,7 @@ impl Timelines for KvmTimelines {
     /// outlive it. Finish or discard the copies you need first.
     fn release(&mut self, cp: KvmCheckpoint) {
         if let Some(template) = cp.template {
-            let mut template = template.into_inner().unwrap_or_else(|e| e.into_inner());
+            let mut template = template.lock().unwrap_or_else(|e| e.into_inner());
             let released = template
                 .connection
                 .send(&serde_json::json!({ "release": true }))
@@ -679,7 +758,7 @@ impl Timelines for KvmTimelines {
                     }
                 }
             }
-            if let Some(mut child) = template.child {
+            if let Some(child) = template.child.as_mut() {
                 let _ = child.wait();
             }
         }
