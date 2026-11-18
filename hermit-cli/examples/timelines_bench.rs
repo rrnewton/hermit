@@ -21,11 +21,12 @@
 //! the fork, every copy's repair and run, and its exit. With `fresh=1` it
 //! then runs R rounds of N fresh launches at once (re-execution: each runs
 //! the whole guest, prefix included). Prints each round and the executions
-//! per second of each kind. Give `cpus=` one idle CPU per copy: without it a
-//! copy keeps the template's one pinned CPU, so copies resumed at once share
-//! it, while each fresh launch places itself on a CPU of its own (MEASURED,
-//! race 60 at request 3, 4 at once: 8.3 to 11.4 executions per second
-//! unpinned against 24.6 to 27.2 pinned). Every same-future execution
+//! per second of each kind. Without `cpus=`, each copy places itself on an
+//! idle CPU of its own, as each fresh launch does (`KvmTimelines::cpus`).
+//! Before that default a copy kept the template's one pinned CPU, so copies
+//! resumed at once shared it (MEASURED, race 60 at request 3, 4 at once: 8.3
+//! to 11.4 executions per second then, 21.8 to 26.8 placed, 24.6 to 27.2
+//! pinned by hand with `cpus=`). Every same-future execution
 //! (copy 0 of a round, every fresh launch) must reproduce the reference
 //! run's standard output and exit status, or the bench fails;
 //! `timelines_gate` is the full equivalence check.

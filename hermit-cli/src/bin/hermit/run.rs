@@ -17630,6 +17630,15 @@ impl RunOpts {
         };
         let gdbserver_port = self.bind_gdbserver_port()?;
         super::pinned_cpu::set_settings(self.pinned_cpu_settings());
+        // PROTOTYPE (multiverse timelines): a run that may be copied keeps
+        // what its copies place themselves with, so that copies resumed at
+        // once do not all stay on this run's one pinned CPU.
+        if self.pin_threads
+            && (std::env::var_os(detcore::timelines::TIMELINE_CONTROL_ENV).is_some()
+                || std::env::var_os(detcore::timelines::TIMELINE_FORK_ENV).is_some())
+        {
+            super::pinned_cpu::enable_copy_placement();
+        }
         let (mut container, tmpfs, identity, resources) = if self.no_namespace {
             let mut container = Container::new();
             apply_affinity(

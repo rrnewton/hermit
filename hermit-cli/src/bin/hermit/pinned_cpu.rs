@@ -345,10 +345,185 @@ pub(crate) fn choose_for_run(allowed: &[usize], dir: &Path) -> Option<(Choice, C
         Ok(fd) => (Some(fd), Coordination::Host(dir.to_path_buf())),
         Err(reason) => (None, Coordination::NetworkNamespaceOnly(reason)),
     };
-    let choice = choose_for_run_with(allowed, observe, &mut held, |cpu| {
-        reserve_both(RESERVATION_PREFIX, dir.as_ref(), cpu)
-    })?;
+    let mut sampled = None;
+    let choice = choose_for_run_with(
+        allowed,
+        |allowed| {
+            sampled = observe(allowed);
+            sampled.clone()
+        },
+        &mut held,
+        |cpu| reserve_both(RESERVATION_PREFIX, dir.as_ref(), cpu),
+    )?;
+    keep_for_copies(allowed, sampled, dir.as_ref());
     Some((choice, coordination))
+}
+
+/// PROTOTYPE (multiverse timelines): what this run's timeline copies place
+/// themselves with. A copy is a host fork of the run made inside its
+/// container, where neither the network namespace (the abstract names) nor
+/// `/dev/shm` (the lock directory) is the host's, so the run keeps what its
+/// own placement outside the container used, and its copies inherit it:
+/// the allowed CPUs, the PMU-bound ones, the lock directory open (moved high
+/// like a reservation, so the descriptors a guest's setup sees keep their
+/// numbers), and `/proc/stat` readings, the run's own and then one per batch
+/// of forks (`copy_before_fork`).
+struct ForCopies {
+    allowed: Vec<usize>,
+    pmu_bound: BTreeSet<usize>,
+    dir: Option<OwnedFd>,
+    readings: Vec<(std::time::Instant, Reading)>,
+}
+
+/// Set by [`enable_copy_placement`] before the run places itself: only a run
+/// that may be copied keeps the lock directory open.
+static COPIES_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+static FOR_COPIES: Mutex<Option<ForCopies>> = Mutex::new(None);
+
+/// The CPU this copy reserved, held until it exits.
+static COPY_HOLD: Mutex<Option<OwnedFd>> = Mutex::new(None);
+
+/// How many readings [`ForCopies`] keeps: the run's own and the latest
+/// batches'.
+const COPY_READINGS: usize = 8;
+
+/// Makes this run keep what its timeline copies place themselves with, and
+/// installs Detcore's copy placement. Call before the run places itself.
+pub(crate) fn enable_copy_placement() {
+    COPIES_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+    detcore::timelines::install_copy_placement(detcore::timelines::CopyPlacement {
+        before_fork: copy_before_fork,
+        place: place_copy,
+    });
+}
+
+fn keep_for_copies(allowed: &[usize], sampled: Option<Observation>, dir: Option<&OwnedFd>) {
+    if !COPIES_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let dir = dir
+        .and_then(|dir| dir.try_clone().ok())
+        .and_then(|dir| move_high(dir).ok());
+    let (pmu_bound, readings) = match sampled {
+        Some(observation) => (
+            observation.pmu_bound,
+            vec![(std::time::Instant::now(), observation.after)],
+        ),
+        None => (pmu_bound_cpus(Path::new("/sys")), Vec::new()),
+    };
+    *FOR_COPIES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = Some(ForCopies {
+        allowed: allowed.to_vec(),
+        pmu_bound,
+        dir,
+        readings,
+    });
+}
+
+/// In the template, before a batch of forks: a fresh `/proc/stat` reading
+/// for the copies to compare with an earlier one.
+fn copy_before_fork() {
+    let mut kept = FOR_COPIES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let Some(kept) = kept.as_mut() else {
+        return;
+    };
+    let Ok(text) = fs::read_to_string("/proc/stat") else {
+        return;
+    };
+    let reading = parse_proc_stat(&text, &kept.allowed);
+    kept.readings.push((std::time::Instant::now(), reading));
+    if kept.readings.len() > COPY_READINGS {
+        // Keep the run's own reading, the longest window, as a fallback.
+        kept.readings.remove(1);
+    }
+}
+
+/// The sample a copy chooses from: the template's latest reading against
+/// the latest one at least [`SAMPLE_WINDOW`] older (else the oldest), and
+/// that window's length.
+fn copy_observation(kept: &ForCopies) -> Option<(Observation, Duration)> {
+    let (after_at, after) = kept.readings.last()?;
+    let (before_at, before) = kept
+        .readings
+        .iter()
+        .rev()
+        .find(|(at, _)| after_at.duration_since(*at) >= SAMPLE_WINDOW)
+        .or_else(|| kept.readings.first().filter(|(at, _)| at < after_at))?;
+    Some((
+        Observation {
+            before: before.clone(),
+            after: after.clone(),
+            pmu_bound: kept.pmu_bound.clone(),
+        },
+        after_at.duration_since(*before_at),
+    ))
+}
+
+/// In a copy, before anything else: choose and reserve its CPU the way a run
+/// does, from the template's latest sample, without a sample window of its
+/// own. The copy at `position` in its batch starts from candidate
+/// `position`: copies made together try different CPUs first (a copy's
+/// random state is the template's, so a random draw would be the same in
+/// every copy), and copy j of each batch goes back to the CPU copy j had
+/// before while it stays idle and free, warm, rather than to a new one each
+/// time. A CPU another run or copy holds is passed over; with every
+/// candidate held, the copy shares one. The reservation is the host lock
+/// file when the run kept the lock directory, else an abstract name in the
+/// container's network namespace, which other copies of this run see.
+/// `None`: the run kept nothing, or allows one CPU, so the copy keeps the
+/// template's.
+fn place_copy(position: usize) -> Result<detcore::timelines::PlacedCpu, String> {
+    let kept = FOR_COPIES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let Some(kept) = kept.as_ref() else {
+        return Ok(None);
+    };
+    if kept.allowed.len() < 2 {
+        return Ok(None);
+    }
+    let observed = copy_observation(kept);
+    let (pool, basis) = observed
+        .as_ref()
+        .and_then(|(observation, _)| candidates(&kept.allowed, observation))
+        .unwrap_or_else(|| (kept.allowed.clone(), Basis::Unsampled));
+    let window = observed.map_or(0, |(_, window)| window.as_millis());
+    let count = pool.len();
+    for passed_over in 0..count {
+        let cpu = pool[(position + passed_over) % count];
+        let held = match &kept.dir {
+            Some(dir) => lock(dir, cpu),
+            None => reserve(RESERVATION_PREFIX, cpu),
+        };
+        match held {
+            Ok(Some(fd)) => {
+                *COPY_HOLD
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner()) = Some(fd);
+                return Ok(Some((
+                    cpu,
+                    format!(
+                        "{basis} (copy sample {window} ms); reserved, {passed_over} held passed over"
+                    ),
+                )));
+            }
+            Ok(None) => continue,
+            Err(error) => {
+                return Ok(Some((
+                    cpu,
+                    format!("{basis} (copy sample {window} ms); unreserved: {error}"),
+                )));
+            }
+        }
+    }
+    Ok(Some((
+        pool[position % count],
+        format!("{basis} (copy sample {window} ms); every candidate held, so shared"),
+    )))
 }
 
 /// [`choose_for_run`] with the observation, the process's reservation and
@@ -2283,6 +2458,63 @@ mod tests {
             assert!(bad.parse::<PinnedCpuPolicy>().is_err(), "{bad:?}");
         }
         assert_eq!(cpu_set(&[0, 1, 2, 5, 7, 8]), "0-2,5,7-8");
+    }
+
+    /// A timeline copy places itself from the template's readings, without a
+    /// sample window of its own: copies of one batch start from different
+    /// idle candidates (by position), never take a busy or PMU-bound CPU
+    /// while an idle free one remains, pass over a CPU another copy holds,
+    /// and share only when every candidate is held. The sample spans the
+    /// latest reading and the latest one at least SAMPLE_WINDOW older.
+    #[test]
+    fn copies_place_themselves_from_the_template_readings() {
+        let (_dir, fd) = private_lock_dir();
+        let start = std::time::Instant::now();
+        // Over the window CPUs 2, 3 and 5 were idle and 4 busy; 2 is
+        // PMU-bound. A reading 10 ms before the last is too close to use.
+        let before = times(&[(2, 0, 0), (3, 0, 0), (4, 0, 0), (5, 0, 0)]);
+        let close = times(&[(2, 4, 4), (3, 4, 4), (4, 4, 4), (5, 4, 4)]);
+        let after = times(&[(2, 5, 5), (3, 5, 5), (4, 0, 5), (5, 5, 5)]);
+        *FOR_COPIES.lock().unwrap() = Some(ForCopies {
+            allowed: vec![2, 3, 4, 5],
+            pmu_bound: BTreeSet::from([2]),
+            dir: Some(fd),
+            readings: vec![
+                (start, before),
+                (start + SAMPLE_WINDOW, close),
+                (start + SAMPLE_WINDOW + Duration::from_millis(10), after),
+            ],
+        });
+        let take = || COPY_HOLD.lock().unwrap().take().expect("a reservation");
+        // The candidates are 3 and 5: position 0 starts at 3, position 1 at 5.
+        let (cpu, how) = place_copy(0).expect("placed").expect("a CPU");
+        assert_eq!(cpu, 3, "{how}");
+        assert!(how.contains("reserved, 0 held passed over"), "{how}");
+        assert!(how.contains("copy sample 60 ms"), "{how}");
+        let first = take();
+        let (cpu, how) = place_copy(1).expect("placed").expect("a CPU");
+        assert_eq!(cpu, 5, "{how}");
+        let second = take();
+        // Both held: the next copy shares the one its position names.
+        let (cpu, how) = place_copy(2).expect("placed").expect("a CPU");
+        assert_eq!(cpu, 3, "{how}");
+        assert!(how.contains("every candidate held, so shared"), "{how}");
+        assert!(
+            COPY_HOLD.lock().unwrap().is_none(),
+            "a shared CPU holds nothing"
+        );
+        // Once 3 is free again, a copy starting at 5 passes over to it.
+        drop(first);
+        let (cpu, how) = place_copy(1).expect("placed").expect("a CPU");
+        assert_eq!(cpu, 3, "{how}");
+        assert!(how.contains("reserved, 1 held passed over"), "{how}");
+        drop(take());
+        drop(second);
+        // One allowed CPU, or nothing kept: the copy keeps the template's.
+        FOR_COPIES.lock().unwrap().as_mut().unwrap().allowed = vec![3];
+        assert_eq!(place_copy(0).expect("placed"), None);
+        *FOR_COPIES.lock().unwrap() = None;
+        assert_eq!(place_copy(0).expect("placed"), None);
     }
 
     /// A private lock directory for one test, and its open descriptor.

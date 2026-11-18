@@ -157,7 +157,10 @@ pub struct KvmTimelines {
     next_id: u64,
     /// Connections that said hello before anyone waited for them.
     arrived: HashMap<u64, Connection>,
-    /// CPUs for copies, round robin by timeline number (empty: no pinning).
+    /// CPUs for copies, round robin by timeline number. Empty: each copy
+    /// chooses and reserves an idle CPU the way a fresh pinned run does
+    /// (`detcore::timelines::CopyPlacement`, Hermit's pinned-CPU placement),
+    /// so copies resumed at once run on CPUs of their own.
     pub cpus: Vec<usize>,
 }
 
