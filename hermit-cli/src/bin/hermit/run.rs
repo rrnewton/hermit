@@ -14733,9 +14733,14 @@ impl RunOpts {
             self.verify_run(directory, global)
         } else {
             // PROTOTYPE (fuzzpoc): with HERMIT_FORK_SERVER, serve runs from
-            // here; only a forked child returns, and runs once. The pinned CPU
-            // is placed once, for every run, before the first fork.
+            // here; only a forked child returns, and runs once. The launch
+            // namespace's mounts are read and the pinned CPU is placed once,
+            // for every run, before the first fork.
             if super::fork_server::requested() {
+                // Read once here: every run would otherwise read and parse
+                // the whole host mount table again (run_once keeps a value
+                // already read), as one long run reads it once at its start.
+                self.capture_launch_namespace_mounts();
                 super::pinned_cpu::set_settings(self.pinned_cpu_settings());
                 super::container::narrow_affinity_for_fork_server(
                     self.pin_threads,
