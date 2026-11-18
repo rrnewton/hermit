@@ -18,14 +18,21 @@
 //! - Promises: an answer lies in the request's `[lo, hi]` and depends only on
 //!   the requests this run has made so far and the source's own configuration.
 //! - May assume: requests arrive one at a time, in run order, with consecutive
-//!   indices from 0. Hermit serializes the guest, so the order is a function
-//!   of the previous answers and the guest's inputs.
+//!   indices from 0, each through `answer`, or through `skip` when a pause
+//!   hook answered it instead. Hermit serializes the guest, so the order is a
+//!   function of the previous answers and the guest's inputs.
 //! - May refuse: a request it cannot answer (a controller that replies
 //!   `"refuse"`, or whose socket fails). The refusal names the index; the run
 //!   stops there, which localizes a first divergence to one choice.
 //!
 //! A source that always answers the default reproduces the seeded run, so an
 //! empty tape is the ordinary `--chaos --sched-seed` run.
+//!
+//! A *pause hook* ([`set_pause_hook`]) sees each request before the source
+//! does and may answer it itself; the source then skips the request, so a
+//! hook's answer to request `i` replaces only byte `i` of a tape. It is the
+//! entry point for a layer that pauses a run at a choice point, for example to
+//! checkpoint it, and answers there; no command-line option installs one.
 //!
 //! Scope: the ptrace backend, where Detcore runs in the Hermit process, so the
 //! controller is one process-wide value; `hermit run` refuses the options on
@@ -46,6 +53,7 @@ use std::io::BufReader;
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use crate::types::DetTid;
@@ -111,6 +119,12 @@ pub struct ChoiceRefusal {
 pub trait ChoiceSource: Send {
     /// The value to use for `req`, within `[req.lo, req.hi]`, or a refusal.
     fn answer(&mut self, req: &ChoiceRequest) -> Result<u64, ChoiceRefusal>;
+
+    /// `req` was answered without asking this source, by a pause hook's
+    /// [`PauseAction::Answer`]. A source that reads its answers by position
+    /// moves past `req`, so that the hook's answer replaces only this
+    /// request's. The default does nothing.
+    fn skip(&mut self, _req: &ChoiceRequest) {}
 }
 
 /// Decodes answers from a byte tape, one byte per choice, front to back, in the
@@ -157,10 +171,17 @@ impl ChoiceSource for TapeSource {
             Self::decode(req, b)
         })
     }
+
+    /// Moves past `req`'s byte, so the next request reads the byte after it.
+    fn skip(&mut self, _req: &ChoiceRequest) {
+        self.pos += 1;
+    }
 }
 
 /// Asks a controller process over a Unix stream socket, one JSON line per
 /// request and one per answer: `{"i":N,"v":V}` or `{"i":N,"default":true}`.
+/// It keeps the default [`ChoiceSource::skip`], so the controller sees no line
+/// for a request a pause hook answered: the next request's `"i"` jumps past it.
 pub struct SocketSource {
     writer: UnixStream,
     reader: BufReader<UnixStream>,
@@ -219,6 +240,38 @@ impl ChoiceSource for SocketSource {
         }
         Ok(v)
     }
+}
+
+/// What a pause hook tells [`choose`] to do with a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PauseAction {
+    /// Ask the run's choice source, as without a hook.
+    Continue,
+    /// Answer with this value instead of asking the source, which skips the
+    /// request ([`ChoiceSource::skip`]). The value is recorded like any
+    /// answer; a value outside the request's `[lo, hi]` ends the run, as a
+    /// controller's does ([`refuse_run`]).
+    Answer(u64),
+}
+
+/// A callback at each choice point of a run that has a choice source, after
+/// [`choose`] numbers the request and before the source answers it. It runs
+/// inside [`choose`] with the run's controller locked, so it must not call
+/// [`start_run`], [`active`] or [`choose`]. A hook that copies the process by
+/// forking must fork from inside the hook, on its own thread: the copy's
+/// version of that thread then holds the lock and releases it when [`choose`]
+/// returns, where a fork from any other thread would leave the copy's
+/// controller locked for good. There is none unless [`set_pause_hook`]
+/// installs one.
+pub type PauseHook = Arc<dyn Fn(&ChoiceRequest) -> PauseAction + Send + Sync>;
+
+/// The installed pause hook. Process-wide, like the controller.
+static PAUSE_HOOK: Mutex<Option<PauseHook>> = Mutex::new(None);
+
+/// Install a pause hook, or with `None` remove it. It applies from the next
+/// choice point on, in this run and later ones, until replaced.
+pub fn set_pause_hook(hook: Option<PauseHook>) {
+    *PAUSE_HOOK.lock().unwrap() = hook;
 }
 
 /// The request as one JSON object (no trailing newline).
@@ -316,8 +369,9 @@ pub struct ChoicePoint {
     pub site: &'static str,
 }
 
-/// Resolve one choice point: the controller's answer, or `point.default` when
-/// no controller is configured. A refusal ends the run ([`refuse_run`]).
+/// Resolve one choice point: the pause hook's answer if it gives one, else the
+/// controller's, or `point.default` when no controller is configured (the hook
+/// is not asked then). A refusal ends the run ([`refuse_run`]).
 pub fn choose(point: ChoicePoint) -> u64 {
     let ChoicePoint {
         kind,
@@ -345,9 +399,22 @@ pub fn choose(point: ChoicePoint) -> u64 {
         site,
     };
     c.next_index += 1;
-    let v = match c.source.answer(&req) {
-        Ok(v) => v,
-        Err(refusal) => refuse_run(c, &req, &refusal.reason),
+    // Cloned out, so the hook slot is not locked while the hook runs.
+    let hook = PAUSE_HOOK.lock().unwrap().clone();
+    let v = match hook.map_or(PauseAction::Continue, |hook| hook(&req)) {
+        PauseAction::Continue => match c.source.answer(&req) {
+            Ok(v) => v,
+            Err(refusal) => refuse_run(c, &req, &refusal.reason),
+        },
+        PauseAction::Answer(v) if (req.lo..=req.hi).contains(&v) => {
+            c.source.skip(&req);
+            v
+        }
+        PauseAction::Answer(v) => refuse_run(
+            c,
+            &req,
+            &format!("pause hook answer {v} is outside [{}, {}]", req.lo, req.hi),
+        ),
     };
     if let Some(f) = c.record.as_mut() {
         let mut line = request_json(&req);
@@ -441,5 +508,153 @@ mod tests {
         assert_eq!(v["schema"], SCHEMA);
         assert_eq!(v["kind"], "sched.slice");
         assert_eq!(v["ctx"]["dtid"], 3);
+    }
+
+    /// The controller and the pause hook are process-wide, so a test that sets
+    /// them holds this lock; its guard clears both when it drops.
+    static RUN_LOCK: Mutex<()> = Mutex::new(());
+
+    struct RunGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for RunGuard {
+        fn drop(&mut self) {
+            set_pause_hook(None);
+            start_run(&crate::config::Config::default());
+        }
+    }
+
+    fn run_guard() -> RunGuard {
+        RunGuard {
+            _lock: RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner()),
+        }
+    }
+
+    /// Starts a run through `start_run` with `tape` as its `--choice-tape` and
+    /// `dir/record` as its `--choice-record`, and returns the record's path.
+    fn start_tape_run(dir: &Path, tape: &[u8]) -> std::path::PathBuf {
+        let tape_path = dir.join("tape");
+        std::fs::write(&tape_path, tape).unwrap();
+        let record = dir.join("record");
+        start_run(&crate::config::Config {
+            choice_tape: Some(tape_path),
+            choice_record: Some(record.clone()),
+            ..Default::default()
+        });
+        record
+    }
+
+    fn slice_point() -> ChoicePoint {
+        ChoicePoint {
+            kind: ChoiceKind::SchedSlice,
+            lo: 1,
+            hi: 10_000,
+            default: 77,
+            scale: 1000,
+            dtid: DetTid::from_raw(3),
+            thread_rcbs: 0,
+            site: "test",
+        }
+    }
+
+    /// The answer on each record line, checking that each line starts with
+    /// the schema.
+    fn recorded(record: &Path) -> Vec<u64> {
+        std::fs::read_to_string(record)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                assert!(line.starts_with("{\"schema\":1,"), "{line}");
+                let v: serde_json::Value = serde_json::from_str(line).unwrap();
+                v["v"].as_u64().unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_pause_hook_answer_is_used_recorded_and_replaces_one_tape_byte() {
+        let _run = run_guard();
+        let dir = tempfile::tempdir().unwrap();
+        // At scale 1000, bytes 144, 112 and 136 decode to 2000, 500 and 1414.
+        let record = start_tape_run(dir.path(), &[144, 112, 136]);
+        set_pause_hook(Some(Arc::new(|req: &ChoiceRequest| {
+            if req.index == 1 {
+                PauseAction::Answer(4242)
+            } else {
+                PauseAction::Continue
+            }
+        })));
+        let answers: Vec<u64> = (0..3).map(|_| choose(slice_point())).collect();
+        // Request 2 reads byte 2, not byte 1: the hook's answer replaced byte 1.
+        assert_eq!(answers, [2000, 4242, 1414]);
+        assert_eq!(recorded(&record), answers);
+    }
+
+    #[test]
+    fn each_request_a_hook_answers_moves_the_tape_by_one_byte() {
+        let _run = run_guard();
+        let dir = tempfile::tempdir().unwrap();
+        // At scale 1000, bytes 144, 112, 136 and 120 decode to 2000, 500, 1414
+        // and 707.
+        let record = start_tape_run(dir.path(), &[144, 112, 136, 120]);
+        set_pause_hook(Some(Arc::new(|req: &ChoiceRequest| {
+            if req.index.is_multiple_of(2) {
+                PauseAction::Answer(4242)
+            } else {
+                PauseAction::Continue
+            }
+        })));
+        let answers: Vec<u64> = (0..4).map(|_| choose(slice_point())).collect();
+        // Requests 1 and 3 read bytes 1 and 3.
+        assert_eq!(answers, [4242, 500, 4242, 707]);
+        assert_eq!(recorded(&record), answers);
+    }
+
+    #[test]
+    fn a_pause_hook_answer_out_of_range_ends_the_run_as_a_refusal() {
+        const CHILD: &str = "HERMIT_TEST_CHOICE_PAUSE_REFUSAL_CHILD";
+        const CASE: &str =
+            "choice::tests::a_pause_hook_answer_out_of_range_ends_the_run_as_a_refusal";
+        if let Some(dir) = std::env::var_os(CHILD) {
+            // The child: choose() refuses, which exits the process.
+            let _run = run_guard();
+            start_tape_run(Path::new(&dir), &[]);
+            set_pause_hook(Some(Arc::new(|_: &ChoiceRequest| {
+                PauseAction::Answer(10_001)
+            })));
+            choose(slice_point());
+            return;
+        }
+        // A refusal ends the process, so the run is this test alone in a child
+        // process of this binary.
+        let dir = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", CASE, "--nocapture", "--test-threads=1"])
+            .env(CHILD, dir.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+            "{output:?}"
+        );
+        let reason = "pause hook answer 10001 is outside [1, 10000]";
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains(&format!("HERMIT_CHOICE_REFUSED: choice 0: {reason}")),
+            "{output:?}"
+        );
+        // The record's one line is the refused request.
+        let record = std::fs::read_to_string(dir.path().join("record")).unwrap();
+        let lines: Vec<serde_json::Value> = record
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 1, "{record}");
+        assert_eq!(lines[0]["schema"], SCHEMA);
+        assert_eq!(lines[0]["i"], 0);
+        assert_eq!(lines[0]["refused"], reason);
+        assert!(lines[0].get("v").is_none(), "{record}");
     }
 }
