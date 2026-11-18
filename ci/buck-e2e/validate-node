@@ -36,6 +36,35 @@
 # inputs: bootstrap/rust-deps-stamp.py check), runs the subset's
 # shell-test twins (//ci/buck-e2e:stock-local, -c hermit_e2e.stock_runner=true, every cell
 # on this host) and ingests their artifacts with ci/buck-e2e/ingest.py --local-listing.
+# scripts/validate.rs --buck-s0 runs the no-argument form as ONE node, so the stage's buck2
+# daemon is the cells' daemon: dagrun kills every process carrying a step's DAGRUN_STEP
+# nonce when the step ends, the daemon included, so a daemon never outlives its node.
+#   HERMIT_VALIDATE_AWAIT_PREFLIGHT  optional: the preflight nodes this node runs beside,
+#                               in dependency order (--buck-s0: pre.submodules
+#                               pre.reverie_pin). Before the first cell runs it waits for
+#                               each one's exit status in
+#                               $VALIDATE_RUN_STATE/preflight/<tag>.rc, which
+#                               scripts/validate.rs --buck-s0 makes each preflight command
+#                               write as it exits, and exits 1 on a nonzero status, or on
+#                               none within HERMIT_VALIDATE_AWAIT_PREFLIGHT_SECONDS (a
+#                               positive integer, required with it). So no cell runs on a
+#                               tree the preflight refused, even under validate -k, where
+#                               dagrun's fail-fast family does not cancel this node.
+#   HERMIT_VALIDATE_BUCK_DAEMON_MEMORY_MAX, HERMIT_VALIDATE_BUCK_DAEMON_CPU_SECONDS
+#                               buck-stock only, required, positive integers (the DAG sets
+#                               them). The buck2 daemon, and every cell it runs, lives in
+#                               the daemon's own systemd scope (buck2.slice), outside this
+#                               node's cgroup, so the node's box and CPU budget do not see
+#                               them. Before the stage this node starts the daemon
+#                               (`buck2 server --status`), sets the scope's MemoryMax to
+#                               the first (systemctl --user set-property --runtime, read
+#                               back from memory.max), and every 10 s compares the scope's
+#                               CPU since then with the second: past it, or once the scope
+#                               is gone while the node runs (the daemon was replaced by an
+#                               unbounded one), it stops the daemon and the node fails. A
+#                               daemon with no systemd scope exits 2: it cannot be bounded.
+#                               On every exit the scope's CPU and memory.peak are printed
+#                               and kept in buck-invocations/daemon-scope.tsv.
 #   HERMIT_VALIDATE_BUCK2       the absolute path of the internal buck2 (a DotSlash file),
 #                               which is never committed.
 #   VALIDATE_RUN_STATE          the run's state directory. The rows go to
@@ -130,6 +159,36 @@ stage_inputs() {
     "${proxy[@]}" ./ci/buck-e2e/stage --from-cargo
 }
 
+# The preflight gate (HERMIT_VALIDATE_AWAIT_PREFLIGHT, above): wait for each named preflight
+# node's exit status, in order; a failed or silent preflight ends this node before any cell.
+await_preflight() {
+    local tags=${HERMIT_VALIDATE_AWAIT_PREFLIGHT:-} bound=${HERMIT_VALIDATE_AWAIT_PREFLIGHT_SECONDS:-}
+    local tag file status deadline
+    [[ -n $tags ]] || return 0
+    if [[ ! $bound =~ ^[1-9][0-9]{0,5}$ ]]; then
+        echo "validate-node: HERMIT_VALIDATE_AWAIT_PREFLIGHT_SECONDS is '${bound}', not a positive number of seconds" >&2
+        exit 2
+    fi
+    deadline=$((SECONDS + bound))
+    for tag in $tags; do
+        file=$VALIDATE_RUN_STATE/preflight/$tag.rc
+        step "waiting for the preflight node $tag before any cell runs"
+        until [[ -s $file ]]; do
+            if ((SECONDS >= deadline)); then
+                echo "validate-node: the preflight node $tag wrote no exit status to $file within $bound s; no cell runs on a tree the preflight has not passed" >&2
+                exit 1
+            fi
+            sleep 1
+        done
+        status=$(<"$file")
+        if [[ $status != 0 ]]; then
+            echo "validate-node: the preflight node $tag failed (exit $status); no cell runs on a tree the preflight refused" >&2
+            exit 1
+        fi
+    done
+    step "the preflight passed: $tags"
+}
+
 if [[ $phase == stage ]]; then
     cd "$root"
     stage_inputs
@@ -173,10 +232,17 @@ if [[ $buck2 != /* || ! -f $buck2 || ! -x $buck2 ]]; then
     exit 2
 fi
 subset=
+daemon_memory_max='' daemon_cpu_seconds=''
 if [[ $mode == stock ]]; then
     subset=${HERMIT_VALIDATE_E2E_SUBSET:-}
     if [[ $subset != /* || ! -f $subset ]]; then
         echo "validate-node: HERMIT_VALIDATE_E2E_SUBSET is '${subset}', not the absolute path of a subset file (ci/buck-e2e/subsets/*.json)" >&2
+        exit 2
+    fi
+    daemon_memory_max=${HERMIT_VALIDATE_BUCK_DAEMON_MEMORY_MAX:-}
+    daemon_cpu_seconds=${HERMIT_VALIDATE_BUCK_DAEMON_CPU_SECONDS:-}
+    if [[ ! $daemon_memory_max =~ ^[1-9][0-9]{0,15}$ || ! $daemon_cpu_seconds =~ ^[1-9][0-9]{0,7}$ ]]; then
+        echo "validate-node: buck-stock bounds the buck2 daemon's scope, and HERMIT_VALIDATE_BUCK_DAEMON_MEMORY_MAX is '${daemon_memory_max}' and HERMIT_VALIDATE_BUCK_DAEMON_CPU_SECONDS '${daemon_cpu_seconds}', not two positive integers (bytes, CPU seconds)" >&2
         exit 2
     fi
 fi
@@ -269,6 +335,71 @@ keep_invocations() { # $1: a deadline (epoch microseconds); $2: what set it. Cop
         fi
     done
 }
+# The buck2 daemon's scope (HERMIT_VALIDATE_BUCK_DAEMON_*, above): bounded before the stage.
+daemon_scope='' daemon_cpu_start='' daemon_watch='' daemon_breach=''
+bound_daemon() {
+    local status_json unit memory_max
+    daemon_breach=$state/daemon-bound-breach
+    mkdir -p "$state"
+    rm -f -- "$daemon_breach"
+    step "starting the buck2 daemon to bound its scope: MemoryMax $daemon_memory_max bytes, $daemon_cpu_seconds CPU-s"
+    if ! status_json=$(timeout --foreground -k 5 600 "$buck2" server --status); then
+        echo "validate-node: \`buck2 server --status\` failed or ran past 600 s (above), so no daemon was started and nothing ran" >&2
+        exit 1
+    fi
+    daemon_scope=$(python3 -c 'import json, sys; print(json.load(sys.stdin).get("allprocs_cgroup_path") or "")' <<<"$status_json")
+    if [[ $daemon_scope != /sys/fs/cgroup/*.scope || ! -r $daemon_scope/cpu.stat || ! -r $daemon_scope/memory.peak ]]; then
+        echo "validate-node: the buck2 daemon has no systemd scope here ('${daemon_scope}', buck2_resource_control.status), so its CPU and memory, and the cells', cannot be bounded" >&2
+        exit 2
+    fi
+    unit=${daemon_scope##*/}
+    if ! timeout --foreground -k 5 60 systemctl --user set-property --runtime "$unit" "MemoryMax=$daemon_memory_max"; then
+        echo "validate-node: systemctl --user set-property --runtime $unit MemoryMax=$daemon_memory_max failed or took over 60 s (above); the daemon cannot be bounded, so no cell runs" >&2
+        exit 1
+    fi
+    read -r memory_max <"$daemon_scope/memory.max"
+    if [[ $memory_max != "$daemon_memory_max" ]]; then
+        echo "validate-node: set MemoryMax=$daemon_memory_max on $unit, but its memory.max reads '${memory_max}'" >&2
+        exit 2
+    fi
+    read -r _ daemon_cpu_start <"$daemon_scope/cpu.stat"
+    watch_daemon_cpu &
+    daemon_watch=$!
+}
+watch_daemon_cpu() { # every 10 s: past the CPU budget, or with the scope gone, stop the daemon
+    local usage budget_us=$((daemon_cpu_seconds * 1000000)) why
+    while sleep 10; do
+        if ! read -r _ usage 2>/dev/null <"$daemon_scope/cpu.stat"; then
+            why="the bounded daemon's scope $daemon_scope is gone while the node runs: the daemon stopped, or was replaced by one without the bounds"
+        elif ((usage - daemon_cpu_start > budget_us)); then
+            why="the buck2 daemon's scope used $(((usage - daemon_cpu_start) / 1000000)) CPU-s, past its $daemon_cpu_seconds CPU-s budget"
+        else
+            continue
+        fi
+        echo "$why" >"$daemon_breach"
+        echo "validate-node: $why: stopping the daemon" >&2
+        timeout --foreground -k 1 30 "$buck2" kill >/dev/null 2>&1
+        return
+    done
+}
+record_daemon() { # the scope's CPU and memory.peak, read with builtins (no fork) before the daemon stops
+    local usage peak
+    [[ -n $daemon_scope ]] || return 0
+    [[ -z $daemon_watch ]] || kill "$daemon_watch" 2>/dev/null
+    if read -r _ usage 2>/dev/null <"$daemon_scope/cpu.stat" && read -r peak 2>/dev/null <"$daemon_scope/memory.peak"; then
+        echo "validate-node: the buck2 daemon's scope used $(((usage - daemon_cpu_start) / 1000000)) of its $daemon_cpu_seconds CPU-s; memory.peak $peak of its MemoryMax $daemon_memory_max bytes" >&2
+        [[ -z $kept ]] || printf 'scope	%s
+cpu_usec	%s
+cpu_budget_seconds	%s
+memory_peak_bytes	%s
+memory_max_bytes	%s
+' \
+            "$daemon_scope" "$((usage - daemon_cpu_start))" "$daemon_cpu_seconds" "$peak" "$daemon_memory_max" >"$kept/daemon-scope.tsv"
+    else
+        echo "validate-node: the buck2 daemon's scope $daemon_scope was gone before its CPU and memory.peak could be read" >&2
+    fi
+    daemon_scope=
+}
 exiting=
 on_exit() { # keep the invocations' records, then stop the buck2 daemon; the node's status stands
     local status=$?
@@ -286,7 +417,12 @@ on_exit() { # keep the invocations' records, then stop the buck2 daemon; the nod
         fi
         keep_invocations "$deadline" "$why"
     fi
+    record_daemon
     "$buck2" kill >/dev/null 2>&1
+    if [[ -n $daemon_breach && -s $daemon_breach ]]; then
+        echo "validate-node: fails: $(<"$daemon_breach")" >&2
+        ((status != 0)) || exit 1
+    fi
 }
 on_signal() { # $1: the signal. Record it, stop the buck2 daemon, keep what records fit in
     # 2 seconds (none if the exit had begun keeping them), then die of $1 as if it were not
@@ -297,6 +433,7 @@ on_signal() { # $1: the signal. Record it, stop the buck2 daemon, keep what reco
     # would see that command's status and record a signal as an ordinary exit.
     trap - EXIT
     set +e
+    record_daemon
     if [[ -n $kept ]]; then
         printf '%s\tsignal %s\n' "$(date -u +%s.%N)" "$1" >>"$kept/phases.tsv"
     fi
@@ -330,6 +467,9 @@ else
     step "regenerating the Buck third-party rules"
     "${proxy[@]}" ./bootstrap/regenerate-rust-deps
 fi
+if [[ $mode == stock ]]; then
+    bound_daemon
+fi
 if [[ $mode == hybrid ]]; then
     step "staging the RE link inputs"
     "${proxy[@]}" ./shim/modes/stage-re-inputs
@@ -337,6 +477,7 @@ fi
 if [[ $phase == all ]]; then
     stage_inputs
 fi
+await_preflight
 rm -rf -- "${state:?}/results"
 # The failed cells' logs are evidence, not input: an earlier attempt's copy that cannot be
 # removed costs this run its copy, never the run.
