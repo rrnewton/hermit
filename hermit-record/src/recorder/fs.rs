@@ -50,6 +50,7 @@ use crate::event::SyscallEvent;
 use crate::event::WriteEvent;
 use crate::event::deterministic_ioctl_error;
 use crate::event::xattr_query_output;
+use crate::host::DescriptorKind;
 use crate::host::RecordHost;
 use crate::vectored_offset;
 
@@ -95,11 +96,8 @@ fn read_iovec_output<M: MemoryAccess>(
     Ok(buf)
 }
 
-fn consumed_sigpipe_count(pid: libc::pid_t, fd: libc::c_int, bytes: &[u8]) -> u64 {
-    let path = format!("/proc/{pid}/fd/{fd}");
-    if !std::fs::read_link(path)
-        .is_ok_and(|target| target == std::path::Path::new("anon_inode:[signalfd]"))
-    {
+fn consumed_sigpipe_count(is_signalfd: bool, bytes: &[u8]) -> u64 {
+    if !is_signalfd {
         return 0;
     }
 
@@ -158,7 +156,7 @@ fn uses_append_offset(status_flags: libc::c_int, write_flags: libc::c_int) -> bo
 
 #[cfg(test)]
 fn shares_open_file_description(left: libc::c_int, right: libc::c_int) -> bool {
-    match crate::fd::same_open_file_description(left, right) {
+    match crate::host::PtraceHost::same_open_file_description(left, right) {
         Ok(shared) => shared,
         Err(error) => {
             tracing::debug!(
@@ -836,21 +834,33 @@ impl<H: RecordHost> RecorderWithHost<H> {
     ) -> Result<i64, Errno> {
         let result = guest.inject(syscall).await;
 
-        self.record_event(
-            guest,
-            result.and_then(|length| {
-                let bytes = read_iovec_output(&guest.memory(), iov_addr, iovcnt, length as usize)?;
-                Ok(SyscallEvent::ReadvV2(ReadEvent {
-                    consumed_sigpipe_count: consumed_sigpipe_count(
-                        guest.pid().as_raw(),
-                        fd,
-                        &bytes,
-                    ),
-                    replay_fd_kind: self.fd_replay_kind(guest.pid(), fd),
-                    bytes,
-                }))
-            }),
-        );
+        let event = match result {
+            Ok(length) => {
+                match read_iovec_output(&guest.memory(), iov_addr, iovcnt, length as usize) {
+                    Ok(bytes) => {
+                        let pid = guest.pid();
+                        let kind = H::classify_fd(guest, pid, fd).await;
+                        Ok(SyscallEvent::ReadvV2(ReadEvent {
+                            consumed_sigpipe_count: consumed_sigpipe_count(
+                                kind == DescriptorKind::Signalfd,
+                                &bytes,
+                            ),
+                            replay_fd_kind: match kind {
+                                DescriptorKind::Eventfd => ReplayFdKind::Eventfd,
+                                DescriptorKind::RegularFile => ReplayFdKind::RegularFile,
+                                DescriptorKind::Signalfd | DescriptorKind::Other => {
+                                    ReplayFdKind::None
+                                }
+                            },
+                            bytes,
+                        }))
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        };
+        self.record_event(guest, event);
 
         result
     }
@@ -862,27 +872,44 @@ impl<H: RecordHost> RecorderWithHost<H> {
     ) -> Result<i64, Errno> {
         let result = guest.inject(syscall).await;
 
-        self.record_event(
-            guest,
-            result.and_then(|length| {
+        let event = match result {
+            Ok(length) => {
                 let mut buf = vec![0; length as usize];
                 // A read that transfers nothing never touches the buffer,
                 // which may then be NULL.
-                if !buf.is_empty() {
-                    let addr = syscall.buf().ok_or(Errno::EFAULT)?;
-                    guest.memory().read_exact(addr, &mut buf)?;
+                let copied = if buf.is_empty() {
+                    Ok(())
+                } else {
+                    syscall
+                        .buf()
+                        .ok_or(Errno::EFAULT)
+                        .and_then(|addr| guest.memory().read_exact(addr, &mut buf))
+                };
+                match copied {
+                    Ok(()) => {
+                        let pid = guest.pid();
+                        let kind = H::classify_fd(guest, pid, syscall.fd()).await;
+                        Ok(SyscallEvent::ReadV2(ReadEvent {
+                            consumed_sigpipe_count: consumed_sigpipe_count(
+                                kind == DescriptorKind::Signalfd,
+                                &buf,
+                            ),
+                            bytes: buf,
+                            replay_fd_kind: match kind {
+                                DescriptorKind::Eventfd => ReplayFdKind::Eventfd,
+                                DescriptorKind::RegularFile => ReplayFdKind::RegularFile,
+                                DescriptorKind::Signalfd | DescriptorKind::Other => {
+                                    ReplayFdKind::None
+                                }
+                            },
+                        }))
+                    }
+                    Err(error) => Err(error),
                 }
-                Ok(SyscallEvent::ReadV2(ReadEvent {
-                    consumed_sigpipe_count: consumed_sigpipe_count(
-                        guest.pid().as_raw(),
-                        syscall.fd(),
-                        &buf,
-                    ),
-                    bytes: buf,
-                    replay_fd_kind: self.fd_replay_kind(guest.pid(), syscall.fd()),
-                }))
-            }),
-        );
+            }
+            Err(error) => Err(error),
+        };
+        self.record_event(guest, event);
 
         result
     }
@@ -918,14 +945,16 @@ impl<H: RecordHost> RecorderWithHost<H> {
     ) -> Result<i64, Errno> {
         let result = guest.inject(Syscall::from(syscall)).await;
         let pid = guest.pid();
-        let event = self.write_event(
-            &*guest,
-            pid,
-            pid,
-            syscall.fd(),
-            WritePlacement::of(syscall),
-            result,
-        );
+        let event = self
+            .write_event(
+                guest,
+                pid,
+                pid,
+                syscall.fd(),
+                WritePlacement::of(syscall),
+                result,
+            )
+            .await;
         self.record_event(guest, Ok(SyscallEvent::WriteV2(event)));
 
         result
@@ -999,14 +1028,16 @@ impl<H: RecordHost> RecorderWithHost<H> {
             }
             _ => guest.inject(Syscall::Sendfile(syscall)).await,
         };
-        let write = self.write_event(
-            &*guest,
-            pid,
-            task,
-            syscall.out_fd(),
-            WritePlacement::Position,
-            result,
-        );
+        let write = self
+            .write_event(
+                guest,
+                pid,
+                task,
+                syscall.out_fd(),
+                WritePlacement::Position,
+                result,
+            )
+            .await;
         let bytes = match (result, source) {
             (Ok(count), Some((file, start))) if count > 0 => {
                 let start = match start {
@@ -1059,9 +1090,9 @@ impl<H: RecordHost> RecorderWithHost<H> {
     /// task `task` of process `pid`, placed as `placement`: the captured
     /// output it reaches, the regular-file offset replay writes at, and the
     /// SIGPIPE the kernel generated.
-    fn write_event<G: Guest<Self>>(
+    async fn write_event<G: Guest<Self>>(
         &self,
-        guest: &G,
+        guest: &mut G,
         pid: reverie::Pid,
         task: reverie::Pid,
         fd: libc::c_int,
@@ -1110,7 +1141,7 @@ impl<H: RecordHost> RecorderWithHost<H> {
                 metadata.file_type().is_fifo() || metadata.file_type().is_socket()
             });
         let replay_fd_kind = if result.is_ok() && output_fd.is_none() {
-            self.fd_replay_kind(task, fd)
+            self.fd_replay_kind(guest, task, fd).await
         } else {
             ReplayFdKind::None
         };

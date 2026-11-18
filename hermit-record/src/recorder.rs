@@ -74,6 +74,7 @@ use crate::event_stream::ChildEventStreamIds;
 use crate::event_stream::DebugEvent;
 use crate::event_stream::EventStreamId;
 use crate::event_stream::EventWriter;
+use crate::host::DescriptorKind;
 use crate::host::PtraceHost;
 use crate::host::RecordHost;
 
@@ -121,16 +122,16 @@ struct OutputDescriptions {
 }
 
 impl OutputDescriptions {
-    fn capture(pid: Pid) -> Self {
+    fn capture<H: RecordHost>(pid: Pid) -> Self {
         Self {
-            stdout: Mutex::new(duplicate_regular_output(pid, libc::STDOUT_FILENO)),
-            stderr: Mutex::new(duplicate_regular_output(pid, libc::STDERR_FILENO)),
+            stdout: Mutex::new(duplicate_regular_output::<H>(pid, libc::STDOUT_FILENO)),
+            stderr: Mutex::new(duplicate_regular_output::<H>(pid, libc::STDERR_FILENO)),
             threads: Mutex::new(std::collections::BTreeSet::from([pid.as_raw()])),
         }
     }
 
     /// Whether `candidate` is the root guest's `output_fd` description.
-    fn matches(&self, output_fd: libc::c_int, candidate: &OwnedFd) -> bool {
+    fn matches<H: RecordHost>(&self, output_fd: libc::c_int, candidate: &OwnedFd) -> bool {
         let output = match output_fd {
             libc::STDOUT_FILENO => &self.stdout,
             libc::STDERR_FILENO => &self.stderr,
@@ -140,7 +141,7 @@ impl OutputDescriptions {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         output.as_ref().is_some_and(|target| {
-            crate::fd::same_open_file_description(candidate.as_raw_fd(), target.as_raw_fd())
+            H::same_open_file_description(candidate.as_raw_fd(), target.as_raw_fd())
                 .unwrap_or(false)
         })
     }
@@ -150,7 +151,7 @@ impl OutputDescriptions {
     /// the guest closed it. `caller` has just changed its descriptor table;
     /// the description stays while `caller` or any other live guest thread
     /// still holds it, as one process's table says nothing of another's.
-    fn release_unreferenced(&self, caller: Pid) {
+    fn release_unreferenced<H: RecordHost>(&self, caller: Pid) {
         for output in [&self.stdout, &self.stderr] {
             let mut output = output
                 .lock()
@@ -158,17 +159,17 @@ impl OutputDescriptions {
             let Some(target) = output.as_ref() else {
                 continue;
             };
-            if guest_has_open_file_description(caller, target) {
+            if guest_has_open_file_description::<H>(caller, target) {
                 continue;
             }
             let mut threads = self
                 .threads
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            threads.retain(|thread| Path::new(&format!("/proc/{thread}")).exists());
+            threads.retain(|thread| H::guest_task_exists(Pid::from_raw(*thread)));
             if !threads
                 .iter()
-                .any(|thread| guest_has_open_file_description(Pid::from_raw(*thread), target))
+                .any(|thread| guest_has_open_file_description::<H>(Pid::from_raw(*thread), target))
             {
                 output.take();
             }
@@ -403,34 +404,29 @@ impl OutputIdentity {
     }
 }
 
-fn duplicate_regular_output(pid: Pid, fd: libc::c_int) -> Option<std::os::fd::OwnedFd> {
+fn duplicate_regular_output<H: RecordHost>(
+    pid: Pid,
+    fd: libc::c_int,
+) -> Option<std::os::fd::OwnedFd> {
     let metadata = std::fs::metadata(format!("/proc/{}/fd/{fd}", pid.as_raw())).ok()?;
     metadata
         .file_type()
         .is_file()
-        .then(|| crate::fd::duplicate_guest_fd(pid, fd).ok())
+        .then(|| H::duplicate_guest_fd(pid, fd).ok())
         .flatten()
 }
-fn guest_has_open_file_description(pid: Pid, target: &std::os::fd::OwnedFd) -> bool {
-    let entries = match std::fs::read_dir(format!("/proc/{}/fd", pid.as_raw())) {
-        Ok(entries) => entries,
-        Err(_) => return true,
+fn guest_has_open_file_description<H: RecordHost>(pid: Pid, target: &std::os::fd::OwnedFd) -> bool {
+    let Some(entries) = H::descriptor_numbers(pid) else {
+        return true;
     };
     let mut compared = false;
     let mut saw_any = false;
-    for entry in entries.flatten() {
-        let Some(fd) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<libc::c_int>().ok())
-        else {
-            continue;
-        };
+    for fd in entries {
         saw_any = true;
-        let Ok(candidate) = crate::fd::duplicate_guest_fd(pid, fd) else {
+        let Ok(candidate) = H::duplicate_guest_fd(pid, fd) else {
             continue;
         };
-        match crate::fd::same_open_file_description(candidate.as_raw_fd(), target.as_raw_fd()) {
+        match H::same_open_file_description(candidate.as_raw_fd(), target.as_raw_fd()) {
             Ok(true) => return true,
             Ok(false) => compared = true,
             Err(error) => tracing::debug!(
@@ -449,6 +445,7 @@ fn guest_has_open_file_description(pid: Pid, target: &std::os::fd::OwnedFd) -> b
 pub struct RecorderWithHost<H> {
     /// The backend host this recorder queries for descriptor state and
     /// descriptor duplication ([`RecordHost`]); stateless, never stored.
+    #[serde(skip)]
     _host: PhantomData<H>,
     // TODO: We'll need to keep track of file descriptors here in order to
     // determine if a file descriptor should be fully recorded or simply cached
@@ -529,9 +526,9 @@ impl<H: RecordHost> Tool for RecorderWithHost<H> {
                 Some((_, state)) => state.outputs,
             },
             output_descriptions: match parent {
-                None => {
-                    std::sync::Arc::new(OutputDescriptions::capture(Pid::from_raw(child.as_raw())))
-                }
+                None => std::sync::Arc::new(OutputDescriptions::capture::<H>(Pid::from_raw(
+                    child.as_raw(),
+                ))),
                 Some((_, state)) => {
                     state
                         .output_descriptions
@@ -832,7 +829,7 @@ impl<H: RecordHost> Tool for RecorderWithHost<H> {
             .thread_state()
             .output_descriptions
             .clone()
-            .release_unreferenced(guest.pid());
+            .release_unreferenced::<H>(guest.pid());
         result
     }
 
@@ -972,35 +969,42 @@ impl<H: RecordHost> RecorderWithHost<H> {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#662): Audit guest FD replay classification.
-    fn fd_replay_kind(&self, pid: Pid, fd: libc::c_int) -> ReplayFdKind {
-        if H::fd_link(pid, fd)
-            .is_some_and(|target| target == std::path::Path::new("anon_inode:[eventfd]"))
-        {
-            return ReplayFdKind::Eventfd;
-        }
-
-        if H::fd_is_regular_file(pid, fd) {
-            ReplayFdKind::RegularFile
-        } else {
-            ReplayFdKind::None
+    async fn fd_replay_kind<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        pid: Pid,
+        fd: libc::c_int,
+    ) -> ReplayFdKind {
+        match H::classify_fd(guest, pid, fd).await {
+            DescriptorKind::Eventfd => ReplayFdKind::Eventfd,
+            DescriptorKind::RegularFile => ReplayFdKind::RegularFile,
+            DescriptorKind::Signalfd | DescriptorKind::Other => ReplayFdKind::None,
         }
     }
 
-    fn epoll_requires_replay_kernel_side_effect(&self, pid: Pid, fd: libc::c_int) -> bool {
-        let Some(fdinfo) = H::fdinfo_text(pid, fd) else {
+    async fn epoll_requires_replay_kernel_side_effect<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        pid: Pid,
+        fd: libc::c_int,
+    ) -> bool {
+        let Some(fdinfo) = H::fdinfo_text(guest, pid, fd).await else {
             return false;
         };
-        let targets = fdinfo.lines().filter_map(|line| {
-            line.strip_prefix("tfd:")?
-                .split_whitespace()
-                .next()?
-                .parse::<libc::c_int>()
-                .ok()
-        });
+        let targets: Vec<libc::c_int> = fdinfo
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("tfd:")?
+                    .split_whitespace()
+                    .next()?
+                    .parse::<libc::c_int>()
+                    .ok()
+            })
+            .collect();
         let mut saw_target = false;
         for target in targets {
             saw_target = true;
-            if self.fd_replay_kind(pid, target) == ReplayFdKind::None {
+            if self.fd_replay_kind(guest, pid, target).await == ReplayFdKind::None {
                 return false;
             }
         }
@@ -1017,7 +1021,7 @@ impl<H: RecordHost> RecorderWithHost<H> {
         guest
             .thread_state()
             .output_descriptions
-            .matches(output_fd, candidate)
+            .matches::<H>(output_fd, candidate)
     }
 
     async fn handle_fd_table_mutation<G: Guest<Self>>(
@@ -1030,7 +1034,7 @@ impl<H: RecordHost> RecorderWithHost<H> {
             .thread_state()
             .output_descriptions
             .clone()
-            .release_unreferenced(guest.pid());
+            .release_unreferenced::<H>(guest.pid());
         self.record_event(guest, result.map(SyscallEvent::Return));
         result
     }

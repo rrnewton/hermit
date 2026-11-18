@@ -25,7 +25,6 @@ use hermit_record_format::Shebang;
 use hermit_record_format::consts;
 use hermit_record_format::event;
 use hermit_record_format::event_stream;
-use hermit_record_format::fd;
 use hermit_record_format::host;
 use hermit_record_format::interp;
 use hermit_record_format::record_replay_path;
