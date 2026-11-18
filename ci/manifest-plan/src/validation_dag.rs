@@ -2408,9 +2408,12 @@ pub fn buck_s0_selection(
     stage.job.push_str(BUCK_S0_SUFFIX);
     stage.desc = "Stage the Buck-only subset's inputs with Buck (no cargo)".into();
     stage.description = format!(
-        "Selected only by scripts/validate.rs --buck-s0. On the host it runs ci/buck-e2e/stage --from-buck (ci/buck-e2e/validate-node --stage-only under HERMIT_VALIDATE_E2E_RUNNER=buck-stock): //ci/buck-e2e:harness-bin built by the given buck2, `git archive HEAD`, the subset's fixtures built by that Buck-built harness, and the libunwind runtime closure the Buck-built hermit loads. No cargo runs and nothing is written to target/. It writes ci/buck-e2e/staged/ for HEAD, SOURCE_SHA last, and refuses a tree with uncommitted changes to tracked files. Subset: {BUCK_S0_SUBSET}."
+        "Selected only by scripts/validate.rs --buck-s0. On the host it runs ci/buck-e2e/stage --from-buck (ci/buck-e2e/validate-node --stage-only under HERMIT_VALIDATE_E2E_RUNNER=buck-stock): //ci/buck-e2e:harness-bin and the //hermit-cli:hermit-release the cells run, built by the given buck2 in one build with the cells' own buck2 flags (so the cells reuse its configuration and that hermit), `git archive HEAD`, the subset's fixtures built by that Buck-built harness, and the libunwind runtime closure the Buck-built hermit loads. No cargo runs and nothing is written to target/. It writes ci/buck-e2e/staged/ for HEAD, SOURCE_SHA last, and refuses a tree with uncommitted changes to tracked files. It runs beside the preflight nodes, which change nothing it reads; the cells wait for both. Subset: {BUCK_S0_SUBSET}."
     );
-    stage.deps = vec!["pre.reverie_pin".into()];
+    // Beside the preflight, not after it: pre.submodules and pre.reverie_pin
+    // only read the checkout (the pin check skips the staged copy this writes),
+    // so the stage's build overlaps them, and the cells below wait on both.
+    stage.deps = Vec::new();
     relabel(&mut stage);
     steps.push(stage.clone());
 
@@ -2418,10 +2421,10 @@ pub fn buck_s0_selection(
     cells.job.push_str(BUCK_S0_SUFFIX);
     cells.desc = "Run the Buck-only subset's cells under the stock buck2 test runner".into();
     cells.description = format!(
-        "Selected only by scripts/validate.rs --buck-s0. On the host (ci/buck-e2e/validate-node --cells-only under HERMIT_VALIDATE_E2E_RUNNER=buck-stock) it refuses with exit 2 unless {} staged the inputs for HEAD, runs no cargo (the third-party rules shim/third-party/rust/BUCK are the checkout's setup and must already exist), runs the subset's shell-test twins (//ci/buck-e2e:stock-local, every cell on this host, the Buck-built //hermit-cli:hermit-release) and ingests their artifacts into $VALIDATE_RUN_STATE/buck-e2e/results with ci/buck-e2e/ingest.py --local-listing. It judges nothing: the import twins own the verdicts. Subset: {BUCK_S0_SUBSET}.",
+        "Selected only by scripts/validate.rs --buck-s0. It waits for the preflight (pre.reverie_pin, after pre.submodules) and the stage. On the host (ci/buck-e2e/validate-node --cells-only under HERMIT_VALIDATE_E2E_RUNNER=buck-stock) it refuses with exit 2 unless {} staged the inputs for HEAD, runs no cargo (the third-party rules shim/third-party/rust/BUCK are the checkout's setup and must already exist), runs the subset's shell-test twins (//ci/buck-e2e:stock-local, every cell on this host, the Buck-built //hermit-cli:hermit-release) and ingests their artifacts into $VALIDATE_RUN_STATE/buck-e2e/results with ci/buck-e2e/ingest.py --local-listing. It judges nothing: the import twins own the verdicts. Subset: {BUCK_S0_SUBSET}.",
         stage.tag()
     );
-    cells.deps = vec![stage.tag()];
+    cells.deps = vec![stage.tag(), "pre.reverie_pin".into()];
     relabel(&mut cells);
     steps.push(cells.clone());
 
@@ -8595,6 +8598,15 @@ sys.exit(37)
         }
         let pin = &selected.steps[1];
         assert!(pin.cmd.contains(BUCK_S0_PIN_CHECK_ROOT), "{}", pin.cmd);
+        // The stage runs beside the preflight; the cells wait for both, so no
+        // cell runs on a checkout whose submodules or Reverie pin are refused.
+        assert_eq!(pin.deps, vec!["pre.submodules".to_string()]);
+        let (stage, cells) = (&selected.steps[2], &selected.steps[3]);
+        assert!(stage.deps.is_empty(), "{:?}", stage.deps);
+        assert_eq!(
+            cells.deps,
+            vec!["e2e.buck_stage_s0".to_string(), "pre.reverie_pin".into()]
+        );
         // A subset naming a backend the plan lacks is refused, never shrunk.
         let mut typo = subset.clone();
         typo.backends.push("ptrace2".into());

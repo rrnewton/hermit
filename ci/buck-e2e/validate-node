@@ -28,7 +28,12 @@
 # buck-stock (scripts/validate.rs --buck-s0 --buck2 PATH): a Buck-only run of one subset
 # (HERMIT_VALIDATE_E2E_SUBSET, a ci/buck-e2e/subsets/*.json file) with the public buck2's
 # stock test runner, in a checkout that needs no Cargo target directory. No cargo runs:
-# --stage-only stages with ci/buck-e2e/stage --from-buck; --cells-only does not
+# --stage-only stages with ci/buck-e2e/stage --from-buck, whose one buck2 build also
+# builds the //hermit-cli:hermit-release the cells run, with exactly the buck2 flags the
+# cells' `buck2 test` passes (the stock flags below), so the cells reuse the daemon's
+# analysis and that hermit instead of configuring and building again; under buck-stock
+# --stage-only needs HERMIT_VALIDATE_BUCK2, HERMIT_VALIDATE_E2E_SUBSET and
+# VALIDATE_RUN_STATE, and derives the cells' HERMIT_EPOCH as they do. --cells-only does not
 # regenerate the third-party rules (Reindeer runs cargo metadata, so generating
 # shim/third-party/rust/BUCK is the slot's setup, done once with
 # bootstrap/regenerate-rust-deps, and this refuses without it), runs the subset's
@@ -118,10 +123,58 @@ step() {
     echo "validate-node: $*" >&2
     [[ -z $kept ]] || printf '%s\t%s\n' "$(date -u +%s.%N)" "$*" >>"$kept/phases.tsv" || true
 }
+# Every cell of the run gets one HERMIT_EPOCH: backend parity compares a ptrace reference with
+# its candidates only when they share the guest epoch, and each cell is its own harness
+# process, which would otherwise sample its own start time. The epoch is derived from the
+# inputs, the checked-out commit's committer time, not sampled: it is part of every cell's
+# action digest, so a sample would keep any cell result from being reused, while this keeps
+# a re-validation of the same commit cacheable and its runs reproducible. An exported
+# HERMIT_EPOCH overrides it. Sets epoch; the buck-stock stage derives it too, for its build.
+derive_epoch() {
+    local committed
+    if [[ -n ${HERMIT_EPOCH:-} ]]; then
+        epoch=$HERMIT_EPOCH
+    elif committed=$(git -C "$root" show -s --format=%ct HEAD) && [[ $committed =~ ^[0-9]+$ ]]; then
+        epoch=$(date -u -d "@$committed" +%Y-%m-%dT%H:%M:%S+00:00)
+    else
+        echo "validate-node: cannot read the checked-out commit's committer time for HERMIT_EPOCH; export HERMIT_EPOCH to supply one" >&2
+        exit 2
+    fi
+}
+# The stock flags: the buck2 flags of the buck-stock cells' `buck2 test`, which the stage's
+# `buck2 build` passes too, so the test finds the daemon's configuration, analysis and the
+# stage's //hermit-cli:hermit-release already in place. A flag that differed between the two
+# would cost the cells a second configuration and a second hermit build. $1 is the subset
+# file; sets stock_root, the cells' artifact root, and stock_flags. Needs epoch.
+stock_buck_flags() {
+    local subset_config
+    local -a subset_flags
+    subset_config=$(python3 ./ci/buck-e2e/subset.py "$1" ci/expected-e2e-plan.json buck-config) ||
+        { echo "validate-node: cannot read the buck2 flags of the subset $1 (above)" >&2; exit 2; }
+    mapfile -t subset_flags <<<"$subset_config"
+    # The cells' artifact root is in the run's state directory inside the checkout, never
+    # under host /tmp: Hermit gives a guest its own /tmp, so a guest program staged under
+    # host /tmp is refused.
+    stock_root=$VALIDATE_RUN_STATE/buck-e2e/stock-execution
+    stock_flags=(-c hermit_release.unstamped=true "${subset_flags[@]}" -c hermit_e2e.stock_runner=true
+        -c hermit_e2e.routing=local -c "hermit_e2e.epoch=$epoch" -c "hermit_e2e.stock_artifact_root=$stock_root"
+        --no-remote-cache)
+}
 stage_inputs() {
     if [[ ${HERMIT_VALIDATE_E2E_RUNNER:-} == buck-stock ]]; then
-        step "staging the subset's inputs with Buck (no cargo)"
-        ./ci/buck-e2e/stage --from-buck "${HERMIT_VALIDATE_BUCK2:-}" --subset "${HERMIT_VALIDATE_E2E_SUBSET:-}"
+        local subset_file=${HERMIT_VALIDATE_E2E_SUBSET:-}
+        if [[ $subset_file != /* || ! -f $subset_file ]]; then
+            echo "validate-node: HERMIT_VALIDATE_E2E_SUBSET is '${subset_file}', not the absolute path of a subset file (ci/buck-e2e/subsets/*.json)" >&2
+            exit 2
+        fi
+        if [[ -z ${VALIDATE_RUN_STATE:-} ]]; then
+            echo "validate-node: VALIDATE_RUN_STATE is unset; the buck-stock stage builds with the cells' flags, which name the run's state directory, so it runs under scripts/validate.rs" >&2
+            exit 2
+        fi
+        derive_epoch
+        stock_buck_flags "$subset_file"
+        step "staging the subset's inputs with Buck (no cargo), building with the cells' buck2 flags"
+        ./ci/buck-e2e/stage --from-buck "${HERMIT_VALIDATE_BUCK2:-}" --subset "$subset_file" -- "${stock_flags[@]}"
         return
     fi
     step "staging the inputs Buck does not build (cargo, target/)"
@@ -338,36 +391,18 @@ if ! rm -rf -- "${failed_logs:?}"; then
     failed_logs_args=()
 fi
 mkdir -p "$state/work"
-# Every cell of the run gets one HERMIT_EPOCH: backend parity compares a ptrace reference with
-# its candidates only when they share the guest epoch, and each cell is its own harness
-# process, which would otherwise sample its own start time. The epoch is derived from the
-# inputs, the checked-out commit's committer time, not sampled: it is part of every cell's
-# action digest, so a sample would keep any cell result from being reused, while this keeps
-# a re-validation of the same commit cacheable and its runs reproducible. An exported
-# HERMIT_EPOCH overrides it.
-if [[ -n ${HERMIT_EPOCH:-} ]]; then
-    epoch=$HERMIT_EPOCH
-elif committed=$(git -C "$root" show -s --format=%ct HEAD) && [[ $committed =~ ^[0-9]+$ ]]; then
-    epoch=$(date -u -d "@$committed" +%Y-%m-%dT%H:%M:%S+00:00)
-else
-    echo "validate-node: cannot read the checked-out commit's committer time for HERMIT_EPOCH; export HERMIT_EPOCH to supply one" >&2
-    exit 2
-fi
+derive_epoch
 if [[ $mode == stock ]]; then
-    # The cells' artifact root is in the run's state directory inside the checkout, never
-    # under host /tmp: Hermit gives a guest its own /tmp, so a guest program staged under
-    # host /tmp is refused. A fresh root per run, so the listing holds this run alone.
-    stock_root=$state/stock-execution
+    # The same flags the stage's build passed (stock_buck_flags). A fresh artifact root per
+    # run, so the listing holds this run alone.
+    stock_buck_flags "$subset"
     rm -rf -- "${stock_root:?}"
     mkdir -p "$stock_root"
     python3 ./ci/buck-e2e/subset.py "$subset" ci/expected-e2e-plan.json plan "$state/subset-plan.json" >/dev/null
-    mapfile -t subset_flags < <(python3 ./ci/buck-e2e/subset.py "$subset" ci/expected-e2e-plan.json buck-config)
     step "running the $(basename "$subset") cells under the stock buck2 test runner, HERMIT_EPOCH=$epoch"
     date +%s >"$state/work/stock.times"
     stock_status=0
-    "$buck2" test -c hermit_release.unstamped=true "${subset_flags[@]}" -c hermit_e2e.stock_runner=true \
-        -c hermit_e2e.routing=local -c "hermit_e2e.epoch=$epoch" -c "hermit_e2e.stock_artifact_root=$stock_root" \
-        --no-remote-cache --event-log "$state/work/stock.event-log.pb.zst" //ci/buck-e2e:stock-local \
+    "$buck2" test "${stock_flags[@]}" --event-log "$state/work/stock.event-log.pb.zst" //ci/buck-e2e:stock-local \
         >"$state/work/stock.log" 2>&1 || stock_status=$?
     date +%s >>"$state/work/stock.times"
     echo "$stock_status" >"$state/work/stock.rc"
