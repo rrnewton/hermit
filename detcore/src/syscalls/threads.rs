@@ -2548,8 +2548,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             && self.cfg.replay_preemptions_from.is_none()
             && self.cfg.replay_schedule_from.is_none()
         {
+            // The vfork child's priority is the parent's next chaos draw, read
+            // here from a copy of the stream (the parent draws it for real
+            // below) and offered to a choice controller once, here.
             let mut parent_chaos_prng = ts.chaos_prng.clone();
-            Some(parent_chaos_prng.next_u64())
+            let entropy = parent_chaos_prng.next_u64();
+            Some(ts.chosen_priority_entropy(entropy, "vfork_child_priority"))
         } else {
             None
         };
@@ -2731,7 +2735,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         // Match ordinary clone: the parent consumes the priority entropy after
-        // the child has inherited the parent state.
+        // the child has inherited the parent state. The vfork child's priority
+        // was taken, and offered to a choice controller, above; this draw only
+        // keeps the parent's stream in step, so it asks no controller.
         if is_vfork
             && self.cfg.chaos
             && self.cfg.replay_preemptions_from.is_none()
@@ -2739,7 +2745,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             let _ = guest
                 .thread_state_mut()
-                .chaos_prng_next_u64("child_priority");
+                .chaos_prng_advance("child_priority");
         }
 
         let child_tid = Pid::from_raw(res as i32);

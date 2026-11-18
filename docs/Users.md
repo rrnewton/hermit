@@ -49,6 +49,12 @@ between a run and the host, unless you bind them in: `--bind` for files and
 shared memory objects, `--mount type=bind,source=/dev/mqueue,target=/dev/mqueue`
 for message queues (see [USER_GUIDE.md](USER_GUIDE.md)).
 
+Experimental: under `--chaos` on the ptrace backend, an external search tool
+such as a fuzzer can answer Hermit's scheduling choice points, from a byte tape
+(`--choice-tape`) or over a socket (`--choice-controller`), and
+`--choice-record` writes the choices made. See "Choice points for an external
+controller" in [USER_GUIDE.md](USER_GUIDE.md).
+
 ## Further reading
 
 * Find hermit [CLI examples here](https://fb.workplace.com/notes/hermetic-infra-fyi/hermit-tech-preview-a-linux-reproducibility-tool/244656753248444/)
