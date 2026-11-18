@@ -106,20 +106,23 @@ pub enum PlacementHint {
     AwayFromParent,
 }
 
-/// Where a copy's process runs.
+/// Where a copy's process runs. No pinning by default: the owner's rule
+/// (Slack 6784) is to let the operating system schedule copies unless a
+/// measurement proves that pinning pays off, and design section 13.4
+/// measured no throughput gain from either pinned placement.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Placement {
     /// Pinned, to CPUs the driver owns (for example a fuzzer's container
     /// deciding which copies run where): copy j of a batch runs on CPU
-    /// `cpus[j % cpus.len()]`.
+    /// `cpus[j % cpus.len()]`. Opt-in, for experiments.
     Pool(Vec<usize>),
     /// Pinned, to an idle CPU each copy chooses and reserves the way a fresh
-    /// pinned run does (Hermit's pinned-CPU placement). The default for a run
-    /// that pins its threads.
-    #[default]
+    /// pinned run does (Hermit's pinned-CPU placement). Opt-in, for
+    /// experiments.
     SelfPlaced,
-    /// Not pinned: a copy may run on any CPU the run may use, and the Linux
-    /// scheduler places it.
+    /// Not pinned, the default: a copy may run on any CPU the run may use,
+    /// and the Linux scheduler places it.
+    #[default]
     Unpinned,
     /// Not pinned, with a hint for a `sched_ext` scheduler.
     Hinted(PlacementHint),
@@ -187,6 +190,12 @@ mod tests {
         }
         assert!(Placement::parse("pool:").is_err());
         assert!(Placement::parse("anywhere").is_err());
+    }
+
+    #[test]
+    fn copies_are_not_pinned_by_default() {
+        assert_eq!(Placement::default(), Placement::Unpinned);
+        assert_eq!(Batch::default().placement, None);
     }
 
     #[test]

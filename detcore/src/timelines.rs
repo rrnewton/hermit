@@ -151,7 +151,9 @@ static HOOKS: OnceLock<BackendHooks> = OnceLock::new();
 pub type PlacedCpu = Option<(usize, String)>;
 
 /// Where a copy runs, as its driver chose for the copy's batch (the driver's
-/// placement policy, minus what only a driver handles).
+/// placement policy, minus what only a driver handles). Not pinned unless
+/// the driver asks (owner, Slack 6784: no pinning by default without
+/// measured proof that it pays off).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CopyCpu {
     /// Pinned to `cpus[position % cpus.len()]`, CPUs the driver owns.
@@ -159,16 +161,16 @@ pub enum CopyCpu {
     /// Pinned to an idle CPU the installed [`CopyPlacement`] chooses and
     /// reserves, as a fresh pinned run does; without one, the template's.
     SelfPlaced,
-    /// Not pinned: any CPU the run may use ([`CopyPlacement::allowed`]), and
-    /// the Linux scheduler places the copy.
+    /// Not pinned, the default: any CPU the run may use
+    /// ([`CopyPlacement::allowed`]), and the Linux scheduler places the copy.
     Unpinned,
 }
 
 impl CopyCpu {
-    /// The pool `cpus`, or [`CopyCpu::SelfPlaced`] when it is empty.
+    /// The pool `cpus`, or [`CopyCpu::Unpinned`] when it is empty.
     pub fn from_cpus(cpus: &[usize]) -> Self {
         if cpus.is_empty() {
-            CopyCpu::SelfPlaced
+            CopyCpu::Unpinned
         } else {
             CopyCpu::Pool(cpus.to_vec())
         }
@@ -628,7 +630,7 @@ fn serve_template(request: &crate::choice::ChoiceRequest) {
         send_control(&serde_json::json!({ "refused": format!("{}: {error}", dir.display()) }));
         return;
     }
-    let template = match capture_template(hooks) {
+    let template = match capture_template(hooks, Some((&dir, template_id))) {
         Ok(template) => template,
         Err(error) => {
             send_control(&serde_json::json!({ "refused": error }));
@@ -1049,6 +1051,89 @@ fn redirect_outputs(dir: &std::path::Path, index: usize) -> std::io::Result<()> 
 fn offset_of(fd: RawFd) -> i64 {
     // SAFETY: lseek on a descriptor; -1 for a pipe or terminal.
     unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) }
+}
+
+/// How long a cut waits for a piped output to drain, and then for its file
+/// to settle.
+const PIPED_OUTPUT_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long a piped output's file must keep one size to count as settled.
+const PIPED_OUTPUT_SETTLE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// An output's offset at the cut. A file gives it directly. A pipe does
+/// not: safehermit's byte cap reads standard error through one and copies
+/// it into the file the driver opened for this timeline (`file`). Then the
+/// cut waits until the pipe is empty and the file has stopped growing, and
+/// takes the file's size: this run writes nothing more, as a template.
+/// With no file named (the `HERMIT_TIMELINE_FORK` route), a pipe's offset
+/// stays unknown (-1), as before. Refused rather than cut at a wrong
+/// offset: a pipe that does not drain, a file that does not settle or is
+/// missing, or an output that is neither seekable nor a pipe.
+fn cut_offset(fd: RawFd, file: Option<&std::path::Path>) -> Result<i64, String> {
+    cut_offset_within(fd, file, PIPED_OUTPUT_BOUND, PIPED_OUTPUT_SETTLE)
+}
+
+fn cut_offset_within(
+    fd: RawFd,
+    file: Option<&std::path::Path>,
+    bound: std::time::Duration,
+    settle: std::time::Duration,
+) -> Result<i64, String> {
+    let offset = offset_of(fd);
+    let Some(file) = file else {
+        return Ok(offset);
+    };
+    if offset >= 0 {
+        return Ok(offset);
+    }
+    let drained_by = Instant::now() + bound;
+    loop {
+        let mut pending: libc::c_int = 0;
+        // SAFETY: FIONREAD on a descriptor this process holds, into a local.
+        if unsafe { libc::ioctl(fd, libc::FIONREAD, &mut pending) } != 0 {
+            return Err(format!(
+                "descriptor {fd} is neither seekable nor a pipe ({}): its offset at the cut \
+                 is unknown",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if pending == 0 {
+            break;
+        }
+        if Instant::now() > drained_by {
+            return Err(format!(
+                "descriptor {fd} is a pipe still holding {pending} bytes after {bound:?}: \
+                 its offset at the cut is unknown"
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let size = || {
+        std::fs::metadata(file).map(|m| m.len()).map_err(|e| {
+            format!(
+                "descriptor {fd} is a pipe, and the file it drains into, {}: {e}",
+                file.display()
+            )
+        })
+    };
+    let settled_by = Instant::now() + bound;
+    let mut last = size()?;
+    let mut same_since = Instant::now();
+    while same_since.elapsed() < settle {
+        if Instant::now() > settled_by {
+            return Err(format!(
+                "descriptor {fd} is a pipe, and the file it drains into, {}, kept growing \
+                 for {bound:?}: its offset at the cut is unknown",
+                file.display()
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let now = size()?;
+        if now != last {
+            last = now;
+            same_since = Instant::now();
+        }
+    }
+    Ok(last as i64)
 }
 
 fn micros(since: Instant) -> u64 {
@@ -1772,8 +1857,12 @@ struct Template {
 
 /// Freezes this run as a template. Nothing may log from here until the
 /// parked threads are released: a parked thread could hold the log
-/// writer's lock.
-fn capture_template(hooks: BackendHooks) -> Result<Template, String> {
+/// writer's lock. `own` is where the driver writes this run's outputs
+/// (its directory and timeline number), for the offsets of piped ones.
+fn capture_template(
+    hooks: BackendHooks,
+    own: Option<(&std::path::Path, u64)>,
+) -> Result<Template, String> {
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
     // Every other thread stops in a signal handler with its context saved,
@@ -1794,10 +1883,19 @@ fn capture_template(hooks: BackendHooks) -> Result<Template, String> {
     let records_started = Instant::now();
     let records = record_files();
     let records_us = micros(records_started);
-    let offsets = outputs()
-        .into_iter()
-        .map(|(fd, name)| (format!("{name}_offset"), offset_of(fd).into()))
-        .collect();
+    let mut offsets = serde_json::Map::new();
+    for (fd, name) in outputs() {
+        let file = own.map(|(dir, id)| dir.join(format!("timeline-{id}.{name}")));
+        match cut_offset(fd, file.as_deref()) {
+            Ok(offset) => {
+                offsets.insert(format!("{name}_offset"), offset.into());
+            }
+            Err(error) => {
+                parked.release();
+                return Err(format!("{name}: {error}"));
+            }
+        }
+    }
     Ok(Template {
         hooks,
         parked,
@@ -1823,7 +1921,7 @@ pub(crate) fn fork_copies(spec: &ForkSpec, place: serde_json::Value) -> Option<u
         tracing::warn!("{TIMELINE_FORK_ENV}: {}: {error}", spec.dir.display());
         return None;
     }
-    let template = match capture_template(hooks) {
+    let template = match capture_template(hooks, None) {
         Ok(template) => template,
         Err(error) => {
             let _ = std::fs::write(spec.dir.join("refused.txt"), format!("{error}\n"));
@@ -2263,6 +2361,109 @@ mod tests {
 
     fn counts(counts: StreamCounts) -> (usize, u64, usize, usize) {
         (counts.copied, counts.bytes, counts.lone, counts.external)
+    }
+
+    /// A new, empty file for one test, named after it.
+    fn test_file(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "hermit-timelines-{}-{name}.stderr",
+            std::process::id()
+        ));
+        std::fs::File::create(&path).unwrap();
+        path
+    }
+
+    /// Drains `reader` into `file` the way safehermit's byte cap drains
+    /// standard error: from another thread, late. It waits `before_read`,
+    /// reads what is there, waits `before_write`, writes it, and so on until
+    /// the pipe closes.
+    fn drain_into(
+        reader: RawFd,
+        file: &std::path::Path,
+        before_read: std::time::Duration,
+        before_write: std::time::Duration,
+    ) -> std::thread::JoinHandle<()> {
+        let mut out = std::fs::OpenOptions::new().append(true).open(file).unwrap();
+        std::thread::spawn(move || {
+            std::thread::sleep(before_read);
+            let mut buffer = [0u8; 4096];
+            loop {
+                // SAFETY: reads into the local buffer.
+                let got = unsafe { libc::read(reader, buffer.as_mut_ptr().cast(), buffer.len()) };
+                if got <= 0 {
+                    break;
+                }
+                std::thread::sleep(before_write);
+                out.write_all(&buffer[..got as usize]).unwrap();
+            }
+        })
+    }
+
+    #[test]
+    fn a_seekable_output_is_cut_at_its_offset() {
+        let path = test_file("seekable");
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"start\n").unwrap();
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&file);
+        assert_eq!(cut_offset(fd, Some(&path)), Ok(6));
+        assert_eq!(cut_offset(fd, None), Ok(6));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_piped_output_is_cut_at_the_size_of_the_file_it_drains_into() {
+        // The drainer reads 150 ms late, longer than the settle time, and
+        // writes 30 ms after each read. A cut that did not wait for the pipe
+        // to empty, or for the file to settle after it, would see fewer than
+        // the 6 bytes written before it.
+        let path = test_file("piped");
+        let [reader, writer] = new_pipe();
+        let drainer = drain_into(
+            reader,
+            &path,
+            std::time::Duration::from_millis(150),
+            std::time::Duration::from_millis(30),
+        );
+        put(writer, b"start\n");
+        assert_eq!(cut_offset(writer, Some(&path)), Ok(6));
+        // Without a file to read, a pipe's offset stays unknown.
+        assert_eq!(cut_offset(writer, None), Ok(-1));
+        close(&[writer]);
+        drainer.join().unwrap();
+        close(&[reader]);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_piped_output_that_does_not_drain_is_refused() {
+        let path = test_file("undrained");
+        let [reader, writer] = new_pipe();
+        put(writer, b"nobody reads this\n");
+        let refused = cut_offset_within(
+            writer,
+            Some(&path),
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(10),
+        )
+        .unwrap_err();
+        assert!(refused.contains("still holding 18 bytes"), "{refused}");
+        close(&[reader, writer]);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_piped_output_without_its_file_is_refused() {
+        let [reader, writer] = new_pipe();
+        let missing = std::env::temp_dir().join(format!(
+            "hermit-timelines-{}-missing.stderr",
+            std::process::id()
+        ));
+        let refused = cut_offset(writer, Some(&missing)).unwrap_err();
+        assert!(refused.contains("the file it drains into"), "{refused}");
+        close(&[reader, writer]);
     }
 
     #[test]

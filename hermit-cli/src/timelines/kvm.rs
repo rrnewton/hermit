@@ -615,8 +615,9 @@ impl Timelines for KvmTimelines {
 
     /// Copies made at fork take eager or lazy memory with eager descriptors
     /// and kernel objects; [`CopyPolicy::BACKUP`] makes nothing until a copy
-    /// is resumed. Placement: a pool, self-placed or unpinned; hints wait for
-    /// a scheduler that takes them.
+    /// is resumed. Placement: unpinned (the default), or pinned to a pool or
+    /// self-placed for experiments; hints wait for a scheduler that takes
+    /// them.
     fn honors(&self, copy: &CopyPolicy, placement: &Placement) -> Result<(), Refusal> {
         let made_at_fork = matches!(copy.memory, CopyMode::Eager | CopyMode::Lazy)
             && copy.descriptors == CopyMode::Eager

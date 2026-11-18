@@ -33,9 +33,11 @@
 //! the fork, every copy's repair and run, and its exit. With `fresh=1` it
 //! then runs R rounds of N fresh launches at once (re-execution: each runs
 //! the whole guest, prefix included). Prints each round and the executions
-//! per second of each kind. Without `cpus=`, each copy places itself on an
-//! idle CPU of its own, as each fresh launch does (`KvmTimelines::cpus`).
-//! Before that default a copy kept the template's one pinned CPU, so copies
+//! per second of each kind. Copies are not pinned by default: the Linux
+//! scheduler places them (owner, Slack 6784). `placement=self` or
+//! `placement=pool:A:B` pins them, for experiments; 20 interleaved rounds
+//! showed no throughput gain from either (design section 13.4). Before
+//! placement policies a copy kept the template's one pinned CPU, so copies
 //! resumed at once shared it (MEASURED, race 60 at request 3, 4 at once: 8.3
 //! to 11.4 executions per second then, 21.8 to 26.8 placed, 24.6 to 27.2
 //! pinned by hand with `cpus=`). Every same-future execution

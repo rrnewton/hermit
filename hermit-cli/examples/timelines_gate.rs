@@ -14,8 +14,9 @@
 //! timelines_gate kvm|fork-server dir=DIR launcher=CMD global=ARGS run=ARGS
 //!     [at=I] [bytes=B1:B2:...] [copies=K] [placement=P] [copy=C] [parallel=1] -- GUEST...
 //!
-//! `placement=` (`self`, `unpinned`, `pool:A:B`; `cpus=A:B` is that pool) and
-//! `copy=` (`fork-and-run`, `eager`) are the KVM copies' policies.
+//! `placement=` (`unpinned`, the default; `self` or `pool:A:B` to pin, for
+//! experiments; `cpus=A:B` is that pool) and `copy=` (`fork-and-run`,
+//! `eager`) are the KVM copies' policies.
 //! ```
 //!
 //! `launcher`, `global` and `run` are space-separated argument lists (the
@@ -24,10 +25,13 @@
 //! forks copies, and checks P1 for each: copy 0 takes the same future (its
 //! own source answers), copy k > 0 answers request I as tape byte Bk would;
 //! the checkpoint's observation followed by the copy's must equal a fresh
-//! run's (tape of I zero bytes and Bk) on standard output, choice record,
-//! exit status and canonical information log. With `fork-server`, START
-//! copies must each equal a plain run. Prints one line per check and exits
-//! 1 if any differs.
+//! run's (tape of I zero bytes and Bk) on standard output, standard error,
+//! choice record, exit status and canonical information log. With
+//! `fork-server`, START copies must each equal a plain run. Prints one line
+//! per check and exits 1 if any differs.
+//!
+//! Standard error is compared byte for byte, so a launcher must not write
+//! its own lines there: give safehermit `--sh-report FILE`.
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -207,6 +211,7 @@ impl Gate {
         want_code: i32,
     ) {
         let stdout = Self::bytes(&got.stdout) == Self::bytes(&want.stdout);
+        let stderr = Self::bytes(&got.stderr) == Self::bytes(&want.stderr);
         let record = Self::bytes(&got.record) == Self::bytes(&want.record);
         let (log, records) = match (&got.log, &want.log) {
             (Some(a), Some(b)) => {
@@ -219,15 +224,16 @@ impl Gate {
             _ => (false, "missing".into()),
         };
         let exit = code == want_code;
-        let ok = stdout && record && log && exit;
+        let ok = stdout && stderr && record && log && exit;
         if !ok {
             self.failures += 1;
         }
         let mark = |b: bool| if b { "EQUAL" } else { "DIFFERS" };
         println!(
-            "{label}: {} stdout {} record {} exit {} ({code} vs {want_code}) log {} ({records})",
+            "{label}: {} stdout {} stderr {} record {} exit {} ({code} vs {want_code}) log {} ({records})",
             if ok { "PASS" } else { "FAIL" },
             mark(stdout),
+            mark(stderr),
             mark(record),
             mark(exit),
             mark(log)

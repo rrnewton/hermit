@@ -16,10 +16,12 @@
 //!
 //! - **P1 equivalence**: a copy of a checkpoint at request i, resumed with
 //!   answers `a_i ..`, cannot be told from a fresh run with
-//!   `a_0 .. a_(i-1), a_i ..` by its choice record, standard output, exit
-//!   status or canonical information log: the checkpoint's observation
-//!   followed by the copy's equals the fresh run's. At a START checkpoint
-//!   that says a copy resumed with `None` is a fresh run.
+//!   `a_0 .. a_(i-1), a_i ..` by its choice record, standard output,
+//!   standard error, exit status or canonical information log: the
+//!   checkpoint's observation followed by the copy's equals the fresh
+//!   run's. At a START checkpoint that says a copy resumed with `None` is a
+//!   fresh run. Standard error is the guest's: a launcher that writes its
+//!   own lines there (safehermit without `--sh-report`) makes runs differ.
 //! - **P2 isolation**: copies share no mutable state with each other or
 //!   with the checkpoint, their outputs and logs included.
 //! - **P3 concurrency**: with [`Capabilities::parallel_copies`], copies run
@@ -72,7 +74,7 @@ pub struct RunSpec {
     /// otherwise. Default: [`CopyPolicy::FORK_AND_RUN`].
     pub copy: CopyPolicy,
     /// Where this run's copies run, unless a [`Batch`] says otherwise.
-    /// Default: [`Placement::SelfPlaced`].
+    /// Default: [`Placement::Unpinned`], no pinning.
     pub placement: Placement,
 }
 
