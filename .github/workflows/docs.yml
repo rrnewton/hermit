@@ -141,7 +141,23 @@ jobs:
       if: ${{ github.event_name == 'schedule' || inputs.rebuild_compatibility }}
       env:
         GITHUB_ACTOR: ${{ github.actor }}
-      run: bash scripts/check-runner-trust.sh
+      # --base-from-ref judges authors against origin/$GITHUB_REF_NAME, the
+      # branch this run is on, instead of ci/landing-branches.env. This step
+      # only runs when the job-level `if` passed: a schedule (which GitHub
+      # always runs on the default branch) or a dispatch whose ref is the
+      # default branch. Since the default branch became `integration`, the
+      # landing setting still names `main`, a mirror whose history diverged
+      # from integration's, and every scheduled run refused on integration's
+      # whole separate history. GITHUB_REF_NAME is set for schedule and
+      # dispatch alike; the schedule payload is not relied on (see the job's
+      # `if` above). An empty or unresolvable ref still refuses.
+      #
+      # Here base and HEAD are the same branch, so the commit range is
+      # normally empty. The controls that matter in this workflow are the
+      # job-level `if`, the actor allowlist, and push protection on the
+      # default branch; this author check refuses anything the checked-out
+      # commit adds beyond that branch's tip.
+      run: bash scripts/check-runner-trust.sh --base-from-ref
     - name: Save the dispatched builder pin
       # The workspace stays at the DISPATCHED commit for the whole job;
       # only the builder source moves, into its own checkout.  So the

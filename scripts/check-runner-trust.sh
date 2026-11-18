@@ -23,6 +23,12 @@
 #     passes.
 #
 # Base-range rule:
+#   * --base-from-ref: the base is origin/$GITHUB_REF_NAME, the branch the
+#     workflow run is on (GitHub sets GITHUB_REF_NAME for schedule and
+#     dispatch runs alike; a schedule always runs on the default branch). An
+#     empty GITHUB_REF_NAME refuses; it never falls back to the landing
+#     setting. Workflows whose canonical branch is the default branch use
+#     this, because the landing setting can lag a default-branch change.
 #   * --base <rev> / $RUNNER_TRUST_BASE if given, else origin/<landing>,
 #     else <landing>, where <landing> is Hermit's landing branch
 #     (HERMIT_LANDING_BRANCH, ci/landing-branches.env; main today). The
@@ -35,7 +41,7 @@
 #     be resolved, or merge-base fails, it refuses rather than guessing.
 #
 # Usage:
-#   scripts/check-runner-trust.sh [--actor NAME] [--base REV] [--head REV]
+#   scripts/check-runner-trust.sh [--actor NAME] [--base REV | --base-from-ref] [--head REV]
 #   scripts/check-runner-trust.sh --self-test
 # Actor defaults to $GITHUB_ACTOR. Exit 0 = trusted, 1 = refused.
 set -euo pipefail
@@ -65,9 +71,10 @@ fi
 
 actor="${GITHUB_ACTOR:-}"
 base_arg="${RUNNER_TRUST_BASE:-}"
+base_from_ref=0
 head_arg="HEAD"
 
-usage() { echo "usage: $0 [--actor NAME] [--base REV] [--head REV] | --self-test" >&2; }
+usage() { echo "usage: $0 [--actor NAME] [--base REV | --base-from-ref] [--head REV] | --self-test" >&2; }
 
 in_list() { local needle="$1"; shift; local x; for x in "$@"; do [ "$x" = "$needle" ] && return 0; done; return 1; }
 
@@ -87,6 +94,12 @@ check_authors() {
   head="$(git rev-parse --verify "${head_arg}^{commit}" 2>/dev/null)" || {
     echo "::error::runner-trust: cannot resolve HEAD rev '$head_arg'; refusing" >&2; return 1; }
   base=""
+  if [ "$base_from_ref" -eq 1 ]; then
+    [ -n "${GITHUB_REF_NAME:-}" ] || {
+      echo "::error::runner-trust: --base-from-ref but GITHUB_REF_NAME is empty; refusing" >&2; return 1; }
+    base_arg="origin/${GITHUB_REF_NAME}"
+    echo "runner-trust: base from the run's ref: $base_arg"
+  fi
   if [ -n "$base_arg" ]; then
     base="$(git rev-parse --verify "${base_arg}^{commit}" 2>/dev/null)" || {
       echo "::error::runner-trust: cannot resolve --base '$base_arg'; refusing" >&2; return 1; }
@@ -106,7 +119,11 @@ check_authors() {
   merge_base="$(git merge-base "$base" "$head")" || {
     echo "::error::runner-trust: no merge-base between base $base and HEAD $head; refusing" >&2; return 1; }
   echo "runner-trust: checking authors in ${merge_base}..${head} (author decides; committer is audit-only)"
-  local failures=0 count=0
+  local failures=0 count=0 log_out
+  # Captured first: a failing git log inside a process substitution would go
+  # unnoticed and read as an empty (passing) range.
+  log_out="$(git log --format='%H %an <%ae>|%cn <%ce>' "${merge_base}..${head}")" || {
+    echo "::error::runner-trust: git log failed for ${merge_base}..${head}; refusing" >&2; return 1; }
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     count=$((count + 1))
@@ -118,7 +135,7 @@ check_authors() {
       echo "::error::runner-trust: commit $sha authored by '$author' is not allow-listed (committer=$committer)" >&2
       failures=$((failures + 1))
     fi
-  done < <(git log --format='%H %an <%ae>|%cn <%ce>' "${merge_base}..${head}")
+  done <<< "$log_out"
   if [ "$count" -eq 0 ]; then echo "runner-trust: empty commit range (HEAD is at the base tip); nothing new to execute"; fi
   [ "$failures" -eq 0 ] || { echo "::error::runner-trust: $failures untrusted author(s) in range; refusing to run on a self-hosted runner" >&2; return 1; }
   echo "runner-trust: all $count commit author(s) in range are allow-listed"
@@ -147,6 +164,11 @@ self_test() {
   expect() { # name want-exit actual-exit
     if [ "$2" = "$3" ]; then echo "self-test PASS: $1"; else echo "self-test FAIL: $1 (want exit $2, got $3)" >&2; failures=$((failures + 1)); fi
   }
+  # The cases run in a subshell (they cd into the scratch repo); it exits with
+  # its own failure count, which is added here, so a FAIL makes the self-test
+  # exit non-zero. Any command that fails under set -e also ends the subshell
+  # non-zero and is counted.
+  local sub_rc=0
   (
     cd "$repo"
     # 1. allow-listed actor + allow-listed authors passes
@@ -161,7 +183,47 @@ self_test() {
     # 4. empty range (schedule on main: HEAD == base tip) passes
     git checkout -q base-tip
     guard rrnewton >/dev/null 2>&1 && rc=0 || rc=$?; expect "empty range passes with allowlisted actor" 0 "$rc"
-  )
+    # 5-10. --base-from-ref, after a default-branch change: the run's ref is
+    # `integration`, which already carries an outside author from before the
+    # trust rule; `main` is a mirror whose history diverged at base-tip. Each
+    # case also checks the guard's own output line, not only its exit code.
+    git checkout -q -b integration base-tip
+    commit_as "Outside Dev" "outside@example.com" "landed before the rule"
+    commit_as "hermit-bot3" "344587749+hermit-bot3@users.noreply.github.com" "integration tip"
+    git update-ref refs/remotes/origin/integration HEAD
+    git checkout -q -b mirror base-tip
+    commit_as "Mirror Export" "export@example.com" "mirror-only history"
+    git update-ref refs/remotes/origin/main HEAD
+    git checkout -q integration
+    out="$tmp/guard-out.txt"
+    from_ref() { # event ref-name
+      env -u RUNNER_TRUST_BASE GITHUB_EVENT_NAME="$1" GITHUB_REF_NAME="$2" \
+        bash "$SCRIPT_PATH" --actor hermit-bot3 --base-from-ref --head HEAD > "$out" 2>&1
+    }
+    saw() { grep -qF -- "$1" "$out"; }
+    # 5. schedule: the base resolves from the run's ref, and the run passes
+    from_ref schedule integration && rc=0 || rc=$?; saw "base from the run's ref: origin/integration" || rc="$rc(no base line)"
+    expect "schedule: base origin/\$GITHUB_REF_NAME resolves and passes" 0 "$rc"
+    # 6. dispatch on the default branch: the same base resolves, and it passes
+    from_ref workflow_dispatch integration && rc=0 || rc=$?; saw "base from the run's ref: origin/integration" || rc="$rc(no base line)"
+    expect "dispatch: base origin/\$GITHUB_REF_NAME resolves and passes" 0 "$rc"
+    # 7. empty GITHUB_REF_NAME refuses, at a head whose range would otherwise pass
+    from_ref schedule "" && rc=0 || rc=$?; saw "GITHUB_REF_NAME is empty; refusing" || rc="$rc(no refusal line)"
+    expect "empty GITHUB_REF_NAME refuses (isolated)" 1 "$rc"
+    # 8. an unresolvable ref refuses, at the same head
+    from_ref schedule no-such-branch && rc=0 || rc=$?; saw "cannot resolve --base 'origin/no-such-branch'" || rc="$rc(no refusal line)"
+    expect "unresolvable ref refuses (isolated)" 1 "$rc"
+    # 9. the same run judged against origin/main refuses: the failure --base-from-ref fixes
+    env -u RUNNER_TRUST_BASE bash "$SCRIPT_PATH" --actor hermit-bot3 --base origin/main --head HEAD > "$out" 2>&1 && rc=0 || rc=$?
+    saw "untrusted author(s) in range" || rc="$rc(no refusal line)"
+    expect "base origin/main refuses on the diverged history" 1 "$rc"
+    # 10. a new outside-author commit above the run's ref still refuses
+    commit_as "Outside Dev" "outside@example.com" "new outside work above origin/integration"
+    from_ref schedule integration && rc=0 || rc=$?; saw "authored by 'Outside Dev <outside@example.com>' is not allow-listed" || rc="$rc(no refusal line)"
+    expect "new outside-author commit above origin/\$GITHUB_REF_NAME refuses" 1 "$rc"
+    exit "$failures"
+  ) || sub_rc=$?
+  failures=$((failures + sub_rc))
   if [ "$failures" -eq 0 ]; then echo "runner-trust self-test: all cases passed"; else echo "runner-trust self-test: $failures failure(s)" >&2; return 1; fi
 }
 
@@ -169,6 +231,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --actor) actor="$2"; shift 2 ;;
     --base) base_arg="$2"; shift 2 ;;
+    --base-from-ref) base_from_ref=1; shift ;;
     --head) head_arg="$2"; shift 2 ;;
     --self-test) self_test; exit $? ;;
     -h|--help) usage; exit 0 ;;
