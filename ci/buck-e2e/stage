@@ -14,8 +14,7 @@
 #   SOURCE_SHA  HEAD
 #
 # usage: ci/buck-e2e/stage --from-cargo [--target-dir DIR]   build them here with cargo
-#        ci/buck-e2e/stage --from-buck BUCK2 --subset FILE [-- BUCK2_FLAG...]
-#                                                             build them with Buck, no cargo
+#        ci/buck-e2e/stage --from-buck BUCK2 --subset FILE    build them with Buck, no cargo
 #                                                             (a subset whose cells need no
 #                                                             cargo-only input; see below)
 #        ci/buck-e2e/stage --bundle DIR                       copy them from a prebuilt bundle
@@ -28,10 +27,8 @@ here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 root=$(cd "$here/../.." && pwd)
 staged=$here/staged
 mode= bundle= target_dir=$root/target buck2= subset=
-build_flags=() given_flags=
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --) shift; build_flags=("$@"); given_flags=1; break ;;
         --from-cargo) mode=cargo; shift ;;
         --from-buck) mode=buck; buck2=$2; shift 2 ;;
         --subset) subset=$(realpath "$2"); shift 2 ;;
@@ -41,11 +38,9 @@ while [[ $# -gt 0 ]]; do
         *) echo "ci/buck-e2e/stage: unknown argument $1" >&2; exit 2 ;;
     esac
 done
-[[ -n $mode ]] || { echo "usage: ci/buck-e2e/stage --from-cargo [--target-dir DIR] | --bundle DIR | --from-buck BUCK2 --subset FILE [-- BUCK2_FLAG...]" >&2; exit 2; }
+[[ -n $mode ]] || { echo "usage: ci/buck-e2e/stage --from-cargo [--target-dir DIR] | --bundle DIR | --from-buck BUCK2 --subset FILE" >&2; exit 2; }
 [[ $mode != buck || ( $buck2 == /* && -f $buck2 && -x $buck2 && -f $subset ) ]] ||
     { echo "ci/buck-e2e/stage: --from-buck needs the absolute path of an executable buck2 and --subset FILE" >&2; exit 2; }
-[[ $mode == buck || -z $given_flags ]] ||
-    { echo "ci/buck-e2e/stage: buck2 flags after -- go only with --from-buck" >&2; exit 2; }
 # The host packages --from-cargo needs (docs/BUCK2_OSS.md, "Host prerequisites for Buck
 # validation"), checked before the previous staging is removed. Tests point
 # HERMIT_STAGE_HOST_LIBDIR elsewhere.
@@ -219,11 +214,7 @@ fi
 # a cell that runs in the pinned-root container, which has no libunwind, can start it;
 # run-state/ is empty (a subset holds no compat cell). There is no staged hermit: the
 # cells run the Buck-built //hermit-cli:hermit-release (-c hermit_e2e.hermit=release, the
-# default), which the same buck2 build builds, so a cell run that passes that build's flags
-# finds it built. The flags after -- are that build's flags, verbatim; ci/buck-e2e/validate-node
-# passes the cells' own (they name the run's epoch and artifact root). Without them it
-# builds with -c hermit_release.unstamped=true and the subset's flags.
-# The subset's backends must need no packaged resource (ptrace and kvm do not).
+# default). The subset's backends must need no packaged resource (ptrace and kvm do not).
 if [[ $mode == buck ]]; then
     sha=$(git -C "$root" rev-parse HEAD)
     dirty=$(git -C "$root" status --porcelain --untracked-files=no) ||
@@ -236,9 +227,8 @@ if [[ $mode == buck ]]; then
     mapfile -t buck_flags < <(python3 "$here/subset.py" "$subset" "$root/ci/expected-e2e-plan.json" buck-config)
     tmp=$(mktemp -d)
     trap 'rm -rf "${tmp:?}"' EXIT
-    [[ -n $given_flags ]] || build_flags=(-c hermit_release.unstamped=true "${buck_flags[@]}")
-    env -C "$root" "$buck2" build "${build_flags[@]}" \
-        //ci/buck-e2e:harness-bin //hermit-cli:hermit-release --show-full-output >"$tmp/build.out"
+    env -C "$root" "$buck2" build -c hermit_release.unstamped=true "${buck_flags[@]}" \
+        //ci/buck-e2e:harness-bin --show-full-output >"$tmp/build.out"
     harness_bin=$(awk '$1 ~ /:harness-bin$/ {print $2}' "$tmp/build.out")
     [[ -x $harness_bin/test-harness && -x $harness_bin/hermit-manifest-plan ]] ||
         { echo "ci/buck-e2e/stage: buck2 built no test-harness and hermit-manifest-plan in '$harness_bin'" >&2; exit 1; }

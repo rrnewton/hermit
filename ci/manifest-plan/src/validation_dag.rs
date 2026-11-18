@@ -2408,11 +2408,15 @@ pub fn buck_s0_selection(
     stage.job.push_str(BUCK_S0_SUFFIX);
     stage.desc = "Stage the Buck-only subset's inputs with Buck (no cargo)".into();
     stage.description = format!(
-        "Selected only by scripts/validate.rs --buck-s0. On the host it runs ci/buck-e2e/stage --from-buck (ci/buck-e2e/validate-node --stage-only under HERMIT_VALIDATE_E2E_RUNNER=buck-stock): //ci/buck-e2e:harness-bin and the //hermit-cli:hermit-release the cells run, built by the given buck2 in one build with the cells' own buck2 flags (so the cells reuse its configuration and that hermit), `git archive HEAD`, the subset's fixtures built by that Buck-built harness, and the libunwind runtime closure the Buck-built hermit loads. No cargo runs and nothing is written to target/. It writes ci/buck-e2e/staged/ for HEAD, SOURCE_SHA last, and refuses a tree with uncommitted changes to tracked files. It runs beside the preflight nodes, which change nothing it reads; the cells wait for both. Subset: {BUCK_S0_SUBSET}."
+        "Selected only by scripts/validate.rs --buck-s0. On the host it runs ci/buck-e2e/stage --from-buck (ci/buck-e2e/validate-node --stage-only under HERMIT_VALIDATE_E2E_RUNNER=buck-stock): //ci/buck-e2e:harness-bin built by the given buck2, `git archive HEAD`, the subset's fixtures built by that Buck-built harness, and the libunwind runtime closure the Buck-built hermit loads. No cargo runs and nothing is written to target/. It writes ci/buck-e2e/staged/ for HEAD, SOURCE_SHA last, and refuses a tree with uncommitted changes to tracked files. It runs beside the preflight nodes, which change nothing it reads; the cells wait for both. Subset: {BUCK_S0_SUBSET}."
     );
     // Beside the preflight, not after it: pre.submodules and pre.reverie_pin
     // only read the checkout (the pin check skips the staged copy this writes),
     // so the stage's build overlaps them, and the cells below wait on both.
+    // The stage's buck2 daemon does not outlive this node: dagrun reaps every
+    // process carrying the node's DAGRUN_STEP nonce when the node ends, and the
+    // daemon inherits it from the client. So the cells start a daemon of their
+    // own, and building the cells' hermit here would only build it twice.
     stage.deps = Vec::new();
     relabel(&mut stage);
     steps.push(stage.clone());
