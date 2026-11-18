@@ -206,6 +206,99 @@ fn outputs() -> Vec<(RawFd, &'static str)> {
 }
 
 static TIMELINE: AtomicI64 = AtomicI64::new(-1);
+
+/// PROTOTYPE debugging switches in `HERMIT_TIMELINE_DEBUG` (comma list):
+/// `libcfork` forks through glibc, `noresurrect` re-creates no thread.
+fn debug_switch(name: &str) -> bool {
+    std::env::var("HERMIT_TIMELINE_DEBUG")
+        .map(|value| value.split(',').any(|part| part == name))
+        .unwrap_or(false)
+}
+
+static SEGV_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+extern "C" fn report_fault(
+    signal: libc::c_int,
+    info: *mut libc::siginfo_t,
+    context: *mut libc::c_void,
+) {
+    // Async-signal-safe: formats into a stack buffer and writes it once.
+    let fd = SEGV_FD.load(Ordering::Relaxed);
+    let mut buffer = [0u8; 256];
+    let mut at = 0;
+    let mut put = |text: &[u8]| {
+        for &byte in text {
+            if at < buffer.len() {
+                buffer[at] = byte;
+                at += 1;
+            }
+        }
+    };
+    let hex = |value: u64, put: &mut dyn FnMut(&[u8])| {
+        let mut digits = [0u8; 18];
+        digits[0] = b'0';
+        digits[1] = b'x';
+        for i in 0..16 {
+            let nibble = ((value >> ((15 - i) * 4)) & 0xf) as u8;
+            digits[2 + i] = if nibble < 10 {
+                b'0' + nibble
+            } else {
+                b'a' + nibble - 10
+            };
+        }
+        put(&digits);
+    };
+    // SAFETY: the kernel passes a valid siginfo and ucontext.
+    let (address, rip, rsp, tid) = unsafe {
+        let address = (*info).si_addr() as u64;
+        let context = context as *const libc::ucontext_t;
+        let gregs = (*context).uc_mcontext.gregs;
+        (
+            address,
+            gregs[libc::REG_RIP as usize] as u64,
+            gregs[libc::REG_RSP as usize] as u64,
+            libc::syscall(libc::SYS_gettid) as u64,
+        )
+    };
+    put(b"signal ");
+    hex(signal as u64, &mut put);
+    put(b" addr ");
+    hex(address, &mut put);
+    put(b" rip ");
+    hex(rip, &mut put);
+    put(b" rsp ");
+    hex(rsp, &mut put);
+    put(b" tid ");
+    hex(tid, &mut put);
+    put(b" report_fault ");
+    hex(report_fault as *const () as u64, &mut put);
+    put(b"\n");
+    if fd >= 0 {
+        // SAFETY: writes the formatted bytes to a descriptor this copy opened.
+        unsafe { libc::write(fd, buffer.as_ptr().cast(), at) };
+    }
+    // SAFETY: back to the default action, which ends the process.
+    unsafe {
+        libc::signal(signal, libc::SIG_DFL);
+        libc::raise(signal);
+    }
+}
+
+fn install_fault_report(dir: &std::path::Path, index: usize) {
+    let Ok(file) = std::fs::File::create(dir.join(format!("timeline-{index}.fault"))) else {
+        return;
+    };
+    SEGV_FD.store(std::os::fd::IntoRawFd::into_raw_fd(file), Ordering::Relaxed);
+    for signal in [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL] {
+        // SAFETY: installs a handler that only formats and writes.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = report_fault as *const () as usize;
+            action.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+            libc::sigaction(signal, &action, std::ptr::null_mut());
+        }
+    }
+}
 static TIMELINE_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// This process's timeline number, when it is a copy.
@@ -531,6 +624,18 @@ fn privatize_kernel_objects() -> Result<serde_json::Value, String> {
     }))
 }
 
+fn fork_for_copy() -> Result<libc::pid_t, String> {
+    if debug_switch("libcfork") {
+        // SAFETY: glibc's fork; the debugging comparison for fork_process.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return Err(format!("fork: {}", std::io::Error::last_os_error()));
+        }
+        return Ok(pid);
+    }
+    crate::fork_threads::fork_process()
+}
+
 /// Takes the copies `spec` asks for, at `place` (a description, for the
 /// measurements). Returns `None` in the template once every copy has exited,
 /// and `Some(k)` in copy k once it is repaired, so that the caller goes on
@@ -546,12 +651,26 @@ pub(crate) fn fork_copies(spec: &ForkSpec, place: serde_json::Value) -> Option<u
     }
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
+    // Every other thread stops in a signal handler with its context saved,
+    // so the copies can re-create it. Nothing below logs until they are
+    // released: a parked thread could hold the log writer's lock.
+    let park_started = Instant::now();
+    let parked = match crate::fork_threads::park_others(std::time::Duration::from_secs(5)) {
+        Ok(parked) => parked,
+        Err(error) => {
+            let _ = std::fs::write(spec.dir.join("refused.txt"), format!("{error}\n"));
+            tracing::warn!("{TIMELINE_FORK_ENV}: capture refused: {error}");
+            return None;
+        }
+    };
+    let park_us = micros(park_started);
     let prepare_started = Instant::now();
     let prepared = (hooks.prepare)();
     let prepare_us = micros(prepare_started);
     let prepared = match prepared {
         Ok(description) => description,
         Err(error) => {
+            parked.release();
             let _ = std::fs::write(spec.dir.join("refused.txt"), format!("{error}\n"));
             tracing::warn!("{TIMELINE_FORK_ENV}: capture refused: {error}");
             return None;
@@ -572,16 +691,16 @@ pub(crate) fn fork_copies(spec: &ForkSpec, place: serde_json::Value) -> Option<u
         let mut running = Vec::new();
         for index in 0..spec.copies {
             let forked = Instant::now();
-            // SAFETY: as in the sequential case below.
-            let pid = unsafe { libc::fork() };
+            let pid = match fork_for_copy() {
+                Ok(pid) => pid,
+                Err(error) => {
+                    children.push(serde_json::json!({ "index": index, "error": error }));
+                    break;
+                }
+            };
             if pid == 0 {
-                become_timeline(spec, index, &place, &hooks, &records, forked);
+                become_timeline(spec, index, &place, &hooks, &records, &parked, forked);
                 return Some(index);
-            }
-            if pid < 0 {
-                let error = std::io::Error::last_os_error();
-                children.push(serde_json::json!({ "index": index, "error": error.to_string() }));
-                break;
             }
             running.push((index, pid, forked, micros(forked)));
         }
@@ -618,20 +737,20 @@ pub(crate) fn fork_copies(spec: &ForkSpec, place: serde_json::Value) -> Option<u
             break;
         }
         let forked = Instant::now();
-        // SAFETY: every guest thread is parked and the scheduler runs on the
-        // run's only supervisor thread (the backend's prepare hook refused
-        // otherwise), so the copy has every thread the run needs.
-        let pid = unsafe { libc::fork() };
+        // Every other thread is parked with its context saved; the copy
+        // re-creates them (become_timeline).
+        let pid = match fork_for_copy() {
+            Ok(pid) => pid,
+            Err(error) => {
+                children.push(serde_json::json!({ "index": index, "error": error }));
+                break;
+            }
+        };
         if pid == 0 {
-            become_timeline(spec, index, &place, &hooks, &records, forked);
+            become_timeline(spec, index, &place, &hooks, &records, &parked, forked);
             return Some(index);
         }
         let fork_us = micros(forked);
-        if pid < 0 {
-            let error = std::io::Error::last_os_error();
-            children.push(serde_json::json!({ "index": index, "error": error.to_string() }));
-            break;
-        }
         let mut status = 0;
         let waited = loop {
             // SAFETY: waits for the copy just forked.
@@ -665,8 +784,11 @@ pub(crate) fn fork_copies(spec: &ForkSpec, place: serde_json::Value) -> Option<u
             "signal": libc::WIFSIGNALED(status).then(|| libc::WTERMSIG(status)),
         }));
     }
+    parked.release();
     let summary = serde_json::json!({
         "backend": hooks.name,
+        "parked_threads": parked.count(),
+        "park_us": park_us,
         "spec": format!("{spec:?}"),
         "place": place,
         "copies": spec.copies,
@@ -695,6 +817,7 @@ fn become_timeline(
     place: &serde_json::Value,
     hooks: &BackendHooks,
     records: &[FileRecord],
+    parked: &crate::fork_threads::Parked,
     forked: Instant,
 ) {
     let started = Instant::now();
@@ -714,6 +837,7 @@ fn become_timeline(
         Err(error) => fail("backend repair", error),
     };
     let repair_us = micros(repair_started);
+    install_fault_report(&spec.dir, index);
     let objects_started = Instant::now();
     let objects = match privatize_kernel_objects() {
         Ok(objects) => objects,
@@ -760,6 +884,20 @@ fn become_timeline(
             serde_json::to_string_pretty(&summary).unwrap_or_default()
         ),
     );
+    // Last, once everything they share is the copy's own: the other threads.
+    let threads_started = Instant::now();
+    if debug_switch("noresurrect") {
+        return;
+    }
+    match parked.resurrect() {
+        Ok(threads) => {
+            let _ = std::fs::write(
+                spec.dir.join(format!("timeline-{index}.threads")),
+                format!("{threads} {}\n", micros(threads_started)),
+            );
+        }
+        Err(error) => fail("re-creating threads", error),
+    }
 }
 
 #[cfg(test)]

@@ -62,6 +62,8 @@ mod fatal_core;
 mod fd;
 mod fifo_peer;
 mod finalization;
+#[cfg(target_arch = "x86_64")]
+mod fork_threads;
 pub mod guest_log;
 mod host_inputs;
 pub mod host_timed_producers;
