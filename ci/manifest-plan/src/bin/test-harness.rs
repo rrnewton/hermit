@@ -9395,14 +9395,6 @@ sys.exit(1 if failed else 0)
         assert_eq!((pinned, direct), (22, 39));
     }
 
-    /// The full profile's harness nodes together report each cell of the
-    /// parity population exactly once: a node reports a cell when it plans
-    /// either verify side, and exactly one node plans each side. Every
-    /// population cell's ptrace side is selected by full validation, so no
-    /// population cell goes unreported, whether or not its candidate runs.
-    /// An `E2E_PARITY_SELECT` naming every applicable cell is reported the
-    /// same way, apart from the cells no full node plans a side of, which
-    /// every node drops with a warning.
     /// ci/buck-e2e/cell.sh runs every cell alone with `--parity-plan-of-test`.
     /// For every cell a full-profile node plans, that one-cell run names the
     /// parity golden's CPU profile exactly when the node does, so a Buck cell
@@ -9473,12 +9465,24 @@ sys.exit(1 if failed else 0)
                 cells_checked += 1;
             }
         }
+        // golden > 0 catches a flag that does nothing; golden < cells_checked
+        // proves some checked cell is one its node does not compare, so the
+        // per-cell equality above also catches a flag that names the profile
+        // for every cell.
         assert!(
-            cells_checked > 0 && golden > 0,
+            cells_checked > 0 && golden > 0 && golden < cells_checked,
             "{golden} of {cells_checked}"
         );
     }
 
+    /// The full profile's harness nodes together report each cell of the
+    /// parity population exactly once: a node reports a cell when it plans
+    /// either verify side, and exactly one node plans each side. Every
+    /// population cell's ptrace side is selected by full validation, so no
+    /// population cell goes unreported, whether or not its candidate runs.
+    /// An `E2E_PARITY_SELECT` naming every applicable cell is reported the
+    /// same way, apart from the cells no full node plans a side of, which
+    /// every node drops with a warning.
     #[test]
     fn the_full_profile_reports_each_population_parity_cell_exactly_once() {
         use hermit_manifest_plan::parity;
