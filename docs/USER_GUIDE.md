@@ -899,6 +899,58 @@ and `--replay-schedule-from`, and with `--chaos-target-races` (which sets a new
 thread's priority itself). They have been tested on the ptrace backend, and the
 other backends refuse them.
 
+#### Fork server (experimental)
+
+A search tool runs one command line thousands of times, and a `hermit run`
+launch costs more than a short run. With `HERMIT_FORK_SERVER=SOCKET` in its
+environment, `hermit run` does its setup once (argument checks, CPU-profile
+admission, PMU checks), then listens on the Unix socket `SOCKET` and forks one
+run per request:
+
+```bash
+HERMIT_FORK_SERVER=/tmp/hermit.sock hermit run --chaos --sched-seed=0 \
+  --choice-tape=tape.bin -- PROGRAM &
+# then, per run, over one connection to /tmp/hermit.sock:
+#   RUN <stdin-path> <stdout-path> <stderr-path> <timeout-ms> [coverage=<path>]
+# answered by one line:
+#   STATUS <exit-code> <elapsed-us> | TIMEOUT <elapsed-us> | ERR <reason>
+#   (with " coverage=<bytes|missing|invalid|unarchived>" after a coverage= RUN)
+# and QUIT to stop the server.
+```
+
+For a guest built with a coverage runtime that writes a file (its command
+line names the file), `HERMIT_FORK_SERVER_COVERAGE=FILE` at the server's start
+names that file by its absolute path. The server removes it before every run,
+so no run inherits another's. A RUN with `coverage=<path>` then has it moved to
+`<path>` once the run is reaped and none of its processes is left, and the
+reply ends with its length, or `missing` when the run wrote none. A missing
+file is never an empty map. `invalid` names a file that is not a regular file,
+and `unarchived` a move that failed, for example across file systems.
+`coverage=` on a server without the variable starts no run and is answered
+`ERR`.
+
+Each served run is the run that command line makes as a plain invocation, with
+the request's stdin, stdout and stderr files (stdout and stderr are created or
+truncated): the same guest output, exit status and Detcore outputs. Per-run
+inputs are the files the command line already names, such as the
+`--choice-tape`, rewritten between requests. Runs are served one at a time. A
+run past its timeout (0 means none) is killed with its process group and
+answered `TIMEOUT`. A request that starts no run (malformed, or a file that
+cannot be opened) is answered `ERR`, as is one whose run cannot be watched
+(it is killed at once). The exit status of a run is reported as `STATUS`, with
+128 plus the signal for a run a signal ended.
+
+Only an ordinary ptrace run is served. `--verify`, `--verify-run`,
+`--namespace-only`, other backends, a run manifest (pin the run's host-drawn
+inputs, or pass `--manifest never`), `--backend-engagement-json` and
+`--fatal-core-dir` are refused as a policy refusal (exit 122,
+`class=policy-refusal`) before the server listens. `SOCKET` may name a socket
+an earlier server left behind, which is replaced. A `SOCKET` that names any
+other file, or a socket another server listens on, is refused the same way,
+and the file is left as it is. Launch the server once under
+a bound such as `bin/safehermit`, whose deadline and output cap then cover every
+run it serves.
+
 ### Verify Mode
 
 Verification is an option to `run`, not a separate top-level command:

@@ -356,6 +356,19 @@ pub fn init_shared_stderr_deadline_origin() {
     });
 }
 
+/// For `hermit run`'s fork server: forget the invocation's stderr origin, so the
+/// next run the fork server forks measures its deadline from its own first
+/// blocked write, as a fresh `hermit run` would. Each forked run is its own
+/// invocation that happens to share the server's mapping. Sound only while no
+/// other process of a previous run can still write: the server forks one run
+/// at a time and reaps it (with its process group) before forking the next.
+#[doc(hidden)]
+pub fn reset_shared_stderr_deadline_origin() {
+    if let Some(cell) = shared_origin_cell() {
+        cell.store(0, Ordering::Release);
+    }
+}
+
 fn shared_origin_cell() -> Option<&'static AtomicU64> {
     match STDERR_ORIGIN_ADDR.get() {
         None | Some(0) => None,
@@ -406,13 +419,11 @@ fn stderr_blocked_for() -> std::time::Duration {
     }
 }
 
-/// Reset the shared origin. Test-only: brackets that measure the deadline need
-/// each case to start from zero, and nothing in a real run wants this.
+/// Reset the shared origin, for brackets that measure the deadline and need
+/// each case to start from zero: [`reset_shared_stderr_deadline_origin`].
 #[doc(hidden)]
 pub fn reset_stderr_deadline_origin_for_test() {
-    if let Some(cell) = shared_origin_cell() {
-        cell.store(0, Ordering::Release);
-    }
+    reset_shared_stderr_deadline_origin();
 }
 
 impl std::io::Write for RetryingStderr {
@@ -619,6 +630,25 @@ mod shared_stderr_origin_tests {
              check MAP_SHARED in init_shared_stderr_deadline_origin"
         );
         cell.store(0, Ordering::Release);
+    }
+
+    /// The fork server's reset: a run forked after it measures its deadline
+    /// from its own first blocked write, not from an earlier run's.
+    #[test]
+    fn a_reset_makes_the_next_blocked_write_start_the_deadline() {
+        let _exclusive = exclusive();
+        init_shared_stderr_deadline_origin();
+        reset_shared_stderr_deadline_origin();
+        stderr_blocked_for();
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(stderr_blocked_for() >= Duration::from_millis(30));
+        reset_shared_stderr_deadline_origin();
+        let fresh = stderr_blocked_for();
+        assert!(
+            fresh < Duration::from_millis(30),
+            "after the reset the deadline still counts from the earlier origin: {fresh:?}"
+        );
+        reset_shared_stderr_deadline_origin();
     }
 
     /// The first blocked write installs the origin; later ones inherit it.
