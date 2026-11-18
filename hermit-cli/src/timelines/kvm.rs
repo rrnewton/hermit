@@ -650,15 +650,31 @@ impl Timelines for KvmTimelines {
         }
     }
 
+    /// Ends the template and every copy of it still alive: on this backend
+    /// copies are processes in the template's PID namespace and cannot
+    /// outlive it. Finish or discard the copies you need first.
     fn release(&mut self, cp: KvmCheckpoint) {
         if let Some(template) = cp.template {
             let mut template = template.into_inner().unwrap_or_else(|e| e.into_inner());
-            if template
+            let released = template
                 .connection
                 .send(&serde_json::json!({ "release": true }))
                 .is_ok()
-            {
-                let _ = template.connection.expect("released", REPLY_BOUND);
+                && template.connection.expect("released", REPLY_BOUND).is_ok();
+            if !released {
+                // It did not confirm: end it, by its process if this driver
+                // started it, else by the PID its connection reports.
+                match template.child.as_mut() {
+                    Some(child) => {
+                        let _ = child.kill();
+                    }
+                    None => {
+                        if let Some(pid) = template.connection.pid {
+                            // SAFETY: signals the template, by its PID here.
+                            unsafe { libc::kill(pid, libc::SIGKILL) };
+                        }
+                    }
+                }
             }
             if let Some(mut child) = template.child {
                 let _ = child.wait();

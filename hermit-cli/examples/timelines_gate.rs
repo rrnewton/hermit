@@ -390,7 +390,22 @@ fn run_kvm(options: &Options, gate: &mut Gate) -> Result<(), String> {
             }
         }
     }
+    // Release with a copy that was never resumed: it waits for a command,
+    // and release must still end the template and it promptly (P6).
+    let unresumed = timelines.fork(&checkpoint, 1).map_err(|e| e.to_string())?;
+    let started = Instant::now();
     timelines.release(checkpoint);
+    let release = started.elapsed();
+    let prompt = release < Duration::from_secs(30);
+    if !prompt {
+        gate.failures += 1;
+    }
+    println!(
+        "release with copy {} unresumed: {} in {}",
+        unresumed[0].timeline(),
+        if prompt { "PASS" } else { "FAIL" },
+        ms(release)
+    );
     Ok(())
 }
 

@@ -85,8 +85,17 @@ pub struct PendingRequest {
 }
 
 impl PendingRequest {
-    /// Decodes detcore::choice::request_json's form.
+    /// Decodes detcore::choice::request_json's form. Unknown fields are
+    /// ignored; a `schema` other than 1 is refused.
     pub fn from_json(value: &serde_json::Value) -> Result<Self, Refusal> {
+        if let Some(schema) = value.get("schema")
+            && schema.as_u64() != Some(1)
+        {
+            return Err(Refusal::new(
+                "timeline-protocol",
+                format!("request schema {schema} is not 1"),
+            ));
+        }
         let number = |key: &str| {
             value.get(key).and_then(|v| v.as_u64()).ok_or_else(|| {
                 Refusal::new(
@@ -293,4 +302,66 @@ pub trait Timelines {
     fn discard(&mut self, t: Self::Timeline);
 
     fn release(&mut self, cp: Self::Checkpoint);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_a_request_with_or_without_a_schema() {
+        let plain: serde_json::Value = serde_json::from_str(
+            r#"{"i":3,"kind":"sched.slice","lo":1,"hi":9,"default":5,"scale":4,"ctx":{"dtid":3}}"#,
+        )
+        .unwrap();
+        let request = PendingRequest::from_json(&plain).unwrap();
+        assert_eq!(
+            (request.index, request.kind.as_str(), request.lo, request.hi),
+            (3, "sched.slice", 1, 9)
+        );
+        assert_eq!((request.default, request.scale), (5, 4));
+        let versioned: serde_json::Value = serde_json::from_str(
+            r#"{"schema":1,"i":3,"kind":"sched.slice","lo":1,"hi":9,"default":5,"scale":4,"new":true}"#,
+        )
+        .unwrap();
+        assert_eq!(PendingRequest::from_json(&versioned).unwrap().index, 3);
+        let future: serde_json::Value = serde_json::from_str(
+            r#"{"schema":2,"i":3,"kind":"sched.slice","lo":1,"hi":9,"default":5,"scale":4}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            PendingRequest::from_json(&future).unwrap_err().name,
+            "timeline-protocol"
+        );
+        let missing: serde_json::Value = serde_json::from_str(r#"{"i":3}"#).unwrap();
+        assert!(PendingRequest::from_json(&missing).is_err());
+    }
+
+    #[test]
+    fn joins_a_cut_prefix_with_a_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = |name: &str, text: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, text).unwrap();
+            path
+        };
+        let prefix = Observation {
+            stdout: Some(Part {
+                path: file("template.stdout", "abcdef"),
+                len: Some(3),
+            }),
+            ..Default::default()
+        };
+        let suffix = Observation {
+            stdout: Some(Part::whole(file("copy.stdout", "XYZ"))),
+            log: Some(Part::whole(file("copy.log", "L"))),
+            ..Default::default()
+        };
+        let joined = prefix.join(&suffix, dir.path(), "joined").unwrap();
+        assert_eq!(joined.stdout.unwrap().read().unwrap(), b"abcXYZ");
+        assert_eq!(joined.log.unwrap().read().unwrap(), b"L");
+        assert!(joined.record.is_none());
+        let absent = Part::whole(dir.path().join("never-written"));
+        assert!(absent.read().unwrap().is_empty());
+    }
 }

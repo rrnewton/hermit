@@ -199,8 +199,9 @@ fn install_choice_fork(spec: ForkSpec) {
 /// source answer it (each naming the next request to pause at, or null),
 /// and `{"capture":true}` turns the run into a template. A template reports
 /// `{"captured":...}` and then serves `{"fork":{"ids":[...]}}`, forking one
-/// copy per id, and `{"release":true}`, after which it ends without running
-/// on. Each copy connects back with `{"hello":{"timeline":id,...}}` and is
+/// copy per id, and `{"release":true}`, which ends every copy still alive
+/// (they live in the template's PID namespace) and then the template, which
+/// never runs on. Each copy connects back with `{"hello":{"timeline":id,...}}` and is
 /// paused at the template's request. A copy reports `{"exit":code}` when its
 /// guest ends.
 pub const TIMELINE_CONTROL_ENV: &str = "HERMIT_TIMELINE_CONTROL";
@@ -592,6 +593,13 @@ fn serve_template(request: &crate::choice::ChoiceRequest) {
             }
             send_control(&serde_json::json!({ "forked": forked }));
         } else if message.get("release").is_some() {
+            // Copies are processes in this template's PID namespace and
+            // cannot outlive it; one still waiting for its command would be
+            // waited for forever. Release ends every copy still alive.
+            for &(_, pid) in &children {
+                // SAFETY: signals a copy this template forked.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
             reap_children(&mut children, true);
             send_control(&serde_json::json!({ "released": template_id }));
             // SAFETY: _exit ends the template at once; it never runs on.
