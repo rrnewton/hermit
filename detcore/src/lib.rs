@@ -39,6 +39,7 @@
 pub mod aarch64_lse;
 pub mod access_trace;
 mod arch;
+pub mod choice;
 pub mod clock_identity;
 mod commit_creds;
 mod config;
@@ -6151,7 +6152,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
         // TODO(T78538674): virtualize tid, extend tid<=>dettid mapping here.
         match parent {
-            None => ThreadState::new(DetPid::from_raw(tid.into()), &self.cfg, record_or_replay),
+            None => {
+                // A new guest run: its choice sequence starts here.
+                crate::choice::start_run(&self.cfg);
+                ThreadState::new(DetPid::from_raw(tid.into()), &self.cfg, record_or_replay)
+            }
             Some(pts) => {
                 let clone_flags = pts
                     .1

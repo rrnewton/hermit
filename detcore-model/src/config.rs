@@ -1081,6 +1081,38 @@ pub struct Config {
     #[clap(long, value_name = "filepath")]
     pub record_preemptions_to: Option<PathBuf>,
 
+    /// PROTOTYPE (choice-driver lane): answer the chaos scheduler's choice points
+    /// (timeslice lengths and priority redraws) from this byte tape, one byte per
+    /// choice in run order. Byte 0, or an exhausted tape, takes the default
+    /// (seeded) choice, so an empty tape is the ordinary `--chaos` run. ptrace
+    /// backend only.
+    #[serde(default)]
+    #[clap(
+        long,
+        value_name = "filepath",
+        requires = "chaos",
+        conflicts_with_all = ["choice_controller", "replay_preemptions_from", "replay_schedule_from"]
+    )]
+    pub choice_tape: Option<PathBuf>,
+
+    /// PROTOTYPE (choice-driver lane): ask an external controller listening on
+    /// this Unix stream socket for each chaos choice point, one JSON line per
+    /// request and per answer. ptrace backend only.
+    #[serde(default)]
+    #[clap(
+        long,
+        value_name = "socket-path",
+        requires = "chaos",
+        conflicts_with_all = ["replay_preemptions_from", "replay_schedule_from"]
+    )]
+    pub choice_controller: Option<PathBuf>,
+
+    /// PROTOTYPE (choice-driver lane): write every choice request and its answer
+    /// to this file as JSON lines (needs `--choice-tape` or `--choice-controller`).
+    #[serde(default)]
+    #[clap(long, value_name = "filepath")]
+    pub choice_record: Option<PathBuf>,
+
     /// JSON file to read recorded preemptions from.  When `--chaos` mode is activated, these
     /// recorded preemption points take the place of randomized scheduling decisions.
     #[clap(long, value_name = "filepath", conflicts_with = "replay_schedule_from")]
