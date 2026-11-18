@@ -48,7 +48,7 @@ use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
 
-use crate::record_or_replay::RecordOrReplay;
+use crate::run_mode::RunMode;
 use crate::syscalls::scm_rights::delivered_descriptors;
 use crate::tool_global::unrecoverable_shutdown;
 use crate::tool_local::Detcore;
@@ -214,7 +214,7 @@ pub(crate) fn arrived_descriptors<M: reverie::syscalls::MemoryAccess>(
     }
 }
 
-impl<T: RecordOrReplay> Detcore<T> {
+impl<T: RunMode> Detcore<T> {
     /// The checks of a descriptor where it arrives
     /// ([`arrived_descriptors`]): [`Self::refuse_exit_dependencies`], and
     /// `--strict`'s refusal of a binder descriptor

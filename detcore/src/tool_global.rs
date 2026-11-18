@@ -86,6 +86,7 @@ use tracing::info;
 use tracing::trace;
 use tracing::warn;
 
+use crate::choice::SchedulingChoices as _;
 use crate::config::Config;
 #[cfg(test)]
 use crate::consts::ROOT_DETPID;
@@ -95,13 +96,13 @@ use crate::preemptions::ThreadHistory;
 use crate::preemptions::boundary_recording::HistoryReader;
 use crate::procfs_inode;
 use crate::procfs_inode::ProcfsName;
-use crate::record_or_replay::RecordOrReplay;
 use crate::resources::ChaosEpochTransition;
 use crate::resources::ExternalOpId;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::ResourceMap;
 use crate::resources::Resources;
+use crate::run_mode::RunMode;
 use crate::scheduler::AdmitIntent;
 use crate::scheduler::AdmitSide;
 use crate::scheduler::ConsumeResult;
@@ -117,7 +118,6 @@ use crate::scheduler::SchedResponse;
 use crate::scheduler::SchedValue;
 use crate::scheduler::Scheduler;
 use crate::scheduler::ThreadNextTurn;
-use crate::scheduler::entropy_to_priority;
 use crate::scheduler::guest_send_admission::SendAdmission;
 use crate::scheduler::guest_send_admission::SendScope;
 use crate::scheduler::parked::*;
@@ -1192,6 +1192,12 @@ impl DevicePool {
 #[derive(Debug)]
 pub struct GlobalState {
     sched: Arc<Mutex<Scheduler>>,
+    /// The run's choice session, when a choice source is configured
+    /// (`--choice-tape` or `--choice-controller`); `None`, and nothing
+    /// allocated, otherwise. Built with the run and dropped with it; each
+    /// thread receives a handle in its start grant
+    /// (`GlobalResponse::StartNewThread`).
+    choice_session: Option<crate::choice::ChoiceHandle>,
     #[cfg(feature = "physical-mm-test-support")]
     initial_mm_probe: Mutex<Option<Arc<initial_mm_probe::Probe>>>,
 
@@ -2052,6 +2058,8 @@ impl GlobalState {
 
         Self {
             sched,
+            choice_session: crate::choice::ChoiceSession::from_config(cfg)
+                .map(crate::choice::ChoiceHandle::new),
             #[cfg(feature = "physical-mm-test-support")]
             initial_mm_probe: Mutex::new(None),
             next_port: AtomicU16::new(range[0]),
@@ -3604,6 +3612,9 @@ impl GlobalTool for GlobalState {
                 ),
             );
         }
+        if let GlobalRequest::ChoiceSession = &gr.2 {
+            return self.answer_choice_session();
+        }
         if let GlobalRequest::HoldTable(table) = &gr.2 {
             return self.hold_table(from, table);
         }
@@ -3741,6 +3752,16 @@ impl GlobalTool for GlobalState {
 }
 
 impl GlobalState {
+    /// The answer to `GlobalRequest::ChoiceSession`: the run's session handle
+    /// (none without a choice source), with no logical time, before any
+    /// scheduler state is read or changed.
+    fn answer_choice_session(&self) -> <Self as GlobalTool>::Response {
+        (
+            None,
+            GlobalResponse::ChoiceSession(self.choice_session.clone()),
+        )
+    }
+
     /// Hold `table` as the descriptor table thread `from` holds
     /// (`GlobalRequest::HoldTable`, [`Self::held_tables`]), until the thread
     /// names another, deregisters, or dies. Answered at once: as for a mapping
@@ -4052,6 +4073,9 @@ impl GlobalState {
                     self.capture_brk_mappings(from, gr.1, *check, *fact),
                 ),
             );
+        }
+        if let GlobalRequest::ChoiceSession = &gr.2 {
+            return self.answer_choice_session();
         }
         if let GlobalRequest::HoldTable(table) = &gr.2 {
             return self.hold_table(from, table);
@@ -4752,6 +4776,9 @@ impl GlobalState {
             GlobalRequest::HoldTable(_) => {
                 unreachable!("a held table is answered before clock accounting")
             }
+            GlobalRequest::ChoiceSession => {
+                unreachable!("a choice-session request is answered before clock accounting")
+            }
             #[cfg(target_arch = "aarch64")]
             GlobalRequest::StoreExclusive(_) => {
                 unreachable!("a store-exclusive report is answered before clock accounting")
@@ -5388,7 +5415,8 @@ impl GlobalState {
                         let granted_offset =
                             sched.take_granted_replay_instruction_offset(dettid, first_slice);
                         sched.forget_replay_timeslice(&dettid);
-                        let response = R::StartNewThread(history, first_slice);
+                        let response =
+                            R::StartNewThread(history, first_slice, self.choice_session.clone());
                         let response = match granted_offset {
                             Some(offset) => {
                                 R::WithReplayInstructionOffset(offset, Box::new(response))
@@ -8751,8 +8779,13 @@ pub enum SignalScope {
 /// under this revision (60 on its own base, renumbered to 61 at its
 /// rebase onto main's 60). 62 adds `ReportAdmittedRestartCode`, an admitted
 /// restart code's entry in the unsupported-use summary, sent from a backend
-/// hook with no access to the guest; it is current.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 62;
+/// hook with no access to the guest. 63 gives `GlobalResponse::StartNewThread`
+/// the run's choice-session handle, a serde-skipped in-process capability (a
+/// response that crosses a serialization boundary arrives without it, and a
+/// controlled thread is then refused by name), and adds `ChoiceSession`, by
+/// which a thread that registers itself before its start grant asks for that
+/// handle; it is current.
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 63;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
@@ -8867,6 +8900,13 @@ pub enum GlobalRequest {
     ReleaseResources(Resources),
     /// For convenience, release all the resources held by the current TID.
     ReleaseAllResources,
+    /// The run's choice-session handle (`GlobalResponse::ChoiceSession`),
+    /// asked by a controlled thread whose first draw precedes its start
+    /// grant: one that registers itself, the root
+    /// (`crate::choice::SchedulingChoices::init_thread`). The global state
+    /// answers it before any scheduler or time work, so it consumes no
+    /// choice and changes neither.
+    ChoiceSession,
 
     // TODO-HUMAN-REVIEW(PR-643): Review this new Detcore global RPC request.
     /// Add a syscall to the run-wide unsupported-use summary.
@@ -9854,6 +9894,11 @@ pub enum GlobalResponse {
     },
     ReleaseResources(()),
     ReleaseAllResources(()),
+    /// The run's choice-session handle, the in-process capability that
+    /// `StartNewThread` also carries, skipped by serialization: `None` when
+    /// the run has no session or the response crossed a serialization
+    /// boundary, and the asking thread then refuses by name.
+    ChoiceSession(#[serde(skip)] Option<crate::choice::ChoiceHandle>),
     // TODO-HUMAN-REVIEW(PR-643): Review this new Detcore global RPC response.
     ReportUnsupportedSyscall(()),
     AnnounceSignalHandlerNotInstalled(()),
@@ -9865,10 +9910,18 @@ pub enum GlobalResponse {
     RetireExec(bool),
     MarkPastFirstExecve(Box<ExecFdState>),
     CreateChildThread(Option<MmId>),
-    /// Includes optional preemption points for the new thread, and the
-    /// length of its first timeslice when its start grant names one (a
-    /// schedule replay's recorded first slice; see `thread_start_request`).
-    StartNewThread(Option<ThreadHistory>, Option<LogicalTime>),
+    /// Includes optional preemption points for the new thread, the length
+    /// of its first timeslice when its start grant names one (a schedule
+    /// replay's recorded first slice; see `thread_start_request`), and the
+    /// run's choice session handle when the run has one. The handle is an
+    /// in-process capability that serialization skips: a response that
+    /// crosses a serialization boundary arrives without it, and a controlled
+    /// thread then refuses by name (`crate::choice::ControlledChoices`).
+    StartNewThread(
+        Option<ThreadHistory>,
+        Option<LogicalTime>,
+        #[serde(skip)] Option<crate::choice::ChoiceHandle>,
+    ),
     DeregisterThread(()),
     SetChildTidAddress(()),
     SetSavedGuestSigmask(()),
@@ -10260,7 +10313,7 @@ pub(crate) fn check_brk_mappings<G, T>(
 ) -> Option<bool>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let fact = guest.controller_capture_fact()?;
     let state = guest.thread_state();
@@ -10400,7 +10453,7 @@ pub async fn prepare_exec<G, T>(
     exe: Option<crate::exec_record::ExecRecord>,
 ) where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     // An exec replaces the image holding this process's unsent warning count
     // (`crate::guest_log`); every exec path, DBT's native one included, comes
@@ -10469,7 +10522,7 @@ pub async fn prepare_exec<G, T>(
 pub async fn cancel_exec<G, T>(guest: &mut G)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let detpid = guest.thread_state().detpid.expect("detpid unset");
     let (_, response) = send_and_update_time(guest, GlobalRequest::CancelExec(detpid)).await;
@@ -10481,7 +10534,7 @@ pub async fn mark_past_first_execve<G, T>(
     unprepared_exe: Option<crate::exec_record::ExecRecord>,
 ) where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let controlled =
         guest.signal_control_mode() == reverie::BackendSignalControlMode::ToolControlled;
@@ -10552,7 +10605,7 @@ pub(crate) async fn record_host_input<G, T>(
     kernel_object: bool,
 ) where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let syscall = guest.thread_state().stats.syscall_count;
     let (time, response) = send_and_update_time(
@@ -10639,7 +10692,7 @@ fn report_host_input_change(change: &dyn std::fmt::Display) {
 pub(crate) async fn record_host_mutation<G, T>(guest: &mut G, path: String)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let (time, response) =
         send_and_update_time(guest, GlobalRequest::RecordHostMutation { path }).await;
@@ -10655,7 +10708,7 @@ where
 pub(crate) async fn report_determinism_loss<G, T>(guest: &mut G, reason: String)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let (time, response) =
         send_and_update_time(guest, GlobalRequest::RecordDeterminismLoss(reason)).await;
@@ -10669,7 +10722,7 @@ where
 pub async fn report_unsupported_syscall<G, T>(guest: &mut G, sysno: Sysno)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let (_, response) = send_and_update_time(
         guest,
@@ -10722,7 +10775,7 @@ pub(crate) async fn announce_refused_signal_controls<G, T>(
     alternate_stack: bool,
 ) where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     // Answered before any clock accounting, so the clock and address-space
     // fields are placeholders, as `shared_open_file_request`'s are.
@@ -10745,7 +10798,7 @@ pub(crate) async fn announce_refused_signal_controls<G, T>(
 pub(crate) async fn host_diskstats<G, T>(guest: &mut G) -> Result<Vec<u8>, crate::Errno>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let (_, response) = guest
         .send_rpc((
@@ -10769,7 +10822,7 @@ pub(crate) async fn procfs_sequence<G, T>(
 ) -> Option<crate::procfs::ProcfsSequence>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let (_, response) = guest
         .send_rpc((
@@ -10792,7 +10845,7 @@ pub(crate) async fn store_procfs_sequence<G, T>(
     sequence: crate::procfs::ProcfsSequence,
 ) where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let (_, response) = guest
         .send_rpc((
@@ -10812,7 +10865,7 @@ pub(crate) async fn store_procfs_sequence<G, T>(
 pub(crate) async fn announce_signal_handler_not_installed<G, T>(guest: &mut G, signum: i32)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let (_, response) = send_and_update_time(
         guest,
@@ -10833,7 +10886,7 @@ pub(crate) async fn report_pidfd_self_qualification_refusal<G, T>(
     refusal: crate::PidfdSelfQualificationRefusal,
 ) where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let (_, response) =
         send_and_update_time(guest, GlobalRequest::PidfdSelfQualificationRefusal(refusal)).await;
@@ -10851,7 +10904,7 @@ pub(crate) async fn report_pidfd_self_qualification_refusal<G, T>(
 pub(crate) async fn report_policy_refusal<G, T>(guest: &mut G, reason: String)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let (_, response) = send_and_update_time(guest, GlobalRequest::PolicyRefusal(reason)).await;
     assert!(
@@ -10872,7 +10925,7 @@ pub(crate) async fn kernel_run_target<G, T>(
 ) -> Option<crate::scheduler::KernelRunBlock>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let (_, response) = send_and_update_time(guest, GlobalRequest::KernelRunTarget(target)).await;
     match response {
@@ -10890,7 +10943,7 @@ where
 pub(crate) async fn stopping_refusal<G, T>(guest: &mut G, reason: String)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let (_, response) = send_and_update_time(guest, GlobalRequest::StoppingRefusal(reason)).await;
     assert!(
@@ -10909,7 +10962,7 @@ where
 pub(crate) async fn set_saved_guest_sigmask<G, T>(guest: &mut G, mask: Option<u64>)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let (_, response) =
         send_and_update_time(guest, GlobalRequest::SetSavedGuestSigmask(mask)).await;
@@ -10927,7 +10980,7 @@ where
 pub(crate) async fn begin_wait_mask<G, T>(guest: &mut G, mask: Option<u64>)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let (_, response) = send_and_update_time(guest, GlobalRequest::BeginWaitMask(mask)).await;
     assert!(
@@ -10944,7 +10997,7 @@ where
 pub(crate) async fn end_wait_mask<G, T>(guest: &mut G)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let (_, response) = send_and_update_time(guest, GlobalRequest::EndWaitMask).await;
     assert!(
@@ -10961,7 +11014,7 @@ where
 pub(crate) async fn record_delivery_entry<G, T>(guest: &mut G)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let (_, response) = send_and_update_time(guest, GlobalRequest::DeliveryEntry).await;
     assert!(
@@ -10978,7 +11031,7 @@ where
 pub(crate) async fn pop_delivery_mask<G, T>(guest: &mut G)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let (_, response) = send_and_update_time(guest, GlobalRequest::PopDeliveryMask).await;
     assert!(
@@ -10995,7 +11048,7 @@ where
 pub(crate) async fn withdraw_wait_mask<G, T>(guest: &mut G)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let (_, response) = send_and_update_time(guest, GlobalRequest::WithdrawWaitMask).await;
     assert!(
@@ -11014,7 +11067,7 @@ where
 pub(crate) async fn published_guest_sigmask<G, T>(guest: &mut G, thread: DetTid) -> Option<u64>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let (_, response) =
         send_and_update_time(guest, GlobalRequest::PublishedGuestSigmask(thread)).await;
@@ -11037,7 +11090,7 @@ pub(crate) async fn status_guest_mask<G, T>(
 ) -> crate::scheduler::guest_mask_publication::StatusGuestMask
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     use crate::scheduler::guest_mask_publication::PublishedGuestMask;
     use crate::scheduler::guest_mask_publication::StatusGuestMask;
@@ -11064,7 +11117,7 @@ pub(crate) async fn publish_temporary_mask<G, T>(
 ) -> Option<crate::scheduler::guest_mask_publication::CommittedSendWindow>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let (_, response) =
         send_and_update_time(guest, GlobalRequest::PublishTemporaryMask(control)).await;
@@ -11080,7 +11133,7 @@ where
 pub(crate) async fn in_pid_namespace_init<G, T>(guest: &mut G, thread: DetTid) -> bool
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let (_, response) =
         send_and_update_time(guest, GlobalRequest::InPidNamespaceInit(thread)).await;
@@ -11098,7 +11151,7 @@ where
 pub(crate) async fn virtual_inotify_cookies<G, T>(guest: &mut G, host: Vec<u32>) -> Vec<u32>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let (_, response) =
         send_and_update_time(guest, GlobalRequest::VirtualInotifyCookies(host.clone())).await;
@@ -11114,7 +11167,7 @@ where
 pub(crate) async fn set_sigtimedwait_set<G, T>(guest: &mut G, set: Option<u64>)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let (_, response) = send_and_update_time(guest, GlobalRequest::SetSigtimedwaitSet(set)).await;
     assert!(
@@ -11131,7 +11184,7 @@ where
 pub(crate) async fn record_guest_marker_signal<G, T>(guest: &mut G)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let (_, response) = send_and_update_time(guest, GlobalRequest::RecordGuestMarkerSignal).await;
     assert!(
@@ -11145,7 +11198,7 @@ where
 pub(crate) async fn own_process_signal_inputs<G, T>(guest: &mut G) -> OwnProcessSignalInputs
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     match send_and_update_time(guest, GlobalRequest::OwnProcessSignalInputs)
         .await
@@ -11167,7 +11220,7 @@ pub(crate) async fn process_signal_receiver<G, T>(
 ) -> ProcessSignalReceiver
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     match send_and_update_time(
         guest,
@@ -11186,7 +11239,7 @@ where
 pub(crate) async fn process_signal_sent<G, T>(guest: &mut G, process: DetPid)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     match send_and_update_time(guest, GlobalRequest::ProcessSignalSent(process))
         .await
@@ -11210,7 +11263,7 @@ pub(crate) async fn guest_send_admission<G, T>(
 ) -> SendAdmission
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     match send_and_update_time(
         guest,
@@ -11233,7 +11286,7 @@ pub(crate) async fn guest_send_committed<G, T>(
     signo: i32,
 ) where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     match send_and_update_time(
         guest,
@@ -11252,7 +11305,7 @@ pub(crate) async fn guest_send_committed<G, T>(
 pub(crate) async fn own_process_signal_choice<G, T>(guest: &mut G, named: DetTid, signo: i32)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     match send_and_update_time(guest, GlobalRequest::OwnProcessSignalChoice(named, signo))
         .await
@@ -11266,7 +11319,7 @@ where
 pub(crate) async fn set_child_tid_address<G, T>(guest: &mut G, address: usize)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let (_, response) =
         send_and_update_time(guest, GlobalRequest::SetChildTidAddress(address)).await;
@@ -11288,7 +11341,7 @@ pub(crate) async fn publish_signal_dispositions<G, T>(
 ) -> Option<crate::syscalls::signal_shadow::PublicationAnswer>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let state = guest.thread_state();
     let message = (
@@ -11311,7 +11364,7 @@ pub(crate) async fn post_crash_step<G, T>(
 ) -> Option<std::num::NonZeroU64>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let state = guest.thread_state();
     let message = (
@@ -11331,7 +11384,7 @@ where
 pub(crate) async fn publish_signal_mask<G, T>(guest: &mut G, mask: Option<u64>) -> bool
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let state = guest.thread_state();
     let message = (
@@ -11355,7 +11408,7 @@ pub(crate) async fn publish_instruction_offset<G, T>(
     offset: crate::resources::InstructionOffset,
 ) where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let state = guest.thread_state();
     let message = (
@@ -11375,7 +11428,7 @@ pub(crate) async fn publish_instruction_offset<G, T>(
 async fn publish_runtime_private_memory<G, T>(guest: &mut G)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let Some(facts) = guest.runtime_private_memory_regions() else {
         return;
@@ -11409,7 +11462,7 @@ where
 fn with_cpu_publication<G, T>(guest: &mut G, request: GlobalRequest) -> GlobalRequest
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let state = guest.thread_state_mut();
     let Some(process) = state.detpid else {
@@ -11456,7 +11509,7 @@ pub(crate) fn without_cpu_publication(request: GlobalRequest) -> GlobalRequest {
 pub(crate) async fn record_exit_code<G, T>(guest: &mut G, process: DetPid, code: i32)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(guest, GlobalRequest::RecordExitCode(process, code))
         .await
@@ -11470,7 +11523,7 @@ where
 pub(crate) async fn record_exec_strings<G, T>(guest: &mut G, strings: ExecStrings)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(guest, GlobalRequest::RecordExecStrings(Box::new(strings)))
         .await
@@ -11488,7 +11541,7 @@ pub(crate) async fn process_exec_strings<G, T>(
 ) -> (DetPid, Option<(u64, Box<ExecStrings>)>)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     match send_and_update_time(guest, GlobalRequest::ProcessExecStrings(process))
         .await
@@ -11505,7 +11558,7 @@ pub async fn send_and_update_time<G, T>(
 ) -> (Option<LogicalTime>, GlobalResponse)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     // The successful exec callback must bind a surviving worker to its new
     // backend TID before issuing ordinary replacement-image requests. In
@@ -11878,7 +11931,7 @@ fn resumes_from_grant(request: &GlobalRequest) -> bool {
 pub(crate) fn cap_timeslice_at_deadline<G, T>(guest: &mut G, deadline: Option<Duration>)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let Some(remaining) = deadline else {
         return;
@@ -11923,7 +11976,7 @@ where
 pub(crate) fn publish_request_guest_mask<G, T>(guest: &G, r: &Resources) -> Option<u64>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     if !guest.config().in_guest_signal_delivery || r.blocked_signal_mask_unknown {
         return None;
@@ -11950,7 +12003,7 @@ where
 pub async fn resource_request<G, T>(guest: &mut G, mut r: Resources) -> ResumeStatus
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     // A request made while handling a syscall whose cost the bootstrap window
     // withholds carries that fact to the scheduler, which then withholds the
@@ -12044,7 +12097,7 @@ where
 pub async fn resource_release_all<G, T>(guest: &mut G)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     if guest.config().sequentialize_threads {
         // This bookkeeping RPC does not release the scheduler turn:
@@ -12056,6 +12109,28 @@ where
             GlobalResponse::ReleaseAllResources(x) => x,
             _ => unreachable!(),
         }
+    }
+}
+
+/// The run's choice-session handle, asked of the global state directly: no
+/// signal-state publication, no time update and no scheduler request (the
+/// global state answers it before any of them), so it consumes no choice and
+/// moves no state. `ControlledChoices::init_thread` sends it for a thread
+/// that registers itself, whose first draw precedes its start grant.
+pub(crate) async fn request_choice_session<G, T>(guest: &G) -> Option<crate::choice::ChoiceHandle>
+where
+    G: Guest<Detcore<T>>,
+    T: RunMode,
+{
+    let time = guest.thread_state().thread_logical_time.clone();
+    let mm = guest.thread_state().mm_id;
+    match guest
+        .send_rpc((time, mm, GlobalRequest::ChoiceSession))
+        .await
+        .1
+    {
+        GlobalResponse::ChoiceSession(handle) => handle,
+        _ => unreachable!("a ChoiceSession request has a ChoiceSession answer"),
     }
 }
 
@@ -12073,7 +12148,7 @@ pub async fn thread_start_request<G, T>(
 ) -> (Option<ThreadHistory>, Option<LogicalTime>)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let dettid = guest.thread_state().dettid;
     if cfg.sequentialize_threads {
@@ -12091,20 +12166,24 @@ where
         .await;
         let (start, first_slice_offset) = match resp.1 {
             GlobalResponse::WithReplayInstructionOffset(offset, response) => match *response {
-                GlobalResponse::StartNewThread(preempts, first_slice) => {
-                    ((preempts, first_slice), Some(offset))
+                GlobalResponse::StartNewThread(preempts, first_slice, choices) => {
+                    ((preempts, first_slice, choices), Some(offset))
                 }
                 _ => unreachable!(),
             },
-            GlobalResponse::StartNewThread(preempts, first_slice) => {
-                ((preempts, first_slice), None)
+            GlobalResponse::StartNewThread(preempts, first_slice, choices) => {
+                ((preempts, first_slice, choices), None)
             }
             _ => unreachable!(),
         };
         if let Some(offset) = first_slice_offset {
             guest.thread_state_mut().replay_instruction_offset = Some(offset);
         }
-        let (preempts, first_slice) = start;
+        let (preempts, first_slice, choices) = start;
+        // Before the thread's first draw (its startup reset, in
+        // `finish_thread_start`): a seeded run's policy ignores this, and a
+        // controlled one takes the run's session or refuses by name.
+        guest.thread_state_mut().choices.attach(choices, dettid);
         // Publish only after the deterministic start grant. Before
         // it, parent registration and this RPC can race in host time.
         publish_runtime_private_memory(guest).await;
@@ -12112,6 +12191,10 @@ where
         trace!("[detcore, dtid {}] new thread UNBLOCKED (post-rpc)", dettid);
         (preempts, first_slice)
     } else {
+        // No start grant, so no session handle: only a seeded run gets here
+        // (the choice options imply --chaos, which sequentializes threads),
+        // and a controlled one is refused by name, never run seeded.
+        guest.thread_state_mut().choices.attach(None, dettid);
         (None, None)
     }
 }
@@ -12133,7 +12216,7 @@ pub(crate) fn finish_thread_start<G, T>(
     first_slice: Option<LogicalTime>,
 ) where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     // The start grant's offset, installed by `thread_start_request` beside
     // its first slice: the startup reset clears it (`next_timeslice`), so it
@@ -12215,7 +12298,7 @@ pub async fn create_child_thread<G, T>(
 ) -> Option<MmId>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     // Random (or replayed) starting priority in chaos mode, constant priority otherwise.
     let starting_priority = if guest.config().replay_preemptions_from.is_some() {
@@ -12225,10 +12308,10 @@ where
     } else if guest.config().replay_schedule_from.is_some() {
         Some(replay_starting_priority(guest.config(), child_dettid))
     } else if guest.config().chaos {
-        let entropy = guest
-            .thread_state_mut()
-            .chaos_prng_next_u64("child_priority");
         if guest.config().chaos_target_races {
+            let entropy = guest
+                .thread_state_mut()
+                .chaos_prng_next_u64("child_priority");
             // Targeted chaos: bias a freshly created child to an extreme priority
             // so it either runs before the parent resumes or strictly after it,
             // instead of landing at a uniformly random priority. This maximizes
@@ -12240,7 +12323,11 @@ where
                 Some(LAST_PRIORITY)
             }
         } else {
-            Some(entropy_to_priority(entropy))
+            Some(
+                guest
+                    .thread_state_mut()
+                    .chaos_priority(crate::choice::ChoiceSite::ChildPriority),
+            )
         }
     } else {
         Some(DEFAULT_PRIORITY)
@@ -12300,16 +12387,19 @@ pub async fn create_vfork_child_thread<G, T>(
     vfork: crate::tool_local::PendingVfork,
 ) where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let starting_priority = if guest.config().replay_preemptions_from.is_some() {
         None
     } else if guest.config().replay_schedule_from.is_some() {
         Some(replay_starting_priority(guest.config(), child_dettid))
     } else if guest.config().chaos {
-        Some(entropy_to_priority(vfork.child_priority_entropy.expect(
-            "vfork child priority entropy missing in chaos mode",
-        )))
+        Some(
+            vfork
+                .child_priority
+                .expect("vfork child priority missing in chaos mode")
+                .into_priority(),
+        )
     } else {
         // POSIX vfork suspends the parent until the child execs or _exits. Give
         // the vfork child a strictly higher priority (lower number) than the
@@ -12548,7 +12638,7 @@ pub(crate) async fn robust_list_wakes_after_exec<G, T>(
 ) -> Vec<u64>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     if wakes.is_empty() {
         return Vec::new();
@@ -12619,7 +12709,7 @@ pub async fn futex_action<G, T>(
 ) -> Option<SchedValue>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     assert!(guest.config().sequentialize_threads);
     let dettid = guest.thread_state().dettid;
@@ -12656,7 +12746,7 @@ where
 pub async fn determinize_inode<G, T>(guest: &mut G, inode: RawInode) -> (DetInode, LogicalTime)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     determinize_inode_observing_mtime(
         guest,
@@ -12678,7 +12768,7 @@ pub async fn determinize_named_inode<G, T>(
 ) -> (DetInode, LogicalTime)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     determinize_inode_observing_mtime(
         guest,
@@ -12704,7 +12794,7 @@ pub async fn determinize_inode_observing_mtime<G, T>(
 ) -> (DetInode, LogicalTime)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let resp = send_and_update_time(
         guest,
@@ -12726,7 +12816,7 @@ where
 pub async fn determinize_mapping_inodes<G, T>(guest: &mut G, inodes: Vec<RawInode>) -> Vec<DetInode>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let resp = send_and_update_time(guest, GlobalRequest::DeterminizeMappingInodes(inodes)).await;
     match resp.1 {
@@ -12741,7 +12831,7 @@ where
 pub async fn determinize_device<G, T>(guest: &mut G, raw_device: u64) -> u64
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let resp = send_and_update_time(guest, GlobalRequest::DeterminizeDevice(raw_device)).await;
     match resp.1 {
@@ -12758,7 +12848,7 @@ pub async fn determinize_mount_id<G, T>(
 ) -> Option<u64>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let resp = send_and_update_time(
         guest,
@@ -12782,7 +12872,7 @@ pub async fn resolve_mountinfo_identities<G, T>(
 ) -> Option<Vec<u64>>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let resp = send_and_update_time(
         guest,
@@ -12799,7 +12889,7 @@ where
 pub async fn retire_inode<G, T>(guest: &mut G, inode: RawInode)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let resp = send_and_update_time(guest, GlobalRequest::RetireInode(inode)).await;
     match resp.1 {
@@ -12813,7 +12903,7 @@ where
 pub async fn directory_snapshot_mark<G, T>(guest: &mut G) -> SnapshotMark
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let resp = send_and_update_time(guest, GlobalRequest::DirectorySnapshotMark).await;
     match resp.1 {
@@ -12831,7 +12921,7 @@ pub async fn ready_channel<G, T>(
 ) -> crate::pipe_wake::ReadyOutcome
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let resp = send_and_update_time(guest, GlobalRequest::ReadyChannel(channel, wants)).await;
     match resp.1 {
@@ -12846,7 +12936,7 @@ where
 pub async fn hand_off_turn<G, T>(guest: &mut G) -> bool
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let resp = send_and_update_time(guest, GlobalRequest::HandOffTurn).await;
     match resp.1 {
@@ -12862,7 +12952,7 @@ where
 pub async fn commit_fatal_delivery<G, T>(guest: &mut G, retire_others: bool) -> bool
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     matches!(
         send_and_update_time(guest, GlobalRequest::CommitFatalDelivery(retire_others))
@@ -12883,7 +12973,7 @@ pub async fn determinize_listed_inode<G, T>(
 ) -> (DetInode, LogicalTime)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     determinize_inode_observing_mtime(
         guest,
@@ -12902,7 +12992,7 @@ where
 pub async fn forget_retired_inode<G, T>(guest: &mut G, inode: RawInode, procfs: Option<ProcfsName>)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let resp = send_and_update_time(guest, GlobalRequest::ForgetRetiredInode(inode, procfs)).await;
     match resp.1 {
@@ -12916,7 +13006,7 @@ where
 pub async fn touch_file<G, T>(guest: &mut G, inode: RawInode)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let resp = send_and_update_time(guest, GlobalRequest::TouchFile(inode)).await;
     match resp.1 {
@@ -12929,7 +13019,7 @@ where
 pub async fn set_file_mtime<G, T>(guest: &mut G, inode: RawInode, mtime: LogicalTime)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let resp = send_and_update_time(guest, GlobalRequest::SetFileMtime(inode, mtime)).await;
     match resp.1 {
@@ -12942,7 +13032,7 @@ where
 pub async fn global_time_lower_bound<G, T>(guest: &mut G) -> LogicalTime
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let resp = send_and_update_time(guest, GlobalRequest::GlobalTimeLowerBound).await;
     match resp.1 {
@@ -12957,7 +13047,7 @@ where
 pub async fn thread_observe_time<G, T>(guest: &mut G) -> LogicalTime
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     global_time_lower_bound(guest).await
 }
@@ -12966,7 +13056,7 @@ where
 fn write_backtrace<G, T>(guest: &mut G, m_path: Option<&PathBuf>)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     if let Some(backtrace) = guest.backtrace() {
         if let Some(path) = m_path {
@@ -13046,7 +13136,7 @@ impl std::fmt::Debug for SchedEventForLog<'_> {
 pub async fn trace_schedevent<G, T>(guest: &mut G, ev: SchedEvent, tag_end_rip: bool)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     trace_schedevent_with_access(guest, ev, tag_end_rip, None).await
 }
@@ -13061,7 +13151,7 @@ pub async fn trace_schedevent_with_access<G, T>(
     access: Option<crate::access_trace::AccessPayload>,
 ) where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     assert!(guest.config().sequentialize_threads);
 
@@ -13202,7 +13292,7 @@ pub async fn trace_schedevent_with_access<G, T>(
 fn install_replayed_timeslice<G, T>(guest: &mut G, length: LogicalTime)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     if !guest.thread_state().past_global_first_execve {
         // Before the first execve no slice is replayed: the recording starts
@@ -13240,7 +13330,7 @@ pub async fn register_alarm<G, T>(
 ) -> (LogicalTime, LogicalTime)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let dettid = guest.thread_state().dettid;
     let detpid = guest.thread_state().detpid.expect("detpid unset");
@@ -13261,7 +13351,7 @@ where
 pub async fn alarm_remaining<G, T>(guest: &mut G) -> ItimerSnapshot
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let detpid = guest.thread_state().detpid.expect("detpid unset");
     let resp = send_and_update_time(guest, GlobalRequest::AlarmRemaining(detpid)).await;
@@ -13277,7 +13367,7 @@ where
 pub async fn note_sigalrm_event<G, T>(guest: &mut G, request: GlobalRequest)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let resp = send_and_update_time(guest, request).await;
     match resp.1 {
@@ -13293,7 +13383,7 @@ where
 pub async fn reconcile_alarm<G, T>(guest: &mut G)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let detpid = guest.thread_state().detpid.expect("detpid unset");
     let resp = send_and_update_time(guest, GlobalRequest::ReconcileAlarm(detpid)).await;
@@ -13315,7 +13405,7 @@ pub async fn register_posix_timer<G, T>(
     notification: PosixTimerNotification,
 ) where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let dettid = guest.thread_state().dettid;
     let detpid = guest.thread_state().detpid.expect("detpid unset");
@@ -13349,7 +13439,7 @@ pub async fn register_posix_timer<G, T>(
 pub async fn thread_is_live<G, T>(guest: &mut G, dettid: DetTid) -> bool
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(guest, GlobalRequest::ThreadIsLive(dettid)).await;
     match response.1 {
@@ -13364,7 +13454,7 @@ where
 pub(crate) async fn next_guest_id<G, T>(guest: &mut G) -> Option<i32>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(guest, GlobalRequest::NextGuestId).await;
     match response.1 {
@@ -13378,7 +13468,7 @@ where
 pub(crate) async fn note_host_id_task<G, T>(guest: &mut G)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(guest, GlobalRequest::GaveHostId).await;
     assert_eq!(response.1, GlobalResponse::GaveHostId(()));
@@ -13400,7 +13490,7 @@ where
 pub(crate) async fn thread_id_refused<G, T>(guest: &mut G, dettid: DetTid) -> bool
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(guest, GlobalRequest::ThreadIdRefused(dettid)).await;
     match response.1 {
@@ -13416,7 +13506,7 @@ where
 pub(crate) async fn names_a_retired_exited_leader<G, T>(guest: &mut G, named: DetTid) -> bool
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response =
         send_and_update_time(guest, GlobalRequest::NamesARetiredExitedLeader(named)).await;
@@ -13434,7 +13524,7 @@ where
 pub(crate) async fn parent_death_signal<G, T>(guest: &mut G, arm: Option<i32>) -> i32
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(guest, GlobalRequest::ParentDeathSignal(arm)).await;
     let signal = match response.1 {
@@ -13456,7 +13546,7 @@ where
 pub(crate) async fn pending_real_time_expirations<G, T>(guest: &mut G, detpid: DetPid) -> u64
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response =
         send_and_update_time(guest, GlobalRequest::PendingRealTimeExpirations(detpid)).await;
@@ -13473,7 +13563,7 @@ where
 pub(crate) async fn record_handler_restore_mask<G, T>(guest: &mut G, detpid: DetPid, unblocked: u64)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(
         guest,
@@ -13495,7 +13585,7 @@ where
 pub(crate) async fn register_signalfd<G, T>(guest: &mut G, detpid: DetPid, mask: u64)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(guest, GlobalRequest::RegisterSignalfd(detpid, mask)).await;
     assert!(
@@ -13514,7 +13604,7 @@ where
 pub(crate) async fn descriptors_replaced<G, T>(guest: &mut G, first: u32, last: u32)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     if !guest.config().recordreplay_modes {
         return;
@@ -13543,7 +13633,7 @@ pub(crate) async fn discard_pending_real_time_expirations<G, T>(
     signals: u64,
 ) where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(
         guest,
@@ -13571,7 +13661,7 @@ pub async fn record_host_timed_signals<G, T>(
 ) -> u64
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let dettid = guest.thread_state().dettid;
     let response = send_and_update_time(
@@ -13591,7 +13681,7 @@ where
 pub async fn host_timed_signals<G, T>(guest: &mut G) -> u64
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let dettid = guest.thread_state().dettid;
     let response = send_and_update_time(guest, GlobalRequest::HostTimedSignals(dettid)).await;
@@ -13608,7 +13698,7 @@ where
 pub(crate) async fn host_timed_and_private_sigchld<G, T>(guest: &mut G) -> (u64, u64)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let dettid = guest.thread_state().dettid;
     let response =
@@ -13628,7 +13718,7 @@ pub(crate) async fn child_exit_sigchld<G, T>(
 ) -> crate::scheduler::child_exit_sigchld::ChildExitSigchldAnswer
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(guest, GlobalRequest::ChildExitSigchld(control)).await;
     match response.1 {
@@ -13646,7 +13736,7 @@ pub(crate) async fn discarded_signal<G, T>(
 ) -> crate::scheduler::discarded_at_send::DiscardedSignalAnswer
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(guest, GlobalRequest::DiscardedSignal(control)).await;
     match response.1 {
@@ -13661,7 +13751,7 @@ where
 pub async fn sigalrm_refuses<G, T>(guest: &mut G, control: SigalrmControl) -> bool
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(guest, GlobalRequest::Sigalrm(control)).await;
     match response.1 {
@@ -13678,7 +13768,7 @@ pub async fn refuse_sigalrm<G, T>(
 ) -> Result<(), nix::errno::Errno>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     if sigalrm_refuses(guest, control).await {
         Err(nix::errno::Errno::EPERM)
@@ -13691,7 +13781,7 @@ where
 pub async fn exact_child_wait_state<G, T>(guest: &mut G, child: DetPid) -> ExactChildWaitState
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let parent = guest.thread_state().detpid.expect("detpid unset");
     let response =
@@ -13709,7 +13799,7 @@ pub async fn await_exact_child_physical_exit<G, T>(
 ) -> ExactChildWaitState
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let mut state = exact_child_wait_state(guest, child).await;
     if matches!(
@@ -13730,7 +13820,7 @@ where
 pub async fn wait_for_child_lifecycle<G, T>(guest: &mut G, spec: ChildWaitSpec) -> ResumeStatus
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let dettid = guest.thread_state().dettid;
     let parent = guest.thread_state().detpid.expect("detpid unset");
@@ -13743,7 +13833,7 @@ where
 pub async fn ready_child_wait<G, T>(guest: &mut G, spec: ChildWaitSpec) -> (Option<DetPid>, bool)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let parent = guest.thread_state().detpid.expect("detpid unset");
     let response = send_and_update_time(guest, GlobalRequest::ReadyChildWait(parent, spec)).await;
@@ -13756,7 +13846,7 @@ where
 pub async fn process_group<G, T>(guest: &mut G, process: DetPid) -> Option<DetPid>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(guest, GlobalRequest::ProcessGroup(process)).await;
     match response.1 {
@@ -13770,7 +13860,7 @@ where
 pub async fn setsid_decision<G, T>(guest: &mut G, process: DetPid) -> Result<(), reverie::Errno>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(guest, GlobalRequest::SetsidDecision(process)).await;
     match response.1 {
@@ -13789,7 +13879,7 @@ pub async fn setpgid_decision<G, T>(
 ) -> Result<(DetPid, DetPid), reverie::Errno>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response =
         send_and_update_time(guest, GlobalRequest::SetpgidDecision(caller, pid, pgid)).await;
@@ -13805,7 +13895,7 @@ where
 pub async fn group_or_session_of<G, T>(guest: &mut G, pid: DetPid, session: bool) -> Option<DetPid>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(guest, GlobalRequest::GroupOrSession(pid, session)).await;
     match response.1 {
@@ -13823,7 +13913,7 @@ pub(crate) async fn process_image<G, T>(
 ) -> Option<crate::exec_record::ExecRecord>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     match send_and_update_time(guest, GlobalRequest::ProcessImage(process))
         .await
@@ -13837,7 +13927,7 @@ where
 pub async fn set_process_group<G, T>(guest: &mut G, process: DetPid, group: DetPid) -> bool
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response =
         send_and_update_time(guest, GlobalRequest::SetProcessGroup(process, group)).await;
@@ -13852,7 +13942,7 @@ where
 pub async fn registered_process_of<G, T>(guest: &mut G, dettid: DetTid) -> Option<DetPid>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(guest, GlobalRequest::RegisteredProcessOf(dettid)).await;
     match response.1 {
@@ -13870,7 +13960,7 @@ pub async fn reserve_sigkill<G, T>(
 ) -> Option<crate::scheduler::sigkill_retirement::SigkillReservation>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     // Backends that cannot retire at the kill turn send no extra RPC.
     if !crate::scheduler::sigkill_retirement::retires_sigkill_at_the_kill_turn(
@@ -13895,7 +13985,7 @@ where
 pub async fn set_child_subreaper<G, T>(guest: &mut G, process: DetPid, on: bool)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(guest, GlobalRequest::SetChildSubreaper(process, on)).await;
     match response.1 {
@@ -13909,7 +13999,7 @@ where
 pub async fn child_subreaper<G, T>(guest: &mut G, process: DetPid) -> bool
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(guest, GlobalRequest::ChildSubreaper(process)).await;
     match response.1 {
@@ -13923,7 +14013,7 @@ where
 pub async fn posix_timer_thread<G, T>(guest: &mut G, named: i32) -> PosixTimerThread
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let process = guest.thread_state().detpid.expect("detpid unset");
     let response =
@@ -13939,7 +14029,7 @@ where
 pub async fn forget_thread_timer_copies<G, T>(guest: &mut G, signo: i32)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let process = guest.thread_state().detpid.expect("detpid unset");
     let response = send_and_update_time(
@@ -13961,7 +14051,7 @@ pub async fn exec_timer_flush<G, T>(
 ) -> Result<crate::scheduler::ExecTimerFlush, String>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let process = guest.thread_state().detpid.expect("detpid unset");
     let response = send_and_update_time(guest, GlobalRequest::ExecTimerFlush(process)).await;
@@ -13977,7 +14067,7 @@ where
 pub async fn retire_exited_leader<G, T>(guest: &mut G) -> bool
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(guest, GlobalRequest::RetireExitedLeader).await;
     match response.1 {
@@ -13995,7 +14085,7 @@ pub async fn guest_pid<G, T>(
 ) -> crate::scheduler::pid_namespaces::GuestPidAnswer
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let caller = guest.thread_state().dettid;
     let response = send_and_update_time(guest, GlobalRequest::GuestPid(caller, pid)).await;
@@ -14014,7 +14104,7 @@ pub async fn procfs_listing<G, T>(
 ) -> crate::procfs::listing::ListingFacts
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(guest, GlobalRequest::ProcfsListing(process)).await;
     match response.1 {
@@ -14031,7 +14121,7 @@ pub async fn procfs_task<G, T>(
 ) -> crate::procfs::listing::ProcfsTaskAnswer
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let request = GlobalRequest::ProcfsTask(
         DetTid::from_raw(task.process),
@@ -14052,7 +14142,7 @@ pub(crate) async fn task_stat_facts<G, T>(
 ) -> crate::procfs::task_stat::TaskStatFacts
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let request = GlobalRequest::TaskStatFacts(
         DetTid::from_raw(task.process),
@@ -14071,7 +14161,7 @@ pub(crate) async fn set_task_comm<G, T>(
     comm: crate::procfs::task_stat::TaskComm,
 ) where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(guest, GlobalRequest::SetTaskComm(tid, comm))
         .await
@@ -14084,7 +14174,7 @@ pub(crate) async fn set_task_comm<G, T>(
 pub(crate) async fn record_external_parent<G, T>(guest: &mut G, process: DetPid, parent: i32)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response =
         send_and_update_time(guest, GlobalRequest::RecordExternalParent(process, parent))
@@ -14103,7 +14193,7 @@ pub(crate) async fn register_placeholder<G, T>(
 ) -> Option<u64>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     match send_and_update_time(
         guest,
@@ -14128,7 +14218,7 @@ pub(crate) async fn placeholder<G, T>(
 )>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     match send_and_update_time(guest, GlobalRequest::Placeholder(tag))
         .await
@@ -14147,7 +14237,7 @@ pub(crate) async fn placeholder_flock<G, T>(
 ) -> crate::procfs::locks::PlaceholderFlockOutcome
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     match send_and_update_time(guest, GlobalRequest::PlaceholderFlock(request))
         .await
@@ -14166,7 +14256,7 @@ pub(crate) async fn flock<G, T>(
 ) -> crate::procfs::locks::FlockOutcome
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     match send_and_update_time(guest, GlobalRequest::Flock(request))
         .await
@@ -14182,7 +14272,7 @@ where
 pub(crate) async fn flock_poll<G, T>(guest: &mut G) -> crate::procfs::locks::FlockPoll
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     match send_and_update_time(guest, GlobalRequest::FlockPoll)
         .await
@@ -14198,7 +14288,7 @@ where
 pub(crate) async fn flock_cancel<G, T>(guest: &mut G)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     match send_and_update_time(guest, GlobalRequest::FlockCancel)
         .await
@@ -14220,7 +14310,7 @@ pub(crate) async fn flock_close_check<G, T>(
 ) -> Option<String>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     match send_and_update_time(
         guest,
@@ -14242,7 +14332,7 @@ pub(crate) async fn flock_host_decided<G, T>(
     object: String,
 ) where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(guest, GlobalRequest::FlockHostDecided(key, object))
         .await
@@ -14255,7 +14345,7 @@ pub(crate) async fn flock_host_decided<G, T>(
 pub(crate) async fn flock_mapped<G, T>(guest: &mut G, open_file: OpenFileId)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(guest, GlobalRequest::FlockMapped(open_file))
         .await
@@ -14268,7 +14358,7 @@ where
 pub(crate) async fn flock_unfollowable<G, T>(guest: &mut G, open_files: Vec<OpenFileId>)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(guest, GlobalRequest::FlockUnfollowable(open_files))
         .await
@@ -14281,7 +14371,7 @@ where
 pub(crate) async fn flock_held_by<G, T>(guest: &mut G, open_file: OpenFileId) -> Option<(bool, i64)>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     match send_and_update_time(guest, GlobalRequest::FlockHeldBy(open_file))
         .await
@@ -14297,7 +14387,7 @@ where
 pub(crate) async fn flock_teardown_pending<G, T>(guest: &mut G, processes: Vec<DetPid>) -> bool
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     match send_and_update_time(guest, GlobalRequest::FlockTeardownPending(processes))
         .await
@@ -14318,7 +14408,7 @@ pub(crate) async fn placeholder_copies<G, T>(
 ) -> Result<(), OpenFileId>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     match send_and_update_time(guest, GlobalRequest::PlaceholderCopies(change))
         .await
@@ -14340,7 +14430,7 @@ pub(crate) async fn hold_table<G, T>(
     table: Arc<Mutex<crate::tool_local::FileMetadata>>,
 ) where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let state = guest.thread_state();
     let request = (
@@ -14370,7 +14460,7 @@ pub(crate) async fn placeholder_write_hint<G, T>(
 ) -> u64
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     match send_and_update_time(guest, GlobalRequest::PlaceholderWriteHint(key, hint))
         .await
@@ -14389,7 +14479,7 @@ where
 pub(crate) async fn take_sleep_interruption<G, T>(guest: &mut G) -> Option<LogicalTime>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let (_, response) = guest
         .send_rpc((
@@ -14409,7 +14499,7 @@ where
 pub(crate) async fn cpu_affinity<G, T>(guest: &mut G, tid: DetTid) -> crate::cpu_set::TaskAffinity
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     match send_and_update_time(guest, GlobalRequest::CpuAffinity(tid))
         .await
@@ -14429,7 +14519,7 @@ pub(crate) async fn set_cpu_affinity<G, T>(
 ) -> crate::cpu_set::TaskAffinity
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     match send_and_update_time(guest, GlobalRequest::SetCpuAffinity(tid, cpus))
         .await
@@ -14445,7 +14535,7 @@ where
 pub(crate) async fn set_rss_limit<G, T>(guest: &mut G, process: DetPid, limit: u64)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(guest, GlobalRequest::SetRssLimit(process, limit))
         .await
@@ -14463,7 +14553,7 @@ pub(crate) async fn record_process_auxv<G, T>(
     cmdline: Option<crate::procfs::CmdlineArea>,
 ) where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(guest, GlobalRequest::RecordProcessAuxv(bytes, cmdline))
         .await
@@ -14480,7 +14570,7 @@ pub(crate) async fn process_cmdline<G, T>(
 ) -> (DetPid, Option<crate::procfs::CmdlineArea>)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     match send_and_update_time(guest, GlobalRequest::ProcessCmdline(process))
         .await
@@ -14497,7 +14587,7 @@ where
 pub(crate) async fn process_auxv<G, T>(guest: &mut G, process: DetPid) -> Option<ProcessAuxv>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     match send_and_update_time(guest, GlobalRequest::ProcessAuxv(process))
         .await
@@ -14513,7 +14603,7 @@ where
 pub(crate) async fn mark_changed_root<G, T>(guest: &mut G)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(guest, GlobalRequest::MarkChangedRoot)
         .await
@@ -14526,7 +14616,7 @@ where
 pub(crate) async fn root_changed<G, T>(guest: &mut G, task: DetPid) -> bool
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     match send_and_update_time(guest, GlobalRequest::RootChanged(task))
         .await
@@ -14549,7 +14639,7 @@ pub(crate) async fn note_description_locks<G, T>(
     slots: u32,
 ) where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(
         guest,
@@ -14574,7 +14664,7 @@ pub(crate) async fn note_description_locks_taken<G, T>(
     identity: crate::procfs::locks::LedgerIdentity,
 ) where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(
         guest,
@@ -14596,7 +14686,7 @@ pub(crate) async fn note_second_identity_locks<G, T>(
     slots: u32,
 ) where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(
         guest,
@@ -14619,7 +14709,7 @@ pub(crate) async fn lock_owners<G, T>(
 ) -> Result<Vec<i64>, String>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     match send_and_update_time(guest, GlobalRequest::LockOwners(open_file, locks))
         .await
@@ -14638,7 +14728,7 @@ pub(crate) async fn ledger_lock_rows<G, T>(
 ) -> Result<Vec<crate::procfs::locks::RenderedLockRow>, String>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     match send_and_update_time(guest, GlobalRequest::LedgerLockRows)
         .await
@@ -14654,7 +14744,7 @@ where
 pub(crate) async fn note_table_released<G, T>(guest: &mut G, open_file: OpenFileId, remaining: u32)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(guest, GlobalRequest::TableReleased(open_file, remaining))
         .await
@@ -14668,7 +14758,7 @@ where
 pub(crate) async fn note_table_exec<G, T>(guest: &mut G, surviving: Vec<(OpenFileId, u32)>)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(guest, GlobalRequest::TableExec(surviving))
         .await
@@ -14682,7 +14772,7 @@ where
 pub(crate) async fn note_aliased_inode<G, T>(guest: &mut G, inode: Option<String>)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(guest, GlobalRequest::AliasedInode(inode))
         .await
@@ -14695,7 +14785,7 @@ where
 pub(crate) async fn note_lock_ledger_refused<G, T>(guest: &mut G, reason: String)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(guest, GlobalRequest::LockLedgerRefused(reason))
         .await
@@ -14709,7 +14799,7 @@ where
 pub(crate) async fn note_record_locks_held_as_ofd<G, T>(guest: &mut G, objects: Option<Vec<String>>)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(guest, GlobalRequest::RecordLocksHeldAsOfd(objects))
         .await
@@ -14728,7 +14818,7 @@ pub(crate) async fn guest_lock_rows<G, T>(
 ) -> Result<(Vec<bool>, Vec<String>), String>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     match send_and_update_time(guest, GlobalRequest::GuestLockRows(rows))
         .await
@@ -14752,7 +14842,7 @@ pub(crate) async fn auxv_from_kernel<G, T>(
 ) -> bool
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     match send_and_update_time(guest, GlobalRequest::AuxvFromKernel(why, cmdline))
         .await
@@ -14772,7 +14862,7 @@ pub async fn rendered_file_state<G, T>(
 ) -> crate::procfs::listing::RenderedFileState
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response =
         send_and_update_time(guest, GlobalRequest::RenderedFileState(inode, change)).await;
@@ -14795,7 +14885,7 @@ pub(crate) async fn user_namespace_relation<G, T>(
 )
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let reader = guest.thread_state().dettid;
     let response =
@@ -14815,7 +14905,7 @@ where
 pub(crate) async fn note_user_namespace_owner_may_differ<G, T>(guest: &mut G, process: DetTid)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response =
         send_and_update_time(guest, GlobalRequest::UserNamespaceOwnerMayDiffer(process)).await;
@@ -14831,7 +14921,7 @@ where
 pub async fn procfs_ids<G, T>(guest: &mut G, to_kernel: bool, ids: Vec<i32>) -> Vec<Option<i32>>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(guest, GlobalRequest::ProcfsIds(to_kernel, ids)).await;
     match response.1 {
@@ -14846,7 +14936,7 @@ where
 pub async fn local_pid<G, T>(guest: &mut G, task: DetTid) -> Result<Option<i32>, String>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let caller = guest.thread_state().dettid;
     let response = send_and_update_time(guest, GlobalRequest::LocalPid(caller, task)).await;
@@ -14862,7 +14952,7 @@ where
 pub async fn signal_target_process<G, T>(guest: &mut G, named: DetPid) -> Option<DetPid>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(guest, GlobalRequest::SignalTargetProcess(named)).await;
     match response.1 {
@@ -14876,7 +14966,7 @@ where
 pub(crate) async fn cpu_clock_process<G, T>(guest: &mut G, named: DetPid) -> Option<(DetPid, u32)>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(guest, GlobalRequest::CpuClockProcess(named)).await;
     match response.1 {
@@ -14895,7 +14985,7 @@ pub(crate) async fn suspend_holds_discarded<G, T>(
 ) -> bool
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response =
         send_and_update_time(guest, GlobalRequest::SuspendHoldsDiscarded(process, signal)).await;
@@ -14914,7 +15004,7 @@ pub async fn set_sigchld_disposition<G, T>(
     nocldwait: bool,
 ) where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(
         guest,
@@ -14936,7 +15026,7 @@ pub async fn reserve_sigkill_group<G, T>(
 ) -> Option<crate::scheduler::sigkill_retirement::SigkillReservation>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     // Backends that cannot retire at the kill turn send no extra RPC.
     if !crate::scheduler::sigkill_retirement::retires_sigkill_at_the_kill_turn(
@@ -14960,7 +15050,7 @@ where
 pub(crate) async fn sigkill_dying_threads<G, T>(guest: &mut G, token: u64) -> Vec<(DetTid, MmId)>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(guest, GlobalRequest::SigkillDyingThreads(token)).await;
     match response.1 {
@@ -14981,7 +15071,7 @@ pub(crate) async fn record_sigkill_robust_lists<G, T>(
     )>,
 ) where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response =
         send_and_update_time(guest, GlobalRequest::RecordSigkillRobustLists(token, lists)).await;
@@ -15014,7 +15104,7 @@ where
 pub async fn commit_sigkill<G, T>(guest: &mut G, token: u64, sent: bool)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(guest, GlobalRequest::CommitSigkill(token, sent)).await;
     match response.1 {
@@ -15026,7 +15116,7 @@ where
 pub async fn create_session<G, T>(guest: &mut G, process: DetPid) -> bool
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(guest, GlobalRequest::CreateSession(process)).await;
     match response.1 {
@@ -15038,7 +15128,7 @@ where
 pub async fn consume_child_wait<G, T>(guest: &mut G, child: DetPid) -> bool
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let parent = guest.thread_state().detpid.expect("detpid unset");
     let response =
@@ -15057,7 +15147,7 @@ pub async fn resolve_kill_targets_and_exit<G, T>(
 ) -> (Vec<DetTid>, Option<bool>)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(guest, GlobalRequest::ResolveKillTargets(detpid)).await;
     match response.1 {
@@ -15072,7 +15162,7 @@ where
 pub async fn names_hermit_task<G, T>(guest: &mut G, tgid: Option<i32>, tid: i32) -> bool
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let caller = guest.thread_state().dettid;
     let response =
@@ -15160,7 +15250,7 @@ fn descends_from(task: i32, ancestor: i32) -> bool {
 pub async fn notify_unresolved_sigkill<G, T>(guest: &mut G, group: Option<DetPid>)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(guest, GlobalRequest::NotifyUnresolvedSigkill(group)).await;
     match response.1 {
@@ -15194,7 +15284,7 @@ fn alarm_signal(sig: SigWrapper) -> Signal {
 pub async fn hold_turn_for_group_exit<G, T>(guest: &mut G, dettid: DetTid) -> bool
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(guest, GlobalRequest::HoldTurnForGroupExit(dettid)).await;
     match response.1 {
@@ -15211,7 +15301,7 @@ pub async fn notify_signal_pending<G, T>(
     scope: SignalScope,
 ) where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let response = send_and_update_time(
         guest,
@@ -15242,7 +15332,7 @@ pub async fn notify_signal_pending<G, T>(
 pub async fn unrecoverable_shutdown<G, T>(guest: &G, status: i32) -> !
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     // The process ends here (`crate::guest_log`).
     crate::guest_log::flush_unsent();
@@ -15304,7 +15394,7 @@ mod tests {
             let start = case != 0;
             let (config, state, tid, process) = cancellation_test_state();
             install_test_registration(&state, tid, Ivar::new());
-            let mut thread = crate::ThreadState::new(tid, &config, ());
+            let mut thread = crate::ThreadState::<crate::SeededMode>::new(tid, &config, ());
             thread.detpid = Some(process);
             if !start {
                 thread.next_timeslice(&config);
@@ -15419,7 +15509,7 @@ mod tests {
         };
         let slice = LogicalTime::from_rcbs(123);
         let (config, state, tid, process) = cancellation_test_state();
-        let mut thread = crate::ThreadState::new(tid, &config, ());
+        let mut thread = crate::ThreadState::<crate::SeededMode>::new(tid, &config, ());
         thread.detpid = Some(process);
         thread.replay_instruction_offset = Some(offset);
         let mut guest = ExternalRegistrationGuest {
@@ -15437,7 +15527,7 @@ mod tests {
         // Real schedule startup (past the first execve): the first slice's
         // duration is installed and its offset survives beside it.
         let (config, state, tid, process) = cancellation_test_state();
-        let mut thread = crate::ThreadState::new(tid, &config, ());
+        let mut thread = crate::ThreadState::<crate::SeededMode>::new(tid, &config, ());
         thread.detpid = Some(process);
         thread.past_global_first_execve = true;
         thread.replay_instruction_offset = Some(offset);
@@ -15460,7 +15550,7 @@ mod tests {
         // History startup (no schedule first slice): the reset installs
         // the first row's offset itself, and it survives.
         let (config, state, tid, process) = cancellation_test_state();
-        let probe = crate::ThreadState::new(tid, &config, ());
+        let probe = crate::ThreadState::<crate::SeededMode>::new(tid, &config, ());
         let at = LogicalTime::from_nanos(probe.thread_logical_time.as_nanos().as_nanos() + 1_000);
         let mut writer = crate::preemptions::PreemptionWriter::new(None);
         writer.register_thread(tid, crate::scheduler::runqueue::DEFAULT_PRIORITY);
@@ -15482,7 +15572,7 @@ mod tests {
             rcb_target: 18,
             instructions: 4,
         });
-        let mut thread = crate::ThreadState::new(tid, &config, ());
+        let mut thread = crate::ThreadState::<crate::SeededMode>::new(tid, &config, ());
         thread.detpid = Some(process);
         let mut guest = ExternalRegistrationGuest {
             global: &state,
@@ -15555,6 +15645,115 @@ mod tests {
             false,
         );
         panic!("GlobalState::initialize admitted a debugger with a virtual bound");
+    }
+
+    /// Only a run with a choice source allocates a session: the seeded run's
+    /// global state holds none, so its start grants carry none, and a run
+    /// with a tape holds one, which every start grant clones.
+    #[test]
+    fn only_a_run_with_a_choice_source_holds_a_session() {
+        let seeded = GlobalState::initialize(&Config::default(), false);
+        assert!(seeded.choice_session.is_none());
+        let tape = tempfile::NamedTempFile::new().unwrap();
+        let config = Config {
+            choice_tape: Some(tape.path().to_path_buf()),
+            ..Config::default()
+        };
+        let controlled = GlobalState::initialize(&config, false);
+        assert!(controlled.choice_session.is_some());
+    }
+
+    /// A controlled thread whose start grant carries no session handle (a
+    /// backend whose responses cross a serialization boundary drops it) is
+    /// refused by name with the policy-refusal exit, never run on the seeded
+    /// draws.
+    #[test]
+    fn a_controlled_thread_without_a_session_handle_is_refused() {
+        if !in_child_expecting_refusal(
+            "a_controlled_thread_without_a_session_handle_is_refused",
+            "has no handle to the run's choice session",
+        ) {
+            return;
+        }
+        let mut choices = crate::choice::ControlledChoices::default();
+        crate::choice::SchedulingChoices::attach(&mut choices, None, DetTid::from_raw(7));
+        panic!("a controlled thread attached without a session handle");
+    }
+
+    /// `GlobalRequest::ChoiceSession` answers the run's own handle, with no
+    /// logical time, and consumes no choice: the session's next request is
+    /// still its first. A run without a choice source answers none.
+    #[tokio::test]
+    async fn a_choice_session_request_answers_the_runs_handle_and_consumes_no_choice() {
+        let dir = tempfile::tempdir().unwrap();
+        let tape = dir.path().join("t.tape");
+        std::fs::write(&tape, [0u8]).unwrap();
+        let record = dir.path().join("r.jsonl");
+        let root = DetTid::from_raw(3);
+        let ask = |config: &Config| {
+            (
+                crate::ThreadState::<crate::SeededMode>::new(root, config, ())
+                    .thread_logical_time
+                    .clone(),
+                MmId::initial(root),
+                GlobalRequest::ChoiceSession,
+            )
+        };
+
+        let seeded = GlobalState::initialize(&Config::default(), false);
+        let (time, response) = seeded
+            .receive_rpc(Tid::from_raw(3), ask(&Config::default()))
+            .await;
+        assert!(time.is_none());
+        assert!(matches!(response, GlobalResponse::ChoiceSession(None)));
+
+        let config = Config {
+            choice_tape: Some(tape),
+            choice_record: Some(record.clone()),
+            ..Config::default()
+        };
+        let controlled = GlobalState::initialize(&config, false);
+        let (time, response) = controlled.receive_rpc(Tid::from_raw(3), ask(&config)).await;
+        assert!(time.is_none());
+        let GlobalResponse::ChoiceSession(Some(handle)) = response else {
+            panic!("a run with a tape answered no handle");
+        };
+        assert_eq!(Some(handle.clone()), controlled.choice_session);
+        handle.choose(crate::choice::ChoicePoint {
+            kind: crate::choice::ChoiceKind::SchedPriority,
+            lo: 1,
+            hi: 9,
+            default: 5,
+            scale: 0,
+            dtid: root,
+            thread_rcbs: 0,
+            site: crate::choice::ChoiceSite::ChildPriority,
+        });
+        let first = std::fs::read_to_string(&record).unwrap();
+        assert!(first.contains("\"i\":0,"), "{first}");
+    }
+
+    /// A thread offered a second session while it holds one is refused by
+    /// name: a run has one session.
+    #[test]
+    fn a_thread_offered_another_session_is_refused() {
+        if !in_child_expecting_refusal(
+            "a_thread_offered_another_session_is_refused",
+            "was offered a choice session other than the one it holds",
+        ) {
+            return;
+        }
+        let session = || {
+            crate::choice::ChoiceHandle::new(crate::choice::ChoiceSession::new(
+                Box::new(crate::choice::TapeSource::new(vec![])),
+                None,
+            ))
+        };
+        let mut choices = crate::choice::ControlledChoices::default();
+        let tid = DetTid::from_raw(3);
+        crate::choice::SchedulingChoices::attach(&mut choices, Some(session()), tid);
+        crate::choice::SchedulingChoices::attach(&mut choices, Some(session()), tid);
+        panic!("a thread took a second session");
     }
 
     /// The last positive candidate may be taken only once. Exhaustion stays
@@ -15637,7 +15836,7 @@ mod tests {
             ..Config::default()
         };
         let state = GlobalState::initialize(&config, false);
-        let hold = |tid: DetTid, thread: &crate::ThreadState<()>| {
+        let hold = |tid: DetTid, thread: &crate::ThreadState<crate::SeededMode>| {
             assert_eq!(
                 state.hold_table(
                     Tid::from_raw(tid.as_raw()),
@@ -15651,7 +15850,7 @@ mod tests {
         // holds, and closes its own descriptor of it.
         let parent_id = DetTid::from_raw(9060);
         let child_id = DetTid::from_raw(9061);
-        let parent = crate::ThreadState::new(parent_id, &config, ());
+        let parent = crate::ThreadState::<crate::SeededMode>::new(parent_id, &config, ());
         parent
             .add_fd(3, OFlag::empty(), FdType::Socket, None)
             .unwrap();
@@ -15662,7 +15861,7 @@ mod tests {
         let right = parent.with_detfd(4, |detfd| detfd.clone()).unwrap();
         left.pair_sockets(&right, false);
         drop(right);
-        let child = crate::ThreadState::new(child_id, &config, ());
+        let child = crate::ThreadState::<crate::SeededMode>::new(child_id, &config, ());
         let mut copy = parent.file_metadata.lock().unwrap().fork_for(child_id);
         copy.hold_alone(child_id);
         *child.file_metadata.lock().unwrap() = copy;
@@ -15719,7 +15918,7 @@ mod tests {
         // A thread that named no table beside one that named the process's.
         let shared_id = DetTid::from_raw(9062);
         let unnamed_id = DetTid::from_raw(9063);
-        let shared = crate::ThreadState::new(shared_id, &config, ());
+        let shared = crate::ThreadState::<crate::SeededMode>::new(shared_id, &config, ());
         shared.file_metadata.lock().unwrap().join_holder(shared_id);
         hold(shared_id, &shared);
         assert_eq!(
@@ -18776,7 +18975,7 @@ mod tests {
             cancellation_test_state()
         };
         install_test_registration(&state, tid, Ivar::new());
-        let mut thread = crate::ThreadState::new(tid, &config, ());
+        let mut thread = crate::ThreadState::<crate::SeededMode>::new(tid, &config, ());
         thread.detpid = Some(process);
         thread.next_timeslice(&config);
         if enabled {
@@ -18963,7 +19162,7 @@ mod tests {
                 .with_backend(|backend| backend.needs_killed_thread_rpc_cancellation = true),
             ));
         install_test_registration(&state, tid, Ivar::new());
-        let mut thread = crate::ThreadState::new(tid, &config, ());
+        let mut thread = crate::ThreadState::<crate::SeededMode>::new(tid, &config, ());
         thread.detpid = Some(process);
         thread.next_timeslice(&config);
         let initial_slices = thread.stats.timeslice_count;
@@ -19250,7 +19449,7 @@ mod tests {
     fn boundary_resource_union_refuses_either_annotated_operand_before_mutation() {
         let tid = DetTid::from_raw(17);
         let config = Config::default();
-        let mut thread = crate::ThreadState::new(tid, &config, ());
+        let mut thread = crate::ThreadState::<crate::SeededMode>::new(tid, &config, ());
         let mut observed = crate::slice_boundary::Observations::new(&thread, 0);
         observed
             .callback(
@@ -19341,7 +19540,7 @@ mod tests {
             cancellation_test_state()
         };
         install_test_registration(&state, tid, Ivar::new());
-        let mut thread = crate::ThreadState::new(tid, &config, ());
+        let mut thread = crate::ThreadState::<crate::SeededMode>::new(tid, &config, ());
         thread.detpid = Some(process);
         if route != 1 {
             thread.next_timeslice(&config);
@@ -19488,7 +19687,7 @@ mod tests {
     struct ExternalRegistrationGuest<'a> {
         global: &'a GlobalState,
         config: &'a Config,
-        thread: crate::ThreadState<()>,
+        thread: crate::ThreadState<crate::SeededMode>,
         requests: Mutex<Vec<GlobalRequest>>,
         post_exec: bool,
         ppid: Option<reverie::Pid>,
@@ -19624,11 +19823,11 @@ mod tests {
             panic!("external registration must not access guest memory")
         }
 
-        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<()> {
+        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<crate::SeededMode> {
             &mut self.thread
         }
 
-        fn thread_state(&self) -> &crate::ThreadState<()> {
+        fn thread_state(&self) -> &crate::ThreadState<crate::SeededMode> {
             &self.thread
         }
 
@@ -19683,7 +19882,7 @@ mod tests {
     struct RetirementGuest<'a> {
         global: &'a GlobalState,
         config: &'a Config,
-        thread: crate::ThreadState<()>,
+        thread: crate::ThreadState<crate::SeededMode>,
         requests: Mutex<Vec<GlobalRequest>>,
         retired: std::sync::atomic::AtomicBool,
         hold_private_memory_publication: bool,
@@ -19748,11 +19947,11 @@ mod tests {
             reverie::syscalls::LocalMemory::new()
         }
 
-        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<()> {
+        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<crate::SeededMode> {
             &mut self.thread
         }
 
-        fn thread_state(&self) -> &crate::ThreadState<()> {
+        fn thread_state(&self) -> &crate::ThreadState<crate::SeededMode> {
             &self.thread
         }
 
@@ -19859,7 +20058,7 @@ mod tests {
         let reader = DetTid::from_raw(3);
         let sender = DetTid::from_raw(5);
         let tool: Detcore = Detcore::new(Tid::from_raw(sender.as_raw()), &config);
-        let mut thread = crate::ThreadState::new(sender, &config, ());
+        let mut thread = crate::ThreadState::<crate::SeededMode>::new(sender, &config, ());
         thread.detpid = Some(sender);
         thread.passed_descriptors_out_unreported = true;
         {
@@ -19935,7 +20134,7 @@ mod tests {
             let state = GlobalState::initialize(&config, false);
             let reader = DetTid::from_raw(3);
             let sender = DetTid::from_raw(5);
-            let mut thread = crate::ThreadState::new(sender, &config, ());
+            let mut thread = crate::ThreadState::<crate::SeededMode>::new(sender, &config, ());
             thread.detpid = Some(sender);
             thread.passed_descriptors_out_unreported = exported;
             {
@@ -21621,7 +21820,7 @@ mod tests {
         let rpc = state.receive_rpc(
             Tid::from_raw(root.as_raw()),
             (
-                crate::ThreadState::<()>::new(root, &config, ())
+                crate::ThreadState::<crate::SeededMode>::new(root, &config, ())
                     .thread_logical_time
                     .clone(),
                 MmId::initial(root),
@@ -21728,7 +21927,7 @@ mod tests {
         let rpc = state.receive_rpc(
             Tid::from_raw(sender.as_raw()),
             (
-                crate::ThreadState::<()>::new(sender, &config, ())
+                crate::ThreadState::<crate::SeededMode>::new(sender, &config, ())
                     .thread_logical_time
                     .clone(),
                 MmId::initial(sender),
@@ -21816,7 +22015,7 @@ mod tests {
                     .receive_rpc(
                         Tid::from_raw(victim.as_raw()),
                         (
-                            crate::ThreadState::<()>::new(victim, &config, ())
+                            crate::ThreadState::<crate::SeededMode>::new(victim, &config, ())
                                 .thread_logical_time
                                 .clone(),
                             MmId::initial(victim),
@@ -21857,7 +22056,7 @@ mod tests {
                         .receive_rpc(
                             Tid::from_raw(victim.as_raw()),
                             (
-                                crate::ThreadState::<()>::new(victim, &config, ())
+                                crate::ThreadState::<crate::SeededMode>::new(victim, &config, ())
                                     .thread_logical_time
                                     .clone(),
                                 MmId::initial(victim),
@@ -22834,7 +23033,10 @@ mod tests {
         if child_first {
             assert_eq!(
                 startup.as_mut().await,
-                (None, granted(GlobalResponse::StartNewThread(None, None)))
+                (
+                    None,
+                    granted(GlobalResponse::StartNewThread(None, None, None))
+                )
             );
         } else {
             assert_eq!(
@@ -22888,7 +23090,10 @@ mod tests {
         } else {
             assert_eq!(
                 startup.await,
-                (None, granted(GlobalResponse::StartNewThread(None, None)))
+                (
+                    None,
+                    granted(GlobalResponse::StartNewThread(None, None, None))
+                )
             );
         }
         let mut scheduler = state.sched.lock().unwrap();
@@ -23065,7 +23270,11 @@ mod tests {
             startup.await,
             (
                 None,
-                granted(GlobalResponse::StartNewThread(None, Some(first_slice)))
+                granted(GlobalResponse::StartNewThread(
+                    None,
+                    Some(first_slice),
+                    None
+                ))
             )
         );
         assert!(!state.sched.lock().unwrap().timeslices.contains_key(&child));
@@ -23102,7 +23311,7 @@ mod tests {
         assert!(config.max_timeslice.is_some());
         let length = LogicalTime::from_rcbs(83);
         let start = |first_slice: Option<LogicalTime>, past_global_first_execve: bool| {
-            let mut thread = crate::ThreadState::new(tid, &config, ());
+            let mut thread = crate::ThreadState::<crate::SeededMode>::new(tid, &config, ());
             thread.detpid = Some(process);
             thread.past_global_first_execve = past_global_first_execve;
             thread.last_grant_deadline = Some(Duration::from_nanos(1));
@@ -23169,7 +23378,7 @@ mod tests {
         );
         let length = LogicalTime::from_nanos(1_000);
         for first_slice in [Some(length), None] {
-            let mut thread = crate::ThreadState::new(tid, &config, ());
+            let mut thread = crate::ThreadState::<crate::SeededMode>::new(tid, &config, ());
             thread.detpid = Some(process);
             thread.past_global_first_execve = true;
             thread.last_grant_deadline = Some(Duration::from_nanos(1));
@@ -23253,7 +23462,7 @@ mod tests {
         for (first_slice, past_global_first_execve) in
             [(Some(length), true), (None, true), (Some(length), false)]
         {
-            let mut thread = crate::ThreadState::new(tid, &config, ());
+            let mut thread = crate::ThreadState::<crate::SeededMode>::new(tid, &config, ());
             thread.detpid = Some(process);
             thread.past_global_first_execve = past_global_first_execve;
             thread.last_grant_deadline = Some(Duration::from_nanos(1));
@@ -23387,7 +23596,10 @@ mod tests {
         assert_eq!(first.tid, child);
         assert_eq!(
             startup.await,
-            (None, granted(GlobalResponse::StartNewThread(None, None)))
+            (
+                None,
+                granted(GlobalResponse::StartNewThread(None, None, None))
+            )
         );
         assert_eq!(state.global_time.lock().unwrap().as_nanos(), before_child);
     }
@@ -23501,7 +23713,10 @@ mod tests {
         assert_eq!(first.tid, child);
         assert_eq!(
             startup.await,
-            (None, granted(GlobalResponse::StartNewThread(None, None)))
+            (
+                None,
+                granted(GlobalResponse::StartNewThread(None, None, None))
+            )
         );
     }
 
@@ -23562,7 +23777,10 @@ mod tests {
         assert_eq!(first.tid, child);
         assert_eq!(
             startup.await,
-            (None, granted(GlobalResponse::StartNewThread(None, None)))
+            (
+                None,
+                granted(GlobalResponse::StartNewThread(None, None, None))
+            )
         );
     }
 
@@ -23613,7 +23831,10 @@ mod tests {
         assert_eq!(first.tid, child);
         assert_eq!(
             startup.await,
-            (None, granted(GlobalResponse::StartNewThread(None, None)))
+            (
+                None,
+                granted(GlobalResponse::StartNewThread(None, None, None))
+            )
         );
     }
 
@@ -23665,7 +23886,10 @@ mod tests {
         assert_eq!(first_turn.tid, child);
         assert_eq!(
             first_start.await,
-            (None, granted(GlobalResponse::StartNewThread(None, None)))
+            (
+                None,
+                granted(GlobalResponse::StartNewThread(None, None, None))
+            )
         );
         first_holder.advance_to(first_holder.as_nanos() + LogicalTime::from_nanos(500));
         let deregistered = state
@@ -23744,7 +23968,10 @@ mod tests {
         assert_eq!(second_turn.tid, child);
         assert_eq!(
             startup.await,
-            (None, granted(GlobalResponse::StartNewThread(None, None)))
+            (
+                None,
+                granted(GlobalResponse::StartNewThread(None, None, None))
+            )
         );
     }
 
@@ -23999,7 +24226,10 @@ mod tests {
         assert_eq!(first.tid, leader);
         assert_eq!(
             startup.await,
-            (None, granted(GlobalResponse::StartNewThread(None, None)))
+            (
+                None,
+                granted(GlobalResponse::StartNewThread(None, None, None))
+            )
         );
         assert_eq!(state.global_time.lock().unwrap().as_nanos(), total);
 
@@ -24170,7 +24400,7 @@ mod tests {
             start_response,
             (
                 Some(thread_before),
-                GlobalResponse::StartNewThread(None, None)
+                GlobalResponse::StartNewThread(None, None, None)
             )
         );
 
@@ -24646,7 +24876,7 @@ mod tests {
             start_response,
             (
                 Some(worker_clock.as_nanos()),
-                granted(GlobalResponse::StartNewThread(None, None))
+                granted(GlobalResponse::StartNewThread(None, None, None))
             )
         );
         {
@@ -24772,10 +25002,10 @@ mod tests {
         fn memory(&self) -> Self::Memory {
             self.inner.memory()
         }
-        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<()> {
+        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<crate::SeededMode> {
             &mut self.inner.thread
         }
-        fn thread_state(&self) -> &crate::ThreadState<()> {
+        fn thread_state(&self) -> &crate::ThreadState<crate::SeededMode> {
             &self.inner.thread
         }
         async fn regs(&mut self) -> libc::user_regs_struct {
@@ -25039,7 +25269,7 @@ mod tests {
         assert!(!super::registers_own_image(root, &vfork));
         assert!(super::registers_own_image(DetTid::from_raw(17), &vfork));
 
-        let mut thread = crate::ThreadState::new(root, &Config::default(), ());
+        let mut thread = crate::ThreadState::<crate::SeededMode>::new(root, &Config::default(), ());
         let owner = crate::slice_boundary::lifecycle::Registry::default()
             .fresh(root, thread.mm_id)
             .unwrap();
@@ -28788,7 +29018,7 @@ mod robust_exit_clock_tests {
             let reader = DetTid::from_raw(3);
             let sender = DetTid::from_raw(5);
             let tool: Detcore = Detcore::new(Tid::from_raw(sender.as_raw()), &config);
-            let mut thread = ThreadState::new(sender, &config, ());
+            let mut thread = ThreadState::<crate::SeededMode>::new(sender, &config, ());
             thread.detpid = Some(sender);
             thread.passed_descriptors_out_unreported = exported;
             {
@@ -28911,7 +29141,7 @@ mod robust_exit_clock_tests {
     struct Fixture {
         state: GlobalState,
         tool: Detcore,
-        owners: [ThreadState<()>; 2],
+        owners: [ThreadState<crate::SeededMode>; 2],
         initial_clocks: [DetTime; 2],
         waiters: [DetTid; 2],
         peer: DetTid,
@@ -28940,7 +29170,7 @@ mod robust_exit_clock_tests {
             let waiters = [DetTid::from_raw(21), DetTid::from_raw(23)];
             let peer = DetTid::from_raw(25);
             let mm = MmId::initial(leader);
-            let mut first = ThreadState::new(leader, &config, ());
+            let mut first = ThreadState::<crate::SeededMode>::new(leader, &config, ());
             first.detpid = Some(leader);
             let mut second = first.clone();
             second.dettid = worker;
@@ -29073,7 +29303,7 @@ mod robust_exit_clock_tests {
             self.exit_thread(self.owners[index].clone(), status).await;
         }
 
-        async fn exit_thread(&self, thread: ThreadState<()>, status: ExitStatus) {
+        async fn exit_thread(&self, thread: ThreadState<crate::SeededMode>, status: ExitStatus) {
             let rpc = ExitRpc {
                 state: &self.state,
                 sender: thread.dettid,

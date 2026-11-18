@@ -107,9 +107,9 @@ use tracing::warn;
 
 use crate::fd::FdType;
 use crate::procfs::ProcfsFile;
-use crate::record_or_replay::RecordOrReplay;
 use crate::resources::Device;
 use crate::resources::ResourceID;
+use crate::run_mode::RunMode;
 use crate::tool_local::Detcore;
 
 /// What Detcore knows of a descriptor, for [`descriptor_class`].
@@ -517,7 +517,7 @@ pub(crate) fn is_container_output(resource: &ResourceID) -> bool {
     )
 }
 
-impl<T: RecordOrReplay> Detcore<T> {
+impl<T: RunMode> Detcore<T> {
     /// Signal phase 1's gate for one syscall of a process that handles
     /// SIGALRM: `Some(EOPNOTSUPP)` when [`classify`] refuses it, `None` when it
     /// may run.

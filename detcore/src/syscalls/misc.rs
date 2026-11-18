@@ -33,7 +33,7 @@ use crate::random::splitmix64;
 #[cfg(test)]
 use crate::random::validate_getrandom_flags;
 use crate::random::write_random_chunk;
-use crate::record_or_replay::RecordOrReplay;
+use crate::run_mode::RunMode;
 use crate::scheduler::HostTimedSignalScope;
 use crate::tool_global::SigalrmControl;
 use crate::tool_global::child_subreaper;
@@ -459,7 +459,7 @@ fn fill_canonical_random_iovecs(
     Ok(written)
 }
 
-impl<T: RecordOrReplay> Detcore<T> {
+impl<T: RunMode> Detcore<T> {
     /// Validates seccomp capability probes without installing guest filters.
     // TODO-HUMAN-REVIEW(PR-874): Review deterministic seccomp probe validation.
     pub async fn handle_seccomp<G: Guest<Self>>(
@@ -1557,7 +1557,7 @@ mod tests {
         struct MirrorGuest<'a> {
             config: &'a Config,
             global: &'a GlobalState,
-            thread: crate::ThreadState<()>,
+            thread: crate::ThreadState<crate::SeededMode>,
             sender: Tid,
             answer: Result<i64, Errno>,
             refusal: Option<reverie::UnsupportedOperation>,
@@ -1621,10 +1621,10 @@ mod tests {
             fn memory(&self) -> Self::Memory {
                 reverie::syscalls::LocalMemory::new()
             }
-            fn thread_state(&self) -> &crate::ThreadState<()> {
+            fn thread_state(&self) -> &crate::ThreadState<crate::SeededMode> {
                 &self.thread
             }
-            fn thread_state_mut(&mut self) -> &mut crate::ThreadState<()> {
+            fn thread_state_mut(&mut self) -> &mut crate::ThreadState<crate::SeededMode> {
                 &mut self.thread
             }
             async fn regs(&mut self) -> libc::user_regs_struct {
@@ -1689,7 +1689,7 @@ mod tests {
                 };
                 let global = GlobalState::init_global_state(&config).await;
                 let tool = Detcore::new(Tid::from_raw(process.as_raw()), &config);
-                let mut thread = crate::ThreadState::new(process, &config, ());
+                let mut thread = crate::ThreadState::<crate::SeededMode>::new(process, &config, ());
                 thread.detpid = Some(process);
                 let mut guest = MirrorGuest {
                     config: &config,
@@ -1752,7 +1752,7 @@ mod tests {
             let config = Config::default();
             let global = GlobalState::init_global_state(&config).await;
             let tool = Detcore::new(Tid::from_raw(process.as_raw()), &config);
-            let mut thread = crate::ThreadState::new(process, &config, ());
+            let mut thread = crate::ThreadState::<crate::SeededMode>::new(process, &config, ());
             thread.detpid = Some(process);
             thread.nested_pid_namespace = true;
             let mut guest = MirrorGuest {
@@ -1772,10 +1772,9 @@ mod tests {
                 matches!(result, Err(Error::Errno(Errno::ENOSYS))),
                 "{result:?}"
             );
-            crate::syscalls::helpers::fail_on_tool_decided_injection::<
-                crate::record_or_replay::NoopTool,
-                _,
-            >(&mut guest, sysno);
+            crate::syscalls::helpers::fail_on_tool_decided_injection::<crate::SeededMode, _>(
+                &mut guest, sysno,
+            );
         }
     }
 
@@ -2190,18 +2189,15 @@ mod tests {
     #[test]
     fn process_madvise_is_rejected_deterministically() {
         assert!(matches!(
-            Detcore::<crate::record_or_replay::NoopTool>::handle_process_madvise(
-                (-10_000_i32) as usize,
-                0
-            ),
+            Detcore::<crate::SeededMode>::handle_process_madvise((-10_000_i32) as usize, 0),
             Err(Error::Errno(Errno::EBADF))
         ));
         assert!(matches!(
-            Detcore::<crate::record_or_replay::NoopTool>::handle_process_madvise(3, 1),
+            Detcore::<crate::SeededMode>::handle_process_madvise(3, 1),
             Err(Error::Errno(Errno::EINVAL))
         ));
         assert!(matches!(
-            Detcore::<crate::record_or_replay::NoopTool>::handle_process_madvise(3, 0),
+            Detcore::<crate::SeededMode>::handle_process_madvise(3, 0),
             Err(Error::Errno(Errno::EPERM))
         ));
     }

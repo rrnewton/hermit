@@ -403,7 +403,7 @@ async fn a_child_forked_after_a_parked_masked_call_starts_with_the_own_mask() {
 struct ForkingGuest<'a> {
     global: &'a GlobalState,
     config: &'a Config,
-    thread: crate::ThreadState<()>,
+    thread: crate::ThreadState<crate::SeededMode>,
     current: Option<u64>,
     requests: std::sync::Mutex<Vec<GlobalRequest>>,
 }
@@ -442,10 +442,10 @@ impl reverie::Guest<Detcore> for ForkingGuest<'_> {
     fn memory(&self) -> Self::Memory {
         panic!("a clone registration must not access guest memory")
     }
-    fn thread_state_mut(&mut self) -> &mut crate::ThreadState<()> {
+    fn thread_state_mut(&mut self) -> &mut crate::ThreadState<crate::SeededMode> {
         &mut self.thread
     }
-    fn thread_state(&self) -> &crate::ThreadState<()> {
+    fn thread_state(&self) -> &crate::ThreadState<crate::SeededMode> {
         &self.thread
     }
     fn resume_signal_mask(&self) -> Option<u64> {
@@ -551,7 +551,7 @@ async fn a_clone_publishes_the_creators_current_mask_before_its_child_is_seeded(
                         sched.record_request_guest_mask(parent, &park);
                     }
                 }
-                let mut thread = crate::ThreadState::new(parent, &config, ());
+                let mut thread = crate::ThreadState::<crate::SeededMode>::new(parent, &config, ());
                 thread.detpid = Some(parent);
                 let mut guest = ForkingGuest {
                     global: &state,

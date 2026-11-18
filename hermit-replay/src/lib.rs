@@ -9,7 +9,7 @@
 //! Hermit's ptrace replay tool, [`Replayer`], and the one place its Detcore
 //! instantiation is rooted.
 //!
-//! `detcore::Detcore<Replayer>` drives `reverie_ptrace`'s `TracedTask`, and
+//! `detcore::Detcore<detcore::SeededMode<Replayer>>` drives `reverie_ptrace`'s `TracedTask`, and
 //! that instantiation is large. In its own crate it builds in a separate
 //! rustc process, beside the other backends' instantiations. The entry point,
 //! [`spawn_tracer`], is not generic and returns a boxed future, so `hermit`
@@ -35,7 +35,7 @@ pub use replayer::remember_materialized_object;
 use reverie::process::Command;
 use reverie_ptrace::GdbConnection;
 
-/// The replay tracer: `detcore::Detcore<Replayer>` under `reverie_ptrace`.
+/// The replay tracer: `detcore::Detcore<detcore::SeededMode<Replayer>>` under `reverie_ptrace`.
 pub type Tracer = reverie_ptrace::Tracer<detcore::GlobalState>;
 
 /// The future [`spawn_tracer`] returns.
@@ -55,8 +55,10 @@ pub fn spawn_tracer(
 ) -> SpawnTracer {
     Box::pin(async move {
         detcore::admit_chosen_input_stream(&config, reverie::ToolStreamRole::BinaryReplay);
-        let mut builder = reverie_ptrace::TracerBuilder::<detcore::Detcore<Replayer>>::new(command)
-            .config(config);
+        let mut builder = reverie_ptrace::TracerBuilder::<
+            detcore::Detcore<detcore::SeededMode<Replayer>>,
+        >::new(command)
+        .config(config);
         if let Some(connection) = gdbserver {
             builder = builder.gdbserver(connection);
         }

@@ -17,7 +17,7 @@ use reverie::syscalls::MemoryAccess;
 use tracing::warn;
 
 use crate::Detcore;
-use crate::RecordOrReplay;
+use crate::run_mode::RunMode;
 
 // Added in Linux 6.13 and not yet exposed by the pinned libc crate.
 const MADV_GUARD_INSTALL: i32 = 102;
@@ -150,7 +150,7 @@ fn validate_common_args(call: syscalls::Madvise) -> Result<(), Error> {
     Ok(())
 }
 
-impl<T: RecordOrReplay> Detcore<T> {
+impl<T: RunMode> Detcore<T> {
     /// Apply a deterministic policy to madvise(2).
     ///
     /// Hints and advice with guest-visible semantics are forwarded to the
@@ -545,7 +545,7 @@ impl BrkMappingCheck {
     }
 }
 
-impl<T: RecordOrReplay> Detcore<T> {
+impl<T: RunMode> Detcore<T> {
     /// `brk(addr)` in a run that declares a launcher
     /// (`Detcore::declares_launcher`), where the kernel's program break is the
     /// launcher's: answered from Detcore's model of the guest's break
@@ -1098,10 +1098,11 @@ VmFlags: rd wr mr mw me gd ac
                         false,
                     ),
                 ] {
-                    let mut tool = crate::syscall_hot_path_tests::detcore::<NoopTool>();
+                    let mut tool =
+                        crate::syscall_hot_path_tests::detcore::<crate::SeededMode<NoopTool>>();
                     tool.cfg.recordreplay_modes = false;
                     tool.cfg.backend = backend;
-                    let mut guest = InjectGuest::<NoopTool>::new(reply);
+                    let mut guest = InjectGuest::<crate::SeededMode>::new(reply);
                     if map {
                         guest = guest.with_memory_map(stack_window());
                     }
@@ -1194,9 +1195,11 @@ VmFlags: rd wr mr mw me gd ac
                     false,
                 ),
             ] {
-                let mut tool = crate::syscall_hot_path_tests::detcore::<NoopTool>();
+                let mut tool =
+                    crate::syscall_hot_path_tests::detcore::<crate::SeededMode<NoopTool>>();
                 tool.cfg.backend = backend;
-                let mut guest = InjectGuest::<NoopTool>::new(reply).with_memory_map(stack_window());
+                let mut guest =
+                    InjectGuest::<crate::SeededMode>::new(reply).with_memory_map(stack_window());
                 let call = Syscall::from_raw(sysno, SyscallArgs::new(at, 4096, 0, 0, 0, 0));
                 let _ = tool.handle_memory_lock_call(&mut guest, call).await;
                 assert_eq!(

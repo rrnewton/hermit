@@ -88,7 +88,7 @@ use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::PathPtr;
 use reverie::syscalls::Sysno;
 
-use crate::record_or_replay::RecordOrReplay;
+use crate::run_mode::RunMode;
 use crate::tool_local::Detcore;
 
 /// The longest path `d_path` renders into `do_proc_readlink`'s buffer, and
@@ -293,7 +293,7 @@ pub(crate) fn fits_d_path(target: &[u8]) -> Result<&[u8], Errno> {
     }
 }
 
-impl<T: RecordOrReplay> Detcore<T> {
+impl<T: RunMode> Detcore<T> {
     /// Answer `readlink` of one of the caller's own `exe`, `cwd` and `root`
     /// links at the guest's absolute spelling `path` ([`own_task_link`]) from
     /// Detcore's own knowledge, into the guest's `buffer` of `buffer_len`
@@ -958,7 +958,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 /// `EFAULT`; otherwise the number of bytes copied. `Ok(None)` where the
 /// backend cannot write with the guest's permissions (`ENOSYS`, before
 /// anything is copied): the call then takes its previous path.
-fn copy_link_out<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+fn copy_link_out<T: RunMode, G: Guest<Detcore<T>>>(
     guest: &mut G,
     address: AddrMut<'_, u8>,
     target: &[u8],
@@ -1053,7 +1053,7 @@ pub(crate) fn procfs_file_link_name(observed: &Path, own: Option<(i32, i32)>) ->
 
 /// Whether Detcore's process table lists the live task `thread` as a thread
 /// of process `pid`.
-async fn thread_in_process<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+async fn thread_in_process<T: RunMode, G: Guest<Detcore<T>>>(
     guest: &mut G,
     pid: i32,
     thread: i32,
@@ -1071,7 +1071,7 @@ async fn thread_in_process<T: RecordOrReplay, G: Guest<Detcore<T>>>(
 
 /// Inject `getcwd(address, size)` and read back the path it wrote, without
 /// its NUL.
-async fn getcwd_at<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+async fn getcwd_at<T: RunMode, G: Guest<Detcore<T>>>(
     guest: &mut G,
     address: AddrMut<'_, u8>,
     size: usize,

@@ -39,7 +39,7 @@ pub(crate) enum Publication {
 
 /// Deserialize the real public associated type; do not mirror the private
 /// GlobalRequest enum or construct coordinator findings/errors in the fixture.
-fn request(thread: &ThreadState<()>, leaf: Value) -> Request {
+fn request(thread: &ThreadState<detcore::SeededMode>, leaf: Value) -> Request {
     serde_json::from_value(json!([thread.thread_logical_time, thread.mm_id, leaf,])).unwrap()
 }
 
@@ -47,7 +47,10 @@ fn request(thread: &ThreadState<()>, leaf: Value) -> Request {
 /// This configuration has no deadline or boundary budget. Only the documented
 /// optional lone-owner wrapper around Granted is accepted. Diagnostic replies
 /// deliberately do not use this unwrapping helper.
-fn granted_lifecycle_reply(thread: &mut ThreadState<()>, response: Response) -> Value {
+fn granted_lifecycle_reply(
+    thread: &mut ThreadState<detcore::SeededMode>,
+    response: Response,
+) -> Value {
     let (time, reply) = response;
     if let Some(time) = time {
         thread.thread_logical_time.advance_to(time);
@@ -92,7 +95,7 @@ pub(crate) async fn receiver_cleanup(
     config.rcb_clock_claim = prepared.rcb_clock_claim;
     let tid = DetTid::from_raw(3);
     let from = Tid::from_raw(tid.as_raw());
-    let mut thread = ThreadState::new(tid, &config, ());
+    let mut thread = ThreadState::<detcore::SeededMode>::new(tid, &config, ());
     let epoch = thread.thread_logical_time.as_nanos();
     let priority = ThreadHistory::new().final_prio;
     let history: ThreadHistory = serde_json::from_value(json!({

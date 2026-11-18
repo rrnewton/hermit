@@ -34,7 +34,7 @@ use reverie::syscalls::Syscall;
 
 use super::deterministic_stdio_inode;
 use super::deterministic_stdio_inode_for_resource;
-use crate::record_or_replay::RecordOrReplay;
+use crate::run_mode::RunMode;
 use crate::tool_global::determinize_inode;
 use crate::tool_local::Detcore;
 use crate::types::DetInode;
@@ -138,7 +138,7 @@ pub(crate) fn decimal_fd(component: &OsStr) -> Option<i32> {
 
 /// The bytes of a readlink buffer that a placeholder's link may cover, read
 /// before the kernel writes the link (`restore_link_tail`).
-pub(crate) fn saved_link_bytes<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+pub(crate) fn saved_link_bytes<G: Guest<Detcore<T>>, T: RunMode>(
     guest: &G,
     buffer: Option<AddrMut<'_, libc::c_char>>,
     buffer_len: usize,
@@ -156,7 +156,7 @@ pub(crate) fn saved_link_bytes<G: Guest<Detcore<T>>, T: RecordOrReplay>(
 /// may cover, read before the kernel writes it: as many as a path Linux
 /// renders can have, so that every byte past a shorter substituted target
 /// is restored (`Detcore::substitute_exe_link`).
-fn saved_exe_link_bytes<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+fn saved_exe_link_bytes<G: Guest<Detcore<T>>, T: RunMode>(
     guest: &G,
     buffer: Option<AddrMut<'_, libc::c_char>>,
     buffer_len: usize,
@@ -165,7 +165,7 @@ fn saved_exe_link_bytes<G: Guest<Detcore<T>>, T: RecordOrReplay>(
 }
 
 /// The first `len` bytes of a readlink buffer, or its readable prefix.
-fn saved_link_prefix<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+fn saved_link_prefix<G: Guest<Detcore<T>>, T: RunMode>(
     guest: &G,
     buffer: Option<AddrMut<'_, libc::c_char>>,
     len: usize,
@@ -204,7 +204,7 @@ fn saved_link_prefix<G: Guest<Detcore<T>>, T: RecordOrReplay>(
 
 /// Put back the caller's bytes after a rewritten link of `written` bytes,
 /// where the kernel had written `kernel_len`: Linux writes only the link.
-pub(crate) fn restore_link_tail<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+pub(crate) fn restore_link_tail<G: Guest<Detcore<T>>, T: RunMode>(
     guest: &mut G,
     buffer: AddrMut<'_, libc::c_char>,
     written: usize,
@@ -582,7 +582,7 @@ pub(crate) fn exe_link_candidate(path: &Path) -> bool {
 
 /// Put back the first `written` bytes of a readlink buffer from `saved`,
 /// read before the kernel wrote it, as far as `saved` reaches.
-fn restore_saved_link_bytes<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+fn restore_saved_link_bytes<G: Guest<Detcore<T>>, T: RunMode>(
     guest: &mut G,
     buffer: AddrMut<'_, libc::c_char>,
     written: usize,
@@ -836,7 +836,7 @@ fn canonical_anonymous_proc_fd_target(
     target
 }
 
-impl<T: RecordOrReplay> Detcore<T> {
+impl<T: RunMode> Detcore<T> {
     async fn canonicalize_other_proc_fd_target<G>(
         &self,
         guest: &mut G,

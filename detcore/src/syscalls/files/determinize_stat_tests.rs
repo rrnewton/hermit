@@ -44,7 +44,7 @@ use crate::types::DetPid;
 struct StatGuest<'a> {
     config: &'a Config,
     global: &'a GlobalState,
-    thread: crate::ThreadState<()>,
+    thread: crate::ThreadState<crate::SeededMode>,
     sender: Tid,
 }
 
@@ -102,10 +102,10 @@ impl Guest<Detcore> for StatGuest<'_> {
     fn memory(&self) -> Self::Memory {
         LocalMemory::new()
     }
-    fn thread_state(&self) -> &crate::ThreadState<()> {
+    fn thread_state(&self) -> &crate::ThreadState<crate::SeededMode> {
         &self.thread
     }
-    fn thread_state_mut(&mut self) -> &mut crate::ThreadState<()> {
+    fn thread_state_mut(&mut self) -> &mut crate::ThreadState<crate::SeededMode> {
         &mut self.thread
     }
     async fn regs(&mut self) -> libc::user_regs_struct {
@@ -210,7 +210,7 @@ async fn determinize_stat_reads_the_mode_and_epoch_it_is_configured_with() {
             let process = DetPid::from_raw(7);
             let global = GlobalState::init_global_state(&config).await;
             let tool = Detcore::new(Tid::from_raw(process.as_raw()), &config);
-            let mut thread = crate::ThreadState::new(process, &config, ());
+            let mut thread = crate::ThreadState::<crate::SeededMode>::new(process, &config, ());
             thread.detpid = Some(process);
             let mut guest = StatGuest {
                 config: &config,
@@ -292,7 +292,7 @@ async fn determinize_stat_answers_a_placeholder_only_outside_record_and_replay()
         let process = DetPid::from_raw(7);
         let global = GlobalState::init_global_state(&config).await;
         let tool = Detcore::new(Tid::from_raw(process.as_raw()), &config);
-        let mut thread = crate::ThreadState::new(process, &config, ());
+        let mut thread = crate::ThreadState::<crate::SeededMode>::new(process, &config, ());
         thread.detpid = Some(process);
         let mut guest = StatGuest {
             config: &config,
@@ -344,7 +344,7 @@ async fn determinize_stat_reports_one_link_for_directories_only() {
     let process = DetPid::from_raw(7);
     let global = GlobalState::init_global_state(&config).await;
     let tool = Detcore::new(Tid::from_raw(process.as_raw()), &config);
-    let mut thread = crate::ThreadState::new(process, &config, ());
+    let mut thread = crate::ThreadState::<crate::SeededMode>::new(process, &config, ());
     thread.detpid = Some(process);
     let mut guest = StatGuest {
         config: &config,
@@ -400,7 +400,7 @@ async fn determinized(
     let process = DetPid::from_raw(7);
     let global = GlobalState::init_global_state(config).await;
     let tool = Detcore::new(Tid::from_raw(process.as_raw()), config);
-    let mut thread = crate::ThreadState::new(process, config, ());
+    let mut thread = crate::ThreadState::<crate::SeededMode>::new(process, config, ());
     thread.detpid = Some(process);
     thread.physical_tid = physical_tid;
     let mut guest = StatGuest {

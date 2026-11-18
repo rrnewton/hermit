@@ -33,6 +33,7 @@ use rand_pcg::Pcg64Mcg;
 use reverie::Errno;
 use reverie::Error;
 use reverie::Guest;
+use reverie::Tool as _;
 use reverie::syscalls::CloneFlags;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::Sysno;
@@ -43,13 +44,12 @@ use sha2::Sha256;
 use tracing::debug;
 use tracing::info;
 
+use crate::choice::SchedulingChoices as _;
 use crate::config::Config;
 use crate::detlog;
 use crate::fd::*;
 use crate::memory::MemoryMetadata;
 use crate::preemptions::ThreadHistoryIterator;
-use crate::record_or_replay::NoopTool;
-use crate::record_or_replay::RecordOrReplay;
 use crate::resources::ChaosEpochTransition;
 use crate::resources::Device;
 use crate::resources::ExternalOpId;
@@ -58,13 +58,22 @@ use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::ResourceMap;
 use crate::resources::Resources;
+use crate::run_mode::RecordReplayState;
+use crate::run_mode::RunMode;
+use crate::run_mode::SeededMode;
 use crate::scheduler::Priority;
 use crate::stat::*;
 use crate::types::*;
 
-/// The detcore tool and its per-process state.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Detcore<T = NoopTool> {
+/// The detcore tool and its per-process state, in run mode `T`
+/// ([`crate::RunMode`]: the record-or-replay sub-tool and the scheduling
+/// choice policy, both chosen by type when the run is built).
+#[derive(Serialize, Deserialize)]
+#[serde(bound(
+    serialize = "T::RecordReplay: Serialize",
+    deserialize = "T::RecordReplay: Deserialize<'de>"
+))]
+pub struct Detcore<T: RunMode = SeededMode> {
     //
     // TODO:
     //  - Add Pid cache here.
@@ -78,7 +87,20 @@ pub struct Detcore<T = NoopTool> {
     /// The record or replay sub-tool. Any events that cannot be made
     /// deterministic are forwarded to this tool. Thus, Detcore acts as a
     /// filter-map for syscalls.
-    pub(crate) record_or_replay: T,
+    pub(crate) record_or_replay: T::RecordReplay,
+}
+
+impl<T: RunMode> std::fmt::Debug for Detcore<T>
+where
+    T::RecordReplay: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Detcore")
+            .field("detpid", &self.detpid)
+            .field("cfg", &self.cfg)
+            .field("record_or_replay", &self.record_or_replay)
+            .finish()
+    }
 }
 
 /// The metadata associated with the file system view of a particular *process*.
@@ -842,7 +864,7 @@ fn remaining_ns(deadline: Option<LogicalTime>, interval_ns: u64, now: LogicalTim
     }
 }
 
-impl<T> Default for Detcore<T> {
+impl<T: RunMode> Default for Detcore<T> {
     fn default() -> Self {
         // TODO(T77816673): eventually we want to remove this requirement.
         // In the meantime... just don't call this.
@@ -851,19 +873,19 @@ impl<T> Default for Detcore<T> {
     }
 }
 
-impl<T: RecordOrReplay> AsRef<T> for Detcore<T> {
-    fn as_ref(&self) -> &T {
+impl<T: RunMode> AsRef<T::RecordReplay> for Detcore<T> {
+    fn as_ref(&self) -> &T::RecordReplay {
         &self.record_or_replay
     }
 }
 
-impl<T: RecordOrReplay> AsMut<T> for Detcore<T> {
-    fn as_mut(&mut self) -> &mut T {
+impl<T: RunMode> AsMut<T::RecordReplay> for Detcore<T> {
+    fn as_mut(&mut self) -> &mut T::RecordReplay {
         &mut self.record_or_replay
     }
 }
 
-impl<T: RecordOrReplay> Detcore<T> {
+impl<T: RunMode> Detcore<T> {
     /// Delegate to the record/replay tool without collapsing a tool failure
     /// into a guest-visible errno. Syscall errors remain [`Error::Errno`], while
     /// failures of the record/replay machinery retain their non-errno variant.
@@ -914,7 +936,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // call's future.
         let result = if let Some(respelling) = guest.thread_state().pidfd_respelling {
             Box::pin(self.respelled_record_or_replay(guest, respelling, call)).await
-        } else if crate::record_or_replay::injects_only::<T>() {
+        } else if crate::record_or_replay::injects_only::<T::RecordReplay>() {
             // What the tool's handler would have done (`NoopTool`), here:
             // the same single injection of the same call, awaited at the
             // same point, with its errno converted the same way.
@@ -939,7 +961,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: Syscall,
     ) -> Result<i64, Error> {
         let mut physical = crate::pidfd_self::PhysicalSpelling::new(guest, respelling);
-        if crate::record_or_replay::injects_only::<T>() {
+        if crate::record_or_replay::injects_only::<T::RecordReplay>() {
             physical.inject(call).await.map_err(Error::from)
         } else {
             self.record_or_replay
@@ -2731,7 +2753,7 @@ mod file_metadata_tests {
 
         let owner = DetTid::from_raw(9021);
         let config = Config::default();
-        let mut parent = ThreadState::new(owner, &config, ());
+        let mut parent = ThreadState::<crate::SeededMode>::new(owner, &config, ());
         let maps = std::fs::File::open("/proc/self/maps").unwrap();
         let alias = maps.try_clone().unwrap();
         let closed = maps.try_clone().unwrap();
@@ -2837,7 +2859,8 @@ mod file_metadata_tests {
             7
         );
         let receiving_tid = DetTid::from_raw(9022);
-        let mut successor_thread = ThreadState::new(receiving_tid, &config, ());
+        let mut successor_thread =
+            ThreadState::<crate::SeededMode>::new(receiving_tid, &config, ());
         // The same creator choice used by the real exec-completion handler.
         assert_eq!(state.open_file_creator(), Some(owner));
         successor_thread.set_open_file_creator(state.open_file_creator().unwrap());
@@ -2906,7 +2929,7 @@ mod file_metadata_tests {
         let creator = DetTid::from_raw(9011);
         let leader = DetTid::from_raw(9012);
         let config = Config::default();
-        let mut parent = ThreadState::new(creator, &config, ());
+        let mut parent = ThreadState::<crate::SeededMode>::new(creator, &config, ());
         parent.set_open_file_creator(creator);
         parent.metadata().file_handles.clear();
         let file = std::fs::File::open("/dev/urandom").unwrap();
@@ -2993,7 +3016,7 @@ mod file_metadata_tests {
         );
         assert_eq!(unsafe { libc::dup2(fd, alias_fd) }, alias_fd);
 
-        let mut successor = ThreadState::new(leader, &config, ());
+        let mut successor = ThreadState::<crate::SeededMode>::new(leader, &config, ());
         // Preserve the new image's existing nonrandom association. The handover
         // must not restore the old socket ID used by ReleasePort bookkeeping.
         successor
@@ -3104,7 +3127,7 @@ mod file_metadata_tests {
         let empty = successor.shared_open_files_for_exec().unwrap().unwrap();
         assert!(empty.handles.is_empty());
         let next_sequence = empty.next_sequence;
-        let mut after_close = ThreadState::new(leader, &config, ());
+        let mut after_close = ThreadState::<crate::SeededMode>::new(leader, &config, ());
         after_close.set_open_file_creator(empty.creator);
         after_close
             .metadata()
@@ -3130,7 +3153,8 @@ mod file_metadata_tests {
 
     #[test]
     fn shared_random_promotion_leaves_nonrandom_tables_local() {
-        let state = ThreadState::new(DetTid::from_raw(9013), &Config::default(), ());
+        let state =
+            ThreadState::<crate::SeededMode>::new(DetTid::from_raw(9013), &Config::default(), ());
         let regular = tempfile::tempfile().unwrap();
         let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
         state
@@ -3160,7 +3184,7 @@ mod file_metadata_tests {
         crate::fd::install_test_shared_open_file_channel();
         let owner = DetTid::from_raw(9014);
         let config = Config::default();
-        let parent = ThreadState::new(owner, &config, ());
+        let parent = ThreadState::<crate::SeededMode>::new(owner, &config, ());
         let random = std::fs::File::open("/dev/random").unwrap();
         let fd = random.as_raw_fd();
         assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) }, 0);
@@ -3173,7 +3197,7 @@ mod file_metadata_tests {
         let old_next = transfer.next_sequence;
         let (pipe, _writer) = nix::unistd::pipe2(OFlag::O_NONBLOCK).unwrap();
         let pipe_fd = pipe.as_raw_fd();
-        let successor = ThreadState::new(owner, &config, ());
+        let successor = ThreadState::<crate::SeededMode>::new(owner, &config, ());
         successor
             .metadata()
             .apply_exec_fd_state(
@@ -3208,7 +3232,7 @@ mod file_metadata_tests {
     /// The channel end of a pipe made through `ThreadState::add_fd`, as
     /// `handle_pipe2` stores it on the read end under `--pipe-wake-latency`.
     fn pipe_with_channel(
-        state: &ThreadState<()>,
+        state: &ThreadState<crate::SeededMode>,
     ) -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd, ChannelEnd) {
         let (reader, writer) = nix::unistd::pipe2(OFlag::empty()).unwrap();
         state
@@ -3498,7 +3522,7 @@ mod file_metadata_tests {
             let mut new = replaced.lock().unwrap().for_exec(process);
             new.hold_alone(process);
             new.keep_replaced_table(Arc::clone(&replaced), process);
-            let state = ThreadState::new(process, &Config::default(), ());
+            let state = ThreadState::<crate::SeededMode>::new(process, &Config::default(), ());
             *state.file_metadata.lock().unwrap() = new;
             let released = state.release_exec_dropped_descriptors();
             (replaced, released)
@@ -3589,7 +3613,7 @@ mod file_metadata_tests {
             "the receiver was close-on-exec"
         );
         new.keep_replaced_table(Arc::clone(&replaced), child_id);
-        let state = ThreadState::new(child_id, &Config::default(), ());
+        let state = ThreadState::<crate::SeededMode>::new(child_id, &Config::default(), ());
         *state.file_metadata.lock().unwrap() = new;
 
         assert!(state.release_exec_dropped_descriptors());
@@ -3868,7 +3892,7 @@ mod file_metadata_tests {
     fn a_rediscovering_exec_keeps_pipe_channels_apart() {
         let leader = DetTid::from_raw(9015);
         let config = Config::default();
-        let before = ThreadState::new(leader, &config, ());
+        let before = ThreadState::<crate::SeededMode>::new(leader, &config, ());
         let (a_reader, _a_writer, a_end) = pipe_with_channel(&before);
         assert_eq!(
             unsafe { libc::fcntl(a_reader.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },
@@ -3882,7 +3906,7 @@ mod file_metadata_tests {
             (leader, before.metadata().next_open_file_sequence)
         );
 
-        let after = ThreadState::new(leader, &config, ());
+        let after = ThreadState::<crate::SeededMode>::new(leader, &config, ());
         after
             .metadata()
             .apply_exec_fd_state(
@@ -3919,12 +3943,12 @@ mod file_metadata_tests {
     fn an_exec_carrying_no_channel_still_reserves_the_old_numbering() {
         let leader = DetTid::from_raw(9016);
         let config = Config::default();
-        let before = ThreadState::new(leader, &config, ());
+        let before = ThreadState::<crate::SeededMode>::new(leader, &config, ());
         let (a_reader, _a_writer, a_end) = pipe_with_channel(&before);
         let namespace = before.open_file_namespace_for_exec();
         drop(a_reader);
 
-        let after = ThreadState::new(leader, &config, ());
+        let after = ThreadState::<crate::SeededMode>::new(leader, &config, ());
         let state = ExecFdState {
             open_file_namespace: Some(namespace),
             ..ExecFdState::default()
@@ -3949,7 +3973,7 @@ mod file_metadata_tests {
     fn an_exec_without_the_pipe_wake_latency_is_unchanged() {
         let leader = DetTid::from_raw(9017);
         let config = Config::default();
-        let after = ThreadState::new(leader, &config, ());
+        let after = ThreadState::<crate::SeededMode>::new(leader, &config, ());
         let state = ExecFdState::default();
         assert!(state.is_empty());
         assert_eq!(
@@ -3963,7 +3987,7 @@ mod file_metadata_tests {
             .apply_exec_fd_state(leader, state, true)
             .unwrap();
         let (reader, _writer, _) = pipe_with_channel(&after);
-        let fresh = ThreadState::new(leader, &config, ());
+        let fresh = ThreadState::<crate::SeededMode>::new(leader, &config, ());
         let (fresh_reader, _fresh_writer, _) = pipe_with_channel(&fresh);
         assert_eq!(
             after.metadata().file_handles[&reader.as_raw_fd()].open_file_id(),
@@ -5190,7 +5214,7 @@ mod file_metadata_tests {
 
         let owner = DetTid::from_raw(9031);
         let config = Config::default();
-        let mut parent = ThreadState::new(owner, &config, ());
+        let mut parent = ThreadState::<crate::SeededMode>::new(owner, &config, ());
         let statm = std::fs::File::open("/proc/self/statm").unwrap();
         let alias = statm.try_clone().unwrap();
         let closed = statm.try_clone().unwrap();
@@ -5251,7 +5275,7 @@ mod file_metadata_tests {
         let state: ExecFdState =
             serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
         let receiving = DetTid::from_raw(9032);
-        let mut successor_thread = ThreadState::new(receiving, &config, ());
+        let mut successor_thread = ThreadState::<crate::SeededMode>::new(receiving, &config, ());
         // The creator choice the exec-completion handler makes.
         successor_thread.set_open_file_creator(state.open_file_creator().unwrap());
         let mut successor = successor_thread.metadata();
@@ -5285,7 +5309,7 @@ mod file_metadata_tests {
         );
         // A table whose shared description closed at the exec still carries
         // its numbering.
-        let lone = ThreadState::new(owner, &config, ());
+        let lone = ThreadState::<crate::SeededMode>::new(owner, &config, ());
         let cloexec = std::fs::File::open("/proc/self/statm").unwrap();
         lone.add_fd(cloexec.as_raw_fd(), OFlag::O_CLOEXEC, FdType::Regular, None)
             .unwrap();
@@ -5374,7 +5398,7 @@ mod file_metadata_tests {
     fn a_sent_rendered_record_file_shares_its_sequence() {
         let owner = DetTid::from_raw(9033);
         let config = Config::default();
-        let state = ThreadState::new(owner, &config, ());
+        let state = ThreadState::<crate::SeededMode>::new(owner, &config, ());
         state.metadata().file_handles.clear();
         for (fd, spelling, rendered) in [
             (40, "/proc/7/statm", true),
@@ -5568,7 +5592,10 @@ pub struct PendingVfork {
     pub child_tid_addr: usize,
     pub flags: CloneFlags,
     pub exit_signal: libc::c_int,
-    pub child_priority_entropy: Option<u64>,
+    /// The child's starting priority in chaos mode, prepared by the parent
+    /// ([`ThreadState::prepare_vfork_child_priority`]) and consumed when the
+    /// child is registered.
+    pub child_priority: Option<crate::choice::PreparedChildPriority>,
     /// With `CLONE_NEWUSER`: the creator's effective user ID may not have
     /// been its real one, read before the clone
     /// (`Detcore::user_namespace_owner_may_differ`). The child notes it for
@@ -6289,9 +6316,13 @@ mod live_tasks_tests {
     }
 }
 
-/// The Detcore per-thread state.
-#[derive(Serialize, Deserialize, Clone)]
-pub struct ThreadState<T> {
+/// The Detcore per-thread state, in run mode `T` ([`crate::RunMode`]).
+///
+/// `Clone` is implemented below, by hand, only because a derive cannot state
+/// its one real bound (the sub-tool's thread state is `Clone`).
+#[derive(Serialize, Deserialize)]
+#[serde(bound = "")]
+pub struct ThreadState<T: RunMode = SeededMode> {
     /// The deterministic thread ID of the this thread.
     pub dettid: DetTid,
     /// The deterministic process ID of the this thread.
@@ -6994,7 +7025,14 @@ pub struct ThreadState<T> {
     pub(crate) unrecorded_binder_loss_recorded: bool,
 
     /// Thread state associated with record/replay.
-    pub record_or_replay: T,
+    pub record_or_replay: RecordReplayState<T>,
+
+    /// How this thread's scheduling draws are decided: the run mode's policy
+    /// ([`crate::choice::SchedulingChoices`]), attached to the run's choice
+    /// session, if it has one, when the thread starts. Never serialized: a
+    /// controlled policy's handle is an in-process capability.
+    #[serde(skip)]
+    pub(crate) choices: T::Choices,
 
     /// How much longer does this thread get to run before it must check-in with the
     /// scheduler?  Note that this notion of time slice can extend across a region of time
@@ -7226,7 +7264,7 @@ pub struct ThreadState<T> {
 
 /// We cannot assume that the record_or_replay "subtool" is Debug, so it is handy to be able to
 /// print the Detcore threadstate alone.
-impl<T> std::fmt::Debug for ThreadState<T> {
+impl<T: RunMode> std::fmt::Debug for ThreadState<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ThreadState")
             .field("dettid", &self.dettid)
@@ -7261,7 +7299,155 @@ impl<T> std::fmt::Debug for ThreadState<T> {
     }
 }
 
-impl<T> Default for ThreadState<T> {
+/// `#[derive(Clone)]` would require `T: Clone` but could not require what the
+/// clone actually needs, the record-or-replay sub-tool's thread state being
+/// `Clone`; this is that derive with that bound. A field added to the struct
+/// must be added here too (the struct literal does not compile otherwise).
+impl<T: RunMode> Clone for ThreadState<T>
+where
+    RecordReplayState<T>: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            dettid: self.dettid,
+            detpid: self.detpid,
+            thread_start_entered: self.thread_start_entered,
+            vfork_origin: self.vfork_origin,
+            physical_tid: self.physical_tid,
+            signal_task_identity: self.signal_task_identity,
+            open_file_creator: self.open_file_creator,
+            receive_geometry: Clone::clone(&self.receive_geometry),
+            flock_waiting_description: Clone::clone(&self.flock_waiting_description),
+            entry_import: Clone::clone(&self.entry_import),
+            send_inspection: Clone::clone(&self.send_inspection),
+            inotify_queue: self.inotify_queue,
+            call_parts: Clone::clone(&self.call_parts),
+            traced_call: Clone::clone(&self.traced_call),
+            watch: Clone::clone(&self.watch),
+            mm_id: self.mm_id,
+            published_runtime_private_memory: Clone::clone(&self.published_runtime_private_memory),
+            published_cpu: Clone::clone(&self.published_cpu),
+            external_parent_checked: self.external_parent_checked,
+            memory_metadata: Clone::clone(&self.memory_metadata),
+            pedigree: Clone::clone(&self.pedigree),
+            stats: Clone::clone(&self.stats),
+            preemption_points: Clone::clone(&self.preemption_points),
+            interrupt_at: Clone::clone(&self.interrupt_at),
+            clone_flags: self.clone_flags,
+            pending_vfork: Clone::clone(&self.pending_vfork),
+            restarted_clone_id: Clone::clone(&self.restarted_clone_id),
+            procfs_sequence_taken: self.procfs_sequence_taken,
+            file_metadata: Clone::clone(&self.file_metadata),
+            tool_shares_guest_descriptor_table: self.tool_shares_guest_descriptor_table,
+            timer_slack_ns: self.timer_slack_ns,
+            default_timer_slack_ns: self.default_timer_slack_ns,
+            nested_pid_namespace: self.nested_pid_namespace,
+            changed_root: Clone::clone(&self.changed_root),
+            fs_apart_from_leader: self.fs_apart_from_leader,
+            exe: Clone::clone(&self.exe),
+            exec_effective_ids: self.exec_effective_ids,
+            exec_permitted_before: self.exec_permitted_before,
+            holds_parent_death_signal: self.holds_parent_death_signal,
+            process_files: self.process_files,
+            posix_timers: Clone::clone(&self.posix_timers),
+            resource_limits: Clone::clone(&self.resource_limits),
+            process_cpu_time: Clone::clone(&self.process_cpu_time),
+            guest_clock: Clone::clone(&self.guest_clock),
+            unix_connections: Clone::clone(&self.unix_connections),
+            live_tasks: Clone::clone(&self.live_tasks),
+            parent_process_cpu_time: Clone::clone(&self.parent_process_cpu_time),
+            child_cpu_owners: Clone::clone(&self.child_cpu_owners),
+            parent_cpu_publication: Clone::clone(&self.parent_cpu_publication),
+            restart_block: self.restart_block,
+            woken_wait: self.woken_wait,
+            syscall_cwd: Clone::clone(&self.syscall_cwd),
+            sigalrm_handled: self.sigalrm_handled,
+            signal_shadow: Clone::clone(&self.signal_shadow),
+            signal_shadow_lost: self.signal_shadow_lost,
+            delivery_interruption: self.delivery_interruption,
+            wait_signal_end: self.wait_signal_end,
+            pidfd_respelling: self.pidfd_respelling,
+            delivery_frame_handler: self.delivery_frame_handler,
+            delivery_frame_signal: self.delivery_frame_signal,
+            delivery_frame_orig_ax: self.delivery_frame_orig_ax,
+            delivery_counters: Clone::clone(&self.delivery_counters),
+            published_dispositions: Clone::clone(&self.published_dispositions),
+            published_mask: self.published_mask,
+            sigalrm_blocked_published: self.sigalrm_blocked_published,
+            sigalrm_restarts: self.sigalrm_restarts,
+            sigalrm_interrupts_completion: self.sigalrm_interrupts_completion,
+            sigalrm_admitted_pipe_read: self.sigalrm_admitted_pipe_read,
+            handler_restore_rt_reported: self.handler_restore_rt_reported,
+            signal_register_projection: self.signal_register_projection,
+            last_accounted_user_time: self.last_accounted_user_time,
+            last_accounted_system_time: self.last_accounted_system_time,
+            thread_cpu_start_user_time: self.thread_cpu_start_user_time,
+            thread_cpu_start_system_time: self.thread_cpu_start_system_time,
+            prng: Clone::clone(&self.prng),
+            initialized_random_auxv: Clone::clone(&self.initialized_random_auxv),
+            chaos_prng: Clone::clone(&self.chaos_prng),
+            thread_logical_time: Clone::clone(&self.thread_logical_time),
+            committed_clock_value: self.committed_clock_value,
+            uncharged_bootstrap_syscalls: self.uncharged_bootstrap_syscalls,
+            in_uncharged_bootstrap_syscall: self.in_uncharged_bootstrap_syscall,
+            passed_descriptors_out_unreported: self.passed_descriptors_out_unreported,
+            passed_descriptors_out_reported: self.passed_descriptors_out_reported,
+            nonblocking_result_normalized: self.nonblocking_result_normalized,
+            yield_after_futex_wake: self.yield_after_futex_wake,
+            pipe_handoff_due: self.pipe_handoff_due,
+            own_signal_turn_hold: self.own_signal_turn_hold,
+            delivered_since_request: self.delivered_since_request,
+            returned_from_sigreturn: self.returned_from_sigreturn,
+            delivery_entered: self.delivery_entered,
+            loader_cpu_abort: Clone::clone(&self.loader_cpu_abort),
+            signal_announcements: Clone::clone(&self.signal_announcements),
+            next_signal_announcement: self.next_signal_announcement,
+            consecutive_continuations: self.consecutive_continuations,
+            scheduler_grants: self.scheduler_grants,
+            host_timed_binder_loss_recorded: self.host_timed_binder_loss_recorded,
+            shared_binder_loss_recorded: self.shared_binder_loss_recorded,
+            unrecorded_binder_loss_recorded: self.unrecorded_binder_loss_recorded,
+            record_or_replay: Clone::clone(&self.record_or_replay),
+            choices: Clone::clone(&self.choices),
+            end_of_timeslice: self.end_of_timeslice,
+            replay_rcb_end: self.replay_rcb_end,
+            last_replay_change_point: self.last_replay_change_point,
+            chaos_epoch: self.chaos_epoch,
+            chaos_slowdown_factor: self.chaos_slowdown_factor,
+            chaos_slowdown_active: self.chaos_slowdown_active,
+            claimed_sigchld: self.claimed_sigchld,
+            pending_chaos_epochs: Clone::clone(&self.pending_chaos_epochs),
+            max_timeslice_end: self.max_timeslice_end,
+            slice_bound_end: self.slice_bound_end,
+            post_crash_bound: self.post_crash_bound,
+            crash_armed: self.crash_armed,
+            uncapped_backstop: self.uncapped_backstop,
+            last_grant_deadline: self.last_grant_deadline,
+            last_rcb_timer: self.last_rcb_timer,
+            last_rcb_timer_is_max: self.last_rcb_timer_is_max,
+            lone_grant: self.lone_grant,
+            lone_slice_end: self.lone_slice_end,
+            replaying_lone_slice_end: self.replaying_lone_slice_end,
+            lone_slice_end_at_check_in: self.lone_slice_end_at_check_in,
+            lone_replay_unsound: self.lone_replay_unsound,
+            replayed_stopless_end: self.replayed_stopless_end,
+            armed_instruction_offset: self.armed_instruction_offset,
+            slice_instruction_offset: self.slice_instruction_offset,
+            replay_instruction_offset: self.replay_instruction_offset,
+            chaos_instruction_offset_draws: self.chaos_instruction_offset_draws,
+            replay_backstop: self.replay_backstop,
+            past_global_first_execve: self.past_global_first_execve,
+            robust_list_head: self.robust_list_head,
+            robust_list_process: Clone::clone(&self.robust_list_process),
+            exec_robust_commit: Clone::clone(&self.exec_robust_commit),
+            slice_boundary: Clone::clone(&self.slice_boundary),
+            callback_history: Clone::clone(&self.callback_history),
+            schedule_replay_over: self.schedule_replay_over,
+        }
+    }
+}
+
+impl<T: RunMode> Default for ThreadState<T> {
     fn default() -> Self {
         unreachable!()
     }
@@ -7276,14 +7462,14 @@ pub(crate) fn chaos_epoch_sentinel() -> u64 {
     u64::MAX
 }
 
-impl<T> AsRef<T> for ThreadState<T> {
-    fn as_ref(&self) -> &T {
+impl<T: RunMode> AsRef<RecordReplayState<T>> for ThreadState<T> {
+    fn as_ref(&self) -> &RecordReplayState<T> {
         &self.record_or_replay
     }
 }
 
-impl<T> AsMut<T> for ThreadState<T> {
-    fn as_mut(&mut self) -> &mut T {
+impl<T: RunMode> AsMut<RecordReplayState<T>> for ThreadState<T> {
+    fn as_mut(&mut self) -> &mut RecordReplayState<T> {
         &mut self.record_or_replay
     }
 }
@@ -7371,7 +7557,7 @@ pub(crate) fn chaos_instruction_offset_draw(
     Pcg64Mcg::seed_from_u64(mixed).random_range(0..=max)
 }
 
-impl<T> ThreadState<T> {
+impl<T: crate::RunMode> ThreadState<T> {
     /// Account one hand-off of this thread to the scheduler for a grant, in
     /// which other threads may run: it ends the window in which a signal stop
     /// continues the thread's last delivery (`delivered_since_request`), and
@@ -7968,7 +8154,7 @@ impl<T> ThreadState<T> {
 
     /// Create a fresh new thread state from nothing.  In practice this is only used for the thread
     /// state of the root thread of the container.
-    pub fn new(pid: DetPid, cfg: &Config, record_or_replay: T) -> Self {
+    pub fn new(pid: DetPid, cfg: &Config, record_or_replay: RecordReplayState<T>) -> Self {
         crate::detlog::root_seed_records(pid.as_raw(), cfg.rng_seed(), cfg.sched_seed());
         let thread_logical_time = DetTime::new(cfg);
         let last_accounted_user_time = thread_logical_time.user_cpu_time();
@@ -8120,6 +8306,7 @@ impl<T> ThreadState<T> {
             chaos_instruction_offset_draws: 0,
             replay_backstop: None,
             record_or_replay,
+            choices: T::Choices::default(),
             preemption_points: None,
             past_global_first_execve: false,
             interrupt_at: cfg.interrupts_for_thread(pid),
@@ -8712,6 +8899,38 @@ impl<T> ThreadState<T> {
         let r = self.chaos_prng.next_u64();
         detlog!("[dtid {}] CHAOSRAND({}): u64 => {}", self.dettid, msg, r);
         r
+    }
+
+    /// This thread's identity and position, for a choice point's request.
+    fn draw_context(&self) -> crate::choice::DrawContext {
+        crate::choice::DrawContext {
+            dettid: self.dettid,
+            thread_rcbs: self.committed_clock_value,
+        }
+    }
+
+    /// A chaos priority drawn at `site` (a priority redraw, or a new
+    /// child's starting priority): this thread's next chaos draw, logged
+    /// under the site's name, decided by the run mode's policy. A seeded run
+    /// takes the draw's own priority (`entropy_to_priority`).
+    pub fn chaos_priority(&mut self, site: crate::choice::ChoiceSite) -> Priority {
+        let entropy = self.chaos_prng_next_u64(site.name());
+        let ctx = self.draw_context();
+        self.choices.priority(ctx, site, entropy)
+    }
+
+    /// A vfork child's starting priority, prepared when the parent sets up
+    /// the vfork: the parent's next chaos draw, read from a copy of its
+    /// stream (the parent makes that draw for real, and logs it, after the
+    /// child has inherited its state), decided by the run mode's policy.
+    pub(crate) fn prepare_vfork_child_priority(&self) -> crate::choice::PreparedChildPriority {
+        let mut parent_chaos_prng = self.chaos_prng.clone();
+        let entropy = parent_chaos_prng.next_u64();
+        crate::choice::PreparedChildPriority::new(self.choices.priority(
+            self.draw_context(),
+            crate::choice::ChoiceSite::VforkChildPriority,
+            entropy,
+        ))
     }
 
     /// get file metadata
@@ -10193,6 +10412,10 @@ impl<T> ThreadState<T> {
                     // Add one to prevent generating a zero time slice:
                     let rcbs = 1 + exp.sample(&mut self.chaos_prng) as u64;
                     detlog!("[dtid {}] CHAOSRAND => next_rcbs = {}", self.dettid, rcbs);
+                    // The run mode's policy decides the slice; a seeded run
+                    // takes the draw above (`SeededChoices`).
+                    let ctx = self.draw_context();
+                    let rcbs = self.choices.slice(ctx, rcbs, target_timeout_rcbs);
                     if cfg.chaos_instruction_offset > 0 {
                         let offset = chaos_instruction_offset_draw(
                             cfg.sched_seed(),
@@ -10558,11 +10781,14 @@ mod traced_call_tests {
     /// noted.
     #[test]
     fn a_traced_call_notes_the_slots_it_changes() {
-        let mut state = ThreadState::<()>::new(DetTid::from_raw(3), &Config::default(), ());
+        let mut state =
+            ThreadState::<crate::SeededMode>::new(DetTid::from_raw(3), &Config::default(), ());
         for fd in [10, 11] {
             state.add_fd(fd, OFlag::O_RDWR, FdType::Pipe, None).unwrap();
         }
-        let id = |state: &ThreadState<()>, fd| state.with_detfd(fd, |d| d.open_file_id()).unwrap();
+        let id = |state: &ThreadState<crate::SeededMode>, fd| {
+            state.with_detfd(fd, |d| d.open_file_id()).unwrap()
+        };
         let (ten, eleven) = (id(&state, 10), id(&state, 11));
         state.remove_fd(12);
         assert!(
@@ -10625,7 +10851,8 @@ mod timeslice_tests {
             dettid: DetTid::from_raw(tid),
             head,
         };
-        let mut caller = ThreadState::<()>::new(DetTid::from_raw(3), &Config::default(), ());
+        let mut caller =
+            ThreadState::<crate::SeededMode>::new(DetTid::from_raw(3), &Config::default(), ());
         let sibling = |tid: i32| {
             let mut state = caller.clone();
             state.dettid = DetTid::from_raw(tid);
@@ -10677,7 +10904,8 @@ mod timeslice_tests {
         const BOUND: std::time::Duration = EXIT_GROUP_ROBUST_WALK_WAIT;
 
         for granted_first_filer in [true, false] {
-            let first = ThreadState::<()>::new(DetTid::from_raw(3), &Config::default(), ());
+            let first =
+                ThreadState::<crate::SeededMode>::new(DetTid::from_raw(3), &Config::default(), ());
             let mut second = first.clone();
             second.dettid = DetTid::from_raw(4);
             // Nothing filed: no wait.
@@ -10730,7 +10958,8 @@ mod timeslice_tests {
     /// to the bound, which is reported, not taken as completion.
     #[test]
     fn an_unfinished_walk_is_never_released_by_the_bound() {
-        let walker = ThreadState::<()>::new(DetTid::from_raw(3), &Config::default(), ());
+        let walker =
+            ThreadState::<crate::SeededMode>::new(DetTid::from_raw(3), &Config::default(), ());
         let mut killed = walker.clone();
         killed.dettid = DetTid::from_raw(4);
         walker.file_exit_group_for_robust_lists();
@@ -10744,7 +10973,8 @@ mod timeslice_tests {
     /// killed threads are released at once.
     #[test]
     fn a_wait_ends_when_every_filing_is_cancelled() {
-        let filer = ThreadState::<()>::new(DetTid::from_raw(3), &Config::default(), ());
+        let filer =
+            ThreadState::<crate::SeededMode>::new(DetTid::from_raw(3), &Config::default(), ());
         let mut other = filer.clone();
         other.dettid = DetTid::from_raw(4);
         filer.file_exit_group_for_robust_lists();
@@ -10757,7 +10987,8 @@ mod timeslice_tests {
     /// Without a filed exit_group an exiting thread's head leaves the index.
     #[test]
     fn an_exit_drops_its_head_when_no_exit_group_is_filed() {
-        let mut state = ThreadState::<()>::new(DetTid::from_raw(4), &Config::default(), ());
+        let mut state =
+            ThreadState::<crate::SeededMode>::new(DetTid::from_raw(4), &Config::default(), ());
         state.record_robust_list_head(Some(0x4000));
         state.drop_robust_list_head_at_exit();
         assert!(state.robust_list_heads().is_empty());
@@ -10771,7 +11002,8 @@ mod timeslice_tests {
     /// whatever happened to sit at the computed word address.
     #[test]
     fn a_successful_exec_clears_the_robust_list_head() {
-        let mut state = ThreadState::<()>::new(DetTid::from_raw(3), &Config::default(), ());
+        let mut state =
+            ThreadState::<crate::SeededMode>::new(DetTid::from_raw(3), &Config::default(), ());
         assert_eq!(state.robust_list_head, None, "a fresh thread has no list");
 
         state.record_robust_list_head(Some(0x7ffff7bff920));
@@ -10794,7 +11026,8 @@ mod timeslice_tests {
     /// so the old head -- is still valid.
     #[test]
     fn a_failed_exec_restores_the_robust_list_head() {
-        let mut state = ThreadState::<()>::new(DetTid::from_raw(3), &Config::default(), ());
+        let mut state =
+            ThreadState::<crate::SeededMode>::new(DetTid::from_raw(3), &Config::default(), ());
         state.record_robust_list_head(Some(0x404100));
 
         let saved = state.take_robust_list_for_exec();
@@ -10809,8 +11042,8 @@ mod timeslice_tests {
     }
 
     fn two_owner_robust_list_state() -> (
-        ThreadState<()>,
-        ThreadState<()>,
+        ThreadState<crate::SeededMode>,
+        ThreadState<crate::SeededMode>,
         RobustListWake,
         RobustListWake,
         RobustListWake,
@@ -10827,7 +11060,7 @@ mod timeslice_tests {
         let higher = RobustListWake {
             futex: FutexID::private(mm, 0x6060),
         };
-        let mut first = ThreadState::<()>::new(first_owner, &Config::default(), ());
+        let mut first = ThreadState::<crate::SeededMode>::new(first_owner, &Config::default(), ());
         let mut second = first.clone();
         second.dettid = second_owner;
         first.record_robust_list_head(Some(0x404100));
@@ -11001,7 +11234,7 @@ mod timeslice_tests {
     #[test]
     fn initial_current_image_is_selected_once_before_registration() {
         let tid = DetTid::from_raw(3);
-        let mut state = ThreadState::new(tid, &Config::default(), ());
+        let mut state = ThreadState::<crate::SeededMode>::new(tid, &Config::default(), ());
         assert_eq!(state.mm_id, MmId::initial(tid)); // No fact: old default.
         state.physical_tid = Some(tid.as_raw());
         let physical_tid = state.physical_tid;
@@ -11019,7 +11252,7 @@ mod timeslice_tests {
     fn initial_current_image_rejects_nonfresh_or_other_thread_state() {
         let tid = DetTid::from_raw(3);
         for case in 0..7 {
-            let mut state = ThreadState::new(tid, &Config::default(), ());
+            let mut state = ThreadState::<crate::SeededMode>::new(tid, &Config::default(), ());
             let requested = if case == 0 { DetTid::from_raw(4) } else { tid };
             match case {
                 1 => state.detpid = Some(tid),
@@ -11043,7 +11276,7 @@ mod timeslice_tests {
     fn unparented_thread_recovers_process_memory_identity() {
         let detpid = DetPid::from_raw(4);
         let dettid = DetTid::from_raw(7);
-        let mut state = ThreadState::new(dettid, &Config::default(), ());
+        let mut state = ThreadState::<crate::SeededMode>::new(dettid, &Config::default(), ());
 
         assert!(state.recover_process_mm_id(detpid));
         assert_eq!(state.mm_id, MmId::initial(detpid));
@@ -11055,7 +11288,7 @@ mod timeslice_tests {
         let detpid = DetPid::from_raw(4);
         let dettid = DetTid::from_raw(7);
         let inherited_mm = MmId::initial(detpid).for_exec(detpid);
-        let mut state = ThreadState::new(dettid, &Config::default(), ());
+        let mut state = ThreadState::<crate::SeededMode>::new(dettid, &Config::default(), ());
         state.mm_id = inherited_mm;
 
         assert!(!state.recover_process_mm_id(detpid));
@@ -11066,7 +11299,7 @@ mod timeslice_tests {
     fn backend_can_override_open_file_creator_identity() {
         let host_tid = DetTid::from_raw(10_003);
         let virtual_tid = DetTid::from_raw(3);
-        let mut state = ThreadState::new(host_tid, &Config::default(), ());
+        let mut state = ThreadState::<crate::SeededMode>::new(host_tid, &Config::default(), ());
 
         assert_eq!(state.open_file_creator, None);
         state.set_open_file_creator(virtual_tid);
@@ -11269,11 +11502,11 @@ mod timeslice_tests {
 
         let cfg = Config::default();
         let child = DetPid::from_raw(7);
-        let mut parent = ThreadState::new(DetPid::from_raw(3), &cfg, ());
+        let mut parent = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(3), &cfg, ());
         assert!(!parent.wait_for_child_cpu_publication(child).await);
         let before = serde_json::to_value(&*parent.process_cpu_time.lock().unwrap()).unwrap();
         let first = parent.prepare_child_cpu_publication(child);
-        let mut old_child = ThreadState::new(child, &cfg, ());
+        let mut old_child = ThreadState::<crate::SeededMode>::new(child, &cfg, ());
         old_child.parent_process_cpu_time = Some(Arc::clone(&parent.process_cpu_time));
         old_child.parent_cpu_publication = Some(Arc::clone(&first));
         let mut old_wait = Box::pin(parent.wait_for_child_cpu_publication(child));
@@ -11297,7 +11530,7 @@ mod timeslice_tests {
             assert!(restored.child_cpu_publications.is_empty());
         }
 
-        let mut current_child = ThreadState::new(child, &cfg, ());
+        let mut current_child = ThreadState::<crate::SeededMode>::new(child, &cfg, ());
         current_child.parent_process_cpu_time = Some(Arc::clone(&parent.process_cpu_time));
         current_child.parent_cpu_publication = Some(Arc::clone(&second));
         assert!(current_child.record_exited_child_process_cpu_time(child));
@@ -11333,11 +11566,11 @@ mod timeslice_tests {
         let cfg = Config::default();
         for exits_first in [true, false] {
             let child = DetPid::from_raw(7);
-            let creator = ThreadState::new(DetPid::from_raw(5), &cfg, ());
-            let mut reaper = ThreadState::new(DetPid::from_raw(3), &cfg, ());
+            let creator = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(5), &cfg, ());
+            let mut reaper = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(3), &cfg, ());
             reaper.child_cpu_owners = Arc::clone(&creator.child_cpu_owners);
             let token = creator.prepare_child_cpu_publication(child);
-            let mut orphan = ThreadState::new(child, &cfg, ());
+            let mut orphan = ThreadState::<crate::SeededMode>::new(child, &cfg, ());
             orphan.child_cpu_owners = Arc::clone(&creator.child_cpu_owners);
             orphan.parent_process_cpu_time = Some(Arc::clone(&creator.process_cpu_time));
             orphan.parent_cpu_publication = Some(Arc::clone(&token));
@@ -11380,6 +11613,30 @@ mod timeslice_tests {
         }
     }
 
+    /// A vfork child's priority is prepared from a copy of the parent's
+    /// chaos stream: the parent's own stream does not move (it makes that
+    /// draw itself later), and a seeded run takes the copy's next draw's
+    /// priority, as a fresh draw would.
+    #[test]
+    fn a_vfork_child_priority_is_prepared_from_a_copy_of_the_chaos_stream() {
+        let config = Config {
+            chaos: true,
+            ..Default::default()
+        };
+        let mut state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(3), &config, ());
+        let entropy = rand::Rng::next_u64(&mut state.chaos_prng.clone());
+        let prepared = state.prepare_vfork_child_priority();
+        assert_eq!(
+            prepared.into_priority(),
+            crate::scheduler::entropy_to_priority(entropy)
+        );
+        assert_eq!(
+            state.chaos_prng_next_u64("child_priority"),
+            entropy,
+            "the parent's own next draw is the one the preparation read"
+        );
+    }
+
     fn nz(value: u64) -> Option<NonZeroU64> {
         NonZeroU64::new(value)
     }
@@ -11393,7 +11650,7 @@ mod timeslice_tests {
             max_timeslice: nz(200_000_000),
             ..Default::default()
         };
-        let mut state = ThreadState::new(DetPid::from_raw(3), &config, ());
+        let mut state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(3), &config, ());
         state.next_timeslice(&config);
         let now = state.thread_logical_time.as_nanos();
         let end = state.end_of_timeslice.unwrap();
@@ -11441,7 +11698,7 @@ mod timeslice_tests {
             ..Default::default()
         };
         let replaying = |end_ns: u64, rcb_end: u64| {
-            let mut state = ThreadState::new(DetPid::from_raw(3), &config, ());
+            let mut state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(3), &config, ());
             let now = state.thread_logical_time.as_nanos();
             let history = ThreadHistory::new()
                 .with_prio_changes(vec![(now + Duration::from_nanos(end_ns), DEFAULT_PRIORITY)])
@@ -11495,7 +11752,7 @@ mod timeslice_tests {
             replay_schedule_from: Some(std::path::PathBuf::from("record.json")),
             ..Default::default()
         };
-        let mut state = ThreadState::new(DetPid::from_raw(3), &config, ());
+        let mut state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(3), &config, ());
         state.next_timeslice(&config);
         let start = state.thread_logical_time.as_nanos();
         assert_eq!(
@@ -11552,7 +11809,7 @@ mod timeslice_tests {
             ..Default::default()
         };
         let backstop = LogicalTime::from_nanos(3_000_000);
-        let mut state = ThreadState::new(DetPid::from_raw(3), &config, ());
+        let mut state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(3), &config, ());
         state.next_timeslice(&config);
         state.hear_schedule_replay_reply(false, Some(backstop), bound, true);
         assert_eq!(state.max_slice_length(&config), Some(3_000_000));
@@ -11569,7 +11826,7 @@ mod timeslice_tests {
         state.uncapped_backstop = Some(backstop);
         assert_eq!(state.max_slice_length(&config), Some(100_000));
         // A thread whose first backstop comes with the end of the schedule.
-        let mut late = ThreadState::new(DetPid::from_raw(4), &config, ());
+        let mut late = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(4), &config, ());
         late.next_timeslice(&config);
         let (end, max_end) = (late.end_of_timeslice, late.max_timeslice_end);
         late.hear_schedule_replay_reply(true, Some(backstop), bound, true);
@@ -11589,7 +11846,7 @@ mod timeslice_tests {
             max_timeslice: nz(200_000_000),
             ..Default::default()
         };
-        let mut state = ThreadState::new(DetPid::from_raw(3), &config, ());
+        let mut state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(3), &config, ());
         state.next_timeslice(&config);
         let now = state.thread_logical_time.as_nanos();
         let turn = Duration::from_nanos(500_000);
@@ -11609,7 +11866,7 @@ mod timeslice_tests {
             max_timeslice: nz(200_000_000),
             ..Default::default()
         };
-        let mut state = ThreadState::new(DetPid::from_raw(3), &config, ());
+        let mut state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(3), &config, ());
         state.next_timeslice(&config);
         let end = state.end_of_timeslice;
         state.cap_timeslice_at_deadline(Duration::from_nanos(5_000), 1.0, Duration::ZERO, true);
@@ -11628,7 +11885,7 @@ mod timeslice_tests {
             max_timeslice: nz(100_000),
             ..Default::default()
         };
-        let mut state = ThreadState::new(DetPid::from_raw(3), &config, ());
+        let mut state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(3), &config, ());
         state.next_timeslice(&config);
         let first = state.take_pending_chaos_epochs().pop().unwrap();
         assert_eq!(first.epoch, 0);
@@ -11656,7 +11913,7 @@ mod timeslice_tests {
             ..Default::default()
         };
         let tid = DetPid::from_raw(5);
-        let mut state = ThreadState::new(tid, &config, ());
+        let mut state = ThreadState::<crate::SeededMode>::new(tid, &config, ());
         state.next_timeslice(&config);
         let first = state.pending_chaos_epochs[0];
 
@@ -11699,7 +11956,7 @@ mod timeslice_tests {
             epoch: 7,
             factor: RcbTimeMultiplier::from_f64(3.25),
         };
-        let mut state = ThreadState::new(DetPid::from_raw(5), &config, ());
+        let mut state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(5), &config, ());
         state.preemption_points = Some(
             ThreadHistory::new()
                 .with_chaos_epochs(vec![transition])
@@ -11723,7 +11980,7 @@ mod timeslice_tests {
             max_timeslice: nz(100_000),
             ..Default::default()
         };
-        let mut state = ThreadState::new(DetPid::from_raw(5), &config, ());
+        let mut state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(5), &config, ());
         let now = state.thread_logical_time.as_nanos();
         let first = ChaosEpochTransition {
             logical_time: now,
@@ -11779,8 +12036,12 @@ mod timeslice_tests {
     fn replay_from_500ns(
         config: &Config,
         history: ThreadHistory,
-    ) -> (ThreadState<()>, Option<Priority>, LogicalTime) {
-        let mut state = ThreadState::new(DetPid::from_raw(5), config, ());
+    ) -> (
+        ThreadState<crate::SeededMode>,
+        Option<Priority>,
+        LogicalTime,
+    ) {
+        let mut state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(5), config, ());
         state.preemption_points = Some(history.into_iter());
         state
             .thread_logical_time
@@ -11808,7 +12069,7 @@ mod timeslice_tests {
     #[test]
     fn an_edited_record_skips_the_slices_that_already_ended() {
         let config = edited_replay_config();
-        let start = ThreadState::new(DetPid::from_raw(5), &config, ())
+        let start = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(5), &config, ())
             .thread_logical_time
             .as_nanos();
         let at = |ns: u64| start + Duration::from_nanos(ns);
@@ -11842,7 +12103,7 @@ mod timeslice_tests {
     #[test]
     fn an_edited_record_keeps_a_slice_one_of_whose_deadlines_is_ahead() {
         let config = edited_replay_config();
-        let start = ThreadState::new(DetPid::from_raw(5), &config, ())
+        let start = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(5), &config, ())
             .thread_logical_time
             .as_nanos();
         let at = |ns: u64| start + Duration::from_nanos(ns);
@@ -11881,7 +12142,7 @@ mod timeslice_tests {
     #[test]
     fn an_edited_record_whose_slices_all_ended_goes_on_at_its_final_priority() {
         let config = edited_replay_config();
-        let start = ThreadState::new(DetPid::from_raw(5), &config, ())
+        let start = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(5), &config, ())
             .thread_logical_time
             .as_nanos();
         let history = ThreadHistory::new().with_prio_changes(vec![
@@ -11910,9 +12171,9 @@ mod timeslice_tests {
             clock_multiplier: Some(0.3),
             ..edited_replay_config()
         };
-        let state = ThreadState::new(DetPid::from_raw(5), &config, ());
+        let state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(5), &config, ());
         assert_eq!(state.pmu_epsilon(&config), Duration::from_nanos(3));
-        let mut slowed = ThreadState::new(DetPid::from_raw(5), &config, ());
+        let mut slowed = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(5), &config, ());
         slowed.chaos_slowdown_factor = RcbTimeMultiplier::from_f64(2.0);
         slowed.chaos_slowdown_active = true;
         assert_eq!(slowed.pmu_epsilon(&config), Duration::from_nanos(6));
@@ -11921,7 +12182,7 @@ mod timeslice_tests {
         for (ahead, skipped) in [(2, true), (3, false)] {
             // 50 RCBs at multiplier 1 are 500 ns; at 0.3 the thread's time
             // advances by 150 ns.
-            let mut state = ThreadState::new(DetPid::from_raw(5), &config, ());
+            let mut state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(5), &config, ());
             state
                 .thread_logical_time
                 .add_rcbs_with_multiplier(50, RcbTimeMultiplier::ONE);
@@ -11946,7 +12207,7 @@ mod timeslice_tests {
         // At a 2 times slowdown (a recorded epoch) one RCB is 6 ns: an end
         // 5 ns ahead is within it, one 6 ns ahead is not.
         for (ahead, skipped) in [(5, true), (6, false)] {
-            let mut state = ThreadState::new(DetPid::from_raw(5), &config, ());
+            let mut state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(5), &config, ());
             let begin = state.thread_logical_time.as_nanos();
             state.preemption_points = Some(
                 ThreadHistory::new()
@@ -12002,7 +12263,7 @@ mod timeslice_tests {
             replay_edited_preemptions: false,
             ..edited_replay_config()
         };
-        let start = ThreadState::new(DetPid::from_raw(5), &edited, ())
+        let start = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(5), &edited, ())
             .thread_logical_time
             .as_nanos();
         let at = |ns: u64| start + Duration::from_nanos(ns);
@@ -12049,7 +12310,7 @@ mod timeslice_tests {
         };
         for (edited, expected) in [(true, 20), (false, 10)] {
             let config = config(edited);
-            let mut state = ThreadState::new(DetPid::from_raw(5), &config, ());
+            let mut state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(5), &config, ());
             let now = state.thread_logical_time.as_nanos();
             let doubled = ChaosEpochTransition {
                 logical_time: now,
@@ -12083,7 +12344,7 @@ mod timeslice_tests {
             replay_edited_preemptions: false,
             ..edited_replay_config()
         };
-        let start = ThreadState::new(DetPid::from_raw(5), &config, ())
+        let start = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(5), &config, ())
             .thread_logical_time
             .as_nanos();
         let history = ThreadHistory::new().with_prio_changes(vec![
@@ -12101,7 +12362,7 @@ mod timeslice_tests {
             replay_edited_preemptions: false,
             ..edited_replay_config()
         };
-        let start = ThreadState::new(DetPid::from_raw(5), &config, ())
+        let start = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(5), &config, ())
             .thread_logical_time
             .as_nanos();
         let history = ThreadHistory::new()
@@ -12129,7 +12390,7 @@ mod timeslice_tests {
                 panic_on_rcb_overshoot,
                 ..Default::default()
             };
-            let mut state = ThreadState::new(DetPid::from_raw(5), &config, ());
+            let mut state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(5), &config, ());
             let now = state.thread_logical_time.as_nanos();
             let history = ThreadHistory::new()
                 .with_prio_changes(
@@ -12186,7 +12447,7 @@ mod timeslice_tests {
             replay_preemptions_from: Some(std::path::PathBuf::from("history.json")),
             ..edited_replay_config()
         };
-        let start = ThreadState::new(DetPid::from_raw(5), &config, ())
+        let start = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(5), &config, ())
             .thread_logical_time
             .as_nanos();
         let at = |ns: u64| start + Duration::from_nanos(ns);
@@ -12237,7 +12498,7 @@ mod timeslice_tests {
             replay_preemptions_from: Some("history.json".into()),
             ..Default::default()
         };
-        let mut state = ThreadState::new(DetPid::from_raw(31754), &config, ());
+        let mut state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(31754), &config, ());
         state.thread_logical_time.add_rcbs(863_958);
         state.committed_clock_value = 863_958;
         let now = state.thread_logical_time.as_nanos();
@@ -12281,7 +12542,7 @@ mod timeslice_tests {
             max_timeslice: nz(100_000),
             ..Default::default()
         };
-        let mut state = ThreadState::new(DetPid::from_raw(5), &config, ());
+        let mut state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(5), &config, ());
         let now = state.thread_logical_time.as_nanos();
         let history = ThreadHistory::new()
             .with_prio_changes(vec![(
@@ -12299,7 +12560,7 @@ mod timeslice_tests {
         );
 
         // At the thread's time exactly, too.
-        let mut state = ThreadState::new(DetPid::from_raw(6), &config, ());
+        let mut state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(6), &config, ());
         let now = state.thread_logical_time.as_nanos();
         let history = ThreadHistory::new()
             .with_prio_changes(vec![(now, DEFAULT_PRIORITY + 1)])
@@ -12325,7 +12586,7 @@ mod timeslice_tests {
             replay_preemptions_from: Some(std::path::PathBuf::from("history.json")),
             ..Default::default()
         };
-        let mut state = ThreadState::new(DetPid::from_raw(31744), &config, ());
+        let mut state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(31744), &config, ());
         let start = state.thread_logical_time.as_nanos();
         let history = ThreadHistory::new()
             .with_prio_changes(vec![
@@ -12380,7 +12641,7 @@ mod timeslice_tests {
             max_timeslice: nz(100_000),
             ..Default::default()
         };
-        let mut state = ThreadState::new(DetPid::from_raw(5), &config, ());
+        let mut state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(5), &config, ());
         let now = state.thread_logical_time.as_nanos();
         let history = ThreadHistory::new()
             .with_prio_changes(vec![
@@ -12441,8 +12702,8 @@ mod timeslice_tests {
             ..off.clone()
         };
         let tid = DetTid::from_raw(3);
-        let mut without = ThreadState::new(tid, &off, ());
-        let mut with = ThreadState::new(tid, &on, ());
+        let mut without = ThreadState::<crate::SeededMode>::new(tid, &off, ());
+        let mut with = ThreadState::<crate::SeededMode>::new(tid, &on, ());
         let mut offsets = Vec::new();
         for _ in 0..20 {
             without.next_timeslice(&off);
@@ -12473,7 +12734,7 @@ mod timeslice_tests {
             max_timeslice: nz(100_000),
             ..Default::default()
         };
-        let mut state = ThreadState::new(DetPid::from_raw(5), &chaos, ());
+        let mut state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(5), &chaos, ());
         state.next_timeslice(&chaos);
         let armed = InstructionOffset {
             rcb_target: 40,
@@ -12499,7 +12760,7 @@ mod timeslice_tests {
             max_timeslice: nz(100_000),
             ..Default::default()
         };
-        let mut state = ThreadState::new(DetPid::from_raw(5), &replay, ());
+        let mut state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(5), &replay, ());
         let now = state.thread_logical_time.as_nanos();
         let history = ThreadHistory::new()
             .with_prio_changes(vec![
@@ -12521,7 +12782,7 @@ mod timeslice_tests {
 
         // A row without an exact RCB end is replayed by logical time, which
         // an offset cannot refine.
-        let mut state = ThreadState::new(DetPid::from_raw(5), &replay, ());
+        let mut state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(5), &replay, ());
         state.preemption_points = Some(
             ThreadHistory::new()
                 .with_prio_changes(vec![(now + Duration::from_nanos(70), DEFAULT_PRIORITY)])
@@ -12540,7 +12801,7 @@ mod timeslice_tests {
             max_timeslice: nz(100_000),
             ..Default::default()
         };
-        let mut state = ThreadState::new(DetPid::from_raw(1), &config, ());
+        let mut state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ());
         let now = state.thread_logical_time.as_nanos();
 
         state.next_timeslice(&config);
@@ -12562,7 +12823,7 @@ mod timeslice_tests {
             max_timeslice: None,
             ..Default::default()
         };
-        let mut state = ThreadState::new(DetPid::from_raw(1), &config, ());
+        let mut state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ());
         let now = state.thread_logical_time.as_nanos();
 
         state.next_timeslice(&config);
@@ -12581,7 +12842,7 @@ mod timeslice_tests {
             max_timeslice: nz(20_000),
             ..Default::default()
         };
-        let mut state = ThreadState::new(DetPid::from_raw(1), &config, ());
+        let mut state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ());
         let now = state.thread_logical_time.as_nanos();
 
         state.next_timeslice(&config);
@@ -12600,7 +12861,7 @@ mod timeslice_tests {
             clock_multiplier: Some(1.05),
             ..Default::default()
         };
-        let mut state = ThreadState::new(DetPid::from_raw(1), &config, ());
+        let mut state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ());
         let now = state.thread_logical_time.as_nanos();
         let configured_max = now + Duration::from_nanos(100_000);
         let minimum_progress = now + Duration::from_nanos(11);
@@ -12622,7 +12883,7 @@ mod timeslice_tests {
             chaos_timeslice_range: Some("1000..100000000".parse().unwrap()),
             ..Default::default()
         };
-        let mut state = ThreadState::new(DetPid::from_raw(1), &config, ());
+        let mut state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ());
         let now = state.thread_logical_time.as_nanos();
         let lengths: Vec<u64> = (0..3000)
             .map(|_| {
@@ -12663,8 +12924,8 @@ mod timeslice_tests {
             chaos_timeslice_range: Some("1000..100000".parse().unwrap()),
             ..plain.clone()
         };
-        let mut without = ThreadState::new(DetPid::from_raw(1), &plain, ());
-        let mut with = ThreadState::new(DetPid::from_raw(1), &ranged, ());
+        let mut without = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &plain, ());
+        let mut with = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &ranged, ());
         for _ in 0..16 {
             without.next_timeslice(&plain);
             with.next_timeslice(&ranged);
@@ -12693,16 +12954,16 @@ mod timeslice_tests {
             chaos_timeslice_range: Some("1000..2000".parse().unwrap()),
             ..plain.clone()
         };
-        let mut without = ThreadState::new(DetPid::from_raw(1), &plain, ());
-        let mut with = ThreadState::new(DetPid::from_raw(1), &ranged, ());
+        let mut without = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &plain, ());
+        let mut with = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &ranged, ());
         without.next_timeslice(&plain);
         with.next_timeslice(&ranged);
         assert!(
             with.chaos_prng != without.chaos_prng,
             "before the switch the range draws"
         );
-        let mut without = ThreadState::new(DetPid::from_raw(1), &plain, ());
-        let mut with = ThreadState::new(DetPid::from_raw(1), &ranged, ());
+        let mut without = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &plain, ());
+        let mut with = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &ranged, ());
         let bound = std::num::NonZeroU64::new(200_000_000);
         without.post_crash_bound = bound;
         with.post_crash_bound = bound;
@@ -12734,8 +12995,10 @@ mod timeslice_tests {
             replay_schedule_from: Some(std::path::PathBuf::from("schedule.json")),
             ..Default::default()
         };
-        let mut plain = ThreadState::new(DetPid::from_raw(1), &replay(false), ());
-        let mut chaos = ThreadState::new(DetPid::from_raw(1), &replay(true), ());
+        let mut plain =
+            ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &replay(false), ());
+        let mut chaos =
+            ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &replay(true), ());
         let generator = chaos.chaos_prng.clone();
 
         assert_eq!(plain.next_timeslice(&replay(false)), None);
@@ -12765,7 +13028,7 @@ mod timeslice_tests {
             config.validate();
             assert_eq!(config.max_timeslice, None);
             assert_eq!(config.target_timeslice, nz(100_000));
-            let mut state = ThreadState::new(DetPid::from_raw(3), &config, ());
+            let mut state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(3), &config, ());
             let generator = state.chaos_prng.clone();
             assert_eq!(state.next_timeslice(&config), None);
             assert_eq!(state.max_timeslice_end, None);
@@ -12796,7 +13059,7 @@ mod timeslice_tests {
             replay_schedule_from: Some(std::path::PathBuf::from("schedule.json")),
             ..Default::default()
         };
-        let mut state = ThreadState::new(DetPid::from_raw(1), &config, ());
+        let mut state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ());
         state.next_timeslice(&config);
         state.thread_logical_time.add_rcbs(1000);
         let now = state.thread_logical_time.as_nanos();
@@ -12834,7 +13097,7 @@ mod timeslice_tests {
             replay_schedule_from: Some(std::path::PathBuf::from("schedule.json")),
             ..Default::default()
         };
-        let mut state = ThreadState::new(DetPid::from_raw(1), &config, ());
+        let mut state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ());
         state.next_timeslice(&config);
         let backstop = state.replay_backstop.expect("a schedule replay's backstop");
         state.thread_logical_time.add_rcbs(91);
@@ -12854,7 +13117,7 @@ mod timeslice_tests {
             replay_schedule_from: Some(std::path::PathBuf::from("schedule.json")),
             ..Default::default()
         };
-        let mut state = ThreadState::new(DetPid::from_raw(1), &config, ());
+        let mut state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ());
         let now = state.thread_logical_time.as_nanos();
 
         state.next_timeslice(&config);
@@ -12870,7 +13133,7 @@ mod timeslice_tests {
             max_timeslice: nz(100_000),
             ..Default::default()
         };
-        let mut state = ThreadState::new(DetPid::from_raw(3), &config, ());
+        let mut state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(3), &config, ());
         state.preemption_points = Some(ThreadHistory::new().into_iter());
         let now = state.thread_logical_time.as_nanos();
 
@@ -12890,7 +13153,7 @@ mod timeslice_tests {
             max_timeslice: nz(100_000),
             ..Default::default()
         };
-        let mut state = ThreadState::new(DetPid::from_raw(3), &config, ());
+        let mut state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(3), &config, ());
         let now = state.thread_logical_time.as_nanos();
         let recorded_end = now + Duration::from_nanos(50_000);
         let history = ThreadHistory::new()
@@ -12903,7 +13166,7 @@ mod timeslice_tests {
         state.cap_timeslice_at_deadline(Duration::from_nanos(1_000), 1.0, Duration::ZERO, false);
         assert_eq!(state.end_of_timeslice, Some(recorded_end));
 
-        let mut exhausted = ThreadState::new(DetPid::from_raw(3), &config, ());
+        let mut exhausted = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(3), &config, ());
         exhausted.preemption_points = Some(ThreadHistory::new().into_iter());
         exhausted.next_timeslice(&config);
         exhausted.cap_timeslice_at_deadline(
@@ -12923,7 +13186,7 @@ mod timeslice_tests {
     #[test]
     fn timeslice_expiry_is_inclusive() {
         let config = Config::default();
-        let mut state = ThreadState::new(DetPid::from_raw(1), &config, ());
+        let mut state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ());
         let now = state.thread_logical_time.as_nanos();
 
         state.end_of_timeslice = Some(now + Duration::from_nanos(1));
@@ -12942,7 +13205,7 @@ mod timeslice_tests {
             max_timeslice: nz(20_000),
             ..Default::default()
         };
-        let mut state = ThreadState::new(DetPid::from_raw(1), &config, ());
+        let mut state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ());
         state.next_timeslice(&config);
 
         // Past the target: a syscall would end the slice, an rdtsc must not.
@@ -12965,7 +13228,7 @@ mod timeslice_tests {
             ..Default::default()
         };
         assert!(!config.target_timeslice_syscalls_only);
-        let mut state = ThreadState::new(DetPid::from_raw(1), &config, ());
+        let mut state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ());
         state.next_timeslice(&config);
         state.thread_logical_time.add_rcbs(99);
         assert!(!state.instruction_trap_ends_timeslice(&config));
@@ -12985,7 +13248,7 @@ mod timeslice_tests {
             max_timeslice: None,
             ..Default::default()
         };
-        let mut state = ThreadState::new(DetPid::from_raw(1), &config, ());
+        let mut state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ());
         state.next_timeslice(&config);
         assert_eq!(state.max_timeslice_end, None);
 
@@ -13007,7 +13270,7 @@ mod timeslice_tests {
             max_timeslice: nz(20_000),
             ..Default::default()
         };
-        let mut state = ThreadState::new(DetPid::from_raw(1), &untargeted, ());
+        let mut state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &untargeted, ());
         state.next_timeslice(&untargeted);
         state.thread_logical_time.add_rcbs(1_999);
         assert_eq!(
@@ -13023,7 +13286,7 @@ mod timeslice_tests {
             max_timeslice: nz(20_000),
             ..Default::default()
         };
-        let mut state = ThreadState::new(DetPid::from_raw(1), &targeted, ());
+        let mut state = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &targeted, ());
         state.next_timeslice(&targeted);
         state.preemption_points = Some(ThreadHistory::new().into_iter());
         state.thread_logical_time.add_rcbs(500);
@@ -13354,7 +13617,7 @@ mod native_exec_cut_tests {
                         child_tid_addr: 0,
                         flags: CloneFlags::CLONE_VFORK,
                         exit_signal: libc::SIGCHLD,
-                        child_priority_entropy: None,
+                        child_priority: None,
                         user_namespace_owner_may_differ: false,
                     })
                 }
@@ -13683,8 +13946,8 @@ mod native_main_state_tests {
     use crate::native_exec::tests::state_bytes;
     use crate::native_exec::validate_old_native_exec_cut;
     fn snapshot(
-        tool: &crate::Detcore<crate::native_exec::NoopTool>,
-        thread: &ThreadState<()>,
+        tool: &crate::Detcore,
+        thread: &ThreadState<crate::SeededMode>,
         binding: &crate::native_exec::NativeExecCutBinding,
         receipt: &crate::native_exec::NativeExecPreparationReceipt,
     ) -> crate::native_exec::DetcoreExecSnapshotV2 {

@@ -40,7 +40,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::Detcore;
-use crate::RecordOrReplay;
+use crate::run_mode::RunMode;
 
 /// What the scheduler tells a thread at a stop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,7 +143,7 @@ pub fn hit_refusal(hit: &reverie::WatchHit) -> Option<String> {
 pub fn rearm_after_exec<G, T>(guest: &mut G)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let epoch = guest.thread_state().watch.due_epoch;
     if epoch > 0 {
@@ -156,7 +156,7 @@ where
 pub fn adopt<G, T>(guest: &mut G, order: WatchOrder)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     if let Err(refusal) = try_adopt(guest, order) {
         crate::scheduler::exit_on_scheduler_refusal(&refusal);
@@ -171,7 +171,7 @@ where
 pub fn try_adopt<G, T>(guest: &mut G, order: WatchOrder) -> Result<(), String>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     if guest.config().watch.is_empty() || order.epoch == 0 {
         return Ok(());

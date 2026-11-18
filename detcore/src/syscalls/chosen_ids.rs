@@ -56,7 +56,7 @@ use tracing::debug;
 use tracing::warn;
 
 use crate::Detcore;
-use crate::record_or_replay::RecordOrReplay;
+use crate::run_mode::RunMode;
 use crate::types::DetTid;
 
 #[cfg(test)]
@@ -643,7 +643,7 @@ pub(crate) enum ClonePlan {
     GuestChosen,
 }
 
-impl<T: RecordOrReplay> Detcore<T> {
+impl<T: RunMode> Detcore<T> {
     /// Decide how the guest's clone-family call `call` is issued, and, when
     /// Detcore chooses the IDs (`GuestIds::Chosen`), take the ID of the task
     /// it is to create: in the caller's turn, before anything the call does
@@ -1904,7 +1904,7 @@ fn range_faults_in(smaps: &str, limit: usize, address: usize, len: usize) -> boo
 /// status.
 async fn refuse_host_id<T, G>(guest: &mut G, reason: String) -> !
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let reason = format!(
@@ -1924,7 +1924,7 @@ where
 /// ends with Hermit's policy-refusal status.
 async fn refuse_untraced<T, G>(guest: &mut G, reason: String) -> !
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let reason = format!(

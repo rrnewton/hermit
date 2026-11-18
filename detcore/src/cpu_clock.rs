@@ -36,7 +36,7 @@ use reverie::syscalls::Sysno;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::record_or_replay::RecordOrReplay;
+use crate::run_mode::RunMode;
 use crate::scheduler::pid_namespaces::GuestPidAnswer;
 use crate::tool_local::Detcore;
 use crate::types::DetPid;
@@ -198,7 +198,7 @@ pub(crate) struct CpuTimerClock {
     pub(crate) kind: CpuClockKind,
 }
 
-impl<T: RecordOrReplay> Detcore<T> {
+impl<T: RunMode> Detcore<T> {
     /// The task `owner` names for the calling thread (`pid_for_clock`,
     /// kernel/time/posix-cpu-timers.c:57-95 at v6.16): EINVAL for an id that
     /// names no live thread of the caller's process (a thread's clock) or no

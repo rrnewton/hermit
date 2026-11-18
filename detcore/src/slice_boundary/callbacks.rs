@@ -48,7 +48,7 @@ pub(crate) struct Token {
 }
 
 impl Observations {
-    fn begin_callback<T>(
+    fn begin_callback<T: crate::RunMode>(
         &mut self,
         thread: &ThreadState<T>,
         callback: Callback,
@@ -95,7 +95,7 @@ impl Observations {
         })
     }
 
-    fn publish_callback<T>(
+    fn publish_callback<T: crate::RunMode>(
         &mut self,
         thread: &ThreadState<T>,
         token: &mut Token,
@@ -116,7 +116,7 @@ impl Observations {
     }
 }
 
-fn with_observations<T, R>(
+fn with_observations<T: crate::RunMode, R>(
     thread: &mut ThreadState<T>,
     action: impl FnOnce(&mut Observations, &ThreadState<T>) -> anyhow::Result<R>,
 ) -> anyhow::Result<Option<R>> {
@@ -128,7 +128,7 @@ fn with_observations<T, R>(
     answer.map(Some)
 }
 
-pub(crate) fn begin<T>(
+pub(crate) fn begin<T: crate::RunMode>(
     thread: &mut ThreadState<T>,
     callback: Option<Callback>,
 ) -> anyhow::Result<Option<Token>> {
@@ -142,7 +142,10 @@ pub(crate) fn begin<T>(
     })
 }
 
-pub(crate) fn pre<T>(thread: &mut ThreadState<T>, token: &mut Option<Token>) -> anyhow::Result<()> {
+pub(crate) fn pre<T: crate::RunMode>(
+    thread: &mut ThreadState<T>,
+    token: &mut Option<Token>,
+) -> anyhow::Result<()> {
     with_observations(thread, |observed, thread| {
         let token = token.as_mut().ok_or_else(|| {
             anyhow::anyhow!("slice-boundary protocol refusal: prehook lost its callback token")
@@ -152,7 +155,10 @@ pub(crate) fn pre<T>(thread: &mut ThreadState<T>, token: &mut Option<Token>) -> 
     Ok(())
 }
 
-pub(crate) fn post<T>(thread: &mut ThreadState<T>, mut token: Option<Token>) -> anyhow::Result<()> {
+pub(crate) fn post<T: crate::RunMode>(
+    thread: &mut ThreadState<T>,
+    mut token: Option<Token>,
+) -> anyhow::Result<()> {
     with_observations(thread, |observed, thread| {
         let token = token.as_mut().ok_or_else(|| {
             anyhow::anyhow!("slice-boundary protocol refusal: posthook lost its callback token")
@@ -202,8 +208,9 @@ mod tests {
     use super::*;
     use crate::config::Config;
 
-    fn thread() -> ThreadState<()> {
-        let mut thread = ThreadState::new(DetTid::from_raw(3), &Config::default(), ());
+    fn thread() -> ThreadState<crate::SeededMode> {
+        let mut thread =
+            ThreadState::<crate::SeededMode>::new(DetTid::from_raw(3), &Config::default(), ());
         thread.slice_boundary = Some(Observations::new(&thread, 0));
         thread
     }

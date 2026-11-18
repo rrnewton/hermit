@@ -50,7 +50,7 @@ const THREAD: i32 = 5;
 /// and timers.
 struct GrantGuest {
     config: Config,
-    thread: ThreadState<()>,
+    thread: ThreadState<crate::SeededMode>,
     requests: Mutex<usize>,
     /// The RCB timers set, in order.
     timers: Vec<u64>,
@@ -125,10 +125,10 @@ impl Guest<Detcore> for GrantGuest {
     fn memory(&self) -> LocalMemory {
         LocalMemory::new()
     }
-    fn thread_state(&self) -> &ThreadState<()> {
+    fn thread_state(&self) -> &ThreadState<crate::SeededMode> {
         &self.thread
     }
-    fn thread_state_mut(&mut self) -> &mut ThreadState<()> {
+    fn thread_state_mut(&mut self) -> &mut ThreadState<crate::SeededMode> {
         &mut self.thread
     }
     async fn regs(&mut self) -> libc::user_regs_struct {
@@ -170,7 +170,7 @@ fn edited_config() -> Config {
 
 /// Detcore and a thread replaying `history`, at the start of its run.
 fn setup(config: Config, history: ThreadHistory) -> (Detcore, GrantGuest) {
-    let mut thread = ThreadState::new(DetPid::from_raw(THREAD), &config, ());
+    let mut thread = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(THREAD), &config, ());
     thread.detpid = Some(DetPid::from_raw(THREAD));
     thread.preemption_points = Some(history.into_iter());
     let tool = <Detcore as Tool>::new(Pid::from_raw(THREAD), &config);
@@ -198,7 +198,7 @@ async fn the_post_hook_checks_a_kept_slice_at_the_slowdown_it_installed() {
     let config =
         edited_config().with_backend(|backend| backend.delivers_preemption_timer_events = true);
     assert!(config.use_preemption_timer());
-    let start = ThreadState::new(DetPid::from_raw(THREAD), &config, ())
+    let start = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(THREAD), &config, ())
         .thread_logical_time
         .as_nanos();
     let at = |ns: u64| start + Duration::from_nanos(ns);

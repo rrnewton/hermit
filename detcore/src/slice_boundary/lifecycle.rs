@@ -246,7 +246,7 @@ mod tests {
         use crate::config::Config;
         use crate::slice_boundary::adopt_owner;
         let config = Config::default();
-        let mut thread = ThreadState::new(tid(4), &config, ());
+        let mut thread = ThreadState::<crate::SeededMode>::new(tid(4), &config, ());
         let mm = thread.mm_id;
         let mut registry = Registry::default();
         let owner = registry.fresh(thread.dettid, mm).unwrap();

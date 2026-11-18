@@ -984,7 +984,8 @@ mod tests {
                 decode_initial_state(&legacy, &config, image),
                 Err(Errno::EPROTO)
             ));
-            let mut untouched = crate::tool_local::ThreadState::new(tid, &config, ());
+            let mut untouched =
+                crate::tool_local::ThreadState::<crate::SeededMode>::new(tid, &config, ());
             let prng_before = serde_json::to_vec(&untouched.prng).unwrap();
             let chaos_before = serde_json::to_vec(&untouched.chaos_prng).unwrap();
             let clock_before = serde_json::to_vec(&untouched.thread_logical_time).unwrap();
@@ -1030,7 +1031,7 @@ mod tests {
             ));
         }
 
-        let mut state = crate::tool_local::ThreadState::new(tid, &config, ());
+        let mut state = crate::tool_local::ThreadState::<crate::SeededMode>::new(tid, &config, ());
         let chaos = serde_json::to_vec(&state.chaos_prng).unwrap();
         let clock = serde_json::to_vec(&state.thread_logical_time).unwrap();
         let metadata = std::sync::Arc::clone(&state.file_metadata);

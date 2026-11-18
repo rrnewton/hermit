@@ -48,7 +48,7 @@ use reverie::syscalls::Sysno;
 use super::rendered_procfs;
 use crate::procfs::levels::ProcfsName;
 use crate::procfs::levels::procfs_name;
-use crate::record_or_replay::RecordOrReplay;
+use crate::run_mode::RunMode;
 use crate::tool_local::Detcore;
 
 /// The longest path the kernel accepts, with its NUL (`PATH_MAX`).
@@ -644,7 +644,7 @@ struct Replacement {
 
 /// A transient anonymous page of at least `length` bytes in the guest, or
 /// `None` if the guest's address space has no room.
-pub(crate) async fn map_transient<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+pub(crate) async fn map_transient<T: RunMode, G: Guest<Detcore<T>>>(
     guest: &mut G,
     length: usize,
 ) -> Option<AddrMut<'static, u8>> {
@@ -666,7 +666,7 @@ pub(crate) async fn map_transient<T: RecordOrReplay, G: Guest<Detcore<T>>>(
 
 /// Unmap a page from [`map_transient`]: a mapping left behind would be
 /// visible to the guest.
-pub(crate) async fn unmap_transient<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+pub(crate) async fn unmap_transient<T: RunMode, G: Guest<Detcore<T>>>(
     guest: &mut G,
     page: AddrMut<'_, u8>,
     length: usize,
@@ -701,7 +701,7 @@ struct Decision {
     decided: bool,
 }
 
-impl<T: RecordOrReplay> Detcore<T> {
+impl<T: RunMode> Detcore<T> {
     /// The kernel's answer for a call that looks up a `/proc` name outside
     /// the run's level (see the module documentation), as the guest spelled
     /// it: absolute, relative to its working directory, or relative to a
@@ -2146,7 +2146,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
 /// The path of the `AF_UNIX` address of `length` bytes at `address` in the
 /// guest's memory, if it is one with a path.
-fn socket_address_path<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+fn socket_address_path<G: Guest<Detcore<T>>, T: RunMode>(
     guest: &G,
     address: usize,
     length: usize,
