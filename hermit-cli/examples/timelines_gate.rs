@@ -30,6 +30,12 @@
 //! `fork-server`, START copies must each equal a plain run. Prints one line
 //! per check and exits 1 if any differs.
 //!
+//! A copy Hermit refused by name for using what it shares with its template
+//! and the other copies (owner, Slack 6804: exit 122, and a line on its
+//! standard error carrying `detcore::timelines::SHARING_REFUSAL_PHRASE`) is
+//! not compared: it prints `REFUSED` with that line, and is counted. A gate
+//! with refused copies and no failure exits 4, never 0.
+//!
 //! Standard error is compared byte for byte, so a launcher must not write
 //! its own lines there: give safehermit `--sh-report FILE`.
 
@@ -160,6 +166,9 @@ struct Gate {
     failures: usize,
     /// Runs refused for a skid overshoot and run again (never silently).
     retried: usize,
+    /// Copies refused by name for a use of what they share (owner, Slack
+    /// 6804): neither a pass nor a failure.
+    refused: usize,
 }
 
 /// How many times a run Hermit refused for a skid overshoot is run again.
@@ -173,6 +182,19 @@ fn overshot(outcome: &RunOutcome) -> bool {
     outcome.code == 122
         && String::from_utf8_lossy(&Gate::bytes(&outcome.observation.stderr))
             .contains("cause=skid-overshoot")
+}
+
+/// The line with which Hermit refused this copy for using what it shares
+/// with its template and the other copies: exit 122, and the line on the
+/// copy's own standard error.
+fn sharing_refusal(outcome: &RunOutcome) -> Option<String> {
+    if outcome.code != 122 {
+        return None;
+    }
+    String::from_utf8_lossy(&Gate::bytes(&outcome.observation.stderr))
+        .lines()
+        .find(|line| line.contains(detcore::timelines::SHARING_REFUSAL_PHRASE))
+        .map(str::to_string)
 }
 
 impl Gate {
@@ -412,6 +434,11 @@ fn run_kvm(options: &Options, gate: &mut Gate) -> Result<(), String> {
     }
 
     for (k, outcome) in outcomes.iter().enumerate() {
+        if let Some(line) = sharing_refusal(outcome) {
+            gate.refused += 1;
+            println!("copy-{k}: REFUSED exit {} ({line})", outcome.code);
+            continue;
+        }
         let joined = checkpoint
             .observation()
             .join(&outcome.observation, &options.dir, &format!("joined-{k}"))
@@ -629,6 +656,7 @@ fn main() {
         dir: options.dir.clone(),
         failures: 0,
         retried: 0,
+        refused: 0,
     };
     let result = match options.mode.as_str() {
         "kvm" => run_kvm(&options, &mut gate),
@@ -639,11 +667,15 @@ fn main() {
         eprintln!("timelines_gate: {error}");
         std::process::exit(2);
     }
+    let (verdict, code) = match (gate.failures, gate.refused) {
+        (0, 0) => ("PASS", 0),
+        (0, _) => ("REFUSED", 4),
+        _ => ("FAIL", 1),
+    };
     println!(
-        "{}: {} failure(s); {} run(s) refused for a skid overshoot and run again",
-        if gate.failures == 0 { "PASS" } else { "FAIL" },
-        gate.failures,
-        gate.retried
+        "{verdict}: {} failure(s); {} copies refused by name for a use of what they share; \
+         {} run(s) refused for a skid overshoot and run again",
+        gate.failures, gate.refused, gate.retried
     );
-    std::process::exit(if gate.failures == 0 { 0 } else { 1 });
+    std::process::exit(code);
 }

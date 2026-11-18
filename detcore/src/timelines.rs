@@ -260,6 +260,13 @@ fn before_placed_forks(cpu: &CopyCpu) {
 /// that forks at a choice point, the choice pause hook that takes the copies.
 pub fn install_backend_hooks(hooks: BackendHooks) {
     let _ = HOOKS.set(hooks);
+    // A run that may be copied keeps its calls in flight from the start, and
+    // its copies refuse what they would share (owner, Slack 6804).
+    if (control_from_env().is_some() || spec_from_env().is_some())
+        && !crate::timeline_sharing::install()
+    {
+        tracing::warn!("timelines: another call gate is installed; copies refuse nothing");
+    }
     if let Some(control) = control_from_env() {
         // A driver decides everything; a static fork spec would compete.
         if spec_from_env().is_some() {
@@ -701,9 +708,7 @@ fn serve_template(request: &crate::choice::ChoiceRequest) {
                             id as usize,
                             position,
                             &place,
-                            &template.hooks,
-                            &template.records,
-                            &template.parked,
+                            &template,
                             started,
                         );
                         if let Some(control) = control().as_mut() {
@@ -880,6 +885,10 @@ fn install_fault_report(dir: &std::path::Path, index: usize) {
 }
 static TIMELINE_DIR: OnceLock<PathBuf> = OnceLock::new();
 
+/// The phrase in every refusal of a copy's use of what it shares with its
+/// template and the other copies (owner, Slack 6804; `timeline_sharing`).
+pub use crate::timeline_sharing::REFUSAL_PHRASE as SHARING_REFUSAL_PHRASE;
+
 /// This process's timeline number, when it is a copy.
 pub fn timeline_index() -> Option<usize> {
     let index = TIMELINE.load(Ordering::Relaxed);
@@ -910,6 +919,29 @@ pub fn exit_timeline(code: i32) {
     send_control(&serde_json::json!({ "exit": code }));
     // SAFETY: _exit ends the process at once; nothing runs after it.
     unsafe { libc::_exit(code) };
+}
+
+unsafe extern "C" {
+    /// glibc's `on_exit(3)`: `function` runs at `exit(3)` with its status.
+    fn on_exit(
+        function: extern "C" fn(libc::c_int, *mut libc::c_void),
+        argument: *mut libc::c_void,
+    ) -> libc::c_int;
+}
+
+extern "C" fn exit_as_timeline(status: libc::c_int, _: *mut libc::c_void) {
+    exit_timeline(status);
+}
+
+/// Makes every `exit(3)` of this copy record its status as
+/// [`exit_timeline`] does, so that a run Detcore ends from inside, such as a
+/// refusal (`unrecoverable_shutdown` calls `std::process::exit`), reaches the
+/// driver as an exit and not as a lost copy. [`exit_timeline`] ends the
+/// process with `_exit`, so the template's own exit handlers do not run in
+/// the copy.
+fn record_exit_at_process_exit() {
+    // SAFETY: registers a function with no captured state.
+    unsafe { on_exit(exit_as_timeline, std::ptr::null_mut()) };
 }
 
 /// Whether two descriptors of this process name one open file description.
@@ -1866,6 +1898,9 @@ struct Template {
     records_us: u64,
     /// Each output's offset at the cut, as `<name>_offset`.
     offsets: serde_json::Map<String, serde_json::Value>,
+    /// The unnamed regular files open at the cut, as (device, inode): the
+    /// template and every copy reach them (`timeline_sharing`).
+    unnamed: std::collections::HashSet<(u64, u64)>,
 }
 
 /// Freezes this run as a template. Nothing may log from here until the
@@ -1883,6 +1918,17 @@ fn capture_template(
     let park_started = Instant::now();
     let parked = crate::fork_threads::park_others(std::time::Duration::from_secs(5))?;
     let park_us = micros(park_started);
+    // A copy could write a file the guest maps shared with no syscall to
+    // refuse, so such a capture is refused (owner, Slack 6804).
+    let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
+    if let Some(name) = crate::timeline_sharing::shared_file_mapping(&maps) {
+        parked.release();
+        return Err(format!(
+            "the guest maps {name} shared, and each copy would share its pages with the \
+             template and the other copies; shared file mappings are {}",
+            crate::timeline_sharing::REFUSAL_PHRASE
+        ));
+    }
     let prepare_started = Instant::now();
     let prepared = (hooks.prepare)();
     let prepare_us = micros(prepare_started);
@@ -1895,6 +1941,7 @@ fn capture_template(
     };
     let records_started = Instant::now();
     let records = record_files();
+    let unnamed = crate::timeline_sharing::unnamed_files(&open_fds());
     let records_us = micros(records_started);
     let mut offsets = serde_json::Map::new();
     for (fd, name) in outputs() {
@@ -1918,6 +1965,7 @@ fn capture_template(
         records,
         records_us,
         offsets,
+        unnamed,
     })
 }
 
@@ -1942,16 +1990,6 @@ pub(crate) fn fork_copies(spec: &ForkSpec, place: serde_json::Value) -> Option<u
             return None;
         }
     };
-    let Template {
-        hooks,
-        parked,
-        park_us,
-        prepare_us,
-        prepared,
-        records,
-        records_us,
-        offsets,
-    } = template;
     let mut children = Vec::new();
     let all_started = Instant::now();
     let cpu = CopyCpu::from_cpus(&spec.cpus);
@@ -1971,7 +2009,7 @@ pub(crate) fn fork_copies(spec: &ForkSpec, place: serde_json::Value) -> Option<u
             };
             if pid == 0 {
                 become_timeline(
-                    &spec.dir, &cpu, None, index, index, &place, &hooks, &records, &parked, forked,
+                    &spec.dir, &cpu, None, index, index, &place, &template, forked,
                 );
                 return Some(index);
             }
@@ -2021,7 +2059,7 @@ pub(crate) fn fork_copies(spec: &ForkSpec, place: serde_json::Value) -> Option<u
         };
         if pid == 0 {
             become_timeline(
-                &spec.dir, &cpu, None, index, index, &place, &hooks, &records, &parked, forked,
+                &spec.dir, &cpu, None, index, index, &place, &template, forked,
             );
             return Some(index);
         }
@@ -2059,21 +2097,21 @@ pub(crate) fn fork_copies(spec: &ForkSpec, place: serde_json::Value) -> Option<u
             "signal": libc::WIFSIGNALED(status).then(|| libc::WTERMSIG(status)),
         }));
     }
-    parked.release();
+    template.parked.release();
     let summary = serde_json::json!({
-        "backend": hooks.name,
-        "parked_threads": parked.count(),
-        "park_us": park_us,
+        "backend": template.hooks.name,
+        "parked_threads": template.parked.count(),
+        "park_us": template.park_us,
         "spec": format!("{spec:?}"),
         "place": place,
         "copies": spec.copies,
         "parallel": spec.parallel,
         "all_copies_wall_us": micros(all_started),
-        "prepare_us": prepare_us,
-        "prepare": prepared,
-        "file_records": records.len(),
-        "file_records_us": records_us,
-        "offsets": offsets,
+        "prepare_us": template.prepare_us,
+        "prepare": template.prepared,
+        "file_records": template.records.len(),
+        "file_records_us": template.records_us,
+        "offsets": template.offsets,
         "children": children,
     });
     let _ = std::fs::write(
@@ -2086,6 +2124,25 @@ pub(crate) fn fork_copies(spec: &ForkSpec, place: serde_json::Value) -> Option<u
     None
 }
 
+/// Ends copy `index` before any of its guest code runs, as a run Detcore
+/// refuses ends: `hermit: <message>` on its own standard error, then
+/// `HERMIT_POLICY_REFUSAL_EXIT`, recorded where its driver and template
+/// look for it. Its threads are not re-created yet and may hold locks, so
+/// this takes none (no logging, no flushing, no control message: the copy
+/// has no connection of its own yet).
+fn refuse_copy(dir: &std::path::Path, index: usize, message: &str) -> ! {
+    let line = format!("hermit: {message}\n");
+    // SAFETY: writes from a live buffer to this copy's standard error.
+    let _ = unsafe { libc::write(2, line.as_ptr().cast(), line.len()) };
+    let code = detcore_model::HERMIT_POLICY_REFUSAL_EXIT;
+    let _ = std::fs::write(
+        dir.join(format!("timeline-{index}.exit")),
+        format!("{code}\n"),
+    );
+    // SAFETY: _exit ends the process at once.
+    unsafe { libc::_exit(code) }
+}
+
 /// Turns this new process into copy `index`, the `position`-th of the batch
 /// its template forked together.
 #[allow(clippy::too_many_arguments)]
@@ -2096,11 +2153,16 @@ fn become_timeline(
     index: usize,
     position: usize,
     place: &serde_json::Value,
-    hooks: &BackendHooks,
-    records: &[FileRecord],
-    parked: &crate::fork_threads::Parked,
+    template: &Template,
     forked: Instant,
 ) {
+    let Template {
+        hooks,
+        records,
+        parked,
+        unnamed,
+        ..
+    } = template;
     let started = Instant::now();
     TIMELINE.store(index as i64, Ordering::Relaxed);
     let _ = TIMELINE_DIR.set(dir.to_path_buf());
@@ -2187,6 +2249,22 @@ fn become_timeline(
     let files_us = micros(files_started);
     if let Err(error) = redirect_outputs(dir, index) {
         fail("redirecting output", error.to_string());
+    }
+    record_exit_at_process_exit();
+    let own_outputs = [1, 2]
+        .into_iter()
+        .chain(outputs().into_iter().map(|(fd, _)| fd))
+        .collect::<Vec<_>>();
+    let copy = crate::timeline_sharing::CopyContext {
+        index,
+        outputs: crate::timeline_sharing::identities(&own_outputs),
+        inherited_unnamed: unnamed.clone(),
+    };
+    match crate::timeline_sharing::become_copy(copy) {
+        Ok(None) => {}
+        // Refused before any guest code runs in the copy.
+        Ok(Some(message)) => refuse_copy(dir, index, &message),
+        Err(error) => fail("sharing gate", error),
     }
     let summary = serde_json::json!({
         "index": index,

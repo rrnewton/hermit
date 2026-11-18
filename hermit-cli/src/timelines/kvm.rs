@@ -250,6 +250,17 @@ impl KvmTimelines {
     }
 
     /// Timeline `id`'s files, whole, or cut at `offsets` (by output name).
+    /// The exit status copy `id` recorded (`timeline-<id>.exit`), if it has
+    /// ended. A copy can end before it connects: refused at its start for a
+    /// call in flight at the cut.
+    fn exited(&self, id: u64) -> Option<i32> {
+        std::fs::read_to_string(self.path(id, "exit"))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
     fn files(
         &self,
         id: u64,
@@ -361,6 +372,9 @@ impl KvmTimelines {
                     {
                         return Ok(None);
                     }
+                    if self.exited(id).is_some() {
+                        return Ok(None);
+                    }
                     if Instant::now() > deadline {
                         return Err(Refusal::new(
                             "timeline-no-connection",
@@ -424,11 +438,24 @@ impl KvmTimelines {
             CopyState::Forked(run, connection) => {
                 let mut connection = match connection {
                     Some(connection) => connection,
-                    None => self
-                        .connection_of(t.id, &mut None, REPLY_BOUND)?
-                        .ok_or_else(|| {
-                            Refusal::new("timeline-copy-lost", format!("timeline {}", t.id))
-                        })?,
+                    None => match self.connection_of(t.id, &mut None, REPLY_BOUND)? {
+                        Some(connection) => connection,
+                        None if self.exited(t.id).is_some() => {
+                            return Ok(Running {
+                                id: t.id,
+                                connection: None,
+                                child: None,
+                                started: Instant::now(),
+                                run,
+                            });
+                        }
+                        None => {
+                            return Err(Refusal::new(
+                                "timeline-copy-lost",
+                                format!("timeline {}", t.id),
+                            ));
+                        }
+                    },
                 };
                 connection.expect("paused", REPLY_BOUND)?;
                 let command = match answer {
@@ -505,6 +532,13 @@ impl KvmTimelines {
             let code = status
                 .code()
                 .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
+            return Ok(Stop::Exited(RunOutcome {
+                code,
+                observation: self.files(id, None),
+                wall: started.elapsed(),
+            }));
+        }
+        if let Some(code) = self.exited(id) {
             return Ok(Stop::Exited(RunOutcome {
                 code,
                 observation: self.files(id, None),

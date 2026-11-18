@@ -39,6 +39,7 @@
 pub mod aarch64_lse;
 pub mod access_trace;
 mod arch;
+pub mod call_gate;
 pub mod choice;
 pub mod clock_identity;
 mod commit_creds;
@@ -108,7 +109,6 @@ mod sigalrm_phase1;
 mod signal_announcement_tests;
 pub mod signal_restart;
 mod signal_state;
-pub mod timelines;
 pub mod skid_overshoots;
 pub mod slice_boundary;
 mod sock_diag;
@@ -122,6 +122,8 @@ mod syscall_time;
 mod syscalls;
 #[cfg(test)]
 mod test_pages;
+mod timeline_sharing;
+pub mod timelines;
 mod tool_global;
 #[cfg(feature = "physical-mm-test-support")]
 pub use tool_global::initial_mm_probe;
@@ -7202,6 +7204,16 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         let boundary_token = self
             .pre_handler_hook_observed(guest, false, CheckIn::Event, Some(boundary_entry))
             .await;
+        // On the thread's turn, before any of the call's effects: a policy
+        // installed for this process may refuse it by name (`call_gate`; a
+        // run that may be copied as multiverse timelines installs one), and
+        // learns when its effects are done (`in_flight`, dropped below).
+        // None is installed in a plain run. Boxed, so that the check adds
+        // nothing to this future.
+        let in_flight = match crate::call_gate::installed() {
+            Some(gate) => Some(Box::pin(crate::call_gate::check(&*guest, gate, call)).await),
+            None => None,
+        };
 
         // Bind this exact callback after its original grant. Nested backend
         // signal callbacks receive the backend Guest, never this operation.
@@ -9049,6 +9061,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // The syscall is finished; a turn the post-hook takes (a timeslice
             // end) is the thread's own and advances global time as usual.
             guest.thread_state_mut().in_uncharged_bootstrap_syscall = false;
+            // Its effects are done, so a call gate no longer counts it in
+            // flight through that turn.
+            drop(in_flight);
             self.post_handler_hook_observed(guest, CheckIn::Event, boundary_token)
                 .await;
 
