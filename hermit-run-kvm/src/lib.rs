@@ -23,6 +23,8 @@ use std::pin::Pin;
 use reverie_kvm::KvmBackend;
 use reverie_kvm::ToolRunCompletion;
 
+pub mod guest_fork;
+
 /// The future [`run_detcore`] returns. It borrows the backend it runs on.
 pub type RunDetcore<'a> = Pin<
     Box<dyn Future<Output = reverie_kvm::Result<ToolRunCompletion<detcore::GlobalState>>> + 'a>,

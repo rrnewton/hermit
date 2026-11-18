@@ -16,10 +16,11 @@
 //! controller, `--choice-tape` or `--choice-controller`), the copies are
 //! taken inside the pause hook of choice request I (`crate::choice`), and
 //! `bytes=B0:B1:...` gives copy k the answer that tape byte Bk would give
-//! (0 or absent: the run's own answer), so copies can take different futures. Each copy (a *timeline*) repairs what `fork()` does
-//! not copy, through the hooks its backend installed
-//! ([`install_backend_hooks`]), and then runs the rest of the guest as the
-//! original would have. The parent (the *template*) waits for each copy in
+//! (0 or absent: the run's own answer), so copies can take different
+//! futures. The backend's [`GuestFork`] (given to [`install_timelines`])
+//! holds the guest, makes each copy (a *timeline*) of the guest and of this
+//! process, and rebuilds in the copy what the fork did not copy; the copy
+//! then runs the rest of the guest as the original would have. The parent (the *template*) waits for each copy in
 //! turn and then continues its own run.
 //!
 //! Each timeline's standard output and standard error go to
@@ -128,23 +129,96 @@ pub fn spec_from_env() -> Option<ForkSpec> {
     }
 }
 
-/// What a backend does around the fork. Each returns a one-line description
-/// of what it did, for the measurements.
-#[derive(Clone, Copy)]
-pub struct BackendHooks {
-    /// The backend's name.
-    pub name: &'static str,
-    /// In the template, before the first fork: read what the copies need.
-    pub prepare: fn() -> Result<String, String>,
-    /// In each copy, before anything else: rebuild what fork did not copy,
-    /// giving the copy its guest memory as its driver chose (`None`: the
-    /// backend's default).
-    pub repair: fn(Option<MemoryCopy>) -> Result<String, String>,
-    /// In each copy, as it ends: what the backend did while it ran.
-    pub at_exit: fn() -> String,
+/// What a [`GuestFork`] or [`GuestHolder`] step returns, when it may wait.
+pub type ForkFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+/// The guest thread whose callback holds a run for copying, as a guest fork
+/// may use it: an object-safe view of that thread's `reverie::Guest`.
+pub trait GuestHolder: Send {
+    /// Runs `call` in the holding thread, as the guest would
+    /// (`reverie::Guest::inject`).
+    fn inject(
+        &mut self,
+        call: reverie::syscalls::Syscall,
+    ) -> ForkFuture<'_, Result<i64, reverie::Errno>>;
 }
 
-static HOOKS: OnceLock<BackendHooks> = OnceLock::new();
+/// Which side of one copy's fork a process is on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForkSide {
+    /// The template.
+    Original {
+        /// The copy's process.
+        copy: i32,
+    },
+    /// The copy.
+    Copy,
+}
+
+/// How a backend copies a running guest together with this process, for
+/// timelines (design section 13.6; Reverie's `GuestFork` later). Each step
+/// returns a one-line description of what it did, for the measurements, or a
+/// refusal by name.
+pub trait GuestFork: Send + Sync {
+    /// The backend's name.
+    fn name(&self) -> &'static str;
+    /// In the template, its other threads parked, before the first copy:
+    /// hold the guest for copying and read what the copies need. A refusal
+    /// leaves the run as it was.
+    fn hold(&self) -> Result<String, String>;
+    /// In the template: makes one copy of the held guest and of this process
+    /// ([`fork_this_process`] is the shared half), and returns on both sides,
+    /// as fork(2) does. `holder` is the guest thread whose callback holds the
+    /// run, where the capture point has one; at a scheduler turn or in the
+    /// choice pause hook there is none, and a fork that must wait on a guest
+    /// thread refuses before it forks anything.
+    fn fork_guest<'a>(
+        &'a self,
+        holder: Option<&'a mut dyn GuestHolder>,
+    ) -> ForkFuture<'a, Result<ForkSide, String>>;
+    /// In each copy, before anything else: rebuild what the fork did not
+    /// copy, giving the copy its guest memory as its driver chose (`None`:
+    /// the backend's default).
+    fn materialize(&self, memory: Option<MemoryCopy>) -> Result<String, String>;
+    /// In the template, once its copies are made, or as it is released.
+    fn release(&self) {}
+    /// In each copy, as it ends: what the backend did while it ran.
+    fn exit_report(&self) -> String;
+    /// How a copy finds the objects behind its guest's descriptors, for the
+    /// sharing gate (`crate::timeline_sharing`).
+    fn host_view(&self) -> &'static dyn HostView;
+}
+
+pub use crate::timeline_sharing::HostView;
+pub use crate::timeline_sharing::Object as HostObject;
+pub use crate::timeline_sharing::Resolved as HostResolved;
+pub use crate::timeline_sharing::own_process_view;
+
+static FORK: OnceLock<&'static dyn GuestFork> = OnceLock::new();
+
+/// Forks this process for one copy, every other thread parked by the
+/// capture: the half of a guest fork every backend shares (the guest itself,
+/// on KVM; the tracer, on ptrace).
+pub fn fork_this_process() -> Result<ForkSide, String> {
+    match fork_for_copy()? {
+        0 => Ok(ForkSide::Copy),
+        copy => Ok(ForkSide::Original { copy }),
+    }
+}
+
+/// Runs `fork`'s guest fork at a capture point that holds no guest thread
+/// (a scheduler turn, the choice pause hook): only a guest fork that
+/// completes at once can run there.
+fn fork_guest_now(fork: &dyn GuestFork) -> Result<ForkSide, String> {
+    use futures::FutureExt;
+    fork.fork_guest(None).now_or_never().unwrap_or_else(|| {
+        Err(format!(
+            "{}: its guest fork waits on a guest thread, which this capture point does \
+             not hold",
+            fork.name()
+        ))
+    })
+}
 
 /// The CPU a copy placed itself on and how it got it, or `None` to keep the
 /// template's CPU.
@@ -256,16 +330,20 @@ fn before_placed_forks(cpu: &CopyCpu) {
     }
 }
 
-/// Installs the running backend's hooks, once per process, and, for a spec
-/// that forks at a choice point, the choice pause hook that takes the copies.
-pub fn install_backend_hooks(hooks: BackendHooks) {
-    let _ = HOOKS.set(hooks);
-    // A run that may be copied keeps its calls in flight from the start, and
-    // its copies refuse what they would share (owner, Slack 6804).
-    if (control_from_env().is_some() || spec_from_env().is_some())
-        && !crate::timeline_sharing::install()
-    {
-        tracing::warn!("timelines: another call gate is installed; copies refuse nothing");
+/// Installs timelines for this run, once per process, whatever its
+/// backend: `fork`, how the backend copies a running guest (`None`: it
+/// cannot, and every capture is refused by name); in a run that may be
+/// copied, the sharing gate; then the driver's control, or, for a spec that
+/// forks at a choice point, the choice pause hook that takes the copies.
+pub fn install_timelines(fork: Option<&'static dyn GuestFork>) {
+    let may_be_copied = control_from_env().is_some() || spec_from_env().is_some();
+    if let Some(fork) = fork {
+        let _ = FORK.set(fork);
+        // A run that may be copied keeps its calls in flight from the start,
+        // and its copies refuse what they would share (owner, Slack 6804).
+        if may_be_copied && !crate::timeline_sharing::install(fork.host_view()) {
+            tracing::warn!("timelines: another call gate is installed; copies refuse nothing");
+        }
     }
     if let Some(control) = control_from_env() {
         // A driver decides everything; a static fork spec would compete.
@@ -619,9 +697,9 @@ fn serve_template(request: &crate::choice::ChoiceRequest) {
         "choice": request.index,
         "request": crate::choice::request_json(request),
     });
-    let Some(hooks) = HOOKS.get().copied() else {
+    let Some(guest_fork) = FORK.get().copied() else {
         send_control(
-            &serde_json::json!({ "refused": "this backend installed no host-fork hooks" }),
+            &serde_json::json!({ "refused": "this backend cannot copy a running guest yet" }),
         );
         return;
     };
@@ -637,7 +715,7 @@ fn serve_template(request: &crate::choice::ChoiceRequest) {
         send_control(&serde_json::json!({ "refused": format!("{}: {error}", dir.display()) }));
         return;
     }
-    let template = match capture_template(hooks, Some((&dir, template_id))) {
+    let template = match capture_template(guest_fork, Some((&dir, template_id))) {
         Ok(template) => template,
         Err(error) => {
             send_control(&serde_json::json!({ "refused": error }));
@@ -667,6 +745,7 @@ fn serve_template(request: &crate::choice::ChoiceRequest) {
                     unsafe { libc::kill(pid, libc::SIGKILL) };
                 }
                 reap_children(&mut children, true);
+                guest_fork.release();
                 // SAFETY: _exit ends the template at once.
                 unsafe { libc::_exit(1) };
             }
@@ -699,8 +778,8 @@ fn serve_template(request: &crate::choice::ChoiceRequest) {
             before_placed_forks(&cpu);
             for (position, id) in ids.into_iter().enumerate() {
                 let started = Instant::now();
-                match fork_for_copy() {
-                    Ok(0) => {
+                match fork_guest_now(guest_fork) {
+                    Ok(ForkSide::Copy) => {
                         become_timeline(
                             &dir,
                             &cpu,
@@ -721,8 +800,8 @@ fn serve_template(request: &crate::choice::ChoiceRequest) {
                         }
                         return;
                     }
-                    Ok(pid) => {
-                        children.push((id, pid));
+                    Ok(ForkSide::Original { copy }) => {
+                        children.push((id, copy));
                         forked.push(serde_json::json!({
                             "timeline": id,
                             "fork_us": micros(started),
@@ -743,6 +822,7 @@ fn serve_template(request: &crate::choice::ChoiceRequest) {
                 unsafe { libc::kill(pid, libc::SIGKILL) };
             }
             reap_children(&mut children, true);
+            guest_fork.release();
             send_control(&serde_json::json!({ "released": template_id }));
             // SAFETY: _exit ends the template at once; it never runs on.
             unsafe { libc::_exit(0) };
@@ -909,10 +989,10 @@ pub fn exit_timeline(code: i32) {
             dir.join(format!("timeline-{index}.exit")),
             format!("{code}\n"),
         );
-        if let Some(hooks) = HOOKS.get() {
+        if let Some(fork) = FORK.get() {
             let _ = std::fs::write(
                 dir.join(format!("timeline-{index}.backend")),
-                format!("{}\n", (hooks.at_exit)()),
+                format!("{}\n", fork.exit_report()),
             );
         }
     }
@@ -1889,7 +1969,7 @@ fn fork_for_copy() -> Result<libc::pid_t, String> {
 /// A run frozen for copying: every other thread parked with its context
 /// saved, the backend's state read, and the positions of its files.
 struct Template {
-    hooks: BackendHooks,
+    fork: &'static dyn GuestFork,
     parked: crate::fork_threads::Parked,
     park_us: u64,
     prepare_us: u64,
@@ -1908,7 +1988,7 @@ struct Template {
 /// writer's lock. `own` is where the driver writes this run's outputs
 /// (its directory and timeline number), for the offsets of piped ones.
 fn capture_template(
-    hooks: BackendHooks,
+    fork: &'static dyn GuestFork,
     own: Option<(&std::path::Path, u64)>,
 ) -> Result<Template, String> {
     let _ = std::io::stdout().flush();
@@ -1930,7 +2010,7 @@ fn capture_template(
         ));
     }
     let prepare_started = Instant::now();
-    let prepared = (hooks.prepare)();
+    let prepared = fork.hold();
     let prepare_us = micros(prepare_started);
     let prepared = match prepared {
         Ok(description) => description,
@@ -1957,7 +2037,7 @@ fn capture_template(
         }
     }
     Ok(Template {
-        hooks,
+        fork,
         parked,
         park_us,
         prepare_us,
@@ -1974,15 +2054,15 @@ fn capture_template(
 /// and `Some(k)` in copy k once it is repaired, so that the caller goes on
 /// with the run.
 pub(crate) fn fork_copies(spec: &ForkSpec, place: serde_json::Value) -> Option<usize> {
-    let Some(hooks) = HOOKS.get().copied() else {
-        tracing::warn!("{TIMELINE_FORK_ENV}: this backend installed no host-fork hooks");
+    let Some(guest_fork) = FORK.get().copied() else {
+        tracing::warn!("{TIMELINE_FORK_ENV}: this backend cannot copy a running guest yet");
         return None;
     };
     if let Err(error) = std::fs::create_dir_all(&spec.dir) {
         tracing::warn!("{TIMELINE_FORK_ENV}: {}: {error}", spec.dir.display());
         return None;
     }
-    let template = match capture_template(hooks, None) {
+    let template = match capture_template(guest_fork, None) {
         Ok(template) => template,
         Err(error) => {
             let _ = std::fs::write(spec.dir.join("refused.txt"), format!("{error}\n"));
@@ -2000,19 +2080,19 @@ pub(crate) fn fork_copies(spec: &ForkSpec, place: serde_json::Value) -> Option<u
         let mut running = Vec::new();
         for index in 0..spec.copies {
             let forked = Instant::now();
-            let pid = match fork_for_copy() {
-                Ok(pid) => pid,
+            let pid = match fork_guest_now(guest_fork) {
+                Ok(ForkSide::Original { copy }) => copy,
+                Ok(ForkSide::Copy) => {
+                    become_timeline(
+                        &spec.dir, &cpu, None, index, index, &place, &template, forked,
+                    );
+                    return Some(index);
+                }
                 Err(error) => {
                     children.push(serde_json::json!({ "index": index, "error": error }));
                     break;
                 }
             };
-            if pid == 0 {
-                become_timeline(
-                    &spec.dir, &cpu, None, index, index, &place, &template, forked,
-                );
-                return Some(index);
-            }
             running.push((index, pid, forked, micros(forked)));
         }
         while !running.is_empty() {
@@ -2050,19 +2130,19 @@ pub(crate) fn fork_copies(spec: &ForkSpec, place: serde_json::Value) -> Option<u
         let forked = Instant::now();
         // Every other thread is parked with its context saved; the copy
         // re-creates them (become_timeline).
-        let pid = match fork_for_copy() {
-            Ok(pid) => pid,
+        let pid = match fork_guest_now(guest_fork) {
+            Ok(ForkSide::Original { copy }) => copy,
+            Ok(ForkSide::Copy) => {
+                become_timeline(
+                    &spec.dir, &cpu, None, index, index, &place, &template, forked,
+                );
+                return Some(index);
+            }
             Err(error) => {
                 children.push(serde_json::json!({ "index": index, "error": error }));
                 break;
             }
         };
-        if pid == 0 {
-            become_timeline(
-                &spec.dir, &cpu, None, index, index, &place, &template, forked,
-            );
-            return Some(index);
-        }
         let fork_us = micros(forked);
         let mut status = 0;
         let waited = loop {
@@ -2098,8 +2178,9 @@ pub(crate) fn fork_copies(spec: &ForkSpec, place: serde_json::Value) -> Option<u
         }));
     }
     template.parked.release();
+    guest_fork.release();
     let summary = serde_json::json!({
-        "backend": template.hooks.name,
+        "backend": guest_fork.name(),
         "parked_threads": template.parked.count(),
         "park_us": template.park_us,
         "spec": format!("{spec:?}"),
@@ -2157,7 +2238,7 @@ fn become_timeline(
     forked: Instant,
 ) {
     let Template {
-        hooks,
+        fork,
         records,
         parked,
         unnamed,
@@ -2232,7 +2313,7 @@ fn become_timeline(
         .filter(|cpus| cpus.len() == 1)
         .map(|cpus| cpus[0]);
     let repair_started = Instant::now();
-    let repaired = match (hooks.repair)(memory) {
+    let repaired = match fork.materialize(memory) {
         Ok(description) => description,
         Err(error) => fail("backend repair", error),
     };
@@ -2310,6 +2391,57 @@ fn become_timeline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A guest fork whose fork step completes at once, as the original
+    /// side, or never.
+    struct FakeFork {
+        waits: bool,
+    }
+
+    impl GuestFork for FakeFork {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+        fn hold(&self) -> Result<String, String> {
+            Ok(String::new())
+        }
+        fn fork_guest<'a>(
+            &'a self,
+            holder: Option<&'a mut dyn GuestHolder>,
+        ) -> ForkFuture<'a, Result<ForkSide, String>> {
+            if self.waits {
+                Box::pin(futures::future::pending())
+            } else {
+                let copy = if holder.is_some() { 1 } else { 41 };
+                Box::pin(std::future::ready(Ok(ForkSide::Original { copy })))
+            }
+        }
+        fn materialize(&self, _memory: Option<MemoryCopy>) -> Result<String, String> {
+            Ok(String::new())
+        }
+        fn exit_report(&self) -> String {
+            String::new()
+        }
+        fn host_view(&self) -> &'static dyn HostView {
+            own_process_view()
+        }
+    }
+
+    #[test]
+    fn a_guest_fork_that_waits_is_refused_where_no_guest_thread_is_held() {
+        assert_eq!(
+            fork_guest_now(&FakeFork { waits: false }),
+            Ok(ForkSide::Original { copy: 41 })
+        );
+        assert_eq!(
+            fork_guest_now(&FakeFork { waits: true }),
+            Err(
+                "fake: its guest fork waits on a guest thread, which this capture point \
+                 does not hold"
+                    .to_string()
+            )
+        );
+    }
 
     #[test]
     fn parses_a_spec() {

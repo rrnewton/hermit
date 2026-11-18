@@ -3610,20 +3610,8 @@ async fn run_kvm(
             .map_err(|error| anyhow!("failed to configure KVM metadata timestamps: {error}"))?;
     }
 
-    // Host-fork timelines (PROTOTYPE): what a copy of this run repairs.
-    detcore::timelines::install_backend_hooks(detcore::timelines::BackendHooks {
-        name: "kvm",
-        prepare: || reverie_kvm::host_fork::prepare().map(|report| format!("{report:?}")),
-        repair: |memory| {
-            if let Some(memory) = memory {
-                reverie_kvm::host_fork::set_private_arenas(
-                    memory == detcore::timelines::MemoryCopy::Lazy,
-                );
-            }
-            reverie_kvm::host_fork::repair_in_child().map(|report| format!("{report:?}"))
-        },
-        at_exit: reverie_kvm::host_fork::exit_report,
-    });
+    // Host-fork timelines (PROTOTYPE): how a copy of this run is made.
+    detcore::timelines::install_timelines(Some(&hermit_run_kvm::guest_fork::KVM_GUEST_FORK));
     let execution_started = Instant::now();
     let completion = hermit_run_kvm::run_detcore(&mut backend, config, capture_output)
         .await

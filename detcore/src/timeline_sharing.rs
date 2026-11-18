@@ -427,7 +427,7 @@ pub(crate) enum Kind {
 
 /// One object behind a host descriptor.
 #[derive(Clone, Debug)]
-pub(crate) struct Object {
+pub struct Object {
     /// Its `fstat`.
     pub stat: libc::stat,
     /// The descriptor's open file description is open for writing.
@@ -441,9 +441,14 @@ pub(crate) struct Object {
 
 /// What a path resolves to.
 #[derive(Debug)]
-pub(crate) enum Resolved {
-    /// It names this; `procfs` for a file on procfs.
-    Found { stat: libc::stat, procfs: bool },
+pub enum Resolved {
+    /// It names this.
+    Found {
+        /// Its `stat`.
+        stat: libc::stat,
+        /// It is a file on procfs.
+        procfs: bool,
+    },
     /// Nothing is there (`ENOENT`).
     Missing,
     /// The lookup fails with another error, as a call's will.
@@ -451,8 +456,9 @@ pub(crate) enum Resolved {
 }
 
 /// What a copy's process can read about the objects behind the backend's
-/// link texts, and about paths, without asking the guest.
-pub(crate) trait HostView: Send + Sync {
+/// link texts, and about paths, without asking the guest. Each backend's
+/// guest fork names its own (`crate::timelines::GuestFork::host_view`).
+pub trait HostView: Send + Sync {
     /// What absolute `path` names, following a final symbolic link, as a
     /// guest call resolves it.
     fn resolve(&self, path: &Path) -> Resolved;
@@ -462,6 +468,18 @@ pub(crate) trait HostView: Send + Sync {
     /// whichever of its descriptors is found first.
     fn socket(&self, text: &[u8]) -> Option<Object> {
         self.named(text).into_iter().next()
+    }
+}
+
+impl<V: HostView + ?Sized> HostView for &V {
+    fn resolve(&self, path: &Path) -> Resolved {
+        (**self).resolve(path)
+    }
+    fn named(&self, text: &[u8]) -> Vec<Object> {
+        (**self).named(text)
+    }
+    fn socket(&self, text: &[u8]) -> Option<Object> {
+        (**self).socket(text)
     }
 }
 
@@ -994,15 +1012,21 @@ impl<V: HostView, P: SharingPolicy> CallGate for TimelineGate<V, P> {
     }
 }
 
-static GATE: OnceLock<TimelineGate<OwnProcess, RefuseShared>> = OnceLock::new();
+/// The host view of a backend whose guest descriptors are host descriptors
+/// of this process ([`OwnProcess`]): the KVM backend's.
+pub fn own_process_view() -> &'static dyn HostView {
+    static VIEW: OnceLock<OwnProcess> = OnceLock::new();
+    VIEW.get_or_init(OwnProcess::default)
+}
 
-/// Installs the gate of a run that may be copied: before its guest starts,
-/// so that it knows every call in flight at a cut. Returns false when this
-/// process already has a call gate.
-pub(crate) fn install() -> bool {
-    crate::call_gate::install(
-        GATE.get_or_init(|| TimelineGate::new(OwnProcess::default(), RefuseShared)),
-    )
+static GATE: OnceLock<TimelineGate<&'static dyn HostView, RefuseShared>> = OnceLock::new();
+
+/// Installs the gate of a run that may be copied, reading its copies'
+/// descriptors through `view`: before its guest starts, so that it knows
+/// every call in flight at a cut. Returns false when this process already
+/// has a call gate.
+pub(crate) fn install(view: &'static dyn HostView) -> bool {
+    crate::call_gate::install(GATE.get_or_init(|| TimelineGate::new(view, RefuseShared)))
 }
 
 /// Makes this process copy `context.index` ([`TimelineGate::become_copy`]).
