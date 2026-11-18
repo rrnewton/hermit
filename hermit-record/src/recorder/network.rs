@@ -48,6 +48,7 @@ use crate::event::SelectEvent;
 use crate::event::SockOptEvent;
 use crate::event::SyscallEvent;
 use crate::event::fd_set_bytes;
+use crate::host::DescriptorAccess;
 use crate::host::RecordHost;
 
 fn read_bytes<M: MemoryAccess>(
@@ -782,11 +783,17 @@ impl<H: RecordHost> RecorderWithHost<H> {
         // The socket is in the accepting thread's table, which is not the
         // leader's when the thread was cloned without CLONE_FILES.
         let pid = guest.pid();
-        let peer = H::duplicate_guest_thread_fd(pid, guest.tid(), accepted_fd(fd))
-            .and_then(|socket| accepted_peer_address(socket.as_fd()))
-            .unwrap_or_else(|error| {
-                panic!("accept4 returned fd {fd}, but its peer address could not be read: {error}")
-            });
+        let table = guest.tid();
+        let peer = H::duplicate_guest_thread_fd(
+            &DescriptorAccess::guest_bound(&mut *guest, table),
+            pid,
+            table,
+            accepted_fd(fd),
+        )
+        .and_then(|socket| accepted_peer_address(socket.as_fd()))
+        .unwrap_or_else(|error| {
+            panic!("accept4 returned fd {fd}, but its peer address could not be read: {error}")
+        });
         let copy_out = match peer {
             Some((address, kernel_len)) => copy_peer_address_out(
                 &mut guest.memory(),

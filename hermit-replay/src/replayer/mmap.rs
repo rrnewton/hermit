@@ -74,6 +74,7 @@ use super::ReplayerWithHost;
 use crate::event::MadviseRefill;
 use crate::event::MmapEvent;
 use crate::event::SharedMapping;
+use crate::host::DescriptorAccess;
 use crate::host::RecordHost;
 
 const PAGE_SIZE: usize = 4096;
@@ -583,10 +584,16 @@ fn replay_object_with(
 /// Links the replay object descriptor `fd` of thread `tid` in process `pid`
 /// names to `file`'s backing, so that replayed writes through it reach the
 /// backing too.
-fn link_object<H: RecordHost>(file: SharedFile, pid: Pid, tid: Pid, fd: RawFd) -> io::Result<()> {
+fn link_object<H: RecordHost, G>(
+    access: &DescriptorAccess<'_, G>,
+    file: SharedFile,
+    pid: Pid,
+    tid: Pid,
+    fd: RawFd,
+) -> io::Result<()> {
     let object = replay_object(tid, fd)?;
     link_object_in(&mut shared_backings(), file, object, || {
-        H::duplicate_guest_thread_fd(pid, tid, fd)
+        H::duplicate_guest_thread_fd(access, pid, tid, fd)
     })
 }
 
@@ -1001,7 +1008,15 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         backing
             .write_all_at(recorded, shared.offset)
             .unwrap_or_else(|error| refuse("write the recorded bytes", error));
-        pin_shared_object(|| link_object::<H>(file, pid, tid, syscall.fd()));
+        pin_shared_object(|| {
+            link_object::<H, G>(
+                &DescriptorAccess::guest_bound(&mut *guest, tid),
+                file,
+                pid,
+                tid,
+                syscall.fd(),
+            )
+        });
 
         let opened = match &opening {
             Opening::Name(name) => Some(self.open_view(guest, name, shared.access).await),
@@ -1146,8 +1161,13 @@ impl<H: RecordHost> ReplayerWithHost<H> {
             }
             Err(errno) => refuse("make a socketpair", errno),
         };
-        let sender = H::duplicate_guest_thread_fd(pid, tid, pair[0])
-            .unwrap_or_else(|error| refuse("take the socketpair's sending end", error));
+        let sender = H::duplicate_guest_thread_fd(
+            &DescriptorAccess::guest_bound(&mut *guest, tid),
+            pid,
+            tid,
+            pair[0],
+        )
+        .unwrap_or_else(|error| refuse("take the socketpair's sending end", error));
         self.close_guest_descriptor(guest, pair[0]).await;
         send_descriptor(sender.as_fd(), backing)
             .unwrap_or_else(|error| refuse("send the backing", error));

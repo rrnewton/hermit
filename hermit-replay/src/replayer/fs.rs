@@ -48,6 +48,7 @@ use crate::event::FileCloneImage;
 use crate::event::ReplayFdKind;
 use crate::event::deterministic_ioctl_error;
 use crate::event::xattr_query_output;
+use crate::host::DescriptorAccess;
 use crate::host::RecordHost;
 use crate::vectored_offset;
 
@@ -664,8 +665,11 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         if !self.fd_is_in_replay_root(task, fd) {
             return;
         }
-        let duplicate = H::duplicate_guest_thread_fd(pid, task, fd)
-            .unwrap_or_else(|error| panic!("failed to duplicate replay file for read: {error}"));
+        let duplicate =
+            H::duplicate_guest_thread_fd(&DescriptorAccess::<()>::task(task, task), pid, task, fd)
+                .unwrap_or_else(|error| {
+                    panic!("failed to duplicate replay file for read: {error}")
+                });
         let offset = libc::off_t::try_from(length).expect("recorded read length exceeds off_t");
         // SAFETY: duplicate is an owned descriptor and the recorded read succeeded.
         let result = unsafe { libc::lseek(duplicate.as_raw_fd(), offset, libc::SEEK_CUR) };
@@ -729,7 +733,9 @@ impl<H: RecordHost> ReplayerWithHost<H> {
                 "recorded regular-file write used negative offset {offset}"
             ))
         })?;
-        let duplicate = H::duplicate_guest_thread_fd(pid, task, fd).map_err(Error::Io)?;
+        let duplicate =
+            H::duplicate_guest_thread_fd(&DescriptorAccess::<()>::task(task, task), pid, task, fd)
+                .map_err(Error::Io)?;
         let file = std::fs::File::from(duplicate);
         file.write_all_at(bytes, offset_u64).map_err(Error::Io)?;
 
@@ -1162,8 +1168,15 @@ impl<H: RecordHost> ReplayerWithHost<H> {
                 && event.output_fd.is_none()
                 && self.fd_is_in_replay_root(guest.pid(), syscall.fd())
             {
-                let duplicate =
-                    H::duplicate_guest_fd(guest.pid(), syscall.fd()).map_err(Error::Io)?;
+                let duplicate = {
+                    let pid = guest.pid();
+                    H::duplicate_guest_fd(
+                        &DescriptorAccess::guest_bound(&mut *guest, pid),
+                        pid,
+                        syscall.fd(),
+                    )
+                    .map_err(Error::Io)?
+                };
                 let file = std::fs::File::from(duplicate);
                 let length = u64::try_from(event.length).map_err(|_| {
                     Error::Tool(anyhow::anyhow!(
