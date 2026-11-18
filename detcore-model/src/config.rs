@@ -1925,6 +1925,15 @@ pub struct Config {
     #[clap(long)]
     pub dirent_tmpfs_host_order: bool,
 
+    /// Experimental (provrepro): a directory's virtual mtime follows the
+    /// names created in, removed from and renamed into or out of it, and a
+    /// new file or directory starts at its creation time, as on Linux.
+    /// Without it a directory keeps the virtual mtime it was first seen with
+    /// (or the one `utimensat` set) and a new object starts at the epoch.
+    #[serde(default)]
+    #[clap(long)]
+    pub dir_mtime_follows_entries: bool,
+
     /// How much of `/proc` the guest sees. Every level is the same on every
     /// backend and host. `minimal` (the default) shows a small set, modelled
     /// on gVisor's; `standard` shows every system-wide name Detcore serves or
@@ -3024,6 +3033,9 @@ impl fmt::Display for Config {
         }
         if self.dirent_tmpfs_host_order {
             write!(f, " --dirent-tmpfs-host-order")?;
+        }
+        if self.dir_mtime_follows_entries {
+            write!(f, " --dir-mtime-follows-entries")?;
         }
         match self.proc_level {
             ProcLevel::Minimal => {}
@@ -4500,7 +4512,7 @@ mod legacy_backend_json {
     /// `allow_unresolved_restart_codes` came after it too: only the ptrace
     /// backend on aarch64 asks Detcore about restart codes, so it is never
     /// written and reads as false.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 71] = [
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 72] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -4544,6 +4556,7 @@ mod legacy_backend_json {
         "uname_release",
         "uname_version",
         "dirent_tmpfs_host_order",
+        "dir_mtime_follows_entries",
         "notice_host_network_abstract_binds",
         "notice_autofs_eloop",
         "replay_edited_preemptions",
@@ -4722,6 +4735,7 @@ mod legacy_backend_json {
                     | "lenient_replay"
                     | "eager_lone_preemptions"
                     | "dirent_tmpfs_host_order"
+                    | "dir_mtime_follows_entries"
                     | "replay_continue_fairly"
                     | "strict_binder"
                     | "strict_unknown_syscalls"
@@ -5110,6 +5124,7 @@ mod legacy_backend_json {
                 | "lenient_replay"
                 | "eager_lone_preemptions"
                 | "dirent_tmpfs_host_order"
+                | "dir_mtime_follows_entries"
                 | "chaos_timeslice_range"
                 | "chaos_timeslice_draw"
                 | "chaos_timeslice"
@@ -6198,6 +6213,7 @@ mod tests {
                 | "lenient_replay"
                 | "eager_lone_preemptions"
                 | "dirent_tmpfs_host_order"
+                | "dir_mtime_follows_entries"
                 | "chaos_timeslice_range"
                 | "chaos_timeslice_draw"
                 | "chaos_timeslice"

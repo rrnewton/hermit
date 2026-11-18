@@ -87,6 +87,7 @@ use crate::tool_local::finish_partial_record_or_replay_write;
 use crate::types::*;
 
 pub(crate) mod descriptor_directory;
+pub(crate) mod entry_mtime;
 #[cfg(test)]
 mod determinize_stat_tests;
 pub(crate) mod flock_model;

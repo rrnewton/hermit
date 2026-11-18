@@ -8047,9 +8047,21 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         self.note_send_without_control(guest, send, &result);
                         result
                     }
+                    // Experimental (provrepro): a created name touches its directory.
+                    Syscall::Openat(o) if guest.config().dir_mtime_follows_entries => {
+                        Box::pin(self.openat_touching_entries(guest, o)).await
+                    }
+                    #[cfg(target_arch = "x86_64")]
+                    Syscall::Open(o) if guest.config().dir_mtime_follows_entries => {
+                        Box::pin(self.openat_touching_entries(guest, o.into())).await
+                    }
                     Syscall::Openat(o) => Box::pin(self.handle_openat(guest, o)).await,
                     #[cfg(target_arch = "x86_64")]
                     Syscall::Open(o) => Box::pin(self.handle_openat(guest, o.into())).await,
+                    #[cfg(target_arch = "x86_64")]
+                    Syscall::Creat(o) if guest.config().dir_mtime_follows_entries => {
+                        Box::pin(self.openat_touching_entries(guest, o.into())).await
+                    }
                     #[cfg(target_arch = "x86_64")]
                     Syscall::Creat(o) => Box::pin(self.handle_openat(guest, o.into())).await,
                     Syscall::Close(s) => self.handle_close(guest, s).await,
@@ -8787,6 +8799,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     ) =>
                 {
                     Box::pin(self.handle_memory_lock_call(guest, call)).await
+                }
+                // Experimental (provrepro): directory mtimes follow entry changes.
+                SyscallClassification::PassThrough
+                    if guest.config().dir_mtime_follows_entries
+                        && self.call_changes_entries(guest, &call) =>
+                {
+                    Box::pin(self.passthrough_touching_entries(guest, call)).await
                 }
                 SyscallClassification::PassThrough => self.passthrough(guest, call).await,
                 // The kernel's restart of a wait Detcore emulates, or ran in the
