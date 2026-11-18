@@ -263,6 +263,82 @@ enum ProcfsKind {
     /// never by a path alone. Appended last, so every other kind keeps its
     /// serialized number.
     DeviceNode(DeviceNodeFile),
+    /// Experimental (provrepro, `--cpu-caches`): a CPU's
+    /// `cache/index<M>/<attribute>` for an attribute the witnessed cache
+    /// sizes determine (`level`, `type`, `size`, `ways_of_associativity`,
+    /// `coherency_line_size`, `number_of_sets`, `physical_line_partition`),
+    /// rendered from `MachineDescription::cpu_caches` when the run has them
+    /// and left as the host's bytes otherwise. Appended last, so every other
+    /// kind keeps its serialized number.
+    CpuCache(CpuCacheFile),
+}
+
+/// A file [`ProcfsKind::CpuCache`] names: `cpu<cpu>/cache/index<index>/`'s
+/// `attribute`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct CpuCacheFile {
+    cpu: u32,
+    index: u32,
+    attribute: CpuCacheAttribute,
+}
+
+impl CpuCacheFile {
+    fn of_path(path: &str) -> Option<Self> {
+        let (cpu, within) = cpu_file(path)?;
+        let (index, attribute) = within.strip_prefix("cache/index")?.split_once('/')?;
+        if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let attribute = CpuCacheAttribute::ALL
+            .iter()
+            .find(|(name, _)| *name == attribute)
+            .map(|(_, attribute)| *attribute)?;
+        Some(Self {
+            cpu,
+            index: index.parse().ok()?,
+            attribute,
+        })
+    }
+
+    /// The file's contents on `machine`: the witnessed cache's, or `host`.
+    fn contents(self, machine: &MachineDescription, host: &[u8]) -> Vec<u8> {
+        machine
+            .cpu_caches
+            .and_then(|caches| caches.cache(self.index))
+            .and_then(|cache| cache.sysfs(self.attribute.name()))
+            .map_or_else(|| host.to_vec(), String::into_bytes)
+    }
+}
+
+/// The sysfs cache attributes [`ProcfsKind::CpuCache`] renders.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) enum CpuCacheAttribute {
+    Level,
+    Type,
+    Size,
+    WaysOfAssociativity,
+    CoherencyLineSize,
+    NumberOfSets,
+    PhysicalLinePartition,
+}
+
+impl CpuCacheAttribute {
+    const ALL: [(&'static str, Self); 7] = [
+        ("level", Self::Level),
+        ("type", Self::Type),
+        ("size", Self::Size),
+        ("ways_of_associativity", Self::WaysOfAssociativity),
+        ("coherency_line_size", Self::CoherencyLineSize),
+        ("number_of_sets", Self::NumberOfSets),
+        ("physical_line_partition", Self::PhysicalLinePartition),
+    ];
+
+    fn name(self) -> &'static str {
+        Self::ALL
+            .iter()
+            .find(|(_, attribute)| *attribute == self)
+            .map_or("", |(name, _)| name)
+    }
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -2056,6 +2132,7 @@ impl ProcfsFile {
             other if let Some(file) = CpuConstantFile::from_path(other) => {
                 ProcfsKind::CpuConstant(file)
             }
+            other if let Some(file) = CpuCacheFile::of_path(other) => ProcfsKind::CpuCache(file),
             // In run mode no lookup reaches a node file — the directory
             // itself is absent (is_absent_cpu_entry). These kinds serve
             // record mode, which leaves sysfs lookups alone by design, so
@@ -2414,6 +2491,7 @@ impl ProcfsFile {
         let cpu = match &self.kind {
             ProcfsKind::CpuList(set) | ProcfsKind::CpuMask(set) => set.cpu(),
             ProcfsKind::CpuConstant(file) => file.cpu(),
+            ProcfsKind::CpuCache(file) => Some(file.cpu),
             _ => None,
         };
         cpu.is_none_or(|cpu| cpu < cpus)
@@ -3495,6 +3573,7 @@ impl ProcfsFile {
                 sanitize_cpu_mask(&contents, set.cpus(machine.cpus), machine.cpus)
             }
             ProcfsKind::CpuConstant(file) => file.contents(),
+            ProcfsKind::CpuCache(file) => file.contents(&machine, &contents),
             ProcfsKind::DeviceNode(file) => file.contents(&contents),
             ProcfsKind::Fixed(file) => file.contents(&machine),
             ProcfsKind::BtrfsBytesMayUse => sanitize_btrfs_bytes_may_use(&contents),

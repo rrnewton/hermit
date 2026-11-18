@@ -353,6 +353,7 @@ pub mod access_trace;
 pub mod collections;
 pub mod config;
 pub mod container_mounts;
+pub mod cpu_caches;
 pub mod fd;
 pub mod futex;
 pub mod happens_before;

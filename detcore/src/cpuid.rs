@@ -25,6 +25,10 @@ pub struct InterceptedCpuid {
     /// XCR0 and layout; under `fixed_guest` facts it describes the fixed
     /// KVM machine those facts define.
     xsave: [[u32; 4]; XSAVE_SUBLEAVES],
+    /// Experimental (provrepro, `--cpu-caches`): a witnessed machine's cache
+    /// sizes, which replace the table's cache leaves
+    /// ([`detcore_model::cpu_caches::CpuCacheSizes::answer`]).
+    caches: Option<detcore_model::cpu_caches::CpuCacheSizes>,
 }
 
 /// Leaf 0xD subleaves the v3 table answers from the host: 0, and components
@@ -87,6 +91,7 @@ impl InterceptedCpuid {
         InterceptedCpuid {
             profile: CpuProfile::X86_64V2,
             xsave: [[0; 4]; XSAVE_SUBLEAVES],
+            caches: None,
         }
     }
 
@@ -96,6 +101,7 @@ impl InterceptedCpuid {
         InterceptedCpuid {
             profile: CpuProfile::X86_64V2LegacyBroadwell,
             xsave: [[0; 4]; XSAVE_SUBLEAVES],
+            caches: None,
         }
     }
 
@@ -118,6 +124,7 @@ impl InterceptedCpuid {
         InterceptedCpuid {
             profile: CpuProfile::X86_64V3,
             xsave,
+            caches: None,
         }
     }
 
@@ -125,6 +132,13 @@ impl InterceptedCpuid {
     /// facts after the host qualifies; a v3 configuration without them is a
     /// launch defect, so it is refused rather than given a guessed leaf 0xD.
     pub fn for_config(cfg: &crate::Config) -> Self {
+        Self {
+            caches: cfg.cpu_caches,
+            ..Self::for_profile(cfg)
+        }
+    }
+
+    fn for_profile(cfg: &crate::Config) -> Self {
         match cfg.cpu_profile {
             CpuProfile::X86_64V2 => Self::new(),
             CpuProfile::X86_64V2LegacyBroadwell => Self::legacy_v2(),
@@ -134,6 +148,7 @@ impl InterceptedCpuid {
             CpuProfile::HostNoRdrand => Self {
                 profile: CpuProfile::HostNoRdrand,
                 xsave: [[0; 4]; XSAVE_SUBLEAVES],
+                caches: None,
             },
             CpuProfile::Auto => panic!(
                 "--cpu-profile auto reached Detcore unresolved; the CLI resolves it to a named \
@@ -143,6 +158,21 @@ impl InterceptedCpuid {
     }
 
     pub fn cpuid(&self, leaf: u32, subleaf: u32) -> Option<CpuIdResult> {
+        let result = self.table_cpuid(leaf, subleaf)?;
+        Some(match &self.caches {
+            Some(caches) => {
+                let [eax, ebx, ecx, edx] = caches.answer(
+                    leaf,
+                    subleaf,
+                    [result.eax, result.ebx, result.ecx, result.edx],
+                );
+                cpuid_result(eax, ebx, ecx, edx)
+            }
+            None => result,
+        })
+    }
+
+    fn table_cpuid(&self, leaf: u32, subleaf: u32) -> Option<CpuIdResult> {
         // The host profile reads the native CPUID instruction, which only x86
         // has; launch admission refuses the profile elsewhere.
         #[cfg(target_arch = "x86_64")]

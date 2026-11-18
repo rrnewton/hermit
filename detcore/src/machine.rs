@@ -44,6 +44,10 @@ pub struct MachineDescription {
     /// agree exactly; here they differ by the size modulo 1024 (512 bytes
     /// for the default), as they did before this description.
     pub memory: u64,
+    /// Experimental (provrepro, `--cpu-caches`): a witnessed machine's cache
+    /// sizes, which the sysfs cache files of every CPU then describe.
+    /// `None`: those files are the host's.
+    pub cpu_caches: Option<detcore_model::cpu_caches::CpuCacheSizes>,
 }
 
 /// `--memory`'s default, 1 GB (`bytesize` reads "1GB" as 10^9 bytes).
@@ -56,6 +60,7 @@ impl Default for MachineDescription {
             limits: KernelLimits::default(),
             cpus: 1,
             memory: DEFAULT_MEMORY,
+            cpu_caches: None,
         }
     }
 }
@@ -90,6 +95,7 @@ impl MachineDescription {
             machine.kernel.release = release.clone();
         }
         machine.kernel.version_override = config.uname_version.clone();
+        machine.cpu_caches = config.cpu_caches;
         machine
     }
 }

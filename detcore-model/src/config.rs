@@ -1934,6 +1934,16 @@ pub struct Config {
     #[clap(long)]
     pub dir_mtime_follows_entries: bool,
 
+    /// Experimental (provrepro): the cache sizes the guest reads, as
+    /// `L1D,L1I,L2,L3` (such as `32K,64K,512K,16M`), from CPUID leaves 2, 4,
+    /// 0x8000_0005 and 0x8000_0006, glibc's `sysconf`, `/proc/cpuinfo`, and
+    /// `/sys/devices/system/cpu/cpuN/cache/index0-3/`. Without it, CPUID
+    /// gives the virtual CPU's table and the sysfs cache files are the
+    /// host's.
+    #[serde(default)]
+    #[clap(long, value_name = "L1D,L1I,L2,L3")]
+    pub cpu_caches: Option<crate::cpu_caches::CpuCacheSizes>,
+
     /// How much of `/proc` the guest sees. Every level is the same on every
     /// backend and host. `minimal` (the default) shows a small set, modelled
     /// on gVisor's; `standard` shows every system-wide name Detcore serves or
@@ -3036,6 +3046,9 @@ impl fmt::Display for Config {
         }
         if self.dir_mtime_follows_entries {
             write!(f, " --dir-mtime-follows-entries")?;
+        }
+        if let Some(caches) = &self.cpu_caches {
+            write!(f, " --cpu-caches={caches}")?;
         }
         match self.proc_level {
             ProcLevel::Minimal => {}
@@ -4512,7 +4525,7 @@ mod legacy_backend_json {
     /// `allow_unresolved_restart_codes` came after it too: only the ptrace
     /// backend on aarch64 asks Detcore about restart codes, so it is never
     /// written and reads as false.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 72] = [
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 73] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -4557,6 +4570,7 @@ mod legacy_backend_json {
         "uname_version",
         "dirent_tmpfs_host_order",
         "dir_mtime_follows_entries",
+        "cpu_caches",
         "notice_host_network_abstract_binds",
         "notice_autofs_eloop",
         "replay_edited_preemptions",
@@ -4790,6 +4804,7 @@ mod legacy_backend_json {
                     | "uname_nodename"
                     | "uname_release"
                     | "uname_version"
+                    | "cpu_caches"
                     | "chaos_timeslice_range"
                     | "chaos_timeslice"
                     | "access_trace"
@@ -5118,6 +5133,7 @@ mod legacy_backend_json {
                 | "uname_nodename"
                 | "uname_release"
                 | "uname_version"
+                | "cpu_caches"
                 | "notice_host_network_abstract_binds"
                 | "notice_autofs_eloop"
                 | "replay_edited_preemptions"
@@ -6207,6 +6223,7 @@ mod tests {
                 | "uname_nodename"
                 | "uname_release"
                 | "uname_version"
+                | "cpu_caches"
                 | "notice_host_network_abstract_binds"
                 | "notice_autofs_eloop"
                 | "replay_edited_preemptions"
