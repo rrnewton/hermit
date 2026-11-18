@@ -14746,8 +14746,16 @@ impl RunOpts {
                     self.pin_threads,
                     self.det_opts.det_config.cpu_profile_source,
                 )?;
+                let replaceable = super::fork_server::Replaceable {
+                    record: self.det_opts.det_config.choice_record.is_some(),
+                    tape: self.det_opts.det_config.choice_tape.is_some(),
+                    controller: self.det_opts.det_config.choice_controller.is_some(),
+                    summary: self.summary_json.is_some(),
+                    log_fd: global.log_file_handle.as_ref().map(|file| file.as_raw_fd()),
+                };
+                let paths = super::fork_server::serve_here(&replaceable);
+                self.apply_served_paths(paths)?;
             }
-            super::fork_server::serve_here();
             let (status, _, _) = self.run(global, false)?;
             self.write_backend_engagement_after_run()?;
             drop(private_engagement_summary);
@@ -20684,6 +20692,29 @@ impl RunOpts {
         if let Some(path) = &self.save_config {
             let mut file = File::create(path)?;
             file.write_all(format!("{:#?}\n", self).as_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// PROTOTYPE (fork server): a served run's own paths, from its RUN
+    /// request, in place of the ones the server's command line named (each
+    /// key replaces only a path the command line set, so the run keeps the
+    /// configuration the server validated). A replaced summary path is checked
+    /// as the command line's was.
+    fn apply_served_paths(&mut self, paths: super::fork_server::RunPaths) -> Result<(), Error> {
+        let config = &mut self.det_opts.det_config;
+        if let Some(path) = paths.record {
+            config.choice_record = Some(path);
+        }
+        if let Some(path) = paths.tape {
+            config.choice_tape = Some(path);
+        }
+        if let Some(path) = paths.controller {
+            config.choice_controller = Some(path);
+        }
+        if let Some(path) = paths.summary {
+            self.summary_json = Some(path);
+            self.validate_summary_json_visibility()?;
         }
         Ok(())
     }
