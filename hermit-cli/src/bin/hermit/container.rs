@@ -46,6 +46,7 @@ use hermit::SerializableError;
 use hermit::SkidOvershootError;
 use nix::sched::CpuSet;
 use nix::sched::sched_getaffinity;
+use nix::sched::sched_setaffinity;
 use nix::sys::signal::SaFlags;
 use nix::sys::signal::SigAction;
 use nix::sys::signal::SigHandler;
@@ -1558,6 +1559,42 @@ pub(super) fn apply_affinity(
         );
         container.affinity(choice.cpu);
     }
+    Ok(())
+}
+
+/// PROTOTYPE (fork server): place the CPU every served pinned run uses once,
+/// in the server, over one sample, and narrow the server's own affinity to it.
+/// Each run the server forks then has one allowed CPU, which placement takes
+/// without sampling `/proc/stat` again (a single candidate needs no
+/// observation, `pinned_cpu::choose_reserving`), and keeps the reservation
+/// the server holds (`Hold::Kept`). Without this, every run sleeps through a
+/// fresh sample window. Served runs are sequential, so they share the one
+/// reservation as a single long run would.
+pub(super) fn narrow_affinity_for_fork_server(
+    pin_threads: bool,
+    cpu_profile_source: Option<usize>,
+) -> Result<(), Error> {
+    if !pin_threads {
+        return Ok(());
+    }
+    let affinity = sched_getaffinity(Pid::from_raw(0))
+        .context("failed to query the fork server's allowed CPU affinity mask")?;
+    let mut allowed = cpu_ids(&affinity);
+    if let Some(source) = cpu_profile_source.filter(|cpu| allowed.contains(cpu)) {
+        allowed = vec![source];
+    }
+    let choice = super::pinned_cpu::place(&allowed)
+        .map_err(|refusal| Error::new(PolicyRefusal).context(refusal.0))?
+        .ok_or_else(|| anyhow!("the fork server's allowed CPU affinity mask is empty"))?;
+    let mut one = CpuSet::new();
+    one.set(choice.cpu)
+        .context("the chosen CPU is outside the affinity mask's range")?;
+    sched_setaffinity(Pid::from_raw(0), &one)
+        .context("failed to narrow the fork server's affinity to its chosen CPU")?;
+    eprintln!(
+        "hermit fork server: every run is pinned to core {} ({choice})",
+        choice.cpu
+    );
     Ok(())
 }
 

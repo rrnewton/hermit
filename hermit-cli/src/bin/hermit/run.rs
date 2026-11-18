@@ -14733,7 +14733,15 @@ impl RunOpts {
             self.verify_run(directory, global)
         } else {
             // PROTOTYPE (fuzzpoc): with HERMIT_FORK_SERVER, serve runs from
-            // here; only a forked child returns, and runs once.
+            // here; only a forked child returns, and runs once. The pinned CPU
+            // is placed once, for every run, before the first fork.
+            if super::fork_server::requested() {
+                super::pinned_cpu::set_settings(self.pinned_cpu_settings());
+                super::container::narrow_affinity_for_fork_server(
+                    self.pin_threads,
+                    self.det_opts.det_config.cpu_profile_source,
+                )?;
+            }
             super::fork_server::serve_here();
             let (status, _, _) = self.run(global, false)?;
             self.write_backend_engagement_after_run()?;
