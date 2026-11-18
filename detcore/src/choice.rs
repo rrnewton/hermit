@@ -293,8 +293,14 @@ pub fn start_run(cfg: &crate::config::Config) {
         return;
     };
     let record = cfg.choice_record.as_ref().map(|path| {
-        File::create(path)
-            .unwrap_or_else(|e| panic!("--choice-record {}: cannot create: {e}", path.display()))
+        let file = File::create(path)
+            .unwrap_or_else(|e| panic!("--choice-record {}: cannot create: {e}", path.display()));
+        // Host-fork timelines (PROTOTYPE): each copy records its own suffix.
+        crate::timelines::register_output(
+            std::os::fd::AsRawFd::as_raw_fd(&file),
+            "choices",
+        );
+        file
     });
     *CONTROLLER.lock().unwrap() = Some(Controller {
         source,

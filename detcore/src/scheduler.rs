@@ -11861,14 +11861,15 @@ impl Scheduler {
     /// It runs where `send_signal_at` runs, so the copies start at the same
     /// point of every run.
     fn fork_timelines_at(&mut self) {
-        let Some(at) = self.timeline_fork_at.as_ref().map(|spec| spec.turn) else {
+        let Some(at) = self.timeline_fork_at.as_ref().and_then(|spec| spec.turn) else {
             return;
         };
         let Some(committed) = self.last_committed_turn.filter(|turn| *turn >= at) else {
             return;
         };
         if let Some(spec) = self.timeline_fork_at.take() {
-            crate::timelines::fork_copies(&spec, committed);
+            let place = serde_json::json!({ "turn": at, "committed_turn": committed });
+            let _ = crate::timelines::fork_copies(&spec, place);
         }
     }
 

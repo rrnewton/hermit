@@ -6,12 +6,17 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Host-fork timelines: copies of a run taken at a scheduler turn (PROTOTYPE).
+//! Host-fork timelines: copies of a run taken at a scheduler turn or at a
+//! choice point (PROTOTYPE).
 //!
 //! With [`TIMELINE_FORK_ENV`] set to `turn=N,copies=K,dir=DIR`, the scheduler
 //! stops at its first drain after committing turn N, where every guest thread
 //! is parked (the point `--signal-at` uses), and the run forks K copies of
-//! itself, one at a time. Each copy (a *timeline*) repairs what `fork()` does
+//! itself, one at a time. With `choice=I` instead of `turn=N` (and a choice
+//! controller, `--choice-tape` or `--choice-controller`), the copies are
+//! taken inside the pause hook of choice request I (`crate::choice`), and
+//! `bytes=B0:B1:...` gives copy k the answer that tape byte Bk would give
+//! (0 or absent: the run's own answer), so copies can take different futures. Each copy (a *timeline*) repairs what `fork()` does
 //! not copy, through the hooks its backend installed
 //! ([`install_backend_hooks`]), and then runs the rest of the guest as the
 //! original would have. The parent (the *template*) waits for each copy in
@@ -41,7 +46,12 @@ pub const TIMELINE_FORK_ENV: &str = "HERMIT_TIMELINE_FORK_AT";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ForkSpec {
     /// The first committed turn at or after which the copies are taken.
-    pub turn: u64,
+    pub turn: Option<u64>,
+    /// The choice request at which the copies are taken.
+    pub choice: Option<u64>,
+    /// At a choice point: copy k answers it as tape byte `bytes[k]` would
+    /// (0 or absent: the run's own answer).
+    pub bytes: Vec<u8>,
     /// How many copies, run one after another.
     pub copies: usize,
     /// Where each copy's output and measurements go.
@@ -49,9 +59,11 @@ pub struct ForkSpec {
 }
 
 impl ForkSpec {
-    /// Parses `turn=N,copies=K,dir=DIR`.
+    /// Parses `turn=N,copies=K,dir=DIR` or `choice=I,copies=K,dir=DIR[,bytes=B0:B1]`.
     pub fn parse(text: &str) -> Result<Self, String> {
         let mut turn = None;
+        let mut choice = None;
+        let mut bytes = Vec::new();
         let mut copies = 1;
         let mut dir = None;
         for part in text.split(',') {
@@ -60,13 +72,27 @@ impl ForkSpec {
                 .ok_or_else(|| format!("{TIMELINE_FORK_ENV}: {part:?} is not key=value"))?;
             match key {
                 "turn" => turn = Some(value.parse().map_err(|e| format!("turn: {e}"))?),
+                "choice" => choice = Some(value.parse().map_err(|e| format!("choice: {e}"))?),
+                "bytes" => {
+                    bytes = value
+                        .split(':')
+                        .map(|byte| byte.parse::<u8>().map_err(|e| format!("bytes: {e}")))
+                        .collect::<Result<_, _>>()?
+                }
                 "copies" => copies = value.parse().map_err(|e| format!("copies: {e}"))?,
                 "dir" => dir = Some(PathBuf::from(value)),
                 other => return Err(format!("{TIMELINE_FORK_ENV}: unknown key {other:?}")),
             }
         }
+        if turn.is_some() == choice.is_some() {
+            return Err(format!(
+                "{TIMELINE_FORK_ENV}: exactly one of turn= and choice= is required"
+            ));
+        }
         Ok(Self {
-            turn: turn.ok_or_else(|| format!("{TIMELINE_FORK_ENV}: turn= is required"))?,
+            turn,
+            choice,
+            bytes,
             copies,
             dir: dir.ok_or_else(|| format!("{TIMELINE_FORK_ENV}: dir= is required"))?,
         })
@@ -100,9 +126,44 @@ pub struct BackendHooks {
 
 static HOOKS: OnceLock<BackendHooks> = OnceLock::new();
 
-/// Installs the running backend's hooks, once per process.
+/// Installs the running backend's hooks, once per process, and, for a spec
+/// that forks at a choice point, the choice pause hook that takes the copies.
 pub fn install_backend_hooks(hooks: BackendHooks) {
     let _ = HOOKS.set(hooks);
+    if let Some(spec) = spec_from_env().filter(|spec| spec.choice.is_some()) {
+        install_choice_fork(spec);
+    }
+}
+
+fn install_choice_fork(spec: ForkSpec) {
+    use crate::choice::PauseAction;
+    let Some(at) = spec.choice else {
+        return;
+    };
+    crate::choice::set_pause_hook(Some(Box::new(
+        move |request: &crate::choice::ChoiceRequest| {
+            if request.index != at {
+                return PauseAction::Continue;
+            }
+            let place = serde_json::json!({
+                "choice": at,
+                "request": crate::choice::request_json(request),
+            });
+            let Some(copy) = fork_copies(&spec, place) else {
+                return PauseAction::Continue;
+            };
+            match spec.bytes.get(copy).copied().unwrap_or(0) {
+                0 => PauseAction::Continue,
+                byte => {
+                    use crate::choice::ChoiceSource;
+                    let answer = crate::choice::TapeSource::new(vec![byte])
+                        .answer(request)
+                        .unwrap_or(request.default);
+                    PauseAction::Answer(answer)
+                }
+            }
+        },
+    )));
 }
 
 /// Descriptors, besides standard output and standard error, that each
@@ -112,10 +173,9 @@ static OUTPUTS: std::sync::Mutex<Vec<(RawFd, &'static str)>> = std::sync::Mutex:
 /// Gives each timeline its own copy of what the run writes to `fd` (the
 /// run's `--log-file`, say), named `name`; the template keeps the original.
 pub fn register_output(fd: RawFd, name: &'static str) {
-    OUTPUTS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push((fd, name));
+    let mut outputs = OUTPUTS.lock().unwrap_or_else(|e| e.into_inner());
+    outputs.retain(|&(_, other)| other != name);
+    outputs.push((fd, name));
 }
 
 fn outputs() -> Vec<(RawFd, &'static str)> {
@@ -316,17 +376,18 @@ fn micros(since: Instant) -> u64 {
     since.elapsed().as_micros() as u64
 }
 
-/// Takes the copies `spec` asks for, at committed turn `turn`. Returns in the
-/// template once every copy has exited, and in each copy once it is
-/// repaired, so that the caller's scheduler goes on with the run.
-pub(crate) fn fork_copies(spec: &ForkSpec, turn: u64) {
+/// Takes the copies `spec` asks for, at `place` (a description, for the
+/// measurements). Returns `None` in the template once every copy has exited,
+/// and `Some(k)` in copy k once it is repaired, so that the caller goes on
+/// with the run.
+pub(crate) fn fork_copies(spec: &ForkSpec, place: serde_json::Value) -> Option<usize> {
     let Some(hooks) = HOOKS.get().copied() else {
         tracing::warn!("{TIMELINE_FORK_ENV}: this backend installed no host-fork hooks");
-        return;
+        return None;
     };
     if let Err(error) = std::fs::create_dir_all(&spec.dir) {
         tracing::warn!("{TIMELINE_FORK_ENV}: {}: {error}", spec.dir.display());
-        return;
+        return None;
     }
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
@@ -338,7 +399,7 @@ pub(crate) fn fork_copies(spec: &ForkSpec, turn: u64) {
         Err(error) => {
             let _ = std::fs::write(spec.dir.join("refused.txt"), format!("{error}\n"));
             tracing::warn!("{TIMELINE_FORK_ENV}: capture refused: {error}");
-            return;
+            return None;
         }
     };
     let records_started = Instant::now();
@@ -356,8 +417,8 @@ pub(crate) fn fork_copies(spec: &ForkSpec, turn: u64) {
         // otherwise), so the copy has every thread the run needs.
         let pid = unsafe { libc::fork() };
         if pid == 0 {
-            become_timeline(spec, index, turn, &hooks, &records, forked);
-            return;
+            become_timeline(spec, index, &place, &hooks, &records, forked);
+            return Some(index);
         }
         let fork_us = micros(forked);
         if pid < 0 {
@@ -400,8 +461,8 @@ pub(crate) fn fork_copies(spec: &ForkSpec, turn: u64) {
     }
     let summary = serde_json::json!({
         "backend": hooks.name,
-        "turn_requested": spec.turn,
-        "turn_committed": turn,
+        "spec": format!("{spec:?}"),
+        "place": place,
         "copies": spec.copies,
         "prepare_us": prepare_us,
         "prepare": prepared,
@@ -417,12 +478,13 @@ pub(crate) fn fork_copies(spec: &ForkSpec, turn: u64) {
             serde_json::to_string_pretty(&summary).unwrap_or_default()
         ),
     );
+    None
 }
 
 fn become_timeline(
     spec: &ForkSpec,
     index: usize,
-    turn: u64,
+    place: &serde_json::Value,
     hooks: &BackendHooks,
     records: &[FileRecord],
     forked: Instant,
@@ -454,7 +516,7 @@ fn become_timeline(
         "index": index,
         // SAFETY: getpid has no preconditions.
         "pid": unsafe { libc::getpid() },
-        "turn_committed": turn,
+        "place": place,
         "fork_to_child_us": started.duration_since(forked).as_micros() as u64,
         "repair_us": repair_us,
         "repair": repaired,
@@ -480,11 +542,24 @@ mod tests {
         assert_eq!(
             ForkSpec::parse("turn=40,copies=3,dir=/tmp/x").unwrap(),
             ForkSpec {
-                turn: 40,
+                turn: Some(40),
+                choice: None,
+                bytes: vec![],
                 copies: 3,
                 dir: PathBuf::from("/tmp/x"),
             }
         );
+        assert_eq!(
+            ForkSpec::parse("choice=7,copies=2,dir=/d,bytes=0:144").unwrap(),
+            ForkSpec {
+                turn: None,
+                choice: Some(7),
+                bytes: vec![0, 144],
+                copies: 2,
+                dir: PathBuf::from("/d"),
+            }
+        );
+        assert!(ForkSpec::parse("turn=1,choice=2,dir=/d").is_err());
         assert!(ForkSpec::parse("copies=3,dir=/tmp/x").is_err());
         assert!(ForkSpec::parse("turn=4,dir=/tmp/x,colour=red").is_err());
     }
