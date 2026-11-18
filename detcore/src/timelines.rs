@@ -924,12 +924,551 @@ fn fdinfo_field(info: &str, key: &str) -> Option<String> {
         .map(|rest| rest.trim_start_matches(':').trim().to_string())
 }
 
-/// Gives this copy its own eventfds and epoll instances, which `fork()`
-/// shares with the template and every other copy: an event one copy waits
-/// for could otherwise be taken by another. An eventfd is re-created with
-/// its count and flags; an epoll instance with every registration its
-/// fdinfo lists, against the copy's own descriptors (re-created first).
-/// Descriptors that shared one object share its replacement.
+/// The poll events `fd` reports at once; POLLHUP and POLLERR always count.
+fn poll_now(fd: RawFd, events: libc::c_short) -> libc::c_short {
+    let mut entry = libc::pollfd {
+        fd,
+        events,
+        revents: 0,
+    };
+    // SAFETY: one pollfd and a zero timeout.
+    if unsafe { libc::poll(&mut entry, 1, 0) } < 0 {
+        return 0;
+    }
+    entry.revents
+}
+
+fn close_pair(pair: &[RawFd; 2]) {
+    // SAFETY: two descriptors this copy created; their duplicates live on.
+    unsafe {
+        libc::close(pair[0]);
+        libc::close(pair[1]);
+    }
+}
+
+/// Puts `new` on every descriptor in `group`, with the group's O_NONBLOCK.
+fn dup_group(new: RawFd, group: &[RawFd], status: libc::c_int, what: &str) -> Result<(), String> {
+    // SAFETY: fcntl on a live descriptor.
+    unsafe { libc::fcntl(new, libc::F_SETFL, status & libc::O_NONBLOCK) };
+    for &fd in group {
+        if !dup_onto(new, fd) {
+            return Err(format!(
+                "dup3 {what} onto {fd}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// What `privatize_pipes` and `privatize_socket_pairs` did.
+#[derive(Default)]
+struct StreamCounts {
+    copied: usize,
+    bytes: u64,
+    lone: usize,
+    external: usize,
+}
+
+/// Gives this copy its own pipe for each pipe `fork()` shares with the
+/// template and every other copy (a guest pipe on KVM is a host pipe): a
+/// copy's reader could take another copy's bytes, and would never see end
+/// of file while the template holds a write end. The new pipe has the old
+/// one's capacity and buffered bytes, copied with tee(2), which leaves the
+/// shared pipe as the template and the other copies need it; each open file
+/// description of each end gets its own description of the new end, with
+/// its O_NONBLOCK flag. A pipe with no writer left anywhere (poll reports
+/// POLLHUP) gets a new pipe whose write end is closed, so the copy reads
+/// the buffered bytes and then end of file, as the template would; one with
+/// no reader left anywhere (POLLERR) gets one whose read end is closed. A
+/// pipe with an end held outside this process is left shared and counted
+/// as external. Packet-mode, signal-driven and read-write pipe descriptors
+/// are refused.
+fn privatize_pipes(
+    fds: &[RawFd],
+    kind: &dyn Fn(RawFd) -> String,
+    flags_of: &dyn Fn(RawFd) -> libc::c_int,
+) -> Result<StreamCounts, String> {
+    let mut by_pipe: Vec<(String, Vec<RawFd>)> = Vec::new();
+    for &fd in fds {
+        let target = kind(fd);
+        if !target.starts_with("pipe:") {
+            continue;
+        }
+        match by_pipe.iter_mut().find(|(name, _)| *name == target) {
+            Some((_, group)) => group.push(fd),
+            None => by_pipe.push((target, vec![fd])),
+        }
+    }
+    let mut counts = StreamCounts::default();
+    for (name, group) in by_pipe {
+        if group.iter().any(|&fd| is_output(fd)) {
+            continue;
+        }
+        let mut readers = Vec::new();
+        let mut writers = Vec::new();
+        for &fd in &group {
+            let flags = flags_of(fd);
+            if flags & (libc::O_DIRECT | libc::O_ASYNC) != 0 {
+                return Err(format!(
+                    "{name} (descriptor {fd}) is packet-mode or signal-driven: not copied"
+                ));
+            }
+            match flags & libc::O_ACCMODE {
+                libc::O_RDONLY => readers.push(fd),
+                libc::O_WRONLY => writers.push(fd),
+                _ => {
+                    return Err(format!(
+                        "{name} (descriptor {fd}) is read-write: not copied"
+                    ));
+                }
+            }
+        }
+        let lone = match (readers.first(), writers.first()) {
+            (Some(_), Some(_)) => false,
+            (Some(&reader), None) if poll_now(reader, libc::POLLIN) & libc::POLLHUP != 0 => true,
+            (None, Some(&writer)) if poll_now(writer, libc::POLLOUT) & libc::POLLERR != 0 => true,
+            _ => {
+                counts.external += 1;
+                continue;
+            }
+        };
+        let model = readers.first().or(writers.first()).copied().unwrap_or(-1);
+        let mut new = [-1; 2];
+        // SAFETY: room for both descriptors; closed below after their duplicates.
+        if unsafe { libc::pipe2(new.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            return Err(format!("pipe2: {}", std::io::Error::last_os_error()));
+        }
+        // SAFETY: fcntl on live pipe descriptors.
+        let capacity = unsafe { libc::fcntl(model, libc::F_GETPIPE_SZ) };
+        // SAFETY: as above.
+        if capacity > 0 && unsafe { libc::fcntl(new[1], libc::F_SETPIPE_SZ, capacity) } != capacity
+        {
+            let error = std::io::Error::last_os_error();
+            close_pair(&new);
+            return Err(format!(
+                "{name}: capacity {capacity} not reproduced: {error}"
+            ));
+        }
+        if let Some(&reader) = readers.first() {
+            let mut pending: libc::c_int = 0;
+            // SAFETY: FIONREAD into an int.
+            unsafe { libc::ioctl(reader, libc::FIONREAD, &mut pending) };
+            if pending > 0 {
+                // SAFETY: tee between two pipes; no memory is passed.
+                let copied =
+                    unsafe { libc::tee(reader, new[1], pending as usize, libc::SPLICE_F_NONBLOCK) };
+                if copied != pending as isize {
+                    close_pair(&new);
+                    return Err(format!(
+                        "{name}: tee copied {copied} of {pending} buffered bytes"
+                    ));
+                }
+                counts.bytes += pending as u64;
+            }
+        }
+        for (ends, new_end, access) in [
+            (&readers, new[0], libc::O_RDONLY),
+            (&writers, new[1], libc::O_WRONLY),
+        ] {
+            let mut descriptions: Vec<Vec<RawFd>> = Vec::new();
+            for &fd in ends.iter() {
+                match descriptions
+                    .iter_mut()
+                    .find(|description| same_description(description[0], fd))
+                {
+                    Some(description) => description.push(fd),
+                    None => descriptions.push(vec![fd]),
+                }
+            }
+            for (k, description) in descriptions.iter().enumerate() {
+                let source = if k == 0 {
+                    new_end
+                } else {
+                    // Another open file description of the same end.
+                    let path = format!("/proc/self/fd/{new_end}\0");
+                    // SAFETY: a NUL-terminated path; a new descriptor.
+                    let fd = unsafe { libc::open(path.as_ptr().cast(), access | libc::O_CLOEXEC) };
+                    if fd < 0 {
+                        let error = std::io::Error::last_os_error();
+                        close_pair(&new);
+                        return Err(format!("{name}: reopening an end: {error}"));
+                    }
+                    fd
+                };
+                let result = dup_group(source, description, flags_of(description[0]), "pipe");
+                if k > 0 {
+                    // SAFETY: the duplicates keep the description open.
+                    unsafe { libc::close(source) };
+                }
+                if let Err(error) = result {
+                    close_pair(&new);
+                    return Err(error);
+                }
+            }
+        }
+        // An end nobody in this process holds is closed here: end of file
+        // after the buffered bytes, or EPIPE, as in the template.
+        close_pair(&new);
+        counts.copied += 1;
+        if lone {
+            counts.lone += 1;
+        }
+    }
+    Ok(counts)
+}
+
+/// A Unix socket as the kernel's sock_diag interface describes it.
+struct UnixSocket {
+    kind: libc::c_int,
+    listening: bool,
+    named: bool,
+    /// The peer's inode: `Some(0)` when the peer has been closed, `None`
+    /// when the socket was never connected.
+    peer: Option<u32>,
+    /// RCV_SHUTDOWN (1) and SEND_SHUTDOWN (2).
+    shutdown: u8,
+}
+
+/// The Unix socket with inode `inode`, from sock_diag (`UNIX_DIAG_PEER`,
+/// `UNIX_DIAG_NAME`, and `UNIX_DIAG_SHUTDOWN`, which the kernel always
+/// sends). `None` when no Unix socket has that inode.
+fn unix_socket(inode: u32) -> Result<Option<UnixSocket>, String> {
+    const NETLINK_SOCK_DIAG: libc::c_int = 4;
+    const SOCK_DIAG_BY_FAMILY: u16 = 20;
+    const UDIAG_SHOW_NAME: u32 = 0x1;
+    const UDIAG_SHOW_PEER: u32 = 0x4;
+    const UNIX_DIAG_NAME: u16 = 0;
+    const UNIX_DIAG_PEER: u16 = 2;
+    const UNIX_DIAG_SHUTDOWN: u16 = 6;
+    const TCP_LISTEN: u8 = 10;
+    #[repr(C)]
+    struct Request {
+        header: libc::nlmsghdr,
+        family: u8,
+        protocol: u8,
+        pad: u16,
+        states: u32,
+        inode: u32,
+        show: u32,
+        cookie: [u32; 2],
+    }
+    // SAFETY: a new netlink socket, closed below.
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+            NETLINK_SOCK_DIAG,
+        )
+    };
+    if fd < 0 {
+        return Err(format!(
+            "sock_diag socket: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let request = Request {
+        header: libc::nlmsghdr {
+            nlmsg_len: std::mem::size_of::<Request>() as u32,
+            nlmsg_type: SOCK_DIAG_BY_FAMILY,
+            nlmsg_flags: libc::NLM_F_REQUEST as u16,
+            nlmsg_seq: 1,
+            nlmsg_pid: 0,
+        },
+        family: libc::AF_UNIX as u8,
+        protocol: 0,
+        pad: 0,
+        states: u32::MAX,
+        inode,
+        show: UDIAG_SHOW_NAME | UDIAG_SHOW_PEER,
+        // INET_DIAG_NOCOOKIE: look the socket up by inode alone.
+        cookie: [u32::MAX, u32::MAX],
+    };
+    let mut reply = [0u8; 1024];
+    // SAFETY: sends the request struct and receives into the buffer.
+    let received = unsafe {
+        let sent = libc::send(
+            fd,
+            (&request as *const Request).cast(),
+            std::mem::size_of::<Request>(),
+            0,
+        );
+        if sent < 0 {
+            -1
+        } else {
+            libc::recv(fd, reply.as_mut_ptr().cast(), reply.len(), 0)
+        }
+    };
+    let error = std::io::Error::last_os_error();
+    // SAFETY: the socket opened above.
+    unsafe { libc::close(fd) };
+    if received < 0 {
+        return Err(format!("sock_diag: {error}"));
+    }
+    let received = received as usize;
+    let header = std::mem::size_of::<libc::nlmsghdr>();
+    // unix_diag_msg: family, type, state, pad, inode (4), cookie (8).
+    if received < header + 16 {
+        return Ok(None); // NLMSG_ERROR (ENOENT): not a Unix socket
+    }
+    if u16::from_ne_bytes([reply[4], reply[5]]) == libc::NLMSG_ERROR as u16 {
+        return Ok(None);
+    }
+    let mut socket = UnixSocket {
+        kind: reply[header + 1] as libc::c_int,
+        listening: reply[header + 2] == TCP_LISTEN,
+        named: false,
+        peer: None,
+        shutdown: 0,
+    };
+    let mut at = header + 16;
+    while at + 4 <= received {
+        let length = u16::from_ne_bytes([reply[at], reply[at + 1]]) as usize;
+        let attribute = u16::from_ne_bytes([reply[at + 2], reply[at + 3]]);
+        if length < 4 || at + length > received {
+            break;
+        }
+        let value = &reply[at + 4..at + length];
+        match attribute {
+            UNIX_DIAG_NAME => socket.named = !value.is_empty(),
+            UNIX_DIAG_PEER if value.len() >= 4 => {
+                socket.peer = Some(u32::from_ne_bytes([value[0], value[1], value[2], value[3]]));
+            }
+            UNIX_DIAG_SHUTDOWN if !value.is_empty() => socket.shutdown = value[0],
+            _ => {}
+        }
+        at += (length + 3) & !3;
+    }
+    Ok(Some(socket))
+}
+
+fn int_option(fd: RawFd, option: libc::c_int) -> libc::c_int {
+    let mut value: libc::c_int = 0;
+    let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: an int-sized SOL_SOCKET option into an int.
+    unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            option,
+            (&mut value as *mut libc::c_int).cast(),
+            &mut length,
+        )
+    };
+    value
+}
+
+/// Gives the new socket `new` the buffer sizes and SO_PASSCRED of `old`.
+fn copy_socket_options(old: RawFd, new: RawFd) -> Result<(), String> {
+    for option in [libc::SO_SNDBUF, libc::SO_RCVBUF, libc::SO_PASSCRED] {
+        let wanted = int_option(old, option);
+        if int_option(new, option) == wanted {
+            continue;
+        }
+        // The kernel doubles a buffer size it is given.
+        let given = if option == libc::SO_PASSCRED {
+            wanted
+        } else {
+            wanted / 2
+        };
+        // SAFETY: an int-sized SOL_SOCKET option.
+        unsafe {
+            libc::setsockopt(
+                new,
+                libc::SOL_SOCKET,
+                option,
+                (&given as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if int_option(new, option) != wanted {
+            return Err(format!("socket option {option}: {wanted} not reproduced"));
+        }
+    }
+    Ok(())
+}
+
+/// Gives this copy its own Unix socket pair for each pair `fork()` shares
+/// with the template and every other copy (a guest socketpair on KVM is a
+/// host one), and for each socket whose peer has been closed: a new pair
+/// whose second end is closed, so the copy reads what was waiting and then
+/// end of file. Bytes waiting at an end are read with MSG_PEEK, which
+/// leaves the shared socket as it was, and sent from the new peer; buffer
+/// sizes, SO_PASSCRED, O_NONBLOCK and the shutdown state are copied. A
+/// socket whose peer is outside this process is left shared (external).
+/// Refused: a datagram or seqpacket socket with messages waiting (MSG_PEEK
+/// cannot copy them with their boundaries), a connected socket with an
+/// address, and a listening socket, which no copy can have its own of.
+fn privatize_socket_pairs(
+    fds: &[RawFd],
+    kind: &dyn Fn(RawFd) -> String,
+    flags_of: &dyn Fn(RawFd) -> libc::c_int,
+) -> Result<StreamCounts, String> {
+    let mut ends: Vec<(u32, Vec<RawFd>)> = Vec::new();
+    for &fd in fds {
+        let Some(inode) = kind(fd)
+            .strip_prefix("socket:[")
+            .and_then(|rest| rest.strip_suffix(']'))
+            .and_then(|inode| inode.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if is_output(fd) {
+            continue;
+        }
+        match ends.iter_mut().find(|(other, _)| *other == inode) {
+            Some((_, group)) => group.push(fd),
+            None => ends.push((inode, vec![fd])),
+        }
+    }
+    let waiting = |fd: RawFd| -> usize {
+        let mut count: libc::c_int = 0;
+        // SAFETY: FIONREAD into an int.
+        unsafe { libc::ioctl(fd, libc::FIONREAD, &mut count) };
+        count.max(0) as usize
+    };
+    let mut counts = StreamCounts::default();
+    let mut done: Vec<u32> = Vec::new();
+    for (inode, group) in &ends {
+        if done.contains(inode) {
+            continue;
+        }
+        let Some(socket) = unix_socket(*inode)? else {
+            continue; // not a Unix socket
+        };
+        if socket.listening {
+            return Err(format!(
+                "listening Unix socket {inode}: copies would share it; not copied"
+            ));
+        }
+        // A closed peer shows as inode 0, or as an inode sock_diag no longer
+        // finds; a live one outside this process makes the socket external.
+        let peer = match socket.peer {
+            None => continue, // never connected
+            Some(peer) => match ends.iter().find(|(other, _)| peer != 0 && *other == peer) {
+                Some((_, peer_group)) => Some((peer, peer_group)),
+                None if peer != 0 && unix_socket(peer)?.is_some() => {
+                    counts.external += 1;
+                    continue;
+                }
+                None => None,
+            },
+        };
+        let peer_socket = match peer {
+            Some((peer, _)) => unix_socket(peer)?,
+            None => None,
+        };
+        if socket.named || peer_socket.as_ref().is_some_and(|peer| peer.named) {
+            return Err(format!(
+                "connected Unix socket {inode} has an address: not copied"
+            ));
+        }
+        done.push(*inode);
+        let mut new = [-1; 2];
+        // SAFETY: room for both descriptors; closed below after their duplicates.
+        if unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                socket.kind | libc::SOCK_CLOEXEC,
+                0,
+                new.as_mut_ptr(),
+            )
+        } != 0
+        {
+            return Err(format!("socketpair: {}", std::io::Error::last_os_error()));
+        }
+        let mut steps: Vec<(RawFd, RawFd, RawFd)> = vec![(group[0], new[0], new[1])];
+        if let Some((peer, peer_group)) = peer {
+            done.push(peer);
+            steps.push((peer_group[0], new[1], new[0]));
+        }
+        let mut copy = || -> Result<(), String> {
+            for &(old, end, _) in &steps {
+                copy_socket_options(old, end)?;
+            }
+            // Bytes waiting at an end were sent by its peer: the new peer
+            // sends them.
+            for &(old, _, sender) in &steps {
+                let count = waiting(old);
+                if count == 0 {
+                    continue;
+                }
+                if socket.kind != libc::SOCK_STREAM {
+                    return Err(format!(
+                        "Unix socket {inode}: messages waiting on a non-stream socket: not copied"
+                    ));
+                }
+                let mut buffer = vec![0u8; count];
+                // SAFETY: peeks into the buffer, consuming nothing.
+                let peeked = unsafe {
+                    libc::recv(
+                        old,
+                        buffer.as_mut_ptr().cast(),
+                        count,
+                        libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                    )
+                };
+                // SAFETY: sends what was peeked.
+                let sent = if peeked > 0 {
+                    unsafe {
+                        libc::send(
+                            sender,
+                            buffer.as_ptr().cast(),
+                            peeked as usize,
+                            libc::MSG_DONTWAIT,
+                        )
+                    }
+                } else {
+                    0
+                };
+                if peeked != count as isize || sent != peeked {
+                    return Err(format!(
+                        "Unix socket {inode}: copied {sent} of {count} waiting bytes"
+                    ));
+                }
+                counts.bytes += count as u64;
+            }
+            for (shutdown, end) in [(socket.shutdown, new[0])]
+                .into_iter()
+                .chain(peer_socket.as_ref().map(|peer| (peer.shutdown, new[1])))
+            {
+                let how = match shutdown & 3 {
+                    1 => libc::SHUT_RD,
+                    2 => libc::SHUT_WR,
+                    3 => libc::SHUT_RDWR,
+                    _ => continue,
+                };
+                // SAFETY: shutdown of a socket this copy owns.
+                unsafe { libc::shutdown(end, how) };
+            }
+            dup_group(new[0], group, flags_of(group[0]), "socket")?;
+            if let Some((_, peer_group)) = peer {
+                dup_group(new[1], peer_group, flags_of(peer_group[0]), "socket")?;
+            }
+            Ok(())
+        };
+        let result = copy();
+        // A closed peer stays closed: the copy's end sees what was waiting,
+        // then end of file.
+        close_pair(&new);
+        result?;
+        counts.copied += 1;
+        if peer.is_none() {
+            counts.lone += 1;
+        }
+    }
+    Ok(counts)
+}
+
+/// Gives this copy its own pipes, Unix socket pairs, eventfds and epoll
+/// instances, which `fork()` shares with the template and every other copy:
+/// an event or a byte one copy waits for could otherwise be taken by
+/// another. Pipes and socket pairs go first (see `privatize_pipes` and
+/// `privatize_socket_pairs`), since an epoll instance may watch them. An
+/// eventfd is re-created with its count and flags; an epoll instance with
+/// every registration its fdinfo lists, against the copy's own descriptors
+/// (re-created first). Descriptors that shared one object share its
+/// replacement.
 fn privatize_kernel_objects() -> Result<serde_json::Value, String> {
     let fds = open_fds();
     let kind = |fd: RawFd| {
@@ -957,6 +1496,8 @@ fn privatize_kernel_objects() -> Result<serde_json::Value, String> {
         // SAFETY: fcntl on a live descriptor.
         unsafe { libc::fcntl(fd, libc::F_GETFL) }
     };
+    let pipes = privatize_pipes(&fds, &kind, &flags_of)?;
+    let sockets = privatize_socket_pairs(&fds, &kind, &flags_of)?;
     let mut eventfds = 0;
     for group in groups("anon_inode:[eventfd]") {
         let info = fdinfo(group[0]);
@@ -1048,6 +1589,14 @@ fn privatize_kernel_objects() -> Result<serde_json::Value, String> {
         epolls += 1;
     }
     Ok(serde_json::json!({
+        "pipes": pipes.copied,
+        "pipes_closed_end": pipes.lone,
+        "pipe_bytes": pipes.bytes,
+        "pipes_external": pipes.external,
+        "socket_pairs": sockets.copied,
+        "sockets_closed_peer": sockets.lone,
+        "socket_bytes": sockets.bytes,
+        "sockets_external": sockets.external,
         "eventfds": eventfds,
         "epolls": epolls,
         "registrations": registrations,
@@ -1460,5 +2009,175 @@ mod tests {
         ));
         assert!(command(r#"{"answer":"seven"}"#).is_err());
         assert!(command(r#"{"fork":{"ids":[1]}}"#).is_err());
+    }
+
+    fn link(fd: RawFd) -> String {
+        std::fs::read_link(format!("/proc/self/fd/{fd}"))
+            .map(|target| target.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
+    fn flags(fd: RawFd) -> libc::c_int {
+        // SAFETY: fcntl on a descriptor.
+        unsafe { libc::fcntl(fd, libc::F_GETFL) }
+    }
+
+    fn put(fd: RawFd, bytes: &[u8]) {
+        // SAFETY: writes from a live buffer.
+        let written = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+        assert_eq!(
+            written,
+            bytes.len() as isize,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    fn take(fd: RawFd) -> Vec<u8> {
+        let mut buffer = [0u8; 64];
+        // SAFETY: reads into a live buffer.
+        let got = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+        assert!(got >= 0, "read: {}", std::io::Error::last_os_error());
+        buffer[..got as usize].to_vec()
+    }
+
+    fn new_pipe() -> [RawFd; 2] {
+        let mut fds = [-1; 2];
+        // SAFETY: room for two descriptors.
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        fds
+    }
+
+    fn new_socket_pair(kind: libc::c_int) -> [RawFd; 2] {
+        let mut fds = [-1; 2];
+        // SAFETY: room for two descriptors.
+        let rc = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                kind | libc::SOCK_CLOEXEC,
+                0,
+                fds.as_mut_ptr(),
+            )
+        };
+        assert_eq!(rc, 0);
+        fds
+    }
+
+    fn dup(fd: RawFd) -> RawFd {
+        // SAFETY: duplicates a live descriptor.
+        unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) }
+    }
+
+    fn close(fds: &[RawFd]) {
+        for &fd in fds {
+            // SAFETY: closes a descriptor the test opened.
+            unsafe { libc::close(fd) };
+        }
+    }
+
+    fn counts(counts: StreamCounts) -> (usize, u64, usize, usize) {
+        (counts.copied, counts.bytes, counts.lone, counts.external)
+    }
+
+    #[test]
+    fn a_copy_gets_its_own_pipe_with_the_buffered_bytes() {
+        let [reader, writer] = new_pipe();
+        put(writer, b"hello");
+        // A second description of the read end, nonblocking.
+        let path = format!("/proc/self/fd/{reader}\0");
+        // SAFETY: a NUL-terminated path.
+        let second = unsafe { libc::open(path.as_ptr().cast(), libc::O_RDONLY | libc::O_NONBLOCK) };
+        assert!(second >= 0);
+        let shared = dup(reader);
+        let result = privatize_pipes(&[reader, second, writer], &link, &flags).unwrap();
+        assert_eq!(counts(result), (1, 5, 0, 0));
+        assert_ne!(link(reader), link(shared));
+        assert_eq!(link(reader), link(second));
+        assert!(!same_description(reader, second));
+        assert_eq!(flags(second) & libc::O_NONBLOCK, libc::O_NONBLOCK);
+        assert_eq!(flags(reader) & libc::O_NONBLOCK, 0);
+        put(writer, b"!");
+        assert_eq!(take(reader), b"hello!");
+        // The shared pipe still has its bytes for the template.
+        assert_eq!(take(shared), b"hello");
+        close(&[writer]);
+        assert_eq!(take(reader), b"");
+        close(&[reader, second, shared]);
+    }
+
+    #[test]
+    fn a_pipe_without_a_writer_ends_after_its_bytes() {
+        let [reader, writer] = new_pipe();
+        put(writer, b"abc");
+        close(&[writer]);
+        let shared = dup(reader);
+        let result = privatize_pipes(&[reader], &link, &flags).unwrap();
+        assert_eq!(counts(result), (1, 3, 1, 0));
+        assert_eq!(take(reader), b"abc");
+        assert_eq!(take(reader), b"");
+        assert_eq!(take(shared), b"abc");
+        close(&[reader, shared]);
+    }
+
+    #[test]
+    fn a_pipe_with_a_writer_elsewhere_stays_shared() {
+        let [reader, writer] = new_pipe();
+        let before = link(reader);
+        let result = privatize_pipes(&[reader], &link, &flags).unwrap();
+        assert_eq!(counts(result), (0, 0, 0, 1));
+        assert_eq!(link(reader), before);
+        close(&[reader, writer]);
+    }
+
+    #[test]
+    fn a_copy_gets_its_own_socket_pair_with_the_waiting_bytes() {
+        let [left, right] = new_socket_pair(libc::SOCK_STREAM);
+        put(right, b"ping");
+        put(left, b"pong");
+        let shared = dup(left);
+        let result = privatize_socket_pairs(&[left, right], &link, &flags).unwrap();
+        assert_eq!(counts(result), (1, 8, 0, 0));
+        assert_ne!(link(left), link(shared));
+        assert_eq!(take(left), b"ping");
+        assert_eq!(take(right), b"pong");
+        assert_eq!(take(shared), b"ping");
+        put(left, b"z");
+        assert_eq!(take(right), b"z");
+        close(&[left, right, shared]);
+    }
+
+    #[test]
+    fn a_socket_whose_peer_closed_ends_after_its_bytes() {
+        let [left, right] = new_socket_pair(libc::SOCK_STREAM);
+        put(right, b"bye");
+        close(&[right]);
+        let result = privatize_socket_pairs(&[left], &link, &flags).unwrap();
+        assert_eq!(counts(result), (1, 3, 1, 0));
+        assert_eq!(take(left), b"bye");
+        assert_eq!(take(left), b"");
+        close(&[left]);
+    }
+
+    #[test]
+    fn a_socket_with_a_live_peer_elsewhere_stays_shared() {
+        let [left, right] = new_socket_pair(libc::SOCK_STREAM);
+        let before = link(left);
+        let result = privatize_socket_pairs(&[left], &link, &flags).unwrap();
+        assert_eq!(counts(result), (0, 0, 0, 1));
+        assert_eq!(link(left), before);
+        close(&[left, right]);
+    }
+
+    #[test]
+    fn refuses_a_datagram_pair_with_messages_waiting() {
+        let [left, right] = new_socket_pair(libc::SOCK_DGRAM);
+        put(right, b"m");
+        let before = link(left);
+        let error = privatize_socket_pairs(&[left, right], &link, &flags)
+            .err()
+            .unwrap();
+        assert!(error.contains("non-stream"), "{error}");
+        assert_eq!(link(left), before);
+        close(&[left, right]);
     }
 }
