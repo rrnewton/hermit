@@ -151,23 +151,47 @@ fn fork_run(stdin: &str, stdout: &str, stderr: &str, timeout: Duration) -> Forke
         super::replace_startup_stdin();
         return Forked::Child;
     }
-    let mut status = 0;
+    // Wait on a pidfd, not by polling waitpid: on a loaded host each wait4
+    // takes the kernel's task-list lock, and a polling parent competes with
+    // its own child for CPU (measured: a quarter of the server's samples).
+    // SAFETY: pidfd_open on this process's own child.
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as libc::c_int;
     let mut killed = false;
-    loop {
-        // SAFETY: `pid` is this process's child; `status` is an out-parameter.
-        let done = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-        if done == pid {
-            break;
+    if pidfd >= 0 {
+        loop {
+            let left = if timeout.is_zero() {
+                -1
+            } else {
+                timeout
+                    .saturating_sub(start.elapsed())
+                    .as_millis()
+                    .min(i32::MAX as u128) as i32
+            };
+            let mut ready = libc::pollfd {
+                fd: pidfd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one valid pollfd for the duration of the call.
+            let n = unsafe { libc::poll(&mut ready, 1, left) };
+            if n > 0 {
+                break;
+            }
+            if n == 0 && !killed {
+                // SAFETY: signals the child's own process group, made above.
+                unsafe { libc::kill(-pid, libc::SIGKILL) };
+                killed = true;
+            }
         }
-        if done < 0 {
+        // SAFETY: closes the descriptor opened above.
+        unsafe { libc::close(pidfd) };
+    }
+    let mut status = 0;
+    // SAFETY: `pid` is this process's child; `status` is an out-parameter.
+    while unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
+        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
             return Forked::Parent(format!("ERR waitpid: {}", std::io::Error::last_os_error()));
         }
-        if !killed && !timeout.is_zero() && start.elapsed() > timeout {
-            // SAFETY: signals the child's own process group, made above.
-            unsafe { libc::kill(-pid, libc::SIGKILL) };
-            killed = true;
-        }
-        std::thread::sleep(Duration::from_millis(1));
     }
     let elapsed = start.elapsed().as_micros();
     if killed {
