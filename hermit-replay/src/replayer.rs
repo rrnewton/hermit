@@ -82,27 +82,12 @@ fn capture_guest_fd<H: crate::host::RecordHost>(
     }
 }
 
-fn same_guest_open_file_description(
+fn same_guest_open_file_description<H: RecordHost>(
     pid: Pid,
     left: libc::c_int,
     right: libc::c_int,
 ) -> io::Result<bool> {
-    const KCMP_FILE: libc::c_int = 0;
-    let comparison = unsafe {
-        libc::syscall(
-            libc::SYS_kcmp,
-            pid.as_raw(),
-            pid.as_raw(),
-            KCMP_FILE,
-            left,
-            right,
-        )
-    };
-    if comparison == -1 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(comparison == 0)
-    }
+    H::guest_fds_share_description(pid, left, right)
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -423,8 +408,8 @@ fn fd_is_eventfd<H: RecordHost>(tid: Pid, fd: libc::c_int) -> bool {
 /// Whether descriptor `fd` of thread `tid` is an `AF_UNIX` socket: its socket
 /// inode is listed in the `/proc/<tid>/net/unix` table of the thread's network
 /// namespace.
-fn fd_is_unix_socket(tid: Pid, fd: libc::c_int) -> io::Result<bool> {
-    let target = std::fs::read_link(format!("/proc/{}/fd/{fd}", tid.as_raw()))?;
+fn fd_is_unix_socket<H: RecordHost>(tid: Pid, fd: libc::c_int) -> io::Result<bool> {
+    let target = H::fd_link(tid, fd).ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
     let Some(inode) = socket_inode(&target) else {
         return Ok(false);
     };
@@ -487,8 +472,8 @@ fn file_is_beneath_replay_root<H: RecordHost>(pid: Pid, fd: libc::c_int) -> bool
     crate::record_replay_path::directory_is_beneath(&root, &directory).unwrap_or(false)
 }
 
-fn remember_materialized_file(pid: Pid, fd: libc::c_int) {
-    let Ok(metadata) = std::fs::metadata(format!("/proc/{}/fd/{fd}", pid.as_raw())) else {
+fn remember_materialized_file<H: RecordHost>(pid: Pid, fd: libc::c_int) {
+    let Some(metadata) = H::fd_metadata(pid, fd) else {
         return;
     };
     // FIFOs register beside regular files: the registry is keyed by object
@@ -2112,7 +2097,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
             if ReplayFileIdentity::from_metadata(&metadata) != target_identity {
                 continue;
             }
-            if same_guest_open_file_description(guest.pid(), descriptor.target_fd, fd)? {
+            if same_guest_open_file_description::<H>(guest.pid(), descriptor.target_fd, fd)? {
                 let descriptor_flags = guest
                     .inject_with_retry(Fcntl::new().with_fd(fd).with_cmd(FcntlCmd::F_GETFD))
                     .await
@@ -2280,7 +2265,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
                         ),
                     ));
                 }
-                remember_materialized_file(guest.pid(), alias.fd);
+                remember_materialized_file::<H>(guest.pid(), alias.fd);
             }
             Ok(())
         }
@@ -2504,8 +2489,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         Ok(())
     }
     pub(super) fn fd_is_in_replay_root(&self, pid: Pid, fd: libc::c_int) -> bool {
-        let path = format!("/proc/{}/fd/{fd}", pid.as_raw());
-        let Ok(metadata) = std::fs::metadata(&path) else {
+        let Some(metadata) = H::fd_metadata(pid, fd) else {
             return false;
         };
         if metadata.file_type().is_file() || metadata.file_type().is_fifo() {
@@ -2828,7 +2812,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
                             actual, fd,
                             "replay materialized open returned a different descriptor"
                         );
-                        remember_materialized_file(guest.tid(), actual as libc::c_int);
+                        remember_materialized_file::<H>(guest.tid(), actual as libc::c_int);
                         if flags.contains(OFlag::O_TRUNC) {
                             mmap::truncate_shared_backing(guest.tid(), actual as libc::c_int, 0)
                                 .unwrap_or_else(|error| {
@@ -2966,7 +2950,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
                     panic!("could not restore materialized fifo open status flags: {error}")
                 });
         }
-        remember_materialized_file(guest.tid(), fd as libc::c_int);
+        remember_materialized_file::<H>(guest.tid(), fd as libc::c_int);
         true
     }
 
@@ -3795,7 +3779,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
                 ));
             }
         }
-        remember_materialized_file(guest.tid(), pending.fd);
+        remember_materialized_file::<H>(guest.tid(), pending.fd);
         Ok(())
     }
 
@@ -3884,7 +3868,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         if !self.fd_is_in_replay_root(tid, syscall.fd())
             && file_is_beneath_replay_root::<H>(tid, syscall.fd())
         {
-            remember_materialized_file(tid, syscall.fd());
+            remember_materialized_file::<H>(tid, syscall.fd());
         }
         if !self.fd_is_in_replay_root(tid, syscall.fd()) {
             panic!(
@@ -3970,8 +3954,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         // the replay (https://github.com/rrnewton/hermit/issues/4373). Replay
         // serves getdents from the recording (`handle_getdents64`), which no
         // physical position feeds, so the recorded result is the whole answer.
-        let link = format!("/proc/{}/fd/{}", thread.as_raw(), call.fd());
-        if std::fs::metadata(&link).is_ok_and(|metadata| metadata.is_dir()) {
+        if H::fd_metadata(thread, call.fd()).is_some_and(|metadata| metadata.is_dir()) {
             return next_event!(guest, Return);
         }
         if matches!(call.whence(), Whence::SEEK_DATA | Whence::SEEK_HOLE) {
@@ -4325,7 +4308,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         if recorded.is_ok() {
             let actual = guest.inject_with_retry(syscall).await;
             let unconnected = actual == Err(Errno::ENOTCONN)
-                && !fd_is_unix_socket(guest.tid(), call.fd()).unwrap_or_else(|error| {
+                && !fd_is_unix_socket::<H>(guest.tid(), call.fd()).unwrap_or_else(|error| {
                     panic!(
                         "cannot tell whether shutdown's fd {} is a Unix socket: {error}",
                         call.fd()
@@ -4833,11 +4816,11 @@ mod shutdown_replay_tests {
         };
         let (reader, _writer) = nix::unistd::pipe().unwrap();
 
-        assert!(fd_is_unix_socket(pid, left.as_raw_fd()).unwrap());
-        assert!(fd_is_unix_socket(pid, right.as_raw_fd()).unwrap());
-        assert!(!fd_is_unix_socket(pid, tcp.as_raw_fd()).unwrap());
-        assert!(!fd_is_unix_socket(pid, reader.as_raw_fd()).unwrap());
-        assert!(fd_is_unix_socket(pid, -1).is_err());
+        assert!(fd_is_unix_socket::<PtraceHost>(pid, left.as_raw_fd()).unwrap());
+        assert!(fd_is_unix_socket::<PtraceHost>(pid, right.as_raw_fd()).unwrap());
+        assert!(!fd_is_unix_socket::<PtraceHost>(pid, tcp.as_raw_fd()).unwrap());
+        assert!(!fd_is_unix_socket::<PtraceHost>(pid, reader.as_raw_fd()).unwrap());
+        assert!(fd_is_unix_socket::<PtraceHost>(pid, -1).is_err());
     }
 
     #[test]

@@ -391,8 +391,8 @@ fn require_mkdir_probe_closed(result: Result<i64, Errno>) -> Result<(), Errno> {
 }
 
 impl OutputIdentity {
-    fn for_fd(pid: Pid, fd: i32) -> Option<Self> {
-        let metadata = std::fs::metadata(format!("/proc/{}/fd/{fd}", pid.as_raw())).ok()?;
+    fn for_fd<H: RecordHost>(pid: Pid, fd: i32) -> Option<Self> {
+        let metadata = H::fd_metadata(pid, fd)?;
         Some(Self {
             device: metadata.dev(),
             inode: metadata.ino(),
@@ -408,7 +408,7 @@ fn duplicate_regular_output<H: RecordHost>(
     pid: Pid,
     fd: libc::c_int,
 ) -> Option<std::os::fd::OwnedFd> {
-    let metadata = std::fs::metadata(format!("/proc/{}/fd/{fd}", pid.as_raw())).ok()?;
+    let metadata = H::fd_metadata(pid, fd)?;
     metadata
         .file_type()
         .is_file()
@@ -491,8 +491,8 @@ impl<H: RecordHost> Tool for RecorderWithHost<H> {
         Self {
             _host: PhantomData,
             data: cfg.replay_data.as_ref().unwrap().clone(),
-            stdout: OutputIdentity::for_fd(pid, libc::STDOUT_FILENO),
-            stderr: OutputIdentity::for_fd(pid, libc::STDERR_FILENO),
+            stdout: OutputIdentity::for_fd::<H>(pid, libc::STDOUT_FILENO),
+            stderr: OutputIdentity::for_fd::<H>(pid, libc::STDERR_FILENO),
         }
     }
 
@@ -856,9 +856,7 @@ impl<H: RecordHost> RecorderWithHost<H> {
         let result = guest.inject(syscall).await;
         let materialize = result
             .ok()
-            .and_then(|fd| {
-                std::fs::metadata(format!("/proc/{}/fd/{fd}", guest.tid().as_raw())).ok()
-            })
+            .and_then(|fd| H::fd_metadata(guest.tid(), fd as libc::c_int))
             .map_or(OpenMaterialization::None, |metadata| {
                 if metadata.file_type().is_dir() {
                     OpenMaterialization::Directory

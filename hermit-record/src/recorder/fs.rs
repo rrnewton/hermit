@@ -170,7 +170,7 @@ fn shares_open_file_description(left: libc::c_int, right: libc::c_int) -> bool {
     }
 }
 
-fn output_file_offset(
+fn output_file_offset<H: RecordHost>(
     pid: libc::pid_t,
     fd: libc::c_int,
     placement: WritePlacement,
@@ -181,7 +181,7 @@ fn output_file_offset(
         return None;
     }
 
-    let fdinfo = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd}")).ok()?;
+    let fdinfo = H::fdinfo_text_at(reverie::Pid::from_raw(pid), fd)?;
     let position = fdinfo
         .lines()
         .find_map(|line| line.strip_prefix("pos:\t"))
@@ -370,19 +370,12 @@ async fn copy_at_offset<H: RecordHost, G: Guest<RecorderWithHost<H>>>(
     syscall: Sendfile,
     position: libc::loff_t,
 ) -> Result<Result<i64, Errno>, Errno> {
-    // SAFETY: kcmp only compares two of the task's descriptors.
-    let order = unsafe {
-        libc::syscall(
-            libc::SYS_kcmp,
-            task.as_raw(),
-            task.as_raw(),
-            0, // KCMP_FILE
-            libc::c_long::from(syscall.in_fd()),
-            libc::c_long::from(syscall.out_fd()),
-        )
+    let order = match H::guest_fds_share_description(task, syscall.in_fd(), syscall.out_fd()) {
+        Ok(true) => 0,
+        Ok(false) => 1,
+        Err(_) => -1,
     };
-    let metadata =
-        |fd: libc::c_int| std::fs::metadata(format!("/proc/{}/fd/{fd}", task.as_raw())).ok();
+    let metadata = |fd: libc::c_int| H::fd_metadata(task, fd);
     let (input_file, output_file) = (metadata(syscall.in_fd()), metadata(syscall.out_fd()));
     let same_file = input_file
         .as_ref()
@@ -516,8 +509,9 @@ fn sendfile_source<H: RecordHost>(
     syscall: Sendfile,
     offset: Option<Option<i64>>,
 ) -> Result<Option<(std::fs::File, SendfileStart)>, Errno> {
-    let metadata = |fd: libc::c_int| std::fs::metadata(format!("/proc/{}/fd/{fd}", task.as_raw()));
-    let (Ok(input), Ok(output)) = (metadata(syscall.in_fd()), metadata(syscall.out_fd())) else {
+    let metadata = |fd: libc::c_int| H::fd_metadata(task, fd);
+    let (Some(input), Some(output)) = (metadata(syscall.in_fd()), metadata(syscall.out_fd()))
+    else {
         return Ok(None);
     };
     let same_file = output.file_type().is_file()
@@ -767,14 +761,15 @@ fn capture_clone_snapshot(
     spool_clone_snapshot(source, source_offset, length, data)
 }
 
-fn private_clone_snapshot(
+fn private_clone_snapshot<H: RecordHost>(
     pid: reverie::Pid,
     destination_fd: libc::c_int,
     source: &std::fs::File,
     source_offset: u64,
     length: u64,
 ) -> std::io::Result<std::fs::File> {
-    let destination = std::fs::read_link(format!("/proc/{}/fd/{destination_fd}", pid.as_raw()))?;
+    let destination = H::fd_link(pid, destination_fd)
+        .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
     let relative = destination.strip_prefix("/").map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -1099,7 +1094,7 @@ impl<H: RecordHost> RecorderWithHost<H> {
         placement: WritePlacement,
         result: Result<i64, Errno>,
     ) -> WriteEvent {
-        let metadata = std::fs::metadata(format!("/proc/{}/fd/{fd}", task.as_raw())).ok();
+        let metadata = H::fd_metadata(task, fd);
         let outputs = guest.thread_state().outputs;
         let (output_fd, shares_output_ofd) = metadata.as_ref().map_or((None, false), |metadata| {
             let (stdout_matches, stderr_matches) = outputs.matching(metadata);
@@ -1129,7 +1124,7 @@ impl<H: RecordHost> RecorderWithHost<H> {
         });
         let file_offset = match (result, metadata.as_ref()) {
             (Ok(count), Some(metadata)) => {
-                output_file_offset(task.as_raw(), fd, placement, metadata, count)
+                output_file_offset::<H>(task.as_raw(), fd, placement, metadata, count)
             }
             _ => None,
         };
@@ -1169,12 +1164,7 @@ impl<H: RecordHost> RecorderWithHost<H> {
         syscall: Ftruncate,
     ) -> Result<i64, Errno> {
         let result = guest.inject(syscall).await;
-        let metadata = std::fs::metadata(format!(
-            "/proc/{}/fd/{}",
-            guest.pid().as_raw(),
-            syscall.fd()
-        ))
-        .ok();
+        let metadata = H::fd_metadata(guest.pid(), syscall.fd());
         let outputs = guest.thread_state().outputs;
         let output_fd = if result.is_ok() {
             metadata
@@ -1318,7 +1308,7 @@ impl<H: RecordHost> RecorderWithHost<H> {
                     .checked_sub(source_offset)
                     .expect("successful clone source offset exceeds file length")
             });
-            let private = private_clone_snapshot(
+            let private = private_clone_snapshot::<H>(
                 guest.pid(),
                 syscall.fd(),
                 &source,
@@ -1328,11 +1318,8 @@ impl<H: RecordHost> RecorderWithHost<H> {
             .unwrap_or_else(|error| panic!("failed to make private clone snapshot: {error}"));
             let image = capture_clone_snapshot(&private, 0, replacement_length, &self.data)
                 .unwrap_or_else(|error| panic!("failed to snapshot private clone: {error}"));
-            let destination_path = format!("/proc/{}/fd/{}", guest.pid().as_raw(), syscall.fd());
-            let length = std::fs::metadata(&destination_path)
-                .unwrap_or_else(|error| {
-                    panic!("failed to stat cloned destination {destination_path}: {error}")
-                })
+            let length = H::fd_metadata(guest.pid(), syscall.fd())
+                .unwrap_or_else(|| panic!("failed to stat cloned destination fd {}", syscall.fd()))
                 .len();
             self.record_event(
                 guest,

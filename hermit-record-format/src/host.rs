@@ -10,8 +10,10 @@
 //! that runs their guest: typed descriptor facts, descriptor
 //! duplication into the tool process, and open-file-description
 //! identity. Switching backend is switching the [`RecordHost`]
-//! implementation; syscall handlers call only this trait for these
-//! operations and contain no backend conditionals.
+//! implementation. Descriptor classification, `fdinfo` and link
+//! reads, descriptor `stat` guards, and every descriptor duplication
+//! or identity comparison in the two tools go through this trait;
+//! the reads that remain inline in the tools are named below.
 //!
 //! Fact queries are guest-bound: they take the caller's borrowed
 //! [`Guest`] handle, so an implementation whose facts live behind the
@@ -26,12 +28,29 @@
 //! those same guest-less registry paths; handlers with a guest use
 //! the guest-bound queries.
 //!
-//! Still in the tools, named as later slices: guest-path string
-//! logic, `/proc/<pid>/maps` and limits reads, captured-output
-//! identity internals, and replay materialization. The 6805
+//! Still inline in the tools, exhaustively: guest-path string logic
+//! (pure text, no host read), `/proc/<pid>/maps` and `mem` reads
+//! (sendfile offset permissions, mmap capture, network copy paths),
+//! `/proc/<pid>/limits` and `status` reads, the `/proc/<tid>/net/unix`
+//! table read, process root/directory opens
+//! (`record_replay_path`), the exec-restore descriptor scan, the
+//! tool's own `/proc/self` descriptor reads, captured-output
+//! identity matching over `stat` results this trait returns, and
+//! replay materialization. A second [`RecordHost`] implementation
+//! must route or refuse each of those for its backend before it
+//! lands; none of them may silently fall back to procfs. The 6805
 //! no-touch replay default (virtual files, memfd materialization)
 //! must extend this seam with effect operations or gate at the
 //! handlers; this trait covers queries and duplication only.
+//!
+//! Duplication contract: a host must duplicate the host-backed
+//! descriptions whose offsets and effects callers then drive through
+//! the duplicate (`lseek`, positioned writes, `set_len`, `sendfile`,
+//! `SCM_RIGHTS` inspection) — regular files at minimum. Descriptions
+//! a backend models itself with no host descriptor behind them
+//! (captured pipes, eventfd, epoll, synthetic files) refuse
+//! duplication by error, and each call site names that refusal
+//! rather than serving a substitute descriptor.
 //!
 //! [`RecordHost::fd_link`]'s target strings are Linux's procfs
 //! renderings (`anon_inode:[eventfd]`, `pipe:[…]`, an absolute path):
@@ -128,6 +147,19 @@ pub trait RecordHost: Send + Sync + 'static {
     /// [`Self::fd_link`].
     fn descriptor_numbers(pid: Pid) -> Option<Vec<RawFd>>;
 
+    /// `stat` of descriptor `fd` in the table of guest task `tid`,
+    /// following its link as `stat` on the descriptor does, if it can
+    /// be read. Task-keyed and synchronous: the guards that decide
+    /// whether an effect through [`Self::duplicate_guest_fd`] applies
+    /// read it in the same function as the effect.
+    fn fd_metadata(tid: Pid, fd: RawFd) -> Option<std::fs::Metadata>;
+
+    /// Whether descriptors `left` and `right` in guest task `task`'s
+    /// own table share one open file description (Linux: `kcmp`
+    /// `KCMP_FILE` between the task's descriptors). An error means
+    /// the comparison could not be made, never that they differ.
+    fn guest_fds_share_description(task: Pid, left: RawFd, right: RawFd) -> io::Result<bool>;
+
     /// Whether guest task `pid` still exists. Task-keyed and
     /// synchronous, like [`Self::descriptor_numbers`].
     fn guest_task_exists(pid: Pid) -> bool;
@@ -199,6 +231,31 @@ impl RecordHost for PtraceHost {
 
     fn same_open_file_description(left: RawFd, right: RawFd) -> io::Result<bool> {
         crate::fd::same_open_file_description(left, right)
+    }
+
+    fn fd_metadata(tid: Pid, fd: RawFd) -> Option<std::fs::Metadata> {
+        std::fs::metadata(format!("/proc/{}/fd/{fd}", tid.as_raw())).ok()
+    }
+
+    fn guest_fds_share_description(task: Pid, left: RawFd, right: RawFd) -> io::Result<bool> {
+        const KCMP_FILE: libc::c_int = 0;
+        // SAFETY: kcmp only compares two descriptor-table entries of
+        // the named task.
+        let comparison = unsafe {
+            libc::syscall(
+                libc::SYS_kcmp,
+                task.as_raw(),
+                task.as_raw(),
+                KCMP_FILE,
+                libc::c_long::from(left),
+                libc::c_long::from(right),
+            )
+        };
+        if comparison == -1 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(comparison == 0)
+        }
     }
 
     fn descriptor_numbers(pid: Pid) -> Option<Vec<RawFd>> {
