@@ -481,7 +481,9 @@ impl Parked {
     /// In a copy: re-creates every parked thread. Each resumes its saved
     /// context, so it returns from the parking handler where the original
     /// would have, and goes on as the original.
-    pub(crate) fn resurrect(&self) -> Result<usize, String> {
+    /// `affinity`, when given, replaces each thread's saved CPU set, so that
+    /// a copy pinned to its own CPU keeps all of its threads there.
+    pub(crate) fn resurrect(&self, affinity: Option<&libc::cpu_set_t>) -> Result<usize, String> {
         let offset = glibc_layout()?;
         const STACK: usize = 64 * 1024;
         let flags = libc::CLONE_VM
@@ -495,6 +497,11 @@ impl Parked {
             | libc::CLONE_CHILD_CLEARTID;
         for index in 0..self.count {
             let slot = slot(index);
+            if let Some(affinity) = affinity {
+                // SAFETY: the slot is this copy's own memory; no thread uses
+                // it until the clone below.
+                unsafe { (*slot).affinity = *affinity };
+            }
             // SAFETY: a fresh private mapping for the new thread's first
             // frames; it is never unmapped (the thread leaves it at once,
             // for its own stack, and it is small).

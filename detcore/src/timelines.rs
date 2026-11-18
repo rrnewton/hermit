@@ -831,6 +831,24 @@ fn become_timeline(
         // SAFETY: _exit ends the process at once.
         unsafe { libc::_exit(97) };
     };
+    // First, so that copies started together repair on their own CPUs
+    // rather than queueing on the template's pinned CPU; the re-created
+    // threads get the same set below.
+    let cpu = (!spec.cpus.is_empty()).then(|| spec.cpus[index % spec.cpus.len()]);
+    let affinity = cpu.map(|cpu| {
+        // SAFETY: a zeroed set with one CPU.
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            libc::CPU_SET(cpu, &mut set);
+            set
+        }
+    });
+    if let Some(set) = &affinity {
+        // SAFETY: applies to this thread, the copy's only one so far.
+        if unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), set) } != 0 {
+            fail("pinning", std::io::Error::last_os_error().to_string());
+        }
+    }
     let repair_started = Instant::now();
     let repaired = match (hooks.repair)() {
         Ok(description) => description,
@@ -847,18 +865,6 @@ fn become_timeline(
     let files_started = Instant::now();
     let reopened = reopen_files(records);
     let files_us = micros(files_started);
-    let cpu = (!spec.cpus.is_empty()).then(|| spec.cpus[index % spec.cpus.len()]);
-    if let Some(cpu) = cpu {
-        // SAFETY: a zeroed set with one CPU, for this (the copy's only) thread.
-        let pinned = unsafe {
-            let mut set: libc::cpu_set_t = std::mem::zeroed();
-            libc::CPU_SET(cpu, &mut set);
-            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set)
-        };
-        if pinned != 0 {
-            fail("pinning", std::io::Error::last_os_error().to_string());
-        }
-    }
     if let Err(error) = redirect_outputs(&spec.dir, index) {
         fail("redirecting output", error.to_string());
     }
@@ -889,7 +895,7 @@ fn become_timeline(
     if debug_switch("noresurrect") {
         return;
     }
-    match parked.resurrect() {
+    match parked.resurrect(affinity.as_ref()) {
         Ok(threads) => {
             let _ = std::fs::write(
                 spec.dir.join(format!("timeline-{index}.threads")),
