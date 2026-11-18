@@ -2900,6 +2900,7 @@ fn apply_base_and_explicit_environment(
             command.env_remove(detcore::race_probe::RACE_PROBE_SEED_ENV);
             command.env_remove(detcore::timelines::TIMELINE_FORK_ENV);
             command.env_remove(detcore::timelines::TIMELINE_CONTROL_ENV);
+            command.env_remove(reverie_kvm::host_fork::PRIVATE_ARENAS_ENV);
             command.env_remove(detcore::race_probe::RACE_PROBE_HOLD_DIR_ENV);
             command.env_remove(DAP_LISTEN_INNER_ENV);
         }

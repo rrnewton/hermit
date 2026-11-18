@@ -137,6 +137,8 @@ pub struct BackendHooks {
     pub prepare: fn() -> Result<String, String>,
     /// In each copy, before anything else: rebuild what fork did not copy.
     pub repair: fn() -> Result<String, String>,
+    /// In each copy, as it ends: what the backend did while it ran.
+    pub at_exit: fn() -> String,
 }
 
 static HOOKS: OnceLock<BackendHooks> = OnceLock::new();
@@ -750,6 +752,12 @@ pub fn exit_timeline(code: i32) {
             dir.join(format!("timeline-{index}.exit")),
             format!("{code}\n"),
         );
+        if let Some(hooks) = HOOKS.get() {
+            let _ = std::fs::write(
+                dir.join(format!("timeline-{index}.backend")),
+                format!("{}\n", (hooks.at_exit)()),
+            );
+        }
     }
     send_control(&serde_json::json!({ "exit": code }));
     // SAFETY: _exit ends the process at once; nothing runs after it.

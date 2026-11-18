@@ -3615,6 +3615,7 @@ async fn run_kvm(
         name: "kvm",
         prepare: || reverie_kvm::host_fork::prepare().map(|report| format!("{report:?}")),
         repair: || reverie_kvm::host_fork::repair_in_child().map(|report| format!("{report:?}")),
+        at_exit: reverie_kvm::host_fork::exit_report,
     });
     let execution_started = Instant::now();
     let completion = hermit_run_kvm::run_detcore(&mut backend, config, capture_output)
@@ -3623,12 +3624,13 @@ async fn run_kvm(
     let cleanup_started = Instant::now();
     let result =
         finish_kvm_tool_completion(completion, print_summary, print_summary_to_json_file).await;
-    let teardown_started = Instant::now();
-    // Drop explicitly so the host's KVM VM teardown cost remains observable.
-    drop(backend);
-    let teardown_finished = Instant::now();
-    let (status, stdout, stderr) = result?;
     if detcore::timelines::timeline_index().is_some() {
+        // A timeline copy ends here, before the backend's orderly teardown:
+        // its driver waits only for the exit message, and the kernel releases
+        // the copy's VMs and memory as the process exits. MEASURED (memtouch,
+        // 5 copies each, resume to exit message): 60-266 ms became 16-23 ms
+        // for a 16 MiB guest, and 548-835 ms became 236-413 ms at 1 GiB.
+        let (status, stdout, stderr) = result?;
         if !capture_output {
             std::io::stdout().write_all(&stdout)?;
             std::io::stderr().write_all(&stderr)?;
@@ -3637,7 +3639,13 @@ async fn run_kvm(
             .code()
             .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
         detcore::timelines::exit_timeline(code);
+        std::process::exit(code);
     }
+    let teardown_started = Instant::now();
+    // Drop explicitly so the host's KVM VM teardown cost remains observable.
+    drop(backend);
+    let teardown_finished = Instant::now();
+    let (status, stdout, stderr) = result?;
 
     // Every field below is a host wall-clock duration. Keep this diagnostic at
     // DEBUG so it remains available for backend profiling without entering the
