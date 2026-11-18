@@ -37,7 +37,7 @@ use reverie::syscalls::family::StatFamily;
 use reverie::syscalls::family::WriteFamily;
 use reverie::syscalls::ioctl;
 
-use super::Recorder;
+use super::RecorderWithHost;
 use crate::event::FileCloneEvent;
 use crate::event::FileCloneImage;
 use crate::event::FileExtent;
@@ -50,6 +50,7 @@ use crate::event::SyscallEvent;
 use crate::event::WriteEvent;
 use crate::event::deterministic_ioctl_error;
 use crate::event::xattr_query_output;
+use crate::host::RecordHost;
 use crate::vectored_offset;
 
 /// Read the first `length` output bytes of a vectored read from the guest's
@@ -364,7 +365,7 @@ fn recorder_sendfile(
 /// copied by the recorder when its file-size limit is the guest's
 /// (`copy_under_the_guests_limit`); anything else fails with EFAULT, as
 /// Linux's call does, but without the copy Linux would have made.
-async fn copy_at_offset<G: Guest<Recorder>>(
+async fn copy_at_offset<H: RecordHost, G: Guest<RecorderWithHost<H>>>(
     guest: &mut G,
     pid: reverie::Pid,
     task: reverie::Pid,
@@ -390,7 +391,7 @@ async fn copy_at_offset<G: Guest<Recorder>>(
         .zip(output_file.as_ref())
         .map(|(input, output)| (input.dev(), input.ino()) == (output.dev(), output.ino()));
     let descriptions = Descriptions::of(order, same_file);
-    let input = crate::fd::duplicate_guest_thread_fd(pid, task, syscall.in_fd()).ok();
+    let input = H::duplicate_guest_thread_fd(pid, task, syscall.in_fd()).ok();
     if descriptions == Descriptions::Distinct
         && let Some(input) = &input
     {
@@ -415,7 +416,7 @@ async fn copy_at_offset<G: Guest<Recorder>>(
                 .as_ref()
                 .is_some_and(|output| output.file_type().is_file())
         })
-        .zip(crate::fd::duplicate_guest_thread_fd(pid, task, syscall.out_fd()).ok());
+        .zip(H::duplicate_guest_thread_fd(pid, task, syscall.out_fd()).ok());
     if let Some((input, output)) = &pair
         && recorder_copy_fits(pid, output, syscall.count()).unwrap_or(false)
     {
@@ -453,7 +454,7 @@ async fn copy_at_offset<G: Guest<Recorder>>(
 /// guest's own SIGXFSZ, with the native signal information, and refuses the
 /// write (EFBIG). Different limits cannot be copied this way: EFAULT without
 /// the copy.
-async fn copy_under_the_guests_limit<G: Guest<Recorder>>(
+async fn copy_under_the_guests_limit<H: RecordHost, G: Guest<RecorderWithHost<H>>>(
     guest: &mut G,
     pid: reverie::Pid,
     syscall: Sendfile,
@@ -511,7 +512,7 @@ enum SendfileStart {
 /// Callers handle either error by falling back to read and write, which record
 /// their bytes. `offset` is the guest's offset argument, if it passed one,
 /// with the value it held if readable.
-fn sendfile_source(
+fn sendfile_source<H: RecordHost>(
     pid: reverie::Pid,
     task: reverie::Pid,
     syscall: Sendfile,
@@ -524,7 +525,7 @@ fn sendfile_source(
     let same_file = output.file_type().is_file()
         && input.file_type().is_file()
         && (input.dev(), input.ino()) == (output.dev(), output.ino());
-    let file = crate::fd::duplicate_guest_thread_fd(pid, task, syscall.in_fd())
+    let file = H::duplicate_guest_thread_fd(pid, task, syscall.in_fd())
         .map(std::fs::File::from)
         .map_err(|error| match error.raw_os_error() {
             Some(libc::EBADF) => Errno::EBADF,
@@ -820,7 +821,7 @@ fn private_clone_snapshot(
     Ok(private)
 }
 
-impl Recorder {
+impl<H: RecordHost> RecorderWithHost<H> {
     /// Records the vectored read family (`readv`/`preadv`/`preadv2`). Writes only
     /// need their return count (see `handle_write_family`), but vectored reads
     /// scatter output across guest `iovec` buffers, so we capture the exact
@@ -979,7 +980,7 @@ impl Recorder {
         // gives.
         let offset_fault =
             matches!(offset, Some(Some(_))) && permissions.is_some_and(|(_, writable)| !writable);
-        let source = match sendfile_source(pid, task, syscall, offset) {
+        let source = match sendfile_source::<H>(pid, task, syscall, offset) {
             Ok(source) => source,
             Err(error) => {
                 self.record_event(guest, Err(error));
@@ -1072,7 +1073,7 @@ impl Recorder {
         let (output_fd, shares_output_ofd) = metadata.as_ref().map_or((None, false), |metadata| {
             let (stdout_matches, stderr_matches) = outputs.matching(metadata);
             let candidate = (metadata.file_type().is_file() && (stdout_matches || stderr_matches))
-                .then(|| crate::fd::duplicate_guest_thread_fd(pid, task, fd).ok())
+                .then(|| H::duplicate_guest_thread_fd(pid, task, fd).ok())
                 .flatten();
             let stdout_shares = stdout_matches
                 && candidate.as_ref().is_some_and(|candidate| {
@@ -1274,7 +1275,7 @@ impl Recorder {
                     _ => unreachable!(),
                 };
             let source = std::fs::File::from(
-                crate::fd::duplicate_guest_fd(guest.pid(), source_fd)
+                H::duplicate_guest_fd(guest.pid(), source_fd)
                     .expect("failed to duplicate clone source descriptor"),
             );
             let source_length = source

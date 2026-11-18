@@ -11,10 +11,11 @@ use reverie::Guest;
 use reverie::syscalls::Getrandom;
 use reverie::syscalls::MemoryAccess;
 
-use super::Recorder;
+use super::RecorderWithHost;
 use crate::event::SyscallEvent;
+use crate::host::RecordHost;
 
-impl Recorder {
+impl<H: RecordHost> RecorderWithHost<H> {
     pub(super) async fn handle_getrandom<G: Guest<Self>>(
         &self,
         guest: &mut G,

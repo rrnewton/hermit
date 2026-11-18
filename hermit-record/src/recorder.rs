@@ -17,6 +17,7 @@ use std::fs as stdfs;
 use std::io;
 use std::io::Read;
 use std::io::Write;
+use std::marker::PhantomData;
 use std::os::fd::AsRawFd;
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
@@ -73,6 +74,8 @@ use crate::event_stream::ChildEventStreamIds;
 use crate::event_stream::DebugEvent;
 use crate::event_stream::EventStreamId;
 use crate::event_stream::EventWriter;
+use crate::host::PtraceHost;
+use crate::host::RecordHost;
 
 const MAX_EXEC_DEPENDENCY_DEPTH: usize = 5;
 
@@ -443,7 +446,10 @@ fn guest_has_open_file_description(pid: Pid, target: &std::os::fd::OwnedFd) -> b
 /// A Reverie tool that records syscalls. Note that only syscalls that cannot be
 /// made deterministic are forwarded to this tool.
 #[derive(Serialize, Deserialize)]
-pub struct Recorder {
+pub struct RecorderWithHost<H> {
+    /// The backend host this recorder queries for descriptor state and
+    /// descriptor duplication ([`RecordHost`]); stateless, never stored.
+    _host: PhantomData<H>,
     // TODO: We'll need to keep track of file descriptors here in order to
     // determine if a file descriptor should be fully recorded or simply cached
     // with a reflink. We can use `fstatfs` to figure out if the target file
@@ -460,9 +466,14 @@ pub struct Recorder {
     stderr: Option<OutputIdentity>,
 }
 
-impl Default for Recorder {
+/// The recorder on the ptrace backend's host; what `hermit record`
+/// instantiates today.
+pub type Recorder = RecorderWithHost<PtraceHost>;
+
+impl<H: RecordHost> Default for RecorderWithHost<H> {
     fn default() -> Self {
         Self {
+            _host: PhantomData,
             data: PathBuf::new(),
             stdout: None,
             stderr: None,
@@ -471,7 +482,7 @@ impl Default for Recorder {
 }
 
 #[reverie::tool]
-impl Tool for Recorder {
+impl<H: RecordHost> Tool for RecorderWithHost<H> {
     type GlobalState = detcore::GlobalState;
     type ThreadState = RecorderThreadState;
 
@@ -481,6 +492,7 @@ impl Tool for Recorder {
 
     fn new(pid: Pid, cfg: &<Self::GlobalState as GlobalTool>::Config) -> Self {
         Self {
+            _host: PhantomData,
             data: cfg.replay_data.as_ref().unwrap().clone(),
             stdout: OutputIdentity::for_fd(pid, libc::STDOUT_FILENO),
             stderr: OutputIdentity::for_fd(pid, libc::STDERR_FILENO),
@@ -836,7 +848,7 @@ impl Tool for Recorder {
     }
 }
 
-impl Recorder {
+impl<H: RecordHost> RecorderWithHost<H> {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#662): Audit recorded physical-open classification.
     async fn handle_open<G: Guest<Self>>(
@@ -961,18 +973,13 @@ impl Recorder {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#662): Audit guest FD replay classification.
     fn fd_replay_kind(&self, pid: Pid, fd: libc::c_int) -> ReplayFdKind {
-        let path = format!("/proc/{}/fd/{fd}", pid.as_raw());
-        if std::fs::read_link(&path)
-            .ok()
+        if H::fd_link(pid, fd)
             .is_some_and(|target| target == std::path::Path::new("anon_inode:[eventfd]"))
         {
             return ReplayFdKind::Eventfd;
         }
 
-        if std::fs::metadata(path)
-            .ok()
-            .is_some_and(|metadata| metadata.file_type().is_file())
-        {
+        if H::fd_is_regular_file(pid, fd) {
             ReplayFdKind::RegularFile
         } else {
             ReplayFdKind::None
@@ -980,8 +987,7 @@ impl Recorder {
     }
 
     fn epoll_requires_replay_kernel_side_effect(&self, pid: Pid, fd: libc::c_int) -> bool {
-        let Ok(fdinfo) = std::fs::read_to_string(format!("/proc/{}/fdinfo/{fd}", pid.as_raw()))
-        else {
+        let Some(fdinfo) = H::fdinfo_text(pid, fd) else {
             return false;
         };
         let targets = fdinfo.lines().filter_map(|line| {

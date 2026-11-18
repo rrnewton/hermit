@@ -20,6 +20,7 @@ use std::fs::File;
 use std::io;
 use std::io::Seek;
 use std::io::SeekFrom;
+use std::marker::PhantomData;
 use std::ops::Deref;
 use std::ops::DerefMut;
 use std::os::fd::AsRawFd;
@@ -70,8 +71,11 @@ use reverie::syscalls::Unlinkat;
 use reverie::syscalls::Whence;
 use serde::Deserialize;
 use serde::Serialize;
-fn capture_guest_fd(pid: Pid, fd: libc::c_int) -> (Option<std::os::fd::OwnedFd>, Option<String>) {
-    match crate::fd::duplicate_guest_fd(pid, fd) {
+fn capture_guest_fd<H: crate::host::RecordHost>(
+    pid: Pid,
+    fd: libc::c_int,
+) -> (Option<std::os::fd::OwnedFd>, Option<String>) {
+    match H::duplicate_guest_fd(pid, fd) {
         Ok(duplicate) => (Some(duplicate), None),
         Err(error) if error.raw_os_error() == Some(libc::EBADF) => (None, None),
         Err(error) => (None, Some(error.to_string())),
@@ -549,6 +553,8 @@ use crate::event_stream::DebugEvent;
 use crate::event_stream::EventReader;
 use crate::event_stream::EventStreamId;
 use crate::event_stream::normalize_unused_args;
+use crate::host::PtraceHost;
+use crate::host::RecordHost;
 
 #[derive(Serialize, Deserialize)]
 pub struct ReplayerThreadState {
@@ -1295,9 +1301,9 @@ pub struct ReplayOutputs {
 }
 
 impl ReplayOutputs {
-    fn capture(pid: Pid) -> Self {
-        let (stdout, stdout_error) = capture_guest_fd(pid, libc::STDOUT_FILENO);
-        let (stderr, stderr_error) = capture_guest_fd(pid, libc::STDERR_FILENO);
+    fn capture<H: RecordHost>(pid: Pid) -> Self {
+        let (stdout, stdout_error) = capture_guest_fd::<H>(pid, libc::STDOUT_FILENO);
+        let (stderr, stderr_error) = capture_guest_fd::<H>(pid, libc::STDERR_FILENO);
         Self {
             stdout,
             stderr,
@@ -1332,7 +1338,10 @@ impl Default for ReplayerThreadState {
 /// A Reverie tool that replays syscalls. Note that only syscalls that cannot be
 /// made deterministic are forwarded to this tool.
 #[derive(Serialize, Deserialize)]
-pub struct Replayer {
+pub struct ReplayerWithHost<H> {
+    /// The backend host this replayer queries for descriptor state and
+    /// descriptor duplication ([`RecordHost`]); stateless, never stored.
+    _host: PhantomData<H>,
     // Keep track of the data directory. Each thread uses this path to open its
     // event stream.
     data: PathBuf,
@@ -1343,9 +1352,14 @@ pub struct Replayer {
     outputs: std::sync::Arc<ReplayOutputs>,
 }
 
-impl Default for Replayer {
+/// The replayer on the ptrace backend's host; what `hermit replay`
+/// instantiates today.
+pub type Replayer = ReplayerWithHost<PtraceHost>;
+
+impl<H: RecordHost> Default for ReplayerWithHost<H> {
     fn default() -> Self {
         Self {
+            _host: PhantomData,
             data: PathBuf::new(),
             outputs: Default::default(),
         }
@@ -1353,7 +1367,7 @@ impl Default for Replayer {
 }
 
 #[reverie::tool]
-impl Tool for Replayer {
+impl<H: RecordHost> Tool for ReplayerWithHost<H> {
     fn stream_role() -> reverie::ToolStreamRole {
         reverie::ToolStreamRole::BinaryReplay
     }
@@ -1363,8 +1377,9 @@ impl Tool for Replayer {
 
     fn new(pid: Pid, cfg: &<Self::GlobalState as GlobalTool>::Config) -> Self {
         Self {
+            _host: PhantomData,
             data: cfg.replay_data.as_ref().unwrap().clone(),
-            outputs: std::sync::Arc::new(ReplayOutputs::capture(pid)),
+            outputs: std::sync::Arc::new(ReplayOutputs::capture::<H>(pid)),
         }
     }
 
@@ -1714,7 +1729,7 @@ impl Tool for Replayer {
     }
 }
 
-impl Replayer {
+impl<H: RecordHost> ReplayerWithHost<H> {
     // TODO-HUMAN-REVIEW(#2370)
     async fn handle_exec<G: Guest<Self>>(
         &self,
@@ -3627,7 +3642,7 @@ impl Replayer {
         // every path panics on it. Stage the smallest tier that holds
         // the path, and refuse by name when no tier fits the stack
         // this guest actually has.
-        async fn inject_open<const N: usize, G: Guest<Replayer>>(
+        async fn inject_open<const N: usize, G: Guest<ReplayerWithHost<H2>>, H2: RecordHost>(
             guest: &mut G,
             pending: &PendingPlaceholderOpen,
             path_bytes: &[u8],
@@ -3665,12 +3680,14 @@ impl Replayer {
                 .map_err(|error| format!("re-issued open of {:?} failed: {error}", pending.path))
         }
         let opened = match path_bytes.len() + 1 {
-            0..=256 => inject_open::<256, _>(guest, pending, path_bytes, inject_flags).await,
-            257..=512 => inject_open::<512, _>(guest, pending, path_bytes, inject_flags).await,
-            513..=768 => inject_open::<768, _>(guest, pending, path_bytes, inject_flags).await,
-            769..=896 => inject_open::<896, _>(guest, pending, path_bytes, inject_flags).await,
-            897..=2048 => inject_open::<2048, _>(guest, pending, path_bytes, inject_flags).await,
-            2049..=4096 => inject_open::<4096, _>(guest, pending, path_bytes, inject_flags).await,
+            0..=256 => inject_open::<256, _, H>(guest, pending, path_bytes, inject_flags).await,
+            257..=512 => inject_open::<512, _, H>(guest, pending, path_bytes, inject_flags).await,
+            513..=768 => inject_open::<768, _, H>(guest, pending, path_bytes, inject_flags).await,
+            769..=896 => inject_open::<896, _, H>(guest, pending, path_bytes, inject_flags).await,
+            897..=2048 => inject_open::<2048, _, H>(guest, pending, path_bytes, inject_flags).await,
+            2049..=4096 => {
+                inject_open::<4096, _, H>(guest, pending, path_bytes, inject_flags).await
+            }
             _ => Err(format!(
                 "recorded open path {:?} is too long to re-issue",
                 pending.path
@@ -3952,11 +3969,10 @@ impl Replayer {
         if matches!(call.whence(), Whence::SEEK_DATA | Whence::SEEK_HOLE) {
             let recorded = next_event!(guest, Return);
             if let Ok(expected) = recorded {
-                let duplicate =
-                    crate::fd::duplicate_guest_thread_fd(guest.pid(), thread, call.fd())
-                        .unwrap_or_else(|error| {
-                            panic!("failed to duplicate replay file for extent seek: {error}")
-                        });
+                let duplicate = H::duplicate_guest_thread_fd(guest.pid(), thread, call.fd())
+                    .unwrap_or_else(|error| {
+                        panic!("failed to duplicate replay file for extent seek: {error}")
+                    });
                 // SAFETY: duplicate owns the same open-file description and the
                 // recorded extent seek returned this nonnegative offset.
                 let actual =

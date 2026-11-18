@@ -16,11 +16,12 @@ use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Time;
 use reverie::syscalls::Timespec;
 
-use super::Recorder;
+use super::RecorderWithHost;
 use crate::event::SyscallEvent;
 use crate::event::TimespecEvent;
+use crate::host::RecordHost;
 
-impl Recorder {
+impl<H: RecordHost> RecorderWithHost<H> {
     pub(super) async fn handle_clock_gettime<G: Guest<Self>>(
         &self,
         guest: &mut G,

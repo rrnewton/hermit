@@ -26,11 +26,13 @@ use hermit_record_format::consts;
 use hermit_record_format::event;
 use hermit_record_format::event_stream;
 use hermit_record_format::fd;
+use hermit_record_format::host;
 use hermit_record_format::interp;
 use hermit_record_format::record_replay_path;
 use hermit_record_format::syscall_args::read_iovecs;
 use hermit_record_format::syscall_args::vectored_offset;
 pub use recorder::Recorder;
+pub use recorder::RecorderWithHost;
 use reverie::process::Command;
 
 /// The recording tracer: `detcore::Detcore<Recorder>` under `reverie_ptrace`.

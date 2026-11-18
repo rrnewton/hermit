@@ -24,12 +24,13 @@ use reverie::syscalls::MapFlags;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Mmap;
 
-use super::Recorder;
+use super::RecorderWithHost;
 use crate::event::MadviseEvent;
 use crate::event::MadviseRefill;
 use crate::event::MmapEvent;
 use crate::event::SharedMapping;
 use crate::event::SyscallEvent;
+use crate::host::RecordHost;
 
 const PAGE_SIZE: usize = 4096;
 // Added in Linux 6.13 and not yet exposed by the pinned libc crate.
@@ -471,7 +472,7 @@ fn descriptor_access(fdinfo: &str) -> Option<i32> {
     Some(i32::from_str_radix(flags, 8).ok()? & libc::O_ACCMODE)
 }
 
-impl Recorder {
+impl<H: RecordHost> RecorderWithHost<H> {
     pub(super) async fn handle_mmap<G: Guest<Self>>(
         &self,
         guest: &mut G,

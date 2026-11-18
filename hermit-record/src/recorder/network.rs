@@ -37,7 +37,7 @@ use reverie::syscalls::Syscall;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::family::SockOptFamily;
 
-use super::Recorder;
+use super::RecorderWithHost;
 use crate::event::AcceptEvent;
 use crate::event::EpollWaitEvent;
 use crate::event::InterruptedPoll;
@@ -48,6 +48,7 @@ use crate::event::SelectEvent;
 use crate::event::SockOptEvent;
 use crate::event::SyscallEvent;
 use crate::event::fd_set_bytes;
+use crate::host::RecordHost;
 
 fn read_bytes<M: MemoryAccess>(
     memory: &M,
@@ -521,7 +522,7 @@ fn capture_select_event<M: MemoryAccess>(
     }
 }
 
-impl Recorder {
+impl<H: RecordHost> RecorderWithHost<H> {
     #[cfg(target_arch = "x86_64")]
     pub(super) async fn handle_epoll_wait<G: Guest<Self>>(
         &self,
