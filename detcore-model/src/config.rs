@@ -1944,6 +1944,22 @@ pub struct Config {
     #[clap(long, value_name = "L1D,L1I,L2,L3")]
     pub cpu_caches: Option<crate::cpu_caches::CpuCacheSizes>,
 
+    /// Experimental (provrepro): a stat of a file below this absolute guest
+    /// path (repeatable; `/usr` covers `/usr/lib/x`, not `/usrx`) keeps the
+    /// file's real host mtime, if no earlier stat resolved it, instead of
+    /// the epoch. Only a host mtime no later than the epoch is kept: a later
+    /// one, which every file the guest creates or changes gets from the
+    /// host's clock, still becomes the epoch. For build roots from a pinned
+    /// image, such as `/usr`, `/etc` and `/var/lib`. Without it every real
+    /// host mtime becomes the epoch.
+    #[serde(default)]
+    #[clap(
+        long,
+        value_name = "guest-path",
+        value_parser = crate::kept_host_mtimes::parse_guest_path_prefix
+    )]
+    pub keep_host_mtimes_under: Vec<PathBuf>,
+
     /// How much of `/proc` the guest sees. Every level is the same on every
     /// backend and host. `minimal` (the default) shows a small set, modelled
     /// on gVisor's; `standard` shows every system-wide name Detcore serves or
@@ -3049,6 +3065,9 @@ impl fmt::Display for Config {
         }
         if let Some(caches) = &self.cpu_caches {
             write!(f, " --cpu-caches={caches}")?;
+        }
+        for path in &self.keep_host_mtimes_under {
+            write!(f, " --keep-host-mtimes-under={path:?}")?;
         }
         match self.proc_level {
             ProcLevel::Minimal => {}
@@ -4525,7 +4544,7 @@ mod legacy_backend_json {
     /// `allow_unresolved_restart_codes` came after it too: only the ptrace
     /// backend on aarch64 asks Detcore about restart codes, so it is never
     /// written and reads as false.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 73] = [
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 74] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -4571,6 +4590,7 @@ mod legacy_backend_json {
         "dirent_tmpfs_host_order",
         "dir_mtime_follows_entries",
         "cpu_caches",
+        "keep_host_mtimes_under",
         "notice_host_network_abstract_binds",
         "notice_autofs_eloop",
         "replay_edited_preemptions",
@@ -4762,7 +4782,10 @@ mod legacy_backend_json {
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
                 // Empty, as its serde default is.
                 Some(
-                    "rewrite_exclusives_overlay" | "rewrite_exclusives_unmarked" | "autofs_roots",
+                    "rewrite_exclusives_overlay"
+                    | "rewrite_exclusives_unmarked"
+                    | "autofs_roots"
+                    | "keep_host_mtimes_under",
                 ) => seed
                     .deserialize(serde_json::Value::Array(Vec::new()))
                     .map(Some)
@@ -5134,6 +5157,7 @@ mod legacy_backend_json {
                 | "uname_release"
                 | "uname_version"
                 | "cpu_caches"
+                | "keep_host_mtimes_under"
                 | "notice_host_network_abstract_binds"
                 | "notice_autofs_eloop"
                 | "replay_edited_preemptions"
@@ -6224,6 +6248,7 @@ mod tests {
                 | "uname_release"
                 | "uname_version"
                 | "cpu_caches"
+                | "keep_host_mtimes_under"
                 | "notice_host_network_abstract_binds"
                 | "notice_autofs_eloop"
                 | "replay_edited_preemptions"
@@ -6300,9 +6325,13 @@ mod tests {
         // them in dh-mvz7y, chaos_timed_wait_spread later, `autofs_roots` and
         // `notice_autofs_eloop` later still, then
         // `ephemeral_port_range_override`), so fifty-two keys fewer
-        // than fields.
+        // than fields. The provrepro branch's experimental witness fields
+        // `uname_nodename`, `uname_release`, `uname_version`,
+        // `dirent_tmpfs_host_order`, `dir_mtime_follows_entries`,
+        // `cpu_caches` and `keep_host_mtimes_under` have no key either:
+        // fifty-nine fewer.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 52);
+        assert_eq!(fields.len(), keys.len() + 59);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:

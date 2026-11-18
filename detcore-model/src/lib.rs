@@ -358,6 +358,7 @@ pub mod fd;
 pub mod futex;
 pub mod happens_before;
 pub mod host_input;
+pub mod kept_host_mtimes;
 pub mod liteinst_initial_image;
 /// Bounded sealed native target catalog data, without admission authority.
 #[cfg(feature = "native-exec")]

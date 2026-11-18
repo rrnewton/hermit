@@ -13490,13 +13490,81 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Experimental (provrepro): whether a stat of `target` may keep the
+    /// file's real host mtime (`--keep-host-mtimes-under`), as
+    /// [`detcore_model::kept_host_mtimes::covers`] decides for the guest
+    /// path the call names. Decided before the call, whose result may
+    /// overwrite the path. Without the flag it is false and reads nothing.
+    ///
+    /// The guest path is:
+    /// - for a path (`stat`, `lstat`, `newfstatat`, `statx`), the guest's
+    ///   spelling made absolute against its working directory or `dirfd` as
+    ///   an open's is ([`Self::observed_path`]); a symbolic link in it is not
+    ///   followed, and `..` is resolved as text;
+    /// - for a descriptor (`fstat`, `AT_EMPTY_PATH`), the path Detcore
+    ///   recorded when the descriptor was opened (`DetFd::path`), the open's
+    ///   own spelling made absolute in the same way;
+    /// - for `AT_EMPTY_PATH` with `AT_FDCWD`, the working directory.
+    ///
+    /// Where Detcore has no absolute path (a descriptor it recorded no path
+    /// for, such as one inherited from outside the container, or a relative
+    /// `dirfd` it has no path for), nothing covers the stat, which follows
+    /// the epoch rule. The first stat that observes a file's mtime resolves
+    /// it ([`crate::tool_global::ObservedMtime`]), so a later covered stat
+    /// of that file does not change it, and the guest's own order of calls
+    /// decides which stat is first.
+    async fn keeps_host_mtime<G: Guest<Self>>(guest: &mut G, target: StatTarget<'_>) -> bool {
+        if guest.config().keep_host_mtimes_under.is_empty() {
+            return false;
+        }
+        let guest_path = match target {
+            StatTarget::Descriptor(fd) => guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.path())
+                .ok()
+                .flatten(),
+            StatTarget::Cwd => Self::guest_path_at(guest, libc::AT_FDCWD, Path::new(".")).await,
+            StatTarget::Path {
+                dirfd,
+                path: Some(path),
+                ..
+            } => match path.read(&guest.memory()) {
+                Ok(path) => {
+                    let path: PathBuf = path;
+                    Self::guest_path_at(guest, dirfd, &path).await
+                }
+                Err(_) => None,
+            },
+            StatTarget::Path { path: None, .. } | StatTarget::Overwritten => None,
+        };
+        guest_path.is_some_and(|path| {
+            detcore_model::kept_host_mtimes::covers(&guest.config().keep_host_mtimes_under, &path)
+        })
+    }
+
+    /// The guest's `path`, relative to `dirfd`, made absolute as an open's
+    /// spelling is ([`Self::prepare_guest_cwd`], [`Self::observed_path`]), or
+    /// as given where Detcore cannot.
+    async fn guest_path_at<G: Guest<Self>>(
+        guest: &mut G,
+        dirfd: i32,
+        path: &Path,
+    ) -> Option<PathBuf> {
+        Self::prepare_guest_cwd(guest, dirfd, path).await;
+        Self::observed_path(guest, dirfd, path).ok()
+    }
+
     // Determinize stat by doing:
     //   - using virtual inode instead of real inodes. The virtual inodes
     //     increase monolitically and won't be re-used (like ext4)
     //   - use logical modtime which could be used by program like GNU make
     //     to determine file changes. A file first seen with a canonical host
     //     mtime (`CANONICAL_FILE_MTIME_SECONDS`, e.g. the Nix store's 1) keeps
-    //     it; any other first-seen file reports the epoch.
+    //     it; any other first-seen file reports the epoch. Experimental
+    //     (provrepro): where `keep_host_mtime` holds (`Self::keeps_host_mtime`,
+    //     `--keep-host-mtimes-under`), a first-seen file whose host mtime is
+    //     no later than the epoch keeps that mtime instead
+    //     (`ObservedMtime::from_host_mtime_keeping`).
     //   - atime, ctime and btime always report the epoch: the kernel sets ctime
     //     and btime itself, so even for a Nix store file they are real
     //     timestamps, and Hermit keeps no per-file atime.
@@ -13506,6 +13574,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         stat: S,
         inode_override: Option<DetInode>,
         procfs: ProcfsEntry,
+        keep_host_mtime: bool,
     ) -> Result<DetStat, Error>
     where
         G: Guest<Self>,
@@ -13540,7 +13609,18 @@ impl<T: RecordOrReplay> Detcore<T> {
             None => {
                 // statx fills stx_mtime only when it reports STATX_MTIME.
                 let observed = if stat.mask.contains(StatxMask::STATX_MTIME) {
-                    ObservedMtime::from_host_mtime(stat.mtime.tv_sec, stat.mtime.tv_nsec)
+                    let epoch = LogicalTime::from_nanos(
+                        epoch
+                            .timestamp_nanos_opt()
+                            .expect("epoch cannot be represented in nanoseconds")
+                            as u64,
+                    );
+                    ObservedMtime::from_host_mtime_keeping(
+                        stat.mtime.tv_sec,
+                        stat.mtime.tv_nsec,
+                        keep_host_mtime,
+                        epoch,
+                    )
                 } else {
                     ObservedMtime::Unobserved
                 };
@@ -13772,6 +13852,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                 guest.memory().write_value(statptr.0, &stat.into())?;
                 return Ok(0);
             }
+            // Before the call, which can overwrite the path it names.
+            let keep_host_mtime = Self::keeps_host_mtime(guest, target).await;
             let target = match call.stat() {
                 Some(result) => target.unless_overwritten(
                     &guest.memory(),
@@ -13822,7 +13904,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 None => Self::procfs_entry(guest, &DetStat::from(&stat), target).await,
             };
             let stat = self
-                .determinize_stat(guest, stat, inode_override, procfs)
+                .determinize_stat(guest, stat, inode_override, procfs, keep_host_mtime)
                 .await?;
             let stat = Self::with_procfs_maps_size(guest, target, stat);
             memory.write_value(statptr.0, &stat.into())?;
@@ -13891,6 +13973,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             } else if let Some(stat) = self.rendered_procfs_stat(guest, target).await? {
                 return self.write_rendered_statx(guest, call, stat).await;
             }
+            // Before the call, which can overwrite the path it names.
+            let keep_host_mtime = Self::keeps_host_mtime(guest, target).await;
             let target = match call.statx() {
                 Some(result) => target.unless_overwritten(
                     &guest.memory(),
@@ -13962,7 +14046,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .then_some(stat.stx_mnt_id),
             };
             let stat = self
-                .determinize_stat(guest, stat, inode_override, procfs)
+                .determinize_stat(guest, stat, inode_override, procfs, keep_host_mtime)
                 .await?;
             let stat = Self::with_procfs_maps_size(guest, target, stat);
             let mut statx: reverie::syscalls::linux_abi::Statx = stat.into();

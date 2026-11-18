@@ -316,6 +316,11 @@ pub enum ObservedMtime {
     HostSpecific,
     /// A stat observed one of [`CANONICAL_FILE_MTIME_SECONDS`], which is kept.
     Canonical(LogicalTime),
+    /// Experimental (provrepro, `--keep-host-mtimes-under`): a stat observed
+    /// a real host mtime, no later than the epoch, of a file the guest named
+    /// by a path the flag covers. It is kept as it is, nanoseconds included,
+    /// as Linux reports it (see [`ObservedMtime::from_host_mtime_keeping`]).
+    Kept(LogicalTime),
 }
 
 impl ObservedMtime {
@@ -329,14 +334,56 @@ impl ObservedMtime {
         }
     }
 
+    /// [`Self::from_host_mtime`], for a stat of a file the guest named by a
+    /// path that `--keep-host-mtimes-under` covers when `keep_host` holds:
+    /// a real host mtime no later than `epoch` is kept ([`Self::Kept`]).
+    /// Without `keep_host`, or for a canonical value, it is
+    /// [`Self::from_host_mtime`] exactly.
+    ///
+    /// A host mtime later than the epoch is not kept, and becomes the epoch
+    /// as without the flag. Linux stamps every file the guest creates or
+    /// changes (an `O_CREAT` open, `mkdir`, `truncate`, a write through a
+    /// mapping, a new name in a directory) with the host's clock, whose
+    /// reading is later than any epoch in the past and differs between runs;
+    /// Detcore moves the virtual mtime on only for some of those calls, so a
+    /// stat can be the first to resolve such a file. A pre-existing file of a
+    /// pinned image older than the epoch has the same host mtime in every
+    /// run, so the decision depends only on the configuration (the flag's
+    /// paths and the epoch), the guest's path and the file's own mtime. A
+    /// negative, out-of-range or unrepresentable host mtime is not kept.
+    pub fn from_host_mtime_keeping(
+        tv_sec: i64,
+        tv_nsec: i64,
+        keep_host: bool,
+        epoch: LogicalTime,
+    ) -> Self {
+        let observed = Self::from_host_mtime(tv_sec, tv_nsec);
+        if !keep_host || observed != ObservedMtime::HostSpecific {
+            return observed;
+        }
+        let host = u64::try_from(tv_sec)
+            .ok()
+            .zip(
+                u64::try_from(tv_nsec)
+                    .ok()
+                    .filter(|nanos| *nanos < 1_000_000_000),
+            )
+            .and_then(|(secs, nanos)| secs.checked_mul(1_000_000_000)?.checked_add(nanos))
+            .map(LogicalTime::from_nanos);
+        match host {
+            Some(mtime) if mtime <= epoch => ObservedMtime::Kept(mtime),
+            _ => ObservedMtime::HostSpecific,
+        }
+    }
+
     /// The virtual mtime to assign to a file whose mtime is still unresolved:
-    /// a canonical value is kept, a real timestamp becomes the epoch, and no
-    /// observation leaves it unresolved.
+    /// a canonical or kept value is kept, a real timestamp becomes the epoch,
+    /// and no observation leaves it unresolved.
     fn first_seen_mtime(self, epoch: LogicalTime) -> Option<LogicalTime> {
         match self {
             ObservedMtime::Unobserved => None,
             ObservedMtime::HostSpecific => Some(epoch),
-            ObservedMtime::Canonical(mtime) => Some(mtime),
+            ObservedMtime::Canonical(mtime) | ObservedMtime::Kept(mtime) => Some(mtime),
         }
     }
 }
@@ -28648,6 +28695,85 @@ mod tests {
             epoch,
         );
         assert_eq!(mtime, LogicalTime::from_secs(1));
+    }
+
+    /// `--keep-host-mtimes-under` (experimental): a covered stat keeps a real
+    /// host mtime no later than the epoch, nanoseconds included, through the
+    /// first-seen policy; a later one, an uncovered stat and a canonical
+    /// value are classified as without the flag.
+    #[test]
+    fn kept_host_mtimes_are_kept_only_when_covered_and_not_after_the_epoch() {
+        use super::ObservedMtime;
+
+        // 2024-04-17T15:13:05Z.
+        let epoch = LogicalTime::from_secs(1_713_366_785);
+        // 2023-07-27T12:34:56.000000789Z, an image file's mtime.
+        let (image_secs, image_nanos) = (1_690_461_296, 789);
+        let image = LogicalTime::from_nanos(image_secs as u64 * 1_000_000_000 + image_nanos as u64);
+
+        assert_eq!(
+            ObservedMtime::from_host_mtime_keeping(image_secs, image_nanos, true, epoch),
+            ObservedMtime::Kept(image)
+        );
+        // The epoch itself is not later than the epoch.
+        assert_eq!(
+            ObservedMtime::from_host_mtime_keeping(1_713_366_785, 0, true, epoch),
+            ObservedMtime::Kept(epoch)
+        );
+        // Uncovered: the epoch, as without the flag.
+        assert_eq!(
+            ObservedMtime::from_host_mtime_keeping(image_secs, image_nanos, false, epoch),
+            ObservedMtime::HostSpecific
+        );
+        // Later than the epoch (a file the guest created or changed, stamped
+        // with the host's clock), negative, or not a valid timespec.
+        for (secs, nanos) in [
+            (1_713_366_785, 1),
+            (1_795_000_000, 0),
+            (-1, 0),
+            (image_secs, -1),
+            (image_secs, 1_000_000_000),
+            (i64::MAX, 0),
+        ] {
+            assert_eq!(
+                ObservedMtime::from_host_mtime_keeping(secs, nanos, true, epoch),
+                ObservedMtime::HostSpecific,
+                "{secs}.{nanos} is not kept"
+            );
+        }
+        // Canonical values are unchanged, covered or not.
+        for keep in [false, true] {
+            for secs in super::CANONICAL_FILE_MTIME_SECONDS {
+                assert_eq!(
+                    ObservedMtime::from_host_mtime_keeping(secs, 0, keep, epoch),
+                    ObservedMtime::from_host_mtime(secs, 0),
+                    "canonical {secs}, keep={keep}"
+                );
+            }
+        }
+
+        // Through the pool: the first stat decides, and a kept mtime stays
+        // once resolved, like any other.
+        let mut pool = super::InodePool::new();
+        let kept = ObservedMtime::from_host_mtime_keeping(image_secs, image_nanos, true, epoch);
+        let (_, mtime) = pool.add_inode(crate::types::RawInode::new(2, 20), kept, epoch);
+        assert_eq!(mtime, image);
+        let (_, mtime) = pool.add_inode(
+            crate::types::RawInode::new(2, 20),
+            ObservedMtime::HostSpecific,
+            epoch,
+        );
+        assert_eq!(mtime, image, "a later uncovered stat does not change it");
+        // A file first seen uncovered keeps the epoch, whatever a later
+        // covered stat observes.
+        let (_, mtime) = pool.add_inode(
+            crate::types::RawInode::new(2, 21),
+            ObservedMtime::HostSpecific,
+            epoch,
+        );
+        assert_eq!(mtime, epoch);
+        let (_, mtime) = pool.add_inode(crate::types::RawInode::new(2, 21), kept, epoch);
+        assert_eq!(mtime, epoch, "a later covered stat does not change it");
     }
     include!("tool_global/callback_history_tests.rs");
 }

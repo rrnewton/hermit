@@ -226,6 +226,7 @@ async fn determinize_stat_reads_the_mode_and_epoch_it_is_configured_with() {
                     host_uuid_stat(),
                     Some(DetInode::mint(3)),
                     ProcfsEntry::NotProcfs,
+                    false,
                 )
                 .await
                 .unwrap();
@@ -245,6 +246,7 @@ async fn determinize_stat_reads_the_mode_and_epoch_it_is_configured_with() {
                     host_uuid_stat(),
                     None,
                     ProcfsEntry::At(UUID_WITHIN.into()),
+                    false,
                 )
                 .await
                 .unwrap();
@@ -308,7 +310,7 @@ async fn determinize_stat_answers_a_placeholder_only_outside_record_and_replay()
             ..host_uuid_stat()
         };
         let stat = tool
-            .determinize_stat(&mut guest, memfd, None, ProcfsEntry::NotProcfs)
+            .determinize_stat(&mut guest, memfd, None, ProcfsEntry::NotProcfs, false)
             .await
             .unwrap();
         if recordreplay_modes {
@@ -365,6 +367,7 @@ async fn determinize_stat_reports_one_link_for_directories_only() {
             host_stat(libc::S_IFDIR | 0o755, 5),
             None,
             ProcfsEntry::NotProcfs,
+            false,
         )
         .await
         .unwrap();
@@ -380,6 +383,7 @@ async fn determinize_stat_reports_one_link_for_directories_only() {
             host_stat(libc::S_IFREG | 0o644, 3),
             None,
             ProcfsEntry::NotProcfs,
+            false,
         )
         .await
         .unwrap();
@@ -409,9 +413,101 @@ async fn determinized(
         thread,
         sender: Tid::from_raw(process.as_raw()),
     };
-    tool.determinize_stat(&mut guest, stat, None, procfs)
+    tool.determinize_stat(&mut guest, stat, None, procfs, false)
         .await
         .unwrap()
+}
+
+/// Experimental `--keep-host-mtimes-under`, through `determinize_stat` and a
+/// real global tool: a covered stat of a file whose host mtime is no later
+/// than the epoch reports that mtime, nanoseconds included; an uncovered
+/// stat of the same mtime, a covered one later than the epoch, and a
+/// canonical one report as without the flag. atime, ctime and btime stay
+/// the epoch.
+#[tokio::test]
+async fn determinize_stat_keeps_covered_host_mtimes_not_after_the_epoch() {
+    let epoch = Utc.with_ymd_and_hms(2024, 4, 17, 15, 13, 5).unwrap();
+    let epoch_tp = Timespec {
+        tv_sec: epoch.timestamp(),
+        tv_nsec: 0,
+    };
+    let config = config(false, epoch);
+    let process = DetPid::from_raw(7);
+    let global = GlobalState::init_global_state(&config).await;
+    let tool = Detcore::new(Tid::from_raw(process.as_raw()), &config);
+    let mut thread = crate::ThreadState::new(process, &config, ());
+    thread.detpid = Some(process);
+    let mut guest = StatGuest {
+        config: &config,
+        global: &global,
+        thread,
+        sender: Tid::from_raw(process.as_raw()),
+    };
+    // A regular file with host inode `inode` and host mtime `mtime`.
+    let file = |inode: u64, mtime: Timespec| {
+        let mut stat = host_uuid_stat();
+        stat.mode = libc::S_IFREG | 0o644;
+        stat.dev = 0x801;
+        stat.inode = inode;
+        stat.nlink = 1;
+        stat.mtime = mtime;
+        stat
+    };
+    // 2023-07-27, an image file's mtime.
+    let image = Timespec {
+        tv_sec: 1_690_461_296,
+        tv_nsec: 789,
+    };
+    // 2026-11-18, the host's clock when the guest created a file.
+    let created = Timespec {
+        tv_sec: 1_795_000_000,
+        tv_nsec: 123,
+    };
+    let canonical = Timespec {
+        tv_sec: 1,
+        tv_nsec: 0,
+    };
+    for (inode, mtime, keep, expected, case) in [
+        (100, image, true, image, "covered, older than the epoch"),
+        (101, image, false, epoch_tp, "uncovered"),
+        (102, created, true, epoch_tp, "covered, later"),
+        (103, canonical, true, canonical, "covered, canonical"),
+        (104, canonical, false, canonical, "uncovered, canonical"),
+    ] {
+        let stat = tool
+            .determinize_stat(
+                &mut guest,
+                file(inode, mtime),
+                None,
+                ProcfsEntry::NotProcfs,
+                keep,
+            )
+            .await
+            .unwrap();
+        assert_eq!(stat.mtime, expected, "mtime: {case}");
+        for (field, time) in [
+            ("atime", stat.atime),
+            ("btime", stat.btime),
+            ("ctime", stat.ctime),
+        ] {
+            assert_eq!(time, epoch_tp, "{field}: {case}");
+        }
+    }
+    // Resolved by the first stat: a later stat of the same file, covered or
+    // not, reports what the first decided.
+    for (inode, keep, expected) in [(100, false, image), (101, true, epoch_tp)] {
+        let stat = tool
+            .determinize_stat(
+                &mut guest,
+                file(inode, image),
+                None,
+                ProcfsEntry::NotProcfs,
+                keep,
+            )
+            .await
+            .unwrap();
+        assert_eq!(stat.mtime, expected, "second stat of inode {inode}");
+    }
 }
 
 /// The nlink pin's edges: it follows the statx mask field by field, it
