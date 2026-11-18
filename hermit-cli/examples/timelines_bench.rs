@@ -247,17 +247,32 @@ impl Tally {
 /// bench, hermit and every copy, which safehermit runs in place inside a
 /// boxed scope.
 fn cgroup_counter(name: &str) -> Result<u64, String> {
+    let (file, text) = cgroup_file(name)?;
+    text.trim().parse().map_err(|e| format!("{file}: {e}"))
+}
+
+/// The path and text of a file of the run's cgroup.
+fn cgroup_file(name: &str) -> Result<(String, String), String> {
     let cgroup = std::fs::read_to_string("/proc/self/cgroup").map_err(|e| e.to_string())?;
     let path = cgroup
         .lines()
         .find_map(|line| line.strip_prefix("0::"))
         .ok_or("no cgroup v2 line in /proc/self/cgroup")?;
     let file = format!("/sys/fs/cgroup{path}/{name}");
-    std::fs::read_to_string(&file)
-        .map_err(|e| format!("{file}: {e}"))?
+    let text = std::fs::read_to_string(&file).map_err(|e| format!("{file}: {e}"))?;
+    Ok((file, text))
+}
+
+/// `throttled_usec` of the run's cgroup `cpu.stat`: how long its CPU quota
+/// has held the run's tasks back. `None` without a CPU controller.
+fn throttled() -> Option<Duration> {
+    let (_, text) = cgroup_file("cpu.stat").ok()?;
+    text.lines()
+        .find_map(|line| line.strip_prefix("throttled_usec "))?
         .trim()
         .parse()
-        .map_err(|e| format!("{file}: {e}"))
+        .ok()
+        .map(Duration::from_micros)
 }
 
 fn memory_current() -> Result<u64, String> {
@@ -304,6 +319,7 @@ fn backups(
         std::thread::sleep(Duration::from_millis(500));
         let before = memory_current()? as i64;
         let tasks_before = cgroup_counter("pids.current")?;
+        let throttled_before = throttled();
         let started = Instant::now();
         let mut kept = timelines
             .fork_batch(
@@ -323,6 +339,9 @@ fn backups(
             Some(wait_ready(&options.dir, &ids)?)
         };
         let all_ready = started.elapsed();
+        let throttled_forking = throttled()
+            .zip(throttled_before)
+            .map(|(now, then)| now.saturating_sub(then));
         std::thread::sleep(Duration::from_millis(200));
         let held = memory_current()? as i64 - before;
         let tasks = cgroup_counter("pids.current")? as i64 - tasks_before as i64;
@@ -365,20 +384,37 @@ fn backups(
         for t in kept.drain(k..) {
             timelines.discard(t);
         }
-        std::thread::sleep(Duration::from_millis(500));
+        // A discarded copy's memory is freed as it exits, which can outlast
+        // the discard: wait until the template has reaped every copy.
+        let discarded = Instant::now();
+        let deadline = discarded + Duration::from_secs(60);
+        let mut gone = cgroup_counter("pids.current")? <= tasks_before;
+        while !gone && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+            gone = cgroup_counter("pids.current")? <= tasks_before;
+        }
+        let gone_after = discarded.elapsed();
+        std::thread::sleep(Duration::from_millis(200));
         let after = memory_current()? as i64 - before;
         println!(
-            "backups {n} ({}): fork {} returned, all ready {} (slowest copy's fork to ready {}); \
-             memory held {} ({} per copy), tasks held {tasks}; resumed {k} in {} (exits {codes:?}); \
-             after discarding the rest {}",
+            "backups {n} ({}): fork {} returned, all ready {} (slowest copy's fork to ready {}; \
+             the CPU quota held the run back {} meanwhile); memory held {} ({} per copy), \
+             tasks held {tasks}; resumed {k} in {} (exits {codes:?}); after discarding the rest \
+             {} ({})",
             options.copy.describe(),
             ms(fork_wall),
             ms(all_ready),
             ready.map_or("none: dormant".into(), ms),
+            throttled_forking.map_or("unknown".into(), ms),
             mib(held),
             mib(held / n as i64),
             ms(resume_wall),
             mib(after),
+            if gone {
+                format!("every copy gone {} after the discards", ms(gone_after))
+            } else {
+                "copies still present 60 s after the discards".into()
+            },
         );
     }
     Ok(failures)
@@ -433,10 +469,9 @@ fn chain(
     }
     timelines.discard(copy);
     let mut failures = 0;
-    let picks: Vec<usize> = [0, checkpoints.len() / 2]
-        .into_iter()
-        .filter(|&j| j < checkpoints.len())
-        .collect();
+    let mut picks = vec![0, checkpoints.len() / 2];
+    picks.dedup();
+    picks.retain(|&j| j < checkpoints.len());
     for j in picks {
         let (checkpoint, request) = &checkpoints[j];
         let started = Instant::now();
