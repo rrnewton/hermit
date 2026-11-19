@@ -838,7 +838,16 @@ impl<H: RecordHost> Tool for RecorderWithHost<H> {
             Syscall::Other(Sysno::pidfd_getfd, _) => {
                 self.handle_fd_table_mutation(guest, syscall).await
             }
-            unsupported => return Ok(guest.inject(unsupported).await?),
+            // 6805 slice 5 drift tripwire: the census at the pin
+            // (ai_docs slice-5 note) shows every subscribed syscall
+            // has an arm above, so reaching here means the
+            // subscription and this dispatch drifted apart. Fail the
+            // recording loudly instead of producing one replay
+            // cannot serve; the agreement test below is the detector.
+            unsupported => panic!(
+                "record/replay subscription reached unhandled syscall {unsupported:?}: \
+                 classify it in both dispatch tables"
+            ),
         }?)
     }
 
@@ -1747,6 +1756,105 @@ mod finish_tests {
                 "thread stream {stream} could not be written in full"
             )) && refusal.contains("No space left on device"),
             "{refusal}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod dispatch_agreement_tests {
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+
+    fn source(relative: &str) -> String {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("could not read {}: {error}", path.display()))
+    }
+
+    /// Sysnos the shared subscription names on uncommented lines.
+    fn subscribed_sysnos() -> BTreeSet<String> {
+        let text = source("../hermit-record-format/src/subscriptions.rs");
+        let mut out = BTreeSet::new();
+        for line in text.lines() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            for token in line.split(|c: char| !(c.is_ascii_alphanumeric() || c == ':' || c == '_'))
+            {
+                if let Some(name) = token.strip_prefix("Sysno::") {
+                    out.insert(name.to_owned());
+                }
+            }
+        }
+        out
+    }
+
+    /// Sysnos one dispatch match names, mapping typed variants
+    /// through Reverie's syscall table.
+    fn dispatch_sysnos(
+        source_text: &str,
+        table: &std::collections::BTreeMap<String, String>,
+    ) -> BTreeSet<String> {
+        let start = source_text
+            .find("async fn handle_syscall_event")
+            .expect("dispatch fn");
+        let rest = &source_text[start..];
+        let end = rest
+            .find("async fn handle_post_exec")
+            .expect("dispatch end");
+        let window = &rest[..end];
+        let mut out = BTreeSet::new();
+        for token in window.split(|c: char| !(c.is_ascii_alphanumeric() || c == ':' || c == '_')) {
+            if let Some(variant) = token.strip_prefix("Syscall::") {
+                if let Some(sysno) = table.get(variant) {
+                    out.insert(sysno.clone());
+                }
+            } else if let Some(sysno) = token.strip_prefix("Sysno::") {
+                out.insert(sysno.to_owned());
+            }
+        }
+        out
+    }
+
+    /// 6805 slice 5 detector: every subscribed syscall must have a
+    /// dispatch arm in BOTH tools, and the two arm sets must agree.
+    /// The fallthrough panics are only the backstop.
+    #[test]
+    fn subscription_and_both_dispatches_agree() {
+        let table_text = source("../reverie/reverie-syscalls/src/syscalls.rs");
+        let mut table = std::collections::BTreeMap::new();
+        for line in table_text.lines() {
+            let Some((sysno, variant)) = line.trim().split_once(" => ") else {
+                continue;
+            };
+            let variant = variant.trim_end_matches(',').trim();
+            if sysno
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                && variant
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_uppercase())
+            {
+                table.insert(variant.to_owned(), sysno.to_owned());
+            }
+        }
+        assert!(
+            table.len() > 300,
+            "syscall table parse found {}",
+            table.len()
+        );
+        let subscribed = subscribed_sysnos();
+        let recorder = dispatch_sysnos(&source("src/recorder.rs"), &table);
+        let replayer = dispatch_sysnos(&source("../hermit-replay/src/replayer.rs"), &table);
+        assert_eq!(
+            recorder, replayer,
+            "recorder and replayer dispatch sets drifted"
+        );
+        let missing: Vec<_> = subscribed.difference(&recorder).collect();
+        assert!(
+            missing.is_empty(),
+            "subscribed syscalls with no dispatch arm: {missing:?}"
         );
     }
 }
