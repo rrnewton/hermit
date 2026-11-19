@@ -154,6 +154,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             return result;
         };
         let dettid = guest.thread_state().dettid;
+        if refusal.operation == reverie::UnsupportedOperation::JobControlStop
+            && operation != refusal.operation
+        {
+            // A job-control stop the call raised itself is refused by name
+            // whichever refusal its handler expected, never handed to the
+            // guest as the backend's errno.
+            return self.refuse_job_control_stop(guest, sysno, refusal).await;
+        }
         if refusal.operation != operation || refusal.errno != errno {
             tracing::warn!(
                 "[dtid {dettid}] {sysno}: the backend's refusal ({:?}, {}) is not the one this \
@@ -198,6 +206,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         refusal: reverie::UnsupportedRefusal,
     ) -> Result<i64, Error> {
         let dettid = guest.thread_state().dettid;
+        crate::syscall_histogram::mark_refused::<T, G>(guest);
         report_refusal_reason(
             self.cfg.panic_on_unsupported_syscalls,
             &format!(
@@ -217,15 +226,18 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// terminal's job-control signal at its default disposition, that Linux
     /// raised itself (`SI_KERNEL`) after the call it interrupted returned: a
     /// background process's write to its controlling terminal with TOSTOP set
-    /// raises SIGTTOU so. Linux would stop the process group and restart the
-    /// call once the group is continued. Detcore cannot deliver that stop
-    /// (https://github.com/rrnewton/hermit/issues/4944, minibeads
-    /// dh-h2qd98), and the restarted call would raise the signal again
-    /// forever. The call has returned already, so no errno is left to
+    /// raises SIGTTOU so. So does one raised for another call of the process
+    /// group (Linux sends it to the whole group), which reached this thread
+    /// in a call that cannot raise it, and which the backend held for the
+    /// thread rather than refuse that call. Linux would stop the process
+    /// group and restart the call once the group is continued. Detcore
+    /// cannot deliver that stop (https://github.com/rrnewton/hermit/issues/4944,
+    /// minibeads dh-h2qd98), and the restarted call would raise the signal
+    /// again forever. The call has returned already, so no errno is left to
     /// give it: the run ends under either unsupported-operation policy,
-    /// naming the signal and the call. A job-control stop Linux raised while
-    /// Detcore ran the call is that call's refusal instead
-    /// ([`Self::refuse_job_control_stop`]). Any other signal returns at once,
+    /// naming the signal and the call. A job-control stop Linux raised for
+    /// a call Detcore ran, which raises it itself, is that call's refusal
+    /// instead ([`Self::refuse_job_control_stop`]). Any other signal returns at once,
     /// a terminal's SIGTSTP among them ([`linux_raised_job_control_stop`]).
     pub(crate) async fn refuse_linux_raised_job_control_stop<G: Guest<Self>>(
         &self,
@@ -6313,7 +6325,10 @@ pub(crate) fn tool_decided_injection_failure(
 /// internal failure ([`tool_decided_injection_failure`]), instead of letting
 /// its ENOSYS reach the guest. The panic text and the error log carry
 /// `HERMIT_INTERNAL_FAILURE class=tool-decided-injection`; the CLI's own
-/// summary line classifies the run as `class=container-child-panic`.
+/// summary line classifies the run as `class=container-child-panic`. So does
+/// a `JobControlStop` refusal, which both of its consumers refuse by name
+/// before they judge any other ([`unrouted_job_control_stop`],
+/// `class=unrouted-job-control-stop`).
 ///
 /// This is not a general guard. That no Detcore path injects one of these
 /// calls on KVM rests on an audit of Detcore's handlers. The one known
@@ -6368,10 +6383,39 @@ pub(crate) fn judge_backend_refusal<T, G>(
             refusal.diagnostic
         );
     }
+    if let Some(failure) = unrouted_job_control_stop(&refusal, dettid, sysno) {
+        tracing::error!("{failure}");
+        panic!("{failure}");
+    }
     if let Some(failure) = tool_decided_injection_failure(refusal, dettid, sysno) {
         tracing::error!("{failure}");
         panic!("{failure}");
     }
+}
+
+/// The internal failure of a job-control stop refusal
+/// (`reverie::UnsupportedOperation::JobControlStop`) that reached
+/// [`judge_backend_refusal`]: its consumers are the syscall event's check and
+/// `Detcore::report_backend_refusal`, which both refuse it by name
+/// (`Detcore::refuse_job_control_stop`) before judging any other refusal, so
+/// one that arrives here took a path nobody routed. Failing the run closes
+/// that path, instead of passing its EIO to the guest as Linux's answer.
+pub(crate) fn unrouted_job_control_stop(
+    refusal: &Option<reverie::UnsupportedRefusal>,
+    dettid: DetTid,
+    sysno: Sysno,
+) -> Option<String> {
+    refusal
+        .as_ref()
+        .filter(|refusal| refusal.operation == reverie::UnsupportedOperation::JobControlStop)
+        .map(|refusal| {
+            format!(
+                "HERMIT_INTERNAL_FAILURE class=unrouted-job-control-stop dtid={dettid} \
+                 syscall={sysno}: the backend refused a job-control stop, and no path refused \
+                 it by name ({})",
+                refusal.diagnostic
+            )
+        })
 }
 
 /// `signal`'s name and what makes a terminal raise it, when Linux raised it
@@ -13939,6 +13983,40 @@ mod tool_decided_injection_tests {
             );
         }
     }
+
+    /// A job-control stop refusal that reaches the judge, which both of its
+    /// consumers refuse by name first, is an internal failure; no refusal,
+    /// or any other refusal, is not.
+    #[test]
+    fn a_job_control_stop_the_judge_receives_is_an_internal_failure() {
+        let dettid = DetTid::from_raw(7);
+        let stop = Some(reverie::UnsupportedRefusal::new(
+            reverie::UnsupportedOperation::JobControlStop,
+            Errno::EIO,
+            "Linux raised SIGTTIN, at its default disposition, during the call",
+        ));
+        let failure = unrouted_job_control_stop(&stop, dettid, Sysno::read)
+            .expect("an unrouted job-control stop is an internal failure");
+        assert!(
+            failure.starts_with(
+                "HERMIT_INTERNAL_FAILURE class=unrouted-job-control-stop dtid=7 syscall=read"
+            ),
+            "{failure}"
+        );
+        assert!(failure.contains("Linux raised SIGTTIN"), "{failure}");
+        assert_eq!(unrouted_job_control_stop(&None, dettid, Sysno::read), None);
+        for operation in [
+            reverie::UnsupportedOperation::ToolDecided,
+            reverie::UnsupportedOperation::Signalfd,
+            reverie::UnsupportedOperation::Signal,
+        ] {
+            assert_eq!(
+                unrouted_job_control_stop(&refusal(operation), dettid, Sysno::read),
+                None,
+                "{operation:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -14079,6 +14157,56 @@ mod backend_refusal_tests {
                 }
             }
         })
+    }
+
+    /// A job-control stop the call raised itself is refused by name even by
+    /// a handler that expected another operation's refusal: fail-closed, the
+    /// policy's typed refusal under the call's name, never the backend's EIO
+    /// as the call's answer, and the call counts as refused.
+    #[test]
+    fn a_job_control_stop_is_refused_by_name_whatever_refusal_was_expected() {
+        futures::executor::block_on(async {
+            let stop = reverie::UnsupportedRefusal::new(
+                reverie::UnsupportedOperation::JobControlStop,
+                Errno::EIO,
+                "Linux raised SIGTTIN, at its default disposition, during the call",
+            );
+            let (tool, mut guest) = fail_closed(Some(stop));
+            let result = tool
+                .report_backend_refusal(
+                    &mut guest,
+                    Sysno::read,
+                    reverie::UnsupportedOperation::Signalfd,
+                    Err(Errno::EIO.into()),
+                )
+                .await;
+            match result {
+                Err(Error::Tool(error)) => assert_eq!(
+                    error
+                        .downcast_ref::<crate::UnsupportedSyscallError>()
+                        .expect("the policy's named refusal")
+                        .0,
+                    Sysno::read
+                ),
+                other => panic!("expected the typed refusal, got {other:?}"),
+            }
+            assert!(guest.thread_state().stats.syscall_refused);
+        })
+    }
+
+    /// The generic judge ends the run as an internal failure for a
+    /// job-control stop it receives, which no path routed to the stop's
+    /// refusal by name, rather than let its EIO stand as the call's answer.
+    #[test]
+    #[should_panic(expected = "HERMIT_INTERNAL_FAILURE class=unrouted-job-control-stop")]
+    fn the_judge_fails_the_run_on_a_job_control_stop() {
+        let (_tool, mut guest) = fail_closed(None);
+        let stop = reverie::UnsupportedRefusal::new(
+            reverie::UnsupportedOperation::JobControlStop,
+            Errno::EIO,
+            "Linux raised SIGTTIN, at its default disposition, during the call",
+        );
+        judge_backend_refusal::<NoopTool, _>(&mut guest, Some(stop), Sysno::read);
     }
 }
 

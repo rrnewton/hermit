@@ -181,11 +181,11 @@ unsafe fn run_inner_with_capture(
         )?;
         request.check()?;
     }
-    // The command's ignored-signal launch input (`Command::ignored_signals`)
-    // does not reach this path yet: the in-guest launcher (`PreparedExec`)
-    // starts the guest with the dispositions it inherits, not the set the
-    // ptrace and KVM backends start it with
-    // (https://github.com/facebookexperimental/hermit/issues/484).
+    // The command's ignored-signal launch input (`Command::ignored_signals`),
+    // which the in-guest launcher's child applies before it executes
+    // (`PreparedExec::with_ignored_signals`), as every other backend's
+    // launch does (https://github.com/facebookexperimental/hermit/issues/484).
+    let ignored_signals = command.get_ignored_signals();
     // Resolve with the ordinary Command's current directory and exact PATH.
     let program = command.find_program()?;
     let arguments: Vec<OsString> = std::iter::once(command.get_arg0().to_owned())
@@ -284,6 +284,10 @@ unsafe fn run_inner_with_capture(
         )
         .map_err(rpc)?
         .with_ptrace_launch_facts();
+        let request = match ignored_signals {
+            Some(ignored) => request.with_ignored_signals(ignored),
+            None => request,
+        };
         let request = if capture.is_some() {
             request.with_stdio(command.take_prepared_stdio()?)
         } else {

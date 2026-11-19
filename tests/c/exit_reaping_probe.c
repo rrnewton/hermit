@@ -25,7 +25,10 @@
  *              and WNOWAIT, and exits, so Linux hands the zombie to the
  *              subreaper (forget_original_parent). With SIGCHLD ignored the
  *              subreaper reaps the adopted zombie at once, as it does its
- *              own child, so its wait reports ECHILD.
+ *              own child, so its wait reports ECHILD. The child writes one
+ *              byte to the pipe once it has seen the zombie, so a child that
+ *              fails before then, whose own exit the subreaper reaps the
+ *              same way, prints marker=none rather than the same line.
  *
  * The parent blocks SIGCHLD, and learns of the exit by reading a pipe whose
  * only write end the child holds: EOF means the child's descriptors are
@@ -95,11 +98,17 @@ static int run_adopted(void) {
         info.si_pid != grandchild || info.si_status != 9) {
       _exit(102);
     }
+    /* The zombie exists: say so before handing it to the subreaper. */
+    if (write(pipe_fds[1], "z", 1) != 1) {
+      _exit(103);
+    }
     _exit(7);
   }
   close(pipe_fds[1]);
-  char byte;
-  ssize_t got = read(pipe_fds[0], &byte, 1);
+  char byte = 0;
+  ssize_t marker = read(pipe_fds[0], &byte, 1);
+  const char* marker_result = marker == 1 && byte == 'z' ? "zombie-seen" : "none";
+  ssize_t got = marker == 1 ? read(pipe_fds[0], &byte, 1) : marker;
   close(pipe_fds[0]);
   int status = 0;
   pid_t waited = waitpid(-1, &status, 0);
@@ -107,7 +116,8 @@ static int run_adopted(void) {
       : (waited < 0 && errno == ECHILD) ? "ECHILD"
                                         : "other";
   printf(
-      "adopted read=%zd sigchld_pending=%d wait=%s status=%d\n",
+      "adopted marker=%s read=%zd sigchld_pending=%d wait=%s status=%d\n",
+      marker_result,
       got,
       sigchld_pending(),
       wait_result,

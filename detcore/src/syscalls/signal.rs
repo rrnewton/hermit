@@ -1948,12 +1948,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         if !guest.config().sequentialize_threads {
             return;
         }
-        let ignored = match guest.signal_sets(guest.tid()) {
-            Ok(sets) => sets.ignored & (1 << (libc::SIGCHLD - 1)) != 0,
-            Err(error) => {
+        // Read as every other Detcore decision reads a thread's dispositions:
+        // from the backend where guest threads are not host tasks, and from
+        // the thread's own `/proc` status where they are, which covers the
+        // backends whose `Guest::signal_sets` is not provided.
+        let ignored = match crate::syscalls::read_guest_signal_state(guest) {
+            Ok(state) => state.ignored & (1 << (libc::SIGCHLD - 1)) != 0,
+            Err(errno) => {
                 tracing::warn!(
-                    "the run's first process: no signal-set fact ({error:?}), so a launch that \
-                     left SIGCHLD ignored would not be followed by the exit model"
+                    "the run's first process: its signal dispositions could not be read \
+                     ({errno}), so a launch that left SIGCHLD ignored would not be followed by \
+                     the exit model"
                 );
                 return;
             }

@@ -7298,10 +7298,11 @@ const PROCFS_NOT_YET: &[(&str, &str, &str)] = &[
     (
         "a_guest_starts_with_its_launchers_ignored_signals_on_every_backend",
         "liteinst, in-guest-trap",
-        "the in-guest launcher's first admission (PreparedExec) builds the guest's exec from \
-         the command's program, arguments, environment and directory alone, so it does not \
-         take the command's ignored-signal launch input \
-         (https://github.com/facebookexperimental/hermit/issues/484)",
+        "not observed: both in-guest launches take the command's ignored-signal launch input, \
+         the default one through Command::try_into_std (PreloadBackend::launch) and \
+         --in-guest-exec-stop's through PreparedExec::with_ignored_signals, but neither has \
+         run with it, as LiteInst could not be staged where this was written; compare them \
+         once it can (https://github.com/facebookexperimental/hermit/issues/484)",
     ),
 ];
 
@@ -81156,7 +81157,11 @@ fn kvm_gives_a_pseudoterminal(test: &str, guest_path: &str) -> bool {
 /// (`in_private_devpts`), so that both runs of `--verify` give the guest the
 /// same pseudoterminal. KVM is compared the same way once it gives the guest
 /// a pseudoterminal (`kvm_gives_a_pseudoterminal`); until then its leg is
-/// named as not compared.
+/// named as not compared. Each leg is bounded from outside
+/// (`run_with_deadline`): KVM refuses `--timeout`, a bound it does not
+/// enforce, before the run starts, and coreutils `timeout` would give hermit
+/// SIGTTIN and SIGTTOU at their defaults (it resets both in its child), which
+/// is the input this test varies.
 #[test]
 fn background_terminal_io_with_the_signals_ignored_answers_as_linux() {
     let test = "background_terminal_io_with_the_signals_ignored_answers_as_linux";
@@ -81190,15 +81195,18 @@ fn background_terminal_io_with_the_signals_ignored_answers_as_linux() {
             "--verify-strict",
             "--verify-json",
             report_arg,
-            "--timeout",
-            "60",
             "--",
             guest_path,
         ];
         let mut command = in_private_devpts(&hermit_command(&args));
-        let output = hermit_test::hermit_output(
-            &format!("hermit {args:?} with a devpts of its own"),
-            with_job_control_signals(&mut command, libc::SIG_IGN),
+        with_job_control_signals(&mut command, libc::SIG_IGN).stdin(Stdio::null());
+        let (status, stderr) =
+            run_with_deadline(command, directory.path(), Duration::from_secs(120), false);
+        let output = output_of(
+            status,
+            fs::read(directory.path().join("deadline-run.stdout"))
+                .expect("failed to read the run's stdout"),
+            stderr.into_bytes(),
         );
         assert_success(&output, &args);
         assert_eq!(stdout(&output), BACKGROUND_TERMINAL_IO_IGNORED, "{backend}");
@@ -81371,6 +81379,315 @@ fn a_terminal_job_control_stop_is_refused_by_name() {
     );
 }
 
+/// The terminal refusal of `a_terminal_job_control_stop_is_refused_by_name`
+/// for a reader whose thread name is not UTF-8
+/// (`tests/c/background_terminal_io.c non-utf8-name`): `PR_SET_NAME` allows
+/// any bytes but NUL, and the reader's `/proc` status shows them on its
+/// `Name:` line. The ptrace backend reads the reader's dispositions from those
+/// lines as bytes (Reverie's retained signal-sets fact), so the read is refused
+/// by name, as under any other name. Before, it read the whole status as
+/// UTF-8, took the failed read for a handled signal, and held SIGTTIN for the
+/// read's return, which raised it again until the run's timeout.
+#[test]
+fn a_terminal_job_control_stop_is_refused_by_name_whatever_the_thread_name() {
+    let guest = background_terminal_io_guest();
+    let guest_path = guest.to_str().expect("guest path is UTF-8");
+    let native = with_job_control_signals(Command::new(guest).arg("non-utf8-name"), libc::SIG_DFL)
+        .output()
+        .expect("failed to run the guest natively");
+    assert!(native.status.success(), "native run failed: {native:?}");
+    assert_eq!(
+        stdout(&native),
+        "started with SIGTTIN default, SIGTTOU default\n\
+         read: thread name is not UTF-8\n\
+         read: stopped by SIGTTIN\n\
+         read: 3 bytes\n\
+         read: child exited 0\n\
+         write: thread name is not UTF-8\n\
+         write: stopped by SIGTTOU\n\
+         write: 4 bytes\n\
+         write: child exited 0\n\
+         session: exited 0\n",
+        "native Linux"
+    );
+
+    let args = [
+        "run",
+        "--strict",
+        "--timeout",
+        "60",
+        "--",
+        guest_path,
+        "non-utf8-name",
+    ];
+    let mut command = hermit_command(&args);
+    let output = hermit_test::hermit_output(
+        &format!("hermit {args:?}"),
+        with_job_control_signals(&mut command, libc::SIG_DFL),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{args:?}: {stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "read refused by the backend: Linux raised SIGTTIN, at its default disposition, \
+             during the call (a background process's read of its controlling terminal), and \
+             the ptrace backend cannot stop the process group for it; job-control stops are \
+             not supported"
+        ),
+        "{stderr}"
+    );
+    assert_eq!(
+        stdout(&output),
+        "started with SIGTTIN default, SIGTTOU default\n\
+         read: thread name is not UTF-8\n",
+        "the reader did not rename itself, or printed past the refusal: {stderr}"
+    );
+}
+
+/// The terminal refusal of `a_terminal_job_control_stop_is_refused_by_name`
+/// where a seccomp filter may restrict hermit's tracer thread: hermit runs
+/// under a filter it inherited, which denies only `acct`
+/// (`--unsafe-ignore-host-seccomp`). The ptrace backend then does not ask the
+/// stop's siginfo, which tells a signal Linux raised from one a process sent,
+/// as such a filter may refuse `PTRACE_GETSIGINFO` or kill the tracer at it,
+/// and refuses the read by name, saying so. Before, the backend took the filter
+/// for a reason to hold the signal, and the read raised it again until the
+/// run's timeout.
+#[test]
+fn a_terminal_job_control_stop_under_a_seccomp_filter_is_refused_by_name() {
+    let guest = background_terminal_io_guest();
+    let guest_path = guest.to_str().expect("guest path is UTF-8");
+    let args = ["run", "--strict", "--timeout", "60", "--", guest_path];
+    let mut command = hermit_command_under_host_filter(&args);
+    deny_syscall(&mut command, libc::SYS_acct);
+    let output = hermit_test::hermit_output(
+        &format!("{command:?}"),
+        with_job_control_signals(&mut command, libc::SIG_DFL),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{args:?}: {stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "read refused by the backend: SIGTTIN, at its default disposition, arrived during \
+             the call, and with a seccomp filter possibly restricting the tracer, the ptrace \
+             backend does not ask whether Linux raised it (a background process's read of its \
+             controlling terminal) or a process sent it; job-control stops are not supported"
+        ),
+        "{stderr}"
+    );
+    assert_eq!(
+        stdout(&output),
+        "started with SIGTTIN default, SIGTTOU default\n",
+        "the reader printed past the refusal: {stderr}"
+    );
+}
+
+/// The terminal refusal of `a_terminal_job_control_stop_is_refused_by_name`
+/// for a background change of the terminal's settings
+/// (`tests/c/background_terminal_io.c settings`), which Linux stops with
+/// SIGTTOU whether or not TOSTOP is set (`__tty_check_change`). As for that
+/// test's write, the signal reaches Detcore once the `ioctl` it interrupted
+/// has returned, and Detcore refuses it by name, naming the call, under
+/// either unsupported-operation policy, as the call has no errno left to
+/// give (Detcore's `refuse_linux_raised_job_control_stop`). The ptrace
+/// backend's refusal of a SIGTTOU raised during a call it injected
+/// ("ioctl refused by the backend") is not reached by this guest.
+#[test]
+fn a_background_change_of_terminal_settings_is_refused_by_name() {
+    let guest = background_terminal_io_guest();
+    let guest_path = guest.to_str().expect("guest path is UTF-8");
+    let native = with_job_control_signals(Command::new(guest).arg("settings"), libc::SIG_DFL)
+        .output()
+        .expect("failed to run the guest natively");
+    assert!(native.status.success(), "native run failed: {native:?}");
+    assert_eq!(
+        stdout(&native),
+        "started with SIGTTIN default, SIGTTOU default\n\
+         settings: stopped by SIGTTOU\n\
+         settings: changed\n\
+         settings: child exited 0\n\
+         session: exited 0\n",
+        "native Linux"
+    );
+
+    let args = [
+        "run",
+        "--strict",
+        "--timeout",
+        "60",
+        "--",
+        guest_path,
+        "settings",
+    ];
+    let mut command = hermit_command(&args);
+    let output = hermit_test::hermit_output(
+        &format!("hermit {args:?}"),
+        with_job_control_signals(&mut command, libc::SIG_DFL),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{args:?}: {stderr}"
+    );
+    const SETTINGS_REFUSED: &str = "SIGTTOU refused: Linux raised SIGTTOU, at its default \
+                                    disposition, after the call ioctl (a background process's \
+                                    write to its controlling terminal with TOSTOP set, or a \
+                                    change of the terminal's settings), and Detcore cannot stop \
+                                    the process group for it; job-control stops are not supported";
+    assert!(stderr.contains(SETTINGS_REFUSED), "{stderr}");
+    assert_eq!(
+        stdout(&output),
+        "started with SIGTTIN default, SIGTTOU default\n",
+        "the child printed past the refusal: {stderr}"
+    );
+
+    let permissive = [
+        "run",
+        "--allow-unsupported-syscalls",
+        "--timeout",
+        "60",
+        "--",
+        guest_path,
+        "settings",
+    ];
+    let mut command = hermit_command(&permissive);
+    let output = hermit_test::hermit_output(
+        &format!("hermit {permissive:?}"),
+        with_job_control_signals(&mut command, libc::SIG_DFL),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{permissive:?}: {stderr}"
+    );
+    assert!(stderr.contains(SETTINGS_REFUSED), "{stderr}");
+    assert_eq!(
+        stdout(&output),
+        "started with SIGTTIN default, SIGTTOU default\n",
+        "{permissive:?}: the child printed past the refusal: {stderr}"
+    );
+}
+
+/// The terminal refusal of `a_terminal_job_control_stop_is_refused_by_name`
+/// names only the call that raised the stop, not the other members of the
+/// reader's process group (`tests/c/background_terminal_io.c sibling` and
+/// `sibling-poll`). The reader has a sibling in its background process
+/// group, waiting for a pipe in `read`, or in `poll`. Linux sends the
+/// reader's SIGTTIN to the whole group and stops both. The reader, continued
+/// alone, writes to the pipe and then kills the sibling, which never ran
+/// again. Under Hermit only the reader's read, which raised the signal, is
+/// the backend's refusal. The signal reaches the sibling outside any call the
+/// backend injected, so Detcore refuses it by name when it is delivered
+/// (`ERROR_CATALOG.md` row 131), under either unsupported-operation policy,
+/// and the sibling's call is never failed with EIO, which Linux never gives
+/// a pipe read or a poll. This guest does not reach the backend's choice for
+/// an injected call that a group's signal stops, whether that call could
+/// have raised the signal: Reverie's `terminal_call::call_may_raise` unit
+/// tests cover it. (With a second pseudoterminal for the sibling to wait on
+/// instead of a pipe, a strict run did not end until its `--timeout`: the
+/// sibling's read blocked in the kernel while every other guest process
+/// stayed stopped.)
+#[test]
+fn a_terminal_job_control_stop_is_refused_only_for_the_call_that_raised_it() {
+    let guest = background_terminal_io_guest();
+    let guest_path = guest.to_str().expect("guest path is UTF-8");
+    for (mode, call) in [("sibling", "read"), ("sibling-poll", "poll")] {
+        let native = with_job_control_signals(Command::new(guest).arg(mode), libc::SIG_DFL)
+            .output()
+            .expect("failed to run the guest natively");
+        assert!(
+            native.status.success(),
+            "{mode}: native run failed: {native:?}"
+        );
+        assert_eq!(
+            stdout(&native),
+            "started with SIGTTIN default, SIGTTOU default\n\
+             read: stopped by SIGTTIN\n\
+             read: 3 bytes\n\
+             read: sibling killed by signal 9\n\
+             read: child exited 0\n\
+             session: exited 0\n",
+            "{mode}: native Linux"
+        );
+
+        let args = ["run", "--strict", "--timeout", "60", "--", guest_path, mode];
+        let mut command = hermit_command(&args);
+        let output = hermit_test::hermit_output(
+            &format!("hermit {args:?}"),
+            with_job_control_signals(&mut command, libc::SIG_DFL),
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let printed = stdout(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{args:?}: {printed}{stderr}"
+        );
+        assert!(
+            stderr.contains("read refused by the backend: Linux raised SIGTTIN, at its default"),
+            "{args:?}: {printed}{stderr}"
+        );
+        assert_eq!(
+            printed, "started with SIGTTIN default, SIGTTOU default\n",
+            "{args:?}: the reader or its sibling printed past the refusal: {stderr}"
+        );
+
+        let permissive = [
+            "run",
+            "--allow-unsupported-syscalls",
+            "--timeout",
+            "60",
+            "--",
+            guest_path,
+            mode,
+        ];
+        let mut command = hermit_command(&permissive);
+        let output = hermit_test::hermit_output(
+            &format!("hermit {permissive:?}"),
+            with_job_control_signals(&mut command, libc::SIG_DFL),
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let printed = stdout(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{permissive:?}: {printed}{stderr}"
+        );
+        assert_eq!(
+            stderr
+                .matches("refused by the backend: Linux raised SIGTTIN")
+                .count(),
+            1,
+            "{permissive:?}: only the reader's read is the backend's refusal: {printed}{stderr}"
+        );
+        assert!(
+            stderr.contains(&format!(
+                "SIGTTIN refused: Linux raised SIGTTIN, at its default disposition, after the \
+                 call {call} "
+            )),
+            "{permissive:?}: the signal for the sibling's {call} did not end the run by name: \
+             {printed}{stderr}"
+        );
+        assert_eq!(
+            printed,
+            "started with SIGTTIN default, SIGTTOU default\n\
+             read: failed: Input/output error\n",
+            "{permissive:?}: the sibling's {call} was failed, or a process printed past the \
+             refusal: {stderr}"
+        );
+    }
+}
+
 /// A strict run pins its threads, and the CPU reservation keeps its
 /// descriptors at 1000 and above. A fork sizes the new process's descriptor
 /// table for the highest descriptor the forking process has open, and
@@ -81493,7 +81810,9 @@ fn sigign_line(ignored: &[libc::c_int]) -> String {
 fn a_guest_starts_with_its_launchers_ignored_signals_on_every_backend() {
     let test = "a_guest_starts_with_its_launchers_ignored_signals_on_every_backend";
     const SIGSETXID: libc::c_int = 33;
-    let backends = procfs_backends_among(test, &["ptrace", "kvm", "liteinst", "in-guest-trap"]);
+    // Every backend this build has and this host runs, each one left out
+    // named (`procfs_backends`).
+    let backends = procfs_backends(test);
     assert!(
         backends.contains(&"ptrace"),
         "{test}: ptrace is not compared"
@@ -81595,6 +81914,30 @@ fn thread_in_constructor_preload() -> &'static Path {
 /// launcher's 33 could not be seen at all.
 #[test]
 fn hermit_records_its_launchers_dispositions_before_any_constructor_runs() {
+    let test = "hermit_records_its_launchers_dispositions_before_any_constructor_runs";
+    // Before glibc 2.34, libpthread's initializer, which runs before the
+    // preinit array (`DF_1_INITFIRST`), installs the handlers for 32 and 33,
+    // so no executable can see a launcher's ignored 33
+    // (`reverie::process::start_signals`).
+    // SAFETY: gnu_get_libc_version returns a static NUL-terminated string.
+    let version = unsafe { std::ffi::CStr::from_ptr(libc::gnu_get_libc_version()) }
+        .to_str()
+        .expect("glibc's version is ASCII");
+    let number = |part: Option<&str>| part.and_then(|part| part.parse::<u32>().ok());
+    let mut parts = version.split('.');
+    let (Some(major), Some(minor)) = (number(parts.next()), number(parts.next())) else {
+        panic!("{test}: glibc's version {version:?} is not MAJOR.MINOR");
+    };
+    if (major, minor) < (2, 34) {
+        record_test_skip(
+            test,
+            &format!(
+                "glibc {version} installs its handler for signal 33 before the preinit array \
+                 runs, so the launcher's ignored 33 cannot be recorded"
+            ),
+        );
+        return;
+    }
     const LAUNCHER: &[libc::c_int] = &[libc::SIGUSR2, 33];
     let preload = thread_in_constructor_preload();
     let args = [
@@ -81666,7 +82009,10 @@ fn a_namespace_only_guest_starts_with_its_launchers_ignored_signals() {
 /// changes no disposition, prints sigign's lines (wait reports ECHILD,
 /// nothing pending), natively and at bitwise parity on every backend. So does
 /// its adopted mode: as a subreaper, the guest inherits a grandchild's zombie
-/// when its child exits, and Linux reaps it at once. Detcore learns the
+/// when its child exits, and Linux reaps it at once. The child reports that it
+/// saw the zombie before it exits (`marker=zombie-seen`), so a child that
+/// failed earlier, whose own exit is reaped the same way, does not pass for
+/// one that handed a zombie over. Detcore learns the
 /// disposition when the run's first process starts
 /// (`Detcore::note_launch_sigchld_disposition`), as it learns a later
 /// `rt_sigaction`; a scheduler that did not would expect the adopted zombie
@@ -81687,7 +82033,9 @@ fn a_guest_launched_with_sigchld_ignored_reaps_its_children_as_linux() {
         ("launched", launched),
         (
             "adopted",
-            String::from("adopted read=0 sigchld_pending=0 wait=ECHILD status=-1\n"),
+            String::from(
+                "adopted marker=zombie-seen read=0 sigchld_pending=0 wait=ECHILD status=-1\n",
+            ),
         ),
     ];
     for (mode, expected) in &modes {

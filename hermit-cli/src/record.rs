@@ -55,10 +55,15 @@ impl Record {
         // The guest starts with an explicit set of ignored signals, which
         // the recording names, so that its replay starts the guest the same
         // way whatever the replaying Hermit was started with. A caller that
-        // gave none gets the set a launch without one would give now.
+        // gave none gets the set a launch without one would give now, and the
+        // recording fails if that set cannot be read.
         let mut command = command;
         if command.get_ignored_signals().is_none() {
-            command.ignored_signals(reverie::process::start_signals::ignored_without_input());
+            let ignored = reverie::process::start_signals::ignored_without_input().context(
+                "cannot read the signals this process ignores, which a recording's guest \
+                 launched without an ignored-signal input starts with ignored",
+            )?;
+            command.ignored_signals(ignored);
         }
         let mut metadata = Metadata::new(&command)?;
         metadata.local_networking = options.map(|options| options.local_networking);
