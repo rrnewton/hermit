@@ -650,6 +650,107 @@ fn without_a_timer_there_are_only_priority_choices_and_a_warning() {
     assert_eq!(lines[0]["ctx"]["dtid"], 3, "{}", lines[0]);
 }
 
+/// Two threads that each yield [`YIELDS`] times.
+const YIELDING_GUEST: &str = r#"
+#include <pthread.h>
+#include <sched.h>
+#include <stdio.h>
+
+static void *yielder(void *arg) {
+    (void)arg;
+    for (int i = 0; i < 5; i++) sched_yield();
+    return 0;
+}
+
+int main(void) {
+    pthread_t threads[2];
+    for (int i = 0; i < 2; i++) {
+        if (pthread_create(&threads[i], 0, yielder, 0) != 0) return 2;
+    }
+    for (int i = 0; i < 2; i++) pthread_join(threads[i], 0);
+    puts("yielded");
+    return 0;
+}
+"#;
+
+/// The `sched_yield` calls each thread of [`YIELDING_GUEST`] makes: its
+/// loop bound.
+const YIELDS: usize = 5;
+
+static YIELDING: OnceLock<PathBuf> = OnceLock::new();
+
+/// [`YIELDING_GUEST`], compiled once.
+fn yielding_guest() -> &'static Path {
+    YIELDING.get_or_init(|| {
+        let dir = scratch("yielding-guest");
+        let source = dir.join("yielding.c");
+        fs::write(&source, YIELDING_GUEST).unwrap();
+        let output = dir.join("yielding");
+        let mut command = Command::new("cc");
+        command
+            .args(["-std=c11", "-O2", "-pthread", "-Wall", "-Wextra", "-Werror"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&output);
+        let status = command
+            .status()
+            .unwrap_or_else(|error| panic!("failed to run cc: {error}"));
+        assert!(status.success(), "guest compilation failed: {command:?}");
+        output
+    })
+}
+
+/// A new thread's draws are choice points, as the root's are. Without the
+/// timer, each `sched_yield` under `--chaos` redraws the caller's priority,
+/// so each of the guest's two threads makes one `priority` choice per yield,
+/// asked in its own name; default answers leave the run as the seeded one.
+/// This case needs no PMU.
+#[test]
+fn every_thread_asks_for_its_own_draws() {
+    let dir = scratch("yielding");
+    let tape = dir.join("empty.tape");
+    fs::write(&tape, b"").unwrap();
+    let program = [yielding_guest()];
+    let plain = run_command(chaos_command(&dir, &["--max-timeslice=disabled"], &program));
+    let plain_schedule = schedule(&dir);
+
+    let record = dir.join("r.jsonl");
+    let defaults = run_command(chaos_command(
+        &dir,
+        &[
+            "--max-timeslice=disabled",
+            &format!("--choice-tape={}", tape.display()),
+            &format!("--choice-record={}", record.display()),
+        ],
+        &program,
+    ));
+    assert_eq!(
+        defaults.stdout, plain.stdout,
+        "default answers changed stdout"
+    );
+    assert_eq!(
+        schedule(&dir),
+        plain_schedule,
+        "default answers changed the run"
+    );
+    let mut redraws: BTreeMap<u64, usize> = BTreeMap::new();
+    for line in records(&record) {
+        if line["ctx"]["site"] == "priority" {
+            let dtid = line["ctx"]["dtid"].as_u64().expect("a dtid");
+            *redraws.entry(dtid).or_insert(0) += 1;
+        }
+    }
+    assert_eq!(
+        redraws.values().copied().collect::<Vec<_>>(),
+        vec![YIELDS, YIELDS],
+        "one priority choice per yield, from each of the two threads: {redraws:?}"
+    );
+    assert!(
+        !redraws.contains_key(&3),
+        "the root does not yield: {redraws:?}"
+    );
+}
+
 /// A guest that vforks three children while a sibling thread runs, then
 /// forks two: each child, and the sibling, starts at a priority the chaos
 /// scheduler draws. A vfork child execs this program as `child`, which yields

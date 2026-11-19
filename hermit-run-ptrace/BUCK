@@ -14,6 +14,7 @@ rust_library(
     target_compatible_with = ["ovr_config//cpu:x86_64"],
     deps = [
         "//hermetic_infra/hermit/detcore:detcore",
+        "//hermetic_infra/hermit/hermit-run-choices:hermit-run-choices",
         "//hermetic_infra/reverie:reverie-ptrace",
     ],
 )

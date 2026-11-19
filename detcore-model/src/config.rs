@@ -2218,6 +2218,13 @@ impl Config {
         self
     }
 
+    /// Whether a choice source (`--choice-tape` or `--choice-controller`)
+    /// answers this run's scheduling choices: the run goes through the
+    /// controller runner (`hermit-run-choices`) instead of the ordinary one.
+    pub fn has_choice_source(&self) -> bool {
+        self.choice_tape.is_some() || self.choice_controller.is_some()
+    }
+
     /// Whether the epoch is the stable library default omitted by `Display`.
     pub fn has_default_epoch(&self) -> bool {
         self.epoch == DEFAULT_EPOCH_STR.parse::<DateTime<Utc>>().unwrap()

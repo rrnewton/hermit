@@ -14,6 +14,10 @@
 //! beside the other backends' instantiations. The entry point,
 //! [`spawn_tracer`], is not generic and returns a boxed future, so its callers
 //! instantiate nothing of it (see `hermit-record` for why it is boxed).
+//!
+//! Detcore here is statically the seeded run mode, with no choice machinery.
+//! A run with a choice source is handed over, at launch, to
+//! `hermit-run-choices`, the crate that roots Detcore's controlled run mode.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -39,6 +43,11 @@ pub type SpawnTracer = Pin<Box<dyn Future<Output = Result<Tracer, reverie::Error
 /// the scheduler runs them, which it cannot while the stopped thread holds its
 /// turn. The replay path does the same.
 ///
+/// A CONFIG with a choice source (`--choice-tape` or `--choice-controller`)
+/// is handed to `hermit_run_choices::spawn_tracer`, and the future it
+/// returns is this function's, as it is. The async body below, this crate's
+/// own Detcore instantiation, is always the seeded run.
+///
 /// The future is boxed so the async body, and everything it instantiates, is
 /// compiled in this crate rather than in its caller.
 pub fn spawn_tracer(
@@ -48,39 +57,18 @@ pub fn spawn_tracer(
     sequentialized_guest: bool,
     stats: BackendStatsRequest,
 ) -> SpawnTracer {
-    // The run mode is chosen here, once, by type: a run with a choice source
-    // instantiates Detcore with the controlled scheduling-choice policy; every
-    // other run keeps the seeded instantiation, which does no choice work.
-    if config.choice_tape.is_some() || config.choice_controller.is_some() {
-        spawn_tracer_in_mode::<detcore::ControlledMode>(
+    if config.has_choice_source() {
+        return hermit_run_choices::spawn_tracer(
             command,
             config,
             gdbserver,
             sequentialized_guest,
             stats,
-        )
-    } else {
-        spawn_tracer_in_mode::<detcore::SeededMode>(
-            command,
-            config,
-            gdbserver,
-            sequentialized_guest,
-            stats,
-        )
+        );
     }
-}
-
-/// [`spawn_tracer`] with Detcore in run mode `M`.
-fn spawn_tracer_in_mode<M: detcore::RunMode + 'static>(
-    command: Command,
-    config: detcore::Config,
-    gdbserver: Option<GdbConnection>,
-    sequentialized_guest: bool,
-    stats: BackendStatsRequest,
-) -> SpawnTracer {
     Box::pin(async move {
         let mut builder =
-            reverie_ptrace::TracerBuilder::<detcore::Detcore<M>>::new(command).config(config);
+            reverie_ptrace::TracerBuilder::<detcore::Detcore>::new(command).config(config);
         if let Some(connection) = gdbserver {
             builder = builder.gdbserver(connection);
             if sequentialized_guest {
