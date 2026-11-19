@@ -68,6 +68,42 @@
 //!   `getpeername`, `fstat`, other `ioctl` requests, and waiting for
 //!   readiness (`poll`, `select`, `epoll`), since no copy can move data
 //!   through one.
+//! - **Rule L, a lock.** `flock`, and `fcntl` with `F_GETLK`, `F_SETLK`,
+//!   `F_SETLKW`, `F_OFD_GETLK`, `F_OFD_SETLK`, `F_OFD_SETLKW`, `F_GETLEASE`
+//!   or `F_SETLEASE`, on any descriptor but a file only this copy reaches
+//!   (as Rule F decides). Linux keeps locks and leases on the inode
+//!   (fs/locks.c). A copy shares the inodes of the file system and of the
+//!   sockets it inherited with the template and every other copy, and an
+//!   eventfd or an epoll instance, like most anonymous-inode descriptors,
+//!   has the one inode `anon_inode_getfile` gives them all
+//!   (fs/anon_inodes.c). A lock on a pipe or on a socket pair the copy
+//!   re-created is refused too, since the gate cannot tell those from the
+//!   ones it shares; no program locks one. Testing a lock is refused as
+//!   well: a record lock taken before the cut belongs to the template's
+//!   process, since `fork(2)` passes none on.
+//!
+//!   A copy whose guest holds, from before the cut, a lock that only the
+//!   kernel holds for it is refused as it starts
+//!   ([`TimelineGate::become_copy`]). The copy's own open file description of
+//!   each regular file and directory (`crate::timelines` reopens them) holds
+//!   no `flock`, OFD lock or lease, and `fork(2)` passes no record lock on,
+//!   while the guest would go on as if it held the lock. The run's lock
+//!   ledger says whether it holds one
+//!   (`crate::procfs::locks::LockLedger::host_locks`), and fails closed where
+//!   it knows it cannot follow a lock. A lock that is Detcore's alone does
+//!   not count, since a copy keeps all of Detcore's state: a `flock` of
+//!   Detcore's model where the backend mirrors none on the host (KVM), and a
+//!   `flock` on a placeholder directory.
+//! - **Rule N, a file system notification.** `inotify_init`,
+//!   `inotify_init1` and `fanotify_init`, since the new instance would see
+//!   the other copies' opens and reads of the files it watches (Rule F lets
+//!   those run), and `fcntl` with `F_NOTIFY` on a directory. A copy whose
+//!   guest holds an inotify or fanotify instance from the cut is refused as
+//!   it starts ([`TimelineGate::become_copy`]): the template and every copy
+//!   share that instance's watches and its queue of events, which reach a
+//!   copy through calls that need not name the instance (`epoll_wait` on an
+//!   epoll instance that watches it), so no check at a call can refuse every
+//!   use of it.
 //!
 //! The gate names each descriptor a call reaches as the backend names it
 //! (`Guest::link_path`): the text `readlink(2)` of `/proc/<pid>/fd/<fd>`
@@ -92,6 +128,14 @@
 //! point where calls are checked, so the gate keeps each thread's call in
 //! flight from the run's start, with the names of what it reached as it
 //! entered, and judges those calls as the copy starts.
+//!
+//! Not refused yet (bead dh-hn3izp): a lock from before the cut that the
+//! lock ledger does not see. These are a record lock or a lease where the
+//! ledger does not take the backend's fact of them
+//! (`Detcore::ledger_takes_fact`; on the ptrace backend it does not), and a
+//! lock `crate::procfs::locks` names as hidden though Linux keeps it. Such a
+//! copy is refused at its next lock call (Rule L). Until then, a read of that
+//! descriptor's fdinfo can differ from a fresh run's.
 //!
 //! The structure is the one the lazy design (owner, Slack 6803) extends: the
 //! gate ([`TimelineGate`]) finds, before each call, the resources the copy
@@ -119,6 +163,7 @@ use reverie::syscalls::Sysno;
 
 use crate::call_gate::CallGate;
 use crate::call_gate::GateCall;
+use crate::procfs::locks::HostLocks;
 
 /// How a call uses a descriptor it names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,6 +181,11 @@ pub(crate) enum Use {
     /// Changes what every descriptor that shares its open file description
     /// or socket sees (`F_SETFL`, `FIONBIO`, ...).
     Control,
+    /// Takes, changes, releases or tests a lock or a lease on the object
+    /// behind it.
+    Lock,
+    /// Asks to be told of changes in the directory behind it (`F_NOTIFY`).
+    Watch,
 }
 
 /// A guest descriptor or working directory, as the backend names it
@@ -200,7 +250,16 @@ pub(crate) enum Reach {
         create: bool,
         truncate: bool,
     },
+    /// A new file system notification instance, as a message calls it.
+    NewNotifier(&'static str),
 }
+
+/// The link text of an inotify instance's descriptor, and what a message
+/// calls one (fs/notify/inotify/inotify_user.c names its anonymous inode).
+const INOTIFY: (&[u8], &str) = (b"anon_inode:inotify", "an inotify instance");
+
+/// The same for a fanotify instance (fs/notify/fanotify/fanotify_user.c).
+const FANOTIFY: (&[u8], &str) = (b"anon_inode:[fanotify]", "a fanotify instance");
 
 /// `O_TMPFILE` without the `O_DIRECTORY` bit it includes.
 const O_TMPFILE_BIT: i32 = libc::O_TMPFILE & !libc::O_DIRECTORY;
@@ -215,6 +274,22 @@ fn shared_fcntl(command: i32) -> bool {
     matches!(
         command,
         libc::F_SETFL | libc::F_SETOWN | F_SETOWN_EX | F_SETSIG
+    )
+}
+
+/// `fcntl` commands that take, change, release or test a lock or a lease
+/// (Linux's `do_fcntl`, fs/fcntl.c).
+fn lock_fcntl(command: i32) -> bool {
+    matches!(
+        command,
+        libc::F_GETLK
+            | libc::F_SETLK
+            | libc::F_SETLKW
+            | libc::F_OFD_GETLK
+            | libc::F_OFD_SETLK
+            | libc::F_OFD_SETLKW
+            | libc::F_GETLEASE
+            | libc::F_SETLEASE
     )
 }
 
@@ -351,6 +426,11 @@ pub(crate) fn reaches(call: &GateCall<'_>) -> Vec<Reach> {
         | Sysno::setsockopt
         | Sysno::getsockopt => vec![descriptor(a.arg0, Use::Traffic)],
         Sysno::fcntl if shared_fcntl(a.arg1 as i32) => vec![descriptor(a.arg0, Use::Control)],
+        Sysno::fcntl if lock_fcntl(a.arg1 as i32) => vec![descriptor(a.arg0, Use::Lock)],
+        Sysno::fcntl if a.arg1 as i32 == libc::F_NOTIFY => vec![descriptor(a.arg0, Use::Watch)],
+        Sysno::flock => vec![descriptor(a.arg0, Use::Lock)],
+        Sysno::inotify_init | Sysno::inotify_init1 => vec![Reach::NewNotifier(INOTIFY.1)],
+        Sysno::fanotify_init => vec![Reach::NewNotifier(FANOTIFY.1)],
         Sysno::ioctl if shared_ioctl(a.arg1 as u32) => vec![descriptor(a.arg0, Use::Control)],
         Sysno::open => open(libc::AT_FDCWD, a.arg0, a.arg1 as i32),
         Sysno::openat => open(a.arg0 as RawFd, a.arg1, a.arg2 as i32),
@@ -666,6 +746,12 @@ pub(crate) enum Shared {
     InetSocket(String),
     /// A descriptor the backend does not name, by its number.
     Unnamed(String),
+    /// Any other object a descriptor names (a device, a pipe, a socket that
+    /// is not inet, an event descriptor), by what names it: only its locks
+    /// are refused.
+    Object(String),
+    /// A new file system notification instance, as a message calls it.
+    Notifier(&'static str),
 }
 
 /// What the call would do to a [`Shared`] resource.
@@ -687,6 +773,10 @@ pub(crate) enum Effect {
     UseSocket,
     /// Use a descriptor in a way that changes what may be shared.
     Use,
+    /// Take, change, release or test a lock or a lease.
+    Lock,
+    /// Watch files for changes.
+    Watch,
 }
 
 /// One use of a shared resource, about to happen.
@@ -711,6 +801,9 @@ pub(crate) trait SharingPolicy: Send + Sync {
 /// The phrase every refusal of this module carries.
 pub const REFUSAL_PHRASE: &str = "not supported yet in multiverse copies";
 
+/// What Rule L refuses, as its refusals name it.
+const LOCKS: &str = "locks on anything but a copy's own files";
+
 /// Refuses every use of a shared resource (owner, Slack 6804).
 pub(crate) struct RefuseShared;
 
@@ -727,7 +820,14 @@ impl SharingPolicy for RefuseShared {
             (Shared::File(file), Effect::Metadata) => {
                 format!("would change the metadata of {file}")
             }
+            (Shared::File(object) | Shared::Object(object), Effect::Lock) => {
+                format!("would use the locks of {object}")
+            }
+            (Shared::File(directory), Effect::Watch) => {
+                format!("would watch {directory} for changes")
+            }
             (Shared::File(file), _) => format!("would write {file}"),
+            (Shared::Object(object), _) => format!("would use {object}"),
             (Shared::Name(path), Effect::Create) => format!("would create {}", name(path)),
             (Shared::Name(path), Effect::Truncate) => format!("would truncate {}", name(path)),
             (Shared::Name(path), _) => format!("would change {}", name(path)),
@@ -735,11 +835,22 @@ impl SharingPolicy for RefuseShared {
             (Shared::Unnamed(descriptor), _) => {
                 format!("would use {descriptor}, which the backend does not name")
             }
+            (Shared::Notifier(instance), _) => format!(
+                "would make {instance}, whose watches would see what the other copies do to \
+                 the files they share"
+            ),
         };
-        let what_kind = match what.resource {
-            Shared::InetSocket(_) => "inet sockets",
-            Shared::Unnamed(_) => "descriptors a copy cannot name",
-            Shared::File(_) | Shared::Name(_) => "files the template and the other copies share",
+        let what_kind = match (&what.resource, what.effect) {
+            (Shared::InetSocket(_), _) => "inet sockets",
+            (Shared::Unnamed(_), _) => "descriptors a copy cannot name",
+            // The message does not say the object is shared: the gate cannot
+            // tell a pipe or a socket pair the copy re-created from one it
+            // shares (Rule L).
+            (_, Effect::Lock) | (Shared::Object(_), _) => LOCKS,
+            (_, Effect::Watch) | (Shared::Notifier(_), _) => "file system notifications",
+            (Shared::File(_) | Shared::Name(_), _) => {
+                "files the template and the other copies share"
+            }
         };
         Some(format!(
             "{}(2) {action}; {what_kind} are {REFUSAL_PHRASE}",
@@ -757,6 +868,29 @@ pub(crate) struct CopyContext {
     /// The unnamed regular files the template held at the cut, as (device,
     /// inode): the template and every copy reach them.
     pub inherited_unnamed: HashSet<(u64, u64)>,
+    /// Whether the guest held, at the cut, a lock only the kernel holds for
+    /// it (`crate::procfs::locks::LockLedger::host_locks`).
+    pub locks_at_cut: HostLocks,
+}
+
+/// The refusal of copy `context` when the guest held, at the cut, a lock only
+/// the kernel holds for it, or may have (Rule L): the copy would go on as if
+/// it held the lock, which its own descriptions of its files do not hold, as
+/// it reopens them (`crate::timelines`), nor its processes, since `fork(2)`
+/// passes no record lock on.
+fn held_lock(context: &CopyContext) -> Option<String> {
+    let what = match context.locks_at_cut {
+        HostLocks::None => return None,
+        HostLocks::Held => "holds a lock it took before the cut",
+        HostLocks::Unknown => {
+            "may hold a lock it took before the cut, which Detcore could not follow"
+        }
+    };
+    Some(format!(
+        "multiverse copy {}: the guest {what}, which the copy would not hold: it reopens its \
+         files, and fork(2) passes no record lock on; {LOCKS} are {REFUSAL_PHRASE}",
+        context.index
+    ))
 }
 
 /// The gate of a run that may be copied. In the template it keeps each
@@ -798,7 +932,9 @@ impl<V: HostView, P: SharingPolicy> TimelineGate<V, P> {
     /// checked. A call stops being in flight once Detcore has finished it
     /// (`CallGate::completed`); one waiting at a scheduler turn inside its
     /// handler after its effect is refused too, because the gate cannot tell
-    /// it apart (fail closed).
+    /// it apart (fail closed). Otherwise returns the refusal of a file system
+    /// notification instance the guest holds from the cut (Rule N), or of a
+    /// lock it holds from before the cut (Rule L).
     pub(crate) fn become_copy(&self, context: CopyContext) -> Option<String> {
         let context = self.copy.get_or_init(|| context);
         // A thread parked at the cut can hold this lock; it is re-created
@@ -817,10 +953,32 @@ impl<V: HostView, P: SharingPolicy> TimelineGate<V, P> {
             }
         };
         in_flight.sort_by_key(|(thread, ..)| *thread);
-        in_flight.into_iter().find_map(|(thread, number, reaches)| {
-            self.judge(context, number, reaches)
-                .map(|message| format!("{message} (in flight in thread {thread} at the cut)"))
-        })
+        in_flight
+            .into_iter()
+            .find_map(|(thread, number, reaches)| {
+                self.judge(context, number, reaches)
+                    .map(|message| format!("{message} (in flight in thread {thread} at the cut)"))
+            })
+            .or_else(|| self.held_notifier(context))
+            .or_else(|| held_lock(context))
+    }
+
+    /// The refusal of copy `context` when its guest holds an inotify or
+    /// fanotify instance from the cut (Rule N). It is not a sharing policy's
+    /// to decide, since no policy could give the copy an instance of its own:
+    /// the watches name inodes, not paths, and the queued events cannot be
+    /// read without taking them from the template.
+    fn held_notifier(&self, context: &CopyContext) -> Option<String> {
+        let (text, instance) = [INOTIFY, FANOTIFY]
+            .into_iter()
+            .find(|(text, _)| !self.view.named(text).is_empty())?;
+        Some(format!(
+            "multiverse copy {}: the guest holds {instance} ({}) from before the cut, whose \
+             watches and queued events the template and the other copies share; file system \
+             notifications are {REFUSAL_PHRASE}",
+            context.index,
+            String::from_utf8_lossy(text)
+        ))
     }
 
     /// The refusal, in copy `context`, of a call `number` that reaches
@@ -941,16 +1099,30 @@ impl<V: HostView, P: SharingPolicy> TimelineGate<V, P> {
                     (Kind::SharedFile | Kind::Directory, Use::Metadata) => {
                         found(Effect::Metadata, Shared::File(name))
                     }
-                    (Kind::InetSocket, Use::Read | Use::Write | Use::Traffic | Use::Control) => {
-                        found(Effect::UseSocket, Shared::InetSocket(name))
+                    (Kind::SharedFile | Kind::Directory, Use::Lock) => {
+                        found(Effect::Lock, Shared::File(name))
                     }
+                    (Kind::Other, Use::Lock) => found(Effect::Lock, Shared::Object(name)),
+                    // Linux fails F_NOTIFY on anything but a directory (ENOTDIR).
+                    (Kind::Directory, Use::Watch) => found(Effect::Watch, Shared::File(name)),
+                    (
+                        Kind::InetSocket,
+                        Use::Read | Use::Write | Use::Traffic | Use::Control | Use::Lock,
+                    ) => found(Effect::UseSocket, Shared::InetSocket(name)),
                     (
                         Kind::Unknown,
-                        Use::Write | Use::MapShared | Use::Metadata | Use::Traffic | Use::Control,
+                        Use::Write
+                        | Use::MapShared
+                        | Use::Metadata
+                        | Use::Traffic
+                        | Use::Control
+                        | Use::Lock
+                        | Use::Watch,
                     ) => found(Effect::Use, Shared::Unnamed(name)),
                     _ => None,
                 }
             }
+            Reach::NewNotifier(instance) => found(Effect::Watch, Shared::Notifier(instance)),
             Reach::PathChange { path } => found(Effect::ChangeName, Shared::Name(path)),
             Reach::CreatingOpen {
                 target,
@@ -1013,7 +1185,7 @@ impl<V: HostView, P: SharingPolicy> CallGate for TimelineGate<V, P> {
 }
 
 /// The host view of a backend whose guest descriptors are host descriptors
-/// of this process ([`OwnProcess`]): the KVM backend's.
+/// of this process (`OwnProcess`): the KVM backend's.
 pub fn own_process_view() -> &'static dyn HostView {
     static VIEW: OnceLock<OwnProcess> = OnceLock::new();
     VIEW.get_or_init(OwnProcess::default)
@@ -1027,6 +1199,11 @@ static GATE: OnceLock<TimelineGate<&'static dyn HostView, RefuseShared>> = OnceL
 /// has a call gate.
 pub(crate) fn install(view: &'static dyn HostView) -> bool {
     crate::call_gate::install(GATE.get_or_init(|| TimelineGate::new(view, RefuseShared)))
+}
+
+/// Whether this run may be copied: its gate is installed ([`install`]).
+pub(crate) fn installed() -> bool {
+    GATE.get().is_some()
 }
 
 /// Makes this process copy `context.index` ([`TimelineGate::become_copy`]).
@@ -1078,6 +1255,7 @@ pub(crate) fn shared_file_mapping(maps: &str) -> Option<String> {
 mod tests {
     use std::collections::HashMap;
     use std::os::fd::AsRawFd;
+    use std::os::fd::FromRawFd;
 
     use reverie::syscalls::SyscallArgs;
 
@@ -1152,6 +1330,7 @@ mod tests {
     const AMBIGUOUS: RawFd = 14;
     /// A file whose path names nothing now (a directory mounted over).
     const SHADOWED: RawFd = 15;
+    const DEVICE: RawFd = 16;
 
     /// The guest's links, as the backend names them.
     fn link(link: PathLink) -> Result<Vec<u8>, FactError> {
@@ -1170,6 +1349,7 @@ mod tests {
                 PIPE => "pipe:[110]",
                 AMBIGUOUS => "/memfd:same (deleted)",
                 SHADOWED => "/data/shadowed",
+                DEVICE => "/dev/null",
                 UNNAMED => return Err(FactError::NotProvided),
                 _ => return Err(FactError::Errno(Errno::EBADF)),
             },
@@ -1183,6 +1363,7 @@ mod tests {
             index: 2,
             outputs: [(7, 101)].into(),
             inherited_unnamed: [(7, 104), (7, 112)].into(),
+            locks_at_cut: HostLocks::None,
         }
     }
 
@@ -1656,6 +1837,207 @@ mod tests {
     }
 
     #[test]
+    fn a_lock_is_refused_on_anything_but_a_file_the_copy_alone_reaches() {
+        let exclusive = libc::LOCK_EX as usize;
+        let message = refusal(Sysno::flock, [SHARED as usize, exclusive, 0, 0, 0, 0], &[]).unwrap();
+        assert_eq!(
+            message,
+            "multiverse copy 2: flock(2) would use the locks of /data/shared; locks on anything \
+             but a copy's own files are not supported yet in multiverse copies"
+        );
+        for command in [
+            libc::F_GETLK,
+            libc::F_SETLK,
+            libc::F_SETLKW,
+            libc::F_OFD_GETLK,
+            libc::F_OFD_SETLK,
+            libc::F_OFD_SETLKW,
+            libc::F_GETLEASE,
+            libc::F_SETLEASE,
+        ] {
+            let message = refusal(
+                Sysno::fcntl,
+                [SHARED as usize, command as usize, 0, 0, 0, 0],
+                &[],
+            )
+            .unwrap();
+            assert!(
+                message.contains("fcntl(2) would use the locks of /data/shared"),
+                "{command}: {message}"
+            );
+        }
+        // A directory, an inherited memfd, a device, a pipe and a Unix socket.
+        for (fd, name) in [
+            (DIR, "/data"),
+            (OLD_MEMFD, "/memfd:old (deleted)"),
+            (DEVICE, "/dev/null"),
+            (PIPE, "pipe:[110]"),
+            (UNIX, "socket:[106]"),
+        ] {
+            let message = refusal(Sysno::flock, [fd as usize, exclusive, 0, 0, 0, 0], &[]).unwrap();
+            assert!(
+                message.contains(&format!("flock(2) would use the locks of {name};")),
+                "{message}"
+            );
+        }
+        let message = refusal(Sysno::flock, [INET as usize, exclusive, 0, 0, 0, 0], &[]).unwrap();
+        assert!(message.contains("would use the inet socket"), "{message}");
+        let message =
+            refusal(Sysno::flock, [UNNAMED as usize, exclusive, 0, 0, 0, 0], &[]).unwrap();
+        assert!(
+            message.contains("which the backend does not name"),
+            "{message}"
+        );
+        // The copy's own output, a procfs file, a memfd made after the cut,
+        // and a descriptor that is not open (Linux fails the call).
+        for fd in [OUTPUT, PROC, NEW_MEMFD, 99] {
+            assert_eq!(
+                refusal(Sysno::flock, [fd as usize, exclusive, 0, 0, 0, 0], &[]),
+                None,
+                "{fd}"
+            );
+        }
+        // Other fcntl commands are not locks.
+        for command in [libc::F_GETFD, libc::F_SETFD, libc::F_GETFL, libc::F_DUPFD] {
+            assert_eq!(
+                refusal(
+                    Sysno::fcntl,
+                    [SHARED as usize, command as usize, 0, 0, 0, 0],
+                    &[]
+                ),
+                None,
+                "{command}"
+            );
+        }
+        // A lock waiting at the cut is refused as the copy starts.
+        let no_path = |_: usize| None;
+        let no_memory = |_: usize, _: &mut [u8]| false;
+        let template = TimelineGate::new(view(), RefuseShared);
+        let waiting = [SHARED as usize, exclusive, 0, 0, 0, 0];
+        let flock = call(Sysno::flock, waiting, 11, &no_path, &no_memory);
+        assert_eq!(template.refusal(&flock), None);
+        let message = template.become_copy(context()).unwrap();
+        assert!(
+            message.contains("flock(2) would use the locks of /data/shared")
+                && message.ends_with("(in flight in thread 11 at the cut)"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_new_notification_instance_or_a_directory_watch_is_refused() {
+        let message = refusal(
+            Sysno::inotify_init1,
+            [libc::IN_CLOEXEC as usize, 0, 0, 0, 0, 0],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            message,
+            "multiverse copy 2: inotify_init1(2) would make an inotify instance, whose watches \
+             would see what the other copies do to the files they share; file system \
+             notifications are not supported yet in multiverse copies"
+        );
+        let message = refusal(Sysno::inotify_init, [0; 6], &[]).unwrap();
+        assert!(
+            message.contains("inotify_init(2) would make an inotify instance"),
+            "{message}"
+        );
+        let message = refusal(Sysno::fanotify_init, [0; 6], &[]).unwrap();
+        assert!(
+            message.contains("fanotify_init(2) would make a fanotify instance"),
+            "{message}"
+        );
+        // The template refuses nothing.
+        let no_path = |_: usize| None;
+        let no_memory = |_: usize, _: &mut [u8]| false;
+        let template = TimelineGate::new(view(), RefuseShared);
+        let init = call(Sysno::inotify_init1, [0; 6], 11, &no_path, &no_memory);
+        assert_eq!(template.refusal(&init), None);
+        // dnotify on a directory.
+        let notify = libc::F_NOTIFY as usize;
+        let message = refusal(Sysno::fcntl, [DIR as usize, notify, 0, 0, 0, 0], &[]).unwrap();
+        assert_eq!(
+            message,
+            "multiverse copy 2: fcntl(2) would watch /data for changes; file system \
+             notifications are not supported yet in multiverse copies"
+        );
+        assert!(refusal(Sysno::fcntl, [UNNAMED as usize, notify, 0, 0, 0, 0], &[]).is_some());
+        // Linux fails it on anything but a directory.
+        for fd in [SHARED, PIPE, 99] {
+            assert_eq!(
+                refusal(Sysno::fcntl, [fd as usize, notify, 0, 0, 0, 0], &[]),
+                None,
+                "{fd}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_copy_that_holds_a_notification_instance_is_refused_as_it_starts() {
+        let anonymous = |ino: u64| Object {
+            stat: stat_of(0, ino, 1),
+            writable: false,
+            procfs: false,
+            inet: None,
+        };
+        for (text, instance) in [
+            ("anon_inode:inotify", "an inotify instance"),
+            ("anon_inode:[fanotify]", "a fanotify instance"),
+        ] {
+            let mut view = view();
+            view.objects
+                .insert(text.as_bytes().to_vec(), vec![anonymous(120)]);
+            let gate = TimelineGate::new(view, RefuseShared);
+            assert_eq!(
+                gate.become_copy(context()).unwrap(),
+                format!(
+                    "multiverse copy 2: the guest holds {instance} ({text}) from before the cut, \
+                     whose watches and queued events the template and the other copies share; \
+                     file system notifications are not supported yet in multiverse copies"
+                )
+            );
+        }
+        // An eventfd and an epoll instance are the copy's own
+        // (`crate::timelines` re-creates them): the copy starts.
+        let mut view = view();
+        for text in ["anon_inode:[eventfd]", "anon_inode:[eventpoll]"] {
+            view.objects
+                .insert(text.as_bytes().to_vec(), vec![anonymous(121)]);
+        }
+        let gate = TimelineGate::new(view, RefuseShared);
+        assert_eq!(gate.become_copy(context()), None);
+    }
+
+    /// A copy whose guest held, at the cut, a lock only the kernel holds for
+    /// it, or may have, is refused as it starts (Rule L), by what the ledger
+    /// knew; one whose guest held none starts.
+    #[test]
+    fn a_copy_whose_guest_holds_a_lock_from_before_the_cut_is_refused_as_it_starts() {
+        let start = |locks_at_cut| {
+            TimelineGate::new(view(), RefuseShared).become_copy(CopyContext {
+                locks_at_cut,
+                ..context()
+            })
+        };
+        let tail = "which the copy would not hold: it reopens its files, and fork(2) passes no \
+                    record lock on; locks on anything but a copy's own files are not supported \
+                    yet in multiverse copies";
+        assert_eq!(
+            start(HostLocks::Held).unwrap(),
+            format!("multiverse copy 2: the guest holds a lock it took before the cut, {tail}")
+        );
+        assert_eq!(
+            start(HostLocks::Unknown).unwrap(),
+            format!(
+                "multiverse copy 2: the guest may hold a lock it took before the cut, which \
+                 Detcore could not follow, {tail}"
+            )
+        );
+        assert_eq!(start(HostLocks::None), None);
+    }
+
+    #[test]
     fn the_own_process_view_finds_the_objects_behind_this_process_descriptors() {
         let dir = tempfile::tempdir().unwrap();
         let named = std::fs::File::create(dir.path().join("named")).unwrap();
@@ -1667,6 +2049,15 @@ mod tests {
         let inet = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let (unix, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
         let proc = std::fs::File::open("/proc/self/status").unwrap();
+        // SAFETY: inotify_init1 takes no pointer.
+        let raw = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
+        assert!(
+            raw >= 0,
+            "inotify_init1: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: a new descriptor this test owns.
+        let inotify = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
         // The template held `held`, an unnamed file, at the cut.
         let inherited = unnamed_files(&[held.as_raw_fd()]);
         assert_eq!(inherited.len(), 1);
@@ -1675,6 +2066,7 @@ mod tests {
             index: 0,
             outputs: HashSet::new(),
             inherited_unnamed: inherited,
+            locks_at_cut: HostLocks::None,
         };
         // Each descriptor named as the KVM backend names it: its own link.
         let own = |fd: RawFd| read_link(fd).map_or(Link::Closed, Link::Text);
@@ -1684,6 +2076,10 @@ mod tests {
         assert_eq!(kind(memfd), Kind::PrivateFile);
         assert_eq!(kind(proc.as_raw_fd()), Kind::PrivateFile);
         assert_eq!(kind(unix.as_raw_fd()), Kind::Other);
+        // Linux names an inotify instance's descriptor as Rule N looks for it.
+        assert_eq!(read_link(inotify.as_raw_fd()).as_deref(), Some(INOTIFY.0));
+        assert!(!gate.view.named(INOTIFY.0).is_empty());
+        assert_eq!(kind(inotify.as_raw_fd()), Kind::Other);
         // A number far above anything this test opened.
         assert_eq!(kind(1 << 20), Kind::Closed);
         // The socket is found once, then through the descriptor kept for it.

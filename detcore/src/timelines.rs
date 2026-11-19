@@ -1981,6 +1981,9 @@ struct Template {
     /// The unnamed regular files open at the cut, as (device, inode): the
     /// template and every copy reach them (`timeline_sharing`).
     unnamed: std::collections::HashSet<(u64, u64)>,
+    /// Whether the guest held a lock at the cut that only the kernel holds
+    /// for it (`timeline_sharing`).
+    locks: crate::procfs::locks::HostLocks,
 }
 
 /// Freezes this run as a template. Nothing may log from here until the
@@ -1998,6 +2001,9 @@ fn capture_template(
     let park_started = Instant::now();
     let parked = crate::fork_threads::park_others(std::time::Duration::from_secs(5))?;
     let park_us = micros(park_started);
+    // As the lock ledger last published it: a parked thread may hold its
+    // mutex.
+    let locks = crate::procfs::locks::host_locks_now();
     // A copy could write a file the guest maps shared with no syscall to
     // refuse, so such a capture is refused (owner, Slack 6804).
     let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
@@ -2046,6 +2052,7 @@ fn capture_template(
         records_us,
         offsets,
         unnamed,
+        locks,
     })
 }
 
@@ -2242,6 +2249,7 @@ fn become_timeline(
         records,
         parked,
         unnamed,
+        locks,
         ..
     } = template;
     let started = Instant::now();
@@ -2345,6 +2353,7 @@ fn become_timeline(
         index,
         outputs: crate::timeline_sharing::identities(&own_outputs),
         inherited_unnamed: unnamed.clone(),
+        locks_at_cut: *locks,
     };
     match crate::timeline_sharing::become_copy(copy) {
         Ok(None) => {}

@@ -188,6 +188,14 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::ops::Deref;
+use std::ops::DerefMut;
+use std::sync::LockResult;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
+use std::sync::PoisonError;
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::Ordering;
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -586,6 +594,76 @@ pub(crate) struct LockLedger {
     /// ([`LockLedger::flock_torn_down`]): the kernel has released their
     /// descriptions, and so their flock locks.
     flock_torn_down: BTreeSet<DetPid>,
+}
+
+/// Whether the guest may hold a lock that only the kernel holds for it, which
+/// a multiverse copy of the run would not hold ([`LockLedger::host_locks`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HostLocks {
+    /// The ledger knows of none.
+    None,
+    /// A description some table references, or a copy in flight holds, holds
+    /// one.
+    Held,
+    /// The ledger cannot tell.
+    Unknown,
+}
+
+/// The run's [`LockLedger`] behind its mutex (`GlobalState::lock_ledger`).
+/// While the run may be copied (`crate::timeline_sharing::installed`), each
+/// guard publishes [`LockLedger::host_locks`] as it drops, still holding the
+/// mutex, so that the capture of a template reads it without the mutex
+/// ([`host_locks_now`]): the capture parks every other thread wherever it is,
+/// and one of them may hold the mutex (`crate::timelines`).
+#[derive(Debug, Default)]
+pub(crate) struct SharedLedger(Mutex<LockLedger>);
+
+/// The guard of a locked [`SharedLedger`].
+pub(crate) struct LedgerGuard<'a>(MutexGuard<'a, LockLedger>);
+
+/// [`LockLedger::host_locks`] as the last [`LedgerGuard`] to drop left it.
+static HOST_LOCKS: AtomicU8 = AtomicU8::new(HostLocks::None as u8);
+
+impl SharedLedger {
+    /// Locks the ledger, as `Mutex::lock` does.
+    pub(crate) fn lock(&self) -> LockResult<LedgerGuard<'_>> {
+        self.0
+            .lock()
+            .map(LedgerGuard)
+            .map_err(|poisoned| PoisonError::new(LedgerGuard(poisoned.into_inner())))
+    }
+}
+
+impl Deref for LedgerGuard<'_> {
+    type Target = LockLedger;
+
+    fn deref(&self) -> &LockLedger {
+        &self.0
+    }
+}
+
+impl DerefMut for LedgerGuard<'_> {
+    fn deref_mut(&mut self) -> &mut LockLedger {
+        &mut self.0
+    }
+}
+
+impl Drop for LedgerGuard<'_> {
+    fn drop(&mut self) {
+        if crate::timeline_sharing::installed() {
+            HOST_LOCKS.store(self.0.host_locks() as u8, Ordering::Release);
+        }
+    }
+}
+
+/// [`LockLedger::host_locks`] as the run's ledger last published it
+/// ([`SharedLedger`]): [`HostLocks::None`] until the first publication.
+pub(crate) fn host_locks_now() -> HostLocks {
+    match HOST_LOCKS.load(Ordering::Acquire) {
+        value if value == HostLocks::None as u8 => HostLocks::None,
+        value if value == HostLocks::Held as u8 => HostLocks::Held,
+        _ => HostLocks::Unknown,
+    }
 }
 
 /// The inode a `flock` lock is kept on, by the device and inode numbers the
@@ -1862,6 +1940,58 @@ impl LockLedger {
             .filter(|(open_file, _)| self.counts(open_file, None))
             .find_map(|(_, locks)| locks.as_ref().err())
             .map(String::as_str)
+    }
+
+    /// Whether the guest may hold a lock that only the kernel holds for it,
+    /// which a multiverse copy of the run would not hold
+    /// (`crate::timeline_sharing`): a copy reopens its files, so its open file
+    /// descriptions hold no lock, and `fork(2)` passes no record lock on.
+    /// Every description the ledger keeps is one some table references, of a
+    /// process that lives or not, or a copy in flight holds, and each of its
+    /// locks counts, whatever hides it from `/proc/locks`. A copy keeps all of
+    /// Detcore's state, and so the locks that are Detcore's alone: a `flock`
+    /// its model holds where the backend mirrors none on the host (KVM,
+    /// [`Self::flock_host_fallback`]), and a `flock` on a placeholder
+    /// directory, kept apart from the descriptions' locks
+    /// ([`Self::placeholder_flocks`]). Where the backend mirrors the model's
+    /// locks, each counts, whether or not its description's locks show it.
+    ///
+    /// Where the ledger knows it cannot follow a lock, the answer is
+    /// [`HostLocks::Unknown`]: a description whose locks are unknown, the
+    /// ledger's refusal ([`Self::refuse`]), a lock that went through a
+    /// description the ledger may know under another identity
+    /// ([`Self::alias_inode`]), a record lock the backend holds as an OFD lock
+    /// on a file its fact did not name, and an inode whose `flock` locks the
+    /// kernel decides. Not seen: a record lock or a lease where the ledger does
+    /// not take the backend's fact (`Detcore::ledger_takes_fact`), and a lock
+    /// the module documentation names as hidden (bead dh-hn3izp).
+    pub(crate) fn host_locks(&self) -> HostLocks {
+        let described = self.locks.iter().any(|(open_file, locks)| {
+            locks.as_ref().is_ok_and(|locks| {
+                locks
+                    .iter()
+                    .any(|lock| !(lock.is_flock() && self.holds_model_flock(*open_file)))
+            })
+        });
+        let mirrored = self.flock_host_fallback
+            && self
+                .flock_inodes
+                .values()
+                .any(|inode| !inode.granted.is_empty());
+        if described || mirrored {
+            return HostLocks::Held;
+        }
+        let unknown = self.locks.values().any(Result::is_err)
+            || self.refused.is_some()
+            || self.aliased_everything
+            || !self.aliased_inodes.is_empty()
+            || self.record_lock_held_as_ofd_anywhere
+            || self.flock_inodes.values().any(|inode| inode.host_decided);
+        if unknown {
+            HostLocks::Unknown
+        } else {
+            HostLocks::None
+        }
     }
 }
 
@@ -5836,5 +5966,132 @@ lock:\t4: OFDLCK ADVISORY  WRITE -1 00:2a:1003 0 EOF\n";
             with_appended_rows(b"x".to_vec(), vec![true], vec!["y".to_owned()]),
             (b"x\ny\n".to_vec(), vec![true, true])
         );
+    }
+
+    /// What a multiverse copy would not hold (`LockLedger::host_locks`): each
+    /// lock of a description the ledger keeps, whatever hides it from
+    /// `/proc/locks`, until the description's last reference goes; and,
+    /// where the ledger knows it cannot follow a lock, an unknown answer.
+    #[test]
+    fn a_lock_only_the_kernel_holds_is_one_a_copy_would_not_hold() {
+        let [parent, child] = [3, 4].map(DetPid::from_raw);
+        let mut ledger = LockLedger::default();
+        assert_eq!(ledger.host_locks(), HostLocks::None);
+        ledger.note_locks(parent, description(0), Vec::new(), 1);
+        assert_eq!(ledger.host_locks(), HostLocks::None);
+        ledger.note_locks(parent, description(1), vec![lock("1")], 1);
+        assert_eq!(ledger.host_locks(), HostLocks::Held);
+        // Hidden from `/proc/locks` by an opaque table: still held.
+        ledger.mark_opaque(parent);
+        assert!(ledger.held().is_empty());
+        assert_eq!(ledger.host_locks(), HostLocks::Held);
+        // A fork's copy of the table keeps it after the parent's last close,
+        // until the child exits.
+        ledger.fork(parent, child, false);
+        ledger.release(parent, description(1), 0);
+        assert_eq!(ledger.host_locks(), HostLocks::Held);
+        ledger.prune(|process| process != child);
+        assert_eq!(ledger.host_locks(), HostLocks::None);
+
+        let after = |change: &dyn Fn(&mut LockLedger)| {
+            let mut ledger = LockLedger::default();
+            change(&mut ledger);
+            ledger.host_locks()
+        };
+        let unknown = |ledger: &mut LockLedger| {
+            ledger.note_unknown(parent, description(2), "unread".to_owned(), 1);
+        };
+        assert_eq!(after(&unknown), HostLocks::Unknown);
+        // A lock the ledger knows is named rather than one it may not.
+        assert_eq!(
+            after(&|ledger| {
+                unknown(ledger);
+                ledger.note_locks(parent, description(3), vec![lock("3")], 1);
+            }),
+            HostLocks::Held
+        );
+        // Unknown locks go with the description's last reference.
+        assert_eq!(
+            after(&|ledger| {
+                unknown(ledger);
+                ledger.release(parent, description(2), 0);
+            }),
+            HostLocks::None
+        );
+        assert_eq!(
+            after(&|ledger| ledger.refuse("refused".to_owned())),
+            HostLocks::Unknown
+        );
+        assert_eq!(
+            after(&|ledger| ledger.alias_inode(Some("7".to_owned()))),
+            HostLocks::Unknown
+        );
+        assert_eq!(
+            after(&|ledger| ledger.alias_inode(None)),
+            HostLocks::Unknown
+        );
+        assert_eq!(
+            after(&|ledger| ledger.note_record_locks_held_as_ofd(None)),
+            HostLocks::Unknown
+        );
+        // On a file the fact named, such a record lock is its description's
+        // OFD lock, which counts while the description holds it.
+        assert_eq!(
+            after(&|ledger| ledger.note_record_locks_held_as_ofd(Some(vec!["00:18:7".to_owned()]))),
+            HostLocks::None
+        );
+    }
+
+    /// The flock model's locks are Detcore's alone where the backend mirrors
+    /// none on the host (KVM), and a copy keeps them; where it mirrors them,
+    /// each counts, whether or not its description's locks show it. A flock
+    /// the model does not hold counts, and an inode the kernel decides makes
+    /// the answer unknown.
+    #[test]
+    fn a_copy_keeps_the_flock_models_locks_where_no_host_mirrors_them() {
+        let process = DetPid::from_raw(3);
+        let unmirrored = |open_file, mode| FlockRequest {
+            host_fallback: false,
+            ..flock_request(open_file, mode, true)
+        };
+        let mut ledger = LockLedger::default();
+        assert_eq!(
+            ledger.flock(process, process, unmirrored(description(0), EX)),
+            granted()
+        );
+        assert_eq!(ledger.host_locks(), HostLocks::None);
+        ledger.note_locks(process, description(0), vec![flock_held("WRITE")], 1);
+        assert_eq!(ledger.host_locks(), HostLocks::None);
+        ledger.note_locks(
+            process,
+            description(0),
+            vec![flock_held("WRITE"), lock("0")],
+            1,
+        );
+        assert_eq!(ledger.host_locks(), HostLocks::Held);
+
+        let mut ledger = LockLedger::default();
+        ledger.note_locks(process, description(1), vec![flock_held("WRITE")], 1);
+        assert_eq!(ledger.host_locks(), HostLocks::Held);
+
+        let mut ledger = LockLedger::default();
+        assert_eq!(
+            ledger.flock(process, process, flock_request(description(0), EX, true)),
+            granted()
+        );
+        assert_eq!(ledger.host_locks(), HostLocks::Held);
+        assert_eq!(
+            ledger.flock(process, process, flock_request(description(0), UN, true)),
+            FlockOutcome::Released
+        );
+        assert_eq!(ledger.host_locks(), HostLocks::None);
+
+        let mut ledger = LockLedger::default();
+        ledger.mark_private_tables(process);
+        assert_eq!(
+            ledger.flock(process, process, flock_request(description(0), EX, true)),
+            FlockOutcome::HostDecided
+        );
+        assert_eq!(ledger.host_locks(), HostLocks::Unknown);
     }
 }

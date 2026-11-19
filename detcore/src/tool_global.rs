@@ -1361,8 +1361,10 @@ pub struct GlobalState {
     /// Which guest descriptor tables reference each open file description
     /// whose OFD or flock locks Detcore has read, and which locks it holds,
     /// so that `/proc/locks` keeps exactly the guest's own rows
-    /// (`procfs::locks::LockLedger`). Locked after `sched`, never before it.
-    lock_ledger: Mutex<crate::procfs::locks::LockLedger>,
+    /// (`procfs::locks::LockLedger`), and, while the run may be copied,
+    /// whether a copy would hold its locks (`procfs::locks::SharedLedger`).
+    /// Locked after `sched`, never before it.
+    lock_ledger: crate::procfs::locks::SharedLedger,
     /// The descriptor table each guest thread holds, as the thread last named
     /// it (`GlobalRequest::HoldTable`, `Detcore::name_table_for_death`): at its
     /// start, and after an exec gave it a new one; forgotten when the thread
@@ -2097,7 +2099,7 @@ impl GlobalState {
             post_exec_fd_blocking: process_exit_cleanup.post_exec_fd_blocking,
             exec_images: process_exit_cleanup.exec_images,
             process_auxv: process_exit_cleanup.process_auxv,
-            lock_ledger: Mutex::new(Default::default()),
+            lock_ledger: Default::default(),
             held_tables: Mutex::new(BTreeMap::new()),
             root_dettid: OnceLock::new(),
             root_image_marked: AtomicBool::new(false),
