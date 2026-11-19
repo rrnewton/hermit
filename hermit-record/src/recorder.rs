@@ -1799,11 +1799,22 @@ mod finish_tests {
 
 #[cfg(test)]
 mod dispatch_agreement_tests {
+    #![allow(
+        unexpected_cfgs,
+        reason = "`fbcode_build` is supplied by the internal Buck build"
+    )]
+
     use std::collections::BTreeSet;
     use std::path::PathBuf;
 
     fn source(relative: &str) -> String {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative);
+        // Runtime lookup, not `env!`: the Buck build compiles this
+        // crate without a compile-time `CARGO_MANIFEST_DIR`, and the
+        // test below is fbsource-disabled there (the sources it
+        // parses are not present at Buck test runtime either).
+        let manifest_dir =
+            std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+        let path = PathBuf::from(manifest_dir).join(relative);
         std::fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("could not read {}: {error}", path.display()))
     }
@@ -1855,7 +1866,14 @@ mod dispatch_agreement_tests {
 
     /// 6805 slice 5 detector: every subscribed syscall must have a
     /// dispatch arm in BOTH tools, and the two arm sets must agree.
-    /// The fallthrough panics are only the backstop.
+    /// Syscalls outside the subscription still reach the tools by
+    /// Detcore forwarding and take the live-injection fallthrough;
+    /// this test guards only the subscribed set replay answers from
+    /// the recording.
+    #[cfg_attr(
+        fbcode_build,
+        ignore = "fbsource-disabled: compile-time CARGO_MANIFEST_DIR is not present at test runtime"
+    )]
     #[test]
     fn subscription_and_both_dispatches_agree() {
         let table_text = source("../reverie/reverie-syscalls/src/syscalls.rs");
