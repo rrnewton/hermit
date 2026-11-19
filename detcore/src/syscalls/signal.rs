@@ -4250,7 +4250,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         signal,
                     };
                 }
-                SendAdmission::Catch { receiver, .. } => {
+                SendAdmission::Catch { receiver, .. } | SendAdmission::Die { receiver, .. } => {
                     return GuestSend::Admitted {
                         receiver: Some(receiver),
                         scope,
@@ -4291,7 +4291,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// The forwarded call of a send `admit_guest_send` admitted succeeded:
-    /// a caught copy is claimed for the thread chosen to take it
+    /// a caught or fatal copy is claimed for the thread chosen to take it
     /// (`Scheduler::guest_send_committed`).
     pub(crate) async fn guest_send_committed<G: Guest<Self>>(
         &self,
@@ -6913,8 +6913,8 @@ enum NamedThread {
 pub(crate) enum GuestSend {
     /// The admission does not decide this send: it takes its ordinary path.
     NotDecided,
-    /// Admitted. `receiver`: the thread that is to take its caught copy, for
-    /// which the copy is claimed once the forwarded call succeeds
+    /// Admitted. `receiver`: the thread that is to take its caught or fatal
+    /// copy, for which the copy is claimed once the forwarded call succeeds
     /// (`Detcore::guest_send_committed`).
     Admitted {
         receiver: Option<DetTid>,

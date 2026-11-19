@@ -142,8 +142,24 @@ fn tgkill(s: &Scheduler, tid: DetTid, signal: i32) -> SendAdmission {
     s.guest_send_admission(SENDER, Some(TARGET), tid, SendScope::Thread, signal)
 }
 
+/// A KVM scheduler with the sending process and a one-thread target
+/// process, each thread scripted with `sets` (as `two_processes`).
+fn one_thread_target(sets: SignalSets) -> (Scheduler, Arc<ScriptedControl>) {
+    let control = Arc::new(ScriptedControl::default());
+    let mut s = kvm_scheduler(&control, true);
+    for (pid, tid) in [(SENDER_PID, SENDER), (TARGET, LEADER)] {
+        add_bound_thread(&mut s, pid, tid);
+        control.script(tid, vec![Ok(sets)]);
+    }
+    (s, control)
+}
+
 fn catch(receiver: DetTid, reach: CatchReach) -> SendAdmission {
     SendAdmission::Catch { receiver, reach }
+}
+
+fn die(receiver: DetTid, reach: CatchReach) -> SendAdmission {
+    SendAdmission::Die { receiver, reach }
 }
 
 fn refused(refusal: SendRefusal) -> SendAdmission {
@@ -244,6 +260,135 @@ fn kill_stop_and_die_are_refused_by_name() {
     assert_eq!(
         tgkill(&s, SIBLING, libc::SIGTERM),
         refused(SendRefusal::Die)
+    );
+}
+
+/// A default-fatal copy for a one-thread target is admitted (slice
+/// F-minimal): the receiver reaches its own boundary and dies there, at
+/// its boundary when runnable and through its parked observation when
+/// parked in `pause`.
+#[test]
+fn a_fatal_copy_for_a_one_thread_target_is_admitted_at_its_reach() {
+    let (mut s, _control) = one_thread_target(state(0, 0, 0, 0, 0));
+    runnable(&mut s, LEADER);
+    assert_eq!(kill(&s, libc::SIGTERM), die(LEADER, CatchReach::Boundary));
+    assert_eq!(
+        tgkill(&s, LEADER, libc::SIGTERM),
+        die(LEADER, CatchReach::Boundary)
+    );
+
+    let (mut s, _control) = one_thread_target(state(0, 0, 0, 0, 0));
+    parked_in_pause(&mut s, TARGET, LEADER);
+    assert_eq!(kill(&s, libc::SIGTERM), die(LEADER, CatchReach::Parked));
+}
+
+/// A fork that has already checked in (`ParentContinue`) is not the filed
+/// clone a fatal send could race: its child process already exists in
+/// schedule order before the send, so the still-one-thread parent is
+/// admitted and dies at its boundary. A thread creation that has checked
+/// in is a second live thread of the target, so the same request there
+/// is refused with the two-thread shapes below.
+#[test]
+fn a_fatal_copy_after_a_fork_has_checked_in_is_admitted() {
+    let (mut s, _control) = one_thread_target(state(0, 0, 0, 0, 0));
+    add_bound_thread(&mut s, DetPid::from_raw(30), DetTid::from_raw(30));
+    let mut request = Resources::new(LEADER);
+    request.insert(
+        ResourceID::ParentContinue {
+            parent: LEADER,
+            child: DetTid::from_raw(30),
+        },
+        Permission::W,
+    );
+    s.queue_request_for_test(LEADER, request);
+    assert_eq!(kill(&s, libc::SIGTERM), die(LEADER, CatchReach::Boundary));
+
+    let (mut s, _control) = two_processes(state(0, 0, 0, 0, 0));
+    let mut request = Resources::new(LEADER);
+    request.insert(
+        ResourceID::ParentContinue {
+            parent: LEADER,
+            child: SIBLING,
+        },
+        Permission::W,
+    );
+    s.queue_request_for_test(LEADER, request);
+    runnable(&mut s, SIBLING);
+    assert_eq!(kill(&s, libc::SIGTERM), refused(SendRefusal::Die));
+}
+
+/// Every other fatal shape stays refused by name: a vfork parent, a live
+/// vfork child, no chosen receiver (the one thread has a copy of its own
+/// to take first), and — by its reach's own refusal, as for a caught copy —
+/// a futex wait. A two-thread target is `kill_stop_and_die_are_refused_by_name`.
+#[test]
+fn a_fatal_copy_for_any_other_shape_stays_refused_by_name() {
+    let (mut s, _control) = one_thread_target(state(0, 0, 0, 0, 0));
+    runnable(&mut s, LEADER);
+    s.vfork_barriers.insert(LEADER, None);
+    assert_eq!(kill(&s, libc::SIGTERM), refused(SendRefusal::Die));
+
+    let (mut s, _control) = one_thread_target(state(0, 0, 0, 0, 0));
+    runnable(&mut s, LEADER);
+    s.vfork_barriers.insert(DetTid::from_raw(99), Some(LEADER));
+    assert_eq!(kill(&s, libc::SIGTERM), refused(SendRefusal::Die));
+
+    let usr1 = bit(libc::SIGUSR1);
+    let (mut s, _control) = one_thread_target(state(usr1, 0, 0, 0, usr1));
+    runnable(&mut s, LEADER);
+    assert_eq!(kill(&s, libc::SIGTERM), refused(SendRefusal::Die));
+
+    let (mut s, _control) = one_thread_target(state(0, 0, 0, 0, 0));
+    s.park_futex_waiter(
+        &LEADER,
+        FutexID::private(MmId::initial(TARGET), 0x1000),
+        None,
+        !0,
+        None,
+        false,
+    );
+    assert_eq!(kill(&s, libc::SIGTERM), refused(SendRefusal::Futex(LEADER)));
+}
+
+/// A default-fatal copy for a one-thread receiver polling in
+/// `rt_sigtimedwait` is refused by name, whether it waits for another
+/// signal or for this one unblocked: that probe takes only wait-set
+/// copies and would not end the wait, where Linux ends the group at
+/// once. The blocked waiter is the exception above, not this branch: it
+/// still takes the copy by the wait (a catch).
+#[test]
+fn a_fatal_copy_for_an_rt_sigtimedwait_poller_is_refused_but_a_blocked_waiter_takes_it() {
+    let term = bit(libc::SIGTERM);
+    let usr1 = bit(libc::SIGUSR1);
+
+    // Waiting for another signal, which its own mask blocks.
+    let (mut s, _control) = one_thread_target(state(0, 0, usr1, 0, 0));
+    polling(&mut s, LEADER, "rt_sigtimedwait", None, None);
+    assert!(s.set_sigtimedwait_set(LEADER, Some(usr1)));
+    assert_eq!(kill(&s, libc::SIGTERM), refused(SendRefusal::Die));
+    assert_eq!(tgkill(&s, LEADER, libc::SIGTERM), refused(SendRefusal::Die));
+
+    // Waiting for SIGTERM itself, unblocked outside the wait.
+    let (mut s, _control) = one_thread_target(state(0, 0, 0, 0, 0));
+    polling(&mut s, LEADER, "rt_sigtimedwait", None, None);
+    assert!(s.set_sigtimedwait_set(LEADER, Some(term)));
+    assert_eq!(kill(&s, libc::SIGTERM), refused(SendRefusal::Die));
+
+    // The typed wait state, not the request's debugging label, carries
+    // the capability: the same unblocked waiter under another label is
+    // still refused.
+    let (mut s, _control) = one_thread_target(state(0, 0, 0, 0, 0));
+    polling(&mut s, LEADER, "renamed-debug-label", None, None);
+    assert!(s.set_sigtimedwait_set(LEADER, Some(term)));
+    assert_eq!(kill(&s, libc::SIGTERM), refused(SendRefusal::Die));
+
+    // Waiting for SIGTERM and blocking it: a catch by the wait.
+    let (mut s, _control) = one_thread_target(state(0, 0, term, 0, 0));
+    polling(&mut s, LEADER, "rt_sigtimedwait", None, None);
+    assert!(s.set_sigtimedwait_set(LEADER, Some(term)));
+    assert_eq!(
+        kill(&s, libc::SIGTERM),
+        catch(LEADER, CatchReach::ProbeWaitSetOnly)
     );
 }
 

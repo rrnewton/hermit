@@ -186,6 +186,10 @@ static int reap(pid_t pid, int options) {
 }
 
 int main(void) {
+  /* Line-buffered so each case's line is out before the next case runs: a
+   * run that a backend stops at a later case still shows every case it
+   * completed. */
+  setvbuf(stdout, NULL, _IOLBF, 0);
   int ok = 1;
   pid_t pid;
 
