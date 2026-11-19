@@ -30,17 +30,37 @@
  * main yields once, makes one ordinary syscall, then sets the flag that two
  * pure spinners (no syscalls) wait for, so it is the yielder that is waited on.
  *
+ * `--vfork-spin` and `--spawn-spin` start this program again as a vfork
+ * child, through vfork(2) and execve(2) or through posix_spawn(3), whose
+ * glibc implementation clones with CLONE_VM | CLONE_VFORK. In the new image
+ * (`--spin-child`) the main thread spins without syscalls until a second
+ * thread, which first sleeps for 1 ms, sets the flag. Detcore gave a vfork
+ * child a persistent priority ahead of every other thread, and nothing reset
+ * it at the exec, so the spinner kept the only logical CPU and the sleeper
+ * never ran, even without chaos (Debian's hey build, where `go build` and
+ * dh_golang start Go programs this way, hung in its compile and `go list`).
+ *
+ * `--vfork-child-first` checks the schedule Hermit chooses inside the vfork
+ * interval: while the parent waits in vfork(2), the child runs before every
+ * other runnable thread. A sibling of the parent counts without syscalls; the
+ * child reads the count, makes a call that takes a scheduler turn, and reads
+ * it again. Under Hermit both reads agree. Linux allows that schedule but does
+ * not require it, so this mode is not expected to pass natively.
+ *
  * Success is printing "sched-yield-progress-ok <value>" and exiting 0. Failure
  * is a hang (caught by the harness timeout).
  */
 
+#include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
+#include <spawn.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 static atomic_int g_ready = 0;
@@ -101,6 +121,138 @@ static int run_yield_then_write(void) {
   return 0;
 }
 
+/* Sleep briefly, then set the flag the main thread spins on. */
+static void* sleeping_setter(void* arg) {
+  (void)arg;
+  struct timespec delay = {0, 1000000};
+  nanosleep(&delay, NULL);
+  atomic_store_explicit(&g_ready, 1, memory_order_release);
+  return NULL;
+}
+
+/* The new image of `--vfork-spin` and `--spawn-spin`: spin without syscalls
+ * until a sleeping sibling sets the flag. */
+static int run_spin_child(void) {
+  pthread_t setter;
+  if (pthread_create(&setter, NULL, sleeping_setter, NULL) != 0) {
+    fprintf(stderr, "pthread_create failed\n");
+    return 2;
+  }
+  silent_spinner(NULL);
+  if (pthread_join(setter, NULL) != 0) {
+    fprintf(stderr, "pthread_join failed\n");
+    return 3;
+  }
+  printf("sched-yield-progress-ok spin-child\n");
+  return 0;
+}
+
+/* Wait for `child`, require a clean exit, and print `marker`. */
+static int wait_for_child(pid_t child, const char* marker) {
+  int status = 0;
+  if (waitpid(child, &status, 0) != child) {
+    perror("waitpid");
+    return 6;
+  }
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    fprintf(stderr, "child failed: status=%d\n", status);
+    return 7;
+  }
+  printf("%s\n", marker);
+  return 0;
+}
+
+static int run_vfork_spin(const char* self) {
+  pid_t child = vfork();
+  if (child < 0) {
+    perror("vfork");
+    return 5;
+  }
+  if (child == 0) {
+    execl(self, self, "--spin-child", NULL);
+    _exit(127);
+  }
+  return wait_for_child(child, "vfork-spin-progress-ok");
+}
+
+static int run_spawn_spin(const char* self) {
+  char* child_argv[] = {(char*)self, "--spin-child", NULL};
+  pid_t child;
+  int error = posix_spawn(&child, self, NULL, NULL, child_argv, environ);
+  if (error != 0) {
+    fprintf(stderr, "posix_spawn failed: %s\n", strerror(error));
+    return 5;
+  }
+  return wait_for_child(child, "spawn-spin-progress-ok");
+}
+
+/* What the counting sibling shares with run_vfork_child_first. */
+struct counter_state {
+  atomic_ullong count;
+  atomic_int stop;
+};
+
+/* Count without syscalls until told to stop. */
+static void* counter(void* arg) {
+  struct counter_state* state = arg;
+  while (atomic_load_explicit(&state->stop, memory_order_relaxed) == 0) {
+    atomic_fetch_add_explicit(&state->count, 1, memory_order_relaxed);
+  }
+  return NULL;
+}
+
+static int run_vfork_child_first(void) {
+  /* The sibling writes to this frame, so every return after pthread_create
+   * first stops the sibling and joins it. */
+  struct counter_state state = {0, 0};
+  pthread_t sibling;
+  if (pthread_create(&sibling, NULL, counter, &state) != 0) {
+    fprintf(stderr, "pthread_create failed\n");
+    return 2;
+  }
+  /* The sibling has had a turn, so it is a runnable thread of the run. */
+  while (atomic_load_explicit(&state.count, memory_order_relaxed) == 0) {
+    sched_yield();
+  }
+  pid_t child = vfork();
+  if (child < 0) {
+    perror("vfork");
+    atomic_store_explicit(&state.stop, 1, memory_order_relaxed);
+    (void)pthread_join(sibling, NULL);
+    return 5;
+  }
+  if (child == 0) {
+    unsigned long long before =
+        atomic_load_explicit(&state.count, memory_order_relaxed);
+    /* A path lookup takes a scheduler turn; it finds nothing. */
+    int fd = open("/sched-yield-progress-vfork-child-first", O_RDONLY);
+    if (fd >= 0) {
+      close(fd);
+    }
+    unsigned long long after =
+        atomic_load_explicit(&state.count, memory_order_relaxed);
+    _exit(before == after ? 0 : 1);
+  }
+  int status = 0;
+  if (waitpid(child, &status, 0) != child) {
+    perror("waitpid");
+    atomic_store_explicit(&state.stop, 1, memory_order_relaxed);
+    (void)pthread_join(sibling, NULL);
+    return 6;
+  }
+  atomic_store_explicit(&state.stop, 1, memory_order_relaxed);
+  if (pthread_join(sibling, NULL) != 0) {
+    fprintf(stderr, "pthread_join failed\n");
+    return 3;
+  }
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    printf("vfork-child-first lost: a sibling ran in the vfork interval\n");
+    return 9;
+  }
+  printf("sched-yield-progress-ok vfork-child-first\n");
+  return 0;
+}
+
 static int run_progress(int two_spinners) {
   pthread_t second;
   if (two_spinners && pthread_create(&second, NULL, spinner, NULL) != 0) {
@@ -137,10 +289,23 @@ int main(int argc, char** argv) {
   if (argc == 2 && strcmp(argv[1], "--yield-then-write") == 0) {
     return run_yield_then_write();
   }
+  if (argc == 2 && strcmp(argv[1], "--spin-child") == 0) {
+    return run_spin_child();
+  }
+  if (argc == 2 && strcmp(argv[1], "--vfork-spin") == 0) {
+    return run_vfork_spin(argv[0]);
+  }
+  if (argc == 2 && strcmp(argv[1], "--spawn-spin") == 0) {
+    return run_spawn_spin(argv[0]);
+  }
+  if (argc == 2 && strcmp(argv[1], "--vfork-child-first") == 0) {
+    return run_vfork_child_first();
+  }
   if (argc != 2 || strcmp(argv[1], "--vfork") != 0) {
     fprintf(stderr,
             "usage: %s [--vfork|--vfork-child|--two-spinners|"
-            "--yield-then-write]\n",
+            "--yield-then-write|--vfork-spin|--spawn-spin|--spin-child|"
+            "--vfork-child-first]\n",
             argv[0]);
     return 4;
   }

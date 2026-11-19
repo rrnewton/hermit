@@ -41,20 +41,13 @@ impl RecordVersion {
     /// Check if the recorder/replayer version is compatible with a given
     /// recording (trace).
     pub fn compatible_with(&self, other: &RecordVersion) -> bool {
-        // The window is tied to the literal first psABI version, so
-        // it closes itself when RECORD_VERSION next moves: accepting
-        // 0x1a0 then would admit a stream whose format may have
-        // changed since, which is what the exact gate exists for.
-        const _: () = assert!(
-            RECORD_VERSION.0 == 0x1a1,
-            "the 0x1a0 compatibility window must be re-decided when RECORD_VERSION moves"
-        );
-        // Exact, with one deliberate window: the 0x1a1 replayer
-        // accepts the last pre-psABI version so its recordings
-        // replay on the legacy CPUID table (migrated at load). An
-        // older replayer still refuses this version by the same
-        // equality, by name.
-        self == other || (*self == RecordVersion(0x1a1) && *other == LAST_PRE_PSABI_RECORD_VERSION)
+        // Exact. The one deliberate window, in which the 0x1a1
+        // replayer accepted the last pre-psABI version so that its
+        // recordings replayed on the legacy CPUID table, closed when
+        // RECORD_VERSION moved to 0x1a2: a 0x1a0 recording, like a
+        // 0x1a1 one, was made under the vfork child priority that
+        // 0x1a2 replaces, so it would replay with another schedule.
+        self == other
     }
 }
 
@@ -1037,9 +1030,23 @@ impl RecordVersion {
 // Broadwell table it recorded with, and recordings at 0x1a1 bind
 // their CPUID table digest. It is also why an older replayer
 // refuses a new recording by name instead of replaying it against
-// the wrong CPU. This is the one deliberate exception to exact
-// version equality: RECORD_VERSION accepts 0x1a0 beside itself.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x1a1);
+// the wrong CPU. This was the one deliberate exception to exact
+// version equality: the 0x1a1 RECORD_VERSION accepted 0x1a0 beside
+// itself, until 0x1a2 closed the window.
+// 0x1a1 -> 0x1a2 (HIGHEST_SHIPPED+1 on main d63e33c14c6, which ships
+// 0x1a1; reserved in the shared version reservation list; land-time
+// numbering applies): outside chaos and replay, Detcore
+// gives a vfork child the default priority, as it gives an ordinary
+// clone child, instead of a permanent priority ahead of every other
+// thread. The vfork barrier still runs the child first while its
+// parent waits; after the child's exec, the new program takes turns
+// with the rest of the run instead of starving it by spinning (the
+// Debian hey build hang). Record and replay both compute this
+// priority, so a recording made before, in which a vfork, a
+// posix_spawn or a clone with CLONE_VFORK was followed by an exec,
+// would replay with another schedule. It is refused here, and so is
+// a 0x1a0 recording: the pre-psABI window closes.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x1a2);
 
 /// The last recording version whose `x86-64-v2` (named or absent)
 /// means the pre-psABI legacy table.
@@ -1068,7 +1075,7 @@ pub(crate) const LAST_PRE_PSABI_RECORD_VERSION: RecordVersion = RecordVersion(0x
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x1a1;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x1a2;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1198,8 +1205,8 @@ pub struct Metadata {
     /// The CPU the guest saw (<https://github.com/rrnewton/hermit/issues/4243>).
     /// What `x86-64-v2` (named or absent) means depends on
     /// `version`: at or before [`LAST_PRE_PSABI_RECORD_VERSION`] it
-    /// is the legacy Broadwell table, migrated at load; from
-    /// [`RECORD_VERSION`] it is the psABI table.
+    /// is the legacy Broadwell table, migrated at load; after it, it
+    /// is the psABI table.
     #[serde(default)]
     pub cpu_profile: detcore_model::cpu_profile::CpuProfile,
     /// Under x86-64-v3, the host facts the guest's leaf 0xD and XCOMP answers
@@ -1825,8 +1832,14 @@ mod tests {
     }
 
     #[test]
-    fn record_version_requires_an_exact_match_apart_from_the_pre_psabi_window() {
+    fn record_version_requires_an_exact_match() {
         assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
+        // The pre-psABI window was open only at 0x1a1: a replayer
+        // after it refuses the last pre-psABI version like any other.
+        assert!(
+            !RECORD_VERSION.compatible_with(&LAST_PRE_PSABI_RECORD_VERSION),
+            "the 0x1a0 window closed when RECORD_VERSION moved past 0x1a1"
+        );
 
         // DERIVED FROM THE COMPATIBILITY RULE, NOT ENUMERATED.
         //
@@ -1837,23 +1850,13 @@ mod tests {
         // fail for the reason its name gives once the value has moved past the
         // range someone happened to write down.
         //
-        // `compatible_with` is exact equality apart from the one
-        // pre-psABI window below, so the property to assert is
+        // `compatible_with` is exact equality, so the property to assert is
         // "every OTHER version is refused". Re-deriving the cases from
         // RECORD_VERSION itself means the window travels with the constant and
         // cannot go stale.
         let current = RECORD_VERSION.0;
         for delta in 1..=16u32 {
             let older = RecordVersion(current - delta);
-            // The one deliberate window, open only at 0x1a1: the
-            // last pre-psABI version stays readable so its
-            // recordings replay on the legacy CPUID table (migrated
-            // at load). A future replayer does not inherit it.
-            if older == LAST_PRE_PSABI_RECORD_VERSION {
-                assert!(RECORD_VERSION.compatible_with(&older));
-                assert!(!RecordVersion(0x1a2).compatible_with(&older));
-                continue;
-            }
             assert!(
                 !RECORD_VERSION.compatible_with(&older),
                 "recorder at {current:#x} must refuse a recording made at {:#x}",
@@ -2740,7 +2743,7 @@ mod tests {
     fn record_version_rejects_streams_from_before_the_corrected_rcb_event() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x19a)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x186)));
-        assert!(RECORD_VERSION.compatible_with(&RecordVersion(0x1a0)));
+        assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
     }
 
     #[test]

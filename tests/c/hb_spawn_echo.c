@@ -12,9 +12,15 @@
  * write before the child's with a happens-before edge, once firing at the
  * write's entry and once at its completion
  * (https://github.com/rrnewton/hermit/issues/3929).
+ *
+ * The parent sleeps for 50 ms before its write, so the echo reaches its own
+ * write first and the edge holds it there, whatever order the scheduler gives
+ * the two processes after the spawn. Without the sleep, the parent writes
+ * before the echo has loaded, and the edge holds nothing.
  */
 #include <spawn.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 extern char **environ;
@@ -24,6 +30,10 @@ int main(void) {
   pid_t pid;
   if (posix_spawn(&pid, "/bin/echo", 0, 0, argv, environ) != 0) {
     return 3;
+  }
+  struct timespec delay = {0, 50000000};
+  if (nanosleep(&delay, 0) != 0) {
+    return 5;
   }
   if (write(1, "parent\n", 7) != 7) {
     return 2;
