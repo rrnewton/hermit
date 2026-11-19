@@ -674,6 +674,8 @@ mod tests {
     impl RecordHost for FailingSnapshotHost {
         type InitStorage = ();
 
+        const CAPTURE_AT_CONSTRUCTION: bool = false;
+
         fn install(
             _storage: &Self::InitStorage,
             _provider: Option<std::sync::Arc<dyn reverie::DescriptorProvider>>,

@@ -10,10 +10,17 @@
 //! that runs their guest: typed descriptor facts, descriptor
 //! duplication into the tool process, and open-file-description
 //! identity. Switching backend is switching the [`RecordHost`]
-//! implementation. Descriptor classification, `fdinfo` and link
-//! reads, descriptor `stat` guards, and every descriptor duplication
-//! or identity comparison in the two tools go through this trait;
-//! the reads that remain inline in the tools are named below.
+//! implementation. Backends supply descriptor facts through
+//! `Guest::descriptor_provider()`. The ptrace descriptor bodies in
+//! this module's `PtraceHost` and in [`crate::fd`] are an intermediate,
+//! behaviour-preserving extraction in Hermit; before the KVM
+//! record/replay path lands, those guest-descriptor mechanisms move
+//! to `reverie-ptrace` or Reverie-owned host-descriptor helpers, while
+//! the tools keep consuming only this neutral contract. Descriptor
+//! classification, `fdinfo` and link reads, descriptor `stat` guards,
+//! and every descriptor duplication or identity comparison in the two
+//! tools go through this trait; the reads that remain inline in the
+//! tools are named below.
 //!
 //! Every operation takes a borrowed [`DescriptorAccess`]: the
 //! run-bound capability naming the host's installed provider
@@ -42,9 +49,10 @@
 //! `/proc/<pid>/limits` and `status` reads, the `/proc/<tid>/net/unix`
 //! table read, process root/directory opens
 //! (`record_replay_path`), the replayer `FICLONE` destination reopen
-//! by its `/proc/<pid>/fd` path, the tool's own `/proc/self` descriptor reads,
-//! captured-output identity matching over `stat` results this trait
-//! returns, and replay materialization. A second [`RecordHost`]
+//! by its `/proc/<pid>/fd` path, the target-descriptor `stat` in
+//! `preserve_materialized_exec_descriptor`, the tool's own
+//! `/proc/self` descriptor reads, captured-output identity matching
+//! over `stat` results this trait returns, and replay materialization. A second [`RecordHost`]
 //! implementation must route or refuse each of those for its backend
 //! before it lands; none of them may silently fall back to procfs.
 //! The 6805 no-touch replay default (virtual files, memfd
@@ -214,13 +222,23 @@ pub trait RecordHost: Send + Sync + 'static {
     /// without a retained provider uses `()`.
     type InitStorage: Default + Send + Sync + 'static;
 
+    /// Whether this host's root output endpoints can be captured
+    /// eagerly, at tool construction / root-state creation, with no
+    /// installed provider: such a host builds its ready output
+    /// bundle once, statically. A host that needs its installed
+    /// provider to capture sets this `false` and captures at the
+    /// first pre-execution guest boundary instead.
+    const CAPTURE_AT_CONSTRUCTION: bool;
+
     /// Retains `provider` (the guest's descriptor provider, taken at
     /// the tool's first pre-execution guest boundary) in `storage`
     /// for the rest of the run, before any descriptor capture.
     /// Install is called at every thread start: it is idempotent,
-    /// the same provider is passed each time within one run, the
-    /// first install wins, and a later install naming a different
-    /// run's provider is ignored, never substituted.
+    /// the same provider is passed each time within one run, and
+    /// the first install wins. A later install naming a different
+    /// run's provider must be refused by name, never silently
+    /// ignored or substituted; that refusal is required of every
+    /// retained-provider host before one is added.
     fn install(
         storage: &Self::InitStorage,
         provider: Option<std::sync::Arc<dyn reverie::DescriptorProvider>>,
@@ -387,6 +405,8 @@ fn link_is_eventfd(target: &Path) -> bool {
 
 impl RecordHost for PtraceHost {
     type InitStorage = ();
+
+    const CAPTURE_AT_CONSTRUCTION: bool = true;
 
     fn install(
         _storage: &Self::InitStorage,

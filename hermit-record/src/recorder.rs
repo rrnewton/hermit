@@ -482,6 +482,10 @@ pub struct RecorderWithHost<H: RecordHost> {
     /// installed at `handle_thread_start` before output capture.
     #[serde(skip)]
     init: H::InitStorage,
+    /// This process's host pid from construction, naming the table
+    /// eager root capture reads (hosts with
+    /// `CAPTURE_AT_CONSTRUCTION`).
+    root_pid: libc::pid_t,
 }
 
 /// The recorder on the ptrace backend's host; what `hermit record`
@@ -494,6 +498,7 @@ impl<H: RecordHost> Default for RecorderWithHost<H> {
             _host: PhantomData,
             data: PathBuf::new(),
             init: H::InitStorage::default(),
+            root_pid: 0,
         }
     }
 }
@@ -507,11 +512,12 @@ impl<H: RecordHost> Tool for RecorderWithHost<H> {
         reverie::ToolStreamRole::BinaryRecord
     }
 
-    fn new(_pid: Pid, cfg: &<Self::GlobalState as GlobalTool>::Config) -> Self {
+    fn new(pid: Pid, cfg: &<Self::GlobalState as GlobalTool>::Config) -> Self {
         Self {
             _host: PhantomData,
             data: cfg.replay_data.as_ref().unwrap().clone(),
             init: H::InitStorage::default(),
+            root_pid: pid.as_raw(),
         }
     }
 
@@ -566,12 +572,26 @@ impl<H: RecordHost> Tool for RecorderWithHost<H> {
             pending_exec: None,
             interrupted_poll: None,
             bootstrapped: parent.is_some_and(|(_, state)| state.bootstrapped),
-            fresh_root_capture: parent.is_none(),
+            fresh_root_capture: parent.is_none() && !H::CAPTURE_AT_CONSTRUCTION,
             outputs: match parent {
+                None if H::CAPTURE_AT_CONSTRUCTION => {
+                    let root = Pid::from_raw(self.root_pid);
+                    let access = DescriptorAccess::<H, ()>::task(&self.init, root, root);
+                    ContainerOutputs {
+                        stdout: OutputIdentity::for_fd::<H, ()>(&access, libc::STDOUT_FILENO),
+                        stderr: OutputIdentity::for_fd::<H, ()>(&access, libc::STDERR_FILENO),
+                    }
+                }
                 None => ContainerOutputs::default(),
                 Some((_, state)) => state.outputs,
             },
             output_descriptions: match parent {
+                None if H::CAPTURE_AT_CONSTRUCTION => {
+                    let root = Pid::from_raw(self.root_pid);
+                    std::sync::Arc::new(OutputDescriptions::capture::<H, ()>(
+                        &DescriptorAccess::task(&self.init, root, root),
+                    ))
+                }
                 None => {
                     std::sync::Arc::new(OutputDescriptions::empty(Pid::from_raw(child.as_raw())))
                 }

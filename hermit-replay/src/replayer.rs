@@ -1383,6 +1383,11 @@ pub struct ReplayerWithHost<H: RecordHost> {
     // Keep track of the data directory. Each thread uses this path to open its
     // event stream.
     data: PathBuf,
+    /// The captured output endpoints template: the ready bundle
+    /// itself for eager-capture hosts (built in `new`), an empty
+    /// placeholder replaced per fresh root state for deferred hosts.
+    #[serde(skip)]
+    outputs: std::sync::Arc<ReplayOutputs>,
 }
 
 /// The replayer on the ptrace backend's host; what `hermit replay`
@@ -1395,6 +1400,7 @@ impl<H: RecordHost> Default for ReplayerWithHost<H> {
             _host: PhantomData,
             data: PathBuf::new(),
             init: H::InitStorage::default(),
+            outputs: Default::default(),
         }
     }
 }
@@ -1408,11 +1414,20 @@ impl<H: RecordHost> Tool for ReplayerWithHost<H> {
     type GlobalState = detcore::GlobalState;
     type ThreadState = ReplayerThreadState;
 
-    fn new(_pid: Pid, cfg: &<Self::GlobalState as GlobalTool>::Config) -> Self {
+    fn new(pid: Pid, cfg: &<Self::GlobalState as GlobalTool>::Config) -> Self {
+        let init = H::InitStorage::default();
+        let outputs = if H::CAPTURE_AT_CONSTRUCTION {
+            std::sync::Arc::new(ReplayOutputs::capture::<H, ()>(&DescriptorAccess::task(
+                &init, pid, pid,
+            )))
+        } else {
+            Default::default()
+        };
         Self {
             _host: PhantomData,
             data: cfg.replay_data.as_ref().unwrap().clone(),
-            init: H::InitStorage::default(),
+            init,
+            outputs,
         }
     }
 
@@ -1459,9 +1474,9 @@ impl<H: RecordHost> Tool for ReplayerWithHost<H> {
             child_stream_ids: ChildEventStreamIds::default(),
             interrupted_poll: None,
             bootstrapped: parent.is_some_and(|(_, state)| state.bootstrapped),
-            fresh_root_capture: parent.is_none(),
+            fresh_root_capture: parent.is_none() && !H::CAPTURE_AT_CONSTRUCTION,
             outputs: match parent {
-                None => std::sync::Arc::new(ReplayOutputs::default()),
+                None => self.outputs.clone(),
                 Some((_, state)) => state.outputs.clone(),
             },
         }
