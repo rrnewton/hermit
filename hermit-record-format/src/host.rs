@@ -9,8 +9,8 @@
 //! The descriptor seam between the record/replay tools and the backend
 //! that runs their guest: typed descriptor facts, descriptor
 //! duplication into the tool process, and open-file-description
-//! identity. Switching backend is switching the [`RecordHost`]
-//! implementation. Backends supply descriptor facts through
+//! identity. Switching backend is switching the provider the guest
+//! supplies. Backends supply descriptor facts through
 //! `Guest::descriptor_provider()`. The ptrace descriptor bodies in
 //! this module's `PtraceHost` and in [`crate::fd`] are an intermediate,
 //! behaviour-preserving extraction in Hermit; before the KVM
@@ -49,12 +49,14 @@
 //! `/proc/<pid>/limits` and `status` reads, the `/proc/<tid>/net/unix`
 //! table read, process root/directory opens
 //! (`record_replay_path`), the replayer `FICLONE` destination reopen
-//! by its `/proc/<pid>/fd` path, the target-descriptor `stat` in
-//! `preserve_materialized_exec_descriptor`, the tool's own
+//! by its `/proc/<pid>/fd` path, the whole scan in
+//! `preserve_materialized_exec_descriptor` (its target `stat`,
+//! descriptor listing and per-entry `stat`), the tool's own
 //! `/proc/self` descriptor reads, captured-output identity matching
-//! over `stat` results this trait returns, and replay materialization. A second [`RecordHost`]
-//! implementation must route or refuse each of those for its backend
-//! before it lands; none of them may silently fall back to procfs.
+//! over `stat` results this trait returns, and replay materialization. A
+//! retained-provider host must route or refuse each of those for its
+//! backend before it lands; none of them may silently fall back to
+//! procfs.
 //! The 6805 no-touch replay default (virtual files, memfd
 //! materialization) must extend this seam with effect operations or
 //! gate at the handlers; this trait covers queries and duplication

@@ -1439,7 +1439,7 @@ impl<H: RecordHost> Tool for ReplayerWithHost<H> {
     /// leader never recaptures its own endpoints.
     async fn handle_thread_start<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Error> {
         H::install(&self.init, guest.descriptor_provider());
-        if guest.thread_state().fresh_root_capture {
+        if !H::CAPTURE_AT_CONSTRUCTION && guest.thread_state().fresh_root_capture {
             let table = guest.tid();
             let outputs = std::sync::Arc::new(ReplayOutputs::capture::<H, G>(
                 &DescriptorAccess::guest_bound(&self.init, &mut *guest, table),
