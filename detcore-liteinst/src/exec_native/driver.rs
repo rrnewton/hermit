@@ -193,7 +193,7 @@ unsafe impl NativeExecDriver<Detcore> for Driver {
     fn bind_initial_state(
         &self,
         _tool: &Detcore,
-        state: &mut ThreadState<detcore::SeededMode>,
+        state: &mut ThreadState,
         physical_tid: i32,
     ) -> std::io::Result<()> {
         let tid = unsafe { reverie_inguest::trap::raw_syscall6(libc::SYS_gettid, [0; 6]) };
@@ -215,7 +215,7 @@ unsafe impl NativeExecDriver<Detcore> for Driver {
 
     fn bind_post_exec_state(
         &self,
-        state: &mut ThreadState<detcore::SeededMode>,
+        state: &mut ThreadState,
         mode: reverie::BackendSignalControlMode,
         actual: Option<reverie::SignalTaskIdentity>,
     ) -> std::io::Result<()> {
@@ -233,7 +233,7 @@ unsafe impl NativeExecDriver<Detcore> for Driver {
     fn capture_old<'owner>(
         &'owner self,
         tool: &Detcore,
-        state: &ThreadState<detcore::SeededMode>,
+        state: &ThreadState,
         cut: &ExecCut,
         rpc: &Rpc,
     ) -> Result<Box<dyn NativeExecSession<Detcore> + 'owner>, UnsupportedRefusal> {
@@ -381,7 +381,7 @@ fn encode<T: serde::Serialize>(value: &T, into: &mut [u8]) -> Result<usize, Nati
 }
 
 fn envelope(
-    state: &ThreadState<detcore::SeededMode>,
+    state: &ThreadState,
     request: Q,
 ) -> RequestEnvelope<<GlobalState as reverie::GlobalTool>::Request> {
     RequestEnvelope {
@@ -469,7 +469,7 @@ unsafe impl NativeExecSession<Detcore> for Session<'_> {
     fn prepare<'a>(
         &'a mut self,
         tool: &Detcore,
-        state: &ThreadState<detcore::SeededMode>,
+        state: &ThreadState,
         cut: &ExecCut,
         rpc: &Rpc,
     ) -> Result<Box<dyn PreparedNativeExec<Detcore> + 'a>, NativeExecFailure> {
@@ -713,7 +713,7 @@ impl Transaction<'_, '_> {
     fn final_check(
         &self,
         tool: &Detcore,
-        state: &ThreadState<detcore::SeededMode>,
+        state: &ThreadState,
         cut: &ExecCut,
     ) -> Result<(), NativeExecFailure> {
         if cut != &self.session.cut
@@ -770,7 +770,7 @@ unsafe impl PreparedNativeExec<Detcore> for Transaction<'_, '_> {
     fn revalidate(
         &mut self,
         tool: &Detcore,
-        state: &ThreadState<detcore::SeededMode>,
+        state: &ThreadState,
         cut: &ExecCut,
         _: &Rpc,
     ) -> Result<(), NativeExecFailure> {
@@ -779,7 +779,7 @@ unsafe impl PreparedNativeExec<Detcore> for Transaction<'_, '_> {
     unsafe fn issue_and_call(
         &mut self,
         tool: &Detcore,
-        state: &ThreadState<detcore::SeededMode>,
+        state: &ThreadState,
         cut: &ExecCut,
         rpc: &Rpc,
     ) -> Result<ReturnedNativeExec, NativeExecFailure> {

@@ -21894,7 +21894,7 @@ mod test {
     #[test]
     fn inherited_input_status_flags_remain_kernel_owned() {
         for recordreplay_modes in [false, true] {
-            let tool = crate::Detcore::<crate::SeededMode> {
+            let tool = crate::Detcore::<crate::ConfiguredMode> {
                 detpid: crate::types::DetPid::from_raw(3),
                 cfg: crate::Config {
                     sequentialize_threads: true,
@@ -21941,7 +21941,7 @@ mod test {
     fn inotify_instances_stay_physically_nonblocking_where_detcore_waits() {
         for sequentialize_threads in [false, true] {
             for recordreplay_modes in [false, true] {
-                let tool = crate::Detcore::<crate::SeededMode> {
+                let tool = crate::Detcore::<crate::ConfiguredMode> {
                     detpid: crate::types::DetPid::from_raw(3),
                     cfg: crate::Config {
                         sequentialize_threads,
@@ -23379,7 +23379,7 @@ mod inject_fstat_scratch {
 
     struct ScriptedGuest {
         config: Config,
-        thread: ThreadState<crate::SeededMode>,
+        thread: ThreadState<crate::ConfiguredMode>,
         stack_writable: bool,
         zero_on_commit: bool,
         mmap_fails: bool,
@@ -23486,7 +23486,7 @@ mod inject_fstat_scratch {
                 ..Config::default()
             };
             let pid = DetPid::from_raw(1);
-            let mut thread = ThreadState::<crate::SeededMode>::new(pid, &config, ());
+            let mut thread = ThreadState::<crate::ConfiguredMode>::new(pid, &config, ());
             thread.detpid = Some(pid);
             let tool = <Detcore as Tool>::new(Pid::from_raw(1), &config);
             let guest = Self {
@@ -23691,10 +23691,10 @@ mod inject_fstat_scratch {
                 LocalMemory::new()
             }
         }
-        fn thread_state_mut(&mut self) -> &mut ThreadState<crate::SeededMode> {
+        fn thread_state_mut(&mut self) -> &mut ThreadState<crate::ConfiguredMode> {
             &mut self.thread
         }
-        fn thread_state(&self) -> &ThreadState<crate::SeededMode> {
+        fn thread_state(&self) -> &ThreadState<crate::ConfiguredMode> {
             &self.thread
         }
         async fn regs(&mut self) -> libc::user_regs_struct {
@@ -26285,7 +26285,7 @@ mod inject_fstat_scratch {
             (BTreeMap::from([(21, 3)]), None),
         ] {
             assert_eq!(
-                Detcore::<crate::SeededMode>::maps_target_with_numbers(
+                Detcore::<crate::ConfiguredMode>::maps_target_with_numbers(
                     actual,
                     Some(&numbers),
                     1,
@@ -27575,8 +27575,9 @@ mod serving_kernel_protection_key_tests {
                 (Err(Errno::ENOSYS), None),
                 (Err(Errno::EINTR), None),
             ] {
-                let tool = crate::syscall_hot_path_tests::detcore::<crate::SeededMode<NoopTool>>();
-                let mut guest = InjectGuest::<crate::SeededMode>::new(reply);
+                let tool =
+                    crate::syscall_hot_path_tests::detcore::<crate::ConfiguredMode<NoopTool>>();
+                let mut guest = InjectGuest::<crate::ConfiguredMode>::new(reply);
                 let asked = tool
                     .serving_kernel_enables_protection_keys(&mut guest)
                     .await;

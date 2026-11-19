@@ -34,7 +34,7 @@ const TID: i32 = 23;
 
 struct WatchGuest {
     config: Config,
-    thread: ThreadState<crate::SeededMode>,
+    thread: ThreadState<crate::ConfiguredMode>,
     keeps_timer_events: bool,
     answers: VecDeque<Result<(), WatchError>>,
     armed: Vec<Vec<WatchSpec>>,
@@ -90,10 +90,10 @@ impl Guest<Detcore> for WatchGuest {
     fn memory(&self) -> Self::Memory {
         reverie::syscalls::LocalMemory::new()
     }
-    fn thread_state(&self) -> &ThreadState<crate::SeededMode> {
+    fn thread_state(&self) -> &ThreadState<crate::ConfiguredMode> {
         &self.thread
     }
-    fn thread_state_mut(&mut self) -> &mut ThreadState<crate::SeededMode> {
+    fn thread_state_mut(&mut self) -> &mut ThreadState<crate::ConfiguredMode> {
         &mut self.thread
     }
     async fn regs(&mut self) -> libc::user_regs_struct {

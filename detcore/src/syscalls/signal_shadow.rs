@@ -2100,7 +2100,7 @@ mod tests {
     /// state is scripted; anything else it is asked to do fails the test.
     struct ShadowGuest {
         config: Config,
-        thread: ThreadState<crate::SeededMode>,
+        thread: ThreadState<crate::ConfiguredMode>,
         delivery: DeliveryScript,
     }
 
@@ -2180,10 +2180,10 @@ mod tests {
         fn memory(&self) -> Self::Memory {
             LocalMemory::new()
         }
-        fn thread_state_mut(&mut self) -> &mut ThreadState<crate::SeededMode> {
+        fn thread_state_mut(&mut self) -> &mut ThreadState<crate::ConfiguredMode> {
             &mut self.thread
         }
-        fn thread_state(&self) -> &ThreadState<crate::SeededMode> {
+        fn thread_state(&self) -> &ThreadState<crate::ConfiguredMode> {
             &self.thread
         }
         async fn regs(&mut self) -> libc::user_regs_struct {
@@ -2291,7 +2291,7 @@ mod tests {
             inherited_seccomp: detcore_model::config::InheritedSeccomp::Disabled,
             ..Config::default()
         };
-        let thread = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ());
+        let thread = ThreadState::<crate::ConfiguredMode>::new(DetPid::from_raw(1), &config, ());
         let mut guest = ShadowGuest {
             config,
             thread,
@@ -3540,7 +3540,7 @@ mod tests {
             backend: reverie::BackendCapabilities::KVM,
             ..Config::default()
         };
-        let thread = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ());
+        let thread = ThreadState::<crate::ConfiguredMode>::new(DetPid::from_raw(1), &config, ());
         let guest = ShadowGuest {
             config,
             thread,
@@ -4016,7 +4016,8 @@ mod tests {
                 ..ptrace.clone()
             },
         ] {
-            let thread = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ());
+            let thread =
+                ThreadState::<crate::ConfiguredMode>::new(DetPid::from_raw(1), &config, ());
             let mut guest = ShadowGuest {
                 config,
                 thread,
@@ -4036,7 +4037,7 @@ mod tests {
             backend: reverie::BackendCapabilities::KVM,
             ..Config::default()
         };
-        let thread = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ());
+        let thread = ThreadState::<crate::ConfiguredMode>::new(DetPid::from_raw(1), &config, ());
         let mut guest = ShadowGuest {
             config,
             thread,

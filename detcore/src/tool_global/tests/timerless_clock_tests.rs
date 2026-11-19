@@ -41,7 +41,7 @@ const RIP: u64 = 0x401000;
 
 struct ClockGuest {
     config: Config,
-    thread: ThreadState<crate::SeededMode>,
+    thread: ThreadState<crate::ConfiguredMode>,
     raw: u64,
     reads: usize,
     records: Mutex<Vec<SchedEvent>>,
@@ -120,10 +120,10 @@ impl Guest<Detcore> for ClockGuest {
     fn memory(&self) -> Self::Memory {
         reverie::syscalls::LocalMemory::new()
     }
-    fn thread_state(&self) -> &ThreadState<crate::SeededMode> {
+    fn thread_state(&self) -> &ThreadState<crate::ConfiguredMode> {
         &self.thread
     }
-    fn thread_state_mut(&mut self) -> &mut ThreadState<crate::SeededMode> {
+    fn thread_state_mut(&mut self) -> &mut ThreadState<crate::ConfiguredMode> {
         &mut self.thread
     }
     async fn regs(&mut self) -> libc::user_regs_struct {
@@ -492,7 +492,7 @@ fn interleaved_clock_observations_preserve_deadlines_and_timer_capability() {
             boundary_config.target_timeslice = std::num::NonZeroU64::new(1_000);
             boundary_config.max_timeslice = std::num::NonZeroU64::new(20_000);
             boundary_config.target_timeslice_syscalls_only = true;
-            let mut boundary = ThreadState::<crate::SeededMode>::new(TID, &boundary_config, ());
+            let mut boundary = ThreadState::<crate::ConfiguredMode>::new(TID, &boundary_config, ());
             let initial = boundary.thread_logical_time.as_nanos();
             boundary.next_timeslice(&boundary_config);
             for (delta, total, target_expired, trap_ends) in [

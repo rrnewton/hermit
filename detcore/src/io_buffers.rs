@@ -1304,7 +1304,7 @@ mod event_tests {
 
     struct EventGuest {
         config: Config,
-        thread: ThreadState<crate::SeededMode>,
+        thread: ThreadState<crate::ConfiguredMode>,
         memory: EventMemory,
         injected_iovecs: Vec<(usize, usize)>,
         injected_zero_reads: usize,
@@ -1531,11 +1531,11 @@ mod event_tests {
             self.memory.clone()
         }
 
-        fn thread_state_mut(&mut self) -> &mut ThreadState<crate::SeededMode> {
+        fn thread_state_mut(&mut self) -> &mut ThreadState<crate::ConfiguredMode> {
             &mut self.thread
         }
 
-        fn thread_state(&self) -> &ThreadState<crate::SeededMode> {
+        fn thread_state(&self) -> &ThreadState<crate::ConfiguredMode> {
             &self.thread
         }
 
@@ -1774,7 +1774,7 @@ mod event_tests {
             })
         };
         let pid = DetPid::from_raw(1);
-        let mut thread = ThreadState::<crate::SeededMode>::new(pid, &config, ());
+        let mut thread = ThreadState::<crate::ConfiguredMode>::new(pid, &config, ());
         thread.detpid = Some(pid);
         let fd = DetFd::new(FD, OFlag::O_RDONLY, ty, OpenFileId::new(pid, 99));
         if ty == FdType::Pipe {

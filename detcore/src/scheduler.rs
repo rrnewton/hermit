@@ -31044,7 +31044,7 @@ mod test {
 
         let deliver = |reverse: bool| {
             let mut first =
-                ThreadState::<crate::SeededMode>::new(first_owner, &Config::default(), ());
+                ThreadState::<crate::ConfiguredMode>::new(first_owner, &Config::default(), ());
             let mut second = first.clone();
             second.dettid = second_owner;
             first.record_robust_list_head(Some(0x404100));

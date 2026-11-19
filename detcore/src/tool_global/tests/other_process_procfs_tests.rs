@@ -49,7 +49,7 @@ const PROC: i32 = 40;
 struct ProcfsGuest<'a> {
     config: &'a Config,
     global: &'a GlobalState,
-    thread: crate::ThreadState<crate::SeededMode>,
+    thread: crate::ThreadState<crate::ConfiguredMode>,
     reply: Result<i64, Errno>,
     injected: Vec<(Sysno, SyscallArgs)>,
 }
@@ -110,10 +110,10 @@ impl Guest<Detcore> for ProcfsGuest<'_> {
     fn memory(&self) -> Self::Memory {
         reverie::syscalls::LocalMemory::new()
     }
-    fn thread_state(&self) -> &crate::ThreadState<crate::SeededMode> {
+    fn thread_state(&self) -> &crate::ThreadState<crate::ConfiguredMode> {
         &self.thread
     }
-    fn thread_state_mut(&mut self) -> &mut crate::ThreadState<crate::SeededMode> {
+    fn thread_state_mut(&mut self) -> &mut crate::ThreadState<crate::ConfiguredMode> {
         &mut self.thread
     }
     async fn regs(&mut self) -> libc::user_regs_struct {
@@ -216,7 +216,7 @@ async fn decide_with_descriptor(
     let config = config(kvm);
     let global = state(&config);
     let tool = <Detcore as reverie::Tool>::new(Tid::from_raw(LEADER.as_raw()), &config);
-    let mut thread = crate::ThreadState::<crate::SeededMode>::new(LEADER, &config, ());
+    let mut thread = crate::ThreadState::<crate::ConfiguredMode>::new(LEADER, &config, ());
     thread.detpid = Some(LEADER);
     thread
         .add_fd(

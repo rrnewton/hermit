@@ -218,13 +218,13 @@ fn forwarding_without_a_record_tool_matches_noop_tool() {
     futures::executor::block_on(async {
         for reply in [Ok(42), Ok(0), Err(Errno::EBADF), Err(Errno::EINTR)] {
             for call in calls() {
-                let tool = detcore::<crate::SeededMode<NoopTool>>();
-                let mut direct = InjectGuest::<crate::SeededMode>::new(reply);
+                let tool = detcore::<crate::ConfiguredMode<NoopTool>>();
+                let mut direct = InjectGuest::<crate::ConfiguredMode>::new(reply);
                 let forwarded = tool
                     .record_or_replay_preserving_tool_errors(&mut direct, call)
                     .await;
 
-                let mut through_tool = InjectGuest::<crate::SeededMode>::new(reply);
+                let mut through_tool = InjectGuest::<crate::ConfiguredMode>::new(reply);
                 let expected = NoopTool
                     .handle_syscall_event(&mut through_tool.into_guest(), call)
                     .await;
@@ -296,8 +296,8 @@ fn future_size<F: Future>(_: &F) -> usize {
 /// is moved at least once (into its box, or into its parent's state), so a
 /// smaller future is a shorter copy on every syscall.
 fn hot_path_future_sizes() -> Vec<(&'static str, usize)> {
-    let tool = detcore::<crate::SeededMode<NoopTool>>();
-    let mut guest = InjectGuest::<crate::SeededMode>::new(Ok(0));
+    let tool = detcore::<crate::ConfiguredMode<NoopTool>>();
+    let mut guest = InjectGuest::<crate::ConfiguredMode>::new(Ok(0));
     let call = calls()[0];
     let handler = <Detcore as Tool>::handle_syscall_event(&tool, &mut guest, call);
     let handler_size = std::mem::size_of_val(&*handler);

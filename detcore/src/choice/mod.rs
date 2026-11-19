@@ -72,6 +72,7 @@ pub use policy::ChoiceHandle;
 pub use policy::ControlledChoices;
 pub use policy::DrawContext;
 pub use policy::PreparedChildPriority;
+pub use policy::RunChoices;
 pub use policy::SchedulingChoices;
 pub use policy::SeededChoices;
 pub use session::ChoiceSession;

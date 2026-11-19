@@ -1781,7 +1781,7 @@ mod tests {
                 tv_usec: 8,
             }));
             let tv_addr = tv as *mut Timeval as usize;
-            let mut guest = InjectGuest::<crate::SeededMode>::new(Ok(0));
+            let mut guest = InjectGuest::<crate::ConfiguredMode>::new(Ok(0));
             let virtual_tv = Timeval {
                 tv_sec: 1,
                 tv_usec: 2,
@@ -2064,13 +2064,13 @@ mod sleep_request_tests {
     /// from (`thread_observe_time`), answered with `now()`.
     struct ClockReader {
         config: Config,
-        thread: ThreadState<crate::SeededMode>,
+        thread: ThreadState<crate::ConfiguredMode>,
     }
 
     impl ClockReader {
         fn new() -> Self {
             let config = Config::default();
-            let mut thread = ThreadState::<crate::SeededMode>::new(THREAD, &config, ());
+            let mut thread = ThreadState::<crate::ConfiguredMode>::new(THREAD, &config, ());
             thread.detpid = Some(THREAD);
             Self { config, thread }
         }
@@ -2136,10 +2136,10 @@ mod sleep_request_tests {
         fn memory(&self) -> Self::Memory {
             panic!("building a sleep request must not read guest memory")
         }
-        fn thread_state(&self) -> &ThreadState<crate::SeededMode> {
+        fn thread_state(&self) -> &ThreadState<crate::ConfiguredMode> {
             &self.thread
         }
-        fn thread_state_mut(&mut self) -> &mut ThreadState<crate::SeededMode> {
+        fn thread_state_mut(&mut self) -> &mut ThreadState<crate::ConfiguredMode> {
             &mut self.thread
         }
         async fn regs(&mut self) -> libc::user_regs_struct {

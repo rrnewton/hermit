@@ -208,9 +208,9 @@ mod tests {
     use super::*;
     use crate::config::Config;
 
-    fn thread() -> ThreadState<crate::SeededMode> {
+    fn thread() -> ThreadState<crate::ConfiguredMode> {
         let mut thread =
-            ThreadState::<crate::SeededMode>::new(DetTid::from_raw(3), &Config::default(), ());
+            ThreadState::<crate::ConfiguredMode>::new(DetTid::from_raw(3), &Config::default(), ());
         thread.slice_boundary = Some(Observations::new(&thread, 0));
         thread
     }

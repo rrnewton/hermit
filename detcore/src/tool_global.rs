@@ -15394,7 +15394,7 @@ mod tests {
             let start = case != 0;
             let (config, state, tid, process) = cancellation_test_state();
             install_test_registration(&state, tid, Ivar::new());
-            let mut thread = crate::ThreadState::<crate::SeededMode>::new(tid, &config, ());
+            let mut thread = crate::ThreadState::<crate::ConfiguredMode>::new(tid, &config, ());
             thread.detpid = Some(process);
             if !start {
                 thread.next_timeslice(&config);
@@ -15509,7 +15509,7 @@ mod tests {
         };
         let slice = LogicalTime::from_rcbs(123);
         let (config, state, tid, process) = cancellation_test_state();
-        let mut thread = crate::ThreadState::<crate::SeededMode>::new(tid, &config, ());
+        let mut thread = crate::ThreadState::<crate::ConfiguredMode>::new(tid, &config, ());
         thread.detpid = Some(process);
         thread.replay_instruction_offset = Some(offset);
         let mut guest = ExternalRegistrationGuest {
@@ -15527,7 +15527,7 @@ mod tests {
         // Real schedule startup (past the first execve): the first slice's
         // duration is installed and its offset survives beside it.
         let (config, state, tid, process) = cancellation_test_state();
-        let mut thread = crate::ThreadState::<crate::SeededMode>::new(tid, &config, ());
+        let mut thread = crate::ThreadState::<crate::ConfiguredMode>::new(tid, &config, ());
         thread.detpid = Some(process);
         thread.past_global_first_execve = true;
         thread.replay_instruction_offset = Some(offset);
@@ -15550,7 +15550,7 @@ mod tests {
         // History startup (no schedule first slice): the reset installs
         // the first row's offset itself, and it survives.
         let (config, state, tid, process) = cancellation_test_state();
-        let probe = crate::ThreadState::<crate::SeededMode>::new(tid, &config, ());
+        let probe = crate::ThreadState::<crate::ConfiguredMode>::new(tid, &config, ());
         let at = LogicalTime::from_nanos(probe.thread_logical_time.as_nanos().as_nanos() + 1_000);
         let mut writer = crate::preemptions::PreemptionWriter::new(None);
         writer.register_thread(tid, crate::scheduler::runqueue::DEFAULT_PRIORITY);
@@ -15572,7 +15572,7 @@ mod tests {
             rcb_target: 18,
             instructions: 4,
         });
-        let mut thread = crate::ThreadState::<crate::SeededMode>::new(tid, &config, ());
+        let mut thread = crate::ThreadState::<crate::ConfiguredMode>::new(tid, &config, ());
         thread.detpid = Some(process);
         let mut guest = ExternalRegistrationGuest {
             global: &state,
@@ -15692,7 +15692,7 @@ mod tests {
         let root = DetTid::from_raw(3);
         let ask = |config: &Config| {
             (
-                crate::ThreadState::<crate::SeededMode>::new(root, config, ())
+                crate::ThreadState::<crate::ConfiguredMode>::new(root, config, ())
                     .thread_logical_time
                     .clone(),
                 MmId::initial(root),
@@ -15836,7 +15836,7 @@ mod tests {
             ..Config::default()
         };
         let state = GlobalState::initialize(&config, false);
-        let hold = |tid: DetTid, thread: &crate::ThreadState<crate::SeededMode>| {
+        let hold = |tid: DetTid, thread: &crate::ThreadState<crate::ConfiguredMode>| {
             assert_eq!(
                 state.hold_table(
                     Tid::from_raw(tid.as_raw()),
@@ -15850,7 +15850,7 @@ mod tests {
         // holds, and closes its own descriptor of it.
         let parent_id = DetTid::from_raw(9060);
         let child_id = DetTid::from_raw(9061);
-        let parent = crate::ThreadState::<crate::SeededMode>::new(parent_id, &config, ());
+        let parent = crate::ThreadState::<crate::ConfiguredMode>::new(parent_id, &config, ());
         parent
             .add_fd(3, OFlag::empty(), FdType::Socket, None)
             .unwrap();
@@ -15861,7 +15861,7 @@ mod tests {
         let right = parent.with_detfd(4, |detfd| detfd.clone()).unwrap();
         left.pair_sockets(&right, false);
         drop(right);
-        let child = crate::ThreadState::<crate::SeededMode>::new(child_id, &config, ());
+        let child = crate::ThreadState::<crate::ConfiguredMode>::new(child_id, &config, ());
         let mut copy = parent.file_metadata.lock().unwrap().fork_for(child_id);
         copy.hold_alone(child_id);
         *child.file_metadata.lock().unwrap() = copy;
@@ -15918,7 +15918,7 @@ mod tests {
         // A thread that named no table beside one that named the process's.
         let shared_id = DetTid::from_raw(9062);
         let unnamed_id = DetTid::from_raw(9063);
-        let shared = crate::ThreadState::<crate::SeededMode>::new(shared_id, &config, ());
+        let shared = crate::ThreadState::<crate::ConfiguredMode>::new(shared_id, &config, ());
         shared.file_metadata.lock().unwrap().join_holder(shared_id);
         hold(shared_id, &shared);
         assert_eq!(
@@ -18975,7 +18975,7 @@ mod tests {
             cancellation_test_state()
         };
         install_test_registration(&state, tid, Ivar::new());
-        let mut thread = crate::ThreadState::<crate::SeededMode>::new(tid, &config, ());
+        let mut thread = crate::ThreadState::<crate::ConfiguredMode>::new(tid, &config, ());
         thread.detpid = Some(process);
         thread.next_timeslice(&config);
         if enabled {
@@ -19162,7 +19162,7 @@ mod tests {
                 .with_backend(|backend| backend.needs_killed_thread_rpc_cancellation = true),
             ));
         install_test_registration(&state, tid, Ivar::new());
-        let mut thread = crate::ThreadState::<crate::SeededMode>::new(tid, &config, ());
+        let mut thread = crate::ThreadState::<crate::ConfiguredMode>::new(tid, &config, ());
         thread.detpid = Some(process);
         thread.next_timeslice(&config);
         let initial_slices = thread.stats.timeslice_count;
@@ -19449,7 +19449,7 @@ mod tests {
     fn boundary_resource_union_refuses_either_annotated_operand_before_mutation() {
         let tid = DetTid::from_raw(17);
         let config = Config::default();
-        let mut thread = crate::ThreadState::<crate::SeededMode>::new(tid, &config, ());
+        let mut thread = crate::ThreadState::<crate::ConfiguredMode>::new(tid, &config, ());
         let mut observed = crate::slice_boundary::Observations::new(&thread, 0);
         observed
             .callback(
@@ -19540,7 +19540,7 @@ mod tests {
             cancellation_test_state()
         };
         install_test_registration(&state, tid, Ivar::new());
-        let mut thread = crate::ThreadState::<crate::SeededMode>::new(tid, &config, ());
+        let mut thread = crate::ThreadState::<crate::ConfiguredMode>::new(tid, &config, ());
         thread.detpid = Some(process);
         if route != 1 {
             thread.next_timeslice(&config);
@@ -19687,7 +19687,7 @@ mod tests {
     struct ExternalRegistrationGuest<'a> {
         global: &'a GlobalState,
         config: &'a Config,
-        thread: crate::ThreadState<crate::SeededMode>,
+        thread: crate::ThreadState<crate::ConfiguredMode>,
         requests: Mutex<Vec<GlobalRequest>>,
         post_exec: bool,
         ppid: Option<reverie::Pid>,
@@ -19823,11 +19823,11 @@ mod tests {
             panic!("external registration must not access guest memory")
         }
 
-        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<crate::SeededMode> {
+        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<crate::ConfiguredMode> {
             &mut self.thread
         }
 
-        fn thread_state(&self) -> &crate::ThreadState<crate::SeededMode> {
+        fn thread_state(&self) -> &crate::ThreadState<crate::ConfiguredMode> {
             &self.thread
         }
 
@@ -19882,7 +19882,7 @@ mod tests {
     struct RetirementGuest<'a> {
         global: &'a GlobalState,
         config: &'a Config,
-        thread: crate::ThreadState<crate::SeededMode>,
+        thread: crate::ThreadState<crate::ConfiguredMode>,
         requests: Mutex<Vec<GlobalRequest>>,
         retired: std::sync::atomic::AtomicBool,
         hold_private_memory_publication: bool,
@@ -19947,11 +19947,11 @@ mod tests {
             reverie::syscalls::LocalMemory::new()
         }
 
-        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<crate::SeededMode> {
+        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<crate::ConfiguredMode> {
             &mut self.thread
         }
 
-        fn thread_state(&self) -> &crate::ThreadState<crate::SeededMode> {
+        fn thread_state(&self) -> &crate::ThreadState<crate::ConfiguredMode> {
             &self.thread
         }
 
@@ -20058,7 +20058,7 @@ mod tests {
         let reader = DetTid::from_raw(3);
         let sender = DetTid::from_raw(5);
         let tool: Detcore = Detcore::new(Tid::from_raw(sender.as_raw()), &config);
-        let mut thread = crate::ThreadState::<crate::SeededMode>::new(sender, &config, ());
+        let mut thread = crate::ThreadState::<crate::ConfiguredMode>::new(sender, &config, ());
         thread.detpid = Some(sender);
         thread.passed_descriptors_out_unreported = true;
         {
@@ -20134,7 +20134,7 @@ mod tests {
             let state = GlobalState::initialize(&config, false);
             let reader = DetTid::from_raw(3);
             let sender = DetTid::from_raw(5);
-            let mut thread = crate::ThreadState::<crate::SeededMode>::new(sender, &config, ());
+            let mut thread = crate::ThreadState::<crate::ConfiguredMode>::new(sender, &config, ());
             thread.detpid = Some(sender);
             thread.passed_descriptors_out_unreported = exported;
             {
@@ -21820,7 +21820,7 @@ mod tests {
         let rpc = state.receive_rpc(
             Tid::from_raw(root.as_raw()),
             (
-                crate::ThreadState::<crate::SeededMode>::new(root, &config, ())
+                crate::ThreadState::<crate::ConfiguredMode>::new(root, &config, ())
                     .thread_logical_time
                     .clone(),
                 MmId::initial(root),
@@ -21927,7 +21927,7 @@ mod tests {
         let rpc = state.receive_rpc(
             Tid::from_raw(sender.as_raw()),
             (
-                crate::ThreadState::<crate::SeededMode>::new(sender, &config, ())
+                crate::ThreadState::<crate::ConfiguredMode>::new(sender, &config, ())
                     .thread_logical_time
                     .clone(),
                 MmId::initial(sender),
@@ -22015,7 +22015,7 @@ mod tests {
                     .receive_rpc(
                         Tid::from_raw(victim.as_raw()),
                         (
-                            crate::ThreadState::<crate::SeededMode>::new(victim, &config, ())
+                            crate::ThreadState::<crate::ConfiguredMode>::new(victim, &config, ())
                                 .thread_logical_time
                                 .clone(),
                             MmId::initial(victim),
@@ -22056,9 +22056,13 @@ mod tests {
                         .receive_rpc(
                             Tid::from_raw(victim.as_raw()),
                             (
-                                crate::ThreadState::<crate::SeededMode>::new(victim, &config, ())
-                                    .thread_logical_time
-                                    .clone(),
+                                crate::ThreadState::<crate::ConfiguredMode>::new(
+                                    victim,
+                                    &config,
+                                    (),
+                                )
+                                .thread_logical_time
+                                .clone(),
                                 MmId::initial(victim),
                                 GlobalRequest::DeregisterThread(deregistration.clone()),
                             ),
@@ -23311,7 +23315,7 @@ mod tests {
         assert!(config.max_timeslice.is_some());
         let length = LogicalTime::from_rcbs(83);
         let start = |first_slice: Option<LogicalTime>, past_global_first_execve: bool| {
-            let mut thread = crate::ThreadState::<crate::SeededMode>::new(tid, &config, ());
+            let mut thread = crate::ThreadState::<crate::ConfiguredMode>::new(tid, &config, ());
             thread.detpid = Some(process);
             thread.past_global_first_execve = past_global_first_execve;
             thread.last_grant_deadline = Some(Duration::from_nanos(1));
@@ -23378,7 +23382,7 @@ mod tests {
         );
         let length = LogicalTime::from_nanos(1_000);
         for first_slice in [Some(length), None] {
-            let mut thread = crate::ThreadState::<crate::SeededMode>::new(tid, &config, ());
+            let mut thread = crate::ThreadState::<crate::ConfiguredMode>::new(tid, &config, ());
             thread.detpid = Some(process);
             thread.past_global_first_execve = true;
             thread.last_grant_deadline = Some(Duration::from_nanos(1));
@@ -23462,7 +23466,7 @@ mod tests {
         for (first_slice, past_global_first_execve) in
             [(Some(length), true), (None, true), (Some(length), false)]
         {
-            let mut thread = crate::ThreadState::<crate::SeededMode>::new(tid, &config, ());
+            let mut thread = crate::ThreadState::<crate::ConfiguredMode>::new(tid, &config, ());
             thread.detpid = Some(process);
             thread.past_global_first_execve = past_global_first_execve;
             thread.last_grant_deadline = Some(Duration::from_nanos(1));
@@ -25002,10 +25006,10 @@ mod tests {
         fn memory(&self) -> Self::Memory {
             self.inner.memory()
         }
-        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<crate::SeededMode> {
+        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<crate::ConfiguredMode> {
             &mut self.inner.thread
         }
-        fn thread_state(&self) -> &crate::ThreadState<crate::SeededMode> {
+        fn thread_state(&self) -> &crate::ThreadState<crate::ConfiguredMode> {
             &self.inner.thread
         }
         async fn regs(&mut self) -> libc::user_regs_struct {
@@ -25269,7 +25273,8 @@ mod tests {
         assert!(!super::registers_own_image(root, &vfork));
         assert!(super::registers_own_image(DetTid::from_raw(17), &vfork));
 
-        let mut thread = crate::ThreadState::<crate::SeededMode>::new(root, &Config::default(), ());
+        let mut thread =
+            crate::ThreadState::<crate::ConfiguredMode>::new(root, &Config::default(), ());
         let owner = crate::slice_boundary::lifecycle::Registry::default()
             .fresh(root, thread.mm_id)
             .unwrap();
@@ -29018,7 +29023,7 @@ mod robust_exit_clock_tests {
             let reader = DetTid::from_raw(3);
             let sender = DetTid::from_raw(5);
             let tool: Detcore = Detcore::new(Tid::from_raw(sender.as_raw()), &config);
-            let mut thread = ThreadState::<crate::SeededMode>::new(sender, &config, ());
+            let mut thread = ThreadState::<crate::ConfiguredMode>::new(sender, &config, ());
             thread.detpid = Some(sender);
             thread.passed_descriptors_out_unreported = exported;
             {
@@ -29141,7 +29146,7 @@ mod robust_exit_clock_tests {
     struct Fixture {
         state: GlobalState,
         tool: Detcore,
-        owners: [ThreadState<crate::SeededMode>; 2],
+        owners: [ThreadState<crate::ConfiguredMode>; 2],
         initial_clocks: [DetTime; 2],
         waiters: [DetTid; 2],
         peer: DetTid,
@@ -29170,7 +29175,7 @@ mod robust_exit_clock_tests {
             let waiters = [DetTid::from_raw(21), DetTid::from_raw(23)];
             let peer = DetTid::from_raw(25);
             let mm = MmId::initial(leader);
-            let mut first = ThreadState::<crate::SeededMode>::new(leader, &config, ());
+            let mut first = ThreadState::<crate::ConfiguredMode>::new(leader, &config, ());
             first.detpid = Some(leader);
             let mut second = first.clone();
             second.dettid = worker;
@@ -29303,7 +29308,11 @@ mod robust_exit_clock_tests {
             self.exit_thread(self.owners[index].clone(), status).await;
         }
 
-        async fn exit_thread(&self, thread: ThreadState<crate::SeededMode>, status: ExitStatus) {
+        async fn exit_thread(
+            &self,
+            thread: ThreadState<crate::ConfiguredMode>,
+            status: ExitStatus,
+        ) {
             let rpc = ExitRpc {
                 state: &self.state,
                 sender: thread.dettid,

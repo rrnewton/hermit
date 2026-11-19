@@ -58,7 +58,7 @@ enum Sent {
 /// by it, and a resource request is filed in it.
 struct DyingGuest {
     config: Config,
-    thread: ThreadState<crate::SeededMode>,
+    thread: ThreadState<crate::ConfiguredMode>,
     scheduler: Mutex<Scheduler>,
     sent: Mutex<Vec<Sent>>,
 }
@@ -145,10 +145,10 @@ impl Guest<Detcore> for DyingGuest {
     fn memory(&self) -> LocalMemory {
         LocalMemory::new()
     }
-    fn thread_state(&self) -> &ThreadState<crate::SeededMode> {
+    fn thread_state(&self) -> &ThreadState<crate::ConfiguredMode> {
         &self.thread
     }
-    fn thread_state_mut(&mut self) -> &mut ThreadState<crate::SeededMode> {
+    fn thread_state_mut(&mut self) -> &mut ThreadState<crate::ConfiguredMode> {
         &mut self.thread
     }
     async fn regs(&mut self) -> libc::user_regs_struct {
@@ -189,7 +189,7 @@ fn setup(gate: bool, holds_turn: bool) -> (Detcore, DyingGuest) {
     };
     config.backend = reverie::BackendCapabilities::LITEINST_IN_GUEST;
     let mut thread =
-        ThreadState::<crate::SeededMode>::new(DetPid::from_raw(DECIDER.as_raw()), &config, ());
+        ThreadState::<crate::ConfiguredMode>::new(DetPid::from_raw(DECIDER.as_raw()), &config, ());
     thread.detpid = Some(DetPid::from_raw(DECIDER.as_raw()));
     let mut scheduler = Scheduler::new(&config);
     for dettid in [PEER, DECIDER] {

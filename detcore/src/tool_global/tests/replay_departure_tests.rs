@@ -61,7 +61,7 @@ async fn stale_filing_cleanup(stale: bool) -> (anyhow::Result<()>, Option<u64>, 
         ..Config::default()
     });
     let tid = DetTid::from_raw(3);
-    let mut thread = crate::ThreadState::<crate::SeededMode>::new(tid, &config, ());
+    let mut thread = crate::ThreadState::<crate::ConfiguredMode>::new(tid, &config, ());
     thread.detpid = Some(tid);
     let epoch = thread.thread_logical_time.as_nanos();
     let history = ThreadHistory::new()

@@ -39,8 +39,8 @@ use crate::types::DetPid;
 fn kvm_thread(
     reply: Result<i64, Errno>,
     proc_fd: Option<RawFd>,
-) -> InjectGuest<crate::SeededMode<NoopTool>> {
-    let mut guest = InjectGuest::<crate::SeededMode>::new(reply);
+) -> InjectGuest<crate::ConfiguredMode<NoopTool>> {
+    let mut guest = InjectGuest::<crate::ConfiguredMode>::new(reply);
     guest.config = Config {
         directory_placeholder: Some(std::path::PathBuf::from("/placeholder")),
         ..Config::default()
@@ -89,7 +89,7 @@ fn readlinks_holding(
 ) -> Vec<(Result<i64, Errno>, Vec<Sysno>)> {
     let path = CString::new(path).unwrap();
     let mut buffer = [0u8; 256];
-    let tool = detcore::<crate::SeededMode<NoopTool>>();
+    let tool = detcore::<crate::ConfiguredMode<NoopTool>>();
     let mut answers = Vec::new();
     // x86_64 exercises readlink and readlinkat; aarch64 has readlinkat alone.
     #[cfg(target_arch = "x86_64")]
