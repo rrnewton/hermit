@@ -1604,6 +1604,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/nanosleep_guest_send_due_time.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/nanosleep_guest_send_due_time.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test run_kvm_guest_sent_signal_ends_nanosleep_at_its_due_time compiles this guest, in which a parent sends a caught SIGUSR1 to a child in a 6 ms nanosleep and then computes in the same turn so the waking pass comes after the deadline, and requires EINTR with a positive remaining time natively and on KVM (the remaining time is taken from the send's due time), a completed sleep with the handler run on ptrace, and KVM bitwise parity under hermit run --strict --verify --verify-strict; it remains a guest fixture because a generic manifest cannot assert this exact backend-specific output."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/nested_vfork.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/nested_vfork.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test a_nested_vfork_child_that_exits_completes_at_bitwise_parity compiles this guest, a chain of DEPTH vfork children (each vforks the next, the last execs, the others exit), and requires depths 2 and 3 to finish with their exact output at bitwise parity under hermit run --strict --verify --verify-strict; hermit-cli/tests/record_replay.rs record_nested_vfork_chains also records and replays both depths at bitwise parity (https://github.com/rrnewton/hermit/issues/4163: the outer vfork child was never readmitted, so the run spun until its timeout); it remains a guest fixture because a generic manifest cannot assert this exact output."

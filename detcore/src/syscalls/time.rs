@@ -617,6 +617,13 @@ where
     Err(tv_repair_error("tv", TvRepairFailureKind::NoStoreProbe))
 }
 
+/// Whether a sleep interrupted at `interrupted` had already reached its
+/// deadline: Linux's `do_nanosleep` returns 0 then (kernel/time/hrtimer.c:
+/// `if (rem <= 0) return 0;`), never EINTR with no time left.
+fn sleep_completed_by_deadline(target: LogicalTime, interrupted: LogicalTime) -> bool {
+    interrupted >= target
+}
+
 fn remaining_sleep_duration(target: LogicalTime, now: LogicalTime) -> Duration {
     if target > now {
         target.duration_since(now)
@@ -925,6 +932,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let now = thread_observe_time(guest).await;
         let interrupted = interrupted_at.map_or(now, |due| due.min(now));
+        // Linux's `do_nanosleep` returns 0 when no time remains at the
+        // wake, even with a signal pending (it is then delivered as the
+        // call returns): an interrupted sleep never reports EINTR with
+        // no time left. That covers a wake for a signal with no recorded
+        // due time whose remaining time would otherwise be read from a
+        // clock already past the deadline.
+        if sleep_completed_by_deadline(target_time, interrupted) {
+            return Ok(0);
+        }
         let delta = remaining_sleep_duration(target_time, interrupted);
         // Linux never touches remain for TIMER_ABSTIME, even when
         // a caught signal interrupts the absolute sleep.
@@ -1738,6 +1754,21 @@ mod tests {
         assert_eq!(tx.tick, 10_000);
         assert_eq!(tx.time.tv_sec, 123);
         assert_eq!(tx.time.tv_usec, 456_789);
+    }
+
+    #[test]
+    fn a_sleep_interrupted_at_or_after_its_deadline_is_complete() {
+        let target = LogicalTime::from_nanos(1_000);
+
+        assert!(!sleep_completed_by_deadline(
+            target,
+            LogicalTime::from_nanos(750)
+        ));
+        assert!(sleep_completed_by_deadline(target, target));
+        assert!(sleep_completed_by_deadline(
+            target,
+            LogicalTime::from_nanos(1_250)
+        ));
     }
 
     #[test]

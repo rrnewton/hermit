@@ -8147,7 +8147,7 @@ impl Scheduler {
         }
         self.real_timers.retire_task(*detpid, *dtid);
         self.retire_parked_requests(*dtid);
-        self.parked.observed_timer_dequeues.remove(dtid);
+        self.parked.observed_due_dequeues.remove(dtid);
         self.blocked.sleep_interruptions.remove(dtid);
 
         let _ = self.priorities.remove(dtid);

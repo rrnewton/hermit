@@ -238,8 +238,9 @@ pub enum ObservationFinish {
     /// The observation selected a caught signal: the syscall is interrupted.
     /// `dequeue` is the removal that selection made, as the observation's
     /// `Caught` step names it, so the scheduler can tell whether the signal
-    /// that interrupts the wait is a timer's publication
-    /// (`ParkedRequests::observed_timer_dequeues`).
+    /// that interrupts the wait has a recorded due time (a timer's
+    /// publication or a guest-sent claimed copy;
+    /// `ParkedRequests::observed_due_dequeues`).
     InterruptForCaught {
         selection: PreparedSignalToken,
         dequeue: Option<reverie::DequeueId>,
@@ -375,12 +376,13 @@ pub(super) struct ParkedRequests {
     /// first due time, and adds none.
     pub(super) timer_publications: Vec<TimerPublication>,
     /// For a thread observing a parked wait, the removal of a timer's
-    /// published signal that its observation made, with the timer's due time
+    /// published signal or a guest-sent claimed copy that its observation
+    /// made, with when that copy was due
     /// (`Scheduler::apply_signal_dequeue`). The observation's finish takes it:
     /// a caught interruption of a `nanosleep` by exactly that removal notes the
     /// due time for the sleep's remaining time
     /// (https://github.com/rrnewton/hermit/issues/4931).
-    pub(super) observed_timer_dequeues: BTreeMap<DetTid, ObservedTimerDequeue>,
+    pub(super) observed_due_dequeues: BTreeMap<DetTid, ObservedDueDequeue>,
     /// The parent-death signals (a kernel sigset) Detcore published to each
     /// live process through the control (`publish_parent_death_signal`),
     /// which `select_parked_alarm` asks the backend's recipients for, beside
@@ -402,9 +404,10 @@ pub(super) struct TimerPublication {
     pub due: LogicalTime,
 }
 
-/// The removal of a timer's published signal by an observing thread.
+/// The removal of a timer's published signal or a guest-sent claimed copy
+/// by an observing thread, with when the copy was due.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct ObservedTimerDequeue {
+pub(super) struct ObservedDueDequeue {
     pub wait: ContinuationId,
     pub lease: ParkedObservationLease,
     pub dequeue: reverie::DequeueId,
@@ -764,29 +767,41 @@ impl Scheduler {
             self.real_timers.fail(pid, TimerFailure::Unsupported);
         }
         let ack = self.real_timers.dequeue(pid, dequeue)?;
-        // The removal of a timer's published signal from the process queue.
+        // The removal of a copy with a recorded due time: a timer's
+        // published signal (matched by its exact event), or a guest-sent
+        // copy claimed for this thread (matched by signal and queue).
         // Made by a thread observing a parked wait, it may be the signal that
         // interrupts that wait; the observation's finish decides
-        // (`finish_observation`).
+        // (`finish_observation`). A timer's exact event is judged first:
+        // a guest copy coalesced with a pending timer copy queues nothing
+        // new, so the removal is the timer's.
+        let mut due = None;
         if dequeue.domain == PendingDomain::Process
             && let Some(index) = self.parked.timer_publications.iter().position(|p| {
                 p.pid == pid && p.process == dequeue.process && p.event == dequeue.event
             })
         {
-            let publication = self.parked.timer_publications.remove(index);
-            if let Some(NextTurnOwner::Observation { wait, lease }) =
+            due = Some(self.parked.timer_publications.remove(index).due);
+        }
+        if due.is_none() && self.sigchld_process(tid) == pid {
+            due = self
+                .guest_send_claims
+                .get(&tid)
+                .and_then(|claim| claim.due_for(dequeue.domain, dequeue.event.signal()));
+        }
+        if let Some(due) = due
+            && let Some(NextTurnOwner::Observation { wait, lease }) =
                 self.next_turns.get(&tid).map(|turn| turn.protocol.owner)
-            {
-                self.parked.observed_timer_dequeues.insert(
-                    tid,
-                    ObservedTimerDequeue {
-                        wait,
-                        lease,
-                        dequeue: dequeue.id(),
-                        due: publication.due,
-                    },
-                );
-            }
+        {
+            self.parked.observed_due_dequeues.insert(
+                tid,
+                ObservedDueDequeue {
+                    wait,
+                    lease,
+                    dequeue: dequeue.id(),
+                    due,
+                },
+            );
         }
         Ok(ack)
     }
@@ -1598,10 +1613,15 @@ impl Scheduler {
     /// nor a `sched_yield` (`takes_alarm_priority`).
     ///
     /// Where the SIGALRM choice began no observation of the process, the
-    /// parent-death signals Detcore published to it
-    /// (`published_parent_death_signals`) are asked about next, in signal
-    /// order: the backend reports the threads that could take each one now,
-    /// and the first eligible parked one, in that order, is woken to take it.
+    /// copies a guest sent to it are asked about next, on the receiver each
+    /// send's admission chose (`select_guest_sent_receiver`), and only then
+    /// the parent-death signals Detcore published to it
+    /// (`published_parent_death_signals`), in signal order: the backend
+    /// reports the threads that could take each one now, and the first
+    /// eligible parked one, in that order, is woken to take it. Where the
+    /// guest-sent receiver and a parent-death taker are different threads,
+    /// this fixed order decides which thread is observed first; Linux
+    /// permits either wake order there, and the next pass serves the other.
     pub(super) fn select_parked_alarm(&mut self) -> Result<(), SelectionFailure> {
         let Some(control) = self.parked.control.clone() else {
             return Ok(());
@@ -1654,6 +1674,9 @@ impl Scheduler {
             if self.select_alarm_receiver(&control, pid, process)? {
                 continue;
             }
+            if self.select_guest_sent_receiver(pid)? {
+                continue;
+            }
             let published = self
                 .parked
                 .published_parent_death_signals
@@ -1673,7 +1696,12 @@ impl Scheduler {
                     // A child wait that a ready child or ECHILD completes is
                     // admitted so that ordinary completion can win.
                     self.admit_completed_child_wait(pid, tid, recipient.task)?;
-                    if self.parked_alarm_observable(pid, tid, recipient.task)? {
+                    if self.parked_alarm_observable(
+                        pid,
+                        tid,
+                        recipient.task,
+                        self.committed_time,
+                    )? {
                         self.refuse_contested_guest_send_claim(pid, tid);
                         // Other wait families remain pending for their
                         // existing return boundary; this does not claim that
@@ -1736,7 +1764,7 @@ impl Scheduler {
                 else {
                     return Ok(false);
                 };
-                if self.parked_alarm_observable(pid, tid, recipient.task)? {
+                if self.parked_alarm_observable(pid, tid, recipient.task, self.committed_time)? {
                     self.refuse_contested_guest_send_claim(pid, tid);
                     // Other wait families remain pending for their
                     // existing return boundary; this does not claim that
@@ -1785,6 +1813,64 @@ impl Scheduler {
         Ok(false)
     }
 
+    /// The guest-sent step of `select_parked_alarm` for `pid`: for each
+    /// receiver of the process with a standing claimed copy
+    /// (`guest_send_claims`, in thread-ID order, the order of step 3's
+    /// process-signal takers), begin the observation on the first one
+    /// parked in an observable wait. Returns whether it began an
+    /// observation of the process, which then admits no other one in this
+    /// pass.
+    ///
+    /// This is how a caught copy another guest process sent reaches a
+    /// receiver parked in an emulated `pause`, `nanosleep`, polled read or
+    /// child wait, whose wait Linux ends for the signal when it is sent
+    /// (`signal_wake_up` on the chosen thread; section 6 of the KVM
+    /// cross-process signal design). A chosen receiver that is not parked
+    /// in an observable wait takes the copy at its next boundary instead,
+    /// and this step does nothing for it. The tie at the pass is decided
+    /// from committed state alone, as the other steps decide it: a child
+    /// wait a ready child or ECHILD completes is admitted first, so
+    /// ordinary completion wins, and a `nanosleep` is judged by when the
+    /// send was due, the sender's committed time recorded on the claim,
+    /// not by this pass's later time (`parked_alarm_observable`). An
+    /// observation that could first take a copy claimed for another
+    /// thread of the process is refused until the opportunity rule, as at
+    /// the other steps (`refuse_contested_guest_send_claim`), so this step
+    /// decides no contested order. Every claimed copy carries its due
+    /// time from construction, so every candidate below has one.
+    fn select_guest_sent_receiver(&mut self, pid: DetPid) -> Result<bool, SelectionFailure> {
+        if self.guest_send_claims.is_empty() {
+            return Ok(false);
+        }
+        let candidates: Vec<(DetTid, LogicalTime)> = self
+            .guest_send_claims
+            .iter()
+            .filter(|(thread, claim)| {
+                claim.shared() | claim.private() != 0 && self.sigchld_process(**thread) == pid
+            })
+            .filter_map(|(thread, claim)| claim.earliest_due().map(|due| (*thread, due)))
+            .collect();
+        for (tid, due) in candidates {
+            let Some((_, task)) = self.real_timers.task_identity(pid, tid) else {
+                continue;
+            };
+            // A child wait that a ready child or ECHILD completes is
+            // admitted so that ordinary completion can win.
+            self.admit_completed_child_wait(pid, tid, task)?;
+            if self.parked_alarm_observable(pid, tid, task, due)? {
+                self.refuse_contested_guest_send_claim(pid, tid);
+                self.begin_alarm_observation(pid, tid, task)
+                    .map_err(|failure| SelectionFailure {
+                        pid,
+                        tid: Some(tid),
+                        failure,
+                    })?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Observe the first thread of `pid`, in thread-ID order, that is parked
     /// in a wait the observation protocol can interrupt
     /// (`parked_alarm_observable`: a `pause`, a `nanosleep` whose deadline is
@@ -1822,7 +1908,9 @@ impl Scheduler {
             let Some((_, task)) = self.real_timers.task_identity(pid, tid) else {
                 continue;
             };
-            if !self.parked_alarm_observable(pid, tid, task)? || !self.has_own_signal_to_take(tid) {
+            if !self.parked_alarm_observable(pid, tid, task, self.committed_time)?
+                || !self.has_own_signal_to_take(tid)
+            {
                 continue;
             }
             self.begin_alarm_observation(pid, tid, task)
@@ -2420,14 +2508,24 @@ impl Scheduler {
 
     /// Whether `tid`, a live thread of `pid` whose exact lifetime is `task`,
     /// is parked in a wait the observation protocol can interrupt for a
-    /// pending signal: a `pause`, a `nanosleep` whose deadline is still ahead,
-    /// a polled read, or a child wait that no ready child or ECHILD completes;
-    /// its request filed and not yet answered.
+    /// pending signal: a `pause`, a `nanosleep` whose deadline is still ahead
+    /// of `judged_at`, a polled read, or a child wait that no ready child or
+    /// ECHILD completes; its request filed and not yet answered.
+    ///
+    /// `judged_at` is when the signal that would interrupt the wait was
+    /// due: the pass's committed time for the signals Detcore publishes at
+    /// the pass, and a guest-sent copy's due time, the sender's committed
+    /// time at its send, for the guest-sent step
+    /// (`select_guest_sent_receiver`), as a timed signal is judged by when
+    /// it was due and not by the pass that pops it (`signal_sent_at`). A
+    /// `nanosleep` whose deadline is at or before `judged_at` is left to
+    /// finish, as the wake rule leaves it (deadline <= `signal_sent_at`).
     fn parked_alarm_observable(
         &self,
         pid: DetPid,
         tid: DetTid,
         task: reverie::SignalTaskIdentity,
+        judged_at: LogicalTime,
     ) -> Result<bool, SelectionFailure> {
         let Some(origin) = self.parked_alarm_origin(pid, tid, task) else {
             return Ok(false);
@@ -2469,7 +2567,7 @@ impl Scheduler {
             }
             _ => return Ok(false),
         };
-        Ok(deadline > self.committed_time && !turn.req.is_empty() && !turn.resp.is_full())
+        Ok(deadline > judged_at && !turn.req.is_empty() && !turn.resp.is_full())
     }
 
     fn validate_child_wait_resources(
@@ -2775,7 +2873,7 @@ impl Scheduler {
             .ok_or(ProtocolFailure::Identity)?;
         // Taken whatever the outcome: only a caught interruption by exactly
         // this removal uses it.
-        let observed = self.parked.observed_timer_dequeues.remove(&wait.dettid);
+        let observed = self.parked.observed_due_dequeues.remove(&wait.dettid);
         let result = (|| {
             if !matches!(owned.phase, ContinuationPhase::Observing(expected) if expected == lease)
                 || owned.origin.control.site() != Some(site)
@@ -2815,10 +2913,15 @@ impl Scheduler {
                         return Err(ProtocolFailure::Identity);
                     }
                     // A `nanosleep` interrupted by the caught signal its own
-                    // observation removed, a timer's publication: Linux ends
-                    // the sleep at the timer's due time, so the sleep's
-                    // remaining time is taken from there, however late the
-                    // finish (https://github.com/rrnewton/hermit/issues/4931).
+                    // observation removed, a timer's publication or a
+                    // guest-sent claimed copy: Linux ends the sleep when
+                    // that copy was due (the timer's expiry, or the sender's
+                    // committed time at its send), so the sleep's remaining
+                    // time is taken from there, however late the finish
+                    // (https://github.com/rrnewton/hermit/issues/4931). Without
+                    // it the remaining time would be read at the copyout,
+                    // which can be past the deadline and report no time
+                    // left for an interrupted sleep.
                     if let ControlCapability::ParkedWait {
                         policy: ParkedWaitPolicy::NanosleepNoHandlerRestart { absolute_deadline },
                         ..

@@ -37,6 +37,7 @@ use reverie::SignalProcessId;
 use reverie::SignalRecipient;
 use reverie::SignalTaskIdentity;
 
+use super::guest_send_admission::SendScope;
 use super::parked::*;
 use super::real_timer::TimerFailure;
 use super::signal_state_reader::TemporaryMaskUnknown;
@@ -638,6 +639,39 @@ fn sleep(
     s.blocked.timed_waiters.insert(at(deadline), tid);
     response
 }
+/// `tid` parked in an emulated `pause` at a controlled site, as `sleep`
+/// files a `nanosleep`.
+fn pause_parked(
+    s: &mut Scheduler,
+    tid: DetTid,
+    mm: MmId,
+    site: reverie::CallbackSignalSite,
+) -> Ivar<SchedResponse> {
+    let mut r = Resources::new(tid);
+    r.insert(
+        ResourceID::SleepUntil(LogicalTime::INDEFINITE),
+        Permission::W,
+    );
+    r.fyi(crate::resources::PAUSE_FYI);
+    s.install_resource_origin(
+        tid,
+        ResourceOrigin {
+            rpc: RpcOrigin::DirectRequestResources,
+            mm,
+            control: ControlCapability::ParkedWait {
+                policy: ParkedWaitPolicy::PauseNoHandlerRestart,
+                site,
+            },
+        },
+    )
+    .unwrap();
+    let turn = &s.next_turns[&tid];
+    turn.req.put(Ok(r));
+    let response = turn.resp.clone();
+    s.blocked.timed_waiters.insert(LogicalTime::INDEFINITE, tid);
+    response
+}
+
 fn selected(response: &Ivar<SchedResponse>) -> AlarmControl {
     match response.try_read().expect("observation transport") {
         SchedResponse::ObserveSignal(c) => *c,
@@ -2104,6 +2138,149 @@ fn natural_due_sleep_is_not_rewritten_as_interrupted() {
     assert!(response.try_read().is_none());
     assert!(b.permits.lock().unwrap().is_empty());
     assert!(s.run_queue.contains_tid(tid));
+}
+
+/// A caught copy another guest process sent, claimed for a receiver parked
+/// in `pause`, begins the receiver's observation at the next pass, though
+/// no SIGALRM recipient names it (stage X1 slice D1).
+#[test]
+fn guest_sent_copy_observes_a_receiver_parked_in_pause() {
+    let (mut s, b) = fixture();
+    let (tid, mm, site) = add(&mut s, 100, 100);
+    let response = pause_parked(&mut s, tid, mm, site);
+    s.committed_time = at(10);
+    s.guest_send_committed(tid, SendScope::Process, libc::SIGUSR1);
+    s.select_parked_alarm().unwrap();
+    let c = selected(&response);
+    assert_eq!(c.permit.task, task(100, 100));
+    assert_eq!(b.permits.lock().unwrap().as_slice(), &[c.permit]);
+}
+
+/// A guest-sent copy to a receiver parked in `nanosleep` is judged by when
+/// the send was due, the sender's committed time recorded on the claim, not
+/// by the later pass that serves it: due before the deadline it interrupts
+/// the sleep however late the pass, and due at or after the deadline it
+/// leaves the sleep to finish, its timed waiter still registered (the
+/// design's section 6, "Time", and the wake rule for a signal due at a
+/// parked sleep's deadline).
+#[test]
+fn guest_sent_copy_observes_a_parked_nanosleep_judged_by_its_due_time() {
+    for (due, observed) in [(99, true), (100, false), (101, false)] {
+        let (mut s, b) = fixture();
+        let (tid, mm, site) = add(&mut s, 100, 100);
+        let response = sleep(&mut s, tid, mm, site, 100);
+        s.committed_time = at(due);
+        s.guest_send_committed(tid, SendScope::Process, libc::SIGUSR1);
+        s.committed_time = at(150);
+        s.select_parked_alarm().unwrap();
+        if observed {
+            let c = selected(&response);
+            assert_eq!(c.permit.task, task(100, 100), "due {due}");
+            assert_eq!(
+                b.permits.lock().unwrap().as_slice(),
+                &[c.permit],
+                "due {due}"
+            );
+            // The finish of that observation notes the due time for the
+            // remaining time, as a timer's interruption does: with the
+            // pass already past the deadline, the remaining time is
+            // deadline - due, never the zero a reading of the clock at
+            // the copyout would give.
+            let process = task(100, 100).process;
+            let mut info = [0; reverie::SIGNAL_INFO_SIZE];
+            info[..4].copy_from_slice(&libc::SIGUSR1.to_ne_bytes());
+            info[8..12].copy_from_slice(&libc::SI_USER.to_ne_bytes());
+            let removal = reverie::SignalDequeue {
+                process,
+                sequence: 1,
+                consumer: reverie::SignalConsumer::ReturnToUser,
+                domain: reverie::PendingDomain::Process,
+                event: reverie::SignalEvent::new(
+                    libc::SIGUSR1,
+                    info,
+                    reverie::SignalTarget::Process { pid: process.tgid },
+                )
+                .unwrap(),
+            };
+            s.apply_signal_dequeue(DetPid::from_raw(100), tid, removal)
+                .unwrap();
+            let ack = Ivar::new();
+            s.post_control(
+                tid,
+                mm,
+                ControlIntent::Finish {
+                    wait: c.continuation,
+                    lease: c.lease,
+                    site,
+                    finish: ObservationFinish::InterruptForCaught {
+                        selection: reverie::PreparedSignalToken {
+                            site,
+                            selection_nonce: 1,
+                        },
+                        dequeue: Some(removal.id()),
+                    },
+                    ack: ack.clone(),
+                },
+            )
+            .unwrap();
+            s.drain_control_intents();
+            assert_eq!(
+                ack.try_read(),
+                Some(Ok(FinishAck::Interrupted)),
+                "due {due}"
+            );
+            let noted = s.take_sleep_interruption(tid);
+            assert_eq!(noted, Some(at(due)), "due {due}");
+            assert_eq!(
+                at(100).as_nanos() - noted.unwrap().as_nanos(),
+                100 - due,
+                "due {due}: the remaining time"
+            );
+        } else {
+            assert!(response.try_read().is_none(), "due {due}");
+            assert!(b.permits.lock().unwrap().is_empty(), "due {due}");
+            assert_eq!(
+                s.blocked.timed_waiters.thread_deadline(tid),
+                Some(at(100)),
+                "due {due}"
+            );
+        }
+    }
+}
+
+/// A guest-sent copy to a receiver parked in a child wait that a ready
+/// child completes does not begin an observation: the completed wait is
+/// admitted first, so ordinary completion wins, and the claim stands for
+/// the receiver's next boundary. With no child ready, the observation
+/// begins.
+#[test]
+fn guest_sent_copy_to_a_child_wait_yields_to_a_ready_child() {
+    for ready in [true, false] {
+        let (mut s, b) = fixture();
+        let (tid, mm, site) = add(&mut s, 100, 100);
+        let (child, _, _) = add_process_child(&mut s, 100, 200);
+        let response = child_wait(&mut s, tid, mm, site, child_spec(), true);
+        if ready {
+            s.logically_exited_processes.insert(child);
+        }
+        s.committed_time = at(10);
+        s.guest_send_committed(tid, SendScope::Process, libc::SIGUSR1);
+        s.select_parked_alarm().unwrap();
+        if ready {
+            assert!(response.try_read().is_none(), "ready child");
+            assert!(b.permits.lock().unwrap().is_empty(), "ready child");
+            assert!(s.run_queue.contains_tid(tid), "ready child");
+            assert!(!s.blocked.child_waiters.contains_key(&tid), "ready child");
+            assert!(
+                s.guest_send_claims.contains_key(&tid),
+                "the claim stands for the boundary after the wait"
+            );
+        } else {
+            let c = selected(&response);
+            assert_eq!(c.permit.task, task(100, 100), "no ready child");
+            assert_eq!(b.permits.lock().unwrap().as_slice(), &[c.permit]);
+        }
+    }
 }
 
 #[test]
@@ -8860,7 +9037,7 @@ fn a_caught_timer_interruption_of_an_observed_nanosleep_notes_the_timers_due_tim
         .unwrap();
         s.drain_control_intents();
         assert!(matches!(ack.try_read(), Some(Ok(_))), "{case}");
-        assert!(s.parked.observed_timer_dequeues.is_empty(), "{case}");
+        assert!(s.parked.observed_due_dequeues.is_empty(), "{case}");
         if case.starts_with("caught") && case != "caught another removal" {
             let due = s.take_sleep_interruption(tid);
             assert_eq!(due, Some(at(10)), "{case}");
@@ -8870,6 +9047,109 @@ fn a_caught_timer_interruption_of_an_observed_nanosleep_notes_the_timers_due_tim
                 "the remaining time"
             );
             assert_eq!(s.take_sleep_interruption(tid), None, "taken once");
+        } else {
+            assert_eq!(s.take_sleep_interruption(tid), None, "{case}");
+        }
+    }
+}
+
+/// The guest-sent counterpart of
+/// `a_caught_timer_interruption_of_an_observed_nanosleep_notes_the_timers_due_time`:
+/// a caught copy another guest process sent that an observed `nanosleep`'s
+/// own observation removes interrupts the sleep at the send's due time
+/// (the sender's committed time recorded on the claim), however late the
+/// finish, in either queue. Deadline N = 100, due D = 10, committed time
+/// past N at the finish: the remaining time is N - D = 90, never the
+/// `EINTR` with no time left Linux cannot return. A removal of another
+/// signal notes nothing.
+#[test]
+fn a_caught_guest_sent_interruption_of_an_observed_nanosleep_notes_the_sends_due_time() {
+    for (case, scope, domain, removed) in [
+        (
+            "process-directed",
+            SendScope::Process,
+            reverie::PendingDomain::Process,
+            libc::SIGUSR1,
+        ),
+        (
+            "thread-directed",
+            SendScope::Thread,
+            reverie::PendingDomain::Thread,
+            libc::SIGUSR1,
+        ),
+        (
+            "another signal",
+            SendScope::Process,
+            reverie::PendingDomain::Process,
+            libc::SIGUSR2,
+        ),
+    ] {
+        let (mut s, _b) = fixture();
+        let (tid, mm, site) = add(&mut s, 100, 100);
+        let response = sleep(&mut s, tid, mm, site, 100);
+        s.committed_time = at(10);
+        s.guest_send_committed(tid, scope, libc::SIGUSR1);
+        s.select_parked_alarm().unwrap();
+        let observed = selected(&response);
+        s.committed_time = at(150);
+        let process = task(100, 100).process;
+        let mut info = [0; reverie::SIGNAL_INFO_SIZE];
+        info[..4].copy_from_slice(&removed.to_ne_bytes());
+        info[8..12].copy_from_slice(
+            &(if domain == reverie::PendingDomain::Thread {
+                libc::SI_TKILL
+            } else {
+                libc::SI_USER
+            })
+            .to_ne_bytes(),
+        );
+        let target = match domain {
+            reverie::PendingDomain::Process => reverie::SignalTarget::Process { pid: process.tgid },
+            reverie::PendingDomain::Thread => reverie::SignalTarget::Thread {
+                pid: process.tgid,
+                tid: reverie::Tid::from_raw(100),
+            },
+        };
+        let removal = reverie::SignalDequeue {
+            process,
+            sequence: 1,
+            consumer: reverie::SignalConsumer::ReturnToUser,
+            domain,
+            event: reverie::SignalEvent::new(removed, info, target).unwrap(),
+        };
+        s.apply_signal_dequeue(DetPid::from_raw(100), tid, removal)
+            .unwrap();
+        let ack = Ivar::new();
+        s.post_control(
+            tid,
+            mm,
+            ControlIntent::Finish {
+                wait: observed.continuation,
+                lease: observed.lease,
+                site,
+                finish: ObservationFinish::InterruptForCaught {
+                    selection: reverie::PreparedSignalToken {
+                        site,
+                        selection_nonce: 1,
+                    },
+                    dequeue: Some(removal.id()),
+                },
+                ack: ack.clone(),
+            },
+        )
+        .unwrap();
+        s.drain_control_intents();
+        assert_eq!(ack.try_read(), Some(Ok(FinishAck::Interrupted)), "{case}");
+        assert!(s.parked.observed_due_dequeues.is_empty(), "{case}");
+        if removed == libc::SIGUSR1 {
+            let due = s.take_sleep_interruption(tid);
+            assert_eq!(due, Some(at(10)), "{case}");
+            assert_eq!(
+                at(100).as_nanos() - due.unwrap().as_nanos(),
+                90,
+                "{case}: the remaining time"
+            );
+            assert_eq!(s.take_sleep_interruption(tid), None, "{case}: taken once");
         } else {
             assert_eq!(s.take_sleep_interruption(tid), None, "{case}");
         }

@@ -57,6 +57,14 @@
  *   stop           SIGTSTP, default action, to a runnable child: it stops;
  *                  SIGCONT resumes it.
  *   pause          A caught SIGUSR1 to a child in pause(2): EINTR.
+ *   sleep          A caught SIGUSR1 to a child in a long nanosleep(2):
+ *                  EINTR with a positive remaining time.
+ *   waitchild      A caught SIGUSR1 to a child waiting in waitpid(2) for
+ *                  its own child, which is not ready: EINTR, and a second
+ *                  wait reaps it.
+ *   waitchild-ready The same where its own child is already a zombie: the
+ *                  wait reaps it at once, and the signal then ends the
+ *                  pause(2) the child reports from.
  *   futex          A caught SIGUSR1 to a child whose only thread waits on a
  *                  futex: EINTR.
  *   read           A caught SIGUSR1 to a child in read(2) of an empty pipe:
@@ -514,6 +522,77 @@ static void child_main(const char *mode) {
     printf("child: alarm %d\n", (int)alarm_count);
     report_usr1();
     _exit(0);
+  }
+  if (strcmp(mode, "sleep") == 0) {
+    install_usr1();
+    alarm(5);
+    child_ready();
+    const struct timespec length = {10, 0};
+    struct timespec rem = {0, 0};
+    int result = nanosleep(&length, &rem);
+    int error = errno;
+    child_wait_for_go();
+    report_call("nanosleep", result, error);
+    printf(
+        "child: time left %s\n",
+        rem.tv_sec > 0 || rem.tv_nsec > 0 ? "yes" : "no");
+    report_usr1();
+    _exit(alarm_count ? CHILD_TIMED_OUT : 0);
+  }
+  if (strcmp(mode, "waitchild") == 0 || strcmp(mode, "waitchild-ready") == 0) {
+    install_usr1();
+    alarm(5);
+    pid_t grandchild = fork();
+    if (grandchild == 0) {
+      if (strcmp(mode, "waitchild") == 0) {
+        const struct timespec length = {0, 100 * 1000 * 1000};
+        nanosleep(&length, NULL);
+      }
+      _exit(7);
+    }
+    if (grandchild < 0) {
+      _exit(CHILD_SETUP_FAILED);
+    }
+    child_ready();
+    if (strcmp(mode, "waitchild-ready") == 0) {
+      /* Let the grandchild become a zombie before the wait. */
+      const struct timespec settle = {0, 10 * 1000 * 1000};
+      nanosleep(&settle, NULL);
+    }
+    int status = 0;
+    pid_t first = waitpid(grandchild, &status, 0);
+    int first_error = errno;
+    int second_reaped = 0;
+    if (strcmp(mode, "waitchild") == 0) {
+      child_wait_for_go();
+      if (first == -1 && first_error == EINTR) {
+        int second_status = 0;
+        pid_t second = waitpid(grandchild, &second_status, 0);
+        second_reaped =
+            second == grandchild && WIFEXITED(second_status) &&
+            WEXITSTATUS(second_status) == 7;
+      }
+      printf(
+          "child: first wait %s, second wait reaped %s\n",
+          first == -1 && first_error == EINTR   ? "EINTR"
+              : first == grandchild             ? "reaped"
+                                                : "other",
+          second_reaped ? "yes" : "no");
+    } else {
+      int reaped =
+          first == grandchild && WIFEXITED(status) && WEXITSTATUS(status) == 7;
+      /* The wait already returned; park so the pending signal's delivery
+       * is the pause's EINTR (or the pause returns at once for it). */
+      int result = pause();
+      int pause_error = errno;
+      child_wait_for_go();
+      printf(
+          "child: first wait reaped %s, pause %s\n",
+          reaped ? "yes" : "no",
+          result == -1 && pause_error == EINTR ? "EINTR" : "other");
+    }
+    report_usr1();
+    _exit(alarm_count ? CHILD_TIMED_OUT : 0);
   }
   if (strcmp(mode, "read") == 0 || strcmp(mode, "recv") == 0) {
     install_usr1();
