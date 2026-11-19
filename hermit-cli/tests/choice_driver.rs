@@ -15,17 +15,27 @@
 //! strings, so two runs that differ only in Hermit flags would differ in the
 //! guest's stack layout. Under the minimal environment they do not, and runs
 //! with and without the choice flags can be compared directly.
+//!
+//! The last cases test `tools/libvoidstar`, the guest library whose
+//! `fuzz_get_random` reads one word per call from a path Hermit is to answer
+//! with `guest.random` choices. They are native: they compile the library and
+//! a probe with `cc` and run no Hermit, so they check the library's own
+//! behaviour, its refusal without Hermit included.
 
 #[path = "common/hermit_binary.rs"]
 mod hermit_test;
+#[path = "common/test_skip.rs"]
+mod test_skip;
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::BufRead;
 use std::io::BufReader;
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixListener;
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -936,5 +946,356 @@ fn each_new_thread_or_process_is_one_priority_choice() {
     assert_ne!(
         outcomes[0], outcomes[1],
         "the first vfork child's priority changed nothing: the answer is not applied"
+    );
+}
+
+/// The names the public Antithesis stub exports (antithesis_stub
+/// `libvoidstar.c` at commit 00659dd02d9d), which `tools/libvoidstar` must
+/// export exactly.
+const VOIDSTAR_EXPORTS: [&str; 14] = [
+    "__sanitizer_cov_pcs_init",
+    "__sanitizer_cov_trace_pc_guard",
+    "__sanitizer_cov_trace_pc_guard_init",
+    "__sanitizer_cov_trace_pc_guard_internal",
+    "coverage_lease_generation_addr",
+    "fuzz_flush",
+    "fuzz_get_random",
+    "fuzz_json_data",
+    "fuzz_json_data_unfilterable",
+    "init_coverage_module",
+    "instrumentation_max_abi_version",
+    "instrumentation_request_abi_version",
+    "notify_coverage",
+    "notify_coverage_v2",
+];
+
+/// The path `fuzz_get_random` reads. It exists on no filesystem; Hermit is to
+/// intercept it.
+const GUEST_RANDOM_PATH: &str = "/dev/hermit/guest-random";
+
+/// The variable naming the directory that receives SDK records.
+const OUTPUT_DIR_VARIABLE: &str = "ANTITHESIS_OUTPUT_DIR";
+
+static VOIDSTAR: OnceLock<PathBuf> = OnceLock::new();
+
+/// `tools/libvoidstar/libvoidstar.c`, compiled once with the command its
+/// README documents, `cc -O2 -shared -fPIC`, plus warnings as errors.
+fn voidstar_library() -> &'static Path {
+    VOIDSTAR.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let output = scratch("voidstar-library").join("libvoidstar.so");
+        let mut command = Command::new("cc");
+        command
+            .args(["-O2", "-shared", "-fPIC", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tools/libvoidstar/libvoidstar.c"))
+            .arg("-o")
+            .arg(&output);
+        let status = command
+            .status()
+            .unwrap_or_else(|error| panic!("failed to run cc: {error}"));
+        assert!(
+            status.success(),
+            "libvoidstar compilation failed: {command:?}"
+        );
+        output
+    })
+}
+
+/// A program that loads the library named by its first argument with
+/// `dlopen`, as the SDKs do, finds each export it calls by name, and
+/// exercises the group its second argument names: `abi`, `coverage`,
+/// `random` or `json`. It prints what the library returned.
+const VOIDSTAR_PROBE: &str = r##"
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <inttypes.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/prctl.h>
+#include <unistd.h>
+
+static void *library;
+
+static void *symbol(const char *name) {
+    void *address = dlsym(library, name);
+    if (address == NULL) {
+        fprintf(stderr, "probe: no %s: %s\n", name, dlerror());
+        _exit(2);
+    }
+    return address;
+}
+
+#define FN(type, name) ((type)symbol(#name))
+
+static int abi(void) {
+    uint64_t (*max)(void) = FN(uint64_t (*)(void), instrumentation_max_abi_version);
+    uint64_t (*request)(uint64_t) =
+        FN(uint64_t (*)(uint64_t), instrumentation_request_abi_version);
+    printf("max %" PRIu64 "\n", max());
+    const uint64_t asks[] = {0, 1, 3, UINT64_MAX, 0, 3};
+    for (size_t i = 0; i < sizeof asks / sizeof asks[0]; i++) {
+        printf("request %" PRIu64 " granted %" PRIu64 "\n", asks[i], request(asks[i]));
+    }
+    printf("max %" PRIu64 "\n", max());
+    return 0;
+}
+
+static int coverage(void) {
+    uint32_t guards[4] = {0};
+    const uintptr_t pcs[2] = {1, 2};
+    FN(void (*)(uint32_t *, uint32_t *), __sanitizer_cov_trace_pc_guard_init)(guards, guards + 4);
+    FN(void (*)(uint32_t *), __sanitizer_cov_trace_pc_guard)(&guards[0]);
+    FN(void (*)(uint32_t *, uint64_t), __sanitizer_cov_trace_pc_guard_internal)(&guards[1], 7);
+    FN(void (*)(const uintptr_t *, const uintptr_t *), __sanitizer_cov_pcs_init)(pcs, pcs + 2);
+    printf("guards %u %u %u %u\n", guards[0], guards[1], guards[2], guards[3]);
+    printf("init_coverage_module %zu\n",
+           FN(size_t (*)(size_t, const char *), init_coverage_module)(4, "probe"));
+    printf("notify_coverage %d\n", (int)FN(bool (*)(size_t), notify_coverage)(5));
+    printf("notify_coverage_v2 %" PRIu64 "\n",
+           FN(uint64_t (*)(size_t, uint64_t), notify_coverage_v2)(5, 3));
+    const uint64_t *(*lease)(void) =
+        FN(const uint64_t *(*)(void), coverage_lease_generation_addr);
+    const uint64_t *first = lease();
+    printf("lease %s %" PRIu64 "\n", first != NULL && lease() == first ? "stable" : "moved",
+           first != NULL ? *first : UINT64_MAX);
+    return 0;
+}
+
+static int random_word(void) {
+    /* An abort here is the expected outcome: leave no core file. */
+    prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+    uint64_t word = FN(uint64_t (*)(void), fuzz_get_random)();
+    printf("word %" PRIu64 "\n", word);
+    return 0;
+}
+
+static int json(void) {
+    void (*data)(const char *, size_t) = FN(void (*)(const char *, size_t), fuzz_json_data);
+    void (*unfilterable)(const char *, size_t) =
+        FN(void (*)(const char *, size_t), fuzz_json_data_unfilterable);
+    data("{\"a\":1}", 7);
+    unfilterable("{\"b\":2}\n", 8);
+    data("{\"c\":3}, bytes past the length", 7);
+    FN(void (*)(void), fuzz_flush)();
+    puts("returned");
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc != 3) {
+        fprintf(stderr, "usage: probe LIBRARY abi|coverage|random|json\n");
+        return 2;
+    }
+    library = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+    if (library == NULL) {
+        fprintf(stderr, "probe: %s\n", dlerror());
+        return 2;
+    }
+    if (strcmp(argv[2], "abi") == 0) return abi();
+    if (strcmp(argv[2], "coverage") == 0) return coverage();
+    if (strcmp(argv[2], "random") == 0) return random_word();
+    if (strcmp(argv[2], "json") == 0) return json();
+    fprintf(stderr, "probe: unknown mode %s\n", argv[2]);
+    return 2;
+}
+"##;
+
+static VOIDSTAR_PROBE_PROGRAM: OnceLock<PathBuf> = OnceLock::new();
+
+/// [`VOIDSTAR_PROBE`], compiled once.
+fn voidstar_probe() -> &'static Path {
+    VOIDSTAR_PROBE_PROGRAM.get_or_init(|| {
+        let dir = scratch("voidstar-probe");
+        let source = dir.join("probe.c");
+        fs::write(&source, VOIDSTAR_PROBE).unwrap();
+        let output = dir.join("probe");
+        let mut command = Command::new("cc");
+        command
+            .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&output)
+            .arg("-ldl");
+        let status = command
+            .status()
+            .unwrap_or_else(|error| panic!("failed to run cc: {error}"));
+        assert!(status.success(), "probe compilation failed: {command:?}");
+        output
+    })
+}
+
+/// Run the probe on the library natively, in `dir`, exercising `mode`, with
+/// `ANTITHESIS_OUTPUT_DIR` set to `output_dir` or unset.
+fn probe(dir: &Path, mode: &str, output_dir: Option<&Path>) -> Output {
+    let mut command = Command::new(voidstar_probe());
+    command.current_dir(dir).arg(voidstar_library()).arg(mode);
+    match output_dir {
+        Some(output_dir) => command.env(OUTPUT_DIR_VARIABLE, output_dir),
+        None => command.env_remove(OUTPUT_DIR_VARIABLE),
+    };
+    command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run the probe: {error}"))
+}
+
+/// [`probe`], requiring success; its stdout and stderr.
+fn probed(dir: &Path, mode: &str, output_dir: Option<&Path>) -> (String, String) {
+    let output = probe(dir, mode, output_dir);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "probe {mode} failed: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status
+    );
+    (stdout, stderr)
+}
+
+/// The library's dynamic symbol table defines exactly the stub's 14 names,
+/// and `nm -D --defined-only`, where the host has `nm`, lists the same.
+#[test]
+fn the_voidstar_library_exports_exactly_the_stubs_fourteen_names() {
+    use goblin::elf::section_header::SHN_UNDEF;
+    use goblin::elf::sym::STB_LOCAL;
+
+    let library = voidstar_library();
+    let expected: BTreeSet<&str> = VOIDSTAR_EXPORTS.into_iter().collect();
+    let bytes = fs::read(library).unwrap();
+    let elf = goblin::elf::Elf::parse(&bytes).expect("libvoidstar.so is not ELF");
+    let defined: BTreeSet<&str> = elf
+        .dynsyms
+        .iter()
+        .filter(|symbol| symbol.st_bind() != STB_LOCAL && symbol.st_shndx != SHN_UNDEF as usize)
+        .map(|symbol| elf.dynstrtab.get_at(symbol.st_name).expect("a symbol name"))
+        .collect();
+    assert_eq!(defined, expected, "the dynamic symbol table's exports");
+
+    match Command::new("nm")
+        .args(["-D", "--defined-only"])
+        .arg(library)
+        .output()
+    {
+        Ok(output) => {
+            let text = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "nm failed: {}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let listed: BTreeSet<&str> = text
+                .lines()
+                .filter_map(|line| line.split_whitespace().nth(2))
+                .collect();
+            assert_eq!(listed, expected, "nm -D --defined-only lists:\n{text}");
+        }
+        Err(error) => eprintln!("no nm ({error}): only the dynamic symbol table was read"),
+    }
+}
+
+/// The library offers ABI version 1 only: the maximum is 1, every request
+/// (0, 1, 3, u64::MAX, then 0 and 3 again) is granted 1, and the maximum stays
+/// 1 after them.
+#[test]
+fn the_voidstar_library_offers_and_grants_abi_version_1_only() {
+    let dir = scratch("voidstar-abi");
+    let (stdout, stderr) = probed(&dir, "abi", None);
+    let mut expected = String::from("max 1\n");
+    for request in [0, 1, 3, u64::MAX, 0, 3] {
+        expected.push_str(&format!("request {request} granted 1\n"));
+    }
+    expected.push_str("max 1\n");
+    assert_eq!(stdout, expected);
+    assert_eq!(stderr, "", "the ABI functions said something");
+}
+
+/// The coverage entry points record nothing and return the stub's inert
+/// values: the guards stay zero, `init_coverage_module` returns 2^32,
+/// `notify_coverage` false, `notify_coverage_v2` two 20-bit fields of ones,
+/// and `coverage_lease_generation_addr` the same address on every call,
+/// holding 0.
+#[test]
+fn the_voidstar_coverage_entry_points_return_the_stubs_inert_values() {
+    let dir = scratch("voidstar-coverage");
+    let (stdout, stderr) = probed(&dir, "coverage", None);
+    let expected = format!(
+        "guards 0 0 0 0\n\
+         init_coverage_module {}\n\
+         notify_coverage 0\n\
+         notify_coverage_v2 {}\n\
+         lease stable 0\n",
+        1u64 << 32,
+        (0xFFFFFu64 << 20) | 0xFFFFF,
+    );
+    assert_eq!(stdout, expected);
+    assert_eq!(stderr, "", "the coverage functions said something");
+}
+
+/// Without Hermit's interception the path does not exist, so
+/// `fuzz_get_random` returns no word: the process ends by SIGABRT, and its
+/// stderr is one line naming the path. No other randomness stands in.
+#[test]
+fn without_hermit_fuzz_get_random_aborts_and_names_its_path() {
+    let test = "without_hermit_fuzz_get_random_aborts_and_names_its_path";
+    if fs::symlink_metadata(GUEST_RANDOM_PATH).is_ok() {
+        test_skip::record_test_skip(
+            test,
+            &format!("{GUEST_RANDOM_PATH} exists on this host, so the library's open can succeed"),
+        );
+        return;
+    }
+    let dir = scratch("voidstar-random");
+    let output = probe(&dir, "random", None);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.signal(),
+        Some(libc::SIGABRT),
+        "fuzz_get_random did not abort: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status
+    );
+    assert_eq!(stdout, "", "a word was returned");
+    let prefix = format!("hermit libvoidstar: {GUEST_RANDOM_PATH}: ");
+    assert!(
+        stderr.starts_with(&prefix) && stderr.ends_with('\n') && stderr.lines().count() == 1,
+        "stderr is not one line naming {GUEST_RANDOM_PATH}: {stderr:?}"
+    );
+}
+
+/// With `ANTITHESIS_OUTPUT_DIR` set, each `fuzz_json_data` or
+/// `fuzz_json_data_unfilterable` record is appended to `sdk.jsonl` there as
+/// one line: its bytes up to the given length, unchanged, plus a newline only
+/// if it has none, after what the file already held. Without the variable
+/// the records are dropped, and stderr says so exactly once.
+#[test]
+fn fuzz_json_data_appends_one_line_per_record_or_says_once_that_it_drops_them() {
+    let dir = scratch("voidstar-json");
+    let output_dir = dir.join("output");
+    fs::create_dir(&output_dir).unwrap();
+    let sdk = output_dir.join("sdk.jsonl");
+    fs::write(&sdk, "{\"before\":0}\n").unwrap();
+    let (stdout, stderr) = probed(&dir, "json", Some(&output_dir));
+    assert_eq!(stdout, "returned\n");
+    assert_eq!(stderr, "", "a record was not appended");
+    assert_eq!(
+        fs::read_to_string(&sdk).unwrap(),
+        "{\"before\":0}\n{\"a\":1}\n{\"b\":2}\n{\"c\":3}\n"
+    );
+
+    let dropping = scratch("voidstar-json-unset");
+    let (stdout, stderr) = probed(&dropping, "json", None);
+    assert_eq!(stdout, "returned\n");
+    assert_eq!(
+        stderr, "hermit libvoidstar: ANTITHESIS_OUTPUT_DIR unset; SDK records are dropped\n",
+        "three dropped records, said once"
+    );
+    assert!(
+        fs::read_dir(&dropping).unwrap().next().is_none(),
+        "a dropped record left a file in the working directory"
     );
 }
