@@ -4418,6 +4418,14 @@ impl<H: RecordHost> ReplayerWithHost<H> {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
+    /// Replayed side effects stay injected under the rr-like default
+    /// (6805) on purpose: the callers (dup family, socket/pidfd
+    /// creation, fcntl FD_CLOEXEC, close/close_range, pidfd_getfd,
+    /// fd-flag ioctls) change only the guest's own descriptor table
+    /// — placeholder numbering and open-file-description identity
+    /// later log-served handlers rely on — and touch no host file.
+    /// Skipping them would corrupt descriptor numbering, not save
+    /// a host effect.
     async fn handle_replayed_side_effect<G: Guest<Self>>(
         &self,
         guest: &mut G,
