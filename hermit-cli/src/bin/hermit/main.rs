@@ -20,15 +20,23 @@
 #[unsafe(link_section = ".preinit_array")]
 static CAPTURE_STARTUP_STDIN: unsafe extern "C" fn() = hermit::app::capture_startup_stdin;
 
-// Records the signals Hermit's launcher left ignored before any thread exists,
-// the table every guest starts from (reverie's `start_signals`). Executable
-// images only, like the capture above.
+// Records the signals Hermit's launcher left ignored before any thread exists:
+// every guest starts with those ignored and every other signal at its default,
+// as that launcher would have started it (the guest command's launch input,
+// reverie's `start_signals`). Executable images only, like the capture above.
 #[used]
 #[unsafe(link_section = ".preinit_array")]
 static RECORD_LAUNCH_DISPOSITIONS: extern "C" fn() =
     reverie::process::start_signals::record_launch_dispositions;
 
 fn main() {
+    // Hermit waits for the processes it starts, which the kernel reaps itself
+    // while SIGCHLD is ignored, so a launcher that left SIGCHLD ignored made
+    // every run fail at its first wait. Hermit's own process takes the
+    // default; the guest still starts with SIGCHLD ignored (the record above).
+    // SAFETY: the default action installs no handler, and no other thread
+    // exists yet.
+    unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
     if let Some(status) = hermit::app::executable_entry() {
         std::process::exit(status);
     }

@@ -130,7 +130,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/background_terminal_io.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/background_terminal_io.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test a_guest_starts_with_terminal_job_control_signals_ignored_and_does_not_wedge compiles this guest, which opens a pseudoterminal, makes it a session's controlling terminal with TOSTOP, and has background children read and write it. The test requires the output of a native run started with SIGTTIN and SIGTTOU ignored from a ptrace --verify run started with both at their defaults, and fails if the run wedges. It remains a guest fixture because a generic manifest cannot set the launcher's dispositions or assert this exact output."
+      "why": "tests/c/background_terminal_io.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration tests background_terminal_io_with_the_signals_ignored_answers_as_linux and a_terminal_job_control_stop_is_refused_by_name compile this guest, which opens a pseudoterminal, makes it a session's controlling terminal with TOSTOP, and has background children read and write it. The first requires a ptrace --verify run started with SIGTTIN and SIGTTOU ignored to print a native run's lines under the same launcher, at bitwise parity; the second confirms the native lines with both at their defaults (Linux stops each child) and requires the ptrace run to be refused by name at the background read. It remains a guest fixture because a generic manifest cannot set the launcher's dispositions or assert this exact output."
     },
     {
       "disposition": "guest-fixture",
@@ -622,7 +622,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/exit_reaping_probe.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/exit_reaping_probe.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test compiles this auto-reap and SIGCHLD probe and runs its three modes under strict verification on ptrace and on in-guest LiteInst, asserting the same exact output from both; it remains a guest fixture because a generic manifest cannot express one program run in three modes with per-mode expected lines on two backends in one test."
+      "why": "tests/c/exit_reaping_probe.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration tests compile this auto-reap and SIGCHLD probe: one runs its sigign, nocldwait and rawexit modes under strict verification on ptrace and on in-guest LiteInst, asserting the same exact output from both, and a_guest_launched_with_sigchld_ignored_reaps_its_children_as_linux runs its launched mode, which changes no disposition, and its adopted mode, in which a subreaper inherits a grandchild's zombie, from a launcher that left SIGCHLD ignored, natively and at bitwise parity on ptrace and KVM; it remains a guest fixture because a generic manifest cannot express one program run in several modes with per-mode expected lines and launch dispositions on several backends."
     },
     {
       "disposition": "guest-fixture",
@@ -1139,6 +1139,12 @@
       "path": "tests/c/host_timed_producer_probe.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/host_timed_producer_probe.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test compiles this probe of signal producers whose signal Linux sends at a moment host timing decides (A5 step 3c slice 0b, https://github.com/rrnewton/hermit/issues/4485), runs it natively for Linux's answers, requires both in-guest LiteInst backends to refuse with EPERM and a named WARN exactly the F_SETOWN-family operations that complete a producer and the parent-death signals Detcore cannot hold while verifying bitwise, to end a run whose held parent-death signal would fire with the named refusal pdeathsig-would-fire, to warn on refused RLIMIT_CPU changes, and to clear or refuse inherited producer state at launch, and requires ptrace to print Linux's output unchanged; it remains a guest fixture because a generic manifest cannot express those per-backend verdicts or the launcher state the launch cases set up."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/ignored_signals_probe.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/ignored_signals_probe.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test a_replay_starts_the_guest_with_its_recordings_ignored_signals compiles this guest, which prints the signals it started with ignored as rt_sigaction reports them and makes one more call for each, records it under one launcher's set and replays it under another's, and requires the replay to print the recorded line; it remains a guest fixture because a generic manifest cannot set the launcher's dispositions or replay a recording under different ones."
     },
     {
       "disposition": "support-data",
@@ -3557,6 +3563,12 @@
       "path": "tests/c/threadExhaustion.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/threadExhaustion.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/thread_in_constructor_preload.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/thread_in_constructor_preload.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test hermit_records_its_launchers_dispositions_before_any_constructor_runs builds this shared library and preloads it into Hermit, whose constructor creates and joins a thread (so glibc gives Hermit's process its handler for signal 33 before main), reports that, and removes itself from the environment; the test requires the guest to start with the launcher's ignored 33, which only a record taken before every constructor keeps. It is not a guest: it remains a fixture because a generic manifest cannot preload a library into Hermit itself or set the launcher's dispositions."
     },
     {
       "disposition": "guest-fixture",

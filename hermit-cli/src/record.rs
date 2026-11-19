@@ -52,6 +52,14 @@ impl Record {
     ) -> Result<Self, Error> {
         let cpu_profile = options.unwrap_or_default().cpu_profile;
         crate::cpu_profile_admission::check_record(cpu_profile)?;
+        // The guest starts with an explicit set of ignored signals, which
+        // the recording names, so that its replay starts the guest the same
+        // way whatever the replaying Hermit was started with. A caller that
+        // gave none gets the set a launch without one would give now.
+        let mut command = command;
+        if command.get_ignored_signals().is_none() {
+            command.ignored_signals(reverie::process::start_signals::ignored_without_input());
+        }
         let mut metadata = Metadata::new(&command)?;
         metadata.local_networking = options.map(|options| options.local_networking);
         // A recording always names its level, so its replay does not depend

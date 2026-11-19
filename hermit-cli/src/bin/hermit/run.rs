@@ -2926,6 +2926,17 @@ fn disable_sanitizer_leak_detection(command: &mut Command) {
     command.env("LSAN_OPTIONS", "detect_leaks=0");
 }
 
+/// The signals a guest starts with ignored: those Hermit's launcher left
+/// ignored, which the executable recorded before its first instruction
+/// (`main.rs`, `reverie::process::start_signals::record_launch_dispositions`
+/// in its preinit array). A process that did not record them (another
+/// program that links this library, or the library's own test binary)
+/// takes the set a launch without an input would give.
+pub(super) fn guest_launch_ignored_signals() -> u64 {
+    use reverie::process::start_signals;
+    start_signals::launch_dispositions().unwrap_or_else(start_signals::ignored_without_input)
+}
+
 pub(super) fn apply_base_environment(
     command: &mut Command,
     base_env: &BaseEnv,
@@ -19834,6 +19845,12 @@ impl RunOpts {
             .unwrap_or_else(|| self.program_path());
         let mut command = Command::new(program);
         command.args(&self.args);
+        // The guest starts with exactly the signals Hermit's launcher left
+        // ignored, and every other at its default, as that launcher would
+        // have started it, whatever Hermit's own process changed since
+        // (https://github.com/facebookexperimental/hermit/issues/484). Every
+        // backend takes this one launch input.
+        command.ignored_signals(guest_launch_ignored_signals());
         // The guest's first process has the base ID; Detcore numbers the rest.
         if let Some(base) = self.det_opts.det_config.guest_ids.base() {
             command.pid(reverie::process::Pid::from_raw(base));

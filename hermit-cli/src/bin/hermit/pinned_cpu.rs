@@ -44,8 +44,9 @@
 //! for its lifetime (`reserve`): an abstract Unix socket named after the CPU,
 //! which the kernel lets one socket in a network namespace hold
 //! (`unix_bind_abstract`, net/unix/af_unix.c) and releases when the last
-//! descriptor for it closes: when Hermit and its container init, which holds
-//! a copy and dies with Hermit, have exited, however they exit. A CPU another
+//! descriptor for it closes: when Hermit has exited, however it exits (its
+//! container init closes the copies it inherits before it forks the guest,
+//! `close_inherited_reservation`, and dies with Hermit). A CPU another
 //! run holds is passed over for the next draw from the same sample, and only
 //! when every allowed CPU is held does a run share one: the CPU it drew
 //! first. Sharing costs speed, never determinism. Runs in different network

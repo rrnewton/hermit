@@ -181,6 +181,11 @@ unsafe fn run_inner_with_capture(
         )?;
         request.check()?;
     }
+    // The command's ignored-signal launch input (`Command::ignored_signals`)
+    // does not reach this path yet: the in-guest launcher (`PreparedExec`)
+    // starts the guest with the dispositions it inherits, not the set the
+    // ptrace and KVM backends start it with
+    // (https://github.com/facebookexperimental/hermit/issues/484).
     // Resolve with the ordinary Command's current directory and exact PATH.
     let program = command.find_program()?;
     let arguments: Vec<OsString> = std::iter::once(command.get_arg0().to_owned())

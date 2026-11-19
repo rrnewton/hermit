@@ -1562,7 +1562,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// The restart checkpoint (A5 step 3c.1c, design D40, with IR-2's
     /// placement): run straight after the dispatch `match`, before every
-    /// observer of the result (`fail_on_tool_decided_injection`,
+    /// observer of the result (the backend refusal check, `judge_backend_refusal`,
     /// `delivery_interruption`, DETLOG's `SyscallResult`, the posthook
     /// happens-before checkpoint, the post-handler hook and the completion),
     /// so each of them, and the backend, sees the result it returns. Under the
@@ -5686,6 +5686,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         guest: &mut G,
         signal: Signal,
     ) -> Result<Option<Signal>, Errno> {
+        // A job-control stop Linux raised after a call returned, which
+        // Detcore cannot deliver, ends the run by name.
+        self.refuse_linux_raised_job_control_stop(guest, signal as i32)
+            .await;
         self.catch_up_lone_slice_ends(guest).await;
         let delivered = self
             .handle_inbound_signal(guest, SigWrapper::from(signal))
@@ -6646,13 +6650,16 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
         self.post_handler_hook_observed(guest, CheckIn::Event, boundary_token)
             .await;
-        // A --strict run never holds a binder descriptor: the run's first
-        // process is checked for one it was started with, before the guest's
-        // first instruction (`Self::refuse_binder_held_at_start`).
+        // The run's first process, before the guest's first instruction: a
+        // --strict run never holds a binder descriptor
+        // (`Self::refuse_binder_held_at_start`), and the scheduler learns
+        // whether the process's launch left SIGCHLD ignored
+        // (`Self::note_launch_sigchld_disposition`).
         if guest.is_root_process()
             && guest.tid() == guest.pid()
             && !guest.thread_state().past_global_first_execve
         {
+            Box::pin(self.note_launch_sigchld_disposition(guest)).await;
             Box::pin(self.refuse_binder_held_at_start(guest)).await;
         }
         Ok(())
@@ -8849,9 +8856,25 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // ends the run as an internal failure before its ENOSYS can reach the
             // guest, when it is the event's last injection. The check reads only
             // the handler's latest refusal, and only if no consumer took it
-            // first; it is not a general guard (see
-            // `fail_on_tool_decided_injection`).
-            crate::syscalls::helpers::fail_on_tool_decided_injection::<T, _>(guest, call.number());
+            // first; it is not a general guard (see `judge_backend_refusal`). A
+            // job-control stop the backend could not deliver during the call is
+            // refused by name (`Self::refuse_job_control_stop`).
+            let res = match guest.take_unsupported_refusal() {
+                Some(refusal)
+                    if refusal.operation == reverie::UnsupportedOperation::JobControlStop =>
+                {
+                    self.refuse_job_control_stop(guest, call.number(), refusal)
+                        .await
+                }
+                refusal => {
+                    crate::syscalls::helpers::judge_backend_refusal::<T, _>(
+                        guest,
+                        refusal,
+                        call.number(),
+                    );
+                    res
+                }
+            };
             syscall_histogram::finish::<T, _>(guest, call.number(), &res, injected_at_entry);
 
             // A copy may already have changed guest memory before reporting a

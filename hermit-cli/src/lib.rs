@@ -3558,6 +3558,13 @@ async fn run_kvm(
     backend
         .set_ids_per_task(reverie::task_ids::HERMIT_PTRACE_IDS_PER_TASK)
         .map_err(|error| anyhow!("failed to configure KVM task IDs: {error}"))?;
+    // The guest starts with the signals its command's launch input names
+    // ignored, as a ptrace guest does (`Command::ignored_signals`).
+    if let Some(ignored) = command.get_ignored_signals() {
+        backend.set_ignored_signals(ignored).map_err(|error| {
+            anyhow!("failed to configure the KVM guest's ignored signals: {error}")
+        })?;
+    }
     // The ptrace launcher execs the path `find_program` resolved, so that is
     // the filename Linux records in AT_EXECFN and copies to the top of the
     // stack, including for a `#!` script whose argv now starts with the

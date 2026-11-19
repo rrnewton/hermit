@@ -1772,10 +1772,11 @@ mod tests {
                 matches!(result, Err(Error::Errno(Errno::ENOSYS))),
                 "{result:?}"
             );
-            crate::syscalls::helpers::fail_on_tool_decided_injection::<
-                crate::record_or_replay::NoopTool,
-                _,
-            >(&mut guest, sysno);
+            // As the syscall event's check takes and judges it.
+            let refusal = guest.take_unsupported_refusal();
+            crate::syscalls::helpers::judge_backend_refusal::<crate::record_or_replay::NoopTool, _>(
+                &mut guest, refusal, sysno,
+            );
         }
     }
 

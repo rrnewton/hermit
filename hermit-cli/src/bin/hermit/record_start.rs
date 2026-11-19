@@ -442,6 +442,10 @@ impl StartOpts {
     fn guest_command(&self) -> Result<Command, Error> {
         let mut command = Command::new(self.program());
         command.args(&self.args);
+        // As a run's guest starts, with the signals Hermit's launcher left
+        // ignored (`run::guest_launch_ignored_signals`); the recording names
+        // the set for its replay.
+        command.ignored_signals(super::run::guest_launch_ignored_signals());
         if let Some(workdir) = &self.workdir {
             command.current_dir(workdir);
         }

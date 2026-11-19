@@ -1935,6 +1935,35 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(result?)
     }
 
+    /// The run's first process starts with the signal dispositions its launch
+    /// gave it, such as the signals its launcher left ignored. With SIGCHLD
+    /// ignored, Linux reaps its children automatically from its first
+    /// instruction (`do_notify_parent`), so the scheduler's exit model learns
+    /// it now, as it learns a later `rt_sigaction` (above). `execve` keeps an
+    /// ignored action and clears every flag (`flush_signal_handlers`), so a
+    /// launch gives no `SA_NOCLDWAIT`. The backend's signal-set fact says
+    /// which signals the process ignores; where it gives none, the model keeps
+    /// the default, with a warning.
+    pub(crate) async fn note_launch_sigchld_disposition<G: Guest<Self>>(&self, guest: &mut G) {
+        if !guest.config().sequentialize_threads {
+            return;
+        }
+        let ignored = match guest.signal_sets(guest.tid()) {
+            Ok(sets) => sets.ignored & (1 << (libc::SIGCHLD - 1)) != 0,
+            Err(error) => {
+                tracing::warn!(
+                    "the run's first process: no signal-set fact ({error:?}), so a launch that \
+                     left SIGCHLD ignored would not be followed by the exit model"
+                );
+                return;
+            }
+        };
+        let dettid = guest.thread_state().dettid;
+        if ignored && let Some(process) = registered_process_of(guest, dettid).await {
+            set_sigchld_disposition(guest, process, true, false).await;
+        }
+    }
+
     /// Signal phase 1's Detcore-side refusals of a new guest SIGALRM handler,
     /// each EPERM before anything changes (design section 6 and closure 5):
     /// threads not sequentialized (`alarm` would arm a kernel timer; named

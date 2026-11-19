@@ -7295,6 +7295,14 @@ const PROCFS_NOT_YET: &[(&str, &str, &str)] = &[
          carry, /proc/stat read across exec is not continued \
          (https://github.com/rrnewton/hermit/issues/4480)",
     ),
+    (
+        "a_guest_starts_with_its_launchers_ignored_signals_on_every_backend",
+        "liteinst, in-guest-trap",
+        "the in-guest launcher's first admission (PreparedExec) builds the guest's exec from \
+         the command's program, arguments, environment and directory alone, so it does not \
+         take the command's ignored-signal launch input \
+         (https://github.com/facebookexperimental/hermit/issues/484)",
+    ),
 ];
 
 /// The backends `test` runs on here, ptrace first: every backend in
@@ -13373,7 +13381,7 @@ fn a_recording_from_before_rendered_io_and_arch_status_is_refused_by_version() {
     let mut metadata: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
     assert_eq!(
-        metadata["version"], 0x1a1,
+        metadata["version"], 0x1a4,
         "RECORD_VERSION moved; point this test at the current version and the one before"
     );
     metadata["version"] = serde_json::json!(0x197);
@@ -53795,7 +53803,7 @@ fn the_4505_signal_guests_get_past_their_handlers_under_record() {
     };
     let mut metadata: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
-    assert_eq!(metadata["version"], 0x1a1, "RECORD_VERSION moved");
+    assert_eq!(metadata["version"], 0x1a4, "RECORD_VERSION moved");
     metadata["version"] = serde_json::json!(0x17f);
     // Drop the current recorder's CPU profile fields, so the era check does not fire first.
     if let Some(document) = metadata.as_object_mut() {
@@ -65430,18 +65438,19 @@ fn a_rerun_of_an_era_migrated_manifest_stays_on_the_legacy_table() {
     );
 }
 
-/// A genuine pre-split (0x1a0) recording of a CPUID-dependent guest
-/// replays bit for bit on the legacy table its era migrates to.
-/// The fixture under tests/fixtures/recordings was recorded by a
-/// pre-fix binary (see its README); its guest prints a LEAK line
-/// per leaked bit, so replaying it on the psABI table instead —
-/// which is what removing the load-time migration would do —
-/// changes its output and its exit status, and this test goes red.
-/// The copy whose version is edited to the psABI era must instead
-/// be refused: no digest was ever recorded for it to bind.
+/// A genuine pre-split (0x1a0) recording of a CPUID-dependent guest is
+/// refused by name, before its guest runs. The 0x1a1 replayer replayed
+/// it bit for bit on the legacy table its era migrates to, the one
+/// exception to exact version equality; that window closed when
+/// RECORD_VERSION moved to 0x1a4, whose recordings name the signals
+/// their guest started with ignored. The fixture under
+/// tests/fixtures/recordings was recorded by a pre-fix binary (see its
+/// README); its guest prints a line per checked bit, none of which may
+/// appear. Copies whose version is edited to 0x1a1, with and without the
+/// psABI table's digest, are refused the same way.
 #[cfg(target_arch = "x86_64")]
 #[test]
-fn a_genuine_pre_psabi_recording_replays_bit_for_bit() {
+fn a_genuine_pre_psabi_recording_is_refused_by_name() {
     const ID: &str = "7a1b8833fde348c785270b61161d3a17";
     fn copy_recording(from: &Path, to: &Path) {
         fs::create_dir_all(to).unwrap();
@@ -65458,88 +65467,48 @@ fn a_genuine_pre_psabi_recording_replays_bit_for_bit() {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/recordings")
         .join(ID);
-    let expected = fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/recordings")
-            .join(format!("{ID}-expected-stdout.txt")),
-    )
-    .unwrap();
-    let run = UnpinnedRun::new();
-    copy_recording(&fixture, &run.data().join(ID));
-    let (status, stdout, stderr) = run.run(&["--log=debug", "replay", "--autopilot", ID], &[]);
+    // The version the copy's metadata names, and the table digest it
+    // carries, if any; `None` leaves the fixture's metadata as it was
+    // recorded.
+    let refused_as = |version: Option<u32>, digest: Option<String>| {
+        let run = UnpinnedRun::new();
+        copy_recording(&fixture, &run.data().join(ID));
+        let metadata_path = run.data().join(ID).join("metadata.json");
+        let mut metadata: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
+        let recorded = metadata["version"].as_u64().unwrap();
+        if let Some(version) = version {
+            metadata["version"] = version.into();
+        }
+        if let Some(digest) = digest {
+            metadata["cpu_table_digest"] = digest.into();
+        }
+        fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
+        let (status, stdout, stderr) = run.run(&["--log=debug", "replay", "--autopilot", ID], &[]);
+        let named = version.map_or(recorded, u64::from);
+        assert_ne!(status, Some(0), "{named:#x}: {stderr}");
+        assert_eq!(stdout, "", "{named:#x}: the guest ran: {stderr}");
+        assert!(
+            stderr.contains(&format!(
+                "Version mismatch, recording version RecordVersion({named}), replayer version"
+            )),
+            "{named:#x}: {stderr}"
+        );
+        recorded
+    };
     assert_eq!(
-        (status, stdout.as_str()),
-        (Some(0), expected.as_str()),
-        "{stderr}"
+        refused_as(None, None),
+        0x1a0,
+        "the fixture is the genuine pre-split recording"
     );
-    assert_eq!(
-        logged_profile(&stderr),
-        Some("x86-64-v2-legacy"),
-        "{stderr}"
-    );
-
-    // The same recording claiming the psABI era carries no table
-    // digest for replay to bind, so it is refused by name.
-    let edited = UnpinnedRun::new();
-    copy_recording(&fixture, &edited.data().join(ID));
-    let metadata_path = edited.data().join(ID).join("metadata.json");
-    let mut metadata: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
-    metadata["version"] = 0x1a1.into();
-    fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
-    let (status, stdout, stderr) = edited.run(&["--log=debug", "replay", "--autopilot", ID], &[]);
-    assert_ne!(status, Some(0), "{stderr}");
-    assert_ne!(stdout, expected, "{stderr}");
-    assert!(stderr.contains("carries no CPUID table digest"), "{stderr}");
-
-    // The output-discriminating control: the same recording claiming
-    // the psABI era WITH that table's digest passes the digest gate
-    // and replays on the psABI table, where the guest's branches on
-    // the seven bits go the other way and the replay departs from
-    // the recorded output instead of reproducing it. This is what
-    // removing the load-time migration would do to the genuine
-    // replay above, so the migration is pinned by output, not only
-    // by the refusal.
-    let forced = UnpinnedRun::new();
-    copy_recording(&fixture, &forced.data().join(ID));
-    let metadata_path = forced.data().join(ID).join("metadata.json");
-    let mut metadata: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
-    metadata["version"] = 0x1a1.into();
+    refused_as(Some(0x1a1), None);
     let digest = detcore::virtual_cpuid_digest(&detcore::Config {
         cpu_profile: detcore_model::cpu_profile::CpuProfile::X86_64V2,
         ..Default::default()
     });
-    metadata["cpu_table_digest"] = digest
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>()
-        .into();
-    fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
-    let (status, stdout, stderr) = forced.run(&["--log=debug", "replay", "--autopilot", ID], &[]);
-    assert!(
-        !stderr.contains("CPUID table digest"),
-        "the forced copy must pass the digest gate:\n{stderr}"
-    );
-    assert_eq!(
-        logged_profile(&stderr),
-        Some("x86-64-v2"),
-        "the forced copy must present the psABI table:\n{stderr}"
-    );
-    assert_ne!(status, Some(0), "{stderr}");
-    // The departure is exactly at the first discriminating line:
-    // every line the two tables answer alike is reproduced, and
-    // the replay stops on the write whose verdict the psABI
-    // table flips, so stdout ends mid-line there.
-    assert_eq!(
-        stdout,
-        "v2\n\
-         sse2 advertised: ok\n\
-         v2 features advertised: ok\n\
-         v3 leaf1 features hidden: ok\n\
-         rdrand masked: ok\n\
-         known leak avx hidden",
-        "the forced replay must depart at the first leak line:\n{stderr}"
+    refused_as(
+        Some(0x1a1),
+        Some(digest.iter().map(|byte| format!("{byte:02x}")).collect()),
     );
 }
 
@@ -81102,74 +81071,303 @@ fn with_job_control_signals(command: &mut Command, handler: libc::sighandler_t) 
     command
 }
 
-/// A guest starts with SIGTTIN and SIGTTOU ignored, whatever Hermit was started
-/// with. They are two of the named exceptions in the table every launched
-/// program starts with (reverie-process `start_signals`). The guest's
-/// background read of its controlling terminal fails with EIO, and its
-/// background write goes through. A native run started with both signals
-/// ignored prints the same.
-///
-/// With both at their defaults the guest wedged, measured 2026-11-18. The
-/// child's read raised SIGTTIN, Detcore held the signal until the call
-/// returned, and the kernel restarted the read and raised it again. The tracer
-/// logged "SIGTTIN replaces held SIGTTIN in the single pending-signal slot"
-/// 457,921 times, until safehermit killed the run at its output cap. This test
-/// fails, or times out, if the exception is dropped before that hold delivers
-/// the signal as a stop. KVM has no pseudoterminals yet (`posix_openpt` fails
-/// with EINVAL), so the guest runs on ptrace only.
+/// `tests/c/background_terminal_io.c` on Linux when its launcher leaves
+/// SIGTTIN and SIGTTOU ignored: the background read fails with EIO, and the
+/// background write goes through without a stop (`__tty_check_change`,
+/// drivers/tty/tty_jobctrl.c).
+const BACKGROUND_TERMINAL_IO_IGNORED: &str = "started with SIGTTIN ignored, SIGTTOU ignored\n\
+                                              read: failed: Input/output error\n\
+                                              read: child exited 0\n\
+                                              write: 4 bytes\n\
+                                              write: child exited 0\n\
+                                              session: exited 0\n";
+
+/// The same guest on Linux when its launcher leaves both signals at their
+/// defaults: Linux stops each child's group, and the leader continues it in
+/// the foreground.
+const BACKGROUND_TERMINAL_IO_DEFAULT: &str = "started with SIGTTIN default, SIGTTOU default\n\
+                                              read: stopped by SIGTTIN\n\
+                                              read: 3 bytes\n\
+                                              read: child exited 0\n\
+                                              write: stopped by SIGTTOU\n\
+                                              write: 4 bytes\n\
+                                              write: child exited 0\n\
+                                              session: exited 0\n";
+
+/// `command`, a Hermit command, run in a user and mount namespace of its own
+/// whose `/dev/pts` is a fresh devpts instance, with `/dev/ptmx` bound to the
+/// instance's `ptmx`. A run without an image shares the host's devpts, so a
+/// guest's new pseudoterminal takes the host's lowest free number, which any
+/// process on the host can change between the two runs of `--verify`: the
+/// name the guest opens then differs, and so does the work of formatting it
+/// (measured: `/dev/pts/98` in one run and `/dev/pts/125` in the other). The
+/// fresh instance numbers the guest's pseudoterminals from 0 in every run.
+fn in_private_devpts(command: &Command) -> Command {
+    let mut wrapped = Command::new("unshare");
+    wrapped
+        .args(["--user", "--map-root-user", "--mount", "sh", "-c"])
+        .arg(
+            "mount -t devpts -o newinstance,ptmxmode=0666 devpts /dev/pts && \
+             mount --bind /dev/pts/ptmx /dev/ptmx && exec \"$0\" \"$@\"",
+        )
+        .arg(command.get_program())
+        .args(command.get_args());
+    for (name, value) in command.get_envs() {
+        match value {
+            Some(value) => wrapped.env(name, value),
+            None => wrapped.env_remove(name),
+        };
+    }
+    if let Some(directory) = command.get_current_dir() {
+        wrapped.current_dir(directory);
+    }
+    wrapped
+}
+
+/// Whether the KVM backend gives `tests/c/background_terminal_io.c` a
+/// pseudoterminal, asked by running the guest there once. KVM has none yet:
+/// the guest's `posix_openpt` fails with EINVAL, and the terminal tests name
+/// the KVM leg as not compared. So does a host without KVM. Any other answer
+/// is true, so a KVM backend that opens one, or fails some other way, is
+/// compared and must answer as the test requires.
+fn kvm_gives_a_pseudoterminal(test: &str, guest_path: &str) -> bool {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("{test}: NOT COMPARED: kvm is not available on this host");
+        return false;
+    }
+    let args = ["--backend", "kvm", "run", "--", guest_path];
+    let output = hermit(&args);
+    if output.status.code() == Some(1)
+        && stdout(&output).ends_with("\nFAIL posix_openpt: Invalid argument\n")
+    {
+        eprintln!(
+            "{test}: NOT COMPARED: kvm: the KVM backend has no pseudoterminals yet \
+             (the guest's posix_openpt fails with EINVAL)"
+        );
+        return false;
+    }
+    true
+}
+
+/// A guest whose launcher left SIGTTIN and SIGTTOU ignored starts with both
+/// ignored, as it would natively, so its background read of its controlling
+/// terminal fails with EIO and its background write goes through: the native
+/// lines, at bitwise parity on ptrace. Hermit runs with a devpts of its own
+/// (`in_private_devpts`), so that both runs of `--verify` give the guest the
+/// same pseudoterminal. KVM is compared the same way once it gives the guest
+/// a pseudoterminal (`kvm_gives_a_pseudoterminal`); until then its leg is
+/// named as not compared.
 #[test]
-fn a_guest_starts_with_terminal_job_control_signals_ignored_and_does_not_wedge() {
+fn background_terminal_io_with_the_signals_ignored_answers_as_linux() {
+    let test = "background_terminal_io_with_the_signals_ignored_answers_as_linux";
     let guest = background_terminal_io_guest();
     let guest_path = guest.to_str().expect("guest path is UTF-8");
-    let expected = "started with SIGTTIN ignored, SIGTTOU ignored\n\
-                    read: failed: Input/output error\n\
-                    read: child exited 0\n\
-                    write: 4 bytes\n\
-                    write: child exited 0\n\
-                    session: exited 0\n";
     let native = with_job_control_signals(&mut Command::new(guest), libc::SIG_IGN)
         .output()
         .expect("failed to run the guest natively");
     assert!(native.status.success(), "native run failed: {native:?}");
     assert_eq!(
         stdout(&native),
-        expected,
-        "native Linux with both signals ignored"
+        BACKGROUND_TERMINAL_IO_IGNORED,
+        "native Linux"
     );
 
-    let directory = tempfile::tempdir().expect("failed to create report directory");
-    let report = directory.path().join("verify.json");
-    let report_arg = report.to_str().expect("report path is UTF-8");
-    let args = [
-        "run",
-        "--strict",
-        "--verify",
-        "--verify-strict",
-        "--verify-json",
-        report_arg,
-        "--timeout",
-        "60",
-        "--",
-        guest_path,
-    ];
+    let mut backends = vec!["ptrace"];
+    if kvm_gives_a_pseudoterminal(test, guest_path) {
+        backends.push("kvm");
+    }
+    for backend in backends {
+        let directory = tempfile::tempdir().expect("failed to create report directory");
+        let report = directory.path().join("verify.json");
+        let report_arg = report.to_str().expect("report path is UTF-8");
+        let args = [
+            "--log=info",
+            "--backend",
+            backend,
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            report_arg,
+            "--timeout",
+            "60",
+            "--",
+            guest_path,
+        ];
+        let mut command = in_private_devpts(&hermit_command(&args));
+        let output = hermit_test::hermit_output(
+            &format!("hermit {args:?} with a devpts of its own"),
+            with_job_control_signals(&mut command, libc::SIG_IGN),
+        );
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), BACKGROUND_TERMINAL_IO_IGNORED, "{backend}");
+        assert_bitwise_report(backend, &report);
+    }
+}
+
+/// The same guest on Linux when its launcher leaves SIGTTIN ignored and
+/// SIGTTOU at its default: the read fails with EIO, and Linux stops the
+/// writer's group.
+const BACKGROUND_TERMINAL_IO_WRITE_STOPS: &str = "started with SIGTTIN ignored, SIGTTOU default\n\
+                                                  read: failed: Input/output error\n\
+                                                  read: child exited 0\n\
+                                                  write: stopped by SIGTTOU\n\
+                                                  write: 4 bytes\n\
+                                                  write: child exited 0\n\
+                                                  session: exited 0\n";
+
+/// A guest whose launcher left SIGTTIN at its default reads its controlling
+/// terminal from a background process group. Linux stops the group there
+/// (`BACKGROUND_TERMINAL_IO_DEFAULT`, which this test confirms natively), and
+/// the ptrace backend cannot stop it (https://github.com/rrnewton/hermit/issues/4944,
+/// minibeads dh-h2qd98). The run is refused
+/// by name at that read, as a policy refusal naming the signal and the call,
+/// before the reader prints anything. Before, the guest started with both
+/// signals ignored whatever its launcher left, a silent substitution of
+/// Linux's behaviour for another input's; and before that it wedged: the
+/// tracer held the signal for the read's return, and each restart of the read
+/// raised it again (457,921 times, measured 2026-11-18). KVM has no
+/// pseudoterminals yet (`kvm_gives_a_pseudoterminal`), so its leg is named
+/// as not compared; once it has, the test stops to be given KVM's answer,
+/// Linux's or a refusal by name.
+///
+/// A run that allows unsupported operations gives that read EIO instead, as
+/// Linux gives a background read with SIGTTIN ignored, and the write's
+/// SIGTTOU then ends the run by name, as below.
+///
+/// With SIGTTIN ignored and SIGTTOU at its default, the read fails with EIO
+/// as on Linux, and the write with TOSTOP set raises SIGTTOU after the call
+/// returns: Detcore refuses that signal by name, naming the write, and the
+/// run ends as a policy refusal, where Linux stops the writer
+/// (`BACKGROUND_TERMINAL_IO_WRITE_STOPS`).
+#[test]
+fn a_terminal_job_control_stop_is_refused_by_name() {
+    let test = "a_terminal_job_control_stop_is_refused_by_name";
+    let guest = background_terminal_io_guest();
+    let guest_path = guest.to_str().expect("guest path is UTF-8");
+    assert!(
+        !kvm_gives_a_pseudoterminal(test, guest_path),
+        "{test}: the KVM backend now gives the guest a pseudoterminal: give this test \
+         its KVM leg, Linux's BACKGROUND_TERMINAL_IO_DEFAULT at bitwise parity or a \
+         refusal by name"
+    );
+    let native = with_job_control_signals(&mut Command::new(guest), libc::SIG_DFL)
+        .output()
+        .expect("failed to run the guest natively");
+    assert!(native.status.success(), "native run failed: {native:?}");
+    assert_eq!(
+        stdout(&native),
+        BACKGROUND_TERMINAL_IO_DEFAULT,
+        "native Linux"
+    );
+
+    let args = ["run", "--strict", "--timeout", "60", "--", guest_path];
     let mut command = hermit_command(&args);
     let output = hermit_test::hermit_output(
         &format!("hermit {args:?}"),
         with_job_control_signals(&mut command, libc::SIG_DFL),
     );
-    assert_success(&output, &args);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{args:?}: {stderr}"
+    );
+    assert!(
+        stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "read refused by the backend: Linux raised SIGTTIN, at its default \
+                         disposition, during the call (a background process's read of its \
+                         controlling terminal), and the ptrace backend cannot stop the process \
+                         group for it; job-control stops are not supported"
+        ),
+        "{stderr}"
+    );
     assert_eq!(
         stdout(&output),
-        expected,
-        "ptrace --verify, started with both at default"
+        "started with SIGTTIN default, SIGTTOU default\n",
+        "the reader printed past the refusal: {stderr}"
     );
-    let verdict: serde_json::Value =
-        serde_json::from_slice(&fs::read(&report).expect("read the verification report"))
-            .expect("parse the verification report");
+
+    let permissive = [
+        "run",
+        "--allow-unsupported-syscalls",
+        "--timeout",
+        "60",
+        "--",
+        guest_path,
+    ];
+    let mut command = hermit_command(&permissive);
+    let output = hermit_test::hermit_output(
+        &format!("hermit {permissive:?}"),
+        with_job_control_signals(&mut command, libc::SIG_DFL),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
-        verdict["bitwise_parity"],
-        serde_json::Value::Bool(true),
-        "{verdict}"
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{permissive:?}: {stderr}"
+    );
+    assert!(
+        stderr.contains("read refused by the backend: Linux raised SIGTTIN, at its default"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "SIGTTOU refused: Linux raised SIGTTOU, at its default disposition, after \
+             the call write"
+        ),
+        "{stderr}"
+    );
+    assert_eq!(
+        stdout(&output),
+        "started with SIGTTIN default, SIGTTOU default\n\
+         read: failed: Input/output error\n\
+         read: child exited 0\n",
+        "{permissive:?}: the read did not fail with EIO, or the writer printed past \
+         the refusal: {stderr}"
+    );
+
+    const TTIN_IGNORED: &[libc::c_int] = &[libc::SIGTTIN];
+    let native = with_exactly_these_signals_ignored(&mut Command::new(guest), TTIN_IGNORED)
+        .output()
+        .expect("failed to run the guest natively");
+    assert!(native.status.success(), "native run failed: {native:?}");
+    assert_eq!(
+        stdout(&native),
+        BACKGROUND_TERMINAL_IO_WRITE_STOPS,
+        "native Linux"
+    );
+    let mut command = hermit_command(&args);
+    let output = hermit_test::hermit_output(
+        &format!("hermit {args:?}"),
+        with_exactly_these_signals_ignored(&mut command, TTIN_IGNORED),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{args:?}: {stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "SIGTTOU refused: Linux raised SIGTTOU, at its default disposition, after \
+                         the call write (a background process's write to its controlling terminal \
+                         with TOSTOP set, or a change of the terminal's settings), and Detcore \
+                         cannot stop the process group for it; job-control stops are not supported"
+        ),
+        "{stderr}"
+    );
+    assert_eq!(
+        stdout(&output),
+        "started with SIGTTIN ignored, SIGTTOU default\n\
+         read: failed: Input/output error\n\
+         read: child exited 0\n",
+        "the writer printed past the refusal: {stderr}"
     );
 }
 
@@ -81181,18 +81379,32 @@ fn a_guest_starts_with_terminal_job_control_signals_ignored_and_does_not_wedge()
 /// (`pinned_cpu::close_inherited_reservation`). So the guest's
 /// `/proc/self/status` shows the 64-descriptor table an unpinned run's guest
 /// gets, not 1024. Before that, a pinned and an unpinned run differed here
-/// (https://github.com/facebookexperimental/hermit/issues/484).
+/// (https://github.com/facebookexperimental/hermit/issues/484). The run
+/// refuses to start without a reservation of its own
+/// (`--pinned-cpu=refuse`), since a run that holds none has no descriptors to
+/// leak, so the test skips by name where no CPU can be reserved.
 #[test]
 fn a_pinned_runs_guest_gets_the_descriptor_table_of_an_unpinned_run() {
+    let test = "a_pinned_runs_guest_gets_the_descriptor_table_of_an_unpinned_run";
     let args = [
         "run",
         "--strict",
+        "--pinned-cpu=refuse",
         "--",
         "/bin/grep",
         "FDSize",
         "/proc/self/status",
     ];
     let output = hermit(&args);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if let Some(refusal) = stderr
+        .lines()
+        .find(|line| line.contains("--pinned-cpu=refuse:"))
+    {
+        assert!(!output.status.success(), "{stderr}");
+        record_test_skip(test, &format!("no CPU reservation: {refusal}"));
+        return;
+    }
     assert_success(&output, &args);
     assert_eq!(stdout(&output), "FDSize:\t64\n");
 }
@@ -81249,42 +81461,190 @@ fn with_exactly_these_signals_ignored<'command>(
     command
 }
 
-/// A guest starts with the same signals ignored on every backend. Those are
-/// the table every launched program starts with (reverie-process
-/// `start_signals`): the signals ignored when Hermit started, except SIGPIPE,
-/// plus SIGTTIN and SIGTTOU (see
-/// `a_guest_starts_with_terminal_job_control_signals_ignored_and_does_not_wedge`).
-/// Hermit starts here with SIGPIPE, SIGUSR2 and signal 33 ignored, and every
-/// other signal at its default. The guest's `SigIgn` must name SIGUSR2, 33,
-/// SIGTTIN and SIGTTOU, and nothing else.
+/// The `SigIgn` line of a process whose launcher left exactly `ignored`
+/// ignored.
+fn sigign_line(ignored: &[libc::c_int]) -> String {
+    let set = ignored
+        .iter()
+        .fold(0u64, |set, &signal| set | 1u64 << (signal - 1));
+    format!("SigIgn:\t{set:016x}\n")
+}
+
+/// A guest starts with exactly the signals its launcher left ignored, and
+/// every other at its default, on every backend, as the launcher would have
+/// started it natively: the guest's `SigIgn` is the native line, at bitwise
+/// parity. Hermit's launcher here leaves SIGHUP, SIGINT, SIGTERM, SIGPIPE,
+/// SIGUSR2 and signal 33 ignored, then nothing ignored. Hermit's own process
+/// ignores SIGPIPE (the Rust runtime does, before `main`), installs handlers
+/// for SIGHUP, SIGINT and SIGTERM, and gets glibc's handler for signal 33
+/// with its first thread, so a guest that took Hermit's dispositions at its
+/// launch, rather than those its executable recorded before its first
+/// instruction (`main.rs`), names another set in one of the two cases.
 ///
 /// Before, a ptrace guest started with the signals ignored in the Hermit
-/// process that forked it, at the moment it forked. glibc installs its own
-/// handler for signal 33 (SIGSETXID) when a process creates its first thread,
-/// so whether the guest kept the launcher's 33 depended on whether that process
-/// had created a thread yet. That was a race, which pinning settled
-/// differently (https://github.com/facebookexperimental/hermit/issues/484). A
-/// KVM guest started with no signal ignored at all.
+/// process that forked it, at the moment it forked: whether it kept the
+/// launcher's 33 depended on whether that process had created a thread yet, a
+/// race that pinning settled differently
+/// (https://github.com/facebookexperimental/hermit/issues/484). A KVM guest
+/// started with no signal ignored at all. Then every guest started with
+/// SIGPIPE at its default and SIGTTIN and SIGTTOU ignored, whatever its
+/// launcher left.
 #[test]
-fn a_guest_starts_with_the_same_ignored_signals_on_every_backend() {
-    let test = "a_guest_starts_with_the_same_ignored_signals_on_every_backend";
+fn a_guest_starts_with_its_launchers_ignored_signals_on_every_backend() {
+    let test = "a_guest_starts_with_its_launchers_ignored_signals_on_every_backend";
     const SIGSETXID: libc::c_int = 33;
-    let bit = |signal: libc::c_int| 1u64 << (signal - 1);
-    let expected = format!(
-        "SigIgn:\t{:016x}\n",
-        bit(libc::SIGUSR2) | bit(SIGSETXID) | bit(libc::SIGTTIN) | bit(libc::SIGTTOU)
-    );
-    let backends = procfs_backends_among(test, &["ptrace", "kvm"]);
+    let backends = procfs_backends_among(test, &["ptrace", "kvm", "liteinst", "in-guest-trap"]);
     assert!(
         backends.contains(&"ptrace"),
         "{test}: ptrace is not compared"
     );
-    for backend in backends {
+    let launches: [&'static [libc::c_int]; 2] = [
+        &[
+            libc::SIGHUP,
+            libc::SIGINT,
+            libc::SIGTERM,
+            libc::SIGPIPE,
+            libc::SIGUSR2,
+            SIGSETXID,
+        ],
+        &[],
+    ];
+    for ignored in launches {
+        let expected = sigign_line(ignored);
+        let native = with_exactly_these_signals_ignored(
+            Command::new("/bin/grep").args(["SigIgn", "/proc/self/status"]),
+            ignored,
+        )
+        .output()
+        .expect("run grep natively");
+        assert_eq!(stdout(&native), expected, "native Linux");
+        for backend in backends.iter().copied() {
+            let directory = tempfile::tempdir().expect("failed to create report directory");
+            let report = directory.path().join("verify.json");
+            let report_arg = report.to_str().expect("report path is UTF-8");
+            let args = [
+                "--log=info",
+                "--backend",
+                backend,
+                "run",
+                "--strict",
+                "--verify",
+                "--verify-strict",
+                "--verify-json",
+                report_arg,
+                "--",
+                "/bin/grep",
+                "SigIgn",
+                "/proc/self/status",
+            ];
+            let mut command = hermit_command(&args);
+            let output = hermit_test::hermit_output(
+                &format!("hermit {args:?}"),
+                with_exactly_these_signals_ignored(&mut command, ignored),
+            );
+            assert_success(&output, &args);
+            assert_eq!(stdout(&output), expected, "{backend} {ignored:?}");
+            assert_bitwise_report(backend, &report);
+        }
+    }
+}
+
+static THREAD_IN_CONSTRUCTOR_PRELOAD: OnceLock<PathBuf> = OnceLock::new();
+
+/// `tests/c/thread_in_constructor_preload.c` as a shared library, built once
+/// per test process.
+fn thread_in_constructor_preload() -> &'static Path {
+    THREAD_IN_CONSTRUCTOR_PRELOAD.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("thread-in-constructor-preload");
+        fs::create_dir_all(&build_root).expect("failed to create the preload directory");
+        let preload = build_root.join("libthread_in_constructor_preload.so");
+        let output = Command::new("cc")
+            .args([
+                "-shared", "-fPIC", "-O1", "-g", "-Wall", "-Wextra", "-Werror", "-std=c11",
+                "-pthread",
+            ])
+            .arg(repository.join("tests/c/thread_in_constructor_preload.c"))
+            .arg("-o")
+            .arg(&preload)
+            .output()
+            .expect("failed to compile the preload");
+        assert!(
+            output.status.success(),
+            "preload compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        preload
+    })
+}
+
+/// Hermit records the signals its launcher left ignored from its executable's
+/// preinit array (`main.rs`), which the dynamic loader runs before any
+/// library's constructor. Here Hermit starts with SIGUSR2 and signal 33
+/// ignored, and with a preload whose constructor creates and joins a thread
+/// (`tests/c/thread_in_constructor_preload.c`). glibc gives a process its
+/// handler for 33 at its first `pthread_create`, so Hermit's own 33 is caught
+/// before `main`, as the preload reports. The preload then removes itself from
+/// the environment, so the guest does not load it. The guest still starts with
+/// the launcher's 33 ignored; a record taken in `main`, or none at all, would
+/// start it with 33 at its default. On a glibc older than 2.34, whose
+/// libpthread initializer ran before the preinit array (`DF_1_INITFIRST`), the
+/// launcher's 33 could not be seen at all.
+#[test]
+fn hermit_records_its_launchers_dispositions_before_any_constructor_runs() {
+    const LAUNCHER: &[libc::c_int] = &[libc::SIGUSR2, 33];
+    let preload = thread_in_constructor_preload();
+    let args = [
+        "run",
+        "--strict",
+        "--",
+        "/bin/grep",
+        "SigIgn",
+        "/proc/self/status",
+    ];
+    let mut command = hermit_command(&args);
+    command.env("LD_PRELOAD", preload);
+    let output = hermit_test::hermit_output(
+        &format!("hermit {args:?} with LD_PRELOAD={}", preload.display()),
+        with_exactly_these_signals_ignored(&mut command, LAUNCHER),
+    );
+    assert_success(&output, &args);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr
+            .matches("preload: signal 33 caught after the thread\n")
+            .count(),
+        1,
+        "the preload must run once, in Hermit's process, and leave its 33 caught before main: \
+         {stderr}"
+    );
+    assert_eq!(stdout(&output), sigign_line(LAUNCHER), "{stderr}");
+}
+
+/// `--namespace-only` runs the guest in Hermit's namespaces without
+/// instrumentation, so the guest starts as its launcher would have started
+/// it: its `SigIgn` is the native line, whatever Hermit's own process ignores
+/// (SIGPIPE, which the Rust runtime ignores, among them). A launcher's
+/// ignored SIGPIPE reaches the guest, where a launch without the input would
+/// reset it to its default.
+#[test]
+fn a_namespace_only_guest_starts_with_its_launchers_ignored_signals() {
+    const LAUNCHES: [&[libc::c_int]; 2] = [&[libc::SIGHUP, libc::SIGPIPE, libc::SIGUSR2, 33], &[]];
+    for ignored in LAUNCHES {
+        let expected = sigign_line(ignored);
+        let native = with_exactly_these_signals_ignored(
+            Command::new("/bin/grep").args(["SigIgn", "/proc/self/status"]),
+            ignored,
+        )
+        .output()
+        .expect("run grep natively");
+        assert_eq!(stdout(&native), expected, "native Linux");
         let args = [
-            "--backend",
-            backend,
             "run",
-            "--strict",
+            "--namespace-only",
             "--",
             "/bin/grep",
             "SigIgn",
@@ -81293,12 +81653,130 @@ fn a_guest_starts_with_the_same_ignored_signals_on_every_backend() {
         let mut command = hermit_command(&args);
         let output = hermit_test::hermit_output(
             &format!("hermit {args:?}"),
-            with_exactly_these_signals_ignored(
-                &mut command,
-                &[libc::SIGPIPE, libc::SIGUSR2, SIGSETXID],
-            ),
+            with_exactly_these_signals_ignored(&mut command, ignored),
         );
         assert_success(&output, &args);
-        assert_eq!(stdout(&output), expected, "{backend}");
+        assert_eq!(stdout(&output), expected, "{ignored:?}");
     }
+}
+
+/// A guest whose launcher left SIGCHLD ignored starts with it ignored, so
+/// Linux reaps its children itself and sends it no SIGCHLD
+/// (`do_notify_parent`): `tests/c/exit_reaping_probe.c launched`, which
+/// changes no disposition, prints sigign's lines (wait reports ECHILD,
+/// nothing pending), natively and at bitwise parity on every backend. So does
+/// its adopted mode: as a subreaper, the guest inherits a grandchild's zombie
+/// when its child exits, and Linux reaps it at once. Detcore learns the
+/// disposition when the run's first process starts
+/// (`Detcore::note_launch_sigchld_disposition`), as it learns a later
+/// `rt_sigaction`; a scheduler that did not would expect the adopted zombie
+/// to wait for the subreaper's wait. Hermit's own process takes SIGCHLD's
+/// default before anything else (`main.rs`), since it waits for the processes
+/// it starts.
+#[test]
+fn a_guest_launched_with_sigchld_ignored_reaps_its_children_as_linux() {
+    let test = "a_guest_launched_with_sigchld_ignored_reaps_its_children_as_linux";
+    let guest = EXIT_REAPING_LAUNCHED_GUEST.get_or_init(|| compile_c_guest("exit_reaping_probe"));
+    let guest_path = guest.to_str().expect("guest path is UTF-8");
+    let launched: String = (0..3)
+        .map(|round| {
+            format!("launched round={round} read=0 sigchld_pending=0 wait=ECHILD status=-1\n")
+        })
+        .collect();
+    let modes = [
+        ("launched", launched),
+        (
+            "adopted",
+            String::from("adopted read=0 sigchld_pending=0 wait=ECHILD status=-1\n"),
+        ),
+    ];
+    for (mode, expected) in &modes {
+        let mode: &str = mode;
+        let native =
+            with_exactly_these_signals_ignored(Command::new(guest).arg(mode), &[libc::SIGCHLD])
+                .output()
+                .expect("run the probe natively");
+        assert!(native.status.success(), "native run failed: {native:?}");
+        assert_eq!(stdout(&native), *expected, "{mode}: native Linux");
+    }
+    let backends = procfs_backends_among(test, &["ptrace", "kvm"]);
+    assert!(
+        backends.contains(&"ptrace"),
+        "{test}: ptrace is not compared"
+    );
+    for backend in backends {
+        for (mode, expected) in &modes {
+            let mode: &str = mode;
+            let directory = tempfile::tempdir().expect("failed to create report directory");
+            let report = directory.path().join("verify.json");
+            let report_arg = report.to_str().expect("report path is UTF-8");
+            let args = [
+                "--log=info",
+                "--backend",
+                backend,
+                "run",
+                "--strict",
+                "--verify",
+                "--verify-strict",
+                "--verify-json",
+                report_arg,
+                "--",
+                guest_path,
+                mode,
+            ];
+            let mut command = hermit_command(&args);
+            let output = hermit_test::hermit_output(
+                &format!("hermit {args:?}"),
+                with_exactly_these_signals_ignored(&mut command, &[libc::SIGCHLD]),
+            );
+            assert_success(&output, &args);
+            assert_eq!(stdout(&output), *expected, "{backend} {mode}");
+            assert_bitwise_report(backend, &report);
+        }
+    }
+}
+
+static EXIT_REAPING_LAUNCHED_GUEST: OnceLock<PathBuf> = OnceLock::new();
+
+static IGNORED_SIGNALS_PROBE: OnceLock<PathBuf> = OnceLock::new();
+
+/// A recording names the signals its guest started with ignored, and its
+/// replay starts the guest with the same set, whatever the replaying Hermit's
+/// launcher left. The guest, `tests/c/ignored_signals_probe.c`, asks the
+/// kernel for each signal's disposition with `rt_sigaction`, which replay
+/// runs rather than gives back from the recording, and makes one call more
+/// for each ignored signal. So a replay that started the guest with another
+/// set would print another line and make other calls than its recording. A
+/// guest that read its `SigIgn` from /proc would not tell: replay gives a read
+/// its recorded bytes.
+#[test]
+fn a_replay_starts_the_guest_with_its_recordings_ignored_signals() {
+    const RECORDED: &[libc::c_int] = &[libc::SIGHUP, libc::SIGUSR2, 33];
+    const REPLAYED: &[libc::c_int] = &[libc::SIGINT, libc::SIGPIPE];
+    const EXPECTED: &str = "ignored: 1 12 33\n";
+    let probe = IGNORED_SIGNALS_PROBE.get_or_init(|| compile_c_guest("ignored_signals_probe"));
+    let probe_path = probe.to_str().expect("probe path is UTF-8");
+    let native = with_exactly_these_signals_ignored(&mut Command::new(probe), RECORDED)
+        .output()
+        .expect("run the probe natively");
+    assert_eq!(stdout(&native), EXPECTED, "native Linux");
+    let data = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let directory = data.path().to_str().expect("data path is UTF-8");
+    let record_args = ["record", "--data-dir", directory, "--", probe_path];
+    let mut record = hermit_command(&record_args);
+    let output = hermit_test::hermit_output(
+        &format!("hermit {record_args:?}"),
+        with_exactly_these_signals_ignored(&mut record, RECORDED),
+    );
+    assert_success(&output, &record_args);
+    assert_eq!(stdout(&output), EXPECTED, "record");
+
+    let replay_args = ["replay", "--autopilot", "--data-dir", directory];
+    let mut replay = hermit_command(&replay_args);
+    let output = hermit_test::hermit_output(
+        &format!("hermit {replay_args:?}"),
+        with_exactly_these_signals_ignored(&mut replay, REPLAYED),
+    );
+    assert_success(&output, &replay_args);
+    assert_eq!(stdout(&output), EXPECTED, "replay");
 }

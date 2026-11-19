@@ -25,12 +25,16 @@ paths.
 
 Its guest output depends on the seven CPUID bits of
 https://github.com/facebookexperimental/hermit/issues/124, so it
-is the bit-for-bit replay oracle for the legacy-table
-migration: replayed on the legacy table it prints the seven
-LEAK lines in
-`7a1b8833fde348c785270b61161d3a17-expected-stdout.txt` byte for
+was the bit-for-bit replay oracle for the legacy-table
+migration: the 0x1a1 replayer, which accepted 0x1a0 recordings,
+replayed it on the legacy table and printed the seven LEAK lines
+in `7a1b8833fde348c785270b61161d3a17-expected-stdout.txt` byte for
 byte; on the psABI table the same guest prints FIXED lines and
-exits nonzero, so a broken migration cannot pass.
+exits nonzero. Since RECORD_VERSION 0x1a4, whose recordings name
+the signals their guest started with ignored, the replayer
+accepts only its own version, so this recording is a genuine
+older recording that replay refuses by name before its guest runs
+(`a_genuine_pre_psabi_recording_is_refused_by_name`).
 
 Nothing was normalized after recording: editing the recorded
 program path breaks the recording's bootstrap exec request

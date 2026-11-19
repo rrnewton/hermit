@@ -41,20 +41,12 @@ impl RecordVersion {
     /// Check if the recorder/replayer version is compatible with a given
     /// recording (trace).
     pub fn compatible_with(&self, other: &RecordVersion) -> bool {
-        // The window is tied to the literal first psABI version, so
-        // it closes itself when RECORD_VERSION next moves: accepting
-        // 0x1a0 then would admit a stream whose format may have
-        // changed since, which is what the exact gate exists for.
-        const _: () = assert!(
-            RECORD_VERSION.0 == 0x1a1,
-            "the 0x1a0 compatibility window must be re-decided when RECORD_VERSION moves"
-        );
-        // Exact, with one deliberate window: the 0x1a1 replayer
-        // accepts the last pre-psABI version so its recordings
-        // replay on the legacy CPUID table (migrated at load). An
-        // older replayer still refuses this version by the same
-        // equality, by name.
-        self == other || (*self == RecordVersion(0x1a1) && *other == LAST_PRE_PSABI_RECORD_VERSION)
+        // Exact. The 0x1a1 replayer also accepted the last pre-psABI
+        // version, 0x1a0, so that its recordings replayed on the legacy
+        // CPUID table; that window closed when RECORD_VERSION moved to
+        // 0x1a4, whose recordings name the signals their guest started
+        // with ignored, which no 0x1a0 recording does.
+        self == other
     }
 }
 
@@ -1037,9 +1029,22 @@ impl RecordVersion {
 // Broadwell table it recorded with, and recordings at 0x1a1 bind
 // their CPUID table digest. It is also why an older replayer
 // refuses a new recording by name instead of replaying it against
-// the wrong CPU. This is the one deliberate exception to exact
-// version equality: RECORD_VERSION accepts 0x1a0 beside itself.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x1a1);
+// the wrong CPU. It was the one deliberate exception to exact
+// version equality: the 0x1a1 replayer accepted 0x1a0 beside itself.
+// 0x1a1 -> 0x1a4 (reserved in minibeads dh-gxmvo, comment
+// dh-gxmvo-c646f38baff, past 0x1a2 and 0x1a3 reserved there; land-time
+// numbering applies): a guest starts with exactly the signals Hermit's
+// launcher left ignored, and every other at its default
+// (https://github.com/facebookexperimental/hermit/issues/484). Its
+// SIGPIPE starts as the launcher left it, where it started at the
+// default, and SIGTTIN and SIGTTOU are no longer ignored for it: Linux's
+// job-control stop at their default disposition is refused by name. A
+// recording names the set (`Metadata::ignored_signals`), and replay
+// starts the guest with it, whatever the replaying Hermit was started
+// with. A recording made before would replay its guest with other
+// dispositions; it is refused here, and so is 0x1a0, which closes the
+// pre-psABI window.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x1a4);
 
 /// The last recording version whose `x86-64-v2` (named or absent)
 /// means the pre-psABI legacy table.
@@ -1068,7 +1073,7 @@ pub(crate) const LAST_PRE_PSABI_RECORD_VERSION: RecordVersion = RecordVersion(0x
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x1a1;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x1a4;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1221,6 +1226,16 @@ pub struct Metadata {
     /// Absent means the default scheduler.
     #[serde(default)]
     pub schedule: RecordedSchedule,
+    /// The signals the recording's guest started with ignored, every other
+    /// at its default: its command's launch input
+    /// (`reverie::process::Command::ignored_signals`, signal `n` at bit
+    /// `n - 1`), which is the set the recording Hermit's launcher left
+    /// ignored. Replay starts the guest with the same set, whatever the
+    /// replaying Hermit was started with. Every recorder from 0x1a4 writes
+    /// it; `None` is only a hand-written metadata.json, whose replay starts
+    /// the guest as a launch without an input does.
+    #[serde(default)]
+    pub ignored_signals: Option<u64>,
 }
 
 impl Metadata {
@@ -1286,6 +1301,7 @@ impl Metadata {
             cpu_table_digest: None,
             cpu_profile_residual: None,
             schedule: RecordedSchedule::Default,
+            ignored_signals: command.get_ignored_signals(),
         })
     }
 
@@ -1340,6 +1356,12 @@ impl Metadata {
 
         if let Some(domainname) = &self.domainname {
             command.domainname(domainname);
+        }
+
+        // The guest starts with the signals its recording's guest started
+        // with ignored.
+        if let Some(ignored) = self.ignored_signals {
+            command.ignored_signals(ignored);
         }
 
         command
@@ -1828,7 +1850,7 @@ mod tests {
     }
 
     #[test]
-    fn record_version_requires_an_exact_match_apart_from_the_pre_psabi_window() {
+    fn record_version_requires_an_exact_match() {
         assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
 
         // DERIVED FROM THE COMPATIBILITY RULE, NOT ENUMERATED.
@@ -1840,23 +1862,18 @@ mod tests {
         // fail for the reason its name gives once the value has moved past the
         // range someone happened to write down.
         //
-        // `compatible_with` is exact equality apart from the one
-        // pre-psABI window below, so the property to assert is
+        // `compatible_with` is exact equality, so the property to assert is
         // "every OTHER version is refused". Re-deriving the cases from
         // RECORD_VERSION itself means the window travels with the constant and
-        // cannot go stale.
+        // cannot go stale. The 0x1a1 replayer's one exception, the last
+        // pre-psABI version, is refused too: its window closed at 0x1a4.
         let current = RECORD_VERSION.0;
+        assert!(
+            current - LAST_PRE_PSABI_RECORD_VERSION.0 <= 16,
+            "the loop below no longer reaches the closed pre-psABI window"
+        );
         for delta in 1..=16u32 {
             let older = RecordVersion(current - delta);
-            // The one deliberate window, open only at 0x1a1: the
-            // last pre-psABI version stays readable so its
-            // recordings replay on the legacy CPUID table (migrated
-            // at load). A future replayer does not inherit it.
-            if older == LAST_PRE_PSABI_RECORD_VERSION {
-                assert!(RECORD_VERSION.compatible_with(&older));
-                assert!(!RecordVersion(0x1a2).compatible_with(&older));
-                continue;
-            }
             assert!(
                 !RECORD_VERSION.compatible_with(&older),
                 "recorder at {current:#x} must refuse a recording made at {:#x}",
@@ -2743,7 +2760,19 @@ mod tests {
     fn record_version_rejects_streams_from_before_the_corrected_rcb_event() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x19a)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x186)));
-        assert!(RECORD_VERSION.compatible_with(&RecordVersion(0x1a0)));
+        assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
+    }
+
+    /// A recording made before 0x1a4 names no set of signals its guest
+    /// started with ignored, and its guest started with SIGPIPE at the
+    /// default whatever the launcher left (and, at 0x1a1, SIGTTIN and
+    /// SIGTTOU ignored), so its replay would start the guest with other
+    /// dispositions. The version gate refuses it, the base's 0x1a1 and the
+    /// pre-psABI 0x1a0 that 0x1a1 also accepted included.
+    #[test]
+    fn record_version_rejects_streams_without_the_guests_ignored_signals() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x1a1)));
+        assert!(!RECORD_VERSION.compatible_with(&LAST_PRE_PSABI_RECORD_VERSION));
     }
 
     #[test]
@@ -2859,5 +2888,44 @@ mod tests {
         let loaded: Metadata =
             serde_json::from_str(&serde_json::to_string(&metadata).unwrap()).unwrap();
         assert_eq!(loaded.schedule, RecordedSchedule::Chaos { seed: 7 });
+    }
+
+    /// A recording names the signals its guest started with ignored, its
+    /// command's launch input, and the command replay builds from the
+    /// loaded metadata starts the guest with the same set. A hand-written
+    /// metadata.json that names none gives the replay command no input.
+    #[test]
+    fn the_guests_ignored_signals_reach_the_replay_command() {
+        let bit = |signal: libc::c_int| 1u64 << (signal - 1);
+        let ignored = bit(libc::SIGHUP) | bit(libc::SIGPIPE) | bit(33) | bit(64);
+        let mut recorded = Command::new("/bin/true");
+        recorded.ignored_signals(ignored);
+        let metadata = Metadata::new(&recorded).unwrap();
+        assert_eq!(metadata.ignored_signals, Some(ignored));
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(METADATA_NAME),
+            serde_json::to_string(&metadata).unwrap(),
+        )
+        .unwrap();
+        let loaded = Metadata::load(dir.path()).unwrap();
+        assert_eq!(loaded.ignored_signals, Some(ignored));
+        assert_eq!(loaded.command().get_ignored_signals(), Some(ignored));
+
+        let unnamed: Metadata = serde_json::from_value(serde_json::json!({
+            "exe": "/bin/true",
+            "program": "true",
+            "arg0": "true",
+            "args": [],
+            "current_dir": "/",
+            "hostname": null,
+            "domainname": null,
+            "envs": {},
+            "version": RECORD_VERSION,
+        }))
+        .unwrap();
+        assert_eq!(unnamed.ignored_signals, None);
+        assert_eq!(unnamed.command().get_ignored_signals(), None);
     }
 }

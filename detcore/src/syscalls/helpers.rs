@@ -181,6 +181,87 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await
     }
 
+    /// The backend dropped a job-control signal that Linux raised during the
+    /// guest's `sysno` at its default disposition, because it cannot stop the
+    /// process group for it (`reverie::UnsupportedOperation::JobControlStop`):
+    /// a background process's read of its controlling terminal raises
+    /// `SIGTTIN` so. Linux would stop the group and restart the call once the
+    /// group is continued. Refused by name, naming the signal (the refusal's
+    /// diagnostic) and the call: a fail-closed run ends as a policy refusal,
+    /// and a run that allows unsupported operations gives the call `EIO`,
+    /// which Linux gives a background read when `SIGTTIN` is ignored or
+    /// blocked (`__tty_check_change`, drivers/tty/tty_jobctrl.c).
+    pub(crate) async fn refuse_job_control_stop<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: Sysno,
+        refusal: reverie::UnsupportedRefusal,
+    ) -> Result<i64, Error> {
+        let dettid = guest.thread_state().dettid;
+        report_refusal_reason(
+            self.cfg.panic_on_unsupported_syscalls,
+            &format!(
+                "[dtid {dettid}] {sysno} refused by the backend: {} \
+                 (https://github.com/rrnewton/hermit/issues/4944)",
+                refusal.diagnostic
+            ),
+        );
+        if !self.cfg.panic_on_unsupported_syscalls {
+            crate::tool_global::report_unsupported_syscall(guest, sysno).await;
+        }
+        self.refuse_unserviceable_operation_because(guest, sysno, Errno::EIO, refusal.diagnostic)
+            .await
+    }
+
+    /// Ends the run as a policy refusal when the backend reports `signal`, a
+    /// terminal's job-control signal at its default disposition, that Linux
+    /// raised itself (`SI_KERNEL`) after the call it interrupted returned: a
+    /// background process's write to its controlling terminal with TOSTOP set
+    /// raises SIGTTOU so. Linux would stop the process group and restart the
+    /// call once the group is continued. Detcore cannot deliver that stop
+    /// (https://github.com/rrnewton/hermit/issues/4944, minibeads
+    /// dh-h2qd98), and the restarted call would raise the signal again
+    /// forever. The call has returned already, so no errno is left to
+    /// give it: the run ends under either unsupported-operation policy,
+    /// naming the signal and the call. A job-control stop Linux raised while
+    /// Detcore ran the call is that call's refusal instead
+    /// ([`Self::refuse_job_control_stop`]). Any other signal returns at once,
+    /// a terminal's SIGTSTP among them ([`linux_raised_job_control_stop`]).
+    pub(crate) async fn refuse_linux_raised_job_control_stop<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: i32,
+    ) {
+        if !matches!(signal, libc::SIGTTIN | libc::SIGTTOU) {
+            return;
+        }
+        let si_code = guest
+            .signal_info()
+            .map(|info| i32::from_ne_bytes([info[8], info[9], info[10], info[11]]));
+        let Ok(state) = crate::syscalls::read_guest_signal_state(guest) else {
+            return;
+        };
+        let Some((name, description)) =
+            linux_raised_job_control_stop(signal, si_code, state.ignored, state.caught)
+        else {
+            return;
+        };
+        let regs = guest.regs().await;
+        let call = usize::try_from(crate::arch::syscall_number(&regs))
+            .ok()
+            .and_then(Sysno::new)
+            .map_or_else(|| "no call".to_owned(), |sysno| sysno.to_string());
+        let reason = format!(
+            "[dtid {}] {name} refused: Linux raised {name}, at its default disposition, after \
+             the call {call} ({description}), and Detcore cannot stop the process group for it; \
+             job-control stops are not supported (https://github.com/rrnewton/hermit/issues/4944)",
+            guest.thread_state().dettid
+        );
+        report_refusal_reason(true, &reason);
+        crate::tool_global::unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT)
+            .await
+    }
+
     /// Record or replay a BLOCKING syscall without stalling the current thread (and thus
     /// deadlocking).  This uses a protocol of an extra resource request before/after the
     /// syscall to inform the scheduler that the thread is leaving/rejoining the runnable
@@ -6223,10 +6304,14 @@ pub(crate) fn tool_decided_injection_failure(
         })
 }
 
-/// Ends the run as an internal failure when the last call Detcore injected
-/// while handling the guest's `sysno` came back with a `ToolDecided` refusal
-/// ([`tool_decided_injection_failure`]), instead of letting its ENOSYS reach
-/// the guest. The panic text and the error log carry
+/// Judges the refusal the backend recorded for the last call Detcore
+/// injected while handling the guest's `sysno`, which the syscall event takes
+/// once, after Detcore's handler returns (a job-control stop is refused by
+/// name there instead, `Detcore::refuse_job_control_stop`), and which
+/// `Detcore::report_backend_refusal` passes on when it is not the refusal its
+/// call can be refused with. A `ToolDecided` refusal ends the run as an
+/// internal failure ([`tool_decided_injection_failure`]), instead of letting
+/// its ENOSYS reach the guest. The panic text and the error log carry
 /// `HERMIT_INTERNAL_FAILURE class=tool-decided-injection`; the CLI's own
 /// summary line classifies the run as `class=container-child-panic`.
 ///
@@ -6260,18 +6345,6 @@ pub(crate) fn tool_decided_injection_failure(
 /// (`UnsupportedOperation::Pidfd`: sending one in an `SCM_RIGHTS` message), is
 /// named in a warning as well: no handler takes that refusal, and its ENOSYS
 /// reaches the guest as the backend answered.
-pub(crate) fn fail_on_tool_decided_injection<T, G>(guest: &mut G, sysno: Sysno)
-where
-    T: RecordOrReplay,
-    G: Guest<Detcore<T>>,
-{
-    let refusal = guest.take_unsupported_refusal();
-    judge_backend_refusal::<T, G>(guest, refusal, sysno);
-}
-
-/// [`fail_on_tool_decided_injection`]'s judgement of a refusal already taken
-/// from the backend: also used by `Detcore::report_backend_refusal` for a
-/// refusal that is not the one its call can be refused with.
 pub(crate) fn judge_backend_refusal<T, G>(
     guest: &mut G,
     refusal: Option<reverie::UnsupportedRefusal>,
@@ -6299,6 +6372,39 @@ pub(crate) fn judge_backend_refusal<T, G>(
         tracing::error!("{failure}");
         panic!("{failure}");
     }
+}
+
+/// `signal`'s name and what makes a terminal raise it, when Linux raised it
+/// itself (`si_code`, from the delivery's siginfo, is `SI_KERNEL`) as a
+/// terminal's job-control signal for a call (SIGTTIN or SIGTTOU) at its
+/// default disposition (neither in `ignored` nor in `caught`, signal `n` at
+/// bit `n - 1`): a signal whose delivery Linux makes a stop of the process
+/// group, and which the call raises again each time it is restarted while the
+/// process stays in the background (`__tty_check_change`,
+/// drivers/tty/tty_jobctrl.c). `None` for any other signal, one a process
+/// sent, one without a siginfo, and one the thread ignores or catches. A
+/// terminal's SIGTSTP (its suspend character, the line discipline's `isig`)
+/// is not one: no call raises it, so it is delivered as any other signal is.
+pub(crate) fn linux_raised_job_control_stop(
+    signal: i32,
+    si_code: Option<i32>,
+    ignored: u64,
+    caught: u64,
+) -> Option<(&'static str, &'static str)> {
+    let stop = match signal {
+        libc::SIGTTIN => (
+            "SIGTTIN",
+            "a background process's read of its controlling terminal",
+        ),
+        libc::SIGTTOU => (
+            "SIGTTOU",
+            "a background process's write to its controlling terminal with TOSTOP set, or a \
+             change of the terminal's settings",
+        ),
+        _ => return None,
+    };
+    let bit = 1u64 << (signal - 1);
+    (si_code == Some(libc::SI_KERNEL) && ignored & bit == 0 && caught & bit == 0).then_some(stop)
 }
 
 /// Report a named refusal through tracing, and, when the run ends
@@ -8222,6 +8328,49 @@ pub fn poll_nfds(nfds: libc::nfds_t) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only a terminal's job-control signal for a call that Linux raised
+    /// itself, at its default disposition, is a stop Detcore refuses: each of
+    /// the two by name, and neither of them ignored, caught, sent by a
+    /// process, or without a siginfo, nor any other signal Linux raises. A
+    /// terminal's SIGTSTP, which no call raises, is delivered as before.
+    #[test]
+    fn only_a_linux_raised_job_control_stop_at_its_default_is_refused() {
+        let bit = |signal: i32| 1u64 << (signal - 1);
+        let kernel = Some(libc::SI_KERNEL);
+        for (signal, name) in [(libc::SIGTTIN, "SIGTTIN"), (libc::SIGTTOU, "SIGTTOU")] {
+            let stop = linux_raised_job_control_stop(signal, kernel, 0, 0);
+            assert_eq!(stop.map(|(named, _)| named), Some(name));
+            let others = !bit(signal);
+            assert_eq!(
+                linux_raised_job_control_stop(signal, kernel, others, others),
+                stop,
+                "another signal's disposition does not matter"
+            );
+            assert_eq!(
+                linux_raised_job_control_stop(signal, kernel, bit(signal), 0),
+                None
+            );
+            assert_eq!(
+                linux_raised_job_control_stop(signal, kernel, 0, bit(signal)),
+                None
+            );
+            assert_eq!(
+                linux_raised_job_control_stop(signal, Some(libc::SI_USER), 0, 0),
+                None
+            );
+            assert_eq!(linux_raised_job_control_stop(signal, None, 0, 0), None);
+        }
+        for signal in [
+            libc::SIGTSTP,
+            libc::SIGSTOP,
+            libc::SIGCHLD,
+            libc::SIGPIPE,
+            libc::SIGINT,
+        ] {
+            assert_eq!(linux_raised_job_control_stop(signal, kernel, 0, 0), None);
+        }
+    }
 
     /// The backend drops a handler when its thread dies during a wait, and
     /// the shield with it: that must not panic, though the mask was never put
