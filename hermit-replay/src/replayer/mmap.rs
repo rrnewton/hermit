@@ -242,31 +242,49 @@ struct SharedBacking {
     /// made in replay). Each is held open, so its inode cannot name another
     /// file while it is linked here.
     objects: Vec<(FileId, OwnedFd)>,
+    /// `eventfd-id`s of placeholder descriptors of mappings of this
+    /// file, for descriptors that name no replay object (a virtual
+    /// open under the rr-like default). An eventfd id names one
+    /// eventfd instance for its life and is never reused, so writes
+    /// through the placeholder resolve here without a file identity.
+    placeholder_ids: Vec<String>,
 }
 
 impl SharedBacking {
     /// A new backing: a file of a fresh name beneath the replay root `root`,
-    /// or a memfd when none can be made there.
-    fn new(root: OwnedFd) -> io::Result<Self> {
+    /// or a memfd when none can be made there — or directly when
+    /// `prefer_memfd` (the rr-like replay default, 6805 slice 4: no
+    /// backing file is created in the root at all).
+    fn new(root: OwnedFd, prefer_memfd: bool) -> io::Result<Self> {
         let name = backing_name();
         let path = std::ffi::CString::new(name.as_str()).expect("a backing name holds no NUL");
         // SAFETY: the path is a valid C string; the result is checked.
-        let fd = unsafe {
-            libc::openat(
-                root.as_raw_fd(),
-                path.as_ptr(),
-                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0o600,
-            )
+        let fd = if prefer_memfd {
+            -1
+        } else {
+            unsafe {
+                libc::openat(
+                    root.as_raw_fd(),
+                    path.as_ptr(),
+                    libc::O_RDWR
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    0o600,
+                )
+            }
         };
         let (file, name) = if fd >= 0 {
             // SAFETY: openat returned a new descriptor that nothing else owns.
             (unsafe { OwnedFd::from_raw_fd(fd) }, Some(name))
         } else {
-            tracing::debug!(
-                error = %io::Error::last_os_error(),
-                "cannot make a file beneath the replay root; backing a shared file with a memfd"
-            );
+            if !prefer_memfd {
+                tracing::debug!(
+                    error = %io::Error::last_os_error(),
+                    "cannot make a file beneath the replay root; backing a shared file with a memfd"
+                );
+            }
             // SAFETY: the name is a valid C string; the result is checked.
             let fd = unsafe {
                 libc::memfd_create(c"hermit-replay-shared-file".as_ptr(), libc::MFD_CLOEXEC)
@@ -284,6 +302,7 @@ impl SharedBacking {
             root,
             name,
             objects: Vec::new(),
+            placeholder_ids: Vec::new(),
         };
         Ok(backing)
     }
@@ -464,7 +483,12 @@ enum Opening {
 /// `TempChroot`, `super::replay_root_of`) whatever root the process chrooted
 /// into, and is made beneath that real root; without a known replay root,
 /// the process's own root stands for it.
-fn backing_of(pid: Pid, recorded: FileId, end: u64) -> io::Result<(SharedFile, File, Opening)> {
+fn backing_of(
+    pid: Pid,
+    recorded: FileId,
+    end: u64,
+    prefer_memfd: bool,
+) -> io::Result<(SharedFile, File, Opening)> {
     let own = FileId::of(&std::fs::metadata(format!("/proc/{}/root", pid.as_raw()))?);
     let (root, real_root) = match super::replay_root_of(pid) {
         Some(((device, inode), real_root)) => (FileId { device, inode }, Some(real_root)),
@@ -476,10 +500,13 @@ fn backing_of(pid: Pid, recorded: FileId, end: u64) -> io::Result<(SharedFile, F
         prune(&mut backings);
         let backing = match backings.entry(file) {
             Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => entry.insert(SharedBacking::new(match real_root {
-                Some(real_root) => real_root,
-                None => crate::record_replay_path::open_process_root(pid)?,
-            })?),
+            Entry::Vacant(entry) => entry.insert(SharedBacking::new(
+                match real_root {
+                    Some(real_root) => real_root,
+                    None => crate::record_replay_path::open_process_root(pid)?,
+                },
+                prefer_memfd,
+            )?),
         };
         let opening = match &backing.name {
             None => Opening::Receive,
@@ -592,9 +619,45 @@ fn link_object<H: RecordHost, G>(
     fd: RawFd,
 ) -> io::Result<()> {
     let object = replay_object(tid, fd)?;
+    if object.is_none() {
+        // No replay object: under the rr-like default the descriptor
+        // is a placeholder eventfd for a virtual open. Link by its
+        // eventfd id instead, so writes through it still resolve.
+        if let Some(id) = super::placeholder_eventfd_id::<H, G>(access, fd) {
+            return link_placeholder_in(&mut shared_backings(), file, id);
+        }
+    }
     link_object_in(&mut shared_backings(), file, object, || {
         H::duplicate_guest_thread_fd(access, pid, tid, fd)
     })
+}
+
+/// Links placeholder eventfd `id` to `file`'s backing, with the same
+/// one-name-one-file rule as [`link_object_in`]. No descriptor is
+/// pinned: an eventfd id is never reused, so the name cannot come
+/// to name another descriptor while it is linked here.
+fn link_placeholder_in(
+    backings: &mut SharedBackings,
+    file: SharedFile,
+    id: String,
+) -> io::Result<()> {
+    if backings
+        .iter()
+        .any(|(other, backing)| *other != file && backing.placeholder_ids.contains(&id))
+    {
+        return Err(io::Error::other(
+            "replay object already backs another shared file",
+        ));
+    }
+    let Some(backing) = backings.get_mut(&file) else {
+        return Err(io::Error::other(
+            "shared file backing disappeared before object pinning",
+        ));
+    };
+    if !backing.placeholder_ids.contains(&id) {
+        backing.placeholder_ids.push(id);
+    }
+    Ok(())
 }
 
 fn link_object_in(
@@ -631,11 +694,44 @@ fn link_object_in(
 /// replay object linked to one. `tid`'s own descriptor table is the one
 /// read: a thread made without `CLONE_FILES` has a table of its own.
 fn object_backing(tid: Pid, fd: RawFd) -> io::Result<Option<File>> {
-    object_backing_in(
-        &shared_backings(),
-        || replay_object(tid, fd),
-        OwnedFd::try_clone,
-    )
+    let backings = shared_backings();
+    // A placeholder descriptor names no replay object; resolve it by
+    // the eventfd id a shared view linked for it (slice 4), before
+    // the file-identity lookup real descriptors take.
+    if let Some(backing) =
+        placeholder_backing_in(&backings, || placeholder_id_at(tid, fd), OwnedFd::try_clone)?
+    {
+        return Ok(Some(backing));
+    }
+    object_backing_in(&backings, || replay_object(tid, fd), OwnedFd::try_clone)
+}
+
+/// The `eventfd-id` of descriptor `fd` of thread `tid`, read from its
+/// `fdinfo` as [`super::placeholder_eventfd_id`] reads it through the
+/// host seam; this free path holds no access (as [`replay_object`]).
+fn placeholder_id_at(tid: Pid, fd: RawFd) -> Option<String> {
+    let fdinfo = std::fs::read_to_string(format!("/proc/{}/fdinfo/{fd}", tid.as_raw())).ok()?;
+    super::parse_eventfd_id(&fdinfo)
+}
+
+fn placeholder_backing_in(
+    backings: &SharedBackings,
+    inspect: impl FnOnce() -> Option<String>,
+    duplicate: impl FnOnce(&OwnedFd) -> io::Result<OwnedFd>,
+) -> io::Result<Option<File>> {
+    if backings.is_empty() {
+        return Ok(None);
+    }
+    let Some(id) = inspect() else {
+        return Ok(None);
+    };
+    let Some(backing) = backings
+        .values()
+        .find(|backing| backing.placeholder_ids.contains(&id))
+    else {
+        return Ok(None);
+    };
+    Ok(Some(File::from(duplicate(&backing.file)?)))
 }
 
 fn object_backing_in(
@@ -1003,8 +1099,9 @@ impl<H: RecordHost> ReplayerWithHost<H> {
             .ok()
             .and_then(|len| shared.offset.checked_add(len))
             .unwrap_or_else(|| refuse("size the backing", "offset and length overflow"));
-        let (file, backing, opening) = backing_of(pid, recorded_file, end)
-            .unwrap_or_else(|error| refuse("make the backing", error));
+        let (file, backing, opening) =
+            backing_of(pid, recorded_file, end, !self.write_output_files)
+                .unwrap_or_else(|error| refuse("make the backing", error));
         backing
             .write_all_at(recorded, shared.offset)
             .unwrap_or_else(|error| refuse("write the recorded bytes", error));
@@ -1906,7 +2003,7 @@ mod tests {
         assert_eq!(mapped_files([1, 2, 3, 4], read(Some(3))).0, None);
 
         let directory = tempfile::tempdir().unwrap();
-        let backing = || SharedBacking::new(path_descriptor(directory.path())).unwrap();
+        let backing = || SharedBacking::new(path_descriptor(directory.path()), false).unwrap();
         let key = |inode| SharedFile {
             root: mapped,
             recorded: FileId { device: 1, inode },
@@ -1942,8 +2039,8 @@ mod tests {
     #[test]
     fn a_backing_opens_by_its_name_and_is_unlinked_when_dropped() {
         let directory = tempfile::tempdir().unwrap();
-        let backing = SharedBacking::new(path_descriptor(directory.path())).unwrap();
-        let other = SharedBacking::new(path_descriptor(directory.path())).unwrap();
+        let backing = SharedBacking::new(path_descriptor(directory.path()), false).unwrap();
+        let other = SharedBacking::new(path_descriptor(directory.path()), false).unwrap();
         let name = backing
             .name
             .clone()
@@ -1963,9 +2060,29 @@ mod tests {
     /// the backing, through which no mapping can be made writable; a
     /// read-write one's is the backing's own.
     #[test]
+    fn a_preferred_memfd_backing_leaves_the_root_empty() {
+        let directory = tempfile::tempdir().unwrap();
+        let memfd = SharedBacking::new(path_descriptor(directory.path()), true).unwrap();
+        assert_eq!(memfd.name, None, "a preferred memfd backing took a name");
+        assert_eq!(
+            std::fs::read_dir(directory.path()).unwrap().count(),
+            0,
+            "a preferred memfd backing left a file in the retained root"
+        );
+        let named = SharedBacking::new(path_descriptor(directory.path()), false).unwrap();
+        assert!(named.name.is_some(), "a named backing lost its name");
+        assert_eq!(
+            std::fs::read_dir(directory.path()).unwrap().count(),
+            1,
+            "a named backing made no file in the retained root"
+        );
+    }
+
+    #[test]
     fn a_read_only_hand_off_cannot_be_made_writable() {
         // A root no file can be made in (procfs) forces the memfd fallback.
-        let fallback = SharedBacking::new(path_descriptor(std::path::Path::new("/proc"))).unwrap();
+        let fallback =
+            SharedBacking::new(path_descriptor(std::path::Path::new("/proc")), false).unwrap();
         assert_eq!(fallback.name, None, "a file was made in /proc");
         let backing = File::from(fallback.file.try_clone().unwrap());
         backing.set_len(PAGE_SIZE as u64).unwrap();
@@ -2017,7 +2134,7 @@ mod tests {
         let real = tempfile::tempdir().unwrap();
         let chrooted = real.path().join("chrooted");
         std::fs::create_dir(&chrooted).unwrap();
-        let backing = SharedBacking::new(path_descriptor(real.path())).unwrap();
+        let backing = SharedBacking::new(path_descriptor(real.path()), false).unwrap();
         let name = backing
             .name
             .clone()
@@ -2049,7 +2166,7 @@ mod tests {
     #[test]
     fn a_pushed_backing_arrives_as_the_same_file() {
         let directory = tempfile::tempdir().unwrap();
-        let backing = SharedBacking::new(path_descriptor(directory.path())).unwrap();
+        let backing = SharedBacking::new(path_descriptor(directory.path()), false).unwrap();
         let mut pair = [0; 2];
         // SAFETY: pair has room for the two descriptors.
         assert_eq!(
@@ -2159,7 +2276,7 @@ mod tests {
         );
     }
     fn local_backing(directory: &std::path::Path, inode: u64) -> (SharedFile, SharedBacking, File) {
-        let backing = SharedBacking::new(path_descriptor(directory)).unwrap();
+        let backing = SharedBacking::new(path_descriptor(directory), false).unwrap();
         let file = File::from(backing.file.try_clone().unwrap());
         let key = SharedFile {
             root: FileId::of(&std::fs::metadata(directory).unwrap()),
@@ -2169,6 +2286,35 @@ mod tests {
             },
         };
         (key, backing, file)
+    }
+
+    #[test]
+    fn a_placeholder_id_links_and_resolves_its_backing() {
+        let directory = tempfile::tempdir().unwrap();
+        let (key, backing, _file) = local_backing(directory.path(), 1);
+        let (other_key, other, _other_file) = local_backing(directory.path(), 2);
+        let mut backings = SharedBackings::from([(key, backing), (other_key, other)]);
+        link_placeholder_in(&mut backings, key, "41".to_owned()).unwrap();
+        // Idempotent for the same file, refused for another.
+        link_placeholder_in(&mut backings, key, "41".to_owned()).unwrap();
+        assert!(
+            link_placeholder_in(&mut backings, other_key, "41".to_owned()).is_err(),
+            "one placeholder id linked two shared files"
+        );
+        let resolved = placeholder_backing_in(
+            &backings,
+            || Some("41".to_owned()),
+            |fd| fd.try_clone(),
+        )
+        .unwrap();
+        assert!(resolved.is_some(), "linked placeholder did not resolve");
+        let missing = placeholder_backing_in(
+            &backings,
+            || Some("99".to_owned()),
+            |fd| fd.try_clone(),
+        )
+        .unwrap();
+        assert!(missing.is_none(), "unlinked placeholder id resolved");
     }
 
     fn assert_shared_refusal(action: impl FnOnce(), step: &str) {
