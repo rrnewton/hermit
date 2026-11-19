@@ -3423,6 +3423,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
     ) -> Result<i64, Errno> {
         let recorded = next_event!(guest, Return);
         if let Ok(expected) = recorded
+            && self.write_output_files
             && self.path_mutation_dirfds_are_confined(guest.pid(), syscall)
         {
             match guest.inject_with_retry(syscall).await {
@@ -3461,6 +3462,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         };
         let recorded = next_event!(guest, Return);
         if let Ok(expected) = recorded
+            && self.write_output_files
             && self.fd_is_in_replay_root(guest.pid(), fd)
         {
             match guest.inject_with_retry(syscall).await {
@@ -3555,7 +3557,11 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         });
         let governs_live_calls = !name.to_bytes().starts_with(b"user.");
         // A placeholder descriptor names a file the replay root lacks.
-        let outcome = if in_replay_root {
+        // rr-like default (6805): no attribute is established anywhere;
+        // queries replay from the recording, so nothing observes it.
+        let outcome = if !self.write_output_files {
+            Ok(())
+        } else if in_replay_root {
             guest.inject_with_retry(live_call).await.map(drop)
         } else {
             Err(Errno::ENOENT)
@@ -4371,7 +4377,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         syscall: Syscall,
     ) -> Result<i64, Errno> {
         let recorded = next_event!(guest, Return);
-        if recorded.is_ok() {
+        if self.write_output_files && recorded.is_ok() {
             let actual = guest.inject_with_retry(syscall).await;
             if actual != recorded {
                 tracing::warn!(
@@ -4469,6 +4475,11 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         let Syscall::Setsockopt(call) = syscall else {
             unreachable!("handle_setsockopt called for {syscall:?}");
         };
+        // rr-like default (6805): no socket state is reapplied; later
+        // calls on this descriptor replay from the recording too.
+        if !self.write_output_files {
+            return next_event!(guest, Return);
+        }
         let table = guest.tid();
         if H::fd_is_eventfd(
             &mut DescriptorAccess::guest_bound(&self.init, &mut *guest, table),
@@ -4504,6 +4515,11 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         let Syscall::Shutdown(call) = syscall else {
             unreachable!("handle_shutdown called for {syscall:?}");
         };
+        // rr-like default (6805): as in `handle_setsockopt`, the
+        // recorded result stands alone.
+        if !self.write_output_files {
+            return next_event!(guest, Return);
+        }
         let table = guest.tid();
         if H::fd_is_eventfd(
             &mut DescriptorAccess::guest_bound(&self.init, &mut *guest, table),
