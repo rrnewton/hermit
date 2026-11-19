@@ -869,16 +869,12 @@ impl<H: RecordHost> Tool for RecorderWithHost<H> {
             Syscall::Other(Sysno::pidfd_getfd, _) => {
                 self.handle_fd_table_mutation(guest, syscall).await
             }
-            // 6805 slice 5 drift tripwire: the census at the pin
-            // (ai_docs slice-5 note) shows every subscribed syscall
-            // has an arm above, so reaching here means the
-            // subscription and this dispatch drifted apart. Fail the
-            // recording loudly instead of producing one replay
-            // cannot serve; the agreement test below is the detector.
-            unsupported => panic!(
-                "record/replay subscription reached unhandled syscall {unsupported:?}: \
-                 classify it in both dispatch tables"
-            ),
+            // Detcore also forwards syscalls outside the tools'
+            // subscription (e.g. set_tid_address at thread start):
+            // execute them live and record nothing, as before. The
+            // agreement test below guards the subscribed set, which
+            // is the set replay answers from the recording.
+            unsupported => return Ok(guest.inject(unsupported).await?),
         }?)
     }
 

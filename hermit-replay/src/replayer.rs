@@ -1786,13 +1786,11 @@ impl<H: RecordHost> Tool for ReplayerWithHost<H> {
             // Reverie. Replay must materialize its real OFD alias and validate
             // both successful fd allocation and failure errno.
             Syscall::Other(Sysno::pidfd_getfd, _) => self.handle_pidfd_getfd(guest, syscall).await,
-            // 6805 slice 5 drift tripwire, as in the recorder: a
-            // subscribed syscall with no arm here is drift, and a
-            // live injection would be unrecorded nondeterminism.
-            unsupported => panic!(
-                "record/replay subscription reached unhandled syscall {unsupported:?}: \
-                 classify it in both dispatch tables"
-            ),
+            // As in the recorder: Detcore forwards syscalls outside
+            // the tools' subscription too; execute them live. Only
+            // the subscribed set is answered from the recording (the
+            // agreement test in hermit-record guards that set).
+            unsupported => return Ok(guest.inject_with_retry(unsupported).await?),
         }?)
     }
 
