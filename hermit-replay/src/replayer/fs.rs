@@ -665,11 +665,13 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         if !self.fd_is_in_replay_root(task, fd) {
             return;
         }
-        let duplicate =
-            H::duplicate_guest_thread_fd(&DescriptorAccess::<()>::task(task, task), pid, task, fd)
-                .unwrap_or_else(|error| {
-                    panic!("failed to duplicate replay file for read: {error}")
-                });
+        let duplicate = H::duplicate_guest_thread_fd(
+            &DescriptorAccess::<H, ()>::task(&self.init, task, task),
+            pid,
+            task,
+            fd,
+        )
+        .unwrap_or_else(|error| panic!("failed to duplicate replay file for read: {error}"));
         let offset = libc::off_t::try_from(length).expect("recorded read length exceeds off_t");
         // SAFETY: duplicate is an owned descriptor and the recorded read succeeded.
         let result = unsafe { libc::lseek(duplicate.as_raw_fd(), offset, libc::SEEK_CUR) };
@@ -733,9 +735,13 @@ impl<H: RecordHost> ReplayerWithHost<H> {
                 "recorded regular-file write used negative offset {offset}"
             ))
         })?;
-        let duplicate =
-            H::duplicate_guest_thread_fd(&DescriptorAccess::<()>::task(task, task), pid, task, fd)
-                .map_err(Error::Io)?;
+        let duplicate = H::duplicate_guest_thread_fd(
+            &DescriptorAccess::<H, ()>::task(&self.init, task, task),
+            pid,
+            task,
+            fd,
+        )
+        .map_err(Error::Io)?;
         let file = std::fs::File::from(duplicate);
         file.write_all_at(bytes, offset_u64).map_err(Error::Io)?;
 
@@ -962,8 +968,14 @@ impl ReplayOutputs {
                 )));
             }
         };
-        let output = output.as_ref().ok_or_else(|| {
-            let reason = error.as_deref().unwrap_or("descriptor was closed");
+        let output = output
+            .get()
+            .and_then(|output| output.as_ref())
+            .ok_or_else(|| {
+                let reason = error
+                    .get()
+                    .and_then(|error| error.as_deref())
+                    .unwrap_or("descriptor was closed");
             Error::Tool(anyhow::anyhow!(
                 "recording requires output fd {output_fd}, but replay could not duplicate it: {reason}"
             ))
@@ -1171,7 +1183,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
                 let duplicate = {
                     let pid = guest.pid();
                     H::duplicate_guest_fd(
-                        &DescriptorAccess::guest_bound(&mut *guest, pid),
+                        &DescriptorAccess::guest_bound(&self.init, &mut *guest, pid),
                         pid,
                         syscall.fd(),
                     )
@@ -1503,7 +1515,7 @@ mod tests {
     #[test]
     fn missing_or_invalid_output_endpoint_is_an_outer_tool_error() {
         let outputs = ReplayOutputs {
-            stdout_error: Some("Too many open files".to_owned()),
+            stdout_error: std::sync::OnceLock::from(Some("Too many open files".to_owned())),
             ..ReplayOutputs::default()
         };
         for output_fd in [libc::STDOUT_FILENO, libc::STDERR_FILENO, 9] {

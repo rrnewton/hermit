@@ -785,7 +785,7 @@ impl<H: RecordHost> RecorderWithHost<H> {
         let pid = guest.pid();
         let table = guest.tid();
         let peer = H::duplicate_guest_thread_fd(
-            &DescriptorAccess::guest_bound(&mut *guest, table),
+            &DescriptorAccess::guest_bound(&self.init, &mut *guest, table),
             pid,
             table,
             accepted_fd(fd),

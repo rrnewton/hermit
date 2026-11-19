@@ -22,7 +22,6 @@ use std::os::fd::AsRawFd;
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -123,18 +122,25 @@ struct OutputDescriptions {
 }
 
 impl OutputDescriptions {
-    fn capture<H: RecordHost, G>(access: &DescriptorAccess<'_, G>) -> Self {
+    fn empty(pid: Pid) -> Self {
         Self {
-            stdout: Mutex::new(duplicate_regular_output::<H, G>(
-                access,
-                libc::STDOUT_FILENO,
-            )),
-            stderr: Mutex::new(duplicate_regular_output::<H, G>(
-                access,
-                libc::STDERR_FILENO,
-            )),
-            threads: Mutex::new(std::collections::BTreeSet::from([access.pid().as_raw()])),
+            stdout: Mutex::new(None),
+            stderr: Mutex::new(None),
+            threads: Mutex::new(std::collections::BTreeSet::from([pid.as_raw()])),
         }
+    }
+
+    fn capture_into<H: RecordHost, G>(&self, access: &DescriptorAccess<'_, H, G>) {
+        *self
+            .stdout
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            duplicate_regular_output::<H, G>(access, libc::STDOUT_FILENO);
+        *self
+            .stderr
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            duplicate_regular_output::<H, G>(access, libc::STDERR_FILENO);
     }
 
     /// Whether `candidate` is the root guest's `output_fd` description.
@@ -159,7 +165,7 @@ impl OutputDescriptions {
     /// descriptor table; the description stays while it or any other live
     /// guest thread still holds it, as one process's table says nothing of
     /// another's.
-    fn release_unreferenced<H: RecordHost, G>(&self, access: &DescriptorAccess<'_, G>) {
+    fn release_unreferenced<H: RecordHost, G>(&self, access: &DescriptorAccess<'_, H, G>) {
         for output in [&self.stdout, &self.stderr] {
             let mut output = output
                 .lock()
@@ -178,7 +184,7 @@ impl OutputDescriptions {
             if !threads.iter().any(|thread| {
                 let thread = Pid::from_raw(*thread);
                 guest_has_open_file_description::<H, ()>(
-                    &DescriptorAccess::task(thread, thread),
+                    &DescriptorAccess::task(access.storage(), thread, thread),
                     target,
                 )
             }) {
@@ -206,7 +212,7 @@ struct ContainerOutputs {
 impl ContainerOutputs {
     /// Whether `metadata` names the root guest's stdout, and whether it names
     /// its stderr.
-    fn matching(&self, metadata: &std::fs::Metadata) -> (bool, bool) {
+    fn matching(&self, metadata: &reverie::DescriptorMetadata) -> (bool, bool) {
         (
             self.stdout
                 .is_some_and(|identity| identity.matches(metadata)),
@@ -338,27 +344,12 @@ fn exec_request_is_live_executable(request: &ExecRequest) -> bool {
     )
 }
 
-fn same_guest_open_file_description(
-    pid: Pid,
+fn same_guest_open_file_description<H: RecordHost, G>(
+    access: &DescriptorAccess<'_, H, G>,
     left: libc::c_int,
     right: libc::c_int,
 ) -> io::Result<bool> {
-    const KCMP_FILE: libc::c_int = 0;
-    let comparison = unsafe {
-        libc::syscall(
-            libc::SYS_kcmp,
-            pid.as_raw(),
-            pid.as_raw(),
-            KCMP_FILE,
-            left,
-            right,
-        )
-    };
-    if comparison == -1 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(comparison == 0)
-    }
+    H::guest_fds_share_description(access, left, right)
 }
 
 #[derive(
@@ -402,32 +393,31 @@ fn require_mkdir_probe_closed(result: Result<i64, Errno>) -> Result<(), Errno> {
 }
 
 impl OutputIdentity {
-    fn for_fd<H: RecordHost, G>(access: &DescriptorAccess<'_, G>, fd: i32) -> Option<Self> {
+    fn for_fd<H: RecordHost, G>(access: &DescriptorAccess<'_, H, G>, fd: i32) -> Option<Self> {
         let metadata = H::fd_metadata(access, fd)?;
         Some(Self {
-            device: metadata.dev(),
-            inode: metadata.ino(),
+            device: metadata.device,
+            inode: metadata.inode,
         })
     }
 
-    fn matches(&self, metadata: &std::fs::Metadata) -> bool {
-        self.device == metadata.dev() && self.inode == metadata.ino()
+    fn matches(&self, metadata: &reverie::DescriptorMetadata) -> bool {
+        self.device == metadata.device && self.inode == metadata.inode
     }
 }
 
 fn duplicate_regular_output<H: RecordHost, G>(
-    access: &DescriptorAccess<'_, G>,
+    access: &DescriptorAccess<'_, H, G>,
     fd: libc::c_int,
 ) -> Option<std::os::fd::OwnedFd> {
     let metadata = H::fd_metadata(access, fd)?;
     metadata
-        .file_type()
         .is_file()
         .then(|| H::duplicate_guest_fd(access, access.pid(), fd).ok())
         .flatten()
 }
 fn guest_has_open_file_description<H: RecordHost, G>(
-    access: &DescriptorAccess<'_, G>,
+    access: &DescriptorAccess<'_, H, G>,
     target: &std::os::fd::OwnedFd,
 ) -> bool {
     let mut compared = false;
@@ -466,7 +456,7 @@ fn guest_has_open_file_description<H: RecordHost, G>(
 /// A Reverie tool that records syscalls. Note that only syscalls that cannot be
 /// made deterministic are forwarded to this tool.
 #[derive(Serialize, Deserialize)]
-pub struct RecorderWithHost<H> {
+pub struct RecorderWithHost<H: RecordHost> {
     /// The backend host this recorder queries for descriptor state and
     /// descriptor duplication ([`RecordHost`]); stateless, never stored.
     #[serde(skip)]
@@ -480,11 +470,10 @@ pub struct RecorderWithHost<H> {
     // Keep track of the data directory. Each thread uses this path to open its
     // event stream.
     data: PathBuf,
-    /// This process's descriptors 1 and 2 when it was created. Only the root
-    /// guest's are the container's output endpoints, so only the root thread
-    /// takes them (`RecorderThreadState::outputs`).
-    stdout: Option<OutputIdentity>,
-    stderr: Option<OutputIdentity>,
+    /// The host's installed descriptor provider for this run,
+    /// installed at `handle_thread_start` before output capture.
+    #[serde(skip)]
+    init: H::InitStorage,
 }
 
 /// The recorder on the ptrace backend's host; what `hermit record`
@@ -496,8 +485,7 @@ impl<H: RecordHost> Default for RecorderWithHost<H> {
         Self {
             _host: PhantomData,
             data: PathBuf::new(),
-            stdout: None,
-            stderr: None,
+            init: H::InitStorage::default(),
         }
     }
 }
@@ -511,14 +499,39 @@ impl<H: RecordHost> Tool for RecorderWithHost<H> {
         reverie::ToolStreamRole::BinaryRecord
     }
 
-    fn new(pid: Pid, cfg: &<Self::GlobalState as GlobalTool>::Config) -> Self {
-        let access = DescriptorAccess::<()>::task(pid, pid);
+    fn new(_pid: Pid, cfg: &<Self::GlobalState as GlobalTool>::Config) -> Self {
         Self {
             _host: PhantomData,
             data: cfg.replay_data.as_ref().unwrap().clone(),
-            stdout: OutputIdentity::for_fd::<H, ()>(&access, libc::STDOUT_FILENO),
-            stderr: OutputIdentity::for_fd::<H, ()>(&access, libc::STDERR_FILENO),
+            init: H::InitStorage::default(),
         }
+    }
+
+    /// First pre-execution guest boundary: install the run's
+    /// descriptor provider, then (process leader only) capture the
+    /// root endpoints into this thread's state, before any
+    /// descriptor-mutating injection or recorded write.
+    async fn handle_thread_start<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Error> {
+        H::install(&self.init, guest.descriptor_provider());
+        if guest.tid() == guest.pid() {
+            let table = guest.tid();
+            let stdout = OutputIdentity::for_fd::<H, G>(
+                &DescriptorAccess::guest_bound(&self.init, &mut *guest, table),
+                libc::STDOUT_FILENO,
+            );
+            let stderr = OutputIdentity::for_fd::<H, G>(
+                &DescriptorAccess::guest_bound(&self.init, &mut *guest, table),
+                libc::STDERR_FILENO,
+            );
+            guest.thread_state_mut().outputs = ContainerOutputs { stdout, stderr };
+            let descriptions = guest.thread_state().output_descriptions.clone();
+            descriptions.capture_into::<H, G>(&DescriptorAccess::guest_bound(
+                &self.init,
+                &mut *guest,
+                table,
+            ));
+        }
+        Ok(())
     }
 
     fn init_thread_state(
@@ -544,19 +557,13 @@ impl<H: RecordHost> Tool for RecorderWithHost<H> {
             interrupted_poll: None,
             bootstrapped: parent.is_some_and(|(_, state)| state.bootstrapped),
             outputs: match parent {
-                None => ContainerOutputs {
-                    stdout: self.stdout,
-                    stderr: self.stderr,
-                },
+                None => ContainerOutputs::default(),
                 Some((_, state)) => state.outputs,
             },
             output_descriptions: match parent {
-                None => std::sync::Arc::new(OutputDescriptions::capture::<H, ()>(
-                    &DescriptorAccess::task(
-                        Pid::from_raw(child.as_raw()),
-                        Pid::from_raw(child.as_raw()),
-                    ),
-                )),
+                None => {
+                    std::sync::Arc::new(OutputDescriptions::empty(Pid::from_raw(child.as_raw())))
+                }
                 Some((_, state)) => {
                     state
                         .output_descriptions
@@ -855,8 +862,11 @@ impl<H: RecordHost> Tool for RecorderWithHost<H> {
         guest.thread_state_mut().bootstrapped = true;
         let table = guest.tid();
         let descriptions = guest.thread_state().output_descriptions.clone();
-        descriptions
-            .release_unreferenced::<H, G>(&DescriptorAccess::guest_bound(&mut *guest, table));
+        descriptions.release_unreferenced::<H, G>(&DescriptorAccess::guest_bound(
+            &self.init,
+            &mut *guest,
+            table,
+        ));
         result
     }
 
@@ -886,14 +896,14 @@ impl<H: RecordHost> RecorderWithHost<H> {
             .ok()
             .and_then(|fd| {
                 H::fd_metadata(
-                    &DescriptorAccess::guest_bound(&mut *guest, table),
+                    &DescriptorAccess::guest_bound(&self.init, &mut *guest, table),
                     fd as libc::c_int,
                 )
             })
             .map_or(OpenMaterialization::None, |metadata| {
-                if metadata.file_type().is_dir() {
+                if metadata.is_dir() {
                     OpenMaterialization::Directory
-                } else if metadata.file_type().is_file() {
+                } else if metadata.is_file() {
                     OpenMaterialization::RegularFile
                 } else {
                     OpenMaterialization::None
@@ -1006,7 +1016,12 @@ impl<H: RecordHost> RecorderWithHost<H> {
         pid: Pid,
         fd: libc::c_int,
     ) -> ReplayFdKind {
-        match H::classify_fd(&mut DescriptorAccess::guest_bound(&mut *guest, pid), fd).await {
+        match H::classify_fd(
+            &mut DescriptorAccess::guest_bound(&self.init, &mut *guest, pid),
+            fd,
+        )
+        .await
+        {
             DescriptorKind::Eventfd => ReplayFdKind::Eventfd,
             DescriptorKind::RegularFile => ReplayFdKind::RegularFile,
             DescriptorKind::Signalfd | DescriptorKind::Other => ReplayFdKind::None,
@@ -1019,8 +1034,11 @@ impl<H: RecordHost> RecorderWithHost<H> {
         pid: Pid,
         fd: libc::c_int,
     ) -> bool {
-        let Some(fdinfo) =
-            H::fdinfo_text(&mut DescriptorAccess::guest_bound(&mut *guest, pid), fd).await
+        let Some(fdinfo) = H::fdinfo_text(
+            &mut DescriptorAccess::guest_bound(&self.init, &mut *guest, pid),
+            fd,
+        )
+        .await
         else {
             return false;
         };
@@ -1061,8 +1079,11 @@ impl<H: RecordHost> RecorderWithHost<H> {
         let result = guest.inject(syscall).await;
         let table = guest.tid();
         let descriptions = guest.thread_state().output_descriptions.clone();
-        descriptions
-            .release_unreferenced::<H, G>(&DescriptorAccess::guest_bound(&mut *guest, table));
+        descriptions.release_unreferenced::<H, G>(&DescriptorAccess::guest_bound(
+            &self.init,
+            &mut *guest,
+            table,
+        ));
         self.record_event(guest, result.map(SyscallEvent::Return));
         result
     }
@@ -1301,30 +1322,34 @@ impl<H: RecordHost> RecorderWithHost<H> {
             Err(error) => return Err(io::Error::from_raw_os_error(error.into_raw())),
         };
 
+        let pid = guest.pid();
         let mut candidate_fds = Vec::new();
-        for entry in std::fs::read_dir(format!("/proc/{}/fd", guest.pid().as_raw()))? {
-            let entry = entry?;
-            let Some(fd) = entry
-                .file_name()
-                .to_str()
-                .and_then(|name| name.parse::<libc::c_int>().ok())
-            else {
-                continue;
-            };
-            let metadata = match std::fs::metadata(entry.path()) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
-            };
-            if metadata.dev() == target_identity.device && metadata.ino() == target_identity.inode {
-                candidate_fds.push(fd);
-            }
+        let listed = {
+            let access = DescriptorAccess::guest_bound(&self.init, &mut *guest, pid);
+            H::visit_descriptor_numbers(&access, |fd| {
+                if let Some(metadata) = H::fd_metadata(&access, fd)
+                    && metadata.device == target_identity.device
+                    && metadata.inode == target_identity.inode
+                {
+                    candidate_fds.push(fd);
+                }
+                true
+            })
+        };
+        if listed.is_none() {
+            return Err(io::Error::from_raw_os_error(libc::ENOENT));
         }
         candidate_fds.sort_unstable();
 
         let mut aliases = Vec::new();
         for fd in candidate_fds {
-            if fd != target_fd && !same_guest_open_file_description(guest.pid(), target_fd, fd)? {
+            if fd != target_fd
+                && !same_guest_open_file_description::<H, G>(
+                    &DescriptorAccess::guest_bound(&self.init, &mut *guest, pid),
+                    target_fd,
+                    fd,
+                )?
+            {
                 continue;
             }
             let descriptor_flags = guest

@@ -72,7 +72,7 @@ use reverie::syscalls::Whence;
 use serde::Deserialize;
 use serde::Serialize;
 fn capture_guest_fd<H: crate::host::RecordHost, G>(
-    access: &DescriptorAccess<'_, G>,
+    access: &DescriptorAccess<'_, H, G>,
     fd: libc::c_int,
 ) -> (Option<std::os::fd::OwnedFd>, Option<String>) {
     match H::duplicate_guest_fd(access, access.pid(), fd) {
@@ -83,7 +83,7 @@ fn capture_guest_fd<H: crate::host::RecordHost, G>(
 }
 
 fn same_guest_open_file_description<H: RecordHost, G>(
-    access: &DescriptorAccess<'_, G>,
+    access: &DescriptorAccess<'_, H, G>,
     left: libc::c_int,
     right: libc::c_int,
 ) -> io::Result<bool> {
@@ -101,6 +101,13 @@ impl ReplayFileIdentity {
         Self {
             device: metadata.dev(),
             inode: metadata.ino(),
+        }
+    }
+
+    fn from_descriptor_metadata(metadata: &reverie::DescriptorMetadata) -> Self {
+        Self {
+            device: metadata.device,
+            inode: metadata.inode,
         }
     }
 }
@@ -260,7 +267,7 @@ fn register_materialized(root: ReplayFileIdentity, object: OwnedFd) -> io::Resul
     Ok(())
 }
 
-fn materialized_file_is_registered(pid: Pid, metadata: &std::fs::Metadata) -> bool {
+fn materialized_file_is_registered(pid: Pid, metadata: &reverie::DescriptorMetadata) -> bool {
     let Ok(root) = replay_root_identity(pid) else {
         return false;
     };
@@ -268,7 +275,9 @@ fn materialized_file_is_registered(pid: Pid, metadata: &std::fs::Metadata) -> bo
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(&root)
-        .is_some_and(|files| files.contains_key(&ReplayFileIdentity::from_metadata(metadata)))
+        .is_some_and(|files| {
+            files.contains_key(&ReplayFileIdentity::from_descriptor_metadata(metadata))
+        })
 }
 
 fn unexpected_pidfd_getfd_fd(
@@ -335,7 +344,7 @@ fn parse_eventfd_id(fdinfo: &str) -> Option<String> {
 
 /// The `eventfd-id` of descriptor `fd` in thread `tid`'s table.
 fn placeholder_eventfd_id<H: RecordHost, G>(
-    access: &DescriptorAccess<'_, G>,
+    access: &DescriptorAccess<'_, H, G>,
     fd: libc::c_int,
 ) -> Option<String> {
     let fdinfo = H::fdinfo_text_at(access, fd)?;
@@ -382,7 +391,7 @@ async fn inject_physical_close<T: Tool, G: Guest<T>>(
 /// for an accepted connection. `/proc/<tid>` shows that thread's own table,
 /// which is not the leader's for a thread cloned without `CLONE_FILES`.
 fn holds_accept_stand_in<H: RecordHost, G>(
-    access: &DescriptorAccess<'_, G>,
+    access: &DescriptorAccess<'_, H, G>,
     fd: libc::c_int,
 ) -> bool {
     H::fdinfo_text_at(access, fd).and_then(|fdinfo| parse_eventfd_count(&fdinfo))
@@ -393,7 +402,7 @@ fn holds_accept_stand_in<H: RecordHost, G>(
 /// named #3880 refusal when an accepted connection's stand-in holds the slot,
 /// and the generic divergence otherwise.
 fn slot_divergence_message<H: RecordHost, G>(
-    access: &DescriptorAccess<'_, G>,
+    access: &DescriptorAccess<'_, H, G>,
     fd: libc::c_int,
     placeholder: i64,
 ) -> String {
@@ -411,7 +420,7 @@ fn slot_divergence_message<H: RecordHost, G>(
 
 /// Whether descriptor `fd` of thread `tid` names an eventfd, which is what
 /// `reserve_replay_fd` installs as a placeholder.
-fn fd_is_eventfd<H: RecordHost, G>(access: &DescriptorAccess<'_, G>, fd: libc::c_int) -> bool {
+fn fd_is_eventfd<H: RecordHost, G>(access: &DescriptorAccess<'_, H, G>, fd: libc::c_int) -> bool {
     H::fd_link(access, fd)
         .is_some_and(|target| target == std::path::Path::new("anon_inode:[eventfd]"))
 }
@@ -420,7 +429,7 @@ fn fd_is_eventfd<H: RecordHost, G>(access: &DescriptorAccess<'_, G>, fd: libc::c
 /// inode is listed in the `/proc/<tid>/net/unix` table of the thread's network
 /// namespace.
 fn fd_is_unix_socket<H: RecordHost, G>(
-    access: &DescriptorAccess<'_, G>,
+    access: &DescriptorAccess<'_, H, G>,
     fd: libc::c_int,
 ) -> io::Result<bool> {
     let tid = access.table();
@@ -467,10 +476,10 @@ fn unix_table_lists_inode(table: &[u8], inode: u64) -> bool {
 /// locked the shared `anon_inode` instead of the recorded object, so
 /// distinct recorded objects falsely contended (dh-gg5uv review).
 fn file_is_beneath_replay_root<H: RecordHost, G>(
-    access: &DescriptorAccess<'_, G>,
+    access: &DescriptorAccess<'_, H, G>,
     fd: libc::c_int,
 ) -> bool {
-    let pid = access.pid();
+    let pid = access.table();
     let Some(link) = H::fd_link(access, fd) else {
         return false;
     };
@@ -492,7 +501,10 @@ fn file_is_beneath_replay_root<H: RecordHost, G>(
     crate::record_replay_path::directory_is_beneath(&root, &directory).unwrap_or(false)
 }
 
-fn remember_materialized_file<H: RecordHost, G>(access: &DescriptorAccess<'_, G>, fd: libc::c_int) {
+fn remember_materialized_file<H: RecordHost, G>(
+    access: &DescriptorAccess<'_, H, G>,
+    fd: libc::c_int,
+) {
     let pid = access.table();
     let Some(metadata) = H::fd_metadata(access, fd) else {
         return;
@@ -503,7 +515,7 @@ fn remember_materialized_file<H: RecordHost, G>(access: &DescriptorAccess<'_, G>
     // object must be judged by. A per-thread set of bare descriptor
     // numbers could not do that — it stayed stale across close/reuse and
     // disagreed across `CLONE_FILES` threads (dh-gg5uv review).
-    if metadata.file_type().is_file() || metadata.file_type().is_fifo() {
+    if metadata.is_file() || metadata.is_fifo() {
         let Ok(root) = replay_root_identity(pid) else {
             return;
         };
@@ -710,7 +722,7 @@ fn tgid_is_self_or_ancestor(ancestor: libc::pid_t, tid: Pid) -> bool {
 /// `flock` then refuses by name instead of locking a different open
 /// file description than the recording's.
 fn take_pending_placeholder_open<H: RecordHost, G>(
-    access: &DescriptorAccess<'_, G>,
+    access: &DescriptorAccess<'_, H, G>,
     tid: Pid,
     fd: libc::c_int,
 ) -> Option<PendingPlaceholderOpen> {
@@ -767,7 +779,7 @@ fn take_pending_placeholder_open<H: RecordHost, G>(
 /// anything else at that number is a real descriptor (or another
 /// stand-in) that a pending spend must not clobber.
 fn fd_is_plain_placeholder<H: RecordHost, G>(
-    access: &DescriptorAccess<'_, G>,
+    access: &DescriptorAccess<'_, H, G>,
     fd: libc::c_int,
 ) -> bool {
     if !fd_is_eventfd::<H, G>(access, fd) {
@@ -918,7 +930,7 @@ fn guest_absolute_open_path(tid: Pid, dirfd: libc::c_int, path: &Path) -> Option
 /// cannot be identified; the recorded `flock` then refuses by name
 /// rather than materializing on a guess.
 fn pending_placeholder_open<H: RecordHost, G>(
-    access: &DescriptorAccess<'_, G>,
+    access: &DescriptorAccess<'_, H, G>,
     tid: Pid,
     fd: libc::c_int,
     dirfd: libc::c_int,
@@ -1303,27 +1315,23 @@ fn syscall_clears_pending(syscall: Syscall, fd: libc::c_int) -> bool {
 /// copy is used now, and every other thread shares it.
 #[derive(Default)]
 pub struct ReplayOutputs {
-    pub stdout: Option<std::os::fd::OwnedFd>,
-    pub stderr: Option<std::os::fd::OwnedFd>,
+    pub stdout: std::sync::OnceLock<Option<std::os::fd::OwnedFd>>,
+    pub stderr: std::sync::OnceLock<Option<std::os::fd::OwnedFd>>,
     /// Preserve replayed write ordering independently for each captured stream.
     pub stdout_output_lock: tokio::sync::Mutex<()>,
     pub stderr_output_lock: tokio::sync::Mutex<()>,
-    pub stdout_error: Option<String>,
-    pub stderr_error: Option<String>,
+    pub stdout_error: std::sync::OnceLock<Option<String>>,
+    pub stderr_error: std::sync::OnceLock<Option<String>>,
 }
 
 impl ReplayOutputs {
-    fn capture<H: RecordHost, G>(access: &DescriptorAccess<'_, G>) -> Self {
+    fn capture_into<H: RecordHost, G>(&self, access: &DescriptorAccess<'_, H, G>) {
         let (stdout, stdout_error) = capture_guest_fd::<H, G>(access, libc::STDOUT_FILENO);
         let (stderr, stderr_error) = capture_guest_fd::<H, G>(access, libc::STDERR_FILENO);
-        Self {
-            stdout,
-            stderr,
-            stdout_output_lock: tokio::sync::Mutex::new(()),
-            stderr_output_lock: tokio::sync::Mutex::new(()),
-            stdout_error,
-            stderr_error,
-        }
+        let _ = self.stdout.set(stdout);
+        let _ = self.stderr.set(stderr);
+        let _ = self.stdout_error.set(stdout_error);
+        let _ = self.stderr_error.set(stderr_error);
     }
 }
 
@@ -1350,11 +1358,15 @@ impl Default for ReplayerThreadState {
 /// A Reverie tool that replays syscalls. Note that only syscalls that cannot be
 /// made deterministic are forwarded to this tool.
 #[derive(Serialize, Deserialize)]
-pub struct ReplayerWithHost<H> {
+pub struct ReplayerWithHost<H: RecordHost> {
     /// The backend host this replayer queries for descriptor state and
     /// descriptor duplication ([`RecordHost`]); stateless, never stored.
     #[serde(skip)]
     _host: PhantomData<H>,
+    /// The host's installed descriptor provider for this run,
+    /// installed at `handle_thread_start` before output capture.
+    #[serde(skip)]
+    init: H::InitStorage,
     // Keep track of the data directory. Each thread uses this path to open its
     // event stream.
     data: PathBuf,
@@ -1374,6 +1386,7 @@ impl<H: RecordHost> Default for ReplayerWithHost<H> {
         Self {
             _host: PhantomData,
             data: PathBuf::new(),
+            init: H::InitStorage::default(),
             outputs: Default::default(),
         }
     }
@@ -1388,14 +1401,31 @@ impl<H: RecordHost> Tool for ReplayerWithHost<H> {
     type GlobalState = detcore::GlobalState;
     type ThreadState = ReplayerThreadState;
 
-    fn new(pid: Pid, cfg: &<Self::GlobalState as GlobalTool>::Config) -> Self {
+    fn new(_pid: Pid, cfg: &<Self::GlobalState as GlobalTool>::Config) -> Self {
         Self {
             _host: PhantomData,
             data: cfg.replay_data.as_ref().unwrap().clone(),
-            outputs: std::sync::Arc::new(ReplayOutputs::capture::<H, ()>(&DescriptorAccess::task(
-                pid, pid,
-            ))),
+            init: H::InitStorage::default(),
+            outputs: Default::default(),
         }
+    }
+
+    /// First pre-execution guest boundary: install the run's
+    /// descriptor provider, then (process leader only) capture the
+    /// root endpoints shared by every thread state, before any
+    /// descriptor-mutating injection or replayed write.
+    async fn handle_thread_start<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Error> {
+        H::install(&self.init, guest.descriptor_provider());
+        if guest.tid() == guest.pid() {
+            let table = guest.tid();
+            self.outputs
+                .capture_into::<H, G>(&DescriptorAccess::guest_bound(
+                    &self.init,
+                    &mut *guest,
+                    table,
+                ));
+        }
+        Ok(())
     }
 
     fn init_thread_state(
@@ -1963,7 +1993,16 @@ impl<H: RecordHost> ReplayerWithHost<H> {
             Err(error) => return Err(error),
         };
         if !target_metadata.file_type().is_file()
-            || !materialized_file_is_registered(guest.pid(), &target_metadata)
+            || !materialized_file_is_registered(
+                guest.pid(),
+                &reverie::DescriptorMetadata::new(
+                    target_metadata.mode(),
+                    target_metadata.rdev(),
+                    target_metadata.dev(),
+                    target_metadata.ino(),
+                    target_metadata.len(),
+                ),
+            )
         {
             return Ok(false);
         }
@@ -2127,7 +2166,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
             }
             let pid = guest.pid();
             if same_guest_open_file_description::<H, G>(
-                &DescriptorAccess::guest_bound(&mut *guest, pid),
+                &DescriptorAccess::guest_bound(&self.init, &mut *guest, pid),
                 descriptor.target_fd,
                 fd,
             )? {
@@ -2301,7 +2340,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
                 {
                     let pid = guest.pid();
                     remember_materialized_file::<H, G>(
-                        &DescriptorAccess::guest_bound(&mut *guest, pid),
+                        &DescriptorAccess::guest_bound(&self.init, &mut *guest, pid),
                         alias.fd,
                     );
                 }
@@ -2460,7 +2499,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
             panic!(
                 "{}",
                 slot_divergence_message::<H, G>(
-                    &DescriptorAccess::guest_bound(&mut *guest, table),
+                    &DescriptorAccess::guest_bound(&self.init, &mut *guest, table),
                     fd,
                     placeholder
                 )
@@ -2485,7 +2524,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
             panic!(
                 "{}",
                 slot_divergence_message::<H, G>(
-                    &DescriptorAccess::guest_bound(&mut *guest, table),
+                    &DescriptorAccess::guest_bound(&self.init, &mut *guest, table),
                     fd,
                     placeholder
                 )
@@ -2538,13 +2577,15 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         Ok(())
     }
     pub(super) fn fd_is_in_replay_root(&self, pid: Pid, fd: libc::c_int) -> bool {
-        let Some(metadata) = H::fd_metadata(&DescriptorAccess::<()>::task(pid, pid), fd) else {
+        let Some(metadata) =
+            H::fd_metadata(&DescriptorAccess::<H, ()>::task(&self.init, pid, pid), fd)
+        else {
             return false;
         };
-        if metadata.file_type().is_file() || metadata.file_type().is_fifo() {
+        if metadata.is_file() || metadata.is_fifo() {
             return materialized_file_is_registered(pid, &metadata);
         }
-        if !metadata.file_type().is_dir() {
+        if !metadata.is_dir() {
             return false;
         }
         // Compare directory objects, not procfs link text. The guest may live in
@@ -2700,8 +2741,16 @@ impl<H: RecordHost> ReplayerWithHost<H> {
                     // been served virtually), and requiring it here made a
                     // later flock on the descriptor panic (issue 5007).
                     // Register it now and materialize the open for real.
-                    if !materialized_file_is_registered(pid, &found)
-                        && let Ok(root_identity) = replay_root_identity(pid)
+                    if !materialized_file_is_registered(
+                        pid,
+                        &reverie::DescriptorMetadata::new(
+                            found.mode(),
+                            found.rdev(),
+                            found.dev(),
+                            found.ino(),
+                            found.len(),
+                        ),
+                    ) && let Ok(root_identity) = replay_root_identity(pid)
                         && let Ok(object) = duplicate_controller_fd(resolved.object.as_raw_fd())
                     {
                         let _ = register_materialized(root_identity, object);
@@ -2864,7 +2913,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
                         {
                             let tid = guest.tid();
                             remember_materialized_file::<H, G>(
-                                &DescriptorAccess::guest_bound(&mut *guest, tid),
+                                &DescriptorAccess::guest_bound(&self.init, &mut *guest, tid),
                                 actual as libc::c_int,
                             );
                         }
@@ -2885,7 +2934,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
                             .await;
                         let tid = guest.tid();
                         if let Some(pending) = pending_placeholder_open::<H, G>(
-                            &DescriptorAccess::guest_bound(&mut *guest, tid),
+                            &DescriptorAccess::guest_bound(&self.init, &mut *guest, tid),
                             tid,
                             fd as libc::c_int,
                             dirfd,
@@ -2915,7 +2964,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
                     .await;
                 let tid = guest.tid();
                 if let Some(pending) = pending_placeholder_open::<H, G>(
-                    &DescriptorAccess::guest_bound(&mut *guest, tid),
+                    &DescriptorAccess::guest_bound(&self.init, &mut *guest, tid),
                     tid,
                     fd as libc::c_int,
                     dirfd,
@@ -3012,7 +3061,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         {
             let tid = guest.tid();
             remember_materialized_file::<H, G>(
-                &DescriptorAccess::guest_bound(&mut *guest, tid),
+                &DescriptorAccess::guest_bound(&self.init, &mut *guest, tid),
                 fd as libc::c_int,
             );
         }
@@ -3237,7 +3286,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
                 }
                 let tid = guest.tid();
                 if let Some(pending) = pending_placeholder_open::<H, G>(
-                    &DescriptorAccess::guest_bound(&mut *guest, tid),
+                    &DescriptorAccess::guest_bound(&self.init, &mut *guest, tid),
                     tid,
                     fd as libc::c_int,
                     syscall.dirfd(),
@@ -3849,7 +3898,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         {
             let tid = guest.tid();
             remember_materialized_file::<H, G>(
-                &DescriptorAccess::guest_bound(&mut *guest, tid),
+                &DescriptorAccess::guest_bound(&self.init, &mut *guest, tid),
                 pending.fd,
             );
         }
@@ -3921,12 +3970,12 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         // placeholder, so a thread with a split descriptor table
         // cannot spend its sibling's entry over its own real file.
         let plain = fd_is_plain_placeholder::<H, G>(
-            &DescriptorAccess::guest_bound(&mut *guest, tid),
+            &DescriptorAccess::guest_bound(&self.init, &mut *guest, tid),
             syscall.fd(),
         );
         let taken = if plain {
             take_pending_placeholder_open::<H, G>(
-                &DescriptorAccess::guest_bound(&mut *guest, tid),
+                &DescriptorAccess::guest_bound(&self.init, &mut *guest, tid),
                 tid,
                 syscall.fd(),
             )
@@ -3952,12 +4001,12 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         // object is judged the same way.
         if !self.fd_is_in_replay_root(tid, syscall.fd())
             && file_is_beneath_replay_root::<H, G>(
-                &DescriptorAccess::guest_bound(&mut *guest, tid),
+                &DescriptorAccess::guest_bound(&self.init, &mut *guest, tid),
                 syscall.fd(),
             )
         {
             remember_materialized_file::<H, G>(
-                &DescriptorAccess::guest_bound(&mut *guest, tid),
+                &DescriptorAccess::guest_bound(&self.init, &mut *guest, tid),
                 syscall.fd(),
             );
         }
@@ -4046,7 +4095,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         // serves getdents from the recording (`handle_getdents64`), which no
         // physical position feeds, so the recorded result is the whole answer.
         if H::fd_metadata(
-            &DescriptorAccess::guest_bound(&mut *guest, thread),
+            &DescriptorAccess::guest_bound(&self.init, &mut *guest, thread),
             call.fd(),
         )
         .is_some_and(|metadata| metadata.is_dir())
@@ -4058,7 +4107,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
             if let Ok(expected) = recorded {
                 let pid = guest.pid();
                 let duplicate = H::duplicate_guest_thread_fd(
-                    &DescriptorAccess::guest_bound(&mut *guest, thread),
+                    &DescriptorAccess::guest_bound(&self.init, &mut *guest, thread),
                     pid,
                     thread,
                     call.fd(),
@@ -4376,7 +4425,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         };
         let table = guest.tid();
         if H::fd_is_eventfd(
-            &mut DescriptorAccess::guest_bound(&mut *guest, table),
+            &mut DescriptorAccess::guest_bound(&self.init, &mut *guest, table),
             call.fd(),
         )
         .await
@@ -4411,7 +4460,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         };
         let table = guest.tid();
         if H::fd_is_eventfd(
-            &mut DescriptorAccess::guest_bound(&mut *guest, table),
+            &mut DescriptorAccess::guest_bound(&self.init, &mut *guest, table),
             call.fd(),
         )
         .await
@@ -4423,7 +4472,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
             let actual = guest.inject_with_retry(syscall).await;
             let unconnected = actual == Err(Errno::ENOTCONN)
                 && !fd_is_unix_socket::<H, G>(
-                    &DescriptorAccess::guest_bound(&mut *guest, table),
+                    &DescriptorAccess::guest_bound(&self.init, &mut *guest, table),
                     call.fd(),
                 )
                 .unwrap_or_else(|error| {
@@ -4556,7 +4605,7 @@ mod pending_flock_tests {
         remember_pending_placeholder_open(entry(1_000_002, open_id, None));
         assert!(
             take_pending_placeholder_open::<PtraceHost, ()>(
-                &DescriptorAccess::task(pid, pid),
+                &DescriptorAccess::task(&(), pid, pid),
                 pid,
                 1_000_001
             )
@@ -4564,7 +4613,7 @@ mod pending_flock_tests {
         );
         assert!(
             take_pending_placeholder_open::<PtraceHost, ()>(
-                &DescriptorAccess::task(pid, pid),
+                &DescriptorAccess::task(&(), pid, pid),
                 pid,
                 1_000_002
             )
@@ -4587,7 +4636,7 @@ mod pending_flock_tests {
         let dir_file = File::open(&nested).unwrap();
         let pid = Pid::from_raw(std::process::id() as i32);
         let pending = pending_placeholder_open::<PtraceHost, ()>(
-            &DescriptorAccess::task(pid, pid),
+            &DescriptorAccess::task(&(), pid, pid),
             pid,
             1_000_004,
             dir_file.as_raw_fd(),
@@ -4878,12 +4927,12 @@ mod accept_stand_in_tests {
         let duplicate = stand_in.try_clone().unwrap();
         for fd in [stand_in.as_raw_fd(), duplicate.as_raw_fd()] {
             assert!(holds_accept_stand_in::<PtraceHost, ()>(
-                &DescriptorAccess::task(pid(), pid()),
+                &DescriptorAccess::task(&(), pid(), pid()),
                 fd
             ));
             assert!(
                 slot_divergence_message::<PtraceHost, ()>(
-                    &DescriptorAccess::task(pid(), pid()),
+                    &DescriptorAccess::task(&(), pid(), pid()),
                     fd,
                     9
                 )
@@ -4898,11 +4947,11 @@ mod accept_stand_in_tests {
         let (reader, _writer) = nix::unistd::pipe().unwrap();
         for fd in [placeholder.as_raw_fd(), reader.as_raw_fd(), -1] {
             assert!(!holds_accept_stand_in::<PtraceHost, ()>(
-                &DescriptorAccess::task(pid(), pid()),
+                &DescriptorAccess::task(&(), pid(), pid()),
                 fd
             ));
             assert!(is_generic(&slot_divergence_message::<PtraceHost, ()>(
-                &DescriptorAccess::task(pid(), pid()),
+                &DescriptorAccess::task(&(), pid(), pid()),
                 fd,
                 9
             )));
@@ -4919,11 +4968,11 @@ mod accept_stand_in_tests {
         // it did here, the new placeholder must not read as a stand-in.
         let _reused = eventfd_id(placeholder.as_raw_fd()) == stand_in_id;
         assert!(!holds_accept_stand_in::<PtraceHost, ()>(
-            &DescriptorAccess::task(pid(), pid()),
+            &DescriptorAccess::task(&(), pid(), pid()),
             placeholder.as_raw_fd()
         ));
         assert!(is_generic(&slot_divergence_message::<PtraceHost, ()>(
-            &DescriptorAccess::task(pid(), pid()),
+            &DescriptorAccess::task(&(), pid(), pid()),
             placeholder.as_raw_fd(),
             9
         )));
@@ -4957,7 +5006,7 @@ mod shutdown_replay_tests {
         };
         let (reader, _writer) = nix::unistd::pipe().unwrap();
 
-        let access = DescriptorAccess::<()>::task(pid, pid);
+        let access = DescriptorAccess::<PtraceHost, ()>::task(&(), pid, pid);
         assert!(fd_is_unix_socket::<PtraceHost, ()>(&access, left.as_raw_fd()).unwrap());
         assert!(fd_is_unix_socket::<PtraceHost, ()>(&access, right.as_raw_fd()).unwrap());
         assert!(!fd_is_unix_socket::<PtraceHost, ()>(&access, tcp.as_raw_fd()).unwrap());

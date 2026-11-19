@@ -585,7 +585,7 @@ fn replay_object_with(
 /// names to `file`'s backing, so that replayed writes through it reach the
 /// backing too.
 fn link_object<H: RecordHost, G>(
-    access: &DescriptorAccess<'_, G>,
+    access: &DescriptorAccess<'_, H, G>,
     file: SharedFile,
     pid: Pid,
     tid: Pid,
@@ -1010,7 +1010,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
             .unwrap_or_else(|error| refuse("write the recorded bytes", error));
         pin_shared_object(|| {
             link_object::<H, G>(
-                &DescriptorAccess::guest_bound(&mut *guest, tid),
+                &DescriptorAccess::guest_bound(&self.init, &mut *guest, tid),
                 file,
                 pid,
                 tid,
@@ -1162,7 +1162,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
             Err(errno) => refuse("make a socketpair", errno),
         };
         let sender = H::duplicate_guest_thread_fd(
-            &DescriptorAccess::guest_bound(&mut *guest, tid),
+            &DescriptorAccess::guest_bound(&self.init, &mut *guest, tid),
             pid,
             tid,
             pair[0],

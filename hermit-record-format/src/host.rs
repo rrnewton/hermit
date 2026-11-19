@@ -16,16 +16,25 @@
 //! the reads that remain inline in the tools are named below.
 //!
 //! Every operation takes a borrowed [`DescriptorAccess`]: the
-//! run-bound capability naming the guest process and descriptor
-//! table in scope, plus the caller's [`Guest`] handle where one
-//! exists. Fact queries are guest-bound and asynchronous, so an
-//! implementation whose facts live behind the guest interface
-//! (executor descriptor tables, injected probes) can answer without
-//! ambient state. Synchronous operations (duplication, identity,
-//! registry queries) take the same access: they also run where no
-//! guest handle exists yet (tool construction, synchronous replay
-//! registries), where the access is task-bound only, and a backend
-//! with no host descriptor to duplicate refuses them by error.
+//! run-bound capability naming the host's installed provider
+//! storage, the guest process and descriptor-table owner in scope,
+//! plus the caller's guest handle where one exists. Fact queries
+//! are guest-bound and asynchronous, so an implementation whose
+//! facts live behind the guest interface (executor descriptor
+//! tables, injected probes) can answer without ambient state.
+//! Synchronous operations (duplication, identity, registry queries)
+//! take the same access: they also run where no guest handle exists
+//! yet (tool construction, synchronous replay registries), where
+//! the access is task-bound only, and a backend with no host
+//! descriptor to duplicate refuses them by error.
+//!
+//! The provider itself is installed once per run, at the tool's
+//! first pre-execution guest boundary, from the guest's
+//! `descriptor_provider()` capability, and retained in host-specific
+//! [`RecordHost::InitStorage`] on the tool; retargeting an access to
+//! another descriptor table preserves it. Two runs whose tasks
+//! share numbers are told apart by holding different providers,
+//! never by the numbers alone.
 //!
 //! Still inline in the tools, exhaustively: guest-path string logic
 //! (pure text, no host read), `/proc/<pid>/maps` and `mem` reads
@@ -33,15 +42,16 @@
 //! `/proc/<pid>/limits` and `status` reads, the `/proc/<tid>/net/unix`
 //! table read, process root/directory opens
 //! (`record_replay_path`), the replayer `FICLONE` destination reopen
-//! by its `/proc/<pid>/fd` path, the exec-restore descriptor scan,
-//! the tool's own `/proc/self` descriptor reads, captured-output
-//! identity matching over `stat` results this trait returns, and
-//! replay materialization. A second [`RecordHost`] implementation
-//! must route or refuse each of those for its backend before it
-//! lands; none of them may silently fall back to procfs. The 6805
-//! no-touch replay default (virtual files, memfd materialization)
-//! must extend this seam with effect operations or gate at the
-//! handlers; this trait covers queries and duplication only.
+//! by its `/proc/<pid>/fd` path, the exec-restore descriptor scan's
+//! directory listing, the tool's own `/proc/self` descriptor reads,
+//! captured-output identity matching over `stat` results this trait
+//! returns, and replay materialization. A second [`RecordHost`]
+//! implementation must route or refuse each of those for its backend
+//! before it lands; none of them may silently fall back to procfs.
+//! The 6805 no-touch replay default (virtual files, memfd
+//! materialization) must extend this seam with effect operations or
+//! gate at the handlers; this trait covers queries and duplication
+//! only.
 //!
 //! Duplication contract: a host must duplicate the host-backed
 //! descriptions whose offsets and effects callers then drive through
@@ -86,8 +96,9 @@ pub enum DescriptorKind {
 }
 
 /// A borrowed, run-bound capability for descriptor operations: the
-/// guest process (`pid`) and descriptor-table owner (`table`) in
-/// scope, plus the caller's guest handle where one exists.
+/// host's installed provider storage, the guest process (`pid`) and
+/// descriptor-table owner (`table`) in scope, plus the caller's
+/// guest handle where one exists.
 ///
 /// Construction is explicit at each boundary:
 /// [`DescriptorAccess::guest_bound`] in syscall handlers (the guest
@@ -95,18 +106,21 @@ pub enum DescriptorKind {
 /// through), [`DescriptorAccess::task`] at tool construction and in
 /// synchronous registry paths that name a guest task but hold no
 /// handle. There is no ambient or global access.
-pub struct DescriptorAccess<'a, G> {
+pub struct DescriptorAccess<'a, H: RecordHost + ?Sized, G> {
+    storage: &'a H::InitStorage,
     pid: Pid,
     table: Pid,
     guest: Option<&'a mut G>,
 }
 
-impl<'a, G> DescriptorAccess<'a, G> {
+impl<'a, H: RecordHost + ?Sized, G> DescriptorAccess<'a, H, G> {
     /// Access bound to guest process `pid` and descriptor table
     /// `table` only, with no guest handle: tool construction and
-    /// synchronous registry paths.
-    pub fn task(pid: Pid, table: Pid) -> Self {
+    /// synchronous registry paths. The provider installed in
+    /// `storage` still answers for the run.
+    pub fn task(storage: &'a H::InitStorage, pid: Pid, table: Pid) -> Self {
         Self {
+            storage,
             pid,
             table,
             guest: None,
@@ -123,6 +137,26 @@ impl<'a, G> DescriptorAccess<'a, G> {
         self.table
     }
 
+    /// Retargets this access to descriptor table `table`, preserving
+    /// the installed provider and the guest handle.
+    pub fn retarget(&mut self, table: Pid) {
+        self.table = table;
+    }
+
+    /// The run's descriptor provider, as installed in this access's
+    /// storage: the run identity every answer through this access
+    /// is bound to.
+    pub fn provider(&self) -> Option<&dyn reverie::DescriptorProvider> {
+        H::installed(self.storage)
+    }
+
+    /// The installed-provider storage this access borrows, for
+    /// minting a sibling access (another task's table) in the same
+    /// run without losing the provider.
+    pub fn storage(&self) -> &'a H::InitStorage {
+        self.storage
+    }
+
     /// The guest handle, when this access is guest-bound. Fact
     /// queries on a backend whose facts live behind the guest
     /// interface require it and refuse by their empty answer
@@ -134,12 +168,13 @@ impl<'a, G> DescriptorAccess<'a, G> {
     /// Access bound to `guest`, for descriptor table `table` (the
     /// calling thread's table, which is not the leader's for a
     /// thread cloned without `CLONE_FILES`).
-    pub fn guest_bound<T: Tool>(guest: &'a mut G, table: Pid) -> Self
+    pub fn guest_bound<T: Tool>(storage: &'a H::InitStorage, guest: &'a mut G, table: Pid) -> Self
     where
         G: Guest<T>,
     {
         let pid = guest.pid();
         Self {
+            storage,
             pid,
             table,
             guest: Some(guest),
@@ -149,17 +184,43 @@ impl<'a, G> DescriptorAccess<'a, G> {
 
 /// Descriptor facts and host descriptor operations for one backend.
 ///
-/// Implementations are zero-sized, statically dispatched namespaces:
-/// a tool names its host as a type parameter (for example
-/// `RecorderWithHost<PtraceHost>`), so no host value is stored or
-/// migrated. Run context arrives per call as [`DescriptorAccess`].
+/// A tool names its host as a type parameter (for example
+/// `RecorderWithHost<PtraceHost>`) and stores one
+/// [`RecordHost::InitStorage`] beside it. At its first pre-execution
+/// guest boundary it installs the guest's descriptor provider into
+/// that storage with [`RecordHost::install`]; every operation then
+/// takes a [`DescriptorAccess`] borrowing the storage, so the
+/// provider a run answers through is retained for synchronous,
+/// guest-less paths and preserved when an access is retargeted.
+/// Dispatch is static: implementations are zero-sized namespaces,
+/// and a host whose answers need no retained provider keeps its
+/// operations statically direct.
 pub trait RecordHost: Send + Sync + 'static {
+    /// Host-specific initialization storage: what
+    /// [`RecordHost::install`] retains of a run's descriptor
+    /// provider for later synchronous use. A host that answers
+    /// without a retained provider uses `()`.
+    type InitStorage: Default + Send + Sync + 'static;
+
+    /// Retains `provider` (the guest's descriptor provider, taken at
+    /// the tool's first pre-execution guest boundary) in `storage`
+    /// for the rest of the run. Called once per run, before any
+    /// descriptor capture.
+    fn install(
+        storage: &Self::InitStorage,
+        provider: Option<std::sync::Arc<dyn reverie::DescriptorProvider>>,
+    );
+
+    /// The provider retained by [`RecordHost::install`], if this
+    /// host answers through one.
+    fn installed(storage: &Self::InitStorage) -> Option<&dyn reverie::DescriptorProvider>;
+
     /// Classifies descriptor `fd` in the access's descriptor table.
     /// Asynchronous because a backend whose facts live in its
     /// executor may need to inject a probe (`Fstat`) to answer; the
     /// ptrace implementation reads `/proc` and never awaits.
     fn classify_fd<G: Guest<T>, T: Tool>(
-        access: &mut DescriptorAccess<'_, G>,
+        access: &mut DescriptorAccess<'_, Self, G>,
         fd: RawFd,
     ) -> impl std::future::Future<Output = DescriptorKind> + Send;
 
@@ -167,33 +228,36 @@ pub trait RecordHost: Send + Sync + 'static {
     /// the link-only predicate, for callers that need only this bit
     /// (a full classification would also stat on the ptrace path).
     fn fd_is_eventfd<G: Guest<T>, T: Tool>(
-        access: &mut DescriptorAccess<'_, G>,
+        access: &mut DescriptorAccess<'_, Self, G>,
         fd: RawFd,
     ) -> impl std::future::Future<Output = bool> + Send;
 
     /// The descriptor's `fdinfo` text, if it can be read.
     /// Asynchronous for the same reason as [`Self::classify_fd`].
     fn fdinfo_text<G: Guest<T>, T: Tool>(
-        access: &mut DescriptorAccess<'_, G>,
+        access: &mut DescriptorAccess<'_, Self, G>,
         fd: RawFd,
     ) -> impl std::future::Future<Output = Option<String>> + Send;
 
     /// The link target naming what descriptor `fd` in the access's
     /// table refers to, if it can be read. Synchronous for registry
     /// paths that hold no guest handle.
-    fn fd_link<G>(access: &DescriptorAccess<'_, G>, fd: RawFd) -> Option<PathBuf>;
+    fn fd_link<G>(access: &DescriptorAccess<'_, Self, G>, fd: RawFd) -> Option<PathBuf>;
 
     /// The descriptor's `fdinfo` text by task; the synchronous
     /// counterpart of [`Self::fdinfo_text`] for paths that hold no
     /// guest handle.
-    fn fdinfo_text_at<G>(access: &DescriptorAccess<'_, G>, fd: RawFd) -> Option<String>;
+    fn fdinfo_text_at<G>(access: &DescriptorAccess<'_, Self, G>, fd: RawFd) -> Option<String>;
 
     /// `stat` of descriptor `fd` in the access's table, following
     /// its link as `stat` on the descriptor does, if it can be read.
     /// Synchronous: the guards that decide whether an effect through
     /// [`Self::duplicate_guest_fd`] applies read it in the same
     /// function as the effect.
-    fn fd_metadata<G>(access: &DescriptorAccess<'_, G>, fd: RawFd) -> Option<std::fs::Metadata>;
+    fn fd_metadata<G>(
+        access: &DescriptorAccess<'_, Self, G>,
+        fd: RawFd,
+    ) -> Option<reverie::DescriptorMetadata>;
 
     /// Duplicates guest descriptor `fd` of process `pid` into this
     /// process, preserving its open file description. Synchronous
@@ -203,7 +267,7 @@ pub trait RecordHost: Send + Sync + 'static {
     /// refusal, never a silently wrong duplicate). The access names
     /// the run the duplicate belongs to.
     fn duplicate_guest_fd<G>(
-        access: &DescriptorAccess<'_, G>,
+        access: &DescriptorAccess<'_, Self, G>,
         pid: Pid,
         fd: RawFd,
     ) -> io::Result<OwnedFd>;
@@ -212,7 +276,7 @@ pub trait RecordHost: Send + Sync + 'static {
     /// `tid` in process `pid` (see
     /// [`crate::fd::duplicate_guest_thread_fd`]).
     fn duplicate_guest_thread_fd<G>(
-        access: &DescriptorAccess<'_, G>,
+        access: &DescriptorAccess<'_, Self, G>,
         pid: Pid,
         tid: Pid,
         fd: RawFd,
@@ -228,7 +292,7 @@ pub trait RecordHost: Send + Sync + 'static {
     /// between the task's descriptors). An error means the
     /// comparison could not be made, never that they differ.
     fn guest_fds_share_description<G>(
-        access: &DescriptorAccess<'_, G>,
+        access: &DescriptorAccess<'_, Self, G>,
         left: RawFd,
         right: RawFd,
     ) -> io::Result<bool>;
@@ -238,19 +302,21 @@ pub trait RecordHost: Send + Sync + 'static {
     /// `false` — lazily, so a caller searching for the first match
     /// pays only for the descriptors it inspects. `None` when the
     /// table cannot be listed.
-    fn visit_descriptor_numbers<G>(
-        access: &DescriptorAccess<'_, G>,
-        visit: &mut dyn FnMut(RawFd) -> bool,
+    fn visit_descriptor_numbers<G, F: FnMut(RawFd) -> bool>(
+        access: &DescriptorAccess<'_, Self, G>,
+        visit: F,
     ) -> Option<()>;
 
     /// Whether guest task `pid` still exists.
-    fn guest_task_exists<G>(access: &DescriptorAccess<'_, G>, pid: Pid) -> bool;
+    fn guest_task_exists<G>(access: &DescriptorAccess<'_, Self, G>, pid: Pid) -> bool;
 }
 
 /// The ptrace backend's host: the guest is host tasks, so queries read
 /// the guest's own `/proc` entries and duplication goes through pidfd
 /// (see [`crate::fd`]). This is the behaviour the tools had before the
-/// trait existed, moved unchanged.
+/// trait existed, moved unchanged. Its answers need no retained
+/// provider: initialization storage is `()` and every operation is
+/// statically direct procfs/pidfd code.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct PtraceHost;
 
@@ -284,41 +350,65 @@ fn link_is_eventfd(target: &Path) -> bool {
 }
 
 impl RecordHost for PtraceHost {
+    type InitStorage = ();
+
+    fn install(
+        _storage: &Self::InitStorage,
+        _provider: Option<std::sync::Arc<dyn reverie::DescriptorProvider>>,
+    ) {
+    }
+
+    fn installed(_storage: &Self::InitStorage) -> Option<&dyn reverie::DescriptorProvider> {
+        None
+    }
+
     async fn classify_fd<G: Guest<T>, T: Tool>(
-        access: &mut DescriptorAccess<'_, G>,
+        access: &mut DescriptorAccess<'_, Self, G>,
         fd: RawFd,
     ) -> DescriptorKind {
         classify_ptrace(access.table(), fd)
     }
 
     async fn fd_is_eventfd<G: Guest<T>, T: Tool>(
-        access: &mut DescriptorAccess<'_, G>,
+        access: &mut DescriptorAccess<'_, Self, G>,
         fd: RawFd,
     ) -> bool {
         Self::fd_link(access, fd).is_some_and(|target| link_is_eventfd(&target))
     }
 
     async fn fdinfo_text<G: Guest<T>, T: Tool>(
-        access: &mut DescriptorAccess<'_, G>,
+        access: &mut DescriptorAccess<'_, Self, G>,
         fd: RawFd,
     ) -> Option<String> {
         Self::fdinfo_text_at(access, fd)
     }
 
-    fn fd_link<G>(access: &DescriptorAccess<'_, G>, fd: RawFd) -> Option<PathBuf> {
+    fn fd_link<G>(access: &DescriptorAccess<'_, Self, G>, fd: RawFd) -> Option<PathBuf> {
         std::fs::read_link(format!("/proc/{}/fd/{fd}", access.table().as_raw())).ok()
     }
 
-    fn fdinfo_text_at<G>(access: &DescriptorAccess<'_, G>, fd: RawFd) -> Option<String> {
+    fn fdinfo_text_at<G>(access: &DescriptorAccess<'_, Self, G>, fd: RawFd) -> Option<String> {
         std::fs::read_to_string(format!("/proc/{}/fdinfo/{fd}", access.table().as_raw())).ok()
     }
 
-    fn fd_metadata<G>(access: &DescriptorAccess<'_, G>, fd: RawFd) -> Option<std::fs::Metadata> {
-        std::fs::metadata(format!("/proc/{}/fd/{fd}", access.table().as_raw())).ok()
+    fn fd_metadata<G>(
+        access: &DescriptorAccess<'_, Self, G>,
+        fd: RawFd,
+    ) -> Option<reverie::DescriptorMetadata> {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata =
+            std::fs::metadata(format!("/proc/{}/fd/{fd}", access.table().as_raw())).ok()?;
+        Some(reverie::DescriptorMetadata::new(
+            metadata.mode(),
+            metadata.rdev(),
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+        ))
     }
 
     fn duplicate_guest_fd<G>(
-        _access: &DescriptorAccess<'_, G>,
+        _access: &DescriptorAccess<'_, Self, G>,
         pid: Pid,
         fd: RawFd,
     ) -> io::Result<OwnedFd> {
@@ -326,7 +416,7 @@ impl RecordHost for PtraceHost {
     }
 
     fn duplicate_guest_thread_fd<G>(
-        _access: &DescriptorAccess<'_, G>,
+        _access: &DescriptorAccess<'_, Self, G>,
         pid: Pid,
         tid: Pid,
         fd: RawFd,
@@ -339,7 +429,7 @@ impl RecordHost for PtraceHost {
     }
 
     fn guest_fds_share_description<G>(
-        access: &DescriptorAccess<'_, G>,
+        access: &DescriptorAccess<'_, Self, G>,
         left: RawFd,
         right: RawFd,
     ) -> io::Result<bool> {
@@ -363,9 +453,9 @@ impl RecordHost for PtraceHost {
         }
     }
 
-    fn visit_descriptor_numbers<G>(
-        access: &DescriptorAccess<'_, G>,
-        visit: &mut dyn FnMut(RawFd) -> bool,
+    fn visit_descriptor_numbers<G, F: FnMut(RawFd) -> bool>(
+        access: &DescriptorAccess<'_, Self, G>,
+        mut visit: F,
     ) -> Option<()> {
         let entries = std::fs::read_dir(format!("/proc/{}/fd", access.pid().as_raw())).ok()?;
         for entry in entries.flatten() {
@@ -383,7 +473,7 @@ impl RecordHost for PtraceHost {
         Some(())
     }
 
-    fn guest_task_exists<G>(_access: &DescriptorAccess<'_, G>, pid: Pid) -> bool {
+    fn guest_task_exists<G>(_access: &DescriptorAccess<'_, Self, G>, pid: Pid) -> bool {
         Path::new(&format!("/proc/{}", pid.as_raw())).exists()
     }
 }
@@ -415,7 +505,7 @@ mod tests {
         assert!(eventfd >= 0, "eventfd: {}", io::Error::last_os_error());
         assert_eq!(classify_ptrace(pid, eventfd), DescriptorKind::Eventfd);
         // The typed eventfd predicate's link core agrees, link-only.
-        let access = DescriptorAccess::<()>::task(pid, pid);
+        let access = DescriptorAccess::<PtraceHost, ()>::task(&(), pid, pid);
         assert!(link_is_eventfd(
             &PtraceHost::fd_link(&access, eventfd).unwrap()
         ));
@@ -448,9 +538,9 @@ mod tests {
     #[test]
     fn visit_descriptor_numbers_stops_at_first_reject() {
         let pid = own_pid();
-        let access = DescriptorAccess::<()>::task(pid, pid);
+        let access = DescriptorAccess::<PtraceHost, ()>::task(&(), pid, pid);
         let mut visited = 0;
-        let listed = PtraceHost::visit_descriptor_numbers(&access, &mut |_fd| {
+        let listed = PtraceHost::visit_descriptor_numbers(&access, |_fd| {
             visited += 1;
             false
         });
