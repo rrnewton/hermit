@@ -436,8 +436,94 @@ impl std::fmt::Display for RestartOutcomeRefusal {
 
 impl std::error::Error for RestartOutcomeRefusal {}
 
-fn signal_bit(signal: i32) -> u64 {
-    1u64 << (signal - 1)
+/// Detcore's refusal of the facts a backend passed for a restart code under
+/// a pending temporary mask's restore
+/// (`Tool::resolve_restart_under_pending_mask_restore`) when the signal it
+/// says it delivers at the resume is not one Linux has: signal numbers run
+/// from 1 to `_NSIG`, 64. That is a defect of the backend, not something the
+/// guest did, so it ends the run whatever the configuration:
+/// `Config::allow_unresolved_restart_codes` does not admit it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestartFactsRefusal {
+    /// The syscall Detcore answered.
+    pub syscall: reverie::syscalls::Sysno,
+    /// The restart code it answered it with.
+    pub code: Errno,
+    /// The signal number the backend reported.
+    pub signal: i32,
+}
+
+impl std::fmt::Display for RestartFactsRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "restart facts refused (SignalOutOfRange): the backend reported delivering signal \
+             {} at the resume of {}, which Detcore answered with {} while a temporary signal \
+             mask's restore is pending, and Linux's signal numbers run from 1 to 64. This is a \
+             defect of the backend, not something the guest did; --allow-unsupported-syscalls \
+             does not admit it",
+            self.signal, self.syscall, self.code
+        )
+    }
+}
+
+impl std::error::Error for RestartFactsRefusal {}
+
+/// A signal number Linux has: 1 to `_NSIG`, 64.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KernelSignal(i32);
+
+impl KernelSignal {
+    /// `signal`, if Linux has it.
+    fn new(signal: i32) -> Option<Self> {
+        (1..=64).contains(&signal).then_some(Self(signal))
+    }
+
+    /// Its bit in a kernel signal set (procfs `SigBlk`, `SigCgt`, `SigPnd`).
+    fn bit(self) -> u64 {
+        1 << (self.0 - 1)
+    }
+}
+
+/// SIGKILL and SIGSTOP, which never run a handler.
+const UNRUNNABLE_SIGNALS: u64 = (1 << (libc::SIGKILL - 1)) | (1 << (libc::SIGSTOP - 1));
+
+/// The facts a backend passed for a restart code under a pending temporary
+/// mask's restore (`reverie::PendingMaskRestore`), with the delivered signal
+/// checked against Linux's signal numbers: the form Detcore decides on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaskRestoreFacts {
+    syscall: reverie::syscalls::Sysno,
+    code: Errno,
+    delivered: Option<KernelSignal>,
+    mask_in_effect: u64,
+    caught: u64,
+    pending: u64,
+}
+
+impl MaskRestoreFacts {
+    /// The backend's facts, or their refusal by name when the signal it
+    /// delivers is not one Linux has ([`RestartFactsRefusal`]).
+    pub fn new(facts: &reverie::PendingMaskRestore) -> Result<Self, RestartFactsRefusal> {
+        let delivered = facts
+            .delivered
+            .map(|signal| {
+                KernelSignal::new(signal).ok_or(RestartFactsRefusal {
+                    syscall: facts.syscall,
+                    code: facts.code,
+                    signal,
+                })
+            })
+            .transpose()?;
+        Ok(Self {
+            syscall: facts.syscall,
+            code: facts.code,
+            delivered,
+            mask_in_effect: facts.mask_in_effect,
+            caught: facts.caught,
+            pending: facts.pending,
+        })
+    }
 }
 
 /// Whether a handler runs at the resume the facts describe: `get_signal`
@@ -445,10 +531,10 @@ fn signal_bit(signal: i32) -> u64 {
 /// kernel queues it again, `ptrace_signal`, kernel/signal.c:2591-2632 at
 /// v6.12.9), then, while none has a handler, the pending signals the mask in
 /// effect lets through. SIGKILL and SIGSTOP never run one.
-pub fn mask_restore_handler_runs(facts: &reverie::PendingMaskRestore) -> bool {
-    let unrunnable = signal_bit(libc::SIGKILL) | signal_bit(libc::SIGSTOP);
-    let runs = |signals: u64| signals & facts.caught & !facts.mask_in_effect & !unrunnable != 0;
-    facts.delivered.is_some_and(|signal| runs(signal_bit(signal))) || runs(facts.pending)
+pub fn mask_restore_handler_runs(facts: &MaskRestoreFacts) -> bool {
+    let runs =
+        |signals: u64| signals & facts.caught & !facts.mask_in_effect & !UNRUNNABLE_SIGNALS != 0;
+    facts.delivered.is_some_and(|signal| runs(signal.bit())) || runs(facts.pending)
 }
 
 /// The outcome Linux's `do_signal` takes for the restart code the facts
@@ -457,10 +543,10 @@ pub fn mask_restore_handler_runs(facts: &reverie::PendingMaskRestore) -> bool {
 /// `ERESTARTNOINTR`; with none, a restart for every code. Refuses the two
 /// cases it cannot decide ([`UndecidableRestart`]).
 pub fn linux_mask_restore_outcome(
-    facts: &reverie::PendingMaskRestore,
+    facts: &MaskRestoreFacts,
 ) -> Result<reverie::MaskRestoreOutcome, UndecidableRestart> {
     if let Some(signal) = facts.delivered
-        && facts.mask_in_effect & signal_bit(signal) != 0
+        && facts.mask_in_effect & signal.bit() != 0
     {
         return Err(UndecidableRestart::DeliveredSignalBlockedUnderPendingRestore);
     }
@@ -479,15 +565,24 @@ pub fn linux_mask_restore_outcome(
 /// Detcore's outcome for a restart code under a pending temporary mask's
 /// restore, with a signal held for the resume
 /// (`Tool::resolve_restart_under_pending_mask_restore`): Linux's
-/// ([`linux_mask_restore_outcome`]). A case that cannot decide is refused by
-/// name ([`RestartOutcomeRefusal`]), which ends the run, unless
+/// ([`linux_mask_restore_outcome`]). Facts whose delivered signal Linux does
+/// not have are refused by name ([`RestartFactsRefusal`]) whatever the
+/// configuration. A case that cannot decide is refused by name
+/// ([`RestartOutcomeRefusal`]), which ends the run, unless
 /// `Config::allow_unresolved_restart_codes` admits it; then `EINTR`, after
 /// the same refusal is logged as a warning.
 pub fn pending_mask_restore_outcome(
     config: &Config,
     facts: &reverie::PendingMaskRestore,
 ) -> Result<reverie::MaskRestoreOutcome, Error> {
-    let reason = match linux_mask_restore_outcome(facts) {
+    let facts = match MaskRestoreFacts::new(facts) {
+        Ok(facts) => facts,
+        Err(refusal) => {
+            error!("[detcore] {refusal}");
+            return Err(Error::Tool(anyhow::Error::new(refusal)));
+        }
+    };
+    let reason = match linux_mask_restore_outcome(&facts) {
         Ok(outcome) => return Ok(outcome),
         Err(reason) => reason,
     };
@@ -502,7 +597,7 @@ pub fn pending_mask_restore_outcome(
     }
     warn!("[detcore] {refusal}; admitted, the guest gets EINTR");
     Ok(reverie::MaskRestoreOutcome::Interrupted {
-        handler_runs: mask_restore_handler_runs(facts),
+        handler_runs: mask_restore_handler_runs(&facts),
     })
 }
 
@@ -5263,7 +5358,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
     ) -> Result<reverie::MaskRestoreOutcome, Error> {
         let outcome = pending_mask_restore_outcome(&self.cfg, &facts);
         if self.cfg.allow_unresolved_restart_codes
-            && let Err(reason) = linux_mask_restore_outcome(&facts)
+            && let Ok(checked) = MaskRestoreFacts::new(&facts)
+            && let Err(reason) = linux_mask_restore_outcome(&checked)
         {
             let name = admitted_restart_name(facts.syscall, &format!("{reason:?}"));
             tool_global::report_admitted_restart_code(rpc, facts.tid, name).await;
@@ -9815,6 +9911,18 @@ mod subscription_tests {
         )
     }
 
+    /// `facts` as Detcore decides on them, for a signal Linux has.
+    fn checked(facts: &reverie::PendingMaskRestore) -> MaskRestoreFacts {
+        MaskRestoreFacts::new(facts).expect("the delivered signal is one Linux has")
+    }
+
+    /// The bit of `signal`, one Linux has, in a kernel signal set.
+    fn signal_bit(signal: i32) -> u64 {
+        KernelSignal::new(signal)
+            .expect("a signal Linux has")
+            .bit()
+    }
+
     /// Linux's outcome for each restart code under a pending temporary
     /// mask's restore, by whether a handler runs at the resume, and the two
     /// cases that cannot decide (arch/arm64/kernel/signal.c:1395-1464 at
@@ -9827,9 +9935,9 @@ mod subscription_tests {
         let interrupted = |handler_runs| Ok(MaskRestoreOutcome::Interrupted { handler_runs });
         let restart = |handler_runs| Ok(MaskRestoreOutcome::Restart { handler_runs });
         let outcome = |code, delivered, in_effect, caught, pending| {
-            linux_mask_restore_outcome(&mask_restore_facts(
+            linux_mask_restore_outcome(&checked(&mask_restore_facts(
                 code, delivered, in_effect, caught, pending,
-            ))
+            )))
         };
         // A delivered signal with a handler.
         assert_eq!(outcome(Errno::ERESTARTNOHAND, Some(usr1), 0, bit1, 0), interrupted(true));
@@ -9882,12 +9990,108 @@ mod subscription_tests {
         let (usr1, usr2) = (libc::SIGUSR1, libc::SIGUSR2);
         let (bit1, bit2) = (signal_bit(usr1), signal_bit(usr2));
         let blocked = mask_restore_facts(Errno::ERESTARTNOHAND, Some(usr1), bit1, bit1, 0);
-        assert!(!mask_restore_handler_runs(&blocked));
+        assert!(!mask_restore_handler_runs(&checked(&blocked)));
         let blocked_with_another =
             mask_restore_facts(Errno::ERESTARTNOHAND, Some(usr1), bit1, bit1 | bit2, bit2);
-        assert!(mask_restore_handler_runs(&blocked_with_another));
+        assert!(mask_restore_handler_runs(&checked(&blocked_with_another)));
         let delivered = mask_restore_facts(Errno::ERESTARTNOHAND, Some(usr1), 0, bit1, 0);
-        assert!(mask_restore_handler_runs(&delivered));
+        assert!(mask_restore_handler_runs(&checked(&delivered)));
+    }
+
+    /// Linux's signal numbers run from 1 to `_NSIG`, 64
+    /// (include/uapi/asm-generic/signal.h at v6.12.9): the first and the
+    /// last take bits 0 and 63 of a kernel signal set, and 0, a negative
+    /// number and 65 are none.
+    #[test]
+    fn kernel_signals_run_from_1_to_64() {
+        assert_eq!(KernelSignal::new(1).map(KernelSignal::bit), Some(1));
+        assert_eq!(KernelSignal::new(64).map(KernelSignal::bit), Some(1 << 63));
+        for signal in [0, -1, 65, i32::MIN, i32::MAX] {
+            assert_eq!(KernelSignal::new(signal), None, "{signal}");
+        }
+        assert_eq!(
+            UNRUNNABLE_SIGNALS,
+            signal_bit(libc::SIGKILL) | signal_bit(libc::SIGSTOP)
+        );
+    }
+
+    /// A delivered signal at either end of Linux's range is decided on its
+    /// own bit: signal 1 and signal 64 run their handler when caught and let
+    /// through, and are the blocked-delivery case when the mask in effect
+    /// blocks them.
+    #[test]
+    fn signals_1_and_64_are_decided_on_their_own_bits() {
+        use reverie::MaskRestoreOutcome;
+        for (signal, bit) in [(1, 1_u64), (64, 1 << 63)] {
+            let outcome = |in_effect, caught| {
+                linux_mask_restore_outcome(&checked(&mask_restore_facts(
+                    Errno::ERESTARTNOHAND,
+                    Some(signal),
+                    in_effect,
+                    caught,
+                    0,
+                )))
+            };
+            assert_eq!(
+                outcome(0, bit),
+                Ok(MaskRestoreOutcome::Interrupted { handler_runs: true }),
+                "{signal}"
+            );
+            assert_eq!(
+                outcome(0, !bit),
+                Ok(MaskRestoreOutcome::Restart {
+                    handler_runs: false
+                }),
+                "{signal}: only its own bit decides"
+            );
+            assert_eq!(
+                outcome(bit, bit),
+                Err(UndecidableRestart::DeliveredSignalBlockedUnderPendingRestore),
+                "{signal}"
+            );
+        }
+    }
+
+    /// A delivered signal Linux does not have (0, a negative number, 65) is
+    /// the backend's defect: Detcore refuses its facts by name, whatever the
+    /// configuration, rather than decide on a bit no signal has.
+    #[test]
+    fn a_delivered_signal_linux_does_not_have_is_refused_by_name() {
+        use reverie::syscalls::Sysno;
+        let admitted = Config {
+            allow_unresolved_restart_codes: true,
+            ..Config::default()
+        };
+        for signal in [0, -1, 65, i32::MIN, i32::MAX] {
+            let facts = mask_restore_facts(Errno::ERESTARTNOHAND, Some(signal), 0, u64::MAX, 0);
+            let refusal = RestartFactsRefusal {
+                syscall: Sysno::ppoll,
+                code: Errno::ERESTARTNOHAND,
+                signal,
+            };
+            assert_eq!(MaskRestoreFacts::new(&facts), Err(refusal), "{signal}");
+            for config in [Config::default(), admitted.clone()] {
+                match pending_mask_restore_outcome(&config, &facts) {
+                    Err(reverie::Error::Tool(error)) => {
+                        assert_eq!(
+                            error.downcast_ref::<RestartFactsRefusal>(),
+                            Some(&refusal),
+                            "{error:?}"
+                        );
+                        let text = error.to_string();
+                        assert!(
+                            text.starts_with("restart facts refused (SignalOutOfRange)"),
+                            "{text}"
+                        );
+                        assert!(
+                            text.contains(&format!("signal {signal} ")) && text.contains("1 to 64"),
+                            "{text}"
+                        );
+                    }
+                    other => panic!("{signal}: {other:?}"),
+                }
+            }
+        }
     }
 
     /// Under a pending temporary mask's restore Detcore takes Linux's outcome,

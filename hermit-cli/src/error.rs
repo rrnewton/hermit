@@ -237,7 +237,8 @@ fn is_policy_refusal(err: &Error) -> bool {
     // the window between the backend's check and its send is a timing race
     // of the backend's own, so it is reported as Hermit's failure. Nor is
     // `OutcomeNotWritable`: Detcore decided an outcome the backend cannot
-    // write.
+    // write. Nor is `detcore::RestartFactsRefusal`: the backend's facts named
+    // a signal Linux does not have.
     fn is_restart_policy_refusal(cause: &(dyn std::error::Error + 'static)) -> bool {
         cause.is::<detcore::UnresolvedRestartRefusal>()
             || cause.is::<detcore::RestartOutcomeRefusal>()
@@ -920,7 +921,9 @@ mod tests {
     /// (`UnresolvedRestartRefusal`) and its refusal of an outcome it cannot
     /// decide (`RestartOutcomeRefusal`), and the backend's `NoFreeCarrierSignal`.
     /// The backend's `CarrierInstanceNotTheTracers`, a timing race of its
-    /// own, and `OutcomeNotWritable` are Hermit's failures.
+    /// own, and `OutcomeNotWritable` are Hermit's failures, as is Detcore's
+    /// refusal of facts that name a signal Linux does not have
+    /// (`RestartFactsRefusal`).
     #[test]
     fn restart_code_refusals_are_policy_refusals_but_a_carrier_race_is_not() {
         let backend = |reason| reverie_ptrace::RestartRefusal {
@@ -978,6 +981,15 @@ mod tests {
                     reverie_ptrace::RestartRefusalReason::OutcomeNotWritable,
                 )),
                 "restart code refused (OutcomeNotWritable)",
+                FailureKind::Error,
+            ),
+            (
+                Error::new(detcore::RestartFactsRefusal {
+                    syscall: reverie::syscalls::Sysno::ppoll,
+                    code: reverie::Errno::ERESTARTNOHAND,
+                    signal: 65,
+                }),
+                "restart facts refused (SignalOutOfRange)",
                 FailureKind::Error,
             ),
         ] {
