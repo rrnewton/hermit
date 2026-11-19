@@ -19,7 +19,9 @@
 //!    registers, stack pointer, return address and thread pointer, then waits.
 //! 2. [`fork_process`] forks with a raw `clone`, so glibc's fork bookkeeping
 //!    does not run; it only updates the calling thread's ID in its glibc
-//!    descriptor, as glibc's own fork does.
+//!    descriptor, as glibc's own fork does. In the copy, the calling thread
+//!    then goes on as a new thread, so that the copy keeps its first thread
+//!    (below).
 //! 3. In the copy, [`Parked::resurrect`] clones one new thread per saved
 //!    context, with the same thread pointer and glibc's descriptor ID updated,
 //!    and the new thread resumes the saved context: it returns from the
@@ -27,11 +29,26 @@
 //!    found it, from the signal frame on its own (copied) stack.
 //! 4. In the template, [`Parked::release`] lets every parked thread go on.
 //!
+//! The copy's first thread. The thread that forks becomes the copy's first
+//! thread, its thread-group leader. Once a process's leader has exited, what
+//! `/proc/self` reads through the leader (`fd`, `fdinfo`, `cwd`, `exe`,
+//! `maps`) is gone for every thread of the process: `/proc/self/fd/<n>`
+//! fails with ENOENT. A run keeps its first thread for its whole life, but
+//! the forking thread is a guest thread's supervisor, which exits with its
+//! guest thread. So in the copy, before anything else, the forking thread
+//! parks itself with the parking signal, and the handler starts a new thread
+//! on the saved context, as [`Parked::resurrect`] does; the new thread goes
+//! on as the forking thread. The first thread stays in the handler, with
+//! every signal blocked and off its stack, until the copy exits. When the new
+//! thread cannot start, [`hand_off_error`] says why.
+//!
 //! What a re-created thread does not get back: signals pending for the old
 //! thread, timers aimed at its ID, and kernel state bound to its ID that is
 //! not re-read (the run's perf events re-open on an ID change). x86-64 only.
 
 use std::cell::UnsafeCell;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicI32;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -40,6 +57,24 @@ use std::sync::atomic::Ordering;
 const SIG_PARK: libc::c_int = 50;
 /// The most threads one capture parks.
 const MAX_THREADS: usize = 256;
+/// The slot after the parked threads' slots: in a copy, the forking thread's
+/// context, for the thread that goes on in its place ([`fork_process`]).
+const SUCCESSOR: usize = MAX_THREADS;
+/// A re-created thread's clone: a thread of this process with its saved
+/// thread pointer, whose glibc descriptor ID field the kernel sets to the new
+/// thread's ID and clears at its exit, as for any pthread.
+const THREAD_FLAGS: libc::c_int = libc::CLONE_VM
+    | libc::CLONE_FS
+    | libc::CLONE_FILES
+    | libc::CLONE_SIGHAND
+    | libc::CLONE_THREAD
+    | libc::CLONE_SYSVSEM
+    | libc::CLONE_SETTLS
+    | libc::CLONE_PARENT_SETTID
+    | libc::CLONE_CHILD_CLEARTID;
+/// The size of a re-created thread's first stack, where it runs only
+/// `multiverse_thread_setup` before it resumes on its own stack.
+const FIRST_FRAMES: usize = 64 * 1024;
 /// `PF_USER_WORKER` in a task's flags: a kernel worker thread of the process
 /// (a KVM VM's huge-page recovery worker), which blocks every signal and is
 /// re-created by its own subsystem.
@@ -61,9 +96,11 @@ struct Slot {
     affinity: libc::cpu_set_t,
 }
 
-struct Table(UnsafeCell<[Slot; MAX_THREADS]>);
-// SAFETY: each slot is written by one handler (its index comes from a
-// fetch_add) before PARKED counts it, and read after the forker saw it.
+struct Table(UnsafeCell<[Slot; MAX_THREADS + 1]>);
+// SAFETY: each parked thread's slot is written by one handler (its index
+// comes from a fetch_add) before PARKED counts it, and read after the forker
+// saw it. The successor's slot is written and read by a copy's first thread
+// while it is the copy's only thread, and then by the thread it starts.
 unsafe impl Sync for Table {}
 
 // SAFETY: Slot is plain data, valid when zeroed.
@@ -74,6 +111,16 @@ static PARKED: AtomicU32 = AtomicU32::new(0);
 /// The session parked threads wait for: they go on once RELEASED >= theirs.
 static RELEASED: AtomicU32 = AtomicU32::new(0);
 static SESSION: AtomicU32 = AtomicU32::new(0);
+/// Set in a copy while its first thread hands itself off: the parking
+/// handler then saves into the successor's slot and starts the successor
+/// instead of waiting for a release.
+static HANDING_OFF: AtomicBool = AtomicBool::new(false);
+/// The error number with which a copy's successor thread could not start,
+/// or 0.
+static HAND_OFF_ERROR: AtomicI32 = AtomicI32::new(0);
+/// A copy's first thread once it waits for the copy's exit, or 0. It never
+/// parks again, so a capture in the copy leaves it out.
+static WAITING_FIRST_THREAD: AtomicI32 = AtomicI32::new(0);
 
 fn futex_wake(word: &AtomicU32) {
     // SAFETY: wakes waiters on a live word; no memory is written.
@@ -165,12 +212,38 @@ std::arch::global_asm!(
     "    syscall",
     "    test rax, rax",
     "    jnz 3f",
+    ".Lmultiverse_clone_child:",
     "    mov rdi, [rsp]",
     "    and rsp, -16",
     "    call multiverse_thread_setup",
     "    mov rdi, rax",
     "    jmp multiverse_park_resume",
     "3:",
+    "    ret",
+    "",
+    // The same clone, for a copy's first thread handing itself off; the
+    // child is multiverse_clone_resume's. The parent returns only clone's
+    // error. Once the child exists, the parent's stack is the child's, so the
+    // parent touches no memory again: it gives up its clear-TID address (the
+    // descriptor's ID field is the child's now) and sleeps in pause, with
+    // every signal blocked, until the copy exits.
+    ".globl multiverse_hand_off",
+    ".type multiverse_hand_off,@function",
+    "multiverse_hand_off:",
+    "    mov r10, rcx",
+    "    mov eax, 56",
+    "    syscall",
+    "    test rax, rax",
+    "    jz .Lmultiverse_clone_child",
+    "    js 5f",
+    "    xor edi, edi",
+    "    mov eax, 218",
+    "    syscall",
+    "4:",
+    "    mov eax, 34",
+    "    syscall",
+    "    jmp 4b",
+    "5:",
     "    ret",
 );
 
@@ -187,11 +260,62 @@ unsafe extern "C" {
         ctid: *mut libc::pid_t,
         tls: libc::c_ulong,
     ) -> libc::c_long;
+    fn multiverse_hand_off(
+        flags: libc::c_ulong,
+        stack: *mut libc::c_void,
+        ptid: *mut libc::pid_t,
+        ctid: *mut libc::pid_t,
+        tls: libc::c_ulong,
+    ) -> libc::c_long;
 }
 
 fn slot(index: usize) -> *mut Slot {
-    // SAFETY: index < MAX_THREADS; the pointer stays inside the table.
+    // SAFETY: index <= SUCCESSOR; the pointer stays inside the table.
     unsafe { (SLOTS.0.get() as *mut Slot).add(index) }
+}
+
+/// A copy's successor thread's first stack: a static buffer, not a new
+/// mapping. The hand-off runs before the backend repairs the copy's address
+/// space, and a mapping made then could sit where the backend puts back what
+/// the fork did not copy (KVM refills the template's perf pages at their own
+/// addresses, with MAP_FIXED_NOREPLACE). One hand-off per process image, so
+/// one buffer; the successor leaves it at once, for its own stack.
+#[repr(C, align(16))]
+struct HandOffFrames(UnsafeCell<[u8; FIRST_FRAMES]>);
+// SAFETY: written and used only by a copy's first thread while it is the
+// copy's only thread, and then by its successor's first frames.
+unsafe impl Sync for HandOffFrames {}
+
+static HAND_OFF_FRAMES: HandOffFrames = HandOffFrames(UnsafeCell::new([0; FIRST_FRAMES]));
+
+/// The top of the first stack at `base`, of FIRST_FRAMES bytes, with `slot`
+/// written there for `multiverse_clone_resume` and `multiverse_hand_off`.
+fn frames_top(base: usize, slot: *mut Slot) -> usize {
+    let top = (base + FIRST_FRAMES - 64) & !15;
+    // SAFETY: top lies inside the FIRST_FRAMES bytes at `base`.
+    unsafe { std::ptr::write(top as *mut *mut Slot, slot) };
+    top
+}
+
+/// Maps a re-created thread's first stack, with `slot` at its top for
+/// `multiverse_clone_resume`, and returns the top. The mapping is never
+/// unmapped: the thread leaves it at once, for its own stack, and it is small.
+fn first_frames(slot: *mut Slot) -> Result<usize, std::io::Error> {
+    // SAFETY: a fresh private mapping; no other memory is touched.
+    let stack = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            FIRST_FRAMES,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if stack == libc::MAP_FAILED {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(frames_top(stack as usize, slot))
 }
 
 /// Called by the handler: records the thread and returns its slot, or null
@@ -199,13 +323,20 @@ fn slot(index: usize) -> *mut Slot {
 /// is refused for a missing thread).
 #[unsafe(no_mangle)]
 extern "C" fn multiverse_park_slot() -> *mut Slot {
-    let index = NEXT_SLOT.fetch_add(1, Ordering::Relaxed);
-    if index >= MAX_THREADS {
-        return std::ptr::null_mut();
-    }
+    let index = if HANDING_OFF.load(Ordering::Acquire) {
+        SUCCESSOR
+    } else {
+        let index = NEXT_SLOT.fetch_add(1, Ordering::Relaxed);
+        if index >= MAX_THREADS {
+            return std::ptr::null_mut();
+        }
+        index
+    };
     let slot = slot(index);
-    // SAFETY: this handler owns slot `index` (fetch_add above). Every call
-    // is async-signal-safe: raw system calls into memory this frame owns.
+    // SAFETY: this handler owns slot `index`: a parked thread's index comes
+    // from the fetch_add above, and the successor's slot is a copy's only
+    // thread's. Every call is async-signal-safe: raw system calls into
+    // memory this frame owns.
     unsafe {
         (*slot).tid = libc::syscall(libc::SYS_gettid) as libc::pid_t;
         let mut fs: u64 = 0;
@@ -227,9 +358,14 @@ extern "C" fn multiverse_park_slot() -> *mut Slot {
 }
 
 /// Called by the handler after the context is saved: counts the thread as
-/// parked and waits until its session is released.
+/// parked and waits until its session is released. A copy's first thread
+/// handing itself off starts its successor instead.
 #[unsafe(no_mangle)]
 extern "C" fn multiverse_park_wait() {
+    if HANDING_OFF.load(Ordering::Acquire) {
+        start_successor();
+        return;
+    }
     let session = SESSION.load(Ordering::Acquire);
     PARKED.fetch_add(1, Ordering::AcqRel);
     futex_wake(&PARKED);
@@ -239,6 +375,106 @@ extern "C" fn multiverse_park_wait() {
             break;
         }
         futex_wait(&RELEASED, released, None);
+    }
+}
+
+/// On a copy's first thread, in the parking handler with every signal
+/// blocked and its context saved in the successor's slot: starts the
+/// successor on that context and stays in `multiverse_hand_off`, off its
+/// stack, until the copy exits. Returns only when the successor could not
+/// start, with the error in HAND_OFF_ERROR. Raw system calls only: this runs
+/// in a signal handler.
+fn start_successor() {
+    let slot = slot(SUCCESSOR);
+    let error = match glibc_layout() {
+        Ok(offset) => {
+            let top = frames_top(HAND_OFF_FRAMES.0.get() as usize, slot);
+            // SAFETY: the slot holds this thread's own thread pointer; its
+            // descriptor's ID field is at fs_base + offset.
+            let tid_field = unsafe { ((*slot).fs_base as usize + offset) as *mut libc::pid_t };
+            // SAFETY: as documented on multiverse_hand_off; it returns only
+            // when no thread was started.
+            let failed = unsafe {
+                multiverse_hand_off(
+                    THREAD_FLAGS as libc::c_ulong,
+                    top as *mut libc::c_void,
+                    tid_field,
+                    tid_field,
+                    (*slot).fs_base as libc::c_ulong,
+                )
+            };
+            (-failed) as i32
+        }
+        Err(_) => libc::EINVAL,
+    };
+    HAND_OFF_ERROR.store(error, Ordering::Release);
+}
+
+/// In a copy, on its first thread, at once after the fork: goes on as a new
+/// thread and leaves the first thread waiting for the copy's exit (see the
+/// module documentation). Returns on the new thread, or on the first thread
+/// when the new one could not start ([`hand_off_error`]).
+fn hand_off_first_thread() {
+    // SAFETY: raw system calls on this thread, the copy's only one, into
+    // memory this frame owns. The handler was installed before the fork.
+    unsafe {
+        // The new thread registers glibc's rseq area for itself
+        // (multiverse_thread_setup); the first thread gives it up first.
+        let (offset, size) = RSEQ.get().copied().unwrap_or((0, 0));
+        if size > 0 {
+            let mut fs: u64 = 0;
+            libc::syscall(libc::SYS_arch_prctl, 0x1003 /* ARCH_GET_FS */, &mut fs);
+            libc::syscall(
+                libc::SYS_rseq,
+                (fs as i64 + offset) as u64,
+                size.max(32),
+                1, /* RSEQ_FLAG_UNREGISTER */
+                RSEQ_SIG,
+            );
+        }
+        // The parking signal reaches this thread even if its mask blocks
+        // it; the new thread restores the mask.
+        let mut park: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut park);
+        libc::sigaddset(&mut park, SIG_PARK);
+        let mut mask: libc::sigset_t = std::mem::zeroed();
+        libc::syscall(
+            libc::SYS_rt_sigprocmask,
+            libc::SIG_UNBLOCK,
+            &park,
+            &mut mask,
+            8,
+        );
+        HANDING_OFF.store(true, Ordering::SeqCst);
+        libc::syscall(
+            libc::SYS_tgkill,
+            libc::getpid(),
+            libc::syscall(libc::SYS_gettid),
+            SIG_PARK,
+        );
+        // Here on the new thread, or on the first one if the new one could
+        // not start.
+        HANDING_OFF.store(false, Ordering::SeqCst);
+        libc::syscall(
+            libc::SYS_rt_sigprocmask,
+            libc::SIG_SETMASK,
+            &mask,
+            std::ptr::null_mut::<libc::sigset_t>(),
+            8,
+        );
+        if HAND_OFF_ERROR.load(Ordering::Acquire) == 0 {
+            WAITING_FIRST_THREAD.store(libc::getpid(), Ordering::Release);
+        }
+    }
+}
+
+/// In a copy, why the forking thread could not go on as a new thread, if it
+/// could not ([`fork_process`]). The copy then runs on its first thread,
+/// whose exit would take `/proc/self` away from every other thread.
+pub(crate) fn hand_off_error() -> Option<std::io::Error> {
+    match HAND_OFF_ERROR.load(Ordering::Acquire) {
+        0 => None,
+        errno => Some(std::io::Error::from_raw_os_error(errno)),
     }
 }
 
@@ -332,29 +568,32 @@ fn glibc_layout() -> Result<usize, String> {
     Ok(description[2] as usize)
 }
 
+/// Installs the parking handler unless the kernel already has it. The
+/// kernel's disposition is the record, never a flag in memory: a process
+/// forked while another thread installs the handler copies the dispositions
+/// before the memory, so it can get the old disposition with the new flag.
 fn install_handler() -> Result<(), String> {
-    static INSTALLED: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
-    INSTALLED
-        .get_or_init(|| {
-            // SAFETY: reads and then installs this process's disposition of
-            // SIG_PARK, which nothing else in the process uses (checked).
-            unsafe {
-                let mut old: libc::sigaction = std::mem::zeroed();
-                libc::sigaction(SIG_PARK, std::ptr::null(), &mut old);
-                if old.sa_sigaction != libc::SIG_DFL {
-                    return Err(format!("signal {SIG_PARK} is already handled"));
-                }
-                let mut action: libc::sigaction = std::mem::zeroed();
-                action.sa_sigaction = multiverse_park_handler as *const () as usize;
-                action.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
-                libc::sigfillset(&mut action.sa_mask);
-                if libc::sigaction(SIG_PARK, &action, std::ptr::null_mut()) != 0 {
-                    return Err(format!("sigaction: {}", std::io::Error::last_os_error()));
-                }
-            }
-            Ok(())
-        })
-        .clone()
+    let handler = multiverse_park_handler as *const () as usize;
+    // SAFETY: reads and then installs this process's disposition of
+    // SIG_PARK, which nothing else in the process uses (checked).
+    unsafe {
+        let mut old: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(SIG_PARK, std::ptr::null(), &mut old);
+        if old.sa_sigaction == handler {
+            return Ok(());
+        }
+        if old.sa_sigaction != libc::SIG_DFL {
+            return Err(format!("signal {SIG_PARK} is already handled"));
+        }
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = handler;
+        action.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
+        libc::sigfillset(&mut action.sa_mask);
+        if libc::sigaction(SIG_PARK, &action, std::ptr::null_mut()) != 0 {
+            return Err(format!("sigaction: {}", std::io::Error::last_os_error()));
+        }
+    }
+    Ok(())
 }
 
 fn is_user_worker(tid: libc::pid_t) -> bool {
@@ -403,7 +642,10 @@ pub(crate) fn park_others(timeout: std::time::Duration) -> Result<Parked, String
         None::<()>
     })
     .map_err(|e| format!("/proc/self/task: {e}"))?;
-    tids.retain(|&tid| tid != me && !is_user_worker(tid));
+    // In a copy, its first thread waits for the copy's exit with every
+    // signal blocked and holds no state of the run (fork_process).
+    let first = WAITING_FIRST_THREAD.load(Ordering::Acquire);
+    tids.retain(|&tid| tid != me && tid != first && !is_user_worker(tid));
     if tids.len() > MAX_THREADS {
         return Err(format!("{} threads; at most {MAX_THREADS}", tids.len()));
     }
@@ -442,9 +684,13 @@ pub(crate) fn park_others(timeout: std::time::Duration) -> Result<Parked, String
 
 /// Forks with a raw `clone`, so that glibc does not mark the parked threads'
 /// stacks free in the child; only this thread's ID in its glibc descriptor
-/// is updated (CLONE_CHILD_SETTID), as glibc's own fork does.
+/// is updated (CLONE_CHILD_SETTID), as glibc's own fork does. In the copy it
+/// returns 0 on the thread that goes on in this one's place, the copy's
+/// first thread staying behind (see the module documentation), or on this
+/// thread when that one could not start ([`hand_off_error`]).
 pub(crate) fn fork_process() -> Result<libc::pid_t, String> {
     let offset = glibc_layout()?;
+    install_handler()?;
     // SAFETY: reads this thread's thread pointer.
     let fs = unsafe {
         let mut fs: u64 = 0;
@@ -468,6 +714,9 @@ pub(crate) fn fork_process() -> Result<libc::pid_t, String> {
     if pid < 0 {
         return Err(format!("clone: {}", std::io::Error::last_os_error()));
     }
+    if pid == 0 {
+        hand_off_first_thread();
+    }
     Ok(pid as libc::pid_t)
 }
 
@@ -490,16 +739,6 @@ impl Parked {
     /// a copy pinned to its own CPU keeps all of its threads there.
     pub(crate) fn resurrect(&self, affinity: Option<&libc::cpu_set_t>) -> Result<usize, String> {
         let offset = glibc_layout()?;
-        const STACK: usize = 64 * 1024;
-        let flags = libc::CLONE_VM
-            | libc::CLONE_FS
-            | libc::CLONE_FILES
-            | libc::CLONE_SIGHAND
-            | libc::CLONE_THREAD
-            | libc::CLONE_SYSVSEM
-            | libc::CLONE_SETTLS
-            | libc::CLONE_PARENT_SETTID
-            | libc::CLONE_CHILD_CLEARTID;
         for index in 0..self.count {
             let slot = slot(index);
             if let Some(affinity) = affinity {
@@ -507,33 +746,15 @@ impl Parked {
                 // it until the clone below.
                 unsafe { (*slot).affinity = *affinity };
             }
-            // SAFETY: a fresh private mapping for the new thread's first
-            // frames; it is never unmapped (the thread leaves it at once,
-            // for its own stack, and it is small).
-            let stack = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    STACK,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                    -1,
-                    0,
-                )
-            };
-            if stack == libc::MAP_FAILED {
-                return Err(format!("mmap: {}", std::io::Error::last_os_error()));
-            }
-            // The new thread finds its slot at the top of its stack.
-            let top = (stack as usize + STACK - 64) & !15;
-            // SAFETY: top lies inside the new mapping.
-            unsafe { std::ptr::write(top as *mut *mut Slot, slot) };
+            // The new thread finds its slot at the top of its first stack.
+            let top = first_frames(slot).map_err(|error| format!("mmap: {error}"))?;
             // SAFETY: the slot came from a parked thread of this process
             // image; its descriptor's ID field is at fs_base + offset.
             let tid_field = unsafe { ((*slot).fs_base as usize + offset) as *mut libc::pid_t };
             // SAFETY: as documented on multiverse_clone_resume.
             let tid = unsafe {
                 multiverse_clone_resume(
-                    flags as libc::c_ulong,
+                    THREAD_FLAGS as libc::c_ulong,
                     top as *mut libc::c_void,
                     tid_field,
                     tid_field,
@@ -548,5 +769,262 @@ impl Parked {
             }
         }
         Ok(self.count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The tasks of process `pid`.
+    fn task_count(pid: libc::pid_t) -> usize {
+        let mut count = 0;
+        let _ = crate::util::find_in_directory(
+            std::path::Path::new(&format!("/proc/{pid}/task")),
+            |name| {
+                if name
+                    .to_str()
+                    .is_some_and(|name| name.parse::<u32>().is_ok())
+                {
+                    count += 1;
+                }
+                None::<()>
+            },
+        );
+        count
+    }
+
+    /// A copy's forking thread is a guest thread's supervisor, which exits
+    /// with its guest thread. The copy's descriptors must stay readable
+    /// through /proc after that, because the sharing gate and the backend
+    /// read them there. Before the copy kept its first thread, the forking
+    /// thread was the copy's leader, and its exit made /proc/<copy>/fd/<n>
+    /// fail with ENOENT. The forking thread blocks the parking signal here,
+    /// as a supervisor thread may.
+    #[test]
+    fn a_copy_keeps_its_first_thread_when_the_forking_thread_exits() {
+        let mut fds = [0; 2];
+        // SAFETY: creates a pipe into `fds`.
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        let [reader, writer] = fds;
+        // SAFETY: signal set operations on local sets, and this thread's mask.
+        let mask = unsafe {
+            let mut park: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut park);
+            libc::sigaddset(&mut park, SIG_PARK);
+            let mut mask: libc::sigset_t = std::mem::zeroed();
+            libc::pthread_sigmask(libc::SIG_BLOCK, &park, &mut mask);
+            mask
+        };
+        let forked = fork_process();
+        if forked == Ok(0) {
+            // In the copy, on the thread that went on in the forking thread's
+            // place. Raw system calls only: another thread of the test
+            // process may have held a C library lock at the fork.
+            // SAFETY: raw system calls, and a read of this thread's glibc
+            // descriptor at the offset fork_process used.
+            unsafe {
+                let tid = libc::syscall(libc::SYS_gettid) as libc::pid_t;
+                let mut fs: u64 = 0;
+                libc::syscall(libc::SYS_arch_prctl, 0x1003 /* ARCH_GET_FS */, &mut fs);
+                let descriptor = TID_OFFSET
+                    .get()
+                    .map(|offset| *((fs as usize + offset) as *const libc::pid_t));
+                let report: u8 = if HAND_OFF_ERROR.load(Ordering::Acquire) != 0 {
+                    2
+                } else if tid == libc::getpid() {
+                    3
+                } else if descriptor != Some(tid) {
+                    4
+                } else {
+                    0
+                };
+                libc::syscall(libc::SYS_write, writer, &report as *const u8, 1);
+                if report != 0 {
+                    libc::syscall(libc::SYS_exit_group, 0);
+                }
+                // This thread ends alone, as a supervisor thread ends with
+                // its guest thread.
+                libc::syscall(libc::SYS_exit, 0);
+                libc::_exit(5);
+            }
+        }
+        // SAFETY: restores this thread's mask and closes our write end.
+        unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut());
+            libc::close(writer);
+        }
+        let pid = forked.expect("fork_process");
+        let mut report = [9u8];
+        let mut poll = libc::pollfd {
+            fd: reader,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: polls and reads our own pipe into `report`, then closes it.
+        // The copy holds the write end while it lives, so read only once the
+        // pipe is ready: a copy that never reports must not block the test.
+        let read = unsafe {
+            let read = if libc::poll(&mut poll, 1, 30_000) > 0 {
+                libc::read(reader, report.as_mut_ptr().cast(), 1)
+            } else {
+                -1
+            };
+            libc::close(reader);
+            read
+        };
+        // Then the successor exits, and the copy is down to its first thread.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut status = 0;
+        let ended = loop {
+            // SAFETY: reaps our own child if it has ended.
+            if unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } == pid {
+                break true;
+            }
+            if task_count(pid) <= 1 || std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        let tasks = task_count(pid);
+        let link = std::fs::read_link(format!("/proc/{pid}/fd/0"));
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        if !ended {
+            // SAFETY: ends and reaps our own child.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, &mut status, 0);
+            }
+        }
+        assert_eq!(
+            (read, report[0]),
+            (1, 0),
+            "the copy's report: 2 no successor started, 3 the successor is the \
+             leader, 4 the descriptor's ID is not the successor's"
+        );
+        assert!(
+            !ended,
+            "the copy ended (wait status {status:#x}) when its forking thread's successor did"
+        );
+        assert_eq!(tasks, 1, "the copy's tasks after the successor's exit");
+        assert!(
+            link.is_ok(),
+            "/proc/<copy>/fd/0 after the successor's exit: {link:?}"
+        );
+        let state = stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.trim_start().chars().next());
+        assert_eq!(state, Some('S'), "the copy's first thread sleeps: {stat}");
+    }
+
+    /// The start addresses of this process's mappings. A mapping that grows,
+    /// as the heap does, keeps its start.
+    fn mapping_starts() -> std::collections::BTreeSet<usize> {
+        std::fs::read_to_string("/proc/self/maps")
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.split('-').next())
+            .filter_map(|start| usize::from_str_radix(start, 16).ok())
+            .collect()
+    }
+
+    /// In a child of glibc's fork, whose C library is usable: parks a helper
+    /// thread, forks a copy, and in the copy re-creates the helper and parks
+    /// again. Returns 0, or 1x for the template's park or fork, 2x for the
+    /// copy's (its exit code, as the template saw it; 25 is a mapping the
+    /// hand-off added), 30 for a copy that did not exit.
+    fn capture_round() -> i32 {
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let helper_stop = stop.clone();
+        let helper = std::thread::spawn(move || {
+            while !helper_stop.load(Ordering::Acquire) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        });
+        let Ok(parked) = park_others(std::time::Duration::from_secs(10)) else {
+            return 10;
+        };
+        if parked.count() != 1 {
+            parked.release();
+            return 11;
+        }
+        let before = mapping_starts();
+        let code = match fork_process() {
+            Ok(0) => {
+                // In the copy, on the forking thread's successor. The
+                // hand-off may add no mapping: the backend's repair, which
+                // runs after it, puts back what the fork did not copy at the
+                // template's addresses.
+                let added = mapping_starts().difference(&before).count();
+                // SAFETY: gettid and getpid have no preconditions.
+                let leader = unsafe { libc::syscall(libc::SYS_gettid) == libc::getpid() as i64 };
+                let code = if hand_off_error().is_some() {
+                    20
+                } else if leader {
+                    21
+                } else if added != 0 {
+                    25
+                } else {
+                    match parked.resurrect(None) {
+                        Ok(1) => match park_others(std::time::Duration::from_secs(5)) {
+                            Ok(again) => {
+                                let count = again.count();
+                                again.release();
+                                if count == 1 { 0 } else { 22 }
+                            }
+                            Err(_) => 23,
+                        },
+                        _ => 24,
+                    }
+                };
+                // SAFETY: _exit ends the copy at once.
+                unsafe { libc::_exit(code) };
+            }
+            Ok(copy) => {
+                parked.release();
+                let mut status = 0;
+                // SAFETY: waits for our own child.
+                unsafe { libc::waitpid(copy, &mut status, 0) };
+                if libc::WIFEXITED(status) {
+                    libc::WEXITSTATUS(status)
+                } else {
+                    30
+                }
+            }
+            Err(_) => {
+                parked.release();
+                12
+            }
+        };
+        stop.store(true, Ordering::Release);
+        let _ = helper.join();
+        code
+    }
+
+    /// A capture in a copy parks the copy's threads but leaves out its first
+    /// thread, which waits with every signal blocked and would never park:
+    /// a capture that counted it would wait out its timeout and be refused.
+    #[test]
+    fn a_copy_re_creates_its_threads_and_its_capture_leaves_the_first_thread_out() {
+        // Made before the fork: a child forked while another test thread is
+        // still making them would inherit them half-made and wait forever.
+        glibc_layout().expect("glibc's thread descriptor layout");
+        install_handler().expect("the parking handler");
+        // SAFETY: glibc's fork; the child runs only the round and exits.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork: {}", std::io::Error::last_os_error());
+        if child == 0 {
+            let code = std::panic::catch_unwind(capture_round).unwrap_or(90);
+            // SAFETY: _exit ends the child at once.
+            unsafe { libc::_exit(code) };
+        }
+        let mut status = 0;
+        // SAFETY: waits for our own child.
+        unsafe { libc::waitpid(child, &mut status, 0) };
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "the round's wait status {status:#x}: exit code 1x the template's park \
+             or fork, 2x the copy's, 30 a copy that did not exit, 90 a panic"
+        );
     }
 }

@@ -2258,6 +2258,11 @@ fn become_timeline(
         // SAFETY: _exit ends the process at once.
         unsafe { libc::_exit(97) };
     };
+    // The forking thread went on as a new thread, so that the copy keeps its
+    // first thread, whose exit would take /proc/self away (fork_threads).
+    if let Some(error) = crate::fork_threads::hand_off_error() {
+        fail("keeping the copy's first thread", error.to_string());
+    }
     // First, so that copies started together repair on their own CPUs
     // rather than queueing on the template's pinned CPU; the re-created
     // threads get the same set below. A pool gives copy j of a batch the
