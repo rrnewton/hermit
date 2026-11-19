@@ -715,6 +715,13 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         offset: Option<i64>,
         advances_offset: bool,
     ) -> Result<(), Error> {
+        // rr-like default (6805): the recorded result is the whole
+        // answer; no replay-root file or shared backing is touched.
+        // Reads of this descriptor are served from recorded bytes, so
+        // nothing later consumes these bytes from a real file.
+        if !self.write_output_files {
+            return Ok(());
+        }
         // The pages of a file that guest mappings share are the replay's
         // backing of it, which the write reaches too, as it reaches the page
         // cache every mapping of the file maps under Linux.

@@ -60,6 +60,14 @@ pub struct ReplayOpts {
     // FIXME: This shouldn't exist. It'd be better to use a Unix domain socket.
     gdbserver_port: u16,
 
+    /// Re-apply regular-file writes and recorded opens in the replay
+    /// root, producing the guest's output files there. By default a
+    /// replay answers them from the recording and writes no output
+    /// files, as rr replay does; captured stdout and stderr are
+    /// emitted either way.
+    #[clap(long)]
+    write_output_files: bool,
+
     /// Replay to the end without an attached debugger.
     #[clap(long, short)]
     autopilot: bool,
@@ -425,9 +433,13 @@ impl ReplayOpts {
         // which returns `hermit::SchedulerEndedRun`: the deadlock under
         // Hermit's model the recording ended on.
         if autopilot {
-            hermit.replay(id)
+            hermit.replay_with_output_files(id, self.write_output_files)
         } else {
-            hermit.replay_with_gdbserver(id, self.gdbserver_port)
+            hermit.replay_with_gdbserver_and_output_files(
+                id,
+                self.gdbserver_port,
+                self.write_output_files,
+            )
         }
     }
 }

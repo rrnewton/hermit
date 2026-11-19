@@ -1672,6 +1672,18 @@ pub struct Config {
     #[clap(skip = false)]
     pub replaying: bool,
 
+    /// **Internal:** Set only by `hermit replay --write-output-files`.
+    /// Detcore never reads it; the replay tool does. Without it replay is
+    /// rr-like: regular-file writes and opens are answered from the
+    /// recording and no output file is materialized in the replay root.
+    /// With it, replay re-applies them as it did before the rr-like
+    /// default. Captured stdout/stderr are emitted either way.
+    ///
+    /// Like `replaying`, it never enters the legacy form.
+    #[serde(default)]
+    #[clap(skip = false)]
+    pub replay_write_output_files: bool,
+
     /// **Internal:** debugging option to stop execution after a specific scheduler commit, aka turn number
     /// (non-negative integer). This only makes sense if `--sequentialize-threads` is specified, as the scheduler is otherwise not engaged.
     #[clap(long, value_name = "turn_N")]
@@ -4453,7 +4465,7 @@ mod legacy_backend_json {
     /// `allow_unresolved_restart_codes` came after it too: only the ptrace
     /// backend on aarch64 asks Detcore about restart codes, so it is never
     /// written and reads as false.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 67] = [
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 68] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -4470,6 +4482,7 @@ mod legacy_backend_json {
         "expired_wait_charge",
         "sleep_registration",
         "replaying",
+        "replay_write_output_files",
         "scheduler_turn_cost",
         "cap_preemption_charge",
         "virtual_timeout",
@@ -4663,6 +4676,7 @@ mod legacy_backend_json {
                     | "futex_wake_yields"
                     | "cap_preemption_charge"
                     | "replaying"
+                    | "replay_write_output_files"
                     | "signal_delivery_check_fatal"
                     | "container_procfs"
                     | "notice_host_network_abstract_binds"
@@ -5023,6 +5037,7 @@ mod legacy_backend_json {
                 | "expired_wait_charge"
                 | "sleep_registration"
                 | "replaying"
+                | "replay_write_output_files"
                 | "scheduler_turn_cost"
                 | "cap_preemption_charge"
                 | "virtual_timeout"
@@ -6074,7 +6089,7 @@ mod tests {
     /// `in_guest_reserved_signals`, `in_guest_refuses_host_timed_producers`,
     /// `in_guest_signal_delivery`,
     /// `launch_image`, `target_timeslice_syscalls_only`, `futex_wake_yields`,
-    /// `replaying`,
+    /// `replaying`, `replay_write_output_files`,
     /// `scheduler_turn_cost`, `cap_preemption_charge`, `chaos_timed_wait_spread`,
     /// `inherited_seccomp`, `replay_edited_preemptions`, `lenient_replay` or `detlog_anon`,
     /// which is the key order the encoder writes.
@@ -6107,6 +6122,7 @@ mod tests {
                 | "expired_wait_charge"
                 | "sleep_registration"
                 | "replaying"
+                | "replay_write_output_files"
                 | "scheduler_turn_cost"
                 | "cap_preemption_charge"
                 | "virtual_timeout"
@@ -6203,10 +6219,11 @@ mod tests {
         // none: fourteen more keys and sixty-six fewer (lenient_replay joined
         // them in dh-mvz7y, chaos_timed_wait_spread later, `autofs_roots` and
         // `notice_autofs_eloop` later still, then
-        // `ephemeral_port_range_override`), so fifty-two keys fewer
+        // `ephemeral_port_range_override`, then
+        // `replay_write_output_files`), so fifty-three keys fewer
         // than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 52);
+        assert_eq!(fields.len(), keys.len() + 53);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -7390,12 +7407,19 @@ mod tests {
         };
         let on = Config {
             replaying: true,
+            replay_write_output_files: true,
             ..off.clone()
         };
         let json = to_legacy_backend_json(&on).unwrap();
         assert_eq!(json, to_legacy_backend_json(&off).unwrap());
         assert!(!json.contains("replaying"), "{json}");
+        assert!(!json.contains("replay_write_output_files"), "{json}");
         assert!(!from_legacy_backend_json(&json).unwrap().replaying);
+        assert!(
+            !from_legacy_backend_json(&json)
+                .unwrap()
+                .replay_write_output_files
+        );
         let values: Vec<serde_json::Value> = ordered_entries(&json)
             .into_iter()
             .map(|(_, value)| value)
