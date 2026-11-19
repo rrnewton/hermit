@@ -1424,6 +1424,9 @@ fn record_or_replay_config_with_timer_support(
         deterministic_io: false,
         virtualize_time: crate::RECORD_REPLAY_VIRTUALIZES_TIME,
         virtualize_metadata: false,
+        // rr-like by default; `hermit replay --write-output-files`
+        // opts back into re-applying writes (Replay::spawn overwrites).
+        replay_write_output_files: false,
         mountinfo_root_rewrites: Vec::new(),
         mountinfo_device_rewrites: Vec::new(),
         mountinfo_mount_ids: Vec::new(),

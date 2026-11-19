@@ -5178,6 +5178,18 @@ impl HermitData {
         replay_from(&data)
     }
 
+    /// Replays the given recording ID, optionally re-applying
+    /// regular-file writes and recorded opens in the replay root
+    /// (`--write-output-files`) instead of the rr-like default.
+    pub fn replay_with_output_files(
+        &self,
+        id: Id,
+        write_output_files: bool,
+    ) -> Result<ExitStatus, Error> {
+        let data = self.data_dir.join(id.to_string());
+        replay_from_with_output_files(&data, write_output_files)
+    }
+
     /// Replays the given recording ID with a gdbserver available to attach to.
     ///
     /// The ptrace session runs on a tracer thread, so the calling thread needs no
@@ -5185,6 +5197,18 @@ impl HermitData {
     pub fn replay_with_gdbserver(&self, id: Id, port: u16) -> Result<ExitStatus, Error> {
         let data = self.data_dir.join(id.to_string());
         replay_with_gdbserver(&data, port)
+    }
+
+    /// [`Self::replay_with_gdbserver`] with the output-file choice of
+    /// [`Self::replay_with_output_files`].
+    pub fn replay_with_gdbserver_and_output_files(
+        &self,
+        id: Id,
+        port: u16,
+        write_output_files: bool,
+    ) -> Result<ExitStatus, Error> {
+        let data = self.data_dir.join(id.to_string());
+        replay_with_gdbserver_and_output_files(&data, port, write_output_files)
     }
 
     /// Returns an iterator over the recordings.
@@ -5756,7 +5780,17 @@ async fn record_with_output_async(
 /// The ptrace session runs on a tracer thread, so the calling thread needs no
 /// particular stack; see [`run`].
 pub fn replay_from(dir: &Path) -> Result<ExitStatus, Error> {
-    replay_plain(dir, None, &[])
+    replay_plain(dir, None, &[], false)
+}
+
+/// Replays, re-applying regular-file writes and recorded opens in the
+/// replay root (`hermit replay --write-output-files`) instead of the
+/// rr-like default of answering them from the recording alone.
+pub fn replay_from_with_output_files(
+    dir: &Path,
+    write_output_files: bool,
+) -> Result<ExitStatus, Error> {
+    replay_plain(dir, None, &[], write_output_files)
 }
 
 /// Replays with a gdb server.
@@ -5764,7 +5798,18 @@ pub fn replay_from(dir: &Path) -> Result<ExitStatus, Error> {
 /// The ptrace session runs on a tracer thread, so the calling thread needs no
 /// particular stack; see [`run`].
 pub fn replay_with_gdbserver(dir: &Path, port: u16) -> Result<ExitStatus, Error> {
-    replay_plain(dir, Some(port), &[])
+    replay_plain(dir, Some(port), &[], false)
+}
+
+/// Replays with a gdb server, optionally re-applying regular-file
+/// writes and recorded opens in the replay root (see
+/// [`replay_from_with_output_files`]).
+pub fn replay_with_gdbserver_and_output_files(
+    dir: &Path,
+    port: u16,
+    write_output_files: bool,
+) -> Result<ExitStatus, Error> {
+    replay_plain(dir, Some(port), &[], write_output_files)
 }
 
 /// Replays with a gdb server and mounts inside the replay chroot.
@@ -5776,16 +5821,21 @@ pub fn replay_with_gdbserver_and_mounts(
     port: u16,
     mounts: &[Mount],
 ) -> Result<ExitStatus, Error> {
-    replay_plain(dir, Some(port), mounts)
+    replay_plain(dir, Some(port), mounts, false)
 }
 
-fn replay_plain(dir: &Path, port: Option<u16>, mounts: &[Mount]) -> Result<ExitStatus, Error> {
+fn replay_plain(
+    dir: &Path,
+    port: Option<u16>,
+    mounts: &[Mount],
+    write_output_files: bool,
+) -> Result<ExitStatus, Error> {
     let dir = dir.to_owned();
     let mounts = mounts.to_vec();
     ptrace_completion::run_on_tracer_thread(None, move |control| async move {
         let report = SkidOvershootReport::begin(true);
         let result = async {
-            Replay::spawn(&dir, false, port, &mounts)
+            Replay::spawn(&dir, false, port, &mounts, write_output_files)
                 .await?
                 .wait(control)
                 .await
@@ -5813,7 +5863,7 @@ pub fn replay_with_output_and_mounts(dir: &Path, mounts: &[Mount]) -> Result<Out
     ptrace_completion::run_on_tracer_thread(None, move |control| async move {
         let report = SkidOvershootReport::begin(true);
         let result = async {
-            Replay::spawn(&dir, true, None, &mounts)
+            Replay::spawn(&dir, true, None, &mounts, false)
                 .await?
                 .wait_with_output(control)
                 .await

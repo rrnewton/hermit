@@ -1388,6 +1388,12 @@ pub struct ReplayerWithHost<H: RecordHost> {
     /// placeholder replaced per fresh root state for deferred hosts.
     #[serde(skip)]
     outputs: std::sync::Arc<ReplayOutputs>,
+    /// `hermit replay --write-output-files`: re-apply regular-file
+    /// writes and materialize recorded opens in the replay root, as
+    /// replay did before the rr-like default. Without it, regular-file
+    /// writes and opens are answered from the recording and no output
+    /// file is produced.
+    write_output_files: bool,
 }
 
 /// The replayer on the ptrace backend's host; what `hermit replay`
@@ -1401,6 +1407,7 @@ impl<H: RecordHost> Default for ReplayerWithHost<H> {
             data: PathBuf::new(),
             init: H::InitStorage::default(),
             outputs: Default::default(),
+            write_output_files: false,
         }
     }
 }
@@ -1428,6 +1435,7 @@ impl<H: RecordHost> Tool for ReplayerWithHost<H> {
             data: cfg.replay_data.as_ref().unwrap().clone(),
             init,
             outputs,
+            write_output_files: cfg.replay_write_output_files,
         }
     }
 
@@ -2891,42 +2899,47 @@ impl<H: RecordHost> ReplayerWithHost<H> {
                     Some(absolute) => (libc::AT_FDCWD, absolute),
                     None => (dirfd, path.clone()),
                 };
-            let materialize = match event.materialize {
-                OpenMaterialization::Directory => self
-                    .materialize_recorded_directory(
-                        guest,
-                        syscall,
-                        materialization_dirfd,
-                        &materialization_path,
-                        flags,
-                    )
-                    .unwrap_or_else(|error| {
-                        panic!("failed to materialize recorded open directory: {error}")
-                    }),
-                OpenMaterialization::RegularFile => {
-                    match self.open_materialization_refusal(
-                        guest.tid(),
-                        materialization_dirfd,
-                        &materialization_path,
-                        flags,
-                    ) {
-                        None => true,
-                        Some(reason) => {
-                            // A regular file that replay answers with a
-                            // placeholder here is exactly the descriptor a
-                            // later flock must materialize or refuse; say
-                            // which gate made it a placeholder.
-                            tracing::debug!(
-                                ?syscall,
-                                reason,
-                                "recorded regular-file open stays virtual"
-                            );
-                            false
+            // rr-like default (6805): without --write-output-files a
+            // recorded open stays virtual (placeholder descriptor,
+            // recorded result), exactly as a refused materialization
+            // above already leaves it; nothing is created in the root.
+            let materialize = self.write_output_files
+                && match event.materialize {
+                    OpenMaterialization::Directory => self
+                        .materialize_recorded_directory(
+                            guest,
+                            syscall,
+                            materialization_dirfd,
+                            &materialization_path,
+                            flags,
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("failed to materialize recorded open directory: {error}")
+                        }),
+                    OpenMaterialization::RegularFile => {
+                        match self.open_materialization_refusal(
+                            guest.tid(),
+                            materialization_dirfd,
+                            &materialization_path,
+                            flags,
+                        ) {
+                            None => true,
+                            Some(reason) => {
+                                // A regular file that replay answers with a
+                                // placeholder here is exactly the descriptor a
+                                // later flock must materialize or refuse; say
+                                // which gate made it a placeholder.
+                                tracing::debug!(
+                                    ?syscall,
+                                    reason,
+                                    "recorded regular-file open stays virtual"
+                                );
+                                false
+                            }
                         }
                     }
-                }
-                OpenMaterialization::None => false,
-            };
+                    OpenMaterialization::None => false,
+                };
             if materialize {
                 match guest.inject_with_retry(syscall).await {
                     Ok(actual) => {
@@ -2970,16 +2983,17 @@ impl<H: RecordHost> ReplayerWithHost<H> {
                         }
                     }
                 }
-            } else if self
-                .try_materialize_fifo_open(
-                    guest,
-                    syscall,
-                    materialization_dirfd,
-                    &materialization_path,
-                    flags,
-                    fd,
-                )
-                .await
+            } else if self.write_output_files
+                && self
+                    .try_materialize_fifo_open(
+                        guest,
+                        syscall,
+                        materialization_dirfd,
+                        &materialization_path,
+                        flags,
+                        fd,
+                    )
+                    .await
             {
                 // The recorded open now names the real fifo in this
                 // descriptor table, registered by identity inside.
@@ -3976,6 +3990,12 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         guest: &mut G,
         syscall: Flock,
     ) -> Result<i64, Errno> {
+        // rr-like default (6805): locks have no consumer outside the
+        // recording; the recorded result is the whole answer and no
+        // placeholder is materialized to lock against.
+        if !self.write_output_files {
+            return next_event!(guest, Return);
+        }
         // The calling thread's descriptor table, not the leader's
         // (`guest.pid()`): a thread made without CLONE_FILES holds a
         // different file at this number in the leader's table.

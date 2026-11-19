@@ -128,6 +128,7 @@ impl Replay {
         capture_output: bool,
         gdbserver: Option<u16>,
         mounts: &[Mount],
+        write_output_files: bool,
     ) -> Result<Self, Error> {
         let metadata = Metadata::load(dir)?;
         crate::cpu_profile_admission::check_record_or_replay(metadata.cpu_profile)?;
@@ -157,6 +158,7 @@ impl Replay {
 
         let mut config = record_or_replay_config(dir);
         config.replaying = true;
+        config.replay_write_output_files = write_output_files;
         // The profile the recording ran, which `record` resolved before it
         // started (absent in an old recording: x86-64-v2). Never the profile
         // this invocation would choose, and never derived again from the
@@ -706,7 +708,7 @@ mod tests {
             metadata.to_string(),
         )
         .unwrap();
-        let error = match Replay::spawn(dir.path(), false, None, &[]).await {
+        let error = match Replay::spawn(dir.path(), false, None, &[], false).await {
             Ok(_) => panic!("replay accepted a 0x122 recording"),
             Err(error) => error.to_string(),
         };
@@ -738,7 +740,7 @@ mod tests {
             metadata.to_string(),
         )
         .unwrap();
-        let error = match Replay::spawn(dir.path(), false, None, &[]).await {
+        let error = match Replay::spawn(dir.path(), false, None, &[], false).await {
             Ok(_) => panic!("replay accepted the pre-pairing 0x196 recording"),
             Err(error) => error,
         };
@@ -805,7 +807,7 @@ mod tests {
                 metadata.to_string(),
             )
             .unwrap();
-            let error = match Replay::spawn(dir.path(), false, None, &[]).await {
+            let error = match Replay::spawn(dir.path(), false, None, &[], false).await {
                 Ok(_) => panic!("replay accepted a recording without this run's RCB identity"),
                 Err(error) => error,
             };
@@ -840,7 +842,7 @@ mod tests {
             metadata.to_string(),
         )
         .unwrap();
-        let error = match Replay::spawn(dir.path(), false, None, &[]).await {
+        let error = match Replay::spawn(dir.path(), false, None, &[], false).await {
             Ok(_) => panic!("replay accepted a recording that refuses replay"),
             Err(error) => error.to_string(),
         };
