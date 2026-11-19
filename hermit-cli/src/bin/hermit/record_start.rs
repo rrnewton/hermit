@@ -1225,6 +1225,8 @@ impl StartOpts {
             passthru_opt: false,
             epoch: verify_run::RECORDING_EPOCH.into(),
             exact_branch_counter: Some(exact_branch_counter),
+            // Record/replay runs only on ptrace: startup is monitored.
+            startup_unmonitored: Some(false),
             dbt: None,
             role: if first.is_some() {
                 verify_run::RunRole::Replay
