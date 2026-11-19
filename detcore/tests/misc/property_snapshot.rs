@@ -180,12 +180,13 @@ fn a_property_snapshot_serves_every_read_of_the_files_it_copied() {
 /// whose resolution on the host succeeds but names the tracer's
 /// own, different directory for the same descriptor number), and
 /// a parent that cannot be proven outside the area in the guest
-/// (a missing parent, or any overlong spelled parent, including
-/// one naming a real outside directory) fails closed with the
-/// named refusal rather than being treated as outside on the
-/// strength of any host-side resolution; outside creations the
-/// guest probe can prove (plain, chained, and short descriptor
-/// spellings) still succeed.
+/// (any overlong spelled parent, missing or naming a real outside
+/// directory) fails closed with the named refusal rather than being
+/// treated as outside on the strength of any host-side resolution,
+/// while a short missing parent, whose walk the guest probe shows to
+/// fail, gets the open's own `ENOENT`; outside creations the guest
+/// probe can prove (plain, chained, and short descriptor spellings)
+/// still succeed.
 #[test]
 fn a_late_property_file_is_refused_through_alias_spellings() {
     let area = area();
@@ -698,18 +699,22 @@ fn a_late_property_file_is_refused_through_alias_spellings() {
             unsafe { libc::close(900) };
             unsafe { libc::close(902) };
             drop(directory);
-            // A parent that cannot be proven outside the area fails
-            // closed with the named refusal: a resolution that fails,
-            // in the guest probe or on the host, is not proof of
-            // outside. Natively both spellings fail `ENOENT`.
-            for (what, spelling) in [
+            // Natively both spellings fail `ENOENT`. The short one is
+            // probed in the guest, whose walk fails `ENOENT` as the
+            // open's own would, so the open fails with it. The long one
+            // does not fit the staged probe, so its parent cannot be
+            // shown outside the area, and it fails closed with the
+            // named refusal.
+            for (what, spelling, errno) in [
                 (
                     "short missing parent",
                     "/nonexistent-4791-property-area/missing-short-created".to_owned(),
+                    libc::ENOENT,
                 ),
                 (
                     "long missing parent",
                     format!("/nonexistent-4791-property-area/{dots}missing-long-created"),
+                    libc::EOPNOTSUPP,
                 ),
             ] {
                 let c = std::ffi::CString::new(spelling).unwrap();
@@ -725,9 +730,9 @@ fn a_late_property_file_is_refused_through_alias_spellings() {
                     // SAFETY: the descriptor opened above.
                     unsafe { libc::close(fd) };
                     failures.push(format!("{what}: open succeeded"));
-                } else if std::io::Error::last_os_error().raw_os_error() != Some(libc::EOPNOTSUPP) {
+                } else if std::io::Error::last_os_error().raw_os_error() != Some(errno) {
                     failures.push(format!(
-                        "{what}: refused with {}",
+                        "{what}: failed with {}",
                         std::io::Error::last_os_error()
                     ));
                 }
@@ -735,7 +740,7 @@ fn a_late_property_file_is_refused_through_alias_spellings() {
             // An overlong spelling of a real outside directory is
             // the stated fail-closed bound: only host-side
             // resolution could decide it, and host resolution never
-            // decides a spelled parent, so it is refused by name
+            // proves a spelled parent outside, so it is refused by name
             // even though it is in fact outside. Guest-provable
             // outside creations are the short controls above and
             // below (plain, chained, short descriptor spellings).
@@ -1327,6 +1332,813 @@ fn an_access_mode_3_open_of_a_copied_property_file_runs_as_natively() {
         assert_eq!(native(&file), (true, Some(libc::EBADF)), "under Hermit");
     };
     detcore_testutils::det_test_fn_with_config(
+        true,
+        guest,
+        config,
+        detcore_testutils::expect_success,
+    );
+}
+
+/// The errno an `open` of `path` with `flags` (and mode 0600) fails with, or
+/// `None` where it succeeds; its descriptor is closed.
+fn open_errno(path: &Path, flags: libc::c_int) -> Option<i32> {
+    let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a valid NUL-terminated path and a creation mode.
+    let fd = unsafe { libc::open(c.as_ptr(), flags, 0o600) };
+    if fd >= 0 {
+        // SAFETY: the descriptor opened above.
+        unsafe { libc::close(fd) };
+        None
+    } else {
+        std::io::Error::last_os_error().raw_os_error()
+    }
+}
+
+/// A `capget`/`capset` header naming the calling thread.
+#[repr(C)]
+struct CapHeader {
+    version: u32,
+    pid: libc::c_int,
+}
+
+/// One 32-capability word of a thread's capability sets.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+/// `_LINUX_CAPABILITY_VERSION_3` (include/uapi/linux/capability.h), whose
+/// sets take two words.
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+/// `CAP_DAC_OVERRIDE` (1) and `CAP_DAC_READ_SEARCH` (2), either of which lets
+/// a thread search a directory whose mode denies it (`generic_permission`,
+/// fs/namei.c:476-485 at v6.16).
+const DAC_SEARCH_OVERRIDES: u32 = (1 << 1) | (1 << 2);
+
+/// The calling thread's capability sets.
+fn thread_capabilities() -> [CapData; 2] {
+    let mut header = CapHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let mut data = [CapData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; 2];
+    // SAFETY: a version-3 header and the two words it fills.
+    let ret = unsafe { libc::syscall(libc::SYS_capget, &raw mut header, data.as_mut_ptr()) };
+    assert_eq!(ret, 0, "capget: {}", std::io::Error::last_os_error());
+    data
+}
+
+/// Set the calling thread's capability sets to `data`.
+fn set_thread_capabilities(data: [CapData; 2]) {
+    let mut header = CapHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    // SAFETY: a version-3 header and its two words.
+    let ret = unsafe { libc::syscall(libc::SYS_capset, &raw mut header, data.as_ptr()) };
+    assert_eq!(ret, 0, "capset: {}", std::io::Error::last_os_error());
+}
+
+/// Run `f` with `CAP_DAC_OVERRIDE` and `CAP_DAC_READ_SEARCH` cleared from the
+/// calling thread's effective set, checked clear, and put back after (they
+/// stay permitted). Capabilities are per thread, so no other thread of the
+/// process changes.
+fn without_dac_search_overrides<T>(f: impl FnOnce() -> T) -> T {
+    let saved = thread_capabilities();
+    let mut cleared = saved;
+    cleared[0].effective &= !DAC_SEARCH_OVERRIDES;
+    set_thread_capabilities(cleared);
+    assert_eq!(
+        thread_capabilities()[0].effective & DAC_SEARCH_OVERRIDES,
+        0,
+        "the DAC search overrides are still effective"
+    );
+    let result = f();
+    set_thread_capabilities(saved);
+    result
+}
+
+/// In a fail-closed run, an `O_CREAT` open whose parent walk fails gets the
+/// errno Linux gives it, and creates nothing: a missing directory (`ENOENT`,
+/// as a program probing before `mkdir` expects), with a write-only and a
+/// readable open; a regular file walked through as a directory
+/// (`file/sub/created`, `ENOTDIR`); a symlink loop (`ELOOP`); an overlong
+/// component (`ENAMETOOLONG`); and a directory without search permission,
+/// above the parent and as the parent itself (`EACCES`). The guest runs in a
+/// user namespace of its own, where it may hold `CAP_DAC_READ_SEARCH` or
+/// `CAP_DAC_OVERRIDE` over these files and so search that directory anyway
+/// (the first of those cases then fails `ENOENT`, past it); for the `EACCES`
+/// cases its thread clears both from its effective set and checks they are
+/// clear, as the native thread does. Detcore's guest-side probe of each
+/// parent fails with the errno of the open's own walk, and Detcore then fails
+/// the open with it without running the guest's `openat`. The test sees that
+/// errno and no created file, which would be the same had the open run.
+/// Before, every failed probe was a parent that could not be shown outside
+/// the area, and the run was stopped.
+#[test]
+fn a_create_whose_parent_walk_fails_gets_linuxs_errno() {
+    use std::os::unix::fs::PermissionsExt;
+    let area = area();
+    let outside = tempfile::tempdir_in(area.live.path().parent().unwrap()).unwrap();
+    std::fs::write(outside.path().join("file"), []).unwrap();
+    std::os::unix::fs::symlink("loop", outside.path().join("loop")).unwrap();
+    let unsearchable = outside.path().join("unsearchable");
+    std::fs::create_dir(&unsearchable).unwrap();
+    std::fs::set_permissions(&unsearchable, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let cases: Vec<(PathBuf, libc::c_int, i32)> = vec![
+        (
+            outside.path().join("missing-dir").join("created"),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+            libc::ENOENT,
+        ),
+        (
+            outside.path().join("missing-dir").join("created-rdwr"),
+            libc::O_RDWR | libc::O_CREAT,
+            libc::ENOENT,
+        ),
+        (
+            outside.path().join("file").join("sub").join("created"),
+            libc::O_WRONLY | libc::O_CREAT,
+            libc::ENOTDIR,
+        ),
+        (
+            outside.path().join("loop").join("created"),
+            libc::O_WRONLY | libc::O_CREAT,
+            libc::ELOOP,
+        ),
+        (
+            outside.path().join("n".repeat(300)).join("created"),
+            libc::O_WRONLY | libc::O_CREAT,
+            libc::ENAMETOOLONG,
+        ),
+    ];
+    // Opened by a thread without the capabilities to search any directory.
+    let searchless: Vec<(PathBuf, libc::c_int, i32)> = vec![
+        (
+            unsearchable.join("inner").join("created"),
+            libc::O_WRONLY | libc::O_CREAT,
+            libc::EACCES,
+        ),
+        (
+            unsearchable.join("created"),
+            libc::O_WRONLY | libc::O_CREAT,
+            libc::EACCES,
+        ),
+    ];
+    for (path, flags, errno) in &cases {
+        assert_eq!(
+            open_errno(path, *flags),
+            Some(*errno),
+            "natively: {}",
+            path.display()
+        );
+    }
+    without_dac_search_overrides(|| {
+        for (path, flags, errno) in &searchless {
+            assert_eq!(
+                open_errno(path, *flags),
+                Some(*errno),
+                "natively, without the DAC search overrides: {}",
+                path.display()
+            );
+        }
+    });
+    let config = detcore::Config {
+        max_timeslice: None,
+        sequentialize_threads: true,
+        panic_on_unsupported_syscalls: true,
+        shutdown_on_unsupported_syscall: true,
+        property_snapshot: Some(area.snapshot.clone()),
+        ..Default::default()
+    };
+    let guest_cases = (cases, searchless);
+    let guest = move || {
+        let (cases, searchless) = &guest_cases;
+        for (path, flags, errno) in cases {
+            assert_eq!(
+                open_errno(path, *flags),
+                Some(*errno),
+                "under Hermit: {}",
+                path.display()
+            );
+        }
+        without_dac_search_overrides(|| {
+            for (path, flags, errno) in searchless {
+                assert_eq!(
+                    open_errno(path, *flags),
+                    Some(*errno),
+                    "under Hermit, without the DAC search overrides: {}",
+                    path.display()
+                );
+            }
+        });
+    };
+    detcore_testutils::det_test_fn_with_config(
+        true,
+        guest,
+        config,
+        detcore_testutils::expect_success,
+    );
+    std::fs::set_permissions(&unsearchable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(!outside.path().join("missing-dir").exists());
+    assert!(!unsearchable.join("inner").exists());
+    assert!(!unsearchable.join("created").exists());
+}
+
+/// Whether this test runs alone in a child process of its own. Where it does
+/// not, this runs it so, checks that it passed, and returns `false`. A test
+/// that lowers this process's soft `RLIMIT_NOFILE` needs it, since the limit
+/// is process-global (as in `readdir_order`).
+fn alone_in_own_process() -> bool {
+    const CHILD: &str = "HERMIT_PROPERTY_SNAPSHOT_CHILD";
+    let case = std::thread::current()
+        .name()
+        .unwrap_or_default()
+        .to_string();
+    if std::env::var_os(CHILD).as_deref() == Some(std::ffi::OsStr::new(&case)) {
+        return true;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &case, "--nocapture", "--test-threads=1"])
+        .env(CHILD, &case)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+        "{output:?}"
+    );
+    false
+}
+
+/// Restores the soft `RLIMIT_NOFILE` it lowered when dropped.
+struct LoweredNofile(libc::rlimit);
+
+impl Drop for LoweredNofile {
+    fn drop(&mut self) {
+        // SAFETY: a valid limit, read before it was lowered.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.0) }, 0);
+    }
+}
+
+/// Lowers this process's soft `RLIMIT_NOFILE` to `soft` until the result is
+/// dropped, so that a guest forked from it inherits a physical descriptor
+/// table it can fill. Detcore keeps a guest's own `setrlimit` virtual.
+fn lower_nofile(soft: libc::rlim_t) -> LoweredNofile {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is writable.
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+        0
+    );
+    let lowered = libc::rlimit {
+        rlim_cur: soft.min(limit.rlim_cur),
+        rlim_max: limit.rlim_max,
+    };
+    // SAFETY: a valid limit.
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) }, 0);
+    LoweredNofile(limit)
+}
+
+/// Opens `/dev/null` until this process's descriptor table is full: the
+/// descriptors opened, and the errno of the open that failed.
+fn fill_descriptor_table() -> (Vec<libc::c_int>, Option<i32>) {
+    let mut filler = Vec::new();
+    loop {
+        // SAFETY: a valid NUL-terminated path.
+        let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return (filler, std::io::Error::last_os_error().raw_os_error());
+        }
+        filler.push(fd);
+        assert!(filler.len() < 4096, "the descriptor table never filled");
+    }
+}
+
+/// With its descriptor table full, a fail-closed guest's `O_CREAT` open of a
+/// new file in an existing directory outside the area fails `EMFILE`, as it
+/// does natively, and creates nothing: Linux allocates the descriptor before
+/// it walks the path (`do_sys_openat2`, fs/open.c:1435 at v6.16). Detcore's
+/// probe of the parent, an `openat` the guest thread makes in the same table,
+/// fails `EMFILE` the same way, and Detcore then fails the open with it
+/// without running the guest's `openat`. Detcore keeps a guest's own
+/// `setrlimit` virtual, so the guest inherits a lowered physical limit from
+/// this test's process, which runs the test alone. Before, the failed probe
+/// stopped the run.
+#[test]
+fn a_create_with_a_full_descriptor_table_gets_emfile() {
+    if !alone_in_own_process() {
+        return;
+    }
+    let _lowered = lower_nofile(256);
+    let area = area();
+    let outside = tempfile::tempdir_in(area.live.path().parent().unwrap()).unwrap();
+    let created = outside.path().join("created");
+    let full_table_create = |path: &Path| -> (Option<i32>, Option<i32>) {
+        let (filler, full) = fill_descriptor_table();
+        let created = open_errno(path, libc::O_WRONLY | libc::O_CREAT);
+        for fd in filler {
+            // SAFETY: a descriptor opened above.
+            assert_eq!(unsafe { libc::close(fd) }, 0);
+        }
+        (full, created)
+    };
+    assert_eq!(
+        full_table_create(&created),
+        (Some(libc::EMFILE), Some(libc::EMFILE)),
+        "natively, with a full descriptor table"
+    );
+    assert!(!created.exists());
+    let config = detcore::Config {
+        max_timeslice: None,
+        sequentialize_threads: true,
+        panic_on_unsupported_syscalls: true,
+        shutdown_on_unsupported_syscall: true,
+        property_snapshot: Some(area.snapshot.clone()),
+        ..Default::default()
+    };
+    let guest_created = created.clone();
+    let guest = move || {
+        assert_eq!(
+            full_table_create(&guest_created),
+            (Some(libc::EMFILE), Some(libc::EMFILE)),
+            "under Hermit, with a full descriptor table"
+        );
+    };
+    detcore_testutils::det_test_fn_with_config(
+        true,
+        guest,
+        config,
+        detcore_testutils::expect_success,
+    );
+    assert!(!created.exists());
+}
+
+/// The errno a raw `openat(AT_FDCWD, path, flags, 0600)` fails with, or `None`
+/// where it succeeds; its descriptor is closed. No libc wrapper looks at the
+/// flags.
+fn raw_openat_errno(path: &Path, flags: libc::c_int) -> Option<i32> {
+    let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a valid NUL-terminated path, flags and a creation mode.
+    let fd = unsafe { libc::syscall(libc::SYS_openat, libc::AT_FDCWD, c.as_ptr(), flags, 0o600) };
+    if fd >= 0 {
+        // SAFETY: the descriptor opened above.
+        unsafe { libc::close(fd as libc::c_int) };
+        None
+    } else {
+        std::io::Error::last_os_error().raw_os_error()
+    }
+}
+
+/// In a fail-closed run, an `O_CREAT` open with flags `build_open_flags`
+/// refuses fails `EINVAL`, as natively, whatever its parent: Linux checks
+/// the flags before it reads the pathname, allocates a descriptor or walks
+/// (`do_sys_openat2`, fs/open.c:1427-1429 at v6.16), so a missing parent
+/// (`ENOENT`), a regular file walked through (`ENOTDIR`) and the property
+/// area as the parent (a refusal by name) never answer first. The flags,
+/// passed raw, are `__O_TMPFILE` without `O_DIRECTORY` (open.c:1293-1294)
+/// and `O_CREAT` with `O_DIRECTORY` (:1283-1284). Before, the bare
+/// `__O_TMPFILE` create in a missing directory got the probe's `ENOENT`,
+/// and the others were refused, ending the run.
+#[test]
+fn a_create_with_flags_linux_refuses_gets_einval_before_any_parent_answer() {
+    let area = area();
+    let outside = tempfile::tempdir_in(area.live.path().parent().unwrap()).unwrap();
+    std::fs::write(outside.path().join("file"), []).unwrap();
+    let bare_tmpfile = libc::O_TMPFILE & !libc::O_DIRECTORY;
+    let cases: Vec<(PathBuf, libc::c_int)> = vec![
+        (
+            outside.path().join("missing-dir").join("created"),
+            libc::O_WRONLY | libc::O_CREAT | bare_tmpfile,
+        ),
+        (
+            outside.path().join("file").join("sub").join("created"),
+            libc::O_WRONLY | libc::O_CREAT | bare_tmpfile,
+        ),
+        (
+            area.live.path().join("u:object_r:tmpfile_prop:s0"),
+            libc::O_WRONLY | libc::O_CREAT | bare_tmpfile,
+        ),
+        (
+            outside.path().join("missing-dir").join("created-directory"),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_DIRECTORY,
+        ),
+        (
+            area.live.path().join("u:object_r:directory_prop:s0"),
+            libc::O_RDWR | libc::O_CREAT | libc::O_DIRECTORY,
+        ),
+    ];
+    for (path, flags) in &cases {
+        assert_eq!(
+            raw_openat_errno(path, *flags),
+            Some(libc::EINVAL),
+            "natively: {} with flags {flags:#o}",
+            path.display()
+        );
+    }
+    let config = detcore::Config {
+        max_timeslice: None,
+        sequentialize_threads: true,
+        panic_on_unsupported_syscalls: true,
+        shutdown_on_unsupported_syscall: true,
+        property_snapshot: Some(area.snapshot.clone()),
+        ..Default::default()
+    };
+    let guest_cases = cases.clone();
+    let guest = move || {
+        for (path, flags) in &guest_cases {
+            assert_eq!(
+                raw_openat_errno(path, *flags),
+                Some(libc::EINVAL),
+                "under Hermit: {} with flags {flags:#o}",
+                path.display()
+            );
+        }
+    };
+    detcore_testutils::det_test_fn_with_config(
+        true,
+        guest,
+        config,
+        detcore_testutils::expect_success,
+    );
+    for (path, _) in &cases {
+        assert!(!path.exists(), "created: {}", path.display());
+    }
+    assert!(!outside.path().join("missing-dir").exists());
+}
+
+/// A path outside the area whose parent spelling is `length` bytes long,
+/// padded with `/.`, and a trailing `/` where the padding is odd.
+fn parent_spelled_at(directory: &Path, length: usize, name: &str) -> PathBuf {
+    let base = directory.to_str().unwrap();
+    assert!(base.len() + 2 <= length, "{base} is too long to pad");
+    let padding = length - base.len();
+    let mut parent = format!("{base}{}", "/.".repeat(padding / 2));
+    if padding % 2 == 1 {
+        parent.push('/');
+    }
+    assert_eq!(parent.len(), length);
+    PathBuf::from(format!("{parent}/{name}"))
+}
+
+/// The probe stages a parent spelling of up to 511 bytes, with the `/.` it
+/// appends and the NUL in room of their own: creates outside the area whose
+/// parent spellings are 509, 510 and 511 bytes long are decided in the guest
+/// and run, creating their files as natively, while a 512-byte one is
+/// beyond the probe and refused by name (`EOPNOTSUPP` under the errno
+/// policy), the stated bound, creating nothing.
+#[test]
+fn creates_at_the_staged_probes_parent_bound_are_decided_up_to_511_bytes() {
+    let area = area();
+    let outside = tempfile::tempdir_in(area.live.path().parent().unwrap()).unwrap();
+    let cases: Vec<(usize, PathBuf, Option<i32>)> = [509, 510, 511, 512]
+        .into_iter()
+        .map(|length| {
+            let path = parent_spelled_at(outside.path(), length, &format!("bound-{length}"));
+            (length, path, (length >= 512).then_some(libc::EOPNOTSUPP))
+        })
+        .collect();
+    for (length, path, _) in &cases {
+        assert_eq!(
+            open_errno(path, libc::O_WRONLY | libc::O_CREAT),
+            None,
+            "natively, a {length}-byte parent spelling"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+    let config = detcore::Config {
+        max_timeslice: None,
+        sequentialize_threads: true,
+        property_snapshot: Some(area.snapshot.clone()),
+        ..Default::default()
+    };
+    let guest_cases = cases.clone();
+    let guest = move || {
+        let outcomes: Vec<(usize, Option<i32>)> = guest_cases
+            .iter()
+            .map(|(length, path, _)| (*length, open_errno(path, libc::O_WRONLY | libc::O_CREAT)))
+            .collect();
+        let expected: Vec<(usize, Option<i32>)> = guest_cases
+            .iter()
+            .map(|(length, _, errno)| (*length, *errno))
+            .collect();
+        assert_eq!(
+            outcomes, expected,
+            "under Hermit: (parent spelling length, errno)"
+        );
+    };
+    // One run: the guest creates the files.
+    detcore_testutils::det_test_fn_with_config_repetitions(
+        1,
+        true,
+        guest,
+        config,
+        detcore_testutils::expect_success,
+    );
+    for (length, path, expected) in &cases {
+        assert_eq!(
+            path.exists(),
+            expected.is_none(),
+            "a {length}-byte parent spelling's file exists"
+        );
+    }
+}
+
+/// A create in the property area spelled through a descriptor only the
+/// guest holds (`/proc/self/fd/903/created`, fd 903 being the area in the
+/// guest and absent in this process), so that only Detcore's probe in the
+/// guest decides its parent. With the area's search permission removed and
+/// the guest thread's DAC search overrides cleared, Linux fails the create
+/// `EACCES` at the search check on the parent, as it does natively, and so
+/// does the probe of `parent/.`, which makes that check (`may_lookup`,
+/// fs/namei.c:1839 at v6.16). A probe of the parent's spelling alone opens
+/// the area itself without that check and refuses the create by name
+/// (`EOPNOTSUPP` under the errno policy).
+#[test]
+fn a_create_in_an_unsearchable_area_through_a_guest_descriptor_gets_eacces() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::PermissionsExt;
+    let area = area();
+    let live = area.live.path().to_owned();
+    assert!(
+        !Path::new("/proc/self/fd/903").exists(),
+        "control: fd 903 must be absent in the tracer"
+    );
+    std::fs::set_permissions(&live, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let held = std::fs::File::open(&live).unwrap();
+    let native = PathBuf::from(format!("/proc/self/fd/{}/created", held.as_raw_fd()));
+    let natively =
+        without_dac_search_overrides(|| open_errno(&native, libc::O_WRONLY | libc::O_CREAT));
+    drop(held);
+    assert_eq!(
+        natively,
+        Some(libc::EACCES),
+        "natively: {}",
+        native.display()
+    );
+    let config = detcore::Config {
+        max_timeslice: None,
+        sequentialize_threads: true,
+        property_snapshot: Some(area.snapshot.clone()),
+        ..Default::default()
+    };
+    let guest_live = live.clone();
+    let guest = move || {
+        let directory = std::fs::File::open(&guest_live).unwrap();
+        // SAFETY: duplicating an open directory descriptor.
+        assert_eq!(unsafe { libc::dup2(directory.as_raw_fd(), 903) }, 903);
+        let created = without_dac_search_overrides(|| {
+            open_errno(
+                Path::new("/proc/self/fd/903/created"),
+                libc::O_WRONLY | libc::O_CREAT,
+            )
+        });
+        // SAFETY: the descriptor duplicated above.
+        unsafe { libc::close(903) };
+        assert_eq!(
+            created,
+            Some(libc::EACCES),
+            "under Hermit: /proc/self/fd/903/created"
+        );
+    };
+    detcore_testutils::det_test_fn_with_config(
+        true,
+        guest,
+        config,
+        detcore_testutils::expect_success,
+    );
+    std::fs::set_permissions(&live, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(!live.join("created").exists());
+}
+
+/// What the private-table thread of
+/// [`a_late_file_held_through_a_private_descriptor_table_is_refused`] did:
+/// each call's result, or `-errno`, and the first bytes it read.
+#[repr(C)]
+struct PrivateTable {
+    /// The path of the late file, NUL-terminated.
+    late: [u8; 512],
+    /// A file outside the area, NUL-terminated.
+    outside: [u8; 512],
+    /// Where in the area it is renamed to, NUL-terminated.
+    moved_into: [u8; 512],
+    reopened: libc::c_long,
+    reopened_bytes: [u8; 4],
+    mapped: libc::c_long,
+    mapped_bytes: [u8; 4],
+    /// Cleared by the kernel when the thread exits (`CLONE_CHILD_CLEARTID`).
+    alive: i32,
+}
+
+/// The result of a raw syscall, or `-errno`, read right after it. The thread
+/// shares its creator's thread-local storage, which waits meanwhile.
+fn raw_result(ret: libc::c_long) -> libc::c_long {
+    if ret < 0 {
+        // SAFETY: errno of this task, set by the call just made.
+        -libc::c_long::from(unsafe { *libc::__errno_location() })
+    } else {
+        ret
+    }
+}
+
+/// The thread with a descriptor table of its own: it opens the late file
+/// `O_PATH` at 61, unlinks it, and reopens it readably through
+/// `/proc/thread-self/fd/61`. Then it opens a file outside the area readably,
+/// renames it into the area and unlinks it there, and maps its descriptor,
+/// moved to 60. Raw syscalls only, and no allocation or panic: it shares its
+/// creator's memory and thread-local storage.
+extern "C" fn private_table_thread(arg: *mut libc::c_void) -> libc::c_int {
+    // SAFETY: `arg` is the `PrivateTable` its creator keeps alive.
+    let state = unsafe { &mut *arg.cast::<PrivateTable>() };
+    let path = state.late.as_ptr().cast::<libc::c_char>();
+    // SAFETY: raw syscalls on valid paths and buffers.
+    unsafe {
+        let held = libc::syscall(
+            libc::SYS_openat,
+            libc::AT_FDCWD,
+            path,
+            libc::O_PATH | libc::O_CLOEXEC,
+        );
+        if held >= 0 {
+            libc::syscall(libc::SYS_dup3, held, 61, 0);
+            libc::syscall(libc::SYS_close, held);
+        }
+        libc::syscall(libc::SYS_unlinkat, libc::AT_FDCWD, path, 0);
+        let link = b"/proc/thread-self/fd/61\0";
+        state.reopened = raw_result(libc::syscall(
+            libc::SYS_openat,
+            libc::AT_FDCWD,
+            link.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        ));
+        if state.reopened >= 0 {
+            libc::syscall(
+                libc::SYS_read,
+                state.reopened,
+                state.reopened_bytes.as_mut_ptr(),
+                4,
+            );
+        }
+        let outside = state.outside.as_ptr().cast::<libc::c_char>();
+        let moved_into = state.moved_into.as_ptr().cast::<libc::c_char>();
+        let readable = libc::syscall(
+            libc::SYS_openat,
+            libc::AT_FDCWD,
+            outside,
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        );
+        libc::syscall(
+            libc::SYS_renameat,
+            libc::AT_FDCWD,
+            outside,
+            libc::AT_FDCWD,
+            moved_into,
+        );
+        libc::syscall(libc::SYS_unlinkat, libc::AT_FDCWD, moved_into, 0);
+        if readable >= 0 {
+            libc::syscall(libc::SYS_dup3, readable, 60, 0);
+            libc::syscall(libc::SYS_close, readable);
+        }
+        state.mapped = raw_result(libc::syscall(
+            libc::SYS_mmap,
+            0,
+            4096,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE,
+            60,
+            0,
+        ));
+        if state.mapped >= 0 {
+            std::ptr::copy_nonoverlapping(
+                state.mapped as *const u8,
+                state.mapped_bytes.as_mut_ptr(),
+                4,
+            );
+            libc::syscall(libc::SYS_munmap, state.mapped, 4096);
+        }
+    }
+    0
+}
+
+/// A thread cloned with `CLONE_THREAD` but without `CLONE_FILES` has a
+/// descriptor table of its own. A file the area gained after its snapshot,
+/// held there and then unlinked, is no longer found among the area's
+/// entries, so only the kernel's path for the descriptor names it, as the
+/// area pathname with " (deleted)", and only in that thread's table: its
+/// leader holds `/dev/null` at the same numbers. Its readable reopen
+/// through `/proc/thread-self/fd` is refused with `EOPNOTSUPP` under the
+/// errno policy, and so is a mapping of a descriptor that thread opened
+/// readably outside the area and then moved into it (renamed there, and
+/// unlinked); no live byte reaches the guest. Before, both checks read the leader's table
+/// (`/proc/<pid>/fd`), found `/dev/null` there, and let the guest read
+/// the live file.
+#[test]
+fn a_late_file_held_through_a_private_descriptor_table_is_refused() {
+    use std::os::fd::AsRawFd;
+    let area = area();
+    let late = area.live.path().join("u:object_r:private_table_prop:s0");
+    std::fs::write(&late, [9, 10, 11, 12]).unwrap();
+    let outside_dir = tempfile::tempdir_in(area.live.path().parent().unwrap()).unwrap();
+    let outside = outside_dir.path().join("readable-outside");
+    std::fs::write(&outside, [13, 14, 15, 16]).unwrap();
+    let moved_into = area.live.path().join("u:object_r:moved_in_prop:s0");
+    let config = detcore::Config {
+        max_timeslice: None,
+        sequentialize_threads: true,
+        property_snapshot: Some(area.snapshot.clone()),
+        ..Default::default()
+    };
+    let guest = move || {
+        let null = std::fs::File::open("/dev/null").unwrap();
+        for number in [60, 61] {
+            // SAFETY: duplicating an open descriptor.
+            assert_eq!(unsafe { libc::dup2(null.as_raw_fd(), number) }, number);
+        }
+        let mut state = Box::new(PrivateTable {
+            late: [0; 512],
+            outside: [0; 512],
+            moved_into: [0; 512],
+            reopened: 0,
+            reopened_bytes: [0; 4],
+            mapped: 0,
+            mapped_bytes: [0; 4],
+            alive: 1,
+        });
+        for (field, path) in [
+            (&mut state.late, &late),
+            (&mut state.outside, &outside),
+            (&mut state.moved_into, &moved_into),
+        ] {
+            let bytes = path.as_os_str().as_encoded_bytes();
+            field[..bytes.len()].copy_from_slice(bytes);
+        }
+        let mut stack = vec![0_u8; 1 << 20];
+        // SAFETY: the stack grows down from its 16-byte-aligned end.
+        let top = unsafe { stack.as_mut_ptr().add(stack.len()) };
+        let top = (top as usize & !15) as *mut libc::c_void;
+        let state_ptr: *mut PrivateTable = &mut *state;
+        // SAFETY: a thread without `CLONE_FILES` on a stack and state that
+        // outlive it; its exit clears `alive`.
+        let tid = unsafe {
+            libc::clone(
+                private_table_thread,
+                top,
+                libc::CLONE_VM
+                    | libc::CLONE_FS
+                    | libc::CLONE_SIGHAND
+                    | libc::CLONE_THREAD
+                    | libc::CLONE_SYSVSEM
+                    | libc::CLONE_CHILD_CLEARTID,
+                state_ptr.cast(),
+                std::ptr::null_mut::<libc::pid_t>(),
+                std::ptr::null_mut::<libc::c_void>(),
+                std::ptr::addr_of_mut!((*state_ptr).alive),
+            )
+        };
+        assert!(tid > 0, "clone: {}", std::io::Error::last_os_error());
+        loop {
+            // SAFETY: the kernel clears and wakes this word at the thread's exit.
+            let alive = unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*state_ptr).alive)) };
+            if alive == 0 {
+                break;
+            }
+            // SAFETY: a futex wait on that word while it holds `alive`.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_futex,
+                    std::ptr::addr_of!((*state_ptr).alive),
+                    libc::FUTEX_WAIT,
+                    alive,
+                    std::ptr::null::<libc::timespec>(),
+                )
+            };
+        }
+        drop(stack);
+        assert_eq!(
+            (state.reopened, state.reopened_bytes),
+            (-libc::c_long::from(libc::EOPNOTSUPP), [0; 4]),
+            "the readable reopen through the private table"
+        );
+        assert_eq!(
+            (state.mapped, state.mapped_bytes),
+            (-libc::c_long::from(libc::EOPNOTSUPP), [0; 4]),
+            "the mapping through the private table"
+        );
+    };
+    // One run: the guest unlinks the late file.
+    detcore_testutils::det_test_fn_with_config_repetitions(
+        1,
         true,
         guest,
         config,

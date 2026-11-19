@@ -49,8 +49,28 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
+    let (result, bytes) = inject_with_scratch_reporting(guest, initial, call).await?;
+    Ok((result?, bytes))
+}
+
+/// [`inject_with_scratch`], telling the injected call's own failure apart
+/// from a failure of the staging around it: `Ok((Err(errno), _))` is the
+/// errno the call itself returned (the buffer is then reported as
+/// `initial`, unread), and `Err(errno)` a failure to stage its buffer (the
+/// scratch reservation, the transient page, or a guest memory write or
+/// read). A caller that draws a conclusion from the call's errno needs the
+/// distinction: a staging failure says nothing about the call.
+pub(crate) async fn inject_with_scratch_reporting<G, T, const N: usize>(
+    guest: &mut G,
+    initial: [u8; N],
+    call: impl Fn(AddrMut<'_, u8>) -> Syscall,
+) -> Result<(Result<i64, Errno>, [u8; N]), Errno>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
     match on_stack(guest, &initial, &call).await {
-        Err(Errno::EFAULT) => {
+        Err(Errno::EFAULT) | Ok((Err(Errno::EFAULT), _)) => {
             info!(
                 "Guest stack scratch cannot hold an injected syscall's {N}-byte buffer; using a \
                  transient page instead."
@@ -61,13 +81,13 @@ where
     }
 }
 
-/// [`inject_with_scratch`] with the buffer in the guest stack scratch.
-/// `Err(EFAULT)` when the scratch cannot hold it.
+/// [`inject_with_scratch_reporting`] with the buffer in the guest stack
+/// scratch. `Err(EFAULT)` when the scratch cannot hold it.
 async fn on_stack<G, T, const N: usize>(
     guest: &mut G,
     initial: &[u8; N],
     call: &impl Fn(AddrMut<'_, u8>) -> Syscall,
-) -> Result<(i64, [u8; N]), Errno>
+) -> Result<(Result<i64, Errno>, [u8; N]), Errno>
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -87,16 +107,21 @@ where
     let restored = guest.memory().write_exact(buffer, &saved);
     drop(guard);
     let outcome = outcome?;
-    restored?;
+    // A failed restore is reported after a call that succeeded, as it
+    // always was; after a failed call, the call's own errno is.
+    if outcome.0.is_ok() {
+        restored?;
+    }
     Ok(outcome)
 }
 
-/// [`inject_with_scratch`] with the buffer in a transient private page.
+/// [`inject_with_scratch_reporting`] with the buffer in a transient private
+/// page.
 async fn in_transient_page<G, T, const N: usize>(
     guest: &mut G,
     initial: &[u8; N],
     call: &impl Fn(AddrMut<'_, u8>) -> Syscall,
-) -> Result<(i64, [u8; N]), Errno>
+) -> Result<(Result<i64, Errno>, [u8; N]), Errno>
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -133,20 +158,24 @@ where
 }
 
 /// Write `initial` at `buffer`, inject `call(buffer)`, and read the buffer
-/// back.
+/// back. The call's own failure is the inner `Err`, with the buffer left
+/// unread; a guest memory failure is the outer one.
 async fn run<G, T, const N: usize>(
     guest: &mut G,
     buffer: AddrMut<'_, u8>,
     initial: &[u8; N],
     call: &impl Fn(AddrMut<'_, u8>) -> Syscall,
-) -> Result<(i64, [u8; N]), Errno>
+) -> Result<(Result<i64, Errno>, [u8; N]), Errno>
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
     guest.memory().write_exact(buffer, initial)?;
-    let result = guest.inject_with_retry(call(buffer)).await?;
+    let result = match guest.inject_with_retry(call(buffer)).await {
+        Ok(result) => result,
+        Err(errno) => return Ok((Err(errno), *initial)),
+    };
     let mut bytes = [0_u8; N];
     guest.memory().read_exact(buffer, &mut bytes)?;
-    Ok((result, bytes))
+    Ok((Ok(result), bytes))
 }
