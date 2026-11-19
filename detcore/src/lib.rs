@@ -5208,6 +5208,24 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         outcome
     }
 
+    /// A terminal's job-control signals, SIGTTIN and SIGTTOU, which a call
+    /// Detcore had injected can raise itself (`syscalls::job_control`).
+    fn injection_stop_signals(_config: &Config) -> u64 {
+        crate::syscalls::job_control::INJECTION_STOP_SIGNALS
+    }
+
+    /// A job-control stop that the stopped call could have raised itself is
+    /// refused by name, and any other signal is held
+    /// (`syscalls::job_control::decide`).
+    async fn decide_injection_stop<R: GlobalRPC<Self::GlobalState>>(
+        &self,
+        _rpc: &R,
+        stop: reverie::InjectionStop,
+        facts: &dyn reverie::InjectionStopFacts,
+    ) -> reverie::InjectionStopOutcome {
+        crate::syscalls::job_control::decide(&stop, facts)
+    }
+
     /// Counts each signal the backend passes on without reporting it, which
     /// could reach a guest handler, so the delivery counters show what no
     /// delivery check saw (A5 step 3.2b).
@@ -8857,8 +8875,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // guest, when it is the event's last injection. The check reads only
             // the handler's latest refusal, and only if no consumer took it
             // first; it is not a general guard (see `judge_backend_refusal`). A
-            // job-control stop the backend could not deliver during the call is
-            // refused by name (`Self::refuse_job_control_stop`).
+            // job-control stop during the call, which Detcore refused and the
+            // backend recorded (`syscalls::job_control::decide`), is refused by
+            // name (`Self::refuse_job_control_stop`).
             let res = match guest.take_unsupported_refusal() {
                 Some(refusal)
                     if refusal.operation == reverie::UnsupportedOperation::JobControlStop =>

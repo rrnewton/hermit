@@ -157,9 +157,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         if refusal.operation == reverie::UnsupportedOperation::JobControlStop
             && operation != refusal.operation
         {
-            // A job-control stop the call raised itself is refused by name
-            // whichever refusal its handler expected, never handed to the
-            // guest as the backend's errno.
+            // A job-control stop the call raised itself, which Detcore
+            // refused and the backend recorded, is refused by name whichever
+            // refusal its handler expected, never handed to the guest as the
+            // backend's errno.
             return self.refuse_job_control_stop(guest, sysno, refusal).await;
         }
         if refusal.operation != operation || refusal.errno != errno {
@@ -190,15 +191,17 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// The backend dropped a job-control signal that Linux raised during the
-    /// guest's `sysno` at its default disposition, because it cannot stop the
-    /// process group for it (`reverie::UnsupportedOperation::JobControlStop`):
-    /// a background process's read of its controlling terminal raises
-    /// `SIGTTIN` so. Linux would stop the group and restart the call once the
-    /// group is continued. Refused by name, naming the signal (the refusal's
-    /// diagnostic) and the call: a fail-closed run ends as a policy refusal,
-    /// and a run that allows unsupported operations gives the call `EIO`,
-    /// which Linux gives a background read when `SIGTTIN` is ignored or
-    /// blocked (`__tty_check_change`, drivers/tty/tty_jobctrl.c).
+    /// guest's `sysno` at its default disposition, as Detcore refused it
+    /// (`syscalls::job_control::decide`,
+    /// `reverie::UnsupportedOperation::JobControlStop`): Detcore cannot stop
+    /// the process group for it. A background process's read of its
+    /// controlling terminal raises `SIGTTIN` so. Linux would stop the group
+    /// and restart the call once the group is continued. Refused by name,
+    /// naming the signal (the refusal's diagnostic) and the call: a
+    /// fail-closed run ends as a policy refusal, and a run that allows
+    /// unsupported operations gives the call `EIO`, which Linux gives a
+    /// background read when `SIGTTIN` is ignored or blocked
+    /// (`__tty_check_change`, drivers/tty/tty_jobctrl.c).
     pub(crate) async fn refuse_job_control_stop<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -210,7 +213,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         report_refusal_reason(
             self.cfg.panic_on_unsupported_syscalls,
             &format!(
-                "[dtid {dettid}] {sysno} refused by the backend: {} \
+                "[dtid {dettid}] {sysno} refused: {} \
                  (https://github.com/rrnewton/hermit/issues/4944)",
                 refusal.diagnostic
             ),
@@ -235,10 +238,14 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// minibeads dh-h2qd98), and the restarted call would raise the signal
     /// again forever. The call has returned already, so no errno is left to
     /// give it: the run ends under either unsupported-operation policy,
-    /// naming the signal and the call. A job-control stop Linux raised for
-    /// a call Detcore ran, which raises it itself, is that call's refusal
-    /// instead ([`Self::refuse_job_control_stop`]). Any other signal returns at once,
-    /// a terminal's SIGTSTP among them ([`linux_raised_job_control_stop`]).
+    /// naming the signal and the call. A signal the backend reports without
+    /// its siginfo, or whose dispositions cannot be read, is refused the same
+    /// way, saying which fact is missing ([`DeliveredStop`]): it may be such a
+    /// stop, and delivered it would be one Detcore cannot make. A job-control
+    /// stop Linux raised for a call Detcore ran, which raises it itself, is
+    /// that call's refusal instead ([`Self::refuse_job_control_stop`]). Any
+    /// other signal returns at once, a terminal's SIGTSTP among them
+    /// ([`linux_raised_job_control_stop`]).
     pub(crate) async fn refuse_linux_raised_job_control_stop<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -250,11 +257,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         let si_code = guest
             .signal_info()
             .map(|info| i32::from_ne_bytes([info[8], info[9], info[10], info[11]]));
-        let Ok(state) = crate::syscalls::read_guest_signal_state(guest) else {
-            return;
-        };
-        let Some((name, description)) =
-            linux_raised_job_control_stop(signal, si_code, state.ignored, state.caught)
+        let dispositions = crate::syscalls::read_guest_signal_state(guest)
+            .map(|state| (state.ignored, state.caught));
+        let Some((name, description, why)) =
+            linux_raised_job_control_stop(signal, si_code, dispositions)
         else {
             return;
         };
@@ -263,12 +269,27 @@ impl<T: RecordOrReplay> Detcore<T> {
             .ok()
             .and_then(Sysno::new)
             .map_or_else(|| "no call".to_owned(), |sysno| sysno.to_string());
-        let reason = format!(
-            "[dtid {}] {name} refused: Linux raised {name}, at its default disposition, after \
-             the call {call} ({description}), and Detcore cannot stop the process group for it; \
-             job-control stops are not supported (https://github.com/rrnewton/hermit/issues/4944)",
-            guest.thread_state().dettid
-        );
+        let dettid = guest.thread_state().dettid;
+        const UNSUPPORTED: &str = "job-control stops are not supported \
+                                   (https://github.com/rrnewton/hermit/issues/4944)";
+        let reason = match why {
+            DeliveredStop::Raised => format!(
+                "[dtid {dettid}] {name} refused: Linux raised {name}, at its default disposition, \
+                 after the call {call} ({description}), and Detcore cannot stop the process group \
+                 for it; {UNSUPPORTED}"
+            ),
+            DeliveredStop::OriginUnknown => format!(
+                "[dtid {dettid}] {name} refused: {name}, at its default disposition, arrived after \
+                 the call {call}, and the backend reported no siginfo for it, so Detcore cannot \
+                 tell whether Linux raised it ({description}) or a process sent it; {UNSUPPORTED}"
+            ),
+            DeliveredStop::DispositionUnread(errno) => format!(
+                "[dtid {dettid}] {name} refused: {name} arrived after the call {call}, and the \
+                 thread's signal dispositions could not be read ({errno}), so Detcore cannot tell \
+                 a job-control stop it cannot make ({description}) from a handled signal; \
+                 {UNSUPPORTED}"
+            ),
+        };
         report_refusal_reason(true, &reason);
         crate::tool_global::unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT)
             .await
@@ -6418,24 +6439,44 @@ pub(crate) fn unrouted_job_control_stop(
         })
 }
 
-/// `signal`'s name and what makes a terminal raise it, when Linux raised it
-/// itself (`si_code`, from the delivery's siginfo, is `SI_KERNEL`) as a
-/// terminal's job-control signal for a call (SIGTTIN or SIGTTOU) at its
-/// default disposition (neither in `ignored` nor in `caught`, signal `n` at
-/// bit `n - 1`): a signal whose delivery Linux makes a stop of the process
+/// Why [`linux_raised_job_control_stop`] has a delivered job-control signal
+/// refused: Linux raised it, or what would tell that it did not cannot be
+/// read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DeliveredStop {
+    /// Linux raised it (`SI_KERNEL`), at its default disposition.
+    Raised,
+    /// It is at its default disposition, and the backend reported it without
+    /// a siginfo, so whether Linux raised it or a process sent it is not
+    /// known.
+    OriginUnknown,
+    /// The thread's dispositions could not be read; the errno says why.
+    DispositionUnread(Errno),
+}
+
+/// `signal`'s name, what makes a terminal raise it, and why it is refused,
+/// for a terminal's job-control signal (SIGTTIN or SIGTTOU) delivered after
+/// the call it interrupted, which Linux may have raised itself at its default
+/// disposition: a signal whose delivery Linux makes a stop of the process
 /// group, and which the call raises again each time it is restarted while the
 /// process stays in the background (`__tty_check_change`,
-/// drivers/tty/tty_jobctrl.c). `None` for any other signal, one a process
-/// sent, one without a siginfo, and one the thread ignores or catches. A
-/// terminal's SIGTSTP (its suspend character, the line discipline's `isig`)
-/// is not one: no call raises it, so it is delivered as any other signal is.
+/// drivers/tty/tty_jobctrl.c). That is so when `si_code`, from the delivery's
+/// siginfo, is `SI_KERNEL`, and the signal is neither ignored nor caught
+/// (`dispositions`, the ignored and caught sets, signal `n` at bit `n - 1`).
+/// Without a siginfo (`si_code` is `None`), a signal at its default
+/// disposition may be one Linux raised, and dispositions that cannot be read
+/// may be the default, so either is refused too, as unknown, rather than
+/// delivered as a stop Detcore cannot make. `None` for any other signal, one
+/// a process sent, one the thread ignores or catches, and one whose thread no
+/// longer lives (`ESRCH`). A terminal's SIGTSTP (its suspend character, the
+/// line discipline's `isig`) is not one: no call raises it, so it is
+/// delivered as any other signal is.
 pub(crate) fn linux_raised_job_control_stop(
     signal: i32,
     si_code: Option<i32>,
-    ignored: u64,
-    caught: u64,
-) -> Option<(&'static str, &'static str)> {
-    let stop = match signal {
+    dispositions: Result<(u64, u64), Errno>,
+) -> Option<(&'static str, &'static str, DeliveredStop)> {
+    let (name, description) = match signal {
         libc::SIGTTIN => (
             "SIGTTIN",
             "a background process's read of its controlling terminal",
@@ -6448,7 +6489,17 @@ pub(crate) fn linux_raised_job_control_stop(
         _ => return None,
     };
     let bit = 1u64 << (signal - 1);
-    (si_code == Some(libc::SI_KERNEL) && ignored & bit == 0 && caught & bit == 0).then_some(stop)
+    let why = match dispositions {
+        Err(Errno::ESRCH) => return None,
+        Err(errno) => DeliveredStop::DispositionUnread(errno),
+        Ok((ignored, caught)) if (ignored | caught) & bit != 0 => return None,
+        Ok(_) => match si_code {
+            Some(libc::SI_KERNEL) => DeliveredStop::Raised,
+            Some(_) => return None,
+            None => DeliveredStop::OriginUnknown,
+        },
+    };
+    Some((name, description, why))
 }
 
 /// Report a named refusal through tracing, and, when the run ends
@@ -8375,35 +8426,62 @@ mod tests {
 
     /// Only a terminal's job-control signal for a call that Linux raised
     /// itself, at its default disposition, is a stop Detcore refuses: each of
-    /// the two by name, and neither of them ignored, caught, sent by a
-    /// process, or without a siginfo, nor any other signal Linux raises. A
-    /// terminal's SIGTSTP, which no call raises, is delivered as before.
+    /// the two by name, and neither of them ignored, caught or sent by a
+    /// process, nor any other signal Linux raises. One without a siginfo at
+    /// its default disposition, and one whose dispositions cannot be read,
+    /// may be such a stop, and are refused as unknown, unless the thread no
+    /// longer lives. A terminal's SIGTSTP, which no call raises, is delivered
+    /// as before.
     #[test]
     fn only_a_linux_raised_job_control_stop_at_its_default_is_refused() {
         let bit = |signal: i32| 1u64 << (signal - 1);
         let kernel = Some(libc::SI_KERNEL);
+        let why = |stop: Option<(&str, &str, DeliveredStop)>| stop.map(|(_, _, why)| why);
         for (signal, name) in [(libc::SIGTTIN, "SIGTTIN"), (libc::SIGTTOU, "SIGTTOU")] {
-            let stop = linux_raised_job_control_stop(signal, kernel, 0, 0);
-            assert_eq!(stop.map(|(named, _)| named), Some(name));
+            let stop = linux_raised_job_control_stop(signal, kernel, Ok((0, 0)));
+            assert_eq!(
+                stop.map(|(named, _, why)| (named, why)),
+                Some((name, DeliveredStop::Raised))
+            );
             let others = !bit(signal);
             assert_eq!(
-                linux_raised_job_control_stop(signal, kernel, others, others),
+                linux_raised_job_control_stop(signal, kernel, Ok((others, others))),
                 stop,
                 "another signal's disposition does not matter"
             );
+            for code in [kernel, Some(libc::SI_USER), None] {
+                for dispositions in [(bit(signal), 0), (0, bit(signal))] {
+                    assert_eq!(
+                        linux_raised_job_control_stop(signal, code, Ok(dispositions)),
+                        None,
+                        "{code:?} {dispositions:?}"
+                    );
+                }
+            }
             assert_eq!(
-                linux_raised_job_control_stop(signal, kernel, bit(signal), 0),
+                linux_raised_job_control_stop(signal, Some(libc::SI_USER), Ok((0, 0))),
                 None
             );
             assert_eq!(
-                linux_raised_job_control_stop(signal, kernel, 0, bit(signal)),
-                None
+                why(linux_raised_job_control_stop(signal, None, Ok((0, 0)))),
+                Some(DeliveredStop::OriginUnknown)
             );
-            assert_eq!(
-                linux_raised_job_control_stop(signal, Some(libc::SI_USER), 0, 0),
-                None
-            );
-            assert_eq!(linux_raised_job_control_stop(signal, None, 0, 0), None);
+            for code in [kernel, Some(libc::SI_USER), None] {
+                assert_eq!(
+                    why(linux_raised_job_control_stop(
+                        signal,
+                        code,
+                        Err(Errno::EACCES)
+                    )),
+                    Some(DeliveredStop::DispositionUnread(Errno::EACCES)),
+                    "{code:?}"
+                );
+                assert_eq!(
+                    linux_raised_job_control_stop(signal, code, Err(Errno::ESRCH)),
+                    None,
+                    "{code:?}"
+                );
+            }
         }
         for signal in [
             libc::SIGTSTP,
@@ -8412,7 +8490,12 @@ mod tests {
             libc::SIGPIPE,
             libc::SIGINT,
         ] {
-            assert_eq!(linux_raised_job_control_stop(signal, kernel, 0, 0), None);
+            for code in [kernel, None] {
+                assert_eq!(
+                    linux_raised_job_control_stop(signal, code, Ok((0, 0))),
+                    None
+                );
+            }
         }
     }
 

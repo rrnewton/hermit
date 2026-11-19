@@ -81228,10 +81228,12 @@ const BACKGROUND_TERMINAL_IO_WRITE_STOPS: &str = "started with SIGTTIN ignored, 
 /// A guest whose launcher left SIGTTIN at its default reads its controlling
 /// terminal from a background process group. Linux stops the group there
 /// (`BACKGROUND_TERMINAL_IO_DEFAULT`, which this test confirms natively), and
-/// the ptrace backend cannot stop it (https://github.com/rrnewton/hermit/issues/4944,
-/// minibeads dh-h2qd98). The run is refused
-/// by name at that read, as a policy refusal naming the signal and the call,
-/// before the reader prints anything. Before, the guest started with both
+/// Detcore cannot stop it (https://github.com/rrnewton/hermit/issues/4944,
+/// minibeads dh-h2qd98). The read, which Detcore had the backend inject,
+/// stops before it runs; the backend asks Detcore about the stop
+/// (`reverie::Tool::decide_injection_stop`), and Detcore refuses the run by
+/// name at that read (`syscalls::job_control`), as a policy refusal naming
+/// the signal and the call, before the reader prints anything. Before, the guest started with both
 /// signals ignored whatever its launcher left, a silent substitution of
 /// Linux's behaviour for another input's; and before that it wedged: the
 /// tracer held the signal for the read's return, and each restart of the read
@@ -81288,10 +81290,9 @@ fn a_terminal_job_control_stop_is_refused_by_name() {
     );
     assert!(
         stderr.contains(
-            "read refused by the backend: Linux raised SIGTTIN, at its default \
-                         disposition, during the call (a background process's read of its \
-                         controlling terminal), and the ptrace backend cannot stop the process \
-                         group for it; job-control stops are not supported"
+            "read refused: Linux raised SIGTTIN, at its default disposition, during the call \
+             (a background process's read of its controlling terminal), and Detcore cannot \
+             stop the process group for it; job-control stops are not supported"
         ),
         "{stderr}"
     );
@@ -81321,7 +81322,9 @@ fn a_terminal_job_control_stop_is_refused_by_name() {
         "{permissive:?}: {stderr}"
     );
     assert!(
-        stderr.contains("read refused by the backend: Linux raised SIGTTIN, at its default"),
+        stderr.contains(
+            "read refused: Linux raised SIGTTIN, at its default disposition, during the call"
+        ),
         "{stderr}"
     );
     assert!(
@@ -81383,11 +81386,12 @@ fn a_terminal_job_control_stop_is_refused_by_name() {
 /// for a reader whose thread name is not UTF-8
 /// (`tests/c/background_terminal_io.c non-utf8-name`): `PR_SET_NAME` allows
 /// any bytes but NUL, and the reader's `/proc` status shows them on its
-/// `Name:` line. The ptrace backend reads the reader's dispositions from those
+/// `Name:` line. The ptrace backend reads the reader's dispositions, which
+/// Detcore asks for (`reverie::InjectionStopFacts::signal_sets`), from those
 /// lines as bytes (Reverie's retained signal-sets fact), so the read is refused
-/// by name, as under any other name. Before, it read the whole status as
-/// UTF-8, took the failed read for a handled signal, and held SIGTTIN for the
-/// read's return, which raised it again until the run's timeout.
+/// by name, as under any other name. Before, the backend read the whole status
+/// as UTF-8, took the failed read for a handled signal, and held SIGTTIN for
+/// the read's return, which raised it again until the run's timeout.
 #[test]
 fn a_terminal_job_control_stop_is_refused_by_name_whatever_the_thread_name() {
     let guest = background_terminal_io_guest();
@@ -81433,10 +81437,9 @@ fn a_terminal_job_control_stop_is_refused_by_name_whatever_the_thread_name() {
     );
     assert!(
         stderr.contains(
-            "read refused by the backend: Linux raised SIGTTIN, at its default disposition, \
-             during the call (a background process's read of its controlling terminal), and \
-             the ptrace backend cannot stop the process group for it; job-control stops are \
-             not supported"
+            "read refused: Linux raised SIGTTIN, at its default disposition, during the call \
+             (a background process's read of its controlling terminal), and Detcore cannot \
+             stop the process group for it; job-control stops are not supported"
         ),
         "{stderr}"
     );
@@ -81451,12 +81454,13 @@ fn a_terminal_job_control_stop_is_refused_by_name_whatever_the_thread_name() {
 /// The terminal refusal of `a_terminal_job_control_stop_is_refused_by_name`
 /// where a seccomp filter may restrict hermit's tracer thread: hermit runs
 /// under a filter it inherited, which denies only `acct`
-/// (`--unsafe-ignore-host-seccomp`). The ptrace backend then does not ask the
-/// stop's siginfo, which tells a signal Linux raised from one a process sent,
+/// (`--unsafe-ignore-host-seccomp`). The ptrace backend then does not read the
+/// stop's siginfo for Detcore (`reverie::InjectionStopFacts::signal_info`),
 /// as such a filter may refuse `PTRACE_GETSIGINFO` or kill the tracer at it,
-/// and refuses the read by name, saying so. Before, the backend took the filter
-/// for a reason to hold the signal, and the read raised it again until the
-/// run's timeout.
+/// so Detcore cannot tell a signal Linux raised from one a process sent, and
+/// it refuses the read by name, saying so. Before, the backend took the
+/// filter for a reason to hold the signal, and the read raised it again until
+/// the run's timeout.
 #[test]
 fn a_terminal_job_control_stop_under_a_seccomp_filter_is_refused_by_name() {
     let guest = background_terminal_io_guest();
@@ -81476,10 +81480,10 @@ fn a_terminal_job_control_stop_under_a_seccomp_filter_is_refused_by_name() {
     );
     assert!(
         stderr.contains(
-            "read refused by the backend: SIGTTIN, at its default disposition, arrived during \
-             the call, and with a seccomp filter possibly restricting the tracer, the ptrace \
-             backend does not ask whether Linux raised it (a background process's read of its \
-             controlling terminal) or a process sent it; job-control stops are not supported"
+            "read refused: SIGTTIN, at its default disposition, arrived during the call, and \
+             the backend does not report its siginfo, so Detcore cannot tell whether Linux \
+             raised it (a background process's read of its controlling terminal) or a process \
+             sent it; job-control stops are not supported"
         ),
         "{stderr}"
     );
@@ -81497,9 +81501,10 @@ fn a_terminal_job_control_stop_under_a_seccomp_filter_is_refused_by_name() {
 /// test's write, the signal reaches Detcore once the `ioctl` it interrupted
 /// has returned, and Detcore refuses it by name, naming the call, under
 /// either unsupported-operation policy, as the call has no errno left to
-/// give (Detcore's `refuse_linux_raised_job_control_stop`). The ptrace
-/// backend's refusal of a SIGTTOU raised during a call it injected
-/// ("ioctl refused by the backend") is not reached by this guest.
+/// give (Detcore's `refuse_linux_raised_job_control_stop`). Detcore's refusal
+/// of a SIGTTOU raised during a call it had injected, which stopped before
+/// it ran ("ioctl refused: Linux raised SIGTTOU, ... during the call"), is
+/// not reached by this guest.
 #[test]
 fn a_background_change_of_terminal_settings_is_refused_by_name() {
     let guest = background_terminal_io_guest();
@@ -81578,29 +81583,90 @@ fn a_background_change_of_terminal_settings_is_refused_by_name() {
     );
 }
 
-/// The terminal refusal of `a_terminal_job_control_stop_is_refused_by_name`
-/// names only the call that raised the stop, not the other members of the
-/// reader's process group (`tests/c/background_terminal_io.c sibling` and
-/// `sibling-poll`). The reader has a sibling in its background process
-/// group, waiting for a pipe in `read`, or in `poll`. Linux sends the
-/// reader's SIGTTIN to the whole group and stops both. The reader, continued
-/// alone, writes to the pipe and then kills the sibling, which never ran
-/// again. Under Hermit only the reader's read, which raised the signal, is
-/// the backend's refusal. The signal reaches the sibling outside any call the
-/// backend injected, so Detcore refuses it by name when it is delivered
-/// (`ERROR_CATALOG.md` row 131), under either unsupported-operation policy,
-/// and the sibling's call is never failed with EIO, which Linux never gives
-/// a pipe read or a poll. This guest does not reach the backend's choice for
-/// an injected call that a group's signal stops, whether that call could
-/// have raised the signal: Reverie's `terminal_call::call_may_raise` unit
-/// tests cover it. (With a second pseudoterminal for the sibling to wait on
-/// instead of a pipe, a strict run did not end until its `--timeout`: the
-/// sibling's read blocked in the kernel while every other guest process
-/// stayed stopped.)
+/// `a_background_change_of_terminal_settings_is_refused_by_name` where a
+/// seccomp filter may restrict hermit's tracer thread: hermit runs under a
+/// filter it inherited, which denies only `acct`
+/// (`--unsafe-ignore-host-seccomp`). The ptrace backend then reports the
+/// signal without its siginfo (`Guest::signal_info` is `None`), as such a
+/// filter may refuse `PTRACE_GETSIGINFO` or kill the tracer at it, so
+/// Detcore cannot tell a SIGTTOU that Linux raised from one a process sent.
+/// It refuses the signal by name, saying so, under either
+/// unsupported-operation policy, as for a known origin. Before, Detcore took
+/// the missing siginfo for a sent signal and let the stop through.
 #[test]
-fn a_terminal_job_control_stop_is_refused_only_for_the_call_that_raised_it() {
+fn a_background_change_of_terminal_settings_under_a_seccomp_filter_is_refused_by_name() {
     let guest = background_terminal_io_guest();
     let guest_path = guest.to_str().expect("guest path is UTF-8");
+    const ORIGIN_UNKNOWN: &str = "SIGTTOU refused: SIGTTOU, at its default disposition, arrived \
+                                  after the call ioctl, and the backend reported no siginfo for \
+                                  it, so Detcore cannot tell whether Linux raised it (a \
+                                  background process's write to its controlling terminal with \
+                                  TOSTOP set, or a change of the terminal's settings) or a \
+                                  process sent it; job-control stops are not supported";
+    for policy in ["--strict", "--allow-unsupported-syscalls"] {
+        let args = [
+            "run",
+            policy,
+            "--timeout",
+            "60",
+            "--",
+            guest_path,
+            "settings",
+        ];
+        let mut command = hermit_command_under_host_filter(&args);
+        deny_syscall(&mut command, libc::SYS_acct);
+        let output = hermit_test::hermit_output(
+            &format!("{command:?}"),
+            with_job_control_signals(&mut command, libc::SIG_DFL),
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let printed = stdout(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{args:?}: {printed}{stderr}"
+        );
+        assert!(
+            stderr.contains(ORIGIN_UNKNOWN),
+            "{args:?}: {printed}{stderr}"
+        );
+        assert_eq!(
+            printed, "started with SIGTTIN default, SIGTTOU default\n",
+            "{args:?}: the child printed past the refusal: {stderr}"
+        );
+    }
+}
+
+/// The reader's terminal stop of `a_terminal_job_control_stop_is_refused_by_name`
+/// never fails another member's call in the reader's process group
+/// (`tests/c/background_terminal_io.c sibling` and `sibling-poll`). The
+/// reader has a sibling in its background process group, waiting for a pipe
+/// in `read`, or in `poll`. Linux sends the reader's SIGTTIN to the whole
+/// group and stops both. The reader, continued alone, writes to the pipe and
+/// then kills the sibling, which never ran again. Under Hermit only the
+/// reader's read, which raised the signal, is refused during the call. The
+/// signal reaches the sibling outside any call Detcore had injected, and
+/// Detcore refuses it by name when it is delivered, naming the sibling's call
+/// (`ERROR_CATALOG.md` row 131), under either unsupported-operation policy,
+/// so the sibling's call is never failed with EIO, which Linux never gives a
+/// pipe read or a poll. That refusal, from another thread than the reader's
+/// and after the sibling's own call, is the witness that the sibling was
+/// waiting in that call when the signal came, not still starting.
+///
+/// This guest does not reach Detcore's decision for an injected call that a
+/// group's signal stops before it runs, whether that call could have raised
+/// the signal: Detcore's `syscalls::job_control` unit tests cover the
+/// decision, and Reverie's `injection_stop_hook_tests` the backend's part.
+/// (With a second pseudoterminal for the sibling to wait on instead of a
+/// pipe, a strict run did not end until its `--timeout`: a blocking read of
+/// a pseudoterminal slave does not return under Hermit even with a line
+/// buffered, https://github.com/facebookexperimental/hermit/issues/501.)
+#[test]
+fn a_group_members_call_is_not_failed_for_another_members_terminal_stop() {
+    let guest = background_terminal_io_guest();
+    let guest_path = guest.to_str().expect("guest path is UTF-8");
+    const READER_REFUSED: &str =
+        "read refused: Linux raised SIGTTIN, at its default disposition, during the call";
     for (mode, call) in [("sibling", "read"), ("sibling-poll", "poll")] {
         let native = with_job_control_signals(Command::new(guest).arg(mode), libc::SIG_DFL)
             .output()
@@ -81634,7 +81700,7 @@ fn a_terminal_job_control_stop_is_refused_only_for_the_call_that_raised_it() {
             "{args:?}: {printed}{stderr}"
         );
         assert!(
-            stderr.contains("read refused by the backend: Linux raised SIGTTIN, at its default"),
+            stderr.contains(READER_REFUSED),
             "{args:?}: {printed}{stderr}"
         );
         assert_eq!(
@@ -81664,19 +81730,29 @@ fn a_terminal_job_control_stop_is_refused_only_for_the_call_that_raised_it() {
             "{permissive:?}: {printed}{stderr}"
         );
         assert_eq!(
-            stderr
-                .matches("refused by the backend: Linux raised SIGTTIN")
-                .count(),
+            stderr.matches(READER_REFUSED).count(),
             1,
-            "{permissive:?}: only the reader's read is the backend's refusal: {printed}{stderr}"
-        );
-        assert!(
-            stderr.contains(&format!(
-                "SIGTTIN refused: Linux raised SIGTTIN, at its default disposition, after the \
-                 call {call} "
-            )),
-            "{permissive:?}: the signal for the sibling's {call} did not end the run by name: \
+            "{permissive:?}: only the reader's read is refused during the call: \
              {printed}{stderr}"
+        );
+        let sibling_refused = format!(
+            "SIGTTIN refused: Linux raised SIGTTIN, at its default disposition, after the call \
+             {call} "
+        );
+        // The thread each refusal names, `[dtid N]`, at the start of its
+        // message.
+        let thread_of = |message: &str| {
+            stderr
+                .lines()
+                .find_map(|line| line.find(message).map(|at| &line[..at]))
+                .and_then(|head| head.rfind("[dtid ").map(|start| &head[start..]))
+                .map(str::to_owned)
+        };
+        let (reader, sibling) = (thread_of(READER_REFUSED), thread_of(&sibling_refused));
+        assert!(
+            reader.is_some() && sibling.is_some() && reader != sibling,
+            "{permissive:?}: the signal for the sibling's {call} did not end the run by name, \
+             from the sibling's thread ({reader:?} read, {sibling:?} after): {printed}{stderr}"
         );
         assert_eq!(
             printed,
