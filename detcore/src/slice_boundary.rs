@@ -394,12 +394,12 @@ mod tests {
     use super::*;
     use crate::types::DetTid;
 
-    fn fixture() -> (Config, ThreadState<crate::SeededMode>, Observations) {
+    fn fixture() -> (Config, ThreadState<crate::ConfiguredMode>, Observations) {
         let cfg = Config {
             max_timeslice: NonZeroU64::new(200_000_000),
             ..Default::default()
         };
-        let mut thread = ThreadState::<crate::SeededMode>::new(DetTid::from_raw(3), &cfg, ());
+        let mut thread = ThreadState::<crate::ConfiguredMode>::new(DetTid::from_raw(3), &cfg, ());
         thread.next_timeslice(&cfg);
         let observations = Observations::new(&thread, 0);
         (cfg, thread, observations)
@@ -410,9 +410,9 @@ mod tests {
         let cfg = Config::default();
         let parent = DetTid::from_raw(3);
         let child = DetTid::from_raw(4);
-        let mut shared = ThreadState::<crate::SeededMode>::new(child, &cfg, ());
+        let mut shared = ThreadState::<crate::ConfiguredMode>::new(child, &cfg, ());
         shared.mm_id = MmId::for_clone(MmId::initial(parent), child, true);
-        let mut copied = ThreadState::<crate::SeededMode>::new(child, &cfg, ());
+        let mut copied = ThreadState::<crate::ConfiguredMode>::new(child, &cfg, ());
         copied.mm_id = MmId::for_clone(MmId::initial(parent), child, false);
         let mut a = Observations::new(&shared, 0);
         let mut b = Observations::new(&copied, 0);
@@ -581,7 +581,8 @@ mod tests {
         #[cfg(not(target_arch = "x86_64"))]
         let sysno = Sysno::ppoll;
         observed.syscall(&thread, sysno, Phase::Prehook).unwrap();
-        let mut recorded_thread = ThreadState::<crate::SeededMode>::new(thread.dettid, &config, ());
+        let mut recorded_thread =
+            ThreadState::<crate::ConfiguredMode>::new(thread.dettid, &config, ());
         let mut recorded = observed.clone();
         recorded
             .syscall(&recorded_thread, sysno, Phase::Posthook)
@@ -637,7 +638,8 @@ mod tests {
             .syscall(&thread, Sysno::sched_yield, Phase::Prehook)
             .unwrap();
         let mut copy = observed.clone();
-        let mut record_thread = ThreadState::<crate::SeededMode>::new(thread.dettid, &config, ());
+        let mut record_thread =
+            ThreadState::<crate::ConfiguredMode>::new(thread.dettid, &config, ());
         let marker = copy
             .close_slice(&mut record_thread, &config, true, None)
             .unwrap()
@@ -667,7 +669,8 @@ mod tests {
             .callback(&thread, Entry::NoRcbTimer, Phase::Prehook)
             .unwrap();
         let mut copy = observed.clone();
-        let mut record_thread = ThreadState::<crate::SeededMode>::new(thread.dettid, &config, ());
+        let mut record_thread =
+            ThreadState::<crate::ConfiguredMode>::new(thread.dettid, &config, ());
         copy.publish(&record_thread, Entry::NoRcbTimer, Phase::TimerMaximum)
             .unwrap();
         let marker = copy

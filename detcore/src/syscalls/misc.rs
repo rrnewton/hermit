@@ -1557,7 +1557,7 @@ mod tests {
         struct MirrorGuest<'a> {
             config: &'a Config,
             global: &'a GlobalState,
-            thread: crate::ThreadState<crate::SeededMode>,
+            thread: crate::ThreadState<crate::ConfiguredMode>,
             sender: Tid,
             answer: Result<i64, Errno>,
             refusal: Option<reverie::UnsupportedOperation>,
@@ -1621,10 +1621,10 @@ mod tests {
             fn memory(&self) -> Self::Memory {
                 reverie::syscalls::LocalMemory::new()
             }
-            fn thread_state(&self) -> &crate::ThreadState<crate::SeededMode> {
+            fn thread_state(&self) -> &crate::ThreadState<crate::ConfiguredMode> {
                 &self.thread
             }
-            fn thread_state_mut(&mut self) -> &mut crate::ThreadState<crate::SeededMode> {
+            fn thread_state_mut(&mut self) -> &mut crate::ThreadState<crate::ConfiguredMode> {
                 &mut self.thread
             }
             async fn regs(&mut self) -> libc::user_regs_struct {
@@ -1689,7 +1689,8 @@ mod tests {
                 };
                 let global = GlobalState::init_global_state(&config).await;
                 let tool = Detcore::new(Tid::from_raw(process.as_raw()), &config);
-                let mut thread = crate::ThreadState::<crate::SeededMode>::new(process, &config, ());
+                let mut thread =
+                    crate::ThreadState::<crate::ConfiguredMode>::new(process, &config, ());
                 thread.detpid = Some(process);
                 let mut guest = MirrorGuest {
                     config: &config,
@@ -1752,7 +1753,7 @@ mod tests {
             let config = Config::default();
             let global = GlobalState::init_global_state(&config).await;
             let tool = Detcore::new(Tid::from_raw(process.as_raw()), &config);
-            let mut thread = crate::ThreadState::<crate::SeededMode>::new(process, &config, ());
+            let mut thread = crate::ThreadState::<crate::ConfiguredMode>::new(process, &config, ());
             thread.detpid = Some(process);
             thread.nested_pid_namespace = true;
             let mut guest = MirrorGuest {
@@ -1772,7 +1773,7 @@ mod tests {
                 matches!(result, Err(Error::Errno(Errno::ENOSYS))),
                 "{result:?}"
             );
-            crate::syscalls::helpers::fail_on_tool_decided_injection::<crate::SeededMode, _>(
+            crate::syscalls::helpers::fail_on_tool_decided_injection::<crate::ConfiguredMode, _>(
                 &mut guest, sysno,
             );
         }
@@ -2189,15 +2190,15 @@ mod tests {
     #[test]
     fn process_madvise_is_rejected_deterministically() {
         assert!(matches!(
-            Detcore::<crate::SeededMode>::handle_process_madvise((-10_000_i32) as usize, 0),
+            Detcore::<crate::ConfiguredMode>::handle_process_madvise((-10_000_i32) as usize, 0),
             Err(Error::Errno(Errno::EBADF))
         ));
         assert!(matches!(
-            Detcore::<crate::SeededMode>::handle_process_madvise(3, 1),
+            Detcore::<crate::ConfiguredMode>::handle_process_madvise(3, 1),
             Err(Error::Errno(Errno::EINVAL))
         ));
         assert!(matches!(
-            Detcore::<crate::SeededMode>::handle_process_madvise(3, 0),
+            Detcore::<crate::ConfiguredMode>::handle_process_madvise(3, 0),
             Err(Error::Errno(Errno::EPERM))
         ));
     }

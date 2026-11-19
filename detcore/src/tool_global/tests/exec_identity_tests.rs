@@ -95,7 +95,7 @@ impl GlobalRPC<GlobalState> for ExecRpc<'_> {
 
 struct ExecGuest<'a> {
     rpc: ExecRpc<'a>,
-    thread: ThreadState<crate::SeededMode>,
+    thread: ThreadState<crate::ConfiguredMode>,
 }
 
 #[reverie::tool]
@@ -129,10 +129,10 @@ impl Guest<Detcore> for ExecGuest<'_> {
     fn memory(&self) -> Self::Memory {
         panic!("exec identity handoff must not access guest memory")
     }
-    fn thread_state(&self) -> &ThreadState<crate::SeededMode> {
+    fn thread_state(&self) -> &ThreadState<crate::ConfiguredMode> {
         &self.thread
     }
-    fn thread_state_mut(&mut self) -> &mut ThreadState<crate::SeededMode> {
+    fn thread_state_mut(&mut self) -> &mut ThreadState<crate::ConfiguredMode> {
         &mut self.thread
     }
     async fn regs(&mut self) -> libc::user_regs_struct {
@@ -167,8 +167,8 @@ impl Guest<Detcore> for ExecGuest<'_> {
 struct Fixture {
     state: GlobalState,
     tool: Detcore,
-    parent: ThreadState<crate::SeededMode>,
-    worker: ThreadState<crate::SeededMode>,
+    parent: ThreadState<crate::ConfiguredMode>,
+    worker: ThreadState<crate::ConfiguredMode>,
     before_tail: LogicalTime,
 }
 
@@ -184,7 +184,7 @@ async fn consume(
     state: &GlobalState,
     tool: &Detcore,
     sender: DetTid,
-    thread: ThreadState<crate::SeededMode>,
+    thread: ThreadState<crate::ConfiguredMode>,
 ) {
     consume_with_status(state, tool, sender, thread, ExitStatus::Exited(73)).await;
 }
@@ -193,7 +193,7 @@ async fn consume_with_status(
     state: &GlobalState,
     tool: &Detcore,
     sender: DetTid,
-    thread: ThreadState<crate::SeededMode>,
+    thread: ThreadState<crate::ConfiguredMode>,
     status: ExitStatus,
 ) {
     let rpc = ExecRpc::new(state, sender, Gate::None);
@@ -447,7 +447,7 @@ impl Fixture {
     }
 }
 
-fn deregistration(thread: &ThreadState<crate::SeededMode>) -> ThreadDeregistration {
+fn deregistration(thread: &ThreadState<crate::ConfiguredMode>) -> ThreadDeregistration {
     ThreadDeregistration {
         dettid: thread.dettid,
         detpid: thread.detpid.unwrap(),

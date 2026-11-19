@@ -9281,7 +9281,7 @@ pub(crate) mod kernel_signal_wait_failures {
 
     struct WaitGuest {
         config: Config,
-        thread: ThreadState<crate::SeededMode>,
+        thread: ThreadState<crate::ConfiguredMode>,
         pid: Pid,
         tid: Pid,
         commit_fails: bool,
@@ -9297,7 +9297,8 @@ pub(crate) mod kernel_signal_wait_failures {
         /// installed.
         fn new(tid: Pid, mask: KernelSigset) -> (Self, Kernel) {
             let config = Config::default();
-            let thread = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ());
+            let thread =
+                ThreadState::<crate::ConfiguredMode>::new(DetPid::from_raw(1), &config, ());
             let kernel = Arc::new(Mutex::new(FakeKernel {
                 blocked: mask,
                 ..FakeKernel::default()
@@ -10213,10 +10214,10 @@ pub(crate) mod kernel_signal_wait_failures {
                 kernel.caught,
             ))
         }
-        fn thread_state_mut(&mut self) -> &mut ThreadState<crate::SeededMode> {
+        fn thread_state_mut(&mut self) -> &mut ThreadState<crate::ConfiguredMode> {
             &mut self.thread
         }
-        fn thread_state(&self) -> &ThreadState<crate::SeededMode> {
+        fn thread_state(&self) -> &ThreadState<crate::ConfiguredMode> {
             &self.thread
         }
         async fn regs(&mut self) -> libc::user_regs_struct {
@@ -13807,8 +13808,8 @@ mod backend_refusal_tests {
     fn fail_closed(
         refusal: Option<reverie::UnsupportedRefusal>,
     ) -> (
-        Detcore<crate::SeededMode>,
-        InjectGuest<crate::SeededMode<NoopTool>>,
+        Detcore<crate::ConfiguredMode>,
+        InjectGuest<crate::ConfiguredMode<NoopTool>>,
     ) {
         let config = Config {
             panic_on_unsupported_syscalls: true,
@@ -13816,8 +13817,8 @@ mod backend_refusal_tests {
             shutdown_on_unsupported_syscall: false,
             ..Config::default()
         };
-        let tool = <Detcore<crate::SeededMode> as Tool>::new(Pid::from_raw(4242), &config);
-        let mut guest = InjectGuest::<crate::SeededMode>::new(Ok(0));
+        let tool = <Detcore<crate::ConfiguredMode> as Tool>::new(Pid::from_raw(4242), &config);
+        let mut guest = InjectGuest::<crate::ConfiguredMode>::new(Ok(0));
         guest.config = config;
         if let Some(refusal) = refusal {
             guest = guest.with_refusal(refusal);

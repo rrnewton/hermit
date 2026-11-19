@@ -503,8 +503,8 @@ mod tests {
     use crate::config::Config;
     use crate::types::DetTid;
 
-    fn thread() -> ThreadState<crate::SeededMode> {
-        ThreadState::<crate::SeededMode>::new(DetTid::from_raw(3), &Config::default(), ())
+    fn thread() -> ThreadState<crate::ConfiguredMode> {
+        ThreadState::<crate::ConfiguredMode>::new(DetTid::from_raw(3), &Config::default(), ())
     }
     fn origin() -> Origin {
         Origin {

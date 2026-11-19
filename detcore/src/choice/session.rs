@@ -189,6 +189,17 @@ pub(crate) fn refuse_other_session(dettid: crate::types::DetTid) -> ! {
     ))
 }
 
+/// End the run for a thread holding the seeded policy that is offered the
+/// run's session: a run with a choice source builds every thread's policy
+/// controlled (`SchedulingChoices::for_run`), so this thread was built with
+/// the wrong policy, and its draws would never be asked.
+pub(crate) fn refuse_seeded_with_session(dettid: crate::types::DetTid) -> ! {
+    stop_run(format!(
+        "thread {dettid} holds the seeded policy in a run with a choice session, so its draws \
+         would not be asked"
+    ))
+}
+
 /// End the run for `message`, a choice source that cannot serve it. The
 /// container child exits with Hermit's policy-refusal status, as
 /// `tool_global::unrecoverable_shutdown` does: the parent reports it as a

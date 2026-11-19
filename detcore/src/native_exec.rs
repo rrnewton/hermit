@@ -99,7 +99,7 @@ impl std::error::Error for NativeExecCutError {}
 /// PID/TID read from that same current kernel task through its qualified gate.
 /// No guest work has run; this is the unique freshly constructed initial state.
 pub unsafe fn bind_native_initial_physical_identity(
-    thread: &mut ThreadState<crate::SeededMode>,
+    thread: &mut ThreadState<crate::ConfiguredMode>,
     physical_pid: i32,
     physical_tid: i32,
 ) -> Result<(), NativeExecCutError> {
@@ -127,7 +127,7 @@ pub unsafe fn bind_native_initial_physical_identity(
 /// The first domain has no admitted signal-control capability; equal None is
 /// supported data, never a fabricated task-lifetime identity.
 pub fn bind_native_fresh_signal_identity(
-    thread: &mut ThreadState<crate::SeededMode>,
+    thread: &mut ThreadState<crate::ConfiguredMode>,
     mode: reverie::BackendSignalControlMode,
     actual: Option<reverie::SignalTaskIdentity>,
 ) -> Result<(), NativeExecCutError> {
@@ -212,8 +212,8 @@ pub struct DetcoreExecSnapshotRefV2<'a> {
     detpid: DetPid,
     prepared_mm: MmId,
     config_digest: [u8; 32],
-    tool: &'a Detcore<crate::SeededMode>,
-    thread: &'a ThreadState<crate::SeededMode>,
+    tool: &'a Detcore<crate::ConfiguredMode>,
+    thread: &'a ThreadState<crate::ConfiguredMode>,
     #[serde(skip)]
     _receipt: &'a NativeExecPreparationReceipt,
 }
@@ -230,8 +230,8 @@ pub struct DetcoreExecSnapshotV2 {
     detpid: DetPid,
     prepared_mm: MmId,
     config_digest: [u8; 32],
-    tool: Detcore<crate::SeededMode>,
-    thread: ThreadState<crate::SeededMode>,
+    tool: Detcore<crate::ConfiguredMode>,
+    thread: ThreadState<crate::ConfiguredMode>,
 }
 
 impl DetcoreExecSnapshotV2 {
@@ -274,8 +274,13 @@ impl DetcoreExecSnapshotV2 {
         self,
         binding: &NativeExecCutBinding,
         expected_config: &Config,
-    ) -> Result<(Detcore<crate::SeededMode>, ThreadState<crate::SeededMode>), NativeExecCutError>
-    {
+    ) -> Result<
+        (
+            Detcore<crate::ConfiguredMode>,
+            ThreadState<crate::ConfiguredMode>,
+        ),
+        NativeExecCutError,
+    > {
         self.validate(binding, expected_config)?;
         Ok((self.tool, self.thread))
     }
@@ -285,8 +290,8 @@ impl DetcoreExecSnapshotV2 {
 ///
 /// This is an explicit inactive API; it is not an added ordinary syscall hook.
 pub fn validate_old_native_exec_cut(
-    tool: &Detcore<crate::SeededMode>,
-    thread: &ThreadState<crate::SeededMode>,
+    tool: &Detcore<crate::ConfiguredMode>,
+    thread: &ThreadState<crate::ConfiguredMode>,
     binding: &NativeExecCutBinding,
 ) -> Result<NativeExecPreparationReceipt, NativeExecCutError> {
     binding.validate()?;
@@ -310,8 +315,8 @@ pub fn validate_old_native_exec_cut(
 /// Both old and prepared tables are checked without comparing their total Arc
 /// counts: the existing rollback future legitimately owns old-table aliases.
 pub fn capture_prepared_native_exec<'a>(
-    tool: &'a Detcore<crate::SeededMode>,
-    thread: &'a ThreadState<crate::SeededMode>,
+    tool: &'a Detcore<crate::ConfiguredMode>,
+    thread: &'a ThreadState<crate::ConfiguredMode>,
     binding: &NativeExecCutBinding,
     receipt: &'a NativeExecPreparationReceipt,
 ) -> Result<DetcoreExecSnapshotRefV2<'a>, NativeExecCutError> {
@@ -348,8 +353,8 @@ pub fn capture_prepared_native_exec<'a>(
 /// This checks the complete encoding, including exact length, and never resets
 /// accounting, advances a PRNG, or constructs a replacement model.
 pub fn check_prepared_native_exec_bytes(
-    tool: &Detcore<crate::SeededMode>,
-    thread: &ThreadState<crate::SeededMode>,
+    tool: &Detcore<crate::ConfiguredMode>,
+    thread: &ThreadState<crate::ConfiguredMode>,
     binding: &NativeExecCutBinding,
     receipt: &NativeExecPreparationReceipt,
     expected: &[u8],
@@ -400,8 +405,8 @@ fn compare_encoding<T: Serialize + ?Sized>(
 }
 
 fn validate_tool_and_thread(
-    tool: &Detcore<crate::SeededMode>,
-    thread: &ThreadState<crate::SeededMode>,
+    tool: &Detcore<crate::ConfiguredMode>,
+    thread: &ThreadState<crate::ConfiguredMode>,
     binding: &NativeExecCutBinding,
 ) -> Result<(), NativeExecCutError> {
     if tool.detpid != binding.detpid {
@@ -531,8 +536,8 @@ pub(crate) mod tests {
     use crate::types::SharedMemoryObjectId;
 
     pub(crate) fn fixture() -> (
-        Detcore<crate::SeededMode>,
-        ThreadState<crate::SeededMode>,
+        Detcore<crate::ConfiguredMode>,
+        ThreadState<crate::ConfiguredMode>,
         NativeExecCutBinding,
     ) {
         let owner = DetTid::from_raw(42);
@@ -551,7 +556,7 @@ pub(crate) mod tests {
             cfg,
             record_or_replay: NoopTool,
         };
-        let mut thread = ThreadState::<crate::SeededMode>::new(owner, &tool.cfg, ());
+        let mut thread = ThreadState::<crate::ConfiguredMode>::new(owner, &tool.cfg, ());
         thread.detpid = Some(owner);
         thread.physical_tid = Some(4242);
         thread.thread_start_entered = true;
@@ -575,7 +580,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn prepare(
-        thread: &mut ThreadState<crate::SeededMode>,
+        thread: &mut ThreadState<crate::ConfiguredMode>,
         binding: &NativeExecCutBinding,
     ) {
         let files = thread
@@ -598,8 +603,8 @@ pub(crate) mod tests {
     }
 
     fn encoded(
-        tool: &Detcore<crate::SeededMode>,
-        thread: &ThreadState<crate::SeededMode>,
+        tool: &Detcore<crate::ConfiguredMode>,
+        thread: &ThreadState<crate::ConfiguredMode>,
         binding: &NativeExecCutBinding,
         receipt: &NativeExecPreparationReceipt,
     ) -> Vec<u8> {
@@ -622,7 +627,7 @@ pub(crate) mod tests {
 
     pub(crate) fn thread_for_test(
         snapshot: &mut DetcoreExecSnapshotV2,
-    ) -> &mut ThreadState<crate::SeededMode> {
+    ) -> &mut ThreadState<crate::ConfiguredMode> {
         &mut snapshot.thread
     }
 
@@ -1150,7 +1155,7 @@ pub(crate) mod tests {
         // Model mechanics only: the production unsafe caller supplies the real
         // InitialImage permit and raw same-task IDs, neither simulated here.
         let owner = DetTid::from_raw(41);
-        let mut thread = ThreadState::<crate::SeededMode>::new(owner, &Config::default(), ());
+        let mut thread = ThreadState::<crate::ConfiguredMode>::new(owner, &Config::default(), ());
         unsafe { bind_native_initial_physical_identity(&mut thread, 41, 41) }.unwrap();
         assert_eq!(thread.physical_tid, Some(41));
         assert_eq!(thread.detpid, None);
@@ -1162,7 +1167,8 @@ pub(crate) mod tests {
         );
         assert!(unsafe { bind_native_initial_physical_identity(&mut thread, 41, 41) }.is_err());
         for field in 0..6 {
-            let mut thread = ThreadState::<crate::SeededMode>::new(owner, &Config::default(), ());
+            let mut thread =
+                ThreadState::<crate::ConfiguredMode>::new(owner, &Config::default(), ());
             let (pid, tid) = match field {
                 0 => (42, 41),
                 1 => (42, 42),
@@ -1200,7 +1206,7 @@ pub(crate) mod tests {
             tid: reverie::Pid::from_raw(41),
             task_generation: 0,
         };
-        let mut thread = ThreadState::<crate::SeededMode>::new(owner, &Config::default(), ());
+        let mut thread = ThreadState::<crate::ConfiguredMode>::new(owner, &Config::default(), ());
         bind_native_fresh_signal_identity(
             &mut thread,
             reverie::BackendSignalControlMode::Unchanged,

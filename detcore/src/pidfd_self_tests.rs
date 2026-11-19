@@ -362,8 +362,8 @@ fn the_adapter_respells_every_injection_route_of_the_guest_call() {
     let canonical = group.into_parts().1;
     let getpid = Syscall::from_raw(Sysno::getpid, SyscallArgs::new(0, 0, 0, 0, 0, 0));
     futures::executor::block_on(async {
-        let mut inner =
-            ScriptGuest::<crate::SeededMode>::new(PidfdSelfSpelling::Legacy).replying([
+        let mut inner = ScriptGuest::<crate::ConfiguredMode>::new(PidfdSelfSpelling::Legacy)
+            .replying([
                 Ok(0),
                 Ok(0),
                 Err(Errno::ENOTRECOVERABLE),
@@ -469,15 +469,15 @@ fn forwarding_records_the_canonical_call_and_injects_the_physical_one() {
             ]
         );
 
-        let tool = detcore::<crate::SeededMode<NoopTool>>(&Config::default());
-        let mut guest = ScriptGuest::<crate::SeededMode>::new(PidfdSelfSpelling::Legacy);
+        let tool = detcore::<crate::ConfiguredMode<NoopTool>>(&Config::default());
+        let mut guest = ScriptGuest::<crate::ConfiguredMode>::new(PidfdSelfSpelling::Legacy);
         guest.thread.pidfd_respelling = Some(respelled);
         tool.record_or_replay_preserving_tool_errors(&mut guest, group)
             .await
             .unwrap();
         assert_eq!(guest.injected(), vec![(Route::Inject, pidfd, physical)]);
 
-        let mut guest = ScriptGuest::<crate::SeededMode>::new(PidfdSelfSpelling::Legacy);
+        let mut guest = ScriptGuest::<crate::ConfiguredMode>::new(PidfdSelfSpelling::Legacy);
         tool.record_or_replay_preserving_tool_errors(&mut guest, group)
             .await
             .unwrap();
@@ -494,13 +494,14 @@ fn forwarding_records_the_canonical_call_and_injects_the_physical_one() {
 fn the_slot_is_restored_when_its_guard_or_future_is_dropped() {
     let group = pidfd_send_signal(register(GROUP), 0, 0, 0);
     let respelled = respelling(group);
-    let mut guest = ScriptGuest::<crate::SeededMode>::new(PidfdSelfSpelling::Legacy);
+    let mut guest = ScriptGuest::<crate::ConfiguredMode>::new(PidfdSelfSpelling::Legacy);
     assert_eq!(guest.thread.pidfd_respelling, None);
     {
-        let mut armed = ArmedRespelling::<crate::SeededMode, _>::arm(&mut guest, Some(respelled));
+        let mut armed =
+            ArmedRespelling::<crate::ConfiguredMode, _>::arm(&mut guest, Some(respelled));
         assert_eq!(armed.thread_state().pidfd_respelling, Some(respelled));
         {
-            let inner = ArmedRespelling::<crate::SeededMode, _>::arm(&mut *armed, None);
+            let inner = ArmedRespelling::<crate::ConfiguredMode, _>::arm(&mut *armed, None);
             assert_eq!(inner.thread_state().pidfd_respelling, None);
         }
         assert_eq!(armed.thread_state().pidfd_respelling, Some(respelled));
@@ -508,7 +509,7 @@ fn the_slot_is_restored_when_its_guard_or_future_is_dropped() {
     assert_eq!(guest.thread.pidfd_respelling, None);
 
     let mut held = Box::pin(async {
-        let armed = ArmedRespelling::<crate::SeededMode, _>::arm(&mut guest, Some(respelled));
+        let armed = ArmedRespelling::<crate::ConfiguredMode, _>::arm(&mut guest, Some(respelled));
         futures::future::pending::<()>().await;
         drop(armed);
     });
@@ -520,7 +521,7 @@ fn the_slot_is_restored_when_its_guard_or_future_is_dropped() {
     drop(held);
     assert_eq!(guest.thread.pidfd_respelling, None);
 
-    let encode = |thread: &ThreadState<crate::SeededMode>| {
+    let encode = |thread: &ThreadState<crate::ConfiguredMode>| {
         bincode::serde::encode_to_vec(thread, bincode::config::standard()).unwrap()
     };
     let empty = encode(&guest.thread);
@@ -535,8 +536,8 @@ fn refusing(
     panic: bool,
     exit: bool,
 ) -> (
-    Detcore<crate::SeededMode>,
-    ScriptGuest<crate::SeededMode<NoopTool>>,
+    Detcore<crate::ConfiguredMode>,
+    ScriptGuest<crate::ConfiguredMode<NoopTool>>,
 ) {
     let config = Config {
         sequentialize_threads: false,
@@ -546,14 +547,14 @@ fn refusing(
         ..Config::default()
     };
     (
-        detcore::<crate::SeededMode<NoopTool>>(&config),
+        detcore::<crate::ConfiguredMode<NoopTool>>(&config),
         ScriptGuest::with_config(spelling, config),
     )
 }
 
 async fn send(
-    tool: &Detcore<crate::SeededMode>,
-    guest: &mut ScriptGuest<crate::SeededMode<NoopTool>>,
+    tool: &Detcore<crate::ConfiguredMode>,
+    guest: &mut ScriptGuest<crate::ConfiguredMode<NoopTool>>,
     pidfd: i32,
     signal: i32,
     flags: u32,

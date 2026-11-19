@@ -8,15 +8,19 @@
 
 //! How a run resolves its scheduling choices.
 //!
-//! The policy is a type, chosen once when the run is built
-//! ([`crate::RunMode`]), the way the record-or-replay sub-tool is. Every draw
-//! site calls it the same way, after making Detcore's own seeded draw:
-//! - [`SeededChoices`], the ordinary run's policy, returns that draw as the
-//!   decision. It holds nothing and does nothing else: no lock, no
-//!   allocation, no source, no message.
+//! The policy is the [`crate::RunMode`]'s `Choices` type. Every draw site
+//! calls it the same way, after making Detcore's own seeded draw:
+//! - [`SeededChoices`] returns that draw as the decision. It holds nothing
+//!   and does nothing else: no lock, no allocation, no source, no message.
 //! - [`ControlledChoices`] offers the draw as the default of a choice point
 //!   to the run's [`ChoiceSession`], through the handle the thread received
 //!   when it started.
+//! - [`RunChoices`], the policy of every production run
+//!   ([`crate::ConfiguredMode`]), is one of the two, picked from the run's
+//!   [`Config`] when each thread state is built ([`SchedulingChoices::for_run`]).
+//!   It keeps a single Detcore instantiation for seeded and controlled runs;
+//!   each draw costs one match on the arm. The arm is decided here, in the
+//!   choice module, never in core.
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -28,6 +32,7 @@ use super::ChoiceKind;
 use super::ChoicePoint;
 use super::ChoiceSession;
 use super::ChoiceSite;
+use crate::config::Config;
 use crate::scheduler::Priority;
 use crate::scheduler::entropy_to_priority;
 use crate::scheduler::runqueue::FIRST_PRIORITY;
@@ -46,6 +51,12 @@ pub struct DrawContext {
 
 /// A run's scheduling-choice policy. See the module documentation.
 pub trait SchedulingChoices: Default + Clone + Send + Sync + std::fmt::Debug + 'static {
+    /// The policy of a new thread state in a run configured by `cfg`. A
+    /// policy that the type alone decides needs nothing from the run.
+    fn for_run(_cfg: &Config) -> Self {
+        Self::default()
+    }
+
     /// Before the first draw of a thread that registers itself (the root,
     /// whose registration draws its own starting priority before its start
     /// grant), take from the run whatever this policy needs. Core calls it
@@ -183,6 +194,82 @@ impl SchedulingChoices for ControlledChoices {
             chosen
         );
         chosen
+    }
+}
+
+/// The policy of every production run ([`crate::ConfiguredMode`]): seeded,
+/// or controlled when the run's config names a choice source
+/// ([`Config::has_choice_source`]). One type for both keeps a single Detcore
+/// instantiation per sub-tool; each call is one match on the arm, then the
+/// arm's own policy, unchanged. Every thread state Detcore builds takes
+/// [`SchedulingChoices::for_run`]. The default, seeded, is only what a
+/// decoded thread state holds (the native exec snapshot skips the policy;
+/// native exec runs where the choice options are refused). A seeded thread
+/// offered the run's session is refused by name ([`Self::attach`]), so a
+/// thread built with the wrong arm stops a controlled run rather than draw
+/// without asking.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub enum RunChoices {
+    /// The run has no choice source: [`SeededChoices`].
+    #[default]
+    Seeded,
+    /// A choice source answers the run's choices: [`ControlledChoices`].
+    Controlled(ControlledChoices),
+}
+
+impl SchedulingChoices for RunChoices {
+    fn for_run(cfg: &Config) -> Self {
+        if cfg.has_choice_source() {
+            Self::Controlled(ControlledChoices::default())
+        } else {
+            Self::Seeded
+        }
+    }
+
+    /// The controlled arm's [`ControlledChoices::init_thread`]: a thread not
+    /// yet attached asks the global state for the run's handle. The seeded
+    /// arm needs nothing, as [`SeededChoices`] does.
+    async fn init_thread<M, G>(guest: &mut G)
+    where
+        M: crate::RunMode<Choices = Self>,
+        G: reverie::Guest<crate::Detcore<M>>,
+    {
+        let unattached = matches!(
+            &guest.thread_state().choices,
+            Self::Controlled(ControlledChoices { session: None })
+        );
+        if unattached {
+            let handle = crate::tool_global::request_choice_session(guest).await;
+            let dettid = guest.thread_state().dettid;
+            guest.thread_state_mut().choices.attach(handle, dettid);
+        }
+    }
+
+    /// The arm's own attach, except that a seeded thread offered a session
+    /// (a thread of a controlled run built with the seeded arm) is refused.
+    #[inline]
+    fn attach(&mut self, handle: Option<ChoiceHandle>, dettid: DetTid) {
+        match self {
+            Self::Seeded if handle.is_some() => super::session::refuse_seeded_with_session(dettid),
+            Self::Seeded => SeededChoices.attach(handle, dettid),
+            Self::Controlled(choices) => choices.attach(handle, dettid),
+        }
+    }
+
+    #[inline]
+    fn slice(&self, ctx: DrawContext, seeded: u64, mean_rcbs: f64) -> u64 {
+        match self {
+            Self::Seeded => SeededChoices.slice(ctx, seeded, mean_rcbs),
+            Self::Controlled(choices) => choices.slice(ctx, seeded, mean_rcbs),
+        }
+    }
+
+    #[inline]
+    fn priority(&self, ctx: DrawContext, site: ChoiceSite, entropy: u64) -> Priority {
+        match self {
+            Self::Seeded => SeededChoices.priority(ctx, site, entropy),
+            Self::Controlled(choices) => choices.priority(ctx, site, entropy),
+        }
     }
 }
 

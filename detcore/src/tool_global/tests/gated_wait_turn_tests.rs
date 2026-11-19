@@ -216,7 +216,7 @@ type Answers = VecDeque<ResumeStatus>;
 /// A guest thread whose scheduler RPCs the harness answers and logs.
 struct TurnGuest {
     config: Config,
-    thread: ThreadState<crate::SeededMode>,
+    thread: ThreadState<crate::ConfiguredMode>,
     /// The guest's own mask as the backend records it.
     own_mask: Option<u64>,
     /// Every RPC, in order.
@@ -538,10 +538,10 @@ impl Guest<Detcore> for TurnGuest {
             reads: self.memory_reads.clone(),
         }
     }
-    fn thread_state(&self) -> &ThreadState<crate::SeededMode> {
+    fn thread_state(&self) -> &ThreadState<crate::ConfiguredMode> {
         &self.thread
     }
-    fn thread_state_mut(&mut self) -> &mut ThreadState<crate::SeededMode> {
+    fn thread_state_mut(&mut self) -> &mut ThreadState<crate::ConfiguredMode> {
         &mut self.thread
     }
     fn resume_signal_mask(&self) -> Option<u64> {
@@ -833,7 +833,7 @@ fn turn_guest(gate: bool, own_mask: Option<u64>) -> TurnGuest {
     };
     config.backend = reverie::BackendCapabilities::LITEINST_IN_GUEST;
     let detpid = DetPid::from_raw(THREAD.as_raw());
-    let mut thread = ThreadState::<crate::SeededMode>::new(detpid, &config, ());
+    let mut thread = ThreadState::<crate::ConfiguredMode>::new(detpid, &config, ());
     thread.dettid = THREAD;
     thread.detpid = Some(detpid);
     let stack = Box::leak(Box::new([0_u64; 512])).as_mut_ptr() as usize;
@@ -1284,7 +1284,7 @@ async fn under_the_gate_a_restartable_poll_ends_where_it_would_block_only_for_a_
             .with_buf(AddrMut::from_raw(guest.stack))
             .with_len(8);
         let result =
-            crate::syscalls::helpers::retry_nonblocking_syscall::<crate::SeededMode, _, _>(
+            crate::syscalls::helpers::retry_nonblocking_syscall::<crate::ConfiguredMode, _, _>(
                 &mut guest, read, poll, None,
             )
             .await;
@@ -2030,10 +2030,11 @@ async fn with_the_gate_off_a_restartable_poll_keeps_today_s_path() {
         .with_fd(3)
         .with_buf(AddrMut::from_raw(guest.stack))
         .with_len(8);
-    let result = crate::syscalls::helpers::retry_nonblocking_syscall::<crate::SeededMode, _, _>(
-        &mut guest, read, poll, None,
-    )
-    .await;
+    let result =
+        crate::syscalls::helpers::retry_nonblocking_syscall::<crate::ConfiguredMode, _, _>(
+            &mut guest, read, poll, None,
+        )
+        .await;
     assert_eq!(result.unwrap(), 4);
     assert_eq!(guest.thread.wait_signal_end, None);
 }

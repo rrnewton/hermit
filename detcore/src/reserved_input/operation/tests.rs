@@ -64,7 +64,7 @@ impl Stack for NoStack {
 
 struct Fixture {
     config: Config,
-    thread: ThreadState<crate::SeededMode>,
+    thread: ThreadState<crate::ConfiguredMode>,
     control: ReservedInputControl,
     task: InputTaskId,
     sibling: InputTaskId,
@@ -113,7 +113,8 @@ impl Fixture {
             .backend_register_child(root.task, 5001, 5001, Some(false), Some(shared))
             .unwrap();
         control.grant(root.task, InputGrantKind::Ordinary).unwrap();
-        let mut thread = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(5000), &config, ());
+        let mut thread =
+            ThreadState::<crate::ConfiguredMode>::new(DetPid::from_raw(5000), &config, ());
         thread.detpid = Some(DetPid::from_raw(5000));
         Self {
             thread,
@@ -297,10 +298,10 @@ impl Guest<Detcore> for Fixture {
     fn memory(&self) -> LocalMemory {
         LocalMemory::new()
     }
-    fn thread_state(&self) -> &ThreadState<crate::SeededMode> {
+    fn thread_state(&self) -> &ThreadState<crate::ConfiguredMode> {
         &self.thread
     }
-    fn thread_state_mut(&mut self) -> &mut ThreadState<crate::SeededMode> {
+    fn thread_state_mut(&mut self) -> &mut ThreadState<crate::ConfiguredMode> {
         &mut self.thread
     }
     fn reserved_input_control(&self) -> Option<ReservedInputControl> {
@@ -766,7 +767,7 @@ impl Fixture {
         assert_eq!(self.control.native_request_grant(self.task).unwrap(), grant);
         assert!(self.control.files_proven_unshared(child.task));
         let mut thread =
-            ThreadState::<crate::SeededMode>::new(DetPid::from_raw(tid), &self.config, ());
+            ThreadState::<crate::ConfiguredMode>::new(DetPid::from_raw(tid), &self.config, ());
         thread.detpid = Some(DetPid::from_raw(tid));
         // Only stdio is consumed by these handlers; its kernel facts below are
         // scripted explicitly. This is not a general ThreadState fork fixture.

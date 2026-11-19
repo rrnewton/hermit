@@ -8407,7 +8407,7 @@ mod tests {
     struct FailedExecGuest<'a> {
         config: &'a Config,
         global: &'a GlobalState,
-        thread: crate::ThreadState<crate::SeededMode>,
+        thread: crate::ThreadState<crate::ConfiguredMode>,
         sender: Tid,
         process: Tid,
         old_mm: MmId,
@@ -8451,10 +8451,10 @@ mod tests {
         fn memory(&self) -> Self::Memory {
             panic!("failed exec rollback must not read guest memory")
         }
-        fn thread_state(&self) -> &crate::ThreadState<crate::SeededMode> {
+        fn thread_state(&self) -> &crate::ThreadState<crate::ConfiguredMode> {
             &self.thread
         }
-        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<crate::SeededMode> {
+        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<crate::ConfiguredMode> {
             &mut self.thread
         }
         async fn regs(&mut self) -> libc::user_regs_struct {
@@ -8551,7 +8551,7 @@ mod tests {
             };
             let global = GlobalState::init_global_state(&config).await;
             let tool = Detcore::new(Tid::from_raw(process.as_raw()), &config);
-            let mut thread = crate::ThreadState::<crate::SeededMode>::new(caller, &config, ());
+            let mut thread = crate::ThreadState::<crate::ConfiguredMode>::new(caller, &config, ());
             thread.detpid = Some(process);
             thread.mm_id = MmId::initial(process);
             thread.record_robust_list_head(Some(0x12340));
@@ -8620,7 +8620,7 @@ mod tests {
     struct FailedCloneGuest<'a> {
         config: &'a Config,
         global: &'a GlobalState,
-        thread: crate::ThreadState<crate::SeededMode>,
+        thread: crate::ThreadState<crate::ConfiguredMode>,
         sender: Tid,
         errno: Errno,
         backend_refuses: bool,
@@ -8661,10 +8661,10 @@ mod tests {
         fn memory(&self) -> Self::Memory {
             reverie::syscalls::LocalMemory::new()
         }
-        fn thread_state(&self) -> &crate::ThreadState<crate::SeededMode> {
+        fn thread_state(&self) -> &crate::ThreadState<crate::ConfiguredMode> {
             &self.thread
         }
-        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<crate::SeededMode> {
+        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<crate::ConfiguredMode> {
             &mut self.thread
         }
         async fn regs(&mut self) -> libc::user_regs_struct {
@@ -8729,7 +8729,7 @@ mod tests {
             };
             let global = GlobalState::init_global_state(&config).await;
             let tool = Detcore::new(Tid::from_raw(process.as_raw()), &config);
-            let mut thread = crate::ThreadState::<crate::SeededMode>::new(process, &config, ());
+            let mut thread = crate::ThreadState::<crate::ConfiguredMode>::new(process, &config, ());
             thread.detpid = Some(process);
             let mut guest = FailedCloneGuest {
                 config: &config,
@@ -10736,7 +10736,7 @@ mod disposition_mask_tests {
     /// `(how, set given)` of each.
     struct MaskGuest {
         config: Config,
-        thread: crate::ThreadState<crate::SeededMode>,
+        thread: crate::ThreadState<crate::ConfiguredMode>,
         mask: KernelSigset,
         calls: Mutex<Vec<(i32, bool)>>,
     }
@@ -10770,10 +10770,10 @@ mod disposition_mask_tests {
         fn memory(&self) -> LocalMemory {
             LocalMemory::new()
         }
-        fn thread_state(&self) -> &crate::ThreadState<crate::SeededMode> {
+        fn thread_state(&self) -> &crate::ThreadState<crate::ConfiguredMode> {
             &self.thread
         }
-        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<crate::SeededMode> {
+        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<crate::ConfiguredMode> {
             &mut self.thread
         }
         async fn regs(&mut self) -> libc::user_regs_struct {
@@ -10827,7 +10827,7 @@ mod disposition_mask_tests {
         };
         config.backend = reverie::BackendCapabilities::LITEINST_IN_GUEST;
         let detpid = DetPid::from_raw(41);
-        let mut thread = crate::ThreadState::<crate::SeededMode>::new(detpid, &config, ());
+        let mut thread = crate::ThreadState::<crate::ConfiguredMode>::new(detpid, &config, ());
         thread.detpid = Some(detpid);
         MaskGuest {
             config,

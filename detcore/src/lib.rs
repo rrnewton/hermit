@@ -502,6 +502,7 @@ use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
+pub use run_mode::ConfiguredMode;
 pub use run_mode::ControlledMode;
 pub use run_mode::Mode;
 pub use run_mode::RecordReplayState;
@@ -6513,9 +6514,10 @@ impl<T: RunMode> Tool for Detcore<T> {
                     replay_backstop: None,
 
                     record_or_replay,
-                    // Attached to the run's choice session, if any, when
-                    // the child starts (`thread_start_request`).
-                    choices: T::Choices::default(),
+                    // The run's policy, as every thread state takes it;
+                    // attached to the run's choice session, if any, when the
+                    // child starts (`thread_start_request`).
+                    choices: <T::Choices as crate::choice::SchedulingChoices>::for_run(&self.cfg),
                     preemption_points: None,
 
                     // We only get to the point of creating child threads if we're past the first execve.
@@ -10783,7 +10785,8 @@ mod stopless_end_permission_tests {
     #[test]
     fn a_replay_allows_a_stopless_end_only_where_its_record_does() {
         let config = Config::default();
-        let mut thread = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(5), &config, ());
+        let mut thread =
+            ThreadState::<crate::ConfiguredMode>::new(DetPid::from_raw(5), &config, ());
         assert!(stopless_end_allowed(false, &thread, 100), "past the record");
         assert!(!stopless_end_allowed(true, &thread, 100), "no marked end");
 
@@ -10818,7 +10821,8 @@ mod stopless_end_permission_tests {
     fn a_replay_of_instruction_offset_rows_takes_no_stopless_end() {
         use crate::preemptions::InstructionOffset;
         let config = Config::default();
-        let mut thread = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(5), &config, ());
+        let mut thread =
+            ThreadState::<crate::ConfiguredMode>::new(DetPid::from_raw(5), &config, ());
         thread.replay_rcb_end = Some(100);
         let rows = |offset: Option<InstructionOffset>| {
             Some(
@@ -10848,7 +10852,8 @@ mod process_tree_guest_clock_tests {
     fn forked_process_shares_guest_clock_domain() {
         let config = Config::default();
         let tool = <Detcore as Tool>::new(Pid::from_raw(1), &config);
-        let mut parent = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ());
+        let mut parent =
+            ThreadState::<crate::ConfiguredMode>::new(DetPid::from_raw(1), &config, ());
         parent.clone_flags = Some(CloneFlags::empty());
 
         let child = <Detcore as Tool>::init_thread_state(
@@ -10867,10 +10872,10 @@ mod process_files_tests {
 
     fn child(
         tool: &Detcore,
-        parent: &mut ThreadState<crate::SeededMode>,
+        parent: &mut ThreadState<crate::ConfiguredMode>,
         tid: i32,
         clone_flags: CloneFlags,
-    ) -> ThreadState<crate::SeededMode> {
+    ) -> ThreadState<crate::ConfiguredMode> {
         parent.clone_flags = Some(clone_flags);
         let mut child = <Detcore as Tool>::init_thread_state(
             tool,
@@ -10900,7 +10905,7 @@ mod process_files_tests {
             | CloneFlags::CLONE_FILES
             | CloneFlags::CLONE_SIGHAND
             | CloneFlags::CLONE_THREAD;
-        let mut root = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(3), &config, ());
+        let mut root = ThreadState::<crate::ConfiguredMode>::new(DetPid::from_raw(3), &config, ());
         root.detpid = Some(DetPid::from_raw(3));
         assert!(root.holds_process_files());
 
@@ -10959,10 +10964,10 @@ mod child_rng_identity_tests {
 
     fn child_state(
         tool: &Detcore,
-        parent: &mut ThreadState<crate::SeededMode>,
+        parent: &mut ThreadState<crate::ConfiguredMode>,
         host_tid: i32,
         clone_flags: CloneFlags,
-    ) -> ThreadState<crate::SeededMode> {
+    ) -> ThreadState<crate::ConfiguredMode> {
         parent.clone_flags = Some(clone_flags);
         <Detcore as Tool>::init_thread_state(
             tool,
@@ -10971,12 +10976,12 @@ mod child_rng_identity_tests {
         )
     }
 
-    fn rng_sample(child: &ThreadState<crate::SeededMode>) -> [u64; 4] {
+    fn rng_sample(child: &ThreadState<crate::ConfiguredMode>) -> [u64; 4] {
         let mut rng = child.prng.clone();
         std::array::from_fn(|_| rng.random())
     }
 
-    fn chaos_rng_sample(child: &ThreadState<crate::SeededMode>) -> [u64; 4] {
+    fn chaos_rng_sample(child: &ThreadState<crate::ConfiguredMode>) -> [u64; 4] {
         let mut rng = child.chaos_prng.clone();
         std::array::from_fn(|_| rng.random())
     }
@@ -10995,9 +11000,9 @@ mod child_rng_identity_tests {
             ),
         ] {
             let mut low_tid_parent =
-                ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ());
+                ThreadState::<crate::ConfiguredMode>::new(DetPid::from_raw(1), &config, ());
             let mut high_tid_parent =
-                ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ());
+                ThreadState::<crate::ConfiguredMode>::new(DetPid::from_raw(1), &config, ());
             let low_tid_child = child_state(&tool, &mut low_tid_parent, 2, clone_flags);
             let high_tid_child = child_state(&tool, &mut high_tid_parent, 42_002, clone_flags);
 
@@ -11026,7 +11031,8 @@ mod child_rng_identity_tests {
     fn serialized_siblings_receive_distinct_child_rng_streams() {
         let config = Config::default();
         let tool = <Detcore as Tool>::new(Pid::from_raw(1), &config);
-        let mut parent = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ());
+        let mut parent =
+            ThreadState::<crate::ConfiguredMode>::new(DetPid::from_raw(1), &config, ());
 
         let first = child_state(&tool, &mut parent, 2, CloneFlags::empty());
         let first_pedigree = parent.pedigree.fork_mut();
@@ -11127,7 +11133,7 @@ mod thread_cpu_time_tests {
             let config = Config::default();
             let tool = <Detcore as Tool>::new(Pid::from_raw(1), &config);
             let mut parent =
-                ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ());
+                ThreadState::<crate::ConfiguredMode>::new(DetPid::from_raw(1), &config, ());
             parent.thread_logical_time.add_rcbs(7);
             parent.thread_logical_time.add_syscall_with_cost(101);
             parent.clone_flags = Some(clone_flags);
@@ -11163,7 +11169,7 @@ mod thread_cpu_time_tests {
             let config = Config::default();
             let tool = <Detcore as Tool>::new(Pid::from_raw(1), &config);
             let mut parent =
-                ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ());
+                ThreadState::<crate::ConfiguredMode>::new(DetPid::from_raw(1), &config, ());
 
             // Give the parent nonzero CPU before the child exists. The child's
             // absolute logical clock inherits this position for scheduler
@@ -11201,12 +11207,13 @@ mod thread_cpu_time_tests {
     fn the_per_thread_table_follows_each_threads_accounting() {
         let config = Config::default();
         let tool = <Detcore as Tool>::new(Pid::from_raw(1), &config);
-        let mut parent = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ());
+        let mut parent =
+            ThreadState::<crate::ConfiguredMode>::new(DetPid::from_raw(1), &config, ());
         parent.thread_logical_time.add_rcbs(30);
         parent.thread_logical_time.add_syscall_with_cost(700);
         let zero = (LogicalTime::ZERO, LogicalTime::ZERO);
         let new_child =
-            |parent: &mut ThreadState<crate::SeededMode>, tid: i32, flags: CloneFlags| {
+            |parent: &mut ThreadState<crate::ConfiguredMode>, tid: i32, flags: CloneFlags| {
                 parent.clone_flags = Some(flags);
                 let child = <Detcore as Tool>::init_thread_state(
                     &tool,
@@ -11261,7 +11268,8 @@ mod thread_cpu_time_tests {
     fn an_exited_leaders_clock_keeps_its_final_time() {
         let config = Config::default();
         let tool = <Detcore as Tool>::new(Pid::from_raw(1), &config);
-        let mut leader = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ());
+        let mut leader =
+            ThreadState::<crate::ConfiguredMode>::new(DetPid::from_raw(1), &config, ());
         leader.detpid = Some(DetPid::from_raw(1));
         leader.clone_flags = Some(CloneFlags::CLONE_THREAD);
         let sibling = <Detcore as Tool>::init_thread_state(

@@ -8752,7 +8752,8 @@ mod tests {
         use crate::record_or_replay::NoopTool;
         use crate::syscall_hot_path_tests::InjectGuest;
         futures::executor::block_on(async {
-            let mut tool = crate::syscall_hot_path_tests::detcore::<crate::SeededMode<NoopTool>>();
+            let mut tool =
+                crate::syscall_hot_path_tests::detcore::<crate::ConfiguredMode<NoopTool>>();
             tool.cfg.backend = reverie::BackendCapabilities::PTRACE;
             assert!(crate::syscalls::timerfd::detcore_runs_outside_the_guest(
                 &tool.cfg.backend
@@ -8760,7 +8761,7 @@ mod tests {
             assert!(!crate::syscalls::timerfd::detcore_runs_outside_the_guest(
                 &reverie::BackendCapabilities::LITEINST_IN_GUEST
             ));
-            let mut guest = InjectGuest::<crate::SeededMode>::new(Ok(0));
+            let mut guest = InjectGuest::<crate::ConfiguredMode>::new(Ok(0));
             // SAFETY: plain integers; zero is a valid value for each.
             let mut stat: libc::stat = unsafe { std::mem::zeroed() };
             stat.st_mode = libc::S_IFREG;
@@ -8786,7 +8787,7 @@ mod tests {
     #[test]
     fn the_kernel_serves_every_address_space_file_where_procfs_is_its() {
         use crate::record_or_replay::NoopTool;
-        let mut tool = crate::syscall_hot_path_tests::detcore::<crate::SeededMode<NoopTool>>();
+        let mut tool = crate::syscall_hot_path_tests::detcore::<crate::ConfiguredMode<NoopTool>>();
         for (backend, kernels) in [
             (reverie::BackendCapabilities::PTRACE, true),
             (reverie::BackendCapabilities::DBT, true),
@@ -8855,7 +8856,7 @@ mod tests {
     /// call being answered (`openat`), and nothing else is used.
     struct RefusalGuest<'a> {
         config: &'a crate::config::Config,
-        thread: crate::ThreadState<crate::SeededMode>,
+        thread: crate::ThreadState<crate::ConfiguredMode>,
     }
 
     struct RefusalStack;
@@ -8915,10 +8916,10 @@ mod tests {
         fn memory(&self) -> Self::Memory {
             panic!("binding a task identity reads no guest memory")
         }
-        fn thread_state(&self) -> &crate::ThreadState<crate::SeededMode> {
+        fn thread_state(&self) -> &crate::ThreadState<crate::ConfiguredMode> {
             &self.thread
         }
-        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<crate::SeededMode> {
+        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<crate::ConfiguredMode> {
             &mut self.thread
         }
         async fn regs(&mut self) -> libc::user_regs_struct {
@@ -8981,7 +8982,7 @@ mod tests {
             let tool = Detcore::new(reverie::Tid::from_raw(3), &config);
             let mut guest = RefusalGuest {
                 config: &config,
-                thread: crate::ThreadState::<crate::SeededMode>::new(
+                thread: crate::ThreadState::<crate::ConfiguredMode>::new(
                     crate::types::DetTid::from_raw(3),
                     &config,
                     (),
@@ -10650,7 +10651,7 @@ mod tests {
         use crate::syscall_hot_path_tests::InjectGuest;
         use crate::syscall_hot_path_tests::detcore;
         futures::executor::block_on(async {
-            let tool = detcore::<crate::SeededMode<NoopTool>>();
+            let tool = detcore::<crate::ConfiguredMode<NoopTool>>();
             for spelling in ["/proc/self/comm", "/proc/thread-self/comm", "/proc/3/comm"] {
                 for via_link in [false, true] {
                     for flags in [
@@ -10664,7 +10665,7 @@ mod tests {
                         let mut procfs = ProcfsFile::from_path(Path::new(spelling)).unwrap();
                         procfs.bind_task(3, 5);
                         let target = RenderedTarget { procfs, via_link };
-                        let mut guest = InjectGuest::<crate::SeededMode>::new(Ok(0));
+                        let mut guest = InjectGuest::<crate::ConfiguredMode>::new(Ok(0));
                         let answer = tool
                             .open_rendered_procfs(&mut guest, flags, target)
                             .await

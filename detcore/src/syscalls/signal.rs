@@ -7828,7 +7828,7 @@ mod rt_sigsuspend_tests {
     /// stack pointer in `regs`.
     struct SuspendGuest {
         config: Config,
-        thread: ThreadState<crate::SeededMode>,
+        thread: ThreadState<crate::ConfiguredMode>,
         arena: Box<[u64; ARENA_WORDS]>,
         stack_pointer: Option<usize>,
         caller_mask: usize,
@@ -7869,10 +7869,10 @@ mod rt_sigsuspend_tests {
         fn memory(&self) -> Self::Memory {
             LocalMemory::new()
         }
-        fn thread_state_mut(&mut self) -> &mut ThreadState<crate::SeededMode> {
+        fn thread_state_mut(&mut self) -> &mut ThreadState<crate::ConfiguredMode> {
             &mut self.thread
         }
-        fn thread_state(&self) -> &ThreadState<crate::SeededMode> {
+        fn thread_state(&self) -> &ThreadState<crate::ConfiguredMode> {
             &self.thread
         }
         async fn regs(&mut self) -> libc::user_regs_struct {
@@ -7948,7 +7948,7 @@ mod rt_sigsuspend_tests {
         let mut caller_mask: Box<KernelSigset> = Box::new(unblocks_sigchld);
         let caller_address = &mut *caller_mask as *mut KernelSigset as usize;
         let mut guest = SuspendGuest {
-            thread: ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ()),
+            thread: ThreadState::<crate::ConfiguredMode>::new(DetPid::from_raw(1), &config, ()),
             config: config.clone(),
             arena: Box::new([u64::MAX; ARENA_WORDS]),
             stack_pointer: None,
@@ -7989,7 +7989,7 @@ mod rt_sigsuspend_tests {
             arena[slot] = original;
             let caller_address = &mut arena[slot] as *mut u64 as usize;
             let mut guest = SuspendGuest {
-                thread: ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ()),
+                thread: ThreadState::<crate::ConfiguredMode>::new(DetPid::from_raw(1), &config, ()),
                 config: config.clone(),
                 arena,
                 stack_pointer: None,
@@ -8041,7 +8041,7 @@ mod rt_sigsuspend_tests {
         ];
         for stack_pointer in rows {
             let mut guest = SuspendGuest {
-                thread: ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ()),
+                thread: ThreadState::<crate::ConfiguredMode>::new(DetPid::from_raw(1), &config, ()),
                 config: config.clone(),
                 arena: Box::new([u64::MAX; ARENA_WORDS]),
                 stack_pointer: Some(stack_pointer),
@@ -8114,7 +8114,7 @@ mod before_park_tests {
     struct SleeperGuest<'a> {
         state: &'a GlobalState,
         config: Config,
-        thread: ThreadState<crate::SeededMode>,
+        thread: ThreadState<crate::ConfiguredMode>,
         pid: Pid,
     }
 
@@ -8148,10 +8148,10 @@ mod before_park_tests {
         fn memory(&self) -> Self::Memory {
             panic!("the before-park check reads no guest memory")
         }
-        fn thread_state_mut(&mut self) -> &mut ThreadState<crate::SeededMode> {
+        fn thread_state_mut(&mut self) -> &mut ThreadState<crate::ConfiguredMode> {
             &mut self.thread
         }
-        fn thread_state(&self) -> &ThreadState<crate::SeededMode> {
+        fn thread_state(&self) -> &ThreadState<crate::ConfiguredMode> {
             &self.thread
         }
         async fn regs(&mut self) -> libc::user_regs_struct {
@@ -8385,7 +8385,11 @@ mod before_park_tests {
             let state = GlobalState::for_tests(&config);
             let mut guest = SleeperGuest {
                 state: &state,
-                thread: ThreadState::<crate::SeededMode>::new(DetPid::from_raw(child), &config, ()),
+                thread: ThreadState::<crate::ConfiguredMode>::new(
+                    DetPid::from_raw(child),
+                    &config,
+                    (),
+                ),
                 config,
                 pid: Pid::from_raw(child),
             };
@@ -8444,7 +8448,11 @@ mod before_park_tests {
             let global = GlobalState::for_tests(&config);
             let mut guest = SleeperGuest {
                 state: &global,
-                thread: ThreadState::<crate::SeededMode>::new(DetPid::from_raw(child), &config, ()),
+                thread: ThreadState::<crate::ConfiguredMode>::new(
+                    DetPid::from_raw(child),
+                    &config,
+                    (),
+                ),
                 config,
                 pid: Pid::from_raw(child),
             };
@@ -8514,7 +8522,11 @@ mod before_park_tests {
             let global = GlobalState::for_tests(&config);
             let mut guest = SleeperGuest {
                 state: &global,
-                thread: ThreadState::<crate::SeededMode>::new(DetPid::from_raw(4242), &config, ()),
+                thread: ThreadState::<crate::ConfiguredMode>::new(
+                    DetPid::from_raw(4242),
+                    &config,
+                    (),
+                ),
                 config,
                 pid: Pid::from_raw(4242),
             };
@@ -8601,7 +8613,11 @@ mod before_park_tests {
             let global = GlobalState::for_tests(&config);
             let mut guest = SleeperGuest {
                 state: &global,
-                thread: ThreadState::<crate::SeededMode>::new(DetPid::from_raw(child), &config, ()),
+                thread: ThreadState::<crate::ConfiguredMode>::new(
+                    DetPid::from_raw(child),
+                    &config,
+                    (),
+                ),
                 config,
                 pid: Pid::from_raw(child),
             };

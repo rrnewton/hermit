@@ -12,13 +12,16 @@
 //! [`RunMode`] is type composition only, with exactly two axes: the
 //! record-or-replay sub-tool ([`RunMode::RecordReplay`], with its existing
 //! bound) and the scheduling-choice policy ([`RunMode::Choices`]). It carries
-//! no runtime value, flag or backend selection. [`Mode`] composes the two;
-//! [`SeededMode`] is the ordinary run and [`ControlledMode`] a run whose
-//! scheduling choices a choice source answers.
+//! no runtime value, flag or backend selection itself. [`Mode`] composes the
+//! two. [`ConfiguredMode`] is the production mode: its policy,
+//! [`RunChoices`], is seeded or controlled by the run's config, so seeded
+//! and controlled runs share one Detcore instantiation. [`SeededMode`] and
+//! [`ControlledMode`] fix the policy by type, for tests.
 
 use std::marker::PhantomData;
 
 use crate::choice::ControlledChoices;
+use crate::choice::RunChoices;
 use crate::choice::SchedulingChoices;
 use crate::choice::SeededChoices;
 use crate::record_or_replay::NoopTool;
@@ -41,10 +44,16 @@ impl<R: RecordOrReplay, C: SchedulingChoices> RunMode for Mode<R, C> {
     type Choices = C;
 }
 
-/// The ordinary run of sub-tool `R`: Detcore's seeded draws decide.
+/// The production run of sub-tool `R`: seeded, or controlled when the run's
+/// config names a choice source ([`RunChoices`]).
+pub type ConfiguredMode<R = NoopTool> = Mode<R, RunChoices>;
+
+/// A run of sub-tool `R` whose policy is seeded by type: Detcore's seeded
+/// draws decide.
 pub type SeededMode<R = NoopTool> = Mode<R, SeededChoices>;
 
-/// A run of sub-tool `R` whose scheduling choices a choice source answers.
+/// A run of sub-tool `R` whose policy is controlled by type: a choice
+/// source answers its scheduling choices.
 pub type ControlledMode<R = NoopTool> = Mode<R, ControlledChoices>;
 
 /// The thread state of the record-or-replay sub-tool of mode `M`.

@@ -1099,10 +1099,10 @@ VmFlags: rd wr mr mw me gd ac
                     ),
                 ] {
                     let mut tool =
-                        crate::syscall_hot_path_tests::detcore::<crate::SeededMode<NoopTool>>();
+                        crate::syscall_hot_path_tests::detcore::<crate::ConfiguredMode<NoopTool>>();
                     tool.cfg.recordreplay_modes = false;
                     tool.cfg.backend = backend;
-                    let mut guest = InjectGuest::<crate::SeededMode>::new(reply);
+                    let mut guest = InjectGuest::<crate::ConfiguredMode>::new(reply);
                     if map {
                         guest = guest.with_memory_map(stack_window());
                     }
@@ -1196,10 +1196,10 @@ VmFlags: rd wr mr mw me gd ac
                 ),
             ] {
                 let mut tool =
-                    crate::syscall_hot_path_tests::detcore::<crate::SeededMode<NoopTool>>();
+                    crate::syscall_hot_path_tests::detcore::<crate::ConfiguredMode<NoopTool>>();
                 tool.cfg.backend = backend;
-                let mut guest =
-                    InjectGuest::<crate::SeededMode>::new(reply).with_memory_map(stack_window());
+                let mut guest = InjectGuest::<crate::ConfiguredMode>::new(reply)
+                    .with_memory_map(stack_window());
                 let call = Syscall::from_raw(sysno, SyscallArgs::new(at, 4096, 0, 0, 0, 0));
                 let _ = tool.handle_memory_lock_call(&mut guest, call).await;
                 assert_eq!(

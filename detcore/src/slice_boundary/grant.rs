@@ -424,7 +424,7 @@ pub(crate) mod tests {
     fn grant_is_guest_rcbs_not_turn_time_and_never_changes_deadline_or_maximum() {
         let cfg = Config::default();
         let tid = DetTid::from_raw(3);
-        let mut thread = ThreadState::<crate::SeededMode>::new(tid, &cfg, ());
+        let mut thread = ThreadState::<crate::ConfiguredMode>::new(tid, &cfg, ());
         thread.next_timeslice(&cfg);
         thread.slice_boundary = Some(Observations::new(&thread, 0));
         thread.committed_clock_value = 7;
@@ -469,7 +469,7 @@ pub(crate) mod tests {
                 ..Config::default()
             };
             for resets in [0, 1, 2] {
-                let mut thread = ThreadState::<crate::SeededMode>::new(tid, &cfg, ());
+                let mut thread = ThreadState::<crate::ConfiguredMode>::new(tid, &cfg, ());
                 thread.slice_boundary = Some(Observations::new(&thread, 0));
                 let mut hint = budget(tid, thread.mm_id, 19);
                 if !timers {
@@ -535,7 +535,7 @@ pub(crate) mod tests {
                 );
             }
             for wrong_lifetime in 0..3 {
-                let mut thread = ThreadState::<crate::SeededMode>::new(tid, &cfg, ());
+                let mut thread = ThreadState::<crate::ConfiguredMode>::new(tid, &cfg, ());
                 thread.slice_boundary = Some(Observations::new(&thread, 0));
                 let hint = budget(tid, thread.mm_id, 19);
                 stage_start(&mut thread, hint).unwrap();
@@ -556,7 +556,7 @@ pub(crate) mod tests {
     fn malformed_wire_and_wrong_owner_budget_are_refused_before_state_changes() {
         let cfg = Config::default();
         let tid = DetTid::from_raw(3);
-        let mut thread = ThreadState::<crate::SeededMode>::new(tid, &cfg, ());
+        let mut thread = ThreadState::<crate::ConfiguredMode>::new(tid, &cfg, ());
         thread.next_timeslice(&cfg);
         thread.slice_boundary = Some(Observations::new(&thread, 0));
         thread.committed_clock_value = 7;

@@ -78,7 +78,7 @@ fn take_phases() -> Vec<&'static str> {
 /// RPC, whether it was a resource request and for which resources.
 struct AnnounceGuest {
     config: Config,
-    thread: ThreadState<crate::SeededMode>,
+    thread: ThreadState<crate::ConfiguredMode>,
     requests: Mutex<Vec<Vec<ResourceID>>>,
     continues: Mutex<Vec<bool>>,
     /// What `GlobalRequest::InPidNamespaceInit` answers (A5 step 3c.1e A,
@@ -161,10 +161,10 @@ impl Guest<Detcore> for AnnounceGuest {
     fn memory(&self) -> LocalMemory {
         LocalMemory::new()
     }
-    fn thread_state(&self) -> &ThreadState<crate::SeededMode> {
+    fn thread_state(&self) -> &ThreadState<crate::ConfiguredMode> {
         &self.thread
     }
-    fn thread_state_mut(&mut self) -> &mut ThreadState<crate::SeededMode> {
+    fn thread_state_mut(&mut self) -> &mut ThreadState<crate::ConfiguredMode> {
         &mut self.thread
     }
     async fn regs(&mut self) -> libc::user_regs_struct {
@@ -210,7 +210,7 @@ fn setup_with(adjust: impl FnOnce(&mut Config)) -> (Detcore, AnnounceGuest) {
     // The test thread's own IDs (see `AnnounceGuest::tid`).
     let pid = std::process::id() as i32;
     let tid = unsafe { libc::gettid() };
-    let mut thread = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(tid), &config, ());
+    let mut thread = ThreadState::<crate::ConfiguredMode>::new(DetPid::from_raw(tid), &config, ());
     thread.detpid = Some(DetPid::from_raw(pid));
     let tool = <Detcore as Tool>::new(Pid::from_raw(tid), &config);
     (

@@ -7155,7 +7155,7 @@ mod tests {
     /// placeholder, the identity alone decides.
     #[test]
     fn a_procfs_root_is_told_without_opening_anything() {
-        type Tool = Detcore<crate::SeededMode>;
+        type Tool = Detcore<crate::ConfiguredMode>;
         let proc = reverie::syscalls::linux_abi::PROC_SUPER_MAGIC as i64;
         let none = BTreeSet::new();
         assert!(Tool::on_placeholder_object((22, 1), Some(Ok(proc)), &none));
