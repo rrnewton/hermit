@@ -1669,6 +1669,21 @@ impl<H: RecordHost> Tool for ReplayerWithHost<H> {
             // TODO-HUMAN-REVIEW(#2373)
             Syscall::Flock(call) => self.handle_flock(guest, call).await,
             Syscall::Ftruncate(syscall) => Ok(self.handle_ftruncate(guest, syscall).await?),
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(6805): recorded passthrough effects.
+            Syscall::Fallocate(syscall) => Ok(self.handle_fallocate(guest, syscall).await?),
+            Syscall::Truncate(_) => self.handle_confined_path_mutation(guest, syscall).await,
+            // Advisory/flush effects with no guest-visible state a
+            // live call reads back: the recorded result stands.
+            Syscall::Readahead(_) | Syscall::SyncFileRange(_) => {
+                self.handle_simple(guest, syscall).await
+            }
+            // A root change is namespace state every later path
+            // resolution observes: reapplied live in both modes.
+            Syscall::Chroot(_) => {
+                self.handle_replayed_side_effect(guest, syscall, "chroot")
+                    .await
+            }
             Syscall::Dup(_) => self.handle_dup_family(guest, syscall, "dup").await,
             #[cfg(target_arch = "x86_64")]
             Syscall::Dup2(_) => self.handle_dup2(guest, syscall).await,
@@ -1765,6 +1780,8 @@ impl<H: RecordHost> Tool for ReplayerWithHost<H> {
             | Syscall::Renameat2(_)
             | Syscall::Symlinkat(_)
             | Syscall::Fchmodat(_)
+            // AUTONOMOUS-BOT-IMPLEMENTED (6805 Astra B3)
+            | Syscall::Fchmodat2(_)
             | Syscall::Utimensat(_) => self.handle_confined_path_mutation(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
             #[cfg(target_arch = "x86_64")]
@@ -1836,6 +1853,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
                 .retain(|pending| {
                     !(pending.flags.contains(OFlag::O_CLOEXEC) && pending.tgid == exec_tgid)
                 });
+            mmap::retire_cloexec_placeholder_bindings(exec_tgid);
         }
         let actual_request = self
             .read_exec_request(guest, syscall)
@@ -2876,6 +2894,40 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         Ok(true)
     }
 
+    /// Binds a just-reserved placeholder to the recorded file its
+    /// open named, so writes and truncates through any independent
+    /// open of that file resolve to the one shared backing, and a
+    /// truncating virtual open drops the backing's bytes as the
+    /// recorded truncation did (6805 Astra B2). Memory coherence is
+    /// not an output file: this runs under both output policies.
+    fn bind_virtual_open(
+        &self,
+        pending: Option<&PendingPlaceholderOpen>,
+        tid: Pid,
+        fd: libc::c_int,
+        flags: OFlag,
+        file_id: Option<(u64, u64)>,
+    ) {
+        let Some(file_id) = file_id else {
+            return;
+        };
+        if let Some(id) = pending.and_then(|pending| pending.placeholder_id.clone()) {
+            mmap::bind_placeholder(
+                id,
+                file_id,
+                pending.map_or(tid.as_raw(), |pending| pending.tgid),
+                tid,
+                fd,
+                flags.contains(OFlag::O_CLOEXEC),
+            );
+        }
+        if flags.contains(OFlag::O_TRUNC) {
+            mmap::truncate_recorded_backing(file_id).unwrap_or_else(|error| {
+                mmap::refuse("truncate the shared backing after virtual open", error)
+            });
+        }
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#662): Audit replay-root file and directory materialization.
     async fn handle_virtual_fd_create<G: Guest<Self>>(
@@ -2904,23 +2956,27 @@ impl<H: RecordHost> ReplayerWithHost<H> {
                     None => (dirfd, path.clone()),
                 };
             // rr-like default (6805): without --write-output-files a
-            // recorded open stays virtual (placeholder descriptor,
-            // recorded result), exactly as a refused materialization
-            // above already leaves it; nothing is created in the root.
-            let materialize = self.write_output_files
-                && match event.materialize {
-                    OpenMaterialization::Directory => self
-                        .materialize_recorded_directory(
-                            guest,
-                            syscall,
-                            materialization_dirfd,
-                            &materialization_path,
-                            flags,
-                        )
-                        .unwrap_or_else(|error| {
-                            panic!("failed to materialize recorded open directory: {error}")
-                        }),
-                    OpenMaterialization::RegularFile => {
+            // recorded regular-file open stays virtual (placeholder
+            // descriptor, recorded result), exactly as a refused
+            // materialization above already leaves it. Directories
+            // are namespace scaffolding in the disposable root, not
+            // output files: later live path operations (mkdir,
+            // unlink, exec by dirfd) observe them, so they are
+            // materialized under both policies (Astra/Claude seats).
+            let materialize = match event.materialize {
+                OpenMaterialization::Directory => self
+                    .materialize_recorded_directory(
+                        guest,
+                        syscall,
+                        materialization_dirfd,
+                        &materialization_path,
+                        flags,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("failed to materialize recorded open directory: {error}")
+                    }),
+                OpenMaterialization::RegularFile => {
+                    self.write_output_files && {
                         match self.open_materialization_refusal(
                             guest.tid(),
                             materialization_dirfd,
@@ -2942,8 +2998,9 @@ impl<H: RecordHost> ReplayerWithHost<H> {
                             }
                         }
                     }
-                    OpenMaterialization::None => false,
-                };
+                }
+                OpenMaterialization::None => false,
+            };
             if materialize {
                 match guest.inject_with_retry(syscall).await {
                     Ok(actual) => {
@@ -2959,10 +3016,19 @@ impl<H: RecordHost> ReplayerWithHost<H> {
                             );
                         }
                         if flags.contains(OFlag::O_TRUNC) {
-                            mmap::truncate_shared_backing(guest.tid(), actual as libc::c_int, 0)
-                                .unwrap_or_else(|error| {
-                                    mmap::refuse("truncate the shared backing after open", error)
-                                });
+                            mmap::truncate_shared_backing(
+                                &DescriptorAccess::<H, ()>::task(
+                                    &self.init,
+                                    guest.tid(),
+                                    guest.tid(),
+                                ),
+                                guest.tid(),
+                                actual as libc::c_int,
+                                0,
+                            )
+                            .unwrap_or_else(|error| {
+                                mmap::refuse("truncate the shared backing after open", error)
+                            });
                         }
                     }
                     Err(error) => {
@@ -2974,7 +3040,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
                         self.reserve_replay_fd(guest, fd as i32, flags.contains(OFlag::O_CLOEXEC))
                             .await;
                         let tid = guest.tid();
-                        if let Some(pending) = pending_placeholder_open::<H, G>(
+                        let pending = pending_placeholder_open::<H, G>(
                             &DescriptorAccess::guest_bound(&self.init, &mut *guest, tid),
                             tid,
                             fd as libc::c_int,
@@ -2982,7 +3048,15 @@ impl<H: RecordHost> ReplayerWithHost<H> {
                             path.clone(),
                             flags,
                             mode,
-                        ) {
+                        );
+                        self.bind_virtual_open(
+                            pending.as_ref(),
+                            tid,
+                            fd as libc::c_int,
+                            flags,
+                            event.file_id,
+                        );
+                        if let Some(pending) = pending {
                             remember_pending_placeholder_open(pending);
                         }
                     }
@@ -3005,7 +3079,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
                 self.reserve_replay_fd(guest, fd as i32, flags.contains(OFlag::O_CLOEXEC))
                     .await;
                 let tid = guest.tid();
-                if let Some(pending) = pending_placeholder_open::<H, G>(
+                let pending = pending_placeholder_open::<H, G>(
                     &DescriptorAccess::guest_bound(&self.init, &mut *guest, tid),
                     tid,
                     fd as libc::c_int,
@@ -3013,7 +3087,15 @@ impl<H: RecordHost> ReplayerWithHost<H> {
                     path.clone(),
                     flags,
                     mode,
-                ) {
+                );
+                self.bind_virtual_open(
+                    pending.as_ref(),
+                    tid,
+                    fd as libc::c_int,
+                    flags,
+                    event.file_id,
+                );
+                if let Some(pending) = pending {
                     remember_pending_placeholder_open(pending);
                 }
             }
@@ -3261,6 +3343,10 @@ impl<H: RecordHost> ReplayerWithHost<H> {
             Syscall::Mknodat(call) => self.dirfd_is_confined(pid, call.dirfd()),
             Syscall::Fchownat(call) => self.dirfd_is_confined(pid, call.dirfd()),
             Syscall::Fchmodat(call) => self.dirfd_is_confined(pid, call.dirfd()),
+            Syscall::Fchmodat2(call) => self.dirfd_is_confined(pid, call.dirfd()),
+            // The legacy form resolves against the working directory,
+            // like AT_FDCWD.
+            Syscall::Truncate(_) => true,
             // TODO-HUMAN-REVIEW(#3598): the legacy forms resolve relative
             // paths against the working directory, like AT_FDCWD.
             #[cfg(target_arch = "x86_64")]
@@ -3426,8 +3512,11 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         syscall: Syscall,
     ) -> Result<i64, Errno> {
         let recorded = next_event!(guest, Return);
+        // Path mutations are replay-root namespace state later live
+        // calls observe (mkdir EEXIST, unlink ENOTEMPTY, exec by
+        // path), not output files: they are applied in the
+        // disposable root under both policies (6805 seat findings).
         if let Ok(expected) = recorded
-            && self.write_output_files
             && self.path_mutation_dirfds_are_confined(guest.pid(), syscall)
         {
             match guest.inject_with_retry(syscall).await {
@@ -3465,8 +3554,11 @@ impl<H: RecordHost> ReplayerWithHost<H> {
             _ => unreachable!("descriptor metadata handler received {syscall:?}"),
         };
         let recorded = next_event!(guest, Return);
+        // As with path mutations: descriptor metadata of a real
+        // replay-root file is namespace state, applied in both
+        // policies; placeholders are not in the root and keep the
+        // recorded result alone.
         if let Ok(expected) = recorded
-            && self.write_output_files
             && self.fd_is_in_replay_root(guest.pid(), fd)
         {
             match guest.inject_with_retry(syscall).await {
@@ -3561,11 +3653,9 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         });
         let governs_live_calls = !name.to_bytes().starts_with(b"user.");
         // A placeholder descriptor names a file the replay root lacks.
-        // rr-like default (6805): no attribute is established anywhere;
-        // queries replay from the recording, so nothing observes it.
-        let outcome = if !self.write_output_files {
-            Ok(())
-        } else if in_replay_root {
+        // Attributes are namespace state live calls observe (the doc
+        // above), not output files: established under both policies.
+        let outcome = if in_replay_root {
             guest.inject_with_retry(live_call).await.map(drop)
         } else {
             Err(Errno::ENOENT)
@@ -4214,6 +4304,11 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         syscall: Syscall,
     ) -> Result<i64, Errno> {
         let recorded = next_event!(guest, Return);
+        if !matches!(recorded, Err(Errno::EBADF | Errno::ERESTARTSYS))
+            && let Syscall::Close(call) = syscall
+        {
+            mmap::retire_placeholder_binding(guest.tid(), call.fd());
+        }
 
         // Linux releases a descriptor even when close reports EINTR, EIO,
         // ENOSPC, or EDQUOT. EBADF leaves the namespace unchanged, while
@@ -4381,7 +4476,10 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         syscall: Syscall,
     ) -> Result<i64, Errno> {
         let recorded = next_event!(guest, Return);
-        if self.write_output_files && recorded.is_ok() {
+        // Epoll set state is kernel-object state the kernel-replayed
+        // waits below read, not an output file: reapplied under both
+        // policies (6805 seat findings).
+        if recorded.is_ok() {
             let actual = guest.inject_with_retry(syscall).await;
             if actual != recorded {
                 tracing::warn!(
@@ -4411,6 +4509,9 @@ impl<H: RecordHost> ReplayerWithHost<H> {
             if actual != Err(Errno::EBADF) {
                 assert_eq!(actual, recorded, "dup2 fd-table mutation diverged");
                 if let Syscall::Dup2(call) = syscall {
+                    // The replaced target's binding ends; the alias
+                    // itself resolves through the source's eventfd id.
+                    mmap::retire_placeholder_binding(guest.tid(), call.newfd());
                     follow_pending_through_dup(guest.tid(), call.oldfd(), call.newfd(), false);
                 }
             }
@@ -4487,11 +4588,11 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         let Syscall::Setsockopt(call) = syscall else {
             unreachable!("handle_setsockopt called for {syscall:?}");
         };
-        // rr-like default (6805): no socket state is reapplied; later
-        // calls on this descriptor replay from the recording too.
-        if !self.write_output_files {
-            return next_event!(guest, Return);
-        }
+        // Socket state is not an output file: later live calls (for
+        // example a Detcore-forwarded `sendmmsg`) observe it, so the
+        // rr-like default does not suppress it in either mode (6805
+        // Astra B4). The placeholder exception below is the only
+        // log-served case.
         let table = guest.tid();
         if H::fd_is_eventfd(
             &mut DescriptorAccess::guest_bound(&self.init, &mut *guest, table),
@@ -4527,11 +4628,9 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         let Syscall::Shutdown(call) = syscall else {
             unreachable!("handle_shutdown called for {syscall:?}");
         };
-        // rr-like default (6805): as in `handle_setsockopt`, the
-        // recorded result stands alone.
-        if !self.write_output_files {
-            return next_event!(guest, Return);
-        }
+        // As in `handle_setsockopt`: shutdown state is observed by
+        // later live calls, so it is reapplied under both output
+        // policies (6805 Astra B4).
         let table = guest.tid();
         if H::fd_is_eventfd(
             &mut DescriptorAccess::guest_bound(&self.init, &mut *guest, table),
@@ -4593,6 +4692,17 @@ impl<H: RecordHost> ReplayerWithHost<H> {
     ) -> Result<i64, Errno> {
         let recorded = next_event!(guest, Return);
         if recorded.is_ok() {
+            if let Syscall::Other(_, args) = syscall {
+                // CLOSE_RANGE_CLOEXEC (1 << 2) only flags the range.
+                let first = args.arg0 as libc::c_int;
+                let last = args.arg1.min(libc::c_int::MAX as usize) as libc::c_int;
+                mmap::retire_placeholder_bindings_in_range(
+                    guest.tid(),
+                    first,
+                    last,
+                    args.arg2 & 0b100 != 0,
+                );
+            }
             let actual = guest.inject_with_retry(syscall).await;
             assert_eq!(actual, recorded, "close_range side effects diverged");
         }

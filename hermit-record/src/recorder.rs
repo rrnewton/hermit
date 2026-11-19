@@ -743,6 +743,9 @@ impl<H: RecordHost> Tool for RecorderWithHost<H> {
             | Syscall::Renameat2(_)
             | Syscall::Symlinkat(_)
             | Syscall::Fchmodat(_)
+            // AUTONOMOUS-BOT-IMPLEMENTED (6805 Astra B3, with fallocate
+            // and truncate below)
+            | Syscall::Fchmodat2(_)
             | Syscall::Utimensat(_) => self.handle_simple(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#3598): legacy path mutations share the *at
@@ -792,6 +795,16 @@ impl<H: RecordHost> Tool for RecorderWithHost<H> {
             | Syscall::Flistxattr(_) => self.handle_xattr_query(guest, syscall).await,
             Syscall::Flock(_) => self.handle_simple(guest, syscall).await,
             Syscall::Ftruncate(syscall) => self.handle_ftruncate(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(6805): Detcore-passthrough filesystem
+            // effects, recorded so replay serves them instead of
+            // running them against a virtual descriptor or a path
+            // the replay root lacks.
+            Syscall::Fallocate(_)
+            | Syscall::Truncate(_)
+            | Syscall::Readahead(_)
+            | Syscall::SyncFileRange(_)
+            | Syscall::Chroot(_) => self.handle_simple(guest, syscall).await,
             Syscall::Dup(_) => self.handle_simple(guest, syscall).await,
             Syscall::Dup3(_) => self.handle_fd_table_mutation(guest, syscall).await,
             #[cfg(target_arch = "x86_64")]
@@ -928,16 +941,16 @@ impl<H: RecordHost> RecorderWithHost<H> {
     ) -> Result<i64, Errno> {
         let result = guest.inject(syscall).await;
         let table = guest.tid();
-        let materialize = result
+        let metadata = result.ok().and_then(|fd| {
+            H::fd_metadata(
+                &DescriptorAccess::guest_bound(&self.init, &mut *guest, table),
+                fd as libc::c_int,
+            )
             .ok()
-            .and_then(|fd| {
-                H::fd_metadata(
-                    &DescriptorAccess::guest_bound(&self.init, &mut *guest, table),
-                    fd as libc::c_int,
-                )
-                .ok()
-                .flatten()
-            })
+            .flatten()
+        });
+        let materialize = metadata
+            .as_ref()
             .map_or(OpenMaterialization::None, |metadata| {
                 if metadata.is_dir() {
                     OpenMaterialization::Directory
@@ -947,11 +960,19 @@ impl<H: RecordHost> RecorderWithHost<H> {
                     OpenMaterialization::None
                 }
             });
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(6805): recorded file identity for
+        // independent-open shared-backing coherence.
+        let file_id = metadata
+            .as_ref()
+            .filter(|metadata| metadata.is_file())
+            .map(|metadata| (metadata.device, metadata.inode));
         self.record_event(
             guest,
             Ok(SyscallEvent::Open(OpenEvent {
                 result,
                 materialize,
+                file_id,
             })),
         );
         result
@@ -1799,117 +1820,189 @@ mod finish_tests {
 
 #[cfg(test)]
 mod dispatch_agreement_tests {
-    #![allow(
-        unexpected_cfgs,
-        reason = "`fbcode_build` is supplied by the internal Buck build"
-    )]
-
     use std::collections::BTreeSet;
     use std::path::PathBuf;
 
     fn source(relative: &str) -> String {
-        // Runtime lookup, not `env!`: the Buck build compiles this
-        // crate without a compile-time `CARGO_MANIFEST_DIR`, and the
-        // test below is fbsource-disabled there (the sources it
-        // parses are not present at Buck test runtime either).
-        let manifest_dir =
-            std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
-        let path = PathBuf::from(manifest_dir).join(relative);
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative);
         std::fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("could not read {}: {error}", path.display()))
     }
 
-    /// Sysnos the shared subscription names on uncommented lines.
-    fn subscribed_sysnos() -> BTreeSet<String> {
-        let text = source("../hermit-record-format/src/subscriptions.rs");
-        let mut out = BTreeSet::new();
-        for line in text.lines() {
-            if line.trim_start().starts_with("//") {
+    /// Removes `//` and `/* */` comments, preserving newlines so
+    /// line-based arm scanning still aligns. String and char
+    /// literals are kept (their contents cannot name a dispatch
+    /// arm in these windows, but a `//` inside one must not eat
+    /// the rest of the line).
+    fn strip_comments(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut chars = text.chars().peekable();
+        let mut in_string = false;
+        let mut escaped = false;
+        while let Some(c) = chars.next() {
+            if in_string {
+                out.push(c);
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    in_string = false;
+                }
                 continue;
             }
-            for token in line.split(|c: char| !(c.is_ascii_alphanumeric() || c == ':' || c == '_'))
-            {
-                if let Some(name) = token.strip_prefix("Sysno::") {
-                    out.insert(name.to_owned());
+            match c {
+                '"' => {
+                    in_string = true;
+                    out.push(c);
                 }
+                '/' if chars.peek() == Some(&'/') => {
+                    for c in chars.by_ref() {
+                        if c == '\n' {
+                            out.push(c);
+                            break;
+                        }
+                    }
+                }
+                '/' if chars.peek() == Some(&'*') => {
+                    chars.next();
+                    let mut previous_star = false;
+                    for c in chars.by_ref() {
+                        if c == '\n' {
+                            out.push(c);
+                        }
+                        if previous_star && c == '/' {
+                            break;
+                        }
+                        previous_star = c == '*';
+                    }
+                }
+                _ => out.push(c),
             }
         }
         out
     }
 
-    /// Sysnos one dispatch match names, mapping typed variants
-    /// through Reverie's syscall table.
-    fn dispatch_sysnos(
-        source_text: &str,
-        table: &std::collections::BTreeMap<String, String>,
-    ) -> BTreeSet<String> {
-        let start = source_text
+    /// The typed variants and raw sysnos one dispatch match names
+    /// in arms the compiler would actually build: comments are
+    /// stripped first, and an arm disabled by `#[cfg(any())]` or
+    /// `#[cfg(false)]` does not count (Astra B6: both used to count).
+    fn dispatch_tokens(source_text: &str) -> BTreeSet<String> {
+        let stripped = strip_comments(source_text);
+        let start = stripped
             .find("async fn handle_syscall_event")
             .expect("dispatch fn");
-        let rest = &source_text[start..];
+        let rest = &stripped[start..];
         let end = rest
             .find("async fn handle_post_exec")
             .expect("dispatch end");
         let window = &rest[..end];
         let mut out = BTreeSet::new();
-        for token in window.split(|c: char| !(c.is_ascii_alphanumeric() || c == ':' || c == '_')) {
-            if let Some(variant) = token.strip_prefix("Syscall::") {
-                if let Some(sysno) = table.get(variant) {
-                    out.insert(sysno.clone());
+        let mut skip_arm = false;
+        for line in window.lines() {
+            let squashed: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+            if squashed.starts_with("#[cfg(any())]") || squashed.starts_with("#[cfg(false)]") {
+                skip_arm = true;
+                continue;
+            }
+            if skip_arm {
+                if line.contains("=>") {
+                    skip_arm = false;
                 }
-            } else if let Some(sysno) = token.strip_prefix("Sysno::") {
-                out.insert(sysno.to_owned());
+                continue;
+            }
+            for token in line.split(|c: char| !(c.is_ascii_alphanumeric() || c == ':' || c == '_'))
+            {
+                if let Some(variant) = token.strip_prefix("Syscall::") {
+                    out.insert(format!("variant:{variant}"));
+                } else if let Some(sysno) = token.strip_prefix("Sysno::") {
+                    out.insert(format!("sysno:{sysno}"));
+                }
             }
         }
         out
     }
 
-    /// 6805 slice 5 detector: every subscribed syscall must have a
-    /// dispatch arm in BOTH tools, and the two arm sets must agree.
-    /// Syscalls outside the subscription still reach the tools by
-    /// Detcore forwarding and take the live-injection fallthrough;
-    /// this test guards only the subscribed set replay answers from
-    /// the recording.
-    #[cfg_attr(
-        fbcode_build,
-        ignore = "fbsource-disabled: compile-time CARGO_MANIFEST_DIR is not present at test runtime"
-    )]
+    /// Whether `tokens` name an active arm for `sysno`: its typed
+    /// variant (from the compiled syscall table, via
+    /// `Syscall::from_raw`) or its raw `Sysno::` name in an
+    /// `Other` arm.
+    fn covers(tokens: &BTreeSet<String>, sysno: reverie::syscalls::Sysno) -> bool {
+        use reverie::syscalls::SyscallArgs;
+        if tokens.contains(&format!("sysno:{sysno:?}")) {
+            return true;
+        }
+        let syscall =
+            reverie::syscalls::Syscall::from_raw(sysno, SyscallArgs::new(0, 0, 0, 0, 0, 0));
+        let debug = format!("{syscall:?}");
+        let variant = debug
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .next()
+            .unwrap_or_default();
+        variant != "Other" && tokens.contains(&format!("variant:{variant}"))
+    }
+
+    /// 6805 slice 5 detector: every subscribed syscall must have an
+    /// active dispatch arm in BOTH tools, and the two arm sets must
+    /// agree. The subscribed set comes from the compiled
+    /// subscription, not from parsing its source. Syscalls outside
+    /// the subscription still reach the tools by Detcore forwarding
+    /// and take the live-injection fallthrough; this test guards
+    /// only the subscribed set replay answers from the recording.
     #[test]
     fn subscription_and_both_dispatches_agree() {
-        let table_text = source("../reverie/reverie-syscalls/src/syscalls.rs");
-        let mut table = std::collections::BTreeMap::new();
-        for line in table_text.lines() {
-            let Some((sysno, variant)) = line.trim().split_once(" => ") else {
-                continue;
-            };
-            let variant = variant.trim_end_matches(',').trim();
-            if sysno
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-                && variant
-                    .chars()
-                    .next()
-                    .is_some_and(|c| c.is_ascii_uppercase())
-            {
-                table.insert(variant.to_owned(), sysno.to_owned());
-            }
-        }
+        let subscribed: Vec<_> = hermit_record_format::subscriptions::record_and_replay()
+            .iter_syscalls()
+            .collect();
         assert!(
-            table.len() > 300,
-            "syscall table parse found {}",
-            table.len()
+            subscribed.len() > 100,
+            "subscription enumeration found only {}",
+            subscribed.len()
         );
-        let subscribed = subscribed_sysnos();
-        let recorder = dispatch_sysnos(&source("src/recorder.rs"), &table);
-        let replayer = dispatch_sysnos(&source("../hermit-replay/src/replayer.rs"), &table);
+        let recorder = dispatch_tokens(&source("src/recorder.rs"));
+        let replayer = dispatch_tokens(&source("../hermit-replay/src/replayer.rs"));
+        assert!(
+            recorder.len() > 100 && replayer.len() > 100,
+            "dispatch token parse found {} / {}",
+            recorder.len(),
+            replayer.len()
+        );
         assert_eq!(
             recorder, replayer,
             "recorder and replayer dispatch sets drifted"
         );
-        let missing: Vec<_> = subscribed.difference(&recorder).collect();
+        let missing: Vec<_> = subscribed
+            .iter()
+            .filter(|sysno| !covers(&recorder, **sysno))
+            .collect();
         assert!(
             missing.is_empty(),
-            "subscribed syscalls with no dispatch arm: {missing:?}"
+            "subscribed syscalls with no active dispatch arm: {missing:?}"
+        );
+    }
+
+    /// The B6 mutants: a commented-out arm and a `#[cfg(any())]`
+    /// arm must not count as dispatch coverage.
+    #[test]
+    fn commented_and_cfg_disabled_arms_do_not_count() {
+        let window = "async fn handle_syscall_event() { match x {\n\
+            Syscall::Write(_) => 1,\n\
+            // Syscall::Read(_) => 2,\n\
+            #[cfg(any())]\n\
+            Syscall::Openat(_) => 3,\n\
+            Syscall::Other(Sysno::close_range, _) => 4,\n\
+            _ => 5 } }\n\
+            async fn handle_post_exec() {}";
+        let tokens = dispatch_tokens(window);
+        assert!(tokens.contains("variant:Write"), "{tokens:?}");
+        assert!(tokens.contains("sysno:close_range"), "{tokens:?}");
+        assert!(
+            !tokens.contains("variant:Read"),
+            "a commented arm counted: {tokens:?}"
+        );
+        assert!(
+            !tokens.contains("variant:Openat"),
+            "a cfg(any()) arm counted: {tokens:?}"
         );
     }
 }

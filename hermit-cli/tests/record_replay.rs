@@ -4719,6 +4719,58 @@ fn record_forked_child_writes_into_a_redirected_stdout_pipe() {
     );
 }
 
+/// The rr-like replay default (6805) in both modes: a guest that
+/// writes a regular file and reads it back prints the same in
+/// record and in replay, and neither replay leaves the file in
+/// the host working directory (the replay root is disposable in
+/// both modes; the flag re-applies writes inside it, which is
+/// what live in-replay consumers read).
+#[test]
+fn replay_write_output_files_reapplies_regular_file_writes() {
+    let _guard = hermit_record_lock();
+    let data_dir = tempfile::tempdir().expect("failed to create recording directory");
+    let work = tempfile::tempdir().expect("failed to create guest working directory");
+    let output_path = work.path().join("out.txt");
+    let run = |subcommand: &[&str], what: &str| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+        command
+            .arg("--log=off")
+            .args(subcommand)
+            .arg("--data-dir")
+            .arg(data_dir.path())
+            .current_dir(work.path());
+        if subcommand[0] == "record" {
+            command
+                .arg("--")
+                .arg("/bin/sh")
+                .arg("-c")
+                .arg("printf hello > out.txt; cat out.txt");
+        }
+        command_output(command, what)
+    };
+    let recorded = run(&["record", "--strict"], "record write-output-files guest");
+    assert_eq!(String::from_utf8_lossy(&recorded.stdout), "hello");
+    assert_eq!(fs::read_to_string(&output_path).unwrap(), "hello");
+
+    fs::remove_file(&output_path).unwrap();
+    let replayed = run(&["replay", "--autopilot"], "replay default");
+    assert_eq!(replayed.stdout, recorded.stdout);
+    assert!(
+        !output_path.exists(),
+        "default replay materialized the guest's output file"
+    );
+
+    let replayed = run(
+        &["replay", "--autopilot", "--write-output-files"],
+        "replay with output files",
+    );
+    assert_eq!(replayed.stdout, recorded.stdout);
+    assert!(
+        !output_path.exists(),
+        "flag-on replay wrote outside its disposable root"
+    );
+}
+
 /// Records, then replays, the guest with a regular-file stdout that the test
 /// opened, and writes `TAIL` through the test's own copy of that description
 /// after each run, so the file shows where the run left the description's
@@ -5880,8 +5932,20 @@ fn shared_mapping_replay_refuses_metadata_retagged_as_0x199() {
     let mut metadata: serde_json::Value =
         serde_json::from_slice(&fs::read(&metadata_path).expect("read metadata"))
             .expect("parse metadata");
-    assert_eq!(metadata["version"], 0x1a0, "RECORD_VERSION moved");
+    assert_eq!(metadata["version"], 0x1a2, "RECORD_VERSION moved");
     metadata["version"] = serde_json::json!(0x199);
+    // Drop the current recorder's CPU profile fields, so the era
+    // check does not fire first and the version gate is what refuses.
+    if let Some(document) = metadata.as_object_mut() {
+        for field in [
+            "cpu_profile",
+            "cpu_table_digest",
+            "cpu_profile_host",
+            "cpu_profile_residual",
+        ] {
+            document.remove(field);
+        }
+    }
     fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
     let mut replay = replay_command();
     let refused = hermit_test::hermit_output(&format!("{replay:?}"), &mut replay);
@@ -6510,6 +6574,23 @@ fn record_replay_preserves_read_only_shared_pages_after_truncate_and_advice() {
         "read-only-truncate-advice: before advice: zero\n\
          read-only-truncate-advice: after advice: zero\n\
          read-only-truncate-advice: mprotect: EACCES\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Shared coherence is per recorded file, not per descriptor
+/// (6805 Astra B1/B2): a pwrite through a second independent open
+/// reaches the first open's shared view under the rr-like default,
+/// and closing that open and opening another file — whose replay
+/// placeholder may recycle the freed eventfd id — does not write
+/// into the first file.
+#[test]
+fn record_replay_shares_pages_across_independent_opens() {
+    let _guard = hermit_record_lock();
+    let failures = shared_mappings_failures(
+        "independent-open",
+        "independent-open: view sees after!\n\
+         independent-open: after realloc view sees after!\n",
     );
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

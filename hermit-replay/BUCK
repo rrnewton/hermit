@@ -34,3 +34,11 @@ buck_export_file(
     name = "Cargo.toml",
     visibility = ["//hermetic_infra/hermit:"],
 )
+
+# The dispatch source hermit-record's subscription/dispatch
+# agreement test parses at test runtime (6805 Astra B6).
+buck_export_file(
+    name = "replayer.rs",
+    src = "src/replayer.rs",
+    visibility = ["//hermetic_infra/hermit/hermit-record:"],
+)

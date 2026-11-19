@@ -18,6 +18,7 @@ use reverie::Guest;
 use reverie::Stack;
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
+use reverie::syscalls::Fallocate;
 use reverie::syscalls::Fcntl;
 use reverie::syscalls::FcntlCmd;
 use reverie::syscalls::Ftruncate;
@@ -695,7 +696,11 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         // made without `CLONE_FILES` has a table of its own.
         let (pid, tid) = (guest.pid(), guest.tid());
         if !self.fd_is_in_replay_root(tid, syscall.fd())
-            && !super::mmap::writes_shared_backing(tid, syscall.fd())
+            && !super::mmap::writes_shared_backing(
+                &DescriptorAccess::<H, ()>::task(&self.init, tid, tid),
+                tid,
+                syscall.fd(),
+            )
         {
             return Ok(());
         }
@@ -722,7 +727,14 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         // backing is a memfd, so no host file is touched, and later
         // loads through the mapping must see these bytes.
         if let Some(offset) = offset.and_then(|offset| u64::try_from(offset).ok()) {
-            super::mmap::write_shared_backing(task, fd, bytes, offset).map_err(Error::Io)?;
+            super::mmap::write_shared_backing(
+                &DescriptorAccess::<H, ()>::task(&self.init, task, task),
+                task,
+                fd,
+                bytes,
+                offset,
+            )
+            .map_err(Error::Io)?;
         }
         // rr-like default (6805): the replay-root file itself is not
         // written; reads of this descriptor are served from recorded
@@ -802,16 +814,15 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         };
         match event.replay_fd_kind {
             ReplayFdKind::Eventfd => {
-                // rr-like default (6805): the counter is not consumed
-                // live; reads and writes both answer from the recording.
-                if self.write_output_files {
-                    let actual = inject_kernel_side_effect(guest, fd, syscall).await?;
-                    assert_eq!(
-                        actual,
-                        Ok(event.bytes.len() as i64),
-                        "replayed readv eventfd side effect diverged"
-                    );
-                }
+                // The counter is kernel-object state live readiness
+                // calls observe, not an output file: consumed live
+                // under both policies (6805 seat findings).
+                let actual = inject_kernel_side_effect(guest, fd, syscall).await?;
+                assert_eq!(
+                    actual,
+                    Ok(event.bytes.len() as i64),
+                    "replayed readv eventfd side effect diverged"
+                );
             }
             ReplayFdKind::RegularFile if advances_offset => {
                 self.advance_regular_file_position(guest.pid(), guest.pid(), fd, event.bytes.len());
@@ -834,15 +845,12 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         let event = next_event!(guest, ReadV2)?;
         match event.replay_fd_kind {
             ReplayFdKind::Eventfd => {
-                if self.write_output_files {
-                    let actual =
-                        inject_kernel_side_effect(guest, syscall.fd(), syscall.into()).await?;
-                    assert_eq!(
-                        actual,
-                        Ok(event.bytes.len() as i64),
-                        "replayed read eventfd side effect diverged"
-                    );
-                }
+                let actual = inject_kernel_side_effect(guest, syscall.fd(), syscall.into()).await?;
+                assert_eq!(
+                    actual,
+                    Ok(event.bytes.len() as i64),
+                    "replayed read eventfd side effect diverged"
+                );
             }
             ReplayFdKind::RegularFile => {
                 self.advance_regular_file_position(
@@ -1050,15 +1058,12 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         let successful_count = successful_replay_write_count(event.result)?;
         match event.replay_fd_kind {
             ReplayFdKind::Eventfd => {
-                if self.write_output_files {
-                    let actual =
-                        inject_kernel_side_effect(guest, syscall.fd(), Syscall::from(syscall))
-                            .await?;
-                    assert_eq!(
-                        actual, event.result,
-                        "replayed eventfd write side effect diverged"
-                    );
-                }
+                let actual =
+                    inject_kernel_side_effect(guest, syscall.fd(), Syscall::from(syscall)).await?;
+                assert_eq!(
+                    actual, event.result,
+                    "replayed eventfd write side effect diverged"
+                );
             }
             ReplayFdKind::RegularFile => {
                 if let Some(count) = successful_count {
@@ -1189,8 +1194,13 @@ impl<H: RecordHost> ReplayerWithHost<H> {
                 && event.output_fd.is_none()
                 && let Ok(length) = u64::try_from(event.length)
             {
-                super::mmap::truncate_shared_backing(guest.tid(), syscall.fd(), length)
-                    .map_err(Error::Io)?;
+                super::mmap::truncate_shared_backing(
+                    &DescriptorAccess::<H, ()>::task(&self.init, guest.tid(), guest.tid()),
+                    guest.tid(),
+                    syscall.fd(),
+                    length,
+                )
+                .map_err(Error::Io)?;
             }
             if self.write_output_files
                 && event.replay_regular_file
@@ -1217,6 +1227,70 @@ impl<H: RecordHost> ReplayerWithHost<H> {
             }
         }
         event.result.map_err(Error::from)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(6805): recorded fallocate replay.
+    /// Replays a recorded `fallocate` (6805 Astra B3: it used to run
+    /// natively as a Detcore passthrough, against a placeholder
+    /// under the rr-like default). The recorded result stands; a
+    /// hole-punching or zeroing mode also zeroes the shared backing
+    /// range in both output policies, because mapped loads observe
+    /// it. Plain allocation changes no bytes the backing does not
+    /// already read as zeros. Range-shifting modes
+    /// (`COLLAPSE_RANGE`/`INSERT_RANGE`) move file bytes in ways the
+    /// backing model does not reproduce, so a recorded success with
+    /// one is refused by name instead of silently diverging. With
+    /// `--write-output-files`, the effect is also reapplied to the
+    /// replay-root file.
+    pub(super) async fn handle_fallocate<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Fallocate,
+    ) -> Result<i64, Error> {
+        let recorded = next_event!(guest, Return);
+        if recorded.is_ok() {
+            let mode = syscall.mode();
+            let shifting = libc::FALLOC_FL_COLLAPSE_RANGE | libc::FALLOC_FL_INSERT_RANGE;
+            if mode & shifting != 0 {
+                return Err(Error::Tool(anyhow::anyhow!(
+                    "replay cannot reproduce a recorded fallocate with mode {mode:#x}: \
+                     range-shifting modes move shared file bytes"
+                )));
+            }
+            let zeroing = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_ZERO_RANGE;
+            if mode & zeroing != 0
+                && let (Ok(offset), Ok(len)) = (
+                    u64::try_from(syscall.offset()),
+                    u64::try_from(syscall.len()),
+                )
+            {
+                let access = DescriptorAccess::<H, ()>::task(&self.init, guest.tid(), guest.tid());
+                let zeros = vec![0u8; 64 * 1024];
+                let mut written = 0u64;
+                while written < len {
+                    let chunk = usize::try_from(len - written)
+                        .map_or(zeros.len(), |left| left.min(zeros.len()));
+                    super::mmap::write_shared_backing(
+                        &access,
+                        guest.tid(),
+                        syscall.fd(),
+                        &zeros[..chunk],
+                        offset + written,
+                    )
+                    .map_err(Error::Io)?;
+                    written += chunk as u64;
+                }
+            }
+            if self.write_output_files && self.fd_is_in_replay_root(guest.pid(), syscall.fd()) {
+                let actual = guest.inject_with_retry(Syscall::Fallocate(syscall)).await;
+                assert_eq!(
+                    actual, recorded,
+                    "replayed fallocate returned a different result"
+                );
+            }
+        }
+        recorded.map_err(Error::from)
     }
 
     pub(super) async fn handle_stat_family<G: Guest<Self>>(

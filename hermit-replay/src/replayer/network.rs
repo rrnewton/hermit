@@ -321,10 +321,10 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         maxevents: libc::c_int,
     ) -> Result<i64, Errno> {
         let event = next_event!(guest, EpollWait)?;
-        // rr-like default (6805): no kernel epoll state is advanced;
-        // the recorded events below are the whole answer (epoll_ctl
-        // is likewise not reapplied).
-        if self.write_output_files && event.replay_kernel_side_effect {
+        // Kernel epoll state is advanced exactly when the recording
+        // says the wait ran in the kernel, under both output
+        // policies: it is kernel-object state, not an output file.
+        if event.replay_kernel_side_effect {
             let actual = guest.inject(syscall).await;
             assert_eq!(
                 actual,

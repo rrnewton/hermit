@@ -384,6 +384,38 @@ static void read_only_truncate_advice(void) {
   check(unlink(path) == 0, "unlink the advice file");
 }
 
+/* 6805 Astra B1/B2: coherence is per recorded file, not per
+ * descriptor. A second independent open's pwrite must reach the
+ * first open's shared view, and closing that second open and
+ * opening another file (whose placeholder may recycle the freed
+ * eventfd id in replay) must not write into the first file. */
+static void independent_open(void) {
+  const char* path = "/tmp/hermit-shared-mappings-independent-open";
+  const char* other = "/tmp/hermit-shared-mappings-independent-other";
+  int first = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+  check(first >= 0, "create the independent-open file");
+  if (first < 0) return;
+  check(ftruncate(first, page) == 0, "size the independent-open file");
+  char* view = map_pages(first, 0, 1);
+  memcpy(view, "before", 6);
+  int second = open(path, O_RDWR);
+  check(second >= 0, "open the same file again");
+  if (second < 0) return;
+  check(pwrite(second, "after!", 6, 0) == 6, "pwrite through the second open");
+  printf("independent-open: view sees %.6s\n", view);
+  check(close(second) == 0, "close the second open");
+  int third = open(other, O_RDWR | O_CREAT | O_TRUNC, 0600);
+  check(third >= 0, "create the other file");
+  if (third < 0) return;
+  check(ftruncate(third, page) == 0, "size the other file");
+  check(pwrite(third, "zzzzzz", 6, 0) == 6, "pwrite the other file");
+  printf("independent-open: after realloc view sees %.6s\n", view);
+  check(close(third) == 0, "close the other file");
+  check(close(first) == 0, "close the first open");
+  check(unlink(path) == 0, "unlink the independent-open file");
+  check(unlink(other) == 0, "unlink the other file");
+}
+
 static void chroot_remap(void) {
   int fd = memfd(1);
   char* outside = map_pages(fd, 0, 1);
@@ -582,6 +614,8 @@ int main(int argc, char** argv) {
     read_only_mprotect();
   } else if (strcmp(mode, "read-only-truncate-advice") == 0) {
     read_only_truncate_advice();
+  } else if (strcmp(mode, "independent-open") == 0) {
+    independent_open();
   } else if (strcmp(mode, "chroot") == 0) {
     chroot_remap();
   } else if (strcmp(mode, "seccomp-filter") == 0) {

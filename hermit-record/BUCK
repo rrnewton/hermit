@@ -1,4 +1,5 @@
 load("@fbcode_macros//build_defs:export_files.bzl", "buck_export_file")
+load("@fbcode_macros//build_defs:native_rules.bzl", "buck_filegroup")
 load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
 
 oncall("hermit")
@@ -10,6 +11,14 @@ rust_library(
     srcs = glob(["src/**/*.rs"]),
     autocargo = {"cargo_toml_dir": "."},
     named_deps = {"reverie": "//hermetic_infra/reverie:reverie"},
+    # The dispatch agreement test reads both tools' dispatch
+    # sources as Cargo's CARGO_MANIFEST_DIR lays them out; stage
+    # them in that layout and point the variable at it, as
+    # libhermit's test fixtures do (6805 Astra B6).
+    resources = [":dispatch-agreement-sources"],
+    rustc_flags = [
+        "--env-set=CARGO_MANIFEST_DIR=$(location :dispatch-agreement-sources)/hermit-record",
+    ],
     # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
     target_compatible_with = ["ovr_config//cpu:x86_64"],
     deps = [
@@ -29,4 +38,14 @@ rust_library(
 buck_export_file(
     name = "Cargo.toml",
     visibility = ["//hermetic_infra/hermit:"],
+)
+
+# The two dispatch sources the subscription/dispatch agreement test
+# parses, in the sibling layout Cargo's CARGO_MANIFEST_DIR gives it.
+buck_filegroup(
+    name = "dispatch-agreement-sources",
+    srcs = {
+        "hermit-record/src/recorder.rs": "src/recorder.rs",
+        "hermit-replay/src/replayer.rs": "//hermetic_infra/hermit/hermit-replay:replayer.rs",
+    },
 )

@@ -64,6 +64,16 @@ pub fn record_and_replay() -> Subscription {
         Sysno::fadvise64,
         Sysno::flock,
         Sysno::ftruncate,
+        // Passthrough filesystem effects Detcore would otherwise run
+        // natively in both modes (6805 Astra B3): with recorded opens
+        // virtual under the rr-like default, their results must be
+        // recorded and served, not executed against a placeholder.
+        Sysno::fallocate,
+        Sysno::truncate,
+        Sysno::fchmodat2,
+        Sysno::readahead,
+        Sysno::sync_file_range,
+        Sysno::chroot,
         // Descriptor syncs, metadata changes and xattr calls: replay
         // returns the recorded results, because a replayed descriptor may
         // be a placeholder, and reapplies changes inside the replay root.

@@ -242,12 +242,24 @@ struct SharedBacking {
     /// made in replay). Each is held open, so its inode cannot name another
     /// file while it is linked here.
     objects: Vec<(FileId, OwnedFd)>,
-    /// `eventfd-id`s of placeholder descriptors of mappings of this
-    /// file, for descriptors that name no replay object (a virtual
-    /// open under the rr-like default). An eventfd id names one
-    /// eventfd instance for its life and is never reused, so writes
-    /// through the placeholder resolve here without a file identity.
-    placeholder_ids: Vec<String>,
+    /// Placeholder descriptors of mappings of this file, for
+    /// descriptors that name no replay object (a virtual open under
+    /// the rr-like default). Each entry pins its eventfd open in
+    /// this process for as long as the link lives: the kernel
+    /// reuses an `eventfd-id` as soon as its last descriptor closes
+    /// (6805 Astra B1), so an unowned id string could come to name
+    /// a different placeholder while this backing still maps.
+    placeholders: Vec<PlaceholderPin>,
+}
+
+/// One linked placeholder descriptor: its `eventfd-id`, and a
+/// duplicate this process holds open so the id cannot be reused
+/// while the link lives.
+#[derive(Debug)]
+struct PlaceholderPin {
+    id: String,
+    #[allow(dead_code, reason = "held open so its eventfd-id cannot be reused")]
+    pin: OwnedFd,
 }
 
 impl SharedBacking {
@@ -302,7 +314,7 @@ impl SharedBacking {
             root,
             name,
             objects: Vec::new(),
-            placeholder_ids: Vec::new(),
+            placeholders: Vec::new(),
         };
         Ok(backing)
     }
@@ -326,6 +338,112 @@ fn shared_backings() -> MutexGuard<'static, SharedBackings> {
         .get_or_init(Default::default)
         .lock()
         .expect("should not be poisoned: no code panics while holding it")
+}
+
+/// A virtual open's placeholder bound to the recorded file it opened
+/// (`OpenEvent::file_id`), before any mapping links it to a backing.
+/// Independent opens of one recorded file carry the same recorded
+/// identity, so a write or truncate through any of them resolves to
+/// the one backing (6805 Astra B2). No pin is needed here: the
+/// guest's own descriptor keeps the eventfd instance (and so its
+/// id) alive for exactly the binding's useful life, and the
+/// binding retires when that descriptor number closes, is
+/// replaced, or dies close-on-exec, mirroring the pending-open
+/// registry. A mapping that outlives its descriptor pins at link
+/// time instead ([`PlaceholderPin`]).
+#[derive(Debug)]
+struct PlaceholderBinding {
+    id: String,
+    recorded: FileId,
+    tgid: libc::pid_t,
+    table: i32,
+    fd: RawFd,
+    cloexec: bool,
+}
+
+fn placeholder_bindings() -> MutexGuard<'static, Vec<PlaceholderBinding>> {
+    static BINDINGS: OnceLock<Mutex<Vec<PlaceholderBinding>>> = OnceLock::new();
+    BINDINGS
+        .get_or_init(Default::default)
+        .lock()
+        .expect("should not be poisoned: no code panics while holding it")
+}
+
+fn bind_placeholder_in(bindings: &mut Vec<PlaceholderBinding>, binding: PlaceholderBinding) {
+    bindings.retain(|existing| {
+        existing.id != binding.id && !(existing.table == binding.table && existing.fd == binding.fd)
+    });
+    bindings.push(binding);
+}
+
+fn binding_recorded_in(bindings: &[PlaceholderBinding], id: &str) -> Option<FileId> {
+    bindings
+        .iter()
+        .find(|binding| binding.id == id)
+        .map(|binding| binding.recorded)
+}
+
+/// Binds the placeholder with eventfd identity `id` at descriptor
+/// `fd` of thread `tid` to the recorded file `recorded` its open
+/// named. The identity is the one the pending-open registry just
+/// read for the same descriptor, so binding costs no extra
+/// descriptor query per open.
+pub(super) fn bind_placeholder(
+    id: String,
+    recorded: (u64, u64),
+    tgid: libc::pid_t,
+    tid: Pid,
+    fd: RawFd,
+    cloexec: bool,
+) {
+    bind_placeholder_in(
+        &mut placeholder_bindings(),
+        PlaceholderBinding {
+            id,
+            recorded: FileId {
+                device: recorded.0,
+                inode: recorded.1,
+            },
+            tgid,
+            table: tid.as_raw(),
+            fd,
+            cloexec,
+        },
+    );
+}
+
+/// Retires the binding of descriptor `fd` in `table`'s table, as a
+/// close or a dup onto that number ends it.
+pub(super) fn retire_placeholder_binding(table: Pid, fd: RawFd) {
+    placeholder_bindings().retain(|binding| !(binding.table == table.as_raw() && binding.fd == fd));
+}
+
+/// Retires `table`'s bindings in `[first, last]`, as `close_range`
+/// ends them. A `CLOSE_RANGE_CLOEXEC` range only flags them.
+pub(super) fn retire_placeholder_bindings_in_range(
+    table: Pid,
+    first: RawFd,
+    last: RawFd,
+    cloexec_only: bool,
+) {
+    let mut bindings = placeholder_bindings();
+    if cloexec_only {
+        for binding in bindings.iter_mut() {
+            if binding.table == table.as_raw() && (first..=last).contains(&binding.fd) {
+                binding.cloexec = true;
+            }
+        }
+    } else {
+        bindings.retain(|binding| {
+            !(binding.table == table.as_raw() && (first..=last).contains(&binding.fd))
+        });
+    }
+}
+
+/// Retires close-on-exec bindings of thread group `tgid`, as a
+/// successful exec closes their placeholders.
+pub(super) fn retire_cloexec_placeholder_bindings(tgid: libc::pid_t) {
+    placeholder_bindings().retain(|binding| !(binding.cloexec && binding.tgid == tgid));
 }
 
 /// Every guest task replay has started (`track_task`), whose mappings decide
@@ -621,11 +739,21 @@ fn link_object<H: RecordHost, G>(
     let object = replay_object(tid, fd)?;
     if object.is_none() {
         // No replay object: under the rr-like default the descriptor
-        // is a placeholder eventfd for a virtual open. Link by its
-        // eventfd id instead, so writes through it still resolve.
-        if let Some(id) = super::placeholder_eventfd_id::<H, G>(access, fd) {
-            return link_placeholder_in(&mut shared_backings(), file, id);
+        // may be a placeholder eventfd for a virtual open. Link it
+        // only when its virtual open bound it to this recorded file:
+        // a placeholder with no binding (a /dev/zero descriptor, each
+        // of whose mappings is a distinct recorded object through
+        // the same descriptor) cannot be keyed by descriptor at
+        // all, and writes through it are not regular-file writes.
+        // The duplicate pin keeps the eventfd id from being reused
+        // while the link lives (Astra B1).
+        if let Some(id) = super::placeholder_eventfd_id::<H, G>(access, fd)
+            && binding_recorded_in(&placeholder_bindings(), &id) == Some(file.recorded)
+        {
+            let pin = H::duplicate_guest_thread_fd(access, pid, tid, fd)?;
+            return link_placeholder_in(&mut shared_backings(), file, id, pin);
         }
+        return Ok(());
     }
     link_object_in(&mut shared_backings(), file, object, || {
         H::duplicate_guest_thread_fd(access, pid, tid, fd)
@@ -633,18 +761,24 @@ fn link_object<H: RecordHost, G>(
 }
 
 /// Links placeholder eventfd `id` to `file`'s backing, with the same
-/// one-name-one-file rule as [`link_object_in`]. No descriptor is
-/// pinned: an eventfd id is never reused, so the name cannot come
-/// to name another descriptor while it is linked here.
+/// one-name-one-file rule as [`link_object_in`]. `pin` is a duplicate
+/// of the placeholder held open for the link's life: the kernel
+/// reuses an eventfd id once its last descriptor closes, so only the
+/// pin keeps the name from coming to name another descriptor while
+/// it is linked here (Astra B1).
 fn link_placeholder_in(
     backings: &mut SharedBackings,
     file: SharedFile,
     id: String,
+    pin: OwnedFd,
 ) -> io::Result<()> {
-    if backings
-        .iter()
-        .any(|(other, backing)| *other != file && backing.placeholder_ids.contains(&id))
-    {
+    if backings.iter().any(|(other, backing)| {
+        *other != file
+            && backing
+                .placeholders
+                .iter()
+                .any(|placeholder| placeholder.id == id)
+    }) {
         return Err(io::Error::other(
             "replay object already backs another shared file",
         ));
@@ -654,8 +788,12 @@ fn link_placeholder_in(
             "shared file backing disappeared before object pinning",
         ));
     };
-    if !backing.placeholder_ids.contains(&id) {
-        backing.placeholder_ids.push(id);
+    if !backing
+        .placeholders
+        .iter()
+        .any(|placeholder| placeholder.id == id)
+    {
+        backing.placeholders.push(PlaceholderPin { id, pin });
     }
     Ok(())
 }
@@ -693,41 +831,93 @@ fn link_object_in(
 /// The backing that descriptor `fd` of thread `tid` writes, if it names a
 /// replay object linked to one. `tid`'s own descriptor table is the one
 /// read: a thread made without `CLONE_FILES` has a table of its own.
-fn object_backing(tid: Pid, fd: RawFd) -> io::Result<Option<File>> {
+/// The placeholder identity is read through the same run-bound
+/// descriptor interface that registered it (Astra B5): a failed
+/// required lookup is an error, never "no backing".
+fn object_backing<H: RecordHost, G>(
+    access: &DescriptorAccess<'_, H, G>,
+    tid: Pid,
+    fd: RawFd,
+) -> io::Result<Option<File>> {
     let backings = shared_backings();
+    let bindings = placeholder_bindings();
     // A placeholder descriptor names no replay object; resolve it by
-    // the eventfd id a shared view linked for it (slice 4), before
-    // the file-identity lookup real descriptors take.
-    if let Some(backing) =
-        placeholder_backing_in(&backings, || placeholder_id_at(tid, fd), OwnedFd::try_clone)?
+    // the eventfd id a shared view linked for it, or by the recorded
+    // file its virtual open bound it to, before the file-identity
+    // lookup real descriptors take. The fdinfo read happens only
+    // when a placeholder link or binding could resolve it.
+    // No backing can resolve anything until a shared mapping has
+    // made one, so the fdinfo read is skipped entirely then: this
+    // lookup sits on every replayed regular-file write.
+    let want_id = !backings.is_empty()
+        && (backings
+            .values()
+            .any(|backing| !backing.placeholders.is_empty())
+            || !bindings.is_empty());
+    let id = if want_id {
+        match H::fdinfo_text_at(access, fd)? {
+            Some(fdinfo) => super::parse_eventfd_id(&fdinfo),
+            None => None,
+        }
+    } else {
+        None
+    };
+    if let Some(backing) = placeholder_backing_in(&backings, || Ok(id.clone()), OwnedFd::try_clone)?
+    {
+        return Ok(Some(backing));
+    }
+    if let Some(backing) = recorded_backing_in(&backings, &bindings, || Ok(id), OwnedFd::try_clone)?
     {
         return Ok(Some(backing));
     }
     object_backing_in(&backings, || replay_object(tid, fd), OwnedFd::try_clone)
 }
 
-/// The `eventfd-id` of descriptor `fd` of thread `tid`, read from its
-/// `fdinfo` as [`super::placeholder_eventfd_id`] reads it through the
-/// host seam; this free path holds no access (as [`replay_object`]).
-fn placeholder_id_at(tid: Pid, fd: RawFd) -> Option<String> {
-    let fdinfo = std::fs::read_to_string(format!("/proc/{}/fdinfo/{fd}", tid.as_raw())).ok()?;
-    super::parse_eventfd_id(&fdinfo)
-}
-
 fn placeholder_backing_in(
     backings: &SharedBackings,
-    inspect: impl FnOnce() -> Option<String>,
+    inspect: impl FnOnce() -> io::Result<Option<String>>,
     duplicate: impl FnOnce(&OwnedFd) -> io::Result<OwnedFd>,
 ) -> io::Result<Option<File>> {
     if backings.is_empty() {
         return Ok(None);
     }
-    let Some(id) = inspect() else {
+    let Some(id) = inspect()? else {
+        return Ok(None);
+    };
+    let Some(backing) = backings.values().find(|backing| {
+        backing
+            .placeholders
+            .iter()
+            .any(|placeholder| placeholder.id == id)
+    }) else {
+        return Ok(None);
+    };
+    Ok(Some(File::from(duplicate(&backing.file)?)))
+}
+
+/// The backing of the recorded file a placeholder was bound to at
+/// its virtual open, whether or not a mapping through this
+/// descriptor ever linked it: independent opens of one recorded
+/// file share its backing (Astra B2).
+fn recorded_backing_in(
+    backings: &SharedBackings,
+    bindings: &[PlaceholderBinding],
+    inspect: impl FnOnce() -> io::Result<Option<String>>,
+    duplicate: impl FnOnce(&OwnedFd) -> io::Result<OwnedFd>,
+) -> io::Result<Option<File>> {
+    if backings.is_empty() || bindings.is_empty() {
+        return Ok(None);
+    }
+    let Some(id) = inspect()? else {
+        return Ok(None);
+    };
+    let Some(recorded) = binding_recorded_in(bindings, &id) else {
         return Ok(None);
     };
     let Some(backing) = backings
-        .values()
-        .find(|backing| backing.placeholder_ids.contains(&id))
+        .iter()
+        .find(|(file, _)| file.recorded == recorded)
+        .map(|(_, backing)| backing)
     else {
         return Ok(None);
     };
@@ -767,20 +957,25 @@ fn pin_shared_object(pin: impl FnOnce() -> io::Result<()>) {
 
 /// Whether replayed writes through descriptor `fd` of thread `tid` reach a
 /// shared file's backing.
-pub(super) fn writes_shared_backing(tid: Pid, fd: RawFd) -> bool {
-    shared_write_target(|| object_backing(tid, fd)).is_some()
+pub(super) fn writes_shared_backing<H: RecordHost>(
+    access: &DescriptorAccess<'_, H, ()>,
+    tid: Pid,
+    fd: RawFd,
+) -> bool {
+    shared_write_target(|| object_backing(access, tid, fd)).is_some()
 }
 
 /// Applies a replayed write of `bytes` at `offset` through descriptor `fd` of
 /// thread `tid` to the backing of the shared file it names, as Linux applies
 /// a write to the pages every mapping of the file maps.
-pub(super) fn write_shared_backing(
+pub(super) fn write_shared_backing<H: RecordHost>(
+    access: &DescriptorAccess<'_, H, ()>,
     tid: Pid,
     fd: RawFd,
     bytes: &[u8],
     offset: u64,
 ) -> io::Result<()> {
-    match shared_write_target(|| object_backing(tid, fd)) {
+    match shared_write_target(|| object_backing(access, tid, fd)) {
         Some(backing) => backing.write_all_at(bytes, offset),
         None => Ok(()),
     }
@@ -791,10 +986,39 @@ pub(super) fn write_shared_backing(
 /// `length` read as zeros again, as Linux drops a truncated file's pages.
 /// The backing keeps its size, so a mapping past the end reads zeros where
 /// Linux would raise SIGBUS, as replay's copies always did.
-pub(super) fn truncate_shared_backing(tid: Pid, fd: RawFd, length: u64) -> io::Result<()> {
-    let Some(backing) = shared_write_target(|| object_backing(tid, fd)) else {
+pub(super) fn truncate_shared_backing<H: RecordHost>(
+    access: &DescriptorAccess<'_, H, ()>,
+    tid: Pid,
+    fd: RawFd,
+    length: u64,
+) -> io::Result<()> {
+    let Some(backing) = shared_write_target(|| object_backing(access, tid, fd)) else {
         return Ok(());
     };
+    truncate_backing_file(&backing, length)
+}
+
+/// Truncates the backing of recorded file `recorded`, if one exists,
+/// as a successful virtual `O_TRUNC` open of that file does (Astra
+/// B2): the recorded result stands either way, and mapped loads
+/// must not keep reading bytes the truncation dropped.
+pub(super) fn truncate_recorded_backing(recorded: (u64, u64)) -> io::Result<()> {
+    let recorded = FileId {
+        device: recorded.0,
+        inode: recorded.1,
+    };
+    let backings = shared_backings();
+    let Some(backing) = backings
+        .iter()
+        .find(|(file, _)| file.recorded == recorded)
+        .map(|(_, backing)| backing.file.try_clone())
+    else {
+        return Ok(());
+    };
+    truncate_backing_file(&File::from(backing?), 0)
+}
+
+fn truncate_backing_file(backing: &File, length: u64) -> io::Result<()> {
     let size = backing.metadata()?.len();
     if length >= size {
         return Ok(());
@@ -2294,21 +2518,91 @@ mod tests {
         let (key, backing, _file) = local_backing(directory.path(), 1);
         let (other_key, other, _other_file) = local_backing(directory.path(), 2);
         let mut backings = SharedBackings::from([(key, backing), (other_key, other)]);
-        link_placeholder_in(&mut backings, key, "41".to_owned()).unwrap();
+        // The pin is a real held descriptor: it is what keeps the
+        // eventfd instance (and so its id) alive for the link.
+        let pin = || std::fs::File::open(directory.path()).unwrap().into();
+        link_placeholder_in(&mut backings, key, "41".to_owned(), pin()).unwrap();
         // Idempotent for the same file, refused for another.
-        link_placeholder_in(&mut backings, key, "41".to_owned()).unwrap();
+        link_placeholder_in(&mut backings, key, "41".to_owned(), pin()).unwrap();
         assert!(
-            link_placeholder_in(&mut backings, other_key, "41".to_owned()).is_err(),
+            link_placeholder_in(&mut backings, other_key, "41".to_owned(), pin()).is_err(),
             "one placeholder id linked two shared files"
         );
+        assert_eq!(
+            backings[&key].placeholders.len(),
+            1,
+            "relinking one placeholder pinned it twice"
+        );
         let resolved =
-            placeholder_backing_in(&backings, || Some("41".to_owned()), |fd| fd.try_clone())
+            placeholder_backing_in(&backings, || Ok(Some("41".to_owned())), |fd| fd.try_clone())
                 .unwrap();
         assert!(resolved.is_some(), "linked placeholder did not resolve");
         let missing =
-            placeholder_backing_in(&backings, || Some("99".to_owned()), |fd| fd.try_clone())
+            placeholder_backing_in(&backings, || Ok(Some("99".to_owned())), |fd| fd.try_clone())
                 .unwrap();
         assert!(missing.is_none(), "unlinked placeholder id resolved");
+        // A failed required identity lookup is an error, not "no
+        // backing" (Astra B5).
+        assert!(
+            placeholder_backing_in(
+                &backings,
+                || Err(io::Error::other("fdinfo read failed")),
+                |fd| fd.try_clone(),
+            )
+            .is_err(),
+            "a failed placeholder lookup resolved as no backing"
+        );
+    }
+
+    #[test]
+    fn a_bound_placeholder_resolves_by_recorded_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let (key, backing, _file) = local_backing(directory.path(), 7);
+        let backings = SharedBackings::from([(key, backing)]);
+        let mut bindings = Vec::new();
+        bind_placeholder_in(
+            &mut bindings,
+            PlaceholderBinding {
+                id: "43".to_owned(),
+                recorded: key.recorded,
+                tgid: 99,
+                table: 99,
+                fd: 9,
+                cloexec: false,
+            },
+        );
+        // An independent open bound to the same recorded file
+        // resolves the backing a mapping of it made (Astra B2).
+        let resolved = recorded_backing_in(
+            &backings,
+            &bindings,
+            || Ok(Some("43".to_owned())),
+            |fd| fd.try_clone(),
+        )
+        .unwrap();
+        assert!(resolved.is_some(), "bound placeholder did not resolve");
+        let unbound = recorded_backing_in(
+            &backings,
+            &bindings,
+            || Ok(Some("44".to_owned())),
+            |fd| fd.try_clone(),
+        )
+        .unwrap();
+        assert!(unbound.is_none(), "unbound placeholder id resolved");
+        // Rebinding the same descriptor number replaces, never stacks.
+        bind_placeholder_in(
+            &mut bindings,
+            PlaceholderBinding {
+                id: "45".to_owned(),
+                recorded: key.recorded,
+                tgid: 99,
+                table: 99,
+                fd: 9,
+                cloexec: true,
+            },
+        );
+        assert_eq!(bindings.len(), 1, "rebinding one descriptor stacked");
+        assert_eq!(bindings[0].id, "45");
     }
 
     fn assert_shared_refusal(action: impl FnOnce(), step: &str) {

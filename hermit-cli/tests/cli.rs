@@ -13373,7 +13373,7 @@ fn a_recording_from_before_rendered_io_and_arch_status_is_refused_by_version() {
     let mut metadata: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
     assert_eq!(
-        metadata["version"], 0x1a1,
+        metadata["version"], 0x1a2,
         "RECORD_VERSION moved; point this test at the current version and the one before"
     );
     metadata["version"] = serde_json::json!(0x197);
@@ -53795,7 +53795,7 @@ fn the_4505_signal_guests_get_past_their_handlers_under_record() {
     };
     let mut metadata: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
-    assert_eq!(metadata["version"], 0x1a1, "RECORD_VERSION moved");
+    assert_eq!(metadata["version"], 0x1a2, "RECORD_VERSION moved");
     metadata["version"] = serde_json::json!(0x17f);
     // Drop the current recorder's CPU profile fields, so the era check does not fire first.
     if let Some(document) = metadata.as_object_mut() {
@@ -65431,17 +65431,19 @@ fn a_rerun_of_an_era_migrated_manifest_stays_on_the_legacy_table() {
 }
 
 /// A genuine pre-split (0x1a0) recording of a CPUID-dependent guest
-/// replays bit for bit on the legacy table its era migrates to.
-/// The fixture under tests/fixtures/recordings was recorded by a
-/// pre-fix binary (see its README); its guest prints a LEAK line
-/// per leaked bit, so replaying it on the psABI table instead —
-/// which is what removing the load-time migration would do —
-/// changes its output and its exit status, and this test goes red.
-/// The copy whose version is edited to the psABI era must instead
-/// be refused: no digest was ever recorded for it to bind.
+/// is refused by name at 0x1a2: the pre-psABI compatibility window
+/// closed there, on the terms its own comment set, because the
+/// 0x1a2 stream shape (recorded passthrough effects, open file
+/// identities) cannot read a 0x1a0 stream in step. The fixture
+/// under tests/fixtures/recordings was recorded by a pre-fix binary
+/// (see its README). The copy whose version is edited to the
+/// current era must instead be refused at the next gate: no CPUID
+/// table digest was ever recorded for it to bind. The old
+/// forced-digest control cannot survive relabeling across a schema
+/// bump, so it is gone with the window it pinned.
 #[cfg(target_arch = "x86_64")]
 #[test]
-fn a_genuine_pre_psabi_recording_replays_bit_for_bit() {
+fn a_genuine_pre_psabi_recording_is_refused_by_the_closed_window() {
     const ID: &str = "7a1b8833fde348c785270b61161d3a17";
     fn copy_recording(from: &Path, to: &Path) {
         fs::create_dir_all(to).unwrap();
@@ -65467,80 +65469,27 @@ fn a_genuine_pre_psabi_recording_replays_bit_for_bit() {
     let run = UnpinnedRun::new();
     copy_recording(&fixture, &run.data().join(ID));
     let (status, stdout, stderr) = run.run(&["--log=debug", "replay", "--autopilot", ID], &[]);
-    assert_eq!(
-        (status, stdout.as_str()),
-        (Some(0), expected.as_str()),
-        "{stderr}"
-    );
-    assert_eq!(
-        logged_profile(&stderr),
-        Some("x86-64-v2-legacy"),
-        "{stderr}"
+    assert_ne!(status, Some(0), "{stderr}");
+    assert_ne!(stdout, expected, "{stderr}");
+    assert!(
+        stderr.contains("Version mismatch"),
+        "the closed window must refuse the genuine 0x1a0 recording by name:\n{stderr}"
     );
 
-    // The same recording claiming the psABI era carries no table
-    // digest for replay to bind, so it is refused by name.
+    // The same recording claiming the current era carries no table
+    // digest for replay to bind, so it is refused by name at the
+    // digest gate instead.
     let edited = UnpinnedRun::new();
     copy_recording(&fixture, &edited.data().join(ID));
     let metadata_path = edited.data().join(ID).join("metadata.json");
     let mut metadata: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
-    metadata["version"] = 0x1a1.into();
+    metadata["version"] = 0x1a2.into();
     fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
     let (status, stdout, stderr) = edited.run(&["--log=debug", "replay", "--autopilot", ID], &[]);
     assert_ne!(status, Some(0), "{stderr}");
     assert_ne!(stdout, expected, "{stderr}");
     assert!(stderr.contains("carries no CPUID table digest"), "{stderr}");
-
-    // The output-discriminating control: the same recording claiming
-    // the psABI era WITH that table's digest passes the digest gate
-    // and replays on the psABI table, where the guest's branches on
-    // the seven bits go the other way and the replay departs from
-    // the recorded output instead of reproducing it. This is what
-    // removing the load-time migration would do to the genuine
-    // replay above, so the migration is pinned by output, not only
-    // by the refusal.
-    let forced = UnpinnedRun::new();
-    copy_recording(&fixture, &forced.data().join(ID));
-    let metadata_path = forced.data().join(ID).join("metadata.json");
-    let mut metadata: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
-    metadata["version"] = 0x1a1.into();
-    let digest = detcore::virtual_cpuid_digest(&detcore::Config {
-        cpu_profile: detcore_model::cpu_profile::CpuProfile::X86_64V2,
-        ..Default::default()
-    });
-    metadata["cpu_table_digest"] = digest
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>()
-        .into();
-    fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
-    let (status, stdout, stderr) = forced.run(&["--log=debug", "replay", "--autopilot", ID], &[]);
-    assert!(
-        !stderr.contains("CPUID table digest"),
-        "the forced copy must pass the digest gate:\n{stderr}"
-    );
-    assert_eq!(
-        logged_profile(&stderr),
-        Some("x86-64-v2"),
-        "the forced copy must present the psABI table:\n{stderr}"
-    );
-    assert_ne!(status, Some(0), "{stderr}");
-    // The departure is exactly at the first discriminating line:
-    // every line the two tables answer alike is reproduced, and
-    // the replay stops on the write whose verdict the psABI
-    // table flips, so stdout ends mid-line there.
-    assert_eq!(
-        stdout,
-        "v2\n\
-         sse2 advertised: ok\n\
-         v2 features advertised: ok\n\
-         v3 leaf1 features hidden: ok\n\
-         rdrand masked: ok\n\
-         known leak avx hidden",
-        "the forced replay must depart at the first leak line:\n{stderr}"
-    );
 }
 
 /// `record start` refuses the legacy table by name before any

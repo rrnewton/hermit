@@ -258,6 +258,13 @@ pub struct OpenEvent {
     pub result: Result<i64, Errno>,
     /// Which filesystem object must exist physically during replay.
     pub materialize: OpenMaterialization,
+    /// The recorded regular file's identity (`stat` device and
+    /// inode), for a successful open of one. Independent opens of
+    /// the same file carry the same identity, so replay can bind
+    /// every placeholder descriptor of the file to the one shared
+    /// backing its mappings use, instead of only the descriptor a
+    /// mapping was made through (6805 Astra B2).
+    pub file_id: Option<(u64, u64)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

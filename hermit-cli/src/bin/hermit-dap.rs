@@ -29,6 +29,7 @@ struct ReplayOptions {
     id: OsString,
     data_dir: Option<OsString>,
     gdbserver_port: u16,
+    write_output_files: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -47,7 +48,7 @@ enum Listen {
 
 fn usage() {
     println!(
-        "Usage: hermit-dap [--gdb PATH] [--listen [HOST:]PORT | --listen-fd FD] [--replay ID [--data-dir DIR] [--gdbserver-port PORT]]\n\n\
+        "Usage: hermit-dap [--gdb PATH] [--listen [HOST:]PORT | --listen-fd FD] [--replay ID [--data-dir DIR] [--gdbserver-port PORT] [--write-output-files]]\n\n\
          Start a Debug Adapter Protocol server for a Hermit GDB remote target.\n\
          The DAP attach request must include the guest executable as 'program'\n\
          and the Hermit GDB server address as 'target'.\n\n\
@@ -82,6 +83,7 @@ where
     let mut data_dir = None;
     let mut gdbserver_port = 1234;
     let mut gdbserver_port_set = false;
+    let mut write_output_files = false;
     let mut args = arguments.into_iter();
 
     while let Some(argument) = args.next() {
@@ -135,6 +137,11 @@ where
                 .to_string_lossy()
                 .parse()
                 .map_err(|_| "--gdbserver-port requires a valid port".to_owned())?;
+        } else if argument == "--write-output-files" {
+            if write_output_files {
+                return Err("--write-output-files may only be specified once".to_owned());
+            }
+            write_output_files = true;
         } else if argument == "-h" || argument == "--help" {
             usage();
             return Ok(None);
@@ -152,6 +159,9 @@ where
     if replay.is_none() && gdbserver_port_set {
         return Err("--gdbserver-port requires --replay".to_owned());
     }
+    if replay.is_none() && write_output_files {
+        return Err("--write-output-files requires --replay".to_owned());
+    }
 
     Ok(Some(Options {
         gdb: gdb.unwrap_or_else(default_gdb),
@@ -160,6 +170,7 @@ where
             id,
             data_dir,
             gdbserver_port,
+            write_output_files,
         }),
     }))
 }
@@ -248,6 +259,9 @@ fn replay_command(options: &ReplayOptions) -> Result<Vec<String>, String> {
     if let Some(data_dir) = &options.data_dir {
         args.push("--data-dir".to_owned());
         args.push(data_dir.to_string_lossy().into_owned());
+    }
+    if options.write_output_files {
+        args.push("--write-output-files".to_owned());
     }
 
     let mut serialized = vec![hermit.to_string_lossy().into_owned()];
@@ -376,8 +390,23 @@ mod tests {
                 id: "recording-id".into(),
                 data_dir: Some("/tmp/recordings".into()),
                 gdbserver_port: 2345,
+                write_output_files: false,
             })
         );
+    }
+
+    #[test]
+    fn write_output_files_requires_replay_and_is_recorded() {
+        let options = parse_options([
+            "--replay".into(),
+            "recording-id".into(),
+            "--write-output-files".into(),
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(options.replay.expect("replay options").write_output_files);
+        let error = parse_options(["--write-output-files".into()]).unwrap_err();
+        assert_eq!(error, "--write-output-files requires --replay");
     }
 
     #[test]

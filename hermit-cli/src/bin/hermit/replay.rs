@@ -64,7 +64,9 @@ pub struct ReplayOpts {
     /// root, producing the guest's output files there. By default a
     /// replay answers them from the recording and writes no output
     /// files, as rr replay does; captured stdout and stderr are
-    /// emitted either way.
+    /// emitted either way. Either way, inputs a replay needs (the
+    /// guest executable and its dependencies, the working directory)
+    /// may still be created in the disposable replay root.
     #[clap(long)]
     write_output_files: bool,
 
@@ -398,7 +400,9 @@ impl ReplayOpts {
     /// `hermit-dap --listen ADDRESS --replay ID`. hermit-dap starts its own
     /// `hermit replay --serve-only`, which is not given this replay's flags,
     /// so `--pinned-cpu-dir` and `--pinned-cpu-notice` reach it as their
-    /// environment fallbacks.
+    /// environment fallbacks. The output policy has no environment
+    /// fallback, so it is passed as hermit-dap's own flag, which its
+    /// replay command forwards to `hermit replay`.
     fn dap_adapter_command(
         &self,
         adapter: &Path,
@@ -417,6 +421,9 @@ impl ReplayOpts {
             .arg("--gdbserver-port")
             .arg(self.gdbserver_port.to_string())
             .envs(self.pinned_cpu_placement.to_env());
+        if self.write_output_files {
+            command.arg("--write-output-files");
+        }
         command
     }
 
@@ -516,5 +523,39 @@ mod tests {
             )]
         );
         assert!(env_of(&["replay", "--dap-listen=127.0.0.1:4711"]).is_empty());
+    }
+
+    /// The output policy has no environment fallback, so the adapter
+    /// command carries it as hermit-dap's own flag exactly when this
+    /// replay was given it (6805 Astra B7: it was silently dropped).
+    #[test]
+    fn a_dap_replay_passes_the_output_policy_on() {
+        let args_of = |argv: &[&str]| {
+            let options = ReplayOpts::parse_from(argv);
+            let command = options.dap_adapter_command(
+                Path::new("/bin/hermit-dap"),
+                Path::new("/data"),
+                "0123456789ab",
+                "127.0.0.1:4711",
+            );
+            command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            args_of(&[
+                "replay",
+                "--dap-listen=127.0.0.1:4711",
+                "--write-output-files",
+            ])
+            .iter()
+            .any(|arg| arg == "--write-output-files")
+        );
+        assert!(
+            !args_of(&["replay", "--dap-listen=127.0.0.1:4711"])
+                .iter()
+                .any(|arg| arg == "--write-output-files")
+        );
     }
 }

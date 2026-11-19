@@ -41,20 +41,17 @@ impl RecordVersion {
     /// Check if the recorder/replayer version is compatible with a given
     /// recording (trace).
     pub fn compatible_with(&self, other: &RecordVersion) -> bool {
-        // The window is tied to the literal first psABI version, so
-        // it closes itself when RECORD_VERSION next moves: accepting
-        // 0x1a0 then would admit a stream whose format may have
-        // changed since, which is what the exact gate exists for.
+        // Re-decided at 0x1a2, as the 0x1a1 window's own terms
+        // required: the window is closed. A 0x1a1 (or 0x1a0) stream
+        // lacks the passthrough-effect events and the open event's
+        // recorded file identity 0x1a2 writes, so
+        // accepting it would admit a stream this replayer reads out
+        // of step, which is what the exact gate exists for.
         const _: () = assert!(
-            RECORD_VERSION.0 == 0x1a1,
-            "the 0x1a0 compatibility window must be re-decided when RECORD_VERSION moves"
+            RECORD_VERSION.0 == 0x1a2,
+            "the compatibility window must be re-decided when RECORD_VERSION moves"
         );
-        // Exact, with one deliberate window: the 0x1a1 replayer
-        // accepts the last pre-psABI version so its recordings
-        // replay on the legacy CPUID table (migrated at load). An
-        // older replayer still refuses this version by the same
-        // equality, by name.
-        self == other || (*self == RecordVersion(0x1a1) && *other == LAST_PRE_PSABI_RECORD_VERSION)
+        self == other
     }
 }
 
@@ -1039,7 +1036,19 @@ impl RecordVersion {
 // refuses a new recording by name instead of replaying it against
 // the wrong CPU. This is the one deliberate exception to exact
 // version equality: RECORD_VERSION accepts 0x1a0 beside itself.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x1a1);
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(6805)
+// 0x1a1 -> 0x1a2: record/replay now subscribes to the Detcore
+// passthrough filesystem effects fallocate, truncate, fchmodat2,
+// readahead, sync_file_range and chroot, so a recording carries
+// an event for each where
+// a 0x1a1 recording has none (the call ran natively in both
+// modes); and OpenEvent carries the recorded regular file's
+// identity, which virtual-open coherence binds placeholders by.
+// Either change alone desynchronizes a cross-version stream. The
+// 0x1a0 pre-psABI window closes here, on the terms its own comment
+// set: 0x1a2 accepts only itself.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x1a2);
 
 /// The last recording version whose `x86-64-v2` (named or absent)
 /// means the pre-psABI legacy table.
@@ -1068,7 +1077,7 @@ pub(crate) const LAST_PRE_PSABI_RECORD_VERSION: RecordVersion = RecordVersion(0x
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x1a1;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x1a2;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1851,8 +1860,9 @@ mod tests {
             // The one deliberate window, open only at 0x1a1: the
             // last pre-psABI version stays readable so its
             // recordings replay on the legacy CPUID table (migrated
-            // at load). A future replayer does not inherit it.
-            if older == LAST_PRE_PSABI_RECORD_VERSION {
+            // at load). A future replayer does not inherit it; at
+            // 0x1a2 it is closed and 0x1a0 is refused like the rest.
+            if older == LAST_PRE_PSABI_RECORD_VERSION && current == 0x1a1 {
                 assert!(RECORD_VERSION.compatible_with(&older));
                 assert!(!RecordVersion(0x1a2).compatible_with(&older));
                 continue;
@@ -2737,13 +2747,16 @@ mod tests {
     /// made on one of the seven corrected Intel models counted only taken
     /// conditional branches, so every RCB coordinate it stores names another
     /// point in the guest; the version gate must refuse it on every host, as
-    /// a full recording does not state which counter it used. A recording of
-    /// this version is accepted.
+    /// a full recording does not state which counter it used. At 0x1a1 the
+    /// pre-psABI 0x1a0 window still accepted such recordings' successors;
+    /// at 0x1a2 the window is closed and 0x1a0 is refused like the rest.
+    /// A recording of this version is accepted.
     #[test]
     fn record_version_rejects_streams_from_before_the_corrected_rcb_event() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x19a)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x186)));
-        assert!(RECORD_VERSION.compatible_with(&RecordVersion(0x1a0)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x1a0)));
+        assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
     }
 
     #[test]
