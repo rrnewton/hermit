@@ -273,9 +273,18 @@ pub struct StartOpts {
 
     /// `--pinned-cpu-dir` and `--pinned-cpu-notice`, as for `hermit run`. The
     /// recording and its verify replay are pinned to one CPU under the
-    /// default policy, `--pinned-cpu=share`.
+    /// default policy, `--pinned-cpu=share`, unless `--no-pin-threads`.
     #[clap(flatten)]
     pinned_cpu_placement: super::pinned_cpu::PinnedCpuPlacementArgs,
+
+    /// Do not pin the recording, or the replays this command runs
+    /// (`--verify`, `--verify-run`), to a CPU: Linux places their threads and
+    /// may migrate them, as under `hermit run --no-pin-threads`. For
+    /// measuring whether recording and replay stay deterministic unpinned.
+    /// `--pinned-cpu-dir` and `--pinned-cpu-notice` stay accepted and have no
+    /// effect. A later `hermit replay` of the recording is pinned as usual.
+    #[clap(long)]
+    no_pin_threads: bool,
 
     /// How much of `/proc` the recorded guest sees, as for `hermit run --proc`
     /// (`minimal`, the default, or `standard`). The level is stored in the
@@ -621,6 +630,12 @@ impl StartOpts {
         self.network.unwrap_or(NetworkingMode::Local)
     }
 
+    /// Whether the recording and the replays this command runs are pinned
+    /// to one CPU: always, unless `--no-pin-threads`.
+    fn pins_threads(&self) -> bool {
+        !self.no_pin_threads
+    }
+
     /// The recording's container, with `backend_mounts` (e9patch's overlay
     /// of the rewritten program) installed as a backend's own before the
     /// private `/dev/shm`, so that their sources are still the host's.
@@ -635,7 +650,7 @@ impl StartOpts {
             self.pinned_cpu_placement
                 .settings(super::pinned_cpu::PinnedCpuPolicy::Share, None),
         );
-        let mut container = namespace_container(true, None)?;
+        let mut container = namespace_container(self.pins_threads(), None)?;
         network.configure(&mut container, false);
         let (mut identity_mounts, mut identity_guard) = identity_hardening_mounts(None)?;
         let dev_shm = private_dev_shm(self.mount.iter().map(Mount::get_target));
@@ -1708,6 +1723,7 @@ mod tests {
             mount: Vec::new(),
             network: None,
             pinned_cpu_placement: Default::default(),
+            no_pin_threads: false,
             proc: Default::default(),
             chaos: false,
             seed: None,
@@ -1968,6 +1984,39 @@ mod tests {
         options.cpu_profile = detcore_model::cpu_profile::CpuProfile::Auto;
         options.inexact_branch_counter = || Some("SpecLockMap is enabled".to_string());
         refused_before_preprocessing(&options);
+    }
+
+    /// `record start` pins the recording and the replays it runs to one CPU
+    /// unless `--no-pin-threads`, as `hermit run` does. The placement
+    /// settings, which are not policy, stay accepted with it.
+    #[test]
+    fn record_no_pin_threads_leaves_the_recording_unpinned() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[clap(flatten)]
+            start: StartOpts,
+        }
+        let pins = |args: &[&str]| {
+            <Cli as clap::Parser>::try_parse_from(args)
+                .unwrap()
+                .start
+                .pins_threads()
+        };
+        assert!(pins(&["start", "/bin/true"]));
+        assert!(!pins(&["start", "--no-pin-threads", "/bin/true"]));
+        assert!(!pins(&[
+            "start",
+            "--no-pin-threads",
+            "--pinned-cpu-dir=/srv/hermit-cpu-locks",
+            "--pinned-cpu-notice=off",
+            "/bin/true",
+        ]));
+        assert!(!pins(&[
+            "start",
+            "--verify",
+            "--no-pin-threads",
+            "/bin/true"
+        ]));
     }
 
     /// `record start` takes `run`'s networking contract, local by default,
@@ -2244,6 +2293,7 @@ mod tests {
             mount: Vec::new(),
             network: None,
             pinned_cpu_placement: Default::default(),
+            no_pin_threads: false,
             proc: Default::default(),
             chaos: false,
             seed: None,
